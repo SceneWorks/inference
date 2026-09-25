@@ -55,7 +55,9 @@ WINDOWS_MAGE_LOCK = (
 MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
 )
-# sc-19387: decodes YuE's upstream ICL reference clip in the dispatch-only `candle-audio-yue` lane.
+# sc-19387: the dispatch-only YuE CUDA lane, in its own file because `real-weights.yml` is at
+# GitHub's 500 KB workflow-size limit, and the lock that decodes YuE's upstream ICL reference clip.
+YUE_WORKFLOW = WORKFLOW.with_name("real-weights-yue.yml")
 WINDOWS_YUE_LOCK = (
     ".github/requirements/real-weights-yue-reference-windows-x64-py312.txt"
 )
@@ -89,7 +91,6 @@ APPROVED_REAL_WEIGHT_LOCKS = {
     WINDOWS_SCAIL_HUB_LOCK,
     WINDOWS_MAGE_LOCK,
     MACOS_MAGE_LOCK,
-    WINDOWS_YUE_LOCK,
 }
 HUB_LOCK_PACKAGES = {
     "annotated-doc",
@@ -672,8 +673,6 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             expected_lock = MACOS_MAGE_LOCK
         elif "mage-oracle-verify" in command:
             expected_lock = WINDOWS_MAGE_LOCK
-        elif "yue-reference-decode" in command:
-            expected_lock = WINDOWS_YUE_LOCK
         elif f"{MACOS_INTERPRETER} -m pip" in command:
             expected_lock = MACOS_HUB_LOCK
         elif f"{WINDOWS_INTERPRETER} -m pip" in command:
@@ -719,16 +718,14 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 35,
-        # 14 since sc-19387 added the `candle-audio-yue` job;
         # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
         # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 14,
+        WINDOWS_HUB_LOCK: 13,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
         MACOS_MAGE_LOCK: 1,
-        WINDOWS_YUE_LOCK: 1,
     }
     actual_lock_counts = {lock: locks_seen.count(lock) for lock in set(locks_seen)}
     if actual_lock_counts != expected_lock_counts:
@@ -1009,16 +1006,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
         # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
-        # after sc-24114 added `candle-qwen-image-2-1`; 14 after sc-19387 added `candle-audio-yue`.
+        # after sc-24114 added `candle-qwen-image-2-1`.
         # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 14)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 13)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
-        self.assertEqual(workflow.count(WINDOWS_YUE_LOCK), 1)
         self.assertNotRegex(
             workflow,
             r"\bpip\s+install[^\n]*(?:huggingface[_-]hub|numpy|safetensors)==",
@@ -1585,6 +1581,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             REAL_WEIGHTS_WORKFLOW,
             LTX25_QUANT_CAMPAIGN_WORKFLOW,
             LTX25_QUANT_PROMOTION_WORKFLOW,
+            YUE_WORKFLOW,
         ):
             with self.subTest(workflow=path.name):
                 workflow = path.read_text(encoding="utf-8")
@@ -1593,6 +1590,20 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_yue_workflow_python_installs_are_binary_hash_locked(self) -> None:
+        installs = [
+            line.strip()
+            for line in YUE_WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if re.search(r"\bpip\s+install\b", line) and not line.lstrip().startswith("#")
+        ]
+        locks = [re.search(r"\s-r\s+(\S+)", line).group(1) for line in installs]
+        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK])
+        for line in installs:
+            with self.subTest(install=line):
+                self.assertTrue(line.startswith(f"{WINDOWS_INTERPRETER} -m pip install "))
+                self.assertIn("--only-binary=:all: --require-hashes", line)
+                self.assertTrue(line.endswith("|| exit /b 1"))
 
     def test_ltx25_terminal_workflows_are_autonomous_and_artifact_bound(self) -> None:
         campaign = LTX25_QUANT_CAMPAIGN_WORKFLOW.read_text(encoding="utf-8")

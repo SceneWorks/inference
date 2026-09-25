@@ -1,0 +1,164 @@
+name: YuE real-weight validation (CUDA)
+
+# sc-19387 (epic sc-19373): YuE-v1 lyrics2song through the PRODUCTION registered loader on CUDA.
+# Its own file because `real-weights.yml` sits within ~2 KB of GitHub's 500 KB workflow-size limit
+# (a run on an oversized file is a `startup_failure` with no jobs). Dispatch-only terminal evidence
+# for the epic, not a gate. It runs every test in
+# `crates/audio/candle-audio-yue/tests/registered_loader_real_weights.rs`: the worker-shape
+# `yue_en_cot` at bf16 (7B stage 1 + 1B stage 2, ~16 GB of weights), the repo-root layout of the
+# same case, and `yue_en_icl` at q4 with upstream's `prompt_egs/pop.00001.mp3` as the single-track
+# reference. Each asserts a finite, non-silent 44.1 kHz mix plus the `vocals` / `instrumental`
+# stems and the progress contract.
+#
+# The four SceneWorks rehosts are materialized into the persistent hub cache (release/
+# real-weight-models.toml, profile `yue`) and junctioned into the `YUE_SNAPSHOT_ROOT/<repo>` layout
+# the test reads. The reference clip is fetched at the pinned YuE commit, SHA-256-verified and
+# decoded by `scripts/release/yue_reference_clip.py` from its own hash-locked wheel set.
+#
+# `nvidia-smi` samples device memory every 500 ms around each case. RECORD-ONLY: the box has a
+# second listener, so a co-tenant can inflate it, and no VRAM number is asserted.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Shared with every other real-weight workflow: one job on the physical CUDA host at a time.
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+
+jobs:
+  # `timeout-minutes: 180` is a runaway guard for a lane that has never executed: a cold
+  # `--features cuda` release build plus a one-time ~24 GB fetch, then three one-segment renders.
+  candle-audio-yue:
+    name: Candle YuE lyrics2song real weights (CUDA)
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 180
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SceneWorks--yue-s1-7b-anneal-en-cot-candle\snapshots\5842b8bc97d2a6dddc427a444920050dd3860949
+      CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SceneWorks--yue-s1-7b-anneal-en-icl-candle\snapshots\fc8cb3515e654d419c2831dcdaf931b61a050179
+      CANDLE_AUDIO_YUE_S2_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SceneWorks--yue-s2-1b-general-candle\snapshots\3d6a71c7f2af1010983fc9da7bcaba528f083da6
+      CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SceneWorks--xcodec-mini-infer\snapshots\8ca30a19de500892e23a6ee687fca030053db60d
+      # The bottom rung of the arch ladder, not the hardware -- see `same-l-cuda` in real-weights.yml.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # The runner service's global RUSTC_WRAPPER=sccache resets mid-build on heavy Candle/CUDA
+      # graphs (see `candle-qwen-image-2-1` in real-weights.yml), so this job clears it.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: |
+          if "%CANDLE_GEN_MODELS_ROOT%"=="" (
+            echo Missing repository variable CANDLE_GEN_MODELS_ROOT for the Windows CUDA runner.
+            exit /b 1
+          )
+          if exist "%RUNNER_TEMP%\yue-cuda-evidence" rmdir /s /q "%RUNNER_TEMP%\yue-cuda-evidence"
+          mkdir "%RUNNER_TEMP%\yue-cuda-evidence" || exit /b 1
+          echo YUE_EVIDENCE=%RUNNER_TEMP%\yue-cuda-evidence>>"%GITHUB_ENV%"
+          echo YUE_SNAPSHOT_ROOT=%RUNNER_TEMP%\yue-snapshots>>"%GITHUB_ENV%"
+          echo YUE_REF_DIR=%RUNNER_TEMP%\yue-ref>>"%GITHUB_ENV%"
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH& exit /b 0)
+          nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%YUE_EVIDENCE%\cuda-device-inventory.csv"
+          type "%YUE_EVIDENCE%\cuda-device-inventory.csv"
+      - name: Materialize and verify immutable snapshots
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-cot-bf16 --snapshot "%CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-icl-q4 --snapshot "%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s2-1b-general --snapshot "%CANDLE_AUDIO_YUE_S2_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-xcodec-mini-infer --snapshot "%CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT%" || exit /b 1
+      # The test reads `YUE_SNAPSHOT_ROOT/<repo>`; junctions (no privilege needed, unlike /D links)
+      # give it that layout over the hub-cache snapshot directories without copying ~24 GB.
+      - name: Lay out the YuE snapshot root
+        shell: cmd
+        run: |
+          if exist "%YUE_SNAPSHOT_ROOT%" rmdir /s /q "%YUE_SNAPSHOT_ROOT%"
+          mkdir "%YUE_SNAPSHOT_ROOT%" || exit /b 1
+          mklink /J "%YUE_SNAPSHOT_ROOT%\yue-s1-7b-anneal-en-cot-candle" "%CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT%" || exit /b 1
+          mklink /J "%YUE_SNAPSHOT_ROOT%\yue-s1-7b-anneal-en-icl-candle" "%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" || exit /b 1
+          mklink /J "%YUE_SNAPSHOT_ROOT%\yue-s2-1b-general-candle" "%CANDLE_AUDIO_YUE_S2_SNAPSHOT%" || exit /b 1
+          mklink /J "%YUE_SNAPSHOT_ROOT%\xcodec-mini-infer" "%CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT%" || exit /b 1
+      - name: Stage the upstream ICL reference clip
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\yue-reference-decode" -r .github/requirements/real-weights-yue-reference-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\yue-reference-decode"
+          "%REVIEWED_PYTHON%" scripts/release/yue_reference_clip.py --ref-dir "%YUE_REF_DIR%" > "%YUE_EVIDENCE%\reference-clip.log" 2>&1 || (type "%YUE_EVIDENCE%\reference-clip.log" & exit /b 1)
+          type "%YUE_EVIDENCE%\reference-clip.log"
+      # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings.
+      - name: Build the YuE CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-yue --features cuda --test registered_loader_real_weights --no-run || exit /b 1
+      - name: Run the YuE real-weight renders
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "YUE_FAILED=0"
+          call :run_one bf16 en_cot_renders_one_segment_through_the_registered_loader || set "YUE_FAILED=1"
+          call :run_one bf16 en_cot_renders_one_segment_from_the_tiered_repo_roots || set "YUE_FAILED=1"
+          call :run_one q4 en_icl_renders_one_segment_with_a_single_track_reference || set "YUE_FAILED=1"
+          if not "%YUE_FAILED%"=="0" exit /b 1
+          exit /b 0
+
+          :run_one
+          set "YUE_TIER=%~1"
+          set "log=%YUE_EVIDENCE%\%~2-%~1.log"
+          set "vram=%YUE_EVIDENCE%\%~2-%~1-vram.csv"
+          start "" /b nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits -lms 500 -f "%vram%"
+          cargo test --locked --release -p candle-audio-yue --features cuda --test registered_loader_real_weights %~2 -- --ignored --exact --nocapture > "%log%" 2>&1
+          set "rc=%ERRORLEVEL%"
+          taskkill /im nvidia-smi.exe /f >nul 2>&1
+          type "%log%"
+          if not "%rc%"=="0" (echo ::error::%~2 at %~1 failed& exit /b 1)
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test& exit /b 1)
+          exit /b 0
+      - name: Keep the YuE CUDA evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue-cuda-evidence
+          path: ${{ runner.temp }}/yue-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
