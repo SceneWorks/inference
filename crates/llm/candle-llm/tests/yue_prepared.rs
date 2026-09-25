@@ -14,8 +14,9 @@
 //!   cargo test --release -p candle-llm --test yue_prepared -- --ignored --nocapture
 //! ```
 //!
-//! The default build (no `cuda` / `metal` feature) runs on the CPU; the 7B q4 load peaks around
-//! 30 GB host RAM there.
+//! The default build (no `cuda` / `metal` feature) runs on the CPU; the 7B q4 load peaks at about
+//! 10 GB host RSS there (9.5 GB measured on the 4.2 GB stage-1 tier: the shard read plus the
+//! tensors built from it — its projections load straight from their stored GGML blocks).
 
 use candle_core::{DType, Device, Tensor};
 use candle_llm::LlamaProvider;
