@@ -456,6 +456,58 @@ impl Projection {
         )?))
     }
 
+    /// Load the stored GGML block tensor `source` ([`is_ggml_block_tensor`](
+    /// crate::primitives::quant::is_ggml_block_tensor)) as the projection its blocks hold (a
+    /// prepared Q4 / Q8 snapshot, sc-19375), rebuilt on `device` exactly as stored. `stem` names
+    /// the projection in a refusal.
+    ///
+    /// The blocks already are the lossy code, so `format` must be the GGML format of their bit
+    /// width: any other request would re-quantize a quantized weight, and is refused rather than
+    /// silently served at the stored precision. Every loader that reads a projection — the
+    /// separate, fused-part and stacked-expert sites of both decoders — comes through here.
+    pub(crate) fn load_stored_blocks(
+        stem: &str,
+        source: &Tensor,
+        bias: Option<Tensor>,
+        format: Option<&ProjectionFormat>,
+        device: &Device,
+    ) -> Result<Self> {
+        use crate::error::Error;
+        let Some((stored, _, _)) = crate::primitives::quant::ggml_block_storage(
+            source.dtype() == candle_core::DType::U8,
+            source.dims(),
+        ) else {
+            return Err(Error::Config(format!(
+                "projection `{stem}` is not a stored GGML block tensor"
+            )));
+        };
+        let bits = if stored == GgmlDType::Q8_0 { 8 } else { 4 };
+        match format {
+            Some(ProjectionFormat::Ggml(quant)) if quant.bits() == bits => {}
+            Some(ProjectionFormat::Ggml(quant)) => {
+                return Err(Error::Unsupported(format!(
+                    "projection `{stem}` is stored {stored:?} (a prepared Q{bits} snapshot); it \
+                     cannot be re-quantized to Q{}",
+                    quant.bits()
+                )))
+            }
+            Some(ProjectionFormat::Nvfp4(_)) => {
+                return Err(Error::Unsupported(format!(
+                    "nvfp4: projection `{stem}` is stored {stored:?} (a prepared Q{bits} \
+                     snapshot); NVFP4 projections are quantized from a dense snapshot"
+                )))
+            }
+            None => {
+                return Err(Error::Config(format!(
+                    "projection `{stem}` is stored {stored:?} but the model config has no \
+                     quantization block"
+                )))
+            }
+        }
+        let qt = crate::primitives::quant::from_ggml_block_tensor(source, device)?;
+        Self::load_qtensor(qt, bias)
+    }
+
     /// Load a pre-quantized MLX affine Q8 triple without interpreting its shortened U32 code
     /// matrix as a dense projection. The source is converted once to the resident Q8_0 form used by
     /// the existing quantized forward.

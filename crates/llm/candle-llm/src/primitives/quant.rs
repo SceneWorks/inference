@@ -44,15 +44,17 @@ const STORED_GGML: [GgmlDType; 3] = [GgmlDType::Q4_0, GgmlDType::Q8_0, GgmlDType
 /// The GGML block type and logical `(rows, cols)` of a **stored GGML block tensor** — a prepared
 /// Q4 / Q8 snapshot's on-disk projection form (sc-19375): a `U8` tensor `[rows, blocks_per_row,
 /// block_bytes]` holding the raw GGML blocks of a `[rows, cols]` weight, row-major (GGML blocks run
-/// along the input dimension, so each row is `blocks_per_row` whole blocks). The block type is the
-/// one of [`STORED_GGML`] whose block size is `block_bytes`. `None` for any other tensor. The
-/// loader, load admission and the NVFP4 gate classify a tensor by this one rule, from its dtype
-/// and shape alone.
+/// along the input dimension, so each row is `blocks_per_row` whole blocks). A stacked weight (the
+/// qwen3_5 MoE experts, `[experts, rows, cols]`) is stored `[experts, rows, blocks_per_row,
+/// block_bytes]`, and its `rows` here count every expert's. The block type is the one of
+/// [`STORED_GGML`] whose block size is `block_bytes`. `None` for any other tensor. The loader,
+/// load admission, the weight reader and the NVFP4 gate classify a tensor by this one rule, from
+/// its dtype and shape alone.
 pub(crate) fn ggml_block_storage(
     is_u8: bool,
     shape: &[usize],
 ) -> Option<(GgmlDType, usize, usize)> {
-    let &[rows, blocks, block_bytes] = shape else {
+    let [lead @ .., rows, blocks, block_bytes] = shape else {
         return None;
     };
     if !is_u8 {
@@ -60,13 +62,22 @@ pub(crate) fn ggml_block_storage(
     }
     let dtype = STORED_GGML
         .into_iter()
-        .find(|d| d.type_size() == block_bytes)?;
+        .find(|d| d.type_size() == *block_bytes)?;
+    let rows = lead.iter().try_fold(*rows, |n, &d| n.checked_mul(d))?;
     Some((dtype, rows, blocks.checked_mul(dtype.block_size())?))
+}
+
+/// Whether `t` is a stored GGML block tensor ([`ggml_block_storage`]).
+pub(crate) fn is_ggml_block_tensor(t: &Tensor) -> bool {
+    ggml_block_storage(t.dtype() == DType::U8, t.dims()).is_some()
 }
 
 /// Serialize a 2-D [`QTensor`] of a persisted block type (Q4_0 / Q8_0 / Q4_K) into its stored
 /// GGML block tensor on the CPU: a `U8` `[rows, blocks_per_row, block_bytes]` tensor of the raw
-/// GGML blocks, row-major, which [`from_ggml_block_tensor`] reads back.
+/// GGML blocks, row-major, which [`from_ggml_block_tensor`] reads back. GGML quantizes each block
+/// on its own, so the blocks of any row slice are byte-for-byte those of quantizing that slice
+/// alone — which is what lets a loader carve fused parts and stacked experts out of one stored
+/// tensor.
 pub fn to_ggml_block_tensor(qt: &QTensor) -> Result<Tensor> {
     let dtype = qt.dtype();
     let (rows, cols) = qt.shape().dims2()?;
@@ -84,13 +95,14 @@ pub fn to_ggml_block_tensor(qt: &QTensor) -> Result<Tensor> {
     )?)
 }
 
-/// Rebuild the [`QTensor`] a stored GGML block tensor holds, directly on `device`: the blocks are
-/// used exactly as stored — never dequantized and re-quantized.
+/// Rebuild the [`QTensor`] a rank-3 stored GGML block tensor holds, directly on `device`: the
+/// blocks are used exactly as stored — never dequantized and re-quantized. A stacked (rank-4)
+/// tensor is sliced to one expert first.
 pub fn from_ggml_block_tensor(stored: &Tensor, device: &Device) -> Result<QTensor> {
-    let Some((dtype, rows, cols)) = ggml_block_storage(stored.dtype() == DType::U8, stored.dims())
-    else {
+    let storage = ggml_block_storage(stored.dtype() == DType::U8, stored.dims());
+    let (Some((dtype, rows, cols)), 3) = (storage, stored.rank()) else {
         return Err(crate::error::Error::Config(format!(
-            "ggml block storage: {:?} {:?} is not a stored GGML block tensor",
+            "ggml block storage: {:?} {:?} is not a rank-3 stored GGML block tensor",
             stored.dtype(),
             stored.shape()
         )));
@@ -310,6 +322,39 @@ mod tests {
         for (a, b) in dense.iter().zip(&quant) {
             assert!((a - b).abs() < 0.05, "{a} vs {b}");
         }
+    }
+
+    /// sc-19375: a stored block is used exactly as stored. The hand-built Q8_0 blocks are **not**
+    /// what candle's quantizer would write for their values (`d = 1.0` over codes no wider than
+    /// ±10, where a requantize picks `d = 10 / 127` and rescales every code), so a loader that
+    /// dequantized and re-quantized — which round-trips a canonical block to identical bytes —
+    /// changes these bytes and fails here.
+    #[test]
+    fn stored_blocks_rebuild_byte_exact_even_when_non_canonical() {
+        let one = half::f16::from_f32(1.0).to_le_bytes();
+        let mut bytes = Vec::new();
+        for row in 0..2i32 {
+            for block in 0..2i32 {
+                bytes.extend_from_slice(&one);
+                bytes.extend((0..32i32).map(|i| (((i + row + block) % 21) - 10) as i8 as u8));
+            }
+        }
+        let stored = Tensor::from_vec(bytes.clone(), (2, 2, 34), &Device::Cpu).unwrap();
+        assert_eq!(
+            ggml_block_storage(true, stored.dims()),
+            Some((GgmlDType::Q8_0, 2, 64))
+        );
+        let qt = from_ggml_block_tensor(&stored, &Device::Cpu).unwrap();
+        assert_eq!(qt.dtype(), GgmlDType::Q8_0);
+        assert_eq!(qt.shape().dims(), &[2, 64]);
+        assert_eq!(qt.data().unwrap().as_ref(), bytes.as_slice());
+        // The blocks really are non-canonical: requantizing their values rewrites them.
+        let requantized = QTensor::quantize(&qt.dequantize(&Device::Cpu).unwrap(), GgmlDType::Q8_0)
+            .unwrap()
+            .data()
+            .unwrap()
+            .into_owned();
+        assert_ne!(requantized, bytes);
     }
 
     #[test]
