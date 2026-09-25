@@ -80,6 +80,9 @@ pub struct Stage1Lm {
     /// The sequence the KV cache represents: `history`, or its smart-context shortening. The cache
     /// holds `window[..cache.offset()]`; the rest is fed on the next forward.
     window: Vec<u32>,
+    /// `window` as the sampler's `i32` ids — the repetition-penalty window (the sampler penalises
+    /// each distinct id once). Kept in step with `window` so no step rebuilds it.
+    penalty_window: Vec<i32>,
     cache: Option<ContiguousKvCache>,
     /// Rows in `cache` (1 without guidance, 2 with).
     batch: usize,
@@ -181,6 +184,7 @@ impl Stage1Lm {
             rng: SplitMix64::new(0),
             history: Vec::new(),
             window: Vec::new(),
+            penalty_window: Vec::new(),
             cache: None,
             batch: 1,
             uncond_start: 0,
@@ -391,6 +395,9 @@ impl Stage1Model for Stage1Lm {
             self.cache = Some(self.model.new_cache());
         }
         self.uncond_start = self.window.len() - 1;
+        self.penalty_window.clear();
+        self.penalty_window
+            .extend(self.window.iter().map(|&t| t as i32));
         let logits = self.feed()?;
         self.segment = Some(Segment {
             scale: segment.guidance_scale,
@@ -434,12 +441,9 @@ impl Stage1Model for Stage1Lm {
         } else {
             &self.allowed
         };
-        // The repetition-penalty window is the whole sequence the model sees (`window`, which
-        // already holds every generated token); the sampler penalises each distinct id once.
-        let penalty_window: Vec<i32> = self.window.iter().map(|&t| t as i32).collect();
         let token = sample_row_host(
             scores,
-            &penalty_window,
+            &self.penalty_window,
             &seg.params,
             &mut self.rng,
             Some(allowed),
@@ -447,6 +451,7 @@ impl Stage1Model for Stage1Lm {
         seg.generated += 1;
         self.history.push(token);
         self.window.push(token);
+        self.penalty_window.push(token as i32);
         if token == EOA {
             self.segment.as_mut().expect("open").ended = true;
             Ok(Stage1Step::EndOfAudio)
