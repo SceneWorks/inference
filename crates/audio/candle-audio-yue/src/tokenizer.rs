@@ -41,7 +41,8 @@
 //! it before each segment's prefill; the marker it scans for is [`START_OF_SEGMENT`].
 //!
 //! The golden fixture `tests/fixtures/yue_prompt_reference.json` is produced by running the
-//! reference Python itself (`scripts/reference/yue_prompt_reference.py`).
+//! reference Python itself (`scripts/reference/yue_prompt_reference.py`); the id-parity tests run
+//! against the committed real tokenizer (`tests/fixtures/mm_tokenizer/tokenizer.json`).
 //! [`StubTokenizer`] stays as the end-to-end seam test's weights-free double.
 
 use std::path::Path;
@@ -583,19 +584,21 @@ pub(crate) mod tests {
         assert!(err.to_string().contains(TOKENIZER_FILE), "{err}");
     }
 
-    /// The stage-1 tier directory holding the real `tokenizer.json` (any of the six variants — the
-    /// tokenizer is one file), e.g. `…/yue-s1-7b-anneal-en-cot-candle/bf16`.
+    /// The directory holding the real mm `tokenizer.json`: the committed copy
+    /// (`tests/fixtures/mm_tokenizer/`, byte-identical to the one every stage-1 tier ships), or
+    /// `YUE_S1_SNAPSHOT` — a staged stage-1 tier dir such as `…/yue-s1-7b-anneal-en-cot-candle/bf16`
+    /// — to check a snapshot's own copy instead.
     fn real_stage1_dir() -> PathBuf {
-        PathBuf::from(std::env::var("YUE_S1_SNAPSHOT").expect(
-            "set YUE_S1_SNAPSHOT to a staged YuE stage-1 tier dir containing tokenizer.json",
-        ))
+        std::env::var_os("YUE_S1_SNAPSHOT").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mm_tokenizer"),
+            PathBuf::from,
+        )
     }
 
     /// AC1: the Rust tokenizer's ids equal the upstream Python SentencePiece `tokenize` on every
     /// fixture text (English, Chinese, Japanese, Korean, byte fallback, whitespace runs, embedded
     /// special tokens) and on every string the reference prompt builder tokenized.
     #[test]
-    #[ignore = "needs the real mm tokenizer (YUE_S1_SNAPSHOT); dev box / real-weights lane"]
     fn real_tokenizer_matches_upstream_sentencepiece() {
         let fx = fixture();
         let tok = MmTokenizer::from_file(&real_stage1_dir().join(TOKENIZER_FILE)).unwrap();
@@ -619,7 +622,6 @@ pub(crate) mod tests {
     /// AC2 end to end: the production loader over the real tokenizer reproduces every reference
     /// prompt block.
     #[test]
-    #[ignore = "needs the real mm tokenizer (YUE_S1_SNAPSHOT); dev box / real-weights lane"]
     fn real_prompt_builder_matches_the_reference() {
         let fx = fixture();
         let builder = load(&assets_at(&real_stage1_dir())).unwrap();
