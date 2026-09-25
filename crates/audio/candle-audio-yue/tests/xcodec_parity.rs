@@ -29,9 +29,9 @@ const FIXTURE: &str = "xcodec_decode_reference.safetensors";
 /// on one channel measures 1.9e-3.
 const EMBED_MAX_REL: f64 = 1e-6;
 /// The 16 kHz waveform through `fc_post2` + the ~60-conv DAC decoder; measured max relative
-/// difference 1.6e-6 on CPU/f32 (the noise floor), so ~60× headroom — while a 0.1 % output-gain
-/// error (1e-3) or a one-sample shift (1.7e-1) lands far outside it.
-const WAVE_MAX_REL: f64 = 1e-4;
+/// difference 1.6e-6 on CPU/f32 (the noise floor), so ~6× headroom — while a 0.01 % output-gain
+/// error (1e-4) or a one-sample shift (1.7e-1) lands outside it.
+const WAVE_MAX_REL: f64 = 1e-5;
 
 fn fixture() -> std::collections::HashMap<String, Tensor> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -126,14 +126,14 @@ fn xcodec_get_embed_and_decode_match_the_reference() {
         "a mutated waveform golden passed ({bad_wave_rel:.3e})"
     );
     let mut scaled = ref_wave.clone();
-    scaled.iter_mut().for_each(|v| *v *= 1.001);
+    scaled.iter_mut().for_each(|v| *v *= 1.0001);
     let scaled_rel = max_rel(&wave, &scaled);
     assert!(
         scaled_rel > WAVE_MAX_REL,
-        "a 0.1 % gain-mutated waveform golden passed ({scaled_rel:.3e})"
+        "a 0.01 % gain-mutated waveform golden passed ({scaled_rel:.3e})"
     );
     println!(
         "mutations rejected: embed×1.01 {bad_embed_rel:.3e}, wave shift {bad_wave_rel:.3e}, \
-         wave×1.001 {scaled_rel:.3e}"
+         wave×1.0001 {scaled_rel:.3e}"
     );
 }

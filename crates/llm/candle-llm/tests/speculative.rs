@@ -594,9 +594,9 @@ fn prompt_lookup_qwen3() {
 
 /// Load a dense **target** and a quantized **draft** from the same snapshot — vocab-compatible by
 /// construction, with the quantized draft a faster, lossy approximation that yields genuine partial
-/// acceptance. Prefers a **Q4** draft (more lossy ⇒ more interesting acceptance), falling back to
-/// **Q8** when the model's projection `in`-dims aren't 256-aligned (Q4_K's block size — e.g. SmolLM2's
-/// hidden 576; Qwen3's 1024 is fine).
+/// acceptance. The draft is **Q4** (more lossy ⇒ more interesting acceptance): Q4_K on 256-aligned
+/// projection `in`-dims (Qwen3's 1024) and Q4_0 on 32- but not 256-aligned ones (SmolLM2's hidden
+/// 576), so every model Q8 could quantize — Q8_0 needs the same 32-alignment — is served at Q4.
 fn load_draft_target(env: &str) -> Option<(CausalLm, CausalLm, Tokenizer)> {
     let dir = std::env::var(env).ok().filter(|p| !p.is_empty())?;
     let device = select_device().unwrap();
@@ -608,14 +608,6 @@ fn load_draft_target(env: &str) -> Option<(CausalLm, CausalLm, Tokenizer)> {
         ModelConfig::from_dir(&dir).unwrap(),
         Some(QuantSpec::q4()),
     )
-    .or_else(|_| {
-        CausalLm::from_weights_with(
-            &w,
-            "",
-            ModelConfig::from_dir(&dir).unwrap(),
-            Some(QuantSpec::q8()),
-        )
-    })
     .unwrap();
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json")).unwrap();
     Some((target, draft, tok))

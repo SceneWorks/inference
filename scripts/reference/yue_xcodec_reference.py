@@ -24,6 +24,16 @@ Regenerating (dev box, inside the YuE reference venv)::
     python scripts/reference/yue_xcodec_reference.py
 
 It rewrites ``tests/fixtures/xcodec_decode_reference.safetensors`` and its metadata JSON in place.
+
+``tiny`` mode (``python scripts/reference/yue_xcodec_reference.py tiny``) writes the always-run,
+weights-free fixture ``tests/fixtures/xcodec_tiny_reference.safetensors``. It builds the upstream
+decode modules at toy widths with a fixed torch seed: ``ResidualVectorQuantizer(dim 4, 8
+quantizers)``, ``fc_post2 = Linear(4, 3)`` and the DAC ``Decoder(3, 16, [8, 5, 4, 2])``. The
+weight-norm ``g``, the Snake ``alpha`` and the codebooks are randomized, so none of them sit at the
+identity. It saves that ``SoundStream``-layout state dict together with a code grid and the
+reference ``get_embed``/``decode`` outputs in ONE file, which the codec's CPU unit test loads
+straight through ``XcodecDecoder::load``. That makes every numeric detail of the decoder
+(dilations, Snake, padding, weight-norm fold) checked in ordinary CI, not only on real weights.
 """
 
 from __future__ import annotations
@@ -39,6 +49,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_DIR = REPO_ROOT / "crates" / "audio" / "candle-audio-yue" / "tests" / "fixtures"
 FIXTURE = FIXTURE_DIR / "xcodec_decode_reference.safetensors"
+TINY_FIXTURE = FIXTURE_DIR / "xcodec_tiny_reference.safetensors"
+#: Tiny-mode toy widths and grid length.
+TINY_DIM, TINY_LATENT, TINY_CHANNELS, TINY_FRAMES, TINY_SEED = 4, 3, 16, 4, 19377
 METADATA = FIXTURE_DIR / "xcodec_decode_reference.json"
 
 INFERENCE_DIR_ENV = "YUE_REFERENCE_INFERENCE_DIR"
@@ -71,7 +84,7 @@ def synth_clip() -> list[float]:
     return out
 
 
-def main() -> None:
+def reference_root() -> Path:
     inference_dir = os.environ.get(INFERENCE_DIR_ENV)
     if not inference_dir:
         sys.exit(f"set {INFERENCE_DIR_ENV} to the YuE-v1 clone's inference/ directory")
@@ -80,6 +93,64 @@ def main() -> None:
     os.chdir(inf)
     sys.path[:0] = [str(inf), str(inf / "xcodec_mini_infer"),
                     str(inf / "xcodec_mini_infer" / "descriptaudiocodec")]
+    return inf
+
+
+def tiny() -> None:
+    """The weights-free toy-width fixture (see the module docstring)."""
+    reference_root()
+    import torch
+    from torch import nn
+    from quantization import ResidualVectorQuantizer
+    import descriptaudiocodec.dac.model.dac as dac2
+    from safetensors.torch import save_file
+
+    torch.manual_seed(TINY_SEED)
+
+    class TinyDecode(nn.Module):
+        """`SoundStream`'s decode half under its own attribute names (so the keys match)."""
+
+        def __init__(self):
+            super().__init__()
+            self.quantizer = ResidualVectorQuantizer(dimension=TINY_DIM, n_q=NUM_CODEBOOKS,
+                                                     bins=1024)
+            self.fc_post2 = nn.Linear(TINY_DIM, TINY_LATENT)
+            self.decoder_2 = dac2.Decoder(TINY_LATENT, TINY_CHANNELS, [8, 5, 4, 2])
+
+        def decode(self, codes):  # SoundStream.decode, verbatim
+            quantized = self.quantizer.decode(codes)
+            quantized_acoustic = self.fc_post2(quantized.transpose(1, 2)).transpose(1, 2)
+            return self.decoder_2(quantized_acoustic)
+
+    m = TinyDecode().eval()
+    with torch.no_grad():
+        for name, t in m.named_parameters():
+            if name.endswith(".alpha"):
+                t.copy_(torch.rand_like(t) * 1.5 + 0.5)  # snake alpha in [0.5, 2)
+            elif name.endswith(".weight_g"):
+                t.mul_(torch.rand_like(t) + 0.5)  # g away from ||v||: the fold matters
+        for layer in m.quantizer.vq.layers:
+            layer._codebook.embed.copy_(torch.randn_like(layer._codebook.embed))
+        codes = torch.randint(0, 1024, (NUM_CODEBOOKS, 1, TINY_FRAMES))
+        embed = m.quantizer.decode(codes)  # get_embed
+        wave = m.decode(codes)
+
+    tensors = {k: v.contiguous() for k, v in m.state_dict().items()
+               if not k.endswith((".inited", ".cluster_size", ".embed_avg"))}
+    tensors.update({
+        "ref.codes": codes[:, 0, :].to(torch.int64).contiguous(),
+        "ref.embed": embed[0].contiguous(),
+        "ref.wave": wave.reshape(-1).contiguous(),
+    })
+    save_file(tensors, str(TINY_FIXTURE))
+    print(f"wrote {TINY_FIXTURE} ({TINY_FIXTURE.stat().st_size} bytes), "
+          f"wave peak {float(wave.abs().max()):.4f}")
+
+
+def main() -> None:
+    if sys.argv[1:] == ["tiny"]:
+        return tiny()
+    inf = reference_root()
 
     import torch
     from omegaconf import OmegaConf
@@ -113,7 +184,7 @@ def main() -> None:
     )
     digest = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
     rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=inf, capture_output=True,
-                         text=True).stdout.strip()
+                         text=True, encoding="utf-8").stdout.strip()
     METADATA.write_text(json.dumps({
         "story": "sc-19377",
         "producer": "scripts/reference/yue_xcodec_reference.py",
@@ -131,7 +202,7 @@ def main() -> None:
                     "wave": [wave.numel()]},
         "wave_abs_max": float(wave.abs().max()),
         "sha256": digest,
-    }, indent=2) + "\n")
+    }, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {FIXTURE} ({FIXTURE.stat().st_size} bytes, sha256 {digest})")
     if rev != YUE_REVISION:
         sys.exit(f"YuE clone HEAD {rev} != pinned {YUE_REVISION}")

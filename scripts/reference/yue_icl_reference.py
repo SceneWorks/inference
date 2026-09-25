@@ -223,7 +223,7 @@ def main() -> None:
             return data.to(torch.float32) / 32768.0, rate
 
     namespace = {"torch": torch, "torchaudio": _Torchaudio, "Resample": Resample, "np": np}
-    exec(extract_functions(infer_py.read_text(), {"load_audio_mono", "encode_audio"}), namespace)
+    exec(extract_functions(infer_py.read_text(encoding="utf-8"), {"load_audio_mono", "encode_audio"}), namespace)
     load_audio_mono, encode_audio = namespace["load_audio_mono"], namespace["encode_audio"]
     del torchaudio  # only the redirected loader is used
 
@@ -341,7 +341,7 @@ def main() -> None:
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(fixture, indent=1) + "\n")
+    args.output.write_text(json.dumps(fixture, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {args.output} ({args.output.stat().st_size} bytes)")
     for k, v in margins.items():
         s = sorted(v)
@@ -351,7 +351,7 @@ def main() -> None:
         from safetensors.torch import save_file
         args.dump.mkdir(parents=True, exist_ok=True)
         save_file(dumps, str(args.dump / "icl_intermediates.safetensors"))
-        (args.dump / "margins.json").write_text(json.dumps(margins))
+        (args.dump / "margins.json").write_text(json.dumps(margins), encoding="utf-8")
         print(f"dumped intermediates to {args.dump}")
 
 

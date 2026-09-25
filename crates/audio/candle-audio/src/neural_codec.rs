@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn snake_is_identity_at_zero_and_bounded_growth() {
+    fn snake_matches_its_closed_form() {
         let dev = Device::Cpu;
         let snake = Snake::new(Tensor::ones((1, 2, 1), DType::F32, &dev).unwrap());
         let x = Tensor::zeros((1, 2, 4), DType::F32, &dev).unwrap();
@@ -504,17 +504,23 @@ mod tests {
             y.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             vec![0.0; 8]
         );
-        // snake(π/2) with α=1: x + sin²(x) = π/2 + 1.
-        let x = Tensor::full(std::f32::consts::FRAC_PI_2, (1, 2, 1), &dev).unwrap();
-        for got in snake
+        // Away from π/2 (where sin = sin²): x = 0.5, α = 1 → 0.5 + sin²(0.5); x = 0.5, α = 2 →
+        // 0.5 + sin²(1)/2 (the 1/α scale and the αx argument both matter).
+        let x = Tensor::full(0.5f32, (1, 2, 1), &dev).unwrap();
+        let alpha = Tensor::new(&[[[1f32], [2.]]], &dev).unwrap();
+        let got = Snake::new(alpha)
             .forward(&x)
             .unwrap()
             .flatten_all()
             .unwrap()
             .to_vec1::<f32>()
-            .unwrap()
-        {
-            assert!((got - (std::f32::consts::FRAC_PI_2 + 1.0)).abs() < 2e-6);
+            .unwrap();
+        let want = [
+            0.5 + 0.5f64.sin().powi(2),
+            0.5 + 1f64.sin().powi(2) / (2.0 + 1e-9),
+        ];
+        for (g, w) in got.iter().zip(want) {
+            assert!((*g as f64 - w).abs() < 2e-6, "snake {g} != {w}");
         }
     }
 
