@@ -55,10 +55,11 @@ Codebooks are stored as 3 hex digits per code (8 rows per case). Codebook-0 inpu
   characterise instead of asserting equality (`stage2::tests::metal`,
   `stage2_metal_bf16_divergence_is_characterised_on_real_weights`).
 - **Measured tier divergence** (`stage2_every_tier_loads_through_production_and_is_characterised`,
-  CPU, teacher-forced on the reference stream over the 40-frame case): bf16 through the production
-  loader 0 of 280 picks differ; q8 4 of 280 (max |Δlogit| 0.73 at logit scale 26.3); q4 36 of 280
-  (max |Δlogit| 5.2). Free-running, the first flip cascades: q8 / q4 keep 69 / 71 of 280 residual
-  codes of the reference.
+  CPU, 2026-09-25, teacher-forced on the reference stream over the 40-frame case): bf16 through the
+  production loader 0 of 280 picks differ; q8 4 of 280 (max |Δlogit| 1.26 at logit scale 30.1); q4
+  26 of 280 (max |Δlogit| 7.1). Free-running, the first flip cascades: q8 keeps 121/280 and
+  103/112, q4 77/280 and 14/112 residual codes of the reference (40- / 16-frame cases). Peak RSS
+  19.6 GB.
 
 ## Two upstream defects the producer works around (and the port handles)
 
