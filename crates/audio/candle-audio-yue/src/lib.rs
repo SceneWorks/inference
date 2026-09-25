@@ -16,11 +16,12 @@
 //! | stage 1 (7B Llama) | [`stage1`] | [`stage1::Stage1Model`] (`begin_render` / `begin_segment` / `step` / `end_segment`) | sc-19380 |
 //! | stage 2 (1B Llama) | [`stage2`] | [`stage2::Stage2Model::upsample`] | sc-19381 |
 //! | xcodec decode | [`codec`] | [`codec::CodecDecoder::decode`] | sc-19377 (ported) |
-//! | Vocos upsampler | [`vocoder`] | [`vocoder::Vocoder::decode`] | sc-19378 |
-//! | low-band splice | [`splice`] | [`splice::SpliceFn`] | sc-19378 |
+//! | Vocos upsampler | [`vocoder`] | [`vocoder::Vocoder::decode`] | sc-19378 (ported) |
+//! | limiter + low-band splice | [`splice`] | [`splice::SpliceFn`] | sc-19378 (ported) |
 //!
 //! **Walking skeleton (sc-19382).** Every production loader whose story has not landed refuses
-//! with `Unsupported` (stage 1 has landed: sc-19380), so a registered provider fails closed instead of rendering placeholder audio;
+//! with `Unsupported` (landed: tokenizer sc-19376, stage 1 sc-19380, codec sc-19377), so a
+//! registered provider fails closed instead of rendering placeholder audio;
 //! the story named in the table replaces that module's `load`. Each module's deterministic,
 //! weights-free `load_stub` is the end-to-end seam test's double. The engine itself — staged residency
 //! (each stage released before the next loads), the stage-1 decode loop with a cancel check before
@@ -32,7 +33,7 @@
 //! `yue_{en,zh,jp_kr}_{cot,icl}`. Each loads the stage-1 snapshot from `LoadSpec::weights` and the
 //! [`model::STAGE2_COMPONENT_ID`] / [`model::XCODEC_COMPONENT_ID`] snapshots from
 //! `LoadSpec::components` — caller-provisioned paths, never fetched (epic 13657). Tiers: `quantize`
-//! `Q8` / `Q4` assert the LM tier, unset loads the staged tier; xcodec and Vocos stay fp16 at every
+//! `Q8` / `Q4` assert the LM tier, unset loads the staged tier; xcodec and Vocos stay float32 at every
 //! tier (the approved epic-R2 carve-out).
 
 pub use candle_audio;

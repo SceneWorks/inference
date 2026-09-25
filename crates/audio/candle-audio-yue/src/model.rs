@@ -58,8 +58,9 @@ pub fn stage1_hub_revision(variant: Variant) -> &'static str {
 /// - **Mode**: ICL variants advertise [`ConditioningKind::ReferenceAudio`] (the reference clip);
 ///   CoT variants advertise no conditioning, so the shared floor refuses a reference sent to them.
 ///   Only ICL advertises `supports_reference_region` (the reference window).
-/// - **Song controls**: `supports_segmented_lyrics` (segment count + per-segment token budget) and
-///   `supports_repetition_penalty` on every variant.
+/// - **Song controls**: `supports_segmented_lyrics` (segment count + per-segment token budget),
+///   `supports_repetition_penalty` and `supports_output_limiter` (clamp vs. rescale) on every
+///   variant.
 /// - **Tier**: `supported_quants` = q4 + q8 (bf16 is the unquantized load) for both LMs.
 /// - **Guidance**: `supports_guidance` — CFG on/off (and its scale) is a request knob.
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
@@ -85,6 +86,7 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supports_segmented_lyrics: true,
             supports_repetition_penalty: true,
             supports_reference_region: variant.mode == Mode::Icl,
+            supports_output_limiter: true,
             ..Default::default()
         },
     }
@@ -108,6 +110,7 @@ fn refuse(id: &str, field: &str, why: &str) -> gen_core::Error {
 /// | `guidance` | `None` ⇒ the 1.5 / 1.2 schedule; `0 ..= 1` ⇒ explicitly off; `> 1` ⇒ that scale for every segment; negative / non-finite ⇒ refused |
 /// | `ReferenceAudio` conditioning | ICL reference — dual-track when the clip carries `vocals` + `instrumental` stems |
 /// | `audio.reference_region` | ICL window (default 0–30 s; open end ⇒ clip end) |
+/// | `audio.output_limiter` | `Clamp` (±0.99, default) or `Rescale` (× min(0.99 / peak, 1)) — upstream `save_audio` / `--rescale` |
 pub fn map_request(variant: Variant, req: &GenerationRequest) -> gen_core::Result<YueRequest> {
     let id = variant.id();
     let audio = req.audio.clone().unwrap_or_default();
@@ -149,6 +152,9 @@ pub fn map_request(variant: Variant, req: &GenerationRequest) -> gen_core::Resul
     }
     if let Some(p) = audio.repetition_penalty {
         out.decode.repetition_penalty = p;
+    }
+    if let Some(l) = audio.output_limiter {
+        out.limiter = l;
     }
     if let Some(seed) = req.seed {
         out.seed = seed;
@@ -541,7 +547,7 @@ pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_audio::gen_core::{AudioParams, TimeRegion};
+    use candle_audio::gen_core::{AudioParams, OutputLimiter, TimeRegion};
 
     fn cot() -> Variant {
         Variant::new(Language::En, Mode::Cot)
@@ -590,6 +596,11 @@ mod tests {
     #[test]
     fn every_r5_knob_maps_and_defaults_stay_defaults() {
         let r = map_request(cot(), &song(AudioParams::default())).unwrap();
+        assert_eq!(
+            r.limiter,
+            OutputLimiter::Clamp,
+            "upstream's default limiter"
+        );
         assert_eq!(r, {
             let mut want = YueRequest::new("uplifting pop", "[verse]\nhello");
             want.icl = None;
@@ -600,6 +611,7 @@ mod tests {
             segments: Some(5),
             max_new_tokens_per_segment: Some(50),
             repetition_penalty: Some(1.3),
+            output_limiter: Some(OutputLimiter::Rescale),
             ..Default::default()
         });
         req.seed = Some(7);
@@ -612,6 +624,7 @@ mod tests {
             "the floor never exceeds the budget"
         );
         assert_eq!(r.decode.repetition_penalty, 1.3);
+        assert_eq!(r.limiter, OutputLimiter::Rescale);
         assert_eq!(r.seed, 7);
         assert_eq!(r.decode.guidance, Guidance::Off);
         req.guidance = Some(1.0);

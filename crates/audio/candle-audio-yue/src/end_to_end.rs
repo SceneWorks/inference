@@ -519,25 +519,72 @@ fn the_generator_meets_the_shared_progress_cancel_and_seed_contracts() {
     assert_ne!(a.samples, c.samples, "the seed reaches stage 1");
 }
 
+/// A splice double that tags the whole mix with the limiter it was handed (1.0 = rescale,
+/// 0.5 = clamp), so the engine's routing of `audio.output_limiter` is visible in the output.
+fn tagging_splice(
+    _codec_rate: &crate::splice::TrackPair,
+    vocoder_rate: &crate::splice::TrackPair,
+    limiter: crate::gen_core::OutputLimiter,
+) -> crate::gen_core::Result<crate::splice::SplicedMix> {
+    let tag = match limiter {
+        crate::gen_core::OutputLimiter::Clamp => 0.5,
+        crate::gen_core::OutputLimiter::Rescale => 1.0,
+    };
+    Ok(crate::splice::SplicedMix {
+        mix: vec![tag; vocoder_rate.vocals.len()],
+        vocals: vocoder_rate.vocals.clone(),
+        instrumental: vocoder_rate.instrumental.clone(),
+    })
+}
+
+#[test]
+fn the_requested_output_limiter_reaches_the_splice() {
+    use crate::gen_core::OutputLimiter;
+    let (log, steps) = (Log::default(), Arc::new(Mutex::new(0)));
+    let mut stages = instrumented(&log, &steps, None);
+    stages.splice = tagging_splice;
+    let g = load_with_stages(cot(), &spec(), stages).unwrap();
+    let render = |limiter: Option<OutputLimiter>| {
+        let mut req = song(None);
+        req.audio.as_mut().unwrap().output_limiter = limiter;
+        let track = audio(g.generate(&req, &mut |_| {}).unwrap());
+        assert!(!track.samples.is_empty());
+        track.samples[0]
+    };
+    assert_eq!(render(None), 0.5, "unset ⇒ upstream's default clamp");
+    assert_eq!(render(Some(OutputLimiter::Clamp)), 0.5);
+    assert_eq!(render(Some(OutputLimiter::Rescale)), 1.0);
+}
+
 fn refused<T>(r: crate::gen_core::Result<T>) -> bool {
     matches!(r, Err(Error::Unsupported(_)))
 }
 
 #[test]
 fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
-    // The registered entry point loads lazily, then the render refuses at its first stage.
-    let g = crate::model::load_en_cot(&spec()).unwrap();
-    assert!(refused(g.generate(&song(None), &mut |_| {})));
+    // The production tokenizer (sc-19376) is real: it loads the stage-1 snapshot's tokenizer.json.
+    let stage1 = tempfile::tempdir().unwrap();
+    crate::tokenizer::tests::write_test_tokenizer(stage1.path());
+    let mut spec = spec();
+    spec.weights = WeightsSource::Dir(stage1.path().to_path_buf());
+
+    // The registered entry point loads lazily and builds the prompt; stage 1 is real too (sc-19380),
+    // so with no weights staged the render fails at the stage-1 load — never placeholder audio.
+    let g = crate::model::load_en_cot(&spec).unwrap();
+    assert!(matches!(
+        g.generate(&song(None), &mut |_| {}),
+        Err(Error::Msg(_))
+    ));
 
     // Every unported production stage refuses on its own, so no later stage can fall back to its
     // stub.
     let s = StageSet::production();
     let assets = Assets {
-        stage1: "/staged/yue-s1".into(),
+        stage1: stage1.path().to_path_buf(),
         stage2: "/staged/yue-s2".into(),
         xcodec: "/staged/xcodec".into(),
     };
-    assert!(refused((s.tokenizer)(&assets)), "tokenizer");
+    assert!((s.tokenizer)(&assets).is_ok(), "tokenizer");
     assert!(refused((s.icl_encoder)(&assets)), "icl encoder");
     // Stage 1 is real (sc-19380): an unstaged snapshot is a load error, not the refusal.
     assert!(
@@ -551,6 +598,27 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
         matches!((s.codec)(&assets), Err(e) if !matches!(e, Error::Unsupported(_))),
         "codec"
     );
-    assert!(refused((s.vocoder)(&assets)), "vocoder");
-    assert!(refused((s.splice)(&[0.0], &[0.0])), "splice");
+    // The Vocos upsamplers and the splice (sc-19378) are real: the vocoders fail to load with
+    // nothing staged (never `Unsupported`) — `vocoder::tests` loads staged decoders — and the
+    // splice post-processes (`splice::tests` and `tests/splice_parity.rs`).
+    assert!(
+        matches!((s.vocoder)(&assets), Err(e) if !matches!(e, Error::Unsupported(_))),
+        "vocoder"
+    );
+    let pair = crate::splice::TrackPair {
+        vocals: vec![0.1; 320],
+        instrumental: vec![0.2; 320],
+    };
+    let wide = crate::splice::TrackPair {
+        vocals: vec![0.1; 882],
+        instrumental: vec![0.2; 882],
+    };
+    assert_eq!(
+        (s.splice)(&pair, &wide, crate::gen_core::OutputLimiter::Clamp)
+            .unwrap()
+            .mix
+            .len(),
+        882,
+        "splice"
+    );
 }

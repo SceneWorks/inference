@@ -38,7 +38,8 @@ use candle_llm::{CausalLm, LlamaProvider};
 
 use super::{SegmentStart, Stage1Model, Stage1Step};
 use crate::config::Tier;
-use crate::tokens::{CODEC_OFFSET, EOA, STAGE1_ALLOW_MAX, START_OF_SEGMENT};
+use crate::tokenizer::shorten_context;
+use crate::tokens::{CODEC_OFFSET, EOA, STAGE1_ALLOW_MAX};
 
 /// Additive-mask fill for a blocked attention column (candle-llm's batched-decode convention: a
 /// large finite negative, representable in bf16, so a fully blocked row stays NaN-free).
@@ -312,27 +313,6 @@ fn forward_cfg(
         .map_err(tensor_err("attention mask"))?;
     lm.decode_logits_masked(&ids, cache, &tables, &mask)
         .map_err(llm_err("CFG forward"))
-}
-
-/// The smart context (YuE-exllamav2 `shorten_input`): while `seq` is longer than `max_context`,
-/// drop everything from the first `[start_of_segment]` up to the second — the oldest segment
-/// block. When fewer than three `[start_of_segment]` markers remain (so no segment could be
-/// dropped while keeping one before the current), fall back to the last `max_context` tokens.
-pub fn shorten_context(seq: &[u32], max_context: usize) -> Vec<u32> {
-    let mut seq = seq.to_vec();
-    while seq.len() > max_context {
-        let starts: Vec<usize> = seq
-            .windows(START_OF_SEGMENT.len())
-            .enumerate()
-            .filter(|(_, w)| *w == START_OF_SEGMENT)
-            .map(|(i, _)| i)
-            .collect();
-        if starts.len() < 3 {
-            return seq[seq.len() - max_context..].to_vec();
-        }
-        seq.drain(starts[0]..starts[1]);
-    }
-    seq
 }
 
 impl Stage1Model for Stage1Lm {

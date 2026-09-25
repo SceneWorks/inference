@@ -21,7 +21,7 @@ mod lm;
 #[cfg(test)]
 mod parity;
 
-pub use lm::{shorten_context, Stage1Lm};
+pub use lm::Stage1Lm;
 
 /// What the engine hands stage 1 at the start of a segment.
 #[derive(Clone, Copy, Debug)]

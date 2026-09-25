@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_audio::gen_core::{self, AudioTrack, Quant};
+use candle_audio::gen_core::{self, AudioTrack, OutputLimiter, Quant};
 
 /// Stage-1 checkpoint language.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -113,7 +113,7 @@ impl Variant {
     }
 }
 
-/// The LM weight tier for stage 1 and stage 2 (epic R2). xcodec and Vocos stay fp16 at every tier
+/// The LM weight tier for stage 1 and stage 2 (epic R2). xcodec and Vocos stay float32 at every tier
 /// — the approved whole-pipeline carve-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -144,7 +144,8 @@ pub fn requested_tier(id: &str, quantize: Option<Quant>) -> gen_core::Result<Opt
 /// The staged weight layout the engine loads from — every path caller-provisioned (epic 13657).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assets {
-    /// The stage-1 snapshot (`LoadSpec::weights`): the 7B Llama shards + `tokenizer.model`.
+    /// The stage-1 snapshot (`LoadSpec::weights`): the 7B Llama shards + the mm tokenizer
+    /// (`tokenizer.json`, derived from the upstream `tokenizer.model` shipped beside it).
     pub stage1: PathBuf,
     /// The stage-2 snapshot (component [`STAGE2_COMPONENT_ID`](crate::model::STAGE2_COMPONENT_ID)).
     pub stage2: PathBuf,
@@ -155,9 +156,11 @@ pub struct Assets {
 }
 
 impl Assets {
-    /// The mm sentencepiece tokenizer shipped inside the stage-1 snapshot.
-    pub fn tokenizer_model(&self) -> PathBuf {
-        self.stage1.join("tokenizer.model")
+    /// The mm tokenizer shipped inside the stage-1 snapshot: `tokenizer.json`, the byte-fallback
+    /// BPE derived from the upstream SentencePiece `tokenizer.model` (verified id-for-id against
+    /// the upstream `_MMSentencePieceTokenizer`; see [`crate::tokenizer`]).
+    pub fn tokenizer_json(&self) -> PathBuf {
+        self.stage1.join(crate::tokenizer::TOKENIZER_FILE)
     }
 
     /// The xcodec snapshot root.
@@ -285,6 +288,8 @@ pub struct YueRequest {
     /// the plain instruction/genre/lyrics prompt, exactly as the reference `infer.py` does with
     /// neither `--use_audio_prompt` nor `--use_dual_tracks_prompt`), refused for CoT ones.
     pub icl: Option<IclReference>,
+    /// The output limiter (upstream `save_audio`: clamp by default, `--rescale` on request).
+    pub limiter: OutputLimiter,
 }
 
 impl YueRequest {
@@ -297,6 +302,7 @@ impl YueRequest {
             decode: DecodeConfig::default(),
             seed: DEFAULT_SEED,
             icl: None,
+            limiter: OutputLimiter::Clamp,
         }
     }
 
