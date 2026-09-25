@@ -35,14 +35,19 @@
 //! `Resample` to the reference on a short clip at four source rates; the token test above can only
 //! be exact if that front end is.
 //!
+//! It also encodes upstream's own example reference, `yue/prompt_egs/pop.00001.mp3` and its
+//! `.Vocals` / `.Instrumental` stems (single and dual, 0–30 s = 1 500 frames — past the default
+//! chunking and HuBERT query blocking), from the PCM the producer decoded into
+//! `$YUE_REF_DIR/sceneworks-derived/` (SHA-256-checked; the test fails if it is missing).
+//!
 //! ```text
-//! YUE_XCODEC_SNAPSHOT=/path/to/xcodec-mini-infer \
+//! YUE_XCODEC_SNAPSHOT=/path/to/xcodec-mini-infer YUE_REF_DIR=~/.cache/sceneworks-yue-ref \
 //!   cargo test --locked -p candle-audio-yue --test icl_parity -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
 
-use candle_audio_yue::candle_audio::candle_core::Device;
+use candle_audio_yue::candle_audio::candle_core::{Device, Tensor};
 use candle_audio_yue::codec::CHECKPOINT;
 use candle_audio_yue::config::{IclReference, IclTracks};
 use candle_audio_yue::gen_core::{AudioTrack, CancelFlag};
@@ -200,6 +205,70 @@ fn synthetic_clips_reproduce_the_reference_pcm() {
     let mut pcm = synth_vocals(u32_of(&d["rate"]), u32_of(&d["frames"]));
     pcm[1000] = pcm[1000].wrapping_add(1);
     assert_ne!(sha256_hex(&pcm), d["vocals_pcm_sha256"].as_str().unwrap());
+}
+
+/// Per-stage bounds (`max|Δ| / max|ref|`) for the tiny encode-half fixture — see
+/// [`tiny_encode_half_matches_the_reference_stage_by_stage`] for the measured floors.
+const TINY_MAX_REL: [(&str, f64); 4] = [
+    ("hubert_mean", 1e-5),
+    ("semantic", 1e-5),
+    ("acoustic", 1e-5),
+    ("fc_prior", 1e-5),
+];
+
+fn flat(t: &Tensor) -> Vec<f32> {
+    t.flatten_all().unwrap().to_vec1().unwrap()
+}
+
+fn max_rel(got: &[f32], want: &[f32]) -> f64 {
+    assert_eq!(got.len(), want.len(), "length");
+    let peak = want.iter().fold(0f64, |m, &v| m.max(f64::from(v).abs()));
+    let diff = got.iter().zip(want).fold(0f64, |m, (&a, &b)| {
+        m.max((f64::from(a) - f64::from(b)).abs())
+    });
+    diff / peak
+}
+
+/// The whole encode half — HuBERT (feature encoder, GroupNorm, positional conv, post-LN layers,
+/// the 13-state mean), the RepCodec semantic encoder, the DAC encoder on its padded re-encode
+/// branch, `fc_prior`, the codebook-0 nearest codeword — against upstream's own classes and
+/// `SoundStream.encode`, at small random widths, weights-free (`yue_icl_reference.py --tiny`).
+/// Measured on CPU f32: HuBERT mean 1.2e-6, semantic 9.2e-7, acoustic 1.2e-6, `fc_prior` 8.4e-7
+/// relative (bounds 1e-5, ~8× headroom); codes 51/51 exact.
+#[test]
+fn tiny_encode_half_matches_the_reference_stage_by_stage() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/yue_icl_tiny_reference.safetensors");
+    let fx = candle_audio_yue::candle_audio::candle_core::safetensors::load(&path, &Device::Cpu)
+        .unwrap();
+    let enc = XcodecEncoder::load(&path, &Device::Cpu).expect("load the tiny checkpoint");
+    let input = flat(&fx["ref.input"]);
+    let stages = enc.encode_stages(&input, &|| false).unwrap().unwrap();
+    let got = [
+        ("hubert_mean", &stages.hubert_mean),
+        ("semantic", &stages.semantic),
+        ("acoustic", &stages.acoustic),
+        ("fc_prior", &stages.prior),
+    ];
+    for ((name, t), (bound_name, bound)) in got.into_iter().zip(TINY_MAX_REL) {
+        assert_eq!(name, bound_name);
+        let want = &fx[&format!("ref.{name}")];
+        assert_eq!(&t.dims()[1..], want.dims(), "{name} shape");
+        let rel = max_rel(&flat(t), &flat(want));
+        println!("{name}: max|Δ|/max|ref| = {rel:.3e} (bound {bound:.0e})");
+        assert!(rel <= bound, "{name} diverges: {rel:.3e}");
+    }
+    let want_codes: Vec<u32> = fx["ref.codes"]
+        .to_vec1::<i64>()
+        .unwrap()
+        .into_iter()
+        .map(|c| c as u32)
+        .collect();
+    let codes = enc.encode_codes(&input, &|| false).unwrap().unwrap();
+    assert_eq!(codes, want_codes, "codes");
+    let mut bad = want_codes.clone();
+    bad[7] = (bad[7] + 1) % 1024;
+    assert_ne!(codes, bad, "a mutated code golden passed");
 }
 
 /// torchaudio's resampler, measured against the native port: max |Δ| 6.0e-8 … 1.2e-7 over the four
@@ -423,5 +492,76 @@ fn icl_prompt_ids_match_the_reference_token_for_token() {
             })
             .unwrap();
         assert_ne!(bad_prompt.segments[0].ids, prompt.segments[0].ids);
+    }
+
+    // Upstream's own example reference: 30 s of real music (1 500 frames — past the default
+    // 500-frame chunk and the 256-row HuBERT query block), single 0–30 s and dual stems 0–30 s.
+    let pop = &fx["pop"];
+    let ref_dir = PathBuf::from(std::env::var("YUE_REF_DIR").expect(
+        "set YUE_REF_DIR to the YuE reference environment (holds sceneworks-derived/, written by \
+         scripts/reference/yue_icl_reference.py)",
+    ));
+    let clip = |name: &str| -> AudioTrack {
+        let meta = &pop["clips"][name];
+        let path = ref_dir
+            .join("sceneworks-derived")
+            .join(format!("{name}.f32le"));
+        let raw = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} — run scripts/reference/yue_icl_reference.py to decode it",
+                path.display()
+            )
+        });
+        assert_eq!(
+            {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(&raw)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            },
+            meta["pcm_sha256"].as_str().unwrap(),
+            "{name}: decoded PCM differs from the reference's"
+        );
+        AudioTrack {
+            samples: raw
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            sample_rate: u32_of(&meta["rate"]),
+            channels: meta["channels"].as_u64().unwrap() as u16,
+            stems: Vec::new(),
+        }
+    };
+    let (start_secs, end_secs) = (f32_of(&pop["start"]), f32_of(&pop["end"]));
+    let pop_cases = [
+        (
+            "pop single",
+            IclTracks::Single(clip("pop.00001")),
+            ids(&pop["single_icl_ids"]),
+        ),
+        (
+            "pop dual",
+            IclTracks::Dual {
+                vocals: clip("pop.00001.Vocals"),
+                instrumental: clip("pop.00001.Instrumental"),
+            },
+            ids(&pop["dual_icl_ids"]),
+        ),
+    ];
+    for (name, tracks, want) in pop_cases {
+        let reference = IclReference {
+            tracks,
+            start_secs,
+            end_secs,
+        };
+        let got = enc.encode(&reference, &CancelFlag::new()).expect("encode");
+        let diffs = got.ids.iter().zip(&want).filter(|(a, b)| a != b).count();
+        println!(
+            "{name}: {} ids (reference {}), {diffs} differ",
+            got.ids.len(),
+            want.len()
+        );
+        assert_eq!(got.ids, want, "{name}: windowed ICL ids");
     }
 }

@@ -284,6 +284,19 @@ impl SemanticEncoder {
     }
 }
 
+/// The intermediate tensors of one [`XcodecEncoder::encode_stages`] run (batch 1).
+#[derive(Clone, Debug)]
+pub struct EncodeStages {
+    /// `get_regress_target`: the mean of HuBERT's hidden states, `[1, T, hidden]`.
+    pub hubert_mean: Tensor,
+    /// `e_semantic`: the RepCodec semantic encoding, `[1, hidden, T]`.
+    pub semantic: Tensor,
+    /// `e_acoustic`: the DAC encoding (padded re-encode when upstream takes it), `[1, latent, T]`.
+    pub acoustic: Tensor,
+    /// `fc_prior(cat[e_acoustic, e_semantic])`, `[1, dim, T]` — the quantizer's input.
+    pub prior: Tensor,
+}
+
 /// The native xcodec reference encoder: `SoundStream.encode` at 0.5 kb/s.
 pub struct XcodecEncoder {
     hubert: Hubert,
@@ -400,6 +413,12 @@ impl XcodecEncoder {
         Ok(Some(Tensor::cat(&parts, D::Minus1)?))
     }
 
+    /// Attend HuBERT's queries `rows` at a time ([`Hubert::with_query_chunk`]).
+    pub fn with_query_chunk(mut self, rows: usize) -> Self {
+        self.hubert = self.hubert.with_query_chunk(rows);
+        self
+    }
+
     /// `fc_prior(cat[acoustic, semantic])` — the pre-quantization embedding `[1, dim, T]` for one
     /// mono 16 kHz waveform. `None` when `cancel` trips between stages.
     pub fn prior_embedding(
@@ -407,6 +426,16 @@ impl XcodecEncoder {
         wave: &[f32],
         cancel: &dyn Fn() -> bool,
     ) -> Result<Option<Tensor>, AudioError> {
+        Ok(self.encode_stages(wave, cancel)?.map(|s| s.prior))
+    }
+
+    /// Every stage of `SoundStream.encode` before the quantizer, for one mono 16 kHz waveform —
+    /// what the parity tests hold to the reference stage by stage. `None` when `cancel` trips.
+    pub fn encode_stages(
+        &self,
+        wave: &[f32],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<EncodeStages>, AudioError> {
         let n = wave.len();
         if Hubert::frames_for(n + 2 * SEMANTIC_PAD) == 0 {
             return Err(AudioError::Msg(format!(
@@ -448,13 +477,18 @@ impl XcodecEncoder {
         if cancel() {
             return Ok(None);
         }
-        let e = Tensor::cat(&[acoustic, semantic], 1)?;
-        Ok(Some(
-            self.fc_prior
-                .forward(&e.transpose(1, 2)?.contiguous()?)?
-                .transpose(1, 2)?
-                .contiguous()?,
-        ))
+        let e = Tensor::cat(&[&acoustic, &semantic], 1)?;
+        let prior = self
+            .fc_prior
+            .forward(&e.transpose(1, 2)?.contiguous()?)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        Ok(Some(EncodeStages {
+            hubert_mean: sem_in,
+            semantic,
+            acoustic,
+            prior,
+        }))
     }
 
     /// `SoundStream.encode(x, target_bw = 0.5)` for one mono 16 kHz waveform: the codebook-0
@@ -860,6 +894,38 @@ mod tests {
             let codes = |e: &XcodecEncoder| e.encode_codes(&wave, &|| false).unwrap().unwrap();
             assert_eq!(codes(&enc), codes(&whole), "chunk {chunk}: codes");
         }
+
+        // HuBERT attention in 7-row query blocks (the 202 frames split 29 ways, last block short)
+        // reproduces the unsplit layer mean.
+        let padded = Tensor::from_slice(&wave, (1, n), &Device::Cpu)
+            .unwrap()
+            .pad_with_zeros(1, SEMANTIC_PAD, SEMANTIC_PAD)
+            .unwrap();
+        let mean = |e: &XcodecEncoder| -> Vec<f32> {
+            e.hubert
+                .mean_hidden_states(&padded, usize::MAX, &|| false)
+                .unwrap()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let unsplit = mean(&whole.with_query_chunk(usize::MAX));
+        let blocked = mean(
+            &XcodecEncoder::load(&snap.path().join(CHECKPOINT), &Device::Cpu)
+                .unwrap()
+                .with_query_chunk(7),
+        );
+        let peak = unsplit.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let diff = blocked
+            .iter()
+            .zip(&unsplit)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            diff <= 1e-5 * peak,
+            "query blocks: max|Δ| {diff} vs peak {peak}"
+        );
     }
 
     #[test]

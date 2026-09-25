@@ -18,6 +18,13 @@ produces to `crates/audio/candle-audio-yue/tests/fixtures/yue_icl_reference.json
 * ``resample`` — torchaudio `Resample(sr, 16000)` (the resampler `load_audio_mono` builds) on a
   short int16 clip at several source rates, down- and up-sampling. Weights-free, so the Rust
   resampler is held to it on every CI run.
+* ``pop`` — upstream's own example reference, ``yue/prompt_egs/pop.00001.mp3`` (single, window
+  0–30 s) and its ``.Vocals`` / ``.Instrumental`` stems (dual, 0–30 s): 30 s of real music, so the
+  Rust test crosses its default chunking and HuBERT query blocking. The MP3s are decoded with
+  ``soundfile`` at float32 (standing in for ``torchaudio.load``) and the decoded PCM is written to
+  ``$YUE_REF_DIR/sceneworks-derived/<name>.f32le`` (interleaved little-endian float32, outside the
+  repo — the Rust side has no MP3 decoder); the fixture carries only the ids and each decoded
+  clip's SHA-256.
 * per track, the RVQ nearest-codeword **margin** (`d₂ − d₁`, the gap between the best and
   second-best squared distance) at every frame — how far each reference token is from a float-noise
   flip. Diagnostics only; the Rust gate is exact ids.
@@ -37,6 +44,18 @@ Regenerating (dev box, inside the YuE reference venv; loads the ~1.3 GB codec on
 
     ~/.cache/sceneworks-yue-ref/venv/bin/python scripts/reference/yue_icl_reference.py \
         [--dump /tmp/yue_icl_intermediates]
+
+``--tiny`` instead writes ``tests/fixtures/yue_icl_tiny_reference.safetensors``: a random-init
+(seeded), small-width model of `SoundStream`'s **encode half** built from the upstream classes —
+`dac2.Encoder(2, [8, 5, 4, 2], 3)`, `HubertModel` (hidden 48, 12 heads, 16 positional-conv groups,
+conv width 4, 2 layers, intermediate 8, positional-conv kernel 16, group-norm feature
+encoder, post-LN), RepCodec
+`Encoder(48, 48)`, `fc_prior` and a `ResidualVectorQuantizer` over 1024 × 51 codewords — with its
+state dict under the xcodec checkpoint's names, a 1.0077 s input (not a whole number of frames, so
+`encode` takes its padded re-encode branch), and `SoundStream.encode`'s own intermediates
+(`get_regress_target`, `e_semantic`, `e_acoustic`, the `fc_prior` output) and codes. `encode` and
+`get_regress_target` are the upstream methods, called unbound on the tiny module. Weights-free, so
+the Rust stages are held to it on every CI run; no reference environment weights are loaded.
 
 ``--dump`` also writes the intermediate tensors (resampled waves, HuBERT layer mean, acoustic and
 semantic encodings, the `fc_prior` output) as safetensors for debugging a port; they are never
@@ -157,6 +176,14 @@ def pcm_sha256(pcm: list[int]) -> str:
     return hashlib.sha256(b"".join(v.to_bytes(2, "little", signed=True) for v in pcm)).hexdigest()
 
 
+#: Upstream's example reference and its stems (`yue/prompt_egs`), windowed 0–30 s.
+POP_CLIPS = ["pop.00001", "pop.00001.Vocals", "pop.00001.Instrumental"]
+POP_START, POP_END = 0.0, 30.0
+
+#: The tiny encode-half fixture (``--tiny``).
+TINY_OUTPUT = REPO_ROOT / "crates/audio/candle-audio-yue/tests/fixtures/yue_icl_tiny_reference.safetensors"
+TINY_SAMPLES = 16_000 + 123
+
 # --------------------------------------------------------------------------------------------
 # Reference
 # --------------------------------------------------------------------------------------------
@@ -177,6 +204,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dump", type=Path, default=None, help="write intermediates here")
+    parser.add_argument("--tiny", action="store_true", help="write the tiny-model fixture only")
     args = parser.parse_args()
 
     ref_dir = Path(os.environ.get("YUE_REF_DIR", Path.home() / ".cache/sceneworks-yue-ref"))
@@ -189,7 +217,12 @@ def main() -> None:
     sys.path[:0] = [str(inf), str(inf / "xcodec_mini_infer"),
                     str(inf / "xcodec_mini_infer" / "descriptaudiocodec")]
 
+    if args.tiny:
+        tiny_fixture()
+        return
+
     import numpy as np
+    import soundfile
     import torch
     import torchaudio
     from einops import rearrange
@@ -219,6 +252,8 @@ def main() -> None:
         @staticmethod
         def load(path):
             pcm, rate, channels = clips[path]
+            if isinstance(pcm, np.ndarray):  # decoded float32 [frames, channels]
+                return torch.from_numpy(pcm).t().contiguous(), rate
             data = torch.tensor(pcm, dtype=torch.int16).view(-1, channels).t().contiguous()
             return data.to(torch.float32) / 32768.0, rate
 
@@ -297,6 +332,29 @@ def main() -> None:
     trace("vocals", "vocals.wav")
     trace("instrumental", "instrumental.wav")
 
+    # ---- upstream's own example reference (30 s of real music) ----
+    derived = ref_dir / "sceneworks-derived"
+    derived.mkdir(parents=True, exist_ok=True)
+    pop = {}
+    for name in POP_CLIPS:
+        data, rate = soundfile.read(str(ref_dir / "yue" / "prompt_egs" / f"{name}.mp3"),
+                                    dtype="float32", always_2d=True)
+        data = np.ascontiguousarray(data)
+        raw = data.astype("<f4").tobytes()
+        (derived / f"{name}.f32le").write_bytes(raw)
+        clips[name] = (data, rate, data.shape[1])
+        pop[name] = {"rate": rate, "channels": int(data.shape[1]), "frames": int(data.shape[0]),
+                     "pcm_sha256": hashlib.sha256(raw).hexdigest()}
+    single_pop = codectool.npy2ids(encode_audio(codec_model, load_audio_mono(POP_CLIPS[0]), device,
+                                                target_bw=0.5)[0])
+    pop_single_ids = [int(v) for v in single_pop[int(POP_START * 50): int(POP_END * 50)]]
+    v_ids = codectool.npy2ids(encode_audio(codec_model, load_audio_mono(POP_CLIPS[1]), device,
+                                           target_bw=0.5)[0])
+    i_ids = codectool.npy2ids(encode_audio(codec_model, load_audio_mono(POP_CLIPS[2]), device,
+                                           target_bw=0.5)[0])
+    inter = rearrange([np.array(v_ids), np.array(i_ids)], 'b n -> (n b)')
+    pop_dual_ids = [int(v) for v in inter[int(POP_START*50*2): int(POP_END*50*2)].tolist()]
+
     resample_cases = []
     for rate in RESAMPLE_RATES:
         pcm = synth_resample_input(RESAMPLE_SAMPLES)
@@ -329,6 +387,14 @@ def main() -> None:
             "segment0_prompt_ids": single_prompt,
             "min_margin": min(margins["single"]),
         },
+        "pop": {
+            "clips": pop,
+            "start": POP_START,
+            "end": POP_END,
+            "single_codec_frames": len(single_pop),
+            "single_icl_ids": pop_single_ids,
+            "dual_icl_ids": pop_dual_ids,
+        },
         "dual": {
             **DUAL,
             "vocals_pcm_sha256": pcm_sha256(vocals_pcm),
@@ -353,6 +419,90 @@ def main() -> None:
         save_file(dumps, str(args.dump / "icl_intermediates.safetensors"))
         (args.dump / "margins.json").write_text(json.dumps(margins), encoding="utf-8")
         print(f"dumped intermediates to {args.dump}")
+
+
+def tiny_fixture() -> None:
+    """``--tiny``: a seeded small-width encode half built from the upstream classes."""
+    import torch
+    from safetensors.torch import save_file
+    from transformers import HubertConfig, HubertModel
+    import descriptaudiocodec.dac.model.dac as dac2
+    from RepCodec.repcodec.modules.encoder import Encoder as RepEncoder
+    from quantization import ResidualVectorQuantizer
+    from models.soundstream_hubert_new import SoundStream
+
+    torch.manual_seed(1234)
+    latent, hidden = 3, 48
+    m = torch.nn.Module.__new__(SoundStream)
+    torch.nn.Module.__init__(m)
+    m.encoder = dac2.Encoder(2, [8, 5, 4, 2], latent)
+    m.semantic_model = HubertModel(HubertConfig(
+        hidden_size=hidden, num_attention_heads=12, num_conv_pos_embedding_groups=16,
+        conv_dim=[4] * 7, num_hidden_layers=2, intermediate_size=8, feat_extract_norm="group",
+        do_stable_layer_norm=False, conv_bias=False, num_conv_pos_embeddings=16,
+    ))
+    m.encoder_semantic = RepEncoder(input_channels=hidden, encode_channels=hidden)
+    m.fc_prior = torch.nn.Linear(latent + hidden, latent + hidden)
+    m.quantizer = ResidualVectorQuantizer(dimension=latent + hidden, n_q=12, bins=1024)
+    m.frame_rate = 50
+    # Default inits leave every Snake alpha / norm affine at exactly 1 / 0; perturb every parameter
+    # so a dropped or mis-broadcast one is visible.
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(0.1 * torch.randn_like(p))
+    m.eval()
+
+    state = torch.Generator().manual_seed(99)
+    x = (0.3 * torch.randn(1, 1, TINY_SAMPLES, generator=state)).clamp(-1, 1)
+    x = (x * 32767).round() / 32768.0  # int16-exact
+    with torch.no_grad():
+        # Seed the codebook from the clip's own pre-quant embeddings (+ noise), like k-means init,
+        # so the codes vary instead of collapsing onto one codeword.
+        sem_in = SoundStream.get_regress_target(m, x)
+        sem = m.encoder_semantic(sem_in.transpose(1, 2))
+        ac = m.encoder(x)
+        if ac.shape[2] != sem.shape[2]:
+            ac = m.encoder(torch.transpose(torch.nn.functional.pad(x[:, 0, :], (160, 160)).unsqueeze(0), 0, 1))
+        e = m.fc_prior(torch.cat([ac, sem], dim=1).transpose(1, 2)).transpose(1, 2)
+        frames = e[0].t()
+        pick = torch.randint(0, frames.shape[0], (1024,), generator=state)
+        cb = frames[pick] + 0.5 * frames.std() * torch.randn(1024, frames.shape[1], generator=state)
+        for layer in m.quantizer.vq.layers:
+            layer._codebook.embed.copy_(cb)
+            layer._codebook.inited.fill_(1)
+        codes = SoundStream.encode(m, x, target_bw=0.5)  # [1, 1, T], upstream code
+        dist = frames.pow(2).sum(1, keepdim=True) - 2 * frames @ cb.t() + cb.pow(2).sum(1)[None]
+        top2 = dist.topk(2, dim=1, largest=False).values
+        margin = float((top2[:, 1] - top2[:, 0]).min())
+
+    tensors = {}
+    for k, v in m.encoder.state_dict().items():
+        tensors[f"encoder.{k}"] = v
+    for k, v in m.encoder_semantic.state_dict().items():
+        tensors[f"encoder_semantic.{k}"] = v
+    for k, v in m.semantic_model.state_dict().items():
+        # The parametrized weight norm is stored as weight_g / weight_v in the real checkpoint.
+        k = k.replace("parametrizations.weight.original0", "weight_g")
+        k = k.replace("parametrizations.weight.original1", "weight_v")
+        tensors[f"semantic_model.{k}"] = v
+    tensors["fc_prior.weight"] = m.fc_prior.weight
+    tensors["fc_prior.bias"] = m.fc_prior.bias
+    tensors["quantizer.vq.layers.0._codebook.embed"] = m.quantizer.vq.layers[0]._codebook.embed
+    tensors["ref.input"] = x.reshape(-1)
+    tensors["ref.hubert_mean"] = sem_in[0]
+    tensors["ref.semantic"] = sem[0]
+    tensors["ref.acoustic"] = ac[0]
+    tensors["ref.fc_prior"] = e[0]
+    tensors["ref.codes"] = codes[0, 0].to(torch.int64)
+    tensors = {k: v.detach().contiguous() for k, v in tensors.items()}
+    TINY_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(TINY_OUTPUT), metadata={
+        "story": "sc-19379", "producer": "scripts/reference/yue_icl_reference.py --tiny",
+        "yue_revision": YUE_COMMIT, "torch": torch.__version__, "seed": "1234/99",
+        "min_codeword_margin": f"{margin:.6e}",
+    })
+    print(f"wrote {TINY_OUTPUT} ({TINY_OUTPUT.stat().st_size} bytes); {codes.shape[-1]} frames, "
+          f"min codeword margin {margin:.3e}, distinct codes {len(set(codes.flatten().tolist()))}")
 
 
 def first_segment_prompt(mmtokenizer, codectool, audio_prompt_codec) -> list[int]:

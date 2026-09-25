@@ -35,8 +35,9 @@ pub const NUM_HEADS: usize = 12;
 pub const POS_CONV_GROUPS: usize = 16;
 /// LayerNorm / GroupNorm epsilon (`config.layer_norm_eps`; GroupNorm's torch default is the same).
 pub const EPS: f64 = 1e-5;
-/// Rows of queries attended at once — bounds the `[heads, rows, T]` score block for long clips.
-const QUERY_CHUNK: usize = 256;
+/// Default rows of queries attended at once — bounds the `[heads, rows, T]` score block for long
+/// clips ([`Hubert::with_query_chunk`]).
+pub const DEFAULT_QUERY_CHUNK: usize = 256;
 
 struct Weights<'a> {
     map: &'a HashMap<String, Tensor>,
@@ -80,7 +81,7 @@ struct Layer {
 
 impl Layer {
     /// `HubertEncoderLayer.forward` (post-LN): `h = LN(h + attn(h)); h = LN(h + ff(h))`.
-    fn forward(&self, h: &Tensor) -> Result<Tensor> {
+    fn forward(&self, h: &Tensor, query_chunk: usize) -> Result<Tensor> {
         let (b, t, c) = h.dims3()?;
         let hd = c / NUM_HEADS;
         let heads = |x: Tensor| -> Result<Tensor> {
@@ -93,15 +94,13 @@ impl Layer {
         let v = heads(self.v.forward(h)?)?;
         let kt = k.transpose(2, 3)?.contiguous()?;
         let scale = (hd as f64).powf(-0.5);
-        let mut parts = Vec::with_capacity(t.div_ceil(QUERY_CHUNK));
-        let mut start = 0;
-        while start < t {
-            let rows = QUERY_CHUNK.min(t - start);
+        let mut parts = Vec::with_capacity(t.div_ceil(query_chunk));
+        for start in (0..t).step_by(query_chunk) {
+            let rows = query_chunk.min(t - start);
             let qc = q.narrow(2, start, rows)?;
             let scores = (qc.matmul(&kt)? * scale)?;
             let probs = candle_nn::ops::softmax_last_dim(&scores)?;
             parts.push(probs.matmul(&v)?);
-            start += rows;
         }
         let attn = Tensor::cat(&parts, 2)?
             .transpose(1, 2)?
@@ -122,6 +121,7 @@ pub struct Hubert {
     pos_remove: usize,
     enc_ln: LayerNorm,
     layers: Vec<Layer>,
+    query_chunk: usize,
 }
 
 impl Hubert {
@@ -211,7 +211,15 @@ impl Hubert {
             pos_remove: usize::from(pos_k.is_multiple_of(2)),
             enc_ln: w.layer_norm("encoder.layer_norm")?,
             layers,
+            query_chunk: DEFAULT_QUERY_CHUNK,
         })
+    }
+
+    /// Attend `rows` query rows at a time (default [`DEFAULT_QUERY_CHUNK`]; clamped to ≥ 1). Only
+    /// the score block's size changes — each row's softmax is over every key either way.
+    pub fn with_query_chunk(mut self, rows: usize) -> Self {
+        self.query_chunk = rows.max(1);
+        self
     }
 
     /// Frames the feature encoder yields for `samples` input samples.
@@ -329,7 +337,7 @@ impl Hubert {
             if cancel() {
                 return Ok(None);
             }
-            h = layer.forward(&h)?;
+            h = layer.forward(&h, self.query_chunk)?;
             sum = (sum + &h)?;
         }
         Ok(Some((sum / (self.layers.len() + 1) as f64)?))
