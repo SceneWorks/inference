@@ -1,6 +1,7 @@
 # Reviewed CPython 3.12 / Windows x64 wheels used to decode YuE's upstream ICL reference clip
 # (`prompt_egs/pop.00001.mp3`) to the float32 PCM `candle-audio-yue`'s real-weight smoke reads.
-# The same soundfile/numpy versions produced the committed fixture's `pcm_sha256` on the dev box.
+# This Windows wheel's decoder does NOT reproduce the committed fixture's macOS `pcm_sha256`
+# (94c91250... vs 015da6eb...); the smoke asserts output shape and finiteness only.
 # Resolve with:
 # python -m pip download --only-binary=:all: --platform win_amd64 \
 #   --python-version 3.12 --implementation cp --abi cp312 soundfile==0.14.0 numpy==2.5.3

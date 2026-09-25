@@ -7,7 +7,9 @@
 ``stage-root`` lays out ``YUE_SNAPSHOT_ROOT`` from hub-cache snapshot directories. It cannot use
 junctions: a hub-cache snapshot's files are relative symlinks into ``../../blobs``, and Windows
 resolves those against the path they were opened through, so behind a junction every file is
-"not found". Each file is instead hard-linked (copied across volumes) to its resolved blob.
+"not found". Each file is instead hard-linked to its resolved blob, which needs ``--root`` on the
+cache's volume; across volumes each file is COPIED instead (tens of GB), and the printed per-repo
+counts say which happened.
 
 ``stage-reference`` does only the decode step of ``scripts/reference/yue_icl_reference.py`` (which
 needs the whole torch reference environment): fetch upstream's ``prompt_egs/pop.00001.mp3`` at the

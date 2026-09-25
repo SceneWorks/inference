@@ -12,7 +12,9 @@ name: YuE real-weight validation (CUDA)
 #
 # The four SceneWorks rehosts are materialized into the persistent hub cache (release/
 # real-weight-models.toml, profile `yue`) and hard-linked into the `YUE_SNAPSHOT_ROOT/<repo>` layout
-# the test reads. The reference clip is fetched at the pinned YuE commit, SHA-256-verified and
+# the test reads. That root is a run-scoped directory beside `CANDLE_GEN_MODELS_ROOT` -- the same
+# volume, which is what lets the links succeed (a root under RUNNER_TEMP, on another volume, copied
+# ~23 GB per run) -- and is removed at the end of every run. The reference clip is fetched at the pinned YuE commit, SHA-256-verified and
 # decoded by `scripts/release/yue_real_weights.py` from its own hash-locked wheel set.
 #
 # `nvidia-smi` samples device memory every 500 ms around each case. RECORD-ONLY: the box has a
@@ -89,7 +91,7 @@ jobs:
           if exist "%RUNNER_TEMP%\yue-cuda-evidence" rmdir /s /q "%RUNNER_TEMP%\yue-cuda-evidence"
           mkdir "%RUNNER_TEMP%\yue-cuda-evidence" || exit /b 1
           echo YUE_EVIDENCE=%RUNNER_TEMP%\yue-cuda-evidence>>"%GITHUB_ENV%"
-          echo YUE_SNAPSHOT_ROOT=%RUNNER_TEMP%\yue-snapshots>>"%GITHUB_ENV%"
+          echo YUE_SNAPSHOT_ROOT=%CANDLE_GEN_MODELS_ROOT%\..\yue-snapshot-root-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%>>"%GITHUB_ENV%"
           echo YUE_REF_DIR=%RUNNER_TEMP%\yue-ref>>"%GITHUB_ENV%"
       - name: Record the CUDA device inventory
         continue-on-error: true
@@ -109,6 +111,7 @@ jobs:
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-xcodec-mini-infer --snapshot "%CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT%" || exit /b 1
       # The test reads `YUE_SNAPSHOT_ROOT/<repo>`. Hard links to the resolved blobs, not junctions:
       # hub-cache files are relative symlinks that do not resolve behind a junction (see the script).
+      # The links need the root on the cache's volume; the script copies if they ever cannot.
       - name: Lay out the YuE snapshot root
         shell: cmd
         run: |
@@ -158,3 +161,13 @@ jobs:
           path: ${{ runner.temp }}/yue-cuda-evidence
           if-no-files-found: error
           retention-days: 30
+      # The staged root lives beside the persistent cache, not in RUNNER_TEMP, so nothing else
+      # removes it. Deleting the links never touches the cache's blobs.
+      - name: Remove the run-scoped YuE snapshot root
+        if: always()
+        shell: cmd
+        run: |
+          if not defined YUE_SNAPSHOT_ROOT exit /b 0
+          if exist "%YUE_SNAPSHOT_ROOT%" rmdir /s /q "%YUE_SNAPSHOT_ROOT%"
+          if exist "%YUE_SNAPSHOT_ROOT%" (echo ::error::could not remove %YUE_SNAPSHOT_ROOT%& exit /b 1)
+          exit /b 0
