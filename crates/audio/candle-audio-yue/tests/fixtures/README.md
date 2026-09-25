@@ -61,6 +61,36 @@ Codebooks are stored as 3 hex digits per code (8 rows per case). Codebook-0 inpu
   103/112, q4 77/280 and 14/112 residual codes of the reference (40- / 16-frame cases). Peak RSS
   19.6 GB.
 
+## Metal (bf16) divergence — measured (AC3)
+
+Run 2026-09-25 on the dev Mac (Apple Silicon, `--features metal`, release) with
+`sc-19381-metal-run.sh`: Metal computes in bf16, the reference is the CPU in f32, both
+teacher-forced along the CPU's own stream (so a flip cannot cascade). Flips = residual picks whose
+argmax differs; relative Δ = `max |Δlogit| / max |logit|` over the 7168-wide slice. Deterministic:
+a second run reproduced every number.
+
+| Test / case | Frames | Flips | Flip fraction | max \|Δlogit\| | Logit scale | Relative Δ | Flip margins (logits) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| synthetic 2-layer (`stage2::tests::metal`) | 24 | 17 / 168 | 0.101 | 0.089 | 12.9 | 0.0069 | 0.001–0.046 |
+| real 1B `encode_0_40` | 40 | 9 / 280 | 0.032 | 0.539 | 30.1 | 0.0179 | 0.004–0.087 |
+| real 1B `encode_17_33` | 16 | 2 / 112 | 0.018 | 2.279 | 25.2 | 0.0905 | 0.010, 0.082 |
+| real 1B `encode_0_650`, first chunk | 300 | 13 / 2100 | 0.0062 | 0.345 | 40.7 | 0.0085 | 0.004–0.166 |
+
+Every flip is a near-tie (margin ≤ 0.17 logits at a logit scale of 25–41). The real-weight
+CPU stream still equals the golden in every case. Tolerances, ~2× the measured maximum:
+
+| Constant | Test | Value | Measured max |
+| --- | --- | --- | --- |
+| `MAX_REL_LOGIT_DELTA` | synthetic | 0.014 | 0.0069 |
+| `MAX_FLIP_FRACTION` | synthetic | 0.20 | 0.101 |
+| `METAL_MAX_REL_LOGIT_DELTA` | real 1B (per case) | 0.18 | 0.0905 |
+| `METAL_MAX_FLIP_FRACTION` | real 1B (per case) | 0.065 | 0.032 |
+
+Mutation: scaling the GPU logits ×1.5 inside `CandleStage2Lm::step` fails the real-weight test on
+its first case (relative Δ 0.506 > 0.18). The flip count does not change under that mutation,
+because scaling preserves the argmax; the relative-Δ bound is what catches it. Cost of the run:
+~12.5 min wall (synthetic 9 s, real 1B 11.5 min), peak RSS 16.7 GB.
+
 ## Two upstream defects the producer works around (and the port handles)
 
 1. **Sub-chunk tracks crash upstream.** With fewer than 300 frames, `stage2_inference` still calls

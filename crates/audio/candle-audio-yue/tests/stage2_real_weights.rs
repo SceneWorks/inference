@@ -166,14 +166,15 @@ fn stage2_every_tier_loads_through_production_and_is_characterised() {
 }
 
 /// Bound on `max |Δlogit| / max |logit|` for the dense 1B on Metal (bf16 compute) against the CPU
-/// (f32). PROVISIONAL until the first Metal run (sc-19381): set from the measured value with
-/// headroom. For scale, the CPU q8 tier measured 0.028 against the same reference.
+/// (f32), per case. Measured on an M-series Mac (2026-09-25): 0.0179 (`encode_0_40`), 0.0905
+/// (`encode_17_33`), 0.0085 (first 300-frame chunk of `encode_0_650`); ~2× the maximum.
 #[cfg(feature = "metal")]
-const METAL_MAX_REL_LOGIT_DELTA: f32 = 0.05;
+const METAL_MAX_REL_LOGIT_DELTA: f32 = 0.18;
 /// Bound on the fraction of residual picks that flip on Metal, teacher-forced on the reference
-/// stream (so flips cannot cascade). PROVISIONAL until the first Metal run (sc-19381).
+/// stream (so flips cannot cascade), per case. Measured: 9/280 = 0.032, 2/112 = 0.018,
+/// 13/2100 = 0.0062 (every flip margin <= 0.17 logits); ~2× the maximum.
 #[cfg(feature = "metal")]
-const METAL_MAX_FLIP_FRACTION: f64 = 0.05;
+const METAL_MAX_FLIP_FRACTION: f64 = 0.065;
 
 /// **AC3 on real weights** — the dense tier on Metal (bf16 compute) against the CPU f32
 /// reference, teacher-forced along the reference stream, per golden case (a case longer than one
