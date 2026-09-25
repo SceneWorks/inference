@@ -437,7 +437,8 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
     let g = crate::model::load_en_cot(&spec()).unwrap();
     assert!(refused(g.generate(&song(None), &mut |_| {})));
 
-    // Every production stage refuses on its own, so no later stage can fall back to its stub.
+    // Every unported production stage refuses on its own, so no later stage can fall back to its
+    // stub.
     let s = StageSet::production();
     let assets = Assets {
         stage1: "/staged/yue-s1".into(),
@@ -452,7 +453,12 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
         "stage 1"
     );
     assert!(refused((s.stage2)(&assets, None)), "stage 2");
-    assert!(refused((s.codec)(&assets)), "codec");
+    // The codec (sc-19377) is real: with nothing staged it fails to load (never `Unsupported`);
+    // `codec::tests::production_load_decodes_a_staged_checkpoint_instead_of_refusing` loads it.
+    assert!(
+        matches!((s.codec)(&assets), Err(e) if !matches!(e, Error::Unsupported(_))),
+        "codec"
+    );
     assert!(refused((s.vocoder)(&assets)), "vocoder");
     assert!(refused((s.splice)(&[0.0], &[0.0])), "splice");
 }
