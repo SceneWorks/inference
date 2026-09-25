@@ -75,7 +75,17 @@ pub use nvfp4_weight::{
 };
 #[cfg(feature = "cuda")]
 pub use nvrtc::{device_compute_cap, CompiledKernel};
-pub use nvrtc::{nvrtc_arch_for, KernelCompileError, KernelSource};
+pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource};
+
+/// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
+/// primitives, the NVFP4 decode GEMV and the fused NVFP4 activation quantizer.
+///
+/// Checks that must hold for every runtime-compiled kernel walk this list (with
+/// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
+/// (sc-24164). A `KernelSource` added anywhere in the workspace without being listed in one of
+/// the two fails `candle-llm`'s `every_workspace_kernel_source_is_registered`.
+pub const NVRTC_SOURCES: &[KernelSource] =
+    &[FUSED_DECODE_SRC, NVFP4_GEMV_SRC, cublaslt::NVFP4_QUANT_SRC];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 
 /// Poison-tolerant `Mutex` lock for the handle's overwrite-on-miss caches — the same recovery

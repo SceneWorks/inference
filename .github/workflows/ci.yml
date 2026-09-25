@@ -20,7 +20,17 @@ on:
   # before any ruleset enables a queue keeps the checks reachable from the first enqueue
   # (sc-17780; the sibling SceneWorks change is sc-17773).
   merge_group:
+  # A bare dispatch runs every lane, and that includes `macos-nax` on the self-hosted macOS NAX
+  # runners. `lanes: windows-cuda` scopes a dispatch to the Windows CUDA lanes (`windows-cuda-check`
+  # and the manual `windows-cuda`), so CUDA tests can be run against a branch without scheduling
+  # anything on a self-hosted Mac (sc-24164). The unconditional hosted checks still run.
   workflow_dispatch:
+    inputs:
+      lanes:
+        description: "all = every lane (includes the self-hosted macOS NAX lane); windows-cuda = only the Windows CUDA lanes"
+        type: choice
+        options: [all, windows-cuda]
+        default: all
 
 permissions:
   contents: read
@@ -95,8 +105,11 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD_SHA: ${{ github.sha }}
+          DISPATCH_LANES: ${{ inputs.lanes }}
         run: |
-          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "windows-cuda" ]]; then
+            python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             python3 scripts/ci/select_lanes.py --all --github-output "$GITHUB_OUTPUT"
           else
             python3 scripts/ci/select_lanes.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
