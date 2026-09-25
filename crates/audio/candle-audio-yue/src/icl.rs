@@ -124,76 +124,12 @@ pub fn downmix(track: &AudioTrack) -> Result<Vec<f32>, AudioError> {
         .collect())
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
 /// torchaudio's resampler as `load_audio_mono` builds it: `Resample(orig_freq = sr, new_freq =
-/// 16000)` with the defaults `sinc_interp_hann`, `lowpass_filter_width = 6`, `rolloff = 0.99`.
-///
-/// Ported from `torchaudio.functional._get_sinc_resample_kernel` / `_apply_sinc_resample_kernel`
-/// (torchaudio 2.11) with its dtype path: the phase offsets `arange(0, -new, -1) / new` are float32
-/// (integer true-division), promoted to float64 for the kernel, which is cached as float32; the
-/// output length is `ceil(float32(new · len / orig))`. The convolution accumulates in float64 (the
-/// reference's float32 conv differs only by summation order).
+/// 16000)` with the defaults — the shared [`candle_audio::dsp::resample_sinc_hann`] (which also
+/// serves YuE's low-band splice). A 16 kHz track passes through unchanged, as upstream skips the
+/// resampler for it.
 pub fn resample_to_16k(mono: &[f32], sample_rate: u32) -> Result<Vec<f32>, AudioError> {
-    if sample_rate == 0 {
-        return Err(AudioError::Msg("ICL reference: sample rate 0".into()));
-    }
-    if sample_rate == SAMPLE_RATE {
-        return Ok(mono.to_vec());
-    }
-    const WIDTH: f64 = 6.0;
-    let g = gcd(u64::from(sample_rate), u64::from(SAMPLE_RATE));
-    let orig = (u64::from(sample_rate) / g) as usize;
-    let new = (u64::from(SAMPLE_RATE) / g) as usize;
-    let base = orig.min(new) as f64 * 0.99;
-    let width = (WIDTH * orig as f64 / base).ceil() as usize;
-    let taps = 2 * width + orig;
-    let scale = base / orig as f64;
-    let pi = std::f64::consts::PI;
-
-    let mut kernel = vec![0f32; new * taps];
-    for j in 0..new {
-        let t0 = f64::from(-(j as f32) / new as f32);
-        for k in 0..taps {
-            let idx = (k as f64 - width as f64) / orig as f64;
-            let mut t = ((t0 + idx) * base).clamp(-WIDTH, WIDTH);
-            let window = (t * pi / WIDTH / 2.0).cos().powi(2);
-            t *= pi;
-            let sinc = if t == 0.0 { 1.0 } else { t.sin() / t };
-            kernel[j * taps + k] = (sinc * (window * scale)) as f32;
-        }
-    }
-
-    let len = mono.len();
-    let target = ((new as f64 * len as f64 / orig as f64) as f32).ceil() as usize;
-    let mut out = Vec::with_capacity(target);
-    // `pad(x, (width, width + orig))`, strided by `orig`: output `block·new + j` is phase `j`'s
-    // kernel over padded[block·orig ..], where padded[p] = x[p − width] inside the clip, else 0.
-    let mut block = 0;
-    while out.len() < target {
-        for j in 0..new {
-            if out.len() == target {
-                break;
-            }
-            let start = block * orig;
-            let row = &kernel[j * taps..(j + 1) * taps];
-            let mut acc = 0f64;
-            for (k, &w) in row.iter().enumerate() {
-                let p = start + k;
-                if p >= width && p - width < len {
-                    acc += f64::from(mono[p - width]) * f64::from(w);
-                }
-            }
-            out.push(acc as f32);
-        }
-        block += 1;
-    }
-    Ok(out)
+    candle_audio::dsp::resample_sinc_hann(mono, sample_rate, SAMPLE_RATE)
 }
 
 // ------------------------------------------------------------------------------------------------

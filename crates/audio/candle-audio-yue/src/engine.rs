@@ -20,6 +20,7 @@
 use candle_audio::gen_core::{self, CancelFlag};
 
 use crate::config::{Assets, Tier, Variant, YueRequest};
+use crate::splice::{SplicedMix, TrackPair};
 use crate::stage1::{SegmentStart, Stage1Step};
 use crate::stages::StageSet;
 use crate::tokenizer::PromptInput;
@@ -235,7 +236,7 @@ impl YueEngine {
         let decoded: gen_core::Result<Vec<_>> =
             grids.iter().map(|g| codec.decode(g, cancel)).collect();
         release(Stage::Codec, codec, on_event);
-        let decoded = decoded?;
+        let mut decoded = decoded?;
 
         // Vocos: 44.1 kHz stems.
         check_cancel(cancel)?;
@@ -250,12 +251,22 @@ impl YueEngine {
         let mut stems = stems?;
         check_cancel(cancel)?;
 
-        // Mixes and the low-band splice.
-        let mix_codec_rate = sum_tracks(&decoded[0].wave, &decoded[1].wave);
-        let mut instrumental = stems.pop().unwrap_or_default();
-        let mut vocals = stems.pop().unwrap_or_default();
-        let mix_vocoder_rate = sum_tracks(&vocals, &instrumental);
-        let mut mix = (s.splice)(&mix_codec_rate, &mix_vocoder_rate)?;
+        // Limiter + low-band splice.
+        let codec_rate = TrackPair {
+            vocals: std::mem::take(&mut decoded[0].wave),
+            instrumental: std::mem::take(&mut decoded[1].wave),
+        };
+        let instrumental = stems.pop().unwrap_or_default();
+        let vocals = stems.pop().unwrap_or_default();
+        let vocoder_rate = TrackPair {
+            vocals,
+            instrumental,
+        };
+        let SplicedMix {
+            mut mix,
+            mut vocals,
+            mut instrumental,
+        } = (s.splice)(&codec_rate, &vocoder_rate, req.limiter)?;
         let len = mix.len().min(vocals.len()).min(instrumental.len());
         if len == 0 {
             return Err(gen_core::Error::Msg(format!(
@@ -336,9 +347,4 @@ pub(crate) fn stage1_tracks(
         raw.push(EOA);
     }
     split_raw_output(&raw, prompt_pairs)
-}
-
-/// Sample-wise sum of two mono tracks, over the shorter length.
-fn sum_tracks(a: &[f32], b: &[f32]) -> Vec<f32> {
-    a.iter().zip(b).map(|(x, y)| x + y).collect()
 }
