@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_audio::gen_core::{self, AudioTrack, Quant};
+use candle_audio::gen_core::{self, AudioTrack, OutputLimiter, Quant};
 
 /// Stage-1 checkpoint language.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -113,7 +113,7 @@ impl Variant {
     }
 }
 
-/// The LM weight tier for stage 1 and stage 2 (epic R2). xcodec and Vocos stay fp16 at every tier
+/// The LM weight tier for stage 1 and stage 2 (epic R2). xcodec and Vocos stay float32 at every tier
 /// — the approved whole-pipeline carve-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tier {
@@ -286,6 +286,8 @@ pub struct YueRequest {
     pub seed: u64,
     /// The ICL reference; required for ICL variants, refused for CoT ones.
     pub icl: Option<IclReference>,
+    /// The output limiter (upstream `save_audio`: clamp by default, `--rescale` on request).
+    pub limiter: OutputLimiter,
 }
 
 impl YueRequest {
@@ -298,6 +300,7 @@ impl YueRequest {
             decode: DecodeConfig::default(),
             seed: DEFAULT_SEED,
             icl: None,
+            limiter: OutputLimiter::Clamp,
         }
     }
 

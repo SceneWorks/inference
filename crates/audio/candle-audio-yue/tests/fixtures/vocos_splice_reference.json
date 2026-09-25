@@ -1,0 +1,72 @@
+{
+  "story": "sc-19378",
+  "producer": "scripts/reference/yue_vocos_reference.py",
+  "yue_revision": "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d",
+  "yue_clone_head": "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d",
+  "xcodec_mini_infer_revision": "fe781a67815ab47b4a3a5fce1e8d0a692da7e4e5",
+  "checkpoints": {
+    "codec": "xcodec_mini_infer/final_ckpt/ckpt_00360000.pth [codec_model]",
+    "vocal": "xcodec_mini_infer/decoders/decoder_131000.pth",
+    "inst": "xcodec_mini_infer/decoders/decoder_151000.pth"
+  },
+  "torch": "2.14.0",
+  "torchaudio": "2.11.0",
+  "device": "cpu",
+  "dtype": "float32",
+  "clips": "synthetic stdlib vocal lead / instrumental bed, 1 s @ 16 kHz",
+  "target_bandwidth_kbps": 4.0,
+  "frames": 25,
+  "cutoff_hz": 5500.0,
+  "tensors": {
+    "clamp_inst": [
+      22050
+    ],
+    "clamp_mix": [
+      22050
+    ],
+    "clamp_vocal": [
+      22050
+    ],
+    "inst_codes": [
+      8,
+      25
+    ],
+    "inst_wave16": [
+      8000
+    ],
+    "inst_wave44": [
+      22050
+    ],
+    "rescale_inst": [
+      22050
+    ],
+    "rescale_mix": [
+      22050
+    ],
+    "rescale_vocal": [
+      22050
+    ],
+    "vocal_codes": [
+      8,
+      25
+    ],
+    "vocal_wave16": [
+      8000
+    ],
+    "vocal_wave44": [
+      22050
+    ]
+  },
+  "stats": {
+    "clamp_vocoder_mix_peak_before_limit": 1.1414813995361328,
+    "clamp_final_peak": 0.6842578649520874,
+    "rescale_vocoder_mix_peak_before_limit": 1.1414813995361328,
+    "rescale_final_peak": 0.5935088992118835,
+    "recons_mix_peak": 1.7949118614196777,
+    "vocal_wave16_peak": 1.2057174444198608,
+    "vocal_wave44_peak": 0.6974453926086426,
+    "inst_wave16_peak": 0.8673511147499084,
+    "inst_wave44_peak": 0.9031687378883362
+  },
+  "sha256": "3b46332e55f2a384ec01a6a1afa2f8b739b73c65358a4ab53c14aadb05d2c65d"
+}

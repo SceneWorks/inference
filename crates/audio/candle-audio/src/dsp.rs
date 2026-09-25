@@ -273,6 +273,75 @@ pub fn resample_mono_range(
     resample_range_impl(samples, src_rate, dst_rate, channels, output_range, true)
 }
 
+/// torchaudio's `transforms.Resample(orig, new)` / `functional.resample` with the defaults
+/// (`sinc_interp_hann`, `lowpass_filter_width = 6`, `rolloff = 0.99`) — for ports whose reference
+/// resamples through torchaudio (YuE's ICL reference load and its low-band splice). Distinct from
+/// [`resample`] (this crate's own Kaiser design), which is not bit-comparable to torchaudio.
+///
+/// Ported from `torchaudio.functional._get_sinc_resample_kernel` / `_apply_sinc_resample_kernel`
+/// (torchaudio 2.11) with its dtype path: the phase offsets `arange(0, -new, -1) / new` are float32
+/// (integer true-division), promoted to float64 for the kernel, which is cached as float32; the
+/// output length is `ceil(float32(new · len / orig))`. The convolution over the zero-padded input
+/// (`pad(x, (width, width + orig))`, stride `orig`) accumulates in float64 — the reference's float32
+/// conv differs only by summation order. Mono; an equal-rate call returns the input unchanged.
+pub fn resample_sinc_hann(x: &[f32], orig: u32, new: u32) -> Result<Vec<f32>> {
+    if orig == 0 || new == 0 {
+        return Err(AudioError::Msg(format!(
+            "resample rates must be non-zero, got {orig} -> {new}"
+        )));
+    }
+    if orig == new {
+        return Ok(x.to_vec());
+    }
+    const WIDTH: f64 = 6.0;
+    let g = gcd(orig, new);
+    let (orig, new) = ((orig / g) as usize, (new / g) as usize);
+    let base = orig.min(new) as f64 * 0.99;
+    let width = (WIDTH * orig as f64 / base).ceil() as usize;
+    let taps = 2 * width + orig;
+    let scale = base / orig as f64;
+    let pi = std::f64::consts::PI;
+
+    let mut kernel = vec![0f32; new * taps];
+    for j in 0..new {
+        let t0 = f64::from(-(j as f32) / new as f32);
+        for k in 0..taps {
+            let idx = (k as f64 - width as f64) / orig as f64;
+            let mut t = ((t0 + idx) * base).clamp(-WIDTH, WIDTH);
+            let window = (t * pi / WIDTH / 2.0).cos().powi(2);
+            t *= pi;
+            let sinc = if t == 0.0 { 1.0 } else { t.sin() / t };
+            kernel[j * taps + k] = (sinc * (window * scale)) as f32;
+        }
+    }
+
+    let len = x.len();
+    let target = ((new as f64 * len as f64 / orig as f64) as f32).ceil() as usize;
+    let mut out = Vec::with_capacity(target);
+    // Output `block·new + j` is phase `j`'s kernel over padded[block·orig ..], where
+    // padded[p] = x[p − width] inside the clip, else 0.
+    let mut block = 0;
+    while out.len() < target {
+        for j in 0..new {
+            if out.len() == target {
+                break;
+            }
+            let start = block * orig;
+            let row = &kernel[j * taps..(j + 1) * taps];
+            let mut acc = 0f64;
+            for (k, &w) in row.iter().enumerate() {
+                let p = start + k;
+                if p >= width && p - width < len {
+                    acc += f64::from(x[p - width]) * f64::from(w);
+                }
+            }
+            out.push(acc as f32);
+        }
+        block += 1;
+    }
+    Ok(out)
+}
+
 fn validate_resample_input(
     samples: &[f32],
     src_rate: u32,
@@ -678,6 +747,31 @@ pub fn istft(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torchaudio_sinc_resampler_keeps_a_tone_and_torchaudio_lengths() {
+        let tone: Vec<f32> = (0..3200)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.5)
+            .collect();
+        let up = resample_sinc_hann(&tone, 16_000, 44_100).unwrap();
+        assert_eq!(up.len(), 8820, "ceil(441 · 3200 / 160)");
+        for (i, &got) in up.iter().enumerate().take(2100).skip(2000) {
+            let want = (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44_100.0).sin() * 0.5;
+            assert!(
+                (got as f64 - want).abs() < 1e-2,
+                "sample {i}: {got} vs {want}"
+            );
+        }
+        // A non-integer ratio rounds up: ceil(160 · 1001 / 441) = 364.
+        assert_eq!(
+            resample_sinc_hann(&vec![0.1; 1001], 44_100, 16_000)
+                .unwrap()
+                .len(),
+            364
+        );
+        assert_eq!(resample_sinc_hann(&tone, 16_000, 16_000).unwrap(), tone);
+        assert!(resample_sinc_hann(&tone, 0, 16_000).is_err());
+    }
 
     const OLD_BASE_TAPS_PER_PHASE: usize = 197;
     const OLD_KAISER_BETA: f64 = 8.6;

@@ -42,13 +42,13 @@
 //!   bidirectional** self-attention (the reference's `causal=False`), sinusoidal absolute positional
 //!   embedding added once, `gelu` (erf) FFN. Batch = 1 with a fully-valid sequence, so the reference
 //!   variable-length pad mask is a no-op and is omitted.
-//! - **ISTFTHead** ports the reference's custom `"same"`-padding inverse STFT (n_fft 960, hop 240):
-//!   `irfft` as a fixed inverse-DFT basis matmul, Hann-windowed overlap-add with summed-window
-//!   envelope normalization, trimming the `(n_fft − hop)/2` edge pad.
+//! - **enhanced_vocos** (ConvNeXt backbone + the reference's custom `"same"`-padding ISTFT head,
+//!   n_fft 960, hop 240) is the shared [`candle_audio::vocos::Vocos`] (lifted from here in sc-19378).
 
 use candle_audio::candle_core::pickle::PthTensors;
-use candle_audio::candle_core::{DType, Device, IndexOp, Module, Result as CandleResult, Tensor};
+use candle_audio::candle_core::{DType, Device, Module, Result as CandleResult, Tensor};
 use candle_audio::neural_codec::{resolve_weight_norm, rvq_dequantize};
+use candle_audio::vocos::{hann_window, Vocos, VocosConfig};
 use candle_audio::{AudioError, Result};
 use candle_nn::{
     Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, LayerNorm, Linear, VarBuilder,
@@ -73,12 +73,17 @@ pub const D_MODEL: usize = 768;
 /// Mel-bin count feeding the vocos head (`num_mel_bins`).
 pub const NUM_MEL_BINS: usize = 80;
 
-/// Vocos ISTFT transform size and hop (the 24 kHz `vocos_kwargs`).
-const VOCOS_N_FFT: usize = 960;
-const VOCOS_HOP: usize = 240;
-const VOCOS_DIM: usize = 512;
-const VOCOS_INTERMEDIATE: usize = 4096;
-const VOCOS_LAYERS: usize = 30;
+/// The `enhanced_vocos` geometry (the 24 kHz `vocos_kwargs`): ConvNeXt(80→512, 30 layers, MLP
+/// 4096) + ISTFT n_fft 960 / hop 240 — run through the shared [`candle_audio::vocos::Vocos`].
+const VOCOS: VocosConfig = VocosConfig {
+    input_channels: NUM_MEL_BINS,
+    dim: 512,
+    intermediate_dim: 4096,
+    num_layers: 30,
+    n_fft: 960,
+    hop: 240,
+    ln_eps: 1e-6,
+};
 
 /// Post-RVQ adapter transformer: 4 full-attention layers, 12 heads, ffn 3072.
 const POST_RVQ_LAYERS: usize = 4;
@@ -87,7 +92,6 @@ const ACOUSTIC_LAYERS: usize = 12;
 const ATTENTION_HEADS: usize = 12;
 const FFN_DIM: usize = 3072;
 const LN_EPS: f64 = 1e-5;
-const VOCOS_LN_EPS: f64 = 1e-6;
 
 // --------------------------------------------------------------------------------------------
 // Weight loading (pickle section `generator`, old-style weight-norm resolved)
@@ -483,187 +487,6 @@ impl AcousticDecoder {
 }
 
 // --------------------------------------------------------------------------------------------
-// enhanced_vocos: ConvNeXt backbone + ISTFTHead (custom "same" ISTFT)
-// --------------------------------------------------------------------------------------------
-
-struct ConvNeXtBlock {
-    dwconv: Conv1d, // depthwise, groups=dim, k7 p3
-    norm: LayerNorm,
-    pwconv1: Linear, // dim -> intermediate
-    pwconv2: Linear, // intermediate -> dim
-    gamma: Tensor,   // [dim]
-}
-
-impl ConvNeXtBlock {
-    fn load(vb: &VarBuilder) -> CandleResult<Self> {
-        let dwconv = conv1d(
-            vb,
-            "dwconv",
-            VOCOS_DIM,
-            1,
-            7,
-            Conv1dConfig {
-                padding: 3,
-                groups: VOCOS_DIM,
-                ..Default::default()
-            },
-        )?;
-        Ok(Self {
-            dwconv,
-            norm: layer_norm(vb, "norm", VOCOS_DIM, VOCOS_LN_EPS)?,
-            pwconv1: linear(vb, "pwconv1", VOCOS_INTERMEDIATE, VOCOS_DIM, true)?,
-            pwconv2: linear(vb, "pwconv2", VOCOS_DIM, VOCOS_INTERMEDIATE, true)?,
-            gamma: vb.get(VOCOS_DIM, "gamma")?,
-        })
-    }
-
-    /// `[1, dim, T]` -> `[1, dim, T]`.
-    fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let residual = x;
-        let h = self.dwconv.forward(x)?; // [1, dim, T]
-        let h = h.transpose(1, 2)?.contiguous()?; // [1, T, dim]
-        let h = self.norm.forward(&h)?;
-        let h = self.pwconv1.forward(&h)?.gelu_erf()?;
-        let h = self.pwconv2.forward(&h)?;
-        let h = h.broadcast_mul(&self.gamma)?; // per-channel scale
-        let h = h.transpose(1, 2)?.contiguous()?; // [1, dim, T]
-        residual + h
-    }
-}
-
-struct Vocos {
-    embed: Conv1d, // 80 -> 512, k7 p3
-    norm: LayerNorm,
-    blocks: Vec<ConvNeXtBlock>,
-    final_layer_norm: LayerNorm,
-    head_out: Linear, // 512 -> n_fft + 2
-    /// Inverse-DFT basis for the custom ISTFT: `[N, n_bins]` cos / sin, backward-normalized.
-    idft_cos: Tensor,
-    idft_sin: Tensor,
-    window: Vec<f32>,
-}
-
-impl Vocos {
-    fn load(vb: &VarBuilder, device: &Device) -> CandleResult<Self> {
-        let vb = vb.pp("enhanced_vocos");
-        let bb = vb.pp("backbone");
-        let embed = conv1d(
-            &bb,
-            "embed",
-            VOCOS_DIM,
-            NUM_MEL_BINS,
-            7,
-            Conv1dConfig {
-                padding: 3,
-                ..Default::default()
-            },
-        )?;
-        let mut blocks = Vec::with_capacity(VOCOS_LAYERS);
-        for i in 0..VOCOS_LAYERS {
-            blocks.push(ConvNeXtBlock::load(&bb.pp("convnext").pp(i))?);
-        }
-        let head_out = linear(&vb.pp("head"), "out", VOCOS_N_FFT + 2, VOCOS_DIM, true)?;
-        let (idft_cos, idft_sin) = idft_basis(VOCOS_N_FFT, device)?;
-        Ok(Self {
-            embed,
-            norm: layer_norm(&bb, "norm", VOCOS_DIM, VOCOS_LN_EPS)?,
-            blocks,
-            final_layer_norm: layer_norm(&bb, "final_layer_norm", VOCOS_DIM, VOCOS_LN_EPS)?,
-            head_out,
-            idft_cos,
-            idft_sin,
-            window: hann_window(VOCOS_N_FFT),
-        })
-    }
-
-    /// `[1, NUM_MEL_BINS, T_mel]` -> mono waveform `Vec<f32>` of `T_mel * VOCOS_HOP` samples.
-    fn forward(&self, mel: &Tensor) -> CandleResult<Vec<f32>> {
-        // Backbone.
-        let mut x = self.embed.forward(mel)?; // [1, dim, T]
-                                              // norm applied on (B, T, dim).
-        x = self.norm.forward(&x.transpose(1, 2)?.contiguous()?)?;
-        x = x.transpose(1, 2)?.contiguous()?; // [1, dim, T]
-        for block in &self.blocks {
-            x = block.forward(&x)?;
-        }
-        let x = self
-            .final_layer_norm
-            .forward(&x.transpose(1, 2)?.contiguous()?)?; // [1, T, dim]
-                                                          // ISTFTHead: out -> (mag, phase).
-        let coeffs = self.head_out.forward(&x)?; // [1, T, n_fft+2]
-        let coeffs = coeffs.i(0)?; // [T, n_fft+2]
-        let n_bins = VOCOS_N_FFT / 2 + 1;
-        let mag = coeffs.narrow(1, 0, n_bins)?; // [T, n_bins]
-        let phase = coeffs.narrow(1, n_bins, n_bins)?; // [T, n_bins]
-        let mag = mag.exp()?.clamp(f32::NEG_INFINITY, 1e2)?;
-        let re = (mag.clone() * phase.cos()?)?; // [T, n_bins]
-        let im = (mag * phase.sin()?)?;
-        // irfft via fixed inverse-DFT basis: frames[T, N] = re @ cos^T - im @ sin^T.
-        let frames = (re.matmul(&self.idft_cos.t()?)? - im.matmul(&self.idft_sin.t()?)?)?;
-        let frames: Vec<Vec<f32>> = frames.to_vec2::<f32>()?; // [T][N]
-        Ok(self.overlap_add(&frames))
-    }
-
-    /// Windowed overlap-add with summed-window-square envelope normalization and `"same"` edge
-    /// trimming (`pad = (n_fft - hop)/2`), exactly the reference custom ISTFT.
-    fn overlap_add(&self, frames: &[Vec<f32>]) -> Vec<f32> {
-        let n = VOCOS_N_FFT;
-        let hop = VOCOS_HOP;
-        let t = frames.len();
-        if t == 0 {
-            return Vec::new();
-        }
-        let out_len = (t - 1) * hop + n;
-        let mut y = vec![0f32; out_len];
-        let mut env = vec![0f32; out_len];
-        for (f, frame) in frames.iter().enumerate() {
-            let base = f * hop;
-            for i in 0..n {
-                let w = self.window[i];
-                y[base + i] += frame[i] * w;
-                env[base + i] += w * w;
-            }
-        }
-        let pad = (n - hop) / 2;
-        let mut out = Vec::with_capacity(out_len - 2 * pad);
-        for i in pad..out_len - pad {
-            let e = env[i];
-            out.push(if e > 1e-11 { y[i] / e } else { 0.0 });
-        }
-        out
-    }
-}
-
-/// A periodic Hann window of length `n` (`0.5·(1 − cos(2π i / n))`, torch's default).
-fn hann_window(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos() as f32)
-        .collect()
-}
-
-/// The backward-normalized inverse real-DFT basis `[N, n_bins]`: `cos[n,k] = a_k·cos(2πkn/N)/N`
-/// and `sin[n,k] = a_k·sin(2πkn/N)/N`, with the one-sided fold factor `a_k = 1` at DC/Nyquist and
-/// `2` in between — so `frames = re @ cosᵀ − im @ sinᵀ` reproduces `torch.fft.irfft(norm="backward")`.
-fn idft_basis(n: usize, device: &Device) -> CandleResult<(Tensor, Tensor)> {
-    let n_bins = n / 2 + 1;
-    let inv_n = 1.0 / n as f64;
-    let mut cos = vec![0f32; n * n_bins];
-    let mut sin = vec![0f32; n * n_bins];
-    for idx in 0..n {
-        for k in 0..n_bins {
-            let a = if k == 0 || k == n / 2 { 1.0 } else { 2.0 };
-            let theta = 2.0 * std::f64::consts::PI * (k as f64) * (idx as f64) * inv_n;
-            cos[idx * n_bins + k] = (a * theta.cos() * inv_n) as f32;
-            sin[idx * n_bins + k] = (a * theta.sin() * inv_n) as f32;
-        }
-    }
-    Ok((
-        Tensor::from_vec(cos, (n, n_bins), device)?,
-        Tensor::from_vec(sin, (n, n_bins), device)?,
-    ))
-}
-
-// --------------------------------------------------------------------------------------------
 // The assembled decoder
 // --------------------------------------------------------------------------------------------
 
@@ -699,8 +522,13 @@ impl XyTokenizerCodec {
             Upsample::load(&vb).map_err(|e| AudioError::Msg(format!("codec: upsample: {e}")))?;
         let acoustic = AcousticDecoder::load(&vb)
             .map_err(|e| AudioError::Msg(format!("codec: acoustic_decoder: {e}")))?;
-        let vocos = Vocos::load(&vb, &device)
-            .map_err(|e| AudioError::Msg(format!("codec: enhanced_vocos: {e}")))?;
+        let vocos = Vocos::load(
+            &vb.pp("enhanced_vocos"),
+            VOCOS,
+            hann_window(VOCOS.n_fft),
+            &device,
+        )
+        .map_err(|e| AudioError::Msg(format!("codec: enhanced_vocos: {e}")))?;
         Ok(Self {
             rvq,
             post_rvq,
@@ -784,17 +612,7 @@ fn rms(x: &Tensor) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hann_window_is_periodic() {
-        let w = hann_window(8);
-        assert_eq!(w.len(), 8);
-        assert!(w[0].abs() < 1e-6, "periodic Hann starts at 0");
-        // Symmetric about the middle for a periodic window (w[k] == w[N-k]).
-        for k in 1..8 {
-            assert!((w[k] - w[8 - k]).abs() < 1e-6, "periodic symmetry at {k}");
-        }
-    }
+    use candle_audio::candle_core::IndexOp;
 
     #[test]
     fn sinusoids_shape_and_first_row() {
@@ -809,94 +627,5 @@ mod tests {
         for v in &row0[4..] {
             assert!((v - 1.0).abs() < 1e-6);
         }
-    }
-
-    /// The inverse-DFT basis reproduces `torch.fft.irfft(rfft(x))` for a known real signal: a basis
-    /// built for N points, applied to the analytic rfft of a pure cosine, returns that cosine.
-    #[test]
-    fn idft_basis_reconstructs_a_cosine() {
-        let dev = Device::Cpu;
-        let n = 16usize;
-        let n_bins = n / 2 + 1;
-        // x[t] = cos(2π·2·t/N): rfft is a single spike at bin k=2 with value N/2 (real).
-        let mut re = vec![0f32; n_bins];
-        let im = vec![0f32; n_bins];
-        re[2] = (n as f32) / 2.0;
-        let (cos, sin) = idft_basis(n, &dev).unwrap();
-        let re_t = Tensor::from_vec(re, (1, n_bins), &dev).unwrap();
-        let im_t = Tensor::from_vec(im, (1, n_bins), &dev).unwrap();
-        let frames = (re_t.matmul(&cos.t().unwrap()).unwrap()
-            - im_t.matmul(&sin.t().unwrap()).unwrap())
-        .unwrap();
-        let got = frames.i(0).unwrap().to_vec1::<f32>().unwrap();
-        for (t, g) in got.iter().enumerate() {
-            let want = (2.0 * std::f64::consts::PI * 2.0 * t as f64 / n as f64).cos() as f32;
-            assert!((g - want).abs() < 1e-4, "sample {t}: {g} vs {want}");
-        }
-    }
-
-    #[test]
-    fn overlap_add_length_matches_downsample_rate() {
-        // A synthetic Vocos with the real basis but trivial frames: T frames -> T*hop samples.
-        let dev = Device::Cpu;
-        let (idft_cos, idft_sin) = idft_basis(VOCOS_N_FFT, &dev).unwrap();
-        let vocos = Vocos {
-            embed: conv1d(
-                &VarBuilder::from_tensors(
-                    dummy_conv("e", VOCOS_DIM, NUM_MEL_BINS, 7),
-                    DType::F32,
-                    &dev,
-                ),
-                "e",
-                VOCOS_DIM,
-                NUM_MEL_BINS,
-                7,
-                Conv1dConfig {
-                    padding: 3,
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-            norm: dummy_ln(&dev, VOCOS_DIM),
-            blocks: Vec::new(),
-            final_layer_norm: dummy_ln(&dev, VOCOS_DIM),
-            head_out: dummy_linear(&dev, VOCOS_N_FFT + 2, VOCOS_DIM),
-            idft_cos,
-            idft_sin,
-            window: hann_window(VOCOS_N_FFT),
-        };
-        // 5 frames of zeros -> 5 * hop samples (envelope-normalized zeros).
-        let frames = vec![vec![0f32; VOCOS_N_FFT]; 5];
-        let wav = vocos.overlap_add(&frames);
-        assert_eq!(wav.len(), 5 * VOCOS_HOP);
-    }
-
-    fn dummy_conv(name: &str, out: usize, inp: usize, k: usize) -> HashMap<String, Tensor> {
-        let dev = Device::Cpu;
-        let mut m = HashMap::new();
-        m.insert(
-            format!("{name}.weight"),
-            Tensor::zeros((out, inp, k), DType::F32, &dev).unwrap(),
-        );
-        m.insert(
-            format!("{name}.bias"),
-            Tensor::zeros(out, DType::F32, &dev).unwrap(),
-        );
-        m
-    }
-
-    fn dummy_ln(dev: &Device, dim: usize) -> LayerNorm {
-        LayerNorm::new(
-            Tensor::ones(dim, DType::F32, dev).unwrap(),
-            Tensor::zeros(dim, DType::F32, dev).unwrap(),
-            VOCOS_LN_EPS,
-        )
-    }
-
-    fn dummy_linear(dev: &Device, out: usize, inp: usize) -> Linear {
-        Linear::new(
-            Tensor::zeros((out, inp), DType::F32, dev).unwrap(),
-            Some(Tensor::zeros(out, DType::F32, dev).unwrap()),
-        )
     }
 }
