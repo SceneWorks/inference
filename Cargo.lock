@@ -224,6 +224,7 @@ dependencies = [
  "candle-audio-openvoice",
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
+ "candle-audio-yue",
  "candle-llm",
  "tempfile",
 ]
@@ -393,6 +394,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokenizers 0.22.2",
+]
+
+[[package]]
+name = "candle-audio-yue"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-llm",
+ "candle-nn",
+ "sceneworks-gen-core-testkit",
+ "tempfile",
 ]
 
 [[package]]
