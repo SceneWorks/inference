@@ -440,7 +440,9 @@ fn each_decode_knob_moves_the_stream() {
 #[test]
 fn smart_context_matches_the_reference_shorten_input() {
     for case in fixture()["shortenCases"].as_array().unwrap() {
-        let got = super::shorten_context(
+        // Stage 1 shortens through the canonical `tokenizer::shorten_context`; this fixture (from
+        // the stage-1 reference producer) is a second, independent parity proof of it.
+        let got = crate::tokenizer::shorten_context(
             &ids(&case["seq"]),
             case["maxContext"].as_u64().unwrap() as usize,
         );

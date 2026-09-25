@@ -87,6 +87,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # (Nuke/Blender/Houdini) and may be tiled, PIZ- or DWA-compressed, or multi-part.
 exr = "1.74"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+# YuE's lyric section split (sc-19376) ports Python's `\[(\w+)\]` over Unicode text; Python's `\w`
+# is exactly `[\p{L}\p{N}_]`, which needs the Unicode general-category tables `regex` carries.
+# Already in the resolved graph transitively.
+regex = "1"
 rand = "0.9"
 rand_distr = "0.5"
 # Audio validation harness (sc-12854): repeatability hash over PCM bytes.
