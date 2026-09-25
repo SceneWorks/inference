@@ -200,7 +200,7 @@ def main() -> None:
     save_file(tensors, str(FIXTURE))
     digest = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
     rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=inf, capture_output=True,
-                         text=True).stdout.strip()
+                         text=True, encoding="utf-8").stdout.strip()
     METADATA.write_text(json.dumps({
         "story": "sc-19378",
         "producer": "scripts/reference/yue_vocos_reference.py",
@@ -223,7 +223,7 @@ def main() -> None:
         "tensors": {k: list(v.shape) for k, v in sorted(tensors.items())},
         "stats": stats,
         "sha256": digest,
-    }, indent=2) + "\n")
+    }, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(stats, indent=2))
     print(f"wrote {FIXTURE} ({FIXTURE.stat().st_size} bytes, sha256 {digest})")
     if rev != YUE_REVISION:
