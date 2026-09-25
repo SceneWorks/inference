@@ -95,13 +95,6 @@ impl CodecFrames {
     }
 }
 
-/// The `[start_of_segment]` marker as the mm tokenizer encodes it — the pattern stage 1's smart
-/// context searches for when it drops the oldest segment block.
-pub const START_OF_SEGMENT: [u32; 7] = [518, 2962, 29918, 974, 29918, 28192, 29962];
-/// The `[end_of_segment]` marker as the mm tokenizer encodes it (it opens every later segment's
-/// prompt block).
-pub const END_OF_SEGMENT: [u32; 7] = [518, 355, 29918, 974, 29918, 28192, 29962];
-
 /// Split a render's stage-1 sequence (every prompt block, generated token and `<EOA>`, in order)
 /// into the two codebook-0 tracks, with the reference `Stage1Pipeline.save` semantics:
 ///

@@ -433,19 +433,29 @@ fn refused<T>(r: crate::gen_core::Result<T>) -> bool {
 
 #[test]
 fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
-    // The registered entry point loads lazily, then the render refuses at its first stage.
-    let g = crate::model::load_en_cot(&spec()).unwrap();
-    assert!(refused(g.generate(&song(None), &mut |_| {})));
+    // The production tokenizer (sc-19376) is real: it loads the stage-1 snapshot's tokenizer.json.
+    let stage1 = tempfile::tempdir().unwrap();
+    crate::tokenizer::tests::write_test_tokenizer(stage1.path());
+    let mut spec = spec();
+    spec.weights = WeightsSource::Dir(stage1.path().to_path_buf());
+
+    // The registered entry point loads lazily and builds the prompt; stage 1 is real too (sc-19380),
+    // so with no weights staged the render fails at the stage-1 load — never placeholder audio.
+    let g = crate::model::load_en_cot(&spec).unwrap();
+    assert!(matches!(
+        g.generate(&song(None), &mut |_| {}),
+        Err(Error::Msg(_))
+    ));
 
     // Every unported production stage refuses on its own, so no later stage can fall back to its
     // stub.
     let s = StageSet::production();
     let assets = Assets {
-        stage1: "/staged/yue-s1".into(),
+        stage1: stage1.path().to_path_buf(),
         stage2: "/staged/yue-s2".into(),
         xcodec: "/staged/xcodec".into(),
     };
-    assert!(refused((s.tokenizer)(&assets)), "tokenizer");
+    assert!((s.tokenizer)(&assets).is_ok(), "tokenizer");
     assert!(refused((s.icl_encoder)(&assets)), "icl encoder");
     // Stage 1 is real (sc-19380): an unstaged snapshot is a load error, not the refusal.
     assert!(
