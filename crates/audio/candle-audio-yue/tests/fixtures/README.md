@@ -40,7 +40,7 @@ Codebooks are stored as 3 hex digits per code (8 rows per case). Codebook-0 inpu
   166 of 320 codes of the 40-frame case and 21 of 128 of the 16-frame case against its own f32 run.
   bf16 logits tie or near-tie often (8 significant bits across a 7168-wide slice), the first flip
   changes the teacher-forced context, and every later pick can follow. bf16 output is therefore a
-  numerics-dependent realisation, not a golden — which is the divergence the Metal lane (bf16)
+  numerics-dependent realisation, not a golden — which is the divergence the Metal (bf16) tests
   characterises instead of asserting equality (`stage2::tests::metal`,
   `stage2_metal_bf16_divergence_is_characterised_on_real_weights`).
 - **Measured tier divergence** (`stage2_every_tier_loads_through_production_and_is_characterised`,

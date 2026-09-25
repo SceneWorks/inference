@@ -429,10 +429,11 @@ impl Stage2Lm for Reprefill {
 
 /// **AC3** — Metal computes in bf16 (candle-llm's GPU compute dtype, [`candle_llm::compute_dtype`]);
 /// its residual picks are characterised against the CPU f32 reference on the same weights rather
-/// than assumed equal. Executed by the `macos-metal` CI lane
-/// (`cargo test -p candle-audio-yue --features metal --lib stage2::tests::metal`); a build with the
-/// feature but no Metal device fails rather than skips. (candle's CPU backend has no bf16 matmul,
-/// so there is no CPU stand-in for this.)
+/// than assumed equal. Compiled only with the `metal` feature (absent from every build without
+/// it); run on Metal hardware with
+/// `cargo test -p candle-audio-yue --features metal --lib stage2::tests::metal -- --nocapture`.
+/// A `metal` build with no Metal device fails rather than skips. (candle's CPU backend has no bf16
+/// matmul, so there is no CPU stand-in for this.)
 #[cfg(feature = "metal")]
 mod metal {
     use super::*;
