@@ -404,8 +404,11 @@ dependencies = [
  "candle-audio",
  "candle-llm",
  "candle-nn",
+ "regex",
  "sceneworks-gen-core-testkit",
+ "serde_json",
  "tempfile",
+ "tokenizers 0.22.2",
 ]
 
 [[package]]
