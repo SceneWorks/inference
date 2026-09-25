@@ -575,6 +575,19 @@ pub(crate) mod tests {
             .all(|s| s.ids.ends_with(&[SOA, XCODEC_SEP])));
     }
 
+    /// A tiered stage-1 rehost root carries no `tokenizer.json` of its own — each tier directory
+    /// does — and the production loader finds it there (a q4-only staging included).
+    #[test]
+    fn production_loader_reads_the_tokenizer_from_a_tiered_root() {
+        let root = tempfile::tempdir().unwrap();
+        let q4 = root.path().join("q4");
+        std::fs::create_dir_all(&q4).unwrap();
+        write_test_tokenizer(&q4);
+        let assets = assets_at(root.path());
+        assert_eq!(assets.tokenizer_json(), q4.join(TOKENIZER_FILE));
+        assert!(load(&assets).is_ok());
+    }
+
     #[test]
     fn production_loader_names_a_missing_tokenizer() {
         let dir = tempfile::tempdir().unwrap();
