@@ -439,10 +439,13 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
     let mut spec = spec();
     spec.weights = WeightsSource::Dir(stage1.path().to_path_buf());
 
-    // The registered entry point loads lazily, builds the prompt, then the render refuses at the
-    // first stage that is not implemented yet.
+    // The registered entry point loads lazily and builds the prompt; stage 1 is real too (sc-19380),
+    // so with no weights staged the render fails at the stage-1 load — never placeholder audio.
     let g = crate::model::load_en_cot(&spec).unwrap();
-    assert!(refused(g.generate(&song(None), &mut |_| {})));
+    assert!(matches!(
+        g.generate(&song(None), &mut |_| {}),
+        Err(Error::Msg(_))
+    ));
 
     // Every unimplemented production stage refuses on its own, so no later stage can fall back to
     // its stub.
