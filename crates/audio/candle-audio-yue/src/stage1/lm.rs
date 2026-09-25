@@ -29,7 +29,6 @@
 
 use candle_audio::candle_core::{Device, Tensor};
 use candle_audio::gen_core;
-use candle_llm::core_llm::{LoadSpec, Quantize};
 use candle_llm::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use candle_llm::primitives::sampler::{
     logits_rows_host, sample_row_host, SamplingParams, SplitMix64,
@@ -81,14 +80,14 @@ pub struct Stage1Lm {
     /// The sequence the KV cache represents: `history`, or its smart-context shortening. The cache
     /// holds `window[..cache.offset()]`; the rest is fed on the next forward.
     window: Vec<u32>,
+    /// `window` as the sampler's `i32` ids — the repetition-penalty window (the sampler penalises
+    /// each distinct id once). Kept in step with `window` so no step rebuilds it.
+    penalty_window: Vec<i32>,
     cache: Option<ContiguousKvCache>,
     /// Rows in `cache` (1 without guidance, 2 with).
     batch: usize,
     /// First cache column the unconditional row attends (the segment prompt's last token).
     uncond_start: usize,
-    /// Distinct ids in `window` — the repetition-penalty set — as a membership mask and a list.
-    seen: Vec<bool>,
-    seen_ids: Vec<i32>,
     allowed: Vec<bool>,
     allowed_no_eoa: Vec<bool>,
     segment: Option<Segment>,
@@ -108,28 +107,6 @@ impl std::fmt::Debug for Stage1Lm {
     }
 }
 
-/// The directory a stage-1 (or stage-2) `LoadSpec` loads from: `root` itself when it is a model
-/// snapshot (`config.json`), else — for a tiered repo root (`sceneworks-tiers.json` with `bf16/`,
-/// `q8/`, `q4/`) — the asserted tier's directory, or `bf16/` when no tier was asserted. A tier
-/// directory that is not staged falls back to `bf16/`, which the loader then quantizes to the
-/// asserted tier on load.
-pub(crate) fn lm_snapshot_dir(root: &std::path::Path, tier: Option<Tier>) -> std::path::PathBuf {
-    if root.join("config.json").is_file() {
-        return root.to_path_buf();
-    }
-    let sub = match tier {
-        Some(Tier::Q8) => "q8",
-        Some(Tier::Q4) => "q4",
-        Some(Tier::Bf16) | None => "bf16",
-    };
-    let dir = root.join(sub);
-    if dir.join("config.json").is_file() {
-        dir
-    } else {
-        root.join("bf16")
-    }
-}
-
 impl Stage1Lm {
     /// Load the stage-1 LM from `root` — a snapshot directory, or a tiered repo root whose
     /// `bf16/` / `q8/` / `q4/` directory the tier picks — through [`LlamaProvider::load`]
@@ -137,13 +114,8 @@ impl Stage1Lm {
     /// snapshot's stored GGML blocks. `tier` asserts Q8/Q4 (quantizing a dense snapshot on load,
     /// refusing a snapshot stored at a different tier); `None` loads whatever tier is staged.
     pub fn load(root: &std::path::Path, tier: Option<Tier>) -> gen_core::Result<Self> {
-        let dir = lm_snapshot_dir(root, tier);
-        let mut spec = LoadSpec::dense(dir.to_string_lossy().into_owned());
-        spec.quantize = match tier {
-            Some(Tier::Q8) => Some(Quantize::Q8),
-            Some(Tier::Q4) => Some(Quantize::Q4),
-            Some(Tier::Bf16) | None => None,
-        };
+        let (dir, _stored) = crate::snapshot::resolve_tier_dir(root, tier, "stage-1")?;
+        let spec = crate::snapshot::lm_load_spec(&dir, tier);
         let provider = LlamaProvider::load(&spec).map_err(|e| {
             gen_core::Error::Msg(format!(
                 "candle-audio-yue stage 1: load {}: {e}",
@@ -185,11 +157,10 @@ impl Stage1Lm {
             rng: SplitMix64::new(0),
             history: Vec::new(),
             window: Vec::new(),
+            penalty_window: Vec::new(),
             cache: None,
             batch: 1,
             uncond_start: 0,
-            seen: vec![false; vocab],
-            seen_ids: Vec::new(),
             allowed,
             allowed_no_eoa,
             segment: None,
@@ -215,15 +186,6 @@ impl Stage1Lm {
     #[cfg(test)]
     pub(crate) fn cache_rows(&self) -> usize {
         self.batch
-    }
-
-    fn mark_seen(&mut self, token: u32) {
-        if let Some(slot) = self.seen.get_mut(token as usize) {
-            if !*slot {
-                *slot = true;
-                self.seen_ids.push(token as i32);
-            }
-        }
     }
 
     /// Feed every window token the cache has not seen, in chunks, returning the last position's
@@ -385,13 +347,9 @@ impl Stage1Model for Stage1Lm {
             self.cache = Some(self.model.new_cache());
         }
         self.uncond_start = self.window.len() - 1;
-        for &t in &self.seen_ids {
-            self.seen[t as usize] = false;
-        }
-        self.seen_ids.clear();
-        for i in 0..self.window.len() {
-            self.mark_seen(self.window[i]);
-        }
+        self.penalty_window.clear();
+        self.penalty_window
+            .extend(self.window.iter().map(|&t| t as i32));
         let logits = self.feed()?;
         self.segment = Some(Segment {
             scale: segment.guidance_scale,
@@ -437,7 +395,7 @@ impl Stage1Model for Stage1Lm {
         };
         let token = sample_row_host(
             scores,
-            &self.seen_ids,
+            &self.penalty_window,
             &seg.params,
             &mut self.rng,
             Some(allowed),
@@ -445,7 +403,7 @@ impl Stage1Model for Stage1Lm {
         seg.generated += 1;
         self.history.push(token);
         self.window.push(token);
-        self.mark_seen(token);
+        self.penalty_window.push(token as i32);
         if token == EOA {
             self.segment.as_mut().expect("open").ended = true;
             Ok(Stage1Step::EndOfAudio)

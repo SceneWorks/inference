@@ -30,6 +30,8 @@ regex = { workspace = true }
 # The backend-neutral generator conformance suite (progress contract, typed cancellation, seed
 # determinism, component load gate) the end-to-end seam test runs against the engine.
 sceneworks-gen-core-testkit = { workspace = true }
+# Fingerprints the ICL parity test's synthesized PCM against the reference's (tests/icl_parity.rs).
+sha2 = { workspace = true }
 # RAII fixture roots for the load-gate tests.
 tempfile = { workspace = true }
 # Reads the committed goldens: the prompt builder's (scripts/reference/yue_prompt_reference.py),

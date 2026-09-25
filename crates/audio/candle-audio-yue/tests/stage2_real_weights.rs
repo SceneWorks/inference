@@ -151,7 +151,7 @@ fn stage2_every_tier_loads_through_production_and_is_characterised() {
         }
         drop(stage2);
         let (dir, _) = resolve_tier_dir(&root, Some(tier), "stage-2").unwrap();
-        let mut lm = CandleStage2Lm::load(&dir).unwrap();
+        let mut lm = CandleStage2Lm::load(&dir, Some(tier)).unwrap();
         let d = characterise(&mut reference, &mut lm, &cases[0].cb0).unwrap();
         eprintln!(
             "{tier:?} vs dense f32 (teacher-forced on the reference stream): {} of {} picks \

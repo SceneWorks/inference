@@ -73,10 +73,13 @@ pub struct Sampling {
     /// Keep only the `top_k` highest-logit tokens; `0` disables it.
     pub top_k: usize,
     /// OpenAI/HF presence penalty: subtract this value once from every token logit whose token has
-    /// appeared in the prompt or generated history. `0.0` disables it. Unlike
-    /// [`repetition_penalty`](Self::repetition_penalty), this is additive and independent of count.
+    /// appeared in the prompt or generated history. `0.0` disables it. Like
+    /// [`repetition_penalty`](Self::repetition_penalty) it applies once per distinct id; it differs
+    /// in being additive and in covering the full history rather than a recent window.
     pub presence_penalty: f32,
-    /// CTRL/HF repetition penalty; `1.0` disables it.
+    /// CTRL/HF repetition penalty; `1.0` disables it. Multiplicative (a positive logit is divided by
+    /// it, a negative one multiplied) and applied once per distinct id among the last
+    /// [`repetition_context`](Self::repetition_context) tokens, however often the id occurs there.
     pub repetition_penalty: f32,
     /// History window the repetition penalty looks back over.
     pub repetition_context: usize,

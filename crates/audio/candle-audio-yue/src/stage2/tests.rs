@@ -347,7 +347,9 @@ fn track(frames: u32) -> Vec<u32> {
 
 /// **Production wiring** — `stage2::load` (tier resolution → `LlamaProvider::load` → the
 /// teacher-forced loop) no longer refuses: over a tiered root holding a synthetic bf16 tier it
-/// loads, and it upsamples a track into a valid grid whose row 0 is the input.
+/// loads, and it upsamples a track into a valid grid whose row 0 is the input — dense, and with an
+/// asserted Q8/Q4 that is not staged pre-quantized (quantized from `bf16/` on load). A root with
+/// nothing staged is a load error, not a stub.
 #[test]
 fn production_load_upsamples_through_candle_llm() {
     let root = tempfile::tempdir().unwrap();
@@ -357,11 +359,17 @@ fn production_load_upsamples_through_candle_llm() {
         stage2: root.path().to_path_buf(),
         xcodec: root.path().join("absent-xc"),
     };
-    let mut stage2 = load(&assets, None).unwrap();
     let cb0 = track(12);
-    let grid = stage2.upsample(&cb0, &CancelFlag::new()).unwrap();
-    grid.check_against(&cb0).unwrap();
-    assert!(load(&assets, Some(Tier::Q8)).is_err(), "no q8 tier staged");
+    for tier in [None, Some(Tier::Q8), Some(Tier::Q4)] {
+        let mut stage2 = load(&assets, tier).unwrap();
+        let grid = stage2.upsample(&cb0, &CancelFlag::new()).unwrap();
+        grid.check_against(&cb0).unwrap();
+    }
+    let empty = Assets {
+        stage2: root.path().join("absent-s2"),
+        ..assets
+    };
+    assert!(load(&empty, None).is_err(), "nothing staged");
 }
 
 /// **AC2 with a real LM** — batching is output-neutral: 2 full chunks + a ragged tail decoded as

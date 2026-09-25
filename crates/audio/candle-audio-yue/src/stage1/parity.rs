@@ -27,7 +27,7 @@ use candle_llm::{CausalLm, ModelConfig};
 use serde_json::Value;
 
 use super::{SegmentStart, Stage1Lm, Stage1Model, Stage1Step};
-use crate::config::{Assets, DecodeConfig, Guidance, Tier, Variant, YueRequest};
+use crate::config::{Assets, DecodeConfig, Guidance, Variant, YueRequest};
 use crate::engine::{YueEngine, YueEvent};
 use crate::stages::StageSet;
 use crate::tokenizer::{PromptInput, PromptTokenizer, SegmentPrompt, Stage1Prompt};
@@ -513,25 +513,6 @@ fn production_load_decodes_a_staged_snapshot() {
         }
     }
     lm.end_segment().unwrap();
-}
-
-#[test]
-fn tiered_repo_roots_resolve_to_the_asserted_tier() {
-    let root = tempfile::tempdir().unwrap();
-    for tier in ["bf16", "q8"] {
-        std::fs::create_dir_all(root.path().join(tier)).unwrap();
-        std::fs::write(root.path().join(tier).join("config.json"), "{}").unwrap();
-    }
-    let dir = |t| super::lm::lm_snapshot_dir(root.path(), t);
-    assert_eq!(dir(None), root.path().join("bf16"));
-    assert_eq!(dir(Some(Tier::Q8)), root.path().join("q8"));
-    // An unstaged tier falls back to bf16 (quantized on load).
-    assert_eq!(dir(Some(Tier::Q4)), root.path().join("bf16"));
-    // A snapshot directory is used as is.
-    assert_eq!(
-        super::lm::lm_snapshot_dir(&root.path().join("q8"), None),
-        root.path().join("q8")
-    );
 }
 
 /// A prompt builder that returns the fixture's blocks, so the engine drives the reference prompts.

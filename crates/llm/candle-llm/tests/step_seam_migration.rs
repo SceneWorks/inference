@@ -12,6 +12,10 @@
 //! `CausalLm` reference loop, LLaVA's own caption loop, StarCoder2 through the shared reference
 //! loop and the StarVector-1B decoder with its layer-owned cache. Each golden holds the prompt, the
 //! greedy tokens, the logits every greedy token was chosen from, and a sampled run's tokens.
+//! The sampled tokens (repetition penalty 1.1) were re-captured when the shared sampler's
+//! repetition penalty moved to Hugging Face's once-per-distinct-id semantics (epic sc-19373); the
+//! earlier per-occurrence penalty compounded repeated ids. Prompts, greedy tokens and logits are
+//! the original capture, untouched.
 //!
 //! After the migration the decoders attend un-expanded (`AttnFormulation::Gqa`) by default on
 //! every path — the reference loop, the growing and paged backings and the static cache are one

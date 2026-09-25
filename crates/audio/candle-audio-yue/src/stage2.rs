@@ -70,7 +70,7 @@ pub const SLICE_LEN: usize = (STAGE2_SLICE_MAX - STAGE2_SLICE_MIN + 1) as usize;
 /// shared device selection, memory admission and persisted-`quantization` handling).
 pub fn load(assets: &Assets, tier: Option<Tier>) -> gen_core::Result<Box<dyn Stage2Model>> {
     let (dir, _tier) = crate::snapshot::resolve_tier_dir(&assets.stage2, tier, "stage-2")?;
-    let lm = CandleStage2Lm::load(&dir)?;
+    let lm = CandleStage2Lm::load(&dir, tier)?;
     Ok(Box::new(TeacherForcedStage2::new(lm, DEFAULT_BATCH_SIZE)))
 }
 
@@ -133,10 +133,11 @@ impl std::fmt::Debug for CandleStage2Lm {
 }
 
 impl CandleStage2Lm {
-    /// Load one tier directory through [`LlamaProvider::load`] (device from
-    /// [`candle_llm::select_device`]).
-    pub fn load(dir: &std::path::Path) -> gen_core::Result<Self> {
-        let spec = candle_llm::core_llm::LoadSpec::dense(dir.display().to_string());
+    /// Load one resolved snapshot directory through [`LlamaProvider::load`] (device from
+    /// [`candle_llm::select_device`]); `tier` asserts Q8/Q4 as in
+    /// [`crate::snapshot::lm_load_spec`] (a dense directory is quantized on load).
+    pub fn load(dir: &std::path::Path, tier: Option<Tier>) -> gen_core::Result<Self> {
+        let spec = crate::snapshot::lm_load_spec(dir, tier);
         let provider = LlamaProvider::load(&spec).map_err(|e| match e {
             candle_llm::core_llm::Error::Unsupported(m) => gen_core::Error::Unsupported(m),
             candle_llm::core_llm::Error::Canceled => gen_core::Error::Canceled,
