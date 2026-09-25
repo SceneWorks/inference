@@ -109,7 +109,7 @@ fn refuse(id: &str, field: &str, why: &str) -> gen_core::Error {
 /// | `seed` | sampler seed (default 42) |
 /// | `guidance` | `None` ⇒ the 1.5 / 1.2 schedule; `0 ..= 1` ⇒ explicitly off; `> 1` ⇒ that scale for every segment; negative / non-finite ⇒ refused |
 /// | `ReferenceAudio` conditioning | ICL reference — dual-track when the clip carries `vocals` + `instrumental` stems |
-/// | `audio.reference_region` | ICL window (default 0–30 s; open end ⇒ clip end) |
+/// | `audio.reference_region` | ICL window (default 0–30 s; an open end ⇒ upstream's default end, 30 s — not the clip end) |
 /// | `audio.output_limiter` | `Clamp` (±0.99, default) or `Rescale` (× min(0.99 / peak, 1)) — upstream `save_audio` / `--rescale` |
 pub fn map_request(variant: Variant, req: &GenerationRequest) -> gen_core::Result<YueRequest> {
     let id = variant.id();
@@ -226,11 +226,9 @@ fn icl_reference(
     let (default_start, default_end) = IclReference::DEFAULT_WINDOW;
     let (start_secs, end_secs) = match region {
         None => (default_start, default_end),
-        Some(r) => {
-            let frames = track.samples.len() / usize::from(track.channels.max(1));
-            let clip_secs = frames as f32 / track.sample_rate.max(1) as f32;
-            (r.start_secs, r.end_secs.unwrap_or(clip_secs))
-        }
+        // An open end takes upstream's default `prompt_end_time` (30 s), exactly as the API,
+        // worker, estimator and UI layers do — never the clip end.
+        Some(r) => (r.start_secs, r.end_secs.unwrap_or(default_end)),
     };
     Ok(IclReference {
         tracks,
@@ -679,7 +677,11 @@ mod tests {
         });
         let reference = map_request(icl(), &req).unwrap().icl.unwrap();
         assert!(matches!(reference.tracks, IclTracks::Dual { .. }));
-        assert_eq!(window(&reference), (5.0, 40.0));
+        assert_eq!(
+            window(&reference),
+            (5.0, 30.0),
+            "a start-only region ends at upstream's default 30 s, not the 40 s clip end"
+        );
 
         req.conditioning = vec![Conditioning::ReferenceAudio {
             audio: clip(vec![stem("vocals")]),

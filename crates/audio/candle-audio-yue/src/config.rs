@@ -159,8 +159,21 @@ impl Assets {
     /// The mm tokenizer shipped inside the stage-1 snapshot: `tokenizer.json`, the byte-fallback
     /// BPE derived from the upstream SentencePiece `tokenizer.model` (verified id-for-id against
     /// the upstream `_MMSentencePieceTokenizer`; see [`crate::tokenizer`]).
+    ///
+    /// `stage1` is one snapshot directory (its own `tokenizer.json`) or a tiered rehost root,
+    /// whose copies live in the tier directories (`bf16/`, `q8/`, `q4/` — byte-identical, since
+    /// tiering touches only the projections); the first staged one is used. When none exists the
+    /// root path is returned, so the load error names the file.
     pub fn tokenizer_json(&self) -> PathBuf {
-        self.stage1.join(crate::tokenizer::TOKENIZER_FILE)
+        let file = crate::tokenizer::TOKENIZER_FILE;
+        std::iter::once(self.stage1.join(file))
+            .chain(
+                crate::snapshot::TIER_DIRS
+                    .iter()
+                    .map(|tier| self.stage1.join(tier).join(file)),
+            )
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| self.stage1.join(file))
     }
 
     /// The xcodec snapshot root.
@@ -256,7 +269,8 @@ pub struct IclReference {
     pub tracks: IclTracks,
     /// Window start (seconds).
     pub start_secs: f32,
-    /// Window end (seconds).
+    /// Window end (seconds). A request region with no end resolves to
+    /// [`IclReference::DEFAULT_WINDOW`]'s end (upstream `prompt_end_time` = 30 s), not the clip end.
     pub end_secs: f32,
 }
 

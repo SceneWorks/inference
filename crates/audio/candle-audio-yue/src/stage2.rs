@@ -138,13 +138,7 @@ impl CandleStage2Lm {
     /// [`crate::snapshot::lm_load_spec`] (a dense directory is quantized on load).
     pub fn load(dir: &std::path::Path, tier: Option<Tier>) -> gen_core::Result<Self> {
         let spec = crate::snapshot::lm_load_spec(dir, tier);
-        let provider = LlamaProvider::load(&spec).map_err(|e| match e {
-            candle_llm::core_llm::Error::Unsupported(m) => gen_core::Error::Unsupported(m),
-            candle_llm::core_llm::Error::Canceled => gen_core::Error::Canceled,
-            // Boxed, not stringified: a memory-admission refusal stays a downcastable
-            // `RequestResourceExhausted`.
-            other => backend(other),
-        })?;
+        let provider = LlamaProvider::load(&spec).map_err(crate::snapshot::lm_load_error)?;
         let model = provider.into_causal_lm().ok_or_else(|| {
             gen_core::Error::Unsupported(format!(
                 "candle-audio-yue: {} is not a Llama-family checkpoint",

@@ -116,12 +116,7 @@ impl Stage1Lm {
     pub fn load(root: &std::path::Path, tier: Option<Tier>) -> gen_core::Result<Self> {
         let (dir, _stored) = crate::snapshot::resolve_tier_dir(root, tier, "stage-1")?;
         let spec = crate::snapshot::lm_load_spec(&dir, tier);
-        let provider = LlamaProvider::load(&spec).map_err(|e| {
-            gen_core::Error::Msg(format!(
-                "candle-audio-yue stage 1: load {}: {e}",
-                dir.display()
-            ))
-        })?;
+        let provider = LlamaProvider::load(&spec).map_err(crate::snapshot::lm_load_error)?;
         let model = provider.into_causal_lm().ok_or_else(|| {
             gen_core::Error::Unsupported(format!(
                 "candle-audio-yue stage 1: {} is not a Llama-family checkpoint",

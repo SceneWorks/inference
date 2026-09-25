@@ -15,6 +15,9 @@ use candle_llm::core_llm::{LoadSpec, Quantize};
 
 use crate::config::Tier;
 
+/// Every tier directory a tiered snapshot root may hold, dense first.
+pub const TIER_DIRS: [&str; 3] = ["bf16", "q8", "q4"];
+
 /// The directory each tier lives in under a tiered snapshot root.
 fn tier_dir_name(tier: Tier) -> &'static str {
     match tier {
@@ -110,6 +113,17 @@ pub fn lm_load_spec(dir: &Path, requested: Option<Tier>) -> LoadSpec {
     spec
 }
 
+/// Bridge a [`candle_llm::LlamaProvider::load`] failure into the generator contract, shared by
+/// both LM stages: `Unsupported` and `Canceled` stay typed, and everything else is boxed rather
+/// than stringified, so a memory-admission refusal stays a downcastable `RequestResourceExhausted`.
+pub fn lm_load_error(e: candle_llm::core_llm::Error) -> gen_core::Error {
+    match e {
+        candle_llm::core_llm::Error::Unsupported(m) => gen_core::Error::Unsupported(m),
+        candle_llm::core_llm::Error::Canceled => gen_core::Error::Canceled,
+        other => gen_core::Error::backend(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +211,70 @@ mod tests {
             .contains("declares Q4"));
         let empty = tempfile::tempdir().unwrap();
         assert!(resolve_tier_dir(empty.path(), None, "s2").is_err());
+    }
+
+    /// Both LM loaders surface a `LlamaProvider::load` refusal typed, never stringified to
+    /// `Msg`: a snapshot whose projections are stored Q8_0 but whose `config.json` declares Q4
+    /// resolves (the tier resolver reads only the config) and is then refused by candle-llm as
+    /// `Unsupported` (a stored Q8 projection is never re-quantized to Q4).
+    #[test]
+    fn both_lm_loaders_keep_a_provider_refusal_typed() {
+        let root = tempfile::tempdir().unwrap();
+        let dense = root.path().join("dense");
+        crate::stage2::tests::write_synthetic_snapshot(&dense);
+        let q8 = root.path().join("q8-labelled-q4");
+        candle_llm::prepare::prepare(&candle_llm::core_llm::PrepareSpec {
+            source: dense.clone(),
+            out_dir: q8.clone(),
+            quantize: Some(Quantize::Q8),
+        })
+        .unwrap();
+        let cfg_path = q8.join("config.json");
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        cfg["quantization"]["bits"] = 4.into();
+        std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+
+        let assets = crate::config::Assets {
+            stage1: q8.clone(),
+            stage2: q8.clone(),
+            xcodec: root.path().join("absent-xc"),
+        };
+        let stage1 = crate::stage1::load(&assets, None).err();
+        assert!(
+            matches!(stage1, Some(gen_core::Error::Unsupported(ref m)) if m.contains("re-quantized")),
+            "stage 1: {stage1:?}"
+        );
+        let stage2 = crate::stage2::load(&assets, None).err();
+        assert!(
+            matches!(stage2, Some(gen_core::Error::Unsupported(ref m)) if m.contains("re-quantized")),
+            "stage 2: {stage2:?}"
+        );
+    }
+
+    #[test]
+    fn the_load_error_bridge_keeps_cancel_and_admission_typed() {
+        use candle_llm::core_llm::{Error as LlmError, RequestResourceExhausted};
+        assert!(matches!(
+            lm_load_error(LlmError::Canceled),
+            gen_core::Error::Canceled
+        ));
+        let evidence = RequestResourceExhausted {
+            prompt_tokens: 0,
+            max_new_tokens: 0,
+            max_context_tokens: 0,
+            required_bytes: 2,
+            available_bytes: 1,
+        };
+        let gen_core::Error::Backend(boxed) =
+            lm_load_error(LlmError::RequestResourceExhausted(evidence))
+        else {
+            panic!("admission refusal must be boxed, not stringified");
+        };
+        assert!(matches!(
+            boxed.downcast_ref::<LlmError>(),
+            Some(LlmError::RequestResourceExhausted(e)) if *e == evidence
+        ));
     }
 
     #[test]
