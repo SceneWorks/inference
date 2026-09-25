@@ -323,7 +323,7 @@ impl YueEngine {
 /// and the `<EOA>` that closed it (sampled or forced) — and split it with the reference `save`
 /// semantics. Complete `<SOA>…<EOA>` pairs inside the prompt blocks (the ICL reference block) are
 /// prompt audio, skipped as the reference skips its first pair for an audio-prompted render.
-fn stage1_tracks(
+pub(crate) fn stage1_tracks(
     prompt: &crate::tokenizer::Stage1Prompt,
     generated: &[Vec<u32>],
 ) -> Result<TrackCodes, String> {

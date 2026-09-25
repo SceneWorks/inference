@@ -113,6 +113,10 @@ DECODE = {
     "contextLimit": CONFIG["max_position_embeddings"],
     "seed": 42,
 }
+# Every segment ends at the budget (the `<EOA>` floor equals the budget) and the sequence never
+# outgrows the context, so each forced `<EOA>` reaches the next segment through the incremental
+# cache rather than a smart-context rebuild.
+DECODE_BUDGET_ONLY = {**DECODE, "maxNewTokens": 20, "minNewTokens": 20}
 
 INC = 0x9E3779B97F4A7C15
 MASK64 = (1 << 64) - 1
@@ -273,13 +277,13 @@ def build_model(weights: dict[str, np.ndarray]):
     return model.eval()
 
 
-def render(model, prompts: list[list[int]], guidance: list[float] | None) -> dict:
+def render(model, prompts: list[list[int]], guidance: list[float] | None, decode: dict = DECODE) -> dict:
     """One stage-1 render, segment by segment, the way infer.py drives `generate`."""
     import torch
     import transformers.generation.logits_process as lp
     from transformers import LogitsProcessorList
 
-    rng = SplitMix64(DECODE["seed"])
+    rng = SplitMix64(decode["seed"])
     first_scores: list[np.ndarray] = []
     capture = {"pending": False}
     penalty_call = lp.RepetitionPenaltyLogitsProcessor.__call__
@@ -292,8 +296,8 @@ def render(model, prompts: list[list[int]], guidance: list[float] | None) -> dic
             capture["pending"] = False
         return penalty_call(self, input_ids, scores)
 
-    max_new = DECODE["maxNewTokens"]
-    max_context = DECODE["contextLimit"] - max_new - 1
+    max_new = decode["maxNewTokens"]
+    max_context = decode["contextLimit"] - max_new - 1
     seq: list[int] = []
     segments, ended_by, windows = [], [], []
     real_multinomial = torch.multinomial
@@ -306,11 +310,11 @@ def render(model, prompts: list[list[int]], guidance: list[float] | None) -> dic
             windows.append(len(full))
             kwargs = dict(
                 max_new_tokens=max_new,
-                min_new_tokens=DECODE["minNewTokens"],
+                min_new_tokens=decode["minNewTokens"],
                 do_sample=True,
-                top_p=DECODE["topP"],
-                temperature=DECODE["temperature"],
-                repetition_penalty=DECODE["repetitionPenalty"],
+                top_p=decode["topP"],
+                temperature=decode["temperature"],
+                repetition_penalty=decode["repetitionPenalty"],
                 eos_token_id=EOA,
                 pad_token_id=EOA,
                 logits_processor=LogitsProcessorList([AllowRange()]),
@@ -338,6 +342,7 @@ def render(model, prompts: list[list[int]], guidance: list[float] | None) -> dic
         ids = np.argsort(-row, kind="stable")[:64]
         tops.append([[int(t), float(row[t])] for t in ids])
     return {
+        "decode": decode,
         "segments": segments,
         "endedBy": ended_by,
         "windowLengths": windows,
@@ -447,12 +452,13 @@ def dump() -> None:
         "runs": {
             "guidance": render(model, prompts, DECODE["guidance"]),
             "noGuidance": render(model, prompts, None),
+            "budgetOnly": render(model, prompts, DECODE["guidance"], DECODE_BUDGET_ONLY),
         },
         "shortenCases": shorten_cases(),
         "splitCases": split_cases(),
     }
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    FIXTURE.write_text(json.dumps(fixture, separators=(",", ":")) + "\n")
+    FIXTURE.write_text(json.dumps(fixture, separators=(",", ":")) + "\n", encoding="utf-8")
     for name, run in fixture["runs"].items():
         lens = [len(s) for s in run["segments"]]
         print(f"{name}: segment lengths {lens} ended by {run['endedBy']} windows {run['windowLengths']}")

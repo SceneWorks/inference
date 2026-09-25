@@ -18,8 +18,8 @@
 //!    which sees only the segment prompt's last token (`<xcodec>`) and what is generated after it —
 //!    every earlier cache column is masked out of row 1 and its RoPE positions restart at 0. The
 //!    scores are `scale · (log_softmax(cond) − log_softmax(uncond)) + log_softmax(uncond)`. A scale
-//!    of exactly 1 is no guidance (the raw conditional logits, as `generate` skips the processor);
-//!    guidance off runs batch-of-1.
+//!    of exactly 1 is no guidance (the raw conditional logits, as `generate` skips the processor)
+//!    and, like guidance off, runs batch-of-1.
 //! 3. **Shaping and draw**: the repetition penalty (once per distinct id in the window + generated
 //!    tokens, Hugging Face's CTRL form), the allow-list `[EOA] + [CODEC_OFFSET, STAGE1_ALLOW_MAX]`
 //!    (with `<EOA>` also barred until `min_new_tokens` tokens are out), temperature, top-k, top-p and
@@ -210,6 +210,12 @@ impl Stage1Lm {
         &self.history
     }
 
+    /// Rows the KV cache runs (1 without effective guidance, 2 with).
+    #[cfg(test)]
+    pub(crate) fn cache_rows(&self) -> usize {
+        self.batch
+    }
+
     fn mark_seen(&mut self, token: u32) {
         if let Some(slot) = self.seen.get_mut(token as usize) {
             if !*slot {
@@ -379,10 +385,11 @@ impl Stage1Model for Stage1Lm {
             })?;
         self.segment = None;
         self.history.extend_from_slice(segment.prompt);
-        let batch = if segment.guidance_scale.is_some() {
-            2
-        } else {
-            1
+        // A scale of exactly 1 is no guidance (the raw conditional logits), so the unconditional
+        // row would be computed only to be discarded: run batch-of-1.
+        let batch = match segment.guidance_scale {
+            Some(s) if s != 1.0 => 2,
+            _ => 1,
         };
         if self.history.len() > max_context {
             self.window = shorten_context(&self.history, max_context);

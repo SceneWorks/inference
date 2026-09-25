@@ -161,8 +161,7 @@ pub(crate) fn write_tiny_snapshot(fx: &Value, dir: &Path) {
     std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
 }
 
-fn decode_config(fx: &Value, guided: bool) -> DecodeConfig {
-    let d = &fx["decode"];
+fn decode_config(d: &Value, guided: bool) -> DecodeConfig {
     let f = |k: &str| d[k].as_f64().unwrap() as f32;
     let u = |k: &str| d[k].as_u64().unwrap() as u32;
     DecodeConfig {
@@ -262,7 +261,7 @@ fn check_run(run_key: &str, guided: bool) {
     let got = render(
         &mut lm,
         &prompts(&fx),
-        &decode_config(&fx, guided),
+        &decode_config(&run["decode"], guided),
         seed(&fx),
     );
 
@@ -312,13 +311,59 @@ fn unguided_render_matches_the_reference_token_for_token() {
     check_run("noGuidance", false);
 }
 
+/// Every segment ends at the budget and the context never overflows, so each forced `<EOA>` must
+/// reach the next segment through the incremental KV cache — not a smart-context rebuild from the
+/// full sequence, which would hide a forced `<EOA>` missing from the cache window.
+#[test]
+fn budget_ended_segments_carry_the_forced_eoa_into_the_cache() {
+    check_run("budgetOnly", true);
+}
+
+/// Sequence length the cache would hold before segment `index`'s shortening check, with no
+/// shortening: every prompt block up to and including `index`, plus the earlier segments' output.
+fn unshortened_len(fx: &Value, run: &Value, index: usize) -> u64 {
+    let prompts: usize = fx["prompts"].as_array().unwrap()[..=index]
+        .iter()
+        .map(|p| p.as_array().unwrap().len())
+        .sum();
+    let generated: usize = run["segments"].as_array().unwrap()[..index]
+        .iter()
+        .map(|s| s.as_array().unwrap().len())
+        .sum();
+    (prompts + generated) as u64
+}
+
+#[test]
+fn the_budget_only_run_never_shortens_and_ends_every_segment_at_the_budget() {
+    let fx = fixture();
+    let run = &fx["runs"]["budgetOnly"];
+    let max_new = run["decode"]["maxNewTokens"].as_u64().unwrap() as usize;
+    for (i, (seg, how)) in run["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(run["endedBy"].as_array().unwrap())
+        .enumerate()
+    {
+        assert_eq!(how, "budget", "segment {i}");
+        assert_eq!(seg.as_array().unwrap().len(), max_new + 1, "segment {i}");
+        let window = run["windowLengths"][i].as_u64().unwrap();
+        assert_eq!(
+            window,
+            unshortened_len(&fx, run, i),
+            "segment {i} was shortened"
+        );
+    }
+}
+
 #[test]
 fn the_fixture_exercises_both_endings_the_smart_context_and_the_min_new_floor() {
     let fx = fixture();
     let min_new = fx["decode"]["minNewTokens"].as_u64().unwrap() as usize;
     let max_new = fx["decode"]["maxNewTokens"].as_u64().unwrap() as usize;
     let mut endings = Vec::new();
-    for run in fx["runs"].as_object().unwrap().values() {
+    for key in ["guidance", "noGuidance"] {
+        let run = &fx["runs"][key];
         for (seg, how) in run["segments"]
             .as_array()
             .unwrap()
@@ -363,7 +408,7 @@ fn each_decode_knob_moves_the_stream() {
         .iter()
         .map(ids)
         .collect();
-    let base = decode_config(&fx, true);
+    let base = decode_config(&fx["decode"], true);
     let variants = [
         DecodeConfig {
             guidance: Guidance::On {
@@ -448,7 +493,7 @@ fn production_load_decodes_a_staged_snapshot() {
         xcodec: "/unused".into(),
     };
     let mut lm = (StageSet::production().stage1)(&assets, None).expect("stage 1 loads");
-    let decode = decode_config(&fx, true);
+    let decode = decode_config(&fx["decode"], true);
     lm.begin_render(7).unwrap();
     lm.begin_segment(&SegmentStart {
         index: 0,
@@ -566,7 +611,7 @@ fn engine_with_tiny_stage1(
     let mut req = YueRequest::new("pop", "[verse]\na\n[chorus]\nb\n[bridge]\nc\n[outro]\nd");
     req.segments = 4;
     req.seed = seed(&fx);
-    req.decode = decode_config(&fx, true);
+    req.decode = decode_config(&fx["decode"], true);
     (YueEngine::new(variant, assets, None, stages), req, steps)
 }
 
@@ -614,5 +659,118 @@ fn cancel_stops_the_real_stage1_within_one_step() {
         *steps.lock().unwrap(),
         150,
         "no step after the one that saw the cancel"
+    );
+}
+
+/// A guidance scale of exactly 1 is no guidance: it reproduces the unguided reference stream and
+/// runs batch-of-1 (no unconditional row computed only to be discarded).
+#[test]
+fn unit_guidance_scale_is_no_guidance_on_one_row() {
+    let fx = fixture();
+    let decode = DecodeConfig {
+        guidance: Guidance::On {
+            first: 1.0,
+            rest: 1.0,
+        },
+        ..decode_config(&fx["decode"], false)
+    };
+    let mut lm = Stage1Lm::from_model(tiny_model(&fx)).unwrap();
+    let got = render(&mut lm, &prompts(&fx), &decode, seed(&fx));
+    assert_eq!(lm.cache_rows(), 1);
+    let want: Vec<Vec<u32>> = fx["runs"]["noGuidance"]["segments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(ids)
+        .collect();
+    assert_eq!(got.segments, want);
+}
+
+/// The engine's split skips the prompt's ICL reference pair: a segment-0 prompt block carrying a
+/// complete `<SOA>…<EOA>` reference block yields the same tracks as the reference `save` with
+/// `range_begin = 1` (fixture case `icl_reference_pair_is_skipped`).
+#[test]
+fn engine_split_skips_the_icl_reference_pair() {
+    let fx = fixture();
+    let case = fx["splitCases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "icl_reference_pair_is_skipped")
+        .unwrap();
+    let raw = ids(&case["raw"]);
+    // The generated segment is everything after the last `<SOA><xcodec>` up to the final `<EOA>`.
+    let last_soa = raw.iter().rposition(|&t| t == crate::tokens::SOA).unwrap();
+    let block = raw[..last_soa + 2].to_vec();
+    let generated = raw[last_soa + 2..raw.len() - 1].to_vec();
+    let prompt = Stage1Prompt {
+        segments: vec![SegmentPrompt {
+            label: "verse".into(),
+            ids: block,
+        }],
+    };
+    let tracks = crate::engine::stage1_tracks(&prompt, &[generated]).unwrap();
+    assert_eq!(tracks.vocals, ids(&case["vocals"]));
+    assert_eq!(tracks.instrumental, ids(&case["instrumental"]));
+}
+
+/// A stage 1 that emits a fixed token list per segment, then `<EOA>`.
+struct Scripted(Vec<u32>, usize);
+
+impl Stage1Model for Scripted {
+    fn begin_render(&mut self, _: u64) -> gen_core::Result<()> {
+        Ok(())
+    }
+    fn begin_segment(&mut self, _: &SegmentStart<'_>) -> gen_core::Result<()> {
+        self.1 = 0;
+        Ok(())
+    }
+    fn step(&mut self) -> gen_core::Result<Stage1Step> {
+        self.1 += 1;
+        Ok(match self.0.get(self.1 - 1) {
+            Some(&t) => Stage1Step::Token(t),
+            None => Stage1Step::EndOfAudio,
+        })
+    }
+    fn end_segment(&mut self) -> gen_core::Result<()> {
+        Ok(())
+    }
+}
+
+/// A mid-track token beyond codebook 0 (which the allow-list admits) is refused before stage 2,
+/// where the reference's `offset_tok_ids` asserts on it.
+#[test]
+fn engine_refuses_a_beyond_codebook0_code_before_stage2() {
+    use crate::tokens::codec_token;
+    let mut stages = StageSet::stubs();
+    let tokens = vec![
+        codec_token(0, 1),
+        codec_token(0, 2),
+        codec_token(1, 5),
+        codec_token(0, 3),
+    ];
+    stages.stage1 = std::sync::Arc::new(move |_: &Assets, _| {
+        Ok(Box::new(Scripted(tokens.clone(), 0)) as Box<dyn Stage1Model>)
+    });
+    let assets = Assets {
+        stage1: "/unused".into(),
+        stage2: "/unused".into(),
+        xcodec: "/unused".into(),
+    };
+    let engine = YueEngine::new(Variant::ALL[0], assets, None, stages);
+    let mut events = Vec::new();
+    let err = engine
+        .render(
+            &YueRequest::new("pop", "[verse]\nla"),
+            &CancelFlag::new(),
+            &mut |e| events.push(e),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("outside codebook 0"), "{err}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, YueEvent::StageLoaded(crate::engine::Stage::Stage2))),
+        "stage 2 must not load"
     );
 }
