@@ -32,14 +32,14 @@ use candle_audio_yue::vocoder::{Track, VocosUpsampler, SAMPLES_PER_FRAME};
 /// The 44.1 kHz stems through the embed conv, 8 ConvNeXt blocks, the 3530-wide head, `exp`/`cos`/
 /// `sin` and a 3528-point inverse DFT. Measured max relative difference on CPU/f32: 1.07e-5 (vocal)
 /// and 3.3e-6 (instrumental). That is the f32 noise floor — the torch f32 reference itself differs
-/// from the same model run in float64 by 9.6e-6 / 3.1e-6 — so the bound leaves ~5× headroom, while
+/// from the same model run in float64 by 9.6e-6 / 3.1e-6 — so the bound sits just above it, while
 /// a 0.1 % gain error (1e-3), a one-sample shift (~2e-1) or the other track's decoder (~1) land far
 /// outside it.
-const WAVE_MAX_REL: f64 = 5e-5;
+const WAVE_MAX_REL: f64 = 2e-5;
 /// The full chain (native codec + Vocos + post-process) vs the upstream outputs: the stems' noise
 /// floor carried through the limiter and the splice; measured 6.1e-6 (clamp mix) / 5.9e-6
 /// (rescale mix), the stems as above.
-const MIX_MAX_REL: f64 = 5e-5;
+const MIX_MAX_REL: f64 = 2e-5;
 
 fn fixture() -> HashMap<String, Tensor> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -159,7 +159,7 @@ fn vocos_decoders_and_the_post_processed_mix_match_the_reference() {
         (OutputLimiter::Clamp, "clamp"),
         (OutputLimiter::Rescale, "rescale"),
     ] {
-        let out = post_process(&codec_rate, &vocoder_rate, limiter);
+        let out = post_process(&codec_rate, &vocoder_rate, limiter).unwrap();
         for (got, part) in [
             (&out.mix, "mix"),
             (&out.vocals, "vocal"),

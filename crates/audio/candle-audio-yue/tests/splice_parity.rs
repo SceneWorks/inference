@@ -23,7 +23,7 @@ use candle_audio_yue::gen_core::OutputLimiter;
 use candle_audio_yue::splice::{post_process, replace_low_freq_with_energy_matched, TrackPair};
 
 /// Measured max relative difference vs the torch/torchaudio CPU reference: 2.6e-7 (clamp mix),
-/// 2.5e-7 (rescale mix), 0 on the limited stems — f32 rounding in the resampler's and the IIR's
+/// 3.0e-7 (rescale mix), 0 on the limited stems — f32 rounding in the IIR recursion and the
 /// accumulation order. A 0.1 % gain error measures ~1e-3, a one-sample shift ~1e-1.
 const MAX_REL: f64 = 1e-5;
 
@@ -94,7 +94,7 @@ fn post_process_matches_the_reference_in_both_limiter_modes() {
         (OutputLimiter::Clamp, "clamp"),
         (OutputLimiter::Rescale, "rescale"),
     ] {
-        let out = post_process(&codec, &vocoder, limiter);
+        let out = post_process(&codec, &vocoder, limiter).unwrap();
         // AC 3: mix and both stems at 44.1 kHz (882 samples per 50 Hz codec frame).
         assert_eq!(out.mix.len(), 25 * 882);
         for (got, part) in [
@@ -121,14 +121,16 @@ fn mutated_goldens_and_wrong_ports_fail_the_same_check() {
     let fx = fixture();
     let (codec, vocoder) = pairs(&fx);
     let want = flat(&fx, "clamp_mix");
-    let out = post_process(&codec, &vocoder, OutputLimiter::Clamp);
+    let out = post_process(&codec, &vocoder, OutputLimiter::Clamp).unwrap();
     assert!(max_rel(&out.mix, &want) <= MAX_REL);
 
     let mut gained = want.clone();
     gained.iter_mut().for_each(|v| *v *= 1.001);
     let mut shifted = want.clone();
     shifted.rotate_right(1);
-    let wrong_limiter = post_process(&codec, &vocoder, OutputLimiter::Rescale).mix;
+    let wrong_limiter = post_process(&codec, &vocoder, OutputLimiter::Rescale)
+        .unwrap()
+        .mix;
     // The crossover moved 5 % (and the energy match then scales a different band).
     let recons: Vec<f32> = candle_audio_yue::splice::limit(&codec.vocals, OutputLimiter::Clamp)
         .iter()
@@ -148,10 +150,10 @@ fn mutated_goldens_and_wrong_ports_fail_the_same_check() {
         OutputLimiter::Clamp,
     );
     let right_cutoff =
-        replace_low_freq_with_energy_matched(&recons, 16_000, &mix44, 44_100, 5_500.0);
+        replace_low_freq_with_energy_matched(&recons, 16_000, &mix44, 44_100, 5_500.0).unwrap();
     assert!(max_rel(&right_cutoff, &want) <= MAX_REL);
     let wrong_cutoff =
-        replace_low_freq_with_energy_matched(&recons, 16_000, &mix44, 44_100, 5_225.0);
+        replace_low_freq_with_energy_matched(&recons, 16_000, &mix44, 44_100, 5_225.0).unwrap();
 
     for (label, rel) in [
         ("golden ×1.001", max_rel(&out.mix, &gained)),

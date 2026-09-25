@@ -386,6 +386,52 @@ mod tests {
         assert!(wav.iter().all(|v| v.is_finite()));
     }
 
+    /// `max|got − want| / max|want|`; a length mismatch is an infinite error.
+    fn max_rel(got: &[f32], want: &[f32]) -> f64 {
+        if got.len() != want.len() {
+            return f64::INFINITY;
+        }
+        let peak = want.iter().fold(0f64, |m, &v| m.max(v.abs() as f64));
+        let diff = got
+            .iter()
+            .zip(want)
+            .fold(0f64, |m, (&a, &b)| m.max((a as f64 - b as f64).abs()));
+        diff / peak
+    }
+
+    /// Upstream `VocosBackbone` + `ISTFTHead` at toy widths and MOSS-TTSD's transform (n_fft 960,
+    /// hop 240), run through the shared [`Vocos`] with the computed [`hann_window`] — the exact
+    /// load path `candle-audio-moss-tts` uses. The fixture
+    /// (`scripts/reference/yue_vocos_reference.py tiny`) randomizes every layer scale and LayerNorm
+    /// and drives some log-magnitudes past the `1e2` clamp, so the ConvNeXt block (GELU-erf, γ),
+    /// the head's clamp and the inverse DFT's sign are all observable. Measured max relative
+    /// difference: 1.3e-6 (CPU/f32), bound 1e-5.
+    #[test]
+    fn vocos_matches_the_upstream_reference_at_moss_geometry() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/vocos_tiny_moss_reference.safetensors");
+        let dev = Device::Cpu;
+        let t = candle_core::safetensors::load(&path, &dev).unwrap();
+        let features = t["ref.features"].clone();
+        let want = t["ref.wave"].to_vec1::<f32>().unwrap();
+        let cfg = VocosConfig {
+            input_channels: 5,
+            dim: 8,
+            intermediate_dim: 12,
+            num_layers: 2,
+            n_fft: 960,
+            hop: 240,
+            ln_eps: 1e-6,
+        };
+        let vb = VarBuilder::from_tensors(t, DType::F32, &dev);
+        let vocos = Vocos::load(&vb, cfg, hann_window(cfg.n_fft), &dev).unwrap();
+        let got = vocos.forward(&features).unwrap();
+        assert_eq!(got.len(), 6 * cfg.hop);
+        let rel = max_rel(&got, &want);
+        println!("tiny MOSS-geometry vocos: max|Δ|/max|ref| = {rel:.3e}");
+        assert!(rel <= 1e-5, "vocos diverges from the reference: {rel:.3e}");
+    }
+
     #[test]
     fn cancel_trips_between_blocks_and_bad_geometry_is_refused() {
         let vocos = zero_vocos(TINY);

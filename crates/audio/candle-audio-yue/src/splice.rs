@@ -20,7 +20,7 @@
 //!   `audio.output_limiter`. The 16 kHz stems are
 //!   always clamped — upstream never passes `rescale` to that `save_audio` call.
 //! * The resampler is torchaudio's `Resample(16000, 44100)` (windowed sinc, Hann window, width 6,
-//!   rolloff 0.99; [`resample_sinc_hann`]); the filters are torchaudio's `lowpass_biquad` /
+//!   rolloff 0.99 — the shared [`candle_audio::dsp::resample_sinc_hann`]); the filters are torchaudio's `lowpass_biquad` /
 //!   `highpass_biquad` (Q 0.707) through `lfilter`, whose output is clamped to `±1` ([`biquad`]).
 //!   The RMS is global over the whole clip.
 //! * The final mix is not limited again (upstream writes it unlimited).
@@ -30,7 +30,9 @@
 //!
 //! [`splice_stub`] is the end-to-end seam test's double.
 
+use candle_audio::dsp::resample_sinc_hann;
 use candle_audio::gen_core::{self, OutputLimiter};
+use candle_audio::AudioError;
 
 use crate::codec::SAMPLE_RATE as CODEC_RATE;
 use crate::vocoder::SAMPLE_RATE as VOCODER_RATE;
@@ -76,7 +78,7 @@ pub fn splice(
     vocoder_rate: &TrackPair,
     limiter: OutputLimiter,
 ) -> gen_core::Result<SplicedMix> {
-    Ok(post_process(codec_rate, vocoder_rate, limiter))
+    post_process(codec_rate, vocoder_rate, limiter)
 }
 
 /// The upstream post-process (module docs): limits the stems, builds both mixes and splices the
@@ -85,7 +87,7 @@ pub fn post_process(
     codec_rate: &TrackPair,
     vocoder_rate: &TrackPair,
     limiter: OutputLimiter,
-) -> SplicedMix {
+) -> gen_core::Result<SplicedMix> {
     let recons_mix = sum_tracks(
         &limit(&codec_rate.vocals, OutputLimiter::Clamp),
         &limit(&codec_rate.instrumental, OutputLimiter::Clamp),
@@ -94,17 +96,17 @@ pub fn post_process(
         &sum_tracks(&vocoder_rate.instrumental, &vocoder_rate.vocals),
         limiter,
     );
-    SplicedMix {
+    Ok(SplicedMix {
         mix: replace_low_freq_with_energy_matched(
             &recons_mix,
             CODEC_RATE,
             &vocoder_mix,
             VOCODER_RATE,
             CUTOFF_HZ,
-        ),
+        )?,
         vocals: limit(&vocoder_rate.vocals, limiter),
         instrumental: limit(&vocoder_rate.instrumental, limiter),
-    }
+    })
 }
 
 /// Upstream `save_audio`'s limiter arithmetic.
@@ -133,17 +135,17 @@ pub fn replace_low_freq_with_energy_matched(
     b: &[f32],
     rate_b: u32,
     cutoff: f32,
-) -> Vec<f32> {
-    let a = resample_sinc_hann(a, rate_a, rate_b);
+) -> Result<Vec<f32>, AudioError> {
+    let a = resample_sinc_hann(a, rate_a, rate_b)?;
     let a_low = biquad(&a, BiquadKind::Lowpass, rate_b, cutoff);
     let b_low = biquad(b, BiquadKind::Lowpass, rate_b, cutoff);
     let scale = ((rms(&b_low) + RMS_EPS) / (rms(&a_low) + RMS_EPS)) as f32;
     let b_high = biquad(b, BiquadKind::Highpass, rate_b, cutoff);
-    a_low
+    Ok(a_low
         .iter()
         .zip(&b_high)
         .map(|(lo, hi)| lo * scale + hi)
-        .collect()
+        .collect())
 }
 
 fn rms(x: &[f32]) -> f64 {
@@ -156,65 +158,6 @@ fn rms(x: &[f32]) -> f64 {
 /// Sample-wise sum of two mono tracks, over the shorter length.
 fn sum_tracks(a: &[f32], b: &[f32]) -> Vec<f32> {
     a.iter().zip(b).map(|(x, y)| x + y).collect()
-}
-
-fn gcd(a: u32, b: u32) -> u32 {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
-    }
-}
-
-/// torchaudio's `transforms.Resample(orig, new)` with its defaults (`sinc_interp_hann`,
-/// `lowpass_filter_width = 6`, `rolloff = 0.99`): the polyphase windowed-sinc kernel built in f64
-/// and cached as f32 (`_get_sinc_resample_kernel`), applied as a strided convolution over the
-/// zero-padded input and truncated to `⌈new · len / orig⌉` samples (`_apply_sinc_resample_kernel`).
-pub fn resample_sinc_hann(x: &[f32], orig: u32, new: u32) -> Vec<f32> {
-    const WIDTH_ZEROS: f64 = 6.0;
-    const ROLLOFF: f64 = 0.99;
-    if orig == new || x.is_empty() {
-        return x.to_vec();
-    }
-    let g = gcd(orig, new);
-    let (o, n) = ((orig / g) as usize, (new / g) as usize);
-    let base = o.min(n) as f64 * ROLLOFF;
-    let width = (WIDTH_ZEROS * o as f64 / base).ceil() as usize;
-    let taps = 2 * width + o;
-    let scale = base / o as f64;
-    // kernel[j * taps + k]: output phase j, input tap k.
-    let kernel: Vec<f32> = (0..n)
-        .flat_map(|j| {
-            // Upstream's `arange(0, -new, -1) / new` is an integer tensor's true division, so the
-            // phase offset is rounded to the default f32 before it meets the f64 tap grid.
-            let tj = (-(j as f32) / n as f32) as f64;
-            (0..taps).map(move |k| {
-                let idx = (k as f64 - width as f64) / o as f64;
-                let t = ((tj + idx) * base).clamp(-WIDTH_ZEROS, WIDTH_ZEROS);
-                let window = (t * std::f64::consts::PI / WIDTH_ZEROS / 2.0).cos().powi(2);
-                let t = t * std::f64::consts::PI;
-                let sinc = if t == 0.0 { 1.0 } else { t.sin() / t };
-                (sinc * window * scale) as f32
-            })
-        })
-        .collect();
-    let len = x.len();
-    let mut padded = vec![0f32; width + len + width + o];
-    padded[width..width + len].copy_from_slice(x);
-    let frames = (padded.len() - taps) / o + 1;
-    let target = (n * len).div_ceil(o);
-    let mut out = Vec::with_capacity(frames * n);
-    for f in 0..frames {
-        let window = &padded[f * o..f * o + taps];
-        for row in kernel.chunks_exact(taps) {
-            out.push(row.iter().zip(window).map(|(k, v)| k * v).sum::<f32>());
-        }
-        if out.len() >= target {
-            break;
-        }
-    }
-    out.truncate(target);
-    out
 }
 
 /// Which torchaudio biquad.
@@ -281,25 +224,6 @@ mod tests {
     }
 
     #[test]
-    fn resampling_16k_to_44k1_emits_882_samples_per_codec_frame_and_keeps_a_tone() {
-        let n = 3200;
-        let tone: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin() * 0.5)
-            .collect();
-        let up = resample_sinc_hann(&tone, 16_000, 44_100);
-        assert_eq!(up.len(), n / 320 * 882);
-        // Mid-clip, the upsampled tone is the same sine sampled at 44.1 kHz.
-        for (i, &got) in up.iter().enumerate().take(2100).skip(2000) {
-            let want = (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 44_100.0).sin() * 0.5;
-            assert!(
-                (got as f64 - want).abs() < 1e-2,
-                "sample {i}: {got} vs {want}"
-            );
-        }
-        assert_eq!(resample_sinc_hann(&tone, 16_000, 16_000), tone);
-    }
-
-    #[test]
     fn biquads_split_the_band_and_lfilter_clamps() {
         let sr = 44_100;
         let tone = |f: f32| -> Vec<f32> {
@@ -317,6 +241,34 @@ mod tests {
         let loud: Vec<f32> = low.iter().map(|v| v * 3.0).collect();
         let out = biquad(&loud, BiquadKind::Lowpass, sr, CUTOFF_HZ);
         assert!(out.iter().all(|v| v.abs() <= 1.0) && peak(&out) == 1.0);
+    }
+
+    /// Upstream `--rescale` limits each 44.1 kHz stem by its own peak (`× 0.99 / peak`), not by a
+    /// clamp — a stem above the limit comes back scaled, every sample.
+    #[test]
+    fn rescale_scales_each_vocoder_stem_by_its_own_peak() {
+        let frames = 2;
+        let codec = TrackPair {
+            vocals: vec![0.1; frames * 320],
+            instrumental: vec![0.1; frames * 320],
+        };
+        let loud: Vec<f32> = (0..frames * 882)
+            .map(|i| 1.6 * (i as f32 * 0.05).sin())
+            .collect();
+        let quiet: Vec<f32> = loud.iter().map(|v| v * 0.25).collect();
+        let vocoder = TrackPair {
+            vocals: loud.clone(),
+            instrumental: quiet.clone(),
+        };
+        let out = post_process(&codec, &vocoder, OutputLimiter::Rescale).unwrap();
+        let peak = loud.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(peak > 1.5);
+        let want: Vec<f32> = loud.iter().map(|v| v * (LIMIT / peak)).collect();
+        assert_eq!(out.vocals, want, "loud stem rescaled by 0.99 / peak");
+        assert_eq!(
+            out.instrumental, quiet,
+            "a stem under the limit keeps unit gain"
+        );
     }
 
     #[test]

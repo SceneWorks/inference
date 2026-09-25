@@ -345,6 +345,33 @@ mod tests {
         ));
     }
 
+    /// Upstream `VocosBackbone` + `ISTFTHead` at toy widths and YuE's transform (n_fft 3528, hop
+    /// 882), loaded through the production [`load_decoder`] (widths from the tensors, the stored
+    /// `head.istft.window`). The fixture (`scripts/reference/yue_vocos_reference.py tiny`)
+    /// randomizes every layer scale and LayerNorm and drives some log-magnitudes past the `1e2`
+    /// clamp, so every numeric step of the decoder is checked in ordinary CI. Measured max relative
+    /// difference: 1.1e-6 (CPU/f32), bound 1e-5.
+    #[test]
+    fn load_decoder_matches_the_upstream_reference_at_yue_geometry() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/vocos_tiny_yue_reference.safetensors");
+        let t = candle_audio::candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        let want = t["ref.wave"].to_vec1::<f32>().unwrap();
+        let vocos = load_decoder(&path, &Device::Cpu).unwrap();
+        assert_eq!(vocos.config().n_fft, 3528);
+        assert_eq!(vocos.config().num_layers, 2);
+        let got = vocos.forward(&t["ref.features"]).unwrap();
+        assert_eq!(got.len(), 6 * SAMPLES_PER_FRAME);
+        let peak = want.iter().fold(0f64, |m, &v| m.max(v.abs() as f64));
+        let rel = got
+            .iter()
+            .zip(&want)
+            .fold(0f64, |m, (&a, &b)| m.max((a as f64 - b as f64).abs()))
+            / peak;
+        println!("tiny YuE-geometry vocos: max|Δ|/max|ref| = {rel:.3e}");
+        assert!(rel <= 1e-5, "vocos diverges from the reference: {rel:.3e}");
+    }
+
     #[test]
     fn a_missing_checkpoint_is_an_error_not_a_refusal() {
         let dir = tempfile::tempdir().unwrap();

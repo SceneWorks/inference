@@ -42,6 +42,18 @@ Regenerating (dev box, inside the YuE reference venv)::
     python scripts/reference/yue_vocos_reference.py
 
 It rewrites ``tests/fixtures/vocos_splice_reference.safetensors`` and its metadata JSON in place.
+
+``tiny`` mode (``python scripts/reference/yue_vocos_reference.py tiny``) writes the always-run,
+weights-free fixtures ``tests/fixtures/vocos_tiny_{yue,moss}_reference.safetensors``. Each builds the
+upstream ``VocosBackbone`` + ``ISTFTHead`` (``xcodec_mini_infer/vocos``) at toy widths (input 5,
+dim 8, MLP 12, 2 ConvNeXt blocks) with a fixed torch seed — once at YuE's transform (n_fft 3528,
+hop 882) and once at MOSS-TTSD's (n_fft 960, hop 240) — randomizes the layer scales (``gamma``),
+every LayerNorm weight/bias and the ConvNeXt MLP weights (O(1) GELU inputs) away from their init,
+and biases the head's log-magnitudes so some ``exp(mag)`` exceed 100 (the head's clamp acts). It saves that ``VocosDecoder``-layout state dict with
+a random feature input and the reference waveform (``ref.features`` / ``ref.wave``) in one file per
+geometry; ``candle-audio-yue``'s ``vocoder::tests`` loads the YuE one through ``load_decoder`` and
+``candle-audio``'s ``vocos::tests`` loads the MOSS one through the shared ``Vocos`` with the computed
+Hann window — so every numeric detail of the shared Vocos is checked in ordinary CI.
 """
 
 from __future__ import annotations
@@ -60,6 +72,15 @@ FIXTURE = FIXTURE_DIR / "vocos_splice_reference.safetensors"
 METADATA = FIXTURE_DIR / "vocos_splice_reference.json"
 
 INFERENCE_DIR_ENV = "YUE_REFERENCE_INFERENCE_DIR"
+
+#: Tiny-mode fixtures: (file, n_fft, hop). The MOSS one is consumed by candle-audio's own tests.
+TINY_CASES = (
+    (FIXTURE_DIR / "vocos_tiny_yue_reference.safetensors", 3528, 882),
+    (REPO_ROOT / "crates" / "audio" / "candle-audio" / "tests" / "fixtures"
+     / "vocos_tiny_moss_reference.safetensors", 960, 240),
+)
+TINY_SEED = 19378
+TINY_FRAMES = 6
 
 #: The pinned upstream revisions (epic sc-19373 reference environment).
 YUE_REVISION = "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d"
@@ -109,7 +130,7 @@ def instrumental_clip() -> list[float]:
     return out
 
 
-def main() -> None:
+def reference_root() -> Path:
     inference_dir = os.environ.get(INFERENCE_DIR_ENV)
     if not inference_dir:
         sys.exit(f"set {INFERENCE_DIR_ENV} to the YuE-v1 clone's inference/ directory")
@@ -117,6 +138,58 @@ def main() -> None:
     os.chdir(inf)
     sys.path[:0] = [str(inf), str(inf / "xcodec_mini_infer"),
                     str(inf / "xcodec_mini_infer" / "descriptaudiocodec")]
+    return inf
+
+
+def tiny() -> None:
+    """The weights-free toy-width fixtures (see the module docstring)."""
+    reference_root()
+    import torch
+    from vocos.models import VocosBackbone
+    from vocos.heads import ISTFTHead
+    from vocos.pretrained import VocosDecoder
+    from safetensors.torch import save_file
+
+    for path, n_fft, hop in TINY_CASES:
+        torch.manual_seed(TINY_SEED + n_fft)
+        m = VocosDecoder(
+            backbone=VocosBackbone(input_channels=5, dim=8, intermediate_dim=12, num_layers=2),
+            head=ISTFTHead(dim=8, n_fft=n_fft, hop_length=hop, padding="same"),
+        ).eval()
+        with torch.no_grad():
+            for name, t in m.named_parameters():
+                if name.endswith(".gamma"):
+                    t.copy_(torch.rand_like(t) * 1.5 + 0.25)  # layer scale well away from 1/N
+                elif "norm" in name and name.endswith(".weight"):
+                    t.copy_(torch.rand_like(t) + 0.5)
+                elif "norm" in name and name.endswith(".bias"):
+                    t.copy_(torch.randn_like(t) * 0.3)
+                elif ".pwconv" in name and name.endswith(".weight"):
+                    # O(1) pre-activations, so the GELU's erf form (vs. tanh) is observable.
+                    t.copy_(torch.randn_like(t) * 0.5)
+            out = m.head.out
+            half = n_fft // 2 + 1
+            out.weight.mul_(5.0)  # spread the logits so the phase wraps and mags vary widely
+            out.bias[:half].copy_(torch.rand(half) * 6.0)  # log-mag up to 6: exp > 100 → clamp
+            out.bias[half:].copy_(torch.rand(half) * 6.28)
+            features = torch.randn(1, 5, TINY_FRAMES)
+            logmag = out(m.backbone(features))[..., :half]
+            wave = m(features)
+        clamped = int((logmag.exp() > 100).sum())
+        assert clamped > 0, "the 1e2 magnitude clamp must act"
+        tensors = {k: v.contiguous() for k, v in m.state_dict().items()}
+        tensors["ref.features"] = features.contiguous()
+        tensors["ref.wave"] = wave.reshape(-1).contiguous()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_file(tensors, str(path))
+        print(f"wrote {path} ({path.stat().st_size} bytes), n_fft {n_fft}, "
+              f"{clamped} clamped bins, wave peak {float(wave.abs().max()):.4f}")
+
+
+def main() -> None:
+    if sys.argv[1:] == ["tiny"]:
+        return tiny()
+    inf = reference_root()
 
     import torch
     import torchaudio
