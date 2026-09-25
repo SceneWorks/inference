@@ -281,7 +281,9 @@ pub struct YueRequest {
     pub decode: DecodeConfig,
     /// Sampler seed.
     pub seed: u64,
-    /// The ICL reference; required for ICL variants, refused for CoT ones.
+    /// The ICL reference; optional on ICL variants (without one an `-icl` checkpoint renders from
+    /// the plain instruction/genre/lyrics prompt, exactly as the reference `infer.py` does with
+    /// neither `--use_audio_prompt` nor `--use_dual_tracks_prompt`), refused for CoT ones.
     pub icl: Option<IclReference>,
 }
 
@@ -342,11 +344,6 @@ impl YueRequest {
                 "{id}: a chain-of-thought checkpoint takes no reference audio; use the matching \
                  `_icl` variant"
             ))),
-            (Mode::Icl, None) => msg(
-                "an in-context-learning checkpoint needs a reference clip (ReferenceAudio \
-                 conditioning, single-track or with `vocals` + `instrumental` stems)"
-                    .into(),
-            ),
             (Mode::Icl, Some(icl)) => {
                 let window_ok = icl.start_secs.is_finite()
                     && icl.start_secs >= 0.0
@@ -373,7 +370,9 @@ impl YueRequest {
                 }
                 Ok(())
             }
-            (Mode::Cot, None) => Ok(()),
+            // The reference `infer.py` runs any stage-1 checkpoint without an audio prompt: the
+            // head is the instruction/genre/lyrics text alone, the CoT construction.
+            (Mode::Cot | Mode::Icl, None) => Ok(()),
         }
     }
 }
@@ -440,7 +439,10 @@ mod tests {
         let icl = Variant::new(Language::En, Mode::Icl);
         let ok = YueRequest::new("pop", "[verse]\nla");
         assert!(ok.validate(cot).is_ok());
-        assert!(ok.validate(icl).is_err(), "ICL needs a reference");
+        assert!(
+            ok.validate(icl).is_ok(),
+            "an ICL checkpoint renders without a reference, as the reference infer.py does"
+        );
 
         let mut r = ok.clone();
         r.segments = 0;

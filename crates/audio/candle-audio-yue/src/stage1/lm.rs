@@ -85,9 +85,6 @@ pub struct Stage1Lm {
     batch: usize,
     /// First cache column the unconditional row attends (the segment prompt's last token).
     uncond_start: usize,
-    /// Distinct ids in `window` — the repetition-penalty set — as a membership mask and a list.
-    seen: Vec<bool>,
-    seen_ids: Vec<i32>,
     allowed: Vec<bool>,
     allowed_no_eoa: Vec<bool>,
     segment: Option<Segment>,
@@ -187,8 +184,6 @@ impl Stage1Lm {
             cache: None,
             batch: 1,
             uncond_start: 0,
-            seen: vec![false; vocab],
-            seen_ids: Vec::new(),
             allowed,
             allowed_no_eoa,
             segment: None,
@@ -214,15 +209,6 @@ impl Stage1Lm {
     #[cfg(test)]
     pub(crate) fn cache_rows(&self) -> usize {
         self.batch
-    }
-
-    fn mark_seen(&mut self, token: u32) {
-        if let Some(slot) = self.seen.get_mut(token as usize) {
-            if !*slot {
-                *slot = true;
-                self.seen_ids.push(token as i32);
-            }
-        }
     }
 
     /// Feed every window token the cache has not seen, in chunks, returning the last position's
@@ -405,13 +391,6 @@ impl Stage1Model for Stage1Lm {
             self.cache = Some(self.model.new_cache());
         }
         self.uncond_start = self.window.len() - 1;
-        for &t in &self.seen_ids {
-            self.seen[t as usize] = false;
-        }
-        self.seen_ids.clear();
-        for i in 0..self.window.len() {
-            self.mark_seen(self.window[i]);
-        }
         let logits = self.feed()?;
         self.segment = Some(Segment {
             scale: segment.guidance_scale,
@@ -455,9 +434,12 @@ impl Stage1Model for Stage1Lm {
         } else {
             &self.allowed
         };
+        // The repetition-penalty window is the whole sequence the model sees (`window`, which
+        // already holds every generated token); the sampler penalises each distinct id once.
+        let penalty_window: Vec<i32> = self.window.iter().map(|&t| t as i32).collect();
         let token = sample_row_host(
             scores,
-            &self.seen_ids,
+            &penalty_window,
             &seg.params,
             &mut self.rng,
             Some(allowed),
@@ -465,7 +447,6 @@ impl Stage1Model for Stage1Lm {
         seg.generated += 1;
         self.history.push(token);
         self.window.push(token);
-        self.mark_seen(token);
         if token == EOA {
             self.segment.as_mut().expect("open").ended = true;
             Ok(Stage1Step::EndOfAudio)
