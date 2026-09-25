@@ -191,11 +191,13 @@ def load_upstream(root: Path, model, device):
     generate = ns["stage2_generate"]
 
     def stage2_generate(model, prompt, batch_size=16):
+        ns["calls"].append({"frames": int(prompt.shape[-1]), "batch_size": int(batch_size)})
         if prompt.shape[-1] == 0:
             return np.zeros((0,), dtype=np.int64)
         return generate(model, prompt, batch_size=batch_size)
 
     ns["stage2_generate"] = stage2_generate
+    ns["calls"] = []
     return ns
 
 
@@ -303,7 +305,7 @@ def encode_cb0(root: Path, np, torch) -> list[int]:
                            weights_only=False)
         codec.load_state_dict(state["codec_model"])
         codec.eval()
-        clip = torch.as_tensor(synthetic_clip(np, 1.0))[None, None, :]
+        clip = torch.as_tensor(synthetic_clip(np, CLIP_SECONDS))[None, None, :]
         with torch.no_grad():
             raw = codec.encode(clip, target_bw=0.5)
         raw = raw.transpose(0, 1).cpu().numpy().astype(np.int16)  # infer.py's ICL path
@@ -312,8 +314,12 @@ def encode_cb0(root: Path, np, torch) -> list[int]:
         os.chdir(cwd)
 
 
-# (name, first frame, frames): two single-chunk (ragged-tail) cases cut from the 50-frame encode.
-REAL_CASES = (("encode_0_40", 0, 40), ("encode_17_33", 17, 16))
+# (name, first frame, frames), cut from the 650-frame encode.
+# The 650-frame case takes upstream's unpatched batched branch: `num_batch` 2 <= `batch_size` 4, so
+# both full chunks decode as ONE 2-row group (positions up to 2702 — the full per-chunk context),
+# then the 50-frame tail alone.
+CLIP_SECONDS = 13.0
+REAL_CASES = (("encode_0_40", 0, 40), ("encode_17_33", 17, 16), ("encode_0_650", 0, 650))
 
 
 def cmd_real(args) -> None:
@@ -338,16 +344,21 @@ def cmd_real(args) -> None:
     ids2npy = ns["codectool_stage2"].ids2npy
     ns["codectool_stage2"].ids2npy = lambda ids: raw.append(ids2npy(ids)) or raw[-1]
     rows = [cb0_all[a : a + n] for _, a, n in REAL_CASES]
-    grids = run_stage2(ns, rows, batch_size=4)
+    grids, calls = [], []
+    for row in rows:
+        ns["calls"].clear()
+        grids += run_stage2(ns, [row], batch_size=4)
+        calls.append(list(ns["calls"]))
     cases = []
-    for (name, a, n), cb0, grid, pre in zip(REAL_CASES, rows, grids, raw):
+    for (name, a, n), cb0, grid, pre, call in zip(REAL_CASES, rows, grids, raw, calls):
         assert (grid[0] == np.asarray(cb0)).all()
         cases.append({
             "name": name, "frames": n, "cb0": cb0,
             "repaired_codes": int(((pre < 0) | (pre > 1023)).sum()),
+            "stage2_generate_calls": call,
             "codebooks": [[int(c) for c in r] for r in grid],
         })
-        print(f"{name}: T={n} repaired={cases[-1]['repaired_codes']}")
+        print(f"{name}: T={n} repaired={cases[-1]['repaired_codes']} calls={call}")
     out = args.output or FIXTURES / f"stage2_real_reference{'' if args.compute_dtype == 'float32' else '_' + args.compute_dtype}.json"
     write(Path(out), {
         "producer": f"scripts/reference/yue_stage2_reference.py real --compute-dtype {args.compute_dtype}",
@@ -357,7 +368,7 @@ def cmd_real(args) -> None:
                        "weights": "bf16", "compute_dtype": args.compute_dtype, "device": "cpu",
                        "attn_implementation": "sdpa"},
         "versions": {"torch": torch.__version__, "transformers": __import__("transformers").__version__},
-        "cb0_source": "xcodec encode (target_bw=0.5) of synthetic_clip(1.0 s) — codebook 0",
+        "cb0_source": f"xcodec encode (target_bw=0.5) of synthetic_clip({CLIP_SECONDS} s) — codebook 0",
         "encoded_cb0": cb0_all,
         "cases": cases,
     })

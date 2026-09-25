@@ -11,15 +11,16 @@
 //!   cargo test --release -p candle-audio-yue --test stage2_real_weights -- --ignored --nocapture
 //! ```
 //!
-//! `YUE_S2_SNAPSHOT` is the tiered SceneWorks rehost root (`bf16/`, `q8/`, `q4/`). The CPU runs
-//! peak around 10 GB host RAM (the 1B decoder upcast to f32 plus a quantized tier).
+//! `YUE_S2_SNAPSHOT` is the tiered SceneWorks rehost root (`bf16/`, `q8/`, `q4/`). Measured peak
+//! RSS on an M-series Mac: the exact-parity test ~15 GB (a 2-row, 2702-position f32 KV cache
+//! beside the f32 decoder), the all-tier test ~22 GB.
 
 use candle_audio_yue::candle_audio::candle_core::Device;
 use candle_audio_yue::config::{Assets, Tier};
 use candle_audio_yue::gen_core::CancelFlag;
 use candle_audio_yue::snapshot::resolve_tier_dir;
 use candle_audio_yue::stage2::{
-    self, characterise, upsample_with, CandleStage2Lm, DEFAULT_BATCH_SIZE,
+    self, characterise, upsample_with, CandleStage2Lm, CHUNK_FRAMES, DEFAULT_BATCH_SIZE,
 };
 use candle_llm::{CausalLm, ModelConfig};
 
@@ -121,7 +122,12 @@ fn stage2_every_tier_loads_through_production_and_is_characterised() {
         stage2: root.clone(),
         xcodec: root.join("absent-xcodec"),
     };
-    let cases = golden();
+    // The single-chunk cases only: this test characterises three tiers, and the 650-frame case's
+    // batched schedule is already pinned exactly by the dense parity test above.
+    let cases: Vec<Case> = golden()
+        .into_iter()
+        .filter(|c| c.cb0.len() <= CHUNK_FRAMES)
+        .collect();
     let mut reference = dense_lm(&Device::Cpu);
     for tier in [Tier::Bf16, Tier::Q8, Tier::Q4] {
         let mut stage2 = stage2::load(&assets, Some(tier)).unwrap();
@@ -159,48 +165,68 @@ fn stage2_every_tier_loads_through_production_and_is_characterised() {
     }
 }
 
+/// Bound on `max |Δlogit| / max |logit|` for the dense 1B on Metal (bf16 compute) against the CPU
+/// (f32). PROVISIONAL until the first Metal run (sc-19381): set from the measured value with
+/// headroom. For scale, the CPU q8 tier measured 0.028 against the same reference.
+#[cfg(feature = "metal")]
+const METAL_MAX_REL_LOGIT_DELTA: f32 = 0.05;
+/// Bound on the fraction of residual picks that flip on Metal, teacher-forced on the reference
+/// stream (so flips cannot cascade). PROVISIONAL until the first Metal run (sc-19381).
+#[cfg(feature = "metal")]
+const METAL_MAX_FLIP_FRACTION: f64 = 0.05;
+
 /// **AC3 on real weights** — the dense tier on Metal (bf16 compute) against the CPU f32
-/// reference, teacher-forced along the reference stream: the flips and the logit noise are
-/// reported, and the reference stream itself is still the golden.
+/// reference, teacher-forced along the reference stream, per golden case (a case longer than one
+/// chunk contributes its first full 300-frame chunk — the full per-chunk context). The flips and
+/// the logit noise are reported and bounded by [`METAL_MAX_REL_LOGIT_DELTA`] /
+/// [`METAL_MAX_FLIP_FRACTION`]; the CPU stream itself must still be the golden.
 #[cfg(feature = "metal")]
 #[test]
-#[ignore = "needs the YuE stage-2 snapshot via YUE_S2_SNAPSHOT"]
+#[ignore = "needs the YuE stage-2 snapshot via YUE_S2_SNAPSHOT and a Metal device"]
 fn stage2_metal_bf16_divergence_is_characterised_on_real_weights() {
     let metal = Device::new_metal(0).expect("the metal feature requires a Metal device");
     let mut reference = dense_lm(&Device::Cpu);
     let mut gpu = dense_lm(&metal);
     for case in golden() {
-        let d = characterise(&mut reference, &mut gpu, &case.cb0).unwrap();
+        let frames = case.cb0.len().min(CHUNK_FRAMES);
+        let d = characterise(&mut reference, &mut gpu, &case.cb0[..frames]).unwrap();
         eprintln!(
-            "{}: metal bf16 flips {} of {} residual picks; max |Δlogit| {:.3} at scale {:.3}; \
-             margins {:?}",
+            "{} ({frames} frames): metal bf16 flips {} of {} residual picks ({:.4}); max |Δlogit| \
+             {:.3} at scale {:.3} (relative {:.4}); flip margins {:?}",
             case.name,
             d.mismatches.len(),
             d.positions,
+            d.flip_fraction(),
             d.max_abs_logit_delta,
             d.max_abs_logit,
+            d.relative_logit_delta(),
             d.mismatches
                 .iter()
                 .map(|m| m.reference_margin)
                 .collect::<Vec<_>>()
         );
-        let want: Vec<u32> = (0..case.cb0.len())
-            .flat_map(|t| (0..8).map(move |k| (t, k)))
-            .map(|(t, k)| 45_334 + 1_024 * k as u32 + case.codebooks[k][t])
-            .collect();
         if case.repaired == 0 {
+            let want: Vec<u32> = (0..frames)
+                .flat_map(|t| (0..8).map(move |k| (t, k)))
+                .map(|(t, k)| 45_334 + 1_024 * k as u32 + case.codebooks[k][t])
+                .collect();
             assert_eq!(
                 d.reference_ids, want,
                 "{}: the CPU stream is the golden",
                 case.name
             );
         }
-        for m in &d.mismatches {
-            assert!(
-                m.reference_margin <= 2.0 * d.max_abs_logit_delta,
-                "{}: {m:?} is not a near-tie under the measured noise",
-                case.name
-            );
-        }
+        assert!(
+            d.relative_logit_delta() <= METAL_MAX_REL_LOGIT_DELTA,
+            "{}: relative logit delta {} exceeds {METAL_MAX_REL_LOGIT_DELTA}",
+            case.name,
+            d.relative_logit_delta()
+        );
+        assert!(
+            d.flip_fraction() <= METAL_MAX_FLIP_FRACTION,
+            "{}: flip fraction {} exceeds {METAL_MAX_FLIP_FRACTION}",
+            case.name,
+            d.flip_fraction()
+        );
     }
 }

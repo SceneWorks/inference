@@ -524,6 +524,27 @@ pub struct Divergence {
     pub max_abs_logit: f32,
 }
 
+impl Divergence {
+    /// `max |Δlogit| / max |logit|` — the logit noise relative to the logit scale (0 when the
+    /// reference logits are all zero).
+    pub fn relative_logit_delta(&self) -> f32 {
+        if self.max_abs_logit > 0.0 {
+            self.max_abs_logit_delta / self.max_abs_logit
+        } else {
+            0.0
+        }
+    }
+
+    /// Fraction of compared residual picks that differ (0 when nothing was compared).
+    pub fn flip_fraction(&self) -> f64 {
+        if self.positions == 0 {
+            0.0
+        } else {
+            self.mismatches.len() as f64 / self.positions as f64
+        }
+    }
+}
+
 /// Characterise `other` against `reference` on one chunk (`1..=CHUNK_FRAMES` frames).
 pub fn characterise(
     reference: &mut dyn Stage2Lm,

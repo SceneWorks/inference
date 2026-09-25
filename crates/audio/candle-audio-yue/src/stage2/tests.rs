@@ -427,6 +427,29 @@ impl Stage2Lm for Reprefill {
     }
 }
 
+/// The two divergence metrics the Metal bounds are stated in.
+#[test]
+fn divergence_metrics_are_relative_delta_and_flip_fraction() {
+    let flip = Mismatch {
+        frame: 0,
+        codebook: 1,
+        reference: STAGE2_SLICE_MIN,
+        other: STAGE2_SLICE_MIN + 1,
+        reference_margin: 0.1,
+    };
+    let d = Divergence {
+        positions: 8,
+        mismatches: vec![flip; 2],
+        max_abs_logit_delta: 0.5,
+        max_abs_logit: 20.0,
+        ..Divergence::default()
+    };
+    assert_eq!(d.relative_logit_delta(), 0.025);
+    assert_eq!(d.flip_fraction(), 0.25);
+    assert_eq!(Divergence::default().relative_logit_delta(), 0.0);
+    assert_eq!(Divergence::default().flip_fraction(), 0.0);
+}
+
 /// **AC3** — Metal computes in bf16 (candle-llm's GPU compute dtype, [`candle_llm::compute_dtype`]);
 /// its residual picks are characterised against the CPU f32 reference on the same weights rather
 /// than assumed equal. Compiled only with the `metal` feature (absent from every build without
@@ -438,10 +461,16 @@ impl Stage2Lm for Reprefill {
 mod metal {
     use super::*;
 
+    /// Bound on `max |Δlogit| / max |logit|` for Metal bf16 against CPU f32 on the synthetic model.
+    /// PROVISIONAL until the first Metal run (sc-19381): set from the measured value with headroom.
+    const MAX_REL_LOGIT_DELTA: f32 = 0.08;
+    /// Bound on the fraction of residual picks that flip (teacher-forced on the reference stream).
+    /// PROVISIONAL until the first Metal run (sc-19381): set from the measured value with headroom.
+    const MAX_FLIP_FRACTION: f64 = 0.10;
+
     /// Characterise a bf16-computing LM against the f32 reference over one 24-frame chunk: report
-    /// the flips and their margins, and bound the logit noise that produces them — each flip is a
-    /// reference near-tie (margin within twice the measured noise), and the noise itself is within
-    /// bf16 rounding of this 2-layer model. A broken kernel fails the bound; a flip does not.
+    /// the flips and their margins, and bound both the logit noise
+    /// ([`Divergence::relative_logit_delta`]) and the flip rate ([`Divergence::flip_fraction`]).
     fn check_bf16_divergence(
         tag: &str,
         reference: &mut CandleStage2Lm,
@@ -462,21 +491,16 @@ mod metal {
                 .collect::<Vec<_>>()
         );
         assert_eq!(d.positions, cb0.len() * RESIDUALS);
-        // bf16 keeps 8 significant bits; rounding weights, activations and logits through two
-        // layers moves a logit by a few bf16 ulps of the logit scale. 8 % of the scale is far past
-        // rounding.
         assert!(
-            d.max_abs_logit_delta <= 0.08 * d.max_abs_logit,
-            "{tag}: bf16 logits differ from f32 by {} at scale {} — beyond bf16 rounding",
-            d.max_abs_logit_delta,
-            d.max_abs_logit
+            d.relative_logit_delta() <= MAX_REL_LOGIT_DELTA,
+            "{tag}: relative logit delta {} exceeds {MAX_REL_LOGIT_DELTA}",
+            d.relative_logit_delta()
         );
-        for m in &d.mismatches {
-            assert!(
-                m.reference_margin >= 0.0 && m.reference_margin <= 2.0 * d.max_abs_logit_delta,
-                "{tag}: {m:?} is not an argmax near-tie under the measured noise"
-            );
-        }
+        assert!(
+            d.flip_fraction() <= MAX_FLIP_FRACTION,
+            "{tag}: flip fraction {} exceeds {MAX_FLIP_FRACTION}",
+            d.flip_fraction()
+        );
         d
     }
 

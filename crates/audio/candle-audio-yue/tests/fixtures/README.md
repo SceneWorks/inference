@@ -9,7 +9,7 @@ vendored and no weights are committed.
 | File | Consumer | What |
 | --- | --- | --- |
 | `stage2_mock_reference.json` (33 KB) | `src/stage2/tests.rs` (every lane) | The upstream loop driven by a deterministic integer mock model — the chunk schedule, batch groups, ragged tail, sub-chunk track and `fix_output` repair. |
-| `stage2_real_reference.json` (7 KB) | `tests/stage2_real_weights.rs` (`#[ignore]`, `YUE_S2_SNAPSHOT`) | The upstream loop on the real `m-a-p/YuE-s2-1B-general` (rev `9dfa90b7`), CPU. |
+| `stage2_real_reference.json` (69 KB) | `tests/stage2_real_weights.rs` (`#[ignore]`, `YUE_S2_SNAPSHOT`) | The upstream loop on the real `m-a-p/YuE-s2-1B-general` (rev `9dfa90b7`), CPU. |
 
 ## Mock fixture
 
@@ -30,14 +30,25 @@ Codebooks are stored as 3 hex digits per code (8 rows per case). Codebook-0 inpu
 ## Real-weight fixture
 
 - **Inputs**: codebook 0 of the upstream xcodec encode (`SoundStream`, `target_bw=0.5`, exactly
-  infer.py's ICL path) of a 1 s synthetic, arithmetic 16 kHz clip (a bass tone, a plucked arpeggio
-  and a vibrato lead — no third-party audio). Two single-chunk cases: frames `0..40` and `17..33`.
+  infer.py's ICL path) of a 13 s synthetic, arithmetic 16 kHz clip (a bass tone, a plucked
+  arpeggio and a vibrato lead — no third-party audio), 650 frames. Three cases, with the
+  `stage2_generate` calls upstream made (recorded in the fixture):
+
+  | Case | Frames | Upstream calls | Covers |
+  | --- | --- | --- | --- |
+  | `encode_0_40` | 40 | tail 40 | sub-chunk track (patched `num_batch == 0` path) |
+  | `encode_17_33` | 16 | tail 16 | sub-chunk track |
+  | `encode_0_650` | 650 | **one 2-row group** of 300 (`batch_size` 2) + tail 50 | upstream's **unpatched** batched branch; full per-chunk context (positions to 2702, the whole static-cache capacity) |
+
+  The 650-frame golden takes ~75 min on an M-series CPU: upstream re-prefills the whole context
+  every frame.
 - **Compute dtype: float32.** The checkpoint is bf16; upstream loads it as bf16 and computes in
   bf16. candle-llm computes in f32 on the CPU (bf16 weights upcast), so the golden is the same
   bf16 weights upcast in torch (`--compute-dtype float32`). The Rust CPU run reproduces it exactly
-  — all 8 codebooks, both cases (2026-09-24, torch 2.14.0, transformers 5.17.0).
-- **Why not bf16 compute**: re-running the reference itself in bf16 (upstream's setting) changes
-  166 of 320 codes of the 40-frame case and 21 of 128 of the 16-frame case against its own f32 run.
+  — all 8 codebooks, all three cases (2026-09-24, torch 2.14.0, transformers 5.17.0).
+- **Why not bf16 compute**: re-running the reference itself in bf16 (upstream's setting) changed
+  166 of 320 codes of a 40-frame case and 21 of 128 of a 16-frame case against its own f32 run
+  (measured on the fixture's first revision, cut from a 1 s clip).
   bf16 logits tie or near-tie often (8 significant bits across a 7168-wide slice), the first flip
   changes the teacher-forced context, and every later pick can follow. bf16 output is therefore a
   numerics-dependent realisation, not a golden — which is the divergence the Metal (bf16) tests
@@ -74,4 +85,4 @@ python scripts/reference/yue_stage2_reference.py mock
 python scripts/reference/yue_stage2_reference.py real --compute-dtype float32
 ```
 
-`real` takes about a minute on an M-series CPU and peaks near 10 GB RSS.
+`real` takes about 80 minutes on an M-series CPU (the 650-frame case) and peaked at 12.5 GB RSS.
