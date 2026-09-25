@@ -4,9 +4,17 @@
 //! component loader, and one short song segment is rendered through every production stage —
 //! mm tokenizer → 7B stage 1 → 1B stage 2 → xcodec → Vocos → splice.
 //!
-//! Two cases: `yue_en_cot` (no reference), and `yue_en_icl` with a short single-track reference
-//! (upstream's `prompt_egs/pop.00001.mp3`, decoded to f32 by `scripts/reference/yue_icl_reference.py`
-//! into `$YUE_REF_DIR/sceneworks-derived/`).
+//! Cases, each over the **worker's `LoadSpec` shape** — weights = the selected stage-1 tier
+//! directory (`<stage-1 repo>/<tier>`), `stage2` = the same tier of the stage-2 repo
+//! (`<stage-2 repo>/<tier>`), `xcodec` = the xcodec repo root (not tiered), `quantize` = the tier:
+//!
+//! - `yue_en_cot` (no reference);
+//! - `yue_en_icl` with a short single-track reference (upstream's `prompt_egs/pop.00001.mp3`,
+//!   decoded to f32 by `scripts/reference/yue_icl_reference.py` into
+//!   `$YUE_REF_DIR/sceneworks-derived/`);
+//! - `yue_en_cot` over the tiered repo **roots** — the other layout
+//!   [`candle_audio_yue::snapshot::resolve_tier_dir`] publicly accepts (the worker does not send
+//!   it; a direct engine caller may).
 //!
 //! Gated like the other real-weight tests: `#[ignore]`d in ordinary runs; under `--ignored` the
 //! variables are **required** (unset panics — the test never passes silently).
@@ -19,12 +27,14 @@
 //! ```
 //!
 //! `YUE_SNAPSHOT_ROOT` holds the tiered rehost roots `yue-s1-7b-anneal-en-{cot,icl}-candle/`,
-//! `yue-s2-1b-general-candle/` and `xcodec-mini-infer/`. `YUE_TIER` (default `q4`) is the asserted
-//! tier for both LMs. Add `--features metal` / `--features cuda` to run it on the accelerator.
+//! `yue-s2-1b-general-candle/` and `xcodec-mini-infer/`. `YUE_TIER` (default `q4`) selects the
+//! tier directory of both LMs. Add `--features metal` / `--features cuda` to run it on the
+//! accelerator.
 //!
-//! Measured on CPU (M-series Mac, q4, release build, 2026-09-25): `yue_en_cot` 87 s wall, peak
-//! RSS 7.4 GB; `yue_en_icl` (4 s stereo clip, 0–3 s window) 159 s wall, peak RSS 9.5 GB — each
-//! stage loads and is released in turn, so the peak is the 7B q4 stage 1.
+//! Measured on CPU (M-series Mac, q4, release build, 2026-09-25, one case per process under an
+//! external RSS watchdog): worker-shape `yue_en_cot` 78 s wall, peak RSS 9.7 GB; worker-shape
+//! `yue_en_icl` (4 s stereo clip, 0–3 s window) 102 s, 6.8 GB; repo-root `yue_en_cot` 75 s,
+//! 9.7 GB. Peaks vary run to run (7.4–9.7 GB observed for the same CoT case).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -49,28 +59,41 @@ fn snapshot_root() -> PathBuf {
     )
 }
 
-fn tier() -> Option<Quant> {
+/// The tier directory name and the `quantize` it asserts.
+fn tier() -> (&'static str, Option<Quant>) {
     match std::env::var("YUE_TIER").as_deref() {
-        Err(_) | Ok("q4") => Some(Quant::Q4),
-        Ok("q8") => Some(Quant::Q8),
-        Ok("bf16") => None,
+        Err(_) | Ok("q4") => ("q4", Some(Quant::Q4)),
+        Ok("q8") => ("q8", Some(Quant::Q8)),
+        Ok("bf16") => ("bf16", None),
         Ok(other) => panic!("YUE_TIER must be q4, q8 or bf16, got {other}"),
     }
 }
 
-/// The spec the worker builds: the stage-1 tiered root as the weights, the shared stage-2 and
-/// xcodec roots as the `stage2` / `xcodec` components, the tier as `quantize`.
-fn load_spec(stage1_repo: &str) -> LoadSpec {
+/// How the LM snapshots are handed to the loader.
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    /// What the SceneWorks worker sends: each LM's selected tier directory.
+    WorkerTierDirs,
+    /// The tiered repo roots (the loader picks the tier directory).
+    RepoRoots,
+}
+
+/// The `LoadSpec` for `stage1_repo` in `layout`; xcodec is always its (untiered) repo root.
+fn load_spec(stage1_repo: &str, layout: Layout) -> LoadSpec {
     let root = snapshot_root();
-    let dir = |name: &str| {
-        let p = root.join(name);
+    let (tier_dir, quantize) = tier();
+    let dir = |repo: &str, tiered: bool| {
+        let mut p = root.join(repo);
+        if tiered && matches!(layout, Layout::WorkerTierDirs) {
+            p = p.join(tier_dir);
+        }
         assert!(p.is_dir(), "{} is not staged", p.display());
         WeightsSource::Dir(p)
     };
-    let mut spec = LoadSpec::new(dir(stage1_repo))
-        .with_component(STAGE2_COMPONENT_ID, dir("yue-s2-1b-general-candle"))
-        .with_component(XCODEC_COMPONENT_ID, dir("xcodec-mini-infer"));
-    spec.quantize = tier();
+    let mut spec = LoadSpec::new(dir(stage1_repo, true))
+        .with_component(STAGE2_COMPONENT_ID, dir("yue-s2-1b-general-candle", true))
+        .with_component(XCODEC_COMPONENT_ID, dir("xcodec-mini-infer", false));
+    spec.quantize = quantize;
     spec
 }
 
@@ -92,8 +115,8 @@ fn one_segment_request() -> GenerationRequest {
 
 /// Load `id` through the registry, render `req`, and hold the output and progress to the
 /// generator contract.
-fn render_and_check(id: &str, stage1_repo: &str, req: &GenerationRequest) {
-    let spec = load_spec(stage1_repo);
+fn render_and_check(id: &str, stage1_repo: &str, layout: Layout, req: &GenerationRequest) {
+    let spec = load_spec(stage1_repo, layout);
     let registry = candle_audio_yue::provider_registry().expect("registry builds");
     let t0 = Instant::now();
     let generator = registry
@@ -181,6 +204,18 @@ fn en_cot_renders_one_segment_through_the_registered_loader() {
     render_and_check(
         "yue_en_cot",
         "yue-s1-7b-anneal-en-cot-candle",
+        Layout::WorkerTierDirs,
+        &one_segment_request(),
+    );
+}
+
+#[test]
+#[ignore = "real weights: set YUE_SNAPSHOT_ROOT (see the module docs)"]
+fn en_cot_renders_one_segment_from_the_tiered_repo_roots() {
+    render_and_check(
+        "yue_en_cot",
+        "yue-s1-7b-anneal-en-cot-candle",
+        Layout::RepoRoots,
         &one_segment_request(),
     );
 }
@@ -226,5 +261,10 @@ fn en_icl_renders_one_segment_with_a_single_track_reference() {
         start_secs: 0.0,
         end_secs: Some(3.0),
     });
-    render_and_check("yue_en_icl", "yue-s1-7b-anneal-en-icl-candle", &req);
+    render_and_check(
+        "yue_en_icl",
+        "yue-s1-7b-anneal-en-icl-candle",
+        Layout::WorkerTierDirs,
+        &req,
+    );
 }
