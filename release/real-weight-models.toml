@@ -2537,7 +2537,7 @@ admission_vision_weight_bytes = 1152776672
 
 # sc-19387 (epic sc-19373) -- YuE-v1 lyrics2song: the four published SceneWorks rehosts the
 # `candle-audio-yue` registered loader reads. Materialized on the Windows CUDA runner under
-# `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `yue` profile, which junctions them into the
+# `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `real-weights-yue.yml`, which hard-links them into the
 # `YUE_SNAPSHOT_ROOT` layout `tests/registered_loader_real_weights.rs` expects. Each stage-1 row
 # fetches ONLY the tier its case runs (CoT at bf16, ICL at q4) rather than all three (~24 GB per
 # repo); stage 2 carries both of those tiers; xcodec fetches exactly the three checkpoints the

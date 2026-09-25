@@ -11,9 +11,9 @@ name: YuE real-weight validation (CUDA)
 # stems and the progress contract.
 #
 # The four SceneWorks rehosts are materialized into the persistent hub cache (release/
-# real-weight-models.toml, profile `yue`) and junctioned into the `YUE_SNAPSHOT_ROOT/<repo>` layout
+# real-weight-models.toml, profile `yue`) and hard-linked into the `YUE_SNAPSHOT_ROOT/<repo>` layout
 # the test reads. The reference clip is fetched at the pinned YuE commit, SHA-256-verified and
-# decoded by `scripts/release/yue_reference_clip.py` from its own hash-locked wheel set.
+# decoded by `scripts/release/yue_real_weights.py` from its own hash-locked wheel set.
 #
 # `nvidia-smi` samples device memory every 500 ms around each case. RECORD-ONLY: the box has a
 # second listener, so a co-tenant can inflate it, and no VRAM number is asserted.
@@ -107,23 +107,18 @@ jobs:
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-icl-q4 --snapshot "%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s2-1b-general --snapshot "%CANDLE_AUDIO_YUE_S2_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-xcodec-mini-infer --snapshot "%CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT%" || exit /b 1
-      # The test reads `YUE_SNAPSHOT_ROOT/<repo>`; junctions (no privilege needed, unlike /D links)
-      # give it that layout over the hub-cache snapshot directories without copying ~24 GB.
+      # The test reads `YUE_SNAPSHOT_ROOT/<repo>`. Hard links to the resolved blobs, not junctions:
+      # hub-cache files are relative symlinks that do not resolve behind a junction (see the script).
       - name: Lay out the YuE snapshot root
         shell: cmd
         run: |
-          if exist "%YUE_SNAPSHOT_ROOT%" rmdir /s /q "%YUE_SNAPSHOT_ROOT%"
-          mkdir "%YUE_SNAPSHOT_ROOT%" || exit /b 1
-          mklink /J "%YUE_SNAPSHOT_ROOT%\yue-s1-7b-anneal-en-cot-candle" "%CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT%" || exit /b 1
-          mklink /J "%YUE_SNAPSHOT_ROOT%\yue-s1-7b-anneal-en-icl-candle" "%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" || exit /b 1
-          mklink /J "%YUE_SNAPSHOT_ROOT%\yue-s2-1b-general-candle" "%CANDLE_AUDIO_YUE_S2_SNAPSHOT%" || exit /b 1
-          mklink /J "%YUE_SNAPSHOT_ROOT%\xcodec-mini-infer" "%CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/yue_real_weights.py stage-root --root "%YUE_SNAPSHOT_ROOT%" --repo "yue-s1-7b-anneal-en-cot-candle=%CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT%" --repo "yue-s1-7b-anneal-en-icl-candle=%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" --repo "yue-s2-1b-general-candle=%CANDLE_AUDIO_YUE_S2_SNAPSHOT%" --repo "xcodec-mini-infer=%CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT%" || exit /b 1
       - name: Stage the upstream ICL reference clip
         shell: cmd
         run: |
           "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\yue-reference-decode" -r .github/requirements/real-weights-yue-reference-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\yue-reference-decode"
-          "%REVIEWED_PYTHON%" scripts/release/yue_reference_clip.py --ref-dir "%YUE_REF_DIR%" > "%YUE_EVIDENCE%\reference-clip.log" 2>&1 || (type "%YUE_EVIDENCE%\reference-clip.log" & exit /b 1)
+          "%REVIEWED_PYTHON%" scripts/release/yue_real_weights.py stage-reference --ref-dir "%YUE_REF_DIR%" > "%YUE_EVIDENCE%\reference-clip.log" 2>&1 || (type "%YUE_EVIDENCE%\reference-clip.log" & exit /b 1)
           type "%YUE_EVIDENCE%\reference-clip.log"
       # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings.
       - name: Build the YuE CUDA test binary
