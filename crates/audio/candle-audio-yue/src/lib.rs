@@ -12,7 +12,7 @@
 //! | stage | module | seam | replaced by |
 //! |---|---|---|---|
 //! | tokenizer / prompt builder | [`tokenizer`] | [`tokenizer::PromptTokenizer::build`] | sc-19376 |
-//! | ICL reference encoder | [`icl`] | [`icl::IclEncoder::encode`] | sc-19379 |
+//! | ICL reference encoder | [`icl`] (+ [`hubert`]) | [`icl::IclEncoder::encode`] | sc-19379 (ported) |
 //! | stage 1 (7B Llama) | [`stage1`] | [`stage1::Stage1Model`] (`begin_render` / `begin_segment` / `step` / `end_segment`) | sc-19380 |
 //! | stage 2 (1B Llama) | [`stage2`] | [`stage2::Stage2Model::upsample`] | sc-19381 |
 //! | xcodec decode | [`codec`] | [`codec::CodecDecoder::decode`] | sc-19377 (ported) |
@@ -20,7 +20,7 @@
 //! | limiter + low-band splice | [`splice`] | [`splice::SpliceFn`] | sc-19378 (ported) |
 //!
 //! **Walking skeleton (sc-19382).** Every production loader whose story has not landed refuses
-//! with `Unsupported` (landed: tokenizer sc-19376, stage 1 sc-19380, codec sc-19377), so a
+//! with `Unsupported` (landed: tokenizer sc-19376, ICL encoder sc-19379, stage 1 sc-19380, codec sc-19377, Vocos + splice sc-19378), so a
 //! registered provider fails closed instead of rendering placeholder audio;
 //! the story named in the table replaces that module's `load`. Each module's deterministic,
 //! weights-free `load_stub` is the end-to-end seam test's double. The engine itself — staged residency
@@ -42,6 +42,7 @@ pub use candle_audio::gen_core;
 pub mod codec;
 pub mod config;
 pub mod engine;
+pub mod hubert;
 pub mod icl;
 pub mod model;
 pub mod splice;

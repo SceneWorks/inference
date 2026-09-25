@@ -402,6 +402,35 @@ fn icl_render_releases_the_reference_encoder_before_stage1_loads() {
     ));
 }
 
+#[test]
+fn an_icl_request_against_a_non_icl_checkpoint_is_refused_before_any_stage_loads() {
+    let mut req = song(None);
+    req.conditioning = vec![Conditioning::ReferenceAudio {
+        audio: AudioTrack {
+            samples: vec![0.3; 16_000 * 2],
+            sample_rate: 16_000,
+            channels: 1,
+            stems: Vec::new(),
+        },
+        strength: None,
+    }];
+    for language in [Language::En, Language::Zh, Language::JpKr] {
+        let (log, steps) = (Log::default(), Arc::new(Mutex::new(0)));
+        let g = engine(Variant::new(language, Mode::Cot), &log, &steps, None);
+        match g.generate(&req, &mut |_| {}) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("ReferenceAudio"), "{m}"),
+            other => panic!(
+                "{language:?} CoT accepted a reference: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing (not even the ICL encoder) loads for a refused request"
+        );
+    }
+}
+
 fn log_default() -> Log {
     Log::default()
 }
@@ -493,7 +522,13 @@ fn production_wiring_refuses_instead_of_rendering_placeholder_audio() {
         xcodec: "/staged/xcodec".into(),
     };
     assert!((s.tokenizer)(&assets).is_ok(), "tokenizer");
-    assert!(refused((s.icl_encoder)(&assets)), "icl encoder");
+    // The ICL encoder (sc-19379) is real: with nothing staged it fails to load (never
+    // `Unsupported`); `icl::tests::production_load_encodes_a_staged_checkpoint_instead_of_refusing`
+    // loads it.
+    assert!(
+        matches!((s.icl_encoder)(&assets), Err(e) if !matches!(e, Error::Unsupported(_))),
+        "icl encoder"
+    );
     // Stage 1 is real (sc-19380): an unstaged snapshot is a load error, not the refusal.
     assert!(
         matches!((s.stage1)(&assets, None), Err(Error::Msg(_))),
