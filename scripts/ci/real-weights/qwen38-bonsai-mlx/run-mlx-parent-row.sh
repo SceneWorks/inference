@@ -1,0 +1,2 @@
+BINARY="$(cat "$QWEN_BONSAI_OUTPUT_DIR/binary.txt")"
+python3.12 scripts/release/qwen38_bonsai_terminal.py run --binary "$BINARY" --test-name qwen38_bonsai::native_comparison --model-id mlx-qwen38-parent --model-key bonsai-qwen38-parent --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 --snapshot "$BONSAI_QWEN38_SNAPSHOT" --model-path "$BONSAI_QWEN38_SNAPSHOT" --runtime-sha "$GITHUB_SHA" --cases "$BONSAI_CASES,$QWEN38_ACCEPTANCE_CASES" --preflight "$QWEN_BONSAI_OUTPUT_DIR/mlx-qwen38-parent-preflight.json" --output "$QWEN_BONSAI_OUTPUT_DIR/mlx-qwen38-parent"

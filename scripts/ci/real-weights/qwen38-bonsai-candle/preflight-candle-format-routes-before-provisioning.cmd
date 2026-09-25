@@ -1,0 +1,11 @@
+"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-mlx-2bit --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-bonsai-mlx-preflight.json"
+if errorlevel 1 (echo bonsai=false>>"%GITHUB_OUTPUT%") else (echo bonsai=true>>"%GITHUB_OUTPUT%")
+"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant pq2 --vision-variant bf16 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-bf16-preflight.json"
+if errorlevel 1 (echo pq2_bf16=false>>"%GITHUB_OUTPUT%") else (echo pq2_bf16=true>>"%GITHUB_OUTPUT%")
+"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant pq2 --vision-variant q8 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-pq2-q8-preflight.json"
+if errorlevel 1 (echo pq2_q8=false>>"%GITHUB_OUTPUT%") else (echo pq2_q8=true>>"%GITHUB_OUTPUT%")
+"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant bf16 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-bf16-preflight.json"
+if errorlevel 1 (echo ptq1_bf16=false>>"%GITHUB_OUTPUT%") else (echo ptq1_bf16=true>>"%GITHUB_OUTPUT%")
+"%REVIEWED_PYTHON%" scripts/release/qwen38_bonsai_terminal.py preflight --model-key bonsai-gguf --language-variant ptq1 --vision-variant q8 --load-profile candle-packed-cuda --reservation "%BONSAI_GPU_RESERVATION%" --reservation-token "%BONSAI_RESERVATION_TOKEN%" --output "%RUNNER_TEMP%\qwen38-bonsai-candle\functional-candle-ptq1-q8-preflight.json"
+if errorlevel 1 (echo ptq1_q8=false>>"%GITHUB_OUTPUT%") else (echo ptq1_q8=true>>"%GITHUB_OUTPUT%")
+exit /b 0

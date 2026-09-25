@@ -1,0 +1,6 @@
+"%REVIEWED_PYTHON%" scripts/release/verify_mage_candle_transfer.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1
+"%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\mage-oracle-verify" -r .github/requirements/real-weights-mage-verify-windows-x64-py312.txt || exit /b 1
+set "PYTHONPATH=%RUNNER_TEMP%\mage-oracle-verify"
+"%REVIEWED_PYTHON%" scripts/release/provision_mage_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-edit-artifact || exit /b 1
+"%REVIEWED_PYTHON%" scripts/release/provision_mage_edit_variants.py --gen "%CANDLE_MAGE_SNAPSHOT%" --edit "%CANDLE_MAGE_EDIT_SNAPSHOT%" --edit-base "%CANDLE_MAGE_EDIT_BASE_SNAPSHOT%" --edit-turbo "%CANDLE_MAGE_EDIT_TURBO_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" --verify-only || exit /b 1
+"%REVIEWED_PYTHON%" scripts/release/verify_mage_candle_oracles.py --snapshot "%CANDLE_MAGE_SNAPSHOT%" --edit-snapshot "%CANDLE_MAGE_EDIT_SNAPSHOT%" --output "%MAGE_GOLDEN_DIR%" || exit /b 1

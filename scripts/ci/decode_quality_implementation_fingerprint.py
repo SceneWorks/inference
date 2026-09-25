@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOTS = (
     ".github/workflows/real-weights.yml",
+    "scripts/ci/real-weights",
     "Cargo.lock",
     "Cargo.toml",
     "crates/contracts/gen-core/Cargo.toml",

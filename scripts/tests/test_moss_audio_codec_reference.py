@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 from scripts.reference.moss_audio_codec_reference import (
     CLIP_FRAMES,
     CLIP_PATH,
@@ -269,7 +270,7 @@ class ReferenceArmStaysWiredTests(unittest.TestCase):
             )
 
     def test_the_lane_runs_the_test_and_no_longer_calls_it_half_gated(self) -> None:
-        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertIn("run_one moss_audio_codec_encode_roundtrip_and_reference", workflow)
         self.assertNotIn(
             "HALF-GATED",
@@ -302,7 +303,7 @@ class VoiceCloneFixtureTests(unittest.TestCase):
         self.clip_bytes = VOICECLONE_CLIP_PATH.read_bytes()
         self.metadata = json.loads(VOICECLONE_METADATA_PATH.read_text(encoding="utf-8"))
         self.conformance = CONFORMANCE_PATH.read_text(encoding="utf-8")
-        self.workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.workflow = real_weights_inline_text()
 
     def test_clip_is_whole_f32_samples_at_the_codec_rate(self) -> None:
         self.assertEqual(len(self.clip_bytes) % 4, 0)
