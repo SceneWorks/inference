@@ -8,9 +8,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_core::{Device, Tensor};
+use candle_core::safetensors::{Load, SliceSafetensors};
+use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
+use crate::primitives::quant::ggml_block_storage;
 
 /// A loaded set of named weight tensors, plus the device they live on.
 #[derive(Debug)]
@@ -37,6 +39,12 @@ impl Weights {
     }
 
     /// Load and merge every `*.safetensors` shard in a snapshot directory onto `device`.
+    ///
+    /// A prepared tier's stored GGML block tensors (sc-19375: `U8` `[.., rows, blocks,
+    /// block_bytes]`, see [`from_ggml_block_tensor`](crate::primitives::quant::from_ggml_block_tensor))
+    /// are read onto the **host** instead: the loader rebuilds each as a `QTensor` on `device` straight from those
+    /// bytes, so a copy of them on `device` would only be a second, transient device residency of
+    /// every quantized projection. Load admission prices them on the host accordingly.
     pub fn from_dir(dir: impl AsRef<Path>, device: &Device) -> Result<Self> {
         let dir = dir.as_ref();
         let mut shards: Vec<_> = std::fs::read_dir(dir)?
@@ -52,9 +60,20 @@ impl Weights {
         shards.sort(); // deterministic merge order
         let mut tensors = HashMap::new();
         for shard in shards {
-            let part = candle_core::safetensors::load(&shard, device)
-                .map_err(|e| Error::Msg(format!("load_safetensors {}: {e}", shard.display())))?;
-            tensors.extend(part);
+            let read = |e: candle_core::Error| {
+                Error::Msg(format!("load_safetensors {}: {e}", shard.display()))
+            };
+            // `candle_core::safetensors::load`, but choosing each tensor's device.
+            let data = std::fs::read(&shard)?;
+            let file = SliceSafetensors::new(&data).map_err(read)?;
+            for (name, view) in file.tensors() {
+                let is_u8 = DType::try_from(view.dtype()).is_ok_and(|d| d == DType::U8);
+                let target = match ggml_block_storage(is_u8, view.shape()) {
+                    Some(_) => &Device::Cpu,
+                    None => device,
+                };
+                tensors.insert(name, view.load(target).map_err(read)?);
+            }
         }
         Ok(Self {
             tensors,

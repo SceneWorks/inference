@@ -891,7 +891,7 @@ struct Gemma4Runtime {
 /// Qwen3.5/3.8 ships both VLM-wrapped and flat text-only checkpoints. The decoder math is the
 /// same; only the root of its HF tensor names differs. Reject mixed roots rather than silently
 /// choosing one set of weights from an ambiguous snapshot.
-fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static str> {
+pub(crate) fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static str> {
     match (
         has_key("model.language_model.embed_tokens.weight"),
         has_key("model.embed_tokens.weight"),
@@ -1008,17 +1008,25 @@ pub(crate) fn nvfp4_model_gate(spec: &LoadSpec) -> CoreResult<()> {
 /// [`nvfp4_model_gate`], sc-24140 feature-end review). Packed means both: a `quantization` block
 /// in `config.json` (top level or `text_config`, where [`ModelConfig`] reads it) **and** a
 /// `<stem>.weight` whose `<stem>.scales` sidecar the snapshot names. A prepared Q4/Q8 snapshot
-/// ([`crate::prepare`]) carries the block over *dense* weights, so it is not packed: NVFP4
-/// quantizes its projections like any dense snapshot's. The tensor names come from
-/// `model.safetensors.index.json` when it exists, else from each shard's header — never from
-/// tensor data. An unreadable index or header is left to the loader's own error.
+/// ([`crate::prepare`]) whose block says `storage: "ggml"` stores its projections as GGML blocks
+/// (sc-19375) and is packed too; an older prepared snapshot carries the block over *dense*
+/// weights, so it is not packed: NVFP4 quantizes its projections like any dense snapshot's. The
+/// tensor names come from `model.safetensors.index.json` when it exists, else from each shard's
+/// header — never from tensor data. An unreadable index or header is left to the loader's own
+/// error.
 fn packed_affine_refusal(dir: &Path, config: &Value) -> Option<String> {
-    let has_block = config.get("quantization").is_some()
-        || config
+    let block = config.get("quantization").or_else(|| {
+        config
             .get("text_config")
-            .is_some_and(|text| text.get("quantization").is_some());
-    if !has_block {
-        return None;
+            .and_then(|text| text.get("quantization"))
+    });
+    let block = block?;
+    if block.get("storage").and_then(Value::as_str) == Some(crate::prepare::GGML_STORAGE) {
+        return Some(
+            "this snapshot's projections are stored as GGML blocks (a prepared Q4 / Q8 tier); \
+             NVFP4 projections are quantized from a dense snapshot"
+                .into(),
+        );
     }
     let names = snapshot_tensor_names(dir)?;
     let mut stems: Vec<&str> = names
@@ -1342,8 +1350,11 @@ impl LlamaProvider {
             let config = read_json(source, "config.json");
             let decoder = PricedDecoder::from_config(config.as_ref());
             let format = decoder.format(requested);
-            let builds = matches!(decoder, PricedDecoder::Causal(_) | PricedDecoder::Qwen35(_));
-            let (cast, copy) = if builds && (cuda || format.is_some()) {
+            let builds = matches!(
+                decoder,
+                PricedDecoder::Causal(_) | PricedDecoder::Qwen35(..)
+            );
+            let (cast, copy, held) = if builds && (cuda || format.is_some()) {
                 let tensors = snapshot_tensor_headers(source)?;
                 let (copy, consumed) = match format {
                     Some(format) => snapshot_quantized_copy_bytes(&decoder, format, &tensors)
@@ -1351,16 +1362,20 @@ impl LlamaProvider {
                     None => (0, Default::default()),
                 };
                 // Off CUDA the compute dtype is f32 and the host rule's three payloads cover it.
-                let cast = if cuda {
-                    snapshot_cast_copy_bytes(&tensors, &consumed).ok_or_else(overflow)?
+                let (cast, held) = if cuda {
+                    (
+                        snapshot_cast_copy_bytes(&tensors, &consumed).ok_or_else(overflow)?,
+                        stored_block_bytes(&tensors).ok_or_else(overflow)?,
+                    )
                 } else {
-                    0
+                    (0, 0)
                 };
-                (cast, copy)
+                (cast, copy, held)
             } else {
-                (0, 0)
+                (0, 0, 0)
             };
             LoadWorkingSet::resident_payload(payload, cast, copy, decoder.is_packed())
+                .holding_on_host(held)
         };
         let (host_required, device_required) =
             load_memory_requirements(payload, staging, projector, cuda, working)
@@ -1381,7 +1396,8 @@ impl LlamaProvider {
     /// `requested` is an explicit load-time quantization (`spec.quantize`); when it is `None` a
     /// llama-family snapshot's own persisted `quantization` block (written by the
     /// [`prepare`](crate::prepare) writer) is honored, so a `LoadSpec::dense` of a prepared Q4/Q8
-    /// snapshot loads quantized. The qwen3_5 decoder reads only `requested`.
+    /// snapshot loads quantized. The qwen3_5 decoder honours only a stored-block (`storage:
+    /// "ggml"`, sc-19375) block, so a qwen3_5 tier prepared before then keeps loading dense.
     fn load_dir(
         dir: &Path,
         device: &Device,
@@ -1419,6 +1435,15 @@ impl LlamaProvider {
                 descriptor.family = "prism_hadamard_qwen35".into();
                 descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
             }
+            // An explicit request wins; otherwise a prepared tier's stored-block format (sc-19375).
+            // A bare persisted block (a tier prepared before sc-19375, dense-rounded weights) is
+            // not honoured here, so such a tier keeps loading dense exactly as it did.
+            let format = match (prism.is_some(), requested) {
+                (false, None) => {
+                    crate::prepare::persisted_ggml_blocks(&cfg_value).map(ProjectionFormat::from)
+                }
+                (_, requested) => requested.cloned(),
+            };
             let m = if let Some(registry) = prism.as_ref() {
                 Qwen35Model::from_prism_weights(
                     &weights,
@@ -1430,13 +1455,16 @@ impl LlamaProvider {
                 .map_err(to_core)?
             } else {
                 let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
-                Qwen35Model::from_weights_format(&weights, prefix, qcfg, requested)
+                Qwen35Model::from_weights_format(&weights, prefix, qcfg, format.as_ref())
                     .map_err(to_core)?
             };
             let configured_layers = m.config().mtp_num_hidden_layers;
             let has_mtp_tensors = weights.keys().any(|key| key.starts_with("mtp."));
             let mtp = if configured_layers > 0 {
-                Some(Qwen35Mtp::from_weights_format(&weights, &m, requested).map_err(to_core)?)
+                Some(
+                    Qwen35Mtp::from_weights_format(&weights, &m, format.as_ref())
+                        .map_err(to_core)?,
+                )
             } else if has_mtp_tensors {
                 return Err(CoreError::Load(
                     "qwen3_5 checkpoint carries MTP tensors while config disables MTP".into(),
@@ -1793,6 +1821,17 @@ impl LlamaProvider {
         self.model.is_quantized()
     }
 
+    /// The loaded Llama-family decoder, or `None` for the Qwen3.6 hybrid. An engine that runs its
+    /// own decode loop over raw logits (YuE's CFG / allow-range / teacher-forced loops, epic
+    /// sc-19373) loads through [`LlamaProvider::load`] — the same `LoadSpec`, admission and
+    /// persisted-`quantization` handling as every other caller — and drives this directly.
+    pub fn causal_lm(&self) -> Option<&CausalLm> {
+        match &self.model {
+            Decoder::Causal(m) => Some(m),
+            Decoder::Qwen35(_) => None,
+        }
+    }
+
     /// The load telemetry: the requested weight format and the resident weight census by
     /// projection kind (sc-24135).
     pub fn load_record(&self) -> LoadRecord {
@@ -2138,7 +2177,9 @@ fn load_memory_requirements(
         .checked_add(working.cast)?
         .checked_add(working.copy)?;
     let host = match (working.host, cuda) {
-        (HostRule::Dense, true) => staging,
+        // Plus the stored GGML blocks the weight reader keeps on the host until the decoder is
+        // built (sc-19375).
+        (HostRule::Dense, true) => staging.checked_add(working.held)?,
         (HostRule::Dense, false) => payload.checked_mul(3)?,
         (HostRule::Packed, _) | (HostRule::Gguf, true) => payload.checked_mul(2)?,
         (HostRule::Gguf, false) => working_bytes,
@@ -2205,6 +2246,10 @@ struct LoadWorkingSet {
     cast: u64,
     /// The quantized projection copy, built beside the source.
     copy: u64,
+    /// Payload bytes held on the **host** rather than the device until the decoder is built: a
+    /// prepared tier's stored GGML blocks, which the weight reader keeps host-side so each
+    /// `QTensor` is built once on the device (sc-19375). Not part of `source`.
+    held: u64,
     /// How the host domain is priced.
     host: HostRule,
 }
@@ -2218,6 +2263,7 @@ impl LoadWorkingSet {
             source: payload,
             cast,
             copy,
+            held: 0,
             host: if packed {
                 HostRule::Packed
             } else {
@@ -2225,6 +2271,34 @@ impl LoadWorkingSet {
             },
         }
     }
+
+    /// Move `bytes` of the resident source to the host ([`LoadWorkingSet::held`]).
+    fn holding_on_host(self, bytes: u64) -> Self {
+        Self {
+            source: self.source.saturating_sub(bytes),
+            held: bytes,
+            ..self
+        }
+    }
+}
+
+/// The payload bytes of a snapshot's stored GGML block tensors
+/// ([`ggml_block_storage`](crate::primitives::quant::ggml_block_storage)) — what
+/// [`Weights::from_dir`] reads onto the host instead of the device (sc-19375). `None` on
+/// overflow.
+fn stored_block_bytes(tensors: &SnapshotTensors) -> Option<u64> {
+    tensors
+        .values()
+        .filter(|t| {
+            crate::primitives::quant::ggml_block_storage(t.dtype == "U8", &t.shape).is_some()
+        })
+        .try_fold(0u64, |total, t| {
+            let bytes = t
+                .shape
+                .iter()
+                .try_fold(1u64, |n, &d| n.checked_mul(d as u64))?;
+            total.checked_add(bytes)
+        })
 }
 
 /// The projection format a load stores its quantized copy in, as admission prices it.
@@ -2271,8 +2345,9 @@ enum PricedDecoder {
     Prism,
     /// A llama-family [`CausalLm`].
     Causal(ModelConfig),
-    /// The qwen3_5 hybrid ([`Qwen35Model`] and its [`Qwen35Mtp`]).
-    Qwen35(Qwen35Config),
+    /// The qwen3_5 hybrid ([`Qwen35Model`] and its [`Qwen35Mtp`]), and the stored-block format a
+    /// prepared tier persists ([`crate::prepare::persisted_ggml_blocks`]).
+    Qwen35(Qwen35Config, Option<QuantSpec>),
     /// No readable config, or one the loader refuses before it builds a projection.
     Refused,
 }
@@ -2287,9 +2362,10 @@ impl PricedDecoder {
             return Self::Prism;
         }
         match Architecture::from_config(config) {
-            Ok(Architecture::Qwen35) => {
-                Qwen35Config::from_json(config).map_or(Self::Refused, Self::Qwen35)
-            }
+            Ok(Architecture::Qwen35) => Qwen35Config::from_json(config)
+                .map_or(Self::Refused, |cfg| {
+                    Self::Qwen35(cfg, crate::prepare::persisted_ggml_blocks(config))
+                }),
             Ok(_) => ModelConfig::from_json(config).map_or(Self::Refused, Self::Causal),
             Err(_) => Self::Refused,
         }
@@ -2301,13 +2377,13 @@ impl PricedDecoder {
 
     /// The format the loader stores the projections in: the request; else, for a `CausalLm`,
     /// the snapshot's persisted `quantization` block (a prepared Q4 / Q8 snapshot, which
-    /// `load_dir` re-quantizes on load). The qwen3_5 loader reads only the request
-    /// (`Qwen35Model::from_weights_format(.., requested)`), so a persisted block there is not
+    /// `load_dir` re-quantizes on load or reads as stored blocks). The qwen3_5 loader honours
+    /// only a stored-block (`storage: "ggml"`) block, so a bare persisted block there is not
     /// priced: that load keeps its projections dense.
     fn format(&self, requested: Option<CopyFormat>) -> Option<CopyFormat> {
         match self {
             Self::Causal(cfg) => requested.or(cfg.quantization.map(CopyFormat::Ggml)),
-            Self::Qwen35(_) => requested,
+            Self::Qwen35(_, persisted) => requested.or(persisted.map(CopyFormat::Ggml)),
             Self::Prism | Self::Refused => None,
         }
     }
@@ -2414,21 +2490,26 @@ fn snapshot_quantized_copy_bytes<'a>(
         PricedDecoder::Causal(cfg) => {
             let root = llama::decoder_root(cfg, "", |key| tensors.contains_key(key));
             for (key, tensor) in tensors {
-                let Some((key_root, layer, suffix)) = split_layer_key(key) else {
-                    continue;
-                };
-                if key_root != root
-                    || layer >= cfg.num_layers
-                    || !llama::quantizes_layer_tensor(suffix)
-                {
+                // The loader's own selection — the rule the preparer stores blocks by, too.
+                if !llama::loads_quantized(cfg, &root, key) {
                     continue;
                 }
+                let Some((_, layer, suffix)) = split_layer_key(key) else {
+                    continue;
+                };
                 let fused = matches!(
                     suffix,
                     "self_attn.qkv_proj.weight" | "mlp.gate_up_proj.weight"
                 );
+                // A stored GGML block tensor (a prepared Q4 / Q8 snapshot, sc-19375) is rebuilt
+                // as `QTensor`s on the device — a fused one part by part — while its source
+                // bytes stay on the host ([`stored_block_bytes`]).
+                let stored = crate::primitives::quant::ggml_block_storage(
+                    tensor.dtype == "U8",
+                    &tensor.shape,
+                );
                 let stem = key.strip_suffix(".weight").unwrap_or(key);
-                if let Some(scales) = tensors.get(&format!("{stem}.scales")) {
+                if let (None, Some(scales)) = (stored, tensors.get(&format!("{stem}.scales"))) {
                     // A fused triple is refused by the loader; an unfused one is repacked.
                     if !fused {
                         let biases = tensors.get(&format!("{stem}.biases"));
@@ -2436,7 +2517,10 @@ fn snapshot_quantized_copy_bytes<'a>(
                     }
                     continue;
                 }
-                let Some((rows, cols)) = tensor.dims2() else {
+                let Some((rows, cols)) = stored
+                    .map(|(_, rows, cols)| (rows, cols))
+                    .or_else(|| tensor.dims2())
+                else {
                     continue;
                 };
                 // The loader splits a fused tensor into its q / k / v or gate / up rows and
@@ -2457,6 +2541,15 @@ fn snapshot_quantized_copy_bytes<'a>(
                     }
                     _ => vec![rows],
                 };
+                if let Some((dtype, _, _)) = stored {
+                    for part in parts {
+                        add(ggml_device_bytes(
+                            (part as u64).checked_mul(cols as u64)?,
+                            dtype,
+                        )?)?;
+                    }
+                    continue;
+                }
                 // An NVFP4 part the FP4 GEMM cannot serve stays dense (as its source's cast).
                 if !parts.iter().any(|&part| format.keeps_dense(part, cols)) {
                     consumed.insert(key.as_str());
@@ -2481,26 +2574,40 @@ fn snapshot_quantized_copy_bytes<'a>(
                 }
             }
         }
-        PricedDecoder::Qwen35(cfg) => {
+        PricedDecoder::Qwen35(cfg, _) => {
             let Ok(prefix) = qwen35_dense_prefix(|key| tensors.contains_key(key)) else {
                 return Some((0, consumed));
             };
-            let mtp_layers = cfg.mtp_num_hidden_layers;
             for (key, tensor) in tensors {
-                let loaded = match split_layer_key(key) {
-                    Some((root, layer, _)) => {
-                        (root == prefix && layer < cfg.num_layers)
-                            || (root == "mtp" && layer < mtp_layers)
-                    }
-                    None => mtp_layers > 0,
-                };
-                if !loaded || !qwen35::quantizes_tensor(key) {
+                // The loader's own selection — the rule the preparer stores blocks by, too.
+                if !qwen35::loads_quantized(cfg, prefix, key) {
                     continue;
                 }
                 consumed.insert(key.as_str());
                 // The stacked MoE experts are quantized one expert slice at a time: a
                 // `[mi, hidden]` gate and up from `gate_up_proj`, a `[hidden, mi]` down.
                 let stacked = key.rsplit_once(".mlp.experts.").map(|(_, name)| name);
+                // A prepared tier's stored GGML blocks (sc-19375) are rebuilt slice by slice
+                // exactly as stored, at the blocks each slice holds.
+                if let Some((dtype, rows, cols)) = crate::primitives::quant::ggml_block_storage(
+                    tensor.dtype == "U8",
+                    &tensor.shape,
+                ) {
+                    let slices = match (stacked, cfg.moe) {
+                        (Some("gate_up_proj"), Some(moe)) => 2 * moe.num_experts as usize,
+                        (Some("down_proj"), Some(moe)) => moe.num_experts as usize,
+                        (Some(_), _) => continue,
+                        (None, _) => 1,
+                    };
+                    let slice = ggml_device_bytes(
+                        (rows.checked_div(slices)? as u64).checked_mul(cols as u64)?,
+                        dtype,
+                    )?;
+                    for _ in 0..slices {
+                        add(slice)?;
+                    }
+                    continue;
+                }
                 match (stacked, cfg.moe, &tensor.shape[..]) {
                     (Some("gate_up_proj"), Some(moe), &[_, _, hidden]) => {
                         let slice =
@@ -2673,6 +2780,7 @@ fn gguf_working_set(
         source,
         cast,
         copy,
+        held: 0,
         host: HostRule::Gguf,
     })
 }
@@ -4487,6 +4595,7 @@ mod tests {
             source: u64::MAX / 2,
             cast: u64::MAX / 2,
             copy: 0,
+            held: 0,
             host: HostRule::Gguf,
         };
         for cuda in [true, false] {
@@ -5695,6 +5804,7 @@ mod tests {
             source: map,
             cast,
             copy,
+            held: 0,
             host: HostRule::Gguf,
         };
         let working = map + map / 4 + cast + copy;
@@ -6101,6 +6211,242 @@ mod tests {
         };
         let out = provider.generate(&request, &mut |_| {}).expect("decode");
         assert_eq!(out.usage.generated_tokens, 4);
+    }
+
+    /// Last-position logits of a loaded provider (either decoder) over a fixed prompt, on the
+    /// host.
+    fn provider_logits(provider: &super::LlamaProvider) -> Vec<f32> {
+        use candle_core::{DType, Device};
+        let prompt = vec![1u32, 5, 9, 2, 7];
+        let host = |t: Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        match &provider.model {
+            Decoder::Causal(m) => {
+                let ids = Tensor::from_vec(prompt, (1, 5), m.device()).unwrap();
+                host(m.decode_logits(&ids, &mut m.new_cache(), 0).unwrap())
+            }
+            Decoder::Qwen35(m) => {
+                let ids = Tensor::from_vec(prompt, (1, 5), m.device()).unwrap();
+                host(m.decode_logits(&ids, &mut m.new_cache(), 0).unwrap())
+            }
+        }
+    }
+
+    /// A tiny `Phi3ForCausalLM` snapshot: the llama parts with q‖k‖v fused into `qkv_proj` and
+    /// gate‖up into `gate_up_proj`, 64 wide (Q8_0; Q4_0 under Q4), bf16 on disk.
+    fn phi3_snapshot() -> tempfile::TempDir {
+        let (mut cfg, mut w) = llama_parts(40, 64, 64, 2, 1, 2);
+        cfg["architectures"] = serde_json::json!(["Phi3ForCausalLM"]);
+        cfg["model_type"] = serde_json::json!("phi3");
+        for i in 0..2 {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            let mut take = |s: &str| w.remove(&p(s)).unwrap();
+            let qkv = Tensor::cat(
+                &[
+                    take("self_attn.q_proj.weight"),
+                    take("self_attn.k_proj.weight"),
+                    take("self_attn.v_proj.weight"),
+                ],
+                0,
+            )
+            .unwrap();
+            let gate_up = Tensor::cat(
+                &[take("mlp.gate_proj.weight"), take("mlp.up_proj.weight")],
+                0,
+            )
+            .unwrap();
+            w.insert(p("self_attn.qkv_proj.weight"), qkv);
+            w.insert(p("mlp.gate_up_proj.weight"), gate_up);
+        }
+        write_snapshot(&cfg, &w, 40)
+    }
+
+    /// Prepare `src` as a `quantize` tier through the registered candle preparer.
+    fn prepare_tier(src: &std::path::Path, quantize: core_llm::Quantize) -> tempfile::TempDir {
+        let out = tempfile::Builder::new()
+            .prefix("candle-tier-")
+            .tempdir()
+            .unwrap();
+        crate::prepare::prepare(&core_llm::PrepareSpec::quantized(
+            src.to_path_buf(),
+            out.path().to_path_buf(),
+            quantize,
+        ))
+        .expect("prepare the tier");
+        out
+    }
+
+    /// sc-19375, one decoder family: a `quantize` tier of `src` stores **every** tensor
+    /// `quantized(key)` names as GGML blocks (`U8`) — a fraction of the dense bytes — and writes
+    /// every other tensor exactly as read; it loads with no request (its persisted block drives
+    /// it) to the logits of a load-time quantization of the source, and admission prices its
+    /// device copy exactly as that load-time copy.
+    fn assert_family_tier(
+        tag: &str,
+        src: &std::path::Path,
+        quantize: core_llm::Quantize,
+        quantized: impl Fn(&str) -> bool,
+    ) {
+        let tier = prepare_tier(src, quantize);
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tier.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["quantization"]["storage"], "ggml", "{tag}");
+        let source = super::snapshot_tensor_headers(src).unwrap();
+        let stored = super::snapshot_tensor_headers(tier.path()).unwrap();
+        assert_eq!(
+            source.keys().collect::<std::collections::BTreeSet<_>>(),
+            stored.keys().collect(),
+            "{tag}: same tensor set"
+        );
+        let elems = |h: &super::TensorHeader| h.shape.iter().product::<usize>() as u64;
+        let (mut dense_bytes, mut block_bytes, mut blocks) = (0u64, 0u64, 0);
+        for (key, header) in &source {
+            if quantized(key) {
+                assert_eq!(
+                    stored[key].dtype, "U8",
+                    "{tag}: {key} must be stored as blocks"
+                );
+                assert_eq!(
+                    stored[key].shape[..header.shape.len() - 1],
+                    header.shape[..header.shape.len() - 1],
+                    "{tag}: {key} keeps its rows"
+                );
+                dense_bytes += 2 * elems(header);
+                block_bytes += elems(&stored[key]);
+                blocks += 1;
+            } else {
+                assert_eq!(&stored[key], header, "{tag}: {key} is written as read");
+            }
+        }
+        assert!(blocks > 0, "{tag}");
+        let bound = match quantize {
+            core_llm::Quantize::Q4 => 0.3,
+            _ => 0.55,
+        };
+        assert!(
+            (block_bytes as f64) < bound * dense_bytes as f64,
+            "{tag}: {block_bytes} B of blocks for {dense_bytes} dense bf16 B"
+        );
+
+        let prepared = super::LlamaProvider::load(&spec_at(tier.path(), None)).unwrap();
+        assert!(prepared.is_quantized(), "{tag}: loads quantized");
+        let at_load = super::LlamaProvider::load(&spec_at(src, Some(quantize))).unwrap();
+        assert_eq!(
+            provider_logits(&prepared),
+            provider_logits(&at_load),
+            "{tag}: stored blocks load to the load-time-quantized model exactly"
+        );
+        let copy = |dir: &std::path::Path, quantize| {
+            super::LlamaProvider::load_memory_estimate(&spec_at(dir, quantize), true)
+                .unwrap()
+                .quantized_copy_bytes
+        };
+        assert_eq!(
+            copy(tier.path(), None),
+            copy(src, Some(quantize)),
+            "{tag}: stored blocks priced as the load-time copy"
+        );
+    }
+
+    /// sc-19375: Phi-3's fused `qkv_proj` / `gate_up_proj` are stored as GGML blocks and split
+    /// by rows at load; a Phi-3 tier prepared before then (dense-rounded weights under a bare
+    /// block) still loads quantized.
+    #[test]
+    fn a_phi3_tier_stores_its_fused_projections_as_blocks() {
+        use core_llm::Quantize;
+        let src = phi3_snapshot();
+        for quantize in [Quantize::Q8, Quantize::Q4] {
+            assert_family_tier(&format!("phi3 {quantize:?}"), src.path(), quantize, |key| {
+                key.ends_with("_proj.weight")
+            });
+        }
+
+        let legacy = tempfile::Builder::new()
+            .prefix("candle-phi3-legacy-")
+            .tempdir()
+            .unwrap();
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(src.path().join("config.json")).unwrap())
+                .unwrap();
+        config["quantization"] = serde_json::json!({ "bits": 8 });
+        std::fs::write(legacy.path().join("config.json"), config.to_string()).unwrap();
+        for file in ["tokenizer.json", "model.safetensors"] {
+            std::fs::copy(src.path().join(file), legacy.path().join(file)).unwrap();
+        }
+        let loaded = super::LlamaProvider::load(&spec_at(legacy.path(), None)).unwrap();
+        assert!(
+            loaded.is_quantized(),
+            "a dense-rounded Phi-3 tier loads quantized"
+        );
+        let at_load = super::LlamaProvider::load(&spec_at(src.path(), Some(Quantize::Q8))).unwrap();
+        assert_eq!(provider_logits(&loaded), provider_logits(&at_load));
+    }
+
+    /// sc-19375: a qwen3_5 tier stores every projection its loader quantizes — the Gated
+    /// DeltaNet `in_proj_qkv` / `in_proj_z` / `out_proj`, attention, MLP, the MTP head and the
+    /// stacked MoE experts — as GGML blocks, and its loader reads them from the stored-block
+    /// `quantization` block; the per-head `in_proj_a` / `in_proj_b`, the router, the embeddings
+    /// and the head stay as read. A qwen3_5 tier prepared before then (dense-rounded weights
+    /// under a bare block) still loads dense, exactly as it did.
+    #[test]
+    fn a_qwen35_tier_stores_its_projections_and_experts_as_blocks() {
+        use core_llm::Quantize;
+        for moe in [false, true] {
+            let src = q8_capable_qwen35_snapshot(moe);
+            let headers = super::snapshot_tensor_headers(src.path()).unwrap();
+            let expected = |key: &str| crate::models::qwen35::quantizes_tensor(key);
+            // The tricky keys really are in the fixture, on the right side of the rule.
+            let has = |suffix: &str| headers.keys().any(|k| k.ends_with(suffix) && expected(k));
+            assert!(has("linear_attn.in_proj_qkv.weight") && has("linear_attn.in_proj_z.weight"));
+            assert_eq!(has("mlp.experts.gate_up_proj"), moe);
+            assert_eq!(has("mtp.fc.weight"), !moe);
+            assert!(headers
+                .keys()
+                .any(|k| k.ends_with("in_proj_a.weight") && !expected(k)));
+            for quantize in [Quantize::Q8, Quantize::Q4] {
+                assert_family_tier(
+                    &format!("qwen3_5 moe={moe} {quantize:?}"),
+                    src.path(),
+                    quantize,
+                    expected,
+                );
+            }
+
+            let legacy = tempfile::Builder::new()
+                .prefix("candle-qwen35-legacy-")
+                .tempdir()
+                .unwrap();
+            let mut config: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(src.path().join("config.json")).unwrap(),
+            )
+            .unwrap();
+            config["quantization"] = serde_json::json!({ "bits": 8 });
+            std::fs::write(legacy.path().join("config.json"), config.to_string()).unwrap();
+            for file in ["tokenizer.json", "model.safetensors"] {
+                std::fs::copy(src.path().join(file), legacy.path().join(file)).unwrap();
+            }
+            let loaded = super::LlamaProvider::load(&spec_at(legacy.path(), None)).unwrap();
+            assert!(
+                !loaded.is_quantized(),
+                "moe={moe}: a bare block loads dense"
+            );
+            let dense = super::LlamaProvider::load(&spec_at(src.path(), None)).unwrap();
+            assert_eq!(
+                provider_logits(&loaded),
+                provider_logits(&dense),
+                "moe={moe}"
+            );
+        }
     }
 
     /// A tiny `qwen3` GGUF (2 layers, hidden 32, vocab 40): Q8_0 matrices, f32 norms, and a
