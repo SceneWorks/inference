@@ -469,12 +469,13 @@ fn divergence_metrics_are_relative_delta_and_flip_fraction() {
 mod metal {
     use super::*;
 
-    /// Bound on `max |Δlogit| / max |logit|` for Metal bf16 against CPU f32 on the synthetic model.
-    /// PROVISIONAL until the first Metal run (sc-19381): set from the measured value with headroom.
-    const MAX_REL_LOGIT_DELTA: f32 = 0.08;
-    /// Bound on the fraction of residual picks that flip (teacher-forced on the reference stream).
-    /// PROVISIONAL until the first Metal run (sc-19381): set from the measured value with headroom.
-    const MAX_FLIP_FRACTION: f64 = 0.10;
+    /// Bound on `max |Δlogit| / max |logit|` for Metal bf16 against CPU f32 on the synthetic model:
+    /// measured 0.0069 (0.0888 at logit scale 12.86; M-series Metal, 2026-09-25), ~2× headroom.
+    const MAX_REL_LOGIT_DELTA: f32 = 0.014;
+    /// Bound on the fraction of residual picks that flip, teacher-forced on the reference stream:
+    /// measured 17 of 168 (0.101 — this random model's slice logits sit close together, margins
+    /// 0.001–0.046), ~2× headroom.
+    const MAX_FLIP_FRACTION: f64 = 0.20;
 
     /// Characterise a bf16-computing LM against the f32 reference over one 24-frame chunk: report
     /// the flips and their margins, and bound both the logit noise
