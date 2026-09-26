@@ -31,10 +31,11 @@
 //! - `device_*`: `cuMemGetInfo` used bytes sampled every 20 ms — the device-wide view NVML reports,
 //!   so a co-tenant on the same GPU inflates it. `*_above_baseline` subtracts the GPU's
 //!   `nvidia-smi` `memory.used` taken before this process created a CUDA context, so the context
-//!   itself is charged to the render. On the Windows (WDDM) runner `cuMemGetInfo` also counts
-//!   memory the driver reserves that nvidia-smi does not (~1.2 GiB over nvidia-smi's peak on the
-//!   first capture); the workflow's own nvidia-smi series (split into these phases by `t0_unix`) is the
-//!   NVML figure.
+//!   itself is charged to the render. On the Windows (WDDM) runner `cuMemGetInfo` reads ~1.65 GiB
+//!   used right after context creation whichever GPU ordinal 0 lands on, so on an otherwise idle
+//!   GPU (nvidia-smi baseline ~19 MiB) it over-reads nvidia-smi by ~1.2 GiB; on the GPU whose
+//!   baseline already shows ~1.2 GiB the two agree. The workflow's own nvidia-smi series (split
+//!   into these phases by `t0_unix`) is the NVML figure to use.
 //! - `pool_*`: the stream-ordered memory pool candle allocates every tensor from (cudarc's
 //!   `cuMemAllocAsync` on the device's current pool) — process-local, immune to co-tenants, and the
 //!   pool's own high watermarks catch spikes between samples. `pool_reserved_high` is what the pool
