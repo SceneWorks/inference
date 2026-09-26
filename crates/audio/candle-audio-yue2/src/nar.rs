@@ -75,7 +75,6 @@ use candle_llm::primitives::{sdpa_gqa, AttnMask, KvCache, StaticKvCache};
 #[cfg(test)]
 use candle_nn::VarBuilder;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::generate::stage_rng;
 use crate::latent::{AcousticLatents, LatentSource, LATENT_CHANNELS};
@@ -636,8 +635,7 @@ impl SynthesisRequest<'_> {
             self.context,
             ODE_METHOD,
         ]);
-        let digest = Sha256::digest(record.to_string().as_bytes());
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+        crate::durable::sha256_hex(record.to_string().as_bytes())
     }
 }
 

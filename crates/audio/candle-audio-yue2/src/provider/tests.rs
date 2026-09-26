@@ -1070,3 +1070,160 @@ fn an_unprovisioned_decoder_is_refused_before_any_compute() {
     song_of(&mut standard).decoder = Some(SongDecoder::Standard);
     generator.validate(&standard).unwrap();
 }
+
+fn bounded_memory() -> GenerationMemory {
+    GenerationMemory {
+        stage_residency: true,
+        chunk_attention: true,
+        attention_chunk_size: Some(1 << 30),
+        tile_vae_decode: true,
+        decode_tile_edge: Some(3),
+        ..Default::default()
+    }
+}
+
+/// `(report, Step events, Decoding events)` of one `generate_with_report`.
+fn resumed(generator: &dyn Generator, req: &GenerationRequest) -> (GenerationReport, usize, usize) {
+    let (mut steps, mut decodes) = (0, 0);
+    let report = generator
+        .generate_with_report(req, &mut |p| match p {
+            Progress::Step { .. } => steps += 1,
+            Progress::Decoding => decodes += 1,
+            _ => {}
+        })
+        .unwrap();
+    (report, steps, decodes)
+}
+
+fn resume(mut req: GenerationRequest) -> GenerationRequest {
+    req.audio
+        .as_mut()
+        .unwrap()
+        .artifacts
+        .as_mut()
+        .unwrap()
+        .resume = true;
+    req
+}
+
+/// The memory controls change no result, so they are not part of a run's identity: a COMPLETED
+/// run resumed under another memory block — or by a generator loaded with another
+/// `offload_policy` (a worker restart) — is reused as published, computing nothing.
+///
+/// Mutation that must fail: bind the memory controls into the run identity again
+/// (`identity_config` returning the full effective configuration).
+#[test]
+fn a_completed_run_resumes_under_other_memory_controls_and_offload_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
+    let dir = tmp.path().join("song");
+    let first = generator
+        .generate_with_report(&song_request(Some(&dir)), &mut |_| {})
+        .unwrap();
+    let identity = first.artifacts.unwrap().identity;
+    let samples = audio_of(first.output.unwrap()).samples;
+    let config = std::fs::read(dir.join(CONFIG_JSON)).unwrap();
+
+    let mut other_memory = resume(song_request(Some(&dir)));
+    other_memory.memory = Some(bounded_memory());
+    let (report, steps, decodes) = resumed(generator.as_ref(), &other_memory);
+    assert_eq!((steps, decodes), (0, 0), "nothing was computed again");
+    assert_eq!(report.artifacts.unwrap().identity, identity);
+    assert_eq!(audio_of(report.output.unwrap()).samples, samples);
+
+    let restarted =
+        load_synthetic(&spec(tmp.path(), false).with_offload_policy(OffloadPolicy::Sequential))
+            .unwrap();
+    let (report, steps, decodes) = resumed(restarted.as_ref(), &resume(song_request(Some(&dir))));
+    assert_eq!((steps, decodes), (0, 0), "nothing was computed again");
+    assert_eq!(report.artifacts.unwrap().identity, identity);
+    // The record of the run as it was computed is untouched.
+    assert_eq!(std::fs::read(dir.join(CONFIG_JSON)).unwrap(), config);
+}
+
+/// A cached decode's identity does not bind the decode tiling either: the same cached decode
+/// resumed with another tile is the published one, decoded nothing again.
+///
+/// Mutation that must fail: bind the tiling into the cached-decode identity again.
+#[test]
+fn a_cached_decode_resumes_under_other_decode_tiling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let generator = load_synthetic(&spec(tmp.path(), true)).unwrap();
+    let source = tmp.path().join("song");
+    generator
+        .generate(&song_request(Some(&source)), &mut |_| {})
+        .unwrap();
+    let decode = |dir: &Path, resume: bool, memory: Option<GenerationMemory>| GenerationRequest {
+        memory,
+        audio: Some(AudioParams {
+            song: Some(SongParams {
+                cached_latents: Some(source.clone()),
+                decoder: Some(SongDecoder::Legacy),
+                ..Default::default()
+            }),
+            artifacts: Some(AudioArtifacts {
+                dir: dir.to_path_buf(),
+                resume,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let dir = tmp.path().join("legacy");
+    let (first, _, decodes) = resumed(generator.as_ref(), &decode(&dir, false, None));
+    assert_eq!(decodes, 1);
+    let tiled = GenerationMemory {
+        tile_vae_decode: true,
+        decode_tile_edge: Some(5),
+        ..Default::default()
+    };
+    let (again, steps, decodes) = resumed(generator.as_ref(), &decode(&dir, true, Some(tiled)));
+    assert_eq!((steps, decodes), (0, 0), "the published decode is reused");
+    assert_eq!(
+        again.artifacts.unwrap().identity,
+        first.artifacts.unwrap().identity
+    );
+    assert_eq!(
+        audio_of(again.output.unwrap()).samples,
+        audio_of(first.output.unwrap()).samples
+    );
+}
+
+/// What does change a result is still bound: resuming a completed run with another seed, other
+/// sampling, other ODE steps or another decoder is refused as a different run, and the published
+/// run is left as it was.
+///
+/// Mutation that must fail: project the generation settings out of the identity too.
+#[test]
+fn a_result_changing_request_still_refuses_to_resume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let generator = load_synthetic(&spec(tmp.path(), true)).unwrap();
+    let dir = tmp.path().join("song");
+    generator
+        .generate(&song_request(Some(&dir)), &mut |_| {})
+        .unwrap();
+    let before = std::fs::read(dir.join(RESULT_JSON)).unwrap();
+    let changed: [(&str, fn(&mut GenerationRequest)); 4] = [
+        ("seed", |r| r.seed = Some(18)),
+        ("steps", |r| r.steps = Some(3)),
+        ("sampling", |r| {
+            song_of(r).semantic_sampling = Some(TokenSampling {
+                temperature: Some(0.5),
+                ..small(12, 16)
+            })
+        }),
+        ("decoder", |r| {
+            song_of(r).decoder = Some(SongDecoder::Legacy)
+        }),
+    ];
+    for (what, change) in changed {
+        let mut req = resume(song_request(Some(&dir)));
+        change(&mut req);
+        req.memory = Some(bounded_memory());
+        let err = generator
+            .generate_with_report(&req, &mut |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("identity"), "{what}: {err}");
+    }
+    assert_eq!(std::fs::read(dir.join(RESULT_JSON)).unwrap(), before);
+}

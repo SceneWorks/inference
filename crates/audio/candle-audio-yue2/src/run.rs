@@ -990,7 +990,7 @@ impl Yue2Engine {
             "schema": IDENTITY_SCHEMA,
             "kind": "song",
             "request": request.to_json(),
-            "config": self.effective_config(request, settings),
+            "config": self.identity_config(request, settings),
             "weights": self.model_identity()?,
             "plan": match input {
                 SongInput::Request(_) => Value::Null,
@@ -1205,12 +1205,8 @@ impl Yue2Engine {
             audio.metadata().decoder.to_json(),
             keys.device,
             keys.runtime,
-            audio.metadata().vae_decode(),
-            audio.metadata().halo_frames,
-            match audio.metadata().mode {
-                crate::decode::DecodeMode::Tiled { core_frames } => json!(core_frames),
-                crate::decode::DecodeMode::Full => Value::Null,
-            },
+            // Not the tiling: it changes no sample (a memory control; the decoder metadata in
+            // result.json records it).
         ]));
         stage_ids.insert("decode".into(), stage_entry(&decode_identity, false));
 
@@ -1421,7 +1417,6 @@ impl Yue2Engine {
             &source_identity,
             &latents.identity().to_json(),
             &json!([variant_name(decoder), self.vae_identity(decoder)?]),
-            &json!(format!("{decode:?}")),
             &mot,
         );
         let identity = match output {

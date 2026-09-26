@@ -166,14 +166,14 @@ impl IdentityKeys {
     }
 
     /// A cached decode of the run `source` (its run identity) whose latents are `latent`, with
-    /// the decoder identified by `vae` and decode settings `decode`, by the MoT identified by
-    /// `weights`.
+    /// the decoder identified by `vae`, by the MoT identified by `weights`. The decode tiling is not
+    /// bound: it changes no sample (a memory control, [`MEMORY_CONFIG_KEYS`]), so a cached decode
+    /// under other tiling is the same decode.
     pub fn cached_decode(
         &self,
         source: &str,
         latent: &Value,
         vae: &Value,
-        decode: &Value,
         weights: &Value,
     ) -> String {
         identity_of(&json!({
@@ -182,7 +182,6 @@ impl IdentityKeys {
             "source": source,
             "latent": latent,
             "vae": vae,
-            "decode": decode,
             "weights": weights,
             "device": self.device,
             "runtime": self.runtime,
@@ -294,8 +293,19 @@ impl EngineHooks<'_> {
     }
 }
 
+/// The effective-configuration keys that record memory controls ([`EngineOptions`]). None
+/// changes a result, so no run, stage or cached-decode identity binds them
+/// ([`Yue2Engine::identity_config`]); `config.json` records them.
+pub const MEMORY_CONFIG_KEYS: [&str; 5] = [
+    "offload_ar",
+    "query_tile",
+    "vae_decode",
+    "vae_core_frames",
+    "vae_halo_frames",
+];
+
 /// Memory controls of the engine. Neither changes a result (they are recorded in the effective
-/// configuration, not in any stage identity).
+/// configuration, not in any identity — see [`MEMORY_CONFIG_KEYS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineOptions {
     /// Acoustic-stage query tiling and AR offload.
@@ -969,9 +979,24 @@ impl Yue2Engine {
         })
     }
 
+    /// The effective configuration without its memory controls ([`MEMORY_CONFIG_KEYS`]): what a
+    /// run's result depends on, and so what its identity binds. [`Yue2Engine::effective_config`]
+    /// (the full record, `config.json`) keeps them.
+    pub fn identity_config(&self, request: &SongRequest, settings: &SongSettings) -> Value {
+        let mut config = self.effective_config(request, settings);
+        if let Some(map) = config.as_object_mut() {
+            for key in MEMORY_CONFIG_KEYS {
+                map.remove(key);
+            }
+        }
+        config
+    }
+
     /// The run identity (upstream `identity({"request", "config", "weights"})`): a SHA-256 over
-    /// the request, the effective configuration and the model identities. A resumed run must match
-    /// it exactly.
+    /// the request, the effective configuration without its memory controls
+    /// ([`Yue2Engine::identity_config`]) and the model identities. A resumed run must match it
+    /// exactly; a run resumed under other memory controls (offload, attention chunking, decode
+    /// tiling — none changes a result) is the same run.
     pub fn run_identity(
         &self,
         request: &SongRequest,
@@ -980,7 +1005,7 @@ impl Yue2Engine {
         Ok(identity_of(&json!({
             "schema": IDENTITY_SCHEMA,
             "request": request.to_json(),
-            "config": self.effective_config(request, settings),
+            "config": self.identity_config(request, settings),
             "weights": self.model_identity()?,
             "vae": self.vae_identity(settings.decoder)?,
         })))
@@ -1333,5 +1358,104 @@ pub(crate) fn vae_error(e: crate::vae::VaeError) -> gen_core::Error {
         crate::vae::VaeError::Cancelled { .. } => gen_core::Error::Canceled,
         crate::vae::VaeError::Asset(a) => gen_core::Error::from(a),
         other => msg(other),
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::protocol::SongRequestSpec;
+
+    fn request() -> SongRequest {
+        SongRequest::new(SongRequestSpec::new(
+            "warm piano pop",
+            "[Verse]\nla la la\n",
+        ))
+        .unwrap()
+    }
+
+    /// The run identity binds the result-changing configuration — tier, dtype, device, AR mode,
+    /// generation settings, decoder — and none of the memory controls
+    /// ([`MEMORY_CONFIG_KEYS`]), which `config.json` still records.
+    ///
+    /// Mutations that must fail: stop removing the memory keys; remove `model_dtype` /
+    /// `weight_tier` / `device` from the projection as well.
+    #[test]
+    fn the_run_identity_binds_results_not_memory_controls() {
+        let mut engine = Yue2Engine::synthetic(EngineOptions::default());
+        let request = request();
+        let plain = engine.default_settings();
+        let bounded = SongSettings {
+            options: Some(EngineOptions {
+                nar: NarOptions {
+                    query_tile: QueryTile::ScoreElements(1 << 30),
+                    offload_ar: true,
+                },
+                decode: DecodeOptions::tiled(3).unwrap(),
+            }),
+            ..plain.clone()
+        };
+        let full = engine.effective_config(&request, &bounded);
+        let projected = engine.identity_config(&request, &bounded);
+        for key in MEMORY_CONFIG_KEYS {
+            assert!(full.get(key).is_some(), "config.json records {key}");
+            assert!(projected.get(key).is_none(), "the identity drops {key}");
+        }
+        for key in [
+            "model_dtype",
+            "weight_tier",
+            "device",
+            "quantization",
+            "generation",
+        ] {
+            assert_eq!(projected[key], full[key], "the identity keeps {key}");
+        }
+        let id = engine.run_identity(&request, &plain).unwrap();
+        assert_eq!(engine.run_identity(&request, &bounded).unwrap(), id);
+        let legacy = SongSettings {
+            decoder: VaeVariant::Legacy,
+            ..plain.clone()
+        };
+        assert_ne!(
+            engine.run_identity(&request, &legacy).unwrap(),
+            id,
+            "decoder"
+        );
+        let other_steps = SongSettings {
+            generation: GenerationConfig::new(
+                *plain.generation.abc(),
+                *plain.generation.semantic(),
+                plain.generation.ode_steps() as i64 + 1,
+            )
+            .unwrap(),
+            ..plain.clone()
+        };
+        assert_ne!(
+            engine.run_identity(&request, &other_steps).unwrap(),
+            id,
+            "steps"
+        );
+        let original = (engine.tier, engine.dtype, engine.ar);
+        engine.tier = Tier::Q8;
+        assert_ne!(engine.run_identity(&request, &plain).unwrap(), id, "tier");
+        engine.tier = original.0;
+        engine.dtype = if original.1 == DType::F32 {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        assert_ne!(engine.run_identity(&request, &plain).unwrap(), id, "dtype");
+        engine.dtype = original.1;
+        engine.ar = ArPrecision::Fp8;
+        assert_ne!(
+            engine.run_identity(&request, &plain).unwrap(),
+            id,
+            "AR mode"
+        );
+        engine.ar = original.2;
+        assert_eq!(engine.run_identity(&request, &plain).unwrap(), id);
+        // The device is bound by name; the stage identities bind it too (see
+        // `run::tests::every_stage_identity_binds_every_input_it_depends_on`).
+        assert_eq!(projected["device"], "cpu");
     }
 }
