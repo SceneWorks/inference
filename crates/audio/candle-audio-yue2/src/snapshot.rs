@@ -307,12 +307,12 @@ impl VerifiedClosure {
     }
 }
 
-fn join_rel(dir: &Path, rel: &str) -> PathBuf {
+pub(crate) fn join_rel(dir: &Path, rel: &str) -> PathBuf {
     rel.split('/')
         .fold(dir.to_path_buf(), |p, part| p.join(part))
 }
 
-fn sha256_file(key: &str, path: &Path) -> Result<String, AssetError> {
+pub(crate) fn sha256_file(key: &str, path: &Path) -> Result<String, AssetError> {
     let io = |source| AssetError::Io {
         component: key.to_string(),
         path: path.to_path_buf(),
@@ -440,7 +440,7 @@ fn is_weights_file(name: &str) -> bool {
 /// Every weights / index file under `dir`, as `/`-separated paths relative to the snapshot root,
 /// following symlinks the way a loader would. A symlink loop terminates the walk: the OS refuses
 /// to resolve a path through too many symlinks (ELOOP), and that error is propagated.
-fn collect_weight_files(
+pub(crate) fn collect_weight_files(
     key: &str,
     dir: &Path,
     prefix: &str,
@@ -630,7 +630,7 @@ fn dtype_tag(dtype: candle_core::DType) -> Option<&'static str> {
 }
 
 /// Hash a slice's elements as little-endian bytes, in chunks (endianness-independent).
-fn hash_le<T: Copy, const N: usize>(
+pub(crate) fn hash_le<T: Copy, const N: usize>(
     hasher: &mut Sha256,
     values: &[T],
     to_le: impl Fn(T) -> [u8; N],

@@ -71,7 +71,8 @@ use std::time::Instant;
 
 use candle_audio::candle_core::{DType, Device, Tensor};
 use candle_audio::gen_core;
-use candle_llm::primitives::{linear, sdpa_gqa, AttnMask, KvCache, StaticKvCache};
+use candle_llm::primitives::{sdpa_gqa, AttnMask, KvCache, StaticKvCache};
+#[cfg(test)]
 use candle_nn::VarBuilder;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -80,7 +81,9 @@ use crate::generate::stage_rng;
 use crate::latent::{AcousticLatents, LatentSource, LATENT_CHANNELS};
 use crate::model::{backend, rms_norm, MotPaths, Yue2Config, Yue2Lm};
 use crate::protocol::{self, CODEC_OFFSET, CODEC_SIZE, MUSIC_END, ODE_METHOD, PROTOCOL_VERSION};
+use crate::precision::{Residency, Tier};
 use crate::snapshot::SnapshotDirs;
+use crate::weights::{Loader, Proj};
 
 /// Upstream's query block on CPU / MPS (`attention(query_chunk_size=None)` off CUDA): 256 rows.
 pub const UPSTREAM_QUERY_TILE: usize = 256;
@@ -146,10 +149,10 @@ impl NarConfig {
 #[derive(Debug)]
 pub struct NarHeads {
     config: NarConfig,
-    vae2llm: (Tensor, Tensor),
-    llm2vae: (Tensor, Tensor),
-    time_in: (Tensor, Tensor),
-    time_out: (Tensor, Tensor),
+    vae2llm: (Proj, Tensor),
+    llm2vae: (Proj, Tensor),
+    time_in: (Proj, Tensor),
+    time_out: (Proj, Tensor),
     /// `[max_latent_frames, hidden]` in the model dtype.
     pe: Tensor,
     /// `exp(−ln(10⁴) · i / 128)`, `i < 128`, F32 — the timestep frequencies.
@@ -157,23 +160,23 @@ pub struct NarHeads {
 }
 
 impl NarHeads {
-    pub(crate) fn from_var_builder(
+    pub(crate) fn from_loader(
         config: NarConfig,
         hidden: usize,
-        vb: &VarBuilder,
+        w: &Loader,
     ) -> gen_core::Result<Self> {
         config.validate()?;
         let err = backend("load NAR heads");
         let d = config.latent_dim;
         let linear_pair = |name: &str, out: usize, inp: usize| -> gen_core::Result<_> {
-            let p = vb.pp(name);
             Ok((
-                p.get((out, inp), "weight").map_err(&err)?,
-                p.get(out, "bias").map_err(&err)?,
+                w.matrix(&format!("{name}.weight"), (out, inp))
+                    .map_err(&err)?,
+                w.tensor(&format!("{name}.bias"), out).map_err(&err)?,
             ))
         };
         let half = TIME_FREQUENCIES / 2;
-        let freqs = Tensor::arange(0u32, half as u32, vb.device())
+        let freqs = Tensor::arange(0u32, half as u32, w.device())
             .and_then(|t| t.to_dtype(DType::F32))
             .and_then(|t| t * -(10_000f64.ln()))
             .and_then(|t| t / half as f64)
@@ -184,8 +187,8 @@ impl NarHeads {
             llm2vae: linear_pair("llm2vae", d, hidden)?,
             time_in: linear_pair("time_embedder.mlp.0", hidden, TIME_FREQUENCIES)?,
             time_out: linear_pair("time_embedder.mlp.2", hidden, hidden)?,
-            pe: vb
-                .get((config.max_latent_frames, hidden), "latent_pos_embed.pe")
+            pe: w
+                .tensor("latent_pos_embed.pe", (config.max_latent_frames, hidden))
                 .map_err(&err)?,
             freqs,
             config,
@@ -210,8 +213,22 @@ impl NarHeads {
             .unsqueeze(1)?
             .broadcast_mul(&self.freqs.unsqueeze(0)?)?;
         let emb = Tensor::cat(&[args.cos()?, args.sin()?], 1)?.to_dtype(dtype)?;
-        let h = linear(&emb, &self.time_in.0, Some(&self.time_in.1))?.silu()?;
-        Ok(linear(&h, &self.time_out.0, Some(&self.time_out.1))?.unsqueeze(0)?)
+        let h = self.time_in.0.forward(&emb, Some(&self.time_in.1))?.silu()?;
+        Ok(self
+            .time_out
+            .0
+            .forward(&h, Some(&self.time_out.1))?
+            .unsqueeze(0)?)
+    }
+
+    /// Resident bytes of the heads' weights, biases and position table.
+    fn resident_bytes(&self) -> u64 {
+        let dense = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        [&self.vae2llm, &self.llm2vae, &self.time_in, &self.time_out]
+            .iter()
+            .map(|(w, b)| w.resident_bytes() + dense(b))
+            .sum::<u64>()
+            + dense(&self.pe)
     }
 
     /// Local latent positions `0 … len − 1`, clamped to the table: `[1, len, hidden]`.
@@ -238,31 +255,79 @@ impl Yue2Nar {
     /// heads from exactly the verified `config.json` and weights file. `dtype` as for
     /// [`Yue2Lm::load`] (F32 on a CPU device).
     pub fn load(dirs: &SnapshotDirs, dtype: DType, device: &Device) -> gen_core::Result<Self> {
-        let opened = crate::model::open_verified(dirs, dtype, device)?;
-        Self::from_var_builder(
+        Self::load_tier(dirs, None, dtype, device)
+    }
+
+    /// [`Yue2Nar::load`], asserting the staged tier when `tier` is set (a different staged tier is
+    /// refused, never loaded). The `m-a-p/YuE2-3B` directory holds either the pinned original
+    /// (`bf16`) or a derived tier snapshot ([`crate::tier`]).
+    pub fn load_tier(
+        dirs: &SnapshotDirs,
+        tier: Option<Tier>,
+        dtype: DType,
+        device: &Device,
+    ) -> gen_core::Result<Self> {
+        let opened = crate::model::open_verified(dirs, dtype, device, tier)?;
+        Self::from_opened(opened)
+    }
+
+    pub(crate) fn from_opened(opened: crate::model::VerifiedLmFiles) -> gen_core::Result<Self> {
+        Self::from_loader(
             Yue2Config::from_json(&opened.config_json)?,
             NarConfig::from_json(&opened.config_json)?,
-            opened.vb,
+            &opened.loader,
             opened.weights_sha256,
+            opened.tier,
         )
     }
 
-    /// Build from an arbitrary [`VarBuilder`]. Crate-private: production loads go through
-    /// [`Yue2Nar::load`], which verifies the bytes first.
+    /// Build the released-precision model from an arbitrary [`VarBuilder`]. Crate-private:
+    /// production loads go through [`Yue2Nar::load`], which verifies the bytes first.
+    #[cfg(test)]
     pub(crate) fn from_var_builder(
         config: Yue2Config,
         nar: NarConfig,
         vb: VarBuilder,
         weights_sha256: String,
     ) -> gen_core::Result<Self> {
+        Self::from_loader(
+            config,
+            nar,
+            &Loader::new(vb, None),
+            weights_sha256,
+            Tier::Bf16,
+        )
+    }
+
+    /// Build from a tier-aware [`Loader`].
+    pub(crate) fn from_loader(
+        config: Yue2Config,
+        nar: NarConfig,
+        w: &Loader,
+        weights_sha256: String,
+        tier: Tier,
+    ) -> gen_core::Result<Self> {
         let hidden = config.hidden_size;
-        let heads = NarHeads::from_var_builder(nar, hidden, &vb)?;
-        let lm = Yue2Lm::from_var_builder(config, vb, MotPaths::ArAndNar)?;
+        let heads = NarHeads::from_loader(nar, hidden, w)?;
+        let lm = Yue2Lm::from_loader(config, w, MotPaths::ArAndNar, tier)?;
         Ok(Self {
             lm,
             heads,
             weights_sha256,
         })
+    }
+
+    /// The MoT backbone, mutably (the FP8 AR mode, [`crate::fp8`]).
+    pub fn lm_mut(&mut self) -> &mut Yue2Lm {
+        &mut self.lm
+    }
+
+    /// Measured resident weight bytes of everything loaded: the MoT
+    /// ([`Yue2Lm::weight_residency`]) and the NAR heads.
+    pub fn weight_residency(&self) -> Residency {
+        let mut r = self.lm.weight_residency();
+        r.device_bytes += self.heads.resident_bytes();
+        r
     }
 
     /// The MoT backbone (for the ABC and semantic stages).
@@ -710,7 +775,7 @@ impl ChunkSolver {
         let time = heads
             .time_embedding(raw_t)
             .map_err(backend("time embedding"))?;
-        let mut x = linear(&x_nar, &heads.vae2llm.0, Some(&heads.vae2llm.1))
+        let mut x = heads.vae2llm.0.forward(&x_nar, Some(&heads.vae2llm.1))
             .map_err(backend("vae2llm"))?
             .broadcast_add(&time)
             .and_then(|x| x.broadcast_add(&self.positions))
@@ -744,7 +809,7 @@ impl ChunkSolver {
             x = (&x + p.mlp.forward(&normed)?).map_err(&err)?;
         }
         let x = rms_norm(&x, lm.final_norm(), cfg.rms_norm_eps).map_err(&err)?;
-        linear(&x, &heads.llm2vae.0, Some(&heads.llm2vae.1))
+        heads.llm2vae.0.forward(&x, Some(&heads.llm2vae.1))
             .map_err(backend("llm2vae"))?
             .squeeze(0)
             .and_then(|v| v.narrow(0, 1, self.frames))
@@ -1046,6 +1111,11 @@ pub(crate) mod synthetic {
 
     /// The synthetic MoT with NAR heads on `device` in F32.
     pub(crate) fn model_on(timestep_shift: f64, device: &Device) -> Yue2Nar {
+        model_on_dtype(timestep_shift, device, DType::F32)
+    }
+
+    /// Every synthetic tensor (MoT and NAR heads) by name, F32 on the CPU.
+    pub(crate) fn all_tensors() -> std::collections::HashMap<String, Tensor> {
         let cfg = mot::config();
         let mut tensors = mot::tensors(&cfg);
         for (name, shape, scale, offset) in heads_state_dict(cfg.hidden_size) {
@@ -1054,9 +1124,19 @@ pub(crate) mod synthetic {
             let t = Tensor::from_vec(data, shape, &Device::Cpu).expect("synthetic tensor");
             tensors.insert(name, t);
         }
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
-        Yue2Nar::from_var_builder(cfg, nar_config(timestep_shift), vb, "synthetic".into())
-            .expect("synthetic YuE2 with NAR heads loads")
+        tensors
+    }
+
+    /// The synthetic MoT with NAR heads on `device` computing in `dtype`.
+    pub(crate) fn model_on_dtype(timestep_shift: f64, device: &Device, dtype: DType) -> Yue2Nar {
+        let vb = VarBuilder::from_tensors(all_tensors(), dtype, device);
+        Yue2Nar::from_var_builder(
+            mot::config(),
+            nar_config(timestep_shift),
+            vb,
+            "synthetic".into(),
+        )
+        .expect("synthetic YuE2 with NAR heads loads")
     }
 }
 

@@ -19,6 +19,10 @@ candle-audio = { path = "../candle-audio" }
 # grouped-query SDPA, RoPE tables/rotation, linear/SwiGLU/embedding leaves, and the seeded
 # `TokenRng` stream. Same workspace candle pin as `candle-audio`.
 candle-llm = { workspace = true }
+# The workspace's cuBLASLt FP8 E4M3 GEMM and the sm_89 8-bit capability floor (sc-22995): the
+# experimental FP8 AR mode is upstream's `torch._scaled_mm`, which is that GEMM. CPU-only builds
+# compile only its capability constants; the handle is `cuda`-gated.
+candle-quant-kernels = { workspace = true }
 # `VarBuilder` over the verified safetensors (dtype conversion on load).
 candle-nn = { workspace = true }
 # Streaming SHA-256 over every pinned file as it is read from the snapshot.
@@ -40,7 +44,17 @@ tempfile = { workspace = true }
 
 [features]
 default = []
-# Apple Metal / NVIDIA CUDA backends, forwarded to the audio commons. Not in `default`; nothing in
-# this slice touches a GPU (the asset checks are CPU-only).
-metal = ["candle-audio/metal", "candle-llm/metal", "candle-nn/metal"]
-cuda = ["candle-audio/cuda", "candle-llm/cuda", "candle-nn/cuda"]
+# Apple Metal / NVIDIA CUDA backends, forwarded to the audio commons. Not in `default`. `cuda` also
+# enables the experimental FP8 AR mode's cuBLASLt path (sc-22995).
+metal = [
+    "candle-audio/metal",
+    "candle-llm/metal",
+    "candle-nn/metal",
+    "candle-quant-kernels/metal",
+]
+cuda = [
+    "candle-audio/cuda",
+    "candle-llm/cuda",
+    "candle-nn/cuda",
+    "candle-quant-kernels/cuda",
+]

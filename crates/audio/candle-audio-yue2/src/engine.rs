@@ -34,6 +34,16 @@
 //! The artifact-backed runs (transactional output, resume, cached decoding) are in
 //! [`crate::run`]; the self-contained closure export in [`crate::closure`].
 //!
+//! # Precision (sc-22995)
+//!
+//! [`Yue2Engine::load_with_precision`] takes a [`ModelPrecision`]: the weight [`Tier`] the
+//! `m-a-p/YuE2-3B` directory must hold (the released `bf16` checkpoint, or a derived `q8` / `q4`
+//! tier snapshot, [`crate::tier`]; `None` loads whichever is staged) and the AR mode
+//! ([`ArPrecision`]; the experimental FP8 mode of [`crate::fp8`], prepared before every AR stage
+//! and restored to the exact BF16 originals before the acoustic stage). Both are recorded in the
+//! effective configuration and in every stage identity they can change, so a stage computed at one
+//! precision is never reused by a run at another.
+//!
 //! # Randomness (epic E9)
 //!
 //! The ABC and semantic stages each restart the request seed's SplitMix64 stream
@@ -51,6 +61,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::decode::{decode_latents, DecodeMode, DecodeOptions, DecodedAudio};
+use crate::fp8::{self, ArPrecision};
 use crate::generate::{
     generate_semantic as semantic_decode, plan_score, stage_rng, timing_of, DecodeObserver, Hooks,
 };
@@ -62,6 +73,7 @@ use crate::nar::{
     SynthesisObserver, SynthesisRequest, Yue2Nar,
 };
 use crate::plan::{PlanStep, SymbolicPlan};
+use crate::precision::{Residency, Tier};
 use crate::protocol::{
     check_generation_budget, CotMode, GenerationConfig, Sampling, SongRequest, CONTEXT,
     PROTOCOL_VERSION,
@@ -208,6 +220,15 @@ impl Default for SongSettings {
     }
 }
 
+/// The precision a [`Yue2Engine`] loads the MoT at (see the [module docs](self#precision-sc-22995)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelPrecision {
+    /// The tier the YuE2-3B directory must hold; `None` loads the staged one.
+    pub tier: Option<Tier>,
+    /// How the AR stages multiply the AR projections.
+    pub ar: ArPrecision,
+}
+
 /// The semantic stage's result (upstream `SemanticResult`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SemanticResult {
@@ -271,6 +292,9 @@ pub struct Yue2Engine {
     dtype: DType,
     device: Device,
     weights_sha256: String,
+    /// The loaded weight tier and the AR mode (sc-22995).
+    tier: Tier,
+    ar: ArPrecision,
 }
 
 impl std::fmt::Debug for Yue2Engine {
@@ -391,6 +415,31 @@ impl Yue2Engine {
         generation: GenerationConfig,
         options: EngineOptions,
     ) -> gen_core::Result<Self> {
+        Self::load_with_precision(
+            dirs,
+            dtype,
+            device,
+            ModelPrecision::default(),
+            generation,
+            options,
+        )
+    }
+
+    /// [`Yue2Engine::load`] at an explicit [`ModelPrecision`]: an asserted tier the directory does
+    /// not hold is refused, and the FP8 AR mode is refused before any weight is read unless the
+    /// device is CUDA computing in BF16 (then prepared right after loading, which also checks the
+    /// compute capability and the tier) — never served at another precision.
+    pub fn load_with_precision(
+        dirs: &SnapshotDirs,
+        dtype: DType,
+        device: &Device,
+        precision: ModelPrecision,
+        generation: GenerationConfig,
+        options: EngineOptions,
+    ) -> gen_core::Result<Self> {
+        if precision.ar == ArPrecision::Fp8 {
+            fp8::check_fp8_request(precision.tier.unwrap_or(Tier::Bf16), dtype, device)?;
+        }
         let authorization = license::authorize(
             &[ComponentId::Lm, ComponentId::QwenTiktoken],
             IntendedUse::NoncommercialExperimentation,
@@ -401,12 +450,24 @@ impl Yue2Engine {
             crate::tokenizer::TokenizerError::Asset(a) => gen_core::Error::from(a),
             other => msg(other),
         })?;
-        let nar = Yue2Nar::load(dirs, dtype, device)?;
-        let (dtype, device, weights_sha256) = (
+        let mut nar = Yue2Nar::load_tier(dirs, precision.tier, dtype, device)?;
+        if precision.ar == ArPrecision::Fp8 {
+            fp8::prepare_fp8_ar(nar.lm_mut())?;
+        }
+        let (dtype, device, weights_sha256, tier) = (
             nar.lm().dtype(),
             nar.lm().device().clone(),
             nar.weights_sha256().to_string(),
+            nar.lm().tier(),
         );
+        let mut mot_identity = component_identity(ComponentId::Lm.component());
+        if tier != Tier::Bf16 {
+            mot_identity["tier"] = json!({
+                "tier": tier.name(),
+                "conversion": crate::tier::CONVERSION_ID,
+                "weights_sha256": weights_sha256,
+            });
+        }
         let mut load_timing = Map::new();
         load_timing.insert(
             "resolve_verify_and_load_seconds".into(),
@@ -418,9 +479,11 @@ impl Yue2Engine {
             dtype,
             device,
             weights_sha256,
+            tier,
+            ar: precision.ar,
             vae_source: VaeSource::Snapshots(dirs.clone()),
             vaes: Mutex::new(BTreeMap::new()),
-            mot_identity: component_identity(ComponentId::Lm.component()),
+            mot_identity,
             tokenizer_identity: component_identity(ComponentId::QwenTiktoken.component()),
             generation,
             options,
@@ -433,16 +496,38 @@ impl Yue2Engine {
     /// ranks, the fixture VAEs).
     #[cfg(test)]
     pub(crate) fn synthetic(options: EngineOptions) -> Self {
+        Self::synthetic_with(
+            crate::nar::synthetic::model(1.0),
+            ArPrecision::Native,
+            options,
+        )
+    }
+
+    /// The synthetic engine on `device` computing in `dtype`, running the AR stages in `ar` (the
+    /// FP8 mode is prepared as [`Yue2Engine::load_with_precision`] does).
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn synthetic_on(device: &Device, dtype: DType, ar: ArPrecision) -> Self {
+        let mut nar = crate::nar::synthetic::model_on_dtype(1.0, device, dtype);
+        if ar == ArPrecision::Fp8 {
+            fp8::prepare_fp8_ar(nar.lm_mut()).expect("FP8 AR on the synthetic model");
+        }
+        Self::synthetic_with(nar, ar, EngineOptions::default())
+    }
+
+    #[cfg(test)]
+    fn synthetic_with(nar: Yue2Nar, ar: ArPrecision, options: EngineOptions) -> Self {
         Self {
             tokenizer: {
                 let bytes = std::fs::read(crate::test_fixtures::dir().join("synthetic.tiktoken"))
                     .expect("synthetic.tiktoken");
                 Yue2TextTokenizer::padded_for_tests(&bytes).expect("synthetic table parses")
             },
-            nar: Mutex::new(crate::nar::synthetic::model(1.0)),
-            dtype: DType::F32,
-            device: Device::Cpu,
+            dtype: nar.lm().dtype(),
+            device: nar.lm().device().clone(),
+            tier: nar.lm().tier(),
+            nar: Mutex::new(nar),
             weights_sha256: "synthetic".into(),
+            ar,
             vae_source: VaeSource::Fixture,
             vaes: Mutex::new(BTreeMap::new()),
             mot_identity: json!({"component": "synthetic_mot", "weights_sha256": "synthetic"}),
@@ -483,6 +568,53 @@ impl Yue2Engine {
         &self.device
     }
 
+    /// The loaded weight tier.
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    /// The AR mode.
+    pub fn ar_precision(&self) -> ArPrecision {
+        self.ar
+    }
+
+    /// Measured resident weight bytes of the loaded MoT and NAR heads (the decoders are loaded on
+    /// demand and are FP32 at every tier). In the FP8 AR mode the host-resident BF16 originals are
+    /// [`Residency::host_bytes`].
+    pub fn weight_residency(&self) -> gen_core::Result<Residency> {
+        Ok(self.lock_nar()?.weight_residency())
+    }
+
+    /// The FP8 AR mode's status (upstream `quantization_status`).
+    pub fn fp8_status(&self) -> gen_core::Result<fp8::Fp8Status> {
+        Ok(fp8::status(self.lock_nar()?.lm()))
+    }
+
+    /// Put the exact BF16 AR originals back if the FP8 AR mode is active (upstream `restore_ar`):
+    /// what anything that uses the model outside the AR stages must call first. The acoustic stage
+    /// does it itself; the next AR stage prepares FP8 again.
+    pub fn restore_ar_bf16(&self) -> gen_core::Result<()> {
+        fp8::restore_ar_bf16(self.lock_nar()?.lm_mut())
+    }
+
+    /// Lock the model for an AR stage, preparing the FP8 AR mode first when the engine runs it.
+    fn lock_nar_for_ar(&self) -> gen_core::Result<MutexGuard<'_, Yue2Nar>> {
+        let mut nar = self.lock_nar()?;
+        if self.ar == ArPrecision::Fp8 {
+            fp8::prepare_fp8_ar(nar.lm_mut())?;
+        }
+        Ok(nar)
+    }
+
+    /// What every stage identity a precision can change carries: the tier, and the AR mode for
+    /// the AR stages (`None` for the acoustic stage, which always runs the tier's own weights).
+    fn precision_identity(&self, ar_stage: bool) -> Value {
+        json!({
+            "tier": self.tier.name(),
+            "ar": if ar_stage { self.ar.name() } else { "none" },
+        })
+    }
+
     /// Default [`SongSettings`] of this engine: its generation configuration and the standard
     /// decoder.
     pub fn default_settings(&self) -> SongSettings {
@@ -499,6 +631,9 @@ impl Yue2Engine {
             Err(poisoned) => {
                 let mut guard = poisoned.into_inner();
                 guard.restore_ar()?;
+                // A stage that panicked may have left the FP8 AR mode half-applied: restore the
+                // BF16 originals; the next AR stage prepares FP8 again.
+                fp8::restore_ar_bf16(guard.lm_mut())?;
                 Ok(guard)
             }
         }
@@ -518,6 +653,8 @@ impl Yue2Engine {
             "mot_native_weights_sha256": self.weights_sha256,
             "tokenizer": self.tokenizer_identity,
             "model_dtype": dtype_name(self.dtype),
+            "weight_tier": self.tier.name(),
+            "quantization": self.ar.name(),
             "source": {
                 "repository": crate::inventory::YUE2_SOURCE_REPO,
                 "commit": crate::inventory::YUE2_SOURCE_COMMIT,
@@ -634,9 +771,11 @@ impl Yue2Engine {
                 "same_instruction_and_exact_abc"
             },
             "backend": "candle",
-            "quantization": "none",
+            "quantization": self.ar.name(),
+            "weight_tier": self.tier.name(),
+            "precision_policy": "sc-22995 V2 (candle_audio_yue2::precision)",
             "model_dtype": dtype,
-            "vae_dtype": "float32",
+            "vae_dtype": crate::precision::VAE_DTYPE,
             "vae_decode": decode,
             "vae_core_frames": core,
             "vae_halo_frames": halo,
@@ -687,6 +826,7 @@ impl Yue2Engine {
             self.weights_sha256()?,
             self.tokenizer_identity,
             dtype_name(self.dtype()),
+            self.precision_identity(true),
         ])))
     }
 
@@ -705,6 +845,7 @@ impl Yue2Engine {
             semantic.to_json(),
             self.weights_sha256()?,
             dtype_name(self.dtype()),
+            self.precision_identity(true),
         ])))
     }
 
@@ -728,6 +869,7 @@ impl Yue2Engine {
             "synthesis",
             request.stage_identity(&self.weights_sha256()?, self.dtype()),
             dtype_name(self.dtype()),
+            self.precision_identity(false),
         ])))
     }
 
@@ -747,7 +889,7 @@ impl Yue2Engine {
             PlanStep::GenerateAbc(planning) => {
                 check_generation_budget(planning.prefix().len(), None, generation.abc(), 1.0)
                     .map_err(msg)?;
-                let nar = self.lock_nar()?;
+                let nar = self.lock_nar_for_ar()?;
                 let mut rng = stage_rng(request.seed());
                 let mut forward = TokenForward {
                     stage: Stage::Plan,
@@ -788,7 +930,7 @@ impl Yue2Engine {
         let conditioning = plan
             .semantic_conditioning(&self.tokenizer, generation.semantic())
             .map_err(msg)?;
-        let nar = self.lock_nar()?;
+        let nar = self.lock_nar_for_ar()?;
         let mut rng = stage_rng(plan.request().seed());
         let mut forward = TokenForward {
             stage: Stage::Semantic,
@@ -850,6 +992,9 @@ impl Yue2Engine {
             context: CONTEXT,
         };
         let mut nar = self.lock_nar()?;
+        // The acoustic stage prefills the song prefix with the AR path: always the exact BF16
+        // originals, never the FP8 mode (upstream `synthesize` → `restore_ar`).
+        fp8::restore_ar_bf16(nar.lm_mut())?;
         let mut forward = ProgressForward {
             observer: &mut *hooks.observer,
         };

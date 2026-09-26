@@ -420,6 +420,7 @@ dependencies = [
  "candle-audio",
  "candle-llm",
  "candle-nn",
+ "candle-quant-kernels",
  "fancy-regex 0.17.0",
  "regex",
  "serde_json",

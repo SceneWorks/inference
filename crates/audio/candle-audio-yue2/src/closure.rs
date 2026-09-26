@@ -160,6 +160,20 @@ fn assemble(
     let mut sources = Map::new();
     let mut subdirs = Map::new();
     for id in components_for(decoders) {
+        if id == ComponentId::Lm {
+            let lm = ComponentId::Lm.component();
+            let dir = dirs
+                .snapshot_dir(&lm.repo)
+                .map_err(gen_core::Error::from)?;
+            if crate::tier::is_tier_snapshot(&dir) {
+                let name = repo_dir_name(&lm.repo);
+                subdirs.insert(lm.repo.id.to_string(), json!(name));
+                let mut identity = component_identity(lm);
+                identity["tier"] = copy_tier(&dir, &work.join(name))?;
+                sources.insert(lm.key.to_string(), identity);
+                continue;
+            }
+        }
         // Verify the snapshot immediately before reading the bytes to copy.
         let verified = snapshot::resolve_component(id, dirs).map_err(gen_core::Error::from)?;
         let component = verified.component();
@@ -225,6 +239,75 @@ fn assemble(
     write_json(&work.join(PIPELINE_JSON), &metadata)?;
     sync_dir(work)?;
     Ok(metadata)
+}
+
+/// Copy a derived tier snapshot ([`crate::tier`]) — verified immediately before its bytes are read
+/// — into `root`, re-hashing every copy against the manifest record it was verified with. Returns
+/// the tier's identity for `pipeline.json`.
+fn copy_tier(dir: &Path, root: &Path) -> Result<Value, RunError> {
+    copy_tier_from(crate::tier::TierSource::pinned(), dir, root)
+}
+
+pub(crate) fn copy_tier_from(
+    source: crate::tier::TierSource,
+    dir: &Path,
+    root: &Path,
+) -> Result<Value, RunError> {
+    let verified = crate::tier::verify_tier_from(source, dir).map_err(gen_core::Error::from)?;
+    let files = verified
+        .manifest()
+        .get("files")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let manifest_file = crate::tier::TIER_MANIFEST;
+    let mut copies: Vec<(String, Option<(String, u64)>)> = files
+        .iter()
+        .map(|(rel, rec)| {
+            let want = rec
+                .get("sha256")
+                .and_then(Value::as_str)
+                .zip(rec.get("bytes").and_then(Value::as_u64))
+                .map(|(s, b)| (s.to_string(), b));
+            (rel.clone(), want)
+        })
+        .collect();
+    // The manifest itself is re-verified when the copy loads; it is copied byte for byte.
+    copies.push((manifest_file.to_string(), None));
+    for (rel, want) in copies {
+        let from = crate::snapshot::join_rel(dir, &rel);
+        let to = crate::snapshot::join_rel(root, &rel);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| RunError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        std::fs::copy(&from, &to).map_err(|source| RunError::Io {
+            path: to.clone(),
+            source,
+        })?;
+        let (sha, bytes) = file_digest(&to)?;
+        let expected = match want {
+            Some(w) => w,
+            None => file_digest(&from)?,
+        };
+        if (sha.clone(), bytes) != expected {
+            return Err(RunError::Corrupt {
+                path: to,
+                detail: format!(
+                    "copied bytes hash to {sha} ({bytes} bytes); verified {} ({} bytes)",
+                    expected.0, expected.1
+                ),
+            });
+        }
+    }
+    sync_dir(root)?;
+    Ok(json!({
+        "tier": verified.tier().name(),
+        "conversion": crate::tier::CONVERSION_ID,
+        "weights_sha256": verified.weights_sha256(),
+    }))
 }
 
 /// Read a closure saved by [`save_closure`]. Only `pipeline.json` is parsed here; every weight and

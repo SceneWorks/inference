@@ -276,9 +276,16 @@ fn the_load_gate_refuses_what_it_cannot_honour() {
         load_synthetic(&unknown),
         Err(gen_core::Error::Unsupported(_))
     ));
+    // Q8 / Q4 assert a tier (checked against the staged snapshot when it loads — see
+    // `tier::tests::an_asserted_tier_must_be_the_staged_one`); NVFP4 is not a YuE2 tier.
     let mut quant = ok.clone();
     quant.quantize = Some(Quant::Q8);
-    assert!(load_synthetic(&quant).is_err());
+    assert!(load_synthetic(&quant).is_ok());
+    quant.quantize = Some(Quant::Nvfp4);
+    assert!(matches!(
+        load_synthetic(&quant),
+        Err(gen_core::Error::Unsupported(_))
+    ));
     let file = LoadSpec::new(WeightsSource::File(tmp.path().join("model.safetensors")))
         .with_component(VAE_COMPONENT_ID, WeightsSource::Dir(tmp.path().into()));
     assert!(load_synthetic(&file).is_err());

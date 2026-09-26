@@ -93,6 +93,7 @@ pub use candle_audio::gen_core;
 pub mod closure;
 pub mod decode;
 pub mod engine;
+pub mod fp8;
 pub mod generate;
 pub mod inventory;
 pub mod latent;
@@ -103,13 +104,17 @@ pub mod nar;
 #[cfg(test)]
 mod parity;
 pub mod plan;
+pub mod precision;
+pub mod prepare;
 pub mod protocol;
 pub mod provider;
 pub mod run;
 pub mod sampling;
 pub mod snapshot;
+pub mod tier;
 pub mod tokenizer;
 pub mod vae;
+pub mod weights;
 
 #[cfg(test)]
 mod test_fixtures;

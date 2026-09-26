@@ -10,11 +10,16 @@
 //!
 //! | field | YuE2 |
 //! |---|---|
-//! | `weights` | `Dir`: the `m-a-p/YuE2-3B` snapshot (holds `qwen.tiktoken`), **or** a closure saved by [`crate::closure::save_closure`] (then no components) |
+//! | `weights` | `Dir`: the `m-a-p/YuE2-3B` snapshot (holds `qwen.tiktoken`), a derived `q8` / `q4` tier snapshot of it ([`crate::tier`]), **or** a closure saved by [`crate::closure::save_closure`] (then no components) |
 //! | `components["vae"]` | `Dir`: the `m-a-p/YuE2-Vae` snapshot (required with a plain snapshot) |
 //! | `components["vae_legacy"]` | `Dir`: the `m-a-p/YuE2-Vae-legacy` snapshot (optional; needed for `decoder: Legacy`) |
 //! | `precision` | `Fp32` ⇒ F32; the default ⇒ BF16 on an accelerator, F32 on the CPU (no BF16 matmul) |
-//! | `quantize` | refused — precision tiers are a later slice (sc-22995) |
+//! | `quantize` | `None` loads the staged tier (the original is `bf16`); `Q8` / `Q4` assert that tier — the `weights` directory must be that derived tier snapshot, anything else is refused; `Nvfp4` is refused ([`crate::precision`]) |
+//!
+//! The experimental FP8 AR mode ([`crate::fp8`]) is a native engine option
+//! ([`crate::engine::ModelPrecision`]); `LoadSpec` has no FP8 value, so the registered provider
+//! cannot request it (recorded owner decision `fp8_not_on_the_load_spec` in
+//! [`crate::precision::OWNER_DECISIONS`]).
 //!
 //! Every snapshot is local and verified against its pins when loaded; a missing one is an explicit
 //! cache-miss error, never a download.
@@ -50,7 +55,10 @@ use candle_audio::gen_core::{
 };
 
 use crate::closure::{is_saved_closure, load_closure};
-use crate::engine::{EngineHooks, EngineObserver, EngineOptions, SongSettings, Stage, Yue2Engine};
+use crate::engine::{
+    EngineHooks, EngineObserver, EngineOptions, ModelPrecision, SongSettings, Stage, Yue2Engine,
+};
+use crate::precision::Tier;
 use crate::inventory::{ComponentId, VaeVariant};
 use crate::plan::SymbolicPlan;
 use crate::protocol::{
@@ -480,8 +488,9 @@ fn restore(
     Ok(plan)
 }
 
-/// The snapshot directories (and saved generation configuration) a [`LoadSpec`] names.
-fn resolve_spec(spec: &LoadSpec) -> gen_core::Result<(SnapshotDirs, GenerationConfig)> {
+/// The snapshot directories (and saved generation configuration) a [`LoadSpec`] names, and the
+/// tier it asserts.
+fn resolve_spec(spec: &LoadSpec) -> gen_core::Result<(SnapshotDirs, GenerationConfig, Option<Tier>)> {
     let id = PROVIDER_ID;
     let weights = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -493,11 +502,7 @@ fn resolve_spec(spec: &LoadSpec) -> gen_core::Result<(SnapshotDirs, GenerationCo
             )))
         }
     };
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: quantized tiers are not available yet; load the BF16 checkpoint"
-        )));
-    }
+    let tier = Tier::from_quant(spec.quantize)?;
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id} does not support LoRA/LoKr adapters"
@@ -516,7 +521,7 @@ fn resolve_spec(spec: &LoadSpec) -> gen_core::Result<(SnapshotDirs, GenerationCo
             )));
         }
         let saved = load_closure(&weights)?;
-        return Ok((saved.dirs, saved.generation));
+        return Ok((saved.dirs, saved.generation, tier));
     }
     let dir = |component: &str| -> gen_core::Result<Option<PathBuf>> {
         match spec.components.get(component) {
@@ -537,7 +542,7 @@ fn resolve_spec(spec: &LoadSpec) -> gen_core::Result<(SnapshotDirs, GenerationCo
     if let Some(p) = dir(VAE_LEGACY_COMPONENT_ID)? {
         dirs = dirs.with(ComponentId::VaeLegacy.component().repo.id, p);
     }
-    Ok((dirs, GenerationConfig::default()))
+    Ok((dirs, GenerationConfig::default(), tier))
 }
 
 fn device_and_dtype(spec: &LoadSpec) -> gen_core::Result<(Device, DType)> {
@@ -563,17 +568,28 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 
 /// [`load`], returning the concrete generator (and so its [`Yue2Engine`]).
 pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<Yue2Generator> {
-    let (dirs, generation) = resolve_spec(spec)?;
+    let (dirs, generation, tier) = resolve_spec(spec)?;
     let (device, dtype) = device_and_dtype(spec)?;
     #[cfg(test)]
     if SYNTHETIC_ENGINE.with(|s| s.get()) {
-        let _ = (dirs, generation, device, dtype);
+        let _ = (dirs, generation, device, dtype, tier);
         return Ok(Yue2Generator {
             descriptor: descriptor(),
             engine: Yue2Engine::synthetic(EngineOptions::default()),
         });
     }
-    let engine = Yue2Engine::load(&dirs, dtype, &device, generation, EngineOptions::default())?;
+    let precision = ModelPrecision {
+        tier,
+        ..ModelPrecision::default()
+    };
+    let engine = Yue2Engine::load_with_precision(
+        &dirs,
+        dtype,
+        &device,
+        precision,
+        generation,
+        EngineOptions::default(),
+    )?;
     Ok(Yue2Generator {
         descriptor: descriptor(),
         engine,

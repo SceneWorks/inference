@@ -264,6 +264,7 @@ fn lane_can_prepare(spec: &core_llm::PrepareSpec) -> bool {
         || candle_audio_openvoice::prepare::can_prepare(spec)
         || candle_audio_whisper::prepare::can_prepare(spec)
         || candle_audio_clap::prepare::can_prepare(spec)
+        || candle_audio_yue2::prepare::can_prepare(spec)
         || (candle_llm::prepare::REGISTRATION.can_prepare)(spec)
 }
 
@@ -288,6 +289,9 @@ fn lane_prepare(spec: &core_llm::PrepareSpec) -> core_llm::Result<core_llm::Prep
         candle_audio_whisper::prepare::prepare(spec)
     } else if candle_audio_clap::prepare::can_prepare(spec) {
         candle_audio_clap::prepare::prepare(spec)
+    } else if candle_audio_yue2::prepare::can_prepare(spec) {
+        // YuE2's q8 / q4 tiers are derived locally from the verified original (sc-22995).
+        candle_audio_yue2::prepare::prepare(spec)
     } else {
         (candle_llm::prepare::REGISTRATION.prepare)(spec)
     }
@@ -1454,6 +1458,19 @@ mod tests {
         .unwrap();
         let spec = super::core_llm::PrepareSpec::dense(&mt, mt.join("out"));
         assert!((regs[0].can_prepare)(&spec));
+        // ...a YuE2-3B snapshot dir is accepted and routed to the YuE2 tier preparer (sc-22995),
+        // which refuses a tier YuE2 does not have by name (the LLM preparer would not)...
+        let y2_tmp = tempfile::tempdir().unwrap();
+        let y2 = y2_tmp.path().to_path_buf();
+        std::fs::write(y2.join("config.json"), r#"{"model_type": "yue2"}"#).unwrap();
+        let spec = super::core_llm::PrepareSpec::quantized(
+            &y2,
+            y2.join("out"),
+            super::core_llm::Quantize::Nvfp4,
+        );
+        assert!((regs[0].can_prepare)(&spec));
+        let err = (regs[0].prepare)(&spec).unwrap_err().to_string();
+        assert!(err.contains("not a YuE2 tier"), "{err}");
         // ...while a bare dir (neither audio- nor LLM-shaped) is not.
         let empty_tmp = tempfile::tempdir().unwrap();
         let empty = empty_tmp.path().to_path_buf();
