@@ -1,0 +1,26 @@
+time	global_subbeat	fields
+0.0	0	timestamp=0.0; rhythm=meter:(4, 4),eighth_position:0; structure=verse; key=C:major; chord=N
+0.48	4	timestamp=0.48; rhythm=eighth_position:2
+0.96	8	timestamp=0.96; rhythm=eighth_position:4
+1.44	12	timestamp=1.44; rhythm=eighth_position:6
+1.92	16	timestamp=1.92; rhythm=eighth_position:0; chord=N
+2.4	20	timestamp=2.4; rhythm=eighth_position:2
+2.88	24	timestamp=2.88; rhythm=eighth_position:4
+3.36	28	timestamp=3.36; rhythm=eighth_position:6
+3.84	32	timestamp=3.84; rhythm=eighth_position:0; chord=N
+4.32	36	timestamp=4.32; rhythm=eighth_position:2
+4.8	40	timestamp=4.8; rhythm=eighth_position:4
+5.28	44	timestamp=5.28; rhythm=eighth_position:6
+5.76	48	timestamp=5.76; rhythm=eighth_position:0; chord=N
+6.24	52	timestamp=6.24; rhythm=eighth_position:2
+6.72	56	timestamp=6.72; rhythm=eighth_position:4
+7.2	60	timestamp=7.2; rhythm=eighth_position:6
+7.68	64	timestamp=7.68; rhythm=eighth_position:0; chord=N
+8.16	68	timestamp=8.16; rhythm=eighth_position:2
+8.64	72	timestamp=8.64; rhythm=eighth_position:4
+9.12	76	timestamp=9.12; rhythm=eighth_position:6
+9.6	80	timestamp=9.6; rhythm=eighth_position:0; chord=N
+10.08	84	timestamp=10.08; rhythm=eighth_position:2
+10.56	88	timestamp=10.56; rhythm=eighth_position:4
+11.04	92	timestamp=11.04; rhythm=eighth_position:6
+11.52	96	timestamp=11.52; rhythm=eighth_position:0; chord=N

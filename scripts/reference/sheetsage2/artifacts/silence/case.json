@@ -1,0 +1,39 @@
+{
+  "case": "silence",
+  "generator": "scripts/reference/sheetsage2/native_parity.py silence",
+  "input": {
+    "file": "silence.model_input.24k_mono_f32le.raw",
+    "sample_rate": 24000,
+    "samples": 288000,
+    "sha256": "87b70eb78776e7b61f70a6fdbd06bddbfb7e877812b593071945976f73a89269"
+  },
+  "result": {
+    "abc_error": null,
+    "abc_measures": 7,
+    "diagnostics": [
+      "measure 6: padded final 1/4 span to declared 4/4 with trailing rest"
+    ],
+    "duration_seconds": 12.0,
+    "instrumental_notes": 0,
+    "melody_notes": 0,
+    "vocal_notes": 0,
+    "warnings": []
+  },
+  "transcribe_seconds": 120.75,
+  "upstream_code": "m-a-p/SheetSage2@4f89269db831bdc1880124164a00d4f9385cd129",
+  "weights": "m-a-p/SheetSage2@eab522a8168e8b8b8c4856bf8609cd86198f01fe (identical LFS object at both revisions)",
+  "windows": [
+    {
+      "accept_end": 12.0,
+      "accept_start": 0.0,
+      "accepted_events": 25,
+      "end": 12.0,
+      "events": 26,
+      "generation_stop": null,
+      "prefix_end": 0.0,
+      "prefix_tokens": 0,
+      "start": 0.0,
+      "tokens": 96
+    }
+  ]
+}

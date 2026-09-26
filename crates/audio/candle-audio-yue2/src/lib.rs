@@ -23,7 +23,8 @@
 //!   [`license::authorize`], which refuses any intended use (commercial use, redistribution) that
 //!   has no recorded compatible basis. [`license::CODE_TERMS`] records which upstream code each
 //!   component's native port may derive from: the Apache-2.0 GitHub source for the LM, VAE and
-//!   tokenizer; the cover closure's code is treated as CC BY-NC 4.0 and its port is gated.
+//!   tokenizer; the cover closure's code has no upstream licence (only its weights are licensed), is
+//!   provisionally kept at CC BY-NC 4.0, and its port is gated.
 //!
 //! The request slice (sc-22990) is the native text side of generation:
 //!
@@ -75,6 +76,15 @@
 //! * [`provider`] — the registered `yue2` generator (distinct from YuE1's `yue_*`): the
 //!   `LoadSpec` gate and the `GenerationRequest` mapping onto the engine.
 //!
+//! Covers (sc-22996):
+//!
+//! * [`cover`] — a reviewed two-voice score (the native dialect of the `yue2-music` skill,
+//!   [`cover::abc`]), a target style and aligned source or translated lyrics → a `cot = melody` (chord
+//!   symbols removed) or `cot = full` [`SongRequest`] that plans from the score. Symbolic only: no
+//!   audio or in-context-learning prompt reaches the generator. Recording transcription is the
+//!   separate, gated `candle-audio-sheetsage2` crate (provisionally CC BY-NC 4.0; no upstream code
+//!   licence), which depends on this one.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -91,6 +101,7 @@
 pub use candle_audio::gen_core;
 
 pub mod closure;
+pub mod cover;
 pub mod decode;
 pub mod engine;
 pub mod generate;

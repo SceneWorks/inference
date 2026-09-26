@@ -1,0 +1,62 @@
+{
+  "audio": "audio",
+  "duration_seconds": 358.2,
+  "prompts": [
+    "timestamp",
+    "downbeat_meter",
+    "structure",
+    "key",
+    "chord_full",
+    "melody_full"
+  ],
+  "preset": "default",
+  "melody_only": false,
+  "dtype": "fp32",
+  "window_seconds": 300.0,
+  "overlap_seconds": 200.0,
+  "lookahead_seconds": 100.0,
+  "windows": [
+    {
+      "start": 0.0,
+      "end": 300.0,
+      "accept_start": 0.0,
+      "accept_end": 200.0,
+      "prefix_end": 0.0,
+      "generation_stop": 200.0,
+      "window_index": 0,
+      "prefix_tokens": 0,
+      "tokens": 1545,
+      "events": 379,
+      "accepted_events": 378,
+      "elapsed_seconds": 163.25494491599966
+    },
+    {
+      "start": 58.19999999999999,
+      "end": 358.2,
+      "accept_start": 200.0,
+      "accept_end": 358.2,
+      "prefix_end": 200.0,
+      "generation_stop": null,
+      "window_index": 1,
+      "prefix_tokens": 1124,
+      "tokens": 2382,
+      "events": 587,
+      "accepted_events": 304,
+      "elapsed_seconds": 131.07761899998877
+    }
+  ],
+  "elapsed_seconds": 295.7336291669635,
+  "warnings": [],
+  "peak_gpu_mib": 0,
+  "melody_notes": 461,
+  "vocal_notes": 325,
+  "instrumental_notes": 136,
+  "events": 682,
+  "abc_measures": 125,
+  "abc_error": null,
+  "diagnostics": [
+    "notation only: clipped track 1 note at 73.360 to next onset",
+    "measure 0: inferred 3/4 from downbeat span; declared numerators were [4, 4, 4]",
+    "measure 0: padded leading 3/4 span to 4/4 with preceding rest"
+  ]
+}

@@ -205,3 +205,4 @@ loading; the native `nar_real_weights` test (release) peaks at 23.2 GB `ru_maxrs
 footprint (the file-backed mapping counts toward `ru_maxrss` during the load) and takes 263 s: 22 s
 to verify and load, 211 s for the three-chunk 32-step case, 14 s per run of the 5-step case. Never
 run the two at once.
+
