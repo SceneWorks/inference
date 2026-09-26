@@ -22,11 +22,57 @@ use crate::vae::{
     SAMPLE_RATE,
 };
 
+/// Peak-memory growth per latent frame of the decode tile (bytes): 28 MiB.
+///
+/// Measured 2026-09-26 on the **Candle CPU backend** (release build, Apple M-series), standard
+/// decoder (the legacy decoder has the same architecture and tensor shapes), with the `#[ignore]`d
+/// `tile_footprint_probe` in `tests/vae_real_weights.rs`. Each run is one process; peak RSS comes
+/// from `/usr/bin/time -l`.
+///
+/// * Production-shaped tiled decodes (several consecutive tiles, 16-frame halo), by tile frames
+///   (core + 32): 64 → 1.75 GB, 128 → 3.36 GB, 192 → 4.99 GB, 256 → 6.43 GB (3 tiles) and
+///   6.76 GB (7 tiles), 352 → 8.50 GB. Incremental slopes are 25.1, 25.5, 22.5–27.6 and
+///   18.1–21.6 MB per frame.
+/// * A single full-length decode is cheaper: N = 1 / 64 / 128 / 256 / 384 frames gave
+///   0.80 / 1.50 / 2.48 / 4.74 / 6.86 GB, about 17 MB per frame. Consecutive tiles hold roughly
+///   1.5–2 GB more, which is allocator retention of the previous tile's buffers. That is why the
+///   multi-tile series sets the constant.
+///
+/// The constant rounds the steepest multi-tile slope up (27.6 → 29.4 MB). The dominant terms are
+/// the 64-channel stages at 1920 samples per frame: im2col buffers of the k7 convolutions and the
+/// SnakeBeta temporaries. Treat it as a conservative bound for other backends; cross-platform
+/// admission is calibrated elsewhere (sc-23001). This constant only has to make the tiling honour
+/// the budget it is given.
+pub const TILE_BYTES_PER_FRAME: u64 = 28 << 20;
+
+/// Fixed peak-memory term of a tile decode (bytes): 1 GiB. It covers the process, the
+/// decoder-only weights (265 MB FP32, folded at load) and the mapped weight pages. The probe
+/// measured 0.80 GB for a one-frame decode, and the multi-tile series extrapolates to about
+/// 0.1 GB at zero frames. With [`TILE_BYTES_PER_FRAME`], every measurement above sits 25–70%
+/// below its estimate.
+pub const TILE_RESERVE_BYTES: u64 = 1 << 30;
+
+/// The default decode memory budget [`DecodeOptions::production`] tiles for, in GiB.
+pub const DEFAULT_DECODE_BUDGET_GIB: f64 = 8.0;
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// The estimated peak memory (bytes) of decoding one tile of `tile_frames` latent frames:
+/// [`TILE_RESERVE_BYTES`] + `tile_frames` × [`TILE_BYTES_PER_FRAME`].
+///
+/// The decoded waveform itself is not part of this estimate. It is 2 channels × 1920 samples ×
+/// 4 bytes ≈ 15 KB per latent frame of the whole song, held about three times over while tiles
+/// are concatenated and interleaved, so it grows with the song length rather than the tile.
+pub fn estimated_tile_bytes(tile_frames: usize) -> u64 {
+    TILE_RESERVE_BYTES.saturating_add(TILE_BYTES_PER_FRAME.saturating_mul(tile_frames as u64))
+}
+
 /// How the VAE runs over the latents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeMode {
     /// Exact-boundary halo/crop tiles of `core_frames` latent frames (upstream's default,
-    /// `vae_decode = "halo_crop"`). Bounds decoder activation memory by the tile, not the song.
+    /// `vae_decode = "halo_crop"`). Decoder activation memory is bounded by the tile
+    /// (`core_frames + 2 × halo` frames; see [`estimated_tile_bytes`]), not by the song.
     Tiled {
         /// Latent frames per tile core.
         core_frames: usize,
@@ -46,25 +92,60 @@ pub struct DecodeOptions {
 }
 
 impl DecodeOptions {
-    /// Upstream's defaults: tiles of 1024 frames with a 16-frame halo.
+    /// The production tiling: [`Self::for_memory_budget_gib`] at [`DEFAULT_DECODE_BUDGET_GIB`]
+    /// (8 GiB). That gives 224-frame cores (8.96 s) with the 16-frame halo, a 256-frame tile whose
+    /// estimated peak is 8.0 GiB (8.59 GB). Measured on Candle CPU: 6.43–6.76 GB for 3–7
+    /// consecutive tiles, and 5.82 GB for the real-weight production test. Upstream's own
+    /// 1024/512-frame rule was calibrated for PyTorch on CUDA; natively, a 1024-frame core
+    /// (1056-frame tile) is estimated at about 30 GiB.
     pub fn production() -> Self {
-        Self {
-            mode: DecodeMode::Tiled {
-                core_frames: DEFAULT_CORE_FRAMES,
-            },
-            halo_frames: DEFAULT_HALO_FRAMES,
-        }
+        Self::for_memory_budget_gib(DEFAULT_DECODE_BUDGET_GIB)
+            .expect("the default decode budget admits a tile (unit-tested)")
     }
 
-    /// Upstream's memory-budget rule (`YuE2Pipeline.__init__`): 512-frame cores when the budget is
-    /// at most 12 GiB, otherwise 1024.
-    pub fn for_memory_budget_gib(budget_gib: f64) -> Self {
-        Self {
-            mode: DecodeMode::Tiled {
-                core_frames: if budget_gib <= 12.0 { 512 } else { 1024 },
-            },
-            halo_frames: DEFAULT_HALO_FRAMES,
+    /// The largest tile core (at most upstream's 1024 frames) whose estimated tile footprint,
+    /// [`estimated_tile_bytes`]`(core + 2 × halo)`, fits `budget_gib`:
+    /// `core = min(⌊(budget − reserve) / per_frame⌋ − 2·halo, 1024)`.
+    ///
+    /// A non-finite or non-positive budget is refused ("memory_budget_gib must be positive", as
+    /// upstream refuses it). So is a budget too small for even a one-frame core: clamping the core
+    /// up to 1 would silently exceed the budget.
+    pub fn for_memory_budget_gib(budget_gib: f64) -> Result<Self, VaeError> {
+        if !budget_gib.is_finite() || budget_gib <= 0.0 {
+            return Err(VaeError::MemoryBudget(format!(
+                "memory_budget_gib must be positive and finite (got {budget_gib})"
+            )));
         }
+        let halo = DEFAULT_HALO_FRAMES;
+        // `as` saturates, so an enormous budget becomes u64::MAX and is capped below.
+        let budget = (budget_gib * GIB) as u64;
+        let fit = budget.saturating_sub(TILE_RESERVE_BYTES) / TILE_BYTES_PER_FRAME;
+        let core = usize::try_from(fit)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(2 * halo)
+            .min(DEFAULT_CORE_FRAMES);
+        if core == 0 {
+            return Err(VaeError::MemoryBudget(format!(
+                "a {budget_gib} GiB decode budget is below the smallest tile's estimated \
+                 footprint of {:.2} GiB (1 core + 2 × {halo} halo frames)",
+                estimated_tile_bytes(1 + 2 * halo) as f64 / GIB
+            )));
+        }
+        Ok(Self {
+            mode: DecodeMode::Tiled { core_frames: core },
+            halo_frames: halo,
+        })
+    }
+
+    /// The estimated peak decode memory (bytes) for a `frames`-frame latent under these options.
+    /// This is the largest tile, or the whole latent for [`DecodeMode::Full`]; see
+    /// [`estimated_tile_bytes`] for what it excludes.
+    pub fn estimated_peak_bytes(&self, frames: usize) -> u64 {
+        let tile = match self.mode {
+            DecodeMode::Tiled { core_frames } => frames.min(core_frames + 2 * self.halo_frames),
+            DecodeMode::Full => frames,
+        };
+        estimated_tile_bytes(tile)
     }
 
     /// The full reference FP32 decode.
@@ -405,13 +486,56 @@ mod tests {
             );
             assert_eq!(tiled_out.metadata().to_json()["vae_halo_frames"], json!(16));
         }
+        assert_eq!(DecodeOptions::default(), DecodeOptions::production());
+    }
+
+    /// The budget rule honours the budget it is given. At 8, 12, 16 and 24 GiB the estimated
+    /// footprint of the chosen tile (core + 2 × halo) is within the budget, and one more core frame
+    /// would not be (unless the core is already capped at 1024). NaN, ±inf, 0, −1 and a budget
+    /// below the smallest tile are refused. Mutations: dropping the `− 2·halo` term, or the
+    /// reserve, puts the estimate over budget (red); clamping the core up to 1 instead of
+    /// refusing makes the 1 GiB case pass (red).
+    #[test]
+    fn memory_budget_tiling_fits_its_budget() {
+        for gib in [2.0, 8.0, 12.0, 16.0, 24.0, DEFAULT_DECODE_BUDGET_GIB] {
+            let o = DecodeOptions::for_memory_budget_gib(gib).unwrap();
+            let DecodeMode::Tiled { core_frames } = o.mode else {
+                panic!("{gib}: not tiled")
+            };
+            assert_eq!(o.halo_frames, DEFAULT_HALO_FRAMES);
+            let budget = (gib * GIB) as u64;
+            let est = estimated_tile_bytes(core_frames + 2 * o.halo_frames);
+            assert!(
+                est <= budget,
+                "{gib} GiB: core {core_frames} estimates {est} bytes"
+            );
+            assert_eq!(o.estimated_peak_bytes(100_000), est);
+            if core_frames < DEFAULT_CORE_FRAMES {
+                assert!(estimated_tile_bytes(core_frames + 1 + 2 * o.halo_frames) > budget);
+            }
+            assert!((1..=DEFAULT_CORE_FRAMES).contains(&core_frames));
+        }
         assert_eq!(
-            DecodeOptions::for_memory_budget_gib(12.0).mode,
-            DecodeMode::Tiled { core_frames: 512 }
+            DecodeOptions::production().mode,
+            DecodeMode::Tiled { core_frames: 224 }
         );
+        // Each refusal comes from the intended rule: invalid budgets from the positivity check,
+        // a too-small one from the minimum-tile check.
+        let refusal = |gib: f64| match DecodeOptions::for_memory_budget_gib(gib) {
+            Err(VaeError::MemoryBudget(m)) => m,
+            other => panic!("{gib} GiB must be refused, got {other:?}"),
+        };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            assert!(refusal(bad).contains("must be positive"), "{bad}");
+        }
+        assert!(refusal(1.0).contains("below the smallest tile"));
+        // A full decode's estimate grows with the latent; a tiled one stops at the tile.
+        let full = DecodeOptions::reference_full();
+        assert!(full.estimated_peak_bytes(2000) > full.estimated_peak_bytes(1000));
+        let tiled = DecodeOptions::production();
         assert_eq!(
-            DecodeOptions::default(),
-            DecodeOptions::for_memory_budget_gib(24.0)
+            tiled.estimated_peak_bytes(2000),
+            tiled.estimated_peak_bytes(1000)
         );
     }
 

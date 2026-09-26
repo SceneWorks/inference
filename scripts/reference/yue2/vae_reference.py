@@ -39,6 +39,11 @@ reconstruction overshoots ±1; RIGHT: a quiet 659.25 Hz sine) is encoded by the 
 encoder (posterior mean) into ``REAL_FRAMES`` latent frames; those SAME latents are decoded by both
 pinned decoders through ``YuE2Pipeline.decode`` (tiled at the default core, and full) and by
 ``decode``/``decode_tiled(core_frames=REAL_CORE)``. Both encoders' ``(mean, scale)`` are stored too.
+Two seeded Gaussian latents (scaled to the encoded latent's std) cover tiling at length:
+``long_latent`` (``REAL_LONG_FRAMES``; each decoder's full ``decode`` is stored as
+``<variant>.long_full_raw``) and ``prod_latent`` (``REAL_PROD_FRAMES``, longer than the native
+production core ``REAL_PROD_CORE`` so the production tiling has several tiles; each decoder's
+``YuE2Pipeline.decode`` at that core is stored as ``<variant>.prod_pipeline``).
 Because these waveforms are derived from CC BY-NC 4.0 weights they are written OUTSIDE the
 repository (``--out``, default ``~/.cache/sceneworks-yue2-fixtures/vae``); only
 ``vae_real_reference.json`` (their SHA-256, shapes, statistics and Python's own measured
@@ -50,7 +55,7 @@ Run with the pinned reference environment (``setup_reference_env.sh``)::
     HF_HUB_OFFLINE=1 YUE2_HF_HUB=/path/to/hub \\
         ~/.cache/sceneworks-yue2-ref/venv/bin/python scripts/reference/yue2/vae_reference.py real
 
-Measured peak RSS: tiny 0.34 GB; real 3.0 GB (one 530 MB FP32 VAE resident at a time, loaded
+Measured peak RSS: tiny 0.34 GB; real 5.9 GB (one 530 MB FP32 VAE resident at a time, loaded
 twice over by ``safe_open`` + ``load_state_dict``, plus torch) — CPU only.
 """
 
@@ -90,8 +95,13 @@ TINY_CLAMP_QUANTILE = 0.9
 
 #: Real-mode clip length in latent frames (0.64 s) and the tile core used for seam coverage.
 REAL_FRAMES, REAL_CORE = 16, 4
-#: A longer latent (3 s) for Python's own measured tiled-vs-full boundary error (not stored).
+#: A longer latent (3 s) whose upstream full decode is stored; Rust tiles it at core 16.
 REAL_LONG_FRAMES, REAL_LONG_CORE = 75, 16
+#: The native production tile core (`DecodeOptions::production()` in `candle_audio_yue2::decode`,
+#: derived from its default decode budget; the Rust test asserts they agree) and a latent long
+#: enough for three production tiles (224 + 224 + 37 frames, 19.4 s).
+REAL_PROD_CORE = 224
+REAL_PROD_FRAMES = 2 * REAL_PROD_CORE + 37
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -295,6 +305,7 @@ def real(hub: Path, out: Path) -> None:
     record = {}
     latent = None
     long_latent = None
+    prod_latent = None
     for key, (repo, revision) in (("standard", VAE), ("legacy", VAE_LEGACY)):
         path = snapshot(hub, repo, revision)
         model = YuE2VAE.from_pretrained(path, local_files_only=True)
@@ -307,6 +318,10 @@ def real(hub: Path, out: Path) -> None:
             tensors["latent"] = latent[0].T.contiguous()
             g = torch.Generator().manual_seed(2299375)
             long_latent = torch.randn((1, 64, REAL_LONG_FRAMES), generator=g) * mean.std()
+            tensors["long_latent"] = long_latent[0].T.contiguous()
+            g = torch.Generator().manual_seed(2299376)
+            prod_latent = torch.randn((1, 64, REAL_PROD_FRAMES), generator=g) * mean.std()
+            tensors["prod_latent"] = prod_latent[0].T.contiguous()
         latent_t64 = latent[0].T.contiguous().numpy()
         full_raw = model.decode(latent)
         tiled_raw = model.decode_tiled(latent, core_frames=REAL_CORE, halo_frames=16)
@@ -314,7 +329,11 @@ def real(hub: Path, out: Path) -> None:
         pipe_full = pipeline_decode(model, latent_t64, 1024, full=True)
         long_full = model.decode(long_latent)
         long_tiled = model.decode_tiled(long_latent, core_frames=REAL_LONG_CORE, halo_frames=16)
+        prod_pipeline = pipeline_decode(model, prod_latent[0].T.contiguous().numpy(),
+                                        REAL_PROD_CORE, full=False)
         tensors[f"{key}.pipeline_default"] = torch.from_numpy(pipe_default).contiguous()
+        tensors[f"{key}.long_full_raw"] = long_full.contiguous()
+        tensors[f"{key}.prod_pipeline"] = torch.from_numpy(prod_pipeline).contiguous()
         tensors[f"{key}.full_raw"] = full_raw.contiguous()
         left, right = full_raw[0, 0], full_raw[0, 1]
         record[key] = {
@@ -345,7 +364,12 @@ def real(hub: Path, out: Path) -> None:
         "core_frames": REAL_CORE,
         "long_frames": REAL_LONG_FRAMES,
         "long_core_frames": REAL_LONG_CORE,
-        "long_latent": "torch.randn((1,64,75), Generator.manual_seed(2299375)) * std(latent)",
+        "long_latent": "torch.randn((1,64,75), Generator.manual_seed(2299375)) * std(latent), "
+                       "stored as long_latent [75, 64]",
+        "prod_frames": REAL_PROD_FRAMES,
+        "prod_core_frames": REAL_PROD_CORE,
+        "prod_latent": "torch.randn((1,64,485), Generator.manual_seed(2299376)) * std(latent), "
+                       "stored as prod_latent [485, 64]",
         "clip": "LEFT 0.97*sign(sin(2pi*220t)), RIGHT 0.3*sin(2pi*659.25t), 48 kHz, "
                 f"{REAL_FRAMES * 1920} samples",
         "reference_file": ref.name,
