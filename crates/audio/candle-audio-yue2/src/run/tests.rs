@@ -1162,13 +1162,21 @@ fn the_returned_record_is_the_published_record() {
 
 #[test]
 fn files_and_directories_sync_through_handles_the_platform_accepts() {
-    // `sync_file` flushes through a writable handle (Windows refuses `FlushFileBuffers` on a
-    // read-only one) and changes nothing; `sync_dir` flushes a directory where the platform can.
+    // `sync_file` flushes a file through a handle the platform accepts and changes none of its
+    // bytes — also when the file is read-only (a copy of a `0444` snapshot file); `sync_dir`
+    // flushes a directory where the platform can.
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("artifact.bin");
     fs::write(&file, b"exact bytes").unwrap();
     sync_file(&file).unwrap();
     assert_eq!(fs::read(&file).unwrap(), b"exact bytes", "never truncated");
+    let read_only = tmp.path().join("read-only.bin");
+    fs::write(&read_only, b"pinned bytes").unwrap();
+    let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&read_only, permissions).unwrap();
+    sync_file(&read_only).unwrap();
+    assert_eq!(fs::read(&read_only).unwrap(), b"pinned bytes");
     sync_dir(tmp.path()).unwrap();
     // Neither creates what is not there.
     let missing = tmp.path().join("missing.bin");

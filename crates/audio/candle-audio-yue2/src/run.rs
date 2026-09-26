@@ -318,15 +318,33 @@ pub(crate) fn read_json(path: &Path) -> Result<Value, RunError> {
     serde_json::from_slice(&bytes).map_err(|e| corrupt(path, format!("not JSON: {e}")))
 }
 
-/// `fsync` a file that is already written. The file is opened for **writing** (never created or
-/// truncated): Windows' `FlushFileBuffers` needs a handle with write access, so a read-only
-/// `File::open(..).sync_all()` fails there with `ERROR_ACCESS_DENIED` (ported from sc-22995).
+/// `fsync` a file that is already written, without modifying its bytes.
+///
+/// * Unix: through a read-only handle (`fsync` needs no write access), so a read-only file — for
+///   example a copy of a `0444` pinned snapshot file, whose mode `fs::copy` preserves — syncs too.
+/// * Windows: `FlushFileBuffers` needs a handle with write access, and a read-only-attribute file
+///   cannot be opened for writing, so the read-only attribute is cleared first. Only files this
+///   crate itself wrote or copied are synced, so this changes nothing a caller owns.
 pub(crate) fn sync_file(path: &Path) -> Result<(), RunError> {
-    fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(io(path))
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+            .and_then(|f| f.sync_all())
+            .map_err(io(path))
+    }
+    #[cfg(windows)]
+    {
+        let mut permissions = fs::metadata(path).map_err(io(path))?.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).map_err(io(path))?;
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.sync_all())
+            .map_err(io(path))
+    }
 }
 
 /// `fsync` a directory, making the renames and creations inside it durable (POSIX). On Windows a
