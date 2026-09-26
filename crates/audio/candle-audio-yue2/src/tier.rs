@@ -612,12 +612,7 @@ fn assemble(
     let weights = work.join(WEIGHTS_FILE);
     candle_core::safetensors::save(&out, &weights).map_err(candle_run("write"))?;
     drop(out);
-    std::fs::File::open(&weights)
-        .and_then(|f| f.sync_all())
-        .map_err(|source| RunError::Io {
-            path: weights.clone(),
-            source,
-        })?;
+    crate::run::sync_file(&weights)?;
     let (sha, bytes) = file_digest(&weights)?;
     files.insert(
         WEIGHTS_FILE.to_string(),

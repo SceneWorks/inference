@@ -318,6 +318,17 @@ pub(crate) fn read_json(path: &Path) -> Result<Value, RunError> {
     serde_json::from_slice(&bytes).map_err(|e| corrupt(path, format!("not JSON: {e}")))
 }
 
+/// `fsync` a file that is already written. The file is opened for **writing** (never truncated):
+/// Windows refuses `FlushFileBuffers` on a read-only handle (`ERROR_ACCESS_DENIED`), which a
+/// read-only `File::open(..).sync_all()` hits on every run there.
+pub(crate) fn sync_file(path: &Path) -> Result<(), RunError> {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(io(path))
+}
+
 pub(crate) fn sync_dir(dir: &Path) -> Result<(), RunError> {
     // Directory fsync makes the renames inside it durable; not every platform opens directories.
     #[cfg(unix)]
@@ -722,9 +733,7 @@ impl WorkDir {
         let mut digests = Map::new();
         for name in artifacts {
             let path = self.path(name);
-            fs::File::open(&path)
-                .and_then(|f| f.sync_all())
-                .map_err(io(&path))?;
+            sync_file(&path)?;
             let (sha256, bytes) = file_digest(&path)?;
             digests.insert(name.to_string(), json!({"sha256": sha256, "bytes": bytes}));
         }
@@ -749,9 +758,7 @@ impl WorkDir {
         let artifacts = collect_hashes(&self.work)?;
         for name in artifacts.keys() {
             let path = self.work.join(name);
-            fs::File::open(&path)
-                .and_then(|f| f.sync_all())
-                .map_err(io(&path))?;
+            sync_file(&path)?;
         }
         result.insert("artifacts".into(), Value::Object(artifacts));
         let result = Value::Object(result);

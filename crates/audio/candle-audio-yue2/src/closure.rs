@@ -221,12 +221,7 @@ fn assemble(
                 path: to.clone(),
                 source,
             })?;
-            std::fs::File::open(&to)
-                .and_then(|f| f.sync_all())
-                .map_err(|source| RunError::Io {
-                    path: to.clone(),
-                    source,
-                })?;
+            crate::run::sync_file(&to)?;
             // The copy is checked against the pin, over the bytes now on disk.
             let (sha, bytes) = file_digest(&to)?;
             if sha != pinned.sha256 || bytes != pinned.bytes {

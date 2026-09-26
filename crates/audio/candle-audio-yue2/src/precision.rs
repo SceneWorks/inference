@@ -60,6 +60,28 @@
 //! [`weight_residency`] prices a tier's resident weights from the checkpoint's tensor table alone
 //! (weights-free), per backend, with the FP8 mode's CPU-resident BF16 originals counted separately;
 //! [`crate::model::Yue2Lm::weight_residency`] measures the same thing on a loaded model.
+//!
+//! # Measured quality (2026-09-26)
+//!
+//! `quality::tier_quality_against_the_f32_reference` (`#[ignore]`d, real weights), every
+//! configuration loaded through [`crate::engine::Yue2Engine::load_with_precision`] and compared
+//! with the released checkpoint in F32 on the CPU (itself within 3.6e-5 of the pinned upstream's
+//! F32 top-8 logits). **AR**: teacher-forced on the committed fixture's 184 score / semantic steps
+//! (7 sequences), over each phase's allowed ids. **Acoustic**: the engine's acoustic stage on the
+//! fixture's `supplied_full` plan with the semantic codes of `nar_real_reference.json` — 100
+//! frames × 32 midpoint steps (`multi_chunk_32`'s codes; one chunk at the full context) and 24
+//! frames × 5 steps — then the standard decoder (FP32). One seed per case: these are engineering
+//! fidelity numbers against the original, not a listening benchmark.
+//!
+//! | config | backend | top-1 | top-8 overlap | KL mean / max | latents SNR (100 / 24 fr) | audio SNR (100 / 24 fr) | weights resident |
+//! |---|---|---|---|---|---|---|---|
+//! | `q8` | Candle CPU (Apple M-series), F32 activations | 99.5 % | 99.0 % | 1.5e-4 / 1.2e-3 | 37.0 / 39.7 dB | 30.0 / 32.7 dB | 5.12 GB |
+//! | `q4` | Candle CPU (Apple M-series), F32 activations | 93.5 % | 92.5 % | 9.0e-3 / 4.1e-2 | 18.3 / 19.1 dB | 11.8 / 10.3 dB | 3.52 GB |
+//!
+//! `bf16` on the CPU *is* the reference (the CPU computes the BF16 checkpoint in F32 exactly), so
+//! the released-precision rows — BF16 whole-model device parity, the FP8 AR mode, and the tiers
+//! with BF16 activations — are measured on CUDA (below). Metal BF16 parity is terminal-story
+//! evidence on the owner's GPU ([`OWNER_DECISIONS`]' `metal_bf16_parity`).
 
 use candle_audio::candle_core::quantized::GgmlDType;
 use candle_audio::candle_core::DType;
