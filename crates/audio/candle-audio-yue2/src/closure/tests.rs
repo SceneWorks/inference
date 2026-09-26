@@ -163,6 +163,23 @@ fn a_saved_closure_is_a_byte_identical_verifiable_copy_with_its_licence_files() 
         repo("m-a-p/YuE2-Synth-Vae"),
         &extras,
     );
+    // Read-only sources, as a snapshot store may keep them (`fs::copy` preserves the mode, so
+    // the copies are read-only too and must still sync).
+    for dir in [&lm_dir, &vae_dir] {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let mut p = std::fs::metadata(&path).unwrap().permissions();
+                    p.set_readonly(true);
+                    std::fs::set_permissions(&path, p).unwrap();
+                }
+            }
+        }
+    }
     let sources = [(lm, lm_dir.clone()), (tok, lm_dir.clone()), (vae, vae_dir)];
     let resolve = |id: ComponentId| {
         let (component, dir) = sources
@@ -225,6 +242,10 @@ fn a_saved_closure_is_a_byte_identical_verifiable_copy_with_its_licence_files() 
 
     // A changed copy no longer verifies.
     let changed = dest.join("YuE2-Synth-Vae/THIRD_PARTY_NOTICES.md");
+    let mut p = std::fs::metadata(&changed).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    p.set_readonly(false);
+    std::fs::set_permissions(&changed, p).unwrap();
     std::fs::write(&changed, b"edited\n").unwrap();
     assert!(verify_component(vae, &dest.join("YuE2-Synth-Vae")).is_err());
 }

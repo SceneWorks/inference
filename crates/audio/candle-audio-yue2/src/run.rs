@@ -318,8 +318,43 @@ pub(crate) fn read_json(path: &Path) -> Result<Value, RunError> {
     serde_json::from_slice(&bytes).map_err(|e| corrupt(path, format!("not JSON: {e}")))
 }
 
+/// `fsync` a file that is already written, without modifying its bytes.
+///
+/// * Unix: through a read-only handle (`fsync` needs no write access), so a read-only file — for
+///   example a copy of a `0444` pinned snapshot file, whose mode `fs::copy` preserves — syncs too.
+/// * Windows: `FlushFileBuffers` needs a handle with write access, and a read-only-attribute file
+///   cannot be opened for writing, so the read-only attribute is cleared first. Only files this
+///   crate itself wrote or copied are synced, so this changes nothing a caller owns.
+pub(crate) fn sync_file(path: &Path) -> Result<(), RunError> {
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+            .and_then(|f| f.sync_all())
+            .map_err(io(path))
+    }
+    #[cfg(windows)]
+    {
+        let mut permissions = fs::metadata(path).map_err(io(path))?.permissions();
+        if permissions.readonly() {
+            // Windows has one read-only attribute (no Unix mode bits to widen): clearing it is
+            // exactly what makes the copy openable for the flush.
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).map_err(io(path))?;
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.sync_all())
+            .map_err(io(path))
+    }
+}
+
+/// `fsync` a directory, making the renames and creations inside it durable (POSIX). On Windows a
+/// directory is not opened for flushing: that needs `FILE_FLAG_BACKUP_SEMANTICS` plus write
+/// access, and NTFS journals the metadata of a rename (`MoveFileEx`) itself, so the call is a
+/// deliberate no-op there — file contents are still flushed by [`sync_file`].
 pub(crate) fn sync_dir(dir: &Path) -> Result<(), RunError> {
-    // Directory fsync makes the renames inside it durable; not every platform opens directories.
     #[cfg(unix)]
     {
         fs::File::open(dir)
@@ -327,7 +362,9 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<(), RunError> {
             .map_err(io(dir))?;
     }
     #[cfg(not(unix))]
-    let _ = dir;
+    if !dir.is_dir() {
+        return Err(corrupt(dir, "not a directory"));
+    }
     Ok(())
 }
 
@@ -722,9 +759,7 @@ impl WorkDir {
         let mut digests = Map::new();
         for name in artifacts {
             let path = self.path(name);
-            fs::File::open(&path)
-                .and_then(|f| f.sync_all())
-                .map_err(io(&path))?;
+            sync_file(&path)?;
             let (sha256, bytes) = file_digest(&path)?;
             digests.insert(name.to_string(), json!({"sha256": sha256, "bytes": bytes}));
         }
@@ -749,9 +784,7 @@ impl WorkDir {
         let artifacts = collect_hashes(&self.work)?;
         for name in artifacts.keys() {
             let path = self.work.join(name);
-            fs::File::open(&path)
-                .and_then(|f| f.sync_all())
-                .map_err(io(&path))?;
+            sync_file(&path)?;
         }
         result.insert("artifacts".into(), Value::Object(artifacts));
         write_json(&self.work.join(RESULT_JSON), &Value::Object(result))?;
