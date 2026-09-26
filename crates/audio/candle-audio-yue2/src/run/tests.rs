@@ -914,6 +914,27 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
         }
     }
 
+    // The cached-decode identity binds each of its own arguments: the source run, the latents,
+    // the decoder and the MoT identity.
+    let cached = |source: &str, latent: &str, vae: &str, weights: &str| {
+        base.cached_decode(
+            source,
+            &serde_json::json!(latent),
+            &serde_json::json!(vae),
+            &serde_json::json!(weights),
+        )
+    };
+    let reference = cached("source", "latent", "vae", "mot");
+    assert_eq!(reference, b[4]);
+    for (what, id) in [
+        ("source", cached("other-source", "latent", "vae", "mot")),
+        ("latent", cached("source", "other-latent", "vae", "mot")),
+        ("vae", cached("source", "latent", "other-vae", "mot")),
+        ("weights", cached("source", "latent", "vae", "other-mot")),
+    ] {
+        assert_ne!(id, reference, "{what} → cached_decode");
+    }
+
     // The stage inputs themselves.
     let other = |edit: fn(&mut SamplingOverrides)| {
         let mut o = SamplingOverrides::default();
