@@ -42,6 +42,7 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::durable::hex;
 use crate::inventory::ComponentId;
 use crate::snapshot::{self, AssetError, SnapshotDirs, VerifiedComponent};
 
@@ -472,10 +473,6 @@ fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
         out.extend_from_slice(&bytes[..3 - pad]);
     }
     Some(out)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

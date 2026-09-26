@@ -20,11 +20,11 @@ use std::path::{Path, PathBuf};
 use candle_audio_yue2::cover::abc::KeepVoice;
 use candle_audio_yue2::cover::abc::{compare, parse, VOICES};
 use candle_audio_yue2::cover::{prepare_cover, CoverLyrics, CoverMode, CoverSpec, PreparedCover};
+use candle_audio_yue2::durable::{self, sha256_hex};
 use candle_audio_yue2::license::{authorize_closure, IntendedUse};
 use candle_audio_yue2::run::{verify_run, RunOutput, SongInput};
 use candle_audio_yue2::{Closure, EngineHooks, SongRequest, SongSettings, Yue2Engine};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::provider::{live_models, Transcriber, UnloadReceipt};
 use crate::review::{Readiness, ReviewArtifact, MELODY_SCORE};
@@ -36,6 +36,9 @@ pub const COVER_SCHEMA: &str = "sceneworks-yue2-cover-v1";
 pub const COVER_JSON: &str = "cover.json";
 /// The engine run directory inside a cover directory.
 pub const RUN_DIR: &str = "run";
+/// The integrity record of a cover directory: `cover.json`'s SHA-256 and size, written last (its
+/// presence marks a complete cover; [`verify_cover`] checks it).
+pub const COVER_MANIFEST: &str = "cover_manifest.json";
 
 /// What the cover is built from, besides the transcription.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,13 +85,6 @@ pub struct CoverPlan {
     pub prepared: PreparedCover,
     /// The provenance record written to `cover.json`.
     pub provenance: Value,
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// Build the cover request from a reviewed transcription (see the module docs). Only a verified
@@ -257,6 +253,8 @@ pub struct CoverOutcome {
     pub unload: Option<UnloadReceipt>,
     /// `dir/cover.json`.
     pub provenance_path: PathBuf,
+    /// Its SHA-256, as recorded in [`COVER_MANIFEST`].
+    pub provenance_sha256: String,
 }
 
 /// Unload the transcriber, prove no SheetSage2 model is alive, then load the generator and
@@ -311,18 +309,58 @@ pub fn run_cover<G: CoverGenerator>(
         "identity": result["identity"],
         "status": result["status"],
     });
+    // Durable writes (synced, renamed, parent synced), `cover.json` first and its integrity record
+    // last, so a manifest means a complete cover.
     let path = dir.join(COVER_JSON);
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&provenance).expect("serializable"),
+    durable::write_json(&path, &provenance).map_err(|e| Error::io(&e.path, e.source))?;
+    let (sha256, bytes) = durable::sha256_file(&path).map_err(|e| Error::io(&e.path, e.source))?;
+    let manifest = dir.join(COVER_MANIFEST);
+    durable::write_json(
+        &manifest,
+        &json!({
+            "schema": COVER_SCHEMA,
+            "files": {COVER_JSON: {"sha256": sha256, "bytes": bytes}},
+        }),
     )
-    .map_err(|e| Error::io(&path, e))?;
+    .map_err(|e| Error::io(&e.path, e.source))?;
     Ok(CoverOutcome {
         run_dir,
         result,
         unload,
         provenance_path: path,
+        provenance_sha256: sha256,
     })
+}
+
+/// Verify a cover directory written by [`run_cover`]: [`COVER_MANIFEST`] exists and `cover.json`
+/// has exactly the recorded size and SHA-256. Returns the verified `cover.json`.
+pub fn verify_cover(dir: &Path) -> Result<Value, Error> {
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read(&path).map_err(|e| Error::io(&path, e))
+    };
+    let manifest: Value = serde_json::from_slice(&read(COVER_MANIFEST)?)
+        .map_err(|e| Error::Replay(format!("{COVER_MANIFEST} is not JSON: {e}")))?;
+    let record = &manifest["files"][COVER_JSON];
+    let (Some(want_sha), Some(want_bytes)) = (record["sha256"].as_str(), record["bytes"].as_u64())
+    else {
+        return Err(Error::Replay(format!(
+            "{COVER_MANIFEST} does not record {COVER_JSON}"
+        )));
+    };
+    if manifest["schema"] != COVER_SCHEMA {
+        return Err(Error::Replay(format!(
+            "{COVER_MANIFEST}: not a cover record"
+        )));
+    }
+    let bytes = read(COVER_JSON)?;
+    if bytes.len() as u64 != want_bytes || sha256_hex(&bytes) != want_sha {
+        return Err(Error::Replay(format!(
+            "{COVER_JSON} changed since it was recorded (SHA-256 {}, recorded {want_sha})",
+            sha256_hex(&bytes)
+        )));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Error::Replay(format!("{COVER_JSON}: {e}")))
 }
 
 #[cfg(test)]

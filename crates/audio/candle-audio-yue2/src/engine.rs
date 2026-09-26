@@ -58,7 +58,6 @@ use std::time::Instant;
 use candle_audio::candle_core::{DType, Device};
 use candle_audio::gen_core;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 
 use crate::decode::{decode_latents, DecodeMode, DecodeOptions, DecodedAudio};
 use crate::fp8::{self, ArPrecision};
@@ -478,11 +477,7 @@ pub fn canonical_json(value: &Value) -> String {
 
 /// SHA-256 (lower-case hex) of [`canonical_json`]`(value)`.
 pub fn identity_of(value: &Value) -> String {
-    hex(&Sha256::digest(canonical_json(value).as_bytes()))
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::durable::sha256_hex(canonical_json(value).as_bytes())
 }
 
 fn dtype_name(dtype: DType) -> &'static str {

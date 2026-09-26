@@ -34,12 +34,12 @@
 
 use std::fmt;
 use std::fs;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::durable::hex;
 use crate::protocol::{
     check_generation_budget, negative_prefix, token_prefixes, CotMode, ProtocolError, Sampling,
     SongRequest, PROTOCOL_VERSION,
@@ -582,10 +582,6 @@ fn ids_le(ids: &[u32]) -> Vec<u8> {
     ids.iter().flat_map(|id| id.to_le_bytes()).collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 fn io(path: &Path, source: std::io::Error) -> PlanError {
     PlanError::Io {
         path: path.to_path_buf(),
@@ -631,19 +627,9 @@ fn json_ids(value: &Value, field: &'static str) -> Result<Vec<u32>, PlanError> {
         .collect()
 }
 
-/// Write via a sibling temporary file and a rename, as upstream's `write_json` does.
+/// [`crate::durable::write_atomic`], as upstream's `write_json` writes each file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PlanError> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-    let tmp = path.with_file_name(format!(
-        "{}.{}.tmp",
-        name.as_deref().unwrap_or("plan"),
-        std::process::id()
-    ));
-    let mut file = fs::File::create(&tmp).map_err(|source| io(&tmp, source))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| io(&tmp, source))?;
-    fs::rename(&tmp, path).map_err(|source| io(path, source))
+    crate::durable::write_atomic(path, bytes).map_err(|e| io(&e.path, e.source))
 }
 
 /// A 1-D little-endian int32 `.npy` (format 1.0), byte-identical to `np.save` of

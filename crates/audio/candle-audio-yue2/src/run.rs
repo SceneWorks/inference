@@ -69,14 +69,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Component as PathComponent, Path, PathBuf};
 use std::time::Instant;
 
 use candle_audio::gen_core;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 
+use crate::durable::{self, IoAt};
 use crate::engine::{
     identity_of, EngineHooks, SemanticResult, SongSettings, Stage, StageEvent, Yue2Engine,
     IDENTITY_SCHEMA,
@@ -181,6 +181,15 @@ impl From<RunError> for gen_core::Error {
     }
 }
 
+impl From<IoAt> for RunError {
+    fn from(e: IoAt) -> Self {
+        RunError::Io {
+            path: e.path,
+            source: e.source,
+        }
+    }
+}
+
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> RunError + '_ {
     move |source| RunError::Io {
         path: path.to_path_buf(),
@@ -276,96 +285,9 @@ pub(crate) fn is_nonempty_dir(dir: &Path) -> Result<bool, RunError> {
     }
 }
 
-/// SHA-256 (hex) and size of the bytes of `path` as they are on disk now.
-pub(crate) fn file_digest(path: &Path) -> Result<(String, u64), RunError> {
-    let mut file = fs::File::open(path).map_err(io(path))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 8 << 20];
-    let mut bytes = 0u64;
-    loop {
-        let n = file.read(&mut buf).map_err(io(path))?;
-        if n == 0 {
-            break;
-        }
-        bytes += n as u64;
-        hasher.update(&buf[..n]);
-    }
-    Ok((crate::engine::hex(&hasher.finalize()), bytes))
-}
-
-/// Write via a sibling temporary file, `fsync`, then rename (upstream `write_json`'s shape).
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), RunError> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
-    let mut file = fs::File::create(&tmp).map_err(io(&tmp))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(io(&tmp))?;
-    fs::rename(&tmp, path).map_err(io(path))
-}
-
-pub(crate) fn write_json(path: &Path, value: &Value) -> Result<(), RunError> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| corrupt(path, e.to_string()))?;
-    bytes.push(b'\n');
-    write_atomic(path, &bytes)
-}
-
 pub(crate) fn read_json(path: &Path) -> Result<Value, RunError> {
     let bytes = fs::read(path).map_err(io(path))?;
     serde_json::from_slice(&bytes).map_err(|e| corrupt(path, format!("not JSON: {e}")))
-}
-
-/// `fsync` a file that is already written, without modifying its bytes.
-///
-/// * Unix: through a read-only handle (`fsync` needs no write access), so a read-only file — for
-///   example a copy of a `0444` pinned snapshot file, whose mode `fs::copy` preserves — syncs too.
-/// * Windows: `FlushFileBuffers` needs a handle with write access, and a read-only-attribute file
-///   cannot be opened for writing, so the read-only attribute is cleared first. Only files this
-///   crate itself wrote or copied are synced, so this changes nothing a caller owns.
-pub(crate) fn sync_file(path: &Path) -> Result<(), RunError> {
-    #[cfg(not(windows))]
-    {
-        fs::File::open(path)
-            .and_then(|f| f.sync_all())
-            .map_err(io(path))
-    }
-    #[cfg(windows)]
-    {
-        let mut permissions = fs::metadata(path).map_err(io(path))?.permissions();
-        if permissions.readonly() {
-            // Windows has one read-only attribute (no Unix mode bits to widen): clearing it is
-            // exactly what makes the copy openable for the flush.
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            fs::set_permissions(path, permissions).map_err(io(path))?;
-        }
-        fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .and_then(|f| f.sync_all())
-            .map_err(io(path))
-    }
-}
-
-/// `fsync` a directory, making the renames and creations inside it durable (POSIX). On Windows a
-/// directory is not opened for flushing: that needs `FILE_FLAG_BACKUP_SEMANTICS` plus write
-/// access, and NTFS journals the metadata of a rename (`MoveFileEx`) itself, so the call is a
-/// deliberate no-op there — file contents are still flushed by [`sync_file`].
-pub(crate) fn sync_dir(dir: &Path) -> Result<(), RunError> {
-    #[cfg(unix)]
-    {
-        fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .map_err(io(dir))?;
-    }
-    #[cfg(not(unix))]
-    if !dir.is_dir() {
-        return Err(corrupt(dir, "not a directory"));
-    }
-    Ok(())
 }
 
 /// Every regular file under `dir` (relative, `/`-separated), `result.json` excluded, with its
@@ -393,7 +315,7 @@ fn collect_hashes(dir: &Path) -> Result<Map<String, Value>, RunError> {
                 if rel == RESULT_JSON || rel == LOCK_FILE || rel.ends_with(".tmp") {
                     continue;
                 }
-                let (sha256, bytes) = file_digest(&path)?;
+                let (sha256, bytes) = durable::sha256_file(&path)?;
                 out.insert(rel, json!({"sha256": sha256, "bytes": bytes}));
             } else {
                 return Err(corrupt(&path, "run directories hold only regular files"));
@@ -433,7 +355,7 @@ fn verify_artifact(dir: &Path, name: &str, expected: &Value) -> Result<(), RunEr
             format!("{} bytes, recorded {want_bytes}", meta.len()),
         ));
     }
-    let (sha, _) = file_digest(&path)?;
+    let (sha, _) = durable::sha256_file(&path)?;
     if sha != want_sha {
         return Err(corrupt(
             &path,
@@ -759,13 +681,13 @@ impl WorkDir {
         let mut digests = Map::new();
         for name in artifacts {
             let path = self.path(name);
-            sync_file(&path)?;
-            let (sha256, bytes) = file_digest(&path)?;
+            durable::sync_file(&path)?;
+            let (sha256, bytes) = durable::sha256_file(&path)?;
             digests.insert(name.to_string(), json!({"sha256": sha256, "bytes": bytes}));
         }
         let dir = self.work.join(STAGES_DIR);
         fs::create_dir_all(&dir).map_err(io(&dir))?;
-        write_json(
+        durable::write_json(
             &self.record_path(stage),
             &json!({
                 "schema": IDENTITY_SCHEMA,
@@ -775,7 +697,7 @@ impl WorkDir {
                 "data": data,
             }),
         )?;
-        sync_dir(&self.work)
+        Ok(durable::sync_dir(&self.work)?)
     }
 
     /// Write `result.json` (with every other file's digest), sync, and rename the working
@@ -784,15 +706,15 @@ impl WorkDir {
         let artifacts = collect_hashes(&self.work)?;
         for name in artifacts.keys() {
             let path = self.work.join(name);
-            sync_file(&path)?;
+            durable::sync_file(&path)?;
         }
         result.insert("artifacts".into(), Value::Object(artifacts));
-        write_json(&self.work.join(RESULT_JSON), &Value::Object(result))?;
+        durable::write_json(&self.work.join(RESULT_JSON), &Value::Object(result))?;
         let stages = self.work.join(STAGES_DIR);
         if stages.is_dir() {
-            sync_dir(&stages)?;
+            durable::sync_dir(&stages)?;
         }
-        sync_dir(&self.work)?;
+        durable::sync_dir(&self.work)?;
         if self.target.is_dir() {
             // An empty target directory (checked when the run opened) is replaced.
             fs::remove_dir(&self.target).map_err(io(&self.target))?;
@@ -802,7 +724,7 @@ impl WorkDir {
         let moved = self.target.join(LOCK_FILE);
         fs::remove_file(&moved).map_err(io(&moved))?;
         if let Some(parent) = self.target.parent().filter(|p| !p.as_os_str().is_empty()) {
-            sync_dir(parent)?;
+            durable::sync_dir(parent)?;
         }
         // Hand back the record as a reader of the published file sees it (JSON floats do not all
         // round-trip bit for bit through serde_json's default parser).
@@ -866,7 +788,7 @@ fn read_semantic(path: &Path) -> Result<Vec<u32>, RunError> {
 
 fn write_semantic(path: &Path, codes: &[u32]) -> Result<(), RunError> {
     let bytes = npy_int32(codes).map_err(|e| corrupt(path, e.to_string()))?;
-    write_atomic(path, &bytes)
+    Ok(durable::write_atomic(path, &bytes)?)
 }
 
 fn observe(
@@ -1169,7 +1091,7 @@ impl Yue2Engine {
         let audio = self.decode(&latents, settings.decoder, hooks)?;
         let vae_seconds = vae_start.elapsed().as_secs_f64();
         stages.insert(Stage::Decode, StageEvent::Finished);
-        write_atomic(
+        durable::write_atomic(
             &work.path(AUDIO_WAV),
             &wav_f32_bytes(audio.samples(), SAMPLE_RATE, AUDIO_CHANNELS as u16),
         )?;
@@ -1192,8 +1114,8 @@ impl Yue2Engine {
 
         let request = plan.request();
         let config = self.effective_config(request, settings);
-        write_json(&work.path(REQUEST_JSON), &request.to_json())?;
-        write_json(&work.path(CONFIG_JSON), &config)?;
+        durable::write_json(&work.path(REQUEST_JSON), &request.to_json())?;
+        durable::write_json(&work.path(CONFIG_JSON), &config)?;
         hooks.check_cancel()?;
 
         let mut timing = Map::new();
@@ -1296,12 +1218,12 @@ impl Yue2Engine {
         let plan_id = plan
             .save(&work.work)
             .map_err(|e| corrupt(&work.work, e.to_string()))?;
-        write_json(&work.path(REQUEST_JSON), &request.to_json())?;
+        durable::write_json(&work.path(REQUEST_JSON), &request.to_json())?;
         let settings = SongSettings {
             generation: generation.clone(),
             ..self.default_settings()
         };
-        write_json(
+        durable::write_json(
             &work.path(PROVENANCE_JSON),
             &json!({
                 "weights": self.model_identity()?,
@@ -1427,7 +1349,7 @@ impl Yue2Engine {
             let recorded = original
                 .pointer(&format!("/artifacts/{name}/sha256"))
                 .and_then(Value::as_str);
-            if recorded != Some(file_digest(&to)?.0.as_str()) {
+            if recorded != Some(durable::sha256_file(&to)?.0.as_str()) {
                 return Err(corrupt(&to, "latents changed while they were carried over"));
             }
         }
@@ -1439,11 +1361,11 @@ impl Yue2Engine {
                 "the carried-over latents are not the ones decoded",
             ));
         }
-        write_atomic(
+        durable::write_atomic(
             &work.path(AUDIO_WAV),
             &wav_f32_bytes(audio.samples(), SAMPLE_RATE, AUDIO_CHANNELS as u16),
         )?;
-        write_json(&work.path(REQUEST_JSON), &plan.request().to_json())?;
+        durable::write_json(&work.path(REQUEST_JSON), &plan.request().to_json())?;
         let current = self.effective_config(
             plan.request(),
             &SongSettings {
@@ -1461,7 +1383,7 @@ impl Yue2Engine {
         ] {
             config.insert(key.into(), current.get(key).cloned().unwrap_or(Value::Null));
         }
-        let digest = |name: &str| file_digest(&source.join(name)).map(|(sha, _)| sha);
+        let digest = |name: &str| durable::sha256_file(&source.join(name)).map(|(sha, _)| sha);
         config.insert(
             "cached_decode".into(),
             json!({
@@ -1471,8 +1393,8 @@ impl Yue2Engine {
                 "device": current.get("device"),
             }),
         );
-        write_json(&work.path(CONFIG_JSON), &Value::Object(config))?;
-        write_json(
+        durable::write_json(&work.path(CONFIG_JSON), &Value::Object(config))?;
+        durable::write_json(
             &work.path(SOURCE_GENERATION_JSON),
             &json!({
                 "source_result_sha256": digest(RESULT_JSON)?,
