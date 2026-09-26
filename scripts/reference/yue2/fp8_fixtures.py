@@ -66,7 +66,7 @@ def main() -> None:
             "scale_f32_bits": f32_bits(float(scale.item())),
             "q_values": q.float().flatten().tolist(),
         })
-    OUT.write_text(json.dumps(out, indent=1) + "\n")
+    OUT.write_text(json.dumps(out, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {OUT} ({len(out['cases'])} cases)")
 
 
