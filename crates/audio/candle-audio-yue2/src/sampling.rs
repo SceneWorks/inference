@@ -41,24 +41,9 @@
 use candle_audio::gen_core;
 pub use candle_llm::primitives::{SplitMix64, TokenRng};
 
-/// `<|endoftext|>` — the first protocol special; every ordinary text/ABC id is below it.
-pub const EOD: u32 = 151_643;
-/// Opens the symbolic score.
-pub const ABC_START: u32 = 151_847;
-/// Closes the symbolic score — the ABC phase's stop id.
-pub const ABC_END: u32 = 151_848;
-/// Opens the semantic (codec) tokens.
-pub const MUSIC_START: u32 = 151_851;
-/// Closes the semantic tokens — the semantic phase's stop id.
-pub const MUSIC_END: u32 = 151_852;
-/// Vocabulary id of codec token 0.
-pub const CODEC_OFFSET: u32 = 151_853;
-/// Codec tokens (`CODEC_OFFSET .. CODEC_OFFSET + CODEC_SIZE`).
-pub const CODEC_SIZE: u32 = 32_768;
-/// The released vocabulary.
-pub const VOCAB_SIZE: usize = 184_704;
-/// The released context: prefix + generation budget never exceeds it (no implicit truncation).
-pub const CONTEXT: usize = 24_576;
+pub use crate::protocol::Sampling;
+use crate::protocol::{ABC_END, CODEC_OFFSET, CODEC_SIZE, EOD, MUSIC_END};
+
 /// The largest protocol id a sampler mask names (the last codec id).
 pub(crate) const VOCAB_MAX_PROTOCOL_ID: u32 = CODEC_OFFSET + CODEC_SIZE - 1;
 
@@ -88,76 +73,6 @@ impl Phase {
                 (CODEC_OFFSET..CODEC_OFFSET + CODEC_SIZE).contains(&id) || id == MUSIC_END
             }
         }
-    }
-}
-
-/// One phase's sampling controls — upstream `Sampling`. The ABC and semantic phases each have
-/// their own ([`Sampling::ABC_DEFAULT`], [`Sampling::SEMANTIC_DEFAULT`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Sampling {
-    /// `0` is greedy; otherwise the divisor of the scores, in `[0, 5]`.
-    pub temperature: f64,
-    /// Nucleus mass in `(0, 1]`; `1` disables it.
-    pub top_p: f64,
-    /// Keep the `top_k` highest scores (ties at the threshold survive); `>= 1`.
-    pub top_k: usize,
-    /// Windowed repetition penalty (`> 0`; `1` disables it).
-    pub repetition_penalty: f64,
-    /// How many of the most recent generated tokens the penalty counts, in `[1, 100]`.
-    pub penalty_window: usize,
-    /// The end id is barred before this many outputs.
-    pub min_tokens: usize,
-    /// Output budget (the end id counts as an output).
-    pub max_tokens: usize,
-}
-
-impl Sampling {
-    /// The released ABC-phase defaults (`yue2_generation_config.json` `abc`).
-    pub const ABC_DEFAULT: Sampling = Sampling {
-        temperature: 0.7,
-        top_p: 0.9,
-        top_k: 30,
-        repetition_penalty: 1.005,
-        penalty_window: 100,
-        min_tokens: 32,
-        max_tokens: 4096,
-    };
-
-    /// The released semantic-phase defaults (`yue2_generation_config.json` `semantic`).
-    pub const SEMANTIC_DEFAULT: Sampling = Sampling {
-        temperature: 1.0,
-        top_p: 0.95,
-        top_k: 100,
-        repetition_penalty: 1.2,
-        penalty_window: 50,
-        min_tokens: 200,
-        max_tokens: 9000,
-    };
-
-    /// Upstream `Sampling.__post_init__`: the ranges the sampler's arithmetic is defined on.
-    pub fn validate(&self) -> gen_core::Result<()> {
-        let bad = |what: &str| {
-            Err(gen_core::Error::Msg(format!(
-                "YuE2 sampling: {what}: {self:?}"
-            )))
-        };
-        if ![self.temperature, self.top_p, self.repetition_penalty]
-            .iter()
-            .all(|x| x.is_finite())
-        {
-            return bad("sampling numbers must be finite");
-        }
-        let top_p_ok = self.top_p > 0.0 && self.top_p <= 1.0;
-        if !(0.0..=5.0).contains(&self.temperature) || !top_p_ok || self.top_k < 1 {
-            return bad("invalid temperature/top_p/top_k");
-        }
-        if self.repetition_penalty <= 0.0 || !(1..=100).contains(&self.penalty_window) {
-            return bad("invalid repetition penalty/window");
-        }
-        if self.min_tokens > self.max_tokens || self.max_tokens < 1 {
-            return bad("require 0 <= min_tokens <= max_tokens and max_tokens >= 1");
-        }
-        Ok(())
     }
 }
 
@@ -227,25 +142,27 @@ pub fn distribution(
         })
         .collect();
     let end = phase.end_token() as usize;
-    if step < sampling.min_tokens && end < scores.len() {
+    if step < sampling.min_tokens() as usize && end < scores.len() {
         scores[end] = f32::NEG_INFINITY;
     }
-    let recent = &history[history.len().saturating_sub(sampling.penalty_window)..];
-    window_penalty(&mut scores, recent, sampling.repetition_penalty, arith);
-    if sampling.temperature == 0.0 {
+    let recent = &history[history
+        .len()
+        .saturating_sub(sampling.penalty_window() as usize)..];
+    window_penalty(&mut scores, recent, sampling.repetition_penalty(), arith);
+    if sampling.temperature() == 0.0 {
         return scores;
     }
-    if sampling.temperature != 1.0 {
-        let t = sampling.temperature as f32;
+    if sampling.temperature() != 1.0 {
+        let t = sampling.temperature() as f32;
         for s in &mut scores {
             *s = arith.round(*s / t);
         }
     }
-    top_k(&mut scores, sampling.top_k);
-    if sampling.top_p < 1.0 {
+    top_k(&mut scores, sampling.top_k() as usize);
+    if sampling.top_p() < 1.0 {
         top_p(
             &mut scores,
-            sampling.top_p,
+            sampling.top_p(),
             arith,
             if legacy_off { 3 } else { 1 },
         );
@@ -379,7 +296,7 @@ pub fn next_token(
     arith: Arith,
     rng: &mut dyn TokenRng,
 ) -> gen_core::Result<u32> {
-    if sampling.temperature == 0.0 {
+    if sampling.temperature() == 0.0 {
         return Ok(argmax(scores));
     }
     let probs = probabilities(scores, arith);
@@ -388,78 +305,46 @@ pub fn next_token(
     })
 }
 
+/// A validated [`Sampling`] from all seven values (test construction through the protocol's own
+/// validation).
+#[cfg(test)]
+pub(crate) fn test_sampling(
+    temperature: f64,
+    top_p: f64,
+    top_k: i64,
+    repetition_penalty: f64,
+    penalty_window: i64,
+    min_tokens: i64,
+    max_tokens: i64,
+) -> Sampling {
+    Sampling::semantic_default()
+        .with_overrides(&crate::protocol::SamplingOverrides {
+            temperature: Some(temperature),
+            top_p: Some(top_p),
+            top_k: Some(top_k),
+            repetition_penalty: Some(repetition_penalty),
+            penalty_window: Some(penalty_window),
+            min_tokens: Some(min_tokens),
+            max_tokens: Some(max_tokens),
+        })
+        .expect("valid test sampling")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{ABC_START, MUSIC_START, VOCAB_SIZE};
 
-    fn greedy(min_tokens: usize) -> Sampling {
-        Sampling {
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 1,
-            repetition_penalty: 1.0,
-            penalty_window: 1,
-            min_tokens,
-            max_tokens: min_tokens.max(1),
-        }
-    }
+    const VOCAB: usize = VOCAB_SIZE as usize;
 
-    #[test]
-    fn released_defaults_validate_and_ranges_refuse() {
-        Sampling::ABC_DEFAULT.validate().unwrap();
-        Sampling::SEMANTIC_DEFAULT.validate().unwrap();
-        let base = Sampling::SEMANTIC_DEFAULT;
-        for bad in [
-            Sampling {
-                temperature: 5.5,
-                ..base
-            },
-            Sampling {
-                temperature: f64::NAN,
-                ..base
-            },
-            Sampling { top_p: 0.0, ..base },
-            Sampling {
-                top_p: 1.01,
-                ..base
-            },
-            Sampling { top_k: 0, ..base },
-            Sampling {
-                repetition_penalty: 0.0,
-                ..base
-            },
-            Sampling {
-                penalty_window: 0,
-                ..base
-            },
-            Sampling {
-                penalty_window: 101,
-                ..base
-            },
-            Sampling {
-                min_tokens: 9001,
-                ..base
-            },
-            Sampling {
-                max_tokens: 0,
-                min_tokens: 0,
-                ..base
-            },
-        ] {
-            assert!(bad.validate().is_err(), "accepted {bad:?}");
-        }
+    fn greedy(min_tokens: i64) -> Sampling {
+        test_sampling(0.0, 1.0, 1, 1.0, 1, min_tokens, min_tokens.max(1))
     }
 
     #[test]
     fn phase_masks_are_the_protocol_ranges() {
         assert!(Phase::Abc.allows(0) && Phase::Abc.allows(EOD - 1) && Phase::Abc.allows(ABC_END));
-        for id in [
-            EOD,
-            ABC_START,
-            MUSIC_END,
-            CODEC_OFFSET,
-            VOCAB_SIZE as u32 - 1,
-        ] {
+        for id in [EOD, ABC_START, MUSIC_END, CODEC_OFFSET, VOCAB_SIZE - 1] {
             assert!(!Phase::Abc.allows(id), "abc allowed {id}");
         }
         assert!(Phase::Semantic.allows(CODEC_OFFSET));
@@ -474,7 +359,7 @@ mod tests {
     /// barred until `min_tokens` outputs.
     #[test]
     fn masks_and_min_tokens_steer_greedy() {
-        let mut logits = vec![0.0f32; VOCAB_SIZE];
+        let mut logits = vec![0.0f32; VOCAB];
         logits[EOD as usize] = 50.0; // disallowed in both phases
         logits[MUSIC_END as usize] = 10.0;
         logits[CODEC_OFFSET as usize + 7] = 5.0;
@@ -510,12 +395,8 @@ mod tests {
         let mut scores = vec![2.0f32, -2.0, 2.0, 1.0];
         window_penalty(&mut scores, &[0, 0, 1, 3], 2.0, Arith::F32);
         assert_eq!(scores, vec![0.5, -4.0, 2.0, 0.5]);
-        let sampling = Sampling {
-            repetition_penalty: 2.0,
-            penalty_window: 2,
-            ..greedy(0)
-        };
-        let mut logits = vec![0.0f32; VOCAB_SIZE];
+        let sampling = test_sampling(0.0, 1.0, 1, 2.0, 2, 0, 1);
+        let mut logits = vec![0.0f32; VOCAB];
         logits[10] = 4.0;
         logits[11] = 3.0;
         // 10 is outside the 2-token window: unpenalized, still the argmax.
