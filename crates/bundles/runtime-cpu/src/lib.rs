@@ -2,6 +2,14 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+/// The Candle audio provider crates this bundle ships, for their public APIs beyond the registry
+/// (sc-22988): e.g. `candle_audio_yue2`'s run verification, saved-plan restore, cover preparation
+/// and decode-budget helpers. Exactly the audio catalog's provider set, so a crate the catalog
+/// leaves out (the gated `candle-audio-sheetsage2` transcription crate) is not reachable here.
+#[cfg(feature = "audio")]
+pub mod audio_providers {
+    pub use candle_audio_catalog::providers::*;
+}
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
 #[cfg(feature = "media")]
@@ -131,6 +139,36 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// SceneWorks reaches YuE2 only through this bundle (sc-22988): its registered provider, the
+    /// memory controls it advertises, and the crate's own API (a decode budget in GiB → the
+    /// request's `decode_tile_edge`) through the re-exported provider crates.
+    #[cfg(feature = "audio")]
+    #[test]
+    fn the_bundle_reaches_yue2_and_its_crate_api() {
+        use super::audio_providers::candle_audio_yue2 as yue2;
+        let registry = candle_audio_catalog::provider_registry().unwrap();
+        let d = registry
+            .generators()
+            .map(|r| (r.descriptor)())
+            .find(|d| d.id == yue2::PROVIDER_ID)
+            .expect("yue2 is registered in the bundle's audio lane");
+        assert!(d.capabilities.supports_song_plan_only && d.capabilities.supports_song_cover);
+        assert_eq!(
+            d.capabilities.request_memory_strategies,
+            yue2::provider::REQUEST_MEMORY_STRATEGIES
+        );
+        let core = yue2::decode::DecodeOptions::for_memory_budget_gib(8.0)
+            .unwrap()
+            .core_frames()
+            .unwrap();
+        assert_eq!(
+            yue2::decode::DecodeOptions::tiled(core)
+                .unwrap()
+                .core_frames(),
+            Some(core)
+        );
+    }
+
     #[cfg(feature = "media")]
     #[test]
     fn bundle_exposes_engine_id_vae_geometry() {
