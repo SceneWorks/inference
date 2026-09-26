@@ -302,9 +302,12 @@ def digest(values_f32: np.ndarray) -> str:
 
 def run_generate(recorder, model, prefix, sampling, phase, *, negative=None, cfg=1.0,
                  legacy_off=False, uniforms=None, seed=831001):
-    return recorder.run(lambda on_token: ysampling.generate_tokens(
+    result = recorder.run(lambda on_token: ysampling.generate_tokens(
         model, prefix, sampling, seed, phase, negative=negative, cfg_scale=cfg,
         legacy_off=legacy_off, on_token=on_token, use_cuda_graph=False), uniforms)
+    result.update(prefix=list(prefix), phase=phase, sampling=sampling_dict(sampling),
+                  negative=negative, cfg_scale=cfg, legacy_off=legacy_off)
+    return result
 
 
 def synthetic(_args) -> None:
@@ -357,10 +360,6 @@ def synthetic(_args) -> None:
     for name, case in cases.items():
         kwargs = {k: case[k] for k in ("negative", "cfg", "legacy_off", "uniforms") if k in case}
         result = run_generate(recorder, model, case["prefix"], case["sampling"], case["phase"], **kwargs)
-        result.update(prefix=case["prefix"], phase=case["phase"],
-                      sampling=sampling_dict(case["sampling"]),
-                      negative=case.get("negative"), cfg_scale=case.get("cfg", 1.0),
-                      legacy_off=case.get("legacy_off", False))
         out["cases"][name] = result
         print(f"{name}: {len(result['tokens'])} tokens, truncated={result['truncated']}, "
               f"min top margin={min(s['top_margin'] for s in result['steps']):.3g}, "

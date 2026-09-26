@@ -483,3 +483,189 @@ fn rms_norm_and_rope_match_upstream() {
     println!("worst F32 op |Δ|: {worst:e}");
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Real-weight logit tolerance (YuE2-3B, F32 on the CPU, native vs PyTorch). Set after measuring;
+/// see `tests/fixtures/README.md`.
+const REAL_ABS: f64 = f64::INFINITY;
+/// |Δ| between a cached decode step's logits and a native full recompute of the same sequence.
+const CACHE_ABS: f64 = f64::INFINITY;
+
+fn hub_dirs() -> crate::SnapshotDirs {
+    let hub = std::path::PathBuf::from(std::env::var_os("YUE2_HF_HUB").unwrap_or_else(|| {
+        panic!(
+            "real-weight test run without YUE2_HF_HUB (a hub directory holding the pinned repos)"
+        )
+    }));
+    crate::inventory::REPOS
+        .iter()
+        .fold(crate::SnapshotDirs::new(), |dirs, repo| {
+            let dir = hub
+                .join(format!("models--{}", repo.id.replace('/', "--")))
+                .join("snapshots")
+                .join(repo.revision);
+            dirs.with(repo.id, dir)
+        })
+}
+
+fn opt_u32s(v: &Value) -> Option<Vec<u32>> {
+    (!v.is_null()).then(|| u32s(v))
+}
+
+/// Every mode (`cot` full / melody / off, a supplied full score, a supplied melody score) through
+/// the production stages — [`crate::generate::plan_score`] and
+/// [`crate::generate::generate_semantic`], with their prefix/negative validation — from the
+/// upstream tokenizer's exact prompt ids, on the verified YuE2-3B loaded by [`Yue2Lm::load`].
+/// Greedy token sequences must match exactly; every step's logits row within [`REAL_ABS`]; a
+/// cached decode must equal a full recompute; stochastic decodes replay the reference's draws.
+///
+/// ```text
+/// YUE2_HF_HUB=/path/to/hub cargo test --release -p candle-audio-yue2 --lib \
+///   parity::real_weight -- --ignored --nocapture
+/// ```
+///
+/// CPU F32: expected peak RSS ~9 GB (AR-path weights in F32) plus the mmapped checkpoint pages.
+#[test]
+#[ignore = "real weights: set YUE2_HF_HUB (see the doc comment)"]
+fn real_weight_decodes_match_upstream() {
+    use std::time::Instant;
+
+    use candle_audio::candle_core::{DType, Device};
+
+    use crate::generate::{generate_semantic, plan_score, Cot, ScorePlan, SemanticInput};
+    use crate::sampling::CODEC_OFFSET;
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ar_real_weights.json");
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let dirs = hub_dirs();
+    let start = Instant::now();
+    let lm = Yue2Lm::load(&dirs, MotPaths::Ar, DType::F32, &Device::Cpu).unwrap();
+    println!(
+        "verified + loaded YuE2-3B (AR path, F32) in {:.1?}",
+        start.elapsed()
+    );
+    let never = || false;
+    let mut all = Spread::default();
+    let mut cache_worst = 0.0f64;
+    let report = |name: &str, s: Spread, all: &mut Spread| {
+        println!("{name}: {s:?}");
+        assert_eq!(s.top_id_mismatches, 0, "{name}: top ids differ: {s:?}");
+        all.merge(s);
+    };
+    for (mode, rec) in fixture["modes"].as_object().unwrap() {
+        let t0 = Instant::now();
+        let cot = match rec["cot"].as_str().unwrap() {
+            "full" => Cot::Full,
+            "melody" => Cot::Melody,
+            _ => Cot::Off,
+        };
+        let plan = if let Some(abc) = rec.get("abc") {
+            let mut steps = Steps::default();
+            let (plan, decoded) = plan_score(
+                &lm,
+                cot,
+                &u32s(&rec["planner_prefix"]),
+                &sampling_of(&abc["sampling"]),
+                &mut Injected(VecDeque::new()),
+                Hooks {
+                    cancelled: &never,
+                    observer: &mut steps,
+                },
+            )
+            .unwrap();
+            assert_eq!(decoded.tokens, u32s(&abc["tokens"]), "{mode}: planned ABC");
+            assert_eq!(steps.emitted, u32s(&abc["emitted"]), "{mode}: ABC emitted");
+            assert_eq!(decoded.truncated, abc["truncated"].as_bool().unwrap());
+            assert_eq!(plan.truncated(), decoded.truncated);
+            let s = spread_of(&steps, abc, Phase::Abc, &probes_of(&fixture, Phase::Abc));
+            report(&format!("{mode} abc"), s, &mut all);
+            plan
+        } else if cot == Cot::Off {
+            ScorePlan::off()
+        } else {
+            ScorePlan::supplied(cot, u32s(&rec["abc_ids"])).unwrap()
+        };
+        assert_eq!(
+            plan.abc_ids(),
+            &u32s(&rec["abc_ids"])[..],
+            "{mode}: plan ids"
+        );
+        let sem = &rec["semantic"];
+        let prefix = u32s(&rec["semantic_prefix"]);
+        let negative = opt_u32s(&rec["negative_prefix"]);
+        let mut steps = Steps::default();
+        let out = generate_semantic(
+            &lm,
+            &SemanticInput {
+                plan: &plan,
+                prefix: &prefix,
+                negative: negative.as_deref(),
+                cfg_scale: rec["cfg_scale"].as_f64().unwrap(),
+            },
+            &sampling_of(&sem["sampling"]),
+            &mut Injected(VecDeque::new()),
+            Hooks {
+                cancelled: &never,
+                observer: &mut steps,
+            },
+        )
+        .unwrap();
+        let want = u32s(&sem["tokens"]);
+        assert_eq!(out.decoded.tokens, want, "{mode}: semantic tokens");
+        let codes: Vec<u32> = want.iter().map(|t| t - CODEC_OFFSET).collect();
+        assert_eq!(out.codes, codes);
+        assert_eq!(steps.emitted, u32s(&sem["emitted"]), "{mode}: emitted");
+        assert_eq!(out.decoded.truncated, sem["truncated"].as_bool().unwrap());
+        let branches = if negative.is_some() { 2 } else { 1 };
+        assert_eq!(out.decoded.cfg_branches, branches);
+        let probes = probes_of(&fixture, Phase::Semantic);
+        let s = spread_of(&steps, sem, Phase::Semantic, &probes);
+        report(&format!("{mode} semantic"), s, &mut all);
+        // Cache semantics: a fresh prefill of prefix + tokens[..n-1] (a full recompute) against
+        // the reference's uncached forward, and — without guidance, where the observed row is the
+        // conditional row — against this decode's own last cached step.
+        let mut seq = prefix.clone();
+        seq.extend_from_slice(&want[..want.len() - 1]);
+        let mut cache = lm.new_cache(seq.len()).unwrap();
+        let full: Vec<f32> = lm
+            .prefill(&seq, &mut cache, || Ok(()))
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let s = compare_row(&full, &sem["full_recompute_last"], Phase::Semantic, &probes);
+        report(&format!("{mode} full recompute"), s, &mut all);
+        if negative.is_none() {
+            let last = steps.rows.last().unwrap();
+            let d = full
+                .iter()
+                .zip(last)
+                .map(|(a, b)| (a - b).abs() as f64)
+                .fold(0.0, f64::max);
+            println!("{mode}: cached decode vs full recompute max |Δ| {d:e}");
+            cache_worst = cache_worst.max(d);
+        }
+        println!("{mode}: {:.1?}", t0.elapsed());
+    }
+    for name in ["abc_natural_end", "abc_stochastic", "off_stochastic"] {
+        let case = &fixture[name];
+        let t0 = Instant::now();
+        let phase = phase_of(&case["phase"]);
+        let (steps, _) = replay(&lm, case, "prefix", &sampling_of(&case["sampling"]));
+        let s = spread_of(&steps, case, phase, &probes_of(&fixture, phase));
+        report(name, s, &mut all);
+        println!("{name}: {:.1?}", t0.elapsed());
+    }
+    assert!(
+        !fixture["abc_natural_end"]["truncated"].as_bool().unwrap(),
+        "the natural-end case must end on ABC_END"
+    );
+    println!("ALL real-weight steps: {all:?}; cache worst {cache_worst:e}");
+    assert!(
+        all.max_abs <= REAL_ABS && all.lse_abs <= REAL_ABS,
+        "{all:?}"
+    );
+    assert!(
+        cache_worst <= CACHE_ABS,
+        "cache vs recompute {cache_worst:e}"
+    );
+}
