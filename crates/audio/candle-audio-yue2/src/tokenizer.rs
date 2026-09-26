@@ -389,7 +389,7 @@ fn base64_decode(text: &[u8]) -> Option<Vec<u8>> {
             _ => return None,
         } as u32)
     }
-    if text.is_empty() || text.len() % 4 != 0 {
+    if text.is_empty() || !text.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 4 * 3);

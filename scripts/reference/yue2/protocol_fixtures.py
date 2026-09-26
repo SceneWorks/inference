@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import dataclasses
 import hashlib
 import json
 import math
@@ -202,7 +203,7 @@ def upstream_on_synthetic(ranks: dict[bytes, int], scratch: Path) -> YuE2TextTok
 
 
 def guard_pattern_copy() -> None:
-    source = Path(yue2.__file__).with_name("tokenization_yue2.py").read_text()
+    source = Path(yue2.__file__).with_name("tokenization_yue2.py").read_text(encoding="utf-8")
     if f'pattern = r"{PATTERN}"' not in source:
         sys.exit("upstream pre-tokenizer pattern changed; update PATTERN")
 
@@ -320,7 +321,7 @@ def sampling_cases() -> list:
     out = []
     for phase, default in (("abc", GenerationConfig().abc), ("semantic", GenerationConfig().semantic)):
         for overrides in ok + bad:
-            result = attempt(lambda: __import__("dataclasses").asdict(
+            result = attempt(lambda: dataclasses.asdict(
                 resolve_sampling(from_fixture(overrides), default)))
             out.append({"phase": phase, "overrides": overrides, **result})
     return out

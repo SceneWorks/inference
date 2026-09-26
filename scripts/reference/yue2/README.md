@@ -75,6 +75,7 @@ Conventions for YuE2 generators (mirroring the YuE1 ones under `scripts/referenc
 | Script | Produces |
 | --- | --- |
 | `asset_manifest.py` | `crates/audio/candle-audio-yue2/manifests/*.json` — the conversion manifests: every closure file's size and SHA-256 (checked against upstream's own `weights_manifest.json` via `yue2.storage.model_identity`), the identity conversion, and every tensor's name, dtype, shape and value digest as PyTorch loads it. Peak RSS measured at 7.6 GB (mostly the mmapped YuE2-3B file). |
+| `protocol_fixtures.py` | `crates/audio/candle-audio-yue2/tests/fixtures/protocol/` — text-tokenizer, request-protocol and symbolic-plan fixtures, all evaluated by upstream code (see that directory's README). `--hub` adds the pinned-`qwen.tiktoken` cases. No weights loaded; peak RSS ~0.4 GB. |
 
 The Rust side re-derives the tensor digests natively and compares
 (`crates/audio/candle-audio-yue2/tests/real_weights.rs`, `#[ignore]`d; set `YUE2_HF_HUB`).

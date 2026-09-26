@@ -70,9 +70,12 @@ fn nfc_is_pinned_to_the_reference_unicode_version() {
     );
 }
 
-/// The pre-tokenizer's letter class is Unicode 16.0: a Unicode-17 letter is not `\p{L}`.
+/// The pre-tokenizer's letter class is the reference's Unicode 16.0: a Unicode-16 letter is
+/// `\p{L}`, a Unicode-17 letter is not. Today's `regex-syntax` tables are Unicode 16 too, so this
+/// holds with or without the `\p{Age=16.0}` intersection in `PATTERN`; it is the check that fails
+/// if a lockfile bump brings Unicode-17 tables and the intersection has been removed.
 #[test]
-fn letter_class_is_pinned_to_unicode_16() {
+fn letter_class_is_unicode_16() {
     let fixture = json("tokenizer_synthetic.json");
     let tok = synthetic();
     for name in ["letters_unicode16", "letters_unicode17"] {

@@ -506,7 +506,7 @@ pub struct SongRequestSpec {
     /// Planning mode (default [`CotMode::Full`]).
     pub cot: CotMode,
     /// Seed, `0..2^63` (default [`DEFAULT_SEED`]).
-    pub seed: i128,
+    pub seed: u64,
     /// External ABC score to use as the plan (requires `melody` / `full`).
     pub abc: Option<String>,
     /// CFG scale, finite in `[0, 20]`; `None` uses [`CotMode::default_guidance`].
@@ -522,7 +522,7 @@ impl SongRequestSpec {
             style: style.into(),
             lyrics: lyrics.into(),
             cot: CotMode::Full,
-            seed: DEFAULT_SEED as i128,
+            seed: DEFAULT_SEED,
             abc: None,
             cfg_scale: None,
             id: DEFAULT_ID.to_string(),
@@ -559,7 +559,7 @@ impl SongRequest {
             cfg_scale,
             id,
         } = spec;
-        if !(0..1i128 << 63).contains(&seed) {
+        if seed >= 1 << 63 {
             return Err(invalid("seed", "seed must be an integer in [0, 2**63)"));
         }
         if !is_filename_safe_id(&id) {
@@ -582,7 +582,7 @@ impl SongRequest {
             style,
             lyrics,
             cot,
-            seed: seed as u64,
+            seed,
             abc,
             cfg_scale,
             id,
@@ -613,7 +613,10 @@ impl SongRequest {
                             .ok_or_else(|| invalid("cot", "cot must be off, melody or full"))?,
                     )?
                 }
-                "seed" => spec.seed = json_integer("seed", v)?,
+                "seed" => {
+                    spec.seed = u64::try_from(json_integer("seed", v)?)
+                        .map_err(|_| invalid("seed", "seed must be an integer in [0, 2**63)"))?
+                }
                 "abc" => {
                     spec.abc = match v {
                         Value::Null => None,
@@ -678,7 +681,7 @@ impl SongRequest {
             style: self.style.clone(),
             lyrics: self.lyrics.clone(),
             cot: self.cot,
-            seed: self.seed as i128,
+            seed: self.seed,
             abc: self.abc.clone(),
             cfg_scale: self.cfg_scale,
             id: self.id.clone(),
