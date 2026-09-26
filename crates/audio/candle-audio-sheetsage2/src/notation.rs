@@ -975,7 +975,7 @@ fn same_note_segment(value: i32, next: i32) -> bool {
 
 const SUPPORTED_DURATION_UNITS: [i64; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
 
-fn split_duration_units(duration: i64) -> Result<Vec<i64>, AbcRebuildError> {
+fn split_units(duration: i64) -> Result<Vec<i64>, AbcRebuildError> {
     if duration <= 0 {
         return err(format!("Cannot serialize non-positive duration {duration}"));
     }
@@ -1008,7 +1008,7 @@ fn render_duration_tokens(
     duration: i64,
     tie_out: bool,
 ) -> Result<Vec<String>, AbcRebuildError> {
-    let chunks = split_duration_units(duration)?;
+    let chunks = split_units(duration)?;
     let n = chunks.len();
     Ok(chunks
         .into_iter()
@@ -1765,10 +1765,10 @@ mod tests {
 
     #[test]
     fn durations_split_into_parser_values() {
-        assert_eq!(split_duration_units(5).unwrap(), vec![4, 1]);
-        assert_eq!(split_duration_units(20).unwrap(), vec![16, 4]);
-        assert_eq!(split_duration_units(48).unwrap(), vec![48]);
-        assert!(split_duration_units(0).is_err());
+        assert_eq!(split_units(5).unwrap(), vec![4, 1]);
+        assert_eq!(split_units(20).unwrap(), vec![16, 4]);
+        assert_eq!(split_units(48).unwrap(), vec![48]);
+        assert!(split_units(0).is_err());
     }
 
     #[test]

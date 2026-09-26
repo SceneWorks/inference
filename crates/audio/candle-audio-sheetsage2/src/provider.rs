@@ -28,6 +28,24 @@ use crate::Error;
 /// The model's sample rate.
 pub const SAMPLE_RATE: u32 = 24_000;
 
+/// The transcriber's provider id (the key of its component mapping).
+pub const TRANSCRIBER_ID: &str = "sheetsage2";
+
+/// The licence rows of the components this transcriber loads — the cover closure, CC BY-NC 4.0
+/// weights with their attributions (recorded by sc-22989 in `candle_audio_yue2::license`). A catalog
+/// that composes this transcriber publishes these rows with it.
+pub const COMPONENT_LICENSES: &[candle_audio::gen_core::ComponentLicense] = &[
+    candle_audio_yue2::license::LICENSE_SHEETSAGE2,
+    candle_audio_yue2::license::LICENSE_MERT_V2_FULLSONG,
+];
+
+/// Provider → component mapping: the transcriber loads exactly the cover closure.
+pub const PROVIDER_COMPONENTS: &[candle_audio::gen_core::ProviderComponents] =
+    &[candle_audio::gen_core::ProviderComponents {
+        provider_id: TRANSCRIBER_ID,
+        components: &["yue2_sheetsage2", "yue2_mert_v2_fullsong"],
+    }];
+
 static LIVE_MODELS: AtomicUsize = AtomicUsize::new(0);
 
 /// SheetSage2 models alive in this process (loaded and not yet dropped).
@@ -79,7 +97,7 @@ impl SourceAudio {
             ));
         }
         let c = usize::from(channels);
-        if samples.len() % c != 0 {
+        if !samples.len().is_multiple_of(c) {
             return Err(Error::Request(
                 "interleaved samples are not a whole number of frames".into(),
             ));
@@ -422,4 +440,4 @@ impl Transcriber {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

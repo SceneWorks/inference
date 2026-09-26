@@ -48,7 +48,7 @@
 #![deny(rustdoc::private_intra_doc_links)]
 
 pub mod chord_spelling;
-// pub mod cover;
+pub mod cover;
 pub mod events;
 pub mod exports;
 pub mod grammar;
@@ -99,6 +99,9 @@ pub enum Error {
         /// The error.
         source: std::io::Error,
     },
+    /// The cover generator failed.
+    #[error("generation: {0}")]
+    Generation(String),
     /// A tensor operation failed.
     #[error("candle: {0}")]
     Candle(#[from] candle_core::Error),

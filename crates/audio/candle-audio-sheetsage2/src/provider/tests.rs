@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::tests::tiny_reference;
 
-fn tiny_files() -> ClosureFiles {
+pub(crate) fn tiny_files() -> ClosureFiles {
     let reference = tiny_reference();
     let config = reference["sheetsage2_config"].clone();
     let tensors = |bytes: &[u8]| {
@@ -26,7 +26,7 @@ fn tiny_files() -> ClosureFiles {
 }
 
 /// Window settings that fit the tiny model's 1 s window (the defaults assume 300 s).
-fn tiny_settings() -> TranscriptionSettings {
+pub(crate) fn tiny_settings() -> TranscriptionSettings {
     TranscriptionSettings {
         overlap_seconds: 0.5,
         lookahead_seconds: 0.25,
@@ -34,7 +34,7 @@ fn tiny_settings() -> TranscriptionSettings {
     }
 }
 
-fn tiny_identity() -> ClosureIdentity {
+pub(crate) fn tiny_identity() -> ClosureIdentity {
     ClosureIdentity {
         sheetsage2: ["tiny".into(), "fixture".into(), "-".into(), "-".into()],
         mert: ["tiny".into(), "fixture".into(), "-".into(), "-".into()],
@@ -155,4 +155,34 @@ fn parent_pin_is_cross_checked() {
     check_parent_pin(&config).unwrap();
     config["base_model_sha256"] = serde_json::json!("0".repeat(64));
     assert!(check_parent_pin(&config).is_err());
+}
+
+/// The published component mapping names exactly the cover closure, every key resolves to a
+/// licence row, and the derived provider terms are noncommercial.
+///
+/// Mutation that must fail: drop MERT from `PROVIDER_COMPONENTS`, or publish an Apache row.
+#[test]
+fn published_components_are_the_cover_closure_with_noncommercial_terms() {
+    use candle_audio::gen_core::{provider_terms, LicenseTerm, LICENSE_FAMILIES};
+    let keys: Vec<&str> = Closure::Cover
+        .components()
+        .iter()
+        .map(|id| id.component().key)
+        .collect();
+    assert_eq!(PROVIDER_COMPONENTS[0].components, keys.as_slice());
+    for key in &keys {
+        assert!(
+            COMPONENT_LICENSES.iter().any(|row| row.component == *key),
+            "{key}"
+        );
+    }
+    let terms = provider_terms(
+        &PROVIDER_COMPONENTS[0],
+        COMPONENT_LICENSES,
+        LICENSE_FAMILIES,
+    );
+    assert!(
+        terms.contains(&LicenseTerm::NonCommercialWeights),
+        "{terms:?}"
+    );
 }

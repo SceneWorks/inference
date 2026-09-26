@@ -112,16 +112,7 @@ impl SheetSage2Model {
             Some(head.take("encoder_projection.bias", &[config.hidden_size])?),
             device,
         )?;
-        let decoder = Decoder::load(
-            &mut head,
-            config.vocab_size,
-            config.hidden_size,
-            config.decoder_layers,
-            config.num_attention_heads,
-            config.intermediate_size,
-            config.max_output_seq_len,
-            device,
-        )?;
+        let decoder = Decoder::load(&mut head, &config, device)?;
         head.finish()?;
         Ok(Self {
             layer_weights: softmax(&layer_weight),
@@ -178,7 +169,7 @@ impl SheetSage2Model {
         let stride = self.config.backbone.inputs_to_logits_ratio();
         let mut padded = samples.to_vec();
         padded.resize(window, 0.0);
-        if window % stride != 0 {
+        if !window.is_multiple_of(stride) {
             padded.resize(window + stride - window % stride, 0.0);
         }
         Ok(padded)

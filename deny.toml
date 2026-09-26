@@ -42,6 +42,19 @@ allow = [
 name = "language-tokenizer"
 allow = ["WTFPL"]
 
+# CC-BY-NC-4.0 (noncommercial) is accepted ONLY for the workspace crate `candle-audio-sheetsage2`,
+# the native SheetSage2 / MERT-v2-FullSong transcription port (sc-22996, epic sc-22988). Its only
+# port source is the remote Python inside the m-a-p/SheetSage2 and m-a-p/MERT-v2-FullSong model
+# repositories, which carries no code licence while both repositories declare cc-by-nc-4.0; sc-22989
+# recorded that code derived from it is treated as CC BY-NC 4.0 (`CODE_TERMS` in
+# crates/audio/candle-audio-yue2/src/license.rs). The crate declares that honestly rather than being
+# relicensed, and stays out of the Apache-2.0 `candle-audio-yue2`. Distributing it in a shipped build
+# is still gated on the owner basis recorded there as the unblock condition. Scoped per-crate so any
+# other noncommercial licence in the graph still fails.
+[[licenses.exceptions]]
+name = "candle-audio-sheetsage2"
+allow = ["CC-BY-NC-4.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"

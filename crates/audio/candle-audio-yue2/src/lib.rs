@@ -75,6 +75,14 @@
 //! * [`provider`] — the registered `yue2` generator (distinct from YuE1's `yue_*`): the
 //!   `LoadSpec` gate and the `GenerationRequest` mapping onto the engine.
 //!
+//! Covers (sc-22996):
+//!
+//! * [`cover`] — a reviewed two-voice score (the native dialect of the `yue2-music` skill,
+//!   [`cover::abc`]), a target style and aligned source or translated lyrics → a `cot = melody` (chord
+//!   symbols removed) or `cot = full` [`SongRequest`] that plans from the score. Symbolic only: no
+//!   audio or in-context-learning prompt reaches the generator. Recording transcription is the
+//!   separate, CC BY-NC 4.0 `candle-audio-sheetsage2` crate, which depends on this one.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -91,6 +99,7 @@
 pub use candle_audio::gen_core;
 
 pub mod closure;
+pub mod cover;
 pub mod decode;
 pub mod engine;
 pub mod generate;

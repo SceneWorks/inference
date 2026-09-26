@@ -231,7 +231,7 @@ impl Midi {
         for (track_index, events) in raw_tracks.iter().enumerate() {
             let mut name = String::new();
             let mut program = [0u8; 16];
-            let mut open: Vec<((u8, u8), Vec<(u64, u8)>)> = Vec::new();
+            let mut open: OpenNotes = Vec::new();
             for event in events {
                 match event.kind {
                     TrackEvent::Name(ref n) => name = n.clone(),
@@ -294,6 +294,9 @@ impl Midi {
         })
     }
 }
+
+/// Open notes per `(channel, pitch)`: `(note-on tick, velocity)` in arrival order.
+type OpenNotes = Vec<((u8, u8), Vec<(u64, u8)>)>;
 
 fn push_varlen(out: &mut Vec<u8>, mut value: u64) {
     let mut stack = vec![(value & 0x7F) as u8];

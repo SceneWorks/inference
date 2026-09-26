@@ -114,8 +114,10 @@ impl MertConfig {
         {
             return bad("encoder dimensions and layer counts must be positive");
         }
-        if config.hidden_size % config.num_attention_heads != 0
-            || (config.hidden_size / config.num_attention_heads) % 2 != 0
+        if !config
+            .hidden_size
+            .is_multiple_of(config.num_attention_heads)
+            || !(config.hidden_size / config.num_attention_heads).is_multiple_of(2)
         {
             return bad("hidden_size must divide into an even head dimension");
         }
@@ -124,7 +126,10 @@ impl MertConfig {
         {
             return bad("subsampling widths must start at num_mel_bins and end at hidden_size");
         }
-        if config.n_fft < config.win_length || config.win_length == 0 || config.n_fft % 2 != 0 {
+        if config.n_fft < config.win_length
+            || config.win_length == 0
+            || !config.n_fft.is_multiple_of(2)
+        {
             return bad("n_fft must be even and at least win_length > 0");
         }
         if config.conv_depthwise_kernel_size % 2 != 1 {
@@ -225,7 +230,10 @@ impl SheetSage2Config {
                 config.weights_format
             )));
         }
-        if config.hidden_size % config.num_attention_heads != 0 {
+        if !config
+            .hidden_size
+            .is_multiple_of(config.num_attention_heads)
+        {
             return Err(Error::Config(
                 "hidden_size must be divisible by num_attention_heads".into(),
             ));
@@ -235,7 +243,7 @@ impl SheetSage2Config {
                 "processor and encoder sampling rates must match".into(),
             ));
         }
-        if config.lora_rank == 0 || !(config.lora_alpha > 0.0) {
+        if config.lora_rank == 0 || config.lora_alpha.is_nan() || config.lora_alpha <= 0.0 {
             return Err(Error::Config("lora rank and alpha must be positive".into()));
         }
         Ok(config)

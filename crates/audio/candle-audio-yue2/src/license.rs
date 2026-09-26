@@ -681,7 +681,10 @@ const COVER_PORT: UseDisposition = UseDisposition::Gated {
     reason: "the only SheetSage2 / MERT2 code is the remote Python published inside the model \
              repositories, which carries no code licence of its own; the repositories declare \
              cc-by-nc-4.0, so code derived from it is treated as CC BY-NC 4.0 — noncommercial — \
-             and must not be relicensed into this Apache-2.0 crate",
+             and must not be relicensed into this Apache-2.0 crate. The native port (sc-22996) \
+             therefore lives in the separate workspace crate `candle-audio-sheetsage2`, whose \
+             Cargo licence is CC-BY-NC-4.0 (admitted by one scoped `deny.toml` exception); it is \
+             not composed into the audio catalog or any runtime bundle",
     unblock: "an owner-recorded basis for the cover port, recorded here: an explicit code licence \
               from the rights holder (Multimodal Art Projection), or an owner decision to ship the \
               derived code under CC BY-NC 4.0 with attribution, outside the crate's Apache-2.0 \

@@ -186,12 +186,7 @@ impl<'t> Stitcher<'t> {
         }
         for (index, tokens) in windows.iter().enumerate() {
             let (prefix, prefix_len) = self.prefix(index)?;
-            let expected = if prefix_len == 0 {
-                &prefix[..]
-            } else {
-                &prefix[..]
-            };
-            if tokens.len() < expected.len() || tokens[..expected.len()] != *expected {
+            if !tokens.starts_with(&prefix) {
                 return Err(Error::Replay(format!(
                     "window {index}: persisted tokens do not start with the prefix the stitched \
                      events imply"

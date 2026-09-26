@@ -393,3 +393,145 @@ fn unload_returns_the_weights_memory() {
         "{loaded} → {after}"
     );
 }
+
+/// End to end on real weights, one process: transcribe the first 20 s of the public-domain
+/// recording, persist and reopen the review artifact, plan a `cot=melody` cover (target style +
+/// the anthem's public-domain lyrics), unload the transcriber, and only then load the YuE2 engine
+/// and generate a short cover (150 semantic tokens ≈ 6 s, 16 ODE steps) into a verified run.
+///
+/// Needs the YuE2 generation closure in `YUE2_HF_HUB` too. CPU F32; the engine alone peaks near
+/// 20 GB, so run it alone under an external RSS guard.
+#[test]
+#[ignore = "real weights: set YUE2_HF_HUB (cover + generation closures), SHEETSAGE2_MODEL_INPUTS"]
+fn a_recording_becomes_a_new_cover_after_the_transcriber_is_unloaded() {
+    use candle_audio_sheetsage2::cover::{plan_cover, run_cover, CoverOptions, EngineCover};
+    use candle_audio_yue2::cover::{CoverLyrics, CoverMode};
+    use candle_audio_yue2::protocol::{GenerationConfig, SamplingOverrides};
+    use candle_audio_yue2::{EngineOptions, SongSettings, VaeVariant, Yue2Engine};
+
+    let start = Instant::now();
+    let transcriber = load();
+    let settings = TranscriptionSettings {
+        max_seconds: Some(20.0),
+        ..TranscriptionSettings::default()
+    };
+    let t = transcriber
+        .transcribe(
+            &SourceAudio::mono(model_input("nav_ssb")),
+            &settings,
+            |_| Ok(()),
+        )
+        .unwrap();
+    println!(
+        "transcribed 20 s in {:.1?}: {} vocal notes, warnings {:?}",
+        start.elapsed(),
+        t.review.voices[0].notes,
+        t.review
+            .warnings
+            .iter()
+            .map(|w| &w.code)
+            .collect::<Vec<_>>()
+    );
+    let root = tempfile::tempdir().unwrap();
+    t.save(
+        &root.path().join("transcription"),
+        transcriber.model().tokenizer(),
+    )
+    .unwrap();
+    let artifact = ReviewArtifact::open(&root.path().join("transcription")).unwrap();
+    artifact.replay().unwrap();
+    let lyrics = "[Verse]\nO say can you see by the dawn's early light\nWhat so proudly we hailed \
+                  at the twilight's last gleaming\n";
+    let plan = plan_cover(
+        &artifact,
+        &CoverOptions::new(
+            CoverMode::Melody,
+            "English, intimate female vocal, gentle acoustic folk ballad, fingerpicked guitar, \
+             soft cello, 80 BPM",
+            CoverLyrics::source(lyrics),
+        ),
+    )
+    .unwrap();
+    println!("cover checks: {}", plan.prepared.report.to_json());
+    let transcription_peak = candle_audio::harness::peak_rss_bytes().unwrap_or(0);
+
+    let base = GenerationConfig::default();
+    let semantic = base
+        .semantic()
+        .with_overrides(&SamplingOverrides {
+            min_tokens: Some(150),
+            max_tokens: Some(150),
+            ..Default::default()
+        })
+        .unwrap();
+    let config = GenerationConfig::new(*base.abc(), semantic, 16).unwrap();
+    let dirs = hub();
+    let rss_before_engine = std::cell::Cell::new(0.0f64);
+    let out = root.path().join("cover");
+    let generation = Instant::now();
+    let outcome = run_cover(
+        Some(transcriber),
+        &plan,
+        || {
+            rss_before_engine.set(rss_mib());
+            let engine = Yue2Engine::load(
+                &dirs,
+                candle_audio_sheetsage2::candle_core::DType::F32,
+                &Device::Cpu,
+                config.clone(),
+                EngineOptions::default(),
+            )
+            .map_err(|e| candle_audio_sheetsage2::Error::Generation(e.to_string()))?;
+            Ok(EngineCover {
+                engine,
+                settings: SongSettings {
+                    generation: config.clone(),
+                    decoder: VaeVariant::Standard,
+                },
+            })
+        },
+        &out,
+        &|| false,
+    )
+    .unwrap();
+    let receipt = outcome.unload.unwrap();
+    println!(
+        "unload receipt {receipt:?}; RSS when the engine load began {:.0} MiB (transcription peak \
+         {:.0} MiB); cover generated in {:.1?}; process peak RSS {:.0} MiB",
+        rss_before_engine.get(),
+        transcription_peak as f64 / 1048576.0,
+        generation.elapsed(),
+        candle_audio::harness::peak_rss_bytes().unwrap_or(0) as f64 / 1048576.0
+    );
+    assert!(receipt.released);
+    assert_eq!(outcome.result["status"], "complete");
+    let request: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(outcome.run_dir.join("request.json")).unwrap())
+            .unwrap();
+    assert_eq!(request["cot"], "melody");
+    assert_eq!(request["abc"].as_str(), plan.prepared.request.abc());
+    let wav = std::fs::read(outcome.run_dir.join("audio.wav")).unwrap();
+    let (samples, rate, channels) = candle_audio_yue2::run::read_wav_f32(&wav).unwrap();
+    let rms =
+        (samples.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
+    println!(
+        "cover audio: {:.2} s at {rate} Hz × {channels}, rms {rms:.4}",
+        samples.len() as f64 / f64::from(channels) / f64::from(rate)
+    );
+    assert!(rms > 1e-4, "silent cover");
+    let provenance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&outcome.provenance_path).unwrap()).unwrap();
+    assert_eq!(
+        provenance["transcription"]["manifest_sha256"],
+        artifact.manifest_sha256()
+    );
+    assert_eq!(
+        provenance["transcription_unloaded_before_generation"]
+            ["live_sheetsage2_models_at_generator_load"],
+        0
+    );
+    if let Ok(keep) = std::env::var("SHEETSAGE2_KEEP_COVER") {
+        std::fs::copy(outcome.run_dir.join("audio.wav"), &keep).unwrap();
+        println!("wrote {keep}");
+    }
+}

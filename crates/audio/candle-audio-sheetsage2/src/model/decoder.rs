@@ -8,6 +8,7 @@
 
 use candle_audio::candle_core::{Device, Tensor};
 
+use super::config::SheetSage2Config;
 use super::mert::{LayerNorm, Linear};
 use super::weights::Weights;
 use crate::Error;
@@ -66,17 +67,20 @@ impl DecoderCache {
 }
 
 impl Decoder {
-    /// Load from SheetSage2's `token_embedding.weight` and `decoder.*`.
+    /// Load from SheetSage2's `token_embedding.weight` and `decoder.*` for `config`'s shape.
     pub fn load(
         w: &mut Weights,
-        vocab: usize,
-        width: usize,
-        layers: usize,
-        heads: usize,
-        ffn: usize,
-        max_positions: usize,
+        config: &SheetSage2Config,
         device: &Device,
     ) -> Result<Self, Error> {
+        let (vocab, width, layers, heads, ffn, max_positions) = (
+            config.vocab_size,
+            config.hidden_size,
+            config.decoder_layers,
+            config.num_attention_heads,
+            config.intermediate_size,
+            config.max_output_seq_len,
+        );
         let embedding = w.take("token_embedding.weight", &[vocab, width])?;
         let positions = w.take(
             "decoder.embed_positions.weight",

@@ -6,18 +6,18 @@ use crate::events::parse_tokens_txt;
 use crate::pipeline::{DEFAULT_LOOKAHEAD_SECONDS, DEFAULT_OVERLAP_SECONDS, MAX_OUTPUT_SEQ_LEN};
 use crate::tokenizer::FULL_TASK_PROMPTS;
 
-const REAL_TOKENS: &str =
+pub(crate) const REAL_TOKENS: &str =
     include_str!("../../../../../scripts/reference/sheetsage2/artifacts/real_full/tokens.txt");
-const SILENCE_TOKENS: &str =
+pub(crate) const SILENCE_TOKENS: &str =
     include_str!("../../../../../scripts/reference/sheetsage2/artifacts/silence/tokens.txt");
-const SYNTH_TOKENS: &str =
+pub(crate) const SYNTH_TOKENS: &str =
     include_str!("../../../../../scripts/reference/sheetsage2/artifacts/synth_full/tokens.txt");
 
-fn tokenizer() -> Tokenizer {
+pub(crate) fn tokenizer() -> Tokenizer {
     Tokenizer::new(300.0, 100, Some("5ba3325af0344c7f")).unwrap()
 }
 
-fn identity() -> ClosureIdentity {
+pub(crate) fn identity() -> ClosureIdentity {
     ClosureIdentity {
         sheetsage2: [
             "m-a-p/SheetSage2".into(),
@@ -37,7 +37,7 @@ fn identity() -> ClosureIdentity {
     }
 }
 
-fn transcription(tokens: &str, duration: f64) -> Transcription {
+pub(crate) fn transcription(tokens: &str, duration: f64) -> Transcription {
     let tokenizer = tokenizer();
     let windows: Vec<Vec<u32>> = parse_tokens_txt(tokens)
         .unwrap()

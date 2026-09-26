@@ -323,11 +323,12 @@ def grammar(out: Path) -> None:
             if state.update(token):
                 break
         cases[case] = {"prefix": tokens[:out_index + 1], "steps": steps}
-    write_json(out / "grammar_masks.json", {
+    # Compact (one line): ~780 masks as runs; indentation would triple the committed size.
+    (out / "grammar_masks.json").write_text(json.dumps({
         "generator": "scripts/reference/sheetsage2/native_parity.py grammar",
-        "upstream_code": f"{SHEETSAGE2_REPO}@{SHEETSAGE2_HEAD_REVISION} generation_sheetsage2.PromptGrammarState",
+        "upstream_code": f"{SHEETSAGE2_REPO} generation_sheetsage2.PromptGrammarState",
         "cases": cases,
-    })
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     print({k: len(v["steps"]) for k, v in cases.items()})
 
 

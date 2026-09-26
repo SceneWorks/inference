@@ -872,4 +872,4 @@ fn check_window(record: &WindowRecord, recorded: &Value) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
