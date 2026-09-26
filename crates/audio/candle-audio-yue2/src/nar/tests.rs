@@ -198,10 +198,7 @@ fn compare_evaluations(
                 "{name} chunk {c} evaluation {i}: raw t"
             );
             spread.merge(Spread::of(&e.input, &host(&inputs.get(i).unwrap())));
-            spread.merge(Spread::of(
-                &e.velocity,
-                &host(&velocities.get(i).unwrap()),
-            ));
+            spread.merge(Spread::of(&e.velocity, &host(&velocities.get(i).unwrap())));
         }
     }
     spread
@@ -267,7 +264,11 @@ fn synthetic_synthesis_matches_upstream() {
         let mut spread = compare_evaluations(&trace, &r, name, out.chunks.len(), steps);
         let fin = Spread::of(out.latents.values(), &host(&r[&format!("{name}/final")]));
         spread.merge(fin);
-        assert_eq!(out.latents.frames(), codes.len(), "{name}: every frame solved");
+        assert_eq!(
+            out.latents.frames(),
+            codes.len(),
+            "{name}: every frame solved"
+        );
         eprintln!(
             "{name}: evaluations+final max |Δ| {:.3e} rel L2 {:.3e}; final max |Δ| {:.3e}",
             spread.max_abs, spread.rel_l2, fin.max_abs
@@ -730,7 +731,11 @@ fn cancellation_releases_resources_and_leaves_the_model_intact() {
             matches!(out, Err(gen_core::Error::Canceled)),
             "cancel at poll {cancel_at}: {out:?}"
         );
-        assert_eq!(calls.get(), cancel_at + 1, "no poll after the cancelling one");
+        assert_eq!(
+            calls.get(),
+            cancel_at + 1,
+            "no poll after the cancelling one"
+        );
         assert!(
             !nar.lm().ar_offloaded(),
             "cancel at poll {cancel_at}: AR path restored"

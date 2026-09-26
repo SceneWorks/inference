@@ -116,13 +116,14 @@ impl NarConfig {
                 .map(|n| n as usize)
                 .ok_or_else(|| gen_core::Error::Msg(format!("YuE2 config.json: missing `{key}`")))
         };
-        let config = Self {
-            latent_dim: uint("latent_dim")?,
-            max_latent_frames: uint("max_latent_frames")?,
-            timestep_shift: v.get("timestep_shift").and_then(Value::as_f64).ok_or_else(|| {
-                gen_core::Error::Msg("YuE2 config.json: missing `timestep_shift`".into())
-            })?,
-        };
+        let config =
+            Self {
+                latent_dim: uint("latent_dim")?,
+                max_latent_frames: uint("max_latent_frames")?,
+                timestep_shift: v.get("timestep_shift").and_then(Value::as_f64).ok_or_else(
+                    || gen_core::Error::Msg("YuE2 config.json: missing `timestep_shift`".into()),
+                )?,
+            };
         config.validate()?;
         Ok(config)
     }
@@ -519,17 +520,19 @@ impl SynthesisRequest<'_> {
     /// the model weights, the prefix, the codec ids, the noise values, the step count, the context
     /// and the ODE method. The memory controls ([`NarOptions`]) are deliberately absent.
     pub fn stage_identity(&self, weights_sha256: &str) -> String {
-        let record = json!({
-            "schema": STAGE_IDENTITY_SCHEMA,
-            "protocol": PROTOCOL_VERSION,
-            "weights_sha256": weights_sha256,
-            "prefix": self.prefix,
-            "codes": self.codes,
-            "noise_sha256": self.noise.sha256(),
-            "steps": self.steps,
-            "context": self.context,
-            "ode_method": ODE_METHOD,
-        });
+        // A JSON array, not an object: its byte form does not depend on serde_json's map-order
+        // feature, which workspace feature unification could otherwise flip between builds.
+        let record = json!([
+            STAGE_IDENTITY_SCHEMA,
+            PROTOCOL_VERSION,
+            weights_sha256,
+            self.prefix,
+            self.codes,
+            self.noise.sha256(),
+            self.steps,
+            self.context,
+            ODE_METHOD,
+        ]);
         let digest = Sha256::digest(record.to_string().as_bytes());
         digest.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -671,7 +674,8 @@ impl ChunkSolver {
                 state.dims()
             )));
         }
-        let pad = Tensor::zeros((1, LATENT_CHANNELS), state.dtype(), state.device()).map_err(&err)?;
+        let pad =
+            Tensor::zeros((1, LATENT_CHANNELS), state.dtype(), state.device()).map_err(&err)?;
         let x_nar = Tensor::cat(&[&pad, state, &pad], 0)
             .and_then(|x| x.unsqueeze(0))
             .map_err(&err)?;
@@ -697,14 +701,16 @@ impl ChunkSolver {
         );
         for (i, layer) in lm.layers().iter().enumerate() {
             let p = layer.nar.as_ref().ok_or_else(|| {
-                gen_core::Error::Msg("YuE2 acoustic: the model was loaded without the NAR path".into())
+                gen_core::Error::Msg(
+                    "YuE2 acoustic: the model was loaded without the NAR path".into(),
+                )
             })?;
             let normed = rms_norm(&x, &p.attn_norm, cfg.rms_norm_eps).map_err(&err)?;
             let (q, k, v) = p.attn.project_qkv(&normed, &self.cos, &self.sin)?;
             let (keys, values) = self.cache.update(i, &k, &v).map_err(backend("kv cache"))?;
             debug_assert_eq!(keys.dim(2).ok(), Some(keys_total));
-            let h = attend(&q, &keys, &values, p.attn.scale(), rows)
-                .map_err(backend("attention"))?;
+            let h =
+                attend(&q, &keys, &values, p.attn.scale(), rows).map_err(backend("attention"))?;
             x = (x + p.attn.project_out(&h)?).map_err(&err)?;
             let normed = rms_norm(&x, &p.mlp_norm, cfg.rms_norm_eps).map_err(&err)?;
             x = (&x + p.mlp.forward(&normed)?).map_err(&err)?;
@@ -771,7 +777,10 @@ impl ChunkSolver {
             .to_dtype(DType::F32)
             .and_then(|t| t.to_device(&Device::Cpu))
             .map_err(&err)?;
-        let host: Vec<f32> = result.flatten_all().and_then(|t| t.to_vec1()).map_err(&err)?;
+        let host: Vec<f32> = result
+            .flatten_all()
+            .and_then(|t| t.to_vec1())
+            .map_err(&err)?;
         if host.iter().any(|v| !v.is_finite()) {
             return Err(gen_core::Error::Msg(
                 "YuE2 acoustic flow matching produced non-finite latents".into(),

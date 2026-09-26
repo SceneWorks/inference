@@ -99,3 +99,75 @@ each JSON's `reference` block records Python, torch, numpy, safetensors and tran
   CC BY-NC 4.0 weights, so the tensors stay outside the repository
   (`~/.cache/sceneworks-yue2-fixtures/vae/vae_real_reference.safetensors`); only their SHA-256,
   shapes and statistics are committed here, and the test refuses a reference file with another hash.
+
+# YuE2 acoustic-stage (NAR) fixtures (sc-22992)
+
+Produced by `scripts/reference/yue2/nar_fixtures.py` from the **pinned upstream** `yue2.nar`
+(`synthesize`, `song_chunks`, `CachedNAR`) and `YuE2ForCausalLM.nar_velocity`, imported from the
+shared reference environment. The only instrumentation is a wrapper around `CachedNAR.velocity`
+that records each evaluation's input state, raw `t` and output; nothing is re-implemented.
+
+| File | Subcommand | Consumer |
+| --- | --- | --- |
+| `nar_synthetic.json`, `nar_synthetic.safetensors` | `synthetic` | `nar::tests` (CI, `--lib`) |
+| `nar_real_reference.json` | `real` | `tests/nar_real_weights.rs` (`#[ignore]`, `YUE2_HF_HUB`) |
+
+* **Synthetic** — the 2-layer, 32-wide real-architecture MoT of `ar_synthetic.json` plus NAR heads
+  (`vae2llm`, `llm2vae`, `time_embedder`, and a 64-row `latent_pos_embed.pe`) whose weights are the
+  same integer hash, rebuilt bit-identically by `nar::synthetic`. torch runs single-threaded so the
+  committed values are reproducible. The **injected noise** is upstream's own full-song draw
+  (`song_chunks` with seed 831001), recorded per case and fed to the native side unchanged. Cases:
+  the default 32-step midpoint solve; 7 and 1 steps; three original chunks (context cut to 8 frames
+  per chunk, 21 frames); chunk edges at exactly two full chunks (16 frames) and one frame over (17);
+  a 70-frame chunk whose 72 NAR positions exceed the 64-row position table (the clamp); upstream
+  tiling by 5 query rows with `offload_ar=True` (final only); `CachedNAR` with `nar_cond_end = 5`
+  (text-only visibility); `timestep_shift = 3`; and `joint/*` — the cached velocity against
+  upstream's joint hybrid-mask forward `nar_velocity` (upstream agrees with itself to 1.7e-6).
+* **Real** — `m-a-p/YuE2-3B` @ `1a96eca688d6ae5d7f0feb88573fec89920fcd19` in F32 on the CPU, the
+  exact 357-token semantic prefix of the `supplied_full` request of `ar_real_weights.json`, and
+  hashed codec ids: `multi_chunk_32` (100 frames, context cut to 48 frames per chunk: chunks of 48,
+  48 and a 4-frame tail, the released 32 steps) and `single_chunk_5` (24 frames, released context,
+  5 steps). The latents derive from CC BY-NC 4.0 weights, so the tensors stay outside the
+  repository (`~/.cache/sceneworks-yue2-fixtures/nar/nar_real_reference.safetensors`); only the
+  cases and the file's SHA-256 are committed, and the test refuses a reference with another hash.
+
+## Measured tolerances
+
+| Check | Measured | Bound |
+| --- | --- | --- |
+| Synthetic: every evaluation's input + velocity and the final latents, 8 song-level cases (F32) | max \|Δ\| 2.1e-6, rel L2 4.8e-7 | 2e-5 / 5e-6 |
+| Synthetic: cached velocity vs upstream joint forward and cached velocity | max \|Δ\| 2.1e-6 | 2e-5 / 5e-6 |
+| Synthetic: `nar_cond_end = 5` | max \|Δ\| 2.0e-6 | 2e-5 / 5e-6 |
+| Synthetic: native query tiles / score budgets / offload vs default | 0 (bit-identical) | 1e-5 |
+| Timestep schedule (`logit(t)` as the model's F32) | exact | exact |
+| Real weights: every evaluation's input + velocity and the final latents, 288 evaluations (F32) | max \|Δ\| 4.4e-5 (final 1.9e-5), rel L2 5.9e-6 | 5e-4 / 6e-5 |
+| Real weights: `Rows(7)` + AR offload vs default | 0 (bit-identical) | 1e-5 |
+
+Every assertion was checked against a mutation that must fail it (run one at a time); the smallest
+latent movement among them was 7.3e-3 (midpoint time `t − dt` instead of `t − dt/2`):
+
+| Mutation | Red tests (max \|Δ\| where a bound applies) |
+| --- | --- |
+| Euler (second evaluation at `x, t`) | synthetic parity (0.10), `cond_end` (0.82), tiling-vs-upstream (0.073) |
+| Midpoint time `t − dt` | synthetic parity, `cond_end`, tiling-vs-upstream (7.3e-3) |
+| No `MUSIC_END` in a chunk's AR sequence | synthetic parity (AR sequence), tiling-vs-upstream (0.44) |
+| NAR RoPE positions off by one | joint (0.62), synthetic parity (0.53), `cond_end` (0.72), tiling |
+| Attention drops the first visible key | joint (0.97), synthetic parity (0.36), `cond_end` (0.76), tiling |
+| A query tile drops the last key | `every_query_tile_attends_every_key`, tiling (0.54) |
+| Latent positions shifted by one | joint (4.0), synthetic parity (3.4), `cond_end` (3.2), tiling |
+| `nar_cond_end` ignored | joint (2.2), `cond_end` (1.5) |
+| `timestep_shift` ignored | synthetic parity `shift_3` (0.10) |
+| Chunk noise rows misaligned | noise slicing, long-song composition, synthetic parity `multi_chunk` (6.1) |
+| Offloaded AR path not restored | cancellation, tiling (AR path left offloaded) |
+| No cancellation poll before the midpoint evaluation | cancellation (poll count) |
+| Timestep features `cos`/`sin` swapped | joint (3.1), synthetic parity (2.3), `cond_end` (2.4), tiling |
+| Cache not truncated between evaluations | 8 tests (capacity error / wrong keys) |
+| No `logit` clamp | synthetic parity, `cond_end` (raw `t` schedule) |
+
+Run cost (Apple M-series CPU, F32, measured 2026-09-26): the reference `real` subcommand peaks at
+21.0 GB RSS (`ru_maxrss`: both MoT paths in F32 plus the mapped checkpoint) and takes ~80 s after
+loading; the native `nar_real_weights` test (release) peaks at 23.2 GB `ru_maxrss` / 16.4 GB
+footprint (the file-backed mapping counts toward `ru_maxrss` during the load) and takes 263 s: 22 s
+to verify and load, 211 s for the three-chunk 32-step case, 14 s per run of the 5-step case. Never
+run the two at once.
+
