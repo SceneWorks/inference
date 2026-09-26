@@ -508,7 +508,12 @@ def real(args) -> None:
            "probes": probes, "modes": {}}
     timings = {}
     for mode, request in requests.items():
-        rec = {"cot": request.cot, "cfg_scale": request.guidance}
+        rec = {"cot": request.cot, "cfg_scale": request.guidance,
+               # The request itself, so the native side rebuilds every prefix through its own
+               # tokenizer and protocol (SymbolicPlan) and compares them with the ids below.
+               "request": {"style": request.style, "lyrics": request.lyrics, "cot": request.cot,
+                           "seed": request.seed, "abc": request.abc,
+                           "cfg_scale": request.cfg_scale, "id": request.id}}
         t0 = time.perf_counter()
         if request.cot != "off" and request.abc is None:
             planner = token_prefixes(request, tok)

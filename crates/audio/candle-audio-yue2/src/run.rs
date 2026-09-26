@@ -65,7 +65,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::engine::{
-    identity_of, msg, EngineHooks, SemanticResult, SongSettings, Stage, StageEvent, Yue2Engine,
+    identity_of, EngineHooks, SemanticResult, SongSettings, Stage, StageEvent, Yue2Engine,
     IDENTITY_SCHEMA,
 };
 use crate::inventory::VaeVariant;
@@ -75,7 +75,7 @@ use crate::plan::{
     npy_int32, read_npy_ints, PlanIdentity, SymbolicPlan, ABC_TOKENS_NPY, PLAN_JSON, PLAN_MANIFEST,
     PREFIX_NPY, SCORE_ABC,
 };
-use crate::protocol::{Sampling, SongRequest, CODEC_SIZE, CONTEXT};
+use crate::protocol::{GenerationConfig, SongRequest, CODEC_SIZE, CONTEXT};
 use crate::vae::{variant_name, AUDIO_CHANNELS, SAMPLE_RATE};
 
 /// `result.json` — written last; its presence with `status: complete` in a published directory
@@ -876,7 +876,7 @@ impl Yue2Engine {
             None => {
                 work.clear_unrecorded(&PLAN_FILES_ALL)?;
                 let plan = match input {
-                    SongInput::Request(r) => self.plan(r, settings.generation.abc(), hooks)?,
+                    SongInput::Request(r) => self.plan(r, &settings.generation, hooks)?,
                     SongInput::Plan(p) => {
                         hooks.observer.on_stage(Stage::Plan, StageEvent::Started);
                         hooks.observer.on_stage(Stage::Plan, StageEvent::Finished);
@@ -926,8 +926,7 @@ impl Yue2Engine {
             }
             None => {
                 work.clear_unrecorded(&[SEMANTIC_NPY])?;
-                let semantic =
-                    self.generate_semantic(&plan, settings.generation.semantic(), hooks)?;
+                let semantic = self.generate_semantic(&plan, &settings.generation, hooks)?;
                 write_semantic(&work.path(SEMANTIC_NPY), &semantic.codes)?;
                 work.record(
                     Stage::Semantic,
@@ -958,7 +957,7 @@ impl Yue2Engine {
                 steps: usize::try_from(settings.generation.ode_steps()).unwrap_or(usize::MAX),
                 context: CONTEXT,
             }
-            .stage_identity(&self.weights_sha256()?)
+            .stage_identity(&self.weights_sha256()?, self.dtype())
         };
         let (latents, nar_seconds) = match work.checkpoint(Stage::Synthesis, &synthesis_identity)? {
             Some(data) => {
@@ -1124,11 +1123,11 @@ impl Yue2Engine {
     pub fn plan_to(
         &self,
         request: &SongRequest,
-        abc: &Sampling,
+        generation: &GenerationConfig,
         output: &RunOutput,
         hooks: &mut EngineHooks<'_>,
     ) -> Result<(SymbolicPlan, PlanIdentity, PathBuf), RunError> {
-        let identity = self.plan_stage_identity(request, abc)?;
+        let identity = self.plan_stage_identity(request, generation.abc())?;
         let work = match open_output(output)? {
             Opened::Complete => {
                 let result = verify_run(&output.dir, Some(&identity))?;
@@ -1145,18 +1144,13 @@ impl Yue2Engine {
         };
         work.clear_unrecorded(&PLAN_FILES_ALL)?;
         work.clear_unrecorded(&[REQUEST_JSON, PROVENANCE_JSON, RESULT_JSON])?;
-        let plan = self.plan(request, abc, hooks)?;
+        let plan = self.plan(request, generation, hooks)?;
         let plan_id = plan
             .save(&work.work)
             .map_err(|e| corrupt(&work.work, e.to_string()))?;
         write_json(&work.path(REQUEST_JSON), &request.to_json())?;
         let settings = SongSettings {
-            generation: crate::protocol::GenerationConfig::new(
-                *abc,
-                *self.generation_config().semantic(),
-                self.generation_config().ode_steps() as i64,
-            )
-            .map_err(msg)?,
+            generation: generation.clone(),
             ..self.default_settings()
         };
         write_json(

@@ -231,7 +231,7 @@ fn plan_only_then_restored_stages_equal_the_one_shot_run() {
     // Plan only, published transactionally.
     let plan_dir = tmp.path().join("plan");
     let (_, plan_id, _) = with_hooks(None, |h| {
-        engine.plan_to(&req, s.generation.abc(), &RunOutput::fresh(&plan_dir), h)
+        engine.plan_to(&req, &s.generation, &RunOutput::fresh(&plan_dir), h)
     })
     .0
     .unwrap();
@@ -247,7 +247,7 @@ fn plan_only_then_restored_stages_equal_the_one_shot_run() {
     assert_eq!(restored.abc_ids(), one_shot.semantic.plan.abc_ids());
     assert_eq!(restored.prefix(), one_shot.semantic.plan.prefix());
     let (staged, _) = with_hooks(None, |h| {
-        let semantic = engine.generate_semantic(&restored, s.generation.semantic(), h)?;
+        let semantic = engine.generate_semantic(&restored, &s.generation, h)?;
         let synthesis = engine.synthesize(&semantic, &s.generation, h)?;
         let audio = engine.decode(&synthesis.latents, s.decoder, h)?;
         Ok::<_, gen_core::Error>((semantic, synthesis, audio))
@@ -599,7 +599,7 @@ fn cancellation_at_any_stage_publishes_nothing_complete() {
     let (r, _) = with_hooks(Some(Stage::Plan), |h| {
         engine.plan_to(
             input.request(),
-            s.generation.abc(),
+            &s.generation,
             &RunOutput::fresh(&plan_dir),
             h,
         )

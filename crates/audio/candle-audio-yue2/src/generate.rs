@@ -3,14 +3,16 @@
 //!
 //! Ported from the pinned upstream `src/yue2/sampling.py::generate_tokens` and the `plan` /
 //! `generate_semantic` stages of `src/yue2/pipeline.py`. The model and sampler consume **token
-//! ids**: the tokenizer and the request/prompt assembly (`token_prefixes`, `negative_prefix`)
-//! produce the prefixes these functions take.
+//! ids**; the request, its prefixes and the exact symbolic plan come from [`crate::protocol`] and
+//! [`crate::plan`].
 //!
 //! # One decode ([`decode_tokens`])
 //!
-//! * The prefix plus the output budget must fit the released [`CONTEXT`]; a longer request is an
-//!   error, never an implicit truncation, window or re-prefill. The KV cache is sized to exactly
-//!   `prefix + max_tokens` positions and positions are the cache slots `0, 1, 2, …`.
+//! * The prefix plus the output budget must fit the released
+//!   [`CONTEXT`](crate::protocol::CONTEXT)
+//!   ([`check_generation_budget`]); a longer request is an error, never an implicit truncation,
+//!   window or re-prefill. The KV cache is sized to exactly `prefix + max_tokens` positions and
+//!   positions are the cache slots `0, 1, 2, …`.
 //! * With guidance (`scale != 1`) the negative prefix gets its own cache; every step runs both
 //!   branches and samples from `uncond + scale · (cond − uncond)` in the model dtype.
 //! * A step shapes the row with [`distribution`], draws (or takes the argmax), reports
@@ -25,26 +27,42 @@
 //!
 //! # The stages
 //!
-//! [`plan_score`] generates the score for `cot = full | melody` from the planner prefix
-//! (`… ABC_START`); [`ScorePlan::supplied`] takes an external score's exact ids instead, and
-//! [`ScorePlan::off`] has none. [`generate_semantic`] generates the codec tokens from the semantic
-//! prefix, which must frame **exactly** the plan's ABC ids (`ABC_START abc… ABC_END MUSIC_START`);
-//! under guidance the negative prefix must frame the very same ids (upstream's
-//! `same_instruction_and_exact_abc`), or — for `cot = off`, which has no score — none at all
-//! (`instruction_only`). Both stages restart their random stream from the request seed
-//! ([`stage_rng`]), as upstream does.
+//! The request is planned with [`SymbolicPlan::prepare`]. A [`PlanStep::GenerateAbc`] is sampled
+//! by [`plan_score`] — the planner prefix with the ABC phase's controls
+//! ([`GenerationConfig::abc`]) — into a [`SymbolicPlan`] carrying the exact sampled ids; a
+//! [`PlanStep::Ready`] plan (`cot = off`, or an external score) needs no sampling.
+//! [`generate_semantic`] then takes the plan and its [`SymbolicPlan::semantic_conditioning`] and
+//! samples the codec tokens with the semantic controls ([`GenerationConfig::semantic`]). It
+//! refuses conditioning that is not the plan's: the positive prefix must be the plan's prefix and
+//! frame **exactly** the plan's ABC ids (`ABC_START abc… ABC_END MUSIC_START`); under guidance
+//! the negative must frame the very same ids (upstream's `same_instruction_and_exact_abc`) or —
+//! for `cot = off`, which has no score — only `MUSIC_START` (`instruction_only`); and between the
+//! leading `EOD` and that framing both prefixes hold ordinary text ids only (`< EOD`), as
+//! upstream's `[EOD] + tokenizer.encode(text)` does. Both stages restart their random stream from
+//! the request seed ([`stage_rng`]), as upstream does.
+//!
+//! [`PlanStep::GenerateAbc`]: crate::plan::PlanStep::GenerateAbc
+//! [`PlanStep::Ready`]: crate::plan::PlanStep::Ready
 
 use std::time::Instant;
 
 use candle_audio::candle_core::DType;
 use candle_audio::gen_core;
 use candle_llm::primitives::StaticKvCache;
+use serde_json::{Map, Value};
 
 use crate::model::{backend, Yue2Lm};
-use crate::sampling::{
-    cfg_mix, distribution, next_token, Arith, Phase, Sampling, SplitMix64, TokenRng, ABC_END,
-    ABC_START, CODEC_OFFSET, CONTEXT, EOD, MUSIC_START,
+use crate::plan::{AbcPlanning, SemanticConditioning, SymbolicPlan};
+use crate::protocol::{
+    check_generation_budget, CotMode, GenerationConfig, ProtocolError, Sampling, ABC_END,
+    ABC_START, CODEC_OFFSET, EOD, MUSIC_START,
 };
+use crate::sampling::{cfg_mix, distribution, next_token, Arith, Phase, SplitMix64, TokenRng};
+use crate::tokenizer::Yue2TextTokenizer;
+
+fn protocol_error(e: ProtocolError) -> gen_core::Error {
+    gen_core::Error::Msg(format!("YuE2: {e}"))
+}
 
 /// Classifier-free guidance for one decode.
 #[derive(Clone, Copy, Debug)]
@@ -167,41 +185,29 @@ pub fn decode_tokens(
         observer,
     } = hooks;
     let sampling = request.sampling;
-    sampling.validate()?;
     let model_arith = arith_of(lm.dtype())?;
     let score_arith = if request.legacy_off {
         model_arith
     } else {
         Arith::F32
     };
-    let budget = sampling.max_tokens;
-    let fits = |len: usize| len.checked_add(budget).is_some_and(|n| n <= CONTEXT);
-    if !fits(request.prefix.len()) {
+    let budget = sampling.max_tokens() as usize;
+    let scale = request.guidance.map_or(1.0, |g| g.scale);
+    if !scale.is_finite() {
         return Err(gen_core::Error::Msg(format!(
-            "YuE2: prefix ({}) + requested generation budget ({budget}) exceeds the {CONTEXT}-token \
-             context; no implicit truncation",
-            request.prefix.len()
+            "YuE2: guidance scale {scale} is not finite"
         )));
     }
-    let guidance = match request.guidance {
-        Some(g) if g.scale != 1.0 => {
-            if !g.scale.is_finite() {
-                return Err(gen_core::Error::Msg(format!(
-                    "YuE2: guidance scale {} is not finite",
-                    g.scale
-                )));
-            }
-            if !fits(g.negative.len()) {
-                return Err(gen_core::Error::Msg(format!(
-                    "YuE2: negative prefix ({}) + generation budget ({budget}) exceeds the \
-                     {CONTEXT}-token context",
-                    g.negative.len()
-                )));
-            }
-            Some(g)
-        }
-        _ => None,
-    };
+    // Upstream's refusals before prefill: each supplied branch plus the budget must fit the
+    // context — nothing is truncated to make a request fit.
+    check_generation_budget(
+        request.prefix.len(),
+        request.guidance.map(|g| g.negative.len()),
+        sampling,
+        scale,
+    )
+    .map_err(protocol_error)?;
+    let guidance = request.guidance.filter(|g| g.scale != 1.0);
     check_cancel(cancelled)?;
     let start = Instant::now();
     let prefill = |ids: &[u32]| -> gen_core::Result<(Vec<f32>, StaticKvCache)> {
@@ -266,191 +272,54 @@ pub fn decode_tokens(
     })
 }
 
-/// The symbolic-planning mode (upstream `SongRequest.cot`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cot {
-    /// Plan melody and chords.
-    Full,
-    /// Plan the melody only.
-    Melody,
-    /// No symbolic plan.
-    Off,
+/// Upstream's timing record for a decode (`generate_tokens`' `timing`, minus the CUDA-graph
+/// fields this runtime has no counterpart for).
+pub(crate) fn timing_of(decoded: &Decoded) -> Map<String, Value> {
+    let mut t = Map::new();
+    t.insert("seconds".into(), Value::from(decoded.seconds));
+    t.insert(
+        "prefill_seconds".into(),
+        Value::from(decoded.prefill_seconds),
+    );
+    t.insert("output_tokens".into(), Value::from(decoded.output_tokens));
+    t.insert("content_tokens".into(), Value::from(decoded.tokens.len()));
+    t.insert("prefix_tokens".into(), Value::from(decoded.prefix_tokens));
+    t.insert("cfg_branches".into(), Value::from(decoded.cfg_branches));
+    t.insert("execution".into(), Value::from("candle"));
+    t
 }
 
-impl Cot {
-    /// Upstream's default guidance (`SongRequest.guidance` with no `cfg_scale`): `1.01` for `off`
-    /// (instruction-only negative), `1.0` — no guidance — otherwise.
-    pub fn default_cfg_scale(self) -> f64 {
-        match self {
-            Cot::Off => 1.01,
-            Cot::Full | Cot::Melody => 1.0,
-        }
-    }
-}
-
-/// Where a plan's score came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlanSource {
-    /// `cot = off`: no score.
-    None,
-    /// An external score's exact ids.
-    Supplied,
-    /// Generated by [`plan_score`]; `truncated` when the budget ran out before `ABC_END`.
-    Planned {
-        /// The planner hit its token budget.
-        truncated: bool,
-    },
-}
-
-/// The symbolic plan the semantic stage conditions on: the exact ABC ids (no decode/re-encode).
-#[derive(Clone, Debug, PartialEq)]
-pub struct ScorePlan {
-    cot: Cot,
-    abc_ids: Vec<u32>,
-    source: PlanSource,
-}
-
-fn check_abc_ids(ids: &[u32]) -> gen_core::Result<()> {
-    if let Some(bad) = ids.iter().find(|&&t| t >= EOD) {
-        return Err(gen_core::Error::Msg(format!(
-            "YuE2: ABC id {bad} is outside the ordinary text vocabulary [0, {EOD})"
-        )));
-    }
-    Ok(())
-}
-
-impl ScorePlan {
-    /// `cot = off`: no score.
-    pub fn off() -> Self {
-        Self {
-            cot: Cot::Off,
-            abc_ids: Vec::new(),
-            source: PlanSource::None,
-        }
-    }
-
-    /// An external score (`cot = full | melody`), as its exact tokenizer ids.
-    pub fn supplied(cot: Cot, abc_ids: Vec<u32>) -> gen_core::Result<Self> {
-        if cot == Cot::Off || abc_ids.is_empty() {
-            return Err(gen_core::Error::Msg(
-                "YuE2: an external score requires cot = full | melody and a non-empty score".into(),
-            ));
-        }
-        check_abc_ids(&abc_ids)?;
-        Ok(Self {
-            cot,
-            abc_ids,
-            source: PlanSource::Supplied,
-        })
-    }
-
-    /// The score of a verified [`SymbolicPlan`](crate::plan::SymbolicPlan) — freshly planned,
-    /// built from an external score, or restored from disk — with its **exact** ABC ids (never
-    /// re-encoded from the text) and its truncation flag.
-    pub fn of_plan(plan: &crate::plan::SymbolicPlan) -> gen_core::Result<Self> {
-        use crate::plan::PlanKind;
-        use crate::protocol::CotMode;
-        let cot = match plan.request().cot() {
-            CotMode::Off => Cot::Off,
-            CotMode::Melody => Cot::Melody,
-            CotMode::Full => Cot::Full,
-        };
-        match plan.kind() {
-            PlanKind::Off => Ok(Self::off()),
-            PlanKind::External => Self::supplied(cot, plan.abc_ids().to_vec()),
-            PlanKind::Generated => {
-                check_abc_ids(plan.abc_ids())?;
-                Ok(Self {
-                    cot,
-                    abc_ids: plan.abc_ids().to_vec(),
-                    source: PlanSource::Planned {
-                        truncated: plan.truncated(),
-                    },
-                })
-            }
-        }
-    }
-
-    /// The planning mode.
-    pub fn cot(&self) -> Cot {
-        self.cot
-    }
-
-    /// The exact ABC ids.
-    pub fn abc_ids(&self) -> &[u32] {
-        &self.abc_ids
-    }
-
-    /// Where the score came from.
-    pub fn source(&self) -> PlanSource {
-        self.source
-    }
-
-    /// Whether the planner hit its budget.
-    pub fn truncated(&self) -> bool {
-        matches!(self.source, PlanSource::Planned { truncated: true })
-    }
-
-    /// The tail every semantic prefix of this plan ends with: `ABC_START abc… ABC_END
-    /// MUSIC_START` (for `off`, the empty score `ABC_START ABC_END MUSIC_START`).
-    pub fn semantic_tail(&self) -> Vec<u32> {
-        let mut tail = Vec::with_capacity(self.abc_ids.len() + 3);
-        tail.push(ABC_START);
-        tail.extend_from_slice(&self.abc_ids);
-        tail.extend_from_slice(&[ABC_END, MUSIC_START]);
-        tail
-    }
-
-    /// The tail a guidance negative prefix of this plan ends with: the same exact score for
-    /// `full | melody`, only `MUSIC_START` for `off`.
-    pub fn negative_tail(&self) -> Vec<u32> {
-        match self.cot {
-            Cot::Off => vec![MUSIC_START],
-            Cot::Full | Cot::Melody => self.semantic_tail(),
-        }
-    }
-}
-
-/// Generate the score for `cot = full | melody` from the planner prefix (`EOD … ABC_START`), with
-/// the ABC phase's own sampling controls.
+/// Sample the score for a [`PlanStep::GenerateAbc`](crate::plan::PlanStep::GenerateAbc): the
+/// planner's own prefix (`EOD … ABC_START`) with the ABC phase's controls, then
+/// [`AbcPlanning::finish`] with the exact sampled ids (`ABC_END` excluded) and the truncation flag.
 pub fn plan_score(
     lm: &Yue2Lm,
-    cot: Cot,
-    planner_prefix: &[u32],
-    sampling: &Sampling,
+    planning: AbcPlanning,
+    tokenizer: &Yue2TextTokenizer,
+    config: &GenerationConfig,
     rng: &mut dyn TokenRng,
     hooks: Hooks<'_>,
-) -> gen_core::Result<(ScorePlan, Decoded)> {
-    if cot == Cot::Off {
-        return Err(gen_core::Error::Msg(
-            "YuE2: cot = off has no score to plan (use ScorePlan::off)".into(),
-        ));
-    }
-    if planner_prefix.first() != Some(&EOD) || planner_prefix.last() != Some(&ABC_START) {
-        return Err(gen_core::Error::Msg(
-            "YuE2: the planner prefix must be `EOD … ABC_START`".into(),
-        ));
-    }
+) -> gen_core::Result<(SymbolicPlan, Decoded)> {
     let decoded = decode_tokens(
         lm,
         &DecodeRequest {
             phase: Phase::Abc,
-            prefix: planner_prefix,
-            sampling,
+            prefix: planning.prefix(),
+            sampling: config.abc(),
             guidance: None,
             legacy_off: false,
         },
         rng,
         hooks,
     )?;
-    check_abc_ids(&decoded.tokens)?;
-    let plan = ScorePlan {
-        cot,
-        abc_ids: decoded.tokens.clone(),
-        source: PlanSource::Planned {
-            truncated: decoded.truncated,
-        },
-    };
+    let plan = planning
+        .finish(
+            tokenizer,
+            decoded.tokens.clone(),
+            timing_of(&decoded),
+            decoded.truncated,
+        )
+        .map_err(|e| gen_core::Error::Msg(format!("YuE2 planner: {e}")))?;
     Ok((plan, decoded))
 }
 
@@ -463,78 +332,105 @@ pub struct SemanticTokens {
     pub decoded: Decoded,
 }
 
-/// The semantic stage's conditioning: the plan, the positive prefix, and the guidance.
-#[derive(Clone, Copy, Debug)]
-pub struct SemanticInput<'a> {
-    /// The plan the prefix frames.
-    pub plan: &'a ScorePlan,
-    /// The positive prefix: `EOD …` ending in [`ScorePlan::semantic_tail`].
-    pub prefix: &'a [u32],
-    /// The guidance negative prefix (`EOD …` ending in [`ScorePlan::negative_tail`]); required
-    /// when `cfg_scale != 1`, ignored when it is exactly `1`.
-    pub negative: Option<&'a [u32]>,
-    /// The guidance scale, in `[0, 20]` ([`Cot::default_cfg_scale`] is the released default).
-    pub cfg_scale: f64,
+/// `ABC_START abc… ABC_END MUSIC_START` — the tail every positive prefix of `plan` ends with (for
+/// `cot = off`, the empty score).
+fn semantic_tail(plan: &SymbolicPlan) -> Vec<u32> {
+    let mut tail = Vec::with_capacity(plan.abc_ids().len() + 3);
+    tail.push(ABC_START);
+    tail.extend_from_slice(plan.abc_ids());
+    tail.extend_from_slice(&[ABC_END, MUSIC_START]);
+    tail
 }
 
-/// Generate the semantic codec tokens (see the module docs for the prefix contract).
+/// The tail a guidance negative of `plan` ends with: the same exact score for `full | melody`,
+/// only `MUSIC_START` for `off`.
+fn negative_tail(plan: &SymbolicPlan) -> Vec<u32> {
+    match plan.request().cot() {
+        CotMode::Off => vec![MUSIC_START],
+        CotMode::Full | CotMode::Melody => semantic_tail(plan),
+    }
+}
+
+/// `EOD`, then a non-empty body of ordinary text ids (`< EOD`), then exactly `tail`.
+fn check_framing(branch: &str, prefix: &[u32], tail: &[u32]) -> gen_core::Result<()> {
+    let refuse = |what: &str| {
+        Err(gen_core::Error::Msg(format!(
+            "YuE2 semantic stage: the {branch} prefix {what}"
+        )))
+    };
+    if prefix.first() != Some(&EOD) {
+        return refuse("must start with EOD");
+    }
+    if prefix.len() < 1 + tail.len() || !prefix.ends_with(tail) {
+        return refuse("must end with the plan's exact score framing");
+    }
+    let body = &prefix[1..prefix.len() - tail.len()];
+    if body.is_empty() {
+        return refuse("has no instruction text between EOD and the score framing");
+    }
+    if let Some(bad) = body.iter().find(|&&t| t >= EOD) {
+        return refuse(&format!(
+            "holds id {bad} before the score framing; only ordinary text ids (< EOD) belong there"
+        ));
+    }
+    Ok(())
+}
+
+/// Check that `conditioning` is `plan`'s ([`SymbolicPlan::semantic_conditioning`]'s output).
+fn check_conditioning<'a>(
+    plan: &SymbolicPlan,
+    conditioning: &'a SemanticConditioning,
+) -> gen_core::Result<Option<Guidance<'a>>> {
+    let refuse = |what: String| Err(gen_core::Error::Msg(format!("YuE2 semantic stage: {what}")));
+    let cot = plan.request().cot();
+    let scale = conditioning.cfg_scale;
+    if !(scale.is_finite() && (0.0..=20.0).contains(&scale)) {
+        return refuse(format!("cfg_scale {scale} must be finite and in [0, 20]"));
+    }
+    if scale != plan.request().guidance() {
+        return refuse(format!(
+            "cfg_scale {scale} is not the plan's guidance {}",
+            plan.request().guidance()
+        ));
+    }
+    if conditioning.legacy_off != (cot == CotMode::Off) {
+        return refuse("legacy_off must be set exactly for cot = off".into());
+    }
+    check_framing("positive", &conditioning.positive, &semantic_tail(plan))?;
+    if conditioning.positive != plan.prefix() {
+        return refuse("the positive prefix is not the plan's exact prefix".into());
+    }
+    match (&conditioning.negative, scale != 1.0) {
+        (Some(negative), true) => {
+            check_framing("negative", negative, &negative_tail(plan))?;
+            Ok(Some(Guidance { negative, scale }))
+        }
+        (None, false) => Ok(None),
+        (None, true) => refuse("guidance (cfg_scale != 1) requires a negative prefix".into()),
+        (Some(_), false) => refuse("a negative prefix without guidance (cfg_scale = 1)".into()),
+    }
+}
+
+/// Generate the semantic codec tokens for `plan` from its `conditioning` (see the module docs),
+/// with the semantic phase's controls. The `cot = off` stage samples with the historical
+/// arithmetic (`legacy_off`).
 pub fn generate_semantic(
     lm: &Yue2Lm,
-    input: &SemanticInput<'_>,
-    sampling: &Sampling,
+    plan: &SymbolicPlan,
+    conditioning: &SemanticConditioning,
+    config: &GenerationConfig,
     rng: &mut dyn TokenRng,
     hooks: Hooks<'_>,
 ) -> gen_core::Result<SemanticTokens> {
-    let plan = input.plan;
-    let refuse = |what: String| Err(gen_core::Error::Msg(format!("YuE2 semantic stage: {what}")));
-    if !(input.cfg_scale.is_finite() && (0.0..=20.0).contains(&input.cfg_scale)) {
-        return refuse(format!(
-            "cfg_scale {} must be finite and in [0, 20]",
-            input.cfg_scale
-        ));
-    }
-    let tail = plan.semantic_tail();
-    if input.prefix.first() != Some(&EOD) || !input.prefix.ends_with(&tail) {
-        return refuse(
-            "the prefix must start with EOD and end with the plan's exact score framing \
-             (ABC_START abc… ABC_END MUSIC_START)"
-                .into(),
-        );
-    }
-    let guidance = if input.cfg_scale == 1.0 {
-        None
-    } else {
-        let Some(negative) = input.negative else {
-            return refuse("guidance (cfg_scale != 1) requires a negative prefix".into());
-        };
-        let neg_tail = plan.negative_tail();
-        let body = &negative[..negative.len().saturating_sub(neg_tail.len())];
-        let framed = negative.first() == Some(&EOD) && negative.ends_with(&neg_tail);
-        // `off` negatives are instruction-only: no score framing anywhere before MUSIC_START.
-        let stray_score = plan.cot == Cot::Off && body.contains(&ABC_START);
-        if !framed || stray_score || negative.len() <= neg_tail.len() {
-            return refuse(match plan.cot {
-                Cot::Off => "a cot = off negative must be `EOD instruction… MUSIC_START` with no \
-                             score"
-                    .into(),
-                _ => "the negative prefix must retain the plan's exact score \
-                      (EOD instruction… ABC_START abc… ABC_END MUSIC_START)"
-                    .into(),
-            });
-        }
-        Some(Guidance {
-            negative,
-            scale: input.cfg_scale,
-        })
-    };
+    let guidance = check_conditioning(plan, conditioning)?;
     let decoded = decode_tokens(
         lm,
         &DecodeRequest {
             phase: Phase::Semantic,
-            prefix: input.prefix,
-            sampling,
+            prefix: &conditioning.positive,
+            sampling: config.semantic(),
             guidance,
-            legacy_off: plan.cot == Cot::Off,
+            legacy_off: conditioning.legacy_off,
         },
         rng,
         hooks,
@@ -549,7 +445,12 @@ mod tests {
 
     use super::*;
     use crate::model::{synthetic, MotPaths};
-    use crate::sampling::{self, CODEC_SIZE, MUSIC_END};
+    use crate::plan::PlanStep;
+    use crate::protocol::{
+        SongRequest, SongRequestSpec, CODEC_SIZE, CONTEXT, MUSIC_END, VOCAB_SIZE,
+    };
+    use crate::sampling::{self, test_sampling};
+    use crate::test_fixtures;
 
     /// Draws from a fixed list (parity tests inject the reference's uniforms).
     pub(crate) struct Uniforms(pub std::collections::VecDeque<f32>);
@@ -579,13 +480,8 @@ mod tests {
         false
     }
 
-    fn greedy(max_tokens: usize) -> Sampling {
-        Sampling {
-            temperature: 0.0,
-            min_tokens: 0,
-            max_tokens,
-            ..Sampling::SEMANTIC_DEFAULT
-        }
+    fn greedy(max_tokens: i64) -> Sampling {
+        test_sampling(0.0, 0.95, 100, 1.2, 50, 0, max_tokens)
     }
 
     const PREFIX: [u32; 7] = [EOD, 40, 1234, 99, ABC_START, ABC_END, MUSIC_START];
@@ -650,15 +546,7 @@ mod tests {
         let row = &rec.logits[0];
         // Drive the real loop to the end id through an injected draw: a stochastic sampler with
         // top_k large enough to include MUSIC_END, and a uniform that lands on it.
-        let stochastic = Sampling {
-            temperature: 1.0,
-            top_k: sampling::VOCAB_SIZE,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            min_tokens: 0,
-            max_tokens: 4,
-            ..Sampling::SEMANTIC_DEFAULT
-        };
+        let stochastic = test_sampling(1.0, 1.0, VOCAB_SIZE.into(), 1.0, 50, 0, 4);
         let probs = sampling::probabilities(
             &distribution(row, &stochastic, &[], 0, Phase::Semantic, Arith::F32, false),
             Arith::F32,
@@ -684,15 +572,7 @@ mod tests {
     #[test]
     fn min_tokens_bars_the_end_id_in_the_real_loop() {
         let lm = synthetic::model(MotPaths::Ar);
-        let s = Sampling {
-            temperature: 1.0,
-            top_k: sampling::VOCAB_SIZE,
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            min_tokens: 3,
-            max_tokens: 3,
-            ..Sampling::SEMANTIC_DEFAULT
-        };
+        let s = test_sampling(1.0, 1.0, VOCAB_SIZE.into(), 1.0, 50, 3, 3);
         // Uniform 0.999999 lands past the codec range (on MUSIC_END's slot if it had mass).
         let req = DecodeRequest {
             phase: Phase::Semantic,
@@ -726,7 +606,7 @@ mod tests {
         };
         let (out, rec) = run(&lm, &req, &mut stage_rng(1), &never);
         let err = out.unwrap_err().to_string();
-        assert!(err.contains("no implicit truncation"), "{err}");
+        assert!(err.contains("nothing is truncated implicitly"), "{err}");
         assert!(rec.tokens.is_empty(), "nothing ran");
         let neg = vec![5u32; CONTEXT];
         let req = DecodeRequest {
@@ -737,7 +617,11 @@ mod tests {
             }),
             ..req
         };
-        assert!(run(&lm, &req, &mut stage_rng(1), &never).0.is_err());
+        let err = run(&lm, &req, &mut stage_rng(1), &never)
+            .0
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("negative prefix"), "{err}");
     }
 
     /// Cancellation is observed before the prefill and at every step boundary: tripping it after
@@ -829,63 +713,185 @@ mod tests {
         assert_eq!(rc.logits[0], want);
     }
 
-    fn plan_of(ids: &[u32]) -> ScorePlan {
-        ScorePlan::supplied(Cot::Full, ids.to_vec()).unwrap()
+    fn tok() -> &'static Yue2TextTokenizer {
+        test_fixtures::synthetic()
     }
 
-    /// The semantic stage refuses a negative branch that does not carry the plan's exact score,
-    /// and a positive prefix that does not frame it.
+    fn request(cot: CotMode, abc: Option<&str>, cfg_scale: Option<f64>) -> SongRequest {
+        let mut spec = SongRequestSpec::new("warm piano pop, 88 BPM", "[Verse]\nNeon fades\n");
+        spec.cot = cot;
+        spec.abc = abc.map(str::to_string);
+        spec.cfg_scale = cfg_scale;
+        SongRequest::new(spec).unwrap()
+    }
+
+    fn ready(request: SongRequest) -> SymbolicPlan {
+        match SymbolicPlan::prepare(request, tok()).unwrap() {
+            PlanStep::Ready(plan) => plan,
+            PlanStep::GenerateAbc(_) => panic!("expected a ready plan"),
+        }
+    }
+
+    const SCORE: &str = "X:1\nL:1/16\nK:C\nV: Vocal\nE2G2A2G2|\n";
+
+    fn config(semantic: Sampling) -> GenerationConfig {
+        GenerationConfig::new(test_sampling(0.0, 0.9, 30, 1.005, 100, 0, 4), semantic, 32).unwrap()
+    }
+
+    fn semantic(
+        lm: &Yue2Lm,
+        plan: &SymbolicPlan,
+        conditioning: &SemanticConditioning,
+        config: &GenerationConfig,
+    ) -> gen_core::Result<SemanticTokens> {
+        generate_semantic(
+            lm,
+            plan,
+            conditioning,
+            config,
+            &mut stage_rng(1),
+            Hooks {
+                cancelled: &never,
+                observer: &mut (),
+            },
+        )
+    }
+
+    /// `ids` with `id` inserted at `at`.
+    fn with(ids: &[u32], at: usize, id: u32) -> Vec<u32> {
+        let mut v = ids.to_vec();
+        v.insert(at, id);
+        v
+    }
+
+    fn refused(result: gen_core::Result<SemanticTokens>, needle: &str, what: &str) {
+        match result {
+            Ok(_) => panic!("accepted {what}"),
+            Err(e) => assert!(e.to_string().contains(needle), "{what}: {e}"),
+        }
+    }
+
+    /// The semantic stage takes exactly the plan's conditioning: under guidance the negative must
+    /// carry the plan's exact score; between `EOD` and the framing both prefixes hold ordinary text
+    /// ids only; and scale, legacy flag and positive prefix must be the plan's.
     #[test]
     fn semantic_guidance_requires_the_exact_planned_score() {
         let lm = synthetic::model(MotPaths::Ar);
-        let abc = [11u32, 12, 13];
-        let plan = plan_of(&abc);
-        let prefix = [EOD, 5, 6, ABC_START, 11, 12, 13, ABC_END, MUSIC_START];
-        let good_negative = [EOD, 5, ABC_START, 11, 12, 13, ABC_END, MUSIC_START];
-        let s = greedy(2);
-        let go = |prefix: &[u32], negative: Option<&[u32]>, scale: f64| {
-            generate_semantic(
-                &lm,
-                &SemanticInput {
-                    plan: &plan,
-                    prefix,
-                    negative,
-                    cfg_scale: scale,
-                },
-                &s,
-                &mut stage_rng(1),
-                Hooks {
-                    cancelled: &never,
-                    observer: &mut (),
-                },
-            )
-        };
-        let ok = go(&prefix, Some(&good_negative), 1.5).unwrap();
+        let cfg = config(greedy(2));
+        let plan = ready(request(CotMode::Full, Some(SCORE), Some(1.5)));
+        let good = plan.semantic_conditioning(tok(), cfg.semantic()).unwrap();
+        let ok = semantic(&lm, &plan, &good, &cfg).unwrap();
         assert_eq!(ok.decoded.cfg_branches, 2);
         assert!(ok.codes.iter().all(|&c| c < CODEC_SIZE));
-        // Negative missing the score, carrying a different score, or a truncated score.
-        for bad in [
-            &[EOD, 5, MUSIC_START][..],
-            &[EOD, 5, ABC_START, 11, 12, 14, ABC_END, MUSIC_START],
-            &[EOD, 5, ABC_START, 11, 12, ABC_END, MUSIC_START],
-            &[ABC_START, 11, 12, 13, ABC_END, MUSIC_START],
+
+        let neg = good.negative.clone().unwrap();
+        let tail = semantic_tail(&plan);
+        let body = &neg[1..neg.len() - tail.len()];
+        let n = plan.abc_ids().len();
+        let negative = |ids: Vec<u32>| SemanticConditioning {
+            negative: Some(ids),
+            ..good.clone()
+        };
+        let mut other_score = neg.clone();
+        other_score[neg.len() - 3] += 1;
+        let mut short_score = neg.clone();
+        short_score.remove(neg.len() - 3);
+        let mut no_score = vec![EOD];
+        no_score.extend_from_slice(body);
+        no_score.push(MUSIC_START);
+        for (ids, needle, what) in [
+            (no_score, "framing", "a negative without the score"),
+            (other_score, "framing", "a negative with a different score"),
+            (short_score, "framing", "a negative with a truncated score"),
+            (neg[1..].to_vec(), "EOD", "a negative without EOD"),
+            (
+                with(&neg, 1, ABC_START),
+                "ordinary",
+                "score framing inside the negative body",
+            ),
+            (
+                with(&neg, 2, MUSIC_START),
+                "ordinary",
+                "a stray MUSIC_START in the negative body",
+            ),
         ] {
-            assert!(
-                go(&prefix, Some(bad), 1.5).is_err(),
-                "accepted negative {bad:?}"
-            );
+            refused(semantic(&lm, &plan, &negative(ids), &cfg), needle, what);
         }
-        assert!(
-            go(&prefix, None, 1.5).is_err(),
-            "guidance without a negative"
+        assert!(n > 0);
+
+        let positive = |ids: Vec<u32>| SemanticConditioning {
+            positive: ids,
+            ..good.clone()
+        };
+        let mut other_text = good.positive.clone();
+        other_text[1] = (other_text[1] + 1) % EOD;
+        for (cond, needle, what) in [
+            (
+                positive(with(&good.positive, 1, ABC_END)),
+                "ordinary",
+                "a special id in the positive body",
+            ),
+            (
+                positive(other_text),
+                "exact prefix",
+                "another request's positive prefix",
+            ),
+            (
+                SemanticConditioning {
+                    negative: None,
+                    ..good.clone()
+                },
+                "requires a negative",
+                "guidance without a negative",
+            ),
+            (
+                SemanticConditioning {
+                    cfg_scale: 2.0,
+                    ..good.clone()
+                },
+                "guidance",
+                "a scale that is not the plan's",
+            ),
+            (
+                SemanticConditioning {
+                    cfg_scale: f64::NAN,
+                    ..good.clone()
+                },
+                "finite",
+                "a NaN scale",
+            ),
+            (
+                SemanticConditioning {
+                    legacy_off: true,
+                    ..good.clone()
+                },
+                "legacy_off",
+                "legacy arithmetic outside cot = off",
+            ),
+        ] {
+            refused(semantic(&lm, &plan, &cond, &cfg), needle, what);
+        }
+
+        // Without guidance: one branch, and a stray negative is refused.
+        let plain = ready(request(CotMode::Full, Some(SCORE), None));
+        let cond = plain.semantic_conditioning(tok(), cfg.semantic()).unwrap();
+        assert!(cond.negative.is_none());
+        assert_eq!(
+            semantic(&lm, &plain, &cond, &cfg)
+                .unwrap()
+                .decoded
+                .cfg_branches,
+            1
         );
-        // Scale 1: no negative needed.
-        assert_eq!(go(&prefix, None, 1.0).unwrap().decoded.cfg_branches, 1);
-        // The positive prefix must frame the exact plan too.
-        let wrong = [EOD, 5, 6, ABC_START, 11, 12, ABC_END, MUSIC_START];
-        assert!(go(&wrong, None, 1.0).is_err());
-        assert!(go(&prefix, None, f64::NAN).is_err());
-        assert!(go(&prefix, None, 21.0).is_err());
+        let stray = SemanticConditioning {
+            negative: Some(neg),
+            ..cond
+        };
+        refused(
+            semantic(&lm, &plain, &stray, &cfg),
+            "without guidance",
+            "a negative at scale 1",
+        );
     }
 
     /// The `cot = off` semantic stage samples with the historical arithmetic (top-p keeps three),
@@ -894,25 +900,14 @@ mod tests {
     #[test]
     fn off_semantic_stage_uses_the_legacy_sampler() {
         let lm = synthetic::model(MotPaths::Ar);
-        let s = Sampling {
-            temperature: 1.0,
-            top_p: 1e-6,
-            top_k: 100,
-            repetition_penalty: 1.0,
-            min_tokens: 0,
-            max_tokens: 1,
-            ..Sampling::SEMANTIC_DEFAULT
-        };
-        let stage = |plan: &ScorePlan, prefix: &[u32]| {
+        let cfg = config(test_sampling(1.0, 1e-6, 100, 1.0, 1, 0, 1));
+        let stage = |plan: &SymbolicPlan| {
+            let cond = plan.semantic_conditioning(tok(), cfg.semantic()).unwrap();
             generate_semantic(
                 &lm,
-                &SemanticInput {
-                    plan,
-                    prefix,
-                    negative: None,
-                    cfg_scale: 1.0,
-                },
-                &s,
+                plan,
+                &cond,
+                &cfg,
                 &mut Uniforms([0.999].into()),
                 Hooks {
                     cancelled: &never,
@@ -923,11 +918,11 @@ mod tests {
             .decoded
             .tokens
         };
-        let direct = |legacy_off: bool| {
+        let direct = |prefix: &[u32], legacy_off: bool| {
             let req = DecodeRequest {
                 phase: Phase::Semantic,
-                prefix: &PREFIX,
-                sampling: &s,
+                prefix,
+                sampling: cfg.semantic(),
                 guidance: None,
                 legacy_off,
             };
@@ -936,110 +931,143 @@ mod tests {
                 .unwrap()
                 .tokens
         };
+        let off = ready(request(CotMode::Off, None, Some(1.0)));
         assert_ne!(
-            direct(true),
-            direct(false),
+            direct(off.prefix(), true),
+            direct(off.prefix(), false),
             "the two rules must differ here"
         );
-        assert_eq!(stage(&ScorePlan::off(), &PREFIX), direct(true));
-        let plan = plan_of(&[11]);
-        let full = [EOD, 40, ABC_START, 11, ABC_END, MUSIC_START];
-        let req = DecodeRequest {
-            phase: Phase::Semantic,
-            prefix: &full,
-            sampling: &s,
-            guidance: None,
-            legacy_off: false,
-        };
-        let standard = run(&lm, &req, &mut Uniforms([0.999].into()), &never)
-            .0
-            .unwrap();
-        assert_eq!(stage(&plan, &full), standard.tokens);
+        assert_eq!(stage(&off), direct(off.prefix(), true));
+        let full = ready(request(CotMode::Full, Some(SCORE), None));
+        assert_eq!(stage(&full), direct(full.prefix(), false));
     }
 
+    /// `cot = off` guidance is instruction-only: its negative is `EOD`, ordinary instruction ids and
+    /// `MUSIC_START` — no score framing and no stray specials anywhere.
     #[test]
     fn off_mode_negative_is_instruction_only() {
         let lm = synthetic::model(MotPaths::Ar);
-        let plan = ScorePlan::off();
-        let s = greedy(2);
-        let go = |negative: &[u32]| {
-            generate_semantic(
-                &lm,
-                &SemanticInput {
-                    plan: &plan,
-                    prefix: &PREFIX,
-                    negative: Some(negative),
-                    cfg_scale: Cot::Off.default_cfg_scale(),
-                },
-                &s,
-                &mut stage_rng(1),
-                Hooks {
-                    cancelled: &never,
-                    observer: &mut (),
-                },
-            )
-        };
-        let ok = go(&[EOD, 9, 10, MUSIC_START]).unwrap();
+        let cfg = config(greedy(2));
+        let plan = ready(request(CotMode::Off, None, None));
+        let good = plan.semantic_conditioning(tok(), cfg.semantic()).unwrap();
+        assert_eq!(good.cfg_scale, CotMode::Off.default_guidance());
+        let ok = semantic(&lm, &plan, &good, &cfg).unwrap();
         assert_eq!(ok.decoded.cfg_branches, 2, "off defaults to guidance 1.01");
-        assert!(go(&[EOD, 9, ABC_START, ABC_END, MUSIC_START]).is_err());
-        assert!(go(&[EOD, MUSIC_START]).is_ok());
-        assert!(go(&[MUSIC_START]).is_err());
+        let neg = good.negative.clone().unwrap();
+        let last = neg.len() - 1;
+        let negative = |ids: Vec<u32>| SemanticConditioning {
+            negative: Some(ids),
+            ..good.clone()
+        };
+        let mut framed = neg[..last].to_vec();
+        framed.extend_from_slice(&[ABC_START, ABC_END, MUSIC_START]);
+        for (ids, needle, what) in [
+            (framed, "ordinary", "score framing in an off negative"),
+            (
+                with(&neg, last, ABC_END),
+                "ordinary",
+                "a stray ABC_END in an off negative",
+            ),
+            (
+                with(&neg, 1, MUSIC_START),
+                "ordinary",
+                "a stray MUSIC_START in an off negative",
+            ),
+            (neg[1..].to_vec(), "EOD", "an off negative without EOD"),
+            (
+                vec![EOD, MUSIC_START],
+                "instruction",
+                "an off negative without instruction",
+            ),
+        ] {
+            refused(semantic(&lm, &plan, &negative(ids), &cfg), needle, what);
+        }
+        let special = SemanticConditioning {
+            positive: with(&good.positive, 1, MUSIC_END),
+            ..good.clone()
+        };
+        refused(
+            semantic(&lm, &plan, &special, &cfg),
+            "ordinary",
+            "a special id in an off positive body",
+        );
     }
 
+    /// The whole symbolic path on the synthetic model, for every `cot`:
+    /// [`SymbolicPlan::prepare`] → [`plan_score`] (sampling the planner's own prefix) →
+    /// [`AbcPlanning::finish`] → [`SymbolicPlan::semantic_conditioning`] → [`generate_semantic`].
+    ///
+    /// The ABC stage draws with `u = 0` over the whole allowed range (the lowest id with mass,
+    /// id 0), so the planned ids stay inside the committed test tokenizer's partial rank table,
+    /// which `finish` decodes; that the planner sampled `planning.prefix()` is shown by its logits
+    /// rows equalling a direct decode of that prefix.
     #[test]
-    fn planner_contract() {
+    fn symbolic_plan_drives_both_stages_end_to_end() {
         let lm = synthetic::model(MotPaths::Ar);
-        let s = Sampling {
-            temperature: 0.0,
-            min_tokens: 0,
-            max_tokens: 3,
-            ..Sampling::ABC_DEFAULT
-        };
-        let prefix = [EOD, 40, 41, ABC_START];
-        let mut unit = ();
-        let (plan, dec) = plan_score(
-            &lm,
-            Cot::Melody,
-            &prefix,
-            &s,
-            &mut stage_rng(1),
-            Hooks {
-                cancelled: &never,
-                observer: &mut unit,
-            },
+        let abc_steps = 4;
+        let cfg = GenerationConfig::new(
+            test_sampling(1.0, 1.0, VOCAB_SIZE.into(), 1.0, 1, 0, abc_steps),
+            test_sampling(0.0, 0.95, 100, 1.2, 50, 3, 3),
+            32,
         )
         .unwrap();
-        assert_eq!(plan.abc_ids(), &dec.tokens[..]);
-        assert_eq!(plan.truncated(), dec.truncated);
-        assert!(plan.abc_ids().iter().all(|&t| t < EOD));
-        for bad in [&[EOD, 40][..], &[40, ABC_START]] {
-            assert!(plan_score(
-                &lm,
-                Cot::Full,
-                bad,
-                &s,
-                &mut stage_rng(1),
-                Hooks {
-                    cancelled: &never,
-                    observer: &mut ()
+        let zeros = || Uniforms(vec![0.0; abc_steps as usize].into());
+        for (cot, cfg_scale, branches) in [
+            (CotMode::Full, None, 1),
+            (CotMode::Melody, Some(1.5), 2),
+            (CotMode::Off, None, 2),
+        ] {
+            let plan = match SymbolicPlan::prepare(request(cot, None, cfg_scale), tok()).unwrap() {
+                PlanStep::GenerateAbc(planning) => {
+                    let prefix = planning.prefix().to_vec();
+                    assert_eq!(prefix.last(), Some(&ABC_START));
+                    let direct_req = DecodeRequest {
+                        phase: Phase::Abc,
+                        prefix: &prefix,
+                        sampling: cfg.abc(),
+                        guidance: None,
+                        legacy_off: false,
+                    };
+                    let (direct, direct_rows) = run(&lm, &direct_req, &mut zeros(), &never);
+                    let mut rows = Record::default();
+                    let (plan, decoded) = plan_score(
+                        &lm,
+                        planning,
+                        tok(),
+                        &cfg,
+                        &mut zeros(),
+                        Hooks {
+                            cancelled: &never,
+                            observer: &mut rows,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.prefix_tokens, prefix.len());
+                    assert_eq!(rows.logits, direct_rows.logits, "{cot:?}: planner prefix");
+                    assert_eq!(decoded.tokens, direct.unwrap().tokens);
+                    assert_eq!(decoded.tokens.len(), abc_steps as usize);
+                    assert_eq!(plan.abc_ids(), &decoded.tokens[..]);
+                    assert_eq!(plan.truncated(), decoded.truncated);
+                    assert!(plan.truncated());
+                    assert_eq!(
+                        plan.timing()["output_tokens"],
+                        Value::from(decoded.output_tokens)
+                    );
+                    plan
                 }
-            )
-            .is_err());
+                PlanStep::Ready(plan) => {
+                    assert_eq!(cot, CotMode::Off);
+                    plan
+                }
+            };
+            assert!(plan.prefix().ends_with(&semantic_tail(&plan)));
+            let cond = plan.semantic_conditioning(tok(), cfg.semantic()).unwrap();
+            let out = semantic(&lm, &plan, &cond, &cfg).unwrap();
+            assert_eq!(out.decoded.cfg_branches, branches, "{cot:?}");
+            assert_eq!(out.decoded.prefix_tokens, plan.prefix().len());
+            assert_eq!(out.codes.len(), 3);
+            assert!(out.decoded.truncated);
+            assert!(out.codes.iter().all(|&c| c < CODEC_SIZE));
         }
-        assert!(plan_score(
-            &lm,
-            Cot::Off,
-            &prefix,
-            &s,
-            &mut stage_rng(1),
-            Hooks {
-                cancelled: &never,
-                observer: &mut ()
-            }
-        )
-        .is_err());
-        assert!(ScorePlan::supplied(Cot::Off, vec![1]).is_err());
-        assert!(ScorePlan::supplied(Cot::Full, vec![]).is_err());
-        assert!(ScorePlan::supplied(Cot::Full, vec![EOD]).is_err());
     }
 }

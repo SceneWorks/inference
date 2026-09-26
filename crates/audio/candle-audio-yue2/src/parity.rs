@@ -24,9 +24,10 @@ use sha2::{Digest, Sha256};
 
 use crate::generate::{decode_tokens, DecodeObserver, DecodeRequest, Guidance, Hooks};
 use crate::model::{synthetic, MotPaths, Yue2Lm};
-use crate::sampling::{
-    cfg_mix, distribution, probabilities, Arith, Phase, Sampling, TokenRng, VOCAB_SIZE,
-};
+
+/// The vocabulary width a logits row has.
+const VOCAB: usize = crate::protocol::VOCAB_SIZE as usize;
+use crate::sampling::{cfg_mix, distribution, probabilities, Arith, Phase, Sampling, TokenRng};
 
 /// Draws from the fixture's recorded uniforms; a greedy decode gets an empty queue, so any draw
 /// fails the test.
@@ -79,18 +80,11 @@ fn phase_of(v: &Value) -> Phase {
     }
 }
 
+/// A fixture's seven sampling values through the protocol's own validation.
 fn sampling_of(v: &Value) -> Sampling {
-    let f = |k: &str| v[k].as_f64().unwrap_or_else(|| panic!("sampling.{k}"));
-    let u = |k: &str| v[k].as_u64().unwrap_or_else(|| panic!("sampling.{k}")) as usize;
-    Sampling {
-        temperature: f("temperature"),
-        top_p: f("top_p"),
-        top_k: u("top_k"),
-        repetition_penalty: f("repetition_penalty"),
-        penalty_window: u("penalty_window"),
-        min_tokens: u("min_tokens"),
-        max_tokens: u("max_tokens"),
-    }
+    Sampling::semantic_default()
+        .with_json_overrides(v)
+        .unwrap_or_else(|e| panic!("fixture sampling {v}: {e}"))
 }
 
 /// The largest deviations between native rows and the reference summaries of a set of steps.
@@ -104,7 +98,7 @@ struct Spread {
     lse_abs: f64,
     /// Max of |ΔΣx| / n (the mean per-id error) and |ΔΣx²| / Σx² over the allowed row.
     moment_rel: f64,
-    /// Steps whose top-k ids (in order) differ.
+    /// Steps whose top-k ids disagree beyond noise (see [`top_ids_mismatch`]).
     top_id_mismatches: usize,
     /// Steps compared.
     steps: usize,
@@ -121,12 +115,34 @@ impl Spread {
     }
 }
 
+/// Whether native top-k ids `got` disagree with the reference's `want` (values `want_vals`,
+/// descending) beyond logit noise of `tol`: the top-1 id must match, the top-k **set** must match
+/// exactly, and two entries may appear in swapped order only when the reference gap between them
+/// is within `2 · tol` — two logits each within `tol` of the reference can cross only then.
+fn top_ids_mismatch(got: &[u32], want: &[u32], want_vals: &[f64], tol: f64) -> bool {
+    if got.first() != want.first() || got.len() != want.len() {
+        return true;
+    }
+    let position = |id: u32| got.iter().position(|&g| g == id);
+    let Some(rank): Option<Vec<usize>> = want.iter().map(|&id| position(id)).collect() else {
+        return true; // a reference id is missing from the native top-k set
+    };
+    for i in 0..want.len() {
+        for j in i + 1..want.len() {
+            if rank[j] < rank[i] && want_vals[i] - want_vals[j] > 2.0 * tol {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Compare one native logits row with a reference `summarize_row` record.
-fn compare_row(row: &[f32], reference: &Value, phase: Phase, probes: &[u32]) -> Spread {
-    assert_eq!(row.len(), VOCAB_SIZE, "logits row width");
+fn compare_row(row: &[f32], reference: &Value, phase: Phase, probes: &[u32], tol: f64) -> Spread {
+    assert_eq!(row.len(), VOCAB, "logits row width");
     let want_ids = u32s(&reference["top_ids"]);
     let want_vals = f64s(&reference["top_values"]);
-    let mut allowed: Vec<(u32, f32)> = (0..VOCAB_SIZE as u32)
+    let mut allowed: Vec<(u32, f32)> = (0..VOCAB as u32)
         .filter(|&i| phase.allows(i))
         .map(|i| (i, row[i as usize]))
         .collect();
@@ -149,7 +165,7 @@ fn compare_row(row: &[f32], reference: &Value, phase: Phase, probes: &[u32]) -> 
     let got_ids: Vec<u32> = allowed.iter().take(want_ids.len()).map(|x| x.0).collect();
     let mut s = Spread {
         steps: 1,
-        top_id_mismatches: usize::from(got_ids != want_ids),
+        top_id_mismatches: usize::from(top_ids_mismatch(&got_ids, &want_ids, &want_vals, tol)),
         ..Spread::default()
     };
     let mut pairs: Vec<(f64, f64)> = allowed
@@ -235,12 +251,12 @@ fn replay(lm: &Yue2Lm, case: &Value, prefix_key: &str, sampling: &Sampling) -> (
     (steps, summary)
 }
 
-fn spread_of(steps: &Steps, case: &Value, phase: Phase, probes: &[u32]) -> Spread {
+fn spread_of(steps: &Steps, case: &Value, phase: Phase, probes: &[u32], tol: f64) -> Spread {
     let reference = case["steps"].as_array().expect("steps");
     assert_eq!(steps.rows.len(), reference.len(), "decode steps");
     let mut total = Spread::default();
     for (row, want) in steps.rows.iter().zip(reference) {
-        total.merge(compare_row(row, want, phase, probes));
+        total.merge(compare_row(row, want, phase, probes, tol));
     }
     total
 }
@@ -254,7 +270,7 @@ fn probes_of(fixture: &Value, phase: Phase) -> Vec<u32> {
     )
 }
 
-/// Synthetic-model tolerance. Measured (F32, both sides on the CPU, 93 decode steps over 10
+/// Synthetic-model tolerance (also the order-swap scale of [`top_ids_mismatch`] there). Measured (F32, both sides on the CPU, 93 decode steps over 10
 /// cases): max |Δ| 3.3e-6 over every compared logit (the largest under guidance scale 2, which
 /// doubles the branch difference), |Δ logsumexp| ≤ 6.3e-7, mean per-id |ΔΣx| ≤ 6.7e-7 — pure
 /// reduction-order noise of O(1) logits. Bounded at 2e-5 (6× the measured maximum, headroom for
@@ -273,7 +289,13 @@ fn synthetic_decodes_match_upstream() {
         let sampling = sampling_of(&case["sampling"]);
         let phase = phase_of(&case["phase"]);
         let (steps, _) = replay(&lm, case, "prefix", &sampling);
-        let s = spread_of(&steps, case, phase, &probes_of(&fixture, phase));
+        let s = spread_of(
+            &steps,
+            case,
+            phase,
+            &probes_of(&fixture, phase),
+            SYNTHETIC_ABS,
+        );
         println!("{name}: {s:?}");
         assert_eq!(s.top_id_mismatches, 0, "{name}: top ids differ");
         assert!(
@@ -298,7 +320,7 @@ fn sha(values: &[f32]) -> String {
 fn sampler_rows(history: &[u32]) -> Vec<Vec<f32>> {
     (0..3)
         .map(|k| {
-            let mut row = synthetic::row_values(&format!("sampler/row{k}"), VOCAB_SIZE, 8.0);
+            let mut row = synthetic::row_values(&format!("sampler/row{k}"), VOCAB, 8.0);
             for &t in history {
                 row[t as usize] = 7.99;
             }
@@ -377,7 +399,7 @@ fn sampler_rows_match_upstream() {
                     failures.push(format!("{label}: probabilities differ"));
                 }
             }
-            Arith::F32 if sampling.temperature != 0.0 => {
+            Arith::F32 if sampling.temperature() != 0.0 => {
                 let rel = finite
                     .iter()
                     .zip(f64s(&case["finite_probabilities"]))
@@ -492,6 +514,12 @@ fn rms_norm_and_rope_match_upstream() {
 /// smallest reference top-1 margin in the fixture (1.2e-2): a layer, position or mask error moves
 /// logits by ≥ 1e-2 and fails, while GEMM blocking on another CPU cannot. Greedy and
 /// injected-draw token sequences are compared exactly, not within a tolerance.
+///
+/// Top-8 ids: the smallest **adjacent** reference gap in the fixture is 6.9e-5, below twice the
+/// measured noise, so an exact top-8 order would gate on noise. [`top_ids_mismatch`] keeps the
+/// top-1 id and the top-8 set exact and counts an order swap only when the reference gap between
+/// the swapped entries exceeds `2 · REAL_ABS` (two logits each within `REAL_ABS` cannot cross a
+/// wider gap).
 const REAL_ABS: f64 = 2e-4;
 /// |Δ| between a cached decode step's logits and a native full recompute of the same sequence.
 /// Measured 1.6e-5 (24 cached steps after 120–357-token prefills); bounded at 1e-4.
@@ -519,9 +547,10 @@ fn opt_u32s(v: &Value) -> Option<Vec<u32>> {
 }
 
 /// Every mode (`cot` full / melody / off, a supplied full score, a supplied melody score) through
-/// the production stages — [`crate::generate::plan_score`] and
-/// [`crate::generate::generate_semantic`], with their prefix/negative validation — from the
-/// upstream tokenizer's exact prompt ids, on the verified YuE2-3B loaded by [`Yue2Lm::load`].
+/// the production path end to end: the request rebuilt natively ([`crate::protocol::SongRequest`]),
+/// its prefixes built by the native tokenizer and protocol ([`crate::plan::SymbolicPlan`], checked
+/// id for id against the upstream tokenizer's), [`crate::generate::plan_score`] and
+/// [`crate::generate::generate_semantic`] on the verified YuE2-3B loaded by [`Yue2Lm::load`].
 /// Greedy token sequences must match exactly; every step's logits row within [`REAL_ABS`]; a
 /// cached decode must equal a full recompute; stochastic decodes replay the reference's draws.
 ///
@@ -539,17 +568,20 @@ fn real_weight_decodes_match_upstream() {
 
     use candle_audio::candle_core::{DType, Device};
 
-    use crate::generate::{generate_semantic, plan_score, Cot, ScorePlan, SemanticInput};
-    use crate::sampling::CODEC_OFFSET;
+    use crate::generate::{generate_semantic, plan_score};
+    use crate::plan::{PlanStep, SymbolicPlan};
+    use crate::protocol::{GenerationConfig, SongRequest, CODEC_OFFSET};
+    use crate::tokenizer::Yue2TextTokenizer;
 
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/ar_real_weights.json");
     let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let dirs = hub_dirs();
     let start = Instant::now();
+    let tok = Yue2TextTokenizer::load(&dirs).unwrap();
     let lm = Yue2Lm::load(&dirs, MotPaths::Ar, DType::F32, &Device::Cpu).unwrap();
     println!(
-        "verified + loaded YuE2-3B (AR path, F32) in {:.1?}",
+        "verified + loaded the tokenizer and YuE2-3B (AR path, F32) in {:.1?}",
         start.elapsed()
     );
     let never = || false;
@@ -562,55 +594,68 @@ fn real_weight_decodes_match_upstream() {
     };
     for (mode, rec) in fixture["modes"].as_object().unwrap() {
         let t0 = Instant::now();
-        let cot = match rec["cot"].as_str().unwrap() {
-            "full" => Cot::Full,
-            "melody" => Cot::Melody,
-            _ => Cot::Off,
-        };
-        let plan = if let Some(abc) = rec.get("abc") {
-            let mut steps = Steps::default();
-            let (plan, decoded) = plan_score(
-                &lm,
-                cot,
-                &u32s(&rec["planner_prefix"]),
-                &sampling_of(&abc["sampling"]),
-                &mut Injected(VecDeque::new()),
-                Hooks {
-                    cancelled: &never,
-                    observer: &mut steps,
-                },
-            )
-            .unwrap();
-            assert_eq!(decoded.tokens, u32s(&abc["tokens"]), "{mode}: planned ABC");
-            assert_eq!(steps.emitted, u32s(&abc["emitted"]), "{mode}: ABC emitted");
-            assert_eq!(decoded.truncated, abc["truncated"].as_bool().unwrap());
-            assert_eq!(plan.truncated(), decoded.truncated);
-            let s = spread_of(&steps, abc, Phase::Abc, &probes_of(&fixture, Phase::Abc));
-            report(&format!("{mode} abc"), s, &mut all);
-            plan
-        } else if cot == Cot::Off {
-            ScorePlan::off()
-        } else {
-            ScorePlan::supplied(cot, u32s(&rec["abc_ids"])).unwrap()
+        let request = SongRequest::from_json(&rec["request"]).unwrap();
+        let sem = &rec["semantic"];
+        let abc_sampling = rec
+            .get("abc")
+            .map_or(Sampling::abc_default(), |abc| sampling_of(&abc["sampling"]));
+        let config =
+            GenerationConfig::new(abc_sampling, sampling_of(&sem["sampling"]), 32).unwrap();
+        let plan = match SymbolicPlan::prepare(request, &tok).unwrap() {
+            PlanStep::GenerateAbc(planning) => {
+                let abc = &rec["abc"];
+                assert_eq!(
+                    planning.prefix(),
+                    &u32s(&rec["planner_prefix"])[..],
+                    "{mode}: native planner prefix vs upstream's"
+                );
+                let mut steps = Steps::default();
+                let (plan, decoded) = plan_score(
+                    &lm,
+                    planning,
+                    &tok,
+                    &config,
+                    &mut Injected(VecDeque::new()),
+                    Hooks {
+                        cancelled: &never,
+                        observer: &mut steps,
+                    },
+                )
+                .unwrap();
+                assert_eq!(decoded.tokens, u32s(&abc["tokens"]), "{mode}: planned ABC");
+                assert_eq!(steps.emitted, u32s(&abc["emitted"]), "{mode}: ABC emitted");
+                assert_eq!(decoded.truncated, abc["truncated"].as_bool().unwrap());
+                assert_eq!(plan.truncated(), decoded.truncated);
+                let probes = probes_of(&fixture, Phase::Abc);
+                let s = spread_of(&steps, abc, Phase::Abc, &probes, REAL_ABS);
+                report(&format!("{mode} abc"), s, &mut all);
+                plan
+            }
+            PlanStep::Ready(plan) => plan,
         };
         assert_eq!(
             plan.abc_ids(),
             &u32s(&rec["abc_ids"])[..],
             "{mode}: plan ids"
         );
-        let sem = &rec["semantic"];
+        let cond = plan.semantic_conditioning(&tok, config.semantic()).unwrap();
         let prefix = u32s(&rec["semantic_prefix"]);
         let negative = opt_u32s(&rec["negative_prefix"]);
+        assert_eq!(
+            cond.positive, prefix,
+            "{mode}: native semantic prefix vs upstream's"
+        );
+        assert_eq!(
+            cond.negative, negative,
+            "{mode}: native negative prefix vs upstream's"
+        );
+        assert_eq!(cond.cfg_scale, rec["cfg_scale"].as_f64().unwrap());
         let mut steps = Steps::default();
         let out = generate_semantic(
             &lm,
-            &SemanticInput {
-                plan: &plan,
-                prefix: &prefix,
-                negative: negative.as_deref(),
-                cfg_scale: rec["cfg_scale"].as_f64().unwrap(),
-            },
-            &sampling_of(&sem["sampling"]),
+            &plan,
+            &cond,
+            &config,
             &mut Injected(VecDeque::new()),
             Hooks {
                 cancelled: &never,
@@ -627,7 +672,7 @@ fn real_weight_decodes_match_upstream() {
         let branches = if negative.is_some() { 2 } else { 1 };
         assert_eq!(out.decoded.cfg_branches, branches);
         let probes = probes_of(&fixture, Phase::Semantic);
-        let s = spread_of(&steps, sem, Phase::Semantic, &probes);
+        let s = spread_of(&steps, sem, Phase::Semantic, &probes, REAL_ABS);
         report(&format!("{mode} semantic"), s, &mut all);
         // Cache semantics: a fresh prefill of prefix + tokens[..n-1] (a full recompute) against
         // the reference's uncached forward, and — without guidance, where the observed row is the
@@ -640,7 +685,8 @@ fn real_weight_decodes_match_upstream() {
             .unwrap()
             .to_vec1()
             .unwrap();
-        let s = compare_row(&full, &sem["full_recompute_last"], Phase::Semantic, &probes);
+        let reference = &sem["full_recompute_last"];
+        let s = compare_row(&full, reference, Phase::Semantic, &probes, REAL_ABS);
         report(&format!("{mode} full recompute"), s, &mut all);
         if negative.is_none() {
             let last = steps.rows.last().unwrap();
@@ -659,7 +705,7 @@ fn real_weight_decodes_match_upstream() {
         let t0 = Instant::now();
         let phase = phase_of(&case["phase"]);
         let (steps, _) = replay(&lm, case, "prefix", &sampling_of(&case["sampling"]));
-        let s = spread_of(&steps, case, phase, &probes_of(&fixture, phase));
+        let s = spread_of(&steps, case, phase, &probes_of(&fixture, phase), REAL_ABS);
         report(name, s, &mut all);
         println!("{name}: {:.1?}", t0.elapsed());
     }
@@ -675,5 +721,36 @@ fn real_weight_decodes_match_upstream() {
     assert!(
         cache_worst <= CACHE_ABS,
         "cache vs recompute {cache_worst:e}"
+    );
+}
+
+/// The top-k comparison: top-1 and set membership are exact; an order swap counts only when the
+/// reference gap between the swapped entries exceeds twice the logit tolerance.
+#[test]
+fn top_id_order_swaps_count_only_beyond_twice_the_tolerance() {
+    let want = [7, 3, 9, 1];
+    let vals = [10.0, 9.99995, 9.5, 9.0];
+    let tol = 5e-5;
+    assert!(!top_ids_mismatch(&want, &want, &vals, tol), "identical");
+    // 3 and 7 are 5e-5 apart (< 2·tol) — but 7 is the top-1, which must match exactly.
+    assert!(
+        top_ids_mismatch(&[3, 7, 9, 1], &want, &vals, tol),
+        "top-1 swap"
+    );
+    // 9 and 1 are 0.5 apart: a real reordering.
+    assert!(
+        top_ids_mismatch(&[7, 3, 1, 9], &want, &vals, tol),
+        "large-gap swap"
+    );
+    // A reference id missing from the native top-k.
+    assert!(
+        top_ids_mismatch(&[7, 3, 9, 2], &want, &vals, tol),
+        "set differs"
+    );
+    // A sub-tolerance swap below the top-1 is noise.
+    let vals = [10.0, 9.5, 9.49995, 9.0];
+    assert!(
+        !top_ids_mismatch(&[7, 9, 3, 1], &want, &vals, tol),
+        "noise swap"
     );
 }

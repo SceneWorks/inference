@@ -71,8 +71,15 @@ Each bound was set after measuring, and each is documented next to its constant 
 | Real weights: logits of 258 decode steps, every mode (F32) | max \|Δ\| 3.6e-5, \|Δ lse\| 3.6e-5, moments 1.2e-5 | 2e-4 (min reference top-1 margin 1.2e-2) |
 | Real weights: cached decode vs native full recompute | 1.6e-5 | 1e-4 |
 
-Token sequences (greedy and injected-draw) and truncation flags are compared exactly; on real
-weights all 258 steps' tokens and every step's top-8 ids matched.
+Token sequences (greedy and injected-draw) and truncation flags are compared exactly. Each
+step's top-k ids: the top-1 id and the top-k set exactly, and an order swap counts only when the
+reference gap between the swapped entries exceeds twice the logit tolerance (the smallest
+adjacent top-8 gap on real weights is 6.9e-5, below twice the measured noise). On real weights
+all 258 steps' tokens matched with no top-k mismatch.
+
+The `modes` records also carry each `request` (style, lyrics, cot, seed, external ABC, CFG
+scale): the native test rebuilds every prefix through its own tokenizer and `SymbolicPlan` and
+checks it id for id against the upstream ids recorded beside it.
 
 Run cost (Apple M-series CPU, F32): the reference `real` subcommand peaks at 21.0 GB RSS
 (`ru_maxrss`: both MoT paths in F32 plus the mapped checkpoint) and takes ~50 s; the native
@@ -138,10 +145,10 @@ that records each evaluation's input state, raw `t` and output; nothing is re-im
 | Synthetic: every evaluation's input + velocity and the final latents, 8 song-level cases (F32) | max \|Δ\| 2.1e-6, rel L2 4.8e-7 | 2e-5 / 5e-6 |
 | Synthetic: cached velocity vs upstream joint forward and cached velocity | max \|Δ\| 2.1e-6 | 2e-5 / 5e-6 |
 | Synthetic: `nar_cond_end = 5` | max \|Δ\| 2.0e-6 | 2e-5 / 5e-6 |
-| Synthetic: native query tiles / score budgets / offload vs default | 0 (bit-identical) | 1e-5 |
+| Synthetic: native query tiles / score budgets / offload vs default | measured 0 on macOS CPU, 7.2e-7 on Linux CI | ≤ 1e-5 |
 | Timestep schedule (`logit(t)` as the model's F32) | exact | exact |
-| Real weights: every evaluation's input + velocity and the final latents, 288 evaluations (F32) | max \|Δ\| 4.4e-5 (final 1.9e-5), rel L2 5.9e-6 | 5e-4 / 6e-5 |
-| Real weights: `Rows(7)` + AR offload vs default | 0 (bit-identical) | 1e-5 |
+| Real weights: every evaluation's input + velocity and the final latents, 202 evaluations (F32) | max \|Δ\| 4.4e-5 (final 1.9e-5), rel L2 5.9e-6 | 5e-4 / 6e-5 |
+| Real weights: `Rows(7)` + AR offload vs default | measured 0 on macOS CPU | ≤ 1e-5 |
 
 Every assertion was checked against a mutation that must fail it (run one at a time); the smallest
 latent movement among them was 7.3e-3 (midpoint time `t − dt` instead of `t − dt/2`):
@@ -163,6 +170,31 @@ latent movement among them was 7.3e-3 (midpoint time `t − dt` instead of `t �
 | Timestep features `cos`/`sin` swapped | joint (3.1), synthetic parity (2.3), `cond_end` (2.4), tiling |
 | Cache not truncated between evaluations | 8 tests (capacity error / wrong keys) |
 | No `logit` clamp | synthetic parity, `cond_end` (raw `t` schedule) |
+| `ScoreBytes` ignores the budget (all rows) | `query_tile_rows_are_bounded_by_the_budget` |
+| Budget divided by one score tile instead of `SCORE_TILES_LIVE` (3) | `query_tile_rows_are_bounded_by_the_budget` |
+| `Rows(0)` rounded to one row | `query_tile_rows_…`, `invalid_requests_are_refused` |
+| Too-small `ScoreBytes` rounded up to one row | `query_tile_rows_…`, `invalid_requests_are_refused` |
+| Tile not validated before the prefill | `invalid_requests_are_refused` (poll count) |
+| No `catch_unwind` around the solve | `a_panic_mid_solve_still_restores_the_ar_path` |
+| Restore failure replaces the original error | `a_failed_restore_keeps_the_original_error` |
+| Compute dtype left out of the stage identity | `stage_identity_covers_the_inputs_not_the_memory_controls` |
+| Stage identity depends on the query tile | tiling (stage identity compared across settings) |
+| A chunk exactly at `CONTEXT` refused (`>=`) | `chunks_at_the_released_context_limit` |
+| No position-range check (one over runs) | `chunks_at_the_released_context_limit`, `invalid_requests_are_refused` |
+
+**Where offload is measured.** On the CPU lanes (every test above, and the real-weight run) the
+model already lives in host memory, so `offload_ar` only marks the AR path unavailable — the moves,
+byte accounting and restore-to-device never execute there. `nar::tests::ar_offload_moves_exactly_the_ar_weights_on_a_gpu`
+(`#[cfg(any(feature = "cuda", feature = "metal"))]`) covers them on a real device: exact bytes moved
+(`embed_tokens + lm_head + Σ layer.ar`), every AR tensor on the host while offloaded with the NAR
+twins and final norm left on the device, offload vs no-offload latents, and every AR tensor back on
+the device after a completed and a cancelled synthesis. It runs on the manual CUDA lane
+(`Candle CUDA packages (Windows, manual)`, `ci.yml` dispatched with `lanes=windows-cuda`).
+
+**Context boundary.** `chunks_at_the_released_context_limit` runs the tiny model at the released
+`CONTEXT` (24 576): a 12 282-frame song is one chunk whose AR + NAR positions are exactly 24 576 plus
+a one-frame tail, and a chunk one position longer is refused (18–47 s, 2.1 GB RSS in a debug test
+build on an M-series CPU).
 
 Run cost (Apple M-series CPU, F32, measured 2026-09-26): the reference `real` subcommand peaks at
 21.0 GB RSS (`ru_maxrss`: both MoT paths in F32 plus the mapped checkpoint) and takes ~80 s after

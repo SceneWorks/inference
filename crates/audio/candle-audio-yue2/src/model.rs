@@ -39,10 +39,8 @@
 //! RoPE positions are the physical cache slots `0, 1, 2, …` of the one sequence a cache holds —
 //! upstream's `position_ids = cache_position` for an unpadded single request. There is no
 //! windowing, shortening or re-prefill: a sequence either fits the cache it was given (at most
-//! [`CONTEXT`](crate::sampling::CONTEXT) positions) or the step fails before writing (see
+//! [`CONTEXT`](crate::protocol::CONTEXT) positions) or the step fails before writing (see
 //! [`crate::generate`] for the request-level budget check).
-
-use std::path::Path;
 
 use candle_audio::candle_core::{DType, Device, Tensor, D};
 use candle_audio::gen_core;
@@ -174,6 +172,60 @@ impl Yue2Config {
         }
         Ok(())
     }
+}
+
+/// Refuse a compute dtype/device pair YuE2 cannot run **before** any verification or weight I/O:
+/// the model computes in F32 or BF16 only, and Candle's CPU backend has no BF16 matmul (a CPU
+/// load computes in F32 — the BF16 checkpoint upcasts exactly).
+fn check_compute(dtype: DType, device: &Device) -> gen_core::Result<()> {
+    match dtype {
+        DType::F32 => Ok(()),
+        DType::BF16 if !device.is_cpu() => Ok(()),
+        DType::BF16 => Err(gen_core::Error::Unsupported(
+            "YuE2 on the CPU computes in F32: Candle's CPU backend has no BF16 matmul".into(),
+        )),
+        other => Err(gen_core::Error::Unsupported(format!(
+            "YuE2 computes in F32 or BF16 (the released precision), not {other:?}"
+        ))),
+    }
+}
+
+/// The verified YuE2-3B snapshot, opened for loading (see [`open_verified`]).
+pub(crate) struct VerifiedLmFiles {
+    /// The verified `config.json`, read.
+    pub(crate) config_json: String,
+    /// A builder over exactly the verified weights file, converting to the compute dtype.
+    pub(crate) vb: VarBuilder<'static>,
+    /// SHA-256 of that weights file (from the conversion manifest it was checked against).
+    pub(crate) weights_sha256: String,
+}
+
+/// Refuse an unsupported dtype/device pair, then resolve and verify the pinned YuE2-3B snapshot
+/// **immediately before loading** (the crate's load-boundary rule) and open exactly the verified
+/// `config.json` and weights file. Every loader of the MoT goes through here.
+pub(crate) fn open_verified(
+    dirs: &SnapshotDirs,
+    dtype: DType,
+    device: &Device,
+) -> gen_core::Result<VerifiedLmFiles> {
+    check_compute(dtype, device)?;
+    let verified = snapshot::resolve_component(ComponentId::Lm, dirs)?;
+    let config_path = verified.path("config.json").ok_or_else(|| {
+        gen_core::Error::Msg("verified YuE2-3B snapshot has no config.json".into())
+    })?;
+    let weights = verified.weights_path().ok_or_else(|| {
+        gen_core::Error::Msg("verified YuE2-3B snapshot has no weights file".into())
+    })?;
+    let config_json = std::fs::read_to_string(config_path)?;
+    // SAFETY: the file is the snapshot's verified weights file, opened read-only; the mapping
+    // lives only for the duration of the caller's load (every tensor is copied out in `dtype`).
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) }
+        .map_err(backend("open weights"))?;
+    Ok(VerifiedLmFiles {
+        config_json,
+        vb,
+        weights_sha256: verified.manifest().native.sha256.clone(),
+    })
 }
 
 /// Which Mixture-of-Transformers paths to load.
@@ -432,29 +484,12 @@ impl Yue2Lm {
         dtype: DType,
         device: &Device,
     ) -> gen_core::Result<Self> {
-        let verified = snapshot::resolve_component(ComponentId::Lm, dirs)?;
-        let config_path = verified.path("config.json").ok_or_else(|| {
-            gen_core::Error::Msg("verified YuE2-3B snapshot has no config.json".into())
-        })?;
-        let weights = verified.weights_path().ok_or_else(|| {
-            gen_core::Error::Msg("verified YuE2-3B snapshot has no weights file".into())
-        })?;
-        let config = Yue2Config::from_json(&std::fs::read_to_string(config_path)?)?;
-        Self::load_safetensors(config, weights, paths, dtype, device)
-    }
-
-    fn load_safetensors(
-        config: Yue2Config,
-        weights: &Path,
-        paths: MotPaths,
-        dtype: DType,
-        device: &Device,
-    ) -> gen_core::Result<Self> {
-        // SAFETY: the file is the snapshot's verified weights file, opened read-only; the mapping
-        // lives only for the duration of this load (every tensor is copied out in `dtype`).
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) }
-            .map_err(backend("open weights"))?;
-        Self::from_var_builder(config, vb, paths)
+        let opened = open_verified(dirs, dtype, device)?;
+        Self::from_var_builder(
+            Yue2Config::from_json(&opened.config_json)?,
+            opened.vb,
+            paths,
+        )
     }
 
     /// Build from an arbitrary [`VarBuilder`]. Crate-private: production loads go through
@@ -464,6 +499,7 @@ impl Yue2Lm {
         vb: VarBuilder,
         paths: MotPaths,
     ) -> gen_core::Result<Self> {
+        check_compute(vb.dtype(), vb.device())?;
         config.validate()?;
         let err = backend("load");
         let (h, v) = (config.hidden_size, config.vocab_size);
@@ -681,6 +717,34 @@ impl Yue2Lm {
     }
 }
 
+#[cfg(all(test, any(feature = "cuda", feature = "metal")))]
+impl Yue2Lm {
+    /// Where every weight lives, for the offload tests: `(AR-only tensors, tensors that never
+    /// move)` — the latter being every NAR twin and the final norm.
+    pub(crate) fn placement(&self) -> (Vec<Device>, Vec<Device>) {
+        let path = |p: &MotPath| {
+            let mut t = vec![&p.attn_norm, &p.mlp_norm];
+            t.extend(p.attn.tensors());
+            t.extend([&p.mlp.gate_proj, &p.mlp.up_proj, &p.mlp.down_proj]);
+            t.into_iter()
+                .map(|t| t.device().clone())
+                .collect::<Vec<_>>()
+        };
+        let mut ar = vec![
+            self.embed_tokens.device().clone(),
+            self.lm_head.device().clone(),
+        ];
+        let mut fixed = vec![self.norm.device().clone()];
+        for layer in &self.layers {
+            ar.extend(path(&layer.ar));
+            if let Some(nar) = &layer.nar {
+                fixed.extend(path(nar));
+            }
+        }
+        (ar, fixed)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod synthetic {
     //! A deterministic, tiny-width YuE2 with the real architecture: GQA (2 query heads per KV
@@ -704,10 +768,10 @@ pub(crate) mod synthetic {
             num_key_value_heads: 2,
             head_dim: 16,
             intermediate_size: 64,
-            vocab_size: crate::sampling::VOCAB_SIZE,
+            vocab_size: crate::protocol::VOCAB_SIZE as usize,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
-            max_position_embeddings: crate::sampling::CONTEXT,
+            max_position_embeddings: crate::protocol::CONTEXT,
         }
     }
 
@@ -897,6 +961,28 @@ mod tests {
         }
         let missing = released.replace(r#""head_dim":128,"#, "");
         assert!(Yue2Config::from_json(&missing).is_err());
+    }
+
+    /// An unsupported compute dtype (F16), or BF16 on the CPU (no BF16 matmul), is refused before
+    /// any weight is read; F32 on the CPU loads.
+    #[test]
+    fn unsupported_compute_dtypes_are_refused_before_loading() {
+        let cfg = synthetic::config();
+        for dtype in [DType::F16, DType::BF16, DType::F64] {
+            // An empty builder: reaching any tensor lookup would be a "missing tensor" error.
+            let vb = VarBuilder::from_tensors(Default::default(), dtype, &Device::Cpu);
+            let err = Yue2Lm::from_var_builder(cfg.clone(), vb, MotPaths::Ar).unwrap_err();
+            assert!(
+                matches!(err, gen_core::Error::Unsupported(_)),
+                "{dtype:?}: {err}"
+            );
+        }
+        let dirs = SnapshotDirs::new();
+        let err = Yue2Lm::load(&dirs, MotPaths::Ar, DType::F16, &Device::Cpu).unwrap_err();
+        assert!(matches!(err, gen_core::Error::Unsupported(_)), "{err}");
+        // F32 passes the check and only then reaches verification (a cold cache here).
+        let err = Yue2Lm::load(&dirs, MotPaths::Ar, DType::F32, &Device::Cpu).unwrap_err();
+        assert!(!matches!(err, gen_core::Error::Unsupported(_)), "{err}");
     }
 
     #[test]

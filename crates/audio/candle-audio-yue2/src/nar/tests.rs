@@ -285,14 +285,16 @@ fn synthetic_synthesis_matches_upstream() {
 }
 
 /// Tiled vs untiled on the same model: the tile only splits the query rows of an otherwise
-/// identical score/softmax/value product, so any drift is reduction-order noise. Measured 0.0
-/// (bit-identical) on the CPU; the bound allows another backend's GEMM blocking to depend on the
-/// row count, while a dropped key tile moves latents by ≥ 1e-2 (see the mutation record).
+/// identical score/softmax/value product, so any drift is reduction-order noise. Bound ≤ 1e-5;
+/// measured 0 on macOS CPU and 7.2e-7 on the Linux CI CPU (whose GEMM blocking depends on the row
+/// count), while a dropped key tile moves latents by ≥ 1e-2 (see the mutation record). The values
+/// may therefore differ in their last bits, so only the **stage** identity — not the value hash —
+/// is compared across settings.
 const TILING_MAX_ABS: f32 = 1e-5;
 
-/// Query tiling (every setting, including a score-byte budget small enough to force one row per
-/// call) and AR offload leave the latents — and the stage identity — unchanged, and match the
-/// upstream run that tiled by 5 rows with `offload_ar=True`.
+/// Query tiling (every setting, including a score-byte budget that admits exactly one row per
+/// call) and AR offload leave the latents (within [`TILING_MAX_ABS`]) and the stage identity
+/// unchanged, and match the upstream run that tiled by 5 rows with `offload_ar=True`.
 #[test]
 fn tiling_budget_and_offload_do_not_change_the_latents() {
     let meta = meta();
@@ -318,6 +320,7 @@ fn tiling_budget_and_offload_do_not_change_the_latents() {
     )
     .0;
     let upstream_tiled = host(&r["tiled_q5_offload/final"]);
+    const ONE_ROW: usize = SCORE_TILES_LIVE * 4 * 26 * 4;
     let settings = [
         QueryTile::Whole,
         QueryTile::Rows(1),
@@ -325,8 +328,9 @@ fn tiling_budget_and_offload_do_not_change_the_latents() {
         QueryTile::Rows(5),
         QueryTile::Rows(7),
         QueryTile::Rows(10_000),
-        QueryTile::ScoreBytes(1),
-        QueryTile::ScoreBytes(4 * 4 * 26 * 4),
+        // 26 keys (18 visible AR + 8 NAR), 4 heads, F32: one row costs 3 · 4 · 26 · 4 bytes.
+        QueryTile::ScoreBytes(ONE_ROW),
+        QueryTile::ScoreBytes(3 * ONE_ROW + 5),
         QueryTile::ScoreBytes(usize::MAX / 2),
     ];
     for query_tile in settings {
@@ -353,7 +357,11 @@ fn tiling_budget_and_offload_do_not_change_the_latents() {
                 SYNTH_REL_L2,
                 &format!("{options:?} vs upstream tiled"),
             );
-            assert_eq!(out.latents.identity(), base.latents.identity());
+            assert_eq!(
+                out.latents.identity().source,
+                base.latents.identity().source
+            );
+            assert_eq!(out.latents.frames(), base.latents.frames());
             assert!(!nar.lm().ar_offloaded(), "restored after the synthesis");
         }
     }
@@ -443,7 +451,7 @@ fn cached_velocity_equals_upstream_joint_forward() {
             noise: state,
             nar_cond_end: case["nar_cond_end"].as_u64().unwrap() as usize,
         };
-        let mut solver = ChunkSolver::prefill(&nar, &input, &never).unwrap();
+        let mut solver = ChunkSolver::prefill(&nar, &input, QueryTile::Upstream, &never).unwrap();
         let raw = case["raw_t"].as_f64().unwrap() as f32;
         let velocity = |solver: &mut ChunkSolver, x: &Tensor, t: f32, tile| {
             host(&solver.velocity(&nar, x, t, tile).unwrap())
@@ -685,6 +693,33 @@ fn invalid_requests_are_refused() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("positions"), "{err}");
+    // An unusable query tile is refused before any work, not rounded to one row.
+    for query_tile in [QueryTile::Rows(0), QueryTile::ScoreBytes(1)] {
+        let request = SynthesisRequest {
+            prefix: &prefix,
+            codes: &codes,
+            noise: &noise,
+            steps: 1,
+            context: ctx,
+        };
+        let options = NarOptions {
+            query_tile,
+            offload_ar: true,
+        };
+        let polls = Cell::new(0usize);
+        let cancelled = || {
+            polls.set(polls.get() + 1);
+            false
+        };
+        let hooks = SynthesisHooks {
+            cancelled: &cancelled,
+            observer: &mut (),
+        };
+        let err = synthesize(nar, &request, &options, hooks).unwrap_err();
+        assert!(err.to_string().contains("query"), "{query_tile:?}: {err}");
+        assert_eq!(polls.get(), 2, "{query_tile:?}: refused before the prefill");
+        assert!(!nar.lm().ar_offloaded());
+    }
 }
 
 /// Cancellation at every bounded boundary — before a chunk's prefill, between prefill forwards,
@@ -803,9 +838,9 @@ fn stage_identity_covers_the_inputs_not_the_memory_controls() {
         steps: 32,
         context: protocol::CONTEXT,
     };
-    let id = base.stage_identity("w");
+    let id = base.stage_identity("w", DType::F32);
     assert_eq!(id.len(), 64);
-    assert_eq!(id, base.stage_identity("w"));
+    assert_eq!(id, base.stage_identity("w", DType::F32));
     let other_noise = SongNoise::seeded(2, 2);
     let variants = [
         SynthesisRequest {
@@ -827,9 +862,14 @@ fn stage_identity_covers_the_inputs_not_the_memory_controls() {
         },
     ];
     for v in variants {
-        assert_ne!(v.stage_identity("w"), id);
+        assert_ne!(v.stage_identity("w", DType::F32), id);
     }
-    assert_ne!(base.stage_identity("v"), id);
+    assert_ne!(base.stage_identity("v", DType::F32), id);
+    assert_ne!(
+        base.stage_identity("w", DType::BF16),
+        id,
+        "the compute dtype"
+    );
 }
 
 /// The released acoustic config parses; a different latent width or a bad shift is refused.
@@ -850,4 +890,274 @@ fn acoustic_config_parses_and_refuses_other_architectures() {
         let bad = released.replace(from, to);
         assert!(NarConfig::from_json(&bad).is_err(), "accepted {to}");
     }
+}
+
+/// [`QueryTile::rows`]: exact row counts, the budget covers all [`SCORE_TILES_LIVE`] live score
+/// tiles whenever a row fits, and unusable settings are refused rather than rounded.
+#[test]
+fn query_tile_rows_are_bounded_by_the_budget() {
+    let f32_row = SCORE_TILES_LIVE * 16 * 1000 * 4; // 16 heads, 1000 keys, F32
+    let bf16_row = SCORE_TILES_LIVE * 16 * 1000 * 2;
+    let cases = [
+        (QueryTile::ScoreBytes(f32_row), 300, DType::F32, 1),
+        (QueryTile::ScoreBytes(5 * f32_row + 7), 300, DType::F32, 5),
+        (QueryTile::ScoreBytes(2 * f32_row - 1), 300, DType::F32, 1),
+        (QueryTile::ScoreBytes(10 * bf16_row), 300, DType::BF16, 10),
+        (QueryTile::ScoreBytes(usize::MAX / 2), 300, DType::F32, 300),
+        (QueryTile::Rows(7), 300, DType::F32, 7),
+        (QueryTile::Rows(7), 3, DType::F32, 3),
+        (QueryTile::Upstream, 1000, DType::F32, UPSTREAM_QUERY_TILE),
+        (QueryTile::Upstream, 9, DType::F32, 9),
+        (QueryTile::Whole, 1000, DType::F32, 1000),
+    ];
+    for (tile, queries, dtype, want) in cases {
+        let rows = tile.rows(queries, 16, 1000, dtype).unwrap();
+        assert_eq!(rows, want, "{tile:?} over {queries} queries in {dtype:?}");
+        if let QueryTile::ScoreBytes(bytes) = tile {
+            let peak = SCORE_TILES_LIVE * rows * 16 * 1000 * dtype.size_in_bytes();
+            assert!(peak <= bytes, "{tile:?}: {rows} rows need {peak} bytes");
+        }
+    }
+    assert!(QueryTile::Rows(0).rows(10, 16, 1000, DType::F32).is_err());
+    assert!(QueryTile::ScoreBytes(f32_row - 1)
+        .rows(10, 16, 1000, DType::F32)
+        .is_err());
+    assert!(QueryTile::ScoreBytes(0)
+        .rows(10, 16, 1000, DType::F32)
+        .is_err());
+}
+
+/// Panics in an observer mid-solve: the panic reaches the caller, and the offloaded AR path is
+/// restored on the way (the model is not left refusing its AR path, and still synthesizes the
+/// same latents).
+#[test]
+fn a_panic_mid_solve_still_restores_the_ar_path() {
+    struct Boom;
+    impl SynthesisObserver for Boom {
+        fn on_evaluation(&mut self, e: &Evaluation<'_>) {
+            if e.stage == Stage::Midpoint {
+                panic!("observer failure");
+            }
+        }
+    }
+    let mut nar = synthetic::model(1.0);
+    let prefix: Vec<u32> = u32s(&meta()["cases"][0]["prefix"]);
+    let codes = [3u32, 1, 4, 1, 5];
+    let noise = SongNoise::seeded(9, codes.len());
+    let options = NarOptions {
+        query_tile: QueryTile::Upstream,
+        offload_ar: true,
+    };
+    let before = run(
+        &mut nar,
+        &prefix,
+        &codes,
+        &noise,
+        2,
+        protocol::CONTEXT,
+        &options,
+    )
+    .0;
+    let request = SynthesisRequest {
+        prefix: &prefix,
+        codes: &codes,
+        noise: &noise,
+        steps: 2,
+        context: protocol::CONTEXT,
+    };
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let hooks = SynthesisHooks {
+            cancelled: &never,
+            observer: &mut Boom,
+        };
+        synthesize(&mut nar, &request, &options, hooks)
+    }));
+    let payload = panicked.expect_err("the observer's panic reaches the caller");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"observer failure"));
+    assert!(
+        !nar.lm().ar_offloaded(),
+        "AR path restored during the unwind"
+    );
+    let after = run(
+        &mut nar,
+        &prefix,
+        &codes,
+        &noise,
+        2,
+        protocol::CONTEXT,
+        &options,
+    )
+    .0;
+    assert_eq!(after.latents, before.latents);
+}
+
+/// A restore failure is appended to the error that caused it, never substituted for it.
+#[test]
+fn a_failed_restore_keeps_the_original_error() {
+    assert!(matches!(
+        with_restore(gen_core::Error::Canceled, Ok(())),
+        gen_core::Error::Canceled
+    ));
+    let both = with_restore(
+        gen_core::Error::Msg("offload: device lost".into()),
+        Err(gen_core::Error::Msg("restore: out of memory".into())),
+    )
+    .to_string();
+    let (original, restore) = (
+        both.find("offload: device lost").expect("original kept"),
+        both.find("restore: out of memory")
+            .expect("restore failure kept"),
+    );
+    assert!(original < restore, "original first: {both}");
+}
+
+/// Chunks at the real protocol boundary: with the released [`protocol::CONTEXT`], a song of
+/// `size + 1` frames (`size = (CONTEXT − prefix − 3) / 2`) is one chunk whose AR + NAR positions
+/// are **exactly** `CONTEXT` — the model's whole position range — and a one-frame tail chunk. A
+/// chunk one position longer is refused rather than truncated.
+#[test]
+fn chunks_at_the_released_context_limit() {
+    let mut nar = synthetic::model(1.0);
+    let prefix: Vec<u32> = u32s(&meta()["cases"][0]["prefix"]);
+    let size = (protocol::CONTEXT - prefix.len() - 3) / 2;
+    assert_eq!(
+        prefix.len() + 2 * size + 3,
+        protocol::CONTEXT,
+        "this prefix length makes the first chunk fill the context exactly"
+    );
+    assert_eq!(nar.lm().config().max_position_embeddings, protocol::CONTEXT);
+    let frames = size + 1;
+    let codes: Vec<u32> = (0..frames as u32)
+        .map(|i| (i * 7919 + 5) % protocol::CODEC_SIZE)
+        .collect();
+    let noise = SongNoise::seeded(21, frames);
+    let options = NarOptions::default();
+    let (out, trace) = run(
+        &mut nar,
+        &prefix,
+        &codes,
+        &noise,
+        1,
+        protocol::CONTEXT,
+        &options,
+    );
+    assert_eq!(out.chunks, vec![(0, size), (size, frames)]);
+    assert_eq!(out.latents.frames(), frames, "every frame solved");
+    assert_eq!(trace.evals.len(), 4);
+    // The one-frame tail solved alone is the song's last frame (composition at the boundary).
+    let tail_tokens = chunk_ar_tokens(&prefix, &codes[size..]);
+    let tail_noise = noise.rows(size, frames).unwrap();
+    let hooks = &mut SynthesisHooks {
+        cancelled: &never,
+        observer: &mut (),
+    };
+    let chunk = ChunkInput {
+        ar_tokens: &tail_tokens,
+        noise: &tail_noise,
+        nar_cond_end: 0,
+    };
+    let (tail, _) = solve_chunk(&mut nar, &chunk, 1, &options, 0, 1, hooks).unwrap();
+    assert_eq!(
+        host(&tail),
+        out.latents.values()[size * LATENT_CHANNELS..].to_vec()
+    );
+    // One position past the model's range: the full chunk's AR sequence with one more frame.
+    let over_tokens = chunk_ar_tokens(&prefix, &codes[..size]);
+    let over_noise = noise.rows(0, size + 1).unwrap();
+    let chunk = ChunkInput {
+        ar_tokens: &over_tokens,
+        noise: &over_noise,
+        nar_cond_end: 0,
+    };
+    let err = solve_chunk(&mut nar, &chunk, 1, &options, 0, 1, hooks).unwrap_err();
+    assert!(err.to_string().contains("positions"), "{err}");
+}
+
+/// The offload transition on a real accelerator, where it actually moves memory (on the CPU it
+/// only marks the AR path unavailable). Runs on the manual CUDA lane (`--features cuda`) and any
+/// `--features metal` test run; compiled out of the CPU lanes.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[test]
+fn ar_offload_moves_exactly_the_ar_weights_on_a_gpu() {
+    #[cfg(feature = "cuda")]
+    let device = Device::new_cuda(0).expect("a CUDA device");
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    let device = Device::new_metal(0).expect("a Metal device");
+    let on = |devices: &[Device]| devices.iter().all(|d| d.same_device(&device));
+    let host_only = |devices: &[Device]| devices.iter().all(Device::is_cpu);
+    // Every AR-only tensor of the synthetic checkpoint (F32), counted from its state dict.
+    let cfg = crate::model::synthetic::config();
+    let expected: usize = crate::model::synthetic::state_dict(&cfg)
+        .iter()
+        .filter(|(name, ..)| !name.contains(".nar_") && name != "model.norm.weight")
+        .map(|(_, shape, ..)| shape.iter().product::<usize>() * 4)
+        .sum();
+    let mut nar = synthetic::model_on(1.0, &device);
+    let (ar, fixed) = nar.lm().placement();
+    assert!(on(&ar) && on(&fixed), "loaded on the device");
+
+    // The transition itself.
+    assert_eq!(nar.lm.offload_ar().unwrap(), expected, "bytes moved");
+    let (ar, fixed) = nar.lm().placement();
+    assert!(
+        host_only(&ar),
+        "every AR-only tensor on the host while offloaded"
+    );
+    assert!(on(&fixed), "NAR twins and the final norm never move");
+    nar.restore_ar().unwrap();
+    let (ar, _) = nar.lm().placement();
+    assert!(on(&ar), "restored to the device");
+
+    // Completed synthesis, offload off vs on.
+    let prefix: Vec<u32> = u32s(&meta()["cases"][0]["prefix"]);
+    let codes: Vec<u32> = (0..12).map(|i| (i * 977) % protocol::CODEC_SIZE).collect();
+    let noise = SongNoise::seeded(5, codes.len());
+    let context = prefix.len() + 3 + 2 * 5; // three chunks: 5, 5, 2
+    let plain = NarOptions::default();
+    let offload = NarOptions {
+        offload_ar: true,
+        ..plain
+    };
+    let base = run(&mut nar, &prefix, &codes, &noise, 2, context, &plain).0;
+    assert_eq!(base.offloaded_bytes, 0);
+    let moved = run(&mut nar, &prefix, &codes, &noise, 2, context, &offload).0;
+    assert_eq!(
+        moved.offloaded_bytes, expected,
+        "the offload moved exactly the AR weights"
+    );
+    Spread::of(moved.latents.values(), base.latents.values()).assert_within(
+        TILING_MAX_ABS,
+        1e-5,
+        "offload vs no offload on the device",
+    );
+    let (ar, fixed) = nar.lm().placement();
+    assert!(on(&ar) && on(&fixed) && !nar.lm().ar_offloaded());
+
+    // Cancelled mid-solve with offload on: 7 polls per chunk (chunk loop, `solve_chunk`, one
+    // prefill forward, two per step), so poll 14 is the second chunk's last midpoint evaluation.
+    let polls = Cell::new(0usize);
+    let cancelled = || {
+        polls.set(polls.get() + 1);
+        polls.get() > 8 + 5
+    };
+    let request = SynthesisRequest {
+        prefix: &prefix,
+        codes: &codes,
+        noise: &noise,
+        steps: 2,
+        context,
+    };
+    let hooks = SynthesisHooks {
+        cancelled: &cancelled,
+        observer: &mut (),
+    };
+    let out = synthesize(&mut nar, &request, &offload, hooks);
+    assert!(matches!(out, Err(gen_core::Error::Canceled)), "{out:?}");
+    let (ar, fixed) = nar.lm().placement();
+    assert!(
+        on(&ar) && on(&fixed) && !nar.lm().ar_offloaded(),
+        "restored after a cancel"
+    );
+    let again = run(&mut nar, &prefix, &codes, &noise, 2, context, &offload).0;
+    assert_eq!(again.latents.values(), moved.latents.values());
 }

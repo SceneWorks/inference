@@ -52,8 +52,7 @@ use sha2::{Digest, Sha256};
 
 use crate::decode::{decode_latents, DecodeMode, DecodeOptions, DecodedAudio};
 use crate::generate::{
-    generate_semantic as semantic_decode, plan_score, stage_rng, Cot, DecodeObserver, Decoded,
-    Hooks, ScorePlan, SemanticInput,
+    generate_semantic as semantic_decode, plan_score, stage_rng, timing_of, DecodeObserver, Hooks,
 };
 use crate::inventory::{Closure, Component, ComponentId, VaeVariant};
 use crate::latent::AcousticLatents;
@@ -67,7 +66,7 @@ use crate::protocol::{
     check_generation_budget, CotMode, GenerationConfig, Sampling, SongRequest, CONTEXT,
     PROTOCOL_VERSION,
 };
-use crate::sampling::{self, Phase};
+use crate::sampling::Phase;
 use crate::snapshot::{self, SnapshotDirs};
 use crate::tokenizer::Yue2TextTokenizer;
 use crate::vae::{variant_name, VaeParts, Yue2Vae};
@@ -331,28 +330,6 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The token sampler's controls for a validated protocol [`Sampling`].
-pub fn sampler(s: &Sampling) -> sampling::Sampling {
-    let count = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
-    sampling::Sampling {
-        temperature: s.temperature(),
-        top_p: s.top_p(),
-        top_k: count(s.top_k()),
-        repetition_penalty: s.repetition_penalty(),
-        penalty_window: count(s.penalty_window()),
-        min_tokens: count(s.min_tokens()),
-        max_tokens: count(s.max_tokens()),
-    }
-}
-
-fn cot_of(mode: CotMode) -> Cot {
-    match mode {
-        CotMode::Off => Cot::Off,
-        CotMode::Melody => Cot::Melody,
-        CotMode::Full => Cot::Full,
-    }
-}
-
 fn dtype_name(dtype: DType) -> &'static str {
     match dtype {
         DType::F32 => "float32",
@@ -368,26 +345,6 @@ fn device_name(device: &Device) -> &'static str {
         Device::Cuda(_) => "cuda",
         Device::Metal(_) => "metal",
     }
-}
-
-/// Upstream's per-decode timing record from a native decode.
-fn decode_timing(decoded: &Decoded) -> Map<String, Value> {
-    let mut t = Map::new();
-    t.insert("seconds".into(), json!(decoded.seconds));
-    t.insert("prefill_seconds".into(), json!(decoded.prefill_seconds));
-    t.insert("output_tokens".into(), json!(decoded.output_tokens));
-    t.insert("content_tokens".into(), json!(decoded.tokens.len()));
-    let tps = if decoded.seconds > 0.0 {
-        decoded.output_tokens as f64 / decoded.seconds
-    } else {
-        0.0
-    };
-    t.insert("output_tps".into(), json!(tps));
-    t.insert("prefix_tokens".into(), json!(decoded.prefix_tokens));
-    t.insert("cfg_branches".into(), json!(decoded.cfg_branches));
-    t.insert("execution".into(), json!("eager"));
-    t.insert("attention".into(), json!("sdpa"));
-    t
 }
 
 /// Forwards a decode's tokens to the engine observer as one stage's tokens.
@@ -761,18 +718,18 @@ impl Yue2Engine {
         Ok(identity_of(&json!([
             IDENTITY_SCHEMA,
             "synthesis",
-            request.stage_identity(&self.weights_sha256()?),
+            request.stage_identity(&self.weights_sha256()?, self.dtype()),
             dtype_name(self.dtype()),
         ])))
     }
 
     /// Plan `request` (upstream `pipe.plan`): `cot = off` and an external score need no sampling;
-    /// otherwise the ABC is sampled with `abc` from the request seed, after the context-budget
-    /// check. The plan carries the exact sampled token ids.
+    /// otherwise the ABC is sampled with `generation`'s ABC controls from the request seed, after
+    /// the context-budget check. The plan carries the exact sampled token ids.
     pub fn plan(
         &self,
         request: &SongRequest,
-        abc: &Sampling,
+        generation: &GenerationConfig,
         hooks: &mut EngineHooks<'_>,
     ) -> gen_core::Result<SymbolicPlan> {
         hooks.check_cancel()?;
@@ -780,33 +737,26 @@ impl Yue2Engine {
         let plan = match SymbolicPlan::prepare(request.clone(), &self.tokenizer).map_err(msg)? {
             PlanStep::Ready(plan) => plan,
             PlanStep::GenerateAbc(planning) => {
-                check_generation_budget(planning.prefix().len(), None, abc, 1.0).map_err(msg)?;
+                check_generation_budget(planning.prefix().len(), None, generation.abc(), 1.0)
+                    .map_err(msg)?;
                 let nar = self.lock_nar()?;
                 let mut rng = stage_rng(request.seed());
                 let mut forward = TokenForward {
                     stage: Stage::Plan,
                     observer: &mut *hooks.observer,
                 };
-                let (score, decoded) = plan_score(
+                let (plan, _) = plan_score(
                     nar.lm(),
-                    cot_of(request.cot()),
-                    planning.prefix(),
-                    &sampler(abc),
+                    planning,
+                    &self.tokenizer,
+                    generation,
                     &mut rng,
                     Hooks {
                         cancelled: hooks.cancelled,
                         observer: &mut forward,
                     },
                 )?;
-                drop(nar);
-                planning
-                    .finish(
-                        &self.tokenizer,
-                        score.abc_ids().to_vec(),
-                        decode_timing(&decoded),
-                        decoded.truncated,
-                    )
-                    .map_err(msg)?
+                plan
             }
         };
         hooks.observer.on_stage(Stage::Plan, StageEvent::Finished);
@@ -820,7 +770,7 @@ impl Yue2Engine {
     pub fn generate_semantic(
         &self,
         plan: &SymbolicPlan,
-        semantic: &Sampling,
+        generation: &GenerationConfig,
         hooks: &mut EngineHooks<'_>,
     ) -> gen_core::Result<SemanticResult> {
         hooks.check_cancel()?;
@@ -828,9 +778,8 @@ impl Yue2Engine {
             .observer
             .on_stage(Stage::Semantic, StageEvent::Started);
         let conditioning = plan
-            .semantic_conditioning(&self.tokenizer, semantic)
+            .semantic_conditioning(&self.tokenizer, generation.semantic())
             .map_err(msg)?;
-        let score = ScorePlan::of_plan(plan)?;
         let nar = self.lock_nar()?;
         let mut rng = stage_rng(plan.request().seed());
         let mut forward = TokenForward {
@@ -839,13 +788,9 @@ impl Yue2Engine {
         };
         let tokens = semantic_decode(
             nar.lm(),
-            &SemanticInput {
-                plan: &score,
-                prefix: &conditioning.positive,
-                negative: conditioning.negative.as_deref(),
-                cfg_scale: conditioning.cfg_scale,
-            },
-            &sampler(semantic),
+            plan,
+            &conditioning,
+            generation,
             &mut rng,
             Hooks {
                 cancelled: hooks.cancelled,
@@ -859,7 +804,7 @@ impl Yue2Engine {
         Ok(SemanticResult {
             plan: plan.clone(),
             truncated: tokens.decoded.truncated,
-            timing: decode_timing(&tokens.decoded),
+            timing: timing_of(&tokens.decoded),
             codes: tokens.codes,
         })
     }
@@ -951,7 +896,7 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
     ) -> gen_core::Result<SongResult> {
         let start = Instant::now();
-        let plan = self.plan(request, settings.generation.abc(), hooks)?;
+        let plan = self.plan(request, &settings.generation, hooks)?;
         self.generate_from_plan_timed(plan, settings, hooks, start)
     }
 
@@ -973,7 +918,7 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
         start: Instant,
     ) -> gen_core::Result<SongResult> {
-        let semantic = self.generate_semantic(&plan, settings.generation.semantic(), hooks)?;
+        let semantic = self.generate_semantic(&plan, &settings.generation, hooks)?;
         let synthesis = self.synthesize(&semantic, &settings.generation, hooks)?;
         hooks.check_cancel()?;
         let vae_start = Instant::now();

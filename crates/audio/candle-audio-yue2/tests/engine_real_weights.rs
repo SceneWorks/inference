@@ -304,7 +304,7 @@ fn a_saved_closure_serves_plan_only_and_restored_plan_runs() {
     let (_, plan_id, _) = engine
         .plan_to(
             &request,
-            settings.generation.abc(),
+            &settings.generation,
             &RunOutput::fresh(&plan_dir),
             &mut hooks,
         )

@@ -77,11 +77,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::generate::stage_rng;
-use crate::inventory::ComponentId;
 use crate::latent::{AcousticLatents, LatentSource, LATENT_CHANNELS};
 use crate::model::{backend, rms_norm, MotPaths, Yue2Config, Yue2Lm};
 use crate::protocol::{self, CODEC_OFFSET, CODEC_SIZE, MUSIC_END, ODE_METHOD, PROTOCOL_VERSION};
-use crate::snapshot::{self, SnapshotDirs};
+use crate::snapshot::SnapshotDirs;
 
 /// Upstream's query block on CPU / MPS (`attention(query_chunk_size=None)` off CUDA): 256 rows.
 pub const UPSTREAM_QUERY_TILE: usize = 256;
@@ -239,23 +238,12 @@ impl Yue2Nar {
     /// heads from exactly the verified `config.json` and weights file. `dtype` as for
     /// [`Yue2Lm::load`] (F32 on a CPU device).
     pub fn load(dirs: &SnapshotDirs, dtype: DType, device: &Device) -> gen_core::Result<Self> {
-        let verified = snapshot::resolve_component(ComponentId::Lm, dirs)?;
-        let config_path = verified.path("config.json").ok_or_else(|| {
-            gen_core::Error::Msg("verified YuE2-3B snapshot has no config.json".into())
-        })?;
-        let weights = verified.weights_path().ok_or_else(|| {
-            gen_core::Error::Msg("verified YuE2-3B snapshot has no weights file".into())
-        })?;
-        let text = std::fs::read_to_string(config_path)?;
-        // SAFETY: the verified weights file, opened read-only; every tensor is copied out in
-        // `dtype` during this call.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) }
-            .map_err(backend("open weights"))?;
+        let opened = crate::model::open_verified(dirs, dtype, device)?;
         Self::from_var_builder(
-            Yue2Config::from_json(&text)?,
-            NarConfig::from_json(&text)?,
-            vb,
-            verified.manifest().native.sha256.clone(),
+            Yue2Config::from_json(&opened.config_json)?,
+            NarConfig::from_json(&opened.config_json)?,
+            opened.vb,
+            opened.weights_sha256,
         )
     }
 
@@ -292,8 +280,9 @@ impl Yue2Nar {
         &self.weights_sha256
     }
 
-    /// Restore offloaded AR weights left behind by a panic mid-synthesis (see
-    /// [`Yue2Lm::restore_ar`]); a no-op when nothing is offloaded.
+    /// Retry restoring offloaded AR weights after a restore failed (a synthesis restores them
+    /// itself on success, error, cancellation and panic; see [`Yue2Lm::restore_ar`]). A no-op
+    /// when nothing is offloaded.
     pub fn restore_ar(&mut self) -> gen_core::Result<()> {
         self.lm.restore_ar()
     }
@@ -404,22 +393,51 @@ pub enum QueryTile {
     Upstream,
     /// Every query row at once (upstream's CUDA default).
     Whole,
-    /// At most this many rows (at least one).
+    /// At most this many rows. `Rows(0)` is refused (upstream refuses `query_chunk_size < 1`).
     Rows(usize),
-    /// As many rows as keep one score tile (`heads · rows · keys` elements of the model dtype)
-    /// within this many bytes — a memory budget. At least one row.
+    /// A memory budget in bytes for the attention scores of one call: as many rows as keep
+    /// [`SCORE_TILES_LIVE`] score-sized tiles (`heads · rows · keys` elements of the model dtype
+    /// each) within the budget. It bounds the score temporaries only — not the weights, the KV
+    /// cache or the activations. A budget too small for one row is refused, never rounded up.
     ScoreBytes(usize),
 }
 
+/// Score-sized tiles one attention call can hold at once in `sdpa_gqa`: the raw `QKᵀ` product
+/// while it is scaled, the scaled scores, and the softmax weights while the scores are still alive.
+/// [`QueryTile::ScoreBytes`] divides its budget by this, so the budget covers the peak, not one tile.
+pub const SCORE_TILES_LIVE: usize = 3;
+
 impl QueryTile {
-    fn rows(self, queries: usize, heads: usize, keys: usize, dtype: DType) -> usize {
+    /// Query rows per attention call over `queries` rows and `keys` keys (at most `queries`).
+    pub fn rows(
+        self,
+        queries: usize,
+        heads: usize,
+        keys: usize,
+        dtype: DType,
+    ) -> gen_core::Result<usize> {
         let rows = match self {
             QueryTile::Upstream => UPSTREAM_QUERY_TILE,
             QueryTile::Whole => queries,
+            QueryTile::Rows(0) => {
+                return Err(gen_core::Error::Msg(
+                    "YuE2 acoustic: a query tile must hold at least one row".into(),
+                ))
+            }
             QueryTile::Rows(n) => n,
-            QueryTile::ScoreBytes(bytes) => bytes / (heads * keys * dtype.size_in_bytes()).max(1),
+            QueryTile::ScoreBytes(bytes) => {
+                let per_row = SCORE_TILES_LIVE * heads * keys * dtype.size_in_bytes();
+                if bytes < per_row {
+                    return Err(gen_core::Error::Msg(format!(
+                        "YuE2 acoustic: a {bytes}-byte score budget cannot hold one query row \
+                         ({per_row} bytes for {SCORE_TILES_LIVE} score tiles of {heads} heads × \
+                         {keys} keys)"
+                    )));
+                }
+                bytes / per_row
+            }
         };
-        rows.clamp(1, queries.max(1))
+        Ok(rows.min(queries))
     }
 }
 
@@ -517,15 +535,17 @@ pub struct SynthesisRequest<'a> {
 
 impl SynthesisRequest<'_> {
     /// SHA-256 over everything the latents are a function of: the schema, the protocol version,
-    /// the model weights, the prefix, the codec ids, the noise values, the step count, the context
-    /// and the ODE method. The memory controls ([`NarOptions`]) are deliberately absent.
-    pub fn stage_identity(&self, weights_sha256: &str) -> String {
+    /// the model weights and the dtype they compute in, the prefix, the codec ids, the noise
+    /// values, the step count, the context and the ODE method. The memory controls
+    /// ([`NarOptions`]) are deliberately absent.
+    pub fn stage_identity(&self, weights_sha256: &str, dtype: DType) -> String {
         // A JSON array, not an object: its byte form does not depend on serde_json's map-order
         // feature, which workspace feature unification could otherwise flip between builds.
         let record = json!([
             STAGE_IDENTITY_SCHEMA,
             PROTOCOL_VERSION,
             weights_sha256,
+            dtype.as_str(),
             self.prefix,
             self.codes,
             self.noise.sha256(),
@@ -612,6 +632,7 @@ impl ChunkSolver {
     fn prefill(
         nar: &Yue2Nar,
         input: &ChunkInput<'_>,
+        tile: QueryTile,
         cancelled: &dyn Fn() -> bool,
     ) -> gen_core::Result<Self> {
         let lm = &nar.lm;
@@ -639,6 +660,13 @@ impl ChunkSolver {
         } else {
             ar
         };
+        // Refuse an unusable tile before any work (the key count is fixed for the chunk).
+        tile.rows(
+            nar_len,
+            lm.config().num_attention_heads,
+            visible + nar_len,
+            lm.dtype(),
+        )?;
         let mut cache = lm.new_cache(ar.max(visible + nar_len))?;
         lm.prefill(input.ar_tokens, &mut cache, || check_cancel(cancelled))?;
         let (cos, sin) = lm.rope_tables(ar, nar_len)?;
@@ -698,7 +726,7 @@ impl ChunkSolver {
             cfg.num_attention_heads,
             keys_total,
             lm.dtype(),
-        );
+        )?;
         for (i, layer) in lm.layers().iter().enumerate() {
             let p = layer.nar.as_ref().ok_or_else(|| {
                 gen_core::Error::Msg(
@@ -793,6 +821,11 @@ impl ChunkSolver {
 /// Solve one original chunk end to end — upstream `CachedNAR(model, chunk).solve(steps)` inside
 /// `_offload_ar(model, offload_ar)`: prefill, offload (if asked), solve, release the cache, restore.
 /// `chunk` / `chunks` only label progress. Returns host F32 `[frames, 64]` and the bytes offloaded.
+///
+/// The AR weights come back on success, error, cancellation and a panic inside the solve (caught,
+/// restored, then resumed). If the restore itself fails, its error is appended to the original one
+/// and the model stays marked offloaded, so the AR path keeps refusing until
+/// [`Yue2Nar::restore_ar`] succeeds.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_chunk(
     nar: &mut Yue2Nar,
@@ -816,28 +849,31 @@ pub fn solve_chunk(
         ));
     }
     check_cancel(hooks.cancelled)?;
-    let mut solver = ChunkSolver::prefill(nar, input, hooks.cancelled)?;
+    let mut solver = ChunkSolver::prefill(nar, input, options.query_tile, hooks.cancelled)?;
     let offloaded = if options.offload_ar {
         match nar.lm.offload_ar() {
             Ok(bytes) => bytes,
             Err(e) => {
                 drop(solver);
-                nar.lm.restore_ar()?;
-                return Err(e);
+                return Err(with_restore(e, nar.lm.restore_ar()));
             }
         }
     } else {
         0
     };
-    let result = solver.solve(
-        nar,
-        input.noise,
-        steps,
-        options.query_tile,
-        chunk,
-        chunks,
-        hooks,
-    );
+    // A panic inside the solve (a caller's observer, say) must not leave the AR weights on the
+    // host: catch it, release the cache and restore, then let it continue unwinding.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        solver.solve(
+            nar,
+            input.noise,
+            steps,
+            options.query_tile,
+            chunk,
+            chunks,
+            hooks,
+        )
+    }));
     // Release the prefix cache before the AR weights come back (upstream's ordering), on every
     // path.
     drop(solver);
@@ -846,9 +882,27 @@ pub fn solve_chunk(
     } else {
         Ok(())
     };
-    let latents = result?;
-    restored?;
-    Ok((latents, offloaded))
+    let result = match result {
+        Ok(result) => result,
+        // A restore failure here leaves the model marked offloaded, so the AR path keeps refusing.
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    match (result, restored) {
+        (Ok(latents), Ok(())) => Ok((latents, offloaded)),
+        (Ok(_), Err(restore)) => Err(restore),
+        (Err(e), restored) => Err(with_restore(e, restored)),
+    }
+}
+
+/// `original`, unless restoring the AR path afterwards also failed — then both, the original first
+/// (a restore failure never replaces the error that caused it, nor is it dropped).
+fn with_restore(original: gen_core::Error, restored: gen_core::Result<()>) -> gen_core::Error {
+    match restored {
+        Ok(()) => original,
+        Err(restore) => gen_core::Error::Msg(format!(
+            "{original}; restoring the offloaded AR path afterwards also failed: {restore}"
+        )),
+    }
 }
 
 /// Chunk `codes`' AR sequence — upstream `song_chunks`: `prefix + [c + CODEC_OFFSET …] +
@@ -921,7 +975,7 @@ pub fn synthesize(
     }
     let all = Tensor::cat(&out, 0).map_err(backend("acoustic concat"))?;
     let source = LatentSource::Synthesis {
-        stage_identity: request.stage_identity(&nar.weights_sha256),
+        stage_identity: request.stage_identity(&nar.weights_sha256, nar.lm.dtype()),
     };
     let latents = AcousticLatents::from_tensor(&all, source)
         .map_err(|e| gen_core::Error::Msg(format!("YuE2 acoustic latents: {e}")))?;
@@ -987,6 +1041,11 @@ pub(crate) mod synthetic {
 
     /// The synthetic MoT with NAR heads on the CPU in F32.
     pub(crate) fn model(timestep_shift: f64) -> Yue2Nar {
+        model_on(timestep_shift, &Device::Cpu)
+    }
+
+    /// The synthetic MoT with NAR heads on `device` in F32.
+    pub(crate) fn model_on(timestep_shift: f64, device: &Device) -> Yue2Nar {
         let cfg = mot::config();
         let mut tensors = mot::tensors(&cfg);
         for (name, shape, scale, offset) in heads_state_dict(cfg.hidden_size) {
@@ -995,7 +1054,7 @@ pub(crate) mod synthetic {
             let t = Tensor::from_vec(data, shape, &Device::Cpu).expect("synthetic tensor");
             tensors.insert(name, t);
         }
-        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, device);
         Yue2Nar::from_var_builder(cfg, nar_config(timestep_shift), vb, "synthetic".into())
             .expect("synthetic YuE2 with NAR heads loads")
     }
