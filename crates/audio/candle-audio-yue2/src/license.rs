@@ -4,8 +4,12 @@
 //! collapsed into one "YuE2 licence":
 //!
 //! 1. **First-party source** — `multimodal-art-projection/YuE` at the pinned commit is Apache-2.0
-//!    ([`SOURCE_TERMS`]). This is the only source a native port may derive from. Its Oobleck VAE /
-//!    SnakeBeta code carries two MIT notices of its own.
+//!    ([`SOURCE_TERMS`]). It is the only source a native port of the YuE2 LM, VAE and text
+//!    tokenizer may derive from. Its Oobleck VAE / SnakeBeta code carries two MIT notices of its
+//!    own. It contains **no** SheetSage2 or MERT2 code: the cover closure's only code is the remote
+//!    Python inside those model repositories, which carries no code licence, so code derived from it
+//!    is treated as CC BY-NC 4.0 and a port is gated until an owner records a basis
+//!    ([`CODE_TERMS`]).
 //! 2. **Model weights** — YuE2-3B, both VAEs, SheetSage2 and MERT-v2-FullSong are CC BY-NC 4.0
 //!    ([`COMPONENT_LICENSES`]): noncommercial use only, with attribution.
 //! 3. **`qwen.tiktoken`** — byte-identical to the Qwen-7B tokenizer file, so it carries the Tongyi
@@ -14,7 +18,7 @@
 //! 4. **Bundled archive and third-party terms** — the earlier `yue2-v0.1.6` release archives and the
 //!    wheels in the YuE2-3B repository license their *code* under CC BY-NC 4.0 (not Apache-2.0), and
 //!    SheetSage2's rendering assets carry MIT / font / CC BY 3.0 US terms ([`BUNDLED_TERMS`]). None
-//!    of it is in a closure or a port source.
+//!    of it is in a closure, and none of it is an ungated port source.
 //!
 //! # The gate
 //!
@@ -116,25 +120,72 @@ impl ComponentPolicy {
 }
 
 /// A permitted use of a set of components.
+///
+/// A capability, not a record: its fields are private, so [`authorize`] (and
+/// [`authorize_closure`], which calls it) is the **only** way to obtain one. Code that requires an
+/// `Authorization` for, say, [`IntendedUse::CommercialUse`] therefore cannot be handed a forged
+/// one. A struct literal outside this crate does not compile:
+///
+/// ```compile_fail
+/// use candle_audio_yue2::license::{Authorization, IntendedUse};
+///
+/// let forged = Authorization {
+///     intended: IntendedUse::CommercialUse,
+///     grants: Vec::new(),
+///     attributions: Vec::new(),
+/// };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authorization {
-    /// The use that was authorized.
-    pub intended: IntendedUse,
-    /// The basis each component was permitted on.
-    pub grants: Vec<(ComponentId, Basis)>,
-    /// The attributions the components' licences require, deduplicated, in component order — to be
-    /// shown to the user and retained in provenance and exports.
-    pub attributions: Vec<&'static str>,
+    intended: IntendedUse,
+    grants: Vec<(ComponentId, Basis)>,
+    attributions: Vec<&'static str>,
 }
 
-/// A refused use: every component without a recorded basis for it.
+impl Authorization {
+    /// The use that was authorized.
+    pub fn intended(&self) -> IntendedUse {
+        self.intended
+    }
+
+    /// The basis each component was permitted on, in the order the components were named.
+    pub fn grants(&self) -> &[(ComponentId, Basis)] {
+        &self.grants
+    }
+
+    /// The attributions the components' licences require, deduplicated, in component order — to be
+    /// shown to the user and retained in provenance and exports.
+    pub fn attributions(&self) -> &[&'static str] {
+        &self.attributions
+    }
+}
+
+/// A refused use.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{intended:?} is not permitted for YuE2: {}", describe(gated))]
-pub struct UseRefused {
+pub enum UseRefused {
+    /// No component was named, so there is nothing a basis could have been recorded for.
+    #[error("{intended:?} is not permitted for YuE2: no components were named")]
+    NoComponents {
+        /// The use that was refused.
+        intended: IntendedUse,
+    },
+    /// At least one named component has no recorded compatible basis for the use.
+    #[error("{intended:?} is not permitted for YuE2: {}", describe(gated))]
+    Gated {
+        /// The use that was refused.
+        intended: IntendedUse,
+        /// `(component, reason, unblock)` for every gated component.
+        gated: Vec<(ComponentId, &'static str, &'static str)>,
+    },
+}
+
+impl UseRefused {
     /// The use that was refused.
-    pub intended: IntendedUse,
-    /// `(component, reason, unblock)` for every gated component.
-    pub gated: Vec<(ComponentId, &'static str, &'static str)>,
+    pub fn intended(&self) -> IntendedUse {
+        match self {
+            UseRefused::NoComponents { intended } | UseRefused::Gated { intended, .. } => *intended,
+        }
+    }
 }
 
 fn describe(gated: &[(ComponentId, &'static str, &'static str)]) -> String {
@@ -151,6 +202,9 @@ pub fn authorize(
     components: &[ComponentId],
     intended: IntendedUse,
 ) -> Result<Authorization, UseRefused> {
+    if components.is_empty() {
+        return Err(UseRefused::NoComponents { intended });
+    }
     let mut grants = Vec::new();
     let mut gated = Vec::new();
     let mut attributions: Vec<&'static str> = Vec::new();
@@ -168,13 +222,6 @@ pub fn authorize(
             UseDisposition::Gated { reason, unblock } => gated.push((id, reason, unblock)),
         }
     }
-    if components.is_empty() {
-        gated.push((
-            ComponentId::Lm,
-            "no components were named",
-            "name the closure being used",
-        ));
-    }
     if gated.is_empty() {
         Ok(Authorization {
             intended,
@@ -182,7 +229,7 @@ pub fn authorize(
             attributions,
         })
     } else {
-        Err(UseRefused { intended, gated })
+        Err(UseRefused::Gated { intended, gated })
     }
 }
 
@@ -592,11 +639,125 @@ pub const SOURCE_TERMS: SourceTerms = SourceTerms {
             text: "licenses/yue2-source/licenses/SnakeBeta-NVIDIA-MIT.txt",
         },
     ],
-    port_rule: "native ports derive only from this repository at this commit (Apache-2.0), \
-                retaining its copyright line and the two MIT notices for any ported VAE / SnakeBeta \
-                code; never from the yue2-v0.1.6 release archives, the wheels in m-a-p/YuE2-3B, or \
-                the remote-code copies in the model repositories, whose bundled terms differ",
+    port_rule: "native ports of the YuE2 language model (src/yue2/modeling_yue2.py), VAE \
+                (src/yue2/modeling_vae.py) and text tokenizer (src/yue2/tokenization_yue2.py) derive \
+                only from this repository at this commit (Apache-2.0), retaining its copyright line \
+                and the two MIT notices for any ported VAE / SnakeBeta code; never from the \
+                yue2-v0.1.6 release archives, the wheels in m-a-p/YuE2-3B, or the remote-code copies \
+                in the YuE2 model repositories, whose bundled terms differ. This repository contains \
+                no SheetSage2 or MERT2 code: the cover closure's code terms and port disposition are \
+                recorded separately in CODE_TERMS",
 };
+
+/// The terms of the code a native port of one component would derive from, and whether porting it
+/// into this Apache-2.0 crate has a recorded basis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodeTerms {
+    /// The component the code implements.
+    pub component: ComponentId,
+    /// The upstream code a port derives from.
+    pub code: &'static str,
+    /// Where that code is published, at which revision.
+    pub location: &'static str,
+    /// The terms the code carries, as inspected on [`inventory::RETRIEVED`].
+    pub terms: &'static str,
+    /// SPDX id that code derived from it is treated as carrying.
+    pub treated_as: &'static str,
+    /// Whether a native port may be written into this crate (Apache-2.0): permitted on a recorded
+    /// basis, or gated with its unblock condition.
+    pub port: UseDisposition,
+}
+
+const APACHE_PORT: UseDisposition = UseDisposition::Permitted(Basis {
+    family: "apache-2-0",
+    clause: "§2: \"each Contributor hereby grants to You a perpetual, worldwide, non-exclusive, \
+             no-charge, royalty-free, irrevocable copyright license to reproduce, prepare \
+             Derivative Works of, publicly display, publicly perform, sublicense, and distribute \
+             the Work and such Derivative Works\"",
+    evidence: "licenses/yue2-source/LICENSE",
+});
+
+const COVER_PORT: UseDisposition = UseDisposition::Gated {
+    reason: "the only SheetSage2 / MERT2 code is the remote Python published inside the model \
+             repositories, which carries no code licence of its own; the repositories declare \
+             cc-by-nc-4.0, so code derived from it is treated as CC BY-NC 4.0 — noncommercial — \
+             and must not be relicensed into this Apache-2.0 crate",
+    unblock: "an owner-recorded basis for the cover port, recorded here: an explicit code licence \
+              from the rights holder (Multimodal Art Projection), or an owner decision to ship the \
+              derived code under CC BY-NC 4.0 with attribution, outside the crate's Apache-2.0 \
+              grant",
+};
+
+/// Per-component code terms, in [`ComponentId::ALL`] order. Every component a native port will be
+/// written for has an entry, so no port can land without its code terms being on record.
+pub const CODE_TERMS: &[CodeTerms] = &[
+    CodeTerms {
+        component: ComponentId::Lm,
+        code: "src/yue2/modeling_yue2.py",
+        location: "github.com/multimodal-art-projection/YuE@92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+        terms: "Apache-2.0 (root LICENSE, pyproject license = \"Apache-2.0\")",
+        treated_as: "Apache-2.0",
+        port: APACHE_PORT,
+    },
+    CodeTerms {
+        component: ComponentId::QwenTiktoken,
+        code: "src/yue2/tokenization_yue2.py (the tokenizer data itself is covered by the \
+               Tongyi Qianwen row, not by this code licence)",
+        location: "github.com/multimodal-art-projection/YuE@92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+        terms: "Apache-2.0 (root LICENSE, pyproject license = \"Apache-2.0\")",
+        treated_as: "Apache-2.0",
+        port: APACHE_PORT,
+    },
+    CodeTerms {
+        component: ComponentId::VaeStandard,
+        code: "src/yue2/modeling_vae.py",
+        location: "github.com/multimodal-art-projection/YuE@92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+        terms: "Apache-2.0, with the stable-audio-tools (Oobleck) and BigVGAN (SnakeBeta) MIT \
+                notices in SOURCE_TERMS.third_party",
+        treated_as: "Apache-2.0",
+        port: APACHE_PORT,
+    },
+    CodeTerms {
+        component: ComponentId::VaeLegacy,
+        code: "src/yue2/modeling_vae.py",
+        location: "github.com/multimodal-art-projection/YuE@92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+        terms: "Apache-2.0, with the stable-audio-tools (Oobleck) and BigVGAN (SnakeBeta) MIT \
+                notices in SOURCE_TERMS.third_party",
+        treated_as: "Apache-2.0",
+        port: APACHE_PORT,
+    },
+    CodeTerms {
+        component: ComponentId::SheetSage2,
+        code: "the 22 remote Python files of m-a-p/SheetSage2 (modeling_sheetsage2.py, \
+               tokenization_sheetsage2.py, notation_sheetsage2.py, …, plus copies of \
+               modeling_mert2.py / configuration_mert2.py)",
+        location: "https://huggingface.co/m-a-p/SheetSage2@eab522a8168e8b8b8c4856bf8609cd86198f01fe",
+        terms: "no licence header, SPDX tag or code licence file in any of them; the card declares \
+                cc-by-nc-4.0 and the shipped LICENSE is the CC BY-NC 4.0 MERT2 weight licence, whose \
+                preamble says it \"does not replace separately applicable licenses for code or \
+                dependencies\"; THIRD_PARTY_NOTICES.md says the BART decoder uses Hugging Face \
+                Transformers (Apache 2.0) — imported (transformers BartDecoder), not vendored",
+        treated_as: "CC-BY-NC-4.0",
+        port: COVER_PORT,
+    },
+    CodeTerms {
+        component: ComponentId::MertV2FullSong,
+        code: "modeling_mert2.py and configuration_mert2.py of m-a-p/MERT-v2-FullSong",
+        location: "https://huggingface.co/m-a-p/MERT-v2-FullSong@d8ba1c745e733b3908ce6ad16ebeb17ac7600a42",
+        terms: "no licence header, SPDX tag or code licence file; the card declares cc-by-nc-4.0 \
+                and the shipped LICENSE is the CC BY-NC 4.0 MERT2 weight licence, whose preamble \
+                says it \"does not replace separately applicable licenses for code or \
+                dependencies\"; THIRD_PARTY_NOTICES.md lists PyTorch, torchaudio, Transformers, \
+                huggingface_hub and safetensors as separately installed dependencies",
+        treated_as: "CC-BY-NC-4.0",
+        port: COVER_PORT,
+    },
+];
+
+/// The code terms for component `id`.
+pub fn code_terms(id: ComponentId) -> Option<&'static CodeTerms> {
+    CODE_TERMS.iter().find(|t| t.component == id)
+}
 
 /// A bundled archive or third-party asset outside every closure, with the terms it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -649,6 +810,26 @@ pub const BUNDLED_TERMS: &[BundledTerms] = &[
         terms: "abcjs MIT; the DejaVu font licence; FluidR3 samples by Frank Wen CC BY 3.0 US \
                 (per the repository's THIRD_PARTY_NOTICES.md)",
         disposition: "excluded; score/audio preview rendering is not a transcription dependency",
+    },
+    BundledTerms {
+        artifact: "SheetSage2 remote code (22 *.py files, including copies of modeling_mert2.py \
+                   and configuration_mert2.py byte-identical to MERT-v2-FullSong's)",
+        location: "https://huggingface.co/m-a-p/SheetSage2 (pinned revision)",
+        terms: "no explicit code licence: no header or SPDX tag in any file and no code licence \
+                file; the repository card declares cc-by-nc-4.0; THIRD_PARTY_NOTICES.md cites \
+                Hugging Face Transformers (Apache 2.0) for the BART decoder, which the code \
+                imports rather than vendors",
+        disposition: "excluded at runtime; treated as CC BY-NC 4.0 and any native port gated \
+                      (see CODE_TERMS)",
+    },
+    BundledTerms {
+        artifact: "MERT-v2-FullSong remote code (modeling_mert2.py, configuration_mert2.py)",
+        location: "https://huggingface.co/m-a-p/MERT-v2-FullSong (pinned revision)",
+        terms: "no explicit code licence: no header or SPDX tag and no code licence file; the \
+                repository card declares cc-by-nc-4.0; THIRD_PARTY_NOTICES.md lists only \
+                separately installed dependencies",
+        disposition: "excluded at runtime; treated as CC BY-NC 4.0 and any native port gated \
+                      (see CODE_TERMS)",
     },
 ];
 
@@ -810,8 +991,17 @@ mod tests {
         ] {
             let a = authorize_closure(closure, IntendedUse::NoncommercialExperimentation)
                 .unwrap_or_else(|e| panic!("{closure:?}: {e}"));
-            assert_eq!(a.grants.len(), closure.components().len());
-            assert_eq!(a.attributions.len(), closure.components().len());
+            assert_eq!(a.intended(), IntendedUse::NoncommercialExperimentation);
+            let granted: Vec<ComponentId> = a.grants().iter().map(|(id, _)| *id).collect();
+            assert_eq!(granted, closure.components());
+            assert_eq!(a.attributions().len(), closure.components().len());
+        }
+    }
+
+    fn gated(err: UseRefused) -> Vec<(ComponentId, &'static str, &'static str)> {
+        match err {
+            UseRefused::Gated { gated, .. } => gated,
+            other => panic!("expected a Gated refusal, got {other:?}"),
         }
     }
 
@@ -822,21 +1012,91 @@ mod tests {
         for intended in [IntendedUse::CommercialUse, IntendedUse::Redistribution] {
             for id in ComponentId::ALL {
                 let err = authorize(&[id], intended).unwrap_err();
-                assert_eq!(err.gated.len(), 1);
-                assert_eq!(err.gated[0].0, id);
-                assert!(!err.gated[0].2.is_empty());
+                assert_eq!(err.intended(), intended);
+                let g = gated(err);
+                assert_eq!(g.len(), 1);
+                assert_eq!(g[0].0, id);
+                assert!(!g[0].2.is_empty());
             }
             let closure = Closure::Generation {
                 vae: inventory::VaeVariant::Standard,
             };
             let err = authorize_closure(closure, intended).unwrap_err();
-            assert_eq!(err.gated.len(), closure.components().len());
             assert!(err.to_string().contains("unblock"), "{err}");
+            assert_eq!(gated(err).len(), closure.components().len());
         }
     }
 
+    /// An empty list gets its own refusal — it is not blamed on any component.
     #[test]
     fn an_empty_component_list_is_refused() {
-        assert!(authorize(&[], IntendedUse::NoncommercialExperimentation).is_err());
+        for intended in IntendedUse::ALL {
+            let err = authorize(&[], intended).unwrap_err();
+            assert_eq!(err, UseRefused::NoComponents { intended });
+            assert!(
+                err.to_string().contains("no components were named"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Every component — in particular every cover-closure component, whose only code is remote
+    /// Python with no code licence — has recorded code terms. Cover code is treated as CC BY-NC 4.0
+    /// with its port gated behind an owner-recorded basis; the YuE2 LM / tokenizer / VAE ports are
+    /// permitted only on the Apache-2.0 GitHub source.
+    #[test]
+    fn every_component_has_recorded_code_terms_and_cover_ports_are_gated() {
+        let texts: Vec<&str> = LICENSE_TEXTS.iter().map(|t| t.path).collect();
+        for id in Closure::Cover.components() {
+            let t = code_terms(*id).unwrap_or_else(|| panic!("{id:?} has no recorded code terms"));
+            assert_eq!(t.treated_as, "CC-BY-NC-4.0", "{id:?}");
+            match t.port {
+                UseDisposition::Gated { reason, unblock } => {
+                    assert!(reason.contains("CC BY-NC 4.0"), "{id:?}: {reason}");
+                    assert!(
+                        unblock.contains("owner-recorded basis"),
+                        "{id:?}: {unblock}"
+                    );
+                }
+                UseDisposition::Permitted(b) => panic!("{id:?} port is permitted on {b:?}"),
+            }
+            assert!(
+                BUNDLED_TERMS
+                    .iter()
+                    .any(|b| b.location.contains(id.component().repo.id)
+                        && b.artifact.contains("remote code")),
+                "{id:?}: its remote code has no BUNDLED_TERMS entry"
+            );
+        }
+        for id in ComponentId::ALL {
+            let t = code_terms(id).unwrap_or_else(|| panic!("{id:?} has no recorded code terms"));
+            if Closure::Cover.components().contains(&id) {
+                continue;
+            }
+            assert_eq!(t.treated_as, SOURCE_TERMS.spdx, "{id:?}");
+            assert!(t.location.contains(SOURCE_TERMS.commit), "{id:?}");
+            match t.port {
+                UseDisposition::Permitted(b) => {
+                    assert_eq!(b.family, "apache-2-0");
+                    assert!(texts.contains(&b.evidence));
+                }
+                UseDisposition::Gated { .. } => panic!("{id:?} port is gated"),
+            }
+        }
+        assert_eq!(CODE_TERMS.len(), ComponentId::ALL.len());
+        // The port rule is scoped to the three YuE2 source files and points the cover closure at
+        // its own recorded terms.
+        for needle in [
+            "modeling_yue2.py",
+            "modeling_vae.py",
+            "tokenization_yue2.py",
+            "no SheetSage2 or MERT2 code",
+            "CODE_TERMS",
+        ] {
+            assert!(
+                SOURCE_TERMS.port_rule.contains(needle),
+                "port_rule does not mention {needle}"
+            );
+        }
     }
 }

@@ -1,5 +1,13 @@
 //! Offline resolution and integrity verification of YuE2 snapshots.
 //!
+//! # Verify at the load boundary
+//!
+//! Verification is a statement about the bytes on disk **at the moment of the call**. A loader must
+//! call [`resolve_closure`] / [`resolve_component`] (or [`verify_component`]) **immediately before
+//! it loads**, and must load only the paths the returned [`VerifiedComponent`] names. Caching a
+//! `VerifiedClosure` across requests, or verifying at start-up and loading later, leaves a window in
+//! which a file can be replaced unnoticed.
+//!
 //! A snapshot is found — never fetched — through [`SnapshotDirs`]: the directory the application
 //! provisioned for each pinned repository. A repository with no directory, or whose directory is
 //! absent, is an [`AssetError::CacheMiss`]; nothing here touches the network or derives a cache
@@ -12,8 +20,10 @@
 //! 1. every pinned file exists and is a regular file ([`AssetError::MissingFile`]) with the pinned
 //!    size ([`AssetError::SizeMismatch`]) — all files first, so a missing or truncated shard fails
 //!    before any hashing;
-//! 2. no unpinned weights file sits beside the pinned one ([`AssetError::UnexpectedWeightFile`]) —
-//!    a stray shard or index could otherwise be picked up by a loader;
+//! 2. no unpinned weights or index file (`*.safetensors`, `*.safetensors.index.json`, `*.bin`,
+//!    `*.pt`, `*.pth`, `*.ckpt`) exists anywhere in the snapshot tree, subdirectories included
+//!    ([`AssetError::UnexpectedWeightFile`]) — a stray shard or index could otherwise be picked up
+//!    by a loader;
 //! 3. every pinned file's SHA-256 ([`AssetError::HashMismatch`]);
 //! 4. the weights file's safetensors header — tensor names, dtypes and shapes — equals the committed
 //!    conversion manifest ([`AssetError::TensorTableMismatch`]).
@@ -261,15 +271,36 @@ impl VerifiedComponent {
 }
 
 /// Every component of a closure, verified.
+///
+/// Its fields are private, so [`resolve_closure`] is the only way to obtain one: holding a
+/// `VerifiedClosure` means every component in it passed verification. A struct literal outside
+/// this crate does not compile:
+///
+/// ```compile_fail
+/// use candle_audio_yue2::{Closure, VerifiedClosure};
+///
+/// let forged = VerifiedClosure {
+///     closure: Closure::Cover,
+///     components: Vec::new(),
+/// };
+/// ```
 #[derive(Clone, Debug)]
 pub struct VerifiedClosure {
-    /// The closure that was resolved.
-    pub closure: Closure,
-    /// Its components, in [`Closure::components`] order.
-    pub components: Vec<VerifiedComponent>,
+    closure: Closure,
+    components: Vec<VerifiedComponent>,
 }
 
 impl VerifiedClosure {
+    /// The closure that was resolved.
+    pub fn closure(&self) -> Closure {
+        self.closure
+    }
+
+    /// Its verified components, in [`Closure::components`] order.
+    pub fn components(&self) -> &[VerifiedComponent] {
+        &self.components
+    }
+
     /// The verified component `id`, if it is part of this closure.
     pub fn get(&self, id: ComponentId) -> Option<&VerifiedComponent> {
         self.components.iter().find(|c| c.component.id == id)
@@ -406,6 +437,50 @@ fn is_weights_file(name: &str) -> bool {
         || name.ends_with(".ckpt")
 }
 
+/// Every weights / index file under `dir`, as `/`-separated paths relative to the snapshot root,
+/// following symlinks the way a loader would. A symlink loop terminates the walk: the OS refuses
+/// to resolve a path through too many symlinks (ELOOP), and that error is propagated.
+fn collect_weight_files(
+    key: &str,
+    dir: &Path,
+    prefix: &str,
+    found: &mut Vec<String>,
+) -> Result<(), AssetError> {
+    let io = |path: &Path, source| AssetError::Io {
+        component: key.to_string(),
+        path: path.to_path_buf(),
+        source,
+    };
+    for entry in std::fs::read_dir(dir).map_err(|e| io(dir, e))? {
+        let entry = entry.map_err(|e| io(dir, e))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let path = entry.path();
+        // `metadata` follows symlinks. A dangling link (NotFound) is not a directory, and if its
+        // name is a weights name it still counts as a stray entry. Any other error — a symlink
+        // loop the OS refuses to resolve, a permission error — is propagated, never skipped.
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => collect_weight_files(key, &path, &rel, found)?,
+            Ok(_) => {
+                if is_weights_file(&name) {
+                    found.push(rel);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if is_weights_file(&name) {
+                    found.push(rel);
+                }
+            }
+            Err(e) => return Err(io(&path, e)),
+        }
+    }
+    Ok(())
+}
+
 /// Verify `component` in the snapshot directory `dir` (see the module docs for the checks, in
 /// order). The returned [`VerifiedComponent`] carries the exact paths whose bytes were hashed;
 /// loaders must read those paths. The guarantee is as of this call — a file replaced afterwards is
@@ -463,27 +538,17 @@ pub fn verify_component(
         });
     }
 
-    // 2. No unpinned weights beside the pinned ones.
+    // 2. No unpinned weights anywhere in the snapshot tree.
     if let Some(weights) = component.weights() {
-        let read = std::fs::read_dir(dir).map_err(|source| AssetError::Io {
-            component: key.to_string(),
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        for entry in read {
-            let entry = entry.map_err(|source| AssetError::Io {
+        let mut found = Vec::new();
+        collect_weight_files(key, dir, "", &mut found)?;
+        found.sort();
+        if let Some(stray) = found.into_iter().find(|rel| rel != weights.path) {
+            return Err(AssetError::UnexpectedWeightFile {
                 component: key.to_string(),
-                path: dir.to_path_buf(),
-                source,
-            })?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if is_weights_file(&name) && name != weights.path {
-                return Err(AssetError::UnexpectedWeightFile {
-                    component: key.to_string(),
-                    file: name,
-                    dir: dir.to_path_buf(),
-                });
-            }
+                file: stray,
+                dir: dir.to_path_buf(),
+            });
         }
     }
 

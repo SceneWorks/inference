@@ -593,6 +593,12 @@ pub struct ExcludedFile {
 const REMOTE_CODE: &str = "remote Python model code; production runs natively (epic E3) and ports \
                            derive only from the Apache-2.0 GitHub source at the pinned commit";
 
+const COVER_REMOTE_CODE: &str =
+    "remote Python model / processing code with no code licence of its \
+                                 own; production runs natively (epic E3); treated as CC BY-NC 4.0 \
+                                 and any native port gated (license::CODE_TERMS) — the pinned \
+                                 GitHub source has no SheetSage2 / MERT2 code";
+
 /// Files the pinned repositories ship that no closure loads.
 pub const EXCLUDED: &[ExcludedFile] = &[
     ExcludedFile {
@@ -645,7 +651,7 @@ pub const EXCLUDED: &[ExcludedFile] = &[
     ExcludedFile {
         repo: "m-a-p/SheetSage2",
         path: "*.py",
-        reason: "remote Python model / processing code; production runs natively (epic E3)",
+        reason: COVER_REMOTE_CODE,
     },
     ExcludedFile {
         repo: "m-a-p/SheetSage2",
@@ -677,7 +683,7 @@ pub const EXCLUDED: &[ExcludedFile] = &[
     ExcludedFile {
         repo: "m-a-p/MERT-v2-FullSong",
         path: "*.py",
-        reason: REMOTE_CODE,
+        reason: COVER_REMOTE_CODE,
     },
     ExcludedFile {
         repo: "m-a-p/MERT-v2-FullSong",

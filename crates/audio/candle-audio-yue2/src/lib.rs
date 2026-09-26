@@ -21,10 +21,20 @@
 //!   Tongyi Qianwen terms of the bundled `qwen.tiktoken` vs bundled archive / third-party terms;
 //!   the per-artifact [`gen_core::ComponentLicense`] rows with attribution; and
 //!   [`license::authorize`], which refuses any intended use (commercial use, redistribution) that
-//!   has no recorded compatible basis.
+//!   has no recorded compatible basis. [`license::CODE_TERMS`] records which upstream code each
+//!   component's native port may derive from: the Apache-2.0 GitHub source for the LM, VAE and
+//!   tokenizer; the cover closure's code is treated as CC BY-NC 4.0 and its port is gated.
 //!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
+//!
+//! # Rule for loader slices: verify at the load boundary
+//!
+//! Every loader in this crate must call [`snapshot::resolve_closure`] /
+//! [`snapshot::resolve_component`] **immediately before loading**, and load only the paths the
+//! returned [`VerifiedComponent`] names. The integrity guarantee holds only for the moment of the
+//! call; a verification done earlier (at start-up, or cached from a previous request) does not
+//! cover the bytes a later load reads.
 
 #![deny(rustdoc::private_intra_doc_links)]
 

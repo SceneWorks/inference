@@ -777,6 +777,7 @@ pub const QWEN_RESEARCH: LicenseFamily = LicenseFamily {
 /// file. A different text from [`QWEN_RESEARCH`]: §2 grants use, reproduction, distribution and
 /// derivative works with no non-commercial limit, and §4 conditions only commercial use above a
 /// user-count threshold. The text does not address outputs beyond §5(b), transcribed verbatim.
+/// Quotes and judgement calls: `docs/licensing/sc-22989-tongyi-qianwen-licence-evidence.md`.
 pub const TONGYI_QIANWEN: LicenseFamily = LicenseFamily {
     id: "tongyi-qianwen",
     spdx_id: "LicenseRef-Tongyi-Qianwen-License-Agreement",

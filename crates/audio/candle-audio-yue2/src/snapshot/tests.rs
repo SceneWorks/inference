@@ -239,6 +239,44 @@ fn an_unpinned_extra_shard_is_refused() {
     }
 }
 
+/// A stray shard or index one or more directories down is found too, and reported by its
+/// snapshot-relative path; a harmless nested non-weights file (like the pinned `licenses/` texts)
+/// is not.
+#[test]
+fn a_nested_stray_shard_or_index_is_refused() {
+    let f = fixture();
+    let nested = f.dir.join("licenses");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("NOTICE.txt"), b"not weights").unwrap();
+    verify_component(f.component, &f.dir).expect("a nested non-weights file is fine");
+
+    let deep = f.dir.join("sub/deeper");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("model.safetensors.index.json"), b"{}").unwrap();
+    match verify_component(f.component, &f.dir) {
+        Err(AssetError::UnexpectedWeightFile { file, .. }) => {
+            assert_eq!(file, "sub/deeper/model.safetensors.index.json")
+        }
+        other => panic!("expected UnexpectedWeightFile, got {other:?}"),
+    }
+}
+
+/// A symlink loop in the snapshot tree is refused as an I/O failure (the OS's ELOOP, propagated)
+/// instead of recursing forever, being skipped, or being misreported as a stray shard.
+#[cfg(unix)]
+#[test]
+fn a_symlink_loop_in_the_snapshot_tree_is_refused() {
+    let f = fixture();
+    std::os::unix::fs::symlink(&f.dir, f.dir.join("loop")).unwrap();
+    match verify_component(f.component, &f.dir) {
+        Err(AssetError::Io { source, .. }) => {
+            let msg = source.to_string();
+            assert!(msg.contains("symbolic links"), "{msg}")
+        }
+        other => panic!("expected an Io refusal, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_manifest_tensor_table_that_disagrees_with_the_file_is_refused() {
     let f = fixture_with(|rows| rows[1]["shape"] = serde_json::json!([2, 2]));

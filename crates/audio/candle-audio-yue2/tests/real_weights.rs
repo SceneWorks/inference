@@ -59,22 +59,22 @@ fn every_pinned_closure_verifies_from_the_local_hub_cache() {
         let start = Instant::now();
         let verified = resolve_closure(closure, &root).unwrap_or_else(|e| panic!("{e}"));
         let bytes: u64 = verified
-            .components
+            .components()
             .iter()
             .flat_map(|c| c.component().files.iter().map(|f| f.bytes))
             .sum();
         println!(
             "{closure:?}: {} components, {} files, {:.2} GB hashed in {:.1?}",
-            verified.components.len(),
+            verified.components().len(),
             verified
-                .components
+                .components()
                 .iter()
                 .map(|c| c.files().len())
                 .sum::<usize>(),
             bytes as f64 / 1e9,
             start.elapsed()
         );
-        for c in &verified.components {
+        for c in verified.components() {
             let Some(manifest_path) = c.path("weights_manifest.json") else {
                 println!(
                     "  {}: upstream publishes no weights_manifest.json",
