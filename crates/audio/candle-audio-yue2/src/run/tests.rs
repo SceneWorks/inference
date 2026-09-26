@@ -845,7 +845,23 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
     };
     let b = ids(&base);
     // (key change, which of [plan, semantic, synthesis, nar, cached decode] must change)
-    let cases: [(&str, crate::engine::IdentityKeys, [bool; 5]); 5] = [
+    let cases: [(&str, crate::engine::IdentityKeys, [bool; 5]); 7] = [
+        (
+            "tier",
+            crate::engine::IdentityKeys {
+                tier: "q8",
+                ..base.clone()
+            },
+            [true, true, true, false, false],
+        ),
+        (
+            "ar",
+            crate::engine::IdentityKeys {
+                ar: "fp8",
+                ..base.clone()
+            },
+            [true, true, false, false, false],
+        ),
         (
             "weights",
             crate::engine::IdentityKeys {

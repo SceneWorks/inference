@@ -191,6 +191,7 @@ fn a_saved_closure_is_a_byte_identical_verifiable_copy_with_its_licence_files() 
     let dest = tmp.path().join("closure");
     let metadata = save_resolved(
         &resolve,
+        None,
         &[VaeVariant::Standard],
         &GenerationConfig::default(),
         &dest,

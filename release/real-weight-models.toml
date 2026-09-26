@@ -2611,3 +2611,71 @@ expected_files = [
     "decoders/decoder_131000.safetensors",
     "decoders/decoder_151000.safetensors",
 ]
+
+# sc-22995 (epic sc-22988) -- YuE2 precision tiers: the pinned upstream originals (CC BY-NC 4.0,
+# ungated) the `candle-audio-yue2` quality harness loads on the Windows CUDA runner, materialized
+# under `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `real-weights-yue.yml` (`family: yue2`). The
+# runner's copy is a local noncommercial test copy; nothing is rehosted, and the q8/q4 tiers are
+# derived on the runner by `candle_audio_yue2::tier::convert`. Only the pinned closure files are
+# fetched (the repository also carries wheels and example audio the runtime never reads).
+[[models]]
+key = "yue2-3b"
+repository = "m-a-p/YuE2-3B"
+revision = "1a96eca688d6ae5d7f0feb88573fec89920fcd19"
+license = "CC-BY-NC-4.0"
+size_class = "large"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_3B_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "generation_config.json",
+    "yue2_generation_config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "qwen.tiktoken",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "generation_config.json",
+    "yue2_generation_config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "qwen.tiktoken",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]
+
+[[models]]
+key = "yue2-vae"
+repository = "m-a-p/YuE2-Vae"
+revision = "95535e72a97bc0f09b8ada125d26b4009428c0e8"
+license = "CC-BY-NC-4.0"
+size_class = "small"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_VAE_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]

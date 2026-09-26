@@ -1601,7 +1601,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if re.search(r"\bpip\s+install\b", line) and not line.lstrip().startswith("#")
         ]
         locks = [re.search(r"\s-r\s+(\S+)", line).group(1) for line in installs]
-        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK])
+        # YuE-v1: the hub fetch and the reference-clip decode; YuE2 (sc-22995): the hub fetch.
+        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK, WINDOWS_HUB_LOCK])
         for line in installs:
             with self.subTest(install=line):
                 self.assertTrue(line.startswith(f"{WINDOWS_INTERPRETER} -m pip install "))
