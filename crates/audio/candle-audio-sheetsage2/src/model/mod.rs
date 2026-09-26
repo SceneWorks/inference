@@ -35,7 +35,7 @@ pub struct GenerationStep<'a> {
 
 static LIVE_MODELS: AtomicUsize = AtomicUsize::new(0);
 
-/// SheetSage2 models alive in this process: every successful [`SheetSage2Model::load`] not yet
+/// SheetSage2 models alive in this process: every successfully loaded model not yet
 /// dropped. The cover path requires zero before it loads a generator.
 pub fn live_models() -> usize {
     LIVE_MODELS.load(Ordering::SeqCst)

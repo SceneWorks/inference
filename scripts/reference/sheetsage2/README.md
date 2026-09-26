@@ -110,7 +110,7 @@ above; `--work` outside the repository, `--fixtures` the directory holding the m
 
 | Command | Writes | Consumed by |
 |---|---|---|
-| `tiny` | `crates/audio/candle-audio-sheetsage2/testdata/tiny/` — a seeded tiny model with the real architecture (MERT2 parent + rank-4 adapters, 2 Conformer blocks, 2-layer BART decoder, the real tokenizer and grammar over a 1 s window), every intermediate state and the greedy tokens. No pretrained weights. | lib tests (CI) |
+| `tiny` | `crates/audio/candle-audio-sheetsage2/testdata/tiny/` — a seeded tiny model with the real architecture (MERT2 parent + rank-4 adapters, 2 Conformer blocks, 2-layer BART decoder, the real tokenizer and grammar over a 1 s window), every intermediate state, the greedy tokens and every step's raw logits. The seed is the first from 22996 whose greedy decode decodes strictly, varies (>= 12 distinct ids, no id repeated more than 3 times in a row), has no near-ties (margin >= 0.01) and is well conditioned (float32 within 5e-5 of float64 at every step). No pretrained weights. | lib tests (CI) |
 | `tables` | `testdata/chord_pitches.json` — `mir_eval.chord.encode` pitch sets of the whole chord vocabulary | lib tests (CI) |
 | `grammar` | `testdata/grammar_masks.json` — `PromptGrammarState` masks along `synth_full` / `real_full` and a synthetic corner sequence | lib tests (CI) |
 | `real` | `--work/native_parity/{synth,nav_ssb}.safetensors` — every MERT2 hidden state, the layer mix, the decoder memory and the first logits (≈830 MB each; never committed) | `tests/real_weights.rs` (`#[ignore]`) |
