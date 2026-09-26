@@ -1,0 +1,913 @@
+{
+  "eb_spelling": {
+    "synth_eb_head": {
+      "abc_chord_symbols": [
+        "Ab",
+        "Bb",
+        "Cm",
+        "Eb",
+        "Fm",
+        "Gm"
+      ],
+      "key_header": "K:Eb"
+    },
+    "synth_eb_release": {
+      "abc_chord_symbols": [
+        "A#",
+        "Cm",
+        "D#",
+        "Fm",
+        "G#",
+        "Gm"
+      ],
+      "key_header": "K:Eb"
+    }
+  },
+  "head_code_reproduces_release_tokens": {
+    "real": true,
+    "synth_eb": true
+  },
+  "melody_only_changes_tokens": false,
+  "merged_snapshot_reproduces_adapter_load_tokens": true,
+  "real_clip": {
+    "chord_lab_identical": true,
+    "head_chord_lab": [
+      "C:maj",
+      "C:maj7/5",
+      "C:maj7/7",
+      "N"
+    ],
+    "head_chord_symbols": [
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "C",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "Cmaj7/G",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C"
+    ],
+    "head_revision_abc_identical": true,
+    "head_revision_notes_identical": true,
+    "melody_only_equals_full_without_chord_symbols": false,
+    "melody_only_has_chord_symbols": false,
+    "melody_only_vs_full_without_chord_symbols_diff": [
+      "--- full-without-chord-symbols",
+      "+++ melody-only",
+      "@@ -35 +35 @@",
+      "-b2z6a2b2|c'4e6^f2-|^f4g4z2z2|",
+      "+b2z6a2b2|c'4e6^f2-|^f4g4z4|"
+    ],
+    "release_chord_lab": [
+      "C:maj",
+      "C:maj7/5",
+      "C:maj7/7",
+      "N"
+    ],
+    "release_chord_symbols": [
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "C",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "Cmaj7/G",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C"
+    ]
+  },
+  "real_clip_octave_check": {
+    "case": "real_full",
+    "fraction_f0_half_dominant": 0.827,
+    "method": "For each note in ``melody_vocal.lab`` it takes the note's interior (start + 50 ms to end - 30 ms, at least 2048 samples), a Hann-windowed 65,536-point spectrum, and the peak magnitude within +/-3 % of the transcribed f0, of f0/2 and of 2*f0. A note \"looks an octave high\" when the f0/2 peak exceeds the f0 peak. The mix contains band accompaniment, which can also put energy at f0/2, so this is evidence, not ground truth.",
+    "notes": [
+      {
+        "energy_2f0": 1.857,
+        "energy_f0": 121.285,
+        "energy_f0_half": 150.849,
+        "midi": 79,
+        "start": 1.5
+      },
+      {
+        "energy_2f0": 4.411,
+        "energy_f0": 35.588,
+        "energy_f0_half": 93.574,
+        "midi": 76,
+        "start": 1.94
+      },
+      {
+        "energy_2f0": 1.552,
+        "energy_f0": 68.431,
+        "energy_f0_half": 75.331,
+        "midi": 72,
+        "start": 2.38
+      },
+      {
+        "energy_2f0": 16.316,
+        "energy_f0": 198.098,
+        "energy_f0_half": 126.353,
+        "midi": 76,
+        "start": 3.14
+      },
+      {
+        "energy_2f0": 34.409,
+        "energy_f0": 23.154,
+        "energy_f0_half": 354.971,
+        "midi": 79,
+        "start": 3.89
+      },
+      {
+        "energy_2f0": 132.738,
+        "energy_f0": 36.429,
+        "energy_f0_half": 612.8,
+        "midi": 84,
+        "start": 4.62
+      },
+      {
+        "energy_2f0": 107.582,
+        "energy_f0": 415.356,
+        "energy_f0_half": 857.618,
+        "midi": 88,
+        "start": 6.15
+      },
+      {
+        "energy_2f0": 1.288,
+        "energy_f0": 33.917,
+        "energy_f0_half": 128.482,
+        "midi": 86,
+        "start": 6.7125
+      },
+      {
+        "energy_2f0": 4.598,
+        "energy_f0": 108.531,
+        "energy_f0_half": 181.636,
+        "midi": 84,
+        "start": 6.9
+      },
+      {
+        "energy_2f0": 43.681,
+        "energy_f0": 76.724,
+        "energy_f0_half": 136.018,
+        "midi": 76,
+        "start": 7.66
+      },
+      {
+        "energy_2f0": 9.5,
+        "energy_f0": 26.207,
+        "energy_f0_half": 274.315,
+        "midi": 78,
+        "start": 8.38
+      },
+      {
+        "energy_2f0": 14.164,
+        "energy_f0": 70.166,
+        "energy_f0_half": 54.879,
+        "midi": 79,
+        "start": 9.18
+      },
+      {
+        "energy_2f0": 9.682,
+        "energy_f0": 66.961,
+        "energy_f0_half": 71.654,
+        "midi": 79,
+        "start": 10.78
+      },
+      {
+        "energy_2f0": 1.217,
+        "energy_f0": 12.258,
+        "energy_f0_half": 23.967,
+        "midi": 79,
+        "start": 11.18
+      },
+      {
+        "energy_2f0": 24.436,
+        "energy_f0": 832.045,
+        "energy_f0_half": 663.444,
+        "midi": 88,
+        "start": 11.58
+      },
+      {
+        "energy_2f0": 29.698,
+        "energy_f0": 93.491,
+        "energy_f0_half": 517.963,
+        "midi": 86,
+        "start": 12.66
+      },
+      {
+        "energy_2f0": 150.785,
+        "energy_f0": 75.274,
+        "energy_f0_half": 1073.021,
+        "midi": 84,
+        "start": 13.06
+      },
+      {
+        "energy_2f0": 102.543,
+        "energy_f0": 36.464,
+        "energy_f0_half": 362.138,
+        "midi": 83,
+        "start": 13.86
+      },
+      {
+        "energy_2f0": 76.986,
+        "energy_f0": 261.495,
+        "energy_f0_half": 179.175,
+        "midi": 81,
+        "start": 15.46
+      },
+      {
+        "energy_2f0": 5.599,
+        "energy_f0": 13.635,
+        "energy_f0_half": 114.501,
+        "midi": 83,
+        "start": 15.860000000000001
+      },
+      {
+        "energy_2f0": 48.667,
+        "energy_f0": 373.836,
+        "energy_f0_half": 383.546,
+        "midi": 84,
+        "start": 16.26
+      },
+      {
+        "energy_2f0": 25.266,
+        "energy_f0": 77.55,
+        "energy_f0_half": 175.133,
+        "midi": 84,
+        "start": 17.02
+      },
+      {
+        "energy_2f0": 62.446,
+        "energy_f0": 157.377,
+        "energy_f0_half": 107.214,
+        "midi": 79,
+        "start": 17.82
+      },
+      {
+        "energy_2f0": 4.839,
+        "energy_f0": 14.714,
+        "energy_f0_half": 274.868,
+        "midi": 76,
+        "start": 18.66
+      },
+      {
+        "energy_2f0": 1.12,
+        "energy_f0": 14.291,
+        "energy_f0_half": 84.147,
+        "midi": 72,
+        "start": 19.5
+      },
+      {
+        "energy_2f0": 14.184,
+        "energy_f0": 61.995,
+        "energy_f0_half": 489.201,
+        "midi": 79,
+        "start": 21.26
+      },
+      {
+        "energy_2f0": 15.755,
+        "energy_f0": 48.07,
+        "energy_f0_half": 41.951,
+        "midi": 76,
+        "start": 21.68
+      },
+      {
+        "energy_2f0": 23.749,
+        "energy_f0": 79.073,
+        "energy_f0_half": 100.427,
+        "midi": 72,
+        "start": 22.1
+      },
+      {
+        "energy_2f0": 9.497,
+        "energy_f0": 52.363,
+        "energy_f0_half": 159.418,
+        "midi": 76,
+        "start": 22.86
+      },
+      {
+        "energy_2f0": 33.187,
+        "energy_f0": 81.813,
+        "energy_f0_half": 165.018,
+        "midi": 79,
+        "start": 23.58
+      },
+      {
+        "energy_2f0": 10.229,
+        "energy_f0": 174.696,
+        "energy_f0_half": 208.635,
+        "midi": 84,
+        "start": 24.42
+      },
+      {
+        "energy_2f0": 50.698,
+        "energy_f0": 1126.846,
+        "energy_f0_half": 1256.214,
+        "midi": 88,
+        "start": 25.98
+      },
+      {
+        "energy_2f0": 0.206,
+        "energy_f0": 7.15,
+        "energy_f0_half": 23.639,
+        "midi": 86,
+        "start": 26.580000000000002
+      },
+      {
+        "energy_2f0": 18.755,
+        "energy_f0": 108.131,
+        "energy_f0_half": 100.976,
+        "midi": 84,
+        "start": 26.78
+      },
+      {
+        "energy_2f0": 13.492,
+        "energy_f0": 31.181,
+        "energy_f0_half": 83.902,
+        "midi": 76,
+        "start": 27.58
+      },
+      {
+        "energy_2f0": 49.412,
+        "energy_f0": 105.257,
+        "energy_f0_half": 99.668,
+        "midi": 78,
+        "start": 28.3
+      },
+      {
+        "energy_2f0": 27.917,
+        "energy_f0": 109.849,
+        "energy_f0_half": 117.388,
+        "midi": 79,
+        "start": 29.06
+      },
+      {
+        "energy_2f0": 11.387,
+        "energy_f0": 106.163,
+        "energy_f0_half": 136.957,
+        "midi": 79,
+        "start": 30.66
+      },
+      {
+        "energy_2f0": 15.531,
+        "energy_f0": 67.704,
+        "energy_f0_half": 262.248,
+        "midi": 79,
+        "start": 31.060000000000002
+      },
+      {
+        "energy_2f0": 28.93,
+        "energy_f0": 588.272,
+        "energy_f0_half": 493.622,
+        "midi": 88,
+        "start": 31.46
+      },
+      {
+        "energy_2f0": 2.645,
+        "energy_f0": 80.46,
+        "energy_f0_half": 129.732,
+        "midi": 86,
+        "start": 32.620000000000005
+      },
+      {
+        "energy_2f0": 102.758,
+        "energy_f0": 116.458,
+        "energy_f0_half": 1342.508,
+        "midi": 84,
+        "start": 33.02
+      },
+      {
+        "energy_2f0": 9.142,
+        "energy_f0": 144.6,
+        "energy_f0_half": 174.59,
+        "midi": 83,
+        "start": 33.82
+      },
+      {
+        "energy_2f0": 26.003,
+        "energy_f0": 56.052,
+        "energy_f0_half": 259.07,
+        "midi": 81,
+        "start": 35.42
+      },
+      {
+        "energy_2f0": 1.917,
+        "energy_f0": 56.348,
+        "energy_f0_half": 177.299,
+        "midi": 83,
+        "start": 35.84
+      },
+      {
+        "energy_2f0": 9.247,
+        "energy_f0": 109.0,
+        "energy_f0_half": 117.435,
+        "midi": 84,
+        "start": 36.26
+      },
+      {
+        "energy_2f0": 22.374,
+        "energy_f0": 90.488,
+        "energy_f0_half": 270.655,
+        "midi": 84,
+        "start": 37.06
+      },
+      {
+        "energy_2f0": 3.969,
+        "energy_f0": 7.908,
+        "energy_f0_half": 248.176,
+        "midi": 79,
+        "start": 37.9
+      },
+      {
+        "energy_2f0": 4.508,
+        "energy_f0": 17.333,
+        "energy_f0_half": 383.844,
+        "midi": 76,
+        "start": 38.74
+      },
+      {
+        "energy_2f0": 0.752,
+        "energy_f0": 13.709,
+        "energy_f0_half": 94.364,
+        "midi": 72,
+        "start": 39.5
+      },
+      {
+        "energy_2f0": 18.344,
+        "energy_f0": 147.956,
+        "energy_f0_half": 458.082,
+        "midi": 88,
+        "start": 41.74
+      },
+      {
+        "energy_2f0": 12.19,
+        "energy_f0": 430.687,
+        "energy_f0_half": 403.731,
+        "midi": 88,
+        "start": 42.16
+      },
+      {
+        "energy_2f0": 17.525,
+        "energy_f0": 478.715,
+        "energy_f0_half": 410.946,
+        "midi": 88,
+        "start": 42.58
+      },
+      {
+        "energy_2f0": 225.756,
+        "energy_f0": 789.63,
+        "energy_f0_half": 1412.005,
+        "midi": 89,
+        "start": 43.3
+      },
+      {
+        "energy_2f0": 73.795,
+        "energy_f0": 930.87,
+        "energy_f0_half": 929.804,
+        "midi": 91,
+        "start": 44.02
+      },
+      {
+        "energy_2f0": 78.926,
+        "energy_f0": 405.468,
+        "energy_f0_half": 850.04,
+        "midi": 91,
+        "start": 44.66
+      },
+      {
+        "energy_2f0": 1.859,
+        "energy_f0": 14.266,
+        "energy_f0_half": 39.418,
+        "midi": 89,
+        "start": 46.14
+      },
+      {
+        "energy_2f0": 1.707,
+        "energy_f0": 29.166,
+        "energy_f0_half": 60.611,
+        "midi": 88,
+        "start": 46.519999999999996
+      },
+      {
+        "energy_2f0": 2.61,
+        "energy_f0": 73.101,
+        "energy_f0_half": 277.607,
+        "midi": 86,
+        "start": 46.9
+      },
+      {
+        "energy_2f0": 2.616,
+        "energy_f0": 20.084,
+        "energy_f0_half": 101.042,
+        "midi": 88,
+        "start": 47.54
+      },
+      {
+        "energy_2f0": 1.716,
+        "energy_f0": 21.918,
+        "energy_f0_half": 178.502,
+        "midi": 89,
+        "start": 48.18
+      },
+      {
+        "energy_2f0": 33.0,
+        "energy_f0": 88.418,
+        "energy_f0_half": 453.235,
+        "midi": 89,
+        "start": 48.5
+      },
+      {
+        "energy_2f0": 55.709,
+        "energy_f0": 124.508,
+        "energy_f0_half": 536.611,
+        "midi": 89,
+        "start": 49.14
+      },
+      {
+        "energy_2f0": 2.68,
+        "energy_f0": 11.054,
+        "energy_f0_half": 39.807,
+        "midi": 89,
+        "start": 50.42
+      },
+      {
+        "energy_2f0": 25.687,
+        "energy_f0": 240.788,
+        "energy_f0_half": 435.619,
+        "midi": 88,
+        "start": 51.06
+      },
+      {
+        "energy_2f0": 0.217,
+        "energy_f0": 2.094,
+        "energy_f0_half": 3.425,
+        "midi": 86,
+        "start": 52.02
+      },
+      {
+        "energy_2f0": 1.631,
+        "energy_f0": 75.298,
+        "energy_f0_half": 118.594,
+        "midi": 86,
+        "start": 52.66
+      },
+      {
+        "energy_2f0": 2.745,
+        "energy_f0": 97.058,
+        "energy_f0_half": 201.771,
+        "midi": 84,
+        "start": 52.98
+      },
+      {
+        "energy_2f0": 8.122,
+        "energy_f0": 109.57,
+        "energy_f0_half": 159.35,
+        "midi": 83,
+        "start": 53.94
+      },
+      {
+        "energy_2f0": 3.257,
+        "energy_f0": 8.241,
+        "energy_f0_half": 11.843,
+        "midi": 81,
+        "start": 55.86
+      },
+      {
+        "energy_2f0": 1.241,
+        "energy_f0": 5.912,
+        "energy_f0_half": 34.214,
+        "midi": 83,
+        "start": 56.18
+      },
+      {
+        "energy_2f0": 20.788,
+        "energy_f0": 101.821,
+        "energy_f0_half": 146.474,
+        "midi": 84,
+        "start": 56.5
+      },
+      {
+        "energy_2f0": 52.888,
+        "energy_f0": 121.475,
+        "energy_f0_half": 172.479,
+        "midi": 76,
+        "start": 57.14
+      },
+      {
+        "energy_2f0": 15.003,
+        "energy_f0": 43.199,
+        "energy_f0_half": 217.972,
+        "midi": 78,
+        "start": 58.1
+      },
+      {
+        "energy_2f0": 59.173,
+        "energy_f0": 111.007,
+        "energy_f0_half": 57.419,
+        "midi": 79,
+        "start": 59.06
+      }
+    ],
+    "notes_checked": 75,
+    "notes_with_more_energy_at_f0_half": 62,
+    "transcribed_midi_range": [
+      72,
+      91
+    ]
+  },
+  "synth_eb_head": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "Eb:maj",
+        "C:min",
+        "Ab:maj",
+        "Bb:maj",
+        "Eb:maj",
+        "C:min",
+        "F:min",
+        "Bb:maj",
+        "Eb:maj",
+        "G:min",
+        "Ab:maj",
+        "Bb:maj",
+        "Ab:maj",
+        "Bb:maj",
+        "Eb:maj",
+        "Eb:maj",
+        "N"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "Eb:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "Eb:maj"
+  },
+  "synth_eb_release": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "D#:maj",
+        "C:min",
+        "G#:maj",
+        "A#:maj",
+        "D#:maj",
+        "C:min",
+        "F:min",
+        "A#:maj",
+        "D#:maj",
+        "G:min",
+        "G#:maj",
+        "A#:maj",
+        "G#:maj",
+        "A#:maj",
+        "D#:maj",
+        "D#:maj",
+        "N"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "D#:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "Eb:maj"
+  },
+  "synth_full": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "C:maj",
+        "A:min",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "A:min",
+        "D:min",
+        "G:maj",
+        "C:maj",
+        "E:min",
+        "F:maj",
+        "G:maj",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "C:maj",
+        "C:maj"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "C:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "C:maj"
+  },
+  "synth_merged": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "C:maj",
+        "A:min",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "A:min",
+        "D:min",
+        "G:maj",
+        "C:maj",
+        "E:min",
+        "F:maj",
+        "G:maj",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "C:maj",
+        "C:maj"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "C:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "C:maj"
+  },
+  "token_identity": {
+    "real_full": "64ee66380fb0fe0a05cf42dd4d10d33ddb04bbbd4daee93c4e91bc2122b4f7cc",
+    "real_full_head": "64ee66380fb0fe0a05cf42dd4d10d33ddb04bbbd4daee93c4e91bc2122b4f7cc",
+    "real_melody": "64ee66380fb0fe0a05cf42dd4d10d33ddb04bbbd4daee93c4e91bc2122b4f7cc",
+    "synth_eb_head": "6ea7c09170e5cf595a9f46ff8b8b73ae0366522d05774e73b24b98b701701dbe",
+    "synth_eb_release": "6ea7c09170e5cf595a9f46ff8b8b73ae0366522d05774e73b24b98b701701dbe",
+    "synth_full": "d212ae41eca38c1255693e512c3f185f1cd93113de1cce18561243a36cbbe377",
+    "synth_merged": "d212ae41eca38c1255693e512c3f185f1cd93113de1cce18561243a36cbbe377"
+  }
+}
