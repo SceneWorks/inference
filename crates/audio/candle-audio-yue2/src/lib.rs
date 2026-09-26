@@ -25,6 +25,17 @@
 //!   component's native port may derive from: the Apache-2.0 GitHub source for the LM, VAE and
 //!   tokenizer; the cover closure's code is treated as CC BY-NC 4.0 and its port is gated.
 //!
+//! Decoding (sc-22993):
+//!
+//! * [`latent`] — [`latent::AcousticLatents`], the cached `[frames, 64]` FP32 latent artifact with
+//!   its identity (content SHA-256, shape, dtype, source), verified at the decode boundary and
+//!   persisted as an upstream-compatible `latent.npy` + identity sidecar.
+//! * [`vae`] — the native FP32 Oobleck VAE for both published decoders (standard and legacy):
+//!   [`vae::Yue2Vae::load`] from a verified component, the full reference decode, the exact
+//!   halo/crop tiled decode, and the encoder posterior.
+//! * [`decode`] — [`decode::decode_latents`], the production path: verified latents → clamped
+//!   48 kHz stereo with decoder and latent identity in the output metadata.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!

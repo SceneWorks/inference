@@ -12,11 +12,12 @@ Two modes:
 ``crates/audio/candle-audio-yue2/tests/fixtures/``. It builds two upstream ``YuE2VAE`` models with
 the **released topology** (strides ``[2, 2, 4, 4, 5, 6]``, 64 latent channels, SnakeBeta,
 weight-norm, no final tanh, 2 audio channels) at toy widths, randomizes every parameter (weight-norm
-``g``/``v``, biases, SnakeBeta ``alpha``/``beta`` — none at identity), scales the final conv so ~10% of
-the raw waveform overshoots ±1 (so clamping is exercised) and saves each with upstream's own
-``save_pretrained`` as ``vae_tiny/<variant>/{config.json,model.safetensors}`` (``release_variant``
-``standard`` / ``legacy``, different seeds). ``vae_tiny_reference.safetensors`` holds, for one
-shared ``[frames, 64]`` latent (the ``latent.npy`` layout ``synthesize`` returns):
+``g``/``v``, biases, SnakeBeta ``alpha``/``beta`` — none at identity), scales the final conv so
+~10% of the raw waveform overshoots ±1 (so clamping is exercised) and saves each with upstream's
+own ``save_pretrained`` as ``vae_tiny/<variant>/{config.json,model.safetensors}``
+(``release_variant`` ``standard`` / ``legacy``, different seeds).
+``vae_tiny_reference.safetensors`` holds, for one shared ``[frames, 64]`` latent
+(the ``latent.npy`` layout ``synthesize`` returns):
 
 * ``<variant>.full_raw`` — ``YuE2VAE.decode`` (unclamped ``[1, 2, S]``);
 * ``<variant>.pipeline_tiled`` — ``YuE2Pipeline.decode`` itself (called unbound on a stub carrying
@@ -103,7 +104,7 @@ def sha256_file(path: Path) -> str:
 
 def environment() -> dict:
     env = Path(os.environ.get("YUE2_REF_DIR", Path.home() / ".cache/sceneworks-yue2-ref"))
-    data = json.loads((env / "ENVIRONMENT.json").read_text())
+    data = json.loads((env / "ENVIRONMENT.json").read_text(encoding="utf-8"))
     if data["yue2_commit"] != YUE2_COMMIT:
         sys.exit(f"reference environment is at {data['yue2_commit']}, expected {YUE2_COMMIT}")
     packages = data["packages"]
@@ -191,7 +192,8 @@ def tiny() -> None:
     latent = latent_t64.T.unsqueeze(0).contiguous()
     t = torch.arange(TINY_AUDIO, dtype=torch.float32) / 48000.0
     audio = torch.stack([
-        0.6 * torch.sin(2 * math.pi * 330.0 * t) + 0.1 * torch.randn(TINY_AUDIO, generator=generator),
+        0.6 * torch.sin(2 * math.pi * 330.0 * t)
+        + 0.1 * torch.randn(TINY_AUDIO, generator=generator),
         0.2 * torch.sin(2 * math.pi * 1210.0 * t),
     ]).unsqueeze(0)
 
@@ -260,7 +262,8 @@ def tiny() -> None:
         "latent_sha256": sha256_bytes(latent_t64.numpy().astype("<f4").tobytes()),
         "variants": meta_variants,
     }
-    (FIXTURE_DIR / "vae_tiny_reference.json").write_text(json.dumps(meta, indent=2) + "\n")
+    (FIXTURE_DIR / "vae_tiny_reference.json").write_text(
+        json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(meta, indent=2))
 
 
@@ -350,7 +353,8 @@ def real(hub: Path, out: Path) -> None:
         "latent_sha256": sha256_bytes(tensors["latent"].numpy().astype("<f4").tobytes()),
         "decoders": record,
     }
-    (FIXTURE_DIR / "vae_real_reference.json").write_text(json.dumps(meta, indent=2) + "\n")
+    (FIXTURE_DIR / "vae_real_reference.json").write_text(
+        json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(meta, indent=2))
 
 

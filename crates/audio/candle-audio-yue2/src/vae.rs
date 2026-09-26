@@ -1188,7 +1188,7 @@ pub(crate) mod tests {
 
     /// Every released-topology invariant: the natural length rule (`1920·T − 64`) and the
     /// required halo (12 ≤ 16) agree with upstream's values recorded in the fixture
-    /// (mutation: give ConvT an output padding of `s mod 2` → length red; drop the Residual branch
+    /// (mutation: give ConvT an output padding of `s mod 2` → length red; treat a Residual as pass-through
     /// from the dependency interval → halo red).
     #[test]
     fn geometry_matches_upstream() {

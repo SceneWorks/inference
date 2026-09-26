@@ -164,11 +164,6 @@ impl DecodedAudio {
         self.metadata.samples
     }
 
-    /// Duration in seconds.
-    pub fn duration_seconds(&self) -> f64 {
-        self.metadata.samples as f64 / self.metadata.sample_rate as f64
-    }
-
     /// The provenance.
     pub fn metadata(&self) -> &DecodeMetadata {
         &self.metadata
@@ -455,7 +450,6 @@ mod tests {
         assert_eq!(j["channels"], 2);
         assert_eq!(j["vae_dtype"], "float32");
         assert_eq!(a.metadata().sample_rate, 48_000);
-        assert!((a.duration_seconds() - a.frames() as f64 / 48_000.0).abs() < 1e-12);
     }
 
     /// Switching decoder reuses the persisted, verified latents: one saved artifact is loaded and

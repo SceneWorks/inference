@@ -350,17 +350,15 @@ impl AcousticLatents {
     }
 
     /// The exact bytes `numpy.save` writes for this `[frames, 64]` C-order `float32` array
-    /// (format 1.0, numpy's header growth padding and 64-byte alignment).
+    /// (format 1.0, header padded to 64-byte alignment). numpy also appends "growth" spaces
+    /// (`21 - digits(frames)`) before aligning; for this header they never cross a 64-byte
+    /// boundary, so the aligned result (128 header bytes) is identical without them.
     pub fn to_npy(&self) -> Vec<u8> {
-        let mut header = format!(
+        let header = format!(
             "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, {}), }}",
             self.frames(),
             LATENT_CHANNELS
         );
-        // numpy leaves room to grow the leading axis in place: GROWTH_AXIS_MAX_DIGITS (21) minus
-        // the digits of shape[0].
-        let digits = self.frames().to_string().len();
-        header.push_str(&" ".repeat(21usize.saturating_sub(digits)));
         // `_wrap_header`: pad so magic (8) + u16 length (2) + header + '\n' is a multiple of 64;
         // numpy's pad is 64 - (len % 64), i.e. a full 64 when already aligned.
         let hlen = header.len() + 1;
@@ -544,8 +542,8 @@ mod tests {
         assert_eq!(latents.identity().shape(), [latents.frames(), 64]);
     }
 
-    /// `to_npy` reproduces `numpy.save` byte for byte (mutation: drop numpy's growth padding or
-    /// alignment → red), and reads back to the same identity.
+    /// `to_npy` reproduces `numpy.save` byte for byte (mutation: drop the 64-byte alignment
+    /// padding → red), and reads back to the same identity.
     #[test]
     fn npy_writer_is_byte_identical_to_numpy_save() {
         let latents = fixture_latents();
@@ -568,7 +566,7 @@ mod tests {
         );
     }
 
-    /// Several frame counts round-trip, including ones whose header pads to a full 64 bytes.
+    /// Several frame counts round-trip, each with numpy's fixed 128-byte header.
     #[test]
     fn npy_round_trips_across_header_lengths() {
         for frames in [1usize, 9, 10, 99, 1000, 123456] {
@@ -577,7 +575,8 @@ mod tests {
             let npy = l.to_npy();
             assert_eq!(&npy[..8], b"\x93NUMPY\x01\x00");
             let hlen = u16::from_le_bytes([npy[8], npy[9]]) as usize;
-            assert_eq!((10 + hlen) % 64, 0, "frames {frames}");
+            // numpy writes a 128-byte header for every [frames, 64] f4 array (checked with numpy 2.2.6).
+            assert_eq!(10 + hlen, 128, "frames {frames}");
             assert_eq!(AcousticLatents::from_npy(&npy, source()).unwrap(), l);
         }
     }
