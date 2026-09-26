@@ -212,7 +212,7 @@ pub struct Transcriber {
 }
 
 /// The files of a cover closure, for loading outside a [`VerifiedClosure`] (fixtures).
-pub struct ClosureFiles {
+pub(crate) struct ClosureFiles {
     /// SheetSage2 `config.json`.
     pub sheetsage2_config: serde_json::Value,
     /// MERT `config.json`.
@@ -314,7 +314,7 @@ impl Transcriber {
 
     /// Load from explicit closure files (tiny fixtures and tests). `identity` records what they
     /// are; its tokenizer fingerprint is filled from the model.
-    pub fn from_files(
+    pub(crate) fn from_files(
         files: ClosureFiles,
         mut identity: ClosureIdentity,
         device: &Device,

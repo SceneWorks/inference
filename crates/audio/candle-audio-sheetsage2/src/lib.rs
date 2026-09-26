@@ -1,20 +1,28 @@
 //! Native SheetSage2 + MERT-v2-FullSong recording-to-score transcription, and the YuE2 zero-shot
 //! cover path built on it (epic sc-22988, story sc-22996).
 //!
-//! # Licence — noncommercial, never relicensed
+//! # Licence — gated, provisional, never relicensed
 //!
-//! This crate is a port of the remote Python published inside `m-a-p/SheetSage2` and
-//! `m-a-p/MERT-v2-FullSong`. That code carries no code licence of its own and both repositories
-//! declare `cc-by-nc-4.0`, so — per the disposition recorded by sc-22989 in
-//! [`candle_audio_yue2::license::CODE_TERMS`] — code derived from it is treated as **CC BY-NC 4.0**:
-//! noncommercial use only, with attribution to Multimodal Art Projection (SheetSage2 /
-//! MERT-v2-FullSong, <https://huggingface.co/m-a-p/SheetSage2>,
-//! <https://huggingface.co/m-a-p/MERT-v2-FullSong>). It is a separate crate precisely so that none of
-//! it enters the Apache-2.0 `candle-audio-yue2` crate; the Cargo `license` field says
-//! `CC-BY-NC-4.0`, and `deny.toml` admits it by a scoped, reasoned exception. Every entry point that
-//! runs the models first passes [`candle_audio_yue2::license::authorize`] for
+//! This crate reimplements the remote Python published inside `m-a-p/SheetSage2` and
+//! `m-a-p/MERT-v2-FullSong` (Multimodal Art Projection). Upstream grants a licence for the model
+//! **weights only**: the LICENSE in both repositories is a "MERT2 model-weight license" (CC BY-NC 4.0
+//! for `model.safetensors`) that "does not replace separately applicable licenses for code", and
+//! the remote Python carries no licence of its own. So **no upstream licence covers the code this
+//! crate is derived from.**
+//!
+//! The Cargo `license = "CC-BY-NC-4.0"` is therefore not an upstream grant but the **provisional
+//! disposition** recorded by sc-22989 ([`candle_audio_yue2::license::CODE_TERMS`], whose cover-port
+//! disposition stays `Gated`): the most restrictive terms of the surrounding repositories,
+//! noncommercial only with attribution, until the owner records a basis — an explicit code licence
+//! from the rights holder, or an owner decision. Until then the crate is gated: it is a separate
+//! crate so none of it enters the Apache-2.0 `candle-audio-yue2`, it is not composed into the audio
+//! catalog or any runtime bundle, and `deny.toml` admits it by one scoped, reasoned exception. The
+//! crate's `NOTICE` records the upstream works, revisions, the weight licence and the modifications.
+//!
+//! The public entry points that load the models ([`provider::Transcriber::load`]) first pass
+//! [`candle_audio_yue2::license::authorize`] for
 //! [`IntendedUse::NoncommercialExperimentation`](candle_audio_yue2::license::IntendedUse) over the
-//! cover closure.
+//! cover closure; the lower-level loaders are crate-private.
 //!
 //! # What is here
 //!

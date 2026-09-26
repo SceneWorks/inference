@@ -140,15 +140,15 @@ fn error(ours: &Tensor, theirs: &Tensor) -> (f32, f32) {
 /// Every MERT2 hidden state (mel, subsampler, 24 blocks), the layer mix, the decoder memory and
 /// the first-step logits against upstream's torch CPU fp32 run on the same arrays.
 ///
-/// Tolerances (relative = max-abs over the reference's max-abs), from the values this test
-/// measured on aarch64 CPU (2026-09-26), with ~2x headroom:
+/// Tolerances (relative = max-abs over the reference's max-abs), **per case**, from the values
+/// this test measured on aarch64 CPU (2026-09-26, twice, identical), with 2–4x headroom each:
 ///
-/// | state | synth (measured) | nav_ssb (measured) | bound |
-/// |---|---|---|---|
-/// | mel | 4.0e-4 | 1.9e-5 | 1e-3 |
-/// | subsampler + 24 blocks, worst | 5.8e-3 (block 15) | 5.1e-4 (block 15) | 1.5e-2 |
-/// | decoder memory | 8.3e-3 | 4.2e-4 | 1.5e-2 |
-/// | first-step logits | 4.2e-6 | 9.7e-7 | 1e-4 |
+/// | state | synth measured / bound | nav_ssb measured / bound |
+/// |---|---|---|
+/// | mel | 4.0e-4 / 1e-3 | 1.9e-5 / 1e-4 |
+/// | subsampler + 24 blocks, worst | 5.8e-3 (block 15) / 1.5e-2 | 5.1e-4 (block 15) / 2e-3 |
+/// | decoder memory | 8.3e-3 / 1.5e-2 | 4.2e-4 / 2e-3 |
+/// | first-step logits | 4.2e-6 / 1e-5 | 9.7e-7 / 5e-6 |
 ///
 /// The synthetic clip is ~15x looser than the recording: its spectra have near-empty bands and an
 /// exact-zero tail, where the float32 FFT noise floors of this port and torch's pocketfft differ in
@@ -159,7 +159,10 @@ fn encoder_states_match_the_reference() {
     let transcriber = load();
     let model = transcriber.model();
     let dumps = env_dir("SHEETSAGE2_PARITY_DUMPS");
-    for name in ["synth", "nav_ssb"] {
+    // (case, mel bound, hidden-state / memory bound, logits bound) — see the table above.
+    for (name, mel_bound, state_bound, logit_bound) in
+        [("synth", 1e-3, 1.5e-2, 1e-5), ("nav_ssb", 1e-4, 2e-3, 5e-6)]
+    {
         let reference = candle_audio_sheetsage2::candle_core::safetensors::load(
             dumps.join(format!("{name}.safetensors")),
             &Device::Cpu,
@@ -177,7 +180,7 @@ fn encoder_states_match_the_reference() {
         let mut worst = 0.0f32;
         let (m_abs, m_rel) = error(&features.mel, &get("mel"));
         println!("  mel: max_abs {m_abs:.3e} rel {m_rel:.3e}");
-        assert!(m_rel <= 1e-3, "{name} mel: relative {m_rel:.3e}");
+        assert!(m_rel <= mel_bound, "{name} mel: relative {m_rel:.3e}");
         let mut states = vec![("input_hidden".to_string(), features.input_hidden.clone())];
         for (i, b) in features.blocks.iter().enumerate() {
             states.push((format!("block.{i}"), b.clone()));
@@ -188,7 +191,7 @@ fn encoder_states_match_the_reference() {
             let (abs, rel) = error(ours, &get(key));
             println!("  {key}: max_abs {abs:.3e} rel {rel:.3e}");
             worst = worst.max(rel);
-            assert!(rel <= 1.5e-2, "{name} {key}: relative {rel:.3e}");
+            assert!(rel <= state_bound, "{name} {key}: relative {rel:.3e}");
         }
         // First decoder step over the prompt prefix: the last position's raw logits.
         let prefix: Vec<u32> = [1, 4, 5, 6, 7, 9, 11, 3].to_vec();
@@ -205,7 +208,10 @@ fn encoder_states_match_the_reference() {
         let ours = Tensor::new(first.unwrap(), &Device::Cpu).unwrap();
         let (abs, rel) = error(&ours, &theirs);
         println!("  prefix logits: max_abs {abs:.3e} rel {rel:.3e}; worst hidden rel {worst:.3e}");
-        assert!(rel <= 1e-4, "{name} prefix logits: relative {rel:.3e}");
+        assert!(
+            rel <= logit_bound,
+            "{name} prefix logits: relative {rel:.3e}"
+        );
     }
     let receipt = transcriber.unload();
     assert!(receipt.released);

@@ -22,6 +22,11 @@ const NON_VOCAL_SECTIONS: [&str; 8] = [
     "inst",
 ];
 
+/// Whether a normalized section label carries no lyrics (intro, outro, instrumental, …).
+pub fn is_non_vocal(label: &str) -> bool {
+    NON_VOCAL_SECTIONS.contains(&label)
+}
+
 /// One `[Tag]` section of a lyric sheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LyricSection {
@@ -152,7 +157,7 @@ pub fn score_sections(score: &Score) -> Vec<ScoreSection> {
             .filter(|n| n.onset >= *start && end.is_none_or(|e| n.onset < e))
             .count();
         let label = normalize_label(label);
-        if notes > 0 && !NON_VOCAL_SECTIONS.contains(&label.as_str()) {
+        if notes > 0 && !is_non_vocal(&label) {
             out.push(ScoreSection {
                 label,
                 vocal_notes: notes,

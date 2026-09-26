@@ -24,6 +24,7 @@ impl Weights {
     }
 
     /// Wrap an in-memory map (tests).
+    #[cfg(test)]
     pub fn from_map(label: &'static str, tensors: HashMap<String, Tensor>) -> Self {
         Self { label, tensors }
     }

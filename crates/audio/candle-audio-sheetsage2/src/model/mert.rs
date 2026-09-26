@@ -378,7 +378,7 @@ impl MertEncoder {
     /// `adapters`: `adapter.layers.{i}.attn.{query,key,value,out}_proj.lora_{A,B}.weight`). The
     /// merge `W += (B @ A) · alpha / rank` runs in float32 on the CPU before the tensors move to
     /// `device`.
-    pub fn load(
+    pub(crate) fn load(
         config: &MertConfig,
         parent: &mut Weights,
         adapters: &mut Weights,

@@ -68,7 +68,7 @@ impl DecoderCache {
 
 impl Decoder {
     /// Load from SheetSage2's `token_embedding.weight` and `decoder.*` for `config`'s shape.
-    pub fn load(
+    pub(crate) fn load(
         w: &mut Weights,
         config: &SheetSage2Config,
         device: &Device,

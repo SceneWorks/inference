@@ -236,3 +236,121 @@ fn lyric_helpers() {
     assert_eq!(estimate_syllables("你好世界"), 4);
     assert_eq!(estimate_syllables("the twilight's last gleaming"), 6);
 }
+
+fn codes(prepared: &PreparedCover) -> Vec<&'static str> {
+    prepared.report.warnings.iter().map(|w| w.code).collect()
+}
+
+/// A two-bar verse: four vocal quarter notes per bar (eight notes), an instrumental line, no chords.
+fn verse_score() -> String {
+    small("% verse\nV: Vocal\nC8D8E8F8|G8A8B8c8|\nV: Ins\nE16G16|C32|\n")
+}
+
+/// Each lyric-check warning, on crafted scores and lyrics.
+///
+/// Mutations that must fail: `translation_line_count` — compare `lines.len()` with `>` instead of
+/// `!=`; `translation_syllables` — bound `0.3` → `3.0`; `no_vocal_melody` — drop the check;
+/// `syllables_vs_notes` — bound `1.5 *` → `15.0 *` (the reviewer's surviving mutation).
+#[test]
+fn every_lyric_warning_fires_on_its_case() {
+    let score = verse_score();
+    let prepare = |lyrics: CoverLyrics, text: &str| {
+        prepare_cover(&CoverSpec::new(CoverMode::Melody, text, STYLE, lyrics)).unwrap()
+    };
+    // Eight notes, eight syllables: nothing to report.
+    let clean = prepare(
+        CoverLyrics::source("[Verse]\nla la la la\nla la la la\n"),
+        &score,
+    );
+    assert!(
+        clean.report.warnings.is_empty(),
+        "{:?}",
+        clean.report.warnings
+    );
+
+    // 20 syllables for 8 notes (> 1.5x): syllables_vs_notes.
+    let many = prepare(
+        CoverLyrics::source(
+            "[Verse]\nla la la la la la la la la la\nla la la la la la la la la la\n",
+        ),
+        &score,
+    );
+    assert!(
+        codes(&many).contains(&"syllables_vs_notes"),
+        "{:?}",
+        codes(&many)
+    );
+    // 2 syllables for 8 notes (< 0.5x): syllables_vs_notes.
+    let few = prepare(CoverLyrics::source("[Verse]\nla la\n"), &score);
+    assert!(
+        codes(&few).contains(&"syllables_vs_notes"),
+        "{:?}",
+        codes(&few)
+    );
+
+    // A translation with a line fewer than its source: translation_line_count (only).
+    let fewer_lines = prepare(
+        CoverLyrics::translation(
+            "[Verse]\nla la la la la la la la\n",
+            "[Verse]\nla la la la\nla la la la\n",
+        ),
+        &score,
+    );
+    assert_eq!(codes(&fewer_lines), vec!["translation_line_count"]);
+
+    // A translation with 2x the source's syllables: translation_syllables.
+    let longer = prepare(
+        CoverLyrics::translation(
+            "[Verse]\nla la la la la la la la\nla la la la la la la la\n",
+            "[Verse]\nla la la la\nla la la la\n",
+        ),
+        &score,
+    );
+    assert!(
+        codes(&longer).contains(&"translation_syllables"),
+        "{:?}",
+        codes(&longer)
+    );
+
+    // A score whose Vocal voice is silent: no_vocal_melody.
+    let instrumental = small("% verse\nV: Vocal\nZ|\nV: Ins\nE16G16|\n");
+    let silent = prepare(CoverLyrics::source("[Verse]\nla la\n"), &instrumental);
+    assert!(
+        codes(&silent).contains(&"no_vocal_melody"),
+        "{:?}",
+        codes(&silent)
+    );
+}
+
+/// Intro / outro / instrumental tags (and empty sections) in the lyrics are not sung, just as the
+/// score's non-vocal sections are not counted, so they never cause `sections_misaligned`; a sung
+/// section the score lacks still does.
+///
+/// Mutation that must fail: drop the `is_non_vocal` / non-empty filter from the lyric labels.
+#[test]
+fn non_vocal_lyric_tags_do_not_misalign_sections() {
+    let score = verse_score();
+    let with_intro = prepare_cover(&CoverSpec::new(
+        CoverMode::Melody,
+        &score,
+        STYLE,
+        CoverLyrics::source(
+            "[Intro]\n(guitar)\n\n[Verse]\nla la la la\nla la la la\n\n[Outro]\n\n",
+        ),
+    ))
+    .unwrap();
+    assert_eq!(with_intro.report.lyric_sections, vec!["verse"]);
+    assert!(
+        !codes(&with_intro).contains(&"sections_misaligned"),
+        "{:?}",
+        with_intro.report.warnings
+    );
+    let extra = prepare_cover(&CoverSpec::new(
+        CoverMode::Melody,
+        &score,
+        STYLE,
+        CoverLyrics::source("[Verse]\nla la la la\nla la la la\n[Chorus]\nla la\n"),
+    ))
+    .unwrap();
+    assert!(codes(&extra).contains(&"sections_misaligned"));
+}

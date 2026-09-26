@@ -200,7 +200,7 @@ impl ClosureIdentity {
             "ported_code_revision": self.ported_code_revision,
             "tokenizer_fingerprint": self.tokenizer_fingerprint,
             "device": self.device,
-            "licence": "CC-BY-NC-4.0 weights and derived code; noncommercial experimentation only",
+            "licence": "weights CC BY-NC 4.0 (upstream grant); the port has no upstream code licence and is provisionally CC BY-NC 4.0 (see NOTICE); noncommercial experimentation only",
         })
     }
 
@@ -548,7 +548,11 @@ fn samples_sha256(samples: &[f32]) -> String {
     for s in samples {
         hasher.update(s.to_le_bytes());
     }
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 impl Transcription {
@@ -644,8 +648,10 @@ impl Transcription {
     /// The whole manifest. Replay rebuilds it with this same function and requires it to equal the
     /// persisted one field for field.
     fn manifest(&self, tokenizer: &Tokenizer, files: &BTreeMap<String, Vec<u8>>) -> Value {
-        let digests: BTreeMap<&String, String> =
-            files.iter().map(|(rel, bytes)| (rel, sha256_hex(bytes))).collect();
+        let digests: BTreeMap<&String, String> = files
+            .iter()
+            .map(|(rel, bytes)| (rel, sha256_hex(bytes)))
+            .collect();
         json!({
             "schema": SCHEMA,
             "source": self.source.to_json(),
@@ -899,7 +905,9 @@ impl ReviewArtifact {
         let source = self.source()?;
         let raw = self.read(SOURCE_AUDIO)?;
         if raw.len() % 4 != 0 {
-            return Err(Error::Replay(format!("{SOURCE_AUDIO} is not float32 samples")));
+            return Err(Error::Replay(format!(
+                "{SOURCE_AUDIO} is not float32 samples"
+            )));
         }
         let audio: Vec<f32> = raw
             .chunks_exact(4)
@@ -914,7 +922,9 @@ impl ReviewArtifact {
             self.manifest["window_seconds"]
                 .as_f64()
                 .ok_or_else(|| bad("window_seconds"))?,
-            self.manifest["time_hz"].as_u64().ok_or_else(|| bad("time_hz"))? as u32,
+            self.manifest["time_hz"]
+                .as_u64()
+                .ok_or_else(|| bad("time_hz"))? as u32,
             Some(&closure.tokenizer_fingerprint),
         )?;
         let windows: Vec<Value> = serde_json::from_slice(&self.read(TOKENS_JSON)?)

@@ -226,7 +226,8 @@ fn hand_edited_manifest_fields_are_refused() {
     // its edit, not by re-serialization.
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&parsed).unwrap()).unwrap();
     assert!(ReviewArtifact::open(&dir).is_ok());
-    let edits: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+    type Edit = Box<dyn Fn(&mut Value)>;
+    let edits: Vec<(&str, Edit)> = vec![
         (
             "review.cover.melody forced ready",
             Box::new(|m| m["review"]["cover"]["melody"] = json!({"ready": true})),
@@ -239,7 +240,10 @@ fn hand_edited_manifest_fields_are_refused() {
             "abc_error.full invented",
             Box::new(|m| m["abc_error"]["full"] = json!("forged")),
         ),
-        ("melody_notes inflated", Box::new(|m| m["melody_notes"] = json!(12))),
+        (
+            "melody_notes inflated",
+            Box::new(|m| m["melody_notes"] = json!(12)),
+        ),
         (
             "source.sha256 replaced",
             Box::new(|m| m["source"]["sha256"] = json!("1".repeat(64))),

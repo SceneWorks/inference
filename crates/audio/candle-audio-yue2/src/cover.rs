@@ -27,7 +27,7 @@ use crate::protocol::{
     CotMode, ProtocolError, SongRequest, SongRequestSpec, DEFAULT_ID, DEFAULT_SEED,
 };
 use abc::{KeepVoice, Score};
-use lyrics::{estimate_syllables, score_sections, sections, LyricSection};
+use lyrics::{estimate_syllables, is_non_vocal, score_sections, sections, LyricSection};
 
 /// How much of the score the cover keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -272,10 +272,13 @@ pub fn prepare_cover(spec: &CoverSpec) -> Result<PreparedCover, CoverError> {
         }
     }
     let score_vocal = score_sections(&score);
-    let lyric_labels: Vec<String> = labels(&lyric_sections)
-        .into_iter()
-        .filter(|l| !l.is_empty())
+    // The lyric sections that are sung: the same filter `score_sections` applies to the score
+    // (tagged, non-empty, not an intro / outro / instrumental-type label).
+    let sung: Vec<&LyricSection> = lyric_sections
+        .iter()
+        .filter(|s| !s.label.is_empty() && !s.lines.is_empty() && !is_non_vocal(&s.label))
         .collect();
+    let lyric_labels: Vec<String> = sung.iter().map(|s| s.label.clone()).collect();
     let score_labels: Vec<String> = score_vocal.iter().map(|s| s.label.clone()).collect();
     if notes[0] == 0 && spec.keep != KeepVoice::Ins {
         warnings.push(CoverWarning {
@@ -294,10 +297,7 @@ pub fn prepare_cover(spec: &CoverSpec) -> Result<PreparedCover, CoverError> {
         });
     }
     if lyric_labels.len() == score_vocal.len() {
-        for (section, lyric) in score_vocal
-            .iter()
-            .zip(lyric_sections.iter().filter(|s| !s.label.is_empty()))
-        {
+        for (section, lyric) in score_vocal.iter().zip(&sung) {
             let s = syllables(lyric);
             if s > 0
                 && (s as f64 > 1.5 * section.vocal_notes as f64

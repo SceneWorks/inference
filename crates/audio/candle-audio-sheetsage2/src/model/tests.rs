@@ -99,14 +99,18 @@ fn encoder_states_match_upstream() {
     );
 }
 
-/// Greedy decoding under the grammar reproduces upstream's tokens exactly, and the first step's raw
-/// logits agree. The fixture's minimum greedy margin (> 0.02) shows the comparison is not a string
-/// of near-ties.
+/// Greedy decoding under the grammar reproduces upstream's tokens exactly, and **every** step's raw
+/// logits agree with upstream's (`output.step_logits`, one row per generated token) within 1e-4
+/// relative. The fixture's seed was chosen so the tokens vary (20 distinct ids, no id repeated more
+/// than three times in a row), decode strictly, have no near-ties (minimum greedy margin 0.0299), and
+/// are well conditioned (upstream's own float32 run drifts at most 4.3e-5 from float64). Measured
+/// native worst step: 4.8e-5 on aarch64.
 ///
-/// Mutations that must fail: drop the BART position offset of 2, skip `layernorm_embedding`, or use
-/// the grammar-unmasked argmax.
+/// Mutations that must fail: drop the BART position offset of 2, skip `layernorm_embedding`, use
+/// the grammar-unmasked argmax, drop the self-attention KV cache (attend only to the new token), or
+/// freeze the positions after the prefix.
 #[test]
-fn greedy_tokens_match_upstream_exactly() {
+fn greedy_tokens_and_every_step_match_upstream() {
     let _serial = crate::test_lock();
     let model = tiny_model();
     let reference = tiny_reference();
@@ -114,7 +118,7 @@ fn greedy_tokens_match_upstream_exactly() {
     let waveform = tensors["input.waveform"].to_vec1::<f32>().unwrap();
     let memory = model.encode(&waveform).unwrap();
     let prefix = model.tokenizer().prompt_prefix(&FULL_TASK_PROMPTS).unwrap();
-    let mut first_logits = None;
+    let mut steps: Vec<Vec<f32>> = Vec::new();
     let tokens = model
         .generate(
             &memory,
@@ -122,9 +126,7 @@ fn greedy_tokens_match_upstream_exactly() {
             reference["max_sequence_length"].as_u64().unwrap() as usize,
             Some(reference["stop_time_seconds"].as_f64().unwrap()),
             |step| {
-                if first_logits.is_none() {
-                    first_logits = Some(step.logits.to_vec());
-                }
+                steps.push(step.logits.to_vec());
                 Ok(())
             },
         )
@@ -136,11 +138,63 @@ fn greedy_tokens_match_upstream_exactly() {
         .map(|t| t.as_u64().unwrap() as u32)
         .collect();
     assert_eq!(tokens, expected);
-    assert!(reference["greedy_min_margin"].as_f64().unwrap() > 0.02);
-    let ours = Tensor::new(first_logits.unwrap(), &Device::Cpu).unwrap();
-    let (max_abs, relative) = error(&ours, &tensors["output.first_logits"]);
-    println!("first logits: max_abs {max_abs:.3e} relative {relative:.3e}");
-    assert!(relative < 1e-4);
+    let distinct: std::collections::BTreeSet<&u32> = expected[prefix.len()..].iter().collect();
+    assert!(distinct.len() >= 12, "the oracle must vary: {distinct:?}");
+    assert!(reference["greedy_min_margin"].as_f64().unwrap() > 0.01);
+    let theirs = &tensors["output.step_logits"];
+    assert_eq!(theirs.dim(0).unwrap(), steps.len());
+    let mut worst = 0.0f32;
+    for (i, ours) in steps.iter().enumerate() {
+        let ours = Tensor::new(ours.as_slice(), &Device::Cpu).unwrap();
+        let (_, relative) = error(&ours, &theirs.get(i).unwrap());
+        worst = worst.max(relative);
+        assert!(relative <= 1e-4, "step {i}: relative {relative:.3e}");
+    }
+    println!("{} steps, worst relative {worst:.3e}", steps.len());
+}
+
+/// Incremental decoding (cached self-attention K/V, cached cross-attention K/V, positions offset by
+/// the cache length) equals a full recompute of the whole sequence at every step, within 5e-5
+/// relative (measured worst 8.3e-6; only summation order differs). Native only: it checks the cache
+/// against the uncached path, independent of upstream.
+///
+/// Mutations that must fail: drop the self-attention KV cache, or freeze the positions after the
+/// prefix.
+#[test]
+fn cached_steps_equal_a_full_recompute() {
+    let _serial = crate::test_lock();
+    let model = tiny_model();
+    let reference = tiny_reference();
+    let tensors = tensors(include_bytes!("../../testdata/tiny/reference.safetensors"));
+    let memory = model
+        .encode(&tensors["input.waveform"].to_vec1::<f32>().unwrap())
+        .unwrap();
+    let tokens: Vec<u32> = reference["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    let prefix_len = model
+        .tokenizer()
+        .prompt_prefix(&FULL_TASK_PROMPTS)
+        .unwrap()
+        .len();
+    let decoder = &model.decoder;
+    let mut cache = decoder.start(&memory).unwrap();
+    let mut incremental = vec![decoder.step(&mut cache, &tokens[..prefix_len]).unwrap()];
+    for i in prefix_len..tokens.len() - 1 {
+        incremental.push(decoder.step(&mut cache, &tokens[i..=i]).unwrap());
+    }
+    let mut worst = 0.0f32;
+    for (k, cached) in incremental.iter().enumerate() {
+        let mut fresh = decoder.start(&memory).unwrap();
+        let full = decoder.step(&mut fresh, &tokens[..prefix_len + k]).unwrap();
+        let (_, relative) = error(cached, &full);
+        worst = worst.max(relative);
+        assert!(relative <= 5e-5, "step {k}: relative {relative:.3e}");
+    }
+    println!("{} steps, worst relative {worst:.3e}", incremental.len());
 }
 
 /// A checkpoint that is not float32, has an extra tensor, or pairs with a different parent

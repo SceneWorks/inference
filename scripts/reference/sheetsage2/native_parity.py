@@ -58,6 +58,9 @@ TINY_SEED = 22996
 TINY_SAMPLE_RATE = 1600
 TINY_WINDOW_SECONDS = 1.0
 TINY_SIGNAL_SECONDS = 0.8
+# Weight spread (× 1/sqrt(fan_in)) of the tiny BART decoder layers: large enough that a layer's
+# output outweighs the tied-embedding residual, so greedy decoding does not just repeat its input.
+TINY_DECODER_SPREAD = 8.0
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -122,20 +125,70 @@ def load_arrays(work_fixtures: Path) -> dict:
 # ------------------------------------------------------------------------------------------ tiny
 
 def tiny(out: Path) -> None:
-    import numpy as np
     import torch
     from safetensors.torch import save_file
 
     modules, _ = upstream_package(SHEETSAGE2_HEAD_REVISION)
+    torch.set_num_threads(1)
+    # Seeds are tried in order until upstream's greedy decode is a *useful* oracle: it decodes
+    # strictly (so the native transcribe path runs end to end), it varies (a string of one repeated
+    # token cannot tell a broken KV cache or frozen positions from a working one), and it has no
+    # near-ties. The chosen seed is recorded.
+    for seed in range(TINY_SEED, TINY_SEED + 2000):
+        run = _tiny_run(modules, seed)
+        if run["accept"]:
+            break
+    else:
+        raise SystemExit("no seed in range produced a usable tiny oracle")
+    out.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.contiguous() for k, v in run["parent"].items()},
+              str(out / "mert_parent.safetensors"))
+    save_file({k: v.contiguous() for k, v in run["head"].items()},
+              str(out / "sheetsage2_head.safetensors"))
+    save_file(run["tensors"], str(out / "reference.safetensors"))
+    tokenizer, config, tokens, margins = run["tokenizer"], run["config"], run["tokens"], run["margins"]
+    finite = [m for m in margins if m != float("inf")]
+    write_json(out / "reference.json", {
+        "generator": "scripts/reference/sheetsage2/native_parity.py tiny",
+        "upstream_code": f"{SHEETSAGE2_REPO}@{SHEETSAGE2_HEAD_REVISION}",
+        "seed": seed,
+        "seed_selection": "first seed from 22996 whose greedy decode decodes strictly, has >= 12 "
+                          "distinct generated tokens, no token repeated more than 3 times in a "
+                          "row, a time and a pitch token, a minimum greedy margin >= 0.01, and float32 "
+                          "logits within 5e-5 (relative) of a float64 run at every step",
+        # The files are written in the pinned *adapter* layout (MERT parent + LoRA adapters), which
+        # is what the native loader consumes; the in-memory model was built merged only to run
+        # upstream's forward pass.
+        "sheetsage2_config": dict(
+            {k: v for k, v in config.to_dict().items()
+             if k not in ("transformers_version", "_name_or_path")},
+            weights_format="adapter"),
+        "tokenizer": {"n_tokens": tokenizer.n_tokens, "fingerprint": tokenizer.vocab_fingerprint,
+                      "audio_length_seconds": TINY_WINDOW_SECONDS, "time_hz": 100},
+        "signal_seconds": TINY_SIGNAL_SECONDS,
+        "stop_time_seconds": TINY_SIGNAL_SECONDS,
+        "max_sequence_length": config.max_output_seq_len,
+        "tokens": tokens,
+        "tokens_described": [tokenizer.describe(int(x)) for x in tokens],
+        "greedy_min_margin": min(finite) if finite else None,
+        "float32_vs_float64_max_relative_logit_drift": run["conditioning"],
+        "greedy_margins": margins,
+    })
+    print(f"tiny fixture: seed {seed}, {len(tokens)} tokens, {len(set(tokens))} distinct, "
+          f"min greedy margin {min(finite):.4f}")
+
+
+def _tiny_run(modules, seed, decoder_spread=TINY_DECODER_SPREAD):
+    """Build the tiny model from ``seed``, run upstream on it, and judge the oracle."""
+    import numpy as np
+    import torch
+
     MERT2Config = modules["configuration_mert2"].MERT2Config
-    MERT2Model = modules["modeling_mert2"].MERT2Model
     SheetSage2Config = modules["configuration_sheetsage2"].SheetSage2Config
     SheetSage2Model = modules["modeling_sheetsage2"].SheetSage2Model
     Tokenizer = modules["tokenization_sheetsage2"].SheetSage2Tokenizer
     generation = modules["generation_sheetsage2"]
-
-    torch.manual_seed(TINY_SEED)
-    torch.set_num_threads(1)
+    torch.manual_seed(seed)
     tokenizer = Tokenizer(TINY_WINDOW_SECONDS, 100, "v1")
     backbone = MERT2Config(
         hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
@@ -156,11 +209,7 @@ def tiny(out: Path) -> None:
         tokenizer_fingerprint=tokenizer.vocab_fingerprint,
     )
     model = SheetSage2Model(config).eval()
-
-    # Seeded weights with enough spread that greedy decoding is not a string of near-ties: the
-    # native port has to reproduce every argmax exactly, and the committed margins show the
-    # comparison is meaningful.
-    generator = torch.Generator().manual_seed(TINY_SEED)
+    generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for name, value in model.named_parameters():
             if name.endswith("layer_norm.weight") or name.endswith("layernorm_embedding.weight") \
@@ -171,7 +220,8 @@ def tiny(out: Path) -> None:
                 value.copy_(0.2 * torch.randn(value.shape, generator=generator))
             else:
                 fan_in = value[0].numel() if value.ndim > 1 else value.numel()
-                value.copy_(torch.randn(value.shape, generator=generator) * (1.5 / fan_in ** 0.5))
+                spread = decoder_spread if name.startswith("decoder.layers.") else 1.5
+                value.copy_(torch.randn(value.shape, generator=generator) * (spread / fan_in ** 0.5))
         frontend = model.encoder.feature_extractor
         frontend.mel_mean.copy_(-20.0 + 5.0 * torch.randn(frontend.mel_mean.shape, generator=generator))
         frontend.mel_std.copy_(10.0 + 2.0 * torch.rand(frontend.mel_std.shape, generator=generator))
@@ -208,12 +258,10 @@ def tiny(out: Path) -> None:
         padded, _ = model._prepare_audio(waveform)
         mel = model.encoder.feature_extractor(padded)
         features = model.get_audio_features(waveform, output_hidden_states=True)
-        margins, raw_first = [], None
+        margins, raw = [], []
 
         def capture(position, ids, logits, masked):
-            nonlocal raw_first
-            if raw_first is None:
-                raw_first = logits[0].clone()
+            raw.append(logits[0].clone())
             top = torch.topk(masked[0], 2).values
             margins.append(float(top[0] - top[1]) if torch.isfinite(top[1]) else float("inf"))
 
@@ -222,43 +270,57 @@ def tiny(out: Path) -> None:
             autocast_dtype=None, stop_time_seconds=TINY_SIGNAL_SECONDS, memory=None,
             step_callback=capture,
         )
+    tokens = [int(x) for x in tokens.tolist()]
+    generated = tokens[len(tokenizer.prompt_prefix(generation.FULL_TASK_PROMPTS)):]
+    types = [tokenizer.token_type(x) for x in generated]
+    run_length, longest = 1, 1
+    for prev, cur in zip(generated, generated[1:]):
+        run_length = run_length + 1 if cur == prev else 1
+        longest = max(longest, run_length)
+    finite = [m for m in margins if m != float("inf")]
+    try:
+        tokenizer.decode_sequence(tokens, strict=True)
+        decodes = True
+    except ValueError:
+        decodes = False
+    accept = bool(decodes and len(set(generated)) >= 12 and longest <= 3 and "time" in types
+                  and "pitch" in types and finite and min(finite) >= 0.01)
+    conditioning = None
+    if accept:
+        # Conditioning: the same greedy run in float64. A seed whose float32 logits drift from
+        # float64 by more than 5e-5 (relative, any step) is too sensitive to rounding to be a
+        # 1e-4 oracle for a second float32 implementation, so it is rejected.
+        import copy
+        model64 = copy.deepcopy(model).double()
+        raw64 = []
+        with torch.inference_mode():
+            tokens64 = generation.constrained_prompt_generate(
+                model64, waveform.double(), generation.FULL_TASK_PROMPTS,
+                config.max_output_seq_len, autocast_dtype=None,
+                stop_time_seconds=TINY_SIGNAL_SECONDS, memory=None,
+                step_callback=lambda p, i, logits, m: raw64.append(logits[0].clone()),
+            )
+        if [int(x) for x in tokens64.tolist()] != tokens:
+            accept = False
+        else:
+            conditioning = max(
+                float((a.double() - b).abs().max() / b.abs().max()) for a, b in zip(raw, raw64))
+            accept = conditioning <= 5e-5
     tensors = {
         "input.waveform": waveform[0].contiguous(),
         "output.mel": mel[0].contiguous(),
         "output.input_hidden": features.input_hidden_state[0].contiguous(),
         "output.mixed": features.mixed_hidden_state[0].contiguous(),
         "output.memory": features.encoder_last_hidden_state[0].contiguous(),
-        "output.first_logits": raw_first.contiguous(),
+        "output.first_logits": raw[0].contiguous(),
+        # Every greedy step's raw logits, [steps, vocab].
+        "output.step_logits": torch.stack(raw).contiguous(),
     }
     for index, state in enumerate(features.backbone_hidden_states):
         tensors[f"output.block.{index}"] = state[0].contiguous()
-    out.mkdir(parents=True, exist_ok=True)
-    save_file({k: v.contiguous() for k, v in parent_state.items()}, str(out / "mert_parent.safetensors"))
-    save_file({k: v.contiguous() for k, v in head_state.items()}, str(out / "sheetsage2_head.safetensors"))
-    save_file(tensors, str(out / "reference.safetensors"))
-    finite = [m for m in margins if m != float("inf")]
-    write_json(out / "reference.json", {
-        "generator": "scripts/reference/sheetsage2/native_parity.py tiny",
-        "upstream_code": f"{SHEETSAGE2_REPO}@{SHEETSAGE2_HEAD_REVISION}",
-        "seed": TINY_SEED,
-        # The files are written in the pinned *adapter* layout (MERT parent + LoRA adapters), which
-        # is what the native loader consumes; the in-memory model above was built merged only to
-        # run upstream's forward pass.
-        "sheetsage2_config": dict(
-            {k: v for k, v in config.to_dict().items()
-             if k not in ("transformers_version", "_name_or_path")},
-            weights_format="adapter"),
-        "tokenizer": {"n_tokens": tokenizer.n_tokens, "fingerprint": tokenizer.vocab_fingerprint,
-                      "audio_length_seconds": TINY_WINDOW_SECONDS, "time_hz": 100},
-        "signal_seconds": TINY_SIGNAL_SECONDS,
-        "stop_time_seconds": TINY_SIGNAL_SECONDS,
-        "max_sequence_length": config.max_output_seq_len,
-        "tokens": [int(x) for x in tokens.tolist()],
-        "tokens_described": [tokenizer.describe(int(x)) for x in tokens.tolist()],
-        "greedy_min_margin": min(finite) if finite else None,
-        "greedy_margins": margins,
-    })
-    print(f"tiny fixture: {len(tokens)} tokens, min greedy margin {min(finite):.4f}")
+    return dict(accept=accept, tensors=tensors, parent=parent_state, head=head_state,
+                tokenizer=tokenizer, config=config, tokens=tokens, margins=margins,
+                conditioning=conditioning)
 
 
 # ---------------------------------------------------------------------------------------- tables

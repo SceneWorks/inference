@@ -6,7 +6,7 @@ pub mod config;
 pub mod decoder;
 pub mod frontend;
 pub mod mert;
-pub mod weights;
+pub(crate) mod weights;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -79,7 +79,7 @@ impl SheetSage2Model {
     /// SheetSage2 head/adapter weights and the MERT parent weights. The parent's architecture must
     /// equal SheetSage2's `backbone_config` (upstream's "parent architecture mismatch" check), the
     /// vocabulary fingerprint must match, and every tensor of both files must be consumed.
-    pub fn load(
+    pub(crate) fn load(
         sheetsage2_config: &serde_json::Value,
         mert_config: &serde_json::Value,
         mut head: Weights,

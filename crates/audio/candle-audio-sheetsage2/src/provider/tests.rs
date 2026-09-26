@@ -63,13 +63,15 @@ fn unload_releases_the_model_observably() {
     assert_eq!(live_models(), before);
 }
 
-/// The provider drives the model exactly like the model-level reference run (same window, stop
-/// time and token limit), and a decode failure of the generated tokens surfaces as an error — it is
-/// never swallowed into an empty transcription. The tiny model's random weights produce the
-/// upstream tokens, which open with a payload token before any sub-beat shift; upstream's
-/// `decode_sequence` raises on that too.
+/// End to end on the tiny real-architecture model, in CI: the provider window-plans the source,
+/// encodes, decodes greedily under the grammar with the same window, stop time and token limit as
+/// upstream's reference run, and builds a complete [`Transcription`] (stitching, every export, both
+/// scores, octave evidence, review) from upstream's exact tokens.
+///
+/// Mutations that must fail: stop at the window length instead of the song duration
+/// (`stop_time`), or drop the model-rate crop of the source.
 #[test]
-fn transcribe_runs_the_reference_generation_and_surfaces_decode_errors() {
+fn transcribe_reproduces_the_reference_and_builds_a_transcription() {
     let _serial = crate::test_lock();
     let transcriber = Transcriber::from_files(tiny_files(), tiny_identity(), &Device::Cpu).unwrap();
     let reference = crate::model::tests::tiny_reference();
@@ -80,13 +82,16 @@ fn transcribe_runs_the_reference_generation_and_surfaces_decode_errors() {
     .unwrap();
     let waveform = tensors["input.waveform"].to_vec1::<f32>().unwrap();
     let mut progress = Vec::new();
-    let err = transcriber
-        .transcribe(&SourceAudio::mono(waveform), &tiny_settings(), |p| {
-            progress.push(p);
-            Ok(())
-        })
-        .unwrap_err();
-    assert!(err.to_string().contains("has no subbeat shift"), "{err}");
+    let t = transcriber
+        .transcribe(
+            &SourceAudio::mono(waveform.clone()),
+            &tiny_settings(),
+            |p| {
+                progress.push(p);
+                Ok(())
+            },
+        )
+        .unwrap();
     assert_eq!(
         progress[0],
         Progress::Encoding {
@@ -94,11 +99,48 @@ fn transcribe_runs_the_reference_generation_and_surfaces_decode_errors() {
             windows: 1
         }
     );
-    assert!(reference["tokens_described"][8]
-        .as_str()
+    assert_eq!(progress.last(), Some(&Progress::Notation));
+    let expected: Vec<u32> = reference["tokens"]
+        .as_array()
         .unwrap()
-        .starts_with("<eighth_pos"));
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    assert_eq!(t.stitched.records.len(), 1);
+    assert_eq!(t.stitched.records[0].tokens, expected);
+    assert_eq!(t.source.samples, waveform.len());
+    assert_eq!(t.source.sample_rate, 1600);
+    assert_eq!(t.audio(), waveform.as_slice());
+    assert!(t.stitched.decoded.events.len() > 3);
+    assert!(t.full.text("events.json").is_some());
+    assert!(t.full.midi("transcription.mid").is_some());
+    assert_eq!(
+        t.closure.tokenizer_fingerprint,
+        reference["tokenizer"]["fingerprint"]
+    );
     transcriber.unload();
+}
+
+/// A generated sequence that does not decode is an error, never an empty transcription: the
+/// upstream rule "an event must start with a sub-beat shift" is enforced when a window is accepted.
+#[test]
+fn undecodable_tokens_surface_as_an_error() {
+    use crate::pipeline::Stitcher;
+    let tokenizer = crate::tokenizer::Tokenizer::new(1.0, 100, None).unwrap();
+    let mut stitcher = Stitcher::new(
+        &tokenizer,
+        &crate::tokenizer::FULL_TASK_PROMPTS,
+        0.8,
+        0.5,
+        0.25,
+        48,
+    )
+    .unwrap();
+    let (mut tokens, prefix_len) = stitcher.prefix(0).unwrap();
+    tokens.push(tokenizer.eighth_position.start);
+    tokens.push(crate::tokenizer::EOS);
+    let err = stitcher.accept(0, tokens, prefix_len).unwrap_err();
+    assert!(err.to_string().contains("has no subbeat shift"), "{err}");
 }
 
 /// Cancellation through the progress callback stops the transcription with the caller's error.
