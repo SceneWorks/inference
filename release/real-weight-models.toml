@@ -2679,3 +2679,33 @@ expected_files = [
     "licenses/SnakeBeta-NVIDIA-MIT.txt",
     "licenses/stable-audio-tools-MIT.txt",
 ]
+
+# The legacy (evaluation) decoder of the same closure (sc-22988 feature review): the CUDA lane
+# materializes both decoders so a standard and a legacy decode of one cached latent run there.
+[[models]]
+key = "yue2-vae-legacy"
+repository = "m-a-p/YuE2-Vae-legacy"
+revision = "b54118f0fc462f08999d1ec07e88817f4ee3f770"
+license = "CC-BY-NC-4.0"
+size_class = "small"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]
