@@ -1,0 +1,57 @@
+{
+  "story": "sc-22993",
+  "producer": "scripts/reference/yue2/vae_reference.py real",
+  "reference": {
+    "yue2_commit": "92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+    "python": "3.12.13",
+    "torch": "2.10.0",
+    "numpy": "2.2.6",
+    "safetensors": "0.7.0",
+    "transformers": "4.57.6",
+    "device": "cpu",
+    "dtype": "float32"
+  },
+  "frames": 16,
+  "core_frames": 4,
+  "long_frames": 75,
+  "long_core_frames": 16,
+  "long_latent": "torch.randn((1,64,75), Generator.manual_seed(2299375)) * std(latent)",
+  "clip": "LEFT 0.97*sign(sin(2pi*220t)), RIGHT 0.3*sin(2pi*659.25t), 48 kHz, 30720 samples",
+  "reference_file": "vae_real_reference.safetensors",
+  "reference_sha256": "4b001e8f9a5479dfdb7f3e803d27f56c49bf9c5a0f64ae3925c0f42743d4c9cd",
+  "latent_sha256": "9ccecdf07fda3751fe649248d7701ff9553b0c9a7b63fee3798759cf7dec5b39",
+  "decoders": {
+    "standard": {
+      "repo": "m-a-p/YuE2-Vae",
+      "revision": "95535e72a97bc0f09b8ada125d26b4009428c0e8",
+      "weights_sha256": "807ce9d5149fa27c5ad3e6582058469852e908f6c5acc8c8aa338e7ab7751346",
+      "config_sha256": "f0191bb9694009956de44e0c361a6f1334760be4c8f848e599bde242a54a0970",
+      "natural_output_length": 30656,
+      "required_halo_core_4": 12,
+      "required_halo_default": 12,
+      "raw_abs_max": 1.8295732736587524,
+      "raw_samples_beyond_unit": 22802,
+      "left_rms": 1.0744105577468872,
+      "right_rms": 0.20098845660686493,
+      "python_tiled_core4_vs_full_max_abs": 0.0,
+      "python_long_tiled_core16_vs_full_max_abs": 0.0,
+      "python_pipeline_default_vs_full_max_abs": 0.0
+    },
+    "legacy": {
+      "repo": "m-a-p/YuE2-Vae-legacy",
+      "revision": "b54118f0fc462f08999d1ec07e88817f4ee3f770",
+      "weights_sha256": "b6d283628913bb41145ba99e2314eef613905ee95f690eb70e8212d5f4965044",
+      "config_sha256": "a5053282e619d241155769b9b26751a5badd1f5644707ea3ebb0c6ed849a038c",
+      "natural_output_length": 30656,
+      "required_halo_core_4": 12,
+      "required_halo_default": 12,
+      "raw_abs_max": 1.6735310554504395,
+      "raw_samples_beyond_unit": 22748,
+      "left_rms": 1.0896763801574707,
+      "right_rms": 0.18488025665283203,
+      "python_tiled_core4_vs_full_max_abs": 0.0,
+      "python_long_tiled_core16_vs_full_max_abs": 0.0,
+      "python_pipeline_default_vs_full_max_abs": 0.0
+    }
+  }
+}

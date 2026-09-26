@@ -45,6 +45,17 @@
 //!   that keeps the exact planned score in its negative branch, truthful truncation, and
 //!   cancellation at bounded boundaries.
 //!
+//! Decoding (sc-22993):
+//!
+//! * [`latent`] — [`latent::AcousticLatents`], the cached `[frames, 64]` FP32 latent artifact with
+//!   its identity (content SHA-256, shape, dtype, source), verified at the decode boundary and
+//!   persisted as an upstream-compatible `latent.npy` + identity sidecar.
+//! * [`vae`] — the native FP32 Oobleck VAE for both published decoders (standard and legacy):
+//!   [`vae::Yue2Vae::load`] from a verified component, the full reference decode, the exact
+//!   halo/crop tiled decode, and the encoder posterior.
+//! * [`decode`] — [`decode::decode_latents`], the production path: verified latents → clamped
+//!   48 kHz stereo with decoder and latent identity in the output metadata.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -60,18 +71,21 @@
 
 pub use candle_audio::gen_core;
 
+pub mod decode;
 pub mod generate;
 pub mod inventory;
+pub mod latent;
 pub mod license;
 pub mod manifest;
 pub mod model;
 #[cfg(test)]
 mod parity;
-pub mod sampling;
 pub mod plan;
 pub mod protocol;
+pub mod sampling;
 pub mod snapshot;
 pub mod tokenizer;
+pub mod vae;
 
 #[cfg(test)]
 mod test_fixtures;
