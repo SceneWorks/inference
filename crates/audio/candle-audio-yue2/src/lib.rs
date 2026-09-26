@@ -63,6 +63,30 @@
 //!   midpoint solver, bounded (query-tiled) attention that never drops a key, optional AR offload
 //!   and cancellation — producing [`latent::AcousticLatents`] for the decoder.
 //!
+//! The engine (sc-22994):
+//!
+//! * [`engine`] — [`Yue2Engine`]: one loaded closure running plan → semantic → acoustic → decode,
+//!   every stage also invocable on its own, with cancellation, progress, effective configuration
+//!   and the stage / run identities.
+//! * [`run`] — transactional run directories with every artifact and integrity record,
+//!   identity-checked stage-by-stage resume, plan-only runs and cached-latent decoding.
+//! * [`closure`] — save the verified generation closure to one directory (licence and notice
+//!   files included) and load an engine back from it, offline.
+//! * [`provider`] — the registered `yue2` generator (distinct from YuE1's `yue_*`): the
+//!   `LoadSpec` gate and the `GenerationRequest` mapping onto the engine.
+//!
+//! Precision (sc-22995):
+//!
+//! * [`precision`] — the native `bf16` / `q8` / `q4` tiers, the V2 per-tensor precision map (every
+//!   matmul weight follows the tier; VAE FP32 at every tier), weights-free residency pricing and
+//!   the owner-visible precision decisions.
+//! * [`tier`] — deterministic local derivation of a `q8` / `q4` tier snapshot from the verified
+//!   original, with its conversion manifest, and its verification at the load boundary;
+//!   [`prepare`] exposes it through the audio-lane snapshot preparer.
+//! * [`weights`] — the loaded matmul weight (dense, GGML, or FP8) and the tier-aware loader.
+//! * [`fp8`] — upstream's experimental FP8 AR mode on CUDA sm_89+, with exact BF16 restoration
+//!   before the acoustic stage and counted host-held originals.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -78,7 +102,10 @@
 
 pub use candle_audio::gen_core;
 
+pub mod closure;
 pub mod decode;
+pub mod engine;
+pub mod fp8;
 pub mod generate;
 pub mod inventory;
 pub mod latent;
@@ -89,18 +116,52 @@ pub mod nar;
 #[cfg(test)]
 mod parity;
 pub mod plan;
+pub mod precision;
+pub mod prepare;
 pub mod protocol;
+pub mod provider;
+#[cfg(test)]
+mod quality;
+pub mod run;
 pub mod sampling;
 pub mod snapshot;
+pub mod tier;
 pub mod tokenizer;
 pub mod vae;
+pub mod weights;
 
 #[cfg(test)]
 mod test_fixtures;
 
+pub use engine::{
+    EngineHooks, EngineObserver, EngineOptions, ModelPrecision, SemanticResult, SongResult,
+    SongSettings, Stage, StageEvent, Yue2Engine,
+};
+pub use fp8::ArPrecision;
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
+pub use license::COMPONENT_LICENSES;
 pub use nar::{synthesize, NarOptions, QueryTile, SongNoise, SynthesisRequest, Yue2Nar};
 pub use plan::{PlanError, PlanIdentity, PlanStep, SemanticConditioning, SymbolicPlan};
+pub use precision::Tier;
 pub use protocol::{CotMode, GenerationConfig, ProtocolError, Sampling, SongRequest};
+pub use provider::{
+    descriptor, load, PROVIDER_COMPONENTS, PROVIDER_COMPONENT_LICENSES, PROVIDER_ID, REGISTRATION,
+    REGISTRATIONS,
+};
+pub use run::{verify_run, RunError, RunOutcome, RunOutput, SongInput};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
 pub use tokenizer::{TokenizerError, Yue2TextTokenizer};
+
+/// Add the YuE2 generator to an explicit audio registry builder (catalog composition).
+pub fn register_providers(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    REGISTRATIONS
+        .into_iter()
+        .fold(registry, |r, reg| r.register_generator(reg))
+}
+
+/// Build this crate's own explicit provider catalog.
+pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    register_providers(gen_core::ProviderRegistryBuilder::new()).build()
+}

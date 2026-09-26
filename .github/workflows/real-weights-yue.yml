@@ -19,9 +19,24 @@ name: YuE real-weight validation (CUDA)
 #
 # `nvidia-smi` samples device memory every 500 ms around each case. RECORD-ONLY: the box has a
 # second listener, so a co-tenant can inflate it, and no VRAM number is asserted.
+#
+# sc-22995 (epic sc-22988) adds `family: yue2`: the YuE2 (noncommercial, CC BY-NC 4.0) precision-tier
+# evidence -- the crate's CUDA lib tests (the FP8 GEMM, bit-exact BF16 restoration, the engine's
+# FP8 / acoustic-stage lifecycle) and `quality::tier_quality_against_the_f32_reference`, which
+# measures bf16 / fp8 / q8 / q4 on CUDA (and F32 on CUDA) against the F32 CPU reference of the pinned
+# upstream originals. The q8 / q4 tier snapshots are derived on the runner from the verified
+# originals and removed at the end; nothing is rehosted. The default `family: yue` runs exactly the
+# YuE-v1 job above, as before.
 
 on:
   workflow_dispatch:
+    inputs:
+      family:
+        description: "yue = YuE-v1 renders (sc-19387); yue2 = YuE2 precision tiers (sc-22995)"
+        type: choice
+        required: false
+        default: yue
+        options: [yue, yue2]
 
 permissions:
   contents: read
@@ -39,6 +54,7 @@ jobs:
   # `--features cuda` release build plus a one-time ~24 GB fetch, then three one-segment renders.
   candle-audio-yue:
     name: Candle YuE lyrics2song real weights (CUDA)
+    if: inputs.family != 'yue2'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: 180
     env:
@@ -170,4 +186,136 @@ jobs:
           if not defined YUE_SNAPSHOT_ROOT exit /b 0
           if exist "%YUE_SNAPSHOT_ROOT%" rmdir /s /q "%YUE_SNAPSHOT_ROOT%"
           if exist "%YUE_SNAPSHOT_ROOT%" (echo ::error::could not remove %YUE_SNAPSHOT_ROOT%& exit /b 1)
+          exit /b 0
+
+  # sc-22995: YuE2 precision tiers on CUDA (see the header). `timeout-minutes: 240` is a runaway
+  # guard for a lane that has never executed: a cold `--features cuda` release build, a one-time
+  # ~7.4 GB fetch, the F32 CPU reference (~10 min on the dev Mac), two tier derivations and six
+  # measured configurations.
+  candle-audio-yue2:
+    name: Candle YuE2 precision tiers real weights (CUDA)
+    if: inputs.family == 'yue2'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 240
+    env:
+      CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CANDLE_AUDIO_YUE2_3B_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--m-a-p--YuE2-3B\snapshots\1a96eca688d6ae5d7f0feb88573fec89920fcd19
+      CANDLE_AUDIO_YUE2_VAE_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--m-a-p--YuE2-Vae\snapshots\95535e72a97bc0f09b8ada125d26b4009428c0e8
+      # The bottom rung of the arch ladder, not the hardware -- see `same-l-cuda` in real-weights.yml.
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Install reviewed CPython 3.12
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" -c "import sys; assert sys.version_info[:3] == (3, 12, 10), sys.version" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      # The runner service's global RUSTC_WRAPPER=sccache resets mid-build on heavy Candle/CUDA
+      # graphs (see `candle-qwen-image-2-1` in real-weights.yml), so this job clears it.
+      - name: Disable unstable sccache wrapper for the heavy Candle lane
+        shell: powershell
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value 'RUSTC_WRAPPER='
+          Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
+      - name: Require operator-provided models root and initialize evidence
+        shell: cmd
+        run: |
+          if "%CANDLE_GEN_MODELS_ROOT%"=="" (
+            echo Missing repository variable CANDLE_GEN_MODELS_ROOT for the Windows CUDA runner.
+            exit /b 1
+          )
+          if exist "%RUNNER_TEMP%\yue2-cuda-evidence" rmdir /s /q "%RUNNER_TEMP%\yue2-cuda-evidence"
+          mkdir "%RUNNER_TEMP%\yue2-cuda-evidence" || exit /b 1
+          echo YUE2_EVIDENCE=%RUNNER_TEMP%\yue2-cuda-evidence>>"%GITHUB_ENV%"
+          echo YUE2_QUALITY_OUT=%RUNNER_TEMP%\yue2-quality>>"%GITHUB_ENV%"
+          echo YUE2_TIER_DIR=%CANDLE_GEN_MODELS_ROOT%\..\yue2-tiers-%GITHUB_RUN_ID%-%GITHUB_RUN_ATTEMPT%>>"%GITHUB_ENV%"
+      - name: Record the CUDA device inventory
+        continue-on-error: true
+        shell: cmd
+        run: |
+          where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH& exit /b 0)
+          nvidia-smi --query-gpu=index,name,compute_cap,driver_version,memory.total,memory.used,memory.free --format=csv > "%YUE2_EVIDENCE%\cuda-device-inventory.csv"
+          type "%YUE2_EVIDENCE%\cuda-device-inventory.csv"
+      - name: Materialize and verify immutable YuE2 snapshots
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\huggingface-hub" -r .github/requirements/real-weights-huggingface-hub-windows-x64-py312.txt || exit /b 1
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue2-3b --snapshot "%CANDLE_AUDIO_YUE2_3B_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue2-vae --snapshot "%CANDLE_AUDIO_YUE2_VAE_SNAPSHOT%" || exit /b 1
+      # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings.
+      - name: Build the YuE2 CUDA test binary
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib --no-run || exit /b 1
+      - name: Run the YuE2 CUDA lib tests
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib -- --nocapture > "%YUE2_EVIDENCE%\cuda-lib-tests.log" 2>&1
+          set "rc=%ERRORLEVEL%"
+          type "%YUE2_EVIDENCE%\cuda-lib-tests.log"
+          if not "%rc%"=="0" (echo ::error::the YuE2 CUDA lib tests failed& exit /b 1)
+          rem With --nocapture a test's printed evidence can sit between its name and its "ok", so the
+          rem pass is the zero-failure result line and the CUDA tests are proven to have run by name.
+          findstr /C:"test result: ok." "%YUE2_EVIDENCE%\cuda-lib-tests.log" >nul || (echo ::error::no passing test result& exit /b 1)
+          for %%T in (fp8_gemm_matches_its_dequantized_reference prepare_then_restore_is_bit_exact_and_counted the_engine_restores_bf16_before_the_acoustic_stage) do (
+            findstr /C:"test fp8::tests::cuda::%%T ..." "%YUE2_EVIDENCE%\cuda-lib-tests.log" >nul || (echo ::error::fp8::tests::cuda::%%T did not run& exit /b 1)
+          )
+          exit /b 0
+      - name: Measure the YuE2 tiers against the F32 reference
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "YUE2_HF_HUB=%CANDLE_GEN_MODELS_ROOT%"
+          set "YUE2_QUALITY_DEVICE=cuda"
+          set "YUE2_QUALITY_CONFIGS=f32,f32dev,bf16,fp8,q8,q4"
+          set "log=%YUE2_EVIDENCE%\tier-quality.log"
+          set "vram=%YUE2_EVIDENCE%\tier-quality-vram.csv"
+          start "" /b powershell -NoProfile -Command "while (-not (Test-Path '%vram%.stop')) { nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits | Add-Content -Path '%vram%'; Start-Sleep -Milliseconds 500 }"
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib quality::tier_quality_against_the_f32_reference -- --ignored --exact --nocapture > "%log%" 2>&1
+          set "rc=%ERRORLEVEL%"
+          echo stop> "%vram%.stop"
+          powershell -NoProfile -Command "Start-Sleep -Seconds 2; Import-Csv -Header t,i,m '%vram%' | Group-Object i | ForEach-Object { 'cuda:' + $_.Name + ' peak ' + ($_.Group | Measure-Object -Property m -Maximum).Maximum + ' MiB' }"
+          type "%log%"
+          if exist "%YUE2_QUALITY_OUT%\quality-*.json" copy /y "%YUE2_QUALITY_OUT%\quality-*.json" "%YUE2_EVIDENCE%\" >nul
+          if not "%rc%"=="0" (echo ::error::the YuE2 tier quality measurement failed& exit /b 1)
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::the quality test did not run exactly once& exit /b 1)
+          exit /b 0
+      # Metrics and logs only: no weights, no latents, no audio (those derive from CC BY-NC 4.0
+      # weights and stay on the runner).
+      - name: Keep the YuE2 CUDA evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-cuda-evidence
+          path: ${{ runner.temp }}/yue2-cuda-evidence
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove the run-scoped YuE2 tiers and reference outputs
+        if: always()
+        shell: cmd
+        run: |
+          if defined YUE2_TIER_DIR if exist "%YUE2_TIER_DIR%" rmdir /s /q "%YUE2_TIER_DIR%"
+          if defined YUE2_QUALITY_OUT if exist "%YUE2_QUALITY_OUT%" rmdir /s /q "%YUE2_QUALITY_OUT%"
+          if defined YUE2_TIER_DIR if exist "%YUE2_TIER_DIR%" (echo ::error::could not remove %YUE2_TIER_DIR%& exit /b 1)
           exit /b 0

@@ -205,3 +205,22 @@ loading; the native `nar_real_weights` test (release) peaks at 23.2 GB `ru_maxrs
 footprint (the file-backed mapping counts toward `ru_maxrss` during the load) and takes 263 s: 22 s
 to verify and load, 211 s for the three-chunk 32-step case, 14 s per run of the 5-step case. Never
 run the two at once.
+
+
+# YuE2 precision-tier fixtures (sc-22995)
+
+| File | Generator | Consumer |
+| --- | --- | --- |
+| `fp8_quantize.json` | `scripts/reference/yue2/fp8_fixtures.py` | `fp8::tests::e4m3_quantization_matches_upstream` (CI, `--lib`) |
+
+* **`fp8_quantize.json`** — upstream `yue2.quantization.quantize_tensor` (the per-tensor E4M3
+  quantizer of the experimental FP8 AR mode, applied to every AR weight and every activation) on
+  four generated BF16 tensors: weight-like values over several decades, an activation block with
+  two outliers, small values with exact zeros, and all zeros (the `1e-12` amax floor). It records
+  the F32 scale's bits and every E4M3 code as the value it decodes to; the native quantizer must
+  reproduce both exactly. Pinned upstream commit and torch 2.10.0 (CPU) are in the file. No weights.
+
+The tier quality measurements (`quality::tier_quality_against_the_f32_reference`, `#[ignore]`) take
+their inputs from `ar_real_weights.json` and `nar_real_reference.json` above and write their F32
+reference outputs outside the repository (they derive from CC BY-NC 4.0 weights); the measured
+numbers are recorded in the `precision` module docs.

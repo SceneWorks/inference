@@ -863,6 +863,104 @@ pub struct AudioParams {
     /// output through a limiter, e.g. YuE's `save_audio` — sc-19378). `None` ⇒ the model default
     /// (YuE: [`OutputLimiter::Clamp`], the reference default).
     pub output_limiter: Option<OutputLimiter>,
+    /// **Symbolic-plan song controls** (sc-22994 — YuE2): the planning mode, an externally supplied
+    /// score, an exact saved plan, cached-latent decoding, the decoder and per-phase token sampling.
+    /// `None` ⇒ every model default. Gated by [`Capabilities::supports_symbolic_song`]: a model
+    /// that does not plan a score refuses it as the typed [`Error::Unsupported`] instead of
+    /// rendering from a plan the caller never asked for.
+    pub song: Option<SongParams>,
+    /// **Persist the render's reproducibility record** (sc-22994): the model writes its complete
+    /// artifact set (score / plan / tokens / latents / effective settings / identities / timings /
+    /// integrity records) into [`AudioArtifacts::dir`], publishing it only once the render
+    /// succeeds. Gated by [`Capabilities::supports_audio_artifacts`]: a model that keeps no record
+    /// refuses it rather than returning audio with nothing written where the caller looks.
+    pub artifacts: Option<AudioArtifacts>,
+}
+
+/// Symbolic-plan song controls ([`AudioParams::song`], sc-22994 — YuE2). Every field is optional
+/// so the block stays additively extensible; each model documents how it resolves defaults and
+/// refuses combinations it cannot honour in its own `validate`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SongParams {
+    /// How the model plans the score before rendering. `None` ⇒ the model default.
+    pub planning: Option<SongPlanning>,
+    /// An externally supplied score (YuE2: ABC notation) used as the plan instead of sampling one.
+    /// Requires a planning mode that has a score.
+    pub score: Option<String>,
+    /// Restore an exact saved plan instead of planning — its token ids are reused as saved, never
+    /// re-tokenized.
+    pub plan: Option<SavedPlan>,
+    /// Decode the verified cached latents of this completed run directory instead of generating.
+    pub cached_latents: Option<std::path::PathBuf>,
+    /// Which published decoder renders the latents. `None` ⇒ the model default.
+    pub decoder: Option<SongDecoder>,
+    /// Token sampling of the score-planning phase. `None` fields ⇒ the model defaults.
+    pub score_sampling: Option<TokenSampling>,
+    /// Token sampling of the semantic-token phase. `None` fields ⇒ the model defaults.
+    pub semantic_sampling: Option<TokenSampling>,
+}
+
+/// The planning mode of a symbolic-plan song model ([`SongParams::planning`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongPlanning {
+    /// Plan melody and harmony.
+    Full,
+    /// Plan the melody only.
+    Melody,
+    /// No symbolic plan.
+    Off,
+}
+
+/// Which published decoder a symbolic-plan song model decodes with ([`SongParams::decoder`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongDecoder {
+    /// The listening decoder (YuE2: `m-a-p/YuE2-Vae`).
+    Standard,
+    /// The evaluation decoder (YuE2: `m-a-p/YuE2-Vae-legacy`).
+    Legacy,
+}
+
+/// A saved symbolic plan to restore ([`SongParams::plan`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SavedPlan {
+    /// The plan directory.
+    pub dir: std::path::PathBuf,
+    /// The plan identity recorded when it was saved (lower-case hex), kept outside the plan
+    /// directory; when present, a plan whose identity differs is refused.
+    pub identity: Option<String>,
+}
+
+/// One autoregressive phase's token-sampling overrides ([`SongParams::score_sampling`] /
+/// [`SongParams::semantic_sampling`]). `None` ⇒ the model's default for that field; the model
+/// validates the resolved set as a whole.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TokenSampling {
+    /// Softmax temperature (`0` = greedy).
+    pub temperature: Option<f64>,
+    /// Nucleus mass.
+    pub top_p: Option<f64>,
+    /// Top-k.
+    pub top_k: Option<u32>,
+    /// Windowed repetition penalty.
+    pub repetition_penalty: Option<f64>,
+    /// Repetition-penalty window, in tokens.
+    pub penalty_window: Option<u32>,
+    /// Output tokens before the end token may be sampled.
+    pub min_tokens: Option<u32>,
+    /// Maximum output tokens.
+    pub max_tokens: Option<u32>,
+}
+
+/// Where a model publishes a render's reproducibility record ([`AudioParams::artifacts`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioArtifacts {
+    /// The run directory. A fresh render requires it to be absent or empty; nothing appears there
+    /// until the render has completed.
+    pub dir: std::path::PathBuf,
+    /// Reuse a completed record, or the verified completed stages of an interrupted one, whose
+    /// recorded identities match this request exactly; a mismatched or corrupt record is refused,
+    /// never overwritten.
+    pub resume: bool,
 }
 
 /// The output limiter a model applies before returning audio ([`AudioParams::output_limiter`],
@@ -1396,12 +1494,69 @@ impl GenerationRequest {
             max_new_tokens_per_segment: _,
             // A unit enum (sc-19378): no floats to classify.
             output_limiter: _,
+            // A directory and a flag (sc-22994): no floats to classify.
+            artifacts: _,
             target_duration,
             bpm,
             repetition_penalty,
             reference_region,
+            song,
         }) = audio
         {
+            // Symbolic-song token sampling (sc-22994): its three `f64` fields go through the same
+            // non-finite check. Destructured without `..` so a new float-bearing field fails to
+            // compile here until it is classified.
+            if let Some(SongParams {
+                planning: _,
+                score: _,
+                plan: _,
+                cached_latents: _,
+                decoder: _,
+                score_sampling,
+                semantic_sampling,
+            }) = song
+            {
+                for (phase, sampling) in
+                    [("score", score_sampling), ("semantic", semantic_sampling)]
+                {
+                    if let Some(TokenSampling {
+                        temperature,
+                        top_p,
+                        repetition_penalty,
+                        top_k: _,
+                        penalty_window: _,
+                        min_tokens: _,
+                        max_tokens: _,
+                    }) = sampling
+                    {
+                        for (field, v) in [
+                            ("temperature", temperature),
+                            ("top_p", top_p),
+                            ("repetition_penalty", repetition_penalty),
+                        ] {
+                            if let Some(x) = v {
+                                if !x.is_finite() {
+                                    let name = match (phase, field) {
+                                        ("score", "temperature") => {
+                                            "audio.song.score_sampling.temperature"
+                                        }
+                                        ("score", "top_p") => "audio.song.score_sampling.top_p",
+                                        ("score", _) => {
+                                            "audio.song.score_sampling.repetition_penalty"
+                                        }
+                                        (_, "temperature") => {
+                                            "audio.song.semantic_sampling.temperature"
+                                        }
+                                        (_, "top_p") => "audio.song.semantic_sampling.top_p",
+                                        _ => "audio.song.semantic_sampling.repetition_penalty",
+                                    };
+                                    return Some((name, *x as f32));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let audio_floats: [(&'static str, Option<f32>); 5] = [
                 ("audio.target_duration", *target_duration),
                 ("audio.bpm", *bpm),
@@ -2856,6 +3011,14 @@ pub struct Capabilities {
     /// clamp vs. rescale). `Default` is `false`; the shared floor then rejects the field as the
     /// typed [`Error::Unsupported`] instead of letting a model with no such limiter drop it.
     pub supports_output_limiter: bool,
+    /// Whether this model plans a symbolic score and reads [`AudioParams::song`] (sc-22994 —
+    /// YuE2). `Default` is `false`; the shared floor then rejects the block as the typed
+    /// [`Error::Unsupported`].
+    pub supports_symbolic_song: bool,
+    /// Whether this model publishes a reproducibility record into [`AudioParams::artifacts`]
+    /// (sc-22994). `Default` is `false`; the shared floor then rejects the block as the typed
+    /// [`Error::Unsupported`].
+    pub supports_audio_artifacts: bool,
 
     // --- LTX-2.5 generation axes (sc-18778) ------------------------------------------------------
     //
@@ -3093,7 +3256,9 @@ impl Capabilities {
     ///   [`supports_repetition_penalty`](Self::supports_repetition_penalty) /
     ///   [`supports_reference_region`](Self::supports_reference_region) flag is set (sc-19382), and
     ///   `output_limiter` only when [`supports_output_limiter`](Self::supports_output_limiter) is
-    ///   set (sc-19378),
+    ///   set (sc-19378), and `song` / `artifacts` only when
+    ///   [`supports_symbolic_song`](Self::supports_symbolic_song) /
+    ///   [`supports_audio_artifacts`](Self::supports_audio_artifacts) is set (sc-22994),
     ///
     /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
     /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
@@ -3553,6 +3718,16 @@ impl Capabilities {
                     "audio.output_limiter",
                     audio.output_limiter.is_some(),
                     self.supports_output_limiter,
+                ),
+                (
+                    "audio.song",
+                    audio.song.is_some(),
+                    self.supports_symbolic_song,
+                ),
+                (
+                    "audio.artifacts",
+                    audio.artifacts.is_some(),
+                    self.supports_audio_artifacts,
                 ),
             ];
             for (field, present, supported) in gated {
@@ -5599,12 +5774,67 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_song_sampling_is_named_by_the_float_floor() {
+        // sc-22994: the symbolic-song sampling floats are classified by the same non-finite floor
+        // as every other request float, and the reported name says which phase and field.
+        type Set = fn(&mut TokenSampling, f64);
+        let fields: [(&str, Set); 3] = [
+            ("temperature", |s, v| s.temperature = Some(v)),
+            ("top_p", |s, v| s.top_p = Some(v)),
+            ("repetition_penalty", |s, v| s.repetition_penalty = Some(v)),
+        ];
+        for semantic in [false, true] {
+            for (field, set) in fields {
+                for bad in [f64::NAN, f64::INFINITY] {
+                    let mut sampling = TokenSampling::default();
+                    set(&mut sampling, bad);
+                    let song = if semantic {
+                        SongParams {
+                            semantic_sampling: Some(sampling),
+                            ..Default::default()
+                        }
+                    } else {
+                        SongParams {
+                            score_sampling: Some(sampling),
+                            ..Default::default()
+                        }
+                    };
+                    let req = GenerationRequest {
+                        audio: Some(AudioParams {
+                            song: Some(song),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    };
+                    let phase = if semantic { "semantic" } else { "score" };
+                    let (name, _) = req.first_nonfinite_float().expect("non-finite is caught");
+                    assert_eq!(name, format!("audio.song.{phase}_sampling.{field}"));
+                }
+            }
+        }
+        let finite = GenerationRequest {
+            audio: Some(AudioParams {
+                song: Some(SongParams {
+                    score_sampling: Some(TokenSampling {
+                        temperature: Some(0.7),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(finite.first_nonfinite_float(), None);
+    }
+
+    #[test]
     fn segmented_song_controls_are_refused_unless_advertised() {
         // sc-19382: each field is a typed capability gap on a model that does not read it, and
         // passes once its own flag is advertised.
         type Set = fn(&mut AudioParams);
         type Flag = fn(&mut Capabilities);
-        let cases: [(&str, Set, Flag); 5] = [
+        let cases: [(&str, Set, Flag); 7] = [
             (
                 "segments",
                 |a| a.segments = Some(3),
@@ -5634,6 +5864,26 @@ mod tests {
                 "output_limiter",
                 |a| a.output_limiter = Some(OutputLimiter::Rescale),
                 |c| c.supports_output_limiter = true,
+            ),
+            (
+                "song",
+                |a| {
+                    a.song = Some(SongParams {
+                        planning: Some(SongPlanning::Melody),
+                        ..Default::default()
+                    })
+                },
+                |c| c.supports_symbolic_song = true,
+            ),
+            (
+                "artifacts",
+                |a| {
+                    a.artifacts = Some(AudioArtifacts {
+                        dir: "run".into(),
+                        resume: false,
+                    })
+                },
+                |c| c.supports_audio_artifacts = true,
             ),
         ];
         for (name, set, flag) in cases {

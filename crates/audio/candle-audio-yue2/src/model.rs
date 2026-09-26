@@ -42,16 +42,21 @@
 //! [`CONTEXT`](crate::protocol::CONTEXT) positions) or the step fails before writing (see
 //! [`crate::generate`] for the request-level budget check).
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use candle_audio::candle_core::{DType, Device, Tensor, D};
 use candle_audio::gen_core;
 use candle_llm::primitives::{
-    apply_rope, embed, linear, sdpa_gqa, swiglu, AttnMask, KvCache, Rope, StaticKvCache,
+    apply_rope, embed, sdpa_gqa, swiglu, AttnMask, KvCache, Rope, StaticKvCache,
 };
 use candle_nn::VarBuilder;
 use serde_json::Value;
 
 use crate::inventory::ComponentId;
+use crate::precision::{Residency, Storage, Tier};
 use crate::snapshot::{self, SnapshotDirs};
+use crate::weights::{Loader, Proj};
 
 /// Query positions per prefill forward. Bounds a long prefix's per-forward work so cancellation is
 /// observed between chunks (see [`crate::generate`]); attention itself is additionally tiled by
@@ -194,21 +199,37 @@ fn check_compute(dtype: DType, device: &Device) -> gen_core::Result<()> {
 pub(crate) struct VerifiedLmFiles {
     /// The verified `config.json`, read.
     pub(crate) config_json: String,
-    /// A builder over exactly the verified weights file, converting to the compute dtype.
-    pub(crate) vb: VarBuilder<'static>,
-    /// SHA-256 of that weights file (from the conversion manifest it was checked against).
+    /// A loader over exactly the verified weights file, converting dense tensors to the compute
+    /// dtype and reading the tier's GGML block tensors as stored.
+    pub(crate) loader: Loader<'static>,
+    /// SHA-256 of that weights file (checked against its pin or its tier manifest).
     pub(crate) weights_sha256: String,
+    /// The tier the weights file holds.
+    pub(crate) tier: Tier,
 }
 
-/// Refuse an unsupported dtype/device pair, then resolve and verify the pinned YuE2-3B snapshot
+/// Refuse an unsupported dtype/device pair, then resolve and verify the YuE2-3B snapshot
 /// **immediately before loading** (the crate's load-boundary rule) and open exactly the verified
 /// `config.json` and weights file. Every loader of the MoT goes through here.
+///
+/// The `m-a-p/YuE2-3B` directory is either the pinned original (the `bf16` tier, verified against
+/// its pins) or a derived tier snapshot ([`crate::tier`], verified with
+/// [`crate::tier::verify_tier`]). `expect`, when set, is the tier the caller asserts; any other
+/// staged tier is refused rather than loaded.
 pub(crate) fn open_verified(
     dirs: &SnapshotDirs,
     dtype: DType,
     device: &Device,
+    expect: Option<Tier>,
 ) -> gen_core::Result<VerifiedLmFiles> {
     check_compute(dtype, device)?;
+    let dir = dirs.snapshot_dir(&ComponentId::Lm.component().repo)?;
+    if crate::tier::is_tier_snapshot(&dir) {
+        let verified = crate::tier::verify_tier(&dir)?;
+        check_tier(expect, verified.tier(), &dir)?;
+        return open_tier(&verified, dtype, device);
+    }
+    check_tier(expect, Tier::Bf16, &dir)?;
     let verified = snapshot::resolve_component(ComponentId::Lm, dirs)?;
     let config_path = verified.path("config.json").ok_or_else(|| {
         gen_core::Error::Msg("verified YuE2-3B snapshot has no config.json".into())
@@ -223,8 +244,52 @@ pub(crate) fn open_verified(
         .map_err(backend("open weights"))?;
     Ok(VerifiedLmFiles {
         config_json,
-        vb,
+        loader: Loader::new(vb, None),
         weights_sha256: verified.manifest().native.sha256.clone(),
+        tier: Tier::Bf16,
+    })
+}
+
+/// An asserted tier must be the staged one: a request for `q8` over the BF16 original (or any
+/// other mismatch) is refused, never served at another precision.
+pub(crate) fn check_tier(
+    expect: Option<Tier>,
+    staged: Tier,
+    dir: &std::path::Path,
+) -> gen_core::Result<()> {
+    match expect {
+        Some(want) if want != staged => Err(gen_core::Error::Unsupported(format!(
+            "yue2: the {want} tier was requested but {} holds the {staged} tier{}",
+            dir.display(),
+            if staged == Tier::Bf16 {
+                " (the released checkpoint); derive the tier snapshot locally first \
+                 (candle_audio_yue2::tier::convert, or the audio-lane snapshot preparer)"
+            } else {
+                ""
+            }
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Open a verified tier snapshot for loading.
+pub(crate) fn open_tier(
+    verified: &crate::tier::VerifiedTier,
+    dtype: DType,
+    device: &Device,
+) -> gen_core::Result<VerifiedLmFiles> {
+    check_compute(dtype, device)?;
+    let config_json = std::fs::read_to_string(verified.config_path())?;
+    // SAFETY: the verified tier weights file, opened read-only; every tensor is copied out.
+    let vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[verified.weights_path()], dtype, device) }
+            .map_err(backend("open tier weights"))?;
+    let storage: BTreeMap<String, Storage> = verified.storage_map();
+    Ok(VerifiedLmFiles {
+        config_json,
+        loader: Loader::new(vb, Some(Arc::new(storage))),
+        weights_sha256: verified.weights_sha256().to_string(),
+        tier: verified.tier(),
     })
 }
 
@@ -256,10 +321,10 @@ pub fn rms_norm(
 /// per-head `q_norm` / `k_norm` applied before RoPE.
 #[derive(Debug)]
 pub struct Attention {
-    q_proj: Tensor,
-    k_proj: Tensor,
-    v_proj: Tensor,
-    o_proj: Tensor,
+    q_proj: Proj,
+    k_proj: Proj,
+    v_proj: Proj,
+    o_proj: Proj,
     q_norm: Tensor,
     k_norm: Tensor,
     num_heads: usize,
@@ -269,20 +334,21 @@ pub struct Attention {
 }
 
 impl Attention {
-    fn load(vb: VarBuilder, cfg: &Yue2Config) -> candle_audio::candle_core::Result<Self> {
+    fn load(w: &Loader, prefix: &str, cfg: &Yue2Config) -> candle_audio::candle_core::Result<Self> {
         let (h, hd, nq, nkv) = (
             cfg.hidden_size,
             cfg.head_dim,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
         );
+        let name = |leaf: &str| format!("{prefix}.{leaf}");
         Ok(Self {
-            q_proj: vb.get((nq * hd, h), "q_proj.weight")?,
-            k_proj: vb.get((nkv * hd, h), "k_proj.weight")?,
-            v_proj: vb.get((nkv * hd, h), "v_proj.weight")?,
-            o_proj: vb.get((h, nq * hd), "o_proj.weight")?,
-            q_norm: vb.get(hd, "q_norm.weight")?,
-            k_norm: vb.get(hd, "k_norm.weight")?,
+            q_proj: w.matrix(&name("q_proj.weight"), (nq * hd, h))?,
+            k_proj: w.matrix(&name("k_proj.weight"), (nkv * hd, h))?,
+            v_proj: w.matrix(&name("v_proj.weight"), (nkv * hd, h))?,
+            o_proj: w.matrix(&name("o_proj.weight"), (h, nq * hd))?,
+            q_norm: w.tensor(&name("q_norm.weight"), hd)?,
+            k_norm: w.tensor(&name("k_norm.weight"), hd)?,
             num_heads: nq,
             num_kv_heads: nkv,
             head_dim: hd,
@@ -302,9 +368,9 @@ impl Attention {
     ) -> gen_core::Result<(Tensor, Tensor, Tensor)> {
         let err = backend("attention");
         let (b, t, _) = x.dims3().map_err(&err)?;
-        let q = linear(x, &self.q_proj, None).map_err(backend("q_proj"))?;
-        let k = linear(x, &self.k_proj, None).map_err(backend("k_proj"))?;
-        let v = linear(x, &self.v_proj, None).map_err(backend("v_proj"))?;
+        let q = self.q_proj.forward(x, None).map_err(backend("q_proj"))?;
+        let k = self.k_proj.forward(x, None).map_err(backend("k_proj"))?;
+        let v = self.v_proj.forward(x, None).map_err(backend("v_proj"))?;
         let q = q
             .reshape((b, t, self.num_heads, self.head_dim))
             .map_err(&err)?;
@@ -334,7 +400,9 @@ impl Attention {
             .transpose(1, 2)
             .and_then(|x| x.reshape((b, t, self.num_heads * self.head_dim)))
             .map_err(&err)?;
-        linear(&merged, &self.o_proj, None).map_err(backend("o_proj"))
+        self.o_proj
+            .forward(&merged, None)
+            .map_err(backend("o_proj"))
     }
 
     pub(crate) fn scale(&self) -> f32 {
@@ -353,42 +421,65 @@ impl Attention {
         })
     }
 
-    fn tensors(&self) -> [&Tensor; 6] {
+    /// The four projections, in `q, k, v, o` order.
+    pub(crate) fn projections(&self) -> [&Proj; 4] {
+        [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj]
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn projections_mut(&mut self) -> [&mut Proj; 4] {
         [
-            &self.q_proj,
-            &self.k_proj,
-            &self.v_proj,
-            &self.o_proj,
-            &self.q_norm,
-            &self.k_norm,
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.o_proj,
         ]
+    }
+
+    fn norms(&self) -> [&Tensor; 2] {
+        [&self.q_norm, &self.k_norm]
     }
 }
 
 /// One SwiGLU MLP (`mlp` or `nar_mlp`): `down(silu(gate(x)) * up(x))`.
 #[derive(Debug)]
 pub struct Mlp {
-    gate_proj: Tensor,
-    up_proj: Tensor,
-    down_proj: Tensor,
+    gate_proj: Proj,
+    up_proj: Proj,
+    down_proj: Proj,
 }
 
 impl Mlp {
-    fn load(vb: VarBuilder, cfg: &Yue2Config) -> candle_audio::candle_core::Result<Self> {
+    fn load(w: &Loader, prefix: &str, cfg: &Yue2Config) -> candle_audio::candle_core::Result<Self> {
         let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
-            gate_proj: vb.get((i, h), "gate_proj.weight")?,
-            up_proj: vb.get((i, h), "up_proj.weight")?,
-            down_proj: vb.get((h, i), "down_proj.weight")?,
+            gate_proj: w.matrix(&format!("{prefix}.gate_proj.weight"), (i, h))?,
+            up_proj: w.matrix(&format!("{prefix}.up_proj.weight"), (i, h))?,
+            down_proj: w.matrix(&format!("{prefix}.down_proj.weight"), (h, i))?,
         })
     }
 
     /// `down(silu(gate(x)) * up(x))`.
     pub fn forward(&self, x: &Tensor) -> gen_core::Result<Tensor> {
-        let gate = linear(x, &self.gate_proj, None).map_err(backend("gate_proj"))?;
-        let up = linear(x, &self.up_proj, None).map_err(backend("up_proj"))?;
+        let gate = self
+            .gate_proj
+            .forward(x, None)
+            .map_err(backend("gate_proj"))?;
+        let up = self.up_proj.forward(x, None).map_err(backend("up_proj"))?;
         let act = swiglu(&gate, &up).map_err(backend("swiglu"))?;
-        linear(&act, &self.down_proj, None).map_err(backend("down_proj"))
+        self.down_proj
+            .forward(&act, None)
+            .map_err(backend("down_proj"))
+    }
+
+    /// The three projections, in `gate, up, down` order.
+    pub(crate) fn projections(&self) -> [&Proj; 3] {
+        [&self.gate_proj, &self.up_proj, &self.down_proj]
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn projections_mut(&mut self) -> [&mut Proj; 3] {
+        [&mut self.gate_proj, &mut self.up_proj, &mut self.down_proj]
     }
 
     fn to_device(&self, device: &Device) -> candle_audio::candle_core::Result<Self> {
@@ -428,14 +519,40 @@ impl MotPath {
         self.attn_norm.device().clone()
     }
 
+    /// Every matmul weight of the path: the attention's `q, k, v, o`, then the MLP's
+    /// `gate, up, down` — upstream's AR-linear order.
+    pub(crate) fn projections(&self) -> Vec<&Proj> {
+        let mut out: Vec<&Proj> = self.attn.projections().to_vec();
+        out.extend(self.mlp.projections());
+        out
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn projections_mut(&mut self) -> Vec<&mut Proj> {
+        let mut out: Vec<&mut Proj> = self.attn.projections_mut().into_iter().collect();
+        out.extend(self.mlp.projections_mut());
+        out
+    }
+
+    /// Every vector (norm) weight of the path.
+    fn norms(&self) -> Vec<&Tensor> {
+        let mut out = vec![&self.attn_norm, &self.mlp_norm];
+        out.extend(self.attn.norms());
+        out
+    }
+
     fn bytes(&self) -> usize {
-        let mut tensors = vec![&self.attn_norm, &self.mlp_norm];
-        tensors.extend(self.attn.tensors());
-        tensors.extend([&self.mlp.gate_proj, &self.mlp.up_proj, &self.mlp.down_proj]);
-        tensors
+        let dense: usize = self
+            .norms()
             .iter()
             .map(|t| t.elem_count() * t.dtype().size_in_bytes())
-            .sum()
+            .sum();
+        dense
+            + self
+                .projections()
+                .iter()
+                .map(|p| p.resident_bytes() as usize)
+                .sum::<usize>()
     }
 }
 
@@ -452,6 +569,10 @@ pub struct MotLayer {
 /// untied `lm_head` (the NAR auxiliary heads — `llm2vae`, `vae2llm`, the time and latent-position
 /// embeddings — belong to the acoustic stage, [`crate::nar`], and are not loaded here).
 ///
+/// The model holds one precision tier ([`Tier`], [`crate::precision`]) fixed at load: every matmul
+/// weight is dense (`bf16`) or GGML block-quantized (`q8` / `q4`); the embedding and the norms stay
+/// dense. The experimental FP8 AR mode ([`crate::fp8`]) temporarily swaps the AR projections.
+///
 /// # AR offload
 ///
 /// Upstream's `nar._offload_ar` moves the modules the acoustic ODE never reads — the token
@@ -459,74 +580,99 @@ pub struct MotLayer {
 /// moves them back afterwards. [`Yue2Lm::offload_ar`] / [`Yue2Lm::restore_ar`] are that
 /// transition. While offloaded, every AR entry point ([`Yue2Lm::prefill`], [`Yue2Lm::decode`])
 /// refuses with an error instead of computing on host copies; the NAR twins and the final norm
-/// never move.
+/// never move. A GGML weight moves as its exact blocks.
 #[derive(Debug)]
 pub struct Yue2Lm {
     config: Yue2Config,
     embed_tokens: Tensor,
     layers: Vec<MotLayer>,
     norm: Tensor,
-    lm_head: Tensor,
+    lm_head: Proj,
     rope: Rope,
     dtype: DType,
     device: Device,
+    tier: Tier,
     ar_offloaded: bool,
+    pub(crate) fp8: Option<crate::fp8::Fp8State>,
 }
 
 impl Yue2Lm {
-    /// Resolve and verify the pinned YuE2-3B snapshot from `dirs` **immediately before loading**
-    /// (see the crate's load-boundary rule), then load exactly the verified `config.json` and
-    /// `model.safetensors`. `dtype` is the compute dtype (the BF16 checkpoint is converted on
-    /// load; use `DType::F32` on a CPU device, which has no BF16 matmul).
+    /// Resolve and verify the YuE2-3B snapshot from `dirs` **immediately before loading** (see the
+    /// crate's load-boundary rule), then load exactly the verified `config.json` and weights file:
+    /// the pinned original (`bf16`) or a derived tier snapshot ([`crate::tier`]). `dtype` is the
+    /// compute dtype (the BF16 checkpoint is converted on load; use `DType::F32` on a CPU device,
+    /// which has no BF16 matmul).
     pub fn load(
         dirs: &SnapshotDirs,
         paths: MotPaths,
         dtype: DType,
         device: &Device,
     ) -> gen_core::Result<Self> {
-        let opened = open_verified(dirs, dtype, device)?;
-        Self::from_var_builder(
+        let opened = open_verified(dirs, dtype, device, None)?;
+        Self::from_loader(
             Yue2Config::from_json(&opened.config_json)?,
-            opened.vb,
+            &opened.loader,
             paths,
+            opened.tier,
         )
     }
 
-    /// Build from an arbitrary [`VarBuilder`]. Crate-private: production loads go through
-    /// [`Yue2Lm::load`], which verifies the bytes first.
+    /// Build the released-precision model from an arbitrary [`VarBuilder`]. Crate-private:
+    /// production loads go through [`Yue2Lm::load`], which verifies the bytes first.
+    #[cfg(test)]
     pub(crate) fn from_var_builder(
         config: Yue2Config,
         vb: VarBuilder,
         paths: MotPaths,
     ) -> gen_core::Result<Self> {
-        check_compute(vb.dtype(), vb.device())?;
+        Self::from_loader(config, &Loader::new(vb, None), paths, Tier::Bf16)
+    }
+
+    /// Build from a tier-aware [`Loader`].
+    pub(crate) fn from_loader(
+        config: Yue2Config,
+        w: &Loader,
+        paths: MotPaths,
+        tier: Tier,
+    ) -> gen_core::Result<Self> {
+        check_compute(w.dtype(), w.device())?;
         config.validate()?;
         let err = backend("load");
         let (h, v) = (config.hidden_size, config.vocab_size);
-        let model = vb.pp("model");
-        let embed_tokens = model.get((v, h), "embed_tokens.weight").map_err(&err)?;
+        let embed_tokens = w
+            .tensor("model.embed_tokens.weight", (v, h))
+            .map_err(&err)?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let lb = model.pp(format!("layers.{i}"));
+            let p = format!("model.layers.{i}");
             let ar = MotPath {
-                attn_norm: lb.get(h, "input_layernorm.weight").map_err(&err)?,
-                attn: Attention::load(lb.pp("self_attn"), &config).map_err(&err)?,
-                mlp_norm: lb.get(h, "post_attention_layernorm.weight").map_err(&err)?,
-                mlp: Mlp::load(lb.pp("mlp"), &config).map_err(&err)?,
+                attn_norm: w
+                    .tensor(&format!("{p}.input_layernorm.weight"), h)
+                    .map_err(&err)?,
+                attn: Attention::load(w, &format!("{p}.self_attn"), &config).map_err(&err)?,
+                mlp_norm: w
+                    .tensor(&format!("{p}.post_attention_layernorm.weight"), h)
+                    .map_err(&err)?,
+                mlp: Mlp::load(w, &format!("{p}.mlp"), &config).map_err(&err)?,
             };
             let nar = match paths {
                 MotPaths::Ar => None,
                 MotPaths::ArAndNar => Some(MotPath {
-                    attn_norm: lb.get(h, "nar_input_layernorm.weight").map_err(&err)?,
-                    attn: Attention::load(lb.pp("nar_self_attn"), &config).map_err(&err)?,
-                    mlp_norm: lb.get(h, "nar_pre_mlp_layernorm.weight").map_err(&err)?,
-                    mlp: Mlp::load(lb.pp("nar_mlp"), &config).map_err(&err)?,
+                    attn_norm: w
+                        .tensor(&format!("{p}.nar_input_layernorm.weight"), h)
+                        .map_err(&err)?,
+                    attn: Attention::load(w, &format!("{p}.nar_self_attn"), &config)
+                        .map_err(&err)?,
+                    mlp_norm: w
+                        .tensor(&format!("{p}.nar_pre_mlp_layernorm.weight"), h)
+                        .map_err(&err)?,
+                    mlp: Mlp::load(w, &format!("{p}.nar_mlp"), &config).map_err(&err)?,
                 }),
             };
             layers.push(MotLayer { ar, nar });
         }
-        let norm = model.get(h, "norm.weight").map_err(&err)?;
-        let lm_head = vb.get((v, h), "lm_head.weight").map_err(&err)?;
+        let norm = w.tensor("model.norm.weight", h).map_err(&err)?;
+        let lm_head = w.matrix("lm_head.weight", (v, h)).map_err(&err)?;
         let rope = Rope::standard(config.head_dim as i32, config.rope_theta as f32);
         Ok(Self {
             dtype: embed_tokens.dtype(),
@@ -537,7 +683,9 @@ impl Yue2Lm {
             norm,
             lm_head,
             rope,
+            tier,
             ar_offloaded: false,
+            fp8: None,
         })
     }
 
@@ -556,17 +704,65 @@ impl Yue2Lm {
         &self.device
     }
 
+    /// The precision tier the weights were loaded at.
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
+
     /// Whether the AR-only weights are offloaded (see the [type docs](Yue2Lm#ar-offload)).
     pub fn ar_offloaded(&self) -> bool {
         self.ar_offloaded
+    }
+
+    /// `lm_head`.
+    #[cfg(test)]
+    pub(crate) fn lm_head(&self) -> &Proj {
+        &self.lm_head
+    }
+
+    /// The layers, mutably (the FP8 AR mode swaps AR projections in place).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn layers_mut(&mut self) -> &mut [MotLayer] {
+        &mut self.layers
+    }
+
+    /// Measured resident weight bytes of this model (both paths, embedding, norms, `lm_head`; the
+    /// NAR heads are counted by [`crate::nar::Yue2Nar::weight_residency`]). While the FP8 AR mode
+    /// is active its CPU-held BF16 originals are [`Residency::host_bytes`].
+    pub fn weight_residency(&self) -> Residency {
+        let dense = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let mut device = dense(&self.embed_tokens) + dense(&self.norm);
+        device += self.lm_head.resident_bytes();
+        for layer in &self.layers {
+            for path in std::iter::once(&layer.ar).chain(layer.nar.as_ref()) {
+                device += path.norms().into_iter().map(dense).sum::<u64>();
+                device += path
+                    .projections()
+                    .iter()
+                    .map(|p| p.resident_bytes())
+                    .sum::<u64>();
+            }
+        }
+        Residency {
+            device_bytes: device,
+            host_bytes: self.fp8.as_ref().map_or(0, |f| f.original_bytes()),
+        }
     }
 
     /// Move the AR-only weights — `embed_tokens`, `lm_head` and every layer's AR path — to host
     /// memory, upstream's `_offload_ar(model, True)` entry. Returns the bytes that left the device:
     /// `0` for a model that already lives in host memory (upstream moves only modules whose device
     /// is not the CPU), in which case this only marks the AR path unavailable. An error part-way
-    /// leaves the model marked offloaded; [`Yue2Lm::restore_ar`] brings every tensor back.
+    /// leaves the model marked offloaded; [`Yue2Lm::restore_ar`] brings every tensor back. Refused
+    /// while the FP8 AR mode is active (restore the BF16 AR path first — the acoustic stage always
+    /// does).
     pub fn offload_ar(&mut self) -> gen_core::Result<usize> {
+        if self.fp8.is_some() {
+            return Err(gen_core::Error::Msg(
+                "YuE2: the AR path is in the FP8 mode; restore its BF16 originals before offloading"
+                    .into(),
+            ));
+        }
         self.ar_offloaded = true;
         if self.device.is_cpu() {
             return Ok(0);
@@ -574,11 +770,13 @@ impl Yue2Lm {
         let host = Device::Cpu;
         let err = backend("offload AR path");
         let mut moved = 0;
-        for tensor in [&mut self.embed_tokens, &mut self.lm_head] {
-            if !tensor.device().is_cpu() {
-                moved += tensor.elem_count() * tensor.dtype().size_in_bytes();
-                *tensor = tensor.to_device(&host).map_err(&err)?;
-            }
+        if !self.embed_tokens.device().is_cpu() {
+            moved += self.embed_tokens.elem_count() * self.embed_tokens.dtype().size_in_bytes();
+            self.embed_tokens = self.embed_tokens.to_device(&host).map_err(&err)?;
+        }
+        if !self.lm_head.device().is_cpu() {
+            moved += self.lm_head.resident_bytes() as usize;
+            self.lm_head = self.lm_head.to_device(&host).map_err(&err)?;
         }
         for layer in &mut self.layers {
             if !layer.ar.device().is_cpu() {
@@ -596,10 +794,11 @@ impl Yue2Lm {
         if !self.device.is_cpu() {
             let device = self.device.clone();
             let err = backend("restore AR path");
-            for tensor in [&mut self.embed_tokens, &mut self.lm_head] {
-                if !tensor.device().same_device(&device) {
-                    *tensor = tensor.to_device(&device).map_err(&err)?;
-                }
+            if !self.embed_tokens.device().same_device(&device) {
+                self.embed_tokens = self.embed_tokens.to_device(&device).map_err(&err)?;
+            }
+            if !self.lm_head.device().same_device(&device) {
+                self.lm_head = self.lm_head.to_device(&device).map_err(&err)?;
             }
             for layer in &mut self.layers {
                 if !layer.ar.device().same_device(&device) {
@@ -685,7 +884,10 @@ impl Yue2Lm {
         }
         let last = x.narrow(1, t - 1, 1).map_err(&err)?;
         let last = rms_norm(&last, &self.norm, self.config.rms_norm_eps).map_err(&err)?;
-        let logits = linear(&last, &self.lm_head, None).map_err(backend("lm_head"))?;
+        let logits = self
+            .lm_head
+            .forward(&last, None)
+            .map_err(backend("lm_head"))?;
         logits.flatten_all().map_err(err)
     }
 
@@ -723,17 +925,11 @@ impl Yue2Lm {
     /// move)` — the latter being every NAR twin and the final norm.
     pub(crate) fn placement(&self) -> (Vec<Device>, Vec<Device>) {
         let path = |p: &MotPath| {
-            let mut t = vec![&p.attn_norm, &p.mlp_norm];
-            t.extend(p.attn.tensors());
-            t.extend([&p.mlp.gate_proj, &p.mlp.up_proj, &p.mlp.down_proj]);
-            t.into_iter()
-                .map(|t| t.device().clone())
-                .collect::<Vec<_>>()
+            let mut t: Vec<Device> = p.norms().iter().map(|t| t.device().clone()).collect();
+            t.extend(p.projections().iter().map(|p| p.device()));
+            t
         };
-        let mut ar = vec![
-            self.embed_tokens.device().clone(),
-            self.lm_head.device().clone(),
-        ];
+        let mut ar = vec![self.embed_tokens.device().clone(), self.lm_head.device()];
         let mut fixed = vec![self.norm.device().clone()];
         for layer in &self.layers {
             ar.extend(path(&layer.ar));
@@ -916,8 +1112,14 @@ pub(crate) mod synthetic {
 
     /// The synthetic model on the CPU in F32.
     pub(crate) fn model(paths: MotPaths) -> Yue2Lm {
+        model_on(paths, &Device::Cpu, DType::F32)
+    }
+
+    /// The synthetic model on `device` computing in `dtype` (the F32 values converted on load, as
+    /// a released BF16 checkpoint is).
+    pub(crate) fn model_on(paths: MotPaths, device: &Device, dtype: DType) -> Yue2Lm {
         let cfg = config();
-        let vb = VarBuilder::from_tensors(tensors(&cfg), DType::F32, &Device::Cpu);
+        let vb = VarBuilder::from_tensors(tensors(&cfg), dtype, device);
         Yue2Lm::from_var_builder(cfg, vb, paths).expect("synthetic YuE2 loads")
     }
 }
