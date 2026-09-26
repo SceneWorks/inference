@@ -55,6 +55,8 @@ pub mod inventory;
 pub mod license;
 pub mod manifest;
 pub mod model;
+#[cfg(test)]
+mod parity;
 pub mod sampling;
 pub mod snapshot;
 

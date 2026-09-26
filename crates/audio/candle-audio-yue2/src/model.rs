@@ -605,6 +605,19 @@ pub(crate) mod synthetic {
             .collect()
     }
 
+    /// A fixed logits row for sampler parity: `((h % 2000001) - 1000000) · scale / 10⁶` — two
+    /// million levels, so ties are rare (`row_values` in the fixture generator).
+    pub(crate) fn row_values(name: &str, n: usize, scale: f32) -> Vec<f32> {
+        let seed = fnv1a(name);
+        let step = scale / 1_000_000.0;
+        (0..n)
+            .map(|i| {
+                let x = fmix(seed ^ (i as u32).wrapping_mul(0x9E37_79B1));
+                ((x % 2_000_001) as f32 - 1_000_000.0) * step
+            })
+            .collect()
+    }
+
     /// Every tensor the synthetic checkpoint holds (both MoT paths), by upstream name.
     pub(crate) fn state_dict(cfg: &Yue2Config) -> Vec<(String, Vec<usize>, f32, f32)> {
         let (h, hd, nq, nkv, i, v) = (
