@@ -206,8 +206,7 @@ mod cuda {
             .unwrap()
             .to_dtype(DType::BF16)
             .unwrap();
-        let lt =
-            std::sync::Arc::new(candle_quant_kernels::cublaslt::CublasLt::new(&dev).unwrap());
+        let lt = std::sync::Arc::new(candle_quant_kernels::cublaslt::CublasLt::new(&dev).unwrap());
         assert!(lt.meets_fp8_floor().unwrap(), "the CUDA lane needs sm_89+");
         let (qw, sw) = quantize_e4m3(&w).unwrap();
         let weight = Fp8Weight {
@@ -308,7 +307,10 @@ mod cuda {
             during.device_bytes,
             before.device_bytes - ar_params * 2 + s.device_fp8_bytes
         );
-        assert!(lm.offload_ar().is_err(), "offloading FP8 weights is refused");
+        assert!(
+            lm.offload_ar().is_err(),
+            "offloading FP8 weights is refused"
+        );
         let fp8_logits = {
             let mut cache = lm.new_cache(ids.len()).unwrap();
             lm.prefill(&ids, &mut cache, || Ok(())).unwrap()

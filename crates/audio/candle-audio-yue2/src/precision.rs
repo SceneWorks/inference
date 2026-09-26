@@ -205,7 +205,9 @@ pub fn classify(name: &str) -> Option<TensorClass> {
         | "llm2vae.weight"
         | "time_embedder.mlp.0.weight"
         | "time_embedder.mlp.2.weight" => return Some(TensorClass::NarHead),
-        "vae2llm.bias" | "llm2vae.bias" | "time_embedder.mlp.0.bias"
+        "vae2llm.bias"
+        | "llm2vae.bias"
+        | "time_embedder.mlp.0.bias"
         | "time_embedder.mlp.2.bias" => return Some(TensorClass::Bias),
         _ => {}
     }
@@ -257,10 +259,7 @@ impl Storage {
             Storage::Ggml(d) => {
                 let cols = logical.last().copied().unwrap_or(0);
                 let rows: usize = logical[..logical.len().saturating_sub(1)].iter().product();
-                (
-                    "U8",
-                    vec![rows, cols / d.block_size(), d.type_size()],
-                )
+                ("U8", vec![rows, cols / d.block_size(), d.type_size()])
             }
         }
     }

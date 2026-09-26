@@ -585,10 +585,7 @@ fn assemble(
             Storage::Ggml(dtype) => {
                 let q = QTensor::quantize(&src, dtype).map_err(&err)?;
                 to_ggml_block_tensor(&q).map_err(|e| {
-                    RunError::Engine(gen_core::Error::Msg(format!(
-                        "YuE2 tier {}: {e}",
-                        t.name
-                    )))
+                    RunError::Engine(gen_core::Error::Msg(format!("YuE2 tier {}: {e}", t.name)))
                 })?
             }
         };

@@ -30,7 +30,11 @@ pub fn is_yue2_snapshot(dir: &Path) -> bool {
     };
     serde_json::from_str::<serde_json::Value>(&text)
         .ok()
-        .and_then(|v| v.get("model_type").and_then(|m| m.as_str()).map(|m| m == "yue2"))
+        .and_then(|v| {
+            v.get("model_type")
+                .and_then(|m| m.as_str())
+                .map(|m| m == "yue2")
+        })
         .unwrap_or(false)
 }
 
@@ -121,6 +125,9 @@ mod tests {
         // Not the pinned original: bf16 passthrough verification fails explicitly.
         assert!(prepare(&spec(None)).is_err());
         assert!(prepare(&spec(Some(Quantize::Q8))).is_err());
-        assert!(!tmp.path().join("out").exists(), "a failed conversion leaves nothing");
+        assert!(
+            !tmp.path().join("out").exists(),
+            "a failed conversion leaves nothing"
+        );
     }
 }

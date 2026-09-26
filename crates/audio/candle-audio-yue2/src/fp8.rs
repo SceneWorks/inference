@@ -338,11 +338,16 @@ impl Fp8Weight {
         let padded = if pad == 0 {
             rows
         } else {
-            Tensor::cat(&[&rows, &Tensor::zeros((pad, k), DType::BF16, x.device())?], 0)?
+            Tensor::cat(
+                &[&rows, &Tensor::zeros((pad, k), DType::BF16, x.device())?],
+                0,
+            )?
         };
         let (q, x_scale) = quantize_e4m3(&padded)?;
         let xq = self.lt.stage_fp8(&q)?;
-        let y = self.lt.matmul_fp8_staged(&self.w, self.scale, &xq, x_scale)?;
+        let y = self
+            .lt
+            .matmul_fp8_staged(&self.w, self.scale, &xq, x_scale)?;
         let mut out_dims = dims;
         *out_dims.last_mut().expect("non-empty") = n;
         let y = y.narrow(0, 0, m)?.reshape(out_dims)?;
@@ -405,7 +410,9 @@ mod cuda {
                     let p = lm.layers()[i].ar.projections()[j];
                     p.dense().expect("checked dense BF16").clone()
                 };
-                let host = weight.to_device(&Device::Cpu).map_err(err("move original"))?;
+                let host = weight
+                    .to_device(&Device::Cpu)
+                    .map_err(err("move original"))?;
                 let (q, scale) = quantize_e4m3(&host).map_err(err("quantize weight"))?;
                 let q = q.to_device(device).map_err(err("upload weight"))?;
                 let staged = lt.stage_fp8(&q).map_err(err("stage weight"))?;

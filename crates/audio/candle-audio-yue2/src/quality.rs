@@ -70,10 +70,12 @@ fn hub() -> SnapshotDirs {
 }
 
 fn out_dir() -> PathBuf {
-    env("YUE2_QUALITY_OUT").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").expect("HOME"))
-            .join(".cache/sceneworks-yue2-fixtures/quality")
-    })
+    std::env::var_os("YUE2_QUALITY_OUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/sceneworks-yue2-fixtures/quality")
+        })
 }
 
 fn device_named(name: &str) -> Device {
@@ -354,13 +356,20 @@ fn check_reference_against_upstream(o: &Outputs, fixture: &Value) -> f64 {
                 .map(|v| v.as_f64().unwrap())
                 .collect();
             let top = topk(row, want_ids.len());
-            assert_eq!(allowed[top[0]], want_ids[0], "{}: top-1 vs upstream", seq.name);
+            assert_eq!(
+                allowed[top[0]], want_ids[0],
+                "{}: top-1 vs upstream",
+                seq.name
+            );
             for (i, v) in top.iter().zip(&want_vals) {
                 worst = worst.max((row[*i] as f64 - v).abs());
             }
         }
     }
-    assert!(worst < 1e-3, "F32 reference vs upstream top-8 values: {worst:e}");
+    assert!(
+        worst < 1e-3,
+        "F32 reference vs upstream top-8 values: {worst:e}"
+    );
     worst
 }
 
@@ -370,7 +379,10 @@ fn config(name: &str, device: &Device) -> (ModelPrecision, DType) {
     match name {
         "f32" | "f32dev" => (ModelPrecision::default(), DType::F32),
         "bf16" => {
-            assert!(accel, "bf16 compute needs an accelerator (Candle CPU has no BF16 matmul)");
+            assert!(
+                accel,
+                "bf16 compute needs an accelerator (Candle CPU has no BF16 matmul)"
+            );
             (
                 ModelPrecision {
                     tier: Some(Tier::Bf16),

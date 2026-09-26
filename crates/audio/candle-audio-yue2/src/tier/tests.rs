@@ -203,13 +203,7 @@ fn load(src: &Source, dir: &Path) -> Yue2Nar {
 /// The BF16 original as an F32 model — the reference every tier is compared with.
 fn original(src: &Source) -> Yue2Nar {
     let vb = candle_nn::VarBuilder::from_tensors(src.tensors.clone(), DType::F32, &Device::Cpu);
-    Yue2Nar::from_var_builder(
-        mot::config(),
-        heads::nar_config(1.0),
-        vb,
-        "original".into(),
-    )
-    .unwrap()
+    Yue2Nar::from_var_builder(mot::config(), heads::nar_config(1.0), vb, "original".into()).unwrap()
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -379,7 +373,9 @@ fn a_tier_loads_at_its_precision_map_and_stays_close_to_the_original() {
     let src = source();
     let reference = original(&src);
     let mut previous = (0.0, 0.0);
-    for (tier, (logit_bound, latent_bound)) in [Tier::Q8, Tier::Q4].into_iter().zip(SYNTHETIC_BOUNDS) {
+    for (tier, (logit_bound, latent_bound)) in
+        [Tier::Q8, Tier::Q4].into_iter().zip(SYNTHETIC_BOUNDS)
+    {
         let dir = convert_to(&src, tier, tier.name());
         let mut model = load(&src, &dir);
         assert_eq!(model.lm().tier(), tier);
@@ -616,7 +612,10 @@ fn rehosting_a_tier_is_not_authorized() {
     assert!(authorize(&tier_components, IntendedUse::NoncommercialExperimentation).is_ok());
     let refused = authorize(&tier_components, IntendedUse::Redistribution).unwrap_err();
     let why = refused.to_string();
-    assert!(why.contains("Lm:") && why.contains("QwenTiktoken:"), "{why}");
+    assert!(
+        why.contains("Lm:") && why.contains("QwenTiktoken:"),
+        "{why}"
+    );
     let src = source();
     let dir = convert_to(&src, Tier::Q8, "q8");
     let note = read_manifest(&dir).unwrap()["license"]["note"]

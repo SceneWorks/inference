@@ -58,9 +58,9 @@ use crate::closure::{is_saved_closure, load_closure};
 use crate::engine::{
     EngineHooks, EngineObserver, EngineOptions, ModelPrecision, SongSettings, Stage, Yue2Engine,
 };
-use crate::precision::Tier;
 use crate::inventory::{ComponentId, VaeVariant};
 use crate::plan::SymbolicPlan;
+use crate::precision::Tier;
 use crate::protocol::{
     CotMode, GenerationConfig, SamplingOverrides, SongRequest, SongRequestSpec, DEFAULT_ID,
     DEFAULT_SEED,
@@ -492,7 +492,9 @@ fn restore(
 
 /// The snapshot directories (and saved generation configuration) a [`LoadSpec`] names, and the
 /// tier it asserts.
-fn resolve_spec(spec: &LoadSpec) -> gen_core::Result<(SnapshotDirs, GenerationConfig, Option<Tier>)> {
+fn resolve_spec(
+    spec: &LoadSpec,
+) -> gen_core::Result<(SnapshotDirs, GenerationConfig, Option<Tier>)> {
     let id = PROVIDER_ID;
     let weights = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),

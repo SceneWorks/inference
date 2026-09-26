@@ -252,7 +252,11 @@ pub(crate) fn open_verified(
 
 /// An asserted tier must be the staged one: a request for `q8` over the BF16 original (or any
 /// other mismatch) is refused, never served at another precision.
-pub(crate) fn check_tier(expect: Option<Tier>, staged: Tier, dir: &std::path::Path) -> gen_core::Result<()> {
+pub(crate) fn check_tier(
+    expect: Option<Tier>,
+    staged: Tier,
+    dir: &std::path::Path,
+) -> gen_core::Result<()> {
     match expect {
         Some(want) if want != staged => Err(gen_core::Error::Unsupported(format!(
             "yue2: the {want} tier was requested but {} holds the {staged} tier{}",
@@ -277,10 +281,9 @@ pub(crate) fn open_tier(
     check_compute(dtype, device)?;
     let config_json = std::fs::read_to_string(verified.config_path())?;
     // SAFETY: the verified tier weights file, opened read-only; every tensor is copied out.
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[verified.weights_path()], dtype, device)
-    }
-    .map_err(backend("open tier weights"))?;
+    let vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[verified.weights_path()], dtype, device) }
+            .map_err(backend("open tier weights"))?;
     let storage: BTreeMap<String, Storage> = verified.storage_map();
     Ok(VerifiedLmFiles {
         config_json,
@@ -397,7 +400,9 @@ impl Attention {
             .transpose(1, 2)
             .and_then(|x| x.reshape((b, t, self.num_heads * self.head_dim)))
             .map_err(&err)?;
-        self.o_proj.forward(&merged, None).map_err(backend("o_proj"))
+        self.o_proj
+            .forward(&merged, None)
+            .map_err(backend("o_proj"))
     }
 
     pub(crate) fn scale(&self) -> f32 {
@@ -456,10 +461,15 @@ impl Mlp {
 
     /// `down(silu(gate(x)) * up(x))`.
     pub fn forward(&self, x: &Tensor) -> gen_core::Result<Tensor> {
-        let gate = self.gate_proj.forward(x, None).map_err(backend("gate_proj"))?;
+        let gate = self
+            .gate_proj
+            .forward(x, None)
+            .map_err(backend("gate_proj"))?;
         let up = self.up_proj.forward(x, None).map_err(backend("up_proj"))?;
         let act = swiglu(&gate, &up).map_err(backend("swiglu"))?;
-        self.down_proj.forward(&act, None).map_err(backend("down_proj"))
+        self.down_proj
+            .forward(&act, None)
+            .map_err(backend("down_proj"))
     }
 
     /// The three projections, in `gate, up, down` order.

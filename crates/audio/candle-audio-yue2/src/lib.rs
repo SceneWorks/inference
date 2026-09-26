@@ -115,13 +115,13 @@ pub mod model;
 pub mod nar;
 #[cfg(test)]
 mod parity;
-#[cfg(test)]
-mod quality;
 pub mod plan;
 pub mod precision;
 pub mod prepare;
 pub mod protocol;
 pub mod provider;
+#[cfg(test)]
+mod quality;
 pub mod run;
 pub mod sampling;
 pub mod snapshot;
@@ -138,11 +138,11 @@ pub use engine::{
     SongSettings, Stage, StageEvent, Yue2Engine,
 };
 pub use fp8::ArPrecision;
-pub use precision::Tier;
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
 pub use license::COMPONENT_LICENSES;
 pub use nar::{synthesize, NarOptions, QueryTile, SongNoise, SynthesisRequest, Yue2Nar};
 pub use plan::{PlanError, PlanIdentity, PlanStep, SemanticConditioning, SymbolicPlan};
+pub use precision::Tier;
 pub use protocol::{CotMode, GenerationConfig, ProtocolError, Sampling, SongRequest};
 pub use provider::{
     descriptor, load, PROVIDER_COMPONENTS, PROVIDER_COMPONENT_LICENSES, PROVIDER_ID, REGISTRATION,

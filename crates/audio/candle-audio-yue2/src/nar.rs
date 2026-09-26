@@ -80,8 +80,8 @@ use sha2::{Digest, Sha256};
 use crate::generate::stage_rng;
 use crate::latent::{AcousticLatents, LatentSource, LATENT_CHANNELS};
 use crate::model::{backend, rms_norm, MotPaths, Yue2Config, Yue2Lm};
-use crate::protocol::{self, CODEC_OFFSET, CODEC_SIZE, MUSIC_END, ODE_METHOD, PROTOCOL_VERSION};
 use crate::precision::{Residency, Tier};
+use crate::protocol::{self, CODEC_OFFSET, CODEC_SIZE, MUSIC_END, ODE_METHOD, PROTOCOL_VERSION};
 use crate::snapshot::SnapshotDirs;
 use crate::weights::{Loader, Proj};
 
@@ -213,7 +213,11 @@ impl NarHeads {
             .unsqueeze(1)?
             .broadcast_mul(&self.freqs.unsqueeze(0)?)?;
         let emb = Tensor::cat(&[args.cos()?, args.sin()?], 1)?.to_dtype(dtype)?;
-        let h = self.time_in.0.forward(&emb, Some(&self.time_in.1))?.silu()?;
+        let h = self
+            .time_in
+            .0
+            .forward(&emb, Some(&self.time_in.1))?
+            .silu()?;
         Ok(self
             .time_out
             .0
@@ -775,7 +779,10 @@ impl ChunkSolver {
         let time = heads
             .time_embedding(raw_t)
             .map_err(backend("time embedding"))?;
-        let mut x = heads.vae2llm.0.forward(&x_nar, Some(&heads.vae2llm.1))
+        let mut x = heads
+            .vae2llm
+            .0
+            .forward(&x_nar, Some(&heads.vae2llm.1))
             .map_err(backend("vae2llm"))?
             .broadcast_add(&time)
             .and_then(|x| x.broadcast_add(&self.positions))
@@ -809,7 +816,10 @@ impl ChunkSolver {
             x = (&x + p.mlp.forward(&normed)?).map_err(&err)?;
         }
         let x = rms_norm(&x, lm.final_norm(), cfg.rms_norm_eps).map_err(&err)?;
-        heads.llm2vae.0.forward(&x, Some(&heads.llm2vae.1))
+        heads
+            .llm2vae
+            .0
+            .forward(&x, Some(&heads.llm2vae.1))
             .map_err(backend("llm2vae"))?
             .squeeze(0)
             .and_then(|v| v.narrow(0, 1, self.frames))
