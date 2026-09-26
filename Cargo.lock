@@ -413,6 +413,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-yue2"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "candle-core"
 version = "0.10.2"
 source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"

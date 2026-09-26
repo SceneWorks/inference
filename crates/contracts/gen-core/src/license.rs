@@ -43,7 +43,7 @@
 //!
 //! ## The tables themselves (sc-16662, sc-16665)
 //!
-//! [`families`] carries the transcribed [`LicenseFamily`] rows — twenty-one upstream texts, each
+//! [`families`] carries the transcribed [`LicenseFamily`] rows — twenty-two upstream texts, each
 //! term backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md`,
 //! `docs/licensing/sc-16665-checkpoint-licence-evidence.md` or (Qwen Research, sc-24108) the
 //! family's own doc comment.

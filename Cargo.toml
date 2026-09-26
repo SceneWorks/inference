@@ -16,6 +16,7 @@ members = [
     "crates/audio/candle-audio-stable-audio-3",
     "crates/audio/candle-audio-whisper",
     "crates/audio/candle-audio-yue",
+    "crates/audio/candle-audio-yue2",
     "crates/contracts/core-llm",
     "crates/contracts/core-llm/core-llm-testkit",
     "crates/contracts/gen-core",

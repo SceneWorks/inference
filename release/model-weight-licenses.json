@@ -519,6 +519,32 @@
           "url": "https://stability.ai/use-policy"
         }
       ]
+    },
+    {
+      "id": "tongyi-qianwen",
+      "spdx_id": "LicenseRef-Tongyi-Qianwen-License-Agreement",
+      "name": "Tongyi Qianwen License Agreement",
+      "text_url": "https://huggingface.co/Qwen/Qwen-7B/raw/ef3c5c9c57b252f3149c1408daf4d649ec8b6c85/LICENSE",
+      "terms": [
+        {
+          "term": "downstream_license_copy",
+          "family": "tongyi-qianwen"
+        },
+        {
+          "term": "notice_file_required"
+        },
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If you are commercially using the Materials, and your product or service has more than 100 million monthly active users, You shall request a license from Us. You cannot exercise your rights under this Agreement without our express authorization."
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You can not use the Materials or any output therefrom to improve any other large language model (excluding Tongyi Qianwen or derivative works thereof)."
+        }
+      ]
     }
   ],
   "components": [

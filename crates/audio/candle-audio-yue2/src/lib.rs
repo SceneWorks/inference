@@ -1,0 +1,39 @@
+//! YuE2 — the **noncommercial, experimental** music-generation provider for the SceneWorks Candle
+//! audio lane (epic sc-22988).
+//!
+//! YuE2 coexists with YuE1 (`candle-audio-yue`, epic sc-19373) and never replaces it: every
+//! component key here is `yue2_`-prefixed, every upstream repository and revision is distinct from
+//! YuE1's, and the two crates share no cache namespace (epic E1). YuE1 is the commercially licensed
+//! option (Apache-2.0 weights); YuE2's weights are CC BY-NC 4.0 (epic E2).
+//!
+//! This walking-skeleton slice (sc-22989) is the pinned asset closure every later slice loads from:
+//!
+//! * [`inventory`] — the exact upstream repositories and revisions, every closure file with its
+//!   size and SHA-256, the two closures ([`Closure::Generation`] needs YuE2-3B, `qwen.tiktoken` and
+//!   one VAE; [`Closure::Cover`] is the separate SheetSage2 + MERT-v2-FullSong transcription
+//!   closure), what is deliberately excluded, and the committed conversion manifests.
+//! * [`snapshot`] — offline resolution of a component to a local snapshot directory and full
+//!   integrity verification of the bytes that will be loaded; a cache miss, a missing, truncated,
+//!   corrupt or unexpected shard, or a tensor table that disagrees with the conversion manifest is
+//!   an explicit [`AssetError`]. [`snapshot::native_tensor_digests`] re-reads every tensor through
+//!   Candle's safetensors loader so the native values can be compared with the pinned originals.
+//! * [`license`] — the licence policy: Apache-2.0 GitHub source vs CC BY-NC 4.0 weights vs the
+//!   Tongyi Qianwen terms of the bundled `qwen.tiktoken` vs bundled archive / third-party terms;
+//!   the per-artifact [`gen_core::ComponentLicense`] rows with attribution; and
+//!   [`license::authorize`], which refuses any intended use (commercial use, redistribution) that
+//!   has no recorded compatible basis.
+//!
+//! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
+//! only ever reads a snapshot that is already on disk.
+
+#![deny(rustdoc::private_intra_doc_links)]
+
+pub use candle_audio::gen_core;
+
+pub mod inventory;
+pub mod license;
+pub mod manifest;
+pub mod snapshot;
+
+pub use inventory::{Closure, Component, ComponentId, VaeVariant};
+pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
