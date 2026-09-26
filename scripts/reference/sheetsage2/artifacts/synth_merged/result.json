@@ -1,5 +1,5 @@
 {
-  "audio": "synth.wav",
+  "audio": "audio",
   "duration_seconds": 39.4,
   "prompts": [
     "timestamp",
@@ -28,10 +28,10 @@
       "tokens": 340,
       "events": 70,
       "accepted_events": 69,
-      "elapsed_seconds": 15.237321958004031
+      "elapsed_seconds": 24.050367791991448
     }
   ],
-  "elapsed_seconds": 15.316748417011695,
+  "elapsed_seconds": 24.099728667002637,
   "warnings": [],
   "peak_gpu_mib": 0,
   "melody_notes": 54,

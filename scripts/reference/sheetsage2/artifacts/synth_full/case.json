@@ -7,8 +7,8 @@
       512
     ],
     "seconds_per_300s_window": [
-      13.99,
-      13.94
+      17.48,
+      17.26
     ]
   },
   "environment": {
@@ -22,10 +22,15 @@
     "transformers": "4.45.2"
   },
   "hf_hub_offline": true,
+  "input": {
+    "sample_rate": 24000,
+    "samples": 945600,
+    "sha256": "47d335ef30b3137121f2ca15758333f3fce361eed169f96b6b5823adc063a345"
+  },
   "load": {
     "device": "cpu",
     "dtype": "torch.float32",
-    "load_seconds": 1.6,
+    "load_seconds": 1.82,
     "parameters": 676887449,
     "revision": "eab522a8168e8b8b8c4856bf8609cd86198f01fe",
     "snapshot": "$HF_HUB_CACHE/models--m-a-p--SheetSage2/snapshots/eab522a8168e8b8b8c4856bf8609cd86198f01fe"
@@ -38,7 +43,7 @@
     ],
     "dtype": "fp32",
     "duration_seconds": 39.4,
-    "elapsed_seconds": 15.541423082991969,
+    "elapsed_seconds": 18.11155545798829,
     "instrumental_notes": 54,
     "lookahead_seconds": 100.0,
     "melody_notes": 54,
@@ -59,7 +64,7 @@
     "windows": [
       {
         "accepted_events": 69,
-        "elapsed_seconds": 15.43991770799039,
+        "elapsed_seconds": 18.013210208009696,
         "end": 39.4,
         "events": 70,
         "start": 0.0,
@@ -114,5 +119,5 @@
       ]
     }
   },
-  "transcribe_seconds": 15.56
+  "transcribe_seconds": 18.13
 }

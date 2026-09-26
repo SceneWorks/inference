@@ -14,7 +14,7 @@
   "load": {
     "device": "cpu",
     "dtype": "torch.float32",
-    "load_seconds": 1.61,
+    "load_seconds": 2.63,
     "parameters": 676887449,
     "revision": "eab522a8168e8b8b8c4856bf8609cd86198f01fe",
     "snapshot": "$HF_HUB_CACHE/models--m-a-p--SheetSage2/snapshots/eab522a8168e8b8b8c4856bf8609cd86198f01fe"
@@ -42,16 +42,16 @@
       "type": "ValueError"
     },
     {
-      "error": "Cannot decode audio: [in#0 @ 0xbc8c1c000] Error opening input: Invalid data found when processing input\nError opening input file pipe:0.\nError opening input files: Invalid data found when processing input\n",
+      "error": "Cannot decode audio: [in#0 @ 0x871408000] Error opening input: Invalid data found when processing input\nError opening input file pipe:0.\nError opening input files: Invalid data found when processing input\n",
       "outcome": "raised",
       "probe": "undecodable bytes",
-      "seconds": 0.05,
+      "seconds": 0.04,
       "type": "ValueError"
     },
     {
       "outcome": "returned",
       "probe": "12 s digital silence, full",
-      "seconds": 14.41,
+      "seconds": 25.26,
       "value": {
         "abc_error": null,
         "abc_measures": 7,
@@ -60,7 +60,7 @@
         ],
         "dtype": "fp32",
         "duration_seconds": 12.0,
-        "elapsed_seconds": 14.412346166005591,
+        "elapsed_seconds": 25.257779792009387,
         "instrumental_notes": 0,
         "lookahead_seconds": 100.0,
         "melody_notes": 0,
@@ -81,7 +81,7 @@
         "windows": [
           {
             "accepted_events": 25,
-            "elapsed_seconds": 14.407676083996193,
+            "elapsed_seconds": 25.2525611660094,
             "end": 12.0,
             "events": 26,
             "start": 0.0,
@@ -93,7 +93,7 @@
     {
       "outcome": "returned",
       "probe": "12 s digital silence, melody_only",
-      "seconds": 14.29,
+      "seconds": 17.19,
       "value": {
         "abc_error": null,
         "abc_measures": 7,
@@ -102,7 +102,7 @@
         ],
         "dtype": "fp32",
         "duration_seconds": 12.0,
-        "elapsed_seconds": 14.294366957998136,
+        "elapsed_seconds": 17.190857499983395,
         "instrumental_notes": 0,
         "lookahead_seconds": 100.0,
         "melody_notes": 0,
@@ -123,7 +123,7 @@
         "windows": [
           {
             "accepted_events": 25,
-            "elapsed_seconds": 14.292519542010268,
+            "elapsed_seconds": 17.188835666020168,
             "end": 12.0,
             "events": 26,
             "start": 0.0,
@@ -136,7 +136,7 @@
       "error": "(\"Unsupported backend 'ffmpeg' specified; \", 'please select one of [] instead.')",
       "outcome": "raised",
       "probe": "preset=paper decode via torchaudio FFmpeg backend",
-      "seconds": 0.0,
+      "seconds": 0.01,
       "type": "ValueError"
     }
   ],

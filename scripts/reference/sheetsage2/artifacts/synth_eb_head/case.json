@@ -11,10 +11,15 @@
     "transformers": "4.45.2"
   },
   "hf_hub_offline": true,
+  "input": {
+    "sample_rate": 24000,
+    "samples": 945600,
+    "sha256": "602d95d684303ba16af359d4c0843ff278f6a15f62173374dd603125a4efef13"
+  },
   "load": {
     "device": "cpu",
     "dtype": "torch.float32",
-    "load_seconds": 1.71,
+    "load_seconds": 1.8,
     "parameters": 676887449,
     "revision": "4f89269db831bdc1880124164a00d4f9385cd129",
     "snapshot": "$HF_HUB_CACHE/models--m-a-p--SheetSage2/snapshots/4f89269db831bdc1880124164a00d4f9385cd129"
@@ -27,7 +32,7 @@
     ],
     "dtype": "fp32",
     "duration_seconds": 39.4,
-    "elapsed_seconds": 15.316859084006865,
+    "elapsed_seconds": 17.258850582991727,
     "instrumental_notes": 54,
     "lookahead_seconds": 100.0,
     "melody_notes": 54,
@@ -48,7 +53,7 @@
     "windows": [
       {
         "accepted_events": 69,
-        "elapsed_seconds": 15.211033708998002,
+        "elapsed_seconds": 17.238957916997606,
         "end": 39.4,
         "events": 70,
         "start": 0.0,
@@ -60,5 +65,5 @@
     "fixture": "synth_eb",
     "revision": "4f89269db831bdc1880124164a00d4f9385cd129"
   },
-  "transcribe_seconds": 15.33
+  "transcribe_seconds": 17.32
 }

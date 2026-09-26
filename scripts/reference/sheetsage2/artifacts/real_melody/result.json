@@ -1,5 +1,5 @@
 {
-  "audio": "nav_ssb.oga",
+  "audio": "audio",
   "duration_seconds": 60.0,
   "prompts": [
     "timestamp",
@@ -28,10 +28,10 @@
       "tokens": 456,
       "events": 100,
       "accepted_events": 100,
-      "elapsed_seconds": 15.637450375012122
+      "elapsed_seconds": 17.66796033299761
     }
   ],
-  "elapsed_seconds": 15.811128083005315,
+  "elapsed_seconds": 17.916334333014674,
   "warnings": [],
   "peak_gpu_mib": 0,
   "melody_notes": 76,

@@ -24,7 +24,8 @@ Every capability claim carries one of three tags:
 Revision shorthands:
 
 - `SS2@eab522a` = `m-a-p/SheetSage2@eab522a8168e8b8b8c4856bf8609cd86198f01fe` (release, 2026-09-09)
-- `SS2@4f89269` = upstream `main` on 2026-09-26
+- `SS2@4f89269` = `m-a-p/SheetSage2@4f89269db831bdc1880124164a00d4f9385cd129`, upstream `main`
+  on 2026-09-26 and the "head" revision tested here
 - `MERT@d8ba1c7` = `m-a-p/MERT-v2-FullSong@d8ba1c745e733b3908ce6ad16ebeb17ac7600a42`
 - `YuE@92a73cc` = `github.com/multimodal-art-projection/YuE@92a73cc7652fcc1f937855e4b765e0a0edd7ff2e`
 
@@ -49,7 +50,7 @@ Why this recommendation:
      - key correct.
      Source: [`artifacts/evaluation.json`](../../scripts/reference/sheetsage2/artifacts/evaluation.json).
    - The model closure is two safetensors files, about 2.76 GB in fp32. It runs well within a laptop
-     budget on CPU: about 15–17 s per 300 s window and a 4.7–5.4 GiB process-tree peak (OBSERVED,
+     budget on CPU: about 17–24 s per 300 s window and a 4.2–5.4 GiB process-tree peak (OBSERVED,
      [`artifacts/measurements.json`](../../scripts/reference/sheetsage2/artifacts/measurements.json)).
    - Every tensor op maps to Candle primitives the repo already has or has close templates for (see
      [native portability](#native-portability)).
@@ -65,7 +66,8 @@ Why this recommendation:
      (OBSERVED, [`artifacts/real_full/`](../../scripts/reference/sheetsage2/artifacts/real_full)):
      - meter, key, tempo feel and melodic contour were right;
      - harmony collapsed to C major throughout;
-     - the vocal line was probably written an octave high.
+     - the vocal line was probably written an octave high (medium confidence; a heuristic spectral
+       check, see [real recording](#real-recording-observed-no-ground-truth-so-these-are-qualitative)).
      Any user-facing utility therefore needs the ABC review and editing surface that sc-22997/sc-23000
      are building for YuE2. It should reuse that surface, not duplicate it.
    - **Upstream's renderer is not shippable as is.** It drives headless Chromium through Playwright
@@ -114,8 +116,16 @@ OBSERVED effect:
 - That release ABC is internally inconsistent: a flat key signature with sharp chord names. It is
   exactly what a full-score (`cot=full`) cover would feed to YuE2.
 
-**Consequence for sc-22996:** port the head spelling logic, or pin a revision at or after
-`55bfe14e`, and state which. The weights pin can stay at the release.
+The tested head is `4f89269db831bdc1880124164a00d4f9385cd129`. Its `*.py` files have the same
+git blob ids as those at `55bfe14e32d8b663629b3a86b0f3285c2ca5da0b` ("Fix chord spelling for non-C
+candidate roots", 2026-09-24). The earlier `e8b16e3e4489c8460a3ee6e210054892727bafe7` carries a
+different `chord_spelling_sheetsage2.py` (DOCUMENTED, Hub tree API blob ids). `55bfe14e…` is
+therefore the earliest commit whose code equals the tested head. Its own output was not run
+separately; it follows from the identical code.
+
+**Consequence for sc-22996:** port the head spelling logic, or pin
+`55bfe14e32d8b663629b3a86b0f3285c2ca5da0b` or later, and state which. The weights pin can stay at
+the release.
 
 ## What the utility is
 
@@ -165,9 +175,11 @@ DOCUMENTED from `modeling_mert2.py`, `modeling_sheetsage2.py`, `config.json`@`SS
 DOCUMENTED from `pipeline_sheetsage2.py` and `audio_sheetsage2.py`@`SS2@eab522a`.
 
 - **Decode.** Every window is zero-padded to the **fixed 300 s** context, so a 12 s clip costs about
-  the same encoder time as a 300 s clip (OBSERVED: 14 s per window for 12 s of silence and for a
-  39.4 s clip, [`failures/case.json`](../../scripts/reference/sheetsage2/artifacts/failures/case.json)
-  and [`synth_full/case.json`](../../scripts/reference/sheetsage2/artifacts/synth_full/case.json)).
+  the same encoder time as a 300 s clip. OBSERVED:
+  - 12 s of silence took 17.2–25.3 s per transcription
+    ([`failures/case.json`](../../scripts/reference/sheetsage2/artifacts/failures/case.json));
+  - the 39.4 s clip took 18.1 s, of which the encoder alone was 17.3–17.5 s
+    ([`synth_full/case.json`](../../scripts/reference/sheetsage2/artifacts/synth_full/case.json)).
 - **Longer songs.** Songs longer than 300 s use overlapping windows. The default preset uses 200 s
   overlap and 100 s look-ahead. Each window after the first is conditioned on a token prefix rebuilt
   from the events already accepted, then stitched. **UNTESTED**: this lane bounds clips to ≤60 s,
@@ -177,6 +189,17 @@ DOCUMENTED from `pipeline_sheetsage2.py` and `audio_sheetsage2.py`@`SS2@eab522a`
   FFmpeg's resampler). Arrays are channel-averaged and resampled with
   `torchaudio.functional.resample`. `preset="paper"` decodes through torchaudio's FFmpeg-library
   backend instead.
+  - The experiment fixes the model input explicitly:
+    1. It decodes each fixture once with this same `load_audio`: the `ffmpeg` CLI (FFmpeg 9.0.1
+       here), producing mono 24 kHz float32, with the recording cropped to 60 s.
+    2. It stores the raw array and records its SHA-256 and sample count under `model_input` in
+       [`artifacts/fixtures.json`](../../scripts/reference/sheetsage2/artifacts/fixtures.json).
+    3. It feeds every model case `transcribe(array, sampling_rate=24000)`. Because the rate is
+       already 24 kHz, upstream's array path neither resamples nor alters it.
+  - OBSERVED: the file-fed first run and the array-fed rerun produced byte-identical `tokens.txt`
+    and `score.abc` for all seven transcription cases.
+  - Every committed token oracle is therefore a function of a digest-pinned array, not of whatever
+    resampler a later consumer uses.
 - **Outputs.** Events go to `export_result`, which writes:
   - `events.json` / `events.tsv`;
   - `*.lab` (beat, downbeat, chord, key, structure, melody_{full,vocal,instrumental}, rhythm_events);
@@ -226,22 +249,29 @@ The details are in the [experiment README](../../scripts/reference/sheetsage2/RE
 
 | Case | Result | Wall s (tree) | Transcribe s | Peak tree RSS GiB |
 |---|---|---:|---:|---:|
-| `real_full` (first online load; full prompts; piano WAV + PDF/SVG/PNG) | 27 bars, 3/4, `K:C`, 76 vocal notes, 0 instrumental, ABC valid, no warnings; rendering succeeded | 19.3 | 16.9 | 5.36 |
-| `real_melody` (offline, `melody_only`) | Same notes and bars; no chord symbols | 18.2 | 15.8 | 4.76 |
-| `synth_full` (offline; tensor exports; encoder timing) | Scores below; encoder alone 13.9–14.0 s per 300 s window; 340 tokens | 45.9 | 15.6 | 4.74 |
-| `synth_merged` (`save_pretrained` + reload merged, offline) | Tokens identical to `synth_full`; save 0.6 s, merged reload 0.25 s | 18.8 | 15.3 | 5.39 |
-| `synth_eb_release` / `synth_eb_head` | Tokens identical; chord spelling differs (see drift above) | 18.3 / 17.9 | — | 4.73 |
-| `real_full_head` (head code, online fetch of the code) | Byte-identical ABC and LAB to `real_full` | 21.5 | 16.2 | 4.76 |
-| `failures` (see below) | All probes behaved as listed | 31.3 | — | 4.72 |
-| `render_only` (upstream `render.py`, no model) | Vocal + chords piano WAVs, 2 SVG pages; "No instrumental track is available; skipped." | 2.1 | — | 0.88 |
+| `real_full` (online, warm cache; full prompts; piano WAV + PDF/SVG/PNG) | 27 bars, 3/4, `K:C`, 76 vocal notes, 0 instrumental, ABC valid, no warnings; rendering succeeded | 24.1 | 20.4 | 4.73 |
+| `real_melody` (offline, `melody_only`) | Same notes and bars; no chord symbols | 21.1 | 18.0 | 4.73 |
+| `synth_full` (offline; tensor exports; encoder timing) | Scores below; encoder alone 17.3–17.5 s per 300 s window; 340 tokens | 55.7 | 18.1 | 4.74 |
+| `synth_merged` (`save_pretrained` + reload merged, offline) | Tokens identical to `synth_full`; save 3.6 s, merged reload 0.41 s | 31.7 | 24.2 | 5.40 |
+| `synth_eb_release` / `synth_eb_head` (offline) | Tokens identical; chord spelling differs (see drift above) | 22.1 / 20.1 | 19.6 / 17.3 | 4.72 / 4.73 |
+| `real_full_head` (head code; online, warm cache) | Byte-identical ABC and LAB to `real_full` | 26.6 | 22.1 | 4.16 |
+| `failures` (offline; see below) | All probes behaved as listed | 46.9 | — | 4.63 |
+| `render_only` (upstream `render.py`, no model) | Vocal + chords piano WAVs, 2 SVG pages; "No instrumental track is available; skipped." | 3.2 | — | 0.90 |
 
 Notes on the table:
 
-- Model load from a warm cache was 1.6 s. The very first online load, which included a one-time
-  transformers cache migration, was 15.4 s.
-- About 14 s of each ~15–17 s transcription is the MERT2 encoder over the padded 300 s window. The
-  remaining roughly 1.5–2 s is grammar-masked greedy decoding of 340–456 tokens.
-- The torch CPU peak stayed at about 4.7–5.4 GiB. The fp32 weights alone are about 2.7 GB.
+- **Warm-cache loads.** Model load took 1.7–2.9 s. Every case, including the two online ones, ran
+  with the pinned snapshots already in the local Hugging Face cache.
+- **Cold load: UNTESTED.** Blocker: the snapshots were cached before any timed case ran. Next test:
+  run `real_full` against an empty `HF_HOME` and record the download time and load time separately.
+- **Run-to-run variation.** An earlier identical pass on the same machine measured 15.3–16.9 s per
+  transcription. The table above reflects the committed run. Timings drift with host load and are
+  observations, not a benchmark.
+- **Where the time goes.** Most of each ~17–24 s transcription is the MERT2 encoder over the padded
+  300 s window: 17.3–17.5 s when timed alone on the synthetic clip. The rest is grammar-masked greedy
+  decoding of 340–456 tokens.
+- **Memory.** The torch CPU peak stayed at about 4.2–5.4 GiB. The fp32 weights alone are about
+  2.7 GB.
 
 ### Accuracy on the ground-truth clip (OBSERVED)
 
@@ -278,10 +308,18 @@ What it got wrong:
   harmony of the anthem is missing. A full-score (`cot=full`) cover built from this would lock the
   accompaniment to one chord. This is consistent with the upstream recommendation to prefer
   melody-only covers.
-- **The octave is probably wrong (+12).** The transcribed vocal notes are G5–E5–C5… A spectral check
-  of the first five notes found most energy one octave **below** each transcribed pitch. Confidence
-  in this finding is medium: the band accompaniment also contributes energy. The synthetic clip had
-  no octave errors.
+- **The octave is probably wrong (+12).** Medium confidence.
+  - The committed
+    [`melody_vocal.lab`](../../scripts/reference/sheetsage2/artifacts/real_full/melody_vocal.lab)
+    spans MIDI 72–91 (C5–G6) and opens G5–E5–C5. The top of that range is above a typical soprano
+    line for this anthem.
+  - `evaluate` runs a heuristic spectral check on the exact array the model was fed. For each note
+    it compares the spectral peak at the transcribed f0 with the peak at f0/2.
+  - Result: 62 of 75 checked notes (0.83) have more energy one octave **below** the transcribed
+    pitch. The per-note values are under `real_clip_octave_check` in
+    [`evaluation.json`](../../scripts/reference/sheetsage2/artifacts/evaluation.json).
+  - It is evidence, not ground truth: the band accompaniment can also put energy at f0/2.
+  - The synthetic clip had no octave errors: exact-pitch and pitch-class F1 are equal.
   - Next test: a public-domain a cappella or vocal-stem recording with a known score (for example
     `File:EternalFather USNavyBand acapella.ogg` on Commons), scored with exact-pitch versus
     pitch-class F1.
@@ -317,23 +355,33 @@ Source: [`failures/case.json`](../../scripts/reference/sheetsage2/artifacts/fail
     requires, for example, the exact `V: Vocal …` / `V: Ins …` lines, chord symbols only in Vocal,
     and identical bar grids.
   - What happened: running it was **denied by this session's permission policy** (fetch and execute
-    an external script).
-  - **UNTESTED**. Next test: with owner approval, run
-    `python abc_tools.py inspect <case>/score.abc` on each committed `score.abc`. Alternatively,
-    port its rules as the native validator in sc-22996 and assert them on these fixtures.
+    an external script). It was not retried.
+  - **UNTESTED.** Blocker: executing upstream `abc_tools.py` needs Michael's approval. Alternatively,
+    its rules get ported natively in sc-22996.
+  - Next test, either of:
+    - with approval, run `python abc_tools.py inspect <case>/score.abc` on each committed
+      `score.abc`;
+    - with the rules ported natively, assert them on these fixtures.
   - The committed ABC files do carry the required header lines (OBSERVED by inspection).
-- **`melody_only` and full ABC differ in more than chord symbols.** With chord symbols removed, the
-  two are not byte-identical. Where a chord change split a rest, `z2z2` becomes `z4`
-  (`melody_only_equals_full_without_chord_symbols: false`). The sounding content is the same. A
-  native serializer must reproduce this rest merging to be byte-exact.
+- **`melody_only` and full ABC differ in more than chord symbols.** Both scores are compared as
+  normalized line lists after removing chord symbols.
+  - The melody-only score contains no chord symbols (`melody_only_has_chord_symbols: false`).
+  - It is not line-identical to the full score without chord symbols
+    (`melody_only_equals_full_without_chord_symbols: false`).
+  - The whole difference is the last music line (line 35). The recorded diff is
+    `melody_only_vs_full_without_chord_symbols_diff`: where a chord change had split a rest, the full
+    score keeps `…g4z2z2|` and the melody-only score merges it to `…g4z4|`.
+  - The sounding content is the same. A native serializer must reproduce this rest merging to be
+    byte-exact.
 
 ### Offline and determinism (OBSERVED)
 
-- Every case after the first ran with `HF_HUB_OFFLINE=1` and `local_files_only=True` and succeeded.
+- Every model case except the two online ones (`real_full`, `real_full_head`) ran with
+  `HF_HUB_OFFLINE=1` and `local_files_only=True`, and all succeeded.
 - Rendering uses only bundled assets. The browser context is created offline.
 - The merged snapshot reloads with `local_files_only`.
-- On CPU fp32, repeated runs of the same input produced identical tokens across processes and across
-  adapter-load versus merged-load.
+- On CPU fp32, the same input produced identical tokens across processes, across adapter-load
+  versus merged-load, and across the two complete experiment passes (file-fed, then array-fed).
 
 **UNTESTED: bf16.** CPU autocast is disabled upstream (`inference_autocast` is CUDA-only), so every
 run here was fp32. The upstream default is bf16 autocast on CUDA, and its benchmarks were measured
@@ -354,7 +402,7 @@ SheetSage2 or MERT exists in any crate yet.
 
 | Stage | Reusable today | Gap |
 |---|---|---|
-| Resample and downmix to 24 kHz mono | `candle_audio::dsp::resample_sinc_hann`, a port of the `torchaudio.functional.resample` defaults already used by YuE1 `icl.rs`. Container decoding happens in the SceneWorks host (`gen_core::AudioTrack`); inference has no FFmpeg | Upstream's file path resamples with FFmpeg's resampler, so parity fixtures should inject 24 kHz mono arrays, not files |
+| Resample and downmix to 24 kHz mono | `candle_audio::dsp::resample_sinc_hann`, a port of the `torchaudio.functional.resample` defaults already used by YuE1 `icl.rs`. Container decoding happens in the SceneWorks host (`gen_core::AudioTrack`); inference has no FFmpeg | Upstream's file path resamples with FFmpeg's resampler, which neither Candle resampler reproduces bit-exactly. Parity must therefore consume the digest-pinned 24 kHz mono float32 model-input arrays (`model_input` in `artifacts/fixtures.json`), never re-decode the source files. The production host-side resample is a separate fidelity question, measured end to end rather than token-exactly |
 | STFT, power, mel, dB | `candle_audio::dsp::{hann_window, stft}` (`center=True` reflect, matching torchaudio framing); `mel.rs::MelFilterbank` is HTK with `norm=None`; the CLAP `10·log10(max(x,1e-10))` matches `AmplitudeToDB(top_db=None)`; the chatterbox S3 tokenizer already drops the last frame | Load `window`, `fb`, `mel_mean` and `mel_std` straight from the MERT checkpoint instead of rebuilding them. `dsp::stft` is host-side and radix-2 with no cached twiddles, which is slow for 300 s (30,000 frames). Precompute twiddles or move the STFT to the device |
 | ConvNeXt-v2 1-D subsampler | Private `vocos.rs::ConvNeXtBlock` (depthwise k7, LN, MLP) is the template; the depthwise conv fast path covers k7 and k31 on all backends | GlobalResponseNorm (1-D, L2 over time) is new; so is the kernel-2 resampling conv |
 | Conformer ×24 | Chatterbox S3 tokenizer `Block` (non-causal MHSA with rotate-half RoPE, theta 10000) is the closest attention; `candle_nn::rotary_emb::rope`; `flow_encoder.rs` gives the block skeleton | The macaron FFN and conv module (GLU + depthwise k31 + LN) are new. **Attention over 7,500 frames must be chunked or fused.** A materialised 16×7500² score tensor is about 3.6 GB fp32 per layer. Use `candle-gen` `sdpa_budgeted_bhsd`, `candle-llm` `sdpa`, or the query-chunked loop in `candle-audio-yue/src/hubert.rs` |
@@ -463,7 +511,8 @@ has signed them off, the same status as `docs/licensing/`.
      - key-aware chord spelling, meaning the head code revision or later;
      - a statement of the voice assignment (Vocal/Ins) and octave handling for the ABC handed to
        YuE2;
-     - token-exact parity on the committed CPU fp32 fixtures, then measured bf16 drift.
+     - token-exact parity on the committed CPU fp32 fixtures, fed the digest-pinned model-input
+       arrays, then measured bf16 drift.
   4. **Keep MERT2 embeddings out of scope.** No workflow needs them. The epic already excludes
      standalone MERT2 understanding products.
 - **sc-22989 (assets)** should add the two conditional components with their pins and sha256 values
@@ -502,8 +551,13 @@ required for YuE2 covers regardless of the standalone decision.
 2. **SheetSage2 decode.**
    - Layer mix, projection, BART decoder with self and cross KV cache, `PromptGrammarState`, and the
      computed tokenizer with fingerprint check.
-   - AC: token-exact on the committed fixtures, where `tokens.txt` in `synth_full`, `real_full` and
-     `synth_eb_*` are the oracles.
+   - AC: token-exact on the committed fixtures. The oracles are `tokens.txt` in `synth_full`,
+     `real_full` and `synth_eb_*`. Each oracle's input is the 24 kHz mono float32 array whose SHA-256
+     is recorded as `model_input.sha256` in `artifacts/fixtures.json` and as `input.sha256` in the
+     case's `case.json`.
+   - The parity harness regenerates that array with `run_experiment.py fixtures` (FFmpeg 9.0.1),
+     checks the digest, and feeds the identical samples to the native model. It must not re-decode
+     or resample the source recordings.
 3. **Symbolic post-processing.**
    - Event decode, window plan and stitching, LAB/JSON/MIDI, the ABC builder and validator, and
      key-aware chord spelling (head revision), plus an explicit empty-melody refusal.
