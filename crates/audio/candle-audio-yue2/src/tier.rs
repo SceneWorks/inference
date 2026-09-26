@@ -601,6 +601,7 @@ fn assemble(
                 path: to.clone(),
                 source,
             })?;
+            crate::run::sync_file(&to)?;
             let (sha, bytes) = file_digest(&to)?;
             if sha != pinned.sha256 || bytes != pinned.bytes {
                 return Err(RunError::Corrupt {

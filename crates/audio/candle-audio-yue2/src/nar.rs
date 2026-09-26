@@ -991,12 +991,17 @@ fn chunk_ar_tokens(prefix: &[u32], codes: &[u32]) -> Vec<u32> {
 }
 
 /// Synthesize one song's acoustic latents — upstream `synthesize` (see the module docs).
+///
+/// The AR path this stage prefills the song prefix with is always the tier's own weights: an active
+/// experimental FP8 AR mode ([`crate::fp8`]) is restored to its exact BF16 originals first, as
+/// upstream's `synthesize` calls `restore_ar` (a no-op otherwise).
 pub fn synthesize(
     nar: &mut Yue2Nar,
     request: &SynthesisRequest<'_>,
     options: &NarOptions,
     mut hooks: SynthesisHooks<'_>,
 ) -> gen_core::Result<Synthesis> {
+    crate::fp8::restore_ar_bf16(&mut nar.lm)?;
     let start = Instant::now();
     let refuse = |what: String| Err(gen_core::Error::Msg(format!("YuE2 acoustic: {what}")));
     if request.prefix.is_empty() || request.codes.is_empty() {

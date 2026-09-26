@@ -100,7 +100,8 @@ pub fn save_closure(
         .filter(|dir| crate::tier::is_tier_snapshot(dir));
     save_resolved(
         &|id| snapshot::resolve_component(id, dirs),
-        tier.as_deref(),
+        tier.as_deref()
+            .map(|dir| (dir, crate::tier::TierSource::pinned())),
         decoders,
         generation,
         dest,
@@ -112,9 +113,10 @@ pub fn save_closure(
 type Resolve<'a> = dyn Fn(ComponentId) -> Result<VerifiedComponent, AssetError> + 'a;
 
 /// [`save_closure`] over any resolver of verified components (unit tests pass synthetic ones).
-fn save_resolved(
+/// `tier`: a derived tier snapshot staged as the MoT, and the source it was derived from.
+pub(crate) fn save_resolved(
     resolve: &Resolve<'_>,
-    tier: Option<&Path>,
+    tier: Option<(&Path, crate::tier::TierSource)>,
     decoders: &[VaeVariant],
     generation: &GenerationConfig,
     dest: &Path,
@@ -179,7 +181,7 @@ fn save_resolved(
 /// Copy and verify every closure file into `work` and write `pipeline.json` there.
 fn assemble(
     resolve: &Resolve<'_>,
-    tier: Option<&Path>,
+    tier: Option<(&Path, crate::tier::TierSource)>,
     decoders: &[VaeVariant],
     generation: &GenerationConfig,
     attributions: &[&str],
@@ -188,14 +190,22 @@ fn assemble(
     let mut sources = Map::new();
     let mut subdirs = Map::new();
     for id in components_for(decoders) {
-        if let (ComponentId::Lm, Some(dir)) = (id, tier) {
-            let lm = ComponentId::Lm.component();
-            let name = repo_dir_name(&lm.repo);
-            subdirs.insert(lm.repo.id.to_string(), json!(name));
-            let mut identity = component_identity(lm);
-            identity["tier"] = copy_tier(dir, &work.join(name))?;
-            sources.insert(lm.key.to_string(), identity);
-            continue;
+        match (id, tier) {
+            (ComponentId::Lm, Some((dir, source))) => {
+                let name = repo_dir_name(&source.lm.repo);
+                subdirs.insert(source.lm.repo.id.to_string(), json!(name));
+                let mut identity = component_identity(source.lm);
+                identity["tier"] = copy_tier_from(source, dir, &work.join(name))?;
+                sources.insert(source.lm.key.to_string(), identity);
+                continue;
+            }
+            // The tier copy already carried `qwen.tiktoken`, verified against its pin; copying it
+            // a second time into the same directory would fail on a read-only copy.
+            (ComponentId::QwenTiktoken, Some((_, source))) => {
+                sources.insert(source.tok.key.to_string(), component_identity(source.tok));
+                continue;
+            }
+            _ => {}
         }
         // Verify the snapshot immediately before reading the bytes to copy.
         let verified = resolve(id).map_err(gen_core::Error::from)?;
@@ -259,13 +269,9 @@ fn assemble(
     Ok(metadata)
 }
 
-/// Copy a derived tier snapshot ([`crate::tier`]) — verified immediately before its bytes are read
-/// — into `root`, re-hashing every copy against the manifest record it was verified with. Returns
-/// the tier's identity for `pipeline.json`.
-fn copy_tier(dir: &Path, root: &Path) -> Result<Value, RunError> {
-    copy_tier_from(crate::tier::TierSource::pinned(), dir, root)
-}
-
+/// Copy a derived tier snapshot ([`crate::tier`]) derived from `source` — verified immediately
+/// before its bytes are read — into `root`, syncing each copy and re-hashing it against the
+/// manifest record it was verified with. Returns the tier's identity for `pipeline.json`.
 pub(crate) fn copy_tier_from(
     source: crate::tier::TierSource,
     dir: &Path,
@@ -305,6 +311,7 @@ pub(crate) fn copy_tier_from(
             path: to.clone(),
             source,
         })?;
+        crate::run::sync_file(&to)?;
         let (sha, bytes) = file_digest(&to)?;
         let expected = match want {
             Some(w) => w,

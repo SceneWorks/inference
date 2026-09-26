@@ -593,19 +593,39 @@ mod tests {
         }
     }
 
-    /// The released checkpoint's precision map, per tier: every matmul weight follows the tier
-    /// (Q8_0 / Q4_K, and Q4_0 for `vae2llm`'s 64-wide input), everything else stays BF16.
+    /// The released checkpoint's precision map, per tier, against an expectation written out by
+    /// tensor name — independent of [`classify`] / [`TensorClass::follows_tier`], the code under
+    /// test: every AR and NAR-twin projection, `lm_head` and the four NAR-head weights are Q8_0 at
+    /// `q8` and Q4_K at `q4` (Q4_0 for `vae2llm.weight`, whose input is 64 wide); the embedding,
+    /// the position table, every norm and every bias stay BF16; `bf16` stores everything BF16.
+    ///
+    /// Mutations run: dropping `LmHead` from `follows_tier`, and adding `TokenEmbedding` to it,
+    /// each fail this test.
     #[test]
     fn released_precision_map_follows_the_tier_for_every_matmul_weight() {
+        const HEAD_WEIGHTS: [&str; 5] = [
+            "lm_head.weight",
+            "vae2llm.weight",
+            "llm2vae.weight",
+            "time_embedder.mlp.0.weight",
+            "time_embedder.mlp.2.weight",
+        ];
+        let is_matmul = |name: &str| {
+            HEAD_WEIGHTS.contains(&name)
+                || (name.starts_with("model.layers.") && name.ends_with("_proj.weight"))
+        };
         for tier in Tier::ALL {
-            for t in plan_of(tier) {
-                let want = match (tier, t.class.follows_tier()) {
-                    (Tier::Bf16, _) | (_, false) => Storage::Bf16,
-                    (Tier::Q8, true) => Storage::Ggml(GgmlDType::Q8_0),
-                    (Tier::Q4, true) if t.name == "vae2llm.weight" => {
-                        Storage::Ggml(GgmlDType::Q4_0)
-                    }
-                    (Tier::Q4, true) => Storage::Ggml(GgmlDType::Q4K),
+            let plan = plan_of(tier);
+            let quantized = plan.iter().filter(|t| is_matmul(&t.name)).count();
+            // 28 layers × 2 paths × 7 projections, plus `lm_head` and the four NAR-head weights.
+            assert_eq!(quantized, 28 * 2 * 7 + 5, "{tier}");
+            for t in plan {
+                let want = match tier {
+                    _ if !is_matmul(&t.name) => Storage::Bf16,
+                    Tier::Bf16 => Storage::Bf16,
+                    Tier::Q8 => Storage::Ggml(GgmlDType::Q8_0),
+                    Tier::Q4 if t.name == "vae2llm.weight" => Storage::Ggml(GgmlDType::Q4_0),
+                    Tier::Q4 => Storage::Ggml(GgmlDType::Q4K),
                 };
                 assert_eq!(t.storage, want, "{tier} {}", t.name);
             }

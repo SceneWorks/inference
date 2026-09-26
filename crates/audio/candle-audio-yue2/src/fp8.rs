@@ -112,10 +112,9 @@ impl Fp8Status {
 }
 
 /// The FP8 mode's retained state on a [`Yue2Lm`]: the host-resident BF16 originals of every
-/// replaced AR projection (layer-major, upstream AR-linear order) and the cuBLASLt handle.
+/// replaced AR projection (layer-major, upstream AR-linear order). The cuBLASLt handle is shared by
+/// the FP8 weights themselves (`Fp8Weight`, CUDA builds only).
 pub struct Fp8State {
-    #[cfg(feature = "cuda")]
-    lt: std::sync::Arc<candle_quant_kernels::cublaslt::CublasLt>,
     #[cfg(feature = "cuda")]
     originals: Vec<Vec<Tensor>>,
     #[cfg(not(feature = "cuda"))]
@@ -381,7 +380,6 @@ mod cuda {
             )));
         }
         lm.fp8 = Some(Fp8State {
-            lt: Arc::clone(&lt),
             originals: Vec::with_capacity(lm.layers().len()),
         });
         let swapped = swap_all(lm, &lt, &device);

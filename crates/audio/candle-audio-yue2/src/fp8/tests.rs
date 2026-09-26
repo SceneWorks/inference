@@ -361,6 +361,55 @@ mod cuda {
         restore_ar_bf16(&mut lm).unwrap();
     }
 
+    /// The public acoustic stage restores an active FP8 AR mode itself: called directly on a model
+    /// whose AR projections are FP8 (no engine in between), `nar::synthesize` leaves the mode
+    /// inactive, and its latents are bit-identical to those of a model that never ran FP8.
+    ///
+    /// Mutation (run on the CUDA lane): removing the `restore_ar_bf16` call at the top of
+    /// `nar::synthesize` fails this test.
+    #[test]
+    fn the_public_acoustic_stage_restores_an_active_fp8_mode() {
+        use crate::nar::{
+            synthesize, synthetic::model_on_dtype, NarOptions, SongNoise, SynthesisHooks,
+            SynthesisRequest,
+        };
+        let dev = cuda();
+        let mut fp8 = model_on_dtype(1.0, &dev, DType::BF16);
+        let mut native = model_on_dtype(1.0, &dev, DType::BF16);
+        prepare_fp8_ar(fp8.lm_mut()).unwrap();
+        assert!(fp8.lm().fp8.is_some());
+        let noise = SongNoise::seeded(7, 24);
+        let codes: Vec<u32> = (0..24).map(|i| (i * 977) % 32768).collect();
+        let request = SynthesisRequest {
+            prefix: &[151643, 40, 1234, 99, 151847, 5],
+            codes: &codes,
+            noise: &noise,
+            steps: 3,
+            context: crate::protocol::CONTEXT,
+        };
+        let run = |m: &mut crate::nar::Yue2Nar| {
+            synthesize(
+                m,
+                &request,
+                &NarOptions::default(),
+                SynthesisHooks {
+                    cancelled: &|| false,
+                    observer: &mut (),
+                },
+            )
+            .unwrap()
+            .latents
+            .values()
+            .to_vec()
+        };
+        let got = run(&mut fp8);
+        assert!(
+            fp8.lm().fp8.is_none(),
+            "the acoustic stage restored the BF16 AR path"
+        );
+        assert_eq!(got, run(&mut native), "bit-identical to a native model");
+    }
+
     /// The engine lifecycle: an FP8 engine runs the AR stages in FP8, and the acoustic stage on the
     /// exact BF16 originals — restored before the NAR prefill — then prepares FP8 again for the
     /// next AR stage. The acoustic stage's latents and identity equal a native engine's.

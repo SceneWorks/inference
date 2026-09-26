@@ -692,3 +692,71 @@ fn a_tier_is_saved_into_a_closure_byte_for_byte() {
     std::fs::write(root.join("README.md"), b"changed").unwrap();
     assert!(verify_tier_from(src.source, &root).is_err());
 }
+
+fn set_tree_read_only(dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            set_tree_read_only(&path);
+        } else {
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+    }
+}
+
+/// Saving a closure whose MoT is a derived tier — every file read-only, as a hub cache holds it —
+/// copies the tier once (the tokenizer included, verified by the tier), never copies
+/// `qwen.tiktoken` a second time over the read-only copy, and the saved tier verifies.
+///
+/// Mutation run: copying the `QwenTiktoken` component again when a tier is staged fails this test
+/// (the second `fs::copy` hits the read-only first copy).
+#[test]
+fn a_closure_with_a_read_only_tier_copies_the_tokenizer_once() {
+    use crate::inventory::VaeVariant;
+    use crate::snapshot::verify_component;
+
+    let src = source();
+    let dir = convert_to(&src, Tier::Q8, "q8");
+    set_tree_read_only(&dir);
+    let vae_dir = src.out("vae");
+    let vae = crate::snapshot::tests::synthetic_snapshot(
+        &vae_dir,
+        ComponentId::VaeStandard,
+        "yue2_synth_tier_vae",
+        UpstreamRepo {
+            id: "m-a-p/YuE2-Synthetic-Tier-Vae",
+            ..REPO
+        },
+        &[],
+    );
+    let original = src.dirs.snapshot_dir(&REPO).unwrap();
+    let resolve = |id: ComponentId| match id {
+        ComponentId::Lm => verify_component(src.source.lm, &original),
+        ComponentId::QwenTiktoken => verify_component(src.source.tok, &original),
+        ComponentId::VaeStandard => verify_component(vae, &vae_dir),
+        other => panic!("{other:?} is not part of this closure"),
+    };
+    let dest = src.out("saved");
+    let metadata = crate::closure::save_resolved(
+        &resolve,
+        Some((&dir, src.source)),
+        &[VaeVariant::Standard],
+        &crate::protocol::GenerationConfig::default(),
+        &dest,
+    )
+    .unwrap();
+    let saved = dest.join("YuE2-Synthetic-Tier");
+    assert_eq!(
+        verify_tier_from(src.source, &saved).unwrap().tier(),
+        Tier::Q8
+    );
+    assert_eq!(
+        metadata["source_weights"]["yue2_synthetic_tier"]["tier"]["tier"],
+        "q8"
+    );
+    assert!(metadata["source_weights"]
+        .get("yue2_synthetic_tiktoken")
+        .is_some());
+}
