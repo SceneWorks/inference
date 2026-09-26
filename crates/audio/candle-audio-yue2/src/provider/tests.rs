@@ -1203,7 +1203,8 @@ fn a_result_changing_request_still_refuses_to_resume() {
         .generate(&song_request(Some(&dir)), &mut |_| {})
         .unwrap();
     let before = std::fs::read(dir.join(RESULT_JSON)).unwrap();
-    let changed: [(&str, fn(&mut GenerationRequest)); 4] = [
+    type Change = fn(&mut GenerationRequest);
+    let changed: [(&str, Change); 4] = [
         ("seed", |r| r.seed = Some(18)),
         ("steps", |r| r.steps = Some(3)),
         ("sampling", |r| {
