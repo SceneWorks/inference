@@ -15,6 +15,12 @@ categories = ["science"]
 # `candle_core` (the native safetensors loader the tensor-value check runs through), so this crate
 # resolves the SAME candle build + gen-core rev as the catalog it will register into.
 candle-audio = { path = "../candle-audio" }
+# Shared decoder primitives the YuE2 MoT backbone reuses (sc-22991): the preallocated KV cache,
+# grouped-query SDPA, RoPE tables/rotation, linear/SwiGLU/embedding leaves, and the seeded
+# `TokenRng` stream. Same workspace candle pin as `candle-audio`.
+candle-llm = { workspace = true }
+# `VarBuilder` over the verified safetensors (dtype conversion on load).
+candle-nn = { workspace = true }
 # Streaming SHA-256 over every pinned file as it is read from the snapshot.
 sha2 = { workspace = true }
 # Committed conversion manifests (`manifests/*.json`) and safetensors headers.
@@ -36,5 +42,5 @@ tempfile = { workspace = true }
 default = []
 # Apple Metal / NVIDIA CUDA backends, forwarded to the audio commons. Not in `default`; nothing in
 # this slice touches a GPU (the asset checks are CPU-only).
-metal = ["candle-audio/metal"]
-cuda = ["candle-audio/cuda"]
+metal = ["candle-audio/metal", "candle-llm/metal", "candle-nn/metal"]
+cuda = ["candle-audio/cuda", "candle-llm/cuda", "candle-nn/cuda"]
