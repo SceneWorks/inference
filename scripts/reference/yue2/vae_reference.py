@@ -49,7 +49,7 @@ Run with the pinned reference environment (``setup_reference_env.sh``)::
     HF_HUB_OFFLINE=1 YUE2_HF_HUB=/path/to/hub \\
         ~/.cache/sceneworks-yue2-ref/venv/bin/python scripts/reference/yue2/vae_reference.py real
 
-Expected peak RSS: tiny < 0.5 GB; real ~2.5 GB (one 530 MB FP32 VAE resident at a time, loaded
+Measured peak RSS: tiny 0.34 GB; real 3.0 GB (one 530 MB FP32 VAE resident at a time, loaded
 twice over by ``safe_open`` + ``load_state_dict``, plus torch) — CPU only.
 """
 

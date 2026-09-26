@@ -1,7 +1,9 @@
 //! Native FP32 port of the YuE2 Oobleck VAE (sc-22993) — `yue2/modeling_vae.py` at the pinned
 //! commit, for **both** published decoders (`m-a-p/YuE2-Vae`, the standard listening decoder, and
 //! `m-a-p/YuE2-Vae-legacy`, the benchmark decoder). The two releases share this architecture and
-//! config; they differ in weights and `release_variant` only.
+//! config and differ in `release_variant` and in their **decoder** weights only: all 218 encoder
+//! tensors are identical between the two pinned files (per the committed conversion manifests),
+//! so latents are decoder-agnostic and either decoder can decode any cached latent.
 //!
 //! ```text
 //! decoder  z [B, 64, T]
@@ -42,7 +44,6 @@ use std::path::Path;
 use candle_audio::candle_core::{self, DType, Device, Tensor, D};
 use candle_audio::neural_codec::fold_weight_norm;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::inventory::{ComponentId, VaeVariant};
 use crate::latent::{sha256_f32, AcousticLatents, LatentError, LatentSource, LATENT_CHANNELS};
@@ -788,15 +789,6 @@ pub struct Yue2Vae {
     device: Device,
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path)
-        .map_err(|e| VaeError::Weights(format!("reading {}: {e}", path.display())))?;
-    Ok(Sha256::digest(&bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
-}
-
 impl Yue2Vae {
     /// Load a verified VAE component (resolve it with [`crate::snapshot::resolve_closure`] /
     /// [`crate::snapshot::resolve_component`] immediately before calling this). Only the verified
@@ -1120,6 +1112,16 @@ impl Yue2Vae {
 pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    pub(crate) fn sha256_file(path: &Path) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        let bytes = fs::read(path)
+            .map_err(|e| VaeError::Weights(format!("reading {}: {e}", path.display())))?;
+        Ok(Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    }
 
     pub(crate) fn fixture_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
