@@ -707,11 +707,13 @@ fn set_tree_read_only(dir: &Path) {
 }
 
 /// Saving a closure whose MoT is a derived tier — every file read-only, as a hub cache holds it —
-/// copies the tier once (the tokenizer included, verified by the tier), never copies
-/// `qwen.tiktoken` a second time over the read-only copy, and the saved tier verifies.
+/// copies the tier once (the tokenizer included, verified by the tier's own check against its
+/// pin), never resolves or copies the MoT or `qwen.tiktoken` components beside it, syncs the
+/// read-only copies, and the saved tier verifies.
 ///
-/// Mutation run: copying the `QwenTiktoken` component again when a tier is staged fails this test
-/// (the second `fs::copy` hits the read-only first copy).
+/// Mutations run: resolving the `QwenTiktoken` component again when a tier is staged fails this
+/// test (the resolver refuses it), and so did the write-handle `sync_file` this story first shipped
+/// (the read-only copies could not be synced).
 #[test]
 fn a_closure_with_a_read_only_tier_copies_the_tokenizer_once() {
     use crate::inventory::VaeVariant;
@@ -731,12 +733,9 @@ fn a_closure_with_a_read_only_tier_copies_the_tokenizer_once() {
         },
         &[],
     );
-    let original = src.dirs.snapshot_dir(&REPO).unwrap();
     let resolve = |id: ComponentId| match id {
-        ComponentId::Lm => verify_component(src.source.lm, &original),
-        ComponentId::QwenTiktoken => verify_component(src.source.tok, &original),
         ComponentId::VaeStandard => verify_component(vae, &vae_dir),
-        other => panic!("{other:?} is not part of this closure"),
+        other => panic!("{other:?} must not be resolved: the staged tier carries it"),
     };
     let dest = src.out("saved");
     let metadata = crate::closure::save_resolved(
