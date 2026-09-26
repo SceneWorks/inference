@@ -25,6 +25,16 @@
 //!   component's native port may derive from: the Apache-2.0 GitHub source for the LM, VAE and
 //!   tokenizer; the cover closure's code is treated as CC BY-NC 4.0 and its port is gated.
 //!
+//! The autoregressive stages (sc-22991) run on that closure:
+//!
+//! * [`model`] — the YuE2-3B Mixture-of-Transformers backbone (AR path, and the NAR twins on
+//!   request), loaded from the verified snapshot, with a bounded, preallocated KV cache;
+//! * [`sampling`] — the released token-range masks, stop ids, windowed repetition penalty,
+//!   temperature / top-k / top-p, classifier-free guidance and the categorical draw;
+//! * [`generate`] — score planning and semantic-token generation over token ids, with guidance
+//!   that keeps the exact planned score in its negative branch, truthful truncation, and
+//!   cancellation at bounded boundaries.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -40,9 +50,12 @@
 
 pub use candle_audio::gen_core;
 
+pub mod generate;
 pub mod inventory;
 pub mod license;
 pub mod manifest;
+pub mod model;
+pub mod sampling;
 pub mod snapshot;
 
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
