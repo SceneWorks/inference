@@ -6,6 +6,7 @@
 | `vae_real_reference.json` | `scripts/reference/yue2/vae_reference.py real` | `tests/vae_real_weights.rs` (`#[ignore]`d) |
 | `protocol/` | `scripts/reference/yue2/protocol_fixtures.py` | tokenizer / protocol / plan tests (see `protocol/README.md`) |
 | `ar_synthetic.json`, `sampler.json`, `ar_real_weights.json` | `scripts/reference/yue2/ar_fixtures.py` | `parity` lib tests (see the section below) |
+| `nar_synthetic.{json,safetensors}`, `nar_real_reference.json` | `scripts/reference/yue2/nar_fixtures.py` | `nar` lib tests, `tests/nar_real_weights.rs` (`#[ignore]`d) (see the section below) |
 
 Provenance: upstream `github.com/multimodal-art-projection/YuE` @
 `92a73cc7652fcc1f937855e4b765e0a0edd7ff2e` (the installed pinned `yue2` package, never a copy), run
@@ -140,7 +141,7 @@ that records each evaluation's input state, raw `t` and output; nothing is re-im
   repository (`~/.cache/sceneworks-yue2-fixtures/nar/nar_real_reference.safetensors`); only the
   cases and the file's SHA-256 are committed, and the test refuses a reference with another hash.
 
-### Measured tolerances (acoustic stage)
+### Measured tolerances
 
 | Check | Measured | Bound |
 | --- | --- | --- |
@@ -204,4 +205,3 @@ loading; the native `nar_real_weights` test (release) peaks at 23.2 GB `ru_maxrs
 footprint (the file-backed mapping counts toward `ru_maxrss` during the load) and takes 263 s: 22 s
 to verify and load, 211 s for the three-chunk 32-step case, 14 s per run of the 5-step case. Never
 run the two at once.
-
