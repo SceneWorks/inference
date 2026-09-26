@@ -1,0 +1,44 @@
+{
+  "audio": "nav_ssb.oga",
+  "duration_seconds": 60.0,
+  "prompts": [
+    "timestamp",
+    "downbeat_meter",
+    "structure",
+    "key",
+    "chord_full",
+    "melody_full"
+  ],
+  "preset": "default",
+  "melody_only": true,
+  "dtype": "fp32",
+  "window_seconds": 300.0,
+  "overlap_seconds": 200.0,
+  "lookahead_seconds": 100.0,
+  "windows": [
+    {
+      "start": 0.0,
+      "end": 60.0,
+      "accept_start": 0.0,
+      "accept_end": 60.0,
+      "prefix_end": 0.0,
+      "generation_stop": null,
+      "window_index": 0,
+      "prefix_tokens": 0,
+      "tokens": 456,
+      "events": 100,
+      "accepted_events": 100,
+      "elapsed_seconds": 15.637450375012122
+    }
+  ],
+  "elapsed_seconds": 15.811128083005315,
+  "warnings": [],
+  "peak_gpu_mib": 0,
+  "melody_notes": 76,
+  "vocal_notes": 76,
+  "instrumental_notes": 0,
+  "events": 100,
+  "abc_measures": 27,
+  "abc_error": null,
+  "diagnostics": []
+}

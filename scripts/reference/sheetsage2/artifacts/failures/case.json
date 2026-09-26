@@ -1,0 +1,146 @@
+{
+  "case": "failures",
+  "environment": {
+    "ffmpeg": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+    "machine": "arm64",
+    "mps_available": true,
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "python": "3.11.15",
+    "torch": "2.8.0",
+    "torch_threads": 8,
+    "transformers": "4.45.2"
+  },
+  "hf_hub_offline": true,
+  "load": {
+    "device": "cpu",
+    "dtype": "torch.float32",
+    "load_seconds": 1.61,
+    "parameters": 676887449,
+    "revision": "eab522a8168e8b8b8c4856bf8609cd86198f01fe",
+    "snapshot": "$HF_HUB_CACHE/models--m-a-p--SheetSage2/snapshots/eab522a8168e8b8b8c4856bf8609cd86198f01fe"
+  },
+  "probes": [
+    {
+      "error": "Audio must contain at least 1025 finite samples at 24 kHz",
+      "outcome": "raised",
+      "probe": "array shorter than 1025 samples",
+      "seconds": 0.02,
+      "type": "ValueError"
+    },
+    {
+      "error": "Audio must contain at least 1025 finite samples at 24 kHz",
+      "outcome": "raised",
+      "probe": "non-finite waveform",
+      "seconds": 0.0,
+      "type": "ValueError"
+    },
+    {
+      "error": "Provide sampling_rate for an array or tensor waveform",
+      "outcome": "raised",
+      "probe": "array without sampling_rate",
+      "seconds": 0.0,
+      "type": "ValueError"
+    },
+    {
+      "error": "Cannot decode audio: [in#0 @ 0xbc8c1c000] Error opening input: Invalid data found when processing input\nError opening input file pipe:0.\nError opening input files: Invalid data found when processing input\n",
+      "outcome": "raised",
+      "probe": "undecodable bytes",
+      "seconds": 0.05,
+      "type": "ValueError"
+    },
+    {
+      "outcome": "returned",
+      "probe": "12 s digital silence, full",
+      "seconds": 14.41,
+      "value": {
+        "abc_error": null,
+        "abc_measures": 7,
+        "diagnostics": [
+          "measure 6: padded final 1/4 span to declared 4/4 with trailing rest"
+        ],
+        "dtype": "fp32",
+        "duration_seconds": 12.0,
+        "elapsed_seconds": 14.412346166005591,
+        "instrumental_notes": 0,
+        "lookahead_seconds": 100.0,
+        "melody_notes": 0,
+        "melody_only": false,
+        "overlap_seconds": 200.0,
+        "preset": "default",
+        "prompts": [
+          "timestamp",
+          "downbeat_meter",
+          "structure",
+          "key",
+          "chord_full",
+          "melody_full"
+        ],
+        "vocal_notes": 0,
+        "warnings": [],
+        "window_seconds": 300.0,
+        "windows": [
+          {
+            "accepted_events": 25,
+            "elapsed_seconds": 14.407676083996193,
+            "end": 12.0,
+            "events": 26,
+            "start": 0.0,
+            "tokens": 96
+          }
+        ]
+      }
+    },
+    {
+      "outcome": "returned",
+      "probe": "12 s digital silence, melody_only",
+      "seconds": 14.29,
+      "value": {
+        "abc_error": null,
+        "abc_measures": 7,
+        "diagnostics": [
+          "measure 6: padded final 1/4 span to declared 4/4 with trailing rest"
+        ],
+        "dtype": "fp32",
+        "duration_seconds": 12.0,
+        "elapsed_seconds": 14.294366957998136,
+        "instrumental_notes": 0,
+        "lookahead_seconds": 100.0,
+        "melody_notes": 0,
+        "melody_only": true,
+        "overlap_seconds": 200.0,
+        "preset": "default",
+        "prompts": [
+          "timestamp",
+          "downbeat_meter",
+          "structure",
+          "key",
+          "chord_full",
+          "melody_full"
+        ],
+        "vocal_notes": 0,
+        "warnings": [],
+        "window_seconds": 300.0,
+        "windows": [
+          {
+            "accepted_events": 25,
+            "elapsed_seconds": 14.292519542010268,
+            "end": 12.0,
+            "events": 26,
+            "start": 0.0,
+            "tokens": 96
+          }
+        ]
+      }
+    },
+    {
+      "error": "(\"Unsupported backend 'ffmpeg' specified; \", 'please select one of [] instead.')",
+      "outcome": "raised",
+      "probe": "preset=paper decode via torchaudio FFmpeg backend",
+      "seconds": 0.0,
+      "type": "ValueError"
+    }
+  ],
+  "spec": {
+    "fixture": null
+  }
+}

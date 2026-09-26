@@ -1,0 +1,368 @@
+{
+  "eb_spelling": {
+    "synth_eb_head": {
+      "abc_chord_symbols": [
+        "Ab",
+        "Bb",
+        "Cm",
+        "Eb",
+        "Fm",
+        "Gm"
+      ],
+      "key_header": "K:Eb"
+    },
+    "synth_eb_release": {
+      "abc_chord_symbols": [
+        "A#",
+        "Cm",
+        "D#",
+        "Fm",
+        "G#",
+        "Gm"
+      ],
+      "key_header": "K:Eb"
+    }
+  },
+  "head_code_reproduces_release_tokens": {
+    "real": true,
+    "synth_eb": true
+  },
+  "melody_only_changes_tokens": false,
+  "merged_snapshot_reproduces_adapter_load_tokens": true,
+  "real_clip": {
+    "chord_lab_identical": true,
+    "head_chord_lab": [
+      "C:maj",
+      "C:maj7/5",
+      "C:maj7/7",
+      "N"
+    ],
+    "head_chord_symbols": [
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "C",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "Cmaj7/G",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C"
+    ],
+    "head_revision_abc_identical": true,
+    "head_revision_notes_identical": true,
+    "melody_only_equals_full_without_chord_symbols": false,
+    "melody_only_has_chord_symbols": true,
+    "release_chord_lab": [
+      "C:maj",
+      "C:maj7/5",
+      "C:maj7/7",
+      "N"
+    ],
+    "release_chord_symbols": [
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "C",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/G",
+      "Cmaj7/G",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "C",
+      "Cmaj7/B",
+      "Cmaj7/B",
+      "C",
+      "C"
+    ]
+  },
+  "synth_eb_head": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "Eb:maj",
+        "C:min",
+        "Ab:maj",
+        "Bb:maj",
+        "Eb:maj",
+        "C:min",
+        "F:min",
+        "Bb:maj",
+        "Eb:maj",
+        "G:min",
+        "Ab:maj",
+        "Bb:maj",
+        "Ab:maj",
+        "Bb:maj",
+        "Eb:maj",
+        "Eb:maj",
+        "N"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "Eb:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "Eb:maj"
+  },
+  "synth_eb_release": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "D#:maj",
+        "C:min",
+        "G#:maj",
+        "A#:maj",
+        "D#:maj",
+        "C:min",
+        "F:min",
+        "A#:maj",
+        "D#:maj",
+        "G:min",
+        "G#:maj",
+        "A#:maj",
+        "G#:maj",
+        "A#:maj",
+        "D#:maj",
+        "D#:maj",
+        "N"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "D#:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9346,
+        "precision": 0.9259,
+        "recall": 0.9434
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "Eb:maj"
+  },
+  "synth_full": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "C:maj",
+        "A:min",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "A:min",
+        "D:min",
+        "G:maj",
+        "C:maj",
+        "E:min",
+        "F:maj",
+        "G:maj",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "C:maj",
+        "C:maj"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "C:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "C:maj"
+  },
+  "synth_merged": {
+    "beats": {
+      "downbeat_f_measure": 0.963,
+      "estimated_bpm": 100.0,
+      "estimated_meters": [
+        "4/4"
+      ],
+      "f_measure": 0.9821
+    },
+    "chords": {
+      "estimated_labels": [
+        "C:maj",
+        "A:min",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "A:min",
+        "D:min",
+        "G:maj",
+        "C:maj",
+        "E:min",
+        "F:maj",
+        "G:maj",
+        "F:maj",
+        "G:maj",
+        "C:maj",
+        "C:maj",
+        "C:maj"
+      ],
+      "majmin": 0.9896,
+      "mirex": 0.9896,
+      "root": 0.9896,
+      "thirds": 0.9896
+    },
+    "keys": [
+      "C:major"
+    ],
+    "melody": {
+      "estimated_notes": 54,
+      "instrumental_notes": 54,
+      "onset100ms_pitch_class": {
+        "f1": 0.9907,
+        "precision": 0.9815,
+        "recall": 1.0
+      },
+      "onset50ms_exact_pitch": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "onset50ms_pitch_class": {
+        "f1": 0.9533,
+        "precision": 0.9444,
+        "recall": 0.9623
+      },
+      "reference_notes": 53,
+      "vocal_notes": 0
+    },
+    "reference_key": "C:maj"
+  },
+  "token_identity": {
+    "real_full": "64ee66380fb0fe0a05cf42dd4d10d33ddb04bbbd4daee93c4e91bc2122b4f7cc",
+    "real_full_head": "64ee66380fb0fe0a05cf42dd4d10d33ddb04bbbd4daee93c4e91bc2122b4f7cc",
+    "real_melody": "64ee66380fb0fe0a05cf42dd4d10d33ddb04bbbd4daee93c4e91bc2122b4f7cc",
+    "synth_eb_head": "6ea7c09170e5cf595a9f46ff8b8b73ae0366522d05774e73b24b98b701701dbe",
+    "synth_eb_release": "6ea7c09170e5cf595a9f46ff8b8b73ae0366522d05774e73b24b98b701701dbe",
+    "synth_full": "d212ae41eca38c1255693e512c3f185f1cd93113de1cce18561243a36cbbe377",
+    "synth_merged": "d212ae41eca38c1255693e512c3f185f1cd93113de1cce18561243a36cbbe377"
+  }
+}

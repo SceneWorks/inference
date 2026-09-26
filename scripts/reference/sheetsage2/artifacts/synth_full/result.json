@@ -1,0 +1,46 @@
+{
+  "audio": "synth.wav",
+  "duration_seconds": 39.4,
+  "prompts": [
+    "timestamp",
+    "downbeat_meter",
+    "structure",
+    "key",
+    "chord_full",
+    "melody_full"
+  ],
+  "preset": "default",
+  "melody_only": false,
+  "dtype": "fp32",
+  "window_seconds": 300.0,
+  "overlap_seconds": 200.0,
+  "lookahead_seconds": 100.0,
+  "windows": [
+    {
+      "start": 0.0,
+      "end": 39.4,
+      "accept_start": 0.0,
+      "accept_end": 39.4,
+      "prefix_end": 0.0,
+      "generation_stop": null,
+      "window_index": 0,
+      "prefix_tokens": 0,
+      "tokens": 340,
+      "events": 70,
+      "accepted_events": 69,
+      "elapsed_seconds": 15.43991770799039
+    }
+  ],
+  "elapsed_seconds": 15.541423082991969,
+  "warnings": [],
+  "peak_gpu_mib": 0,
+  "melody_notes": 54,
+  "vocal_notes": 0,
+  "instrumental_notes": 54,
+  "events": 69,
+  "abc_measures": 17,
+  "abc_error": null,
+  "diagnostics": [
+    "measure 16: padded final 2/4 span to declared 4/4 with trailing rest"
+  ]
+}

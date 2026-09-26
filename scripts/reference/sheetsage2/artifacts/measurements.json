@@ -1,0 +1,84 @@
+{
+  "cases": [
+    {
+      "case": "real_full",
+      "killed": null,
+      "peak_tree_rss_gib": 5.36,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 19.3
+    },
+    {
+      "case": "real_melody",
+      "killed": null,
+      "peak_tree_rss_gib": 4.76,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 18.2
+    },
+    {
+      "case": "synth_full",
+      "killed": null,
+      "peak_tree_rss_gib": 4.74,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 45.9
+    },
+    {
+      "case": "synth_merged",
+      "killed": null,
+      "peak_tree_rss_gib": 5.39,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 18.8
+    },
+    {
+      "case": "failures",
+      "killed": null,
+      "peak_tree_rss_gib": 4.72,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 31.3
+    },
+    {
+      "case": "render_only",
+      "killed": null,
+      "peak_tree_rss_gib": 0.88,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 2.1
+    },
+    {
+      "case": "real_full_head",
+      "killed": null,
+      "peak_tree_rss_gib": 4.76,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 21.5
+    },
+    {
+      "case": "synth_eb_release",
+      "killed": null,
+      "peak_tree_rss_gib": 4.73,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 18.3
+    },
+    {
+      "case": "synth_eb_head",
+      "killed": null,
+      "peak_tree_rss_gib": 4.73,
+      "returncode": 0,
+      "rss_sampling": "ps -A rss of the child process tree every 0.5 s",
+      "wall_seconds": 17.9
+    }
+  ],
+  "machine": {
+    "cpu": "Apple M5 Max",
+    "logical_cpus": "18",
+    "memory_gib": 128.0,
+    "model": "Mac17,6",
+    "os": "macOS-26.6.2-arm64-arm-64bit"
+  },
+  "note": "Observations on this one machine, torch CPU device, fp32. Not portable requirements."
+}
