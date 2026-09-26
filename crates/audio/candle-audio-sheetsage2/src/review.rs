@@ -1,6 +1,14 @@
 //! The transcription review artifact: what a reviewer (and the cover path) needs, persisted so it
-//! can be reviewed later and **replayed** — re-derived from the exact tokens and settings, byte for
-//! byte, without the model.
+//! can be reviewed later and **replayed** — re-derived from the exact tokens, settings and model
+//! input, byte for byte, without the model.
+//!
+//! A persisted artifact is only ever used through [`ReviewArtifact::open`], which verifies it
+//! completely: every file against its recorded SHA-256, the source identity against the persisted
+//! model input ([`SOURCE_AUDIO`]), the closure identity against the pinned inventory, and **every
+//! manifest field** — review, cover readiness, warnings, ABC errors, note counts, octave evidence —
+//! against what replay re-derives. A manifest edited by hand (a refusal flipped to ready, warnings
+//! removed, a different source digest) is refused. The source `name`, `original_sha256` and
+//! `conversion` are caller-supplied labels and cannot be re-derived.
 //!
 //! What the review adds to upstream's outputs, all visible and none silently "fixed":
 //!
@@ -21,7 +29,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::events::{tokens_txt, Window, WindowRecord};
+use crate::events::tokens_txt;
 use crate::exports::{export, Exports};
 use crate::octave::OctaveEvidence;
 use crate::pipeline::{Stitched, Stitcher};
@@ -36,6 +44,9 @@ pub const SCHEMA: &str = "sceneworks-sheetsage2-transcription-v1";
 pub const MELODY_SCORE: &str = "score_melody.abc";
 /// The exact per-window tokens.
 pub const TOKENS_JSON: &str = "tokens.json";
+/// The exact model input, float32 little-endian, raw (so the source identity and the octave
+/// evidence can be re-derived on replay).
+pub const SOURCE_AUDIO: &str = "source.f32le";
 
 /// Fewer melody notes than this is a sparse-melody warning.
 pub const SPARSE_MELODY_NOTES: usize = 8;
@@ -505,8 +516,8 @@ fn octave_json(o: &OctaveEvidence) -> Value {
     })
 }
 
-/// A finished transcription: identity, settings, exact tokens, every export, both scores, octave
-/// evidence and the review.
+/// A finished transcription: identity, settings, the model input, exact tokens, every export, both
+/// scores, octave evidence and the review.
 #[derive(Clone, Debug)]
 pub struct Transcription {
     /// What was transcribed.
@@ -523,23 +534,38 @@ pub struct Transcription {
     pub melody_abc: Option<String>,
     /// Why the melody-only score could not be built.
     pub melody_abc_error: Option<String>,
-    /// Spectral octave evidence (needs the source audio; not re-derivable on replay).
+    /// Spectral octave evidence (`None` when there is no vocal note).
     pub octave: Option<OctaveEvidence>,
     /// The review.
     pub review: Review,
+    /// The exact model input (persisted as [`SOURCE_AUDIO`], so the source identity and the octave
+    /// evidence are re-derivable on replay).
+    audio: Vec<f32>,
+}
+
+fn samples_sha256(samples: &[f32]) -> String {
+    let mut hasher = Sha256::new();
+    for s in samples {
+        hasher.update(s.to_le_bytes());
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Transcription {
-    /// Build every output from a stitched timeline.
-    /// `audio` is the model input at `rate` Hz, when available: it feeds the spectral octave
-    /// evidence (replay has no audio and records none).
+    /// Build every output from a stitched timeline and the model input `audio` it was transcribed
+    /// from. `audio` must be the source identity's samples (its SHA-256 and length are checked).
     pub fn build(
         source: SourceIdentity,
         settings: TranscriptionSettings,
         closure: ClosureIdentity,
         stitched: Stitched,
-        audio: Option<(&[f32], u32)>,
+        audio: Vec<f32>,
     ) -> Result<Self, Error> {
+        if audio.len() != source.samples || samples_sha256(&audio) != source.sha256 {
+            return Err(Error::Request(
+                "the audio is not the model input the source identity names".into(),
+            ));
+        }
         let full = export(&stitched.decoded, stitched.duration, false)?;
         let melody = export(&stitched.decoded, stitched.duration, true)?;
         let vocal: Vec<(f64, f64, i64)> = full
@@ -548,12 +574,8 @@ impl Transcription {
             .filter(|n| n.track == 0)
             .map(|n| (n.start, n.end, n.pitch))
             .collect();
-        let octave = match audio {
-            Some((samples, rate)) if !vocal.is_empty() => {
-                Some(crate::octave::octave_evidence(samples, rate, &vocal))
-            }
-            _ => None,
-        };
+        let octave = (!vocal.is_empty())
+            .then(|| crate::octave::octave_evidence(&audio, source.sample_rate, &vocal));
         let review = Review::assess(
             &stitched,
             &full,
@@ -570,7 +592,13 @@ impl Transcription {
             melody_abc_error: melody.abc_error,
             octave,
             review,
+            audio,
         })
+    }
+
+    /// The model input.
+    pub fn audio(&self) -> &[f32] {
+        &self.audio
     }
 
     fn files(&self, tokenizer: &Tokenizer) -> Result<BTreeMap<String, Vec<u8>>, Error> {
@@ -606,7 +634,37 @@ impl Transcription {
             TOKENS_JSON.into(),
             serde_json::to_vec_pretty(&windows).expect("serializable"),
         );
+        files.insert(
+            SOURCE_AUDIO.into(),
+            self.audio.iter().flat_map(|s| s.to_le_bytes()).collect(),
+        );
         Ok(files)
+    }
+
+    /// The whole manifest. Replay rebuilds it with this same function and requires it to equal the
+    /// persisted one field for field.
+    fn manifest(&self, tokenizer: &Tokenizer, files: &BTreeMap<String, Vec<u8>>) -> Value {
+        let digests: BTreeMap<&String, String> =
+            files.iter().map(|(rel, bytes)| (rel, sha256_hex(bytes))).collect();
+        json!({
+            "schema": SCHEMA,
+            "source": self.source.to_json(),
+            "settings": self.settings.to_json(),
+            "closure": self.closure.to_json(),
+            "duration_seconds": self.stitched.duration,
+            "window_seconds": tokenizer.audio_length_seconds(),
+            "time_hz": tokenizer.time_hz(),
+            "windows": self.stitched.records.len(),
+            "events": self.full.events,
+            "melody_notes": self.full.notes.len(),
+            "vocal_notes": self.full.vocal_notes(),
+            "instrumental_notes": self.full.instrumental_notes(),
+            "abc_error": {"full": self.full.abc_error, "melody": self.melody_abc_error},
+            "decode_warnings": self.stitched.warnings,
+            "octave_evidence": self.octave.as_ref().map(octave_json),
+            "review": self.review.to_json(),
+            "artifacts": digests,
+        })
     }
 
     /// Persist into `dir`, which must not exist yet or be empty (a review artifact is never
@@ -625,35 +683,15 @@ impl Transcription {
             )));
         }
         let files = self.files(tokenizer)?;
-        let mut digests = BTreeMap::new();
         for (rel, bytes) in &files {
             let path = join(dir, rel);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
             }
             std::fs::write(&path, bytes).map_err(|e| Error::io(&path, e))?;
-            digests.insert(rel.clone(), sha256_hex(bytes));
         }
-        let manifest = json!({
-            "schema": SCHEMA,
-            "source": self.source.to_json(),
-            "settings": self.settings.to_json(),
-            "closure": self.closure.to_json(),
-            "duration_seconds": self.stitched.duration,
-            "window_seconds": tokenizer.audio_length_seconds(),
-            "time_hz": tokenizer.time_hz(),
-            "windows": self.stitched.records.len(),
-            "events": self.full.events,
-            "melody_notes": self.full.notes.len(),
-            "vocal_notes": self.full.vocal_notes(),
-            "instrumental_notes": self.full.instrumental_notes(),
-            "abc_error": {"full": self.full.abc_error, "melody": self.melody_abc_error},
-            "decode_warnings": self.stitched.warnings,
-            "octave_evidence": self.octave.as_ref().map(octave_json),
-            "review": self.review.to_json(),
-            "artifacts": digests,
-        });
-        let bytes = serde_json::to_vec_pretty(&manifest).expect("serializable");
+        let bytes =
+            serde_json::to_vec_pretty(&self.manifest(tokenizer, &files)).expect("serializable");
         let path = dir.join(MANIFEST);
         std::fs::write(&path, &bytes).map_err(|e| Error::io(&path, e))?;
         Ok(sha256_hex(&bytes))
@@ -665,15 +703,23 @@ fn join(dir: &Path, rel: &str) -> PathBuf {
         .fold(dir.to_path_buf(), |p, part| p.join(part))
 }
 
-/// A persisted review artifact, integrity-checked on open.
+/// A persisted review artifact that passed [`ReviewArtifact::open`]'s full verification.
+///
+/// Its fields are private and `open` is the only constructor, so holding one means the artifact
+/// was replayed: every file hashes to its recorded digest, every derived manifest field (review,
+/// cover readiness, warnings, ABC errors, note counts, decode warnings, octave evidence) equals
+/// what this build re-derives from the persisted tokens and model input, the source identity is
+/// the persisted model input's, and the closure identity is the pinned inventory's.
 #[derive(Clone, Debug)]
 pub struct ReviewArtifact {
     dir: PathBuf,
     manifest: Value,
+    manifest_bytes: Vec<u8>,
     manifest_sha256: String,
+    report: ReplayReport,
 }
 
-/// The outcome of [`ReviewArtifact::replay`].
+/// The outcome of a replay.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayReport {
     /// Artifacts re-derived and found byte-identical.
@@ -682,9 +728,55 @@ pub struct ReplayReport {
     pub windows: usize,
 }
 
+/// The closure identity every persisted artifact must carry: the inventory's pins for both
+/// repositories (revision, weights SHA-256, `config.json` SHA-256), the ported code revision and
+/// the checkpoint's tokenizer fingerprint.
+fn check_pinned_closure(closure: &ClosureIdentity) -> Result<(), Error> {
+    use candle_audio_yue2::inventory::ComponentId;
+    let expect = |id: ComponentId| {
+        let c = id.component();
+        [
+            c.repo.id.to_string(),
+            c.repo.revision.to_string(),
+            c.weights().expect("weights").sha256.to_string(),
+            c.file("config.json").expect("config").sha256.to_string(),
+        ]
+    };
+    if closure.sheetsage2 != expect(ComponentId::SheetSage2)
+        || closure.mert != expect(ComponentId::MertV2FullSong)
+    {
+        return Err(Error::Replay(
+            "the recorded closure identity is not the pinned cover closure".into(),
+        ));
+    }
+    if closure.ported_code_revision != crate::PORTED_CODE_REVISION {
+        return Err(Error::Replay(format!(
+            "recorded with ported code revision {}, this build ports {}",
+            closure.ported_code_revision,
+            crate::PORTED_CODE_REVISION
+        )));
+    }
+    if closure.tokenizer_fingerprint != PINNED_TOKENIZER_FINGERPRINT {
+        return Err(Error::Replay(
+            "the recorded tokenizer fingerprint is not the pinned checkpoint's".into(),
+        ));
+    }
+    if !matches!(closure.device.as_str(), "cpu" | "metal" | "cuda") {
+        return Err(Error::Replay(format!(
+            "unknown device {:?}",
+            closure.device
+        )));
+    }
+    Ok(())
+}
+
+/// `tokenizer_fingerprint` of the pinned `m-a-p/SheetSage2` `config.json`.
+pub const PINNED_TOKENIZER_FINGERPRINT: &str = "5ba3325af0344c7f";
+
 impl ReviewArtifact {
-    /// Open `dir`: parse the manifest and verify every listed artifact's SHA-256. A missing or
-    /// altered file is an error.
+    /// Open and verify `dir` (see the type docs): hash every listed file, then replay. Any
+    /// difference — an altered file, a forged manifest field, a source or closure identity that
+    /// does not hold — is an error.
     pub fn open(dir: &Path) -> Result<Self, Error> {
         let path = dir.join(MANIFEST);
         let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
@@ -696,26 +788,21 @@ impl ReviewArtifact {
                 manifest["schema"]
             )));
         }
-        let artifacts = manifest["artifacts"]
-            .as_object()
-            .ok_or_else(|| bad("artifacts"))?;
-        for (rel, digest) in artifacts {
-            let path = join(dir, rel);
-            let bytes = std::fs::read(&path).map_err(|e| Error::Replay(format!("{rel}: {e}")))?;
-            if Some(sha256_hex(&bytes).as_str()) != digest.as_str() {
-                return Err(Error::Replay(format!(
-                    "{rel} does not match its recorded SHA-256; the artifact was altered"
-                )));
-            }
-        }
-        Ok(Self {
+        let mut artifact = Self {
             dir: dir.to_path_buf(),
             manifest,
             manifest_sha256: sha256_hex(&bytes),
-        })
+            manifest_bytes: bytes,
+            report: ReplayReport {
+                artifacts_matched: 0,
+                windows: 0,
+            },
+        };
+        artifact.report = artifact.replay()?;
+        Ok(artifact)
     }
 
-    /// The manifest.
+    /// The manifest (verified by [`ReviewArtifact::open`]).
     pub fn manifest(&self) -> &Value {
         &self.manifest
     }
@@ -723,6 +810,11 @@ impl ReviewArtifact {
     /// SHA-256 of the manifest file (the artifact's identity for provenance).
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+
+    /// What the verifying replay matched.
+    pub fn report(&self) -> &ReplayReport {
+        &self.report
     }
 
     /// The source identity.
@@ -740,16 +832,24 @@ impl ReviewArtifact {
         ClosureIdentity::from_json(&self.manifest["closure"])
     }
 
-    /// Read an artifact file (already integrity-checked).
+    /// Read an artifact file, re-hashing it against its recorded SHA-256 on every read (a file
+    /// replaced after `open` is refused).
     pub fn read(&self, rel: &str) -> Result<Vec<u8>, Error> {
-        if self.manifest["artifacts"].get(rel).is_none() {
-            return Err(Error::Replay(format!("{rel} is not part of this artifact")));
-        }
+        let digest = self.manifest["artifacts"]
+            .get(rel)
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Replay(format!("{rel} is not part of this artifact")))?;
         let path = join(&self.dir, rel);
-        std::fs::read(&path).map_err(|e| Error::io(&path, e))
+        let bytes = std::fs::read(&path).map_err(|e| Error::Replay(format!("{rel}: {e}")))?;
+        if sha256_hex(&bytes) != digest {
+            return Err(Error::Replay(format!(
+                "{rel} does not match its recorded SHA-256; the artifact was altered"
+            )));
+        }
+        Ok(bytes)
     }
 
-    /// Cover readiness of `melody_only` / full, as recorded.
+    /// Cover readiness of `melody_only` / full, as verified.
     pub fn readiness(&self, melody_only: bool) -> Readiness {
         let r = &self.manifest["review"]["cover"][if melody_only { "melody" } else { "full" }];
         if r["ready"].as_bool() == Some(true) {
@@ -764,7 +864,7 @@ impl ReviewArtifact {
         }
     }
 
-    /// The warnings, as recorded.
+    /// The warnings, as verified.
     pub fn warnings(&self) -> Vec<Warning> {
         self.manifest["review"]["warnings"]
             .as_array()
@@ -779,20 +879,42 @@ impl ReviewArtifact {
             .unwrap_or_default()
     }
 
-    /// Re-derive every artifact from the persisted tokens and settings (no model) and require each
-    /// to be byte-identical to the persisted one. Proves the artifact is self-consistent and that
-    /// this build of the port reproduces it.
+    /// Re-derive the whole artifact — every file and every manifest field — from the persisted
+    /// tokens, settings and model input (no model) and require equality with what is on disk. Also
+    /// checks the source identity against the persisted model input and the closure identity
+    /// against the pinned inventory. [`ReviewArtifact::open`] runs this; call it again to re-check.
     pub fn replay(&self) -> Result<ReplayReport, Error> {
+        // Every file on disk still hashes to its recorded digest (the derived ones are then
+        // compared through the manifest below).
+        for rel in self.manifest["artifacts"]
+            .as_object()
+            .ok_or_else(|| bad("artifacts"))?
+            .keys()
+        {
+            self.read(rel)?;
+        }
         let settings = self.settings()?;
         let closure = self.closure()?;
+        check_pinned_closure(&closure)?;
         let source = self.source()?;
+        let raw = self.read(SOURCE_AUDIO)?;
+        if raw.len() % 4 != 0 {
+            return Err(Error::Replay(format!("{SOURCE_AUDIO} is not float32 samples")));
+        }
+        let audio: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        if audio.len() != source.samples || samples_sha256(&audio) != source.sha256 {
+            return Err(Error::Replay(
+                "the recorded source identity is not the persisted model input's".into(),
+            ));
+        }
         let tokenizer = Tokenizer::new(
             self.manifest["window_seconds"]
                 .as_f64()
                 .ok_or_else(|| bad("window_seconds"))?,
-            self.manifest["time_hz"]
-                .as_u64()
-                .ok_or_else(|| bad("time_hz"))? as u32,
+            self.manifest["time_hz"].as_u64().ok_or_else(|| bad("time_hz"))? as u32,
             Some(&closure.tokenizer_fingerprint),
         )?;
         let windows: Vec<Value> = serde_json::from_slice(&self.read(TOKENS_JSON)?)
@@ -808,9 +930,7 @@ impl ReviewArtifact {
                     .collect()
             })
             .collect::<Result<_, _>>()?;
-        let duration = self.manifest["duration_seconds"]
-            .as_f64()
-            .ok_or_else(|| bad("duration_seconds"))?;
+        let duration = source.duration();
         let prompts: Vec<&str> = settings.prompts.iter().map(String::as_str).collect();
         let stitcher = Stitcher::new(
             &tokenizer,
@@ -821,54 +941,33 @@ impl ReviewArtifact {
             crate::pipeline::MAX_OUTPUT_SEQ_LEN,
         )?;
         let stitched = stitcher.replay(&tokens)?;
-        for (record, window) in stitched.records.iter().zip(&windows) {
-            check_window(record, window)?;
-        }
-        let rebuilt = Transcription::build(source, settings, closure, stitched, None)?;
+        let rebuilt = Transcription::build(source, settings, closure, stitched, audio)?;
         let files = rebuilt.files(&tokenizer)?;
-        let recorded = self.manifest["artifacts"]
-            .as_object()
-            .ok_or_else(|| bad("artifacts"))?;
-        if files.len() != recorded.len() {
+        // Byte equality with the file on disk: the manifest is re-serialized exactly as `save`
+        // writes it (serde_json's float parsing is not round-trip exact, so parsed values are
+        // not compared).
+        let expected =
+            serde_json::to_vec_pretty(&rebuilt.manifest(&tokenizer, &files)).expect("serializable");
+        if expected != self.manifest_bytes {
+            let ours: Value = serde_json::from_slice(&expected).expect("just serialized");
+            let field = ours
+                .as_object()
+                .and_then(|o| {
+                    o.keys()
+                        .chain(self.manifest.as_object().into_iter().flat_map(|m| m.keys()))
+                        .find(|k| o.get(*k) != self.manifest.get(*k))
+                        .cloned()
+                })
+                .unwrap_or_else(|| "(formatting)".into());
             return Err(Error::Replay(format!(
-                "replay produced {} artifacts, the manifest lists {}",
-                files.len(),
-                recorded.len()
+                "manifest field `{field}` differs from the replayed transcription"
             )));
-        }
-        for (rel, bytes) in &files {
-            let recorded_digest = recorded
-                .get(rel)
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::Replay(format!("replay produced unlisted {rel}")))?;
-            if sha256_hex(bytes) != recorded_digest {
-                return Err(Error::Replay(format!(
-                    "replayed {rel} differs from the persisted artifact"
-                )));
-            }
         }
         Ok(ReplayReport {
             artifacts_matched: files.len(),
             windows: tokens.len(),
         })
     }
-}
-
-fn check_window(record: &WindowRecord, recorded: &Value) -> Result<(), Error> {
-    let w: &Window = &record.window;
-    let same = |k: &str, v: f64| recorded[k].as_f64() == Some(v);
-    if !(same("start", w.start)
-        && same("end", w.end)
-        && same("accept_start", w.accept_start)
-        && same("accept_end", w.accept_end)
-        && recorded["prefix_tokens"].as_u64() == Some(record.prefix_tokens as u64))
-    {
-        return Err(Error::Replay(format!(
-            "window {}: the recorded plan differs from the replayed plan",
-            record.index
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

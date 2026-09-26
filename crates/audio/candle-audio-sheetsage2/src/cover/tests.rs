@@ -82,6 +82,37 @@ fn a_reviewed_transcription_plans_melody_and_full_covers() {
     );
 }
 
+/// The reviewer's forgery: an empty transcription whose manifest is edited to claim a ready melody
+/// cover, no warnings and a different source. It cannot be opened, so no cover can be planned from
+/// it; and a verified artifact whose files change after opening is refused by `plan_cover` itself.
+///
+/// Mutations that must fail: drop the manifest comparison in `replay`, or the `replay()` call in
+/// `plan_cover`.
+#[test]
+fn a_forged_or_altered_artifact_cannot_be_planned() {
+    let (root, artifact) = saved(SILENCE_TOKENS, 12.0);
+    let dir = root.path().join("transcription");
+    let manifest_path = dir.join(crate::review::MANIFEST);
+    let original = std::fs::read(&manifest_path).unwrap();
+    let mut forged: Value = serde_json::from_slice(&original).unwrap();
+    forged["review"]["cover"]["melody"] = json!({"ready": true});
+    forged["review"]["warnings"] = json!([]);
+    forged["source"]["sha256"] = json!("1".repeat(64));
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+    assert!(ReviewArtifact::open(&dir).is_err());
+    std::fs::write(&manifest_path, &original).unwrap();
+
+    // Opened while intact, altered afterwards: plan_cover replays and refuses.
+    let score = dir.join(MELODY_SCORE);
+    std::fs::write(&score, b"X:1\n").unwrap();
+    let err = plan_cover(
+        &artifact,
+        &CoverOptions::new(CoverMode::Melody, STYLE, CoverLyrics::source(LYRICS)),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Replay(_)), "{err}");
+}
+
 /// A transcription with no melody cannot be covered as transcribed (upstream would hand YuE2 a
 /// rest-only score); a reviewer-supplied score replaces it explicitly.
 ///

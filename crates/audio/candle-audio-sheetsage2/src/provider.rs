@@ -403,7 +403,7 @@ impl Transcriber {
             settings.clone(),
             self.closure.clone(),
             stitcher.finish(),
-            Some((&audio, rate)),
+            audio,
         )
     }
 

@@ -55,10 +55,12 @@ pub(crate) fn transcription(tokens: &str, duration: f64) -> Transcription {
     .unwrap()
     .replay(&windows)
     .unwrap();
-    let samples = (duration * 24_000.0).round() as usize;
+    // A stand-in model input of the recorded length (the oracles carry tokens, not audio): digital
+    // silence, so the octave evidence is computed but finds nothing.
+    let audio = vec![0.0f32; (duration * 24_000.0).round() as usize];
     let source = SourceIdentity {
-        sha256: "0".repeat(64),
-        samples,
+        sha256: samples_sha256(&audio),
+        samples: audio.len(),
         sample_rate: 24_000,
         name: Some("fixture".into()),
         original_sha256: None,
@@ -69,7 +71,7 @@ pub(crate) fn transcription(tokens: &str, duration: f64) -> Transcription {
         TranscriptionSettings::default(),
         identity(),
         stitched,
-        None,
+        audio,
     )
     .unwrap()
 }
@@ -173,10 +175,12 @@ fn persisted_artifact_replays_byte_for_byte_and_detects_tampering() {
     assert!(ReviewArtifact::open(&dir).is_err());
     std::fs::write(&score, &original).unwrap();
 
-    // A self-consistent forgery (tokens changed AND digest updated) is caught by replay.
+    // A self-consistent forgery (tokens changed AND their digest updated in the manifest) is
+    // caught by the replay inside `open`. The digest is replaced textually so nothing else in the
+    // manifest changes.
     let tokens_path = dir.join(TOKENS_JSON);
-    let mut windows: Vec<Value> =
-        serde_json::from_slice(&std::fs::read(&tokens_path).unwrap()).unwrap();
+    let original_tokens = std::fs::read(&tokens_path).unwrap();
+    let mut windows: Vec<Value> = serde_json::from_slice(&original_tokens).unwrap();
     let list = windows[0]["tokens"].as_array_mut().unwrap();
     // Raise the first melody pitch token by a semitone.
     let at = list
@@ -188,15 +192,74 @@ fn persisted_artifact_replays_byte_for_byte_and_detects_tampering() {
     let forged = serde_json::to_vec_pretty(&windows).unwrap();
     std::fs::write(&tokens_path, &forged).unwrap();
     let manifest_path = dir.join(MANIFEST);
-    let mut manifest: Value =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    manifest["artifacts"][TOKENS_JSON] = json!(sha256_hex(&forged));
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    let reopened = ReviewArtifact::open(&dir).unwrap();
-    let err = reopened.replay().unwrap_err();
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    let edited = manifest.replace(&sha256_hex(&original_tokens), &sha256_hex(&forged));
+    assert_ne!(edited, manifest);
+    std::fs::write(&manifest_path, edited).unwrap();
+    let err = ReviewArtifact::open(&dir).unwrap_err();
     assert!(err.to_string().contains("differs"), "{err}");
+
+    // `read` re-hashes: a file replaced after `open` is refused.
+    std::fs::write(&tokens_path, &original_tokens).unwrap();
+    std::fs::write(&manifest_path, manifest).unwrap();
+    let artifact = ReviewArtifact::open(&dir).unwrap();
+    std::fs::write(&score, b"X:1\n").unwrap();
+    assert!(artifact.read("score.abc").is_err());
+}
+
+/// Every manifest field that is not a file digest is verified too: a hand-edited cover readiness,
+/// a removed warning, an ABC error, a note count, a source digest or a closure digest is refused
+/// by `open` — so no `ReviewArtifact`, and no cover plan, can be made from it.
+///
+/// Mutations that must fail: compare only the artifact digests in `replay` (the pre-fix
+/// behaviour), or skip `check_pinned_closure`.
+#[test]
+fn hand_edited_manifest_fields_are_refused() {
+    let t = transcription(SILENCE_TOKENS, 12.0);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("review");
+    t.save(&dir, &tokenizer()).unwrap();
+    let manifest_path = dir.join(MANIFEST);
+    let original = std::fs::read(&manifest_path).unwrap();
+    let parsed: Value = serde_json::from_slice(&original).unwrap();
+    // Control: rewriting the manifest unchanged keeps it valid, so each refusal below is caused by
+    // its edit, not by re-serialization.
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&parsed).unwrap()).unwrap();
+    assert!(ReviewArtifact::open(&dir).is_ok());
+    let edits: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+        (
+            "review.cover.melody forced ready",
+            Box::new(|m| m["review"]["cover"]["melody"] = json!({"ready": true})),
+        ),
+        (
+            "review.warnings emptied",
+            Box::new(|m| m["review"]["warnings"] = json!([])),
+        ),
+        (
+            "abc_error.full invented",
+            Box::new(|m| m["abc_error"]["full"] = json!("forged")),
+        ),
+        ("melody_notes inflated", Box::new(|m| m["melody_notes"] = json!(12))),
+        (
+            "source.sha256 replaced",
+            Box::new(|m| m["source"]["sha256"] = json!("1".repeat(64))),
+        ),
+        (
+            "closure weights digest replaced",
+            Box::new(|m| m["closure"]["sheetsage2"]["weights_sha256"] = json!("2".repeat(64))),
+        ),
+        (
+            "closure device invented",
+            Box::new(|m| m["closure"]["device"] = json!("tpu")),
+        ),
+    ];
+    for (label, edit) in &edits {
+        let mut forged = parsed.clone();
+        edit(&mut forged);
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+        let err = ReviewArtifact::open(&dir).unwrap_err();
+        assert!(matches!(err, Error::Replay(_)), "{label}: {err}");
+    }
+    std::fs::write(&manifest_path, &original).unwrap();
+    assert!(ReviewArtifact::open(&dir).is_ok());
 }

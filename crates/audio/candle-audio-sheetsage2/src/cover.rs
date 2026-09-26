@@ -91,11 +91,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Build the cover request from a reviewed transcription (see the module docs).
+/// Build the cover request from a reviewed transcription (see the module docs). Only a verified
+/// artifact is accepted: [`ReviewArtifact::open`] is its only constructor and replays it completely,
+/// and this function replays it once more before copying anything into the provenance.
 pub fn plan_cover(artifact: &ReviewArtifact, options: &CoverOptions) -> Result<CoverPlan, Error> {
     let authorization =
         authorize_closure(Closure::Cover, IntendedUse::NoncommercialExperimentation)
             .map_err(|e| Error::Closure(e.to_string()))?;
+    // A `ReviewArtifact` was fully verified when opened; replay again here so files changed on
+    // disk since then are refused too. Every manifest value copied below is therefore verified.
+    artifact.replay()?;
     let melody_only = options.mode == CoverMode::Melody;
     let transcribed_file = if melody_only {
         MELODY_SCORE
