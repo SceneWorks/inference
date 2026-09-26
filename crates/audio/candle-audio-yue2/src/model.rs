@@ -42,8 +42,6 @@
 //! [`CONTEXT`](crate::protocol::CONTEXT) positions) or the step fails before writing (see
 //! [`crate::generate`] for the request-level budget check).
 
-use std::path::Path;
-
 use candle_audio::candle_core::{DType, Device, Tensor, D};
 use candle_audio::gen_core;
 use candle_llm::primitives::{
@@ -190,6 +188,44 @@ fn check_compute(dtype: DType, device: &Device) -> gen_core::Result<()> {
             "YuE2 computes in F32 or BF16 (the released precision), not {other:?}"
         ))),
     }
+}
+
+/// The verified YuE2-3B snapshot, opened for loading (see [`open_verified`]).
+pub(crate) struct VerifiedLmFiles {
+    /// The verified `config.json`, read.
+    pub(crate) config_json: String,
+    /// A builder over exactly the verified weights file, converting to the compute dtype.
+    pub(crate) vb: VarBuilder<'static>,
+    /// SHA-256 of that weights file (from the conversion manifest it was checked against).
+    pub(crate) weights_sha256: String,
+}
+
+/// Refuse an unsupported dtype/device pair, then resolve and verify the pinned YuE2-3B snapshot
+/// **immediately before loading** (the crate's load-boundary rule) and open exactly the verified
+/// `config.json` and weights file. Every loader of the MoT goes through here.
+pub(crate) fn open_verified(
+    dirs: &SnapshotDirs,
+    dtype: DType,
+    device: &Device,
+) -> gen_core::Result<VerifiedLmFiles> {
+    check_compute(dtype, device)?;
+    let verified = snapshot::resolve_component(ComponentId::Lm, dirs)?;
+    let config_path = verified.path("config.json").ok_or_else(|| {
+        gen_core::Error::Msg("verified YuE2-3B snapshot has no config.json".into())
+    })?;
+    let weights = verified.weights_path().ok_or_else(|| {
+        gen_core::Error::Msg("verified YuE2-3B snapshot has no weights file".into())
+    })?;
+    let config_json = std::fs::read_to_string(config_path)?;
+    // SAFETY: the file is the snapshot's verified weights file, opened read-only; the mapping
+    // lives only for the duration of the caller's load (every tensor is copied out in `dtype`).
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) }
+        .map_err(backend("open weights"))?;
+    Ok(VerifiedLmFiles {
+        config_json,
+        vb,
+        weights_sha256: verified.manifest().native.sha256.clone(),
+    })
 }
 
 /// Which Mixture-of-Transformers paths to load.
@@ -448,30 +484,12 @@ impl Yue2Lm {
         dtype: DType,
         device: &Device,
     ) -> gen_core::Result<Self> {
-        check_compute(dtype, device)?;
-        let verified = snapshot::resolve_component(ComponentId::Lm, dirs)?;
-        let config_path = verified.path("config.json").ok_or_else(|| {
-            gen_core::Error::Msg("verified YuE2-3B snapshot has no config.json".into())
-        })?;
-        let weights = verified.weights_path().ok_or_else(|| {
-            gen_core::Error::Msg("verified YuE2-3B snapshot has no weights file".into())
-        })?;
-        let config = Yue2Config::from_json(&std::fs::read_to_string(config_path)?)?;
-        Self::load_safetensors(config, weights, paths, dtype, device)
-    }
-
-    fn load_safetensors(
-        config: Yue2Config,
-        weights: &Path,
-        paths: MotPaths,
-        dtype: DType,
-        device: &Device,
-    ) -> gen_core::Result<Self> {
-        // SAFETY: the file is the snapshot's verified weights file, opened read-only; the mapping
-        // lives only for the duration of this load (every tensor is copied out in `dtype`).
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device) }
-            .map_err(backend("open weights"))?;
-        Self::from_var_builder(config, vb, paths)
+        let opened = open_verified(dirs, dtype, device)?;
+        Self::from_var_builder(
+            Yue2Config::from_json(&opened.config_json)?,
+            opened.vb,
+            paths,
+        )
     }
 
     /// Build from an arbitrary [`VarBuilder`]. Crate-private: production loads go through
@@ -696,6 +714,34 @@ impl Yue2Lm {
     /// Append one token to `cache` and return the next position's logits `[vocab]`.
     pub fn decode(&self, token: u32, cache: &mut StaticKvCache) -> gen_core::Result<Tensor> {
         self.forward_last(&[token], cache)
+    }
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "metal")))]
+impl Yue2Lm {
+    /// Where every weight lives, for the offload tests: `(AR-only tensors, tensors that never
+    /// move)` — the latter being every NAR twin and the final norm.
+    pub(crate) fn placement(&self) -> (Vec<Device>, Vec<Device>) {
+        let path = |p: &MotPath| {
+            let mut t = vec![&p.attn_norm, &p.mlp_norm];
+            t.extend(p.attn.tensors());
+            t.extend([&p.mlp.gate_proj, &p.mlp.up_proj, &p.mlp.down_proj]);
+            t.into_iter()
+                .map(|t| t.device().clone())
+                .collect::<Vec<_>>()
+        };
+        let mut ar = vec![
+            self.embed_tokens.device().clone(),
+            self.lm_head.device().clone(),
+        ];
+        let mut fixed = vec![self.norm.device().clone()];
+        for layer in &self.layers {
+            ar.extend(path(&layer.ar));
+            if let Some(nar) = &layer.nar {
+                fixed.extend(path(nar));
+            }
+        }
+        (ar, fixed)
     }
 }
 

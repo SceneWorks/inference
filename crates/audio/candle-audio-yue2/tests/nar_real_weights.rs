@@ -36,7 +36,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 /// Native vs upstream on YuE2-3B (Candle CPU F32 vs torch 2.10.0 CPU F32): max |Δ| over every
-/// evaluation's input state and velocity and the final latents of both cases (288 evaluations).
+/// evaluation's input state and velocity and the final latents of both cases (202 evaluations: 3 chunks × 64 + 10).
 /// Measured 2026-09-26 (Apple M-series CPU): 4.4e-5 (final latents 1.9e-5) on values of magnitude
 /// O(1) — reduction-order noise through 28 layers of 2048 channels over up to 32 midpoint steps.
 /// The bound is ~11× that; the synthetic mutations (`tests/fixtures/README.md`) move latents by
@@ -45,8 +45,9 @@ const REAL_MAX_ABS: f32 = 5e-4;
 /// Relative L2 over the same tensors. Measured 5.9e-6; bound ~10×.
 const REAL_REL_L2: f64 = 6e-5;
 /// Native `Rows(7)` + AR offload vs native default on the real weights (same process, same model).
-/// Measured 0.0 (bit-identical); the bound allows another backend's GEMM blocking to depend on the
-/// row count.
+/// Bound ≤ 1e-5; measured 0 on macOS CPU (the synthetic equivalent measured 7.2e-7 on the Linux CI
+/// CPU, whose GEMM blocking depends on the row count). Values may differ in their last bits, so only
+/// the stage identity is compared, not the value hash.
 const REAL_TILING_MAX_ABS: f32 = 1e-5;
 
 fn hub() -> SnapshotDirs {
@@ -272,7 +273,10 @@ fn real_weight_synthesis_matches_upstream_and_memory_controls_are_invariant() {
                 d.max_abs <= REAL_TILING_MAX_ABS,
                 "tiling changed the latents: {d:?}"
             );
-            assert_eq!(tiled.latents.identity(), out.latents.identity());
+            assert_eq!(
+                tiled.latents.identity().source,
+                out.latents.identity().source
+            );
             assert!(!nar.lm().ar_offloaded());
         }
     }
