@@ -311,9 +311,21 @@ def grammar(out: Path) -> None:
     tokenizer = modules["tokenization_sheetsage2"].SheetSage2Tokenizer(300.0, 100, "v1")
     generation = modules["generation_sheetsage2"]
     cases = {}
-    for case in ("synth_full", "real_full"):
-        lines = (ARTIFACTS / case / "tokens.txt").read_text(encoding="utf-8").splitlines()
-        tokens = [int(line.split("\t")[1]) for line in lines if line and not line.startswith("#")]
+    t = tokenizer
+    prefix = t.prompt_prefix(generation.FULL_TASK_PROMPTS)
+    # Grammar corners the real oracles never reach: a run of four sub-beat shifts (the fifth is
+    # masked), a meter awaiting its eighth position, pitch runs with and without durations.
+    synthetic = prefix + [t.subbeat_shift_token_start] * 4 + [
+        t.time_id_to_token(10), t.meter_to_token(3, 4), t.eighth_position_to_token(2),
+        t.key_token_start + 5, t.full_chord_token_start + 7, t.pitch_token_start + 60,
+        t.pitch_token_start + 64, t.duration_token_start + 3, t.subbeat_shift_token_start + 256,
+        t.pitch_token_start + 200, t.eos_token]
+    sources = {case: [int(line.split("\t")[1]) for line in
+                      (ARTIFACTS / case / "tokens.txt").read_text(encoding="utf-8").splitlines()
+                      if line and not line.startswith("#")]
+               for case in ("synth_full", "real_full")}
+    sources["synthetic_corners"] = synthetic
+    for case, tokens in sources.items():
         out_index = tokens.index(tokenizer.out_token)
         state = generation.PromptGrammarState(tokenizer)
         steps = []

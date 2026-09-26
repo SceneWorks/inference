@@ -462,6 +462,33 @@ mod tests {
         }
     }
 
+    /// A fresh object rounds times to ticks half to even (`int(round(numpy.float64))`), so exact
+    /// half-ticks go to the even tick. Mutation that must fail: `round()` (half away from zero).
+    #[test]
+    fn exact_half_ticks_round_to_even() {
+        let scale = tick_scale(960, None);
+        let mut midi = Midi::new(960);
+        midi.instruments.push(Instrument {
+            program: 0,
+            name: "Vocal".into(),
+            notes: vec![Note {
+                velocity: 100,
+                pitch: 60,
+                start: 2.5 * scale,
+                end: 5.5 * scale,
+            }],
+        });
+        assert_eq!(
+            (2.5 * scale) / scale,
+            2.5,
+            "the probe must sit exactly on a half tick"
+        );
+        let back = Midi::from_bytes(&midi.to_bytes()).unwrap();
+        let note = back.instruments[0].notes[0];
+        assert_eq!((note.start / scale).round(), 2.0);
+        assert_eq!((note.end / scale).round(), 6.0);
+    }
+
     #[test]
     fn a_note_shorter_than_half_a_tick_is_dropped_like_pretty_midi() {
         let mut midi = Midi::new(960);

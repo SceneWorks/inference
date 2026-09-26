@@ -64,6 +64,9 @@ fn the_dialect_parser_resolves_ties_and_bar_scoped_accidentals() {
 fn stripping_a_transcribed_score_matches_the_melody_only_rendering() {
     let full = parse(FULL).unwrap();
     assert_eq!(full.voices[0].bars.len(), 27);
+    // Ties rejoin every note the notation split across bars or into representable lengths: the
+    // 76 transcribed vocal notes come back as 76 sounding notes.
+    assert_eq!(full.voice("Vocal").notes.len(), 76);
     assert!(full.chord_count() > 0);
     assert!(full.voice("Ins").notes.is_empty());
     let (stripped, removed) = strip_chords(FULL, KeepVoice::Both).unwrap();

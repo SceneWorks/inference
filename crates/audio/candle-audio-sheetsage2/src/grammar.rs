@@ -179,7 +179,9 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    /// Upstream's masks along the committed `synth_full` and `real_full` token oracles
+    /// Upstream's masks along the committed `synth_full` and `real_full` token oracles, plus a synthetic
+    /// sequence that reaches the corners they never do (a four-shift run, meter → eighth position,
+    /// pitch runs)
     /// (`testdata/grammar_masks.json`, produced by `native_parity.py grammar` from upstream's own
     /// `PromptGrammarState`). Every step's allowed set must be identical.
     ///
@@ -215,7 +217,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 332 + 448);
+        assert_eq!(checked, 332 + 448 + 15);
     }
 
     #[test]
