@@ -56,6 +56,13 @@
 //! * [`decode`] — [`decode::decode_latents`], the production path: verified latents → clamped
 //!   48 kHz stereo with decoder and latent identity in the output metadata.
 //!
+//! Acoustic synthesis (sc-22992):
+//!
+//! * [`nar`] — flow matching over the MoT's NAR twins: the song's noise drawn once, the original
+//!   context chunks each prefilled once and reused by every velocity evaluation, the released
+//!   midpoint solver, bounded (query-tiled) attention that never drops a key, optional AR offload
+//!   and cancellation — producing [`latent::AcousticLatents`] for the decoder.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -78,6 +85,7 @@ pub mod latent;
 pub mod license;
 pub mod manifest;
 pub mod model;
+pub mod nar;
 #[cfg(test)]
 mod parity;
 pub mod plan;
@@ -91,6 +99,7 @@ pub mod vae;
 mod test_fixtures;
 
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
+pub use nar::{synthesize, NarOptions, QueryTile, SongNoise, SynthesisRequest, Yue2Nar};
 pub use plan::{PlanError, PlanIdentity, PlanStep, SemanticConditioning, SymbolicPlan};
 pub use protocol::{CotMode, GenerationConfig, ProtocolError, Sampling, SongRequest};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};

@@ -285,8 +285,31 @@ impl Attention {
         linear(&merged, &self.o_proj, None).map_err(backend("o_proj"))
     }
 
-    fn scale(&self) -> f32 {
+    pub(crate) fn scale(&self) -> f32 {
         1.0 / (self.head_dim as f32).sqrt()
+    }
+
+    fn to_device(&self, device: &Device) -> candle_audio::candle_core::Result<Self> {
+        Ok(Self {
+            q_proj: self.q_proj.to_device(device)?,
+            k_proj: self.k_proj.to_device(device)?,
+            v_proj: self.v_proj.to_device(device)?,
+            o_proj: self.o_proj.to_device(device)?,
+            q_norm: self.q_norm.to_device(device)?,
+            k_norm: self.k_norm.to_device(device)?,
+            ..*self
+        })
+    }
+
+    fn tensors(&self) -> [&Tensor; 6] {
+        [
+            &self.q_proj,
+            &self.k_proj,
+            &self.v_proj,
+            &self.o_proj,
+            &self.q_norm,
+            &self.k_norm,
+        ]
     }
 }
 
@@ -315,6 +338,14 @@ impl Mlp {
         let act = swiglu(&gate, &up).map_err(backend("swiglu"))?;
         linear(&act, &self.down_proj, None).map_err(backend("down_proj"))
     }
+
+    fn to_device(&self, device: &Device) -> candle_audio::candle_core::Result<Self> {
+        Ok(Self {
+            gate_proj: self.gate_proj.to_device(device)?,
+            up_proj: self.up_proj.to_device(device)?,
+            down_proj: self.down_proj.to_device(device)?,
+        })
+    }
 }
 
 /// One transformer path of a layer: pre-attention norm, attention, pre-MLP norm, MLP.
@@ -330,6 +361,32 @@ pub struct MotPath {
     pub mlp: Mlp,
 }
 
+impl MotPath {
+    fn to_device(&self, device: &Device) -> candle_audio::candle_core::Result<Self> {
+        Ok(Self {
+            attn_norm: self.attn_norm.to_device(device)?,
+            attn: self.attn.to_device(device)?,
+            mlp_norm: self.mlp_norm.to_device(device)?,
+            mlp: self.mlp.to_device(device)?,
+        })
+    }
+
+    /// The device of every tensor of this path (the first one's; a path is moved as a whole).
+    fn device(&self) -> Device {
+        self.attn_norm.device().clone()
+    }
+
+    fn bytes(&self) -> usize {
+        let mut tensors = vec![&self.attn_norm, &self.mlp_norm];
+        tensors.extend(self.attn.tensors());
+        tensors.extend([&self.mlp.gate_proj, &self.mlp.up_proj, &self.mlp.down_proj]);
+        tensors
+            .iter()
+            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .sum()
+    }
+}
+
 /// One decoder layer: the AR path and, when loaded, the NAR path.
 #[derive(Debug)]
 pub struct MotLayer {
@@ -341,7 +398,16 @@ pub struct MotLayer {
 
 /// The YuE2 MoT language model: token embedding, the decoder layers, the final norm and the
 /// untied `lm_head` (the NAR auxiliary heads — `llm2vae`, `vae2llm`, the time and latent-position
-/// embeddings — belong to the acoustic stage and are not loaded here).
+/// embeddings — belong to the acoustic stage, [`crate::nar`], and are not loaded here).
+///
+/// # AR offload
+///
+/// Upstream's `nar._offload_ar` moves the modules the acoustic ODE never reads — the token
+/// embedding, `lm_head` and every layer's AR path — to host memory while one chunk is solved, and
+/// moves them back afterwards. [`Yue2Lm::offload_ar`] / [`Yue2Lm::restore_ar`] are that
+/// transition. While offloaded, every AR entry point ([`Yue2Lm::prefill`], [`Yue2Lm::decode`])
+/// refuses with an error instead of computing on host copies; the NAR twins and the final norm
+/// never move.
 #[derive(Debug)]
 pub struct Yue2Lm {
     config: Yue2Config,
@@ -352,6 +418,7 @@ pub struct Yue2Lm {
     rope: Rope,
     dtype: DType,
     device: Device,
+    ar_offloaded: bool,
 }
 
 impl Yue2Lm {
@@ -434,6 +501,7 @@ impl Yue2Lm {
             norm,
             lm_head,
             rope,
+            ar_offloaded: false,
         })
     }
 
@@ -450,6 +518,61 @@ impl Yue2Lm {
     /// The device the weights live on.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Whether the AR-only weights are offloaded (see the [type docs](Yue2Lm#ar-offload)).
+    pub fn ar_offloaded(&self) -> bool {
+        self.ar_offloaded
+    }
+
+    /// Move the AR-only weights — `embed_tokens`, `lm_head` and every layer's AR path — to host
+    /// memory, upstream's `_offload_ar(model, True)` entry. Returns the bytes that left the device:
+    /// `0` for a model that already lives in host memory (upstream moves only modules whose device
+    /// is not the CPU), in which case this only marks the AR path unavailable. An error part-way
+    /// leaves the model marked offloaded; [`Yue2Lm::restore_ar`] brings every tensor back.
+    pub fn offload_ar(&mut self) -> gen_core::Result<usize> {
+        self.ar_offloaded = true;
+        if self.device.is_cpu() {
+            return Ok(0);
+        }
+        let host = Device::Cpu;
+        let err = backend("offload AR path");
+        let mut moved = 0;
+        for tensor in [&mut self.embed_tokens, &mut self.lm_head] {
+            if !tensor.device().is_cpu() {
+                moved += tensor.elem_count() * tensor.dtype().size_in_bytes();
+                *tensor = tensor.to_device(&host).map_err(&err)?;
+            }
+        }
+        for layer in &mut self.layers {
+            if !layer.ar.device().is_cpu() {
+                moved += layer.ar.bytes();
+                layer.ar = layer.ar.to_device(&host).map_err(&err)?;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Move every AR-only weight back to the model device and make the AR path available again —
+    /// upstream's `_offload_ar` exit. Idempotent: tensors already on the device are not copied, so
+    /// it also recovers from an [`Yue2Lm::offload_ar`] or an earlier restore that failed part-way.
+    pub fn restore_ar(&mut self) -> gen_core::Result<()> {
+        if !self.device.is_cpu() {
+            let device = self.device.clone();
+            let err = backend("restore AR path");
+            for tensor in [&mut self.embed_tokens, &mut self.lm_head] {
+                if !tensor.device().same_device(&device) {
+                    *tensor = tensor.to_device(&device).map_err(&err)?;
+                }
+            }
+            for layer in &mut self.layers {
+                if !layer.ar.device().same_device(&device) {
+                    layer.ar = layer.ar.to_device(&device).map_err(&err)?;
+                }
+            }
+        }
+        self.ar_offloaded = false;
+        Ok(())
     }
 
     /// The decoder layers (both MoT paths when loaded with [`MotPaths::ArAndNar`]).
@@ -491,6 +614,12 @@ impl Yue2Lm {
     /// from the cache offset; queries attend every cached key plus the causal part of `ids`.
     fn forward_last(&self, ids: &[u32], cache: &mut StaticKvCache) -> gen_core::Result<Tensor> {
         let err = backend("forward");
+        if self.ar_offloaded {
+            return Err(gen_core::Error::Msg(
+                "YuE2 forward: the AR path is offloaded (restore it with `Yue2Lm::restore_ar`)"
+                    .into(),
+            ));
+        }
         if ids.is_empty() {
             return Err(gen_core::Error::Msg(
                 "YuE2 forward: input must contain at least one token".into(),
