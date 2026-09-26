@@ -28,7 +28,7 @@ const REPO: UpstreamRepo = UpstreamRepo {
 };
 
 fn sha(bytes: &[u8]) -> String {
-    crate::engine::hex(&Sha256::digest(bytes))
+    crate::durable::hex(&Sha256::digest(bytes))
 }
 
 fn leak_str(s: String) -> &'static str {

@@ -201,6 +201,25 @@ fn generation_starts_only_after_the_transcription_model_is_gone() {
     );
     assert_eq!(written["request"]["cot"], "melody");
     assert_eq!(written["run"]["identity"], "stand-in");
+    // `cover.json` carries an integrity record (sc-22988 review): it verifies as written, and a
+    // changed byte is refused.
+    let cover_dir = out.path().join("cover");
+    assert_eq!(verify_cover(&cover_dir).unwrap(), written);
+    assert_eq!(
+        outcome.provenance_sha256,
+        candle_audio_yue2::durable::sha256_file(&outcome.provenance_path)
+            .unwrap()
+            .0
+    );
+    let mut tampered = std::fs::read(&outcome.provenance_path).unwrap();
+    let last = tampered.len() - 2;
+    tampered[last] ^= 0x01;
+    std::fs::write(&outcome.provenance_path, tampered).unwrap();
+    let err = verify_cover(&cover_dir).unwrap_err();
+    assert!(
+        err.to_string().contains("changed since it was recorded"),
+        "{err}"
+    );
 
     // A model that was not handed in (still loaded elsewhere) blocks the load.
     let straggler = Transcriber::from_files(tiny_files(), tiny_identity(), &Device::Cpu).unwrap();

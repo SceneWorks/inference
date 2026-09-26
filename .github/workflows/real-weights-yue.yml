@@ -26,7 +26,8 @@ name: YuE real-weight validation (CUDA)
 # measures bf16 / fp8 / q8 / q4 on CUDA (and F32 on CUDA) against the F32 CPU reference of the pinned
 # upstream originals. The q8 / q4 tier snapshots are derived on the runner from the verified
 # originals and removed at the end; nothing is rehosted. The default `family: yue` runs exactly the
-# YuE-v1 job above, as before.
+# YuE-v1 job above, as before. Both YuE2 decoders (standard and legacy) are materialized, so the
+# CUDA lane holds the complete generation closure.
 
 on:
   workflow_dispatch:
@@ -201,6 +202,7 @@ jobs:
       CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CANDLE_AUDIO_YUE2_3B_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--m-a-p--YuE2-3B\snapshots\1a96eca688d6ae5d7f0feb88573fec89920fcd19
       CANDLE_AUDIO_YUE2_VAE_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--m-a-p--YuE2-Vae\snapshots\95535e72a97bc0f09b8ada125d26b4009428c0e8
+      CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--m-a-p--YuE2-Vae-legacy\snapshots\b54118f0fc462f08999d1ec07e88817f4ee3f770
       # The bottom rung of the arch ladder, not the hardware -- see `same-l-cuda` in real-weights.yml.
       CUDA_COMPUTE_CAP: "80"
       CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
@@ -261,6 +263,7 @@ jobs:
           set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue2-3b --snapshot "%CANDLE_AUDIO_YUE2_3B_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue2-vae --snapshot "%CANDLE_AUDIO_YUE2_VAE_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue2-vae-legacy --snapshot "%CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT%" || exit /b 1
       # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings.
       - name: Build the YuE2 CUDA test binary
         shell: cmd

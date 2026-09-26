@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+
+use candle_audio_yue2::durable;
+pub(crate) use candle_audio_yue2::durable::sha256_hex;
 
 use crate::events::tokens_txt;
 use crate::exports::{export, Exports};
@@ -56,13 +58,6 @@ pub const HIGH_VOCAL_MEDIAN: f64 = 76.0;
 pub const OCTAVE_EVIDENCE_FRACTION: f64 = 0.5;
 /// Minimum checked notes before the f0/2 share is reported as a warning.
 pub const OCTAVE_EVIDENCE_MIN_NOTES: usize = 8;
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
 
 /// What was transcribed.
 #[derive(Clone, Debug, PartialEq)]
@@ -544,15 +539,12 @@ pub struct Transcription {
 }
 
 fn samples_sha256(samples: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for s in samples {
         hasher.update(s.to_le_bytes());
     }
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    durable::hex(&hasher.finalize())
 }
 
 impl Transcription {
@@ -694,12 +686,14 @@ impl Transcription {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
             }
-            std::fs::write(&path, bytes).map_err(|e| Error::io(&path, e))?;
+            durable::write_atomic(&path, bytes).map_err(|e| Error::io(&e.path, e.source))?;
         }
         let bytes =
             serde_json::to_vec_pretty(&self.manifest(tokenizer, &files)).expect("serializable");
         let path = dir.join(MANIFEST);
-        std::fs::write(&path, &bytes).map_err(|e| Error::io(&path, e))?;
+        // Written last and durably (synced, renamed, parent synced): a manifest on disk means
+        // every file it names is complete.
+        durable::write_atomic(&path, &bytes).map_err(|e| Error::io(&e.path, e.source))?;
         Ok(sha256_hex(&bytes))
     }
 }

@@ -1117,13 +1117,9 @@ pub(crate) mod tests {
     use std::path::PathBuf;
 
     pub(crate) fn sha256_file(path: &Path) -> Result<String> {
-        use sha2::{Digest, Sha256};
-        let bytes = fs::read(path)
-            .map_err(|e| VaeError::Weights(format!("reading {}: {e}", path.display())))?;
-        Ok(Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect())
+        crate::durable::sha256_file(path)
+            .map(|(sha, _)| sha)
+            .map_err(|e| VaeError::Weights(e.to_string()))
     }
 
     pub(crate) fn fixture_dir() -> PathBuf {

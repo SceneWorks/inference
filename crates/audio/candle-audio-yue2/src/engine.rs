@@ -58,7 +58,6 @@ use std::time::Instant;
 use candle_audio::candle_core::{DType, Device};
 use candle_audio::gen_core;
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 
 use crate::decode::{decode_latents, DecodeMode, DecodeOptions, DecodedAudio};
 use crate::fp8::{self, ArPrecision};
@@ -316,21 +315,28 @@ impl Default for EngineOptions {
 }
 
 /// Per-request settings that are not part of the [`SongRequest`] itself (upstream's
-/// `abc_sampling` / `semantic_sampling` / `generation_config` and the pipeline's decoder).
+/// `abc_sampling` / `semantic_sampling` / `generation_config`, the pipeline's decoder and its
+/// memory controls).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SongSettings {
     /// Both phases' sampling and the midpoint ODE step count.
     pub generation: GenerationConfig,
     /// The decoder the audio is rendered with.
     pub decoder: VaeVariant,
+    /// This request's memory controls (sc-22988); `None` ⇒ the engine's own
+    /// ([`Yue2Engine::options`]). They change no result: the effective configuration records
+    /// them, no stage identity binds them.
+    pub options: Option<EngineOptions>,
 }
 
 impl Default for SongSettings {
-    /// The released generation configuration and the standard (listening) decoder.
+    /// The released generation configuration, the standard (listening) decoder and the engine's
+    /// memory controls.
     fn default() -> Self {
         Self {
             generation: GenerationConfig::default(),
             decoder: VaeVariant::Standard,
+            options: None,
         }
     }
 }
@@ -421,6 +427,10 @@ pub struct Yue2Engine {
     /// The loaded weight tier and the AR mode (sc-22995).
     tier: Tier,
     ar: ArPrecision,
+    /// Attention heads and position capacity of the MoT: the bound a per-request attention chunk
+    /// is checked against before any compute (sc-22988).
+    attention_heads: usize,
+    max_positions: usize,
 }
 
 impl std::fmt::Debug for Yue2Engine {
@@ -478,11 +488,7 @@ pub fn canonical_json(value: &Value) -> String {
 
 /// SHA-256 (lower-case hex) of [`canonical_json`]`(value)`.
 pub fn identity_of(value: &Value) -> String {
-    hex(&Sha256::digest(canonical_json(value).as_bytes()))
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::durable::sha256_hex(canonical_json(value).as_bytes())
 }
 
 fn dtype_name(dtype: DType) -> &'static str {
@@ -586,6 +592,10 @@ impl Yue2Engine {
             nar.weights_sha256().to_string(),
             nar.lm().tier(),
         );
+        let (attention_heads, max_positions) = (
+            nar.lm().config().num_attention_heads,
+            nar.lm().config().max_position_embeddings,
+        );
         let mut mot_identity = component_identity(ComponentId::Lm.component());
         if tier != Tier::Bf16 {
             mot_identity["tier"] = json!({
@@ -607,6 +617,8 @@ impl Yue2Engine {
             weights_sha256,
             tier,
             ar: precision.ar,
+            attention_heads,
+            max_positions,
             vae_source: VaeSource::Snapshots(dirs.clone()),
             vaes: Mutex::new(BTreeMap::new()),
             mot_identity,
@@ -627,6 +639,28 @@ impl Yue2Engine {
             ArPrecision::Native,
             options,
         )
+    }
+
+    /// The synthetic engine behind the registered loader's gate: the same precision checks
+    /// [`Yue2Engine::load_with_precision`] applies before reading weights (an FP8 AR request off
+    /// CUDA/BF16, and an asserted tier that is not the staged one — the synthetic model holds the
+    /// released `bf16` weights — are refused). `weights` names the staged directory in the refusal.
+    #[cfg(test)]
+    pub(crate) fn synthetic_at(
+        precision: ModelPrecision,
+        options: EngineOptions,
+        weights: &std::path::Path,
+    ) -> gen_core::Result<Self> {
+        let engine = Self::synthetic(options);
+        if precision.ar == ArPrecision::Fp8 {
+            fp8::check_fp8_request(
+                precision.tier.unwrap_or(Tier::Bf16),
+                engine.dtype,
+                &engine.device,
+            )?;
+        }
+        crate::model::check_tier(precision.tier, engine.tier, weights)?;
+        Ok(engine)
     }
 
     /// The synthetic engine on `device` computing in `dtype`, running the AR stages in `ar` (the
@@ -651,6 +685,8 @@ impl Yue2Engine {
             dtype: nar.lm().dtype(),
             device: nar.lm().device().clone(),
             tier: nar.lm().tier(),
+            attention_heads: nar.lm().config().num_attention_heads,
+            max_positions: nar.lm().config().max_position_embeddings,
             nar: Mutex::new(nar),
             weights_sha256: "synthetic".into(),
             ar,
@@ -687,9 +723,21 @@ impl Yue2Engine {
         &self.generation
     }
 
-    /// The memory controls.
+    /// The engine's memory controls (what a request without its own uses).
     pub fn options(&self) -> &EngineOptions {
         &self.options
+    }
+
+    /// The memory controls `settings` runs with: its own, or the engine's.
+    pub fn options_for(&self, settings: &SongSettings) -> EngineOptions {
+        settings.options.unwrap_or(self.options)
+    }
+
+    /// The MoT's attention heads and position capacity: a per-request attention chunk
+    /// ([`QueryTile::ScoreElements`]) of at least `heads × positions` elements holds a query row
+    /// for every chunk this model can attend over.
+    pub fn attention_bounds(&self) -> (usize, usize) {
+        (self.attention_heads, self.max_positions)
     }
 
     /// The MoT compute dtype.
@@ -746,6 +794,7 @@ impl Yue2Engine {
         SongSettings {
             generation: self.generation.clone(),
             decoder: VaeVariant::Standard,
+            options: None,
         }
     }
 
@@ -866,19 +915,21 @@ impl Yue2Engine {
         if request.guidance() != request.cot().default_guidance() {
             overrides.insert("cfg_scale".into(), json!(request.guidance()));
         }
-        let (core, halo, decode) = match self.options.decode.mode {
+        let options = self.options_for(settings);
+        let (core, halo, decode) = match options.decode.mode {
             DecodeMode::Tiled { core_frames } => (
                 json!(core_frames),
-                json!(self.options.decode.halo_frames),
+                json!(options.decode.halo_frames),
                 "halo_crop",
             ),
             DecodeMode::Full => (Value::Null, Value::Null, "full"),
         };
-        let query_tile = match self.options.nar.query_tile {
+        let query_tile = match options.nar.query_tile {
             QueryTile::Upstream => json!("upstream"),
             QueryTile::Whole => json!("whole"),
             QueryTile::Rows(n) => json!({"rows": n}),
             QueryTile::ScoreBytes(b) => json!({"score_bytes": b}),
+            QueryTile::ScoreElements(n) => json!({"score_elements": n}),
         };
         let (dtype, device) = (dtype_name(self.dtype), device_name(&self.device));
         json!({
@@ -903,7 +954,7 @@ impl Yue2Engine {
             "vae_core_frames": core,
             "vae_halo_frames": halo,
             "device": device,
-            "offload_ar": self.options.nar.offload_ar,
+            "offload_ar": options.nar.offload_ar,
             "query_tile": query_tile,
             "decoder_release": variant_name(settings.decoder),
             "token_rng": "splitmix64 per stage from the request seed",
@@ -1110,6 +1161,17 @@ impl Yue2Engine {
         generation: &GenerationConfig,
         hooks: &mut EngineHooks<'_>,
     ) -> gen_core::Result<Synthesis> {
+        self.synthesize_with(semantic, generation, &self.options.nar, hooks)
+    }
+
+    /// [`Yue2Engine::synthesize`] with explicit acoustic memory controls (a request's own).
+    pub fn synthesize_with(
+        &self,
+        semantic: &SemanticResult,
+        generation: &GenerationConfig,
+        nar_options: &NarOptions,
+        hooks: &mut EngineHooks<'_>,
+    ) -> gen_core::Result<Synthesis> {
         hooks.check_cancel()?;
         let expected = crate::protocol::token_prefixes(
             semantic.plan.request(),
@@ -1143,7 +1205,7 @@ impl Yue2Engine {
         let synthesis = nar_synthesize(
             &mut nar,
             &request,
-            &self.options.nar,
+            nar_options,
             SynthesisHooks {
                 cancelled: hooks.cancelled,
                 observer: &mut forward,
@@ -1165,6 +1227,17 @@ impl Yue2Engine {
         variant: VaeVariant,
         hooks: &mut EngineHooks<'_>,
     ) -> gen_core::Result<DecodedAudio> {
+        self.decode_with(latents, variant, &self.options.decode, hooks)
+    }
+
+    /// [`Yue2Engine::decode`] with explicit decode tiling (a request's own).
+    pub fn decode_with(
+        &self,
+        latents: &AcousticLatents,
+        variant: VaeVariant,
+        decode: &DecodeOptions,
+        hooks: &mut EngineHooks<'_>,
+    ) -> gen_core::Result<DecodedAudio> {
         hooks.check_cancel()?;
         let vae = self.vae(variant)?;
         hooks.check_cancel()?;
@@ -1173,7 +1246,7 @@ impl Yue2Engine {
         let audio = decode_latents(
             &vae,
             latents,
-            &self.options.decode,
+            decode,
             hooks.cancelled,
             &mut |completed, total| observer.on_decode_progress(completed, total),
         )
@@ -1215,11 +1288,14 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
         start: Instant,
     ) -> gen_core::Result<SongResult> {
+        let options = self.options_for(settings);
         let semantic = self.generate_semantic(&plan, &settings.generation, hooks)?;
-        let synthesis = self.synthesize(&semantic, &settings.generation, hooks)?;
+        let synthesis =
+            self.synthesize_with(&semantic, &settings.generation, &options.nar, hooks)?;
         hooks.check_cancel()?;
         let vae_start = Instant::now();
-        let audio = self.decode(&synthesis.latents, settings.decoder, hooks)?;
+        let audio =
+            self.decode_with(&synthesis.latents, settings.decoder, &options.decode, hooks)?;
         let mut timing = Map::new();
         timing.insert("abc".into(), Value::Object(plan.timing().clone()));
         timing.insert("semantic".into(), Value::Object(semantic.timing.clone()));

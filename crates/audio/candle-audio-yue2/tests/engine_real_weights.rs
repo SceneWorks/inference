@@ -155,7 +155,7 @@ fn registered_loader_generates_a_song_with_every_artifact() {
             .generate(&req, &mut |p| {
                 if let Progress::Step { current, total } = p {
                     if current == total || current % 16 == 0 {
-                        eprintln!("  acoustic step {current}/{total}");
+                        eprintln!("  step {current}/{total} (AR tokens, then acoustic steps)");
                     }
                 }
             })
@@ -301,6 +301,7 @@ fn a_saved_closure_serves_plan_only_and_restored_plan_runs() {
         )
         .unwrap(),
         decoder: VaeVariant::Standard,
+        options: None,
     };
     let never = || false;
     let mut hooks = EngineHooks {
@@ -339,4 +340,66 @@ fn a_saved_closure_serves_plan_only_and_restored_plan_runs() {
     assert_eq!(outcome.result["plan_identity"], plan_id.to_string());
     let saved = SymbolicPlan::restore(&run_dir, engine.tokenizer()).unwrap();
     assert_eq!(saved.abc_ids(), restored.abc_ids(), "exact token ids kept");
+}
+
+/// Every tier the descriptor advertises (`supported_quants`, sc-22988 finding 13) loads through
+/// the registered `LoadSpec` gate from a tier snapshot derived locally from the verified original
+/// (`candle_audio_yue2::tier::convert`), and the loaded engine holds exactly that tier; the
+/// snapshot asserted as the other tier, and a quant the descriptor does not advertise, are refused.
+///
+/// `YUE2_TIER_DIR` (optional) keeps the derived tiers between runs; otherwise they go to a
+/// temporary directory. CPU, load only (no generation).
+#[test]
+#[ignore = "needs the pinned YuE2 weights (YUE2_HF_HUB); derives q8 and q4 tier snapshots"]
+fn every_advertised_tier_loads_through_the_load_spec() {
+    use candle_audio_yue2::gen_core::{Error, Quant};
+    use candle_audio_yue2::precision::Tier;
+
+    let advertised = candle_audio_yue2::descriptor()
+        .capabilities
+        .supported_quants;
+    assert_eq!(advertised, [Quant::Q4, Quant::Q8]);
+    let scratch = tempfile::tempdir().unwrap();
+    let tiers = std::env::var_os("YUE2_TIER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| scratch.path().to_path_buf());
+    let hub_dirs = inventory::REPOS
+        .iter()
+        .fold(SnapshotDirs::new(), |dirs, repo| {
+            dirs.with(repo.id, snapshot(repo))
+        });
+    for &quant in advertised {
+        let tier = match quant {
+            Quant::Q8 => Tier::Q8,
+            Quant::Q4 => Tier::Q4,
+            other => panic!("{other:?} is advertised but is not a YuE2 tier"),
+        };
+        let dir = tiers.join(tier.name());
+        if !dir.exists() {
+            let t = Instant::now();
+            candle_audio_yue2::tier::convert(&hub_dirs, tier, &dir).unwrap();
+            eprintln!("derived {tier} in {:.1} s", t.elapsed().as_secs_f64());
+        }
+        let mut spec = worker_spec();
+        spec.weights = WeightsSource::Dir(dir.clone());
+        spec.quantize = Some(quant);
+        let t = Instant::now();
+        let generator = load_generator(&spec).unwrap_or_else(|e| panic!("{quant:?}: {e}"));
+        assert_eq!(generator.engine().tier(), tier, "{quant:?}");
+        eprintln!(
+            "{quant:?}: loaded through the LoadSpec in {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+        drop(generator);
+        // The derived snapshot asserted as the other tier is refused, never served.
+        spec.quantize = Some(if quant == Quant::Q8 {
+            Quant::Q4
+        } else {
+            Quant::Q8
+        });
+        assert!(matches!(load_generator(&spec), Err(Error::Unsupported(_))));
+    }
+    let mut spec = worker_spec();
+    spec.quantize = Some(Quant::Nvfp4);
+    assert!(matches!(load_generator(&spec), Err(Error::Unsupported(_))));
 }

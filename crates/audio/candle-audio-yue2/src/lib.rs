@@ -71,6 +71,8 @@
 //!   and the stage / run identities.
 //! * [`run`] — transactional run directories with every artifact and integrity record,
 //!   identity-checked stage-by-stage resume, plan-only runs and cached-latent decoding.
+//! * [`durable`] — the one implementation of the crate's digests and durable (synced, atomic)
+//!   writes, shared by every artifact writer here and by the gated transcription crate.
 //! * [`closure`] — save the verified generation closure to one directory (licence and notice
 //!   files included) and load an engine back from it, offline.
 //! * [`provider`] — the registered `yue2` generator (distinct from YuE1's `yue_*`): the
@@ -115,6 +117,7 @@ pub use candle_audio::gen_core;
 pub mod closure;
 pub mod cover;
 pub mod decode;
+pub mod durable;
 pub mod engine;
 pub mod fp8;
 pub mod generate;

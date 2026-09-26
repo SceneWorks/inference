@@ -59,12 +59,11 @@ use candle_llm::primitives::quant::to_ggml_block_tensor;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::durable;
 use crate::inventory::{Component, ComponentId, FileRole, PinnedFile};
 use crate::license::{self, IntendedUse};
 use crate::precision::{self, PlannedTensor, Storage, Tier};
-use crate::run::{
-    file_digest, is_nonempty_dir, partial_dir, read_json, sync_dir, write_json, RunError,
-};
+use crate::run::{is_nonempty_dir, partial_dir, read_json, RunError};
 use crate::snapshot::{self, AssetError, SnapshotDirs};
 
 /// The conversion manifest's file name.
@@ -495,7 +494,7 @@ fn tensor_digest(t: &Tensor) -> candle_core::Result<String> {
         CStorage::Cpu(CpuStorage::U8(v)) => hasher.update(&v[start..start + n]),
         _ => candle_core::bail!("tier digest: unexpected storage {:?}", t.dtype()),
     }
-    Ok(crate::engine::hex(&hasher.finalize()))
+    Ok(durable::hex(&hasher.finalize()))
 }
 
 fn candle_run(what: &str) -> impl Fn(candle_core::Error) -> RunError + '_ {
@@ -553,16 +552,8 @@ pub(crate) fn convert_from(
             return Err(e);
         }
     };
-    if dest.is_dir() {
-        std::fs::remove_dir(dest).map_err(|source| RunError::Io {
-            path: dest.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::rename(&work, dest).map_err(|source| RunError::Io {
-        path: dest.to_path_buf(),
-        source,
-    })?;
+    // Synced, renamed onto `dest`, and the parent synced: the publication survives a crash.
+    durable::publish_dir(&work, dest)?;
     Ok(manifest)
 }
 
@@ -601,8 +592,8 @@ fn assemble(
                 path: to.clone(),
                 source,
             })?;
-            crate::run::sync_file(&to)?;
-            let (sha, bytes) = file_digest(&to)?;
+            durable::sync_file(&to)?;
+            let (sha, bytes) = durable::sha256_file(&to)?;
             if sha != pinned.sha256 || bytes != pinned.bytes {
                 return Err(RunError::Corrupt {
                     path: to,
@@ -664,8 +655,8 @@ fn assemble(
     let weights = work.join(WEIGHTS_FILE);
     candle_core::safetensors::save(&out, &weights).map_err(candle_run("write"))?;
     drop(out);
-    crate::run::sync_file(&weights)?;
-    let (sha, bytes) = file_digest(&weights)?;
+    durable::sync_file(&weights)?;
+    let (sha, bytes) = durable::sha256_file(&weights)?;
     files.insert(
         WEIGHTS_FILE.to_string(),
         json!({"sha256": sha, "bytes": bytes}),
@@ -693,8 +684,8 @@ fn assemble(
                      unmodified beside the weights.",
         },
     });
-    write_json(&work.join(TIER_MANIFEST), &manifest)?;
-    sync_dir(work)?;
+    durable::write_json(&work.join(TIER_MANIFEST), &manifest)?;
+    durable::sync_dir(work)?;
     verify_tier_from(source, work).map_err(asset)?;
     Ok(manifest)
 }

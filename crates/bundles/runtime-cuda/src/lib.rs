@@ -2,6 +2,14 @@
 
 #[cfg(feature = "audio")]
 pub use candle_audio_catalog::audio;
+/// The Candle audio provider crates this bundle ships, for their public APIs beyond the registry
+/// (sc-22988): e.g. `candle_audio_yue2`'s run verification, saved-plan restore, cover preparation
+/// and decode-budget helpers. Exactly the audio catalog's provider set, so a crate the catalog
+/// leaves out (the gated `candle-audio-sheetsage2` transcription crate) is not reachable here.
+#[cfg(feature = "audio")]
+pub mod audio_providers {
+    pub use candle_audio_catalog::providers::*;
+}
 #[cfg(feature = "media")]
 pub use candle_gen_catalog::media;
 #[cfg(feature = "media")]

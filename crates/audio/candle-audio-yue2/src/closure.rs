@@ -37,13 +37,12 @@ use candle_audio::candle_core::{DType, Device};
 use candle_audio::gen_core;
 use serde_json::{json, Map, Value};
 
+use crate::durable;
 use crate::engine::{component_identity, EngineOptions, Yue2Engine};
 use crate::inventory::{Closure, ComponentId, UpstreamRepo, VaeVariant};
 use crate::license::{self, IntendedUse};
 use crate::protocol::GenerationConfig;
-use crate::run::{
-    file_digest, is_nonempty_dir, partial_dir, read_json, sync_dir, write_json, RunError,
-};
+use crate::run::{is_nonempty_dir, partial_dir, read_json, RunError};
 use crate::snapshot::{self, AssetError, SnapshotDirs, VerifiedComponent};
 
 /// `pipeline.json`.
@@ -165,16 +164,8 @@ pub(crate) fn save_resolved(
             return Err(e);
         }
     };
-    if dest.is_dir() {
-        std::fs::remove_dir(dest).map_err(|source| RunError::Io {
-            path: dest.to_path_buf(),
-            source,
-        })?;
-    }
-    std::fs::rename(&work, dest).map_err(|source| RunError::Io {
-        path: dest.to_path_buf(),
-        source,
-    })?;
+    // Synced, renamed onto `dest`, and the parent synced: the publication survives a crash.
+    durable::publish_dir(&work, dest)?;
     Ok(metadata)
 }
 
@@ -234,10 +225,10 @@ fn assemble(
                     path: to.clone(),
                     source,
                 })?;
-                crate::run::sync_file(&to)?;
+                durable::sync_file(&to)?;
             }
             // The copy is checked against the pin, over the bytes now on disk.
-            let (sha, bytes) = file_digest(&to)?;
+            let (sha, bytes) = durable::sha256_file(&to)?;
             if sha != pinned.sha256 || bytes != pinned.bytes {
                 return Err(RunError::Corrupt {
                     path: to,
@@ -248,7 +239,7 @@ fn assemble(
                 });
             }
         }
-        sync_dir(&root)?;
+        durable::sync_dir(&root)?;
         sources.insert(component.key.to_string(), component_identity(component));
     }
     let metadata = json!({
@@ -268,8 +259,8 @@ fn assemble(
                      retained unmodified beside the weights.",
         },
     });
-    write_json(&work.join(PIPELINE_JSON), &metadata)?;
-    sync_dir(work)?;
+    durable::write_json(&work.join(PIPELINE_JSON), &metadata)?;
+    durable::sync_dir(work)?;
     Ok(metadata)
 }
 
@@ -315,11 +306,11 @@ pub(crate) fn copy_tier_from(
             path: to.clone(),
             source,
         })?;
-        crate::run::sync_file(&to)?;
-        let (sha, bytes) = file_digest(&to)?;
+        durable::sync_file(&to)?;
+        let (sha, bytes) = durable::sha256_file(&to)?;
         let expected = match want {
             Some(w) => w,
-            None => file_digest(&from)?,
+            None => durable::sha256_file(&from)?,
         };
         if (sha.clone(), bytes) != expected {
             return Err(RunError::Corrupt {
@@ -331,7 +322,7 @@ pub(crate) fn copy_tier_from(
             });
         }
     }
-    sync_dir(root)?;
+    durable::sync_dir(root)?;
     Ok(json!({
         "tier": verified.tier().name(),
         "conversion": crate::tier::CONVERSION_ID,

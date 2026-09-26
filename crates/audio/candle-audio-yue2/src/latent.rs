@@ -25,6 +25,8 @@ use candle_audio::candle_core::{DType, Device, Tensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::durable::hex;
+
 /// Latent channels per frame (the VAE's `latent_dim`).
 pub const LATENT_CHANNELS: usize = 64;
 /// The only latent dtype (upstream converts to FP32 before saving and decoding).
@@ -220,10 +222,6 @@ impl LatentIdentity {
 pub struct AcousticLatents {
     values: Vec<f32>,
     identity: LatentIdentity,
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// SHA-256 of `values` as little-endian `f32` bytes (endianness-independent).

@@ -927,6 +927,31 @@ fn query_tile_rows_are_bounded_by_the_budget() {
         .is_err());
 }
 
+/// [`QueryTile::ScoreElements`] (gen-core `attention_chunk_size`, sc-22988): as many rows as keep
+/// one call's `heads · rows · keys` score elements within the count, independent of the dtype, and
+/// a count below one row is refused rather than rounded up.
+#[test]
+fn score_elements_bound_one_calls_score_tile() {
+    let row = 16 * 1000;
+    for (elements, queries, want) in [
+        (row, 300, 1),
+        (3 * row + 5, 300, 3),
+        (2 * row - 1, 300, 1),
+        (usize::MAX / 2, 300, 300),
+    ] {
+        for dtype in [DType::F32, DType::BF16] {
+            let rows = QueryTile::ScoreElements(elements)
+                .rows(queries, 16, 1000, dtype)
+                .unwrap();
+            assert_eq!(rows, want, "{elements} elements in {dtype:?}");
+            assert!(rows * row <= elements);
+        }
+    }
+    assert!(QueryTile::ScoreElements(row - 1)
+        .rows(10, 16, 1000, DType::F32)
+        .is_err());
+}
+
 /// Panics in an observer mid-solve: the panic reaches the caller, and the offloaded AR path is
 /// restored on the way (the model is not left refusing its AR path, and still synthesizes the
 /// same latents).

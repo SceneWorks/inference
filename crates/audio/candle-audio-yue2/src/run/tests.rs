@@ -10,6 +10,7 @@ use std::rc::Rc;
 use serde_json::Value;
 
 use super::*;
+use crate::durable::{sha256_file, sync_dir, sync_file, write_json};
 use crate::engine::{EngineHooks, EngineObserver, EngineOptions, SongSettings, Stage, StageEvent};
 use crate::protocol::{
     CotMode, GenerationConfig, Sampling, SamplingOverrides, SongRequest, SongRequestSpec,
@@ -29,6 +30,7 @@ pub(crate) fn settings(decoder: VaeVariant) -> SongSettings {
     SongSettings {
         generation: GenerationConfig::new(abc, semantic, 2).unwrap(),
         decoder,
+        options: None,
     }
 }
 
@@ -340,7 +342,7 @@ fn a_decoder_switch_decodes_the_same_verified_latent_without_touching_the_source
     let source_record = read_json(&out.join(SOURCE_GENERATION_JSON)).unwrap();
     assert_eq!(
         source_record["source_latent_sha256"],
-        file_digest(&source.join(LATENT_FILE)).unwrap().0
+        sha256_file(&source.join(LATENT_FILE)).unwrap().0
     );
 
     // A cached decode never writes into its source.
@@ -554,12 +556,12 @@ fn resume_rejects_mismatched_and_corrupt_work_without_overwriting_it() {
     write_json(&plan_json, &plan).unwrap();
     let manifest_path = work.join(PLAN_MANIFEST);
     let mut manifest = read_json(&manifest_path).unwrap();
-    manifest[PLAN_JSON] = Value::String(file_digest(&plan_json).unwrap().0);
+    manifest[PLAN_JSON] = Value::String(sha256_file(&plan_json).unwrap().0);
     write_json(&manifest_path, &manifest).unwrap();
     let record_path = work.join("stages/plan.json");
     let mut record = read_json(&record_path).unwrap();
     for name in [PLAN_JSON, PLAN_MANIFEST] {
-        let (sha, bytes) = file_digest(&work.join(name)).unwrap();
+        let (sha, bytes) = sha256_file(&work.join(name)).unwrap();
         record["artifacts"][name] = serde_json::json!({"sha256": sha, "bytes": bytes});
     }
     write_json(&record_path, &record).unwrap();
@@ -598,7 +600,7 @@ fn a_tampered_synthesis_checkpoint_is_rejected() {
     let record_path = work.join("stages/synthesis.json");
     let mut record = read_json(&record_path).unwrap();
     for name in [LATENT_FILE, IDENTITY_FILE] {
-        let (sha, bytes) = file_digest(&work.join(name)).unwrap();
+        let (sha, bytes) = sha256_file(&work.join(name)).unwrap();
         record["artifacts"][name] = serde_json::json!({"sha256": sha, "bytes": bytes});
     }
     write_json(&record_path, &record).unwrap();
@@ -727,7 +729,7 @@ fn rehash_result(dir: &Path, names: &[&str]) {
     let path = dir.join(RESULT_JSON);
     let mut result = read_json(&path).unwrap();
     for name in names {
-        let (sha, bytes) = file_digest(&dir.join(name)).unwrap();
+        let (sha, bytes) = sha256_file(&dir.join(name)).unwrap();
         result["artifacts"][*name] = serde_json::json!({"sha256": sha, "bytes": bytes});
     }
     write_json(&path, &result).unwrap();
@@ -1073,7 +1075,7 @@ fn checkpointed_latents_from_another_source_are_refused() {
     let record_path = work.join("stages/synthesis.json");
     let mut record = read_json(&record_path).unwrap();
     for name in [LATENT_FILE, IDENTITY_FILE] {
-        let (sha, bytes) = file_digest(&work.join(name)).unwrap();
+        let (sha, bytes) = sha256_file(&work.join(name)).unwrap();
         record["artifacts"][name] = serde_json::json!({"sha256": sha, "bytes": bytes});
     }
     record["data"]["latent"] = imported.identity().to_json();
@@ -1196,7 +1198,7 @@ fn files_and_directories_sync_through_handles_the_platform_accepts() {
     sync_dir(tmp.path()).unwrap();
     // Neither creates what is not there.
     let missing = tmp.path().join("missing.bin");
-    assert!(matches!(sync_file(&missing), Err(RunError::Io { .. })));
+    assert!(sync_file(&missing).is_err_and(|e| e.path == missing));
     assert!(!missing.exists());
     assert!(sync_dir(&tmp.path().join("missing-dir")).is_err());
 }

@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use candle_audio::candle_core::{self, CpuStorage, Device, Storage};
 use sha2::{Digest, Sha256};
 
+use crate::durable::hex;
 use crate::inventory::{Closure, Component, ComponentId, UpstreamRepo};
 use crate::manifest::{ConversionManifest, TensorEntry};
 
@@ -313,26 +314,13 @@ pub(crate) fn join_rel(dir: &Path, rel: &str) -> PathBuf {
 }
 
 pub(crate) fn sha256_file(key: &str, path: &Path) -> Result<String, AssetError> {
-    let io = |source| AssetError::Io {
-        component: key.to_string(),
-        path: path.to_path_buf(),
-        source,
-    };
-    let mut file = File::open(path).map_err(io)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 8 << 20];
-    loop {
-        let n = file.read(&mut buf).map_err(io)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::durable::sha256_file(path)
+        .map(|(sha, _)| sha)
+        .map_err(|e| AssetError::Io {
+            component: key.to_string(),
+            path: e.path,
+            source: e.source,
+        })
 }
 
 /// Parse the safetensors header of `path` into `name → (dtype, shape)`.

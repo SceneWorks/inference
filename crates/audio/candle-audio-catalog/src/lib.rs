@@ -334,7 +334,7 @@ mod tests {
             TimeRegion,
         };
         let registry = super::provider_registry().unwrap();
-        let fields: [(&str, AudioParams); 8] = [
+        let fields: [(&str, AudioParams); 10] = [
             (
                 "segments",
                 AudioParams {
@@ -394,6 +394,33 @@ mod tests {
                 "artifacts",
                 AudioParams {
                     artifacts: Some(AudioArtifacts::default()),
+                    ..Default::default()
+                },
+            ),
+            // sc-22988: plan-only and cover reach YuE2 and only YuE2.
+            (
+                "song",
+                AudioParams {
+                    song: Some(SongParams {
+                        plan_only: true,
+                        ..Default::default()
+                    }),
+                    artifacts: Some(AudioArtifacts::default()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "song",
+                AudioParams {
+                    song: Some(SongParams {
+                        cover: Some(super::gen_core::SongCover {
+                            mode: super::gen_core::SongCoverMode::Melody,
+                            score: String::new(),
+                            keep: None,
+                            translated_from: None,
+                        }),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             ),
