@@ -1155,3 +1155,23 @@ fn a_missing_decoder_is_refused_before_any_stage_runs() {
         .check_decoder_available(VaeVariant::Standard)
         .unwrap();
 }
+
+#[test]
+fn the_returned_record_is_the_published_record() {
+    // `1.2533222419999999` (a timing CI recorded) does not round-trip bit for bit through serde_json's
+    // default float parser; the outcome must carry what a reader of result.json gets.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("run");
+    let Opened::Work(work) = open_output(&RunOutput::fresh(&dir)).unwrap() else {
+        panic!("a fresh directory opens for work")
+    };
+    fs::write(work.path(AUDIO_WAV), b"x").unwrap();
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "e2e_seconds".into(),
+        serde_json::json!(1.253_322_241_999_999_9_f64),
+    );
+    let (published_dir, returned) = work.publish(result).unwrap();
+    assert_eq!(published_dir, dir);
+    assert_eq!(returned, read_json(&dir.join(RESULT_JSON)).unwrap());
+}
