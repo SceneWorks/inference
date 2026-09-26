@@ -861,6 +861,75 @@ mod tests {
         assert!(go(&prefix, None, 21.0).is_err());
     }
 
+    /// The `cot = off` semantic stage samples with the historical arithmetic (top-p keeps three),
+    /// the planned modes with the standard one (keeps one): with a vanishing `top_p` and a draw
+    /// near 1, only the legacy rule can return anything but the top-1 id.
+    #[test]
+    fn off_semantic_stage_uses_the_legacy_sampler() {
+        let lm = synthetic::model(MotPaths::Ar);
+        let s = Sampling {
+            temperature: 1.0,
+            top_p: 1e-6,
+            top_k: 100,
+            repetition_penalty: 1.0,
+            min_tokens: 0,
+            max_tokens: 1,
+            ..Sampling::SEMANTIC_DEFAULT
+        };
+        let stage = |plan: &ScorePlan, prefix: &[u32]| {
+            generate_semantic(
+                &lm,
+                &SemanticInput {
+                    plan,
+                    prefix,
+                    negative: None,
+                    cfg_scale: 1.0,
+                },
+                &s,
+                &mut Uniforms([0.999].into()),
+                Hooks {
+                    cancelled: &never,
+                    observer: &mut (),
+                },
+            )
+            .unwrap()
+            .decoded
+            .tokens
+        };
+        let direct = |legacy_off: bool| {
+            let req = DecodeRequest {
+                phase: Phase::Semantic,
+                prefix: &PREFIX,
+                sampling: &s,
+                guidance: None,
+                legacy_off,
+            };
+            run(&lm, &req, &mut Uniforms([0.999].into()), &never)
+                .0
+                .unwrap()
+                .tokens
+        };
+        assert_ne!(
+            direct(true),
+            direct(false),
+            "the two rules must differ here"
+        );
+        assert_eq!(stage(&ScorePlan::off(), &PREFIX), direct(true));
+        let plan = plan_of(&[11]);
+        let full = [EOD, 40, ABC_START, 11, ABC_END, MUSIC_START];
+        let req = DecodeRequest {
+            phase: Phase::Semantic,
+            prefix: &full,
+            sampling: &s,
+            guidance: None,
+            legacy_off: false,
+        };
+        let standard = run(&lm, &req, &mut Uniforms([0.999].into()), &never)
+            .0
+            .unwrap();
+        assert_eq!(stage(&plan, &full), standard.tokens);
+    }
+
     #[test]
     fn off_mode_negative_is_instruction_only() {
         let lm = synthetic::model(MotPaths::Ar);
