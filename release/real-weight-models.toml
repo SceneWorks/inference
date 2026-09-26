@@ -2611,3 +2611,94 @@ expected_files = [
     "decoders/decoder_131000.safetensors",
     "decoders/decoder_151000.safetensors",
 ]
+
+# sc-19387: the remaining tiers of the same pinned rehosts, fetched only by `real-weights-yue.yml`'s
+# `mode: memory` (every case at q4, q8 and bf16). Same repositories, revisions and snapshot
+# variables as the rows above; each row adds one tier directory to the same hub-cache snapshot.
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-q4"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q4/config.json",
+    "q4/generation_config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+    "q4/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-q8"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/generation_config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+    "q8/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-q8"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/generation_config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+    "q8/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-bf16"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/generation_config.json",
+    "bf16/model.safetensors.index.json",
+    "bf16/tokenizer.json",
+    "bf16/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s2-1b-general-q8"
+repository = "SceneWorks/yue-s2-1b-general-candle"
+revision = "3d6a71c7f2af1010983fc9da7bcaba528f083da6"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_S2_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+]
