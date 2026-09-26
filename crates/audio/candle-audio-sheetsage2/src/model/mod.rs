@@ -8,6 +8,8 @@ pub mod frontend;
 pub mod mert;
 pub mod weights;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use candle_audio::candle_core::{Device, Tensor};
 
 use crate::grammar::{argmax_first, mask_logits, GrammarState};
@@ -29,6 +31,14 @@ pub struct GenerationStep<'a> {
     pub token: u32,
     /// Masked top-1 minus top-2 logit (`inf` when only one token was allowed).
     pub margin: f32,
+}
+
+static LIVE_MODELS: AtomicUsize = AtomicUsize::new(0);
+
+/// SheetSage2 models alive in this process: every successful [`SheetSage2Model::load`] not yet
+/// dropped. The cover path requires zero before it loads a generator.
+pub fn live_models() -> usize {
+    LIVE_MODELS.load(Ordering::SeqCst)
 }
 
 /// The loaded, merged model.
@@ -114,7 +124,7 @@ impl SheetSage2Model {
         )?;
         let decoder = Decoder::load(&mut head, &config, device)?;
         head.finish()?;
-        Ok(Self {
+        let model = Self {
             layer_weights: softmax(&layer_weight),
             config,
             tokenizer,
@@ -122,7 +132,9 @@ impl SheetSage2Model {
             projection,
             decoder,
             device: device.clone(),
-        })
+        };
+        LIVE_MODELS.fetch_add(1, Ordering::SeqCst);
+        Ok(model)
     }
 
     /// The configuration.
@@ -286,6 +298,12 @@ impl SheetSage2Model {
             output.push(EOS);
         }
         Ok(output)
+    }
+}
+
+impl Drop for SheetSage2Model {
+    fn drop(&mut self) {
+        LIVE_MODELS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

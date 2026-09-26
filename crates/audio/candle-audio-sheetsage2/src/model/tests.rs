@@ -65,6 +65,7 @@ fn error(ours: &Tensor, theirs: &Tensor) -> (f32, f32) {
 /// instead of log10 in the dB step, or reverse `rotate_half`.
 #[test]
 fn encoder_states_match_upstream() {
+    let _serial = crate::test_lock();
     let model = tiny_model();
     let reference = tensors(include_bytes!("../../testdata/tiny/reference.safetensors"));
     let waveform = reference["input.waveform"].to_vec1::<f32>().unwrap();
@@ -106,6 +107,7 @@ fn encoder_states_match_upstream() {
 /// the grammar-unmasked argmax.
 #[test]
 fn greedy_tokens_match_upstream_exactly() {
+    let _serial = crate::test_lock();
     let model = tiny_model();
     let reference = tiny_reference();
     let tensors = tensors(include_bytes!("../../testdata/tiny/reference.safetensors"));
@@ -145,6 +147,7 @@ fn greedy_tokens_match_upstream_exactly() {
 /// architecture is refused at load, never silently accepted.
 #[test]
 fn load_refuses_mismatched_checkpoints() {
+    let _serial = crate::test_lock();
     let reference = tiny_reference();
     let config = &reference["sheetsage2_config"];
     let head = || {

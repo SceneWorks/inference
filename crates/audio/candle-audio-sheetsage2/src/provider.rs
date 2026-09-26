@@ -10,7 +10,6 @@
 //!   whether the model was actually released; [`live_models`] counts every SheetSage2 model alive in
 //!   the process, which the cover path checks before a YuE2 engine is created.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use candle_audio::candle_core::Device;
@@ -46,23 +45,7 @@ pub const PROVIDER_COMPONENTS: &[candle_audio::gen_core::ProviderComponents] =
         components: &["yue2_sheetsage2", "yue2_mert_v2_fullsong"],
     }];
 
-static LIVE_MODELS: AtomicUsize = AtomicUsize::new(0);
-
-/// SheetSage2 models alive in this process (loaded and not yet dropped).
-pub fn live_models() -> usize {
-    LIVE_MODELS.load(Ordering::SeqCst)
-}
-
-/// A loaded model plus its liveness accounting.
-struct Loaded {
-    model: SheetSage2Model,
-}
-
-impl Drop for Loaded {
-    fn drop(&mut self) {
-        LIVE_MODELS.fetch_sub(1, Ordering::SeqCst);
-    }
-}
+pub use crate::model::live_models;
 
 /// The mono 24 kHz input the model consumes, with how it was derived.
 #[derive(Clone, Debug)]
@@ -224,7 +207,7 @@ pub struct UnloadReceipt {
 
 /// The loaded SheetSage2 + MERT-v2-FullSong transcriber.
 pub struct Transcriber {
-    loaded: Arc<Loaded>,
+    loaded: Arc<SheetSage2Model>,
     closure: ClosureIdentity,
 }
 
@@ -344,16 +327,15 @@ impl Transcriber {
             device,
         )?;
         identity.tokenizer_fingerprint = model.tokenizer().fingerprint().to_string();
-        LIVE_MODELS.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
-            loaded: Arc::new(Loaded { model }),
+            loaded: Arc::new(model),
             closure: identity,
         })
     }
 
     /// The loaded model.
     pub fn model(&self) -> &SheetSage2Model {
-        &self.loaded.model
+        &self.loaded
     }
 
     /// The closure identity every transcription records.
@@ -370,7 +352,7 @@ impl Transcriber {
         settings: &TranscriptionSettings,
         mut progress: impl FnMut(Progress) -> Result<(), Error>,
     ) -> Result<Transcription, Error> {
-        let model = &self.loaded.model;
+        let model = &self.loaded;
         let rate = model.config().sampling_rate as u32;
         let minimum = model.config().backbone.minimum_input_samples();
         let (audio, identity) = source.prepare(settings.max_seconds, rate, minimum)?;
@@ -428,8 +410,8 @@ impl Transcriber {
     /// Drop the model and report whether it was released. Consumes the transcriber: nothing can
     /// transcribe with it afterwards.
     pub fn unload(self) -> UnloadReceipt {
-        let parameter_bytes = self.loaded.model.parameter_bytes();
-        let weak: Weak<Loaded> = Arc::downgrade(&self.loaded);
+        let parameter_bytes = self.loaded.parameter_bytes();
+        let weak: Weak<SheetSage2Model> = Arc::downgrade(&self.loaded);
         drop(self);
         UnloadReceipt {
             released: weak.upgrade().is_none(),

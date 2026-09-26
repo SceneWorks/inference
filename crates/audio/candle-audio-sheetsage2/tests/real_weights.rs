@@ -19,6 +19,18 @@
 //!
 //! CPU only, float32. Hidden states are compared by max-abs and relative error (max-abs over the
 //! reference's max-abs); tokens and every symbolic artifact must match exactly.
+//!
+//! Measured 2026-09-26 (Apple M-series CPU, release build, the machine at load average 13–40 from
+//! other jobs, so wall times are pessimistic; one window = the fixed 300 s context):
+//!
+//! | test | result | wall | peak RSS (`ru_maxrss`) |
+//! |---|---|---|---|
+//! | `encoder_states_match_the_reference` | see its table | 257 s + 120 s encoder | ~5.4 GB |
+//! | `transcriptions_match_the_committed_token_oracles` | synth 340, Eb 340, real 456 tokens exact; octave evidence = sc-23003; replay OK | 134 / 109 / 90 s per window | 7.0 GB |
+//! | `multi_window_song_matches_upstream` | 2 windows, 3,927 tokens exact, 1,124-token prefix | 529 s | 7.0 GB |
+//! | `silence_is_refused_as_a_cover_source` | 96 tokens exact; both cover modes refused | 150 s | 7.0 GB |
+//! | `unload_returns_the_weights_memory` | RSS 5,600 → 973 MiB after unload (baseline 961) | 7 s | — |
+//! | `a_recording_becomes_a_new_cover_after_the_transcriber_is_unloaded` | 20 s transcribed (119 s); RSS 827 MiB when the engine load began; 6.0 s cover, rms 0.128, verified run | 489 s | 22.4 GB (engine) |
 
 use std::path::PathBuf;
 use std::time::Instant;
