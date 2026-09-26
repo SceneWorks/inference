@@ -226,6 +226,7 @@ dependencies = [
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
  "candle-audio-yue",
+ "candle-audio-yue2",
  "candle-llm",
  "tempfile",
 ]

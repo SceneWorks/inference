@@ -116,6 +116,14 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     out
 }
 
+/// Flip the low bit of the byte `back` bytes before the end.
+fn flip_byte(path: &Path, back: usize) {
+    let mut bytes = fs::read(path).unwrap();
+    let at = bytes.len() - back;
+    bytes[at] ^= 0x01;
+    fs::write(path, bytes).unwrap();
+}
+
 fn flip_last_byte(path: &Path) {
     let mut bytes = fs::read(path).unwrap();
     let last = bytes.len() - 1;
@@ -359,6 +367,21 @@ fn a_decoder_switch_decodes_the_same_verified_latent_without_touching_the_source
     });
     assert!(matches!(err, Err(RunError::Corrupt { .. })), "{err:?}");
     assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+
+    // So is a source whose record no longer verifies anywhere — here only its audio changed, which
+    // the decode itself never reads: the source must be a verified complete run.
+    let unverified = tmp.path().join("unverified");
+    for (name, bytes) in snapshot(&source) {
+        let path = unverified.join(&name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    flip_byte(&unverified.join(AUDIO_WAV), 4);
+    let (err, rec) = with_hooks(None, |h| {
+        engine.decode_cached(&unverified, VaeVariant::Legacy, None, h)
+    });
+    assert!(matches!(err, Err(RunError::Corrupt { .. })), "{err:?}");
+    assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
 }
 
 #[test]
@@ -501,13 +524,24 @@ fn resume_rejects_mismatched_and_corrupt_work_without_overwriting_it() {
     );
     assert!(!dir.exists());
 
-    // A corrupted checkpoint artifact.
+    // A corrupted checkpoint artifact: the low byte of the last int32 code, so the file still
+    // parses as valid codes — only the recorded digest can tell.
     let dir = make_partial("corrupt");
-    flip_last_byte(&partial_dir(&dir).join(SEMANTIC_NPY));
+    flip_byte(&partial_dir(&dir).join(SEMANTIC_NPY), 4);
     let (err, rec) = run(&engine, &input, &s, &RunOutput::resume(&dir));
     assert!(matches!(err, Err(RunError::Corrupt { .. })), "{err:?}");
     assert_eq!(rec.count(Stage::Semantic, StageEvent::Started), 0);
     assert!(!dir.exists());
+
+    // A different request over an interrupted run: its plan checkpoint belongs to another request.
+    let dir = make_partial("other-request");
+    let other = SongInput::Request(request(CotMode::Off, 99));
+    let (err, rec) = run(&engine, &other, &s, &RunOutput::resume(&dir));
+    assert!(
+        matches!(err, Err(RunError::IdentityMismatch { what: "plan", .. })),
+        "{err:?}"
+    );
+    assert_eq!(rec.count(Stage::Plan, StageEvent::Started), 0);
 
     // A plan checkpoint rewritten consistently (plan manifest and record digests too) is still
     // refused: the restored plan's identity is not the recorded one.
@@ -538,8 +572,8 @@ fn resume_rejects_mismatched_and_corrupt_work_without_overwriting_it() {
 
 #[test]
 fn a_tampered_synthesis_checkpoint_is_rejected() {
-    // Latents rewritten together with their sidecar (so `AcousticLatents::load` accepts them) are
-    // refused because the checkpoint recorded other bytes.
+    // Latents rewritten together with their sidecar (so `AcousticLatents::load` accepts them) and
+    // the checkpoint's digests are refused: the checkpoint recorded another latent identity.
     let engine = engine();
     let tmp = tempfile::tempdir().unwrap();
     let s = settings(VaeVariant::Standard);
@@ -559,6 +593,15 @@ fn a_tampered_synthesis_checkpoint_is_rejected() {
     fs::remove_file(work.join(LATENT_FILE)).unwrap();
     fs::remove_file(work.join(IDENTITY_FILE)).unwrap();
     forged.save(&work).unwrap();
+    // …and the checkpoint's artifact digests updated to the forged bytes, so only the latent
+    // identity the checkpoint recorded can tell.
+    let record_path = work.join("stages/synthesis.json");
+    let mut record = read_json(&record_path).unwrap();
+    for name in [LATENT_FILE, IDENTITY_FILE] {
+        let (sha, bytes) = file_digest(&work.join(name)).unwrap();
+        record["artifacts"][name] = serde_json::json!({"sha256": sha, "bytes": bytes});
+    }
+    write_json(&record_path, &record).unwrap();
     let (err, rec) = run(&engine, &input, &s, &RunOutput::resume(&dir));
     assert!(matches!(err, Err(RunError::Corrupt { .. })), "{err:?}");
     assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
