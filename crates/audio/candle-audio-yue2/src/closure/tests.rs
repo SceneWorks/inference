@@ -122,3 +122,109 @@ fn a_closure_cannot_point_outside_itself() {
     assert!(!is_saved_closure(tmp.path()));
     assert!(is_saved_closure(&dir));
 }
+
+#[test]
+fn a_saved_closure_is_a_byte_identical_verifiable_copy_with_its_licence_files() {
+    use crate::inventory::FileRole;
+    use crate::snapshot::tests::synthetic_snapshot;
+    use crate::snapshot::verify_component;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = |id: &'static str| crate::inventory::UpstreamRepo {
+        id,
+        revision: "0123456789abcdef0123456789abcdef01234567",
+        gated: false,
+        card_license: "cc-by-nc-4.0",
+    };
+    let licence: &[u8] = b"Attribution-NonCommercial 4.0 International (synthetic)\n";
+    let notice: &[u8] = b"Third-party notices (synthetic)\n";
+    let mit: &[u8] = b"MIT (synthetic SnakeBeta)\n";
+    let extras = [
+        ("LICENSE", licence, FileRole::License),
+        ("THIRD_PARTY_NOTICES.md", notice, FileRole::Notice),
+        ("licenses/SnakeBeta-NVIDIA-MIT.txt", mit, FileRole::License),
+    ];
+    let lm_repo = repo("m-a-p/YuE2-Synth-3B");
+    let lm_dir = tmp.path().join("src/lm");
+    let lm = synthetic_snapshot(&lm_dir, ComponentId::Lm, "yue2_synth_lm", lm_repo, &extras);
+    // `qwen.tiktoken` lives in the MoT's repository, as in the real closure.
+    let tok = synthetic_snapshot(
+        &lm_dir,
+        ComponentId::QwenTiktoken,
+        "yue2_synth_tok",
+        lm_repo,
+        &[("qwen.tiktoken", b"AA== 0\n", FileRole::Tokenizer)],
+    );
+    let vae_dir = tmp.path().join("src/vae");
+    let vae = synthetic_snapshot(
+        &vae_dir,
+        ComponentId::VaeStandard,
+        "yue2_synth_vae",
+        repo("m-a-p/YuE2-Synth-Vae"),
+        &extras,
+    );
+    let sources = [(lm, lm_dir.clone()), (tok, lm_dir.clone()), (vae, vae_dir)];
+    let resolve = |id: ComponentId| {
+        let (component, dir) = sources
+            .iter()
+            .find(|(c, _)| c.id == id)
+            .expect("a synthetic component per closure id");
+        verify_component(component, dir)
+    };
+    let dest = tmp.path().join("closure");
+    let metadata = save_resolved(
+        &resolve,
+        &[VaeVariant::Standard],
+        &GenerationConfig::default(),
+        &dest,
+    )
+    .unwrap();
+    assert!(!partial_dir(&dest).exists());
+    assert_eq!(metadata["decoders"], json!(["standard"]));
+
+    // Every pinned file — weights, config, LICENSE, NOTICE and licenses/* — byte for byte.
+    let saved = load_closure(&dest).unwrap();
+    for (component, dir) in &sources {
+        let copy = saved.dirs.snapshot_dir(&component.repo).unwrap();
+        assert_eq!(copy, dest.join(repo_dir_name(&component.repo)));
+        for file in component.files {
+            let rel = |root: &Path| {
+                file.path
+                    .split('/')
+                    .fold(root.to_path_buf(), |d, p| d.join(p))
+            };
+            assert_eq!(
+                std::fs::read(rel(&copy)).unwrap(),
+                std::fs::read(rel(dir)).unwrap(),
+                "{} {}",
+                component.key,
+                file.path
+            );
+        }
+        // And the copy verifies against the pins, as the loader will check it.
+        verify_component(component, &copy).unwrap();
+    }
+    for licence in [
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+        "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    ] {
+        assert!(
+            dest.join("YuE2-Synth-3B").join(licence).is_file(),
+            "{licence}"
+        );
+        assert!(
+            dest.join("YuE2-Synth-Vae").join(licence).is_file(),
+            "{licence}"
+        );
+    }
+    assert_eq!(
+        metadata["source_weights"]["yue2_synth_lm"]["repo"],
+        "m-a-p/YuE2-Synth-3B"
+    );
+
+    // A changed copy no longer verifies.
+    let changed = dest.join("YuE2-Synth-Vae/THIRD_PARTY_NOTICES.md");
+    std::fs::write(&changed, b"edited\n").unwrap();
+    assert!(verify_component(vae, &dest.join("YuE2-Synth-Vae")).is_err());
+}
