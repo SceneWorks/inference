@@ -68,8 +68,7 @@ fn unload_releases_the_model_observably() {
 /// upstream's reference run, and builds a complete [`Transcription`] (stitching, every export, both
 /// scores, octave evidence, review) from upstream's exact tokens.
 ///
-/// Mutations that must fail: stop at the window length instead of the song duration
-/// (`stop_time`), or drop the model-rate crop of the source.
+/// Mutation that must fail: a token limit one below the decoder context (`max_len - 1`).
 #[test]
 fn transcribe_reproduces_the_reference_and_builds_a_transcription() {
     let _serial = crate::test_lock();

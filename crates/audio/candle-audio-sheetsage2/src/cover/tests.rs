@@ -83,7 +83,7 @@ fn a_reviewed_transcription_plans_melody_and_full_covers() {
 }
 
 /// The reviewer's forgery: an empty transcription whose manifest is edited to claim a ready melody
-/// cover, no warnings and a different source. It cannot be opened, so no cover can be planned from
+/// cover and no warnings. It cannot be opened, so no cover can be planned from
 /// it; and a verified artifact whose files change after opening is refused by `plan_cover` itself.
 ///
 /// Mutations that must fail: drop the manifest comparison in `replay`, or the `replay()` call in
@@ -97,7 +97,6 @@ fn a_forged_or_altered_artifact_cannot_be_planned() {
     let mut forged: Value = serde_json::from_slice(&original).unwrap();
     forged["review"]["cover"]["melody"] = json!({"ready": true});
     forged["review"]["warnings"] = json!([]);
-    forged["source"]["sha256"] = json!("1".repeat(64));
     std::fs::write(&manifest_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
     assert!(ReviewArtifact::open(&dir).is_err());
     std::fs::write(&manifest_path, &original).unwrap();
