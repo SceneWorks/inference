@@ -6,6 +6,7 @@
 | `vae_real_reference.json` | `scripts/reference/yue2/vae_reference.py real` | `tests/vae_real_weights.rs` (`#[ignore]`d) |
 | `protocol/` | `scripts/reference/yue2/protocol_fixtures.py` | tokenizer / protocol / plan tests (see `protocol/README.md`) |
 | `ar_synthetic.json`, `sampler.json`, `ar_real_weights.json` | `scripts/reference/yue2/ar_fixtures.py` | `parity` lib tests (see the section below) |
+| `nar_synthetic.{json,safetensors}`, `nar_real_reference.json` | `scripts/reference/yue2/nar_fixtures.py` | `nar` lib tests, `tests/nar_real_weights.rs` (`#[ignore]`d) (see the section below) |
 
 Provenance: upstream `github.com/multimodal-art-projection/YuE` @
 `92a73cc7652fcc1f937855e4b765e0a0edd7ff2e` (the installed pinned `yue2` package, never a copy), run

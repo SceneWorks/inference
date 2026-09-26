@@ -379,7 +379,9 @@ impl Generator for Yue2Generator {
         self.descriptor
             .capabilities
             .validate_request_audio(PROVIDER_ID, req)?;
-        map_request(req, self.engine.generation_config()).map(|_| ())
+        let mapped = map_request(req, self.engine.generation_config())?;
+        // A decoder that is not provisioned is refused here, before any model compute.
+        self.engine.check_decoder_available(mapped.settings.decoder)
     }
 
     /// Progress: `Progress::Step` per acoustic midpoint step over all chunks, `Progress::Decoding`
@@ -567,10 +569,10 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<Yue2Generator> {
     let (device, dtype) = device_and_dtype(spec)?;
     #[cfg(test)]
     if SYNTHETIC_ENGINE.with(|s| s.get()) {
-        let _ = (dirs, generation, device, dtype);
+        let _ = (generation, device, dtype);
         return Ok(Yue2Generator {
             descriptor: descriptor(),
-            engine: Yue2Engine::synthetic(EngineOptions::default()),
+            engine: Yue2Engine::synthetic(EngineOptions::default()).with_checked_decoders(dirs),
         });
     }
     let engine = Yue2Engine::load(&dirs, dtype, &device, generation, EngineOptions::default())?;

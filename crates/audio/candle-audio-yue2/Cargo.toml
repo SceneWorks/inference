@@ -34,6 +34,11 @@ fancy-regex = "0.17"
 regex = { workspace = true }
 unicode-normalization = "0.1.25"
 
+[build-dependencies]
+# `build.rs` digests `src/` into `YUE2_SOURCE_DIGEST`, the runtime identity bound into every run and
+# stage identity (sc-22994).
+sha2 = { workspace = true }
+
 [dev-dependencies]
 # RAII roots for the synthetic snapshot fixtures (missing / corrupt / truncated shards, cache miss).
 tempfile = { workspace = true }

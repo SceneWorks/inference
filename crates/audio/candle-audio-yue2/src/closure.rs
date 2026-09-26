@@ -44,7 +44,7 @@ use crate::protocol::GenerationConfig;
 use crate::run::{
     file_digest, is_nonempty_dir, partial_dir, read_json, sync_dir, write_json, RunError,
 };
-use crate::snapshot::{self, SnapshotDirs};
+use crate::snapshot::{self, AssetError, SnapshotDirs, VerifiedComponent};
 
 /// `pipeline.json`.
 pub const PIPELINE_JSON: &str = "pipeline.json";
@@ -92,6 +92,25 @@ pub fn save_closure(
     generation: &GenerationConfig,
     dest: &Path,
 ) -> Result<Value, RunError> {
+    save_resolved(
+        &|id| snapshot::resolve_component(id, dirs),
+        decoders,
+        generation,
+        dest,
+    )
+}
+
+/// Resolves and verifies one component (the production resolver is
+/// [`snapshot::resolve_component`]).
+type Resolve<'a> = dyn Fn(ComponentId) -> Result<VerifiedComponent, AssetError> + 'a;
+
+/// [`save_closure`] over any resolver of verified components (unit tests pass synthetic ones).
+fn save_resolved(
+    resolve: &Resolve<'_>,
+    decoders: &[VaeVariant],
+    generation: &GenerationConfig,
+    dest: &Path,
+) -> Result<Value, RunError> {
     if decoders.is_empty() {
         return Err(RunError::Invalid(
             "a generation closure needs at least one decoder".into(),
@@ -129,7 +148,7 @@ pub fn save_closure(
     })?;
     // The working directory is this call's own: a failure removes it again (the error that
     // caused it is the one returned).
-    let metadata = match assemble(dirs, decoders, generation, &attributions, &work) {
+    let metadata = match assemble(resolve, decoders, generation, &attributions, &work) {
         Ok(metadata) => metadata,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&work);
@@ -151,7 +170,7 @@ pub fn save_closure(
 
 /// Copy and verify every closure file into `work` and write `pipeline.json` there.
 fn assemble(
-    dirs: &SnapshotDirs,
+    resolve: &Resolve<'_>,
     decoders: &[VaeVariant],
     generation: &GenerationConfig,
     attributions: &[&str],
@@ -161,7 +180,7 @@ fn assemble(
     let mut subdirs = Map::new();
     for id in components_for(decoders) {
         // Verify the snapshot immediately before reading the bytes to copy.
-        let verified = snapshot::resolve_component(id, dirs).map_err(gen_core::Error::from)?;
+        let verified = resolve(id).map_err(gen_core::Error::from)?;
         let component = verified.component();
         let name = repo_dir_name(&component.repo);
         subdirs.insert(component.repo.id.to_string(), json!(name));

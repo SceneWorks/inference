@@ -771,4 +771,4 @@ pub fn verify_native_tensors(verified: &VerifiedComponent) -> Result<usize, Asse
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
