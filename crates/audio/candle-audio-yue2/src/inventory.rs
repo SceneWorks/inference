@@ -595,7 +595,7 @@ const REMOTE_CODE: &str = "remote Python model code; production runs natively (e
 
 const COVER_REMOTE_CODE: &str =
     "remote Python model / processing code with no code licence of its \
-                                 own; production runs natively (epic E3); treated as CC BY-NC 4.0 \
+                                 own; production runs natively (epic E3); provisionally CC BY-NC 4.0 \
                                  and any native port gated (license::CODE_TERMS) — the pinned \
                                  GitHub source has no SheetSage2 / MERT2 code";
 

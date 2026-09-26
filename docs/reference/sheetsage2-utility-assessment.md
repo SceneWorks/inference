@@ -185,6 +185,11 @@ DOCUMENTED from `pipeline_sheetsage2.py` and `audio_sheetsage2.py`@`SS2@eab522a`
   from the events already accepted, then stitched. **UNTESTED**: this lane bounds clips to ≤60 s,
   so the multi-window path never ran. Next test: a >300 s public-domain recording, checking stitched
   event continuity and the `Overlap prefix fills the context` error.
+  **Update (sc-22996, OBSERVED):** a 358.2 s array concatenated from the pinned arrays ran through
+  both windows (window 2 conditioned on a 1,124-token overlap prefix); the native port reproduces
+  both windows' tokens, the prefix and the stitched score exactly
+  ([`artifacts/long_multiwindow/`](../../scripts/reference/sheetsage2/artifacts/long_multiwindow)).
+  The context-overflow error was not reached.
 - **Audio input.** Files are decoded with the `ffmpeg` CLI (`-ac 1 -ar 24000 -f f32le`, using
   FFmpeg's resampler). Arrays are channel-averaged and resampled with
   `torchaudio.functional.resample`. `preset="paper"` decodes through torchaudio's FFmpeg-library

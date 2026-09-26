@@ -7,9 +7,10 @@
 //!    ([`SOURCE_TERMS`]). It is the only source a native port of the YuE2 LM, VAE and text
 //!    tokenizer may derive from. Its Oobleck VAE / SnakeBeta code carries two MIT notices of its
 //!    own. It contains **no** SheetSage2 or MERT2 code: the cover closure's only code is the remote
-//!    Python inside those model repositories, which carries no code licence, so code derived from it
-//!    is treated as CC BY-NC 4.0 and a port is gated until an owner records a basis
-//!    ([`CODE_TERMS`]).
+//!    Python inside those model repositories. Upstream grants no licence for that code (their
+//!    LICENSE covers the weights only), so code derived from it is provisionally kept at CC BY-NC
+//!    4.0 and the port is gated until an owner records a basis ([`CODE_TERMS`]; the port is the
+//!    separate crate `candle-audio-sheetsage2`).
 //! 2. **Model weights** — YuE2-3B, both VAEs, SheetSage2 and MERT-v2-FullSong are CC BY-NC 4.0
 //!    ([`COMPONENT_LICENSES`]): noncommercial use only, with attribution.
 //! 3. **`qwen.tiktoken`** — byte-identical to the Qwen-7B tokenizer file, so it carries the Tongyi
@@ -661,7 +662,8 @@ pub struct CodeTerms {
     pub location: &'static str,
     /// The terms the code carries, as inspected on [`inventory::RETRIEVED`].
     pub terms: &'static str,
-    /// SPDX id that code derived from it is treated as carrying.
+    /// SPDX id that code derived from it is treated as carrying — for the cover closure a provisional
+    /// disposition, not an upstream grant (see `port`).
     pub treated_as: &'static str,
     /// Whether a native port may be written into this crate (Apache-2.0): permitted on a recorded
     /// basis, or gated with its unblock condition.
@@ -679,9 +681,15 @@ const APACHE_PORT: UseDisposition = UseDisposition::Permitted(Basis {
 
 const COVER_PORT: UseDisposition = UseDisposition::Gated {
     reason: "the only SheetSage2 / MERT2 code is the remote Python published inside the model \
-             repositories, which carries no code licence of its own; the repositories declare \
-             cc-by-nc-4.0, so code derived from it is treated as CC BY-NC 4.0 — noncommercial — \
-             and must not be relicensed into this Apache-2.0 crate",
+             repositories, and upstream grants no licence for it: the LICENSE in both repositories \
+             is a model-weight licence (CC BY-NC 4.0 for model.safetensors) that does not replace \
+             separately applicable licences for code. Pending an owner decision, code derived from \
+             it is provisionally kept at the repositories' CC BY-NC 4.0 terms — noncommercial — and \
+             must not be relicensed into this Apache-2.0 crate. The native port (sc-22996) lives in \
+             the separate workspace crate `candle-audio-sheetsage2`, whose Cargo licence field \
+             records that provisional CC-BY-NC-4.0 disposition (admitted by one scoped `deny.toml` \
+             exception, with a NOTICE stating that no upstream code licence exists); it is not \
+             composed into the audio catalog or any runtime bundle",
     unblock: "an owner-recorded basis for the cover port, recorded here: an explicit code licence \
               from the rights holder (Multimodal Art Projection), or an owner decision to ship the \
               derived code under CC BY-NC 4.0 with attribution, outside the crate's Apache-2.0 \
@@ -819,8 +827,9 @@ pub const BUNDLED_TERMS: &[BundledTerms] = &[
                 file; the repository card declares cc-by-nc-4.0; THIRD_PARTY_NOTICES.md cites \
                 Hugging Face Transformers (Apache 2.0) for the BART decoder, which the code \
                 imports rather than vendors",
-        disposition: "excluded at runtime; treated as CC BY-NC 4.0 and any native port gated \
-                      (see CODE_TERMS)",
+        disposition:
+            "excluded at runtime; no upstream code licence, so provisionally kept at CC BY-NC \
+                      4.0 pending an owner decision; the native port is gated (see CODE_TERMS)",
     },
     BundledTerms {
         artifact: "MERT-v2-FullSong remote code (modeling_mert2.py, configuration_mert2.py)",
@@ -828,8 +837,9 @@ pub const BUNDLED_TERMS: &[BundledTerms] = &[
         terms: "no explicit code licence: no header or SPDX tag and no code licence file; the \
                 repository card declares cc-by-nc-4.0; THIRD_PARTY_NOTICES.md lists only \
                 separately installed dependencies",
-        disposition: "excluded at runtime; treated as CC BY-NC 4.0 and any native port gated \
-                      (see CODE_TERMS)",
+        disposition:
+            "excluded at runtime; no upstream code licence, so provisionally kept at CC BY-NC \
+                      4.0 pending an owner decision; the native port is gated (see CODE_TERMS)",
     },
 ];
 
@@ -1041,8 +1051,8 @@ mod tests {
     }
 
     /// Every component — in particular every cover-closure component, whose only code is remote
-    /// Python with no code licence — has recorded code terms. Cover code is treated as CC BY-NC 4.0
-    /// with its port gated behind an owner-recorded basis; the YuE2 LM / tokenizer / VAE ports are
+    /// Python with no code licence — has recorded code terms. Cover code is provisionally CC BY-NC 4.0
+    /// (no upstream code grant) with its port gated behind an owner-recorded basis; the YuE2 LM / tokenizer / VAE ports are
     /// permitted only on the Apache-2.0 GitHub source.
     #[test]
     fn every_component_has_recorded_code_terms_and_cover_ports_are_gated() {
