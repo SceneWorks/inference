@@ -45,6 +45,19 @@
 //!
 //! Without `resume`, an existing non-empty `D` or an existing `D.partial` is refused.
 //!
+//! Every stage identity binds the MoT weights, tokenizer, dtype, **device** and the runtime build
+//! ([`crate::engine::SOURCE_DIGEST`], a digest of this crate's sources — upstream binds
+//! `runtime_sha256` the same way), so work done on another backend or by other code is never
+//! reused; the run identity additionally binds the decoder's pinned identity.
+//!
+//! A run holds an exclusive claim on `D.partial` for its whole duration ([`LOCK_FILE`], created
+//! with `create_new`): a second run — fresh or resumed — is refused with [`RunError::Locked`]
+//! while it is held. The claim is released when the run publishes, fails or is cancelled.
+//!
+//! A cached decode refuses an output that is, is inside, or contains its source (paths resolved
+//! through symlinks and `..`), and carries the source's latent bytes over — checked against the
+//! source's recorded digests — before anything is published.
+//!
 //! # Deliberate differences from upstream
 //!
 //! * Audio is `audio.wav` (IEEE float, upstream's `.wav` subtype) instead of `audio.flac` — this
@@ -70,12 +83,11 @@ use crate::engine::{
 };
 use crate::inventory::VaeVariant;
 use crate::latent::{AcousticLatents, LatentIdentity, LatentSource, IDENTITY_FILE, LATENT_FILE};
-use crate::nar::{SongNoise, SynthesisRequest};
 use crate::plan::{
     npy_int32, read_npy_ints, PlanIdentity, SymbolicPlan, ABC_TOKENS_NPY, PLAN_JSON, PLAN_MANIFEST,
     PREFIX_NPY, SCORE_ABC,
 };
-use crate::protocol::{GenerationConfig, SongRequest, CODEC_SIZE, CONTEXT};
+use crate::protocol::{GenerationConfig, SongRequest, CODEC_SIZE};
 use crate::vae::{variant_name, AUDIO_CHANNELS, SAMPLE_RATE};
 
 /// `result.json` — written last; its presence with `status: complete` in a published directory
@@ -99,6 +111,8 @@ pub const STAGES_DIR: &str = "stages";
 pub const PARTIAL_SUFFIX: &str = ".partial";
 /// Schema of `result.json`.
 pub const RUN_SCHEMA: &str = "yue2-run-v1";
+/// The exclusive claim a run holds on its working directory while it assembles it.
+pub const LOCK_FILE: &str = ".yue2-run.lock";
 
 /// Every way an artifact-backed run fails.
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +164,12 @@ pub enum RunError {
     /// The run was asked for something it cannot do.
     #[error("{0}")]
     Invalid(String),
+    /// Another run holds the working directory.
+    #[error(
+        "{} is claimed by another run (remove the lock file only if no run is active)",
+        .0.display()
+    )]
+    Locked(PathBuf),
 }
 
 impl From<RunError> for gen_core::Error {
@@ -333,7 +353,7 @@ fn collect_hashes(dir: &Path) -> Result<Map<String, Value>, RunError> {
                     .map(|c| c.as_os_str().to_string_lossy().into_owned())
                     .collect::<Vec<_>>()
                     .join("/");
-                if rel == RESULT_JSON || rel.ends_with(".tmp") {
+                if rel == RESULT_JSON || rel == LOCK_FILE || rel.ends_with(".tmp") {
                     continue;
                 }
                 let (sha256, bytes) = file_digest(&path)?;
@@ -538,6 +558,41 @@ struct WorkDir {
     target: PathBuf,
     /// `target.partial`.
     work: PathBuf,
+    /// This run's exclusive claim on `work`.
+    _claim: Claim,
+}
+
+/// An exclusive claim on a working directory: [`LOCK_FILE`] created with `create_new` (so two runs
+/// can never hold it at once), removed when the run publishes, fails or is cancelled.
+struct Claim {
+    path: PathBuf,
+}
+
+impl Claim {
+    fn take(work: &Path) -> Result<Self, RunError> {
+        let path = work.join(LOCK_FILE);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(format!("pid {}\n", std::process::id()).as_bytes())
+                    .map_err(io(&path))?;
+                Ok(Self { path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(RunError::Locked(path)),
+            Err(e) => Err(RunError::Io { path, source: e }),
+        }
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // After publication the working directory was renamed away and the claim travelled
+        // with it (the publisher removes it there); nothing is left to remove here.
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// The state of an output directory at the start of a run.
@@ -570,15 +625,25 @@ fn open_output(output: &RunOutput) -> Result<Opened, RunError> {
         if !output.resume {
             return Err(RunError::Interrupted(work));
         }
-        return Ok(Opened::Work(WorkDir { target, work }));
+        let claim = Claim::take(&work)?;
+        return Ok(Opened::Work(WorkDir {
+            target,
+            work,
+            _claim: claim,
+        }));
     }
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(io(parent))?;
     }
     // `create_dir` (not `_all`) claims the working directory: a concurrent fresh run into the same
-    // target fails here instead of interleaving files.
+    // target fails here instead of interleaving files; the lock file then covers resumes too.
     fs::create_dir(&work).map_err(io(&work))?;
-    Ok(Opened::Work(WorkDir { target, work }))
+    let claim = Claim::take(&work)?;
+    Ok(Opened::Work(WorkDir {
+        target,
+        work,
+        _claim: claim,
+    }))
 }
 
 impl WorkDir {
@@ -680,7 +745,7 @@ impl WorkDir {
 
     /// Write `result.json` (with every other file's digest), sync, and rename the working
     /// directory onto the target.
-    fn publish(self, mut result: Map<String, Value>) -> Result<(PathBuf, Value), RunError> {
+    fn publish(&self, mut result: Map<String, Value>) -> Result<(PathBuf, Value), RunError> {
         let artifacts = collect_hashes(&self.work)?;
         for name in artifacts.keys() {
             let path = self.work.join(name);
@@ -701,10 +766,13 @@ impl WorkDir {
             fs::remove_dir(&self.target).map_err(io(&self.target))?;
         }
         fs::rename(&self.work, &self.target).map_err(io(&self.target))?;
+        // The claim moved with the directory; it is not an artifact (never hashed) — release it.
+        let moved = self.target.join(LOCK_FILE);
+        fs::remove_file(&moved).map_err(io(&moved))?;
         if let Some(parent) = self.target.parent().filter(|p| !p.as_os_str().is_empty()) {
             sync_dir(parent)?;
         }
-        Ok((self.target, result))
+        Ok((self.target.clone(), result))
     }
 }
 
@@ -782,6 +850,57 @@ fn stage_entry(identity: &str, reused: bool) -> Value {
     json!({"identity": identity, "reused": reused})
 }
 
+/// `path` resolved component by component: every prefix that exists is canonicalized (so
+/// symlinks resolve to their targets), `..` then removes one resolved component and `.` none, and
+/// a component that does not exist yet — which cannot be a link — is appended as written.
+fn resolve_path(path: &Path) -> Result<PathBuf, RunError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(io(path))?.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            PathComponent::Prefix(_) | PathComponent::RootDir => resolved.push(component),
+            PathComponent::CurDir => {}
+            PathComponent::ParentDir => {
+                resolved.pop();
+            }
+            PathComponent::Normal(name) => {
+                let next = resolved.join(name);
+                resolved = match fs::canonicalize(&next) {
+                    Ok(canonical) => canonical,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => next,
+                    Err(e) => {
+                        return Err(RunError::Io {
+                            path: next,
+                            source: e,
+                        })
+                    }
+                };
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// Refuse an output (or its working directory) that is, is inside, or contains the source run.
+fn refuse_overlap(source: &Path, output: &Path) -> Result<(), RunError> {
+    let source = resolve_path(source)?;
+    for candidate in [output.to_path_buf(), partial_dir(output)] {
+        let candidate = resolve_path(&candidate)?;
+        if candidate.starts_with(&source) || source.starts_with(&candidate) {
+            return Err(RunError::Invalid(format!(
+                "a cached decode never writes into its source run: {} overlaps {}",
+                candidate.display(),
+                source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The whole-run record fields shared by a song run and a cached decode.
 fn audio_fields(
     result: &mut Map<String, Value>,
@@ -834,6 +953,7 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
     ) -> Result<RunOutcome, RunError> {
         let start = Instant::now();
+        self.check_decoder_available(settings.decoder)?;
         let run_identity = self.input_identity(input, settings)?;
         let work = match open_output(output)? {
             Opened::Complete => return self.reuse_complete(&output.dir, &run_identity, hooks),
@@ -948,17 +1068,7 @@ impl Yue2Engine {
 
         // Acoustic synthesis.
         let synthesis_identity = self.synthesis_stage_identity(&semantic, &settings.generation)?;
-        let nar_identity = {
-            let noise = SongNoise::seeded(plan.request().seed(), semantic.codes.len());
-            SynthesisRequest {
-                prefix: plan.prefix(),
-                codes: &semantic.codes,
-                noise: &noise,
-                steps: usize::try_from(settings.generation.ode_steps()).unwrap_or(usize::MAX),
-                context: CONTEXT,
-            }
-            .stage_identity(&self.weights_sha256()?, self.dtype())
-        };
+        let nar_identity = self.identity_keys().nar(&semantic, &settings.generation);
         let (latents, nar_seconds) = match work.checkpoint(Stage::Synthesis, &synthesis_identity)? {
             Some(data) => {
                 let latents = AcousticLatents::load(&work.work)
@@ -1028,11 +1138,14 @@ impl Yue2Engine {
             &work.path(AUDIO_WAV),
             &wav_f32_bytes(audio.samples(), SAMPLE_RATE, AUDIO_CHANNELS as u16),
         )?;
+        let keys = self.identity_keys();
         let decode_identity = identity_of(&json!([
             IDENTITY_SCHEMA,
             "decode",
             latents.identity().sha256,
             audio.metadata().decoder.to_json(),
+            keys.device,
+            keys.runtime,
             audio.metadata().vae_decode(),
             audio.metadata().halo_frames,
             match audio.metadata().mode {
@@ -1186,6 +1299,10 @@ impl Yue2Engine {
         output: Option<&RunOutput>,
         hooks: &mut EngineHooks<'_>,
     ) -> Result<RunOutcome, RunError> {
+        self.check_decoder_available(decoder)?;
+        if let Some(output) = output {
+            refuse_overlap(source, &output.dir)?;
+        }
         let original = verify_run(source, None)?;
         if original.get("kind").and_then(Value::as_str) == Some("plan") {
             return Err(RunError::Invalid(format!(
@@ -1223,32 +1340,19 @@ impl Yue2Engine {
         }
         let source_config = read_json(&source.join(CONFIG_JSON))?;
 
-        let identity = identity_of(&json!({
-            "schema": IDENTITY_SCHEMA,
-            "kind": "cached_decode",
-            "source": source_identity,
-            "latent": latents.identity().to_json(),
-            "decoder": variant_name(decoder),
-            "decode": self.effective_config(plan.request(), &SongSettings {
-                decoder,
-                ..self.default_settings()
-            }).get("vae_decode").cloned(),
-            "options": format!("{:?}", self.options().decode),
-            "weights": mot,
-        }));
+        let identity = self.identity_keys().cached_decode(
+            &source_identity,
+            &latents.identity().to_json(),
+            &json!([variant_name(decoder), self.vae_identity(decoder)?]),
+            &json!(format!("{:?}", self.options().decode)),
+            &mot,
+        );
         let work = match output {
             None => None,
-            Some(output) => {
-                if output.dir == source || partial_dir(&output.dir) == source {
-                    return Err(RunError::Invalid(
-                        "a cached decode never writes into its source run".into(),
-                    ));
-                }
-                match open_output(output)? {
-                    Opened::Complete => return self.reuse_complete(&output.dir, &identity, hooks),
-                    Opened::Work(work) => Some(work),
-                }
-            }
+            Some(output) => match open_output(output)? {
+                Opened::Complete => return self.reuse_complete(&output.dir, &identity, hooks),
+                Opened::Work(work) => Some(work),
+            },
         };
         let mut stages = BTreeMap::new();
         for stage in [Stage::Plan, Stage::Semantic, Stage::Synthesis] {
@@ -1279,9 +1383,27 @@ impl Yue2Engine {
         plan.save(&work.work)
             .map_err(|e| corrupt(&work.work, e.to_string()))?;
         write_semantic(&work.path(SEMANTIC_NPY), &codes)?;
-        latents
-            .save(&work.work)
+        // The latents are carried over byte for byte and checked BEFORE anything is published:
+        // the copies must hash to the digests the verified source recorded, and must load as the
+        // very latents that were decoded.
+        for name in [LATENT_FILE, IDENTITY_FILE] {
+            let (from, to) = (source.join(name), work.path(name));
+            fs::copy(&from, &to).map_err(io(&to))?;
+            let recorded = original
+                .pointer(&format!("/artifacts/{name}/sha256"))
+                .and_then(Value::as_str);
+            if recorded != Some(file_digest(&to)?.0.as_str()) {
+                return Err(corrupt(&to, "latents changed while they were carried over"));
+            }
+        }
+        let carried = AcousticLatents::load(&work.work)
             .map_err(|e| corrupt(&work.path(LATENT_FILE), e.to_string()))?;
+        if carried.identity() != latents.identity() {
+            return Err(corrupt(
+                &work.path(IDENTITY_FILE),
+                "the carried-over latents are not the ones decoded",
+            ));
+        }
         write_atomic(
             &work.path(AUDIO_WAV),
             &wav_f32_bytes(audio.samples(), SAMPLE_RATE, AUDIO_CHANNELS as u16),
@@ -1357,13 +1479,6 @@ impl Yue2Engine {
         result.insert("source_identity".into(), json!(source_identity));
         result.insert("timing".into(), Value::Object(timing));
         let (dir, result) = work.publish(result)?;
-        // Upstream's post-check: the latents were carried over byte for byte.
-        if file_digest(&dir.join(LATENT_FILE))?.0 != digest(LATENT_FILE)? {
-            return Err(corrupt(
-                &dir.join(LATENT_FILE),
-                "latents changed during re-decoding",
-            ));
-        }
         Ok(RunOutcome {
             dir,
             result,

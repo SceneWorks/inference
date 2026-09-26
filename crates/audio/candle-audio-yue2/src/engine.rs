@@ -91,6 +91,121 @@ pub const ENGINE_ID: &str = "yue2";
 /// the run identity).
 pub const IDENTITY_SCHEMA: &str = "yue2-engine-v1";
 
+/// The native runtime's build identity: a SHA-256 over this crate's `src/` tree (see `build.rs`).
+/// Bound into the effective configuration and every stage identity, so a code change never reuses
+/// a run or checkpoint produced by other code (upstream binds `runtime_sha256` the same way).
+pub const SOURCE_DIGEST: &str = env!("YUE2_SOURCE_DIGEST");
+
+/// Everything outside a stage's own inputs that its result depends on: the MoT weights, the
+/// tokenizer, the compute dtype, the device (backend) and the runtime build. The stage identities
+/// are pure functions of these keys and the stage inputs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentityKeys {
+    /// SHA-256 of the MoT weights file loaded.
+    pub weights_sha256: String,
+    /// The tokenizer's identity record.
+    pub tokenizer: Value,
+    /// The MoT compute dtype.
+    pub dtype: DType,
+    /// The device (backend) the stages ran on: `cpu`, `metal` or `cuda`.
+    pub device: &'static str,
+    /// The runtime build identity ([`SOURCE_DIGEST`]).
+    pub runtime: &'static str,
+    /// The loaded weight tier (`bf16` / `q8` / `q4`, sc-22995).
+    pub tier: &'static str,
+    /// The AR stages' mode (`none` / `fp8`, upstream's `quantization`, sc-22995).
+    pub ar: &'static str,
+}
+
+impl IdentityKeys {
+    /// The plan stage for `request` sampled with `abc`.
+    pub fn plan(&self, request: &SongRequest, abc: &Sampling) -> String {
+        identity_of(&json!([
+            IDENTITY_SCHEMA,
+            "plan",
+            PROTOCOL_VERSION,
+            request.to_json(),
+            abc.to_json(),
+            self.weights_sha256,
+            self.tokenizer,
+            dtype_name(self.dtype),
+            self.device,
+            self.runtime,
+            {"tier": self.tier, "ar": self.ar},
+        ]))
+    }
+
+    /// The semantic stage for `plan` sampled with `semantic`.
+    pub fn semantic(&self, plan: &SymbolicPlan, semantic: &Sampling) -> String {
+        identity_of(&json!([
+            IDENTITY_SCHEMA,
+            "semantic",
+            PROTOCOL_VERSION,
+            plan.identity().to_string(),
+            semantic.to_json(),
+            self.weights_sha256,
+            self.tokenizer,
+            dtype_name(self.dtype),
+            self.device,
+            self.runtime,
+            {"tier": self.tier, "ar": self.ar},
+        ]))
+    }
+
+    /// The acoustic stage identity of [`crate::nar`] (weights, dtype, prefix, codes, noise, steps,
+    /// context, method) — the `stage_identity` its latents carry as their source.
+    pub fn nar(&self, semantic: &SemanticResult, generation: &GenerationConfig) -> String {
+        let noise = SongNoise::seeded(semantic.plan.request().seed(), semantic.codes.len());
+        SynthesisRequest {
+            prefix: semantic.plan.prefix(),
+            codes: &semantic.codes,
+            noise: &noise,
+            steps: step_count(generation),
+            context: CONTEXT,
+        }
+        .stage_identity(&self.weights_sha256, self.dtype)
+    }
+
+    /// A cached decode of the run `source` (its run identity) whose latents are `latent`, with
+    /// the decoder identified by `vae` and decode settings `decode`, by the MoT identified by
+    /// `weights`.
+    pub fn cached_decode(
+        &self,
+        source: &str,
+        latent: &Value,
+        vae: &Value,
+        decode: &Value,
+        weights: &Value,
+    ) -> String {
+        identity_of(&json!({
+            "schema": IDENTITY_SCHEMA,
+            "kind": "cached_decode",
+            "source": source,
+            "latent": latent,
+            "vae": vae,
+            "decode": decode,
+            "weights": weights,
+            "device": self.device,
+            "runtime": self.runtime,
+        }))
+    }
+
+    /// The synthesis stage: [`Self::nar`] plus the device, runtime and tier. Not the AR mode: the
+    /// acoustic stage always runs the tier's own weights (the FP8 AR mode is restored to BF16
+    /// before it, [`crate::fp8`]), so its latents are the same in both modes.
+    pub fn synthesis(&self, semantic: &SemanticResult, generation: &GenerationConfig) -> String {
+        identity_of(&json!([
+            IDENTITY_SCHEMA,
+            "synthesis",
+            self.nar(semantic, generation),
+            dtype_name(self.dtype),
+            self.device,
+            self.runtime,
+            {"tier": self.tier},
+        ]))
+    }
+}
+
 /// A pipeline stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Stage {
@@ -273,6 +388,17 @@ enum VaeSource {
     /// The synthetic fixture decoders (unit tests).
     #[cfg(test)]
     Fixture,
+    /// The fixture decoders, with availability checked against provisioned snapshot directories
+    /// (unit tests of the early decoder check).
+    #[cfg(test)]
+    FixtureChecked(SnapshotDirs),
+}
+
+fn vae_component(variant: VaeVariant) -> ComponentId {
+    match variant {
+        VaeVariant::Standard => ComponentId::VaeStandard,
+        VaeVariant::Legacy => ComponentId::VaeLegacy,
+    }
 }
 
 /// A loaded YuE2 model closure: the MoT (AR + NAR paths), the tokenizer and the decoders.
@@ -543,6 +669,14 @@ impl Yue2Engine {
         }
     }
 
+    /// The synthetic engine, but with decoder availability checked against `dirs` (the fixture
+    /// decoders still render).
+    #[cfg(test)]
+    pub(crate) fn with_checked_decoders(mut self, dirs: SnapshotDirs) -> Self {
+        self.vae_source = VaeSource::FixtureChecked(dirs);
+        self
+    }
+
     /// The tokenizer (to restore saved plans with [`SymbolicPlan::restore`]).
     pub fn tokenizer(&self) -> &Yue2TextTokenizer {
         &self.tokenizer
@@ -604,15 +738,6 @@ impl Yue2Engine {
             fp8::prepare_fp8_ar(nar.lm_mut())?;
         }
         Ok(nar)
-    }
-
-    /// What every stage identity a precision can change carries: the tier, and the AR mode for
-    /// the AR stages (`None` for the acoustic stage, which always runs the tier's own weights).
-    fn precision_identity(&self, ar_stage: bool) -> Value {
-        json!({
-            "tier": self.tier.name(),
-            "ar": if ar_stage { self.ar.name() } else { "none" },
-        })
     }
 
     /// Default [`SongSettings`] of this engine: its generation configuration and the standard
@@ -711,16 +836,14 @@ impl Yue2Engine {
         .map_err(|e| gen_core::Error::Unsupported(e.to_string()))?;
         let vae = match &self.vae_source {
             VaeSource::Snapshots(dirs) => {
-                let id = match variant {
-                    VaeVariant::Standard => ComponentId::VaeStandard,
-                    VaeVariant::Legacy => ComponentId::VaeLegacy,
-                };
-                let verified = snapshot::resolve_component(id, dirs)?;
+                let verified = snapshot::resolve_component(vae_component(variant), dirs)?;
                 let device = &self.device;
                 Yue2Vae::load(&verified, VaeParts::DecoderOnly, device).map_err(vae_error)?
             }
             #[cfg(test)]
-            VaeSource::Fixture => crate::vae::tests::tiny(variant, VaeParts::DecoderOnly),
+            VaeSource::Fixture | VaeSource::FixtureChecked(_) => {
+                crate::vae::tests::tiny(variant, VaeParts::DecoderOnly)
+            }
         };
         let vae = Arc::new(vae);
         vaes.insert(key, Arc::clone(&vae));
@@ -789,6 +912,7 @@ impl Yue2Engine {
                 "crate": env!("CARGO_PKG_NAME"),
                 "version": env!("CARGO_PKG_VERSION"),
                 "upstream_commit": crate::inventory::YUE2_SOURCE_COMMIT,
+                "source_sha256": SOURCE_DIGEST,
             },
             "validation_status": "unvalidated",
         })
@@ -807,6 +931,7 @@ impl Yue2Engine {
             "request": request.to_json(),
             "config": self.effective_config(request, settings),
             "weights": self.model_identity()?,
+            "vae": self.vae_identity(settings.decoder)?,
         })))
     }
 
@@ -817,17 +942,7 @@ impl Yue2Engine {
         request: &SongRequest,
         abc: &Sampling,
     ) -> gen_core::Result<String> {
-        Ok(identity_of(&json!([
-            IDENTITY_SCHEMA,
-            "plan",
-            PROTOCOL_VERSION,
-            request.to_json(),
-            abc.to_json(),
-            self.weights_sha256()?,
-            self.tokenizer_identity,
-            dtype_name(self.dtype()),
-            self.precision_identity(true),
-        ])))
+        Ok(self.identity_keys().plan(request, abc))
     }
 
     /// Identity of the semantic stage: the exact plan, the semantic sampling, the MoT weights and
@@ -837,16 +952,7 @@ impl Yue2Engine {
         plan: &SymbolicPlan,
         semantic: &Sampling,
     ) -> gen_core::Result<String> {
-        Ok(identity_of(&json!([
-            IDENTITY_SCHEMA,
-            "semantic",
-            PROTOCOL_VERSION,
-            plan.identity().to_string(),
-            semantic.to_json(),
-            self.weights_sha256()?,
-            dtype_name(self.dtype()),
-            self.precision_identity(true),
-        ])))
+        Ok(self.identity_keys().semantic(plan, semantic))
     }
 
     /// Identity of the acoustic stage: the acoustic stage identity of [`crate::nar`] (weights,
@@ -856,21 +962,57 @@ impl Yue2Engine {
         semantic: &SemanticResult,
         generation: &GenerationConfig,
     ) -> gen_core::Result<String> {
-        let noise = SongNoise::seeded(semantic.plan.request().seed(), semantic.codes.len());
-        let request = SynthesisRequest {
-            prefix: semantic.plan.prefix(),
-            codes: &semantic.codes,
-            noise: &noise,
-            steps: step_count(generation),
-            context: CONTEXT,
+        Ok(self.identity_keys().synthesis(semantic, generation))
+    }
+
+    /// The keys every stage identity of this engine binds.
+    pub fn identity_keys(&self) -> IdentityKeys {
+        IdentityKeys {
+            weights_sha256: self.weights_sha256.clone(),
+            tokenizer: self.tokenizer_identity.clone(),
+            dtype: self.dtype,
+            device: device_name(&self.device),
+            runtime: SOURCE_DIGEST,
+            tier: self.tier.name(),
+            ar: self.ar.name(),
+        }
+    }
+
+    /// The pinned identity of decoder `variant` (its component record — every file's SHA-256),
+    /// without loading it.
+    pub fn vae_identity(&self, variant: VaeVariant) -> gen_core::Result<Value> {
+        match &self.vae_source {
+            VaeSource::Snapshots(_) => Ok(component_identity(vae_component(variant).component())),
+            #[cfg(test)]
+            VaeSource::Fixture | VaeSource::FixtureChecked(_) => {
+                Ok(self.vae(variant)?.identity().to_json())
+            }
+        }
+    }
+
+    /// Refuse early — before any model compute — when decoder `variant`'s snapshot is not
+    /// provisioned. An existence check only; the decoder is fully verified when it is loaded.
+    pub fn check_decoder_available(&self, variant: VaeVariant) -> gen_core::Result<()> {
+        let key = variant_name(variant);
+        if self
+            .vaes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(key)
+        {
+            return Ok(());
+        }
+        // Outside unit tests the source is always `Snapshots` (the fixture arms are test-only).
+        #[allow(clippy::infallible_destructuring_match)]
+        let dirs = match &self.vae_source {
+            VaeSource::Snapshots(dirs) => dirs,
+            #[cfg(test)]
+            VaeSource::FixtureChecked(dirs) => dirs,
+            #[cfg(test)]
+            VaeSource::Fixture => return Ok(()),
         };
-        Ok(identity_of(&json!([
-            IDENTITY_SCHEMA,
-            "synthesis",
-            request.stage_identity(&self.weights_sha256()?, self.dtype()),
-            dtype_name(self.dtype()),
-            self.precision_identity(false),
-        ])))
+        dirs.snapshot_dir(&vae_component(variant).component().repo)?;
+        Ok(())
     }
 
     /// Plan `request` (upstream `pipe.plan`): `cot = off` and an external score need no sampling;
@@ -1049,6 +1191,7 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
     ) -> gen_core::Result<SongResult> {
         let start = Instant::now();
+        self.check_decoder_available(settings.decoder)?;
         let plan = self.plan(request, &settings.generation, hooks)?;
         self.generate_from_plan_timed(plan, settings, hooks, start)
     }
@@ -1061,6 +1204,7 @@ impl Yue2Engine {
         settings: &SongSettings,
         hooks: &mut EngineHooks<'_>,
     ) -> gen_core::Result<SongResult> {
+        self.check_decoder_available(settings.decoder)?;
         self.generate_from_plan_timed(plan, settings, hooks, Instant::now())
     }
 

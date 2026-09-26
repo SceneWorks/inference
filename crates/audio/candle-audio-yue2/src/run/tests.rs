@@ -707,3 +707,451 @@ fn wav_round_trips_and_rejects_other_formats() {
     assert!(read_wav_f32(&pcm).is_err());
     assert!(read_wav_f32(&bytes[..bytes.len() - 3]).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Review fix pass (sc-22994): one test per integrity check.
+// ---------------------------------------------------------------------------------------------
+
+/// Copy the run directory `from` (recursively) to `to`.
+fn copy_run(from: &Path, to: &Path) {
+    for (name, bytes) in snapshot(from) {
+        let path = to.join(&name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+}
+
+/// Rewrite `names`' digests in `dir/result.json` to the bytes now on disk (what someone replacing
+/// artifacts consistently would do to get past `verify_run`).
+fn rehash_result(dir: &Path, names: &[&str]) {
+    let path = dir.join(RESULT_JSON);
+    let mut result = read_json(&path).unwrap();
+    for name in names {
+        let (sha, bytes) = file_digest(&dir.join(name)).unwrap();
+        result["artifacts"][*name] = serde_json::json!({"sha256": sha, "bytes": bytes});
+    }
+    write_json(&path, &result).unwrap();
+}
+
+fn published_source(engine: &Yue2Engine, root: &Path) -> PathBuf {
+    let source = root.join("source");
+    run(
+        engine,
+        &SongInput::Request(request(CotMode::Off, 31)),
+        &settings(VaeVariant::Standard),
+        &RunOutput::fresh(&source),
+    )
+    .0
+    .unwrap();
+    source
+}
+
+#[test]
+fn a_cached_decode_never_writes_into_beside_or_above_its_source() {
+    let engine = engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let source = published_source(&engine, tmp.path());
+    let before = snapshot(&source);
+    let link = tmp.path().join("link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    let mut outputs = vec![
+        RunOutput::fresh(source.join("nested")),
+        RunOutput::fresh(source.join("a/b")),
+        RunOutput::fresh(source.join("x/../nested")),
+        RunOutput::fresh(tmp.path().join("elsewhere/../source/inner")),
+        RunOutput::resume(&source),
+        // An ancestor of the source.
+        RunOutput::fresh(tmp.path()),
+    ];
+    if cfg!(unix) {
+        outputs.push(RunOutput::fresh(link.join("inner")));
+        outputs.push(RunOutput::fresh(&link));
+    }
+    for output in outputs {
+        let (r, rec) = with_hooks(None, |h| {
+            engine.decode_cached(&source, VaeVariant::Legacy, Some(&output), h)
+        });
+        assert!(matches!(r, Err(RunError::Invalid(_))), "{output:?}: {r:?}");
+        assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+        assert_eq!(
+            snapshot(&source),
+            before,
+            "{output:?}: the source is untouched"
+        );
+    }
+    // A sibling is fine.
+    let (r, _) = with_hooks(None, |h| {
+        engine.decode_cached(
+            &source,
+            VaeVariant::Legacy,
+            Some(&RunOutput::fresh(tmp.path().join("sibling"))),
+            h,
+        )
+    });
+    r.unwrap();
+    assert_eq!(snapshot(&source), before);
+}
+
+#[test]
+fn every_stage_identity_binds_every_input_it_depends_on() {
+    let engine = engine();
+    let s = settings(VaeVariant::Standard);
+    let req = request(CotMode::Off, 1);
+    let plan = with_hooks(None, |h| engine.plan(&req, &s.generation, h))
+        .0
+        .unwrap();
+    let semantic = SemanticResult {
+        plan: plan.clone(),
+        codes: vec![3, 1, 4, 1, 5],
+        truncated: false,
+        timing: Default::default(),
+    };
+    let base = engine.identity_keys();
+    assert_eq!(base.device, "cpu");
+    assert_eq!(base.runtime, crate::engine::SOURCE_DIGEST);
+    assert_eq!(base.runtime.len(), 64);
+    // The engine's stage identities are exactly these pure functions.
+    assert_eq!(
+        engine
+            .plan_stage_identity(&req, s.generation.abc())
+            .unwrap(),
+        base.plan(&req, s.generation.abc())
+    );
+    assert_eq!(
+        engine
+            .synthesis_stage_identity(&semantic, &s.generation)
+            .unwrap(),
+        base.synthesis(&semantic, &s.generation)
+    );
+
+    let decode = |k: &crate::engine::IdentityKeys| {
+        k.cached_decode(
+            "source",
+            &serde_json::json!("latent"),
+            &serde_json::json!("vae"),
+            &serde_json::json!("tiles"),
+            &serde_json::json!("mot"),
+        )
+    };
+    let ids = |k: &crate::engine::IdentityKeys| {
+        [
+            k.plan(&req, s.generation.abc()),
+            k.semantic(&plan, s.generation.semantic()),
+            k.synthesis(&semantic, &s.generation),
+            k.nar(&semantic, &s.generation),
+            decode(k),
+        ]
+    };
+    let b = ids(&base);
+    // (key change, which of [plan, semantic, synthesis, nar, cached decode] must change)
+    let cases: [(&str, crate::engine::IdentityKeys, [bool; 5]); 7] = [
+        (
+            "tier",
+            crate::engine::IdentityKeys {
+                tier: "q8",
+                ..base.clone()
+            },
+            [true, true, true, false, false],
+        ),
+        (
+            "ar",
+            crate::engine::IdentityKeys {
+                ar: "fp8",
+                ..base.clone()
+            },
+            [true, true, false, false, false],
+        ),
+        (
+            "weights",
+            crate::engine::IdentityKeys {
+                weights_sha256: "other-weights".into(),
+                ..base.clone()
+            },
+            [true, true, true, true, false],
+        ),
+        (
+            "tokenizer",
+            crate::engine::IdentityKeys {
+                tokenizer: serde_json::json!({"component": "other"}),
+                ..base.clone()
+            },
+            [true, true, false, false, false],
+        ),
+        (
+            "dtype",
+            crate::engine::IdentityKeys {
+                dtype: candle_audio::candle_core::DType::BF16,
+                ..base.clone()
+            },
+            [true, true, true, true, false],
+        ),
+        (
+            "device",
+            crate::engine::IdentityKeys {
+                device: "metal",
+                ..base.clone()
+            },
+            [true, true, true, false, true],
+        ),
+        (
+            "runtime",
+            crate::engine::IdentityKeys {
+                runtime: "another-build",
+                ..base.clone()
+            },
+            [true, true, true, false, true],
+        ),
+    ];
+    for (name, keys, changes) in cases {
+        let got = ids(&keys);
+        for (i, stage) in ["plan", "semantic", "synthesis", "nar", "cached_decode"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(got[i] != b[i], changes[i], "{name} → {stage}");
+        }
+    }
+
+    // The stage inputs themselves.
+    let other = |edit: fn(&mut SamplingOverrides)| {
+        let mut o = SamplingOverrides::default();
+        edit(&mut o);
+        o
+    };
+    let abc2 = s
+        .generation
+        .abc()
+        .with_overrides(&other(|o| o.top_k = Some(7)))
+        .unwrap();
+    assert_ne!(base.plan(&req, &abc2), b[0], "ABC sampling → plan");
+    let sem2 = s
+        .generation
+        .semantic()
+        .with_overrides(&other(|o| o.temperature = Some(0.3)))
+        .unwrap();
+    assert_ne!(
+        base.semantic(&plan, &sem2),
+        b[1],
+        "semantic sampling → semantic"
+    );
+    let steps3 = GenerationConfig::new(*s.generation.abc(), *s.generation.semantic(), 3).unwrap();
+    assert_ne!(
+        base.synthesis(&semantic, &steps3),
+        b[2],
+        "steps → synthesis"
+    );
+    assert_ne!(base.nar(&semantic, &steps3), b[3], "steps → latent source");
+    let req2 = request(CotMode::Off, 2);
+    assert_ne!(base.plan(&req2, s.generation.abc()), b[0], "seed → plan");
+    // Same prefix and codes, another seed: only the song's noise differs.
+    let plan2 = with_hooks(None, |h| engine.plan(&req2, &s.generation, h))
+        .0
+        .unwrap();
+    assert_eq!(plan2.prefix(), plan.prefix());
+    let semantic2 = SemanticResult {
+        plan: plan2,
+        ..semantic.clone()
+    };
+    assert_ne!(
+        base.nar(&semantic2, &s.generation),
+        b[3],
+        "seed → noise → latent source"
+    );
+    assert_ne!(
+        base.synthesis(&semantic2, &s.generation),
+        b[2],
+        "seed → synthesis"
+    );
+}
+
+#[test]
+fn a_cached_decode_refuses_a_source_generated_by_another_model() {
+    let engine = engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let source = published_source(&engine, tmp.path());
+    let other = tmp.path().join("other-model");
+    copy_run(&source, &other);
+    let path = other.join(RESULT_JSON);
+    let mut result = read_json(&path).unwrap();
+    result["weights"]["mot"] = serde_json::json!({"component": "another_mot"});
+    write_json(&path, &result).unwrap();
+    verify_run(&other, None).expect("result.json is not itself a recorded artifact");
+    let (r, rec) = with_hooks(None, |h| {
+        engine.decode_cached(&other, VaeVariant::Standard, None, h)
+    });
+    assert!(matches!(r, Err(RunError::Invalid(_))), "{r:?}");
+    assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+}
+
+#[test]
+fn an_unpublished_result_in_an_interrupted_run_is_refused_and_left_alone() {
+    let engine = engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let s = settings(VaeVariant::Standard);
+    let input = SongInput::Request(request(CotMode::Off, 41));
+    let dir = tmp.path().join("song");
+    let (r, _) = with_hooks(Some(Stage::Synthesis), |h| {
+        engine.generate_to(&input, &s, &RunOutput::fresh(&dir), h)
+    });
+    assert!(r.is_err());
+    let work = partial_dir(&dir);
+    write_json(
+        &work.join(RESULT_JSON),
+        &serde_json::json!({"status": "complete", "schema": RUN_SCHEMA}),
+    )
+    .unwrap();
+    let before = snapshot(&work);
+    let (r, rec) = run(&engine, &input, &s, &RunOutput::resume(&dir));
+    assert!(matches!(r, Err(RunError::Corrupt { .. })), "{r:?}");
+    assert_eq!(
+        rec.count(Stage::Plan, StageEvent::Reused),
+        0,
+        "nothing reused"
+    );
+    assert_eq!(
+        snapshot(&work),
+        before,
+        "the interrupted run is left as it was"
+    );
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_cached_decode_refuses_latents_the_source_did_not_record() {
+    // Forged latents with a consistent sidecar and consistent result.json digests pass
+    // `verify_run` and `AcousticLatents::load`; only the latent identity the source recorded tells.
+    let engine = engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let source = published_source(&engine, tmp.path());
+    let forged_run = tmp.path().join("forged");
+    copy_run(&source, &forged_run);
+    let latents = AcousticLatents::load(&forged_run).unwrap();
+    let mut values = latents.values().to_vec();
+    values[0] += 0.25;
+    let forged =
+        AcousticLatents::new(values, latents.frames(), latents.identity().source.clone()).unwrap();
+    fs::remove_file(forged_run.join(LATENT_FILE)).unwrap();
+    fs::remove_file(forged_run.join(IDENTITY_FILE)).unwrap();
+    forged.save(&forged_run).unwrap();
+    rehash_result(&forged_run, &[LATENT_FILE, IDENTITY_FILE]);
+    verify_run(&forged_run, None).unwrap();
+    AcousticLatents::load(&forged_run).unwrap();
+    let (r, rec) = with_hooks(None, |h| {
+        engine.decode_cached(&forged_run, VaeVariant::Standard, None, h)
+    });
+    assert!(matches!(r, Err(RunError::Corrupt { .. })), "{r:?}");
+    assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+}
+
+#[test]
+fn checkpointed_latents_from_another_source_are_refused() {
+    // The same values re-attributed to another source, with the checkpoint's digests and its
+    // recorded latent identity both updated: only the "produced by this synthesis" check tells.
+    let engine = engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let s = settings(VaeVariant::Standard);
+    let input = SongInput::Request(request(CotMode::Off, 43));
+    let dir = tmp.path().join("song");
+    let (r, _) = with_hooks(Some(Stage::Decode), |h| {
+        engine.generate_to(&input, &s, &RunOutput::fresh(&dir), h)
+    });
+    assert!(r.is_err());
+    let work = partial_dir(&dir);
+    let latents = AcousticLatents::load(&work).unwrap();
+    let imported = AcousticLatents::new(
+        latents.values().to_vec(),
+        latents.frames(),
+        LatentSource::Imported {
+            file_sha256: "0".repeat(64),
+        },
+    )
+    .unwrap();
+    fs::remove_file(work.join(LATENT_FILE)).unwrap();
+    fs::remove_file(work.join(IDENTITY_FILE)).unwrap();
+    imported.save(&work).unwrap();
+    let record_path = work.join("stages/synthesis.json");
+    let mut record = read_json(&record_path).unwrap();
+    for name in [LATENT_FILE, IDENTITY_FILE] {
+        let (sha, bytes) = file_digest(&work.join(name)).unwrap();
+        record["artifacts"][name] = serde_json::json!({"sha256": sha, "bytes": bytes});
+    }
+    record["data"]["latent"] = imported.identity().to_json();
+    write_json(&record_path, &record).unwrap();
+    let (r, rec) = run(&engine, &input, &s, &RunOutput::resume(&dir));
+    assert!(matches!(r, Err(RunError::Corrupt { .. })), "{r:?}");
+    assert_eq!(rec.count(Stage::Decode, StageEvent::Started), 0);
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_working_directory_is_claimed_by_one_run_at_a_time() {
+    let engine = engine();
+    let tmp = tempfile::tempdir().unwrap();
+    let s = settings(VaeVariant::Standard);
+    let input = SongInput::Request(request(CotMode::Off, 47));
+    let dir = tmp.path().join("song");
+    let (r, _) = with_hooks(Some(Stage::Synthesis), |h| {
+        engine.generate_to(&input, &s, &RunOutput::fresh(&dir), h)
+    });
+    assert!(r.is_err());
+    let work = partial_dir(&dir);
+    assert!(
+        !work.join(LOCK_FILE).exists(),
+        "a failed run releases its claim"
+    );
+
+    // Two concurrent claims: the second is refused while the first is held.
+    let first = Claim::take(&work).unwrap();
+    assert!(matches!(Claim::take(&work), Err(RunError::Locked(_))));
+    let before = snapshot(&work);
+    let (r, rec) = run(&engine, &input, &s, &RunOutput::resume(&dir));
+    assert!(matches!(r, Err(RunError::Locked(_))), "{r:?}");
+    assert!(rec.events.is_empty(), "a refused run does nothing");
+    assert_eq!(snapshot(&work), before);
+    drop(first);
+    assert!(!work.join(LOCK_FILE).exists());
+
+    // Released: the resume proceeds, and the published run carries no lock.
+    run(&engine, &input, &s, &RunOutput::resume(&dir))
+        .0
+        .unwrap();
+    assert!(!dir.join(LOCK_FILE).exists());
+    assert!(!work.exists());
+    verify_run(&dir, None).unwrap();
+}
+
+#[test]
+fn a_missing_decoder_is_refused_before_any_stage_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let standard = tmp.path().join("YuE2-Vae");
+    fs::create_dir(&standard).unwrap();
+    let dirs = crate::snapshot::SnapshotDirs::new().with(
+        crate::inventory::ComponentId::VaeStandard
+            .component()
+            .repo
+            .id,
+        &standard,
+    );
+    let engine = engine().with_checked_decoders(dirs);
+    let input = SongInput::Request(request(CotMode::Off, 53));
+    let dir = tmp.path().join("song");
+    let (r, rec) = run(
+        &engine,
+        &input,
+        &settings(VaeVariant::Legacy),
+        &RunOutput::fresh(&dir),
+    );
+    let err = r.unwrap_err();
+    assert!(err.to_string().contains("offline cache miss"), "{err}");
+    assert!(rec.events.is_empty(), "no stage started");
+    assert!(!dir.exists() && !partial_dir(&dir).exists());
+    let (r, rec) = with_hooks(None, |h| {
+        engine.generate(input.request(), &settings(VaeVariant::Legacy), h)
+    });
+    assert!(r.is_err());
+    assert!(rec.events.is_empty());
+    engine
+        .check_decoder_available(VaeVariant::Standard)
+        .unwrap();
+}

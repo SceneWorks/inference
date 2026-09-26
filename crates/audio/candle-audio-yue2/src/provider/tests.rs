@@ -15,7 +15,14 @@ use crate::run::{verify_run, AUDIO_WAV, RESULT_JSON};
 
 /// A `LoadSpec` in the worker's shape: `weights` = the YuE2-3B snapshot, `vae` (+ optional
 /// `vae_legacy`) = the decoder snapshots.
+/// The snapshot directories are created (empty): only the existence check of the early decoder
+/// probe reads them; the synthetic engine stands in for their contents.
 fn spec(root: &Path, legacy: bool) -> LoadSpec {
+    for dir in ["YuE2-3B", "YuE2-Vae", "YuE2-Vae-legacy"] {
+        if dir != "YuE2-Vae-legacy" || legacy {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+    }
     let mut spec = LoadSpec::new(WeightsSource::Dir(root.join("YuE2-3B")))
         .with_component(VAE_COMPONENT_ID, WeightsSource::Dir(root.join("YuE2-Vae")));
     if legacy {
@@ -250,8 +257,12 @@ fn cancellation_through_the_generator_publishes_nothing() {
 fn the_offline_load_fails_explicitly_on_a_cache_miss() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = crate::provider_registry().unwrap();
+    let missing = LoadSpec::new(WeightsSource::Dir(tmp.path().join("YuE2-3B"))).with_component(
+        VAE_COMPONENT_ID,
+        WeightsSource::Dir(tmp.path().join("YuE2-Vae")),
+    );
     let err = registry
-        .load(PROVIDER_ID, &spec(tmp.path(), false))
+        .load(PROVIDER_ID, &missing)
         .err()
         .expect("nothing is staged");
     let text = err.to_string();
@@ -381,4 +392,34 @@ fn unread_or_conflicting_request_fields_are_refused() {
         base.abc().temperature(),
         "unset fields keep the defaults"
     );
+}
+
+#[test]
+fn an_unprovisioned_decoder_is_refused_before_any_compute() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Only the standard decoder is provisioned.
+    let generator = load_synthetic(&spec(tmp.path(), false)).unwrap();
+    let dir = tmp.path().join("song");
+    let mut req = song_request(Some(&dir));
+    req.audio.as_mut().unwrap().song.as_mut().unwrap().decoder = Some(SongDecoder::Legacy);
+    let err = generator.validate(&req).unwrap_err();
+    assert!(err.to_string().contains("offline cache miss"), "{err}");
+    let mut progress = 0;
+    let err = generator
+        .generate(&req, &mut |_| progress += 1)
+        .unwrap_err();
+    assert!(err.to_string().contains("offline cache miss"), "{err}");
+    assert_eq!(progress, 0, "nothing ran");
+    assert!(!dir.exists() && !crate::run::partial_dir(&dir).exists());
+    // The provisioned decoder passes the same check.
+    let mut standard = req.clone();
+    standard
+        .audio
+        .as_mut()
+        .unwrap()
+        .song
+        .as_mut()
+        .unwrap()
+        .decoder = Some(SongDecoder::Standard);
+    generator.validate(&standard).unwrap();
 }

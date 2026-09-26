@@ -615,7 +615,8 @@ fn rehosting_a_tier_is_not_authorized() {
     let tier_components = [ComponentId::Lm, ComponentId::QwenTiktoken];
     assert!(authorize(&tier_components, IntendedUse::NoncommercialExperimentation).is_ok());
     let refused = authorize(&tier_components, IntendedUse::Redistribution).unwrap_err();
-    assert!(refused.to_string().contains("yue2_3b"), "{refused}");
+    let why = refused.to_string();
+    assert!(why.contains("Lm:") && why.contains("QwenTiktoken:"), "{why}");
     let src = source();
     let dir = convert_to(&src, Tier::Q8, "q8");
     let note = read_manifest(&dir).unwrap()["license"]["note"]

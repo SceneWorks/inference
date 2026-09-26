@@ -146,6 +146,74 @@ fn fixture_with(edit_manifest: impl FnOnce(&mut Vec<serde_json::Value>)) -> Fixt
     }
 }
 
+/// A pinned synthetic snapshot of `repo` written into `dir`: a tiny safetensors weights file, a
+/// config and `extra` files (licence / notice texts), with a conversion manifest over the real
+/// tensor digests — a [`Component`] the production verifier accepts. Shared with the closure
+/// tests (sc-22994).
+pub(crate) fn synthetic_snapshot(
+    dir: &std::path::Path,
+    id: ComponentId,
+    key: &'static str,
+    repo: UpstreamRepo,
+    extra: &[(&'static str, &[u8], FileRole)],
+) -> &'static Component {
+    std::fs::create_dir_all(dir).unwrap();
+    let t = tensors();
+    let weights = safetensors_bytes(&t);
+    let config = br#"{"model_type": "yue2_synthetic"}"#.to_vec();
+    let mut files: Vec<(&'static str, Vec<u8>, FileRole)> = vec![
+        ("config.json", config, FileRole::Config),
+        ("model.safetensors", weights.clone(), FileRole::Weights),
+    ];
+    files.extend(extra.iter().map(|(p, b, r)| (*p, b.to_vec(), *r)));
+    for (path, bytes, _) in &files {
+        let to = path
+            .split('/')
+            .fold(dir.to_path_buf(), |d, part| d.join(part));
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(to, bytes).unwrap();
+    }
+    let pinned: Vec<PinnedFile> = files
+        .iter()
+        .map(|(path, bytes, role)| PinnedFile {
+            path,
+            bytes: bytes.len() as u64,
+            sha256: leak_str(sha(bytes)),
+            role: *role,
+        })
+        .collect();
+    let rows: Vec<serde_json::Value> = t
+        .iter()
+        .map(|(name, dtype, shape, data)| {
+            serde_json::json!({"name": name, "dtype": dtype, "shape": shape, "sha256": sha(data)})
+        })
+        .collect();
+    let source_files: serde_json::Map<String, serde_json::Value> = files
+        .iter()
+        .map(|(path, bytes, _)| {
+            (
+                path.to_string(),
+                serde_json::json!({"bytes": bytes.len(), "sha256": sha(bytes)}),
+            )
+        })
+        .collect();
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "component": key,
+        "source": {"repo": repo.id, "revision": repo.revision, "files": source_files},
+        "conversion": {"kind": "identity"},
+        "native": {"file": "model.safetensors", "bytes": weights.len(), "sha256": sha(&weights)},
+        "tensors": rows,
+    });
+    leak(Component {
+        id,
+        key,
+        repo,
+        files: Box::leak(pinned.into_boxed_slice()),
+        manifest_json: leak_str(manifest.to_string()),
+    })
+}
+
 fn fixture() -> Fixture {
     fixture_with(|_| {})
 }
