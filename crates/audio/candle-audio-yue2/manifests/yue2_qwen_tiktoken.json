@@ -1,0 +1,34 @@
+{
+ "schema": 1,
+ "component": "yue2_qwen_tiktoken",
+ "source": {
+  "repo": "m-a-p/YuE2-3B",
+  "revision": "1a96eca688d6ae5d7f0feb88573fec89920fcd19",
+  "upstream_integrity": "none published upstream (pinned revision + sha256 only)",
+  "files": {
+   "qwen.tiktoken": {
+    "bytes": 2561218,
+    "sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186"
+   }
+  }
+ },
+ "reference": {
+  "script": "scripts/reference/yue2/asset_manifest.py",
+  "yue2_commit": "92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+  "torch": "2.10.0",
+  "safetensors": "0.7.0"
+ },
+ "conversion": {
+  "kind": "identity",
+  "note": "tiktoken BPE ranks file read natively as-is"
+ },
+ "native": {
+  "file": "qwen.tiktoken",
+  "bytes": 2561218,
+  "sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186"
+ },
+ "tokenizer": {
+  "format": "tiktoken-bpe-ranks",
+  "ordinary_tokens": 151643
+ }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "candle-audio-yue2"
+version = "0.0.0"
+edition = "2021"
+description = "YuE2 noncommercial music-generation provider for the SceneWorks Candle audio lane (epic sc-22988) — distinct from YuE1 (`candle-audio-yue`). This slice (sc-22989) is the pinned asset closure: an integrity-checked inventory of YuE2-3B, qwen.tiktoken, the standard/legacy VAEs and the SheetSage2 + MERT-v2-FullSong cover closure, offline snapshot verification against committed conversion manifests, and the licence policy that separates the Apache-2.0 source from the CC BY-NC 4.0 weights."
+# The crate's own code. The model WEIGHTS it resolves are CC BY-NC 4.0 (see `licenses/` and the
+# `license` module); the weights are never vendored here.
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "music", "yue2"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons: re-exports `gen_core` (the `ComponentLicense` rows) and
+# `candle_core` (the native safetensors loader the tensor-value check runs through), so this crate
+# resolves the SAME candle build + gen-core rev as the catalog it will register into.
+candle-audio = { path = "../candle-audio" }
+# Streaming SHA-256 over every pinned file as it is read from the snapshot.
+sha2 = { workspace = true }
+# Committed conversion manifests (`manifests/*.json`) and safetensors headers.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# RAII roots for the synthetic snapshot fixtures (missing / corrupt / truncated shards, cache miss).
+tempfile = { workspace = true }
+
+[features]
+default = []
+# Apple Metal / NVIDIA CUDA backends, forwarded to the audio commons. Not in `default`; nothing in
+# this slice touches a GPU (the asset checks are CPU-only).
+metal = ["candle-audio/metal"]
+cuda = ["candle-audio/cuda"]
