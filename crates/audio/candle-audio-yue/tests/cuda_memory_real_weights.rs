@@ -31,7 +31,10 @@
 //! - `device_*`: `cuMemGetInfo` used bytes sampled every 20 ms — the device-wide view NVML reports,
 //!   so a co-tenant on the same GPU inflates it. `*_above_baseline` subtracts the GPU's
 //!   `nvidia-smi` `memory.used` taken before this process created a CUDA context, so the context
-//!   itself is charged to the render.
+//!   itself is charged to the render. On the Windows (WDDM) runner `cuMemGetInfo` also counts
+//!   memory the driver reserves that nvidia-smi does not (~1.2 GiB over nvidia-smi's peak on the
+//!   first capture); the workflow's own nvidia-smi series (split into these phases by `t0_unix`) is the
+//!   NVML figure.
 //! - `pool_*`: the stream-ordered memory pool candle allocates every tensor from (cudarc's
 //!   `cuMemAllocAsync` on the device's current pool) — process-local, immune to co-tenants, and the
 //!   pool's own high watermarks catch spikes between samples. `pool_reserved_high` is what the pool
@@ -422,6 +425,12 @@ fn measure_one_case() {
     let t0 = probe.origin();
     #[cfg(not(feature = "cuda"))]
     let t0 = Instant::now();
+    // Wall-clock anchor of t0, so an external sampler's timestamps can be split into the phases.
+    let t0_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs_f64()
+        - t0.elapsed().as_secs_f64();
     let mut marks: Vec<(&'static str, f64, (u64, u64))> = Vec::new();
     let mark = |label: &'static str, marks: &mut Vec<_>| {
         #[cfg(feature = "cuda")]
@@ -529,6 +538,7 @@ fn measure_one_case() {
             "reference_region": req.audio.as_ref().and_then(|a| a.reference_region).map(|r| (r.start_secs, r.end_secs)),
             "seed": SEED,
         },
+        "t0_unix": t0_unix,
         "wall_s": wall,
         "song_s": song_secs,
         "phases": phases,

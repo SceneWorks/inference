@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 import urllib.request
 from pathlib import Path
 
@@ -127,28 +128,44 @@ def stage_reference(ref_dir: Path, with_stems: bool = False) -> None:
 GIB = 1024**3
 
 
-def nvidia_smi_peak(csv_path: Path, pci: str | None) -> dict | None:
-    """First sample and max `memory.used` (MiB) of the GPU at `pci` in a sampler CSV.
+def nvidia_smi_peak(csv_path: Path, pci: str | None, record: dict) -> dict | None:
+    """Baseline and peak `memory.used` (MiB) of the GPU at `pci` in a sampler CSV, overall and per
+    phase of `record`.
 
     Rows are `timestamp, index, pci.bus_id, memory.used` every 500 ms from before the case's
-    process starts, so the first row is the pre-process baseline.
+    process starts, so the first row is the pre-process baseline. nvidia-smi's timestamps are the
+    runner's local time, which is also where this runs, so they convert with `time.mktime`.
     """
     if not csv_path.is_file():
         return None
-    used = []
+    rows = []
     for line in csv_path.read_text(encoding="utf-8", errors="replace").splitlines():
         cells = [c.strip() for c in line.split(",")]
         if len(cells) != 4 or not cells[3].isdigit():
             continue
         if pci is None or cells[2].upper() == pci.upper():
-            used.append(int(cells[3]))
-    if not used:
+            try:
+                stamp, _, frac = cells[0].partition(".")
+                t = time.mktime(time.strptime(stamp, "%Y/%m/%d %H:%M:%S")) + float(f"0.{frac or 0}")
+            except ValueError:
+                t = None
+            rows.append((t, int(cells[3])))
+    if not rows:
         return None
+    base = rows[0][1]
+    phases = {}
+    t0 = record.get("t0_unix")
+    if t0 is not None:
+        for p in record["phases"]:
+            inside = [m for t, m in rows if t is not None and t0 + p["start_s"] <= t <= t0 + p["end_s"]]
+            phases[p["phase"]] = (max(inside) - base) / 1024 if inside else None
+    peak = max(m for _, m in rows)
     return {
-        "baseline_mib": used[0],
-        "peak_mib": max(used),
-        "peak_above_baseline_gib": (max(used) - used[0]) / 1024,
-        "samples": len(used),
+        "baseline_mib": base,
+        "peak_mib": peak,
+        "peak_above_baseline_gib": (peak - base) / 1024,
+        "phase_peak_above_baseline_gib": phases,
+        "samples": len(rows),
     }
 
 
@@ -170,7 +187,7 @@ def summarize_memory(evidence: Path) -> None:
                 "device_peak_above_baseline_gib": cuda.get("device_peak_above_baseline_gib"),
                 "pool_reserved_high_gib": cuda.get("pool_reserved_high_gib"),
                 "pool_used_high_gib": cuda.get("pool_used_high_gib"),
-                "nvidia_smi": nvidia_smi_peak(csv_path, cuda.get("pci_bus_id")),
+                "nvidia_smi": nvidia_smi_peak(csv_path, cuda.get("pci_bus_id"), record),
                 "phases": {
                     p["phase"]: {
                         "wall_s": p["wall_s"],
@@ -190,13 +207,14 @@ def summarize_memory(evidence: Path) -> None:
     phases = ["stage1_load", "stage1_decode", "stage2_load", "stage2", "decode"]
     lines = [
         "| case | tier | device peak GiB (above baseline) | nvidia-smi peak GiB | pool reserved GiB "
-        "| pool used GiB | " + " | ".join(f"{p} dev/pool GiB" for p in phases) + " | wall s | song s |",
+        "| pool used GiB | " + " | ".join(f"{p} smi/pool GiB" for p in phases) + " | wall s | song s |",
         "|" + "---|" * (8 + len(phases)),
     ]
     for c in cases:
         smi = c["nvidia_smi"] or {}
+        smi_phase = smi.get("phase_peak_above_baseline_gib") or {}
         per_phase = [
-            f"{gib(c['phases'].get(p, {}).get('device_peak_above_baseline_gib'))}/"
+            f"{gib(smi_phase.get(p))}/"
             f"{gib(c['phases'].get(p, {}).get('pool_reserved_high_gib'))}"
             for p in phases
         ]
