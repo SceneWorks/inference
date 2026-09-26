@@ -99,14 +99,14 @@ fn the_registration_is_a_distinct_conforming_yue2_provider() {
             row.component
         );
     }
-    for component in PROVIDER_COMPONENTS[0].components {
-        assert!(
-            crate::COMPONENT_LICENSES
-                .iter()
-                .any(|r| r.component == *component),
-            "{component} has a licence row"
-        );
-    }
+    let rows: Vec<&str> = PROVIDER_COMPONENT_LICENSES
+        .iter()
+        .map(|r| r.component)
+        .collect();
+    assert_eq!(
+        rows, PROVIDER_COMPONENTS[0].components,
+        "exactly the loaded components have published rows"
+    );
 }
 
 #[test]

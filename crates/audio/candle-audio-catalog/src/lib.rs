@@ -55,6 +55,7 @@ pub mod providers {
     pub use candle_audio_stable_audio_3;
     pub use candle_audio_whisper;
     pub use candle_audio_yue;
+    pub use candle_audio_yue2;
 }
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
@@ -62,7 +63,8 @@ pub mod providers {
 /// small-music — sc-14543 and small-sfx — sc-14544, MOSS-TTS-Realtime
 /// streaming TTS — sc-13392, Chatterbox clone-TTS — sc-13239, MMAudio video→audio Foley 16k — sc-12843
 /// and 44.1 kHz — sc-13441, MOSS-TTSD dialogue — sc-13518, the six YuE lyrics2song variants —
-/// sc-19382), then the voice-cloning identity embedder (Chatterbox `ve`, sc-12844),
+/// sc-19382, and the noncommercial YuE2 song generator `yue2` — sc-22994), then the voice-cloning
+/// identity embedder (Chatterbox `ve`, sc-12844),
 /// then the audio transforms
 /// (OpenVoice V2 voice conversion, sc-13223 — the first real `AudioTransform`), then the
 /// transcribers (Whisper ASR, sc-12850 — the first real `Transcriber`, the audio Captioner-analog),
@@ -78,6 +80,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_audio_mmaudio::register_providers(registry);
     let registry = candle_audio_moss_tts::register_providers(registry);
     let registry = candle_audio_yue::register_providers(registry);
+    let registry = candle_audio_yue2::register_providers(registry);
     let registry = candle_audio_chatterbox_ve::register_providers(registry);
     let registry = candle_audio_openvoice::register_providers(registry);
     let registry = candle_audio_whisper::register_providers(registry);
@@ -141,6 +144,8 @@ pub fn component_licenses() -> Vec<gen_core::ComponentLicense> {
     rows.extend_from_slice(candle_audio_mmaudio::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_moss_tts::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_yue::COMPONENT_LICENSES);
+    // The generation closure only; the cover closure's rows arrive with the provider that loads it.
+    rows.extend_from_slice(candle_audio_yue2::PROVIDER_COMPONENT_LICENSES);
     // Deliberately empty: `chatterbox_ve` loads the row `candle-audio-chatterbox` already owns.
     rows.extend_from_slice(candle_audio_chatterbox_ve::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_openvoice::COMPONENT_LICENSES);
@@ -162,6 +167,7 @@ pub fn provider_components() -> Vec<gen_core::ProviderComponents> {
     providers.extend_from_slice(candle_audio_mmaudio::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_moss_tts::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_yue::PROVIDER_COMPONENTS);
+    providers.extend_from_slice(candle_audio_yue2::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_chatterbox_ve::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_openvoice::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_whisper::PROVIDER_COMPONENTS);
@@ -315,12 +321,16 @@ mod tests {
     /// a provider that would fail bundle validation is caught in its own family first.
     /// sc-19382: the segmented-song / reference-window controls fail closed on every shipped
     /// generator that does not read them — only YuE advertises them (the window on ICL only).
-    /// sc-19378 adds `output_limiter` (YuE's clamp / rescale), YuE-only as well.
+    /// sc-19378 adds `output_limiter` (YuE's clamp / rescale), YuE-only as well. sc-22994 adds
+    /// `song` / `artifacts`, which only YuE2 reads.
     #[test]
     fn segmented_song_controls_reach_only_the_models_that_read_them() {
-        use super::gen_core::{AudioParams, Error, GenerationRequest, OutputLimiter, TimeRegion};
+        use super::gen_core::{
+            AudioArtifacts, AudioParams, Error, GenerationRequest, OutputLimiter, SongParams,
+            TimeRegion,
+        };
         let registry = super::provider_registry().unwrap();
-        let fields: [(&str, AudioParams); 6] = [
+        let fields: [(&str, AudioParams); 8] = [
             (
                 "segments",
                 AudioParams {
@@ -367,6 +377,22 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            // sc-22994: the symbolic-song controls and the artifact record reach YuE2 and only
+            // YuE2.
+            (
+                "song",
+                AudioParams {
+                    song: Some(SongParams::default()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "artifacts",
+                AudioParams {
+                    artifacts: Some(AudioArtifacts::default()),
+                    ..Default::default()
+                },
+            ),
         ];
         for r in registry.generators() {
             let d = (r.descriptor)();
@@ -380,8 +406,12 @@ mod tests {
                 .validate_request_audio(d.id, &request(AudioParams::default()))
                 .unwrap_or_else(|e| panic!("{}: baseline refused: {e}", d.id));
             for (field, audio) in &fields {
-                let reads = d.id.starts_with("yue_")
-                    && (*field != "reference_region" || d.id.ends_with("_icl"));
+                let reads = if matches!(*field, "song" | "artifacts") {
+                    d.id == "yue2"
+                } else {
+                    d.id.starts_with("yue_")
+                        && (*field != "reference_region" || d.id.ends_with("_icl"))
+                };
                 let got = d
                     .capabilities
                     .validate_request_audio(d.id, &request(audio.clone()));
@@ -428,7 +458,8 @@ mod tests {
                 "yue_zh_cot",
                 "yue_zh_icl",
                 "yue_jp_kr_cot",
-                "yue_jp_kr_icl"
+                "yue_jp_kr_icl",
+                "yue2"
             ]
         );
         // The voice-cloning identity embedder surfaces as its own kind (sc-12844), in catalog order.
@@ -598,6 +629,16 @@ mod tests {
             "notice_file_required",
         ];
         const MIT_ONLY: [&str; 1] = ["attribution_required"];
+        // YuE2's generation closure (sc-22994): CC BY-NC 4.0 weights (non-commercial, attribution)
+        // plus the Tongyi Qianwen tokenizer terms (two deployer obligations, notice, licence copy).
+        const YUE2: [&str; 6] = [
+            "attribution_required",
+            "deployer_obligation",
+            "deployer_obligation",
+            "downstream_license_copy",
+            "non_commercial_weights",
+            "notice_file_required",
+        ];
         // Two acceptable-use policies (Gemma's and Stability's) and two licence-copy duties stay
         // TWO elements each: a distributor of a Stable Audio 3 render hands over two documents, not
         // one, and a union that deduped them would show a user one obligation where the catalog
@@ -782,6 +823,18 @@ mod tests {
                     "xcodec_mini_infer",
                 ],
                 APACHE.to_vec(),
+            ),
+            // YuE2 (sc-22994): the generation closure — the CC BY-NC 4.0 MoT and decoders plus the
+            // Tongyi Qianwen `qwen.tiktoken` — never the cover closure.
+            (
+                "yue2",
+                vec![
+                    "yue2_3b",
+                    "yue2_qwen_tiktoken",
+                    "yue2_vae",
+                    "yue2_vae_legacy",
+                ],
+                YUE2.to_vec(),
             ),
             // The same artifact row the generator points at — one checkpoint, one row, two
             // providers.

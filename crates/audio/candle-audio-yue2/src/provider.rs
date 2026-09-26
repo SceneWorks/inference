@@ -587,6 +587,16 @@ candle_audio::register_generators! {
 /// The registration, in catalog order.
 pub const REGISTRATIONS: [gen_core::registry::ModelRegistration; 1] = [REGISTRATION];
 
+/// The licence rows of the components this provider loads (the generation closure) — what the
+/// audio catalog publishes. The cover closure's rows ([`crate::license::COMPONENT_LICENSES`]) join
+/// the catalog with the provider that loads them.
+pub const PROVIDER_COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[
+    crate::license::LICENSE_YUE2_3B,
+    crate::license::LICENSE_QWEN_TIKTOKEN,
+    crate::license::LICENSE_YUE2_VAE,
+    crate::license::LICENSE_YUE2_VAE_LEGACY,
+];
+
 /// Provider → component mapping: the generation closure (MoT, tokenizer, both decoders). The
 /// cover closure (SheetSage2 + MERT-v2-FullSong) is not loaded by this provider.
 pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::ProviderComponents {

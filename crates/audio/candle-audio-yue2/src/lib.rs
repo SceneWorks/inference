@@ -112,7 +112,8 @@ pub use nar::{synthesize, NarOptions, QueryTile, SongNoise, SynthesisRequest, Yu
 pub use plan::{PlanError, PlanIdentity, PlanStep, SemanticConditioning, SymbolicPlan};
 pub use protocol::{CotMode, GenerationConfig, ProtocolError, Sampling, SongRequest};
 pub use provider::{
-    descriptor, load, PROVIDER_COMPONENTS, PROVIDER_ID, REGISTRATION, REGISTRATIONS,
+    descriptor, load, PROVIDER_COMPONENTS, PROVIDER_COMPONENT_LICENSES, PROVIDER_ID, REGISTRATION,
+    REGISTRATIONS,
 };
 pub use run::{verify_run, RunError, RunOutcome, RunOutput, SongInput};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
