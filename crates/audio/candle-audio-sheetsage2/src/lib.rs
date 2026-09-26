@@ -48,7 +48,7 @@
 #![deny(rustdoc::private_intra_doc_links)]
 
 pub mod chord_spelling;
-pub mod cover;
+// pub mod cover;
 pub mod events;
 pub mod exports;
 pub mod grammar;
@@ -111,4 +111,11 @@ impl Error {
             source,
         }
     }
+}
+
+/// Serializes tests that observe process-wide state (the live-model count).
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

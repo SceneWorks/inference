@@ -299,4 +299,4 @@ impl SheetSage2Model {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
