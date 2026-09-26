@@ -1,0 +1,2089 @@
+{
+ "provenance": {
+  "generator": "scripts/reference/yue2/protocol_fixtures.py",
+  "yue2_commit": "92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+  "python": "3.12.13",
+  "unicodedata": "15.0.0",
+  "tiktoken": "0.12.0",
+  "torch": "2.10.0"
+ },
+ "sampling": [
+  {
+   "phase": "abc",
+   "overrides": {},
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": 0
+   },
+   "ok": {
+    "temperature": 0,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": 5
+   },
+   "ok": {
+    "temperature": 5,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": 5.0
+   },
+   "ok": {
+    "temperature": 5.0,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_p": 1
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 1,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_p": 1e-09
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 1e-09,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": 1
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 1,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": 1000000000000
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 1000000000000,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "repetition_penalty": 1e-09
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1e-09,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "penalty_window": 1
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 1,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "penalty_window": 100
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "min_tokens": 0,
+    "max_tokens": 1
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 0,
+    "max_tokens": 1
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "min_tokens": 9000,
+    "max_tokens": 9000
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 9000,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": 2,
+    "top_p": 0.5,
+    "top_k": 7,
+    "repetition_penalty": 1,
+    "penalty_window": 64,
+    "min_tokens": 10,
+    "max_tokens": 20
+   },
+   "ok": {
+    "temperature": 2,
+    "top_p": 0.5,
+    "top_k": 7,
+    "repetition_penalty": 1,
+    "penalty_window": 64,
+    "min_tokens": 10,
+    "max_tokens": 20
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": -0.01
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": 5.0001
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": {
+     "float": "nan"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": {
+     "float": "inf"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_p": 0
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_p": 1.0001
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_p": {
+     "float": "nan"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": 0
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": -3
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": 30.0
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": true
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": "30"
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "repetition_penalty": 0
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "repetition_penalty": -1
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "repetition_penalty": {
+     "float": "-inf"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "penalty_window": 0
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "penalty_window": 101
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "penalty_window": 50.0
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "min_tokens": -1
+   },
+   "error": "ValueError: Require 0 <= min_tokens <= max_tokens"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "min_tokens": 10,
+    "max_tokens": 9
+   },
+   "error": "ValueError: Require 0 <= min_tokens <= max_tokens"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "max_tokens": 0,
+    "min_tokens": 0
+   },
+   "error": "ValueError: Require 0 <= min_tokens <= max_tokens"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "max_tokens": 4096.0
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "min_tokens": false
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": "0.7"
+   },
+   "error": "TypeError: must be real number, not str"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "temperature": null
+   },
+   "error": "TypeError: must be real number, not NoneType"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "seed": 1
+   },
+   "error": "TypeError: Sampling.__init__() got an unexpected keyword argument 'seed'"
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_n": 3
+   },
+   "error": "TypeError: Sampling.__init__() got an unexpected keyword argument 'top_n'"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {},
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": 0
+   },
+   "ok": {
+    "temperature": 0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": 5
+   },
+   "ok": {
+    "temperature": 5,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": 5.0
+   },
+   "ok": {
+    "temperature": 5.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_p": 1
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 1,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_p": 1e-09
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 1e-09,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": 1
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 1,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": 1000000000000
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 1000000000000,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "repetition_penalty": 1e-09
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1e-09,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "penalty_window": 1
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 1,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "penalty_window": 100
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 100,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "min_tokens": 0,
+    "max_tokens": 1
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 0,
+    "max_tokens": 1
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "min_tokens": 9000,
+    "max_tokens": 9000
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 9000,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": 2,
+    "top_p": 0.5,
+    "top_k": 7,
+    "repetition_penalty": 1,
+    "penalty_window": 64,
+    "min_tokens": 10,
+    "max_tokens": 20
+   },
+   "ok": {
+    "temperature": 2,
+    "top_p": 0.5,
+    "top_k": 7,
+    "repetition_penalty": 1,
+    "penalty_window": 64,
+    "min_tokens": 10,
+    "max_tokens": 20
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": -0.01
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": 5.0001
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": {
+     "float": "nan"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": {
+     "float": "inf"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_p": 0
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_p": 1.0001
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_p": {
+     "float": "nan"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": 0
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": -3
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": 30.0
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": true
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": "30"
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "repetition_penalty": 0
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "repetition_penalty": -1
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "repetition_penalty": {
+     "float": "-inf"
+    }
+   },
+   "error": "ValueError: Sampling numbers must be finite"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "penalty_window": 0
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "penalty_window": 101
+   },
+   "error": "ValueError: Invalid repetition penalty/window"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "penalty_window": 50.0
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "min_tokens": -1
+   },
+   "error": "ValueError: Require 0 <= min_tokens <= max_tokens"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "min_tokens": 10,
+    "max_tokens": 9
+   },
+   "error": "ValueError: Require 0 <= min_tokens <= max_tokens"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "max_tokens": 0,
+    "min_tokens": 0
+   },
+   "error": "ValueError: Require 0 <= min_tokens <= max_tokens"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "max_tokens": 4096.0
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "min_tokens": false
+   },
+   "error": "ValueError: Sampling counts must be integers"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": "0.7"
+   },
+   "error": "TypeError: must be real number, not str"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": null
+   },
+   "error": "TypeError: must be real number, not NoneType"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "seed": 1
+   },
+   "error": "TypeError: Sampling.__init__() got an unexpected keyword argument 'seed'"
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_n": 3
+   },
+   "error": "TypeError: Sampling.__init__() got an unexpected keyword argument 'top_n'"
+  }
+ ],
+ "generation_config": [
+  {
+   "input": {},
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "ode_steps": 1
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 1,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "ode_steps": 64
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 64,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "ode_steps": 0
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "ode_steps": -1
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "ode_steps": 32.0
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "ode_steps": true
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "ode_method": "euler"
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "ode_method": "midpoint"
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "context": 24575
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "context": 24576
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "context": 24577
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "version": "yue2-native-v1"
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "abc": {
+     "temperature": 0.5
+    }
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.5,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "semantic": {
+     "max_tokens": 12000,
+     "min_tokens": 0
+    }
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 0,
+     "max_tokens": 12000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "abc": {
+     "top_k": 0
+    }
+   },
+   "error": "ValueError: Invalid sampling temperature/top_p/top_k"
+  },
+  {
+   "input": {
+    "abc": {
+     "bogus": 1
+    }
+   },
+   "error": "TypeError: Sampling.__init__() got an unexpected keyword argument 'bogus'"
+  },
+  {
+   "input": {
+    "unknown": 1
+   },
+   "error": "TypeError: GenerationConfig.__init__() got an unexpected keyword argument 'unknown'"
+  },
+  {
+   "input": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  }
+ ],
+ "request": [
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "off"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "off",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.01,
+    "text": "Generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "melody"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "melody",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a melody-only ABC transcription without chord symbols, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "full"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "FULL"
+   },
+   "error": "ValueError: cot must be off, melody or full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": ""
+   },
+   "error": "ValueError: cot must be off, melody or full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": null
+   },
+   "error": "ValueError: cot must be off, melody or full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "seed": 0
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 0,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "seed": 9223372036854775807
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 9223372036854775807,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "seed": 9223372036854775808
+   },
+   "error": "ValueError: seed must be an integer in [0, 2**63)"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "seed": -1
+   },
+   "error": "ValueError: seed must be an integer in [0, 2**63)"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "seed": 1.0
+   },
+   "error": "ValueError: seed must be an integer in [0, 2**63)"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "seed": true
+   },
+   "error": "ValueError: seed must be an integer in [0, 2**63)"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "seed": "1"
+   },
+   "error": "ValueError: seed must be an integer in [0, 2**63)"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "song"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": ".x"
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "_x"
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "a/b"
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "a b"
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "café"
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "A.b-c_9"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "A.b-c_9"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": ""
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "id": "x\n"
+   },
+   "error": "ValueError: id must be a filename-safe identifier"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "off",
+    "abc": "X:1"
+   },
+   "error": "ValueError: External ABC requires nonempty text and cot=melody/full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "melody",
+    "abc": "X:1"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "melody",
+     "seed": 831001,
+     "abc": "X:1",
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a melody-only ABC transcription without chord symbols, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "full",
+    "abc": ""
+   },
+   "error": "ValueError: External ABC requires nonempty text and cot=melody/full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "abc": "  \n\t"
+   },
+   "error": "ValueError: External ABC requires nonempty text and cot=melody/full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "abc": "\u001c\u001d\u001e\u001f"
+   },
+   "error": "ValueError: External ABC requires nonempty text and cot=melody/full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "abc": "　 "
+   },
+   "error": "ValueError: External ABC requires nonempty text and cot=melody/full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "abc": "​"
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": "​",
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "abc": 5
+   },
+   "error": "ValueError: External ABC requires nonempty text and cot=melody/full"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": 0
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": 0,
+     "id": "song"
+    },
+    "guidance": 0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": 20
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": 20,
+     "id": "song"
+    },
+    "guidance": 20,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": 20.0001
+   },
+   "error": "ValueError: cfg_scale must be finite and in [0,20]"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": -0.0
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": -0.0,
+     "id": "song"
+    },
+    "guidance": -0.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": -1
+   },
+   "error": "ValueError: cfg_scale must be finite and in [0,20]"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": 1.5
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": 1.5,
+     "id": "song"
+    },
+    "guidance": 1.5,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": {
+     "float": "nan"
+    }
+   },
+   "error": "ValueError: cfg_scale must be finite and in [0,20]"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": {
+     "float": "inf"
+    }
+   },
+   "error": "ValueError: cfg_scale must be finite and in [0,20]"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": null
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.0,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cot": "off",
+    "cfg_scale": null
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "off",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": null,
+     "id": "song"
+    },
+    "guidance": 1.01,
+    "text": "Generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": 5,
+    "lyrics": "[Verse]\nla la"
+   },
+   "error": "TypeError: style and lyrics must be strings"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": null
+   },
+   "error": "TypeError: style and lyrics must be strings"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "extra": 1
+   },
+   "error": "TypeError: SongRequest.__init__() got an unexpected keyword argument 'extra'"
+  },
+  {
+   "input": {
+    "lyrics": "[Verse]\nla la"
+   },
+   "error": "TypeError: SongRequest.__init__() missing 1 required positional argument: 'style'"
+  },
+  {
+   "input": {
+    "style": "pop"
+   },
+   "error": "TypeError: SongRequest.__init__() missing 1 required positional argument: 'lyrics'"
+  }
+ ],
+ "chunk_ranges": [
+  {
+   "frames": 1,
+   "prefix_tokens": 100,
+   "context": 24576,
+   "ok": [
+    [
+     0,
+     1
+    ]
+   ]
+  },
+  {
+   "frames": 1500,
+   "prefix_tokens": 800,
+   "context": 24576,
+   "ok": [
+    [
+     0,
+     1500
+    ]
+   ]
+  },
+  {
+   "frames": 30000,
+   "prefix_tokens": 100,
+   "context": 24576,
+   "ok": [
+    [
+     0,
+     12236
+    ],
+    [
+     12236,
+     24472
+    ],
+    [
+     24472,
+     30000
+    ]
+   ]
+  },
+  {
+   "frames": 24000,
+   "prefix_tokens": 1,
+   "context": 24576,
+   "ok": [
+    [
+     0,
+     12286
+    ],
+    [
+     12286,
+     24000
+    ]
+   ]
+  },
+  {
+   "frames": 5,
+   "prefix_tokens": 24571,
+   "context": 24576,
+   "ok": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     5
+    ]
+   ]
+  },
+  {
+   "frames": 5,
+   "prefix_tokens": 24572,
+   "context": 24576,
+   "error": "ValueError: Empty codec or prefix leaves no acoustic context"
+  },
+  {
+   "frames": 5,
+   "prefix_tokens": 24573,
+   "context": 24576,
+   "error": "ValueError: Empty codec or prefix leaves no acoustic context"
+  },
+  {
+   "frames": 5,
+   "prefix_tokens": 30000,
+   "context": 24576,
+   "error": "ValueError: Empty codec or prefix leaves no acoustic context"
+  },
+  {
+   "frames": 0,
+   "prefix_tokens": 100,
+   "context": 24576,
+   "error": "ValueError: Empty codec or prefix leaves no acoustic context"
+  },
+  {
+   "frames": 10,
+   "prefix_tokens": 4,
+   "context": 11,
+   "ok": [
+    [
+     0,
+     2
+    ],
+    [
+     2,
+     4
+    ],
+    [
+     4,
+     6
+    ],
+    [
+     6,
+     8
+    ],
+    [
+     8,
+     10
+    ]
+   ]
+  },
+  {
+   "frames": 10,
+   "prefix_tokens": 4,
+   "context": 10,
+   "ok": [
+    [
+     0,
+     1
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     2,
+     3
+    ],
+    [
+     3,
+     4
+    ],
+    [
+     4,
+     5
+    ],
+    [
+     5,
+     6
+    ],
+    [
+     6,
+     7
+    ],
+    [
+     7,
+     8
+    ],
+    [
+     8,
+     9
+    ],
+    [
+     9,
+     10
+    ]
+   ]
+  },
+  {
+   "frames": 10,
+   "prefix_tokens": 4,
+   "context": 24577,
+   "error": "ValueError: context must be an integer in 1..24576"
+  },
+  {
+   "frames": 10,
+   "prefix_tokens": 4,
+   "context": 0,
+   "error": "ValueError: context must be an integer in 1..24576"
+  }
+ ],
+ "budget": [
+  {
+   "prefix_tokens": 100,
+   "negative_tokens": null,
+   "max_tokens": 9000,
+   "cfg_scale": 1.0,
+   "ok": true
+  },
+  {
+   "prefix_tokens": 15576,
+   "negative_tokens": null,
+   "max_tokens": 9000,
+   "cfg_scale": 1.0,
+   "ok": true
+  },
+  {
+   "prefix_tokens": 15577,
+   "negative_tokens": null,
+   "max_tokens": 9000,
+   "cfg_scale": 1.0,
+   "error": "ValueError: Prefix + requested generation budget exceeds 24576; no implicit truncation"
+  },
+  {
+   "prefix_tokens": 24575,
+   "negative_tokens": null,
+   "max_tokens": 1,
+   "cfg_scale": 1.0,
+   "ok": true
+  },
+  {
+   "prefix_tokens": 24576,
+   "negative_tokens": null,
+   "max_tokens": 1,
+   "cfg_scale": 1.0,
+   "error": "ValueError: Prefix + requested generation budget exceeds 24576; no implicit truncation"
+  },
+  {
+   "prefix_tokens": 100,
+   "negative_tokens": null,
+   "max_tokens": 9000,
+   "cfg_scale": 1.5,
+   "error": "ValueError: CFG requires a negative prefix"
+  },
+  {
+   "prefix_tokens": 100,
+   "negative_tokens": 50,
+   "max_tokens": 9000,
+   "cfg_scale": 1.5,
+   "ok": true
+  },
+  {
+   "prefix_tokens": 100,
+   "negative_tokens": 15577,
+   "max_tokens": 9000,
+   "cfg_scale": 1.5,
+   "error": "ValueError: Negative prefix + generation budget exceeds context"
+  },
+  {
+   "prefix_tokens": 100,
+   "negative_tokens": 15576,
+   "max_tokens": 9000,
+   "cfg_scale": 1.01,
+   "ok": true
+  },
+  {
+   "prefix_tokens": 100,
+   "negative_tokens": 50,
+   "max_tokens": 9000,
+   "cfg_scale": 1.0,
+   "ok": true
+  },
+  {
+   "prefix_tokens": 100,
+   "negative_tokens": 24576,
+   "max_tokens": 1,
+   "cfg_scale": 1.0,
+   "error": "ValueError: Negative prefix + generation budget exceeds context"
+  }
+ ],
+ "python_isspace": [
+  9,
+  10,
+  11,
+  12,
+  13,
+  28,
+  29,
+  30,
+  31,
+  32,
+  133,
+  160,
+  5760,
+  8192,
+  8193,
+  8194,
+  8195,
+  8196,
+  8197,
+  8198,
+  8199,
+  8200,
+  8201,
+  8202,
+  8232,
+  8233,
+  8239,
+  8287,
+  12288
+ ]
+}
