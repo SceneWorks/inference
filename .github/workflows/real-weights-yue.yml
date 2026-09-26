@@ -19,9 +19,31 @@ name: YuE real-weight validation (CUDA)
 #
 # `nvidia-smi` samples device memory every 500 ms around each case. RECORD-ONLY: the box has a
 # second listener, so a co-tenant can inflate it, and no VRAM number is asserted.
+#
+# `mode: memory` (sc-19387) replaces the three smokes with the device-memory measurement feeding the
+# SceneWorks CUDA admission estimate: `tests/cuda_memory_real_weights.rs::measure_one_case`, one
+# process per (case, tier), at the Metal capture's request shapes -- `cot_default`, `icl_default`,
+# `cot_worst`, `icl_long` at q4, q8 and bf16 by default. It fetches the remaining tiers of the same
+# pinned rehosts plus the upstream song's vocal/instrumental stems, records per-phase device and
+# memory-pool peaks and wall time (record-only), and folds them into `memory-summary.{json,md}` in
+# the evidence artifact and the job summary. The default dispatch (`mode: smoke`) is unchanged.
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "smoke = the three real-weight renders; memory = the device-memory measurement"
+        type: choice
+        options: [smoke, memory]
+        default: smoke
+      memory_cases:
+        description: "memory mode: space-separated cases (cot_default icl_default cot_worst icl_long)"
+        type: string
+        default: "cot_default icl_default cot_worst icl_long"
+      memory_tiers:
+        description: "memory mode: space-separated tiers (q4 q8 bf16)"
+        type: string
+        default: "q4 q8 bf16"
 
 permissions:
   contents: read
@@ -37,11 +59,16 @@ env:
 jobs:
   # `timeout-minutes: 180` is a runaway guard for a lane that has never executed: a cold
   # `--features cuda` release build plus a one-time ~24 GB fetch, then three one-segment renders.
+  # The memory mode's 600 is the same kind of guard over twelve full songs (the Metal capture of
+  # the same shapes took ~3.7 h of render time), plus a one-time ~37 GB fetch of the other tiers.
   candle-audio-yue:
     name: Candle YuE lyrics2song real weights (CUDA)
     runs-on: [self-hosted, windows, cuda, real-weights]
-    timeout-minutes: 180
+    timeout-minutes: ${{ inputs.mode == 'memory' && 600 || 180 }}
     env:
+      YUE_MODE: ${{ inputs.mode || 'smoke' }}
+      YUE_MEMORY_CASES: ${{ inputs.memory_cases || 'cot_default icl_default cot_worst icl_long' }}
+      YUE_MEMORY_TIERS: ${{ inputs.memory_tiers || 'q4 q8 bf16' }}
       CANDLE_GEN_MODELS_ROOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SceneWorks--yue-s1-7b-anneal-en-cot-candle\snapshots\5842b8bc97d2a6dddc427a444920050dd3860949
       CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT: ${{ vars.CANDLE_GEN_MODELS_ROOT }}\models--SceneWorks--yue-s1-7b-anneal-en-icl-candle\snapshots\fc8cb3515e654d419c2831dcdaf931b61a050179
@@ -109,6 +136,18 @@ jobs:
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-icl-q4 --snapshot "%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s2-1b-general --snapshot "%CANDLE_AUDIO_YUE_S2_SNAPSHOT%" || exit /b 1
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-xcodec-mini-infer --snapshot "%CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT%" || exit /b 1
+      # Every tier of both stage-1 LMs and of stage 2, into the same pinned snapshots (reuses the
+      # hash-locked hub install from the step above).
+      - name: Materialize the memory mode's remaining tiers
+        if: ${{ env.YUE_MODE == 'memory' }}
+        shell: cmd
+        run: |
+          set "PYTHONPATH=%RUNNER_TEMP%\huggingface-hub"
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-cot-q4 --snapshot "%CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-cot-q8 --snapshot "%CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-icl-q8 --snapshot "%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s1-7b-anneal-en-icl-bf16 --snapshot "%CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT%" || exit /b 1
+          "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue-s2-1b-general-q8 --snapshot "%CANDLE_AUDIO_YUE_S2_SNAPSHOT%" || exit /b 1
       # The test reads `YUE_SNAPSHOT_ROOT/<repo>`. Hard links to the resolved blobs, not junctions:
       # hub-cache files are relative symlinks that do not resolve behind a junction (see the script).
       # The links need the root on the cache's volume; the script copies if they ever cannot.
@@ -121,15 +160,20 @@ jobs:
         run: |
           "%REVIEWED_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "%RUNNER_TEMP%\yue-reference-decode" -r .github/requirements/real-weights-yue-reference-windows-x64-py312.txt || exit /b 1
           set "PYTHONPATH=%RUNNER_TEMP%\yue-reference-decode"
-          "%REVIEWED_PYTHON%" scripts/release/yue_real_weights.py stage-reference --ref-dir "%YUE_REF_DIR%" > "%YUE_EVIDENCE%\reference-clip.log" 2>&1 || (type "%YUE_EVIDENCE%\reference-clip.log" & exit /b 1)
+          set "YUE_STEMS="
+          if "%YUE_MODE%"=="memory" set "YUE_STEMS=--with-stems"
+          "%REVIEWED_PYTHON%" scripts/release/yue_real_weights.py stage-reference --ref-dir "%YUE_REF_DIR%" %YUE_STEMS% > "%YUE_EVIDENCE%\reference-clip.log" 2>&1 || (type "%YUE_EVIDENCE%\reference-clip.log" & exit /b 1)
           type "%YUE_EVIDENCE%\reference-clip.log"
       # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings.
       - name: Build the YuE CUDA test binary
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --release -p candle-audio-yue --features cuda --test registered_loader_real_weights --no-run || exit /b 1
+          set "YUE_TEST=registered_loader_real_weights"
+          if "%YUE_MODE%"=="memory" set "YUE_TEST=cuda_memory_real_weights"
+          cargo test --locked --release -p candle-audio-yue --features cuda --test %YUE_TEST% --no-run || exit /b 1
       - name: Run the YuE real-weight renders
+        if: ${{ env.YUE_MODE != 'memory' }}
         shell: cmd
         run: |
           call "%VCVARS%"
@@ -153,6 +197,56 @@ jobs:
           if not "%rc%"=="0" (echo ::error::%~2 at %~1 failed& exit /b 1)
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test& exit /b 1)
           exit /b 0
+      # The inputs reach a `for` list in cmd below, so only the known case and tier names pass.
+      - name: Check the memory-mode selection
+        if: ${{ env.YUE_MODE == 'memory' }}
+        shell: powershell
+        run: |
+          foreach ($c in $env:YUE_MEMORY_CASES -split ' ' | Where-Object { $_ }) {
+            if ($c -notin @('cot_default', 'icl_default', 'cot_worst', 'icl_long')) { Write-Output "::error::unknown memory case '$c'"; exit 1 }
+          }
+          foreach ($t in $env:YUE_MEMORY_TIERS -split ' ' | Where-Object { $_ }) {
+            if ($t -notin @('q4', 'q8', 'bf16')) { Write-Output "::error::unknown memory tier '$t'"; exit 1 }
+          }
+      # One process per (case, tier): `cuda_memory_real_weights` writes `<case>-<tier>.json` (device
+      # and memory-pool peaks per phase, wall time) into the evidence directory; the sampler beside it
+      # records every GPU's nvidia-smi `memory.used` every 500 ms from before the process starts, so
+      # its first row is the case's baseline. A failed case does not stop the others.
+      - name: Measure YuE device memory
+        if: ${{ env.YUE_MODE == 'memory' }}
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "YUE_FAILED=0"
+          set "YUE_MEMORY_OUT=%YUE_EVIDENCE%"
+          for %%C in (%YUE_MEMORY_CASES%) do for %%T in (%YUE_MEMORY_TIERS%) do call :measure %%C %%T || set "YUE_FAILED=1"
+          if not "%YUE_FAILED%"=="0" exit /b 1
+          exit /b 0
+
+          :measure
+          set "YUE_MEMORY_CASE=%~1"
+          set "YUE_TIER=%~2"
+          set "log=%YUE_EVIDENCE%\%~1-%~2.log"
+          set "vram=%YUE_EVIDENCE%\%~1-%~2-vram.csv"
+          start "" /b powershell -NoProfile -Command "while (-not (Test-Path '%vram%.stop')) { nvidia-smi --query-gpu=timestamp,index,pci.bus_id,memory.used --format=csv,noheader,nounits | Add-Content -Path '%vram%'; Start-Sleep -Milliseconds 500 }"
+          powershell -NoProfile -Command "Start-Sleep -Seconds 2"
+          cargo test --locked --release -p candle-audio-yue --features cuda --test cuda_memory_real_weights measure_one_case -- --ignored --exact --nocapture > "%log%" 2>&1
+          set "rc=%ERRORLEVEL%"
+          echo stop> "%vram%.stop"
+          powershell -NoProfile -Command "Start-Sleep -Seconds 2"
+          type "%log%"
+          if not "%rc%"=="0" (echo ::error::%~1 at %~2 failed& exit /b 1)
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~1 at %~2 did not run exactly one passing test& exit /b 1)
+          exit /b 0
+      - name: Summarize the YuE memory measurement
+        if: ${{ !cancelled() && env.YUE_MODE == 'memory' }}
+        shell: cmd
+        run: |
+          "%REVIEWED_PYTHON%" scripts/release/yue_real_weights.py summarize-memory --evidence "%YUE_EVIDENCE%" > "%YUE_EVIDENCE%\memory-summary.log" 2>&1
+          set "rc=%ERRORLEVEL%"
+          type "%YUE_EVIDENCE%\memory-summary.log"
+          type "%YUE_EVIDENCE%\memory-summary.log" >> "%GITHUB_STEP_SUMMARY%"
+          exit /b %rc%
       - name: Keep the YuE CUDA evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

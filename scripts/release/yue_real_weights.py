@@ -17,6 +17,11 @@ pinned YuE commit, verify its SHA-256, decode it with ``soundfile`` at float32 e
 producer does, and write the ``.f32le``. The decoded PCM's SHA-256 is compared with the committed
 fixture's ``pcm_sha256`` and printed: a mismatch (a different libsndfile/mpg123 build) is reported,
 not fatal, because the smoke asserts output shape and finiteness, not reference-exact ids.
+``--with-stems`` also stages the song's ``Vocals`` / ``Instrumental`` stems (SHA-256-pinned, each
+with a ``<clip>.json`` rate/channels sidecar) for ``tests/cuda_memory_real_weights.rs``.
+
+``summarize-memory`` folds the memory mode's per-case JSONs and nvidia-smi CSVs into
+``memory-summary.json`` / ``memory-summary.md`` in the evidence directory.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 import urllib.request
 from pathlib import Path
 
@@ -33,11 +39,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = REPO_ROOT / "crates/audio/candle-audio-yue/tests/fixtures/yue_icl_reference.json"
 YUE_COMMIT = "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d"
 CLIP = "pop.00001"
-CLIP_URL = (
-    "https://raw.githubusercontent.com/multimodal-art-projection/YuE/"
-    f"{YUE_COMMIT}/prompt_egs/{CLIP}.mp3"
-)
 CLIP_SHA256 = "27760a9be58c03258d749f31d23e848ad17a85e22cb2b56594ee87df84fbe4b8"
+# The same song's separated stems, which `tests/cuda_memory_real_weights.rs` loops into the dual
+# ICL references of the memory-measurement cases (`stage-reference --with-stems`).
+STEM_SHA256 = {
+    f"{CLIP}.Vocals": "bcc751ffb3d9cb281eeb219f8eb78b7340a5e6d2cd0dfb687d081325c8f01c88",
+    f"{CLIP}.Instrumental": "fba52a706c76c5e2ed30203a922c3a5ece82f4b9fa41e4d32f492b3898bff81b",
+}
 
 
 def stage_root(root: Path, repos: list[str]) -> None:
@@ -65,15 +73,20 @@ def stage_root(root: Path, repos: list[str]) -> None:
         print(f"{name}: {linked} hard-linked, {copied} copied from {source_dir}")
 
 
-def stage_reference(ref_dir: Path) -> None:
-    with urllib.request.urlopen(CLIP_URL, timeout=120) as response:
+def fetch_and_decode(ref_dir: Path, clip: str, sha256: str):
+    """Fetch `prompt_egs/<clip>.mp3` at the pinned commit, verify it, decode it to `.f32le`."""
+    url = (
+        "https://raw.githubusercontent.com/multimodal-art-projection/YuE/"
+        f"{YUE_COMMIT}/prompt_egs/{clip}.mp3"
+    )
+    with urllib.request.urlopen(url, timeout=120) as response:
         mp3 = response.read()
     actual = hashlib.sha256(mp3).hexdigest()
-    if actual != CLIP_SHA256:
-        raise SystemExit(f"{CLIP_URL}: sha256 {actual} != pinned {CLIP_SHA256}")
+    if actual != sha256:
+        raise SystemExit(f"{url}: sha256 {actual} != pinned {sha256}")
     raw_dir = ref_dir / "prompt_egs"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    mp3_path = raw_dir / f"{CLIP}.mp3"
+    mp3_path = raw_dir / f"{clip}.mp3"
     mp3_path.write_bytes(mp3)
 
     import numpy as np
@@ -83,7 +96,12 @@ def stage_reference(ref_dir: Path) -> None:
     raw = np.ascontiguousarray(data).astype("<f4").tobytes()
     derived = ref_dir / "sceneworks-derived"
     derived.mkdir(parents=True, exist_ok=True)
-    (derived / f"{CLIP}.f32le").write_bytes(raw)
+    (derived / f"{clip}.f32le").write_bytes(raw)
+    return data, rate, raw
+
+
+def stage_reference(ref_dir: Path, with_stems: bool = False) -> None:
+    data, rate, raw = fetch_and_decode(ref_dir, CLIP, CLIP_SHA256)
 
     expected = json.loads(FIXTURE.read_text(encoding="utf-8"))["pop"]["clips"][CLIP]
     decoded = {
@@ -96,6 +114,119 @@ def stage_reference(ref_dir: Path) -> None:
         raise SystemExit(f"{CLIP}: decoded {decoded}, fixture expects {expected}")
     verdict = "matches" if decoded == expected else "DIFFERS from"
     print(f"{CLIP}: decoded {decoded} ({verdict} the committed fixture {expected})")
+    if not with_stems:
+        return
+    for clip, sha256 in STEM_SHA256.items():
+        data, rate, raw = fetch_and_decode(ref_dir, clip, sha256)
+        meta = {"rate": rate, "channels": int(data.shape[1]), "frames": int(data.shape[0])}
+        (ref_dir / "sceneworks-derived" / f"{clip}.json").write_text(
+            json.dumps(meta), encoding="utf-8"
+        )
+        print(f"{clip}: decoded {meta}, pcm sha256 {hashlib.sha256(raw).hexdigest()}")
+
+
+GIB = 1024**3
+
+
+def nvidia_smi_peak(csv_path: Path, pci: str | None, record: dict) -> dict | None:
+    """Baseline and peak `memory.used` (MiB) of the GPU at `pci` in a sampler CSV, overall and per
+    phase of `record`.
+
+    Rows are `timestamp, index, pci.bus_id, memory.used` every 500 ms from before the case's
+    process starts, so the first row is the pre-process baseline. nvidia-smi's timestamps are the
+    runner's local time, which is also where this runs, so they convert with `time.mktime`.
+    """
+    if not csv_path.is_file():
+        return None
+    rows = []
+    for line in csv_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        cells = [c.strip() for c in line.split(",")]
+        if len(cells) != 4 or not cells[3].isdigit():
+            continue
+        if pci is None or cells[2].upper() == pci.upper():
+            try:
+                stamp, _, frac = cells[0].partition(".")
+                t = time.mktime(time.strptime(stamp, "%Y/%m/%d %H:%M:%S")) + float(f"0.{frac or 0}")
+            except ValueError:
+                t = None
+            rows.append((t, int(cells[3])))
+    if not rows:
+        return None
+    base = rows[0][1]
+    phases = {}
+    t0 = record.get("t0_unix")
+    if t0 is not None:
+        for p in record["phases"]:
+            inside = [m for t, m in rows if t is not None and t0 + p["start_s"] <= t <= t0 + p["end_s"]]
+            phases[p["phase"]] = (max(inside) - base) / 1024 if inside else None
+    peak = max(m for _, m in rows)
+    return {
+        "baseline_mib": base,
+        "peak_mib": peak,
+        "peak_above_baseline_gib": (peak - base) / 1024,
+        "phase_peak_above_baseline_gib": phases,
+        "samples": len(rows),
+    }
+
+
+def summarize_memory(evidence: Path) -> None:
+    """Fold the per-case JSONs and nvidia-smi CSVs into `memory-summary.{json,md}`."""
+    cases = []
+    for path in sorted(evidence.glob("*.json")):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(record, dict) or "case" not in record or "phases" not in record:
+            continue
+        cuda = record.get("cuda") or {}
+        csv_path = evidence / f"{record['case']}-{record['tier']}-vram.csv"
+        cases.append(
+            {
+                "case": record["case"],
+                "tier": record["tier"],
+                "wall_s": record["wall_s"],
+                "song_s": record["song_s"],
+                "device_peak_above_baseline_gib": cuda.get("device_peak_above_baseline_gib"),
+                "pool_reserved_high_gib": cuda.get("pool_reserved_high_gib"),
+                "pool_used_high_gib": cuda.get("pool_used_high_gib"),
+                "nvidia_smi": nvidia_smi_peak(csv_path, cuda.get("pci_bus_id"), record),
+                "phases": {
+                    p["phase"]: {
+                        "wall_s": p["wall_s"],
+                        "device_peak_above_baseline_gib": p.get("device_peak_above_baseline_gib"),
+                        "pool_reserved_high_gib": p.get("pool_reserved_high_gib"),
+                        "pool_used_high_gib": p.get("pool_used_high_gib"),
+                    }
+                    for p in record["phases"]
+                },
+            }
+        )
+    (evidence / "memory-summary.json").write_text(json.dumps(cases, indent=2), encoding="utf-8")
+
+    def gib(value) -> str:
+        return "-" if value is None else f"{value:.2f}"
+
+    phases = ["stage1_load", "stage1_decode", "stage2_load", "stage2", "decode"]
+    lines = [
+        "| case | tier | device peak GiB (above baseline) | nvidia-smi peak GiB | pool reserved GiB "
+        "| pool used GiB | " + " | ".join(f"{p} smi/pool GiB" for p in phases) + " | wall s | song s |",
+        "|" + "---|" * (8 + len(phases)),
+    ]
+    for c in cases:
+        smi = c["nvidia_smi"] or {}
+        smi_phase = smi.get("phase_peak_above_baseline_gib") or {}
+        per_phase = [
+            f"{gib(smi_phase.get(p))}/"
+            f"{gib(c['phases'].get(p, {}).get('pool_reserved_high_gib'))}"
+            for p in phases
+        ]
+        lines.append(
+            f"| {c['case']} | {c['tier']} | {gib(c['device_peak_above_baseline_gib'])} "
+            f"| {gib(smi.get('peak_above_baseline_gib'))} | {gib(c['pool_reserved_high_gib'])} "
+            f"| {gib(c['pool_used_high_gib'])} | " + " | ".join(per_phase)
+            + f" | {c['wall_s']:.1f} | {c['song_s']:.1f} |"
+        )
+    table = "\n".join(lines) + "\n"
+    (evidence / "memory-summary.md").write_text(table, encoding="utf-8")
+    print(table)
 
 
 def main() -> int:
@@ -106,11 +237,22 @@ def main() -> int:
     root.add_argument("--repo", required=True, action="append", help="NAME=SNAPSHOT_DIR")
     reference = commands.add_parser("stage-reference", help="populate YUE_REF_DIR")
     reference.add_argument("--ref-dir", required=True, type=Path)
+    reference.add_argument(
+        "--with-stems",
+        action="store_true",
+        help="also stage the vocal + instrumental stems the memory-measurement cases loop",
+    )
+    summary = commands.add_parser(
+        "summarize-memory", help="fold the memory-mode case records into a summary table"
+    )
+    summary.add_argument("--evidence", required=True, type=Path)
     args = parser.parse_args()
     if args.command == "stage-root":
         stage_root(args.root, args.repo)
+    elif args.command == "stage-reference":
+        stage_reference(args.ref_dir, args.with_stems)
     else:
-        stage_reference(args.ref_dir)
+        summarize_memory(args.evidence)
     return 0
 
 
