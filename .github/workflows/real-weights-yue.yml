@@ -197,17 +197,14 @@ jobs:
           if not "%rc%"=="0" (echo ::error::%~2 at %~1 failed& exit /b 1)
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::%~2 did not run exactly one passing test& exit /b 1)
           exit /b 0
-      # The inputs reach a `for` list in cmd below, so only the known case and tier names pass.
+      # The inputs reach a `for` list in cmd below, so only the known case and tier names pass, and
+      # an empty or whitespace-only list fails instead of measuring nothing and going green. The
+      # script reads both from the environment, so no shell expands the raw input first.
       - name: Check the memory-mode selection
         if: ${{ env.YUE_MODE == 'memory' }}
-        shell: powershell
+        shell: cmd
         run: |
-          foreach ($c in $env:YUE_MEMORY_CASES -split ' ' | Where-Object { $_ }) {
-            if ($c -notin @('cot_default', 'icl_default', 'cot_worst', 'icl_long')) { Write-Output "::error::unknown memory case '$c'"; exit 1 }
-          }
-          foreach ($t in $env:YUE_MEMORY_TIERS -split ' ' | Where-Object { $_ }) {
-            if ($t -notin @('q4', 'q8', 'bf16')) { Write-Output "::error::unknown memory tier '$t'"; exit 1 }
-          }
+          "%REVIEWED_PYTHON%" scripts/release/yue_real_weights.py check-memory-selection || exit /b 1
       # One process per (case, tier): `cuda_memory_real_weights` writes `<case>-<tier>.json` (device
       # and memory-pool peaks per phase, wall time) into the evidence directory; the sampler beside it
       # records every GPU's nvidia-smi `memory.used` every 500 ms from before the process starts, so

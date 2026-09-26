@@ -204,20 +204,30 @@ def summarize_memory(evidence: Path) -> None:
     def gib(value) -> str:
         return "-" if value is None else f"{value:.2f}"
 
+    # Per phase: nvidia-smi (500 ms) / device (20 ms cuMemGetInfo) / pool reserved high watermark.
+    # The 500 ms series under-samples phases shorter than a few seconds (both loads), so a cell is
+    # starred when the pool's watermark -- which cannot miss a spike -- exceeds its nvidia-smi read.
     phases = ["stage1_load", "stage1_decode", "stage2_load", "stage2", "decode"]
     lines = [
+        "Per-phase cells: nvidia-smi 500 ms / device 20 ms / pool reserved high, GiB above the "
+        "pre-process baseline. `*` = pool high exceeds the nvidia-smi read (500 ms missed the "
+        "spike; use the device/pool figure). `stage2_load` spans stage 1's teardown, so its peak is "
+        "stage 1's resident set, not stage 2's need.",
+        "",
         "| case | tier | device peak GiB (above baseline) | nvidia-smi peak GiB | pool reserved GiB "
-        "| pool used GiB | " + " | ".join(f"{p} smi/pool GiB" for p in phases) + " | wall s | song s |",
+        "| pool used GiB | " + " | ".join(f"{p} smi/dev/pool" for p in phases) + " | wall s | song s |",
         "|" + "---|" * (8 + len(phases)),
     ]
     for c in cases:
         smi = c["nvidia_smi"] or {}
         smi_phase = smi.get("phase_peak_above_baseline_gib") or {}
-        per_phase = [
-            f"{gib(smi_phase.get(p))}/"
-            f"{gib(c['phases'].get(p, {}).get('pool_reserved_high_gib'))}"
-            for p in phases
-        ]
+        per_phase = []
+        for p in phases:
+            s = smi_phase.get(p)
+            dev = c["phases"].get(p, {}).get("device_peak_above_baseline_gib")
+            pool = c["phases"].get(p, {}).get("pool_reserved_high_gib")
+            flag = "*" if pool is not None and (s is None or pool > s) else ""
+            per_phase.append(f"{gib(s)}/{gib(dev)}/{gib(pool)}{flag}")
         lines.append(
             f"| {c['case']} | {c['tier']} | {gib(c['device_peak_above_baseline_gib'])} "
             f"| {gib(smi.get('peak_above_baseline_gib'))} | {gib(c['pool_reserved_high_gib'])} "
@@ -227,6 +237,23 @@ def summarize_memory(evidence: Path) -> None:
     table = "\n".join(lines) + "\n"
     (evidence / "memory-summary.md").write_text(table, encoding="utf-8")
     print(table)
+
+
+MEMORY_CASES = ("cot_default", "icl_default", "cot_worst", "icl_long")
+MEMORY_TIERS = ("q4", "q8", "bf16")
+
+
+def check_memory_selection(cases: str, tiers: str) -> None:
+    """Refuse an unknown name (the lists reach a cmd `for`) or an empty list (zero cases would
+    report green having measured nothing)."""
+    for label, raw, known in (("case", cases, MEMORY_CASES), ("tier", tiers, MEMORY_TIERS)):
+        names = raw.split()
+        if not names:
+            raise SystemExit(f"::error::no memory {label} selected")
+        for name in names:
+            if name not in known:
+                raise SystemExit(f"::error::unknown memory {label} {name!r}")
+    print(f"memory selection: cases {cases.split()} x tiers {tiers.split()}")
 
 
 def main() -> int:
@@ -246,11 +273,20 @@ def main() -> int:
         "summarize-memory", help="fold the memory-mode case records into a summary table"
     )
     summary.add_argument("--evidence", required=True, type=Path)
+    selection = commands.add_parser(
+        "check-memory-selection",
+        help="validate $YUE_MEMORY_CASES / $YUE_MEMORY_TIERS (known names, non-empty); read "
+        "from the environment so no shell expands the raw inputs",
+    )
     args = parser.parse_args()
     if args.command == "stage-root":
         stage_root(args.root, args.repo)
     elif args.command == "stage-reference":
         stage_reference(args.ref_dir, args.with_stems)
+    elif args.command == "check-memory-selection":
+        check_memory_selection(
+            os.environ.get("YUE_MEMORY_CASES", ""), os.environ.get("YUE_MEMORY_TIERS", "")
+        )
     else:
         summarize_memory(args.evidence)
     return 0

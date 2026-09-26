@@ -24,8 +24,10 @@
 //!
 //! Phases, from the generator's progress events (the stage LMs report `Loading` only once loaded):
 //! `registry_load` (the lazy load), `stage1_load` (ICL encode + prompt + stage-1 load),
-//! `stage1_decode` (every segment), `stage2_load`, `stage2` (both tracks), `decode` (xcodec + Vocos
-//! + splice).
+//! `stage1_decode` (every segment), `stage2_load`, `stage2` (both tracks), `decode` (xcodec,
+//! Vocos, splice). `stage2_load` opens at the last stage-1 step, so its window also spans the engine
+//! releasing stage 1 (`engine.rs`, `release(Stage::Stage1, …)`) before stage 2 loads: its peak is
+//! stage 1's still-resident set, not what loading stage 2 needs.
 //!
 //! Memory, under `--features cuda` (CUDA ordinal 0, the device candle renders on):
 //! - `device_*`: `cuMemGetInfo` used bytes sampled every 20 ms — the device-wide view NVML reports,
@@ -34,8 +36,10 @@
 //!   itself is charged to the render. On the Windows (WDDM) runner `cuMemGetInfo` reads ~1.65 GiB
 //!   used right after context creation whichever GPU ordinal 0 lands on, so on an otherwise idle
 //!   GPU (nvidia-smi baseline ~19 MiB) it over-reads nvidia-smi by ~1.2 GiB; on the GPU whose
-//!   baseline already shows ~1.2 GiB the two agree. The workflow's own nvidia-smi series (split
-//!   into these phases by `t0_unix`) is the NVML figure to use.
+//!   baseline already shows ~1.2 GiB the two agree. Where that baseline agrees, this 20 ms series
+//!   is the authoritative per-phase figure: the workflow's own nvidia-smi series (split into these
+//!   phases by `t0_unix`) samples every 500 ms and under-reads any phase shorter than a few seconds
+//!   (both `*_load` phases).
 //! - `pool_*`: the stream-ordered memory pool candle allocates every tensor from (cudarc's
 //!   `cuMemAllocAsync` on the device's current pool) — process-local, immune to co-tenants, and the
 //!   pool's own high watermarks catch spikes between samples. `pool_reserved_high` is what the pool
@@ -395,6 +399,67 @@ fn nvidia_smi_used_mib(pci: &str) -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// Every phase, in the order its end is marked.
+const PHASES: [&str; 6] = [
+    "registry_load",
+    "stage1_load",
+    "stage1_decode",
+    "stage2_load",
+    "stage2",
+    "decode",
+];
+
+/// The phase a generator progress event ENDS, if any. `loads` counts the `Loading` events seen:
+/// stage 1 then stage 2 each report one once loaded. `Step` totals are `segments + 2`, so the
+/// step with `current + 2 == total` is the last stage-1 segment.
+fn phase_ended(p: &Progress, loads: &mut u32) -> Option<&'static str> {
+    match p {
+        Progress::Loading(LoadPhase::Renderer) => {
+            *loads += 1;
+            Some(if *loads == 1 {
+                "stage1_load"
+            } else {
+                "stage2_load"
+            })
+        }
+        Progress::Step { current, total } if *current + 2 == *total => Some("stage1_decode"),
+        Progress::Decoding => Some("stage2"),
+        _ => None,
+    }
+}
+
+/// The generator's documented event order for a 2-segment render yields every phase once, in
+/// order (weights-free; guards the `current + 2 == total` boundary).
+#[test]
+fn progress_events_mark_every_phase_in_order() {
+    let events = [
+        Progress::Loading(LoadPhase::Renderer),
+        Progress::Step {
+            current: 1,
+            total: 4,
+        },
+        Progress::Step {
+            current: 2,
+            total: 4,
+        },
+        Progress::Loading(LoadPhase::Renderer),
+        Progress::Step {
+            current: 3,
+            total: 4,
+        },
+        Progress::Step {
+            current: 4,
+            total: 4,
+        },
+        Progress::Decoding,
+    ];
+    let mut loads = 0;
+    let mut labels = vec!["registry_load"];
+    labels.extend(events.iter().filter_map(|p| phase_ended(p, &mut loads)));
+    labels.push("decode");
+    assert_eq!(labels, PHASES);
+}
+
 #[cfg(feature = "cuda")]
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -452,28 +517,15 @@ fn measure_one_case() {
     let out = generator
         .generate(&req, &mut |p| {
             let at = t0.elapsed().as_secs_f64();
-            match &p {
-                Progress::Loading(LoadPhase::Renderer) => {
-                    loads += 1;
-                    mark(
-                        if loads == 1 {
-                            "stage1_load"
-                        } else {
-                            "stage2_load"
-                        },
-                        &mut marks,
-                    );
-                }
-                Progress::Step { current, total } if *current + 2 == *total => {
-                    mark("stage1_decode", &mut marks)
-                }
-                Progress::Decoding => mark("stage2", &mut marks),
-                _ => {}
+            if let Some(label) = phase_ended(&p, &mut loads) {
+                mark(label, &mut marks);
             }
             progress.push(format!("{at:.2} {p:?}"));
         })
         .unwrap_or_else(|e| panic!("{id}: render failed: {e}"));
     mark("decode", &mut marks);
+    let labels: Vec<&str> = marks.iter().map(|m| m.0).collect();
+    assert_eq!(labels, PHASES, "{id}: phase marks out of order");
     let wall = t0.elapsed().as_secs_f64();
 
     let GenerationOutput::Audio(track) = out else {
