@@ -419,10 +419,13 @@ dependencies = [
  "candle-audio",
  "candle-llm",
  "candle-nn",
+ "fancy-regex 0.17.0",
+ "regex",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "unicode-normalization",
 ]
 
 [[package]]
