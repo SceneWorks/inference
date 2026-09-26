@@ -1,0 +1,66 @@
+{
+  "story": "sc-22993",
+  "producer": "scripts/reference/yue2/vae_reference.py tiny",
+  "reference": {
+    "yue2_commit": "92a73cc7652fcc1f937855e4b765e0a0edd7ff2e",
+    "python": "3.12.13",
+    "torch": "2.10.0",
+    "numpy": "2.2.6",
+    "safetensors": "0.7.0",
+    "transformers": "4.57.6",
+    "device": "cpu",
+    "dtype": "float32"
+  },
+  "topology": {
+    "channels": 3,
+    "c_mults": [
+      1,
+      2,
+      2,
+      3,
+      3,
+      4
+    ],
+    "strides": [
+      2,
+      2,
+      4,
+      4,
+      5,
+      6
+    ],
+    "latent_dim": 64
+  },
+  "frames": 7,
+  "core_frames": 3,
+  "halo_frames": 16,
+  "audio_samples": 5797,
+  "latent_npy_sha256": "6e9e0604cfccd25d3a65ab703277725b8b7397387cb6eb01e9a14ed8dfb34828",
+  "latent_sha256": "02764673914296daf4e8f4c5ba8c4fb0bb7b2c3b8f0fd0f7bec2661f3d637ab5",
+  "variants": {
+    "standard": {
+      "seed": 22993,
+      "config_sha256": "61ebde9a7b680aa6632882caa9bcb568d50a66b7ff3538e9425f0bfd3c9ddc75",
+      "weights_sha256": "039ed124b166230706592ccce0b8ba72eab10af29e693c41c76b518d54d503df",
+      "natural_output_length": 13376,
+      "required_halo": 12,
+      "raw_samples_beyond_unit": 2676,
+      "raw_abs_max": 2.7266814708709717,
+      "python_tiled_vs_full_max_abs": 0.0,
+      "python_pipeline_tiled_vs_full_max_abs": 0.0,
+      "encode_frames": 3
+    },
+    "legacy": {
+      "seed": 22994,
+      "config_sha256": "1644790222d239c517f584891983507e1ce47ac761386228fade9d3733db05c3",
+      "weights_sha256": "78682f196ed16ab9b713936b3aee9d8efe940ce33baef4f1bab47a59325574d3",
+      "natural_output_length": 13376,
+      "required_halo": 12,
+      "raw_samples_beyond_unit": 2676,
+      "raw_abs_max": 1.1579097509384155,
+      "python_tiled_vs_full_max_abs": 0.0,
+      "python_pipeline_tiled_vs_full_max_abs": 0.0,
+      "encode_frames": 3
+    }
+  }
+}

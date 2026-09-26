@@ -40,10 +40,13 @@
 
 pub use candle_audio::gen_core;
 
+pub mod decode;
 pub mod inventory;
+pub mod latent;
 pub mod license;
 pub mod manifest;
 pub mod snapshot;
+pub mod vae;
 
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
