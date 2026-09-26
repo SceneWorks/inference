@@ -78,7 +78,9 @@
 
 pub use candle_audio::gen_core;
 
+pub mod closure;
 pub mod decode;
+pub mod engine;
 pub mod generate;
 pub mod inventory;
 pub mod latent;
@@ -90,6 +92,8 @@ pub mod nar;
 mod parity;
 pub mod plan;
 pub mod protocol;
+pub mod provider;
+pub mod run;
 pub mod sampling;
 pub mod snapshot;
 pub mod tokenizer;
@@ -98,9 +102,32 @@ pub mod vae;
 #[cfg(test)]
 mod test_fixtures;
 
+pub use engine::{
+    EngineHooks, EngineObserver, EngineOptions, SemanticResult, SongResult, SongSettings, Stage,
+    StageEvent, Yue2Engine,
+};
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
+pub use license::COMPONENT_LICENSES;
 pub use nar::{synthesize, NarOptions, QueryTile, SongNoise, SynthesisRequest, Yue2Nar};
 pub use plan::{PlanError, PlanIdentity, PlanStep, SemanticConditioning, SymbolicPlan};
 pub use protocol::{CotMode, GenerationConfig, ProtocolError, Sampling, SongRequest};
+pub use provider::{
+    descriptor, load, PROVIDER_COMPONENTS, PROVIDER_ID, REGISTRATION, REGISTRATIONS,
+};
+pub use run::{verify_run, RunError, RunOutcome, RunOutput, SongInput};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
 pub use tokenizer::{TokenizerError, Yue2TextTokenizer};
+
+/// Add the YuE2 generator to an explicit audio registry builder (catalog composition).
+pub fn register_providers(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    REGISTRATIONS
+        .into_iter()
+        .fold(registry, |r, reg| r.register_generator(reg))
+}
+
+/// Build this crate's own explicit provider catalog.
+pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    register_providers(gen_core::ProviderRegistryBuilder::new()).build()
+}

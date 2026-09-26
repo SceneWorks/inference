@@ -344,6 +344,33 @@ impl ScorePlan {
         })
     }
 
+    /// The score of a verified [`SymbolicPlan`](crate::plan::SymbolicPlan) — freshly planned,
+    /// built from an external score, or restored from disk — with its **exact** ABC ids (never
+    /// re-encoded from the text) and its truncation flag.
+    pub fn of_plan(plan: &crate::plan::SymbolicPlan) -> gen_core::Result<Self> {
+        use crate::plan::PlanKind;
+        use crate::protocol::CotMode;
+        let cot = match plan.request().cot() {
+            CotMode::Off => Cot::Off,
+            CotMode::Melody => Cot::Melody,
+            CotMode::Full => Cot::Full,
+        };
+        match plan.kind() {
+            PlanKind::Off => Ok(Self::off()),
+            PlanKind::External => Self::supplied(cot, plan.abc_ids().to_vec()),
+            PlanKind::Generated => {
+                check_abc_ids(plan.abc_ids())?;
+                Ok(Self {
+                    cot,
+                    abc_ids: plan.abc_ids().to_vec(),
+                    source: PlanSource::Planned {
+                        truncated: plan.truncated(),
+                    },
+                })
+            }
+        }
+    }
+
     /// The planning mode.
     pub fn cot(&self) -> Cot {
         self.cot
