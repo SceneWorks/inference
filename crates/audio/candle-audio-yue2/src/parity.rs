@@ -546,7 +546,40 @@ fn opt_u32s(v: &Value) -> Option<Vec<u32>> {
     (!v.is_null()).then(|| u32s(v))
 }
 
-/// Every mode (`cot` full / melody / off, a supplied full score, a supplied melody score) through
+/// The Chinese AR case of `ar_real_weights.json` (sc-22988 feature review).
+const CHINESE_MODE: &str = "zh_full";
+
+/// The real-weight fixture carries a Chinese request with its planned ABC and its semantic prefix
+/// and tokens, so the parity run covers CJK text through the native tokenizer and protocol.
+fn assert_chinese_case(fixture: &Value) {
+    let rec = &fixture["modes"][CHINESE_MODE];
+    let lyrics = rec["request"]["lyrics"].as_str().unwrap_or_default();
+    assert!(
+        lyrics
+            .chars()
+            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)),
+        "{CHINESE_MODE}: the lyrics are Chinese"
+    );
+    assert_eq!(rec["cot"], "full", "{CHINESE_MODE}: planned");
+    for key in ["planner_prefix", "abc_ids", "semantic_prefix"] {
+        assert!(!u32s(&rec[key]).is_empty(), "{CHINESE_MODE}: {key}");
+    }
+    assert!(!u32s(&rec["abc"]["tokens"]).is_empty());
+    assert!(!u32s(&rec["semantic"]["tokens"]).is_empty());
+}
+
+/// Weights-free: the committed real-weight fixture keeps its Chinese case (the `#[ignore]`d parity
+/// run replays it).
+#[test]
+fn the_real_weight_fixture_has_a_chinese_planned_case() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/ar_real_weights.json");
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_chinese_case(&fixture);
+}
+
+/// Every mode (`cot` full / melody / off, a supplied full score, a supplied melody score, and the
+/// Chinese `cot = full` request [`CHINESE_MODE`]) through
 /// the production path end to end: the request rebuilt natively ([`crate::protocol::SongRequest`]),
 /// its prefixes built by the native tokenizer and protocol ([`crate::plan::SymbolicPlan`], checked
 /// id for id against the upstream tokenizer's), [`crate::generate::plan_score`] and
@@ -584,6 +617,7 @@ fn real_weight_decodes_match_upstream() {
         "verified + loaded the tokenizer and YuE2-3B (AR path, F32) in {:.1?}",
         start.elapsed()
     );
+    assert_chinese_case(&fixture);
     let never = || false;
     let mut all = Spread::default();
     let mut cache_worst = 0.0f64;

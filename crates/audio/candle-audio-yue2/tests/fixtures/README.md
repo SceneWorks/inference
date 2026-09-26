@@ -55,17 +55,18 @@ No weights are committed. The files hold token ids, logit summaries and SHA-256 
   million levels) under eight sampling setups, in F32 and in the BF16 `legacy_off` arithmetic; the
   CFG line `u + s·(c − u)` in F32 and BF16; and upstream `RMSNorm` / `_apply_rotary` on a fixed
   `[1, 7, 16, 128]` input at cache positions 300–306.
-* **`ar_real_weights.json`** — the exact prompt ids of five requests built by the upstream
-  tokenizer and `token_prefixes` / `negative_prefix` from `examples/song.json` (style + lyrics):
-  `cot` full (guidance 1.0), melody (1.5), off (default 1.01, instruction-only negative), a
-  supplied full score `examples/score.abc` (2.0) and a supplied melody score `examples/melody.abc`
-  (1.0). Planned modes decode 32 greedy ABC tokens, then every mode 24 greedy semantic tokens
-  (`min_tokens` = budget, so all truncate); plus a planner that ends on its own (`ABC_END` after the
-  teacher-forced melody score), a stochastic ABC decode with the released ABC controls and a
-  stochastic `cot = off` semantic decode with the released semantic controls, both with injected
-  draws. Every step records the logits row it sampled from as: top-8 ids/values over the phase's
-  allow mask, fixed probe ids, and F64 Σx, Σx², logsumexp over the allowed row. The last step's
-  row is also recomputed without a cache.
+* **`ar_real_weights.json`** — the exact prompt ids of six requests built by the upstream tokenizer
+  and `token_prefixes` / `negative_prefix` from `examples/song.json` (style + lyrics): `cot` full
+  (guidance 1.0), melody (1.5), off (default 1.01, instruction-only negative), a supplied full score
+  `examples/score.abc` (2.0) and a supplied melody score `examples/melody.abc` (1.0), plus
+  `zh_full`: `cot` full (1.0) from a Chinese style and lyrics written for the fixture (`ZH_STYLE` /
+  `ZH_LYRICS` in the generator). Planned modes decode 32 greedy ABC tokens, then every mode 24
+  greedy semantic tokens (`min_tokens` = budget, so all truncate); plus a planner that ends on its
+  own (`ABC_END` after the teacher-forced melody score), a stochastic ABC decode with the released
+  ABC controls and a stochastic `cot = off` semantic decode with the released semantic controls,
+  both with injected draws. Every step records the logits row it sampled from as: top-8 ids/values
+  over the phase's allow mask, fixed probe ids, and F64 Σx, Σx², logsumexp over the allowed row. The
+  last step's row is also recomputed without a cache.
 
 ### Deliberate substitutions in the reference
 

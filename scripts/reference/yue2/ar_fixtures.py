@@ -23,7 +23,7 @@ Subcommands
 
 ``real``  (YuE2-3B, F32 on the CPU; minutes) writes ``tests/fixtures/ar_real_weights.json``: the
 exact prompt/negative token ids of every mode (``cot`` full / melody / off, a supplied full score, a
-supplied melody score) built by the upstream tokenizer and protocol, and bounded upstream decodes
+supplied melody score, and a Chinese ``cot`` full request) built by the upstream tokenizer and protocol, and bounded upstream decodes
 from them with per-step logit summaries. Expected peak RSS ~16 GB (F32 weights of both MoT paths
 plus the mmapped checkpoint); run it alone, under an RSS guard.
 
@@ -69,6 +69,9 @@ LM_REPO, LM_REVISION = "m-a-p/YuE2-3B", "1a96eca688d6ae5d7f0feb88573fec89920fcd1
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = REPO_ROOT / "crates/audio/candle-audio-yue2/tests/fixtures"
 MASK32 = 0xFFFFFFFF
+# The Chinese AR case's request text (written for this fixture; not from upstream's examples).
+ZH_STYLE = "Mandarin, gentle pop ballad, warm female voice, acoustic piano and soft strings, 76 BPM"
+ZH_LYRICS = "[Verse]\n夜色慢慢落在小巷\n路灯陪我走回家\n\n[Chorus]\n唱一首歌给明天\n把光留在心里面"
 
 
 # ── deterministic values (mirrors `model::synthetic` in the Rust crate) ──────────────────────
@@ -497,6 +500,9 @@ def real(args) -> None:
         "off": SongRequest(style, lyrics, cot="off"),
         "supplied_full": SongRequest(style, lyrics, cot="full", abc=score, cfg_scale=2.0),
         "supplied_melody": SongRequest(style, lyrics, cot="melody", abc=melody),
+        # A Chinese request (sc-22988 feature review): planned ABC and semantic tokens from a
+        # Mandarin style and lyrics, so CJK text crosses the native tokenizer and protocol too.
+        "zh_full": SongRequest(ZH_STYLE, ZH_LYRICS, cot="full"),
     }
     abc_steps, sem_steps = args.abc_steps, args.semantic_steps
     greedy_abc = Sampling(0.0, .9, 30, 1.005, 100, min(32, abc_steps // 2), abc_steps)
