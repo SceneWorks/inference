@@ -25,6 +25,42 @@ fn outcome<T>(case: &Value, result: &Result<T, ProtocolError>) -> bool {
     expect_ok
 }
 
+/// The declared [`STRICTER_THAN_UPSTREAM`] class an input belongs to, if any.
+fn deviation_class(input: &Value) -> Option<&'static str> {
+    fn any(v: &Value, pred: &dyn Fn(&Value) -> bool) -> bool {
+        pred(v)
+            || match v {
+                Value::Array(items) => items.iter().any(|i| any(i, pred)),
+                Value::Object(map) => map.values().any(|i| any(i, pred)),
+                _ => false,
+            }
+    }
+    let above_i64 = |v: &Value| {
+        v.as_number().is_some_and(|n| {
+            (n.is_u64() && n.as_i64().is_none())
+                || n.as_f64()
+                    .is_some_and(|f| f.fract() == 0.0 && f >= i64::MAX as f64)
+        })
+    };
+    if any(input, &Value::is_boolean) {
+        Some("bool-as-number")
+    } else if any(input, &above_i64) {
+        Some("integer-above-i64")
+    } else {
+        None
+    }
+}
+
+/// [`outcome`], except that an input upstream accepts and this port refuses is skipped when it
+/// belongs to a declared [`STRICTER_THAN_UPSTREAM`] class (pinned by
+/// `stricter_than_upstream_is_exactly_the_declared_list`).
+fn outcome_or_deviation<T>(case: &Value, input: &Value, result: &Result<T, ProtocolError>) -> bool {
+    if case.get("ok").is_some() && result.is_err() && deviation_class(input).is_some() {
+        return false;
+    }
+    outcome(case, result)
+}
+
 /// One `{"float": ..}` marker field goes through the typed API (JSON cannot carry non-finite
 /// numbers); everything else goes through the JSON entry point.
 fn resolve_sampling(default: &Sampling, overrides: &Value) -> Result<Sampling, ProtocolError> {
@@ -59,7 +95,7 @@ fn sampling_validation_matches_upstream() {
             _ => Sampling::semantic_default(),
         };
         let result = resolve_sampling(&default, &case["overrides"]);
-        if outcome(case, &result) {
+        if outcome_or_deviation(case, &case["overrides"], &result) {
             let got = result.unwrap().to_json();
             assert!(same(&got, &case["ok"]), "case {case}: native {got}");
         }
@@ -90,17 +126,66 @@ fn non_finite_sampling_values_are_refused() {
             );
         }
     }
-    let err = GenerationConfig::from_json(&json!({"semantic": {"temperature": true}})).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            ProtocolError::Invalid {
-                field: "temperature",
-                ..
-            }
-        ),
-        "{err}"
+}
+
+/// Exactly the declared [`STRICTER_THAN_UPSTREAM`] classes separate this port from upstream:
+/// every upstream-accepted fixture input the port refuses belongs to one of them, each class
+/// occurs, and each is refused for its stated reason. Every other case is parity (the three
+/// `*_validation_matches_upstream` tests).
+#[test]
+fn stricter_than_upstream_is_exactly_the_declared_list() {
+    let cases = fixture("protocol_cases.json");
+    let mut native: Vec<(&Value, &Value, Result<(), ProtocolError>)> = Vec::new();
+    for case in cases["sampling"].as_array().unwrap() {
+        let default = match case["phase"].as_str().unwrap() {
+            "abc" => Sampling::abc_default(),
+            _ => Sampling::semantic_default(),
+        };
+        let result = resolve_sampling(&default, &case["overrides"]).map(drop);
+        native.push((case, &case["overrides"], result));
+    }
+    for case in cases["generation_config"].as_array().unwrap() {
+        native.push((
+            case,
+            &case["input"],
+            GenerationConfig::from_json(&case["input"]).map(drop),
+        ));
+    }
+    for case in cases["request"].as_array().unwrap() {
+        native.push((case, &case["input"], song_request(&case["input"]).map(drop)));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (case, input, result) in native {
+        let Err(err) = result else { continue };
+        if case.get("ok").is_none() {
+            continue;
+        }
+        let class = deviation_class(input).unwrap_or_else(|| {
+            panic!("undeclared deviation: upstream accepts {case}, native: {err}")
+        });
+        let reason = err.to_string();
+        match class {
+            "bool-as-number" => assert!(reason.contains("must be a number"), "{input}: {reason}"),
+            _ => assert!(
+                reason.contains("must be an integer") || reason.contains("out of range"),
+                "{input}: {reason}"
+            ),
+        }
+        seen.insert(class);
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        STRICTER_THAN_UPSTREAM.to_vec()
     );
+}
+
+/// `context` compares by value, as upstream's `!=` does: `24576.0` is the context, `24576.5` and
+/// `true` are not.
+#[test]
+fn context_compares_by_value() {
+    assert!(GenerationConfig::from_json(&json!({"context": 24576.0})).is_ok());
+    assert!(GenerationConfig::from_json(&json!({"context": 24576.5})).is_err());
+    assert!(GenerationConfig::from_json(&json!({"context": true})).is_err());
 }
 
 #[test]
@@ -125,7 +210,7 @@ fn generation_config_validation_matches_upstream() {
     let cases = fixture("protocol_cases.json");
     for case in cases["generation_config"].as_array().unwrap() {
         let result = GenerationConfig::from_json(&case["input"]);
-        if outcome(case, &result) {
+        if outcome_or_deviation(case, &case["input"], &result) {
             let got = result.unwrap().to_json();
             assert!(same(&got, &case["ok"]), "case {case}: native {got}");
         }
@@ -158,7 +243,7 @@ fn request_validation_matches_upstream() {
     assert!(cases.len() >= 45, "fixture lost cases");
     for case in cases {
         let result = song_request(&case["input"]);
-        if outcome(case, &result) {
+        if outcome_or_deviation(case, &case["input"], &result) {
             let request = result.unwrap();
             let ok = &case["ok"];
             if ok.get("request").is_none() {

@@ -310,6 +310,11 @@ def sampling_cases() -> list:
           {"penalty_window": 1}, {"penalty_window": 100}, {"min_tokens": 0, "max_tokens": 1},
           {"min_tokens": 9000, "max_tokens": 9000}, {"temperature": 2, "top_p": 0.5, "top_k": 7,
           "repetition_penalty": 1, "penalty_window": 64, "min_tokens": 10, "max_tokens": 20}]
+    # Upstream accepts these (bool passes math.isfinite and compares as 0/1; Python ints are
+    # unbounded); the native port refuses them deliberately (protocol.rs, STRICTER_THAN_UPSTREAM).
+    ok += [{"temperature": True}, {"top_p": True}, {"repetition_penalty": True},
+           {"top_k": 2**63}, {"top_k": 2**64}, {"min_tokens": 0, "max_tokens": 2**64},
+           {"min_tokens": 2**63, "max_tokens": 2**63}]
     bad = [{"temperature": -0.01}, {"temperature": 5.0001}, {"temperature": nf("nan")},
            {"temperature": nf("inf")}, {"top_p": 0}, {"top_p": 1.0001}, {"top_p": nf("nan")},
            {"top_k": 0}, {"top_k": -3}, {"top_k": 30.0}, {"top_k": True}, {"top_k": "30"},
@@ -334,7 +339,11 @@ def generation_config_cases() -> list:
              {"context": 24577}, {"version": "yue2-native-v1"},
              {"abc": {"temperature": 0.5}}, {"semantic": {"max_tokens": 12000, "min_tokens": 0}},
              {"abc": {"top_k": 0}}, {"abc": {"bogus": 1}}, {"unknown": 1},
-             json.loads(json.dumps(GenerationConfig().to_dict()))]
+             json.loads(json.dumps(GenerationConfig().to_dict())),
+             # context compares by value upstream (24576.0 == 24576), a bool never equals it.
+             {"context": 24576.0}, {"context": 24576.5}, {"context": True},
+             # Accepted upstream, refused natively (see sampling_cases).
+             {"ode_steps": 2**64}, {"semantic": {"temperature": True}}]
     return [{"input": c, **attempt(lambda: GenerationConfig.from_dict(c).to_dict())} for c in cases]
 
 
@@ -352,6 +361,8 @@ def song_request_cases() -> list:
         {"cfg_scale": -0.0}, {"cfg_scale": -1}, {"cfg_scale": 1.5}, {"cfg_scale": nf("nan")},
         {"cfg_scale": nf("inf")}, {"cfg_scale": None}, {"cot": "off", "cfg_scale": None},
         {"style": 5}, {"lyrics": None}, {"extra": 1},
+        # Accepted upstream (as 1 / 0), refused natively (see sampling_cases).
+        {"cfg_scale": True}, {"cfg_scale": False},
     ]
     out = []
     for variant in variants:

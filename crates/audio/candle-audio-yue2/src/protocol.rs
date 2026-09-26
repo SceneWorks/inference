@@ -20,9 +20,29 @@
 //!
 //! JSON entry points ([`Sampling::with_json_overrides`], [`GenerationConfig::from_json`],
 //! [`SongRequest::from_json`]) mirror upstream's keyword construction: an unknown key is an
-//! error, integers must be JSON integers, and booleans are never numbers.
+//! error, counts must be JSON integers, and `context` compares by value (`24576.0` is accepted,
+//! as upstream's `!=` accepts it).
+//!
+//! # Deliberately stricter than upstream
+//!
+//! Two input classes the pinned upstream accepts are refused here, listed in
+//! [`STRICTER_THAN_UPSTREAM`] and pinned against upstream-evaluated fixtures by a test:
+//!
+//! * **`bool-as-number`** — a JSON boolean for a float control (`temperature`, `top_p`,
+//!   `repetition_penalty`) or `cfg_scale`. Python's `math.isfinite(True)` holds and `True`
+//!   compares as `1`, so upstream silently samples at temperature 1 or guides at scale 1. A
+//!   boolean in a numeric control is a caller bug, not a request; refusing it is explicit.
+//! * **`integer-above-i64`** — a count (`top_k`, `min_tokens`, `max_tokens`, `ode_steps`) above
+//!   `2^63 - 1`. Python integers are unbounded, so upstream accepts such a `Sampling` and then
+//!   either refuses it at generation (`max_tokens` past the 24576-token context) or treats it like
+//!   any `top_k` at or above the 184704-token vocabulary. JSON numbers of that size do not survive
+//!   a 64-bit parse exactly, so they are refused at the edge rather than approximated.
 
 use serde_json::{Map, Number, Value};
+
+/// The input classes this port refuses although the pinned upstream accepts them (see the
+/// module docs).
+pub const STRICTER_THAN_UPSTREAM: [&str; 2] = ["bool-as-number", "integer-above-i64"];
 
 use crate::tokenizer::{TokenizerError, Yue2TextTokenizer, ORDINARY_TOKENS};
 
@@ -441,7 +461,8 @@ impl GenerationConfig {
                     }
                 }
                 "context" => {
-                    if json_count("context", v)? != CONTEXT as i64 {
+                    // Upstream's `context != CONTEXT` compares by value: 24576.0 passes.
+                    if v.as_number().and_then(Number::as_f64) != Some(CONTEXT as f64) {
                         return Err(invalid("context", format!("require context={CONTEXT}")));
                     }
                 }

@@ -189,6 +189,32 @@ fn a_tiktoken_swapped_after_verification_is_refused() {
     );
 }
 
+/// Reports how long one unbroken 32k-character piece (ASCII letters, then CJK) takes to encode
+/// on the real table. Timing is printed, never asserted (machine-dependent); the structural bound
+/// on merge work is a lib test (`tokenizer::tests::merge_work_is_linear_in_the_piece`).
+#[test]
+#[ignore = "real weights: set YUE2_HF_HUB (see the module docs)"]
+fn long_unbroken_piece_encode_time() {
+    let tok = tokenizer();
+    let ascii: String = (0..32_768u32)
+        .map(|i| char::from(b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8 % 26))
+        .collect();
+    let cjk: String = (0..32_768u32)
+        .map(|i| char::from_u32(0x4E00 + (i.wrapping_mul(2_654_435_761) >> 20) % 0x5000).unwrap())
+        .collect();
+    for (name, text) in [("ascii", &ascii), ("cjk", &cjk)] {
+        let start = Instant::now();
+        let ids = tok.encode(text).unwrap();
+        eprintln!(
+            "{name}: 32768 chars ({} bytes) -> {} ids in {:.2?}",
+            text.len(),
+            ids.len(),
+            start.elapsed()
+        );
+        assert_eq!(tok.decode(&ids), *text);
+    }
+}
+
 /// The checkpoint's own `yue2_generation_config.json` (pinned bytes) is exactly the protocol
 /// defaults.
 #[test]

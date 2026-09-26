@@ -227,6 +227,113 @@
   {
    "phase": "abc",
    "overrides": {
+    "temperature": true
+   },
+   "ok": {
+    "temperature": true,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_p": true
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": true,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "repetition_penalty": true
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": true,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": 9223372036854775808
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 9223372036854775808,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "top_k": 18446744073709551616
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 18446744073709551616,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 32,
+    "max_tokens": 4096
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "min_tokens": 0,
+    "max_tokens": 18446744073709551616
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 0,
+    "max_tokens": 18446744073709551616
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
+    "min_tokens": 9223372036854775808,
+    "max_tokens": 9223372036854775808
+   },
+   "ok": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 30,
+    "repetition_penalty": 1.005,
+    "penalty_window": 100,
+    "min_tokens": 9223372036854775808,
+    "max_tokens": 9223372036854775808
+   }
+  },
+  {
+   "phase": "abc",
+   "overrides": {
     "temperature": -0.01
    },
    "error": "ValueError: Invalid sampling temperature/top_p/top_k"
@@ -637,6 +744,113 @@
     "penalty_window": 64,
     "min_tokens": 10,
     "max_tokens": 20
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "temperature": true
+   },
+   "ok": {
+    "temperature": true,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_p": true
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": true,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "repetition_penalty": true
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": true,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": 9223372036854775808
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 9223372036854775808,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "top_k": 18446744073709551616
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 18446744073709551616,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 200,
+    "max_tokens": 9000
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "min_tokens": 0,
+    "max_tokens": 18446744073709551616
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 0,
+    "max_tokens": 18446744073709551616
+   }
+  },
+  {
+   "phase": "semantic",
+   "overrides": {
+    "min_tokens": 9223372036854775808,
+    "max_tokens": 9223372036854775808
+   },
+   "ok": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 100,
+    "repetition_penalty": 1.2,
+    "penalty_window": 50,
+    "min_tokens": 9223372036854775808,
+    "max_tokens": 9223372036854775808
    }
   },
   {
@@ -1176,6 +1390,107 @@
     },
     "semantic": {
      "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "context": 24576.0
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 32,
+    "ode_method": "midpoint",
+    "context": 24576.0,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "context": 24576.5
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "context": true
+   },
+   "error": "ValueError: Require context=24576 and midpoint with positive integer steps"
+  },
+  {
+   "input": {
+    "ode_steps": 18446744073709551616
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": 1.0,
+     "top_p": 0.95,
+     "top_k": 100,
+     "repetition_penalty": 1.2,
+     "penalty_window": 50,
+     "min_tokens": 200,
+     "max_tokens": 9000
+    },
+    "ode_steps": 18446744073709551616,
+    "ode_method": "midpoint",
+    "context": 24576,
+    "version": "yue2-native-v1"
+   }
+  },
+  {
+   "input": {
+    "semantic": {
+     "temperature": true
+    }
+   },
+   "ok": {
+    "abc": {
+     "temperature": 0.7,
+     "top_p": 0.9,
+     "top_k": 30,
+     "repetition_penalty": 1.005,
+     "penalty_window": 100,
+     "min_tokens": 32,
+     "max_tokens": 4096
+    },
+    "semantic": {
+     "temperature": true,
      "top_p": 0.95,
      "top_k": 100,
      "repetition_penalty": 1.2,
@@ -1767,6 +2082,46 @@
     "extra": 1
    },
    "error": "TypeError: SongRequest.__init__() got an unexpected keyword argument 'extra'"
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": true
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": true,
+     "id": "song"
+    },
+    "guidance": true,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
+  },
+  {
+   "input": {
+    "style": "pop",
+    "lyrics": "[Verse]\nla la",
+    "cfg_scale": false
+   },
+   "ok": {
+    "request": {
+     "style": "pop",
+     "lyrics": "[Verse]\nla la",
+     "cot": "full",
+     "seed": 831001,
+     "abc": null,
+     "cfg_scale": false,
+     "id": "song"
+    },
+    "guidance": false,
+    "text": "Generate a chord-annotated ABC transcription, then generate music with codec tokens from the given conditions.\n[Tags]\npop\n[Lyrics]\n[Verse]\nla la\n"
+   }
   },
   {
    "input": {

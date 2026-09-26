@@ -246,6 +246,118 @@ fn merges_follow_rank_order_not_position() {
     assert_eq!(tok.encode("abc").unwrap(), vec![b'a' as u32, 256]);
     assert_eq!(tok.encode("ab").unwrap(), vec![257]);
     assert_eq!(tok.encode("abab").unwrap(), vec![257, 257]);
+    // A recurring pair merges leftmost first: `aaa` with `aa` ranked is `aa` + `a`.
+    let mut t = bytes_table();
+    t.push((b"aa".to_vec(), 256));
+    let tok = Yue2TextTokenizer::from_partial_ranks_for_tests(&as_lines(&t)).unwrap();
+    assert_eq!(tok.encode("aaa").unwrap(), vec![256, b'a' as u32]);
+}
+
+/// The straightforward merge (re-rank every adjacent pair, join the lowest, leftmost on ties) —
+/// the oracle the linked-list/heap merge must agree with.
+fn reference_merge(piece: &[u8], rank_of: impl Fn(&[u8]) -> Option<u32>) -> Vec<usize> {
+    let mut bounds: Vec<usize> = (0..=piece.len()).collect();
+    loop {
+        let mut best: Option<(u32, usize)> = None;
+        for i in 0..bounds.len().saturating_sub(2) {
+            if let Some(rank) = rank_of(&piece[bounds[i]..bounds[i + 2]]) {
+                if best.is_none_or(|(r, _)| rank < r) {
+                    best = Some((rank, i));
+                }
+            }
+        }
+        match best {
+            Some((_, i)) => {
+                bounds.remove(i + 1);
+            }
+            None => return bounds,
+        }
+    }
+}
+
+/// Deterministic pseudo-random text over the synthetic table's corpus alphabet (English, CJK,
+/// ABC punctuation), so pieces hit many merges, recurring pairs and byte fallbacks.
+fn pseudo_random_text(seed: u32, chars: usize) -> String {
+    let alphabet: Vec<char> = "the nightaeiou 夜色我等风吹过那条老街|:/[]ABCDEFG,'"
+        .chars()
+        .collect();
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    (0..chars)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            alphabet[state as usize % alphabet.len()]
+        })
+        .collect()
+}
+
+/// The heap merge agrees with the reference merge on every piece of 300 pseudo-random texts and
+/// on long unbroken runs.
+#[test]
+fn byte_pair_merge_matches_the_reference_merge() {
+    let tok = synthetic();
+    let rank_of = |b: &[u8]| tok.encoder.get(b).copied();
+    let mut pieces = 0;
+    for seed in 0..300 {
+        let text = pseudo_random_text(seed, 1 + seed as usize % 97);
+        for piece in tok.pattern.find_iter(&text) {
+            let piece = piece.unwrap().as_str().as_bytes();
+            assert_eq!(
+                byte_pair_merge(piece, rank_of),
+                reference_merge(piece, rank_of),
+                "{:?}",
+                String::from_utf8_lossy(piece)
+            );
+            pieces += 1;
+        }
+    }
+    assert!(pieces > 1000, "{pieces}");
+    for run in [
+        "nightnightnight",
+        "aaaaaaaaaaaaa",
+        "夜色夜色夜色夜色",
+        "  \n \n  ",
+    ] {
+        let piece = run.repeat(20);
+        assert_eq!(
+            byte_pair_merge(piece.as_bytes(), rank_of),
+            reference_merge(piece.as_bytes(), rank_of)
+        );
+    }
+}
+
+/// One long unbroken piece costs a linear number of rank lookups (at most 3 per byte), not one
+/// per adjacent pair per merge. Counting lookups bounds the work without a timing assertion; the
+/// merge loop around them is a heap, `O(log n)` per lookup.
+#[test]
+fn merge_work_is_linear_in_the_piece() {
+    let tok = synthetic();
+    for text in [
+        "night".repeat(6_554),
+        "夜色我等风吹过那条老街".repeat(1_000),
+        pseudo_random_text(7, 32_768).replace([' ', '|', ':', '/', '[', ']', ',', '\''], ""),
+    ] {
+        let piece = text.as_bytes();
+        let mut lookups = 0usize;
+        let bounds = byte_pair_merge(piece, |b| {
+            lookups += 1;
+            tok.encoder.get(b).copied()
+        });
+        let merges = piece.len() + 1 - bounds.len();
+        assert!(
+            merges * 8 > piece.len(),
+            "only {merges} merges in {} bytes",
+            piece.len()
+        );
+        assert!(
+            lookups <= 3 * piece.len(),
+            "{lookups} lookups for {} bytes",
+            piece.len()
+        );
+        let ids = tok.encode(&text).unwrap();
+        assert_eq!(tok.decode(&ids), text);
+    }
 }
 
 /// Loading goes through verification: a `qwen.tiktoken` that fails the pinned size/hash never

@@ -280,25 +280,7 @@ impl Yue2TextTokenizer {
             ids.push(rank);
             return;
         }
-        // Byte-pair merge: repeatedly join the adjacent pair whose concatenation has the lowest
-        // rank (the leftmost one when the same bytes recur), until no pair is ranked.
-        let mut bounds: Vec<usize> = (0..=piece.len()).collect();
-        loop {
-            let mut best: Option<(u32, usize)> = None;
-            for i in 0..bounds.len().saturating_sub(2) {
-                if let Some(&rank) = self.encoder.get(&piece[bounds[i]..bounds[i + 2]]) {
-                    if best.is_none_or(|(r, _)| rank < r) {
-                        best = Some((rank, i));
-                    }
-                }
-            }
-            match best {
-                Some((_, i)) => {
-                    bounds.remove(i + 1);
-                }
-                None => break,
-            }
-        }
+        let bounds = byte_pair_merge(piece, |bytes| self.encoder.get(bytes).copied());
         ids.extend(bounds.windows(2).map(|w| {
             // Every part is a single byte (all 256 are ranked, checked at load) or a merge result
             // that was looked up above.
@@ -328,6 +310,66 @@ impl Yue2TextTokenizer {
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
+}
+
+/// tiktoken's byte-pair merge: repeatedly join the adjacent pair of parts whose concatenation has
+/// the lowest rank — the leftmost such pair when a rank recurs — until no adjacent pair is ranked.
+/// Returns the part boundaries (`0 = b[0] < … < b[n] = piece.len()`).
+///
+/// Like tiktoken's `_byte_pair_merge`, a merge re-ranks only its two neighbouring pairs; the
+/// lowest pair comes from a min-heap keyed `(rank, start offset)` (the offset gives the leftmost
+/// pick), with stale entries skipped. `rank_of` is therefore called at most `3 * piece.len()`
+/// times and the whole merge is `O(n log n)`, so one long unbroken piece of user text cannot
+/// stall encoding.
+fn byte_pair_merge(piece: &[u8], mut rank_of: impl FnMut(&[u8]) -> Option<u32>) -> Vec<usize> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = piece.len();
+    if n < 2 {
+        return (0..=n).collect();
+    }
+    // A part is named by its start offset, which never changes. Part `i` spans `i..next[i]`;
+    // `alive` is false once a part is absorbed by its left neighbour; `pair[i]` is the rank of
+    // part `i` joined with its successor (`None` when unranked or last).
+    let mut next: Vec<usize> = (1..=n).collect();
+    let mut prev: Vec<Option<usize>> = (0..n).map(|i| i.checked_sub(1)).collect();
+    let mut alive = vec![true; n];
+    let mut pair: Vec<Option<u32>> = vec![None; n];
+    let mut heap = BinaryHeap::new();
+    for i in 0..n - 1 {
+        pair[i] = rank_of(&piece[i..i + 2]);
+        if let Some(rank) = pair[i] {
+            heap.push(Reverse((rank, i)));
+        }
+    }
+    while let Some(Reverse((rank, i))) = heap.pop() {
+        if !alive[i] || pair[i] != Some(rank) {
+            continue; // stale: the part was absorbed or its pair re-ranked since the push
+        }
+        let absorbed = next[i];
+        alive[absorbed] = false;
+        next[i] = next[absorbed];
+        if next[i] < n {
+            prev[next[i]] = Some(i);
+        }
+        for p in std::iter::once(i).chain(prev[i]) {
+            pair[p] = (next[p] < n)
+                .then(|| next[next[p]])
+                .and_then(|stop| rank_of(&piece[p..stop]));
+            if let Some(rank) = pair[p] {
+                heap.push(Reverse((rank, p)));
+            }
+        }
+    }
+    let mut bounds = Vec::with_capacity(n + 1);
+    let mut i = 0;
+    while i < n {
+        bounds.push(i);
+        i = next[i];
+    }
+    bounds.push(n);
+    bounds
 }
 
 /// `base64(token) rank` lines, ranks exactly `0..n` in any order.

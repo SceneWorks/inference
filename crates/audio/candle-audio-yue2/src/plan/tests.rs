@@ -457,19 +457,39 @@ fn identity_covers_the_model_facing_content() {
     text.abc = Some("X".into());
     let mut truncated = plan.clone();
     truncated.truncated = true;
-    let mut seed = plan.clone();
-    seed.request = SongRequest::new(crate::protocol::SongRequestSpec {
-        seed: 1,
-        ..plan.request.spec()
-    })
-    .unwrap();
+    // Each request variant changes exactly one field, through validation.
+    let with_request = |edit: &dyn Fn(&mut crate::protocol::SongRequestSpec)| {
+        let mut spec = plan.request.spec();
+        edit(&mut spec);
+        let mut changed = plan.clone();
+        changed.request = SongRequest::new(spec).unwrap();
+        assert_ne!(changed.request, plan.request);
+        changed
+    };
+    let requests = [
+        ("request.seed", with_request(&|s| s.seed = 1)),
+        (
+            "request.cfg_scale",
+            with_request(&|s| s.cfg_scale = Some(1.5)),
+        ),
+        (
+            "request.abc",
+            with_request(&|s| s.abc = Some("X:1\nK:C\nC|".into())),
+        ),
+        ("request.style", with_request(&|s| s.style.push('!'))),
+        ("request.lyrics", with_request(&|s| s.lyrics.push('!'))),
+        ("request.cot", with_request(&|s| s.cot = CotMode::Melody)),
+        ("request.id", with_request(&|s| s.id = "other_song".into())),
+    ];
     for (what, changed) in [
         ("abc_ids", ids),
         ("prefix", prefix),
         ("abc", text),
         ("truncated", truncated),
-        ("seed", seed),
-    ] {
+    ]
+    .into_iter()
+    .chain(requests)
+    {
         assert_ne!(changed.identity(), base, "{what}");
     }
     let mut timing = plan.clone();
