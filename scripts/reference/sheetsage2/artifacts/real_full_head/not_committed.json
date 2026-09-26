@@ -1,0 +1,26 @@
+{
+  "files": {
+    "beat.lab": 945,
+    "chords.mid": 916,
+    "downbeat.lab": 152,
+    "events.json": 60364,
+    "events.tsv": 8602,
+    "melody.mid": 633,
+    "melody_full.lab": 1454,
+    "melody_instrumental.lab": 0,
+    "melody_instrumental.mid": 87,
+    "melody_vocal.lab": 1302,
+    "melody_vocal.mid": 633,
+    "notation/song_beats.txt": 957,
+    "notation/song_chords.txt": 590,
+    "notation/song_keys.txt": 18,
+    "notation/song_melody.mid": 633,
+    "notation/song_structures.txt": 16,
+    "playback.json": 34792,
+    "rhythm_events.lab": 2339,
+    "structure.lab": 16,
+    "tokens.json": 3111,
+    "transcription.mid": 1486
+  },
+  "reason": "size/type policy (weights, tensors, audio and large files stay in --work); duplicate cases keep only the files that differ in kind"
+}

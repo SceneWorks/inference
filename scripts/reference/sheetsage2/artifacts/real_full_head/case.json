@@ -1,0 +1,68 @@
+{
+  "case": "real_full_head",
+  "environment": {
+    "ffmpeg": "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers",
+    "machine": "arm64",
+    "mps_available": true,
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "python": "3.11.15",
+    "torch": "2.8.0",
+    "torch_threads": 8,
+    "transformers": "4.45.2"
+  },
+  "hf_hub_offline": false,
+  "input": {
+    "sample_rate": 24000,
+    "samples": 1440000,
+    "sha256": "3518342e1f512be4611518627a6531eb293b6296cce8e5791c76fd2c5c9c82a0"
+  },
+  "load": {
+    "device": "cpu",
+    "dtype": "torch.float32",
+    "load_seconds": 2.94,
+    "parameters": 676887449,
+    "revision": "4f89269db831bdc1880124164a00d4f9385cd129",
+    "snapshot": "$HF_HUB_CACHE/models--m-a-p--SheetSage2/snapshots/4f89269db831bdc1880124164a00d4f9385cd129"
+  },
+  "result": {
+    "abc_error": null,
+    "abc_measures": 27,
+    "diagnostics": [],
+    "dtype": "fp32",
+    "duration_seconds": 60.0,
+    "elapsed_seconds": 22.02259849998518,
+    "instrumental_notes": 0,
+    "lookahead_seconds": 100.0,
+    "melody_notes": 76,
+    "melody_only": false,
+    "overlap_seconds": 200.0,
+    "preset": "default",
+    "prompts": [
+      "timestamp",
+      "downbeat_meter",
+      "structure",
+      "key",
+      "chord_full",
+      "melody_full"
+    ],
+    "vocal_notes": 76,
+    "warnings": [],
+    "window_seconds": 300.0,
+    "windows": [
+      {
+        "accepted_events": 100,
+        "elapsed_seconds": 21.99430720799137,
+        "end": 60.0,
+        "events": 100,
+        "start": 0.0,
+        "tokens": 456
+      }
+    ]
+  },
+  "spec": {
+    "fixture": "nav_ssb",
+    "online": true,
+    "revision": "4f89269db831bdc1880124164a00d4f9385cd129"
+  },
+  "transcribe_seconds": 22.09
+}

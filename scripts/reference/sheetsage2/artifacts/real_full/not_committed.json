@@ -1,0 +1,10 @@
+{
+  "files": {
+    "piano_mix.wav": 10590216,
+    "score.pdf": 95577,
+    "score_001.svg": 1203529,
+    "score_002.png": 46364,
+    "score_002.svg": 1060977
+  },
+  "reason": "size/type policy (weights, tensors, audio and large files stay in --work); duplicate cases keep only the files that differ in kind"
+}
