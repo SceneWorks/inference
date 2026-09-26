@@ -7,7 +7,8 @@
 //! ## Per-step cost
 //!
 //! A decode step does O(1) work beyond attention itself (which reads the whole cache, inherently
-//! O(position)): the KV cache is allocated once per render at the context limit and written in
+//! O(position)): the KV cache is allocated once per render at the render's bound (see
+//! [`crate::stage1::render_positions`], capped at the context limit) and written in
 //! place (no per-step `cat` of the history), attention reads the cache's un-expanded K/V views
 //! directly (no per-step `repeat_kv` of every cached position, no transposed-key copy), and the
 //! CFG step mask is a narrowed view of a per-segment mask (no per-step host build and upload).
@@ -93,16 +94,21 @@ pub struct Stage1Lm {
     /// `window` as the sampler's `i32` ids — the repetition-penalty window (the sampler penalises
     /// each distinct id once). Kept in step with `window` so no step rebuilds it.
     penalty_window: Vec<i32>,
-    /// Preallocated for `context_limit` positions (every window fits: the smart context keeps it
-    /// at most `context_limit − max_new_tokens − 1` before a segment's budget) and reused across
-    /// the render's segments; a smart-context rebuild only rewinds it. Reallocated only when the
-    /// row count changes.
+    /// Preallocated for [`Self::capacity`] positions and reused across the render's segments; a
+    /// smart-context rebuild only rewinds it. Reallocated only when the row count or the
+    /// capacity changes.
     cache: Option<StaticKvCache>,
+    /// The render's KV capacity: `min(max_positions, context_limit)` from
+    /// [`Stage1Model::begin_render`]. The window never outgrows it — the whole sequence stays
+    /// within the engine's render bound, a shortened window is shorter than the sequence, and the
+    /// smart context keeps every window within `context_limit − max_new_tokens − 1` before a
+    /// segment's budget — and [`Stage1Model::begin_segment`] refuses a segment that could.
+    capacity: usize,
     /// Rows in `cache` (1 without guidance, 2 with).
     batch: usize,
     /// First cache column the unconditional row attends (the segment prompt's last token).
     uncond_start: usize,
-    /// The CFG decode step's additive mask for the open segment, `[2, 1, 1, context_limit]` in the
+    /// The CFG decode step's additive mask for the open segment, `[2, 1, 1, capacity]` in the
     /// compute dtype: row 0 attends every column, row 1 only columns `>= uncond_start`. A step
     /// attends a narrowed view of it, so no step builds or uploads a mask.
     step_mask: Option<Tensor>,
@@ -176,6 +182,7 @@ impl Stage1Lm {
             window: Vec::new(),
             penalty_window: Vec::new(),
             cache: None,
+            capacity: 0,
             batch: 1,
             uncond_start: 0,
             step_mask: None,
@@ -214,7 +221,7 @@ impl Stage1Lm {
         self.cache.as_ref()
     }
 
-    /// Allocate the KV cache for `self.batch` rows at `context_limit` positions, unless one of that
+    /// Allocate the KV cache for `self.batch` rows at the render's `capacity`, unless one of that
     /// row count is already held (then it is kept, possibly rewound by the caller).
     fn ensure_cache(&mut self) -> gen_core::Result<()> {
         if self.cache.is_some() {
@@ -226,7 +233,7 @@ impl Stage1Lm {
             self.batch,
             usize::try_from(cfg.num_kv_heads).unwrap_or(0),
             usize::try_from(cfg.head_dim).unwrap_or(0),
-            self.context_limit,
+            self.capacity,
             self.model.compute_dtype(),
             self.model.device(),
         )
@@ -235,13 +242,13 @@ impl Stage1Lm {
         Ok(())
     }
 
-    /// The open segment's CFG step mask `[2, 1, 1, context_limit]` (see the `step_mask` field).
+    /// The open segment's CFG step mask `[2, 1, 1, capacity]` (see the `step_mask` field).
     fn build_step_mask(&mut self) -> gen_core::Result<Tensor> {
         #[cfg(test)]
         {
             self.host_mask_builds += 1;
         }
-        let cols = self.context_limit;
+        let cols = self.capacity;
         let mut mask = vec![0f32; 2 * cols];
         for m in &mut mask[cols..cols + self.uncond_start.min(cols)] {
             *m = MASK_NEG;
@@ -384,11 +391,19 @@ fn prefill_cfg_mask(
 }
 
 impl Stage1Model for Stage1Lm {
-    fn begin_render(&mut self, seed: u64) -> gen_core::Result<()> {
+    fn begin_render(&mut self, seed: u64, max_positions: usize) -> gen_core::Result<()> {
         self.rng = SplitMix64::new(seed);
         self.history.clear();
         self.window.clear();
-        // Keep the preallocated buffers for the next render; only the written length resets.
+        // Size the KV cache to this render, never past the model context. Production loads a
+        // fresh `Stage1Lm` per render (and drops it before stage 2), so this allocates once; a
+        // caller that holds one `Stage1Lm` across renders (tests, the bench) keeps the buffers
+        // when the next render's capacity matches and only rewinds them.
+        let capacity = max_positions.min(self.context_limit);
+        if capacity != self.capacity {
+            self.cache = None;
+            self.capacity = capacity;
+        }
         if let Some(cache) = self.cache.as_mut() {
             cache.reset();
         }
@@ -433,8 +448,30 @@ impl Stage1Model for Stage1Lm {
             Some(s) if s != 1.0 => 2,
             _ => 1,
         };
-        if self.history.len() > max_context {
-            self.window = shorten_context(&self.history, max_context);
+        let shortened =
+            (self.history.len() > max_context).then(|| shorten_context(&self.history, max_context));
+        // The positions this segment can write: its window plus the budget (the last sampled
+        // token and the closing `<EOA>` are never fed within the segment). Within the engine's
+        // render bound this always fits — the unshortened window is the whole sequence, a
+        // shortened one is shorter — so exceeding it means the caller's `max_positions` did not
+        // cover the segments it runs: refuse before touching the cache.
+        let window_len = shortened
+            .as_ref()
+            .map_or(self.window.len() + segment.prompt.len(), Vec::len);
+        if window_len + max_new > self.capacity {
+            self.history
+                .truncate(self.history.len() - segment.prompt.len());
+            return Err(gen_core::Error::Msg(format!(
+                "candle-audio-yue stage 1: segment {} needs {} KV positions ({window_len} in the \
+                 window + {max_new} to generate) but the render was sized for {} (the \
+                 begin_render bound must cover every segment the render runs)",
+                segment.index,
+                window_len + max_new,
+                self.capacity
+            )));
+        }
+        if let Some(window) = shortened {
+            self.window = window;
             // The shortened window is a different sequence: rebuild the cache from position 0
             // (a rewind of the preallocated buffers, which the next feed overwrites).
             if let Some(cache) = self.cache.as_mut() {

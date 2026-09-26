@@ -53,7 +53,8 @@ fn main() {
         min_new_tokens: tokens,
         ..DecodeConfig::default()
     };
-    lm.begin_render(42).expect("begin render");
+    let bound = candle_audio_yue::stage1::render_positions([prompt.as_slice()], tokens);
+    lm.begin_render(42, bound).expect("begin render");
     let t = Instant::now();
     lm.begin_segment(&SegmentStart {
         index: 0,

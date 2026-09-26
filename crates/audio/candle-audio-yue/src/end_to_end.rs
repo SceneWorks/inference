@@ -61,8 +61,8 @@ struct Stage1Probe {
 }
 
 impl Stage1Model for Stage1Probe {
-    fn begin_render(&mut self, seed: u64) -> crate::gen_core::Result<()> {
-        self.logged.inner.begin_render(seed)
+    fn begin_render(&mut self, seed: u64, max_positions: usize) -> crate::gen_core::Result<()> {
+        self.logged.inner.begin_render(seed, max_positions)
     }
     fn begin_segment(&mut self, segment: &SegmentStart<'_>) -> crate::gen_core::Result<()> {
         self.logged.inner.begin_segment(segment)
@@ -443,8 +443,8 @@ struct PromptRecorder {
 }
 
 impl Stage1Model for PromptRecorder {
-    fn begin_render(&mut self, seed: u64) -> crate::gen_core::Result<()> {
-        self.inner.begin_render(seed)
+    fn begin_render(&mut self, seed: u64, max_positions: usize) -> crate::gen_core::Result<()> {
+        self.inner.begin_render(seed, max_positions)
     }
     fn begin_segment(&mut self, segment: &SegmentStart<'_>) -> crate::gen_core::Result<()> {
         self.prompts.lock().unwrap().push(segment.prompt.to_vec());
