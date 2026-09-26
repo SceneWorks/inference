@@ -39,7 +39,7 @@
 //! RoPE positions are the physical cache slots `0, 1, 2, …` of the one sequence a cache holds —
 //! upstream's `position_ids = cache_position` for an unpadded single request. There is no
 //! windowing, shortening or re-prefill: a sequence either fits the cache it was given (at most
-//! [`CONTEXT`](crate::sampling::CONTEXT) positions) or the step fails before writing (see
+//! [`CONTEXT`](crate::protocol::CONTEXT) positions) or the step fails before writing (see
 //! [`crate::generate`] for the request-level budget check).
 
 use std::path::Path;
@@ -173,6 +173,22 @@ impl Yue2Config {
             )));
         }
         Ok(())
+    }
+}
+
+/// Refuse a compute dtype/device pair YuE2 cannot run **before** any verification or weight I/O:
+/// the model computes in F32 or BF16 only, and Candle's CPU backend has no BF16 matmul (a CPU
+/// load computes in F32 — the BF16 checkpoint upcasts exactly).
+fn check_compute(dtype: DType, device: &Device) -> gen_core::Result<()> {
+    match dtype {
+        DType::F32 => Ok(()),
+        DType::BF16 if !device.is_cpu() => Ok(()),
+        DType::BF16 => Err(gen_core::Error::Unsupported(
+            "YuE2 on the CPU computes in F32: Candle's CPU backend has no BF16 matmul".into(),
+        )),
+        other => Err(gen_core::Error::Unsupported(format!(
+            "YuE2 computes in F32 or BF16 (the released precision), not {other:?}"
+        ))),
     }
 }
 
@@ -432,6 +448,7 @@ impl Yue2Lm {
         dtype: DType,
         device: &Device,
     ) -> gen_core::Result<Self> {
+        check_compute(dtype, device)?;
         let verified = snapshot::resolve_component(ComponentId::Lm, dirs)?;
         let config_path = verified.path("config.json").ok_or_else(|| {
             gen_core::Error::Msg("verified YuE2-3B snapshot has no config.json".into())
@@ -464,6 +481,7 @@ impl Yue2Lm {
         vb: VarBuilder,
         paths: MotPaths,
     ) -> gen_core::Result<Self> {
+        check_compute(vb.dtype(), vb.device())?;
         config.validate()?;
         let err = backend("load");
         let (h, v) = (config.hidden_size, config.vocab_size);
@@ -704,10 +722,10 @@ pub(crate) mod synthetic {
             num_key_value_heads: 2,
             head_dim: 16,
             intermediate_size: 64,
-            vocab_size: crate::sampling::VOCAB_SIZE,
+            vocab_size: crate::protocol::VOCAB_SIZE as usize,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
-            max_position_embeddings: crate::sampling::CONTEXT,
+            max_position_embeddings: crate::protocol::CONTEXT,
         }
     }
 
@@ -897,6 +915,28 @@ mod tests {
         }
         let missing = released.replace(r#""head_dim":128,"#, "");
         assert!(Yue2Config::from_json(&missing).is_err());
+    }
+
+    /// An unsupported compute dtype (F16), or BF16 on the CPU (no BF16 matmul), is refused before
+    /// any weight is read; F32 on the CPU loads.
+    #[test]
+    fn unsupported_compute_dtypes_are_refused_before_loading() {
+        let cfg = synthetic::config();
+        for dtype in [DType::F16, DType::BF16, DType::F64] {
+            // An empty builder: reaching any tensor lookup would be a "missing tensor" error.
+            let vb = VarBuilder::from_tensors(Default::default(), dtype, &Device::Cpu);
+            let err = Yue2Lm::from_var_builder(cfg.clone(), vb, MotPaths::Ar).unwrap_err();
+            assert!(
+                matches!(err, gen_core::Error::Unsupported(_)),
+                "{dtype:?}: {err}"
+            );
+        }
+        let dirs = SnapshotDirs::new();
+        let err = Yue2Lm::load(&dirs, MotPaths::Ar, DType::F16, &Device::Cpu).unwrap_err();
+        assert!(matches!(err, gen_core::Error::Unsupported(_)), "{err}");
+        // F32 passes the check and only then reaches verification (a cold cache here).
+        let err = Yue2Lm::load(&dirs, MotPaths::Ar, DType::F32, &Device::Cpu).unwrap_err();
+        assert!(!matches!(err, gen_core::Error::Unsupported(_)), "{err}");
     }
 
     #[test]

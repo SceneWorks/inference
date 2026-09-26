@@ -71,8 +71,15 @@ Each bound was set after measuring, and each is documented next to its constant 
 | Real weights: logits of 258 decode steps, every mode (F32) | max \|Δ\| 3.6e-5, \|Δ lse\| 3.6e-5, moments 1.2e-5 | 2e-4 (min reference top-1 margin 1.2e-2) |
 | Real weights: cached decode vs native full recompute | 1.6e-5 | 1e-4 |
 
-Token sequences (greedy and injected-draw) and truncation flags are compared exactly; on real
-weights all 258 steps' tokens and every step's top-8 ids matched.
+Token sequences (greedy and injected-draw) and truncation flags are compared exactly. Each
+step's top-k ids: the top-1 id and the top-k set exactly, and an order swap counts only when the
+reference gap between the swapped entries exceeds twice the logit tolerance (the smallest
+adjacent top-8 gap on real weights is 6.9e-5, below twice the measured noise). On real weights
+all 258 steps' tokens matched with no top-k mismatch.
+
+The `modes` records also carry each `request` (style, lyrics, cot, seed, external ABC, CFG
+scale): the native test rebuilds every prefix through its own tokenizer and `SymbolicPlan` and
+checks it id for id against the upstream ids recorded beside it.
 
 Run cost (Apple M-series CPU, F32): the reference `real` subcommand peaks at 21.0 GB RSS
 (`ru_maxrss`: both MoT paths in F32 plus the mapped checkpoint) and takes ~50 s; the native
