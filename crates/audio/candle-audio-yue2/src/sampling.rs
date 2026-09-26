@@ -147,10 +147,8 @@ impl Sampling {
         {
             return bad("sampling numbers must be finite");
         }
-        if !(0.0..=5.0).contains(&self.temperature)
-            || !(self.top_p > 0.0 && self.top_p <= 1.0)
-            || self.top_k < 1
-        {
+        let top_p_ok = self.top_p > 0.0 && self.top_p <= 1.0;
+        if !(0.0..=5.0).contains(&self.temperature) || !top_p_ok || self.top_k < 1 {
             return bad("invalid temperature/top_p/top_k");
         }
         if self.repetition_penalty <= 0.0 || !(1..=100).contains(&self.penalty_window) {
@@ -355,7 +353,7 @@ pub fn argmax(scores: &[f32]) -> u32 {
 /// cumulative probability (F64) exceeds `u · Σp`. `None` when no id has positive probability.
 pub fn draw(probabilities: &[f32], u: f32) -> Option<u32> {
     let total: f64 = probabilities.iter().map(|&p| p as f64).sum();
-    if !(total > 0.0) {
+    if total.is_nan() || total <= 0.0 {
         return None;
     }
     let target = u as f64 * total;
@@ -565,8 +563,8 @@ mod tests {
         assert_eq!(round_bf16(1.2), 1.203125);
         assert_eq!(round_bf16(0.95), 0.94921875);
         // Exactly halfway between 1.0 and 1.0078125 rounds to the even (1.0).
-        assert_eq!(round_bf16(1.00390625), 1.0);
-        assert_eq!(round_bf16(1.01171875), 1.015625);
+        assert_eq!(round_bf16(1.0 + 2f32.powi(-8)), 1.0);
+        assert_eq!(round_bf16(1.0 + 3.0 * 2f32.powi(-8)), 1.015625);
         assert!(round_bf16(f32::NAN).is_nan());
         assert_eq!(round_bf16(f32::NEG_INFINITY), f32::NEG_INFINITY);
     }

@@ -13,7 +13,7 @@
 //!   `prefix + max_tokens` positions and positions are the cache slots `0, 1, 2, …`.
 //! * With guidance (`scale != 1`) the negative prefix gets its own cache; every step runs both
 //!   branches and samples from `uncond + scale · (cond − uncond)` in the model dtype.
-//! * A step shapes the row with [`sampling::distribution`], draws (or takes the argmax), reports
+//! * A step shapes the row with [`distribution`], draws (or takes the argmax), reports
 //!   the token (end id included) to the observer, and stops on the phase's end id. Otherwise the
 //!   token is fed back — except after the last budgeted step, which runs no forward.
 //! * `truncated` is true exactly when the budget ran out before the end id.

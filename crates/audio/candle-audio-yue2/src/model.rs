@@ -152,12 +152,15 @@ impl Yue2Config {
             self.vocab_size,
             self.max_position_embeddings,
         ];
-        if dims.contains(&0) || self.head_dim % 2 != 0 {
+        if dims.contains(&0) || !self.head_dim.is_multiple_of(2) {
             return Err(gen_core::Error::Unsupported(format!(
                 "YuE2 config has an empty dimension or an odd head width: {self:?}"
             )));
         }
-        if self.num_attention_heads % self.num_key_value_heads != 0 {
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
             return Err(gen_core::Error::Unsupported(format!(
                 "YuE2 config: {} query heads do not group over {} key/value heads",
                 self.num_attention_heads, self.num_key_value_heads

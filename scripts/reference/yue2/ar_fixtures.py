@@ -287,7 +287,7 @@ def probe_ids() -> dict[str, list[int]]:
 
 def env_record() -> dict:
     ref = Path(os.environ.get("YUE2_REF_DIR", Path.home() / ".cache/sceneworks-yue2-ref"))
-    env = json.loads((ref / "ENVIRONMENT.json").read_text()) if (ref / "ENVIRONMENT.json").exists() else {}
+    env = json.loads((ref / "ENVIRONMENT.json").read_text(encoding="utf-8")) if (ref / "ENVIRONMENT.json").exists() else {}
     return {"upstream_commit": UPSTREAM_COMMIT, "yue2_package": getattr(yue2, "__version__", None),
             "torch": torch.__version__, "numpy": np.__version__,
             "environment_commit": env.get("yue2_commit"), "python": sys.version.split()[0]}
@@ -461,7 +461,7 @@ def snapshot_dir() -> Path:
     if not hub:
         raise SystemExit("set YUE2_HF_HUB to the hub directory holding models--m-a-p--YuE2-3B")
     path = Path(hub) / "models--m-a-p--YuE2-3B" / "snapshots" / LM_REVISION
-    manifest = json.loads((path / "weights_manifest.json").read_text())
+    manifest = json.loads((path / "weights_manifest.json").read_text(encoding="utf-8"))
     weights = path / "model.safetensors"
     want = manifest["files"]["model.safetensors"]
     if weights.stat().st_size != want["bytes"]:
@@ -480,9 +480,9 @@ def real(args) -> None:
 
     snap = snapshot_dir()
     upstream = Path(os.environ.get("YUE2_REF_DIR", Path.home() / ".cache/sceneworks-yue2-ref")) / "YuE"
-    song = json.loads((upstream / "examples/song.json").read_text())
-    score = (upstream / "examples/score.abc").read_text()
-    melody = (upstream / "examples/melody.abc").read_text()
+    song = json.loads((upstream / "examples/song.json").read_text(encoding="utf-8"))
+    score = (upstream / "examples/score.abc").read_text(encoding="utf-8")
+    melody = (upstream / "examples/melody.abc").read_text(encoding="utf-8")
     tok = YuE2TextTokenizer(snap / "qwen.tiktoken")
     start = time.perf_counter()
     model = YuE2ForCausalLM.from_pretrained(snap, local_files_only=True,
@@ -560,15 +560,15 @@ def real(args) -> None:
     out["sampling"] = {"abc_greedy": sampling_dict(greedy_abc),
                        "semantic_greedy": sampling_dict(greedy_sem)}
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    out["run"] = {"load_seconds": load_seconds, "mode_seconds": timings,
-                  "peak_rss_gb": peak / (1 << 30 if sys.platform == "darwin" else 1 << 20)}
-    print(json.dumps(out["run"]))
+    # Machine-dependent run cost: printed, never committed.
+    print(json.dumps({"load_seconds": load_seconds, "mode_seconds": timings,
+                      "peak_rss_gb": peak / (1 << 30 if sys.platform == "darwin" else 1 << 20)}))
     write(FIXTURES / "ar_real_weights.json", out)
 
 
 def write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=1, sort_keys=False) + "\n")
+    path.write_text(json.dumps(data, indent=1, sort_keys=False) + "\n", encoding="utf-8")
     print(f"wrote {path} ({path.stat().st_size / 1024:.0f} KiB)")
 
 
