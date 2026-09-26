@@ -336,6 +336,9 @@ pub(crate) fn sync_file(path: &Path) -> Result<(), RunError> {
     {
         let mut permissions = fs::metadata(path).map_err(io(path))?.permissions();
         if permissions.readonly() {
+            // Windows has one read-only attribute (no Unix mode bits to widen): clearing it is
+            // exactly what makes the copy openable for the flush.
+            #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions).map_err(io(path))?;
         }
