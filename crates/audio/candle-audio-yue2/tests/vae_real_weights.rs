@@ -15,9 +15,9 @@
 //!   --test vae_real_weights -- --ignored --nocapture --test-threads 1
 //! ```
 //!
-//! CPU only. Measured peak RSS 2.28 GB for the whole file (one 530 MB FP32 VAE mapped plus its
-//! folded weights at a time — the encoder test loads both halves — and activations of a ≤ 3 s
-//! clip); ~50 s in release mode.
+//! CPU only. Measured peak RSS 2.3–2.6 GB (two runs) for the whole file: one 530 MB FP32 VAE
+//! mapped plus its folded weights at a time (the encoder test loads both halves) and activations
+//! of a ≤ 3 s clip; 37–50 s in release mode.
 //!
 //! Every waveform compared here is produced by the production entry points
 //! ([`decode_latents`] on a [`Yue2Vae::load`]ed verified component) — not a test-only forward.
