@@ -22,7 +22,15 @@
 //!   --test engine_real_weights -- --ignored --nocapture --exact --test-threads 1 <name>
 //! ```
 //!
-//! Measured 2026-09-26 (Apple M-series CPU, release) — see the story's PR for the run record.
+//! Measured 2026-09-26 (Apple M-series CPU, release, one test per process):
+//!
+//! * `registered_loader_generates_a_song_with_every_artifact`: 440 s wall — 20 s resolve + verify +
+//!   load, 23 s for the 48-token score, 101 s for 200 semantic tokens, 273 s for 32 midpoint steps,
+//!   11 s standard decode; 8.00 s of audio (rms 0.093); resume 0.01 s; legacy re-decode 12 s. Peak
+//!   `ru_maxrss` 23.2 GB (the mapped checkpoint counts during the load), peak footprint 19.0 GB.
+//! * `a_saved_closure_serves_plan_only_and_restored_plan_runs`: 144 s wall (closure copy 75 s, load
+//!   from it 15 s, plan only 11 s, a 2 s song from the restored plan 44 s); `ru_maxrss` 23.2 GB,
+//!   peak footprint 17.0 GB.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
