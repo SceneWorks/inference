@@ -183,7 +183,11 @@ fn source() -> Source {
     Source {
         dirs: SnapshotDirs::new().with(REPO.id, dir),
         tmp,
-        source: TierSource { lm, tok },
+        source: TierSource {
+            lm,
+            tok,
+            pins: None,
+        },
         tensors,
     }
 }
@@ -623,6 +627,53 @@ fn rehosting_a_tier_is_not_authorized() {
         .unwrap()
         .to_string();
     assert!(note.contains("not authorized"), "{note}");
+}
+
+/// A tier must reproduce its source's pinned conversion output: the synthetic source's own
+/// outputs verify once pinned, a different pinned digest is a hash mismatch, and a source that
+/// pins no output for the tier refuses it. The pinned YuE2-3B original pins both derived tiers.
+///
+/// Mutation run: skipping the pin comparison fails the `wrong` case.
+#[test]
+fn pinned_outputs_are_enforced() {
+    let src = source();
+    let dir = convert_to(&src, Tier::Q8, "q8");
+    let rec = &read_manifest(&dir).unwrap()["files"][WEIGHTS_FILE];
+    let (sha, bytes) = (
+        leak_str(rec["sha256"].as_str().unwrap().to_string()),
+        rec["bytes"].as_u64().unwrap(),
+    );
+    let with = |pins: Vec<TierPin>| TierSource {
+        pins: Some(Box::leak(pins.into_boxed_slice())),
+        ..src.source
+    };
+    let right = with(vec![TierPin {
+        tier: Tier::Q8,
+        bytes,
+        sha256: sha,
+    }]);
+    assert!(verify_tier_from(right, &dir).is_ok());
+    let wrong = with(vec![TierPin {
+        tier: Tier::Q8,
+        bytes,
+        sha256: leak_str("0".repeat(64)),
+    }]);
+    assert!(matches!(
+        verify_tier_from(wrong, &dir),
+        Err(AssetError::HashMismatch { .. })
+    ));
+    let none = with(vec![TierPin {
+        tier: Tier::Q4,
+        bytes,
+        sha256: sha,
+    }]);
+    assert!(verify_tier_from(none, &dir)
+        .unwrap_err()
+        .to_string()
+        .contains("no pinned q8 output"));
+    let pinned: Vec<Tier> = TIER_PINS.iter().map(|p| p.tier).collect();
+    assert_eq!(pinned, [Tier::Q8, Tier::Q4]);
+    assert_eq!(TierSource::pinned().pins, Some(TIER_PINS));
 }
 
 /// A saved closure carries a derived tier byte for byte, and the copy verifies.

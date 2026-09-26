@@ -426,6 +426,9 @@ fn tier_quality_against_the_f32_reference() {
     let mut reference: Option<Outputs> = reference_path
         .is_file()
         .then(|| load_reference(&reference_path));
+    // The `bf16` run's latents, when it ran: the FP8 mode's acoustic stage must reproduce them bit
+    // for bit (it runs on the restored BF16 originals).
+    let mut bf16_latents: Option<BTreeMap<String, Vec<f32>>> = None;
     for name in configs.split(',') {
         let device = device_named(if name == "f32" {
             &ref_device_name
@@ -462,8 +465,13 @@ fn tier_quality_against_the_f32_reference() {
         let load_seconds = t.elapsed().as_secs_f64();
         let residency = engine.weight_residency().unwrap();
         let fp8 = engine.fp8_status().unwrap();
+        let on = if name == "f32" {
+            &ref_device_name
+        } else {
+            &device_name
+        };
         println!(
-            "{name} on {device_name}: loaded in {load_seconds:.1} s; weights {:.2} GB on the \
+            "{name} on {on}: loaded in {load_seconds:.1} s; weights {:.2} GB on the \
              device + {:.2} GB host originals",
             residency.device_bytes as f64 / 1e9,
             residency.host_bytes as f64 / 1e9
@@ -553,14 +561,59 @@ fn tier_quality_against_the_f32_reference() {
             serde_json::to_vec_pretty(&result).unwrap(),
         )
         .unwrap();
-        // Sanity bounds only — the measured numbers are the evidence (see the crate docs). Every
-        // output finite (`signal_stats` asserts it), and no configuration so broken that it
-        // disagrees with the reference on most steps.
+        // The bounds: see `BOUNDS`. Every output is finite (`signal_stats` asserts it).
+        let (_, top1_min, kl_mean_max, snr_min) = BOUNDS
+            .iter()
+            .copied()
+            .find(|b| b.0 == name)
+            .expect("every configuration has bounds");
+        let top1 = total.top1_agree as f64 / total.steps as f64;
+        let kl_mean = total.kl_sum / total.steps as f64;
         assert!(
-            total.top1_agree * 2 > total.steps,
-            "{name}: top-1 agreement {} of {}",
-            total.top1_agree,
-            total.steps
+            top1 >= top1_min,
+            "{name}: top-1 agreement {top1} < {top1_min}"
         );
+        assert!(
+            kl_mean <= kl_mean_max,
+            "{name}: mean KL {kl_mean} > {kl_mean_max}"
+        );
+        for (case, stats) in &nar {
+            let snr = stats["latents"]["snr_db"].as_f64().unwrap();
+            assert!(
+                snr >= snr_min,
+                "{name} {case}: latents SNR {snr} dB < {snr_min}"
+            );
+        }
+        match name {
+            "bf16" => bf16_latents = Some(outputs.latents.clone()),
+            "fp8" => {
+                if let Some(bf16) = &bf16_latents {
+                    assert_eq!(
+                        &outputs.latents, bf16,
+                        "the FP8 mode's acoustic stage must run the restored BF16 originals"
+                    );
+                    println!("fp8: acoustic latents are bit-identical to bf16's");
+                }
+            }
+            _ => {}
+        }
     }
 }
+
+/// `(config, top-1 agreement ≥, mean KL ≤, latents SNR ≥ dB)` against the F32 reference.
+///
+/// Measured 2026-09-26 — Candle CPU (Apple M-series, F32 activations): q8 99.5 % / 1.5e-4 /
+/// 37.0 dB, q4 93.5 % / 9.0e-3 / 18.3 dB; Candle CUDA (RTX PRO 6000 Blackwell, BF16 activations,
+/// run 36255139284): f32dev 100 % / 1.3e-12 / 119.5 dB, bf16 98.4 % / 3.1e-4 / 37.1 dB, fp8 97.8 %
+/// / 1.9e-3 / 37.1 dB, q8 98.9 % / 4.8e-4 / 34.1 dB, q4 94.0 % / 9.1e-3 / 17.9 dB (the worst of the
+/// two acoustic cases). Bounds leave ≈3× on KL and ≈3–5 dB on SNR for another machine's
+/// reduction order; each is far outside the next-coarser configuration's measurement (a q8 run
+/// that loaded q4 weights, an FP8 mode left active in the acoustic stage — the bit-identity check
+/// — or a BF16 run on the wrong weights fails).
+const BOUNDS: [(&str, f64, f64, f64); 5] = [
+    ("f32dev", 0.999, 1e-8, 90.0),
+    ("bf16", 0.95, 1e-3, 32.0),
+    ("fp8", 0.93, 6e-3, 32.0),
+    ("q8", 0.95, 1.5e-3, 30.0),
+    ("q4", 0.85, 3e-2, 14.0),
+];

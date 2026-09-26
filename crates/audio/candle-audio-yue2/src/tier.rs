@@ -46,7 +46,8 @@
 //! the committed original's tensor table and the tier; every copied file is checked against the
 //! **inventory pins** (not the manifest); every BF16 tensor's recorded digest must equal the pinned
 //! original's; the weights file's header must be exactly the plan's stored table; no other weights
-//! file may be present; and the weights file must hash to the manifest's SHA-256.
+//! file may be present; and the weights file must hash to its **pinned conversion output**
+//! ([`TIER_PINS`]) — so a derived tier is as exactly pinned as the original it comes from.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -78,6 +79,36 @@ pub const WEIGHTS_FILE: &str = "model.safetensors";
 /// The component key tier errors are reported under.
 pub const COMPONENT_KEY: &str = "yue2_3b_tier";
 
+/// The exact weights file one tier's conversion produces from the pinned original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierPin {
+    /// The tier.
+    pub tier: Tier,
+    /// Size of its `model.safetensors`.
+    pub bytes: u64,
+    /// SHA-256 of its `model.safetensors`.
+    pub sha256: &'static str,
+}
+
+/// The pinned outputs of [`CONVERSION_ID`] over the pinned YuE2-3B original. Measured 2026-09-26:
+/// a conversion on macOS arm64 (Apple M-series) and one on Windows x86-64 (the CUDA runner, run
+/// 36255139284) produced these exact bytes — Candle's CPU GGML quantizer is per-block scalar code —
+/// so they are asset pins, not machine-dependent values. A derived tier must reproduce them
+/// exactly ([`verify_tier`]); a conversion whose output differs (a changed quantizer or writer) is
+/// refused, and needs a new [`CONVERSION_ID`] and new pins.
+pub const TIER_PINS: &[TierPin] = &[
+    TierPin {
+        tier: Tier::Q8,
+        bytes: 4_259_728_200,
+        sha256: "9b10c9fce645ae40708c665b88696cbb0f17c946570b5c35e2567d5ae1ffa83e",
+    },
+    TierPin {
+        tier: Tier::Q4,
+        bytes: 2_658_814_800,
+        sha256: "df443371ec5b39b3b53525bf4cb8fc36e78c3597899e35d2aef585415fb4a9a6",
+    },
+];
+
 /// Whether `dir` holds a tier snapshot (a `yue2-tier.json`).
 pub fn is_tier_snapshot(dir: &Path) -> bool {
     dir.join(TIER_MANIFEST).is_file()
@@ -90,6 +121,10 @@ pub(crate) struct TierSource {
     pub(crate) lm: &'static Component,
     /// The tokenizer component (`qwen.tiktoken`, same repository).
     pub(crate) tok: &'static Component,
+    /// The exact outputs every tier's conversion must produce from this source. Always
+    /// [`TIER_PINS`] outside unit tests; `None` exists only for the synthetic test sources, whose
+    /// outputs the tests pin themselves (`pinned_outputs_are_enforced`).
+    pub(crate) pins: Option<&'static [TierPin]>,
 }
 
 impl TierSource {
@@ -98,6 +133,7 @@ impl TierSource {
         Self {
             lm: ComponentId::Lm.component(),
             tok: ComponentId::QwenTiktoken.component(),
+            pins: Some(TIER_PINS),
         }
     }
 
@@ -386,6 +422,21 @@ pub(crate) fn verify_tier_from(source: TierSource, dir: &Path) -> Result<Verifie
         .get("bytes")
         .and_then(Value::as_u64)
         .ok_or_else(|| manifest_error(format!("{WEIGHTS_FILE} has no size")))?;
+    // The recorded digest must be the pinned output of this conversion over this source.
+    if let Some(pins) = source.pins {
+        let pin = pins
+            .iter()
+            .find(|p| p.tier == tier)
+            .ok_or_else(|| manifest_error(format!("no pinned {tier} output for this source")))?;
+        if (weights_bytes, weights_sha256.as_str()) != (pin.bytes, pin.sha256) {
+            return Err(AssetError::HashMismatch {
+                component: COMPONENT_KEY.into(),
+                file: WEIGHTS_FILE.into(),
+                expected: pin.sha256.into(),
+                actual: weights_sha256,
+            });
+        }
+    }
     let weights = file_check(dir, WEIGHTS_FILE, weights_bytes, &weights_sha256)?;
     let table = snapshot::read_tensor_table(COMPONENT_KEY, WEIGHTS_FILE, &weights)?;
     let expected: BTreeMap<String, (String, Vec<usize>)> = plan

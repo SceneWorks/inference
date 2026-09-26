@@ -65,8 +65,9 @@
 //!
 //! `quality::tier_quality_against_the_f32_reference` (`#[ignore]`d, real weights), every
 //! configuration loaded through [`crate::engine::Yue2Engine::load_with_precision`] and compared
-//! with the released checkpoint in F32 on the CPU (itself within 3.6e-5 of the pinned upstream's
-//! F32 top-8 logits). **AR**: teacher-forced on the committed fixture's 184 score / semantic steps
+//! with the released checkpoint in F32 on the CPU (itself within 3.6e-5 on macOS and 9.9e-5 on the
+//! Windows runner of the pinned upstream's F32 top-8 logits). **AR**: teacher-forced on the
+//! committed fixture's 184 score / semantic steps
 //! (7 sequences), over each phase's allowed ids. **Acoustic**: the engine's acoustic stage on the
 //! fixture's `supplied_full` plan with the semantic codes of `nar_real_reference.json` — 100
 //! frames × 32 midpoint steps (`multi_chunk_32`'s codes; one chunk at the full context) and 24
@@ -77,11 +78,27 @@
 //! |---|---|---|---|---|---|---|---|
 //! | `q8` | Candle CPU (Apple M-series), F32 activations | 99.5 % | 99.0 % | 1.5e-4 / 1.2e-3 | 37.0 / 39.7 dB | 30.0 / 32.7 dB | 5.12 GB |
 //! | `q4` | Candle CPU (Apple M-series), F32 activations | 93.5 % | 92.5 % | 9.0e-3 / 4.1e-2 | 18.3 / 19.1 dB | 11.8 / 10.3 dB | 3.52 GB |
+//! | `f32` | Candle CUDA (RTX PRO 6000 Blackwell, sm_120), F32 | 100 % | 100 % | 1.3e-12 / 6.9e-12 | 119.5 / 121.6 dB | 111.6 / 113.2 dB | 14.52 GB |
+//! | `bf16` | Candle CUDA (RTX PRO 6000 Blackwell), BF16 | 98.4 % | 98.2 % | 3.1e-4 / 1.2e-3 | 37.1 / 37.7 dB | 27.5 / 29.5 dB | 7.26 GB |
+//! | `bf16` + FP8 AR | Candle CUDA (RTX PRO 6000 Blackwell), BF16 + FP8 E4M3 GEMM | 97.8 % | 96.3 % | 1.9e-3 / 9.6e-3 | 37.1 / 37.7 dB ¹ | 27.5 / 29.5 dB ¹ | 5.85 GB + 2.82 GB host ² |
+//! | `q8` | Candle CUDA (RTX PRO 6000 Blackwell), BF16 activations | 98.9 % | 98.2 % | 4.8e-4 / 2.3e-3 | 34.1 / 35.0 dB | 27.2 / 27.1 dB | 4.26 GB |
+//! | `q4` | Candle CUDA (RTX PRO 6000 Blackwell), BF16 activations | 94.0 % | 92.6 % | 9.1e-3 / 3.8e-2 | 17.9 / 19.5 dB | 11.4 / 11.7 dB | 2.66 GB |
 //!
-//! `bf16` on the CPU *is* the reference (the CPU computes the BF16 checkpoint in F32 exactly), so
-//! the released-precision rows — BF16 whole-model device parity, the FP8 AR mode, and the tiers
-//! with BF16 activations — are measured on CUDA (below). Metal BF16 parity is terminal-story
-//! evidence on the owner's GPU ([`OWNER_DECISIONS`]' `metal_bf16_parity`).
+//! CUDA rows: run [36255139284](https://github.com/SceneWorks/inference/actions/runs/36255139284)
+//! (`real-weights-yue.yml`, `family: yue2`); peak device memory 16.4 GB (the F32 row), sampled
+//! record-only. ¹ The FP8 mode's acoustic stage runs the restored BF16 originals, so its latents
+//! are **bit-identical** to the `bf16` row's (asserted by the harness). ² The AR projections' BF16
+//! originals, held in host memory while the AR stages run FP8. The FP8 AR stages took 23 s against
+//! BF16's 5 s for the same 184 teacher-forced steps (the activation's E4M3 cast runs on the host);
+//! upstream makes no speed claim for the mode and neither does this port.
+//!
+//! **BF16 whole-model device parity** (open since sc-22991, whose Candle CPU has no BF16 matmul) is
+//! the CUDA `bf16` row: 98.4 % top-1, mean KL 3.1e-4, latents 37 dB. `bf16` on the CPU *is* the
+//! reference (the CPU computes the BF16 checkpoint in F32 exactly). Metal BF16 parity is
+//! terminal-story evidence on the owner's GPU ([`OWNER_DECISIONS`]' `metal_bf16_parity`).
+//!
+//! The derived tier snapshots were byte-identical on both machines (the pins in
+//! [`crate::tier::TIER_PINS`]).
 
 use candle_audio::candle_core::quantized::GgmlDType;
 use candle_audio::candle_core::DType;
