@@ -52,7 +52,6 @@
 //! Driven by `.github/workflows/real-weights-yue.yml` with `mode: memory`.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use candle_audio_yue::gen_core::{
     AudioParams, AudioStem, AudioTrack, Conditioning, GenerationOutput, GenerationRequest,
@@ -424,7 +423,7 @@ fn measure_one_case() {
     #[cfg(feature = "cuda")]
     let t0 = probe.origin();
     #[cfg(not(feature = "cuda"))]
-    let t0 = Instant::now();
+    let t0 = std::time::Instant::now();
     // Wall-clock anchor of t0, so an external sampler's timestamps can be split into the phases.
     let t0_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -514,7 +513,7 @@ fn measure_one_case() {
             phase["device_used_peak_bytes"] = json!(dev);
             phase["device_peak_above_baseline_gib"] = json!(dev
                 .zip(base_bytes)
-                .map(|(d, b)| (d.saturating_sub(b)) as f64 / GIB));
+                .map(|(d, b)| d.saturating_sub(b) as f64 / GIB));
             phase["pool_used_high_bytes"] = json!(pool_used_high);
             phase["pool_reserved_high_bytes"] = json!(pool_reserved_high);
             phase["pool_used_high_gib"] = json!(*pool_used_high as f64 / GIB);
