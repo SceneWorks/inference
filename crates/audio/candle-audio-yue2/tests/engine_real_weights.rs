@@ -155,7 +155,7 @@ fn registered_loader_generates_a_song_with_every_artifact() {
             .generate(&req, &mut |p| {
                 if let Progress::Step { current, total } = p {
                     if current == total || current % 16 == 0 {
-                        eprintln!("  acoustic step {current}/{total}");
+                        eprintln!("  step {current}/{total} (AR tokens, then acoustic steps)");
                     }
                 }
             })
