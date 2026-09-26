@@ -1159,3 +1159,20 @@ fn the_returned_record_is_the_published_record() {
     assert_eq!(published_dir, dir);
     assert_eq!(returned, read_json(&dir.join(RESULT_JSON)).unwrap());
 }
+
+#[test]
+fn files_and_directories_sync_through_handles_the_platform_accepts() {
+    // `sync_file` flushes through a writable handle (Windows refuses `FlushFileBuffers` on a
+    // read-only one) and changes nothing; `sync_dir` flushes a directory where the platform can.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("artifact.bin");
+    fs::write(&file, b"exact bytes").unwrap();
+    sync_file(&file).unwrap();
+    assert_eq!(fs::read(&file).unwrap(), b"exact bytes", "never truncated");
+    sync_dir(tmp.path()).unwrap();
+    // Neither creates what is not there.
+    let missing = tmp.path().join("missing.bin");
+    assert!(matches!(sync_file(&missing), Err(RunError::Io { .. })));
+    assert!(!missing.exists());
+    assert!(sync_dir(&tmp.path().join("missing-dir")).is_err());
+}
