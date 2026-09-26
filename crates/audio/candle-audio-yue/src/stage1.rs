@@ -45,10 +45,29 @@ pub enum Stage1Step {
     EndOfAudio,
 }
 
+/// The stage-1 positions a render can occupy: every segment block the render runs (segment 0's
+/// includes the head), plus each segment's `max_new_tokens` budget and the `<EOA>` that closes it
+/// (sampled or forced). The whole sequence never outgrows this, and the smart context only ever
+/// shortens it, so it bounds the KV cache (capped at the model context by the implementation).
+/// Saturating.
+pub fn render_positions<'a>(
+    blocks: impl IntoIterator<Item = &'a [u32]>,
+    max_new_tokens: u32,
+) -> usize {
+    blocks.into_iter().fold(0usize, |acc, block| {
+        acc.saturating_add(block.len())
+            .saturating_add(max_new_tokens as usize)
+            .saturating_add(1)
+    })
+}
+
 /// The stage-1 seam.
 pub trait Stage1Model: Send {
     /// Start a render: reset context and seed the sampler (one RNG stream across all segments).
-    fn begin_render(&mut self, seed: u64) -> gen_core::Result<()>;
+    /// `max_positions` is the render's sequence bound ([`render_positions`] over the segments the
+    /// engine will run); an implementation sizes its KV cache to it and refuses a segment that
+    /// could outgrow it.
+    fn begin_render(&mut self, seed: u64, max_positions: usize) -> gen_core::Result<()>;
     /// Append this segment's prompt block to the context (prefill).
     fn begin_segment(&mut self, segment: &SegmentStart<'_>) -> gen_core::Result<()>;
     /// Decode one token.
@@ -83,7 +102,7 @@ pub struct StubStage1 {
 }
 
 impl Stage1Model for StubStage1 {
-    fn begin_render(&mut self, seed: u64) -> gen_core::Result<()> {
+    fn begin_render(&mut self, seed: u64, _max_positions: usize) -> gen_core::Result<()> {
         *self = Self {
             seed,
             ..Self::default()

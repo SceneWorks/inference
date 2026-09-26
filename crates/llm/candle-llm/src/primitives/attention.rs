@@ -26,7 +26,8 @@
 //! batched matmul per side serves every group — no [`repeat_kv`] expansion, and no `contiguous`
 //! copy of the cache's narrowed K/V views (the matmul reads their strides directly). The causal
 //! mask broadcasts over the groups from a 5-D view of the scores; a single-query decode step builds
-//! none. Numerically it is the eager path's arithmetic in a different batching (`groups` query rows
+//! none. [`sdpa_gqa`] (sc-19373) is the same kernel under an explicit additive mask (a batched
+//! decode's per-row mask), which broadcasts over the groups the same way. Numerically it is the eager path's arithmetic in a different batching (`groups` query rows
 //! per matmul instead of one), so it agrees with `repeat_kv` + [`sdpa`] to the backend's
 //! reduction order — a few ULPs, the same tolerance the flash path carries; the real-weight
 //! greedy fixture (`tests/static_kv_parity.rs`) is the token-level gate.
@@ -478,6 +479,59 @@ pub fn sdpa_gqa_causal(
     values: &Tensor,
     scale: f32,
 ) -> Result<Tensor> {
+    sdpa_gqa(queries, keys, values, scale, AttnMask::Causal)
+}
+
+/// The query tile of an additive mask, regrouped to broadcast over the folded grouped-query
+/// scores `[b, Hkv, groups, rows, L]`: a head-broadcast mask `[mb, 1, mq, L]` becomes
+/// `[mb, 1, 1, rows, L]`; a per-head one `[mb, H, mq, L]` becomes `[mb, Hkv, groups, rows, L]`
+/// (head `h = kv · groups + g`, the [`repeat_kv`] convention). Views only — no copy.
+fn gqa_additive_tile(
+    mask: &Tensor,
+    query_start: usize,
+    query_len: usize,
+    total_query_len: usize,
+    (heads, kv_heads, groups): (usize, usize, usize),
+) -> Result<Tensor> {
+    let (mb, mh, _mq, k_len) = mask.dims4().map_err(|_| {
+        Error::Msg(format!(
+            "sdpa_gqa: an additive mask must be [batch, heads, q_len, k_len], got {:?}",
+            mask.dims()
+        ))
+    })?;
+    let tile = additive_mask_chunk(mask, query_start, query_len, total_query_len)?;
+    let rows = tile.dim(2)?;
+    match mh {
+        1 => Ok(tile.unsqueeze(2)?),
+        mh if mh == heads => Ok(tile.reshape((mb, kv_heads, groups, rows, k_len))?),
+        mh => Err(Error::Msg(format!(
+            "sdpa_gqa: additive mask head axis must be 1 or {heads}, got {mh}"
+        ))),
+    }
+}
+
+/// [`sdpa_gqa_causal`] under an explicit `mask` — the same zero-copy grouped-query attention
+/// (query groups folded onto the sequence axis, un-expanded K/V views read in place) for the masks
+/// that fold over the groups without materializing anything per head:
+///
+/// * [`AttnMask::Causal`] — exactly [`sdpa_gqa_causal`];
+/// * [`AttnMask::None`] — bidirectional;
+/// * [`AttnMask::Additive`] — a caller-built additive mask `[batch | 1, 1 | heads, q_len | 1,
+///   k_len]` (a batched decode's per-row mask: a padded batch, or classifier-free guidance's
+///   restricted unconditional row). A per-head mask is regrouped `[b, Hkv, groups, q, k]`; a
+///   head-broadcast one broadcasts over the groups. The mask may be a strided view (a
+///   [`Tensor::narrow`] of a preallocated mask); it is read in place.
+///
+/// The sliding-window masks are [`Error::Unsupported`] here (their band is built on the expanded
+/// path). Numerically this is the eager path's arithmetic in a different batching, like
+/// [`sdpa_gqa_causal`]: it agrees with `repeat_kv` + [`sdpa`] to the backend's reduction order.
+pub fn sdpa_gqa(
+    queries: &Tensor,
+    keys: &Tensor,
+    values: &Tensor,
+    scale: f32,
+    mask: AttnMask<'_>,
+) -> Result<Tensor> {
     let (b, h, q_len, d) = queries.dims4()?;
     let (bk, hkv, k_len, dk) = keys.dims4()?;
     if bk != b || dk != d || values.dims() != keys.dims() || hkv == 0 || h % hkv != 0 {
@@ -488,10 +542,18 @@ pub fn sdpa_gqa_causal(
             values.dims()
         )));
     }
-    if k_len < q_len {
-        return Err(Error::Msg(format!(
-            "causal attention needs k_len >= q_len, got {k_len} keys and {q_len} queries"
-        )));
+    match mask {
+        AttnMask::Causal if k_len < q_len => {
+            return Err(Error::Msg(format!(
+                "causal attention needs k_len >= q_len, got {k_len} keys and {q_len} queries"
+            )));
+        }
+        AttnMask::SlidingCausal { .. } | AttnMask::AdditiveSliding { .. } => {
+            return Err(Error::Unsupported(
+                "sdpa_gqa: sliding-window masks attend on the expanded path".into(),
+            ));
+        }
+        _ => {}
     }
     let groups = h / hkv;
     // Same tile bound as the eager path: the folded tile has `hkv * groups * rows == h * rows`
@@ -526,22 +588,38 @@ pub fn sdpa_gqa_causal(
             .contiguous()?
             .reshape((b, hkv, groups * query_len, d))?;
         let scores = (query.matmul(&keys_t)? * scale as f64)?; // [b, Hkv, groups * rows, L]
-                                                               // A single-query bottom-right causal mask is all zeros: skip it (the decode step).
-        let scores = if q_len == 1 {
-            scores
-        } else {
-            let tile = causal_mask_chunk(
+        let tile = match mask {
+            AttnMask::None => None,
+            // A single-query bottom-right causal mask is all zeros: skip it (the decode step).
+            AttnMask::Causal if q_len == 1 => None,
+            AttnMask::Causal => Some(
+                causal_mask_chunk(
+                    query_start,
+                    query_len,
+                    q_len,
+                    k_len,
+                    scores.dtype(),
+                    scores.device(),
+                )?
+                .unsqueeze(2)?, // [1, 1, 1, rows, L]
+            ),
+            AttnMask::Additive(additive) => Some(gqa_additive_tile(
+                additive,
                 query_start,
                 query_len,
                 q_len,
-                k_len,
-                scores.dtype(),
-                scores.device(),
-            )?; // [1, 1, rows, L]
-            scores
+                (h, hkv, groups),
+            )?),
+            AttnMask::SlidingCausal { .. } | AttnMask::AdditiveSliding { .. } => {
+                unreachable!("sliding masks are refused before any tile is built")
+            }
+        };
+        let scores = match tile {
+            None => scores,
+            Some(tile) => scores
                 .reshape((b, hkv, groups, query_len, k_len))?
-                .broadcast_add(&tile.unsqueeze(2)?)?
-                .reshape((b, hkv, groups * query_len, k_len))?
+                .broadcast_add(&tile)?
+                .reshape((b, hkv, groups * query_len, k_len))?,
         };
         let weights = softmax_last_dim(&scores)?;
         // [b, Hkv, groups * rows, d] -> [b, H, rows, d] (head h = kv * groups + g).
@@ -770,6 +848,106 @@ mod tests {
         // Mis-grouped heads and k_len < q_len are rejected.
         assert!(sdpa_gqa_causal(&varied4(1, 3, 1, 4, 0.0), &k, &k, 0.5).is_err());
         assert!(sdpa_gqa_causal(&varied4(1, 2, 8, 4, 0.0), &k, &k, 0.5).is_err());
+    }
+
+    /// sc-19373: the folded grouped-query path under an explicit additive mask — head-broadcast
+    /// (`[b, 1, q, k]`, including a narrowed view of a wider preallocated mask) and per-head
+    /// (`[b, H, q, k]`) — agrees with `repeat_kv` + eager `sdpa` under the same mask, over narrowed
+    /// K/V views, without materializing K/V; `None` is bidirectional; sliding masks are refused.
+    #[test]
+    fn gqa_additive_matches_repeat_kv_sdpa_without_materializing() {
+        use crate::primitives::kv_cache::kv_materialize_count;
+        let (b, hkv, groups, d, cap) = (2usize, 2usize, 3usize, 4usize, 16usize);
+        let h = hkv * groups;
+        let k_buf = varied4(b, hkv, cap, d, 1.7);
+        let v_buf = varied4(b, hkv, cap, d, 3.1);
+        // Row 1 of the batch attends only columns >= 3 (classifier-free guidance's shape); per-head
+        // masks additionally block one column per head.
+        let blocked = |row: usize, head: usize, q: usize, k: usize, k_len: usize, q_len: usize| {
+            let causal = k > (k_len - q_len) + q;
+            causal || (row == 1 && k < 3) || (head != usize::MAX && k == head % k_len && k != 0)
+        };
+        let build = |heads: usize, q_len: usize, k_len: usize| -> Tensor {
+            let mut m = Vec::with_capacity(b * heads * q_len * k_len);
+            for row in 0..b {
+                for head in 0..heads {
+                    let head = if heads == 1 { usize::MAX } else { head };
+                    for q in 0..q_len {
+                        for k in 0..k_len {
+                            let neg = blocked(row, head, q, k, k_len, q_len);
+                            m.push(if neg { MASK_NEG } else { 0.0 });
+                        }
+                    }
+                }
+            }
+            Tensor::from_vec(m, (b, heads, q_len, k_len), &Device::Cpu).unwrap()
+        };
+        for (q_len, k_len) in [(1usize, 9usize), (1, 16), (5, 9), (7, 7)] {
+            let k = k_buf.narrow(2, 0, k_len).unwrap();
+            let v = v_buf.narrow(2, 0, k_len).unwrap();
+            let q = varied4(b, h, q_len, d, 0.4);
+            for heads in [1usize, h] {
+                let mask = build(heads, q_len, k_len);
+                let before = kv_materialize_count();
+                let got = sdpa_gqa(&q, &k, &v, 0.5, AttnMask::Additive(&mask)).unwrap();
+                assert_eq!(
+                    kv_materialize_count(),
+                    before,
+                    "gqa path must not expand K/V"
+                );
+                assert_eq!(got.dims(), &[b, h, q_len, d]);
+                let want = sdpa_eager(
+                    &q,
+                    &repeat_kv(&k, groups).unwrap(),
+                    &repeat_kv(&v, groups).unwrap(),
+                    0.5,
+                    None,
+                    AttnMask::Additive(&mask),
+                )
+                .unwrap();
+                let diff = max_abs_diff(&got, &want);
+                assert!(diff <= 1e-6, "heads={heads} q={q_len} k={k_len}: {diff}");
+            }
+        }
+        // A decode step's mask as a narrowed view of a wider preallocated `[b, 1, 1, cap]` mask.
+        let wide = build(1, 1, cap);
+        let k = k_buf.narrow(2, 0, 11).unwrap();
+        let v = v_buf.narrow(2, 0, 11).unwrap();
+        let q = varied4(b, h, 1, d, 0.6);
+        let view = wide.narrow(3, 0, 11).unwrap();
+        assert!(!view.is_contiguous());
+        let got = sdpa_gqa(&q, &k, &v, 0.5, AttnMask::Additive(&view)).unwrap();
+        let dense = view.contiguous().unwrap();
+        let want = sdpa_gqa(&q, &k, &v, 0.5, AttnMask::Additive(&dense)).unwrap();
+        assert_eq!(bits(&got), bits(&want));
+        // The mask actually applies: row 1 differs from an unmasked (bidirectional) attend.
+        let open = sdpa_gqa(&q, &k, &v, 0.5, AttnMask::None).unwrap();
+        assert!(max_abs_diff(&got, &open) > 1e-3);
+        let want = sdpa_eager(
+            &q,
+            &repeat_kv(&k, groups).unwrap(),
+            &repeat_kv(&v, groups).unwrap(),
+            0.5,
+            None,
+            AttnMask::None,
+        )
+        .unwrap();
+        assert!(max_abs_diff(&open, &want) <= 1e-6);
+        // Causal through `sdpa_gqa` is `sdpa_gqa_causal`, bit for bit.
+        let q = varied4(b, h, 5, d, 0.2);
+        let k = k_buf.narrow(2, 0, 9).unwrap();
+        let v = v_buf.narrow(2, 0, 9).unwrap();
+        assert_eq!(
+            bits(&sdpa_gqa(&q, &k, &v, 0.5, AttnMask::Causal).unwrap()),
+            bits(&sdpa_gqa_causal(&q, &k, &v, 0.5).unwrap())
+        );
+        // Sliding masks and a mis-shaped mask head axis are refused.
+        assert!(matches!(
+            sdpa_gqa(&q, &k, &v, 0.5, AttnMask::SlidingCausal { window: 4 }),
+            Err(Error::Unsupported(_))
+        ));
+        let bad = build(1, 5, 9).repeat((1, 2, 1, 1)).unwrap();
+        assert!(sdpa_gqa(&q, &k, &v, 0.5, AttnMask::Additive(&bad)).is_err());
     }
 
     /// sc-24164: K/V handed over as a bare `[b, s, hkv, d] -> [b, hkv, s, d]` transpose of a

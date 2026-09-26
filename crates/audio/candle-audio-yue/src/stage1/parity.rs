@@ -191,9 +191,14 @@ struct Render {
     first_scores: Vec<Vec<f32>>,
 }
 
+/// The render bound the engine hands `begin_render` for these segment blocks.
+fn bound(prompts: &[Vec<u32>], decode: &DecodeConfig) -> usize {
+    crate::stage1::render_positions(prompts.iter().map(Vec::as_slice), decode.max_new_tokens)
+}
+
 /// Drive `lm` over `prompts` with the engine's loop shape (budgeted `step`s, then `end_segment`).
 fn render(lm: &mut Stage1Lm, prompts: &[Vec<u32>], decode: &DecodeConfig, seed: u64) -> Render {
-    lm.begin_render(seed).unwrap();
+    lm.begin_render(seed, bound(prompts, decode)).unwrap();
     let (mut segments, mut ended_by) = (Vec::new(), Vec::new());
     for (index, prompt) in prompts.iter().enumerate() {
         lm.begin_segment(&SegmentStart {
@@ -317,6 +322,141 @@ fn unguided_render_matches_the_reference_token_for_token() {
 #[test]
 fn budget_ended_segments_carry_the_forced_eoa_into_the_cache() {
     check_run("budgetOnly", true);
+}
+
+/// Drive the fixture's `run_key` render, asserting per step that no decode step copies cached K/V
+/// or builds a host mask and that the KV buffers never move, and that the cache holds exactly
+/// `capacity` positions. Returns `(decode steps, smart-context rewinds)`.
+fn assert_bounded_decode(run_key: &str, capacity: usize) -> (usize, usize) {
+    use candle_llm::primitives::kv_cache::{kv_materialize_count, KvCache};
+    let fx = fixture();
+    let run = &fx["runs"][run_key];
+    let decode = decode_config(&run["decode"], true);
+    let mut lm = Stage1Lm::from_model(tiny_model(&fx)).unwrap();
+    lm.begin_render(seed(&fx), bound(&prompts(&fx), &decode))
+        .unwrap();
+    let (mut buffers, mut steps, mut rewinds, mut cached) = (None, 0usize, 0usize, 0i32);
+    for (index, prompt) in prompts(&fx).iter().enumerate() {
+        lm.begin_segment(&SegmentStart {
+            index,
+            prompt,
+            guidance_scale: decode.guidance.scale_for(index),
+            decode: &decode,
+        })
+        .unwrap();
+        let cache = lm.kv_cache().expect("a segment holds the cache");
+        assert_eq!(cache.capacity(), capacity, "{run_key}: KV capacity");
+        assert_eq!(cache.batch_size(), 2);
+        if cache.offset() < cached + prompt.len() as i32 {
+            rewinds += 1;
+        }
+        let addresses = cache.storage_addresses(0).unwrap();
+        assert_eq!(
+            *buffers.get_or_insert(addresses),
+            addresses,
+            "segment {index}: the KV cache was reallocated"
+        );
+        let (materialized, masks) = (kv_materialize_count(), lm.host_mask_builds);
+        for _ in 0..decode.max_new_tokens {
+            let ended = matches!(lm.step().unwrap(), Stage1Step::EndOfAudio);
+            steps += 1;
+            assert_eq!(
+                kv_materialize_count(),
+                materialized,
+                "segment {index}, step {steps}: a decode step copied cached K/V"
+            );
+            assert_eq!(
+                lm.host_mask_builds, masks,
+                "segment {index}, step {steps}: a decode step built a host mask"
+            );
+            assert_eq!(
+                lm.kv_cache().unwrap().storage_addresses(0).unwrap(),
+                addresses
+            );
+            if ended {
+                break;
+            }
+        }
+        lm.end_segment().unwrap();
+        cached = lm.kv_cache().unwrap().offset();
+    }
+    (steps, rewinds)
+}
+
+/// sc-19373 performance regression: a decode step's work beyond attention is O(1), and the KV
+/// cache is sized to the render, not the model context. Over both CFG fixture renders no decode
+/// step copies cached K/V (no growing-cache `cat`, no `repeat_kv` expansion, no transposed-key
+/// copy — candle-llm's materialization counter stays put) or builds a host attention mask, and the
+/// cache is allocated once: its buffers never move across every step, segment and the guided
+/// render's smart-context rebuild (a rewind, not a reallocation).
+///
+/// Capacity is `min(render bound, context)`: the budget-only render's bound (every segment block
+/// plus 4 × (20 + 1)) is well under the 480-position context, so its cache is exactly the bound;
+/// the guided render's bound (4 × (130 + 1) generated) outgrows the context — that is why it
+/// shortens — so its cache is the context.
+#[test]
+fn decode_steps_neither_copy_the_kv_cache_nor_build_a_mask() {
+    let fx = fixture();
+    let context = fx["config"]["max_position_embeddings"].as_u64().unwrap() as usize;
+    let prompts = prompts(&fx);
+    let budget_only = bound(
+        &prompts,
+        &decode_config(&fx["runs"]["budgetOnly"]["decode"], true),
+    );
+    let block_total: usize = prompts.iter().map(Vec::len).sum();
+    assert_eq!(budget_only, block_total + prompts.len() * (20 + 1));
+    assert!(budget_only < context, "{budget_only} vs {context}");
+    let (steps, rewinds) = assert_bounded_decode("budgetOnly", budget_only);
+    assert_eq!((steps, rewinds), (4 * 20, 0));
+
+    let guided = bound(
+        &prompts,
+        &decode_config(&fx["runs"]["guidance"]["decode"], true),
+    );
+    assert!(guided > context, "{guided} vs {context}");
+    let (steps, rewinds) = assert_bounded_decode("guidance", context);
+    assert!(steps > 100, "{steps} decode steps exercised");
+    assert_eq!(
+        rewinds, 1,
+        "the last segment's smart-context rebuild rewinds the cache"
+    );
+}
+
+/// A render bound that does not cover the segments run is refused at the segment that would
+/// outgrow the cache — before any write — rather than failing mid-decode; the next render with an
+/// adequate bound reallocates and decodes normally.
+#[test]
+fn a_segment_beyond_the_render_bound_is_refused_before_it_decodes() {
+    let fx = fixture();
+    let decode = decode_config(&fx["runs"]["budgetOnly"]["decode"], true);
+    let prompts = prompts(&fx);
+    let mut lm = Stage1Lm::from_model(tiny_model(&fx)).unwrap();
+    // Sized for the first segment only.
+    lm.begin_render(1, bound(&prompts[..1], &decode)).unwrap();
+    let start = |index: usize| SegmentStart {
+        index,
+        prompt: &prompts[index],
+        guidance_scale: decode.guidance.scale_for(index),
+        decode: &decode,
+    };
+    lm.begin_segment(&start(0)).unwrap();
+    while !matches!(lm.step().unwrap(), Stage1Step::EndOfAudio) {
+        if lm.sequence().len() >= prompts[0].len() + decode.max_new_tokens as usize {
+            break;
+        }
+    }
+    lm.end_segment().unwrap();
+    let before = lm.sequence().to_vec();
+    let err = lm.begin_segment(&start(1)).unwrap_err().to_string();
+    assert!(err.contains("KV positions"), "{err}");
+    assert_eq!(
+        lm.sequence(),
+        before,
+        "a refused segment leaves the sequence"
+    );
+    // An adequate bound renders all four segments.
+    let got = render(&mut lm, &prompts, &decode, 1);
+    assert_eq!(got.segments.len(), 4);
 }
 
 /// Sequence length the cache would hold before segment `index`'s shortening check, with no
@@ -496,7 +636,8 @@ fn production_load_decodes_a_staged_snapshot() {
     };
     let mut lm = (StageSet::production().stage1)(&assets, None).expect("stage 1 loads");
     let decode = decode_config(&fx["decode"], true);
-    lm.begin_render(7).unwrap();
+    lm.begin_render(7, bound(&prompts(&fx)[..1], &decode))
+        .unwrap();
     lm.begin_segment(&SegmentStart {
         index: 0,
         prompt: &prompts(&fx)[0],
@@ -542,8 +683,8 @@ struct Tripping {
 }
 
 impl Stage1Model for Tripping {
-    fn begin_render(&mut self, seed: u64) -> gen_core::Result<()> {
-        self.inner.begin_render(seed)
+    fn begin_render(&mut self, seed: u64, max_positions: usize) -> gen_core::Result<()> {
+        self.inner.begin_render(seed, max_positions)
     }
     fn begin_segment(&mut self, s: &SegmentStart<'_>) -> gen_core::Result<()> {
         self.inner.begin_segment(s)
@@ -701,7 +842,7 @@ fn engine_split_skips_the_icl_reference_pair() {
 struct Scripted(Vec<u32>, usize);
 
 impl Stage1Model for Scripted {
-    fn begin_render(&mut self, _: u64) -> gen_core::Result<()> {
+    fn begin_render(&mut self, _: u64, _: usize) -> gen_core::Result<()> {
         Ok(())
     }
     fn begin_segment(&mut self, _: &SegmentStart<'_>) -> gen_core::Result<()> {

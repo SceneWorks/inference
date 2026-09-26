@@ -295,7 +295,13 @@ impl YueEngine {
         cancel: &CancelFlag,
         on_event: &mut dyn FnMut(YueEvent),
     ) -> gen_core::Result<Vec<Vec<u32>>> {
-        stage1.begin_render(req.seed)?;
+        // The render's sequence bound: the segment blocks this render runs, each with its budget
+        // and closing `<EOA>` — what stage 1 sizes its KV cache to.
+        let max_positions = crate::stage1::render_positions(
+            prompt.segments.iter().take(total).map(|b| b.ids.as_slice()),
+            req.decode.max_new_tokens,
+        );
+        stage1.begin_render(req.seed, max_positions)?;
         let mut segments = Vec::with_capacity(total);
         for (index, block) in prompt.segments.iter().take(total).enumerate() {
             check_cancel(cancel)?;

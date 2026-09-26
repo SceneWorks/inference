@@ -35,7 +35,7 @@ use crate::decode::step::{LogitsScope, StepModel, StepOutput, StepRequest};
 use crate::device::compute_dtype;
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
-use crate::primitives::attention::{sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
+use crate::primitives::attention::{sdpa, sdpa_gqa, sdpa_gqa_causal, AttnFormulation, AttnMask};
 use crate::primitives::decode_cache::DecodeCache;
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 use crate::primitives::nn::{
@@ -976,6 +976,7 @@ impl CausalLm {
             AttnMask::Causal,
             None,
             formulation,
+            false,
         )
     }
 
@@ -1053,7 +1054,7 @@ impl CausalLm {
         // Single-sequence / uniform batch: positions [offset, offset+s) shared across the batch, with
         // an implicit bottom-right causal mask; cos/sin `[1, s, head_dim]` broadcast over the batch.
         let tables = self.rope_tables_seq(s, offset)?;
-        self.forward_to_last_logits(input_embeds, cache, &tables, AttnMask::Causal)
+        self.forward_to_last_logits(input_embeds, cache, &tables, AttnMask::Causal, false)
     }
 
     /// Run a forward step over token ids and return **every layer's** hidden states rather than
@@ -1141,6 +1142,7 @@ impl CausalLm {
             mask,
             Some(&mut out),
             self.attn_formulation,
+            false,
         )?;
         if let Some(last) = out.last_mut() {
             *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
@@ -1268,6 +1270,7 @@ impl CausalLm {
                     layer_idx: i,
                     shared_kv: &mut shared_kv,
                     formulation: self.attn_formulation,
+                    additive_gqa: false,
                 };
                 self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, &mut state)
             },
@@ -1297,7 +1300,29 @@ impl CausalLm {
         mask: &Tensor,
     ) -> Result<Tensor> {
         let embeds = self.embed(input_ids)?;
-        self.forward_to_last_logits(&embeds, cache, tables, AttnMask::Additive(mask))
+        self.forward_to_last_logits(&embeds, cache, tables, AttnMask::Additive(mask), false)
+    }
+
+    /// [`CausalLm::decode_logits_masked`] attending the additive `mask` **un-expanded**: every
+    /// grouped-query layer that can express it (no score soft-cap, no sliding window, not MLA)
+    /// attends through [`sdpa_gqa`] — the query groups folded onto the sequence axis over the
+    /// cache's K/V as handed back, so a static cache's narrowed views are read in place and no
+    /// [`repeat_kv`] expansion (nor a transposed-key copy)
+    /// is made per step. The mask may itself be a strided view (a narrowed, preallocated mask).
+    ///
+    /// Opt-in rather than the [`decode_logits_masked`](Self::decode_logits_masked) default because
+    /// the folded GEMMs differ from the expanded ones by the backend's reduction order (see
+    /// [`AttnFormulation`]); existing masked callers keep the arithmetic their parity evidence was
+    /// measured on. A layer that cannot express it keeps the expanded path.
+    pub fn decode_logits_masked_gqa(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut dyn KvCache,
+        tables: &RopeTables,
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let embeds = self.embed(input_ids)?;
+        self.forward_to_last_logits(&embeds, cache, tables, AttnMask::Additive(mask), true)
     }
 
     /// **Per-sequence** batched decode step for iteration-level continuous batching (story 7347,
@@ -1394,7 +1419,7 @@ impl CausalLm {
         let embeds = self.embed(input_ids)?;
         let s = embeds.dim(1)? as i32;
         let tables = self.rope_tables_seq(s, offset)?;
-        let h = self.run_decoder_stack(&embeds, cache, &tables, AttnMask::Causal)?;
+        let h = self.run_decoder_stack(&embeds, cache, &tables, AttnMask::Causal, false)?;
         self.project_logits(&h) // [b, s, vocab]
     }
 
@@ -1407,9 +1432,10 @@ impl CausalLm {
         cache: &mut dyn KvCache,
         tables: &RopeTables,
         mask: AttnMask<'_>,
+        additive_gqa: bool,
     ) -> Result<Tensor> {
         let (b, s, _) = input_embeds.dims3()?;
-        let h = self.run_decoder_stack(input_embeds, cache, tables, mask)?;
+        let h = self.run_decoder_stack(input_embeds, cache, tables, mask, additive_gqa)?;
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?; // [b, 1, hidden]
         let logits = self.project_logits(&last_h)?; // [b, 1, vocab]
         Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
@@ -1423,6 +1449,7 @@ impl CausalLm {
         cache: &mut dyn KvCache,
         tables: &RopeTables,
         mask: AttnMask<'_>,
+        additive_gqa: bool,
     ) -> Result<Tensor> {
         self.run_decoder_stack_collecting(
             input_embeds,
@@ -1431,12 +1458,14 @@ impl CausalLm {
             mask,
             None,
             self.attn_formulation,
+            additive_gqa,
         )
     }
 
     /// [`CausalLm::run_decoder_stack`] with an optional sink for **every** layer's output — the one
     /// loop, so the hidden-state-stack forward cannot drift from the logits forward (device hops,
     /// mask carrying, and RoPE-table placement included).
+    #[allow(clippy::too_many_arguments)]
     fn run_decoder_stack_collecting(
         &self,
         input_embeds: &Tensor,
@@ -1445,6 +1474,7 @@ impl CausalLm {
         mask: AttnMask<'_>,
         mut collect: Option<&mut Vec<Tensor>>,
         formulation: AttnFormulation,
+        additive_gqa: bool,
     ) -> Result<Tensor> {
         // Gemma 4's KV-sharing tail reads keys/values published **within one forward**. Upstream
         // keeps `shared_kv_states` alive across decode steps (they are the prefill's full-length
@@ -1508,6 +1538,7 @@ impl CausalLm {
                 layer_idx: i,
                 shared_kv: &mut shared_kv,
                 formulation,
+                additive_gqa,
             };
             h = layer.forward(&h, cos_d, sin_d, layer_mask, &mut state)?;
             if let Some(sink) = collect.as_deref_mut() {
@@ -1896,6 +1927,10 @@ struct LayerState<'a> {
     shared_kv: &'a mut SharedKv,
     /// How a grouped-query layer attends (see [`CausalLm::effective_attn_formulation`]).
     formulation: AttnFormulation,
+    /// Attend an [`AttnMask::Additive`] mask un-expanded through [`sdpa_gqa`] too (the opt-in
+    /// [`CausalLm::decode_logits_masked_gqa`]); `false` keeps every other masked caller on the
+    /// `repeat_kv` + [`sdpa`] arithmetic it has always run.
+    additive_gqa: bool,
 }
 
 impl LlamaLayer {
@@ -2283,10 +2318,17 @@ impl LlamaAttention {
         let mask = self.layer_mask(mask);
         // [b, heads, s, head_dim]. Un-expanded where the formulation asks for it and the layer can
         // express it (plain causal, no soft-cap — a sliding layer's mask is `SlidingCausal` here);
-        // otherwise the `repeat_kv` expansion through `sdpa`, the pre-migration arithmetic.
+        // otherwise the `repeat_kv` expansion through `sdpa`, the pre-migration arithmetic. An
+        // additive mask joins the un-expanded path only on the opt-in `decode_logits_masked_gqa`
+        // (a sliding layer's additive mask is `AdditiveSliding` here, so it never matches).
         let out = match (state.formulation, mask) {
             (AttnFormulation::Gqa, AttnMask::Causal) if self.softcap.is_none() => {
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)?
+            }
+            (AttnFormulation::Gqa, AttnMask::Additive(_))
+                if state.additive_gqa && self.softcap.is_none() =>
+            {
+                sdpa_gqa(&q, &k_all, &v_all, self.scale, mask)?
             }
             _ => {
                 let k_all = repeat_kv(&k_all, self.groups)?;
@@ -2755,6 +2797,98 @@ mod tests {
             Weights::from_map(w, device.clone()),
             ModelConfig::from_json(&cfg).unwrap(),
         )
+    }
+
+    /// sc-19373: `decode_logits_masked_gqa` over a static cache computes the same batched masked
+    /// forward as `decode_logits_masked` over the growing cache (a batch of two with one row
+    /// restricted to a suffix of the columns, as classifier-free guidance runs it) — to reduction
+    /// order — while a decode step copies no cached K/V: no `cat`, no `repeat_kv`, no transposed-key
+    /// copy, with the step's mask a narrowed view of a preallocated one.
+    #[test]
+    fn masked_gqa_matches_the_expanded_masked_forward_without_copying_kv() {
+        use crate::primitives::kv_cache::{kv_materialize_count, StaticKvCache};
+        let (w, cfg) = tiny_qwen3(40, false, &Device::Cpu);
+        let model = CausalLm::from_weights_format(&w, "", cfg, None).unwrap();
+        let c = model.config().clone();
+        let dt = model.compute_dtype();
+        let cap = 16usize;
+        let mut growing = model.new_cache();
+        let mut fixed = StaticKvCache::new(
+            c.num_layers,
+            2,
+            c.num_kv_heads as usize,
+            c.head_dim as usize,
+            cap,
+            dt,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let blocked = 2usize; // row 1 attends only columns >= 2
+        let mask_for = |start: usize, n: usize| -> Tensor {
+            let keys = start + n;
+            let mut m = vec![-1e30f32; 2 * n * keys];
+            for q in 0..n {
+                for k in 0..=start + q {
+                    m[q * keys + k] = 0.0;
+                    if k >= blocked {
+                        m[(n + q) * keys + k] = 0.0;
+                    }
+                }
+            }
+            Tensor::from_vec(m, (2, 1, n, keys), &Device::Cpu).unwrap()
+        };
+        let mut step_mask = vec![0f32; 2 * cap];
+        step_mask[cap..cap + blocked].fill(-1e30);
+        let step_mask = Tensor::from_vec(step_mask, (2, 1, 1, cap), &Device::Cpu).unwrap();
+        let forward = |tokens: &[u32], start: usize| {
+            let n = tokens.len();
+            let ids: Vec<u32> = tokens.iter().chain(tokens).copied().collect();
+            let ids = Tensor::from_vec(ids, (2, n), &Device::Cpu).unwrap();
+            let mut pos: Vec<i32> = (start..start + n).map(|p| p as i32).collect();
+            pos.extend((start..start + n).map(|p| p.saturating_sub(blocked) as i32));
+            (ids, model.rope_tables(&pos, 2, n as i32).unwrap())
+        };
+        // Prefill 5 columns, then 4 single-token decode steps.
+        let mut start = 0usize;
+        for (i, tokens) in [&[3u32, 9, 1, 7, 12][..], &[5], &[8], &[2], &[30]]
+            .into_iter()
+            .enumerate()
+        {
+            let n = tokens.len();
+            let (ids, tables) = forward(tokens, start);
+            let want = model
+                .decode_logits_masked(&ids, &mut growing, &tables, &mask_for(start, n))
+                .unwrap();
+            let mask = if n == 1 {
+                step_mask.narrow(3, 0, start + 1).unwrap()
+            } else {
+                mask_for(start, n)
+            };
+            let before = kv_materialize_count();
+            let got = model
+                .decode_logits_masked_gqa(&ids, &mut fixed, &tables, &mask)
+                .unwrap();
+            if i > 0 {
+                assert_eq!(
+                    kv_materialize_count(),
+                    before,
+                    "step {i}: the masked GQA decode step copied cached K/V"
+                );
+            }
+            let diff = (got - &want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(diff <= 1e-5, "step {i}: max|delta| = {diff}");
+            start += n;
+        }
+        assert_eq!(fixed.offset(), 9);
     }
 
     /// sc-24140: the llama-family load census names every projection's kind — the 7 attention/MLP
