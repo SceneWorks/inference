@@ -832,7 +832,6 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
             "source",
             &serde_json::json!("latent"),
             &serde_json::json!("vae"),
-            &serde_json::json!("tiles"),
             &serde_json::json!("mot"),
         )
     };
