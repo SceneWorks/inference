@@ -67,6 +67,12 @@ fn stripping_a_transcribed_score_matches_the_melody_only_rendering() {
     // Ties rejoin every note the notation split across bars or into representable lengths: the
     // 76 transcribed vocal notes come back as 76 sounding notes.
     assert_eq!(full.voice("Vocal").notes.len(), 76);
+    // `"C"g4e4c4-|"C"c2…` (bar 17): the tied C5 sounds for a quarter plus an eighth.
+    assert!(full
+        .voice("Vocal")
+        .notes
+        .iter()
+        .any(|n| n.onset == Frac::new(50, 1) && n.pitch == 72 && n.span == Frac::new(3, 2)));
     assert!(full.chord_count() > 0);
     assert!(full.voice("Ins").notes.is_empty());
     let (stripped, removed) = strip_chords(FULL, KeepVoice::Both).unwrap();
