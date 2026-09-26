@@ -484,11 +484,18 @@ fn rms_norm_and_rope_match_upstream() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Real-weight logit tolerance (YuE2-3B, F32 on the CPU, native vs PyTorch). Set after measuring;
-/// see `tests/fixtures/README.md`.
-const REAL_ABS: f64 = f64::INFINITY;
+/// Real-weight logit tolerance (YuE2-3B, F32 on the CPU, native Candle vs PyTorch 2.10). Measured
+/// over 258 decode steps (every mode, planner and semantic, guidance 1 / 1.01 / 1.5 / 2, greedy
+/// and injected-draw): max |Δ| 3.6e-5 over the top-8 and probe logits, |Δ logsumexp| 3.6e-5,
+/// mean per-id |ΔΣx| and relative |ΔΣx²| ≤ 1.2e-5 — 28 layers of F32 reduction-order noise on
+/// logits of magnitude ~10. Bounded at 2e-4 (5.5× the measured maximum) and still 60× below the
+/// smallest reference top-1 margin in the fixture (1.2e-2): a layer, position or mask error moves
+/// logits by ≥ 1e-2 and fails, while GEMM blocking on another CPU cannot. Greedy and
+/// injected-draw token sequences are compared exactly, not within a tolerance.
+const REAL_ABS: f64 = 2e-4;
 /// |Δ| between a cached decode step's logits and a native full recompute of the same sequence.
-const CACHE_ABS: f64 = f64::INFINITY;
+/// Measured 1.6e-5 (24 cached steps after 120–357-token prefills); bounded at 1e-4.
+const CACHE_ABS: f64 = 1e-4;
 
 fn hub_dirs() -> crate::SnapshotDirs {
     let hub = std::path::PathBuf::from(std::env::var_os("YUE2_HF_HUB").unwrap_or_else(|| {
@@ -523,7 +530,8 @@ fn opt_u32s(v: &Value) -> Option<Vec<u32>> {
 ///   parity::real_weight -- --ignored --nocapture
 /// ```
 ///
-/// CPU F32: expected peak RSS ~9 GB (AR-path weights in F32) plus the mmapped checkpoint pages.
+/// CPU F32: peak RSS measured 9.5 GB (the AR path's 2.2 B parameters in F32); ~210 s on an Apple
+/// M-series CPU, 16 s of it verifying and loading the checkpoint.
 #[test]
 #[ignore = "real weights: set YUE2_HF_HUB (see the doc comment)"]
 fn real_weight_decodes_match_upstream() {
@@ -661,7 +669,7 @@ fn real_weight_decodes_match_upstream() {
     );
     println!("ALL real-weight steps: {all:?}; cache worst {cache_worst:e}");
     assert!(
-        all.max_abs <= REAL_ABS && all.lse_abs <= REAL_ABS,
+        all.max_abs <= REAL_ABS && all.lse_abs <= REAL_ABS && all.moment_rel <= REAL_ABS,
         "{all:?}"
     );
     assert!(

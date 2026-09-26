@@ -486,7 +486,7 @@ def real(args) -> None:
     tok = YuE2TextTokenizer(snap / "qwen.tiktoken")
     start = time.perf_counter()
     model = YuE2ForCausalLM.from_pretrained(snap, local_files_only=True,
-                                            torch_dtype=torch.float32).eval()
+                                            dtype=torch.float32).eval()
     load_seconds = time.perf_counter() - start
     probes = probe_ids()
     recorder = Recorder(lambda row, phase: summarize_row(row, phase, 8, probes[phase]))
@@ -538,11 +538,13 @@ def real(args) -> None:
         print(f"{mode}: prefix {len(prefix)}, abc {len(abc_ids)}, semantic "
               f"{len(rec['semantic']['tokens'])} ({timings[mode]:.1f}s)", flush=True)
 
-    # A planner that reaches ABC_END by itself: the supplied full score teacher-forced after
-    # ABC_START, then greedy with no min_tokens.
-    planner_prefix = token_prefixes(SongRequest(style, lyrics, cot="full"), tok) + tok.encode(score)
+    # A planner that reaches ABC_END by itself: the supplied melody score teacher-forced after
+    # ABC_START, then greedy with no min_tokens (the model closes the voices and ends the score).
+    planner_prefix = token_prefixes(SongRequest(style, lyrics, cot="melody"), tok) + tok.encode(melody)
     out["abc_natural_end"] = {"planner_prefix": planner_prefix, **run_generate(
-        recorder, model, planner_prefix, Sampling(0.0, .9, 30, 1.005, 100, 0, 8), "abc")}
+        recorder, model, planner_prefix, Sampling(0.0, .9, 30, 1.005, 100, 0, 24), "abc")}
+    if out["abc_natural_end"]["truncated"]:
+        raise SystemExit("abc_natural_end no longer reaches ABC_END within its budget")
     # Stochastic decodes with injected draws: the released ABC controls, and cot = off's
     # released semantic controls (legacy arithmetic, default guidance 1.01).
     full_planner = out["modes"]["full"]["planner_prefix"]
