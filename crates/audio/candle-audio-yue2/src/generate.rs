@@ -274,7 +274,7 @@ pub fn decode_tokens(
 
 /// Upstream's timing record for a decode (`generate_tokens`' `timing`, minus the CUDA-graph
 /// fields this runtime has no counterpart for).
-fn timing_of(decoded: &Decoded) -> Map<String, Value> {
+pub(crate) fn timing_of(decoded: &Decoded) -> Map<String, Value> {
     let mut t = Map::new();
     t.insert("seconds".into(), Value::from(decoded.seconds));
     t.insert(

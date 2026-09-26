@@ -855,6 +855,42 @@
       "retrieved": "2026-09-24"
     },
     {
+      "component": "yue2_3b",
+      "source_url": "https://huggingface.co/m-a-p/YuE2-3B",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "YuE2-3B — YuE2 by the YuE2 authors (Multimodal Art Projection), https://huggingface.co/m-a-p/YuE2-3B — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_qwen_tiktoken",
+      "source_url": "https://huggingface.co/Qwen/Qwen-7B",
+      "gated": false,
+      "declared": "tongyi-qianwen-license-agreement",
+      "family": "tongyi-qianwen",
+      "attribution": "Tongyi Qianwen is licensed under the Tongyi Qianwen LICENSE AGREEMENT, Copyright (c) Alibaba Cloud. All Rights Reserved.",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_vae",
+      "source_url": "https://huggingface.co/m-a-p/YuE2-Vae",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "YuE2-Vae — YuE2 by the YuE2 authors (Multimodal Art Projection), https://huggingface.co/m-a-p/YuE2-Vae — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_vae_legacy",
+      "source_url": "https://huggingface.co/m-a-p/YuE2-Vae-legacy",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "YuE2-Vae-legacy — YuE2 by the YuE2 authors (Multimodal Art Projection), https://huggingface.co/m-a-p/YuE2-Vae-legacy — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
       "component": "yue_s1_7b_anneal_en_cot",
       "source_url": "https://huggingface.co/m-a-p/YuE-s1-7B-anneal-en-cot",
       "gated": false,
@@ -1393,6 +1429,38 @@
         {
           "term": "downstream_license_copy",
           "family": "apache-2-0"
+        },
+        {
+          "term": "notice_file_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "yue2",
+      "components": [
+        "yue2_3b",
+        "yue2_qwen_tiktoken",
+        "yue2_vae",
+        "yue2_vae_legacy"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "If you are commercially using the Materials, and your product or service has more than 100 million monthly active users, You shall request a license from Us. You cannot exercise your rights under this Agreement without our express authorization."
+        },
+        {
+          "term": "deployer_obligation",
+          "text": "You can not use the Materials or any output therefrom to improve any other large language model (excluding Tongyi Qianwen or derivative works thereof)."
+        },
+        {
+          "term": "downstream_license_copy",
+          "family": "tongyi-qianwen"
+        },
+        {
+          "term": "non_commercial_weights"
         },
         {
           "term": "notice_file_required"

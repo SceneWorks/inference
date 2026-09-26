@@ -211,6 +211,23 @@ impl Yue2TextTokenizer {
         Self::from_ranks(parse_ranks(bytes)?)
     }
 
+    /// [`Self::from_partial_ranks_for_tests`] padded to the checkpoint's [`ORDINARY_TOKENS`] with
+    /// filler tokens that can never be produced by encoding text (they start with `0xFF 0xFE`,
+    /// which no UTF-8 text contains), so a synthetic model may sample **any** ordinary id and
+    /// still decode. Test fixtures only.
+    #[cfg(test)]
+    pub(crate) fn padded_for_tests(bytes: &[u8]) -> Result<Self, TokenizerError> {
+        let mut ranks = parse_ranks(bytes)?;
+        let mut filler = 0u32;
+        while ranks.len() < ORDINARY_TOKENS as usize {
+            let mut token = vec![0xFF, 0xFE];
+            token.extend_from_slice(&filler.to_be_bytes());
+            ranks.push(token);
+            filler += 1;
+        }
+        Self::from_ranks(ranks)
+    }
+
     fn from_ranks(decoder: Vec<Vec<u8>>) -> Result<Self, TokenizerError> {
         let mut encoder = HashMap::with_capacity(decoder.len());
         for (rank, token) in decoder.iter().enumerate() {

@@ -44,6 +44,9 @@ candle-audio-mmaudio = { path = "../candle-audio-mmaudio" }
 # sc-19382: YuE lyrics2song (epic sc-19373) — six stage-1 variants (en/zh/jp-kr × CoT/ICL), each a
 # segment-by-segment song Generator returning a 44.1 kHz mix plus vocal and instrumental stems.
 candle-audio-yue = { path = "../candle-audio-yue" }
+# sc-22994: YuE2 (epic sc-22988) — the noncommercial, experimental symbolic-plan song generator
+# (`yue2`), a distinct provider beside YuE1's six `yue_*` generators, never an alias of them.
+candle-audio-yue2 = { path = "../candle-audio-yue2" }
 # The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
 # registration recognizes audio snapshots and delegates everything else to candle-llm's
 # preparer unchanged. This crate is the composition owner (previously each bundle wired
@@ -70,6 +73,7 @@ metal = [
     "candle-audio-mmaudio/metal",
     "candle-audio-moss-tts/metal",
     "candle-audio-yue/metal",
+    "candle-audio-yue2/metal",
 ]
 cuda = [
     "candle-audio/cuda",
@@ -86,6 +90,7 @@ cuda = [
     "candle-audio-mmaudio/cuda",
     "candle-audio-moss-tts/cuda",
     "candle-audio-yue/cuda",
+    "candle-audio-yue2/cuda",
 ]
 
 [dev-dependencies]
