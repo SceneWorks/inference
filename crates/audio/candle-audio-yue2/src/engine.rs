@@ -598,7 +598,7 @@ impl Yue2Engine {
     }
 
     /// Lock the model for an AR stage, preparing the FP8 AR mode first when the engine runs it.
-    fn lock_nar_for_ar(&self) -> gen_core::Result<MutexGuard<'_, Yue2Nar>> {
+    pub(crate) fn lock_nar_for_ar(&self) -> gen_core::Result<MutexGuard<'_, Yue2Nar>> {
         let mut nar = self.lock_nar()?;
         if self.ar == ArPrecision::Fp8 {
             fp8::prepare_fp8_ar(nar.lm_mut())?;

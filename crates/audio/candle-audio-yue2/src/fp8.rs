@@ -144,12 +144,6 @@ impl Fp8State {
         #[cfg(not(feature = "cuda"))]
         match self.never {}
     }
-
-    /// The retained originals (layer-major, upstream AR-linear order).
-    #[cfg(feature = "cuda")]
-    pub(crate) fn originals(&self) -> &[Vec<Tensor>] {
-        &self.originals
-    }
 }
 
 fn unsupported(why: impl std::fmt::Display) -> gen_core::Error {

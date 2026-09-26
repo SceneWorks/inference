@@ -37,6 +37,19 @@
 //! share a YuE2 file until an owner records a basis here. The gate never strips an upstream access
 //! gate and never relabels a licence.
 //!
+//! # Derived tier snapshots (sc-22995)
+//!
+//! A `q8` / `q4` tier snapshot ([`crate::tier`]) is Adapted Material of the CC BY-NC 4.0 YuE2-3B
+//! weights (plus a byte-identical `qwen.tiktoken`). [`crate::tier::convert`] produces one only on
+//! the user's machine, from the original they acquired, after authorizing
+//! [`IntendedUse::NoncommercialExperimentation`] — the same basis that permits running the
+//! original — and every licence, notice and model-card file travels with it unmodified. Sharing or
+//! rehosting a tier snapshot (SceneWorks' usual pre-quantized hub rehost) is
+//! [`IntendedUse::Redistribution`] of the MoT and the tokenizer, which stays **gated** below: no
+//! derived tier is uploaded anywhere until an owner records a compatible distribution basis here.
+//! This is the owner-visible item `tier_snapshot_rehost` of
+//! [`crate::precision::OWNER_DECISIONS`].
+//!
 //! Every licence text this module cites is vendored verbatim under the crate's `licenses/`
 //! directory and pinned by SHA-256 in [`LICENSE_TEXTS`].
 

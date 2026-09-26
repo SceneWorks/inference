@@ -75,6 +75,18 @@
 //! * [`provider`] — the registered `yue2` generator (distinct from YuE1's `yue_*`): the
 //!   `LoadSpec` gate and the `GenerationRequest` mapping onto the engine.
 //!
+//! Precision (sc-22995):
+//!
+//! * [`precision`] — the native `bf16` / `q8` / `q4` tiers, the V2 per-tensor precision map (every
+//!   matmul weight follows the tier; VAE FP32 at every tier), weights-free residency pricing and
+//!   the owner-visible precision decisions.
+//! * [`tier`] — deterministic local derivation of a `q8` / `q4` tier snapshot from the verified
+//!   original, with its conversion manifest, and its verification at the load boundary;
+//!   [`prepare`] exposes it through the audio-lane snapshot preparer.
+//! * [`weights`] — the loaded matmul weight (dense, GGML, or FP8) and the tier-aware loader.
+//! * [`fp8`] — upstream's experimental FP8 AR mode on CUDA sm_89+, with exact BF16 restoration
+//!   before the acoustic stage and counted host-held originals.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -103,6 +115,8 @@ pub mod model;
 pub mod nar;
 #[cfg(test)]
 mod parity;
+#[cfg(test)]
+mod quality;
 pub mod plan;
 pub mod precision;
 pub mod prepare;
@@ -120,9 +134,11 @@ pub mod weights;
 mod test_fixtures;
 
 pub use engine::{
-    EngineHooks, EngineObserver, EngineOptions, SemanticResult, SongResult, SongSettings, Stage,
-    StageEvent, Yue2Engine,
+    EngineHooks, EngineObserver, EngineOptions, ModelPrecision, SemanticResult, SongResult,
+    SongSettings, Stage, StageEvent, Yue2Engine,
 };
+pub use fp8::ArPrecision;
+pub use precision::Tier;
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
 pub use license::COMPONENT_LICENSES;
 pub use nar::{synthesize, NarOptions, QueryTile, SongNoise, SynthesisRequest, Yue2Nar};

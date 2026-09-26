@@ -606,6 +606,25 @@ fn an_asserted_tier_must_be_the_staged_one() {
     assert!(crate::model::check_tier(None, staged, &dir).is_ok());
 }
 
+/// Deriving a tier is authorized (local noncommercial experimentation, the basis every conversion
+/// checks); rehosting one is redistribution of the MoT and its tokenizer, which has no recorded
+/// basis — and the tier's manifest says so.
+#[test]
+fn rehosting_a_tier_is_not_authorized() {
+    use crate::license::{authorize, IntendedUse};
+    let tier_components = [ComponentId::Lm, ComponentId::QwenTiktoken];
+    assert!(authorize(&tier_components, IntendedUse::NoncommercialExperimentation).is_ok());
+    let refused = authorize(&tier_components, IntendedUse::Redistribution).unwrap_err();
+    assert!(refused.to_string().contains("yue2_3b"), "{refused}");
+    let src = source();
+    let dir = convert_to(&src, Tier::Q8, "q8");
+    let note = read_manifest(&dir).unwrap()["license"]["note"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(note.contains("not authorized"), "{note}");
+}
+
 /// A saved closure carries a derived tier byte for byte, and the copy verifies.
 #[test]
 fn a_tier_is_saved_into_a_closure_byte_for_byte() {
