@@ -275,7 +275,12 @@ jobs:
           set "rc=%ERRORLEVEL%"
           type "%YUE2_EVIDENCE%\cuda-lib-tests.log"
           if not "%rc%"=="0" (echo ::error::the YuE2 CUDA lib tests failed& exit /b 1)
-          findstr /C:"fp8::tests::cuda::prepare_then_restore_is_bit_exact_and_counted ... ok" "%YUE2_EVIDENCE%\cuda-lib-tests.log" >nul || (echo ::error::the FP8 CUDA tests did not run& exit /b 1)
+          rem With --nocapture a test's printed evidence can sit between its name and its "ok", so the
+          rem pass is the zero-failure result line and the CUDA tests are proven to have run by name.
+          findstr /C:"test result: ok." "%YUE2_EVIDENCE%\cuda-lib-tests.log" >nul || (echo ::error::no passing test result& exit /b 1)
+          for %%T in (fp8_gemm_matches_its_dequantized_reference prepare_then_restore_is_bit_exact_and_counted the_engine_restores_bf16_before_the_acoustic_stage) do (
+            findstr /C:"test fp8::tests::cuda::%%T ..." "%YUE2_EVIDENCE%\cuda-lib-tests.log" >nul || (echo ::error::fp8::tests::cuda::%%T did not run& exit /b 1)
+          )
           exit /b 0
       - name: Measure the YuE2 tiers against the F32 reference
         shell: cmd
