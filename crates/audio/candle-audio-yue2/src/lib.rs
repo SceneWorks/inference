@@ -63,6 +63,18 @@
 //!   midpoint solver, bounded (query-tiled) attention that never drops a key, optional AR offload
 //!   and cancellation — producing [`latent::AcousticLatents`] for the decoder.
 //!
+//! The engine (sc-22994):
+//!
+//! * [`engine`] — [`Yue2Engine`]: one loaded closure running plan → semantic → acoustic → decode,
+//!   every stage also invocable on its own, with cancellation, progress, effective configuration
+//!   and the stage / run identities.
+//! * [`run`] — transactional run directories with every artifact and integrity record,
+//!   identity-checked stage-by-stage resume, plan-only runs and cached-latent decoding.
+//! * [`closure`] — save the verified generation closure to one directory (licence and notice
+//!   files included) and load an engine back from it, offline.
+//! * [`provider`] — the registered `yue2` generator (distinct from YuE1's `yue_*`): the
+//!   `LoadSpec` gate and the `GenerationRequest` mapping onto the engine.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!

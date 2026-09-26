@@ -266,6 +266,11 @@ pub struct Yue2Engine {
     options: EngineOptions,
     authorization: Authorization,
     load_timing: Map<String, Value>,
+    /// The MoT's compute dtype, device and weights digest, fixed at load (offload moves AR
+    /// weights to host memory and back but changes none of these).
+    dtype: DType,
+    device: Device,
+    weights_sha256: String,
 }
 
 impl std::fmt::Debug for Yue2Engine {
@@ -397,6 +402,11 @@ impl Yue2Engine {
             other => msg(other),
         })?;
         let nar = Yue2Nar::load(dirs, dtype, device)?;
+        let (dtype, device, weights_sha256) = (
+            nar.lm().dtype(),
+            nar.lm().device().clone(),
+            nar.weights_sha256().to_string(),
+        );
         let mut load_timing = Map::new();
         load_timing.insert(
             "resolve_verify_and_load_seconds".into(),
@@ -405,6 +415,9 @@ impl Yue2Engine {
         Ok(Self {
             tokenizer,
             nar: Mutex::new(nar),
+            dtype,
+            device,
+            weights_sha256,
             vae_source: VaeSource::Snapshots(dirs.clone()),
             vaes: Mutex::new(BTreeMap::new()),
             mot_identity: component_identity(ComponentId::Lm.component()),
@@ -427,6 +440,9 @@ impl Yue2Engine {
                 Yue2TextTokenizer::padded_for_tests(&bytes).expect("synthetic table parses")
             },
             nar: Mutex::new(crate::nar::synthetic::model(1.0)),
+            dtype: DType::F32,
+            device: Device::Cpu,
+            weights_sha256: "synthetic".into(),
             vae_source: VaeSource::Fixture,
             vaes: Mutex::new(BTreeMap::new()),
             mot_identity: json!({"component": "synthetic_mot", "weights_sha256": "synthetic"}),
@@ -459,16 +475,12 @@ impl Yue2Engine {
 
     /// The MoT compute dtype.
     pub fn dtype(&self) -> DType {
-        self.lock_nar()
-            .map(|n| n.lm().dtype())
-            .unwrap_or(DType::F32)
+        self.dtype
     }
 
-    /// The device the MoT lives on.
-    pub fn device(&self) -> Device {
-        self.lock_nar()
-            .map(|n| n.lm().device().clone())
-            .unwrap_or(Device::Cpu)
+    /// The device the MoT lives on (the decoders load onto it too).
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Default [`SongSettings`] of this engine: its generation configuration and the standard
@@ -494,19 +506,18 @@ impl Yue2Engine {
 
     /// SHA-256 of the MoT weights the stages run (part of every stage identity).
     pub fn weights_sha256(&self) -> gen_core::Result<String> {
-        Ok(self.lock_nar()?.weights_sha256().to_string())
+        Ok(self.weights_sha256.clone())
     }
 
     /// The source / model identities recorded in artifacts (upstream `pipe.weights`, plus the
     /// tokenizer, the compute dtype and the device).
     pub fn model_identity(&self) -> gen_core::Result<Value> {
-        let nar = self.lock_nar()?;
         Ok(json!({
             "engine": ENGINE_ID,
             "mot": self.mot_identity,
-            "mot_native_weights_sha256": nar.weights_sha256(),
+            "mot_native_weights_sha256": self.weights_sha256,
             "tokenizer": self.tokenizer_identity,
-            "model_dtype": dtype_name(nar.lm().dtype()),
+            "model_dtype": dtype_name(self.dtype),
             "source": {
                 "repository": crate::inventory::YUE2_SOURCE_REPO,
                 "commit": crate::inventory::YUE2_SOURCE_COMMIT,
@@ -568,8 +579,8 @@ impl Yue2Engine {
                     VaeVariant::Legacy => ComponentId::VaeLegacy,
                 };
                 let verified = snapshot::resolve_component(id, dirs)?;
-                let device = self.device();
-                Yue2Vae::load(&verified, VaeParts::DecoderOnly, &device).map_err(vae_error)?
+                let device = &self.device;
+                Yue2Vae::load(&verified, VaeParts::DecoderOnly, device).map_err(vae_error)?
             }
             #[cfg(test)]
             VaeSource::Fixture => crate::vae::tests::tiny(variant, VaeParts::DecoderOnly),
@@ -609,10 +620,7 @@ impl Yue2Engine {
             QueryTile::Rows(n) => json!({"rows": n}),
             QueryTile::ScoreBytes(b) => json!({"score_bytes": b}),
         };
-        let (dtype, device) = match self.lock_nar() {
-            Ok(n) => (dtype_name(n.lm().dtype()), device_name(n.lm().device())),
-            Err(_) => ("unknown", "unknown"),
-        };
+        let (dtype, device) = (dtype_name(self.dtype), device_name(&self.device));
         json!({
             "engine": ENGINE_ID,
             "protocol": PROTOCOL_VERSION,
