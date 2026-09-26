@@ -15,9 +15,10 @@
 //!   --test vae_real_weights -- --ignored --nocapture --test-threads 1
 //! ```
 //!
-//! CPU only. Measured peak RSS 2.3–2.6 GB (two runs) for the whole file: one 530 MB FP32 VAE
-//! mapped plus its folded weights at a time (the encoder test loads both halves) and activations
-//! of a ≤ 3 s clip; 37–50 s in release mode.
+//! CPU only. Measured peak RSS 6.6 GB for the whole file (~95 s in release mode). The
+//! production-tiling test dominates: three 224-frame-core tiles of the decoder, 5.8 GB when run
+//! alone, within its 8 GiB estimate (`decode::estimated_tile_bytes`). The other tests stay under
+//! 2.6 GB.
 //!
 //! Every waveform compared here is produced by the production entry points
 //! ([`decode_latents`] on a [`Yue2Vae::load`]ed verified component) — not a test-only forward.
@@ -267,9 +268,12 @@ fn both_pinned_decoders_match_upstream_on_identical_cached_latents() {
         assert!(rms(&left) > 2.0 * rms(&right));
         assert!(cl > 0.5 && cr > 0.5 && cl > xl.abs() && cr > xr.abs());
 
-        // The full reference FP32 path and a many-seam tiling agree with the production output.
+        // At 16 frames the production options decode a single tile, which is the same computation
+        // as the full decode, so that pair proves nothing about tiling. The real tiled check here
+        // is a many-seam tiling (core 4: three seams) against the full reference decode. The
+        // production core is exercised on a multi-tile latent in
+        // `production_tiling_matches_upstream_on_a_multi_tile_latent`.
         let full = decode(&vae, &cached, DecodeOptions::reference_full());
-        let (max_full, _) = compare(full.samples(), out.samples());
         let seams = decode(
             &vae,
             &cached,
@@ -279,8 +283,8 @@ fn both_pinned_decoders_match_upstream_on_identical_cached_latents() {
             },
         );
         let (max_seams, _) = compare(seams.samples(), full.samples());
-        println!("  {key}: full vs production {max_full:e}; core-4 tiling vs full {max_seams:e}");
-        assert!(max_full < TILED_VS_FULL_MAX_ABS && max_seams < TILED_VS_FULL_MAX_ABS);
+        println!("  {key}: core-4 tiling vs full {max_seams:e}");
+        assert!(max_seams < TILED_VS_FULL_MAX_ABS, "{key}: {max_seams}");
     }
     // Decoding with both decoders never touched the cached latents.
     assert_eq!(
@@ -289,64 +293,145 @@ fn both_pinned_decoders_match_upstream_on_identical_cached_latents() {
     );
 }
 
-/// AC2 on real weights at song-like length: halo/crop tiles (core 16, five seams, plus a short
-/// final tile) against the full reference decode, both decoders, on a 75-frame (3 s) latent.
+/// Upstream `[1, 2, S]` raw decoder output → the production layout: clamped, interleaved L/R.
+fn clamped_interleaved(raw: &Tensor) -> Vec<f32> {
+    to_vec(
+        &raw.clamp(-1f32, 1f32)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
+            .t()
+            .unwrap()
+            .contiguous()
+            .unwrap(),
+    )
+}
+
+/// Largest |Δ| within ±128 samples (both channels) of each tile boundary `k·core·1920`.
+fn seam_max_abs(a: &[f32], b: &[f32], core: usize, frames: usize) -> f32 {
+    let samples = a.len() / 2;
+    let mut worst = 0f32;
+    for seam in (core..frames).step_by(core).map(|f| f * 1920) {
+        for i in seam.saturating_sub(128)..(seam + 128).min(samples) {
+            for c in 0..2 {
+                worst = worst.max((a[i * 2 + c] - b[i * 2 + c]).abs());
+            }
+        }
+    }
+    worst
+}
+
+fn latents_from(r: &std::collections::HashMap<String, Tensor>, name: &str) -> AcousticLatents {
+    AcousticLatents::from_tensor(
+        &r[name],
+        LatentSource::Synthesis {
+            stage_identity: format!("vae_real_reference:{name}"),
+        },
+    )
+    .unwrap()
+}
+
+/// AC2 on real weights at song-like length: the stored 75-frame (3 s) upstream latent, both
+/// decoders. The native full reference decode matches upstream's full decode; halo/crop tiles
+/// (core 16: four seams plus a short final tile) match the native full decode over the whole
+/// waveform and specifically within ±128 samples of every seam, and match upstream too.
 #[test]
 #[ignore = "real weights: set YUE2_HF_HUB and generate the reference (see the module docs)"]
 fn halo_crop_tiling_matches_full_decode_on_a_long_latent() {
     let r = reference();
-    let base = to_vec(&r["latent"]);
-    // 75 frames: the 16-frame reference latent, then four affine variants of it (deterministic,
-    // in-distribution scale), truncated.
-    let mut values = Vec::new();
-    for (k, (a, b)) in [
-        (1.0, 0.0),
-        (-0.8, 0.05),
-        (0.9, -0.1),
-        (0.6, 0.2),
-        (-1.1, 0.0),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        values.extend(base.iter().map(|v| a * v + b + 0.01 * k as f32));
-    }
-    values.truncate(75 * 64);
-    let latents = AcousticLatents::new(
-        values,
-        75,
-        LatentSource::Synthesis {
-            stage_identity: "long-affine-fixture".into(),
-        },
-    )
-    .unwrap();
-    for id in [ComponentId::VaeStandard, ComponentId::VaeLegacy] {
+    let meta = meta();
+    let frames = meta["long_frames"].as_u64().unwrap() as usize;
+    let core = meta["long_core_frames"].as_u64().unwrap() as usize;
+    let latents = latents_from(&r, "long_latent");
+    assert_eq!(latents.frames(), frames);
+    for (id, key) in [
+        (ComponentId::VaeStandard, "standard"),
+        (ComponentId::VaeLegacy, "legacy"),
+    ] {
         let vae = load(id, VaeParts::DecoderOnly);
         let full = decode(&vae, &latents, DecodeOptions::reference_full());
         let tiled = decode(
             &vae,
             &latents,
             DecodeOptions {
-                mode: DecodeMode::Tiled { core_frames: 16 },
+                mode: DecodeMode::Tiled { core_frames: core },
                 halo_frames: 16,
             },
         );
-        assert_eq!(full.frames(), 75 * 1920 - 64);
+        assert_eq!(full.frames(), frames * 1920 - 64);
+        let upstream = clamped_interleaved(&r[&format!("{key}.long_full_raw")]);
+        let (up_max, up_snr) = compare(full.samples(), &upstream);
         let (max, snr) = compare(tiled.samples(), full.samples());
-        // Seam neighbourhoods specifically (±128 samples around each core boundary).
-        let mut seam_max = 0f32;
-        for seam in (16usize..75).step_by(16).map(|f| f * 1920) {
-            for i in seam.saturating_sub(128)..(seam + 128).min(full.frames()) {
-                for c in 0..2 {
-                    let k = i * 2 + c;
-                    seam_max = seam_max.max((tiled.samples()[k] - full.samples()[k]).abs());
-                }
-            }
-        }
+        let seam_max = seam_max_abs(tiled.samples(), full.samples(), core, frames);
+        let (tiled_up_max, _) = compare(tiled.samples(), &upstream);
         println!(
-            "  {id:?}: tiled(core 16) vs full max|Δ| {max:e} (seams {seam_max:e}), SNR {snr:.1} dB"
+            "  {key}: full vs upstream full max|Δ| {up_max:e} (SNR {up_snr:.1} dB); tiled(core \
+             {core}) vs full max|Δ| {max:e} (seams {seam_max:e}), SNR {snr:.1} dB; tiled vs \
+             upstream {tiled_up_max:e}"
         );
-        assert!(max < TILED_VS_FULL_MAX_ABS, "{id:?}: {max}");
+        assert!(
+            up_max < WAVEFORM_MAX_ABS,
+            "{key}: full vs upstream {up_max}"
+        );
+        assert!(up_snr > WAVEFORM_MIN_SNR_DB, "{key}: SNR {up_snr}");
+        assert!(max < TILED_VS_FULL_MAX_ABS, "{key}: tiled vs full {max}");
+        assert!(seam_max < TILED_VS_FULL_MAX_ABS, "{key}: seams {seam_max}");
+        assert!(
+            tiled_up_max < WAVEFORM_MAX_ABS,
+            "{key}: tiled vs upstream {tiled_up_max}"
+        );
+    }
+}
+
+/// The production tiling itself ([`DecodeOptions::production`], 224-frame cores from the default
+/// decode budget) on a latent longer than one core: the stored 485-frame upstream latent decodes
+/// in three tiles (224 + 224 + 37) and matches upstream `YuE2Pipeline.decode` at the same core,
+/// over the whole waveform and at both production seams, for both decoders.
+#[test]
+#[ignore = "real weights: set YUE2_HF_HUB and generate the reference (see the module docs)"]
+fn production_tiling_matches_upstream_on_a_multi_tile_latent() {
+    let r = reference();
+    let meta = meta();
+    let frames = meta["prod_frames"].as_u64().unwrap() as usize;
+    let core = meta["prod_core_frames"].as_u64().unwrap() as usize;
+    let production = DecodeOptions::production();
+    assert_eq!(
+        production.mode,
+        DecodeMode::Tiled { core_frames: core },
+        "the reference was generated for a different production core; regenerate it"
+    );
+    let latents = latents_from(&r, "prod_latent");
+    assert_eq!(latents.frames(), frames);
+    assert!(
+        frames > 2 * core,
+        "the latent must span several production tiles"
+    );
+    for (id, key) in [
+        (ComponentId::VaeStandard, "standard"),
+        (ComponentId::VaeLegacy, "legacy"),
+    ] {
+        let vae = load(id, VaeParts::DecoderOnly);
+        let start = Instant::now();
+        let mut tiles = Vec::new();
+        let out = decode_latents(&vae, &latents, &production, &|| false, &mut |c, t| {
+            tiles.push((c, t))
+        })
+        .unwrap();
+        let want = to_vec(&r[&format!("{key}.prod_pipeline")]);
+        let (max, snr) = compare(out.samples(), &want);
+        let seam_max = seam_max_abs(out.samples(), &want, core, frames);
+        println!(
+            "  {key}: production ({} tiles, {:.2?}) vs upstream pipeline max|Δ| {max:e} \
+             (seams {seam_max:e}), SNR {snr:.1} dB",
+            tiles.len(),
+            start.elapsed()
+        );
+        assert_eq!(tiles, vec![(1, 3), (2, 3), (3, 3)]);
+        assert_eq!(out.frames(), frames * 1920 - 64);
+        assert_eq!(out.metadata().vae_decode(), "halo_crop");
+        assert!(max < WAVEFORM_MAX_ABS, "{key}: {max}");
+        assert!(seam_max < WAVEFORM_MAX_ABS, "{key}: seams {seam_max}");
+        assert!(snr > WAVEFORM_MIN_SNR_DB, "{key}: SNR {snr}");
     }
 }
 
@@ -378,4 +463,49 @@ fn native_encoder_matches_upstream_for_both_vaes() {
             assert!(max < ENCODE_MAX_ABS, "encode_latents: {max}");
         }
     }
+}
+
+/// Tile-footprint probe behind `decode::TILE_BYTES_PER_FRAME` / `decode::TILE_RESERVE_BYTES`: one
+/// full decode of `YUE2_VAE_PROBE_FRAMES` latent frames (a single tile of that many frames) with
+/// the standard decoder, or tiles of `YUE2_VAE_PROBE_CORE` frames when that is set. Measure the process's peak RSS externally, one process per size, e.g.
+/// `/usr/bin/time -l <test binary> --ignored --exact tile_footprint_probe`; the constants are the
+/// fitted slope and intercept. Asserts nothing about memory (RSS is machine-dependent).
+#[test]
+#[ignore = "measurement probe: set YUE2_HF_HUB and YUE2_VAE_PROBE_FRAMES"]
+fn tile_footprint_probe() {
+    // A measurement tool, not a check: without a size it has nothing to measure, so a plain
+    // `--ignored` run of this file does not fail on it.
+    let Some(frames) = std::env::var_os("YUE2_VAE_PROBE_FRAMES") else {
+        println!("tile_footprint_probe: set YUE2_VAE_PROBE_FRAMES=<frames> to measure");
+        return;
+    };
+    let frames: usize = frames
+        .to_str()
+        .and_then(|f| f.parse().ok())
+        .expect("YUE2_VAE_PROBE_FRAMES is an integer");
+    let vae = load(ComponentId::VaeStandard, VaeParts::DecoderOnly);
+    let values: Vec<f32> = (0..frames * 64)
+        .map(|i| ((i as f32) * 0.618).sin() * 0.8)
+        .collect();
+    let latents = AcousticLatents::new(
+        values,
+        frames,
+        LatentSource::Synthesis {
+            stage_identity: "probe".into(),
+        },
+    )
+    .unwrap();
+    // With YUE2_VAE_PROBE_CORE, decode in production-shaped tiles of that core (16-frame halo)
+    // instead of one full-length tile, to measure retention across consecutive tiles.
+    let options = match std::env::var("YUE2_VAE_PROBE_CORE") {
+        Ok(core) => DecodeOptions {
+            mode: DecodeMode::Tiled {
+                core_frames: core.parse().expect("YUE2_VAE_PROBE_CORE is an integer"),
+            },
+            halo_frames: 16,
+        },
+        Err(_) => DecodeOptions::reference_full(),
+    };
+    let out = decode(&vae, &latents, options);
+    assert_eq!(out.frames(), 1920 * frames - 64);
 }

@@ -94,6 +94,9 @@ pub enum VaeError {
     /// The latents failed identity verification.
     #[error(transparent)]
     Latent(#[from] LatentError),
+    /// A decode memory budget is invalid or too small for any tile.
+    #[error("YuE2 VAE decode budget: {0}")]
+    MemoryBudget(String),
     /// The caller cancelled between tiles.
     #[error("YuE2 VAE decode cancelled after {completed} of {total} tiles")]
     Cancelled {

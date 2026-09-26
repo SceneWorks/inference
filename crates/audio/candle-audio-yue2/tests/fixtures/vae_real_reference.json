@@ -15,10 +15,13 @@
   "core_frames": 4,
   "long_frames": 75,
   "long_core_frames": 16,
-  "long_latent": "torch.randn((1,64,75), Generator.manual_seed(2299375)) * std(latent)",
+  "long_latent": "torch.randn((1,64,75), Generator.manual_seed(2299375)) * std(latent), stored as long_latent [75, 64]",
+  "prod_frames": 485,
+  "prod_core_frames": 224,
+  "prod_latent": "torch.randn((1,64,485), Generator.manual_seed(2299376)) * std(latent), stored as prod_latent [485, 64]",
   "clip": "LEFT 0.97*sign(sin(2pi*220t)), RIGHT 0.3*sin(2pi*659.25t), 48 kHz, 30720 samples",
   "reference_file": "vae_real_reference.safetensors",
-  "reference_sha256": "4b001e8f9a5479dfdb7f3e803d27f56c49bf9c5a0f64ae3925c0f42743d4c9cd",
+  "reference_sha256": "c4073edb3c7abfbf5d50a9c5bfa67c73b9b9a8ba20115570ddb616d00d5b72d4",
   "latent_sha256": "9ccecdf07fda3751fe649248d7701ff9553b0c9a7b63fee3798759cf7dec5b39",
   "decoders": {
     "standard": {

@@ -247,7 +247,7 @@ impl AcousticLatents {
         if frames == 0 {
             return Err(LatentError::Invalid("zero frames".into()));
         }
-        if values.len() != frames * LATENT_CHANNELS {
+        if frames.checked_mul(LATENT_CHANNELS) != Some(values.len()) {
             return Err(LatentError::Invalid(format!(
                 "{} values for {frames} frames of {LATENT_CHANNELS} channels",
                 values.len()
@@ -489,11 +489,16 @@ fn parse_npy(bytes: &[u8]) -> Result<(usize, &[u8]), LatentError> {
         _ => return Err(bad(format!("shape {dims:?}, expected [frames, 64]"))),
     };
     let data = &bytes[start + hlen..];
-    if data.len() != frames * LATENT_CHANNELS * 4 {
+    // `frames` comes from an untrusted header: size it with checked arithmetic.
+    let expected = frames.checked_mul(LATENT_CHANNELS * 4).ok_or_else(|| {
+        bad(format!(
+            "shape [{frames}, 64] overflows the addressable size"
+        ))
+    })?;
+    if data.len() != expected {
         return Err(bad(format!(
-            "{} data bytes for shape [{frames}, 64] (expected {})",
-            data.len(),
-            frames * LATENT_CHANNELS * 4
+            "{} data bytes for shape [{frames}, 64] (expected {expected})",
+            data.len()
         )));
     }
     Ok((frames, data))
@@ -607,6 +612,24 @@ mod tests {
             .to_npy();
         let wide = String::from_utf8_lossy(&wide).replacen("(1, 64)", "(2, 32)", 1);
         assert!(AcousticLatents::from_npy(wide.as_bytes(), source()).is_err());
+        // A header claiming usize::MAX frames must be refused, not overflow the size computation
+        // (mutation: unchecked `frames * 64 * 4` panics with overflow in test builds → red).
+        let header = format!(
+            "{{'descr': '<f4', 'fortran_order': False, 'shape': ({}, 64), }}",
+            usize::MAX
+        );
+        let pad = 64 - ((10 + header.len() + 1) % 64);
+        let mut huge = b"\x93NUMPY\x01\x00".to_vec();
+        huge.extend_from_slice(&((header.len() + 1 + pad) as u16).to_le_bytes());
+        huge.extend_from_slice(header.as_bytes());
+        huge.resize(huge.len() + pad, b' ');
+        huge.push(b'\n');
+        huge.extend_from_slice(&[0u8; 256]);
+        let err = AcousticLatents::from_npy(&huge, source()).unwrap_err();
+        assert!(
+            matches!(&err, LatentError::Npy(m) if m.contains("overflows")),
+            "{err}"
+        );
     }
 
     /// Empty, ragged and non-finite latents are refused at construction.
