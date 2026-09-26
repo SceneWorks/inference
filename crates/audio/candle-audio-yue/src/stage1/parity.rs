@@ -319,6 +319,73 @@ fn budget_ended_segments_carry_the_forced_eoa_into_the_cache() {
     check_run("budgetOnly", true);
 }
 
+/// sc-19373 performance regression: a decode step's work beyond attention is O(1). Over the
+/// guided fixture render (both CFG rows, a smart-context rebuild in the last segment), no decode
+/// step copies cached K/V (no growing-cache `cat`, no `repeat_kv` expansion, no transposed-key
+/// copy — candle-llm's materialization counter stays put) or builds a host attention mask, and the
+/// KV cache is allocated once, at the context limit: its buffers never move, across every step,
+/// segment and the shortened window's rebuild (a rewind, not a reallocation).
+#[test]
+fn decode_steps_neither_copy_the_kv_cache_nor_build_a_mask() {
+    use candle_llm::primitives::kv_cache::{kv_materialize_count, KvCache};
+    let fx = fixture();
+    let run = &fx["runs"]["guidance"];
+    let decode = decode_config(&run["decode"], true);
+    let context = fx["config"]["max_position_embeddings"].as_u64().unwrap() as usize;
+    let mut lm = Stage1Lm::from_model(tiny_model(&fx)).unwrap();
+    lm.begin_render(seed(&fx)).unwrap();
+    let (mut buffers, mut steps, mut rewinds, mut cached) = (None, 0usize, 0usize, 0i32);
+    for (index, prompt) in prompts(&fx).iter().enumerate() {
+        lm.begin_segment(&SegmentStart {
+            index,
+            prompt,
+            guidance_scale: decode.guidance.scale_for(index),
+            decode: &decode,
+        })
+        .unwrap();
+        let cache = lm.kv_cache().expect("a segment holds the cache");
+        assert_eq!(cache.capacity(), context, "allocated at the context limit");
+        assert_eq!(cache.batch_size(), 2);
+        if cache.offset() < cached + prompt.len() as i32 {
+            rewinds += 1;
+        }
+        let addresses = cache.storage_addresses(0).unwrap();
+        assert_eq!(
+            *buffers.get_or_insert(addresses),
+            addresses,
+            "segment {index}: the KV cache was reallocated"
+        );
+        let (materialized, masks) = (kv_materialize_count(), lm.host_mask_builds);
+        for _ in 0..decode.max_new_tokens {
+            let ended = matches!(lm.step().unwrap(), Stage1Step::EndOfAudio);
+            steps += 1;
+            assert_eq!(
+                kv_materialize_count(),
+                materialized,
+                "segment {index}, step {steps}: a decode step copied cached K/V"
+            );
+            assert_eq!(
+                lm.host_mask_builds, masks,
+                "segment {index}, step {steps}: a decode step built a host mask"
+            );
+            assert_eq!(
+                lm.kv_cache().unwrap().storage_addresses(0).unwrap(),
+                addresses
+            );
+            if ended {
+                break;
+            }
+        }
+        lm.end_segment().unwrap();
+        cached = lm.kv_cache().unwrap().offset();
+    }
+    assert!(steps > 100, "{steps} decode steps exercised");
+    assert_eq!(
+        rewinds, 1,
+        "the last segment's smart-context rebuild rewinds the cache"
+    );
+}
+
 /// Sequence length the cache would hold before segment `index`'s shortening check, with no
 /// shortening: every prompt block up to and including `index`, plus the earlier segments' output.
 fn unshortened_len(fx: &Value, run: &Value, index: usize) -> u64 {

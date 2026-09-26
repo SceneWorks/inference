@@ -1,7 +1,17 @@
 //! The production stage 1: the YuE `LlamaForCausalLM` driven through candle-llm's primitives — the
-//! Llama decoder ([`CausalLm`], GQA, bf16/q8/q4 projections), its contiguous KV cache, the batched
-//! masked forward ([`CausalLm::decode_logits_masked`]) and the host reference sampler
-//! ([`sample_row_host`] with its `allowed` mask and the seeded [`SplitMix64`] stream).
+//! Llama decoder ([`CausalLm`], GQA, bf16/q8/q4 projections), its preallocated [`StaticKvCache`],
+//! the batched masked forward attending un-expanded ([`CausalLm::decode_logits_masked_gqa`]) and
+//! the host reference sampler ([`sample_row_host`] with its `allowed` mask and the seeded
+//! [`SplitMix64`] stream).
+//!
+//! ## Per-step cost
+//!
+//! A decode step does O(1) work beyond attention itself (which reads the whole cache, inherently
+//! O(position)): the KV cache is allocated once per render at the context limit and written in
+//! place (no per-step `cat` of the history), attention reads the cache's un-expanded K/V views
+//! directly (no per-step `repeat_kv` of every cached position, no transposed-key copy), and the
+//! CFG step mask is a narrowed view of a per-segment mask (no per-step host build and upload).
+//! The growing cache's per-step copies made a 3000-token segment quadratic (sc-19373).
 //!
 //! ## Reference semantics
 //!
@@ -29,7 +39,7 @@
 
 use candle_audio::candle_core::{Device, Tensor};
 use candle_audio::gen_core;
-use candle_llm::primitives::kv_cache::{ContiguousKvCache, KvCache};
+use candle_llm::primitives::kv_cache::{KvCache, StaticKvCache};
 use candle_llm::primitives::sampler::{
     logits_rows_host, sample_row_host, SamplingParams, SplitMix64,
 };
@@ -83,11 +93,19 @@ pub struct Stage1Lm {
     /// `window` as the sampler's `i32` ids — the repetition-penalty window (the sampler penalises
     /// each distinct id once). Kept in step with `window` so no step rebuilds it.
     penalty_window: Vec<i32>,
-    cache: Option<ContiguousKvCache>,
+    /// Preallocated for `context_limit` positions (every window fits: the smart context keeps it
+    /// at most `context_limit − max_new_tokens − 1` before a segment's budget) and reused across
+    /// the render's segments; a smart-context rebuild only rewinds it. Reallocated only when the
+    /// row count changes.
+    cache: Option<StaticKvCache>,
     /// Rows in `cache` (1 without guidance, 2 with).
     batch: usize,
     /// First cache column the unconditional row attends (the segment prompt's last token).
     uncond_start: usize,
+    /// The CFG decode step's additive mask for the open segment, `[2, 1, 1, context_limit]` in the
+    /// compute dtype: row 0 attends every column, row 1 only columns `>= uncond_start`. A step
+    /// attends a narrowed view of it, so no step builds or uploads a mask.
+    step_mask: Option<Tensor>,
     allowed: Vec<bool>,
     allowed_no_eoa: Vec<bool>,
     segment: Option<Segment>,
@@ -95,6 +113,10 @@ pub struct Stage1Lm {
     /// raw conditional logits), before the penalty and the masks.
     #[cfg(test)]
     pub(crate) first_scores: Vec<Vec<f32>>,
+    /// Test hook: attention masks built on the host (per prefill chunk and per segment step mask;
+    /// never per decode step).
+    #[cfg(test)]
+    pub(crate) host_mask_builds: usize,
 }
 
 impl std::fmt::Debug for Stage1Lm {
@@ -156,11 +178,14 @@ impl Stage1Lm {
             cache: None,
             batch: 1,
             uncond_start: 0,
+            step_mask: None,
             allowed,
             allowed_no_eoa,
             segment: None,
             #[cfg(test)]
             first_scores: Vec::new(),
+            #[cfg(test)]
+            host_mask_builds: 0,
         })
     }
 
@@ -183,6 +208,49 @@ impl Stage1Lm {
         self.batch
     }
 
+    /// The KV cache, once a segment has created it.
+    #[cfg(test)]
+    pub(crate) fn kv_cache(&self) -> Option<&StaticKvCache> {
+        self.cache.as_ref()
+    }
+
+    /// Allocate the KV cache for `self.batch` rows at `context_limit` positions, unless one of that
+    /// row count is already held (then it is kept, possibly rewound by the caller).
+    fn ensure_cache(&mut self) -> gen_core::Result<()> {
+        if self.cache.is_some() {
+            return Ok(());
+        }
+        let cfg = self.model.config();
+        let cache = StaticKvCache::new(
+            cfg.num_layers,
+            self.batch,
+            usize::try_from(cfg.num_kv_heads).unwrap_or(0),
+            usize::try_from(cfg.head_dim).unwrap_or(0),
+            self.context_limit,
+            self.model.compute_dtype(),
+            self.model.device(),
+        )
+        .map_err(llm_err("KV cache"))?;
+        self.cache = Some(cache);
+        Ok(())
+    }
+
+    /// The open segment's CFG step mask `[2, 1, 1, context_limit]` (see the `step_mask` field).
+    fn build_step_mask(&mut self) -> gen_core::Result<Tensor> {
+        #[cfg(test)]
+        {
+            self.host_mask_builds += 1;
+        }
+        let cols = self.context_limit;
+        let mut mask = vec![0f32; 2 * cols];
+        for m in &mut mask[cols..cols + self.uncond_start.min(cols)] {
+            *m = MASK_NEG;
+        }
+        Tensor::from_vec(mask, (2, 1, 1, cols), self.model.device())
+            .and_then(|m| m.to_dtype(self.model.compute_dtype()))
+            .map_err(tensor_err("step mask"))
+    }
+
     /// Feed every window token the cache has not seen, in chunks, returning the last position's
     /// logits `[batch, vocab]`.
     fn feed(&mut self) -> gen_core::Result<Tensor> {
@@ -192,6 +260,8 @@ impl Stage1Lm {
             .cache
             .as_mut()
             .expect("the cache is created before any feed");
+        #[cfg(test)]
+        let host_mask_builds = &mut self.host_mask_builds;
         let mut start = cache.offset() as usize;
         let end = self.window.len();
         if start >= end {
@@ -210,7 +280,23 @@ impl Stage1Lm {
                 lm.decode_logits(&ids, cache, start as i32)
                     .map_err(llm_err("forward"))?
             } else {
-                forward_cfg(lm, cache, &device, tokens, start, self.uncond_start)?
+                let step_mask = self
+                    .step_mask
+                    .as_ref()
+                    .expect("a CFG segment builds its step mask before any feed");
+                let mask = if n == 1 {
+                    // The decode step: a view of the segment's mask, nothing built or uploaded.
+                    step_mask
+                        .narrow(3, 0, stop)
+                        .map_err(tensor_err("step mask view"))?
+                } else {
+                    #[cfg(test)]
+                    {
+                        *host_mask_builds += 1;
+                    }
+                    prefill_cfg_mask(lm, &device, n, start, self.uncond_start)?
+                };
+                forward_cfg(lm, cache, &device, tokens, start, self.uncond_start, &mask)?
             });
             start = stop;
         }
@@ -246,7 +332,9 @@ fn log_softmax(row: &[f32]) -> Vec<f32> {
 
 /// One batch-of-2 CFG forward over `tokens` (the window columns `start..start + tokens.len()`):
 /// both rows are fed the same ids; row 0 attends causally over every column at its absolute
-/// position, row 1 only columns `>= uncond_start` with positions shifted to start at 0.
+/// position, row 1 only columns `>= uncond_start` with positions shifted to start at 0 — which
+/// `mask` (`[2, 1, tokens.len(), start + tokens.len()]`, possibly a view) encodes. Attention reads
+/// the cache's K/V un-expanded ([`CausalLm::decode_logits_masked_gqa`]).
 fn forward_cfg(
     lm: &CausalLm,
     cache: &mut dyn KvCache,
@@ -254,6 +342,7 @@ fn forward_cfg(
     tokens: &[u32],
     start: usize,
     uncond_start: usize,
+    mask: &Tensor,
 ) -> gen_core::Result<Tensor> {
     let n = tokens.len();
     let keys = start + n;
@@ -265,6 +354,20 @@ fn forward_cfg(
     let tables = lm
         .rope_tables(&positions, 2, n as i32)
         .map_err(llm_err("rope tables"))?;
+    lm.decode_logits_masked_gqa(&ids, cache, &tables, mask)
+        .map_err(llm_err("CFG forward"))
+}
+
+/// The additive CFG mask of an `n`-column prefill chunk at `start` (see [`forward_cfg`]),
+/// `[2, 1, n, start + n]` in the compute dtype. Built once per prefill chunk, never per decode step.
+fn prefill_cfg_mask(
+    lm: &CausalLm,
+    device: &Device,
+    n: usize,
+    start: usize,
+    uncond_start: usize,
+) -> gen_core::Result<Tensor> {
+    let keys = start + n;
     let mut mask = vec![MASK_NEG; 2 * n * keys];
     for q in 0..n {
         let col = start + q;
@@ -275,11 +378,9 @@ fn forward_cfg(
             }
         }
     }
-    let mask = Tensor::from_vec(mask, (2, 1, n, keys), device)
+    Tensor::from_vec(mask, (2, 1, n, keys), device)
         .and_then(|m| m.to_dtype(lm.compute_dtype()))
-        .map_err(tensor_err("attention mask"))?;
-    lm.decode_logits_masked(&ids, cache, &tables, &mask)
-        .map_err(llm_err("CFG forward"))
+        .map_err(tensor_err("attention mask"))
 }
 
 impl Stage1Model for Stage1Lm {
@@ -287,7 +388,11 @@ impl Stage1Model for Stage1Lm {
         self.rng = SplitMix64::new(seed);
         self.history.clear();
         self.window.clear();
-        self.cache = None;
+        // Keep the preallocated buffers for the next render; only the written length resets.
+        if let Some(cache) = self.cache.as_mut() {
+            cache.reset();
+        }
+        self.step_mask = None;
         self.segment = None;
         #[cfg(test)]
         self.first_scores.clear();
@@ -330,18 +435,27 @@ impl Stage1Model for Stage1Lm {
         };
         if self.history.len() > max_context {
             self.window = shorten_context(&self.history, max_context);
-            self.cache = None;
+            // The shortened window is a different sequence: rebuild the cache from position 0
+            // (a rewind of the preallocated buffers, which the next feed overwrites).
+            if let Some(cache) = self.cache.as_mut() {
+                cache.reset();
+            }
         } else {
             self.window.extend_from_slice(segment.prompt);
         }
         if batch != self.batch {
+            // A different row count is a different buffer shape; the next feed rebuilds the whole
+            // window into it.
             self.cache = None;
             self.batch = batch;
         }
-        if self.cache.is_none() {
-            self.cache = Some(self.model.new_cache());
-        }
+        self.ensure_cache()?;
         self.uncond_start = self.window.len() - 1;
+        self.step_mask = if batch == 2 {
+            Some(self.build_step_mask()?)
+        } else {
+            None
+        };
         self.penalty_window.clear();
         self.penalty_window
             .extend(self.window.iter().map(|&t| t as i32));
