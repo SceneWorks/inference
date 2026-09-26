@@ -35,6 +35,46 @@
 //! * [`plan`] — exact symbolic plans ([`SymbolicPlan`]): planned, saved and restored as token IDs
 //!   with integrity checks; an edited ABC is a new request.
 //!
+//! The autoregressive stages (sc-22991) run on that closure:
+//!
+//! * [`model`] — the YuE2-3B Mixture-of-Transformers backbone (AR path, and the NAR twins on
+//!   request), loaded from the verified snapshot, with a bounded, preallocated KV cache;
+//! * [`sampling`] — the released token-range masks, stop ids, windowed repetition penalty,
+//!   temperature / top-k / top-p, classifier-free guidance and the categorical draw;
+//! * [`generate`] — score planning and semantic-token generation over token ids, with guidance
+//!   that keeps the exact planned score in its negative branch, truthful truncation, and
+//!   cancellation at bounded boundaries.
+//!
+//! Decoding (sc-22993):
+//!
+//! * [`latent`] — [`latent::AcousticLatents`], the cached `[frames, 64]` FP32 latent artifact with
+//!   its identity (content SHA-256, shape, dtype, source), verified at the decode boundary and
+//!   persisted as an upstream-compatible `latent.npy` + identity sidecar.
+//! * [`vae`] — the native FP32 Oobleck VAE for both published decoders (standard and legacy):
+//!   [`vae::Yue2Vae::load`] from a verified component, the full reference decode, the exact
+//!   halo/crop tiled decode, and the encoder posterior.
+//! * [`decode`] — [`decode::decode_latents`], the production path: verified latents → clamped
+//!   48 kHz stereo with decoder and latent identity in the output metadata.
+//!
+//! Acoustic synthesis (sc-22992):
+//!
+//! * [`nar`] — flow matching over the MoT's NAR twins: the song's noise drawn once, the original
+//!   context chunks each prefilled once and reused by every velocity evaluation, the released
+//!   midpoint solver, bounded (query-tiled) attention that never drops a key, optional AR offload
+//!   and cancellation — producing [`latent::AcousticLatents`] for the decoder.
+//!
+//! The engine (sc-22994):
+//!
+//! * [`engine`] — [`Yue2Engine`]: one loaded closure running plan → semantic → acoustic → decode,
+//!   every stage also invocable on its own, with cancellation, progress, effective configuration
+//!   and the stage / run identities.
+//! * [`run`] — transactional run directories with every artifact and integrity record,
+//!   identity-checked stage-by-stage resume, plan-only runs and cached-latent decoding.
+//! * [`closure`] — save the verified generation closure to one directory (licence and notice
+//!   files included) and load an engine back from it, offline.
+//! * [`provider`] — the registered `yue2` generator (distinct from YuE1's `yue_*`): the
+//!   `LoadSpec` gate and the `GenerationRequest` mapping onto the engine.
+//!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.
 //!
@@ -50,19 +90,57 @@
 
 pub use candle_audio::gen_core;
 
+pub mod closure;
+pub mod decode;
+pub mod engine;
+pub mod generate;
 pub mod inventory;
+pub mod latent;
 pub mod license;
 pub mod manifest;
+pub mod model;
+pub mod nar;
+#[cfg(test)]
+mod parity;
 pub mod plan;
 pub mod protocol;
+pub mod provider;
+pub mod run;
+pub mod sampling;
 pub mod snapshot;
 pub mod tokenizer;
+pub mod vae;
 
 #[cfg(test)]
 mod test_fixtures;
 
+pub use engine::{
+    EngineHooks, EngineObserver, EngineOptions, SemanticResult, SongResult, SongSettings, Stage,
+    StageEvent, Yue2Engine,
+};
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
+pub use license::COMPONENT_LICENSES;
+pub use nar::{synthesize, NarOptions, QueryTile, SongNoise, SynthesisRequest, Yue2Nar};
 pub use plan::{PlanError, PlanIdentity, PlanStep, SemanticConditioning, SymbolicPlan};
 pub use protocol::{CotMode, GenerationConfig, ProtocolError, Sampling, SongRequest};
+pub use provider::{
+    descriptor, load, PROVIDER_COMPONENTS, PROVIDER_COMPONENT_LICENSES, PROVIDER_ID, REGISTRATION,
+    REGISTRATIONS,
+};
+pub use run::{verify_run, RunError, RunOutcome, RunOutput, SongInput};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
 pub use tokenizer::{TokenizerError, Yue2TextTokenizer};
+
+/// Add the YuE2 generator to an explicit audio registry builder (catalog composition).
+pub fn register_providers(
+    registry: gen_core::ProviderRegistryBuilder,
+) -> gen_core::ProviderRegistryBuilder {
+    REGISTRATIONS
+        .into_iter()
+        .fold(registry, |r, reg| r.register_generator(reg))
+}
+
+/// Build this crate's own explicit provider catalog.
+pub fn provider_registry() -> gen_core::Result<gen_core::ProviderRegistry> {
+    register_providers(gen_core::ProviderRegistryBuilder::new()).build()
+}

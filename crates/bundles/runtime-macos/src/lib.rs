@@ -283,7 +283,8 @@ mod tests {
         // over SAME-L, both domains, 380 s) + the three pre-trained -base siblings
         // stable_audio_3_{small_music,small_sfx,medium}_base (sc-14546 — rectified_flow,
         // Euler/50/7.0 defaults), and moss_ttsd_v05
-        // (multi-speaker dialogue TTS, sc-13518), the six yue_* lyrics2song variants (sc-19382), plus the
+        // (multi-speaker dialogue TTS, sc-13518), the six yue_* lyrics2song variants (sc-19382), the noncommercial yue2 song generator
+        // (sc-22994), plus the
         // voice-cloning identity embedder
         // chatterbox_ve (sc-12844); later stories extend in catalog order. The lane carries the
         // composed candle preparer (sc-12835/sc-12836) while the main preparer registry stays
@@ -316,7 +317,8 @@ mod tests {
                     "yue_zh_cot",
                     "yue_zh_icl",
                     "yue_jp_kr_cot",
-                    "yue_jp_kr_icl"
+                    "yue_jp_kr_icl",
+                    "yue2"
                 ]
             );
             assert_eq!(snapshot.audio_voice_embedder_ids, ["chatterbox_ve"]);
@@ -434,6 +436,7 @@ mod tests {
                 "yue_zh_icl",
                 "yue_jp_kr_cot",
                 "yue_jp_kr_icl",
+                "yue2",
                 "dummy-audio"
             ]
         );

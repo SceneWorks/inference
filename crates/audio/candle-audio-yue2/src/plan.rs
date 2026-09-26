@@ -648,7 +648,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PlanError> {
 
 /// A 1-D little-endian int32 `.npy` (format 1.0), byte-identical to `np.save` of
 /// `np.asarray(ids, dtype=np.int32)`.
-fn npy_int32(ids: &[u32]) -> Result<Vec<u8>, PlanError> {
+pub(crate) fn npy_int32(ids: &[u32]) -> Result<Vec<u8>, PlanError> {
     let mut header = format!(
         "{{'descr': '<i4', 'fortran_order': False, 'shape': ({},), }}",
         ids.len()
@@ -672,7 +672,7 @@ fn npy_int32(ids: &[u32]) -> Result<Vec<u8>, PlanError> {
 
 /// Read a 1-D integer `.npy` (any signed/unsigned width, either byte order; format 1.0–3.0), the
 /// arrays upstream's `np.load(..., allow_pickle=False)` accepts for a plan.
-fn read_npy_ints(file: &'static str, bytes: &[u8]) -> Result<Vec<i128>, PlanError> {
+pub(crate) fn read_npy_ints(file: &'static str, bytes: &[u8]) -> Result<Vec<i128>, PlanError> {
     let bad = |detail: &str| malformed(file, detail.to_string());
     let rest = bytes
         .strip_prefix(b"\x93NUMPY")

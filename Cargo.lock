@@ -226,6 +226,7 @@ dependencies = [
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
  "candle-audio-yue",
+ "candle-audio-yue2",
  "candle-llm",
  "tempfile",
 ]
@@ -430,6 +431,8 @@ name = "candle-audio-yue2"
 version = "0.0.0"
 dependencies = [
  "candle-audio",
+ "candle-llm",
+ "candle-nn",
  "fancy-regex 0.17.0",
  "regex",
  "serde_json",
