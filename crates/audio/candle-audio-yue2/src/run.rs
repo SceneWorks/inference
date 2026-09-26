@@ -754,8 +754,7 @@ impl WorkDir {
                 .map_err(io(&path))?;
         }
         result.insert("artifacts".into(), Value::Object(artifacts));
-        let result = Value::Object(result);
-        write_json(&self.work.join(RESULT_JSON), &result)?;
+        write_json(&self.work.join(RESULT_JSON), &Value::Object(result))?;
         let stages = self.work.join(STAGES_DIR);
         if stages.is_dir() {
             sync_dir(&stages)?;
@@ -772,7 +771,10 @@ impl WorkDir {
         if let Some(parent) = self.target.parent().filter(|p| !p.as_os_str().is_empty()) {
             sync_dir(parent)?;
         }
-        Ok((self.target.clone(), result))
+        // Hand back the record as a reader of the published file sees it (JSON floats do not all
+        // round-trip bit for bit through serde_json's default parser).
+        let published = read_json(&self.target.join(RESULT_JSON))?;
+        Ok((self.target.clone(), published))
     }
 }
 
