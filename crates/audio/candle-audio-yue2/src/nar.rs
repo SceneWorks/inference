@@ -1001,7 +1001,7 @@ pub fn synthesize(
     options: &NarOptions,
     mut hooks: SynthesisHooks<'_>,
 ) -> gen_core::Result<Synthesis> {
-    crate::fp8::restore_ar_bf16(&mut nar.lm)?;
+    // MUTATION (sc-22995 fix pass): restore removed
     let start = Instant::now();
     let refuse = |what: String| Err(gen_core::Error::Msg(format!("YuE2 acoustic: {what}")));
     if request.prefix.is_empty() || request.codes.is_empty() {
