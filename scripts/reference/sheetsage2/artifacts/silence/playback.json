@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "duration": 12.0,
+  "midi": "transcription.mid",
+  "tracks": [],
+  "measures": [
+    {
+      "index": 0,
+      "start": 0.0,
+      "end": 1.92,
+      "score_start": 0.0,
+      "score_end": 1.0,
+      "leading_rest": 0.0,
+      "trailing_rest": 0.0
+    },
+    {
+      "index": 1,
+      "start": 1.92,
+      "end": 3.84,
+      "score_start": 1.0,
+      "score_end": 2.0,
+      "leading_rest": 0.0,
+      "trailing_rest": 0.0
+    },
+    {
+      "index": 2,
+      "start": 3.84,
+      "end": 5.76,
+      "score_start": 2.0,
+      "score_end": 3.0,
+      "leading_rest": 0.0,
+      "trailing_rest": 0.0
+    },
+    {
+      "index": 3,
+      "start": 5.76,
+      "end": 7.68,
+      "score_start": 3.0,
+      "score_end": 4.0,
+      "leading_rest": 0.0,
+      "trailing_rest": 0.0
+    },
+    {
+      "index": 4,
+      "start": 7.68,
+      "end": 9.6,
+      "score_start": 4.0,
+      "score_end": 5.0,
+      "leading_rest": 0.0,
+      "trailing_rest": 0.0
+    },
+    {
+      "index": 5,
+      "start": 9.6,
+      "end": 11.52,
+      "score_start": 5.0,
+      "score_end": 6.0,
+      "leading_rest": 0.0,
+      "trailing_rest": 0.0
+    },
+    {
+      "index": 6,
+      "start": 11.52,
+      "end": 12.0,
+      "score_start": 6.0,
+      "score_end": 7.0,
+      "leading_rest": 0.0,
+      "trailing_rest": 0.75
+    }
+  ],
+  "warnings": []
+}

@@ -365,6 +365,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-audio-sheetsage2"
+version = "0.0.0"
+dependencies = [
+ "candle-audio",
+ "candle-audio-yue2",
+ "candle-nn",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "candle-audio-stable-audio-3"
 version = "0.0.0"
 dependencies = [

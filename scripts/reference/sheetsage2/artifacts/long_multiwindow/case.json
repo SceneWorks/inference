@@ -1,0 +1,65 @@
+{
+  "case": "long_multiwindow",
+  "generator": "scripts/reference/sheetsage2/native_parity.py long_multiwindow",
+  "input": {
+    "file": "long_multiwindow.model_input.24k_mono_f32le.raw",
+    "recipe": {
+      "note": "concatenation of the digest-pinned sc-23003 arrays",
+      "order": [
+        "nav_ssb",
+        "synth",
+        "nav_ssb",
+        "synth",
+        "nav_ssb",
+        "synth",
+        "nav_ssb"
+      ]
+    },
+    "sample_rate": 24000,
+    "samples": 8596800,
+    "sha256": "33b7dbda90c5f7c7e6c1e35e9c0ca1c541fb26452a90136f22c74618281a31c6"
+  },
+  "result": {
+    "abc_error": null,
+    "abc_measures": 125,
+    "diagnostics": [
+      "notation only: clipped track 1 note at 73.360 to next onset",
+      "measure 0: inferred 3/4 from downbeat span; declared numerators were [4, 4, 4]",
+      "measure 0: padded leading 3/4 span to 4/4 with preceding rest"
+    ],
+    "duration_seconds": 358.2,
+    "instrumental_notes": 136,
+    "melody_notes": 461,
+    "vocal_notes": 325,
+    "warnings": []
+  },
+  "transcribe_seconds": 295.83,
+  "upstream_code": "m-a-p/SheetSage2@4f89269db831bdc1880124164a00d4f9385cd129",
+  "weights": "m-a-p/SheetSage2@eab522a8168e8b8b8c4856bf8609cd86198f01fe (identical LFS object at both revisions)",
+  "windows": [
+    {
+      "accept_end": 200.0,
+      "accept_start": 0.0,
+      "accepted_events": 378,
+      "end": 300.0,
+      "events": 379,
+      "generation_stop": 200.0,
+      "prefix_end": 0.0,
+      "prefix_tokens": 0,
+      "start": 0.0,
+      "tokens": 1545
+    },
+    {
+      "accept_end": 358.2,
+      "accept_start": 200.0,
+      "accepted_events": 304,
+      "end": 358.2,
+      "events": 587,
+      "generation_stop": null,
+      "prefix_end": 200.0,
+      "prefix_tokens": 1124,
+      "start": 58.19999999999999,
+      "tokens": 2382
+    }
+  ]
+}

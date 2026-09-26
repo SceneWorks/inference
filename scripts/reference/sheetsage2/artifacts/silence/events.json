@@ -1,0 +1,605 @@
+{
+  "schema_version": "v1",
+  "prompts": [
+    "timestamp",
+    "downbeat_meter",
+    "structure",
+    "key",
+    "chord_full",
+    "melody_full"
+  ],
+  "events": [
+    {
+      "subbeat": 0,
+      "tokens_by_field": {
+        "timestamp": [
+          517
+        ],
+        "rhythm": [
+          30537,
+          30709
+        ],
+        "structure": [
+          30968
+        ],
+        "key": [
+          30988
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 0.0,
+        "rhythm": {
+          "meter": [
+            4,
+            4
+          ],
+          "eighth_position": 0
+        },
+        "structure": "verse",
+        "key": "C:major",
+        "chord": "N"
+      },
+      "time": 0.0,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 0,
+      "global_subbeat": 0
+    },
+    {
+      "subbeat": 4,
+      "tokens_by_field": {
+        "timestamp": [
+          565
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 0.48,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 0.48,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 4,
+      "global_subbeat": 4
+    },
+    {
+      "subbeat": 8,
+      "tokens_by_field": {
+        "timestamp": [
+          613
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 0.96,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 0.96,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 8,
+      "global_subbeat": 8
+    },
+    {
+      "subbeat": 12,
+      "tokens_by_field": {
+        "timestamp": [
+          661
+        ],
+        "rhythm": [
+          30715
+        ]
+      },
+      "values": {
+        "timestamp": 1.44,
+        "rhythm": {
+          "eighth_position": 6
+        }
+      },
+      "time": 1.44,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 12,
+      "global_subbeat": 12
+    },
+    {
+      "subbeat": 16,
+      "tokens_by_field": {
+        "timestamp": [
+          709
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 1.92,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "N"
+      },
+      "time": 1.92,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 16,
+      "global_subbeat": 16
+    },
+    {
+      "subbeat": 20,
+      "tokens_by_field": {
+        "timestamp": [
+          757
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 2.4,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 2.4,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 20,
+      "global_subbeat": 20
+    },
+    {
+      "subbeat": 24,
+      "tokens_by_field": {
+        "timestamp": [
+          805
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 2.88,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 2.88,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 24,
+      "global_subbeat": 24
+    },
+    {
+      "subbeat": 28,
+      "tokens_by_field": {
+        "timestamp": [
+          853
+        ],
+        "rhythm": [
+          30715
+        ]
+      },
+      "values": {
+        "timestamp": 3.36,
+        "rhythm": {
+          "eighth_position": 6
+        }
+      },
+      "time": 3.36,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 28,
+      "global_subbeat": 28
+    },
+    {
+      "subbeat": 32,
+      "tokens_by_field": {
+        "timestamp": [
+          901
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 3.84,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "N"
+      },
+      "time": 3.84,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 32,
+      "global_subbeat": 32
+    },
+    {
+      "subbeat": 36,
+      "tokens_by_field": {
+        "timestamp": [
+          949
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 4.32,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 4.32,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 36,
+      "global_subbeat": 36
+    },
+    {
+      "subbeat": 40,
+      "tokens_by_field": {
+        "timestamp": [
+          997
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 4.8,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 4.8,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 40,
+      "global_subbeat": 40
+    },
+    {
+      "subbeat": 44,
+      "tokens_by_field": {
+        "timestamp": [
+          1045
+        ],
+        "rhythm": [
+          30715
+        ]
+      },
+      "values": {
+        "timestamp": 5.28,
+        "rhythm": {
+          "eighth_position": 6
+        }
+      },
+      "time": 5.28,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 44,
+      "global_subbeat": 44
+    },
+    {
+      "subbeat": 48,
+      "tokens_by_field": {
+        "timestamp": [
+          1093
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 5.76,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "N"
+      },
+      "time": 5.76,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 48,
+      "global_subbeat": 48
+    },
+    {
+      "subbeat": 52,
+      "tokens_by_field": {
+        "timestamp": [
+          1141
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 6.24,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 6.24,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 52,
+      "global_subbeat": 52
+    },
+    {
+      "subbeat": 56,
+      "tokens_by_field": {
+        "timestamp": [
+          1189
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 6.72,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 6.72,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 56,
+      "global_subbeat": 56
+    },
+    {
+      "subbeat": 60,
+      "tokens_by_field": {
+        "timestamp": [
+          1237
+        ],
+        "rhythm": [
+          30715
+        ]
+      },
+      "values": {
+        "timestamp": 7.2,
+        "rhythm": {
+          "eighth_position": 6
+        }
+      },
+      "time": 7.2,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 60,
+      "global_subbeat": 60
+    },
+    {
+      "subbeat": 64,
+      "tokens_by_field": {
+        "timestamp": [
+          1285
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 7.68,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "N"
+      },
+      "time": 7.68,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 64,
+      "global_subbeat": 64
+    },
+    {
+      "subbeat": 68,
+      "tokens_by_field": {
+        "timestamp": [
+          1333
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 8.16,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 8.16,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 68,
+      "global_subbeat": 68
+    },
+    {
+      "subbeat": 72,
+      "tokens_by_field": {
+        "timestamp": [
+          1381
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 8.64,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 8.64,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 72,
+      "global_subbeat": 72
+    },
+    {
+      "subbeat": 76,
+      "tokens_by_field": {
+        "timestamp": [
+          1429
+        ],
+        "rhythm": [
+          30715
+        ]
+      },
+      "values": {
+        "timestamp": 9.12,
+        "rhythm": {
+          "eighth_position": 6
+        }
+      },
+      "time": 9.12,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 76,
+      "global_subbeat": 76
+    },
+    {
+      "subbeat": 80,
+      "tokens_by_field": {
+        "timestamp": [
+          1477
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 9.6,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "N"
+      },
+      "time": 9.6,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 80,
+      "global_subbeat": 80
+    },
+    {
+      "subbeat": 84,
+      "tokens_by_field": {
+        "timestamp": [
+          1525
+        ],
+        "rhythm": [
+          30711
+        ]
+      },
+      "values": {
+        "timestamp": 10.08,
+        "rhythm": {
+          "eighth_position": 2
+        }
+      },
+      "time": 10.08,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 84,
+      "global_subbeat": 84
+    },
+    {
+      "subbeat": 88,
+      "tokens_by_field": {
+        "timestamp": [
+          1573
+        ],
+        "rhythm": [
+          30713
+        ]
+      },
+      "values": {
+        "timestamp": 10.56,
+        "rhythm": {
+          "eighth_position": 4
+        }
+      },
+      "time": 10.56,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 88,
+      "global_subbeat": 88
+    },
+    {
+      "subbeat": 92,
+      "tokens_by_field": {
+        "timestamp": [
+          1621
+        ],
+        "rhythm": [
+          30715
+        ]
+      },
+      "values": {
+        "timestamp": 11.04,
+        "rhythm": {
+          "eighth_position": 6
+        }
+      },
+      "time": 11.04,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 92,
+      "global_subbeat": 92
+    },
+    {
+      "subbeat": 96,
+      "tokens_by_field": {
+        "timestamp": [
+          1669
+        ],
+        "rhythm": [
+          30709
+        ],
+        "chord": [
+          31037
+        ]
+      },
+      "values": {
+        "timestamp": 11.52,
+        "rhythm": {
+          "eighth_position": 0
+        },
+        "chord": "N"
+      },
+      "time": 11.52,
+      "window_index": 0,
+      "window_start": 0.0,
+      "source_subbeat": 96,
+      "global_subbeat": 96
+    }
+  ],
+  "has_eos": true
+}
