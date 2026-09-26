@@ -417,10 +417,13 @@ name = "candle-audio-yue2"
 version = "0.0.0"
 dependencies = [
  "candle-audio",
+ "fancy-regex 0.17.0",
+ "regex",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "unicode-normalization",
 ]
 
 [[package]]

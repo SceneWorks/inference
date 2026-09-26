@@ -25,6 +25,16 @@
 //!   component's native port may derive from: the Apache-2.0 GitHub source for the LM, VAE and
 //!   tokenizer; the cover closure's code is treated as CC BY-NC 4.0 and its port is gated.
 //!
+//! The request slice (sc-22990) is the native text side of generation:
+//!
+//! * [`tokenizer`] — the frozen `qwen.tiktoken` text/ABC BPE ([`Yue2TextTokenizer`]), loaded only
+//!   through verification.
+//! * [`protocol`] — the `yue2-native-v1` request protocol: [`SongRequest`], per-phase
+//!   [`Sampling`], [`GenerationConfig`], the exact positive / CFG-negative token prefixes, and the
+//!   explicit context-budget refusals.
+//! * [`plan`] — exact symbolic plans ([`SymbolicPlan`]): planned, saved and restored as token IDs
+//!   with integrity checks; an edited ABC is a new request.
+//!
 //! Decoding (sc-22993):
 //!
 //! * [`latent`] — [`latent::AcousticLatents`], the cached `[frames, 64]` FP32 latent artifact with
@@ -56,8 +66,17 @@ pub mod inventory;
 pub mod latent;
 pub mod license;
 pub mod manifest;
+pub mod plan;
+pub mod protocol;
 pub mod snapshot;
+pub mod tokenizer;
 pub mod vae;
 
+#[cfg(test)]
+mod test_fixtures;
+
 pub use inventory::{Closure, Component, ComponentId, VaeVariant};
+pub use plan::{PlanError, PlanIdentity, PlanStep, SemanticConditioning, SymbolicPlan};
+pub use protocol::{CotMode, GenerationConfig, ProtocolError, Sampling, SongRequest};
 pub use snapshot::{AssetError, SnapshotDirs, VerifiedClosure, VerifiedComponent};
+pub use tokenizer::{TokenizerError, Yue2TextTokenizer};

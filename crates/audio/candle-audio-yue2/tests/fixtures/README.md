@@ -4,6 +4,7 @@
 | --- | --- | --- |
 | `vae_tiny/{standard,legacy}/{config.json,model.safetensors}`, `vae_tiny_reference.{safetensors,json}` | `scripts/reference/yue2/vae_reference.py tiny` | lib tests of `vae`, `decode`, `latent` (always run in CI) |
 | `vae_real_reference.json` | `scripts/reference/yue2/vae_reference.py real` | `tests/vae_real_weights.rs` (`#[ignore]`d) |
+| `protocol/` | `scripts/reference/yue2/protocol_fixtures.py` | tokenizer / protocol / plan tests (see `protocol/README.md`) |
 
 Provenance: upstream `github.com/multimodal-art-projection/YuE` @
 `92a73cc7652fcc1f937855e4b765e0a0edd7ff2e` (the installed pinned `yue2` package, never a copy), run
