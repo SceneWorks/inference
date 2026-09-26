@@ -148,6 +148,33 @@ impl DecodeOptions {
         estimated_tile_bytes(tile)
     }
 
+    /// Halo/crop tiles of exactly `core_frames` latent frames per core (the production halo): a
+    /// request's own decode tile (gen-core `GenerationMemory::decode_tile_edge`, sc-22988). The
+    /// core must be `1..=`[`DEFAULT_CORE_FRAMES`] (upstream's largest); anything else is refused,
+    /// never clamped. Every tile size decodes the same samples ([`DecodeMode::Tiled`]).
+    pub fn tiled(core_frames: usize) -> Result<Self, VaeError> {
+        if !(1..=DEFAULT_CORE_FRAMES).contains(&core_frames) {
+            return Err(VaeError::MemoryBudget(format!(
+                "a decode tile core must be 1..={DEFAULT_CORE_FRAMES} latent frames (got \
+                 {core_frames})"
+            )));
+        }
+        Ok(Self {
+            mode: DecodeMode::Tiled { core_frames },
+            halo_frames: DEFAULT_HALO_FRAMES,
+        })
+    }
+
+    /// The tile core in latent frames, or `None` for the full decode. With
+    /// [`Self::for_memory_budget_gib`] this turns a decode memory budget into the tile a request
+    /// selects (`decode_tile_edge`).
+    pub fn core_frames(&self) -> Option<usize> {
+        match self.mode {
+            DecodeMode::Tiled { core_frames } => Some(core_frames),
+            DecodeMode::Full => None,
+        }
+    }
+
     /// The full reference FP32 decode.
     pub fn reference_full() -> Self {
         Self {

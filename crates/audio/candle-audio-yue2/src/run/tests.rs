@@ -30,6 +30,7 @@ pub(crate) fn settings(decoder: VaeVariant) -> SongSettings {
     SongSettings {
         generation: GenerationConfig::new(abc, semantic, 2).unwrap(),
         decoder,
+        options: None,
     }
 }
 

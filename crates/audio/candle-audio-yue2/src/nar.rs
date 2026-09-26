@@ -469,6 +469,10 @@ pub enum QueryTile {
     /// each) within the budget. It bounds the score temporaries only — not the weights, the KV
     /// cache or the activations. A budget too small for one row is refused, never rounded up.
     ScoreBytes(usize),
+    /// At most this many attention-score **elements** in one call (`heads · rows · keys`): the
+    /// unit of gen-core's `GenerationMemory::attention_chunk_size` (sc-22988). As many rows as fit;
+    /// a count too small for one row is refused, never rounded up.
+    ScoreElements(usize),
 }
 
 /// Score-sized tiles one attention call can hold at once in `sdpa_gqa`: the raw `QKᵀ` product
@@ -504,6 +508,16 @@ impl QueryTile {
                     )));
                 }
                 bytes / per_row
+            }
+            QueryTile::ScoreElements(elements) => {
+                let per_row = heads * keys;
+                if elements < per_row {
+                    return Err(gen_core::Error::Msg(format!(
+                        "YuE2 acoustic: a {elements}-element score chunk cannot hold one query \
+                         row ({heads} heads × {keys} keys)"
+                    )));
+                }
+                elements / per_row
             }
         };
         Ok(rows.min(queries))

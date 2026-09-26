@@ -76,10 +76,11 @@ use std::time::Instant;
 use candle_audio::gen_core;
 use serde_json::{json, Map, Value};
 
+use crate::decode::DecodeOptions;
 use crate::durable::{self, IoAt};
 use crate::engine::{
-    identity_of, EngineHooks, SemanticResult, SongSettings, Stage, StageEvent, Yue2Engine,
-    IDENTITY_SCHEMA,
+    identity_of, EngineHooks, EngineOptions, SemanticResult, SongSettings, Stage, StageEvent,
+    Yue2Engine, IDENTITY_SCHEMA,
 };
 use crate::inventory::VaeVariant;
 use crate::latent::{AcousticLatents, LatentIdentity, LatentSource, IDENTITY_FILE, LATENT_FILE};
@@ -231,6 +232,31 @@ pub struct RunOutput {
     pub dir: PathBuf,
     /// Resume a complete or interrupted run with a matching identity.
     pub resume: bool,
+    /// Extra records published inside `D` with the run (e.g. a cover's `cover.json`, sc-22988):
+    /// written before `result.json`, so its digests cover them and [`verify_run`] checks them, and
+    /// bound into the run identity, so a resumed run must carry the very same records.
+    pub attachments: Vec<RunAttachment>,
+}
+
+/// A record published inside a run directory ([`RunOutput::attachments`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunAttachment {
+    /// A plain file name (no directory), not one of the run's own files.
+    pub name: String,
+    /// Its exact bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl RunAttachment {
+    /// `value` as pretty JSON with a final newline, under `name`.
+    pub fn json(name: impl Into<String>, value: &Value) -> Self {
+        let mut bytes = serde_json::to_vec_pretty(value).expect("a JSON value serializes");
+        bytes.push(b'\n');
+        Self {
+            name: name.into(),
+            bytes,
+        }
+    }
 }
 
 impl RunOutput {
@@ -239,6 +265,7 @@ impl RunOutput {
         Self {
             dir: dir.into(),
             resume: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -247,7 +274,79 @@ impl RunOutput {
         Self {
             dir: dir.into(),
             resume: true,
+            attachments: Vec::new(),
         }
+    }
+
+    /// Publish `attachment` with the run.
+    pub fn with_attachment(mut self, attachment: RunAttachment) -> Self {
+        self.attachments.push(attachment);
+        self
+    }
+
+    /// Refuse an attachment that is not a plain file name, names one of the run's own files, or
+    /// repeats another.
+    fn check_attachments(&self) -> Result<(), RunError> {
+        let reserved = [
+            RESULT_JSON,
+            REQUEST_JSON,
+            CONFIG_JSON,
+            SEMANTIC_NPY,
+            AUDIO_WAV,
+            SOURCE_GENERATION_JSON,
+            PROVENANCE_JSON,
+            STAGES_DIR,
+            LOCK_FILE,
+            LATENT_FILE,
+            IDENTITY_FILE,
+        ];
+        let mut seen = Vec::new();
+        for a in &self.attachments {
+            let plain = Path::new(&a.name)
+                .components()
+                .map(|c| matches!(c, PathComponent::Normal(_)))
+                .collect::<Vec<_>>()
+                == [true];
+            if !plain
+                || a.name.ends_with(".tmp")
+                || reserved.contains(&a.name.as_str())
+                || PLAN_FILES_ALL.contains(&a.name.as_str())
+                || seen.contains(&&a.name)
+            {
+                return Err(RunError::Invalid(format!(
+                    "{:?} cannot be attached to a run (a plain, unused file name is required)",
+                    a.name
+                )));
+            }
+            seen.push(&a.name);
+        }
+        Ok(())
+    }
+
+    /// `identity` bound to the attachments' names and SHA-256 (unchanged without attachments).
+    fn bind(&self, identity: String) -> String {
+        if self.attachments.is_empty() {
+            return identity;
+        }
+        let attached: Map<String, Value> = self
+            .attachments
+            .iter()
+            .map(|a| (a.name.clone(), json!(durable::sha256_hex(&a.bytes))))
+            .collect();
+        identity_of(&json!({
+            "schema": IDENTITY_SCHEMA,
+            "kind": "attached",
+            "run": identity,
+            "attachments": attached,
+        }))
+    }
+
+    /// Write the attachments into the working directory (just before `result.json`).
+    fn write_attachments(&self, work: &WorkDir) -> Result<(), RunError> {
+        for a in &self.attachments {
+            durable::write_atomic(&work.path(&a.name), &a.bytes)?;
+        }
+        Ok(())
     }
 }
 
@@ -910,8 +1009,10 @@ impl Yue2Engine {
         hooks: &mut EngineHooks<'_>,
     ) -> Result<RunOutcome, RunError> {
         let start = Instant::now();
+        output.check_attachments()?;
         self.check_decoder_available(settings.decoder)?;
-        let run_identity = self.input_identity(input, settings)?;
+        let options = self.options_for(settings);
+        let run_identity = output.bind(self.input_identity(input, settings)?);
         let work = match open_output(output)? {
             Opened::Complete => return self.reuse_complete(&output.dir, &run_identity, hooks),
             Opened::Work(work) => work,
@@ -1057,7 +1158,8 @@ impl Yue2Engine {
             }
             None => {
                 work.clear_unrecorded(&[LATENT_FILE, IDENTITY_FILE])?;
-                let synthesis = self.synthesize(&semantic, &settings.generation, hooks)?;
+                let synthesis =
+                    self.synthesize_with(&semantic, &settings.generation, &options.nar, hooks)?;
                 synthesis
                     .latents
                     .save(&work.work)
@@ -1088,7 +1190,7 @@ impl Yue2Engine {
         work.clear_unrecorded(&[AUDIO_WAV])?;
         hooks.check_cancel()?;
         let vae_start = Instant::now();
-        let audio = self.decode(&latents, settings.decoder, hooks)?;
+        let audio = self.decode_with(&latents, settings.decoder, &options.decode, hooks)?;
         let vae_seconds = vae_start.elapsed().as_secs_f64();
         stages.insert(Stage::Decode, StageEvent::Finished);
         durable::write_atomic(
@@ -1146,6 +1248,7 @@ impl Yue2Engine {
         result.insert("license".into(), self.license_record(settings.decoder)?);
         result.insert("stages".into(), Value::Object(stage_ids));
         result.insert("timing".into(), Value::Object(timing));
+        output.write_attachments(&work)?;
         let (dir, result) = work.publish(result)?;
         Ok(RunOutcome {
             dir,
@@ -1197,7 +1300,8 @@ impl Yue2Engine {
         output: &RunOutput,
         hooks: &mut EngineHooks<'_>,
     ) -> Result<(SymbolicPlan, PlanIdentity, PathBuf), RunError> {
-        let identity = self.plan_stage_identity(request, generation.abc())?;
+        output.check_attachments()?;
+        let identity = output.bind(self.plan_stage_identity(request, generation.abc())?);
         let work = match open_output(output)? {
             Opened::Complete => {
                 let result = verify_run(&output.dir, Some(&identity))?;
@@ -1239,6 +1343,7 @@ impl Yue2Engine {
         result.insert("identity".into(), json!(identity));
         result.insert("plan_identity".into(), json!(plan_id.to_string()));
         result.insert("truncated".into(), json!({"abc": plan.truncated()}));
+        output.write_attachments(&work)?;
         let (dir, _) = work.publish(result)?;
         Ok((plan, plan_id, dir))
     }
@@ -1256,8 +1361,23 @@ impl Yue2Engine {
         output: Option<&RunOutput>,
         hooks: &mut EngineHooks<'_>,
     ) -> Result<RunOutcome, RunError> {
+        self.decode_cached_with(source, decoder, &self.options().decode, output, hooks)
+    }
+
+    /// [`Yue2Engine::decode_cached`] with explicit decode tiling (a request's own). The tiling
+    /// changes no sample; it is recorded in the configuration and bound into the identity like
+    /// the engine's own.
+    pub fn decode_cached_with(
+        &self,
+        source: &Path,
+        decoder: VaeVariant,
+        decode: &DecodeOptions,
+        output: Option<&RunOutput>,
+        hooks: &mut EngineHooks<'_>,
+    ) -> Result<RunOutcome, RunError> {
         self.check_decoder_available(decoder)?;
         if let Some(output) = output {
+            output.check_attachments()?;
             refuse_overlap(source, &output.dir)?;
         }
         let original = verify_run(source, None)?;
@@ -1301,9 +1421,13 @@ impl Yue2Engine {
             &source_identity,
             &latents.identity().to_json(),
             &json!([variant_name(decoder), self.vae_identity(decoder)?]),
-            &json!(format!("{:?}", self.options().decode)),
+            &json!(format!("{decode:?}")),
             &mot,
         );
+        let identity = match output {
+            Some(output) => output.bind(identity),
+            None => identity,
+        };
         let work = match output {
             None => None,
             Some(output) => match open_output(output)? {
@@ -1316,10 +1440,10 @@ impl Yue2Engine {
             observe(&mut stages, hooks, stage, StageEvent::Reused);
         }
         let vae_start = Instant::now();
-        let audio = self.decode(&latents, decoder, hooks)?;
+        let audio = self.decode_with(&latents, decoder, decode, hooks)?;
         let vae_seconds = vae_start.elapsed().as_secs_f64();
         stages.insert(Stage::Decode, StageEvent::Finished);
-        let Some(work) = work else {
+        let (Some(work), Some(output)) = (work, output) else {
             return Ok(RunOutcome {
                 dir: source.to_path_buf(),
                 result: original,
@@ -1370,6 +1494,10 @@ impl Yue2Engine {
             plan.request(),
             &SongSettings {
                 decoder,
+                options: Some(EngineOptions {
+                    decode: *decode,
+                    ..*self.options()
+                }),
                 ..self.default_settings()
             },
         );
@@ -1435,6 +1563,7 @@ impl Yue2Engine {
         result.insert("license".into(), self.license_record(decoder)?);
         result.insert("source_identity".into(), json!(source_identity));
         result.insert("timing".into(), Value::Object(timing));
+        output.write_attachments(&work)?;
         let (dir, result) = work.publish(result)?;
         Ok(RunOutcome {
             dir,

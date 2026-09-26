@@ -505,6 +505,7 @@ fn a_recording_becomes_a_new_cover_after_the_transcriber_is_unloaded() {
                 settings: SongSettings {
                     generation: config.clone(),
                     decoder: VaeVariant::Standard,
+                    options: None,
                 },
             })
         },

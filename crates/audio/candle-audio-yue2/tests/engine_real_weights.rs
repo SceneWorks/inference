@@ -301,6 +301,7 @@ fn a_saved_closure_serves_plan_only_and_restored_plan_runs() {
         )
         .unwrap(),
         decoder: VaeVariant::Standard,
+        options: None,
     };
     let never = || false;
     let mut hooks = EngineHooks {

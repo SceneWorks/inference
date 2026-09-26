@@ -184,6 +184,29 @@ pub trait Generator {
         Ok(out)
     }
 
+    /// **Generate and report** (sc-22988): the render's [`GenerationReport`] — its output, the
+    /// reproducibility record it published ([`AudioParams::artifacts`]) and its non-fatal
+    /// warnings (e.g. a truncated autoregressive phase).
+    ///
+    /// Additive for the reason [`generate_streaming`](Self::generate_streaming) is: a dedicated
+    /// default-implemented method instead of new fields on [`GenerationOutput`] / [`AudioTrack`],
+    /// whose literals and exhaustive matches span the workspace and its consumers. The default
+    /// wraps [`generate`](Self::generate) in [`GenerationReport::from_output`] (no record, no
+    /// warnings), so every provider can be driven through it and is byte-for-byte unaffected.
+    ///
+    /// A provider that publishes records or reports warnings overrides this as its primary
+    /// implementation and derives [`generate`](Self::generate) from it. That is the only way to
+    /// receive an artifacts-only render ([`SongParams::plan_only`], `output: None`), which
+    /// [`generate`](Self::generate) refuses.
+    fn generate_with_report(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationReport> {
+        self.generate(req, on_progress)
+            .map(GenerationReport::from_output)
+    }
+
     /// **Open a stateful multi-turn conversational session** (sc-14150) — the stateful counterpart
     /// (path **B**) of the stateless [`Conditioning::ConversationHistory`] carrier (path **A**). A
     /// context-aware conversational TTS model (e.g. MOSS-TTS-Realtime, a voice-agent foundation model)
@@ -898,6 +921,107 @@ pub struct SongParams {
     pub score_sampling: Option<TokenSampling>,
     /// Token sampling of the semantic-token phase. `None` fields ⇒ the model defaults.
     pub semantic_sampling: Option<TokenSampling>,
+    /// **Plan only** (sc-22988): plan the score and publish the exact plan as an artifacts-only
+    /// record (kind `plan`) into [`AudioParams::artifacts`], rendering no audio. Requires
+    /// `artifacts` (a plan that is never published is lost — the shared floor refuses the pair
+    /// otherwise) and is gated by [`Capabilities::supports_song_plan_only`]. Its result is
+    /// [`GenerationReport::artifacts`] with [`GenerationReport::output`] `None`, read through
+    /// [`Generator::generate_with_report`]; [`Generator::generate`] has no audio to return and
+    /// refuses.
+    pub plan_only: bool,
+    /// **Zero-shot cover** (sc-22988): plan from a reviewed score instead of sampling one. The
+    /// target style is the request `prompt`; the sung lyrics are [`AudioParams::lyrics`]. Gated
+    /// by [`Capabilities::supports_song_cover`]. The cover fixes the planning mode and the score
+    /// itself, so a model refuses it together with [`Self::planning`], [`Self::score`],
+    /// [`Self::plan`] or [`Self::cached_latents`].
+    pub cover: Option<SongCover>,
+}
+
+/// A zero-shot cover from a reviewed score ([`SongParams::cover`], sc-22988 — YuE2). Symbolic
+/// only: the melody travels as the score; no source audio reaches the generator. Transcribing a
+/// recording into such a score is a separate step outside this contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SongCover {
+    /// Melody-only (harmony removed, accompaniment free) or the full score with its harmony.
+    pub mode: SongCoverMode,
+    /// The reviewed score (YuE2: the native two-voice ABC dialect).
+    pub score: String,
+    /// Which melodies a melody-only cover keeps. `None` ⇒ both.
+    pub keep: Option<SongCoverVoice>,
+    /// When [`AudioParams::lyrics`] is a translation: the source lyrics it translates,
+    /// section-aligned. `None` ⇒ the lyrics are the source lyrics.
+    pub translated_from: Option<String>,
+}
+
+/// How much of a [`SongCover`] score is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongCoverMode {
+    /// The melody only: every chord symbol removed, so the accompaniment is free.
+    Melody,
+    /// The full score with its supplied harmony.
+    Full,
+}
+
+/// Which melodies a melody-only [`SongCover`] keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SongCoverVoice {
+    /// Both melodies.
+    Both,
+    /// The vocal melody only (the instrumental voice becomes rests on the same grid).
+    Vocal,
+    /// The instrumental melody only (the vocal voice becomes rests on the same grid).
+    Instrumental,
+}
+
+/// The complete result of one generation (sc-22988), returned by
+/// [`Generator::generate_with_report`]: the rendered output, the reproducibility record the render
+/// published, and the non-fatal conditions the caller must see.
+///
+/// [`Generator::generate`] returns only [`Self::output`]; a caller that must know a render was
+/// truncated, or that reads an artifacts-only render (a plan with no audio), calls
+/// [`Generator::generate_with_report`] instead.
+#[derive(Clone, Debug)]
+pub struct GenerationReport {
+    /// What was rendered. `None` only for an artifacts-only request ([`SongParams::plan_only`]),
+    /// whose result is [`Self::artifacts`].
+    pub output: Option<GenerationOutput>,
+    /// The record published into [`AudioParams::artifacts`], when the request asked for one.
+    pub artifacts: Option<ArtifactRecord>,
+    /// Non-fatal conditions of this render (a truncated phase, a cover-check warning), in the
+    /// order they were found. Empty when there is nothing to report.
+    pub warnings: Vec<GenerationWarning>,
+}
+
+impl GenerationReport {
+    /// A report carrying only `output`: what [`Generator::generate_with_report`] returns for a
+    /// provider that keeps no record and reports no warnings.
+    pub fn from_output(output: GenerationOutput) -> Self {
+        Self {
+            output: Some(output),
+            artifacts: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// A published reproducibility record ([`GenerationReport::artifacts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    /// The published directory.
+    pub dir: std::path::PathBuf,
+    /// The record's kind (YuE2: `song`, `plan` or `cached_decode`).
+    pub kind: String,
+    /// The record's identity (lower-case hex), as the record's own index states it.
+    pub identity: String,
+}
+
+/// A non-fatal condition of a render ([`GenerationReport::warnings`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationWarning {
+    /// A stable, machine-readable code (e.g. `semantic_truncated`).
+    pub code: String,
+    /// A human-readable detail.
+    pub message: String,
 }
 
 /// The planning mode of a symbolic-plan song model ([`SongParams::planning`]).
@@ -1512,6 +1636,9 @@ impl GenerationRequest {
                 plan: _,
                 cached_latents: _,
                 decoder: _,
+                // A flag and a text-only cover block (sc-22988): no floats to classify.
+                plan_only: _,
+                cover: _,
                 score_sampling,
                 semantic_sampling,
             }) = song
@@ -3019,6 +3146,27 @@ pub struct Capabilities {
     /// (sc-22994). `Default` is `false`; the shared floor then rejects the block as the typed
     /// [`Error::Unsupported`].
     pub supports_audio_artifacts: bool,
+    /// Whether this model serves an artifacts-only plan ([`SongParams::plan_only`], sc-22988).
+    /// `Default` is `false`; the shared floor then rejects `plan_only` as the typed
+    /// [`Error::Unsupported`], so a symbolic-song model that cannot stop after planning never
+    /// renders audio the caller did not ask for.
+    pub supports_song_plan_only: bool,
+    /// Whether this model builds a zero-shot cover from a reviewed score ([`SongParams::cover`],
+    /// sc-22988). `Default` is `false`; the shared floor then rejects the cover as the typed
+    /// [`Error::Unsupported`].
+    pub supports_song_cover: bool,
+    /// The per-request [`GenerationMemory`] rungs this model honours **without** a
+    /// [`MemoryProviderContract`] (sc-22988 — the audio lane, which the image memory ladder does
+    /// not cover): [`MemoryStrategy::StagedResidency`] ↔ `stage_residency`,
+    /// [`MemoryStrategy::BoundedDecode`] ↔ `tile_vae_decode` / `decode_tile_edge`,
+    /// [`MemoryStrategy::BoundedAttention`] ↔ `chunk_attention` / `attention_chunk_size`.
+    ///
+    /// Weights-free discoverability for a consumer's admission (each provider documents the units
+    /// of its parameters). `Default` is empty, which says nothing either way — an image provider
+    /// declares its rungs through its [`MemoryProviderContract`] instead — so the shared floor does
+    /// not read it; a provider that lists a rung refuses every [`GenerationMemory`] field outside
+    /// its list in its own `validate` rather than ignoring it.
+    pub request_memory_strategies: &'static [MemoryStrategy],
 
     // --- LTX-2.5 generation axes (sc-18778) ------------------------------------------------------
     //
@@ -3258,7 +3406,11 @@ impl Capabilities {
     ///   `output_limiter` only when [`supports_output_limiter`](Self::supports_output_limiter) is
     ///   set (sc-19378), and `song` / `artifacts` only when
     ///   [`supports_symbolic_song`](Self::supports_symbolic_song) /
-    ///   [`supports_audio_artifacts`](Self::supports_audio_artifacts) is set (sc-22994),
+    ///   [`supports_audio_artifacts`](Self::supports_audio_artifacts) is set (sc-22994), and
+    ///   `song.plan_only` / `song.cover` only when
+    ///   [`supports_song_plan_only`](Self::supports_song_plan_only) /
+    ///   [`supports_song_cover`](Self::supports_song_cover) is set, `plan_only` also only together
+    ///   with `artifacts` (sc-22988),
     ///
     /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
     /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
@@ -3729,6 +3881,16 @@ impl Capabilities {
                     audio.artifacts.is_some(),
                     self.supports_audio_artifacts,
                 ),
+                (
+                    "audio.song.plan_only",
+                    audio.song.as_ref().is_some_and(|s| s.plan_only),
+                    self.supports_song_plan_only,
+                ),
+                (
+                    "audio.song.cover",
+                    audio.song.as_ref().is_some_and(|s| s.cover.is_some()),
+                    self.supports_song_cover,
+                ),
             ];
             for (field, present, supported) in gated {
                 if present && !supported {
@@ -3736,6 +3898,14 @@ impl Capabilities {
                         "{id}: {field} is not supported"
                     )));
                 }
+            }
+            // An artifacts-only render publishes its result and returns nothing else: without a
+            // record to publish into, the plan would be computed and lost (sc-22988).
+            if audio.song.as_ref().is_some_and(|s| s.plan_only) && audio.artifacts.is_none() {
+                return Err(Error::Msg(format!(
+                    "{id}: audio.song.plan_only requires audio.artifacts (the plan is published \
+                     there; nothing else is returned)"
+                )));
             }
         }
         if check_size
@@ -5908,6 +6078,115 @@ mod tests {
                 c.validate_request_audio("tts", &req).is_ok(),
                 "{name} must pass when advertised"
             );
+        }
+    }
+
+    #[test]
+    fn plan_only_and_cover_are_gated_and_plan_only_needs_artifacts() {
+        // sc-22988: each is a typed capability gap unless its own flag is advertised; a plan-only
+        // request without a record to publish into is a malformed request, not a capability gap.
+        let symbolic = || Capabilities {
+            audio_sample_rates: vec![48_000],
+            max_count: 1,
+            supports_symbolic_song: true,
+            supports_audio_artifacts: true,
+            ..Default::default()
+        };
+        let req = |song: SongParams, artifacts: bool| GenerationRequest {
+            prompt: "a song".into(),
+            audio: Some(AudioParams {
+                song: Some(song),
+                artifacts: artifacts.then(|| AudioArtifacts {
+                    dir: "run".into(),
+                    resume: false,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let plan_only = SongParams {
+            plan_only: true,
+            ..Default::default()
+        };
+        let cover = SongParams {
+            cover: Some(SongCover {
+                mode: SongCoverMode::Melody,
+                score: "X:1".into(),
+                keep: None,
+                translated_from: None,
+            }),
+            ..Default::default()
+        };
+        let mut caps = symbolic();
+        for (name, song) in [("plan_only", &plan_only), ("cover", &cover)] {
+            let got = caps.validate_request_audio("song", &req(song.clone(), true));
+            assert!(
+                matches!(&got, Err(Error::Unsupported(m)) if m.contains(name)),
+                "{name} must be refused when not advertised: {got:?}"
+            );
+        }
+        caps.supports_song_plan_only = true;
+        caps.supports_song_cover = true;
+        caps.validate_request_audio("song", &req(plan_only.clone(), true))
+            .unwrap();
+        caps.validate_request_audio("song", &req(cover, false))
+            .unwrap();
+        let orphan = caps.validate_request_audio("song", &req(plan_only, false));
+        assert!(
+            matches!(&orphan, Err(Error::Msg(m)) if m.contains("requires audio.artifacts")),
+            "{orphan:?}"
+        );
+    }
+
+    #[test]
+    fn generate_with_report_defaults_to_the_bare_output() {
+        // sc-22988: the additive entry point wraps `generate` for every provider that does not
+        // override it — no record, no warnings, the same output.
+        struct Plain(ModelDescriptor);
+        impl Generator for Plain {
+            fn descriptor(&self) -> &ModelDescriptor {
+                &self.0
+            }
+            fn validate(&self, _req: &GenerationRequest) -> Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _req: &GenerationRequest,
+                on_progress: &mut dyn FnMut(Progress),
+            ) -> Result<GenerationOutput> {
+                on_progress(Progress::Decoding);
+                Ok(GenerationOutput::Audio(AudioTrack {
+                    samples: vec![0.25, -0.25],
+                    sample_rate: 48_000,
+                    channels: 2,
+                    stems: Vec::new(),
+                }))
+            }
+        }
+        let generator = Plain(ModelDescriptor {
+            encoder_contract: None,
+            denoiser_output_latent_space: None,
+            control_kinds: None,
+            required_components: &[],
+            id: "plain",
+            family: "test",
+            backend: "candle",
+            modality: Modality::Audio,
+            capabilities: Capabilities {
+                max_count: 1,
+                ..Default::default()
+            },
+        });
+        let mut progress = Vec::new();
+        let report = generator
+            .generate_with_report(&GenerationRequest::default(), &mut |p| progress.push(p))
+            .unwrap();
+        assert_eq!(progress, [Progress::Decoding], "progress is forwarded");
+        assert!(report.artifacts.is_none() && report.warnings.is_empty());
+        match report.output {
+            Some(GenerationOutput::Audio(track)) => assert_eq!(track.samples, [0.25, -0.25]),
+            other => panic!("expected the generated audio, got {other:?}"),
         }
     }
 
