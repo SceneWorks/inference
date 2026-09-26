@@ -414,6 +414,36 @@ fn the_load_gate_refuses_what_it_cannot_honour() {
     assert!(load_synthetic(&file).is_err());
 }
 
+/// The advertised tiers are exactly the accepted ones: every `Quant` the descriptor lists passes
+/// the `LoadSpec` gate and reaches the tier assertion (refused only because the synthetic model
+/// holds `bf16` weights — a derived tier snapshot loads, see `engine_real_weights`), and every
+/// other `Quant` is refused at the gate as unadvertised.
+///
+/// Mutations that must fail: advertise `&[]` (the pre-review descriptor), or drop the
+/// advertised-set gate while advertising only `Q8`.
+#[test]
+fn the_advertised_quants_are_exactly_the_accepted_ones() {
+    // Exhaustive: a new `Quant` fails to compile here until it is classified.
+    let every = [Quant::Q4, Quant::Q8, Quant::Nvfp4];
+    for q in every {
+        match q {
+            Quant::Q4 | Quant::Q8 | Quant::Nvfp4 => {}
+        }
+    }
+    let advertised = descriptor().capabilities.supported_quants;
+    assert_eq!(advertised, [Quant::Q4, Quant::Q8]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut spec = spec(tmp.path(), false);
+    for q in every {
+        spec.quantize = Some(q);
+        let err = load_synthetic(&spec).err().unwrap().to_string();
+        let accepted = err.contains("tier was requested but");
+        let refused = err.contains("is not an advertised YuE2 tier");
+        assert!(accepted != refused, "{q:?}: {err}");
+        assert_eq!(accepted, advertised.contains(&q), "{q:?}: {err}");
+    }
+}
+
 #[test]
 fn unread_or_conflicting_request_fields_are_refused() {
     let base = GenerationConfig::default();

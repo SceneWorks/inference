@@ -15,7 +15,7 @@
 //! | `components["vae_legacy"]` | `Dir`: the `m-a-p/YuE2-Vae-legacy` snapshot (the legacy decoder) |
 //! | | a plain snapshot stages **at least one** of the two decoders ([`DECODER_COMPONENTS`]); every request's decoder is checked before any compute |
 //! | `precision` | `Fp32` ⇒ F32; the default ⇒ BF16 on an accelerator, F32 on the CPU (no BF16 matmul) |
-//! | `quantize` | `None` loads the staged tier (the original is `bf16`); `Q8` / `Q4` assert that tier — the `weights` directory must be that derived tier snapshot, anything else is refused; `Nvfp4` is refused ([`crate::precision`]) |
+//! | `quantize` | `None` loads the staged tier (the original is `bf16`); `Q8` / `Q4` assert that tier — the `weights` directory must be that derived tier snapshot, anything else is refused. Exactly [`SUPPORTED_QUANTS`] (advertised as `supported_quants`, the audio lane's convention: the unquantized `bf16` load is `None`) is accepted; `Nvfp4` is refused ([`crate::precision`]) |
 //! | `offload_policy` | `Sequential` ⇒ the AR-only weights move to host memory while the acoustic stage runs (upstream `offload_ar`) for every request that does not choose otherwise; `Resident` ⇒ they stay |
 //! | `load_shape` | only the eager materialization YuE2 loads with; `DeferredMaterialization` is refused |
 //!
@@ -85,7 +85,7 @@ use candle_audio::candle_core::{DType, Device};
 use candle_audio::gen_core::{
     self, ArtifactRecord, AudioParams, AudioTrack, Capabilities, GenerationMemory,
     GenerationOutput, GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadShape,
-    LoadSpec, MemoryStrategy, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
+    LoadSpec, MemoryStrategy, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
     SongCover, SongCoverMode, SongCoverVoice, SongDecoder, SongPlanning, TokenSampling,
     WeightsSource,
 };
@@ -136,6 +136,9 @@ pub const REQUEST_MEMORY_STRATEGIES: &[MemoryStrategy] = &[
     MemoryStrategy::BoundedDecode,
     MemoryStrategy::BoundedAttention,
 ];
+/// The quantized tiers a `LoadSpec` may assert ([`Capabilities::supported_quants`]; the `bf16`
+/// original is the unquantized load, `quantize: None`, as for YuE1). Exactly these are accepted.
+pub const SUPPORTED_QUANTS: &[Quant] = &[Quant::Q4, Quant::Q8];
 /// The record a cover publishes inside its run directory (under the run's digests).
 pub const COVER_JSON: &str = "cover.json";
 /// Schema of [`COVER_JSON`].
@@ -164,6 +167,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_song_cover: true,
             supports_sequential_offload: true,
             request_memory_strategies: REQUEST_MEMORY_STRATEGIES,
+            supported_quants: SUPPORTED_QUANTS,
             ..Default::default()
         },
     }
@@ -940,6 +944,13 @@ fn resolve_spec(
             )))
         }
     };
+    // The accepted set is the advertised set: an unadvertised quant is refused here.
+    if let Some(quant) = spec.quantize.filter(|q| !SUPPORTED_QUANTS.contains(q)) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: quantize={quant:?} is not an advertised YuE2 tier (supported_quants: \
+             {SUPPORTED_QUANTS:?}; the unquantized bf16 original is quantize: None)"
+        )));
+    }
     let tier = Tier::from_quant(spec.quantize)?;
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
