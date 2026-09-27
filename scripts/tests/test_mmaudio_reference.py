@@ -201,6 +201,12 @@ class MMAudioReferenceFixtureTests(unittest.TestCase):
         self.assertEqual(len(actual), 102, "the vendored file count changed")
         self.assertEqual(recorded, actual)
 
+    def test_security_patch_keeps_the_original_fixture_producer_digest(self) -> None:
+        self.assertEqual(
+            ref.read_metadata()["vendorTreeSha256"], ref.ORIGINAL_VENDOR_TREE_SHA256
+        )
+        self.assertEqual(ref.vendor_tree_digest(), ref.TENSOR_ONLY_VENDOR_TREE_SHA256)
+
     def test_manifest_keys_cover_every_component_the_gates_load(self) -> None:
         # Read through `verify_model_snapshot.load_model`, never a hand-rolled TOML scan: a key that
         # disappears from the manifest must be an error here, not a silently missing revision.
@@ -280,6 +286,12 @@ class MMAudioReferenceVerifierDiscriminationTests(unittest.TestCase):
             any("vendored reference tree" in error for error in ref.verify_fixtures()),
             "a local edit to _vendor/mmaudio must invalidate the fixtures",
         )
+
+    def test_rejects_a_tree_outside_the_exact_security_patch(self) -> None:
+        with mock.patch.object(ref, "vendor_tree_digest", return_value="0" * 64):
+            self.assertTrue(
+                any("vendored reference tree" in error for error in ref.verify_fixtures())
+            )
 
     def test_rejects_a_changed_generation_configuration(self) -> None:
         for field, value in (
