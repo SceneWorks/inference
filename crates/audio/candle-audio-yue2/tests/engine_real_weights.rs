@@ -9,13 +9,17 @@
 //!   (weights = the YuE2-3B snapshot, `vae` / `vae_legacy` = the decoder snapshots) through the
 //!   provider registry's `load`, one ~8 s song (`cot = full`, planned score) published with every
 //!   artifact, resumed without regenerating, then re-decoded with the legacy decoder from its
-//!   cached latents. No Python process is involved.
+//!   cached latents. No Python process is involved. It runs on the registry's production device
+//!   for the build ([`production_device`]: the CPU in F32 by default, CUDA or Metal in BF16 with
+//!   `--features cuda` / `--features metal`) and prints one
+//!   [`evidence`](candle_audio_yue2::evidence) summary line (`YUE2_EVIDENCE_SUMMARY {json}`).
 //! * [`a_saved_closure_serves_plan_only_and_restored_plan_runs`] — the closure saved to one
 //!   directory and loaded back through the same `LoadSpec` gate, then plan-only → restore →
 //!   a run from the exact restored plan through the public entry points.
 //!
-//! CPU, F32 (the BF16 checkpoint upcast; accelerator tiers are sc-22995). Run one test per process
-//! under an external RSS guard; each loads both MoT paths in F32 (~16 GB) plus one decode tile:
+//! A default build computes on the CPU in F32 (the BF16 checkpoint upcast). Run one test per
+//! process under an external RSS guard; on the CPU each loads both MoT paths in F32 (~16 GB) plus
+//! one decode tile:
 //!
 //! ```text
 //! YUE2_HF_HUB=<hub dir> cargo test --release -p candle-audio-yue2 \
@@ -35,7 +39,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use candle_audio::candle_core::Device;
+use serde_json::{json, Value};
+
 use candle_audio_yue2::closure::save_closure;
+use candle_audio_yue2::evidence::{audio_record, peak_rss_bytes, summary_line};
 use candle_audio_yue2::gen_core::{
     AudioArtifacts, AudioParams, GenerationOutput, GenerationRequest, LoadSpec, Progress,
     SongDecoder, SongParams, SongPlanning, TokenSampling, WeightsSource,
@@ -43,7 +51,9 @@ use candle_audio_yue2::gen_core::{
 use candle_audio_yue2::inventory::{self, VaeVariant};
 use candle_audio_yue2::protocol::{GenerationConfig, SamplingOverrides, SongRequestSpec};
 use candle_audio_yue2::provider::{load_generator, VAE_COMPONENT_ID, VAE_LEGACY_COMPONENT_ID};
-use candle_audio_yue2::run::{read_wav_f32, verify_run, RunOutput, SongInput, AUDIO_WAV};
+use candle_audio_yue2::run::{
+    read_wav_f32, verify_run, RunOutput, SongInput, AUDIO_WAV, CONFIG_JSON,
+};
 use candle_audio_yue2::{EngineHooks, SnapshotDirs, SongSettings, SymbolicPlan, PROVIDER_ID};
 
 fn hub() -> PathBuf {
@@ -106,6 +116,26 @@ fn check_playable(samples: &[f32]) -> (f64, f64) {
     (samples.len() as f64 / 2.0 / 48_000.0, rms)
 }
 
+/// The registry's production device for this build ([`candle_audio::default_device`]: CUDA with
+/// `--features cuda`, Metal with `--features metal`, else the CPU) and the compute dtype the
+/// registered provider loads the default `LoadSpec` at there (F32 on the CPU, which has no BF16
+/// matmul; BF16 on a GPU).
+fn production_device() -> (&'static str, &'static str) {
+    match candle_audio::default_device().unwrap() {
+        Device::Cpu => ("cpu", "float32"),
+        Device::Cuda(_) => ("cuda", "bfloat16"),
+        Device::Metal(_) => ("metal", "bfloat16"),
+    }
+}
+
+/// Weights-free: a default build renders on the CPU in F32 — the local run the real-weight test
+/// keeps (`--features cuda` / `metal` builds move it to the GPU).
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+#[test]
+fn the_default_build_renders_on_the_cpu_in_f32() {
+    assert_eq!(production_device(), ("cpu", "float32"));
+}
+
 fn list(dir: &Path) -> Vec<String> {
     let result = verify_run(dir, None).expect("a verified run");
     result["artifacts"]
@@ -117,17 +147,16 @@ fn list(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-#[ignore = "needs the pinned YuE2 weights (YUE2_HF_HUB); CPU, ~16 GB+ RSS"]
+#[ignore = "needs the pinned YuE2 weights (YUE2_HF_HUB); the build's device (CPU: ~16 GB+ RSS)"]
 fn registered_loader_generates_a_song_with_every_artifact() {
+    let (device, dtype) = production_device();
     let out = tempfile::tempdir().unwrap();
     let dir = out.path().join("song");
     let t = Instant::now();
     let registry = candle_audio_yue2::provider_registry().unwrap();
     let generator = registry.load(PROVIDER_ID, &worker_spec()).unwrap();
-    eprintln!(
-        "load (resolve + verify + load): {:.1} s",
-        t.elapsed().as_secs_f64()
-    );
+    let load_seconds = t.elapsed().as_secs_f64();
+    eprintln!("load (resolve + verify + load) on {device} in {dtype}: {load_seconds:.1} s");
 
     // ~8 s: 200 codec frames at 25 frames/s; a 48-token planned score.
     let req = GenerationRequest {
@@ -161,17 +190,20 @@ fn registered_loader_generates_a_song_with_every_artifact() {
             })
             .unwrap(),
     );
+    let generate_seconds = t.elapsed().as_secs_f64();
     let (seconds, rms) = check_playable(&samples);
     eprintln!(
-        "generated {seconds:.2} s of 48 kHz stereo (rms {rms:.4}) in {:.1} s",
-        t.elapsed().as_secs_f64()
+        "generated {seconds:.2} s of 48 kHz stereo (rms {rms:.4}) in {generate_seconds:.1} s"
     );
     let result = verify_run(&dir, None).unwrap();
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(dir.join(CONFIG_JSON)).unwrap()).unwrap();
     eprintln!("truncated: {}", result["truncated"]);
     eprintln!("timing: {}", result["timing"]);
     eprintln!("artifacts: {:?}", list(&dir));
     assert!((6.0..=10.0).contains(&seconds), "{seconds} s");
-    assert_eq!(result["weights"]["model_dtype"], "float32");
+    assert_eq!(config["device"], device, "the registry's production device");
+    assert_eq!(result["weights"]["model_dtype"], dtype);
     assert_eq!(
         result["weights"]["mot"]["revision"],
         inventory::YUE2_3B_REPO.revision
@@ -211,10 +243,8 @@ fn registered_loader_generates_a_song_with_every_artifact() {
     );
     assert_eq!(steps, 0);
     assert_eq!(again, samples);
-    eprintln!(
-        "resume of the complete run: {:.2} s",
-        t.elapsed().as_secs_f64()
-    );
+    let resume_seconds = t.elapsed().as_secs_f64();
+    eprintln!("resume of the complete run: {resume_seconds:.2} s");
 
     // The legacy decoder over the same cached latents, into a new run.
     let legacy_dir = out.path().join("legacy");
@@ -235,13 +265,42 @@ fn registered_loader_generates_a_song_with_every_artifact() {
     };
     let t = Instant::now();
     let legacy = audio_of(generator.generate(&decode, &mut |_| {}).unwrap());
+    let legacy_seconds = t.elapsed().as_secs_f64();
     check_playable(&legacy);
     let legacy_result = verify_run(&legacy_dir, None).unwrap();
     assert_eq!(legacy_result["latent"], result["latent"]);
     assert_eq!(legacy_result["decoder"]["decoder_release"], "legacy");
-    eprintln!(
-        "legacy re-decode of the cached latents: {:.1} s",
-        t.elapsed().as_secs_f64()
+    eprintln!("legacy re-decode of the cached latents: {legacy_seconds:.1} s");
+
+    let wav_sha256 = |r: &Value| r["artifacts"][AUDIO_WAV]["sha256"].clone();
+    let with_wav = |mut record: Value, r: &Value| {
+        record["wav_sha256"] = wav_sha256(r);
+        record
+    };
+    println!(
+        "{}",
+        summary_line(json!({
+            "test": "engine_real_weights::registered_loader_generates_a_song_with_every_artifact",
+            "backend": config["backend"],
+            "device": config["device"],
+            "dtype": result["weights"]["model_dtype"],
+            "weight_tier": result["weights"]["weight_tier"],
+            "quantization": result["weights"]["quantization"],
+            "rng": {"token_rng": config["token_rng"], "noise": config["noise"], "seed": req.seed},
+            "seconds": {
+                "load": load_seconds,
+                "generate": generate_seconds,
+                "stages": result["timing"],
+                "resume": resume_seconds,
+                "legacy_decode": legacy_seconds,
+            },
+            "peak_rss_bytes": peak_rss_bytes(),
+            "outputs": {
+                "standard": with_wav(audio_record(&samples), &result),
+                "legacy": with_wav(audio_record(&legacy), &legacy_result),
+            },
+            "truncated": result["truncated"],
+        }))
     );
 }
 

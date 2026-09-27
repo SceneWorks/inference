@@ -18,23 +18,41 @@
 //!   tier): waveform SNR and relative L2.
 //!
 //! The reference is the released checkpoint in F32 (`f32`, the CPU unless
-//! `YUE2_QUALITY_REFERENCE_DEVICE=cuda`); its outputs are written to `YUE2_QUALITY_OUT` (default
-//! `~/.cache/sceneworks-yue2-fixtures/quality` — they are derived from CC BY-NC 4.0 weights, so
-//! never inside the repository) and reused by later runs. An F32 reference is itself checked
-//! against the pinned upstream's F32 logits in the committed fixture (top-k values), so a reference
-//! computed on another device is shown to be the same reference.
+//! `YUE2_QUALITY_REFERENCE_DEVICE` names another device); its outputs are written to
+//! `YUE2_QUALITY_OUT` (default `~/.cache/sceneworks-yue2-fixtures/quality` — they are derived from
+//! CC BY-NC 4.0 weights, so never inside the repository) and reused by later runs. An F32
+//! reference is itself checked against the pinned upstream's F32 logits in the committed fixture
+//! (top-k values), so a reference computed on another device is shown to be the same reference.
 //!
 //! ```text
 //! YUE2_HF_HUB=/path/to/hub YUE2_QUALITY_CONFIGS=f32,q8,q4 \
 //!   cargo test --release -p candle-audio-yue2 --lib quality:: -- --ignored --nocapture
 //! ```
 //!
+//! Devices (`YUE2_QUALITY_DEVICE`, `YUE2_QUALITY_REFERENCE_DEVICE`): `cpu` (the default), `cuda`
+//! (a `--features cuda` build) and `metal` (a `--features metal` build; the process-wide Metal
+//! device the registered provider loads on, [`candle_audio::default_device`]).
+//!
 //! Configurations (`YUE2_QUALITY_CONFIGS`, comma-separated, run in order, each engine dropped before
 //! the next loads): `f32` (the reference), `f32dev` (F32 on `YUE2_QUALITY_DEVICE`, compared with the
-//! reference: the device's own F32 parity), `q8`, `q4` (CPU F32 compute, or CUDA BF16 with
-//! `YUE2_QUALITY_DEVICE=cuda`), `bf16` and `fp8` (CUDA only). Derived tiers are read from, or
-//! written to, `YUE2_TIER_DIR/<tier>` (default `YUE2_QUALITY_OUT/tiers`). Results are written as
-//! `quality-<config>-<device>.json` beside the reference.
+//! reference: the device's own F32 parity), `q8`, `q4` (CPU F32 compute, or BF16 on CUDA / Metal),
+//! `bf16` (CUDA or Metal: Candle's CPU has no BF16 matmul) and `fp8` (CUDA only — upstream's
+//! `torch._scaled_mm`, the cuBLASLt E4M3 GEMM; refused on CPU and Metal). Every configuration is
+//! checked against its device before anything loads, so a refused one fails the run at once rather
+//! than after the configurations before it. Derived tiers are read from, or written to,
+//! `YUE2_TIER_DIR/<tier>` (default `YUE2_QUALITY_OUT/tiers`). Results are written as
+//! `quality-<config>-<device>.json` beside the reference, each recording the backend, device,
+//! compute dtype and random streams (epic E9: the acoustic stage's noise is the request seed's own
+//! stream, so a result reproduces on the same backend and dtype only), and each configuration
+//! prints one [`crate::evidence`] summary line.
+//!
+//! On the owner's Mac (sc-23002; the F32 CPU reference already saved in `YUE2_QUALITY_OUT`):
+//!
+//! ```text
+//! YUE2_HF_HUB=/path/to/hub YUE2_QUALITY_DEVICE=metal YUE2_QUALITY_CONFIGS=f32dev,bf16,q8,q4 \
+//!   cargo test --release -p candle-audio-yue2 --features metal --lib \
+//!   quality::tier_quality_against_the_f32_reference -- --ignored --exact --nocapture
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -43,7 +61,10 @@ use std::time::Instant;
 use candle_audio::candle_core::{DType, Device, Tensor};
 use serde_json::{json, Value};
 
-use crate::engine::{EngineHooks, EngineOptions, ModelPrecision, SemanticResult, Yue2Engine};
+use crate::engine::{
+    EngineHooks, EngineOptions, ModelPrecision, SemanticResult, SongSettings, Yue2Engine,
+};
+use crate::evidence;
 use crate::fp8::ArPrecision;
 use crate::inventory::{self, ComponentId, VaeVariant};
 use crate::plan::{PlanStep, SymbolicPlan};
@@ -78,11 +99,47 @@ fn out_dir() -> PathBuf {
         })
 }
 
-fn device_named(name: &str) -> Device {
-    match name {
-        "cpu" => Device::Cpu,
-        "cuda" => Device::new_cuda(0).expect("a CUDA device"),
-        other => panic!("unknown device {other} (cpu | cuda)"),
+/// A device a configuration runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualityDevice {
+    Cpu,
+    Cuda,
+    Metal,
+}
+
+impl QualityDevice {
+    fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "cpu" => Ok(Self::Cpu),
+            "cuda" => Ok(Self::Cuda),
+            "metal" => Ok(Self::Metal),
+            other => Err(format!("unknown device {other} (cpu | cuda | metal)")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Metal => "metal",
+        }
+    }
+
+    fn open(self) -> Device {
+        match self {
+            Self::Cpu => Device::Cpu,
+            Self::Cuda => Device::new_cuda(0).expect("a CUDA device"),
+            Self::Metal if !cfg!(feature = "metal") => {
+                panic!("the metal device needs a `--features metal` build")
+            }
+            Self::Metal => {
+                // The process-wide instance the registered provider loads on (a second
+                // `Device::new_metal(0)` would be a different, non-equal device).
+                let device = candle_audio::default_device().expect("a Metal device");
+                assert!(device.is_metal(), "{device:?} is not Metal");
+                device
+            }
+        }
     }
 }
 
@@ -181,6 +238,9 @@ struct Outputs {
     latents: BTreeMap<String, Vec<f32>>,
     audio: BTreeMap<String, Vec<f32>>,
     seconds: BTreeMap<String, f64>,
+    /// The acoustic input's truncation flags: the supplied plan's score and the fixture's semantic
+    /// codes (passed as an untruncated [`SemanticResult`]).
+    truncated: Value,
 }
 
 fn run(engine: &Yue2Engine, fixture: &Value) -> Outputs {
@@ -201,6 +261,7 @@ fn run(engine: &Yue2Engine, fixture: &Value) -> Outputs {
         cancelled: &|| false,
         observer: &mut (),
     };
+    o.truncated = json!({"abc": plan.truncated(), "semantic": false});
     for (name, codes, steps) in nar_cases() {
         let generation =
             GenerationConfig::new(Sampling::abc_default(), Sampling::semantic_default(), steps)
@@ -373,40 +434,90 @@ fn check_reference_against_upstream(o: &Outputs, fixture: &Value) -> f64 {
     worst
 }
 
-fn config(name: &str, device: &Device) -> (ModelPrecision, DType) {
-    let accel = !device.is_cpu();
+/// The precision and compute dtype configuration `name` loads on `device`, or why `device` cannot
+/// run it.
+fn config(name: &str, device: QualityDevice) -> Result<(ModelPrecision, DType), String> {
+    let accel = device != QualityDevice::Cpu;
     let dtype = if accel { DType::BF16 } else { DType::F32 };
     match name {
-        "f32" | "f32dev" => (ModelPrecision::default(), DType::F32),
-        "bf16" => {
-            assert!(
-                accel,
-                "bf16 compute needs an accelerator (Candle CPU has no BF16 matmul)"
-            );
-            (
-                ModelPrecision {
-                    tier: Some(Tier::Bf16),
-                    ar: ArPrecision::Native,
-                },
-                DType::BF16,
-            )
+        "f32" | "f32dev" => Ok((ModelPrecision::default(), DType::F32)),
+        "bf16" if !accel => {
+            Err("bf16 compute needs an accelerator (Candle CPU has no BF16 matmul)".into())
         }
-        "fp8" => (
+        "bf16" => Ok((
+            ModelPrecision {
+                tier: Some(Tier::Bf16),
+                ar: ArPrecision::Native,
+            },
+            DType::BF16,
+        )),
+        "fp8" if device != QualityDevice::Cuda => Err(format!(
+            "fp8 is CUDA only (the cuBLASLt E4M3 GEMM, compute capability >= 8.9), not {}",
+            device.name()
+        )),
+        "fp8" => Ok((
             ModelPrecision {
                 tier: Some(Tier::Bf16),
                 ar: ArPrecision::Fp8,
             },
             DType::BF16,
-        ),
-        "q8" | "q4" => (
+        )),
+        "q8" | "q4" => Ok((
             ModelPrecision {
                 tier: Tier::parse(name),
                 ar: ArPrecision::Native,
             },
             dtype,
-        ),
-        other => panic!("unknown configuration {other}"),
+        )),
+        other => Err(format!(
+            "unknown configuration {other} (f32 | f32dev | bf16 | fp8 | q8 | q4)"
+        )),
     }
+}
+
+/// `YUE2_QUALITY_CONFIGS` resolved against the devices, every entry checked before anything loads:
+/// `(config, device, precision, compute dtype)`. `f32` runs on the reference device, every other
+/// configuration on `device`.
+fn plan_configs(
+    configs: &str,
+    device: &str,
+    reference_device: &str,
+) -> Result<Vec<(String, QualityDevice, ModelPrecision, DType)>, String> {
+    let device = QualityDevice::parse(device)?;
+    let reference_device = QualityDevice::parse(reference_device)?;
+    configs
+        .split(',')
+        .map(|name| {
+            let on = if name == "f32" {
+                reference_device
+            } else {
+                device
+            };
+            let (precision, dtype) =
+                config(name, on).map_err(|e| format!("{name} on {}: {e}", on.name()))?;
+            Ok((name.to_string(), on, precision, dtype))
+        })
+        .collect()
+}
+
+/// What the loaded engine declares it runs with — its effective configuration for the supplied
+/// request: backend, device, compute dtype, weight tier, AR mode and the random streams (epic E9).
+fn engine_record(engine: &Yue2Engine, fixture: &Value) -> Value {
+    let request = SongRequest::from_json(&fixture["modes"]["supplied_full"]["request"]).unwrap();
+    let settings = SongSettings {
+        generation: GenerationConfig::default(),
+        decoder: VaeVariant::Standard,
+        options: None,
+    };
+    let c = engine.effective_config(&request, &settings);
+    json!({
+        "backend": c["backend"],
+        "device": c["device"],
+        "dtype": c["model_dtype"],
+        "weight_tier": c["weight_tier"],
+        "quantization": c["quantization"],
+        "rng": {"token_rng": c["token_rng"], "noise": c["noise"], "seed": request.seed()},
+    })
 }
 
 #[test]
@@ -429,13 +540,11 @@ fn tier_quality_against_the_f32_reference() {
     // The `bf16` run's latents, when it ran: the FP8 mode's acoustic stage must reproduce them bit
     // for bit (it runs on the restored BF16 originals).
     let mut bf16_latents: Option<BTreeMap<String, Vec<f32>>> = None;
-    for name in configs.split(',') {
-        let device = device_named(if name == "f32" {
-            &ref_device_name
-        } else {
-            &device_name
-        });
-        let (precision, dtype) = config(name, &device);
+    let planned = plan_configs(&configs, &device_name, &ref_device_name)
+        .unwrap_or_else(|e| panic!("YUE2_QUALITY_CONFIGS: {e}"));
+    for (name, on, precision, dtype) in planned {
+        let name = name.as_str();
+        let device = on.open();
         let mut dirs = hub.clone();
         if let Some(tier @ (Tier::Q8 | Tier::Q4)) = precision.tier {
             let dir = tier_dir.join(tier.name());
@@ -465,11 +574,9 @@ fn tier_quality_against_the_f32_reference() {
         let load_seconds = t.elapsed().as_secs_f64();
         let residency = engine.weight_residency().unwrap();
         let fp8 = engine.fp8_status().unwrap();
-        let on = if name == "f32" {
-            &ref_device_name
-        } else {
-            &device_name
-        };
+        let record = engine_record(&engine, &fixture);
+        let bounds = bounds_record(name, on);
+        let on = on.name();
         println!(
             "{name} on {on}: loaded in {load_seconds:.1} s; weights {:.2} GB on the \
              device + {:.2} GB host originals",
@@ -478,6 +585,37 @@ fn tier_quality_against_the_f32_reference() {
         );
         let outputs = run(&engine, &fixture);
         drop(engine);
+        let mut seconds = serde_json::Map::new();
+        seconds.insert("load".into(), json!(load_seconds));
+        for (k, v) in &outputs.seconds {
+            seconds.insert(k.clone(), json!(v));
+        }
+        println!(
+            "{}",
+            evidence::summary_line(json!({
+                "test": "quality::tier_quality_against_the_f32_reference",
+                "config": name,
+                "backend": record["backend"],
+                "device": record["device"],
+                "dtype": record["dtype"],
+                "weight_tier": record["weight_tier"],
+                "quantization": record["quantization"],
+                "rng": record["rng"],
+                "seconds": seconds,
+                "peak_rss_bytes": evidence::peak_rss_bytes(),
+                "residency": {
+                    "device_bytes": residency.device_bytes,
+                    "host_bytes": residency.host_bytes,
+                },
+                "outputs": outputs
+                    .audio
+                    .iter()
+                    .map(|(k, v)| (k.clone(), evidence::audio_record(v)))
+                    .collect::<serde_json::Map<_, _>>(),
+                "truncated": outputs.truncated,
+                "bounds": bounds,
+            }))
+        );
         if name == "f32" {
             let worst = check_reference_against_upstream(&outputs, &fixture);
             println!("f32 reference on {ref_device_name}: top-8 values vs upstream ≤ {worst:e}");
@@ -524,7 +662,11 @@ fn tier_quality_against_the_f32_reference() {
         let result = json!({
             "config": name,
             "device": device_name,
+            "backend": record["backend"],
+            "dtype": record["dtype"],
+            "rng": record["rng"],
             "reference": format!("f32 on {ref_device_name}"),
+            "bounds": bounds,
             "load_seconds": load_seconds,
             "seconds": outputs.seconds,
             "residency": {"device_bytes": residency.device_bytes, "host_bytes": residency.host_bytes},
@@ -562,7 +704,7 @@ fn tier_quality_against_the_f32_reference() {
         )
         .unwrap();
         // The bounds: see `BOUNDS`. Every output is finite (`signal_stats` asserts it).
-        let (_, top1_min, kl_mean_max, snr_min) = BOUNDS
+        let (_, top1_min, kl_mean_max, snr_min, _) = BOUNDS
             .iter()
             .copied()
             .find(|b| b.0 == name)
@@ -600,7 +742,8 @@ fn tier_quality_against_the_f32_reference() {
     }
 }
 
-/// `(config, top-1 agreement ≥, mean KL ≤, latents SNR ≥ dB)` against the F32 reference.
+/// `(config, top-1 agreement ≥, mean KL ≤, latents SNR ≥ dB, backends the bound was measured on)`
+/// against the F32 reference.
 ///
 /// Measured 2026-09-26 — Candle CPU (Apple M-series, F32 activations): q8 99.5 % / 1.5e-4 /
 /// 37.0 dB, q4 93.5 % / 9.0e-3 / 18.3 dB; Candle CUDA (RTX PRO 6000 Blackwell, BF16 activations,
@@ -610,10 +753,130 @@ fn tier_quality_against_the_f32_reference() {
 /// reduction order; each is far outside the next-coarser configuration's measurement (a q8 run
 /// that loaded q4 weights, an FP8 mode left active in the acoustic stage — the bit-identity check
 /// — or a BF16 run on the wrong weights fails).
-const BOUNDS: [(&str, f64, f64, f64); 5] = [
-    ("f32dev", 0.999, 1e-8, 90.0),
-    ("bf16", 0.95, 1e-3, 32.0),
-    ("fp8", 0.93, 6e-3, 32.0),
-    ("q8", 0.95, 1.5e-3, 30.0),
-    ("q4", 0.85, 3e-2, 14.0),
+///
+/// **Metal reuses these CPU/CUDA-derived bounds and is unmeasured until the first Metal run**
+/// (sc-23002): a Metal pass means "within the CPU/CUDA envelope", not "Metal-calibrated". Every
+/// result records the bounds it was judged against and where they were measured
+/// ([`bounds_record`]).
+const BOUNDS: [(&str, f64, f64, f64, &[&str]); 5] = [
+    ("f32dev", 0.999, 1e-8, 90.0, &["cuda"]),
+    ("bf16", 0.95, 1e-3, 32.0, &["cuda"]),
+    ("fp8", 0.93, 6e-3, 32.0, &["cuda"]),
+    ("q8", 0.95, 1.5e-3, 30.0, &["cpu", "cuda"]),
+    ("q4", 0.85, 3e-2, 14.0, &["cpu", "cuda"]),
 ];
+
+/// The bounds configuration `name` is judged against on `device`, with their provenance:
+/// `measured_on` (the backends the [`BOUNDS`] were derived from) and whether `device` is one of
+/// them. `null` for the `f32` reference, which is checked against upstream instead.
+fn bounds_record(name: &str, device: QualityDevice) -> Value {
+    match BOUNDS.iter().find(|b| b.0 == name) {
+        None => Value::Null,
+        Some(&(_, top1_min, kl_mean_max, snr_min, measured_on)) => json!({
+            "top1_agreement_min": top1_min,
+            "kl_mean_max": kl_mean_max,
+            "latents_snr_min_db": snr_min,
+            "measured_on": measured_on,
+            "measured_on_this_device": measured_on.contains(&device.name()),
+        }),
+    }
+}
+
+/// Weights-free: every result names where its bounds were measured, and a Metal result says its
+/// bounds were not measured on Metal.
+#[test]
+fn bounds_carry_their_provenance() {
+    use QualityDevice::{Cpu, Cuda, Metal};
+
+    assert_eq!(bounds_record("f32", Cpu), Value::Null);
+    for &(name, top1_min, ..) in &BOUNDS {
+        let metal = bounds_record(name, Metal);
+        assert_eq!(metal["top1_agreement_min"], top1_min, "{name}");
+        let on: Vec<&str> = metal["measured_on"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: no measured_on"))
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!on.is_empty(), "{name}");
+        assert!(
+            on.iter().all(|b| ["cpu", "cuda"].contains(b)),
+            "{name}: {on:?}"
+        );
+        assert_eq!(metal["measured_on_this_device"], false, "{name} on Metal");
+    }
+    for name in ["q8", "q4"] {
+        let record = bounds_record(name, Metal);
+        assert_eq!(record["measured_on"], json!(["cpu", "cuda"]), "{name}");
+        assert_eq!(bounds_record(name, Cpu)["measured_on_this_device"], true);
+    }
+    assert_eq!(bounds_record("bf16", Cuda)["measured_on_this_device"], true);
+    assert_eq!(bounds_record("bf16", Cpu)["measured_on"], json!(["cuda"]));
+}
+
+/// Weights-free (runs on the CPU): the device and configuration parsing the Metal run depends on.
+#[test]
+fn metal_is_a_quality_device_and_fp8_is_cuda_only() {
+    use QualityDevice::{Cpu, Cuda, Metal};
+
+    for (name, device) in [("cpu", Cpu), ("cuda", Cuda), ("metal", Metal)] {
+        assert_eq!(QualityDevice::parse(name), Ok(device));
+        assert_eq!(device.name(), name);
+    }
+    assert!(QualityDevice::parse("mps").is_err());
+
+    // Every configuration but FP8 runs on Metal at CUDA's precision: BF16 compute, the tier's
+    // weights, the native AR path.
+    for name in ["f32", "f32dev", "bf16", "q8", "q4"] {
+        assert_eq!(
+            config(name, Metal),
+            config(name, Cuda),
+            "{name} on Metal matches CUDA"
+        );
+    }
+    assert_eq!(
+        config("q4", Metal),
+        Ok((
+            ModelPrecision {
+                tier: Some(Tier::Q4),
+                ar: ArPrecision::Native,
+            },
+            DType::BF16,
+        ))
+    );
+    assert_eq!(
+        config("f32dev", Metal),
+        Ok((ModelPrecision::default(), DType::F32))
+    );
+    let fp8 = config("fp8", Metal).unwrap_err();
+    assert!(fp8.contains("CUDA only") && fp8.contains("metal"), "{fp8}");
+    assert!(config("fp8", Cpu).is_err());
+    assert_eq!(config("fp8", Cuda).unwrap().0.ar, ArPrecision::Fp8);
+    assert!(config("bf16", Cpu).is_err());
+
+    // The whole list is checked before anything loads: one refused entry refuses the run, and
+    // `f32` resolves on the reference device.
+    let planned = plan_configs("f32dev,bf16,q8,q4", "metal", "cpu").unwrap();
+    let devices: Vec<_> = planned.iter().map(|p| (p.0.as_str(), p.1)).collect();
+    assert_eq!(
+        devices,
+        [
+            ("f32dev", Metal),
+            ("bf16", Metal),
+            ("q8", Metal),
+            ("q4", Metal)
+        ]
+    );
+    assert_eq!(plan_configs("f32", "metal", "cpu").unwrap()[0].1, Cpu);
+    let refused = plan_configs("f32dev,bf16,fp8,q8", "metal", "cpu").unwrap_err();
+    assert!(refused.starts_with("fp8 on metal:"), "{refused}");
+}
+
+/// Weights-free: a build without the `metal` feature refuses the Metal device by name instead of
+/// silently measuring on the CPU (the audio lane's default device in such a build).
+#[cfg(not(feature = "metal"))]
+#[test]
+#[should_panic(expected = "needs a `--features metal` build")]
+fn the_metal_device_needs_a_metal_build() {
+    QualityDevice::Metal.open();
+}

@@ -90,6 +90,12 @@
 //! * [`fp8`] — upstream's experimental FP8 AR mode on CUDA sm_89+, with exact BF16 restoration
 //!   before the acoustic stage and counted host-held originals.
 //!
+//! Terminal evidence (sc-23002):
+//!
+//! * [`evidence`] — the one-line machine-readable summary (`YUE2_EVIDENCE_SUMMARY {json}`) the
+//!   real-weight harnesses print: device, dtype, random streams, stage wall times, peak memory,
+//!   output duration / rms / SHA-256 and truncation flags.
+//!
 //! Covers (sc-22996):
 //!
 //! * [`cover`] — a reviewed two-voice score (the native dialect of the `yue2-music` skill,
@@ -119,6 +125,7 @@ pub mod cover;
 pub mod decode;
 pub mod durable;
 pub mod engine;
+pub mod evidence;
 pub mod fp8;
 pub mod generate;
 pub mod inventory;
