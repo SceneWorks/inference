@@ -40,6 +40,9 @@
 use std::path::{Path, PathBuf};
 
 use candle_audio::candle_core::{DType, Device, Tensor};
+use candle_audio::gen_core::safetensors_shards::{
+    resolve_safetensors_shards, snapshot_shard_roots,
+};
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
@@ -125,32 +128,17 @@ pub struct MossSfxPipeline {
 /// Enumerate the text-encoder safetensors shards via `model.safetensors.index.json` (falling
 /// back to the single-file layout when no index exists).
 fn text_encoder_shards(dir: &Path) -> Result<Vec<PathBuf>> {
-    let index_path = dir.join("model.safetensors.index.json");
-    if index_path.is_file() {
-        let text = std::fs::read_to_string(&index_path)
-            .map_err(|e| AudioError::Msg(format!("read {}: {e}", index_path.display())))?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| AudioError::Msg(format!("parse {}: {e}", index_path.display())))?;
-        let map = v
-            .get("weight_map")
-            .and_then(|m| m.as_object())
-            .ok_or_else(|| AudioError::Msg(format!("{}: no weight_map", index_path.display())))?;
-        let mut shards: Vec<String> = map
-            .values()
-            .filter_map(|s| s.as_str().map(str::to_string))
-            .collect();
-        shards.sort();
-        shards.dedup();
-        return Ok(shards.into_iter().map(|s| dir.join(s)).collect());
+    let roots = snapshot_shard_roots(dir).map_err(|e| AudioError::Msg(e.to_string()))?;
+    resolve_safetensors_shards(dir, "model", &roots).map_err(|e| AudioError::Msg(e.to_string()))
+}
+
+fn mmap_text_encoder_shards(shards: &[PathBuf], device: &Device) -> Result<VarBuilder<'static>> {
+    // Safety: mmap of files that the pinned-SHA snapshot contract guarantees are not
+    // mutated concurrently — the same invariant every provider family relies on.
+    unsafe {
+        VarBuilder::from_mmaped_safetensors(shards, DType::F32, device)
+            .map_err(|e| AudioError::Msg(format!("mmap text encoder shards: {e}")))
     }
-    let single = dir.join("model.safetensors");
-    if single.is_file() {
-        return Ok(vec![single]);
-    }
-    Err(AudioError::Msg(format!(
-        "{}: neither model.safetensors.index.json nor model.safetensors present",
-        dir.display()
-    )))
 }
 
 impl MossSfxPipeline {
@@ -165,12 +153,7 @@ impl MossSfxPipeline {
             .map_err(|e| AudioError::Msg(format!("load {}: {e}", tokenizer_path.display())))?;
 
         let shards = text_encoder_shards(&root.join("text_encoder"))?;
-        // Safety: mmap of files that the pinned-SHA snapshot contract guarantees are not
-        // mutated concurrently — the same invariant every provider family relies on.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&shards, DType::F32, device)
-                .map_err(|e| AudioError::Msg(format!("mmap text encoder shards: {e}")))?
-        };
+        let vb = mmap_text_encoder_shards(&shards, device)?;
         let text_encoder = Qwen3Encoder::new(&config.text_encoder, vb)
             .map_err(|e| AudioError::Msg(format!("build qwen3 text encoder: {e}")))?;
 
@@ -334,6 +317,111 @@ mod tests {
     use super::{
         configured_full_window_seconds, crop_decoded_audio, synthesis_geometry, SynthesisGeometry,
     };
+    use super::{mmap_text_encoder_shards, text_encoder_shards};
+    use candle_audio::candle_core::Device;
+    use std::path::Path;
+
+    fn shard_fixture(path: &Path) {
+        let header = br#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn shard_index(dir: &Path, name: &str) {
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map": {"x": name}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn text_encoder_shard_loader_rejects_invalid_entries_before_mmap() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("text_encoder");
+        std::fs::create_dir(&dir).unwrap();
+        shard_fixture(&dir.join("model.safetensors"));
+        shard_index(&dir, "model.safetensors");
+        let shards = text_encoder_shards(&dir).unwrap();
+        assert_eq!(
+            mmap_text_encoder_shards(&shards, &Device::Cpu)
+                .unwrap()
+                .get((1,), "x")
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0]
+        );
+
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        shard_fixture(&dir.join("nested/part.bin"));
+        shard_index(&dir, "nested/part.bin");
+        let nested = text_encoder_shards(&dir).unwrap();
+        assert_eq!(
+            mmap_text_encoder_shards(&nested, &Device::Cpu)
+                .unwrap()
+                .get((1,), "x")
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0]
+        );
+
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            shard_index(&dir, name);
+            assert!(text_encoder_shards(&dir).is_err(), "{name}");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp.path().join("outside.safetensors");
+            shard_fixture(&outside);
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            shard_index(&dir, "external.safetensors");
+            assert!(text_encoder_shards(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("outside authorized"));
+
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            shard_index(&dir, "pipe.safetensors");
+            assert!(text_encoder_shards(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file"));
+
+            let repository = temp.path().join("models--org--moss");
+            let cache_dir = repository.join("snapshots/revision/text_encoder");
+            let blobs = repository.join("blobs");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::create_dir(&blobs).unwrap();
+            shard_fixture(&blobs.join("digest"));
+            symlink("../../../blobs/digest", cache_dir.join("model.safetensors")).unwrap();
+            shard_index(&cache_dir, "model.safetensors");
+            let shards = text_encoder_shards(&cache_dir).unwrap();
+            assert_eq!(
+                mmap_text_encoder_shards(&shards, &Device::Cpu)
+                    .unwrap()
+                    .get((1,), "x")
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                vec![1.0]
+            );
+        }
+    }
 
     #[test]
     fn denoise_window_is_configured_full_window_not_requested_crop() {

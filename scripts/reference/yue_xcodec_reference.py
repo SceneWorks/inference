@@ -42,6 +42,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -59,6 +60,15 @@ INFERENCE_DIR_ENV = "YUE_REFERENCE_INFERENCE_DIR"
 #: The codec's pinned upstream revisions (epic sc-19373 reference environment).
 YUE_REVISION = "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d"
 XCODEC_REVISION = "fe781a67815ab47b4a3a5fce1e8d0a692da7e4e5"
+
+
+def load_codec_state(path="./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth"):
+    import torch
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)["codec_model"]
+    except pickle.UnpicklingError as exc:
+        raise ValueError(f"{path}: xcodec checkpoint requires a tensor-only PyTorch export") from exc
 
 SAMPLE_RATE = 16_000
 #: 4 kb/s at 0.5 kb/s per quantizer = the 8 codebooks YuE's stage 2 emits.
@@ -160,8 +170,7 @@ def main() -> None:
     torch.manual_seed(0)
     cfg = OmegaConf.load("./xcodec_mini_infer/final_ckpt/config.yaml")
     codec = SoundStream(**cfg.generator.config)
-    state = torch.load("./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth",
-                       map_location="cpu", weights_only=False)["codec_model"]
+    state = load_codec_state()
     codec.load_state_dict(state)
     codec.eval()
 

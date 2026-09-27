@@ -3,7 +3,7 @@ torch==2.13.0
 torchvision==0.28.0
 numpy==2.4.3
 diffusers==0.38.0
-transformers==5.5.0
+transformers==5.10.4
 accelerate==1.13.0
 safetensors==0.8.0
 einops==0.8.2

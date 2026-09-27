@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_audio::candle_core::{DType, Device, Tensor, D};
+use candle_audio::gen_core::safetensors_shards::{
+    resolve_safetensors_shards, snapshot_shard_roots,
+};
 use candle_audio::{AudioError, Result};
 use candle_nn::VarBuilder;
 use rand::rngs::StdRng;
@@ -156,32 +159,8 @@ pub struct AceStepPipeline {
 /// Resolve the safetensors shard paths for a component whose files are `{stem}.safetensors` (single
 /// file) or `{stem}-NNNNN-of-MMMMM.safetensors` enumerated by `{stem}.safetensors.index.json`.
 fn safetensors_shards(dir: &Path, stem: &str) -> Result<Vec<PathBuf>> {
-    let index_path = dir.join(format!("{stem}.safetensors.index.json"));
-    if index_path.is_file() {
-        let text = std::fs::read_to_string(&index_path)
-            .map_err(|e| AudioError::Msg(format!("read {}: {e}", index_path.display())))?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| AudioError::Msg(format!("parse {}: {e}", index_path.display())))?;
-        let map = v
-            .get("weight_map")
-            .and_then(|m| m.as_object())
-            .ok_or_else(|| AudioError::Msg(format!("{}: no weight_map", index_path.display())))?;
-        let mut shards: Vec<String> = map
-            .values()
-            .filter_map(|s| s.as_str().map(str::to_string))
-            .collect();
-        shards.sort();
-        shards.dedup();
-        return Ok(shards.into_iter().map(|s| dir.join(s)).collect());
-    }
-    let single = dir.join(format!("{stem}.safetensors"));
-    if single.is_file() {
-        return Ok(vec![single]);
-    }
-    Err(AudioError::Msg(format!(
-        "{}: neither {stem}.safetensors.index.json nor {stem}.safetensors present",
-        dir.display()
-    )))
+    let roots = snapshot_shard_roots(dir).map_err(|e| AudioError::Msg(e.to_string()))?;
+    resolve_safetensors_shards(dir, stem, &roots).map_err(|e| AudioError::Msg(e.to_string()))
 }
 
 fn mmap_vb(paths: &[PathBuf], device: &Device) -> Result<VarBuilder<'static>> {
@@ -899,6 +878,134 @@ fn peak_normalize(samples: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shard_fixture(path: &Path) {
+        let header = br#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn shard_index(dir: &Path, name: &str) {
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map": {"x": name}}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn text_encoder_shard_loader_rejects_invalid_entries_before_mmap() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("text_encoder");
+        std::fs::create_dir(&dir).unwrap();
+        shard_fixture(&dir.join("model.safetensors"));
+        shard_index(&dir, "model.safetensors");
+        let shards = safetensors_shards(&dir, "model").unwrap();
+        assert_eq!(
+            mmap_vb(&shards, &Device::Cpu)
+                .unwrap()
+                .get((1,), "x")
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0]
+        );
+
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        shard_fixture(&dir.join("nested/part.bin"));
+        shard_index(&dir, "nested/part.bin");
+        let nested = safetensors_shards(&dir, "model").unwrap();
+        assert_eq!(
+            mmap_vb(&nested, &Device::Cpu)
+                .unwrap()
+                .get((1,), "x")
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0]
+        );
+
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            shard_index(&dir, name);
+            assert!(safetensors_shards(&dir, "model").is_err(), "{name}");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp.path().join("outside.safetensors");
+            shard_fixture(&outside);
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            shard_index(&dir, "external.safetensors");
+            assert!(safetensors_shards(&dir, "model")
+                .unwrap_err()
+                .to_string()
+                .contains("outside authorized"));
+
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            shard_index(&dir, "pipe.safetensors");
+            assert!(safetensors_shards(&dir, "model")
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file"));
+
+            let repository = temp.path().join("models--org--ace");
+            let cache_dir = repository.join("snapshots/revision/text_encoder");
+            let blobs = repository.join("blobs");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::create_dir(&blobs).unwrap();
+            shard_fixture(&blobs.join("digest"));
+            symlink("../../../blobs/digest", cache_dir.join("model.safetensors")).unwrap();
+            shard_index(&cache_dir, "model.safetensors");
+            let shards = safetensors_shards(&cache_dir, "model").unwrap();
+            assert_eq!(
+                mmap_vb(&shards, &Device::Cpu)
+                    .unwrap()
+                    .get((1,), "x")
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                vec![1.0]
+            );
+        }
+    }
+
+    #[test]
+    fn transformer_shard_loader_uses_the_same_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("transformer");
+        std::fs::create_dir(&dir).unwrap();
+        shard_fixture(&dir.join("diffusion_pytorch_model.safetensors"));
+        let index = dir.join("diffusion_pytorch_model.safetensors.index.json");
+        std::fs::write(
+            &index,
+            r#"{"weight_map":{"x":"diffusion_pytorch_model.safetensors"}}"#,
+        )
+        .unwrap();
+        let shards = safetensors_shards(&dir, "diffusion_pytorch_model").unwrap();
+        assert_eq!(
+            mmap_vb(&shards, &Device::Cpu)
+                .unwrap()
+                .get((1,), "x")
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0]
+        );
+        std::fs::write(&index, r#"{"weight_map":{"x":"../outside.safetensors"}}"#).unwrap();
+        assert!(safetensors_shards(&dir, "diffusion_pytorch_model").is_err());
+    }
 
     #[test]
     fn peak_normalize_hits_minus_one_dbfs() {

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import pickle
 from typing import Any
 
 import torch
@@ -170,7 +171,12 @@ class MageFlowModel(nn.Module):
 
             if os.path.exists(full_path):
                 logger.info(f"Loading full model weights from {full_path}")
-                sd = torch.load(full_path, map_location="cpu")
+                try:
+                    sd = torch.load(full_path, map_location="cpu", weights_only=True)
+                except pickle.UnpicklingError as exc:
+                    raise ValueError(
+                        f"{full_path}: unsupported checkpoint object; provide tensor-only weights"
+                    ) from exc
                 # Handle wrapped EMA format: {'ema_state_dict': ..., ...}
                 if isinstance(sd, dict) and "ema_state_dict" in sd:
                     sd = sd["ema_state_dict"]
