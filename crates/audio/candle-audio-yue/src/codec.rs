@@ -24,6 +24,17 @@
 //! once in [`candle_audio::neural_codec::DacDecoder`]. Upstream's module is named after SEANet, but
 //! the checkpoint's decode path is this DAC decoder (`SEANetDecoder` is never constructed).
 //!
+//! **Chunked decode.** Upstream `SoundStream.decode` runs the whole song through the decoder at
+//! once (`infer.py`'s `recons` loop), so its working set grows linearly with song length — the
+//! 16 kHz-rate residual convs dominate (their `im2col` buffers are ~7× the 64-channel activation).
+//! [`XcodecDecoder`] instead decodes [`DECODE_CHUNK_FRAMES`] frames at a time, each with
+//! [`DECODER_CONTEXT_FRAMES`] frames of real codes on each side (clipped at the song edges, where
+//! the decoder's own zero padding applies exactly as in the whole-song pass), and keeps only its
+//! own frames' samples. Every layer is shift-equivariant in whole frames (each transposed conv
+//! emits exactly `rate` samples per input sample) and the context covers the decoder's full
+//! receptive field ([`decoder_context_frames`]), so the stitched waveform is the whole-song
+//! waveform up to float summation order, with the working set bounded by one chunk.
+//!
 //! Precision: the codec runs in **float32** at every LM tier (the approved epic-R2 carve-out — the
 //! staged `xcodec-mini-infer` checkpoint is float32 and is never tiered). [`StubCodec`] stays as
 //! the end-to-end seam test's weights-free double.
@@ -51,6 +62,48 @@ pub const DECODER_RATES: [usize; 4] = [8, 5, 4, 2];
 /// The codec checkpoint inside the `xcodec_mini_infer` snapshot (the SceneWorks safetensors
 /// rehost of `final_ckpt/ckpt_00360000.pth`'s `codec_model` state dict).
 pub const CHECKPOINT: &str = "final_ckpt/ckpt_00360000.safetensors";
+
+/// Codec frames (20 ms each) the codec decoder and the Vocos upsampler
+/// ([`crate::vocoder::VocosUpsampler`]) evaluate at once — 5 s of audio. It bounds the decode
+/// stage's working set to one chunk's worth at any song length: measured CPU/f32 peak RSS of the
+/// whole decode stage (both tracks' codec + Vocos + splice) is 1.4 GiB for a 60 s and 1.5 GiB for a
+/// 218 s song (the remaining growth is the song-length f32 stems the splice holds, ~0.4 MB/s),
+/// where whole-song evaluation (as upstream does it) peaked at 8.7 GiB and 28.9 GiB. The working
+/// set scales ~5 MB per chunk frame (100 → 0.7 GiB, 500 → 2.6 GiB, 1 000 → 5.0 GiB); the seams are
+/// exact (module docs), so the value trades only per-chunk dispatch overhead and the recomputed
+/// context frames (measured wall time unchanged at 250 vs whole-song) against memory.
+pub const DECODE_CHUNK_FRAMES: usize = 250;
+
+/// Frames of codes each side of a codec decode chunk, cropped after decoding:
+/// [`decoder_context_frames`] of [`DECODER_RATES`] (12 frames).
+pub const DECODER_CONTEXT_FRAMES: usize = decoder_context_frames(&DECODER_RATES);
+
+/// The DAC decoder's one-sided receptive field in codec frames (rounded up): the `k7` input conv at
+/// the frame rate; per upsampling block its `k = 2·rate` transposed conv (≤ 2 input samples each
+/// side) and three `k7` residual units with dilations 1, 3, 9 (3 · 13 samples each side at the
+/// block's output rate); then the `k7` output conv. For `[8, 5, 4, 2]` that is 3 692 samples =
+/// 11.5 frames. A chunk decoded with at least this many frames of real codes on each side
+/// reproduces the whole-song samples of its own frames.
+pub const fn decoder_context_frames(rates: &[usize]) -> usize {
+    let mut hop = 1;
+    let mut i = 0;
+    while i < rates.len() {
+        hop *= rates[i];
+        i += 1;
+    }
+    // Accumulated in output samples.
+    let mut rf = 3 * hop;
+    let mut rate_in = 1;
+    i = 0;
+    while i < rates.len() {
+        rf += 2 * (hop / rate_in);
+        rate_in *= rates[i];
+        rf += 3 * (1 + 3 + 9) * (hop / rate_in);
+        i += 1;
+    }
+    rf += 3;
+    rf.div_ceil(hop)
+}
 
 /// One decoded track.
 #[derive(Clone, Debug)]
@@ -87,6 +140,7 @@ pub struct XcodecDecoder {
     fc_post2: Linear,
     decoder: DacDecoder,
     device: Device,
+    chunk_frames: usize,
 }
 
 impl XcodecDecoder {
@@ -149,7 +203,15 @@ impl XcodecDecoder {
             fc_post2: Linear::new(fc_w, Some(fc_b)),
             decoder,
             device: device.clone(),
+            chunk_frames: DECODE_CHUNK_FRAMES,
         })
+    }
+
+    /// Decode `frames` codec frames at a time ([`DECODE_CHUNK_FRAMES`] by default; clamped to
+    /// ≥ 1). Only the working set changes — the chunk seams are exact (module docs).
+    pub fn with_chunk_frames(mut self, frames: usize) -> Self {
+        self.chunk_frames = frames.max(1);
+        self
     }
 
     /// Upstream `SoundStream.get_embed`: the RVQ-dequantized embedding `[1, dim, frames]` (the
@@ -177,6 +239,40 @@ impl XcodecDecoder {
             .contiguous()?;
         Ok(self.decoder.decode(&x, cancel)?)
     }
+
+    /// The whole-song 16 kHz waveform of an embedding (`[1, dim, frames]`), decoded `chunk_frames`
+    /// frames at a time with `context_frames` frames of real embedding each side (clipped at the
+    /// song edges), each chunk cropped to its own frames' samples. With `context_frames ≥`
+    /// [`DECODER_CONTEXT_FRAMES`] it equals [`Self::decode_embedding`] over the whole song; the
+    /// production path is [`CodecDecoder::decode`] ([`Self::with_chunk_frames`],
+    /// [`DECODER_CONTEXT_FRAMES`]). `None` when `cancel` trips.
+    pub fn decode_embedding_chunked(
+        &self,
+        embedding: &Tensor,
+        chunk_frames: usize,
+        context_frames: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<f32>>, AudioError> {
+        let total = embedding.dim(2)?;
+        let chunk = chunk_frames.max(1);
+        let mut wave = Vec::with_capacity(total * SAMPLES_PER_FRAME);
+        for f0 in (0..total).step_by(chunk) {
+            let f1 = f0.saturating_add(chunk).min(total);
+            let first = f0.saturating_sub(context_frames);
+            let last = f1.saturating_add(context_frames).min(total);
+            let part = embedding.narrow(2, first, last - first)?;
+            let Some(y) = self.decode_embedding(&part, cancel)? else {
+                return Ok(None);
+            };
+            let y = y.narrow(
+                2,
+                (f0 - first) * SAMPLES_PER_FRAME,
+                (f1 - f0) * SAMPLES_PER_FRAME,
+            )?;
+            wave.extend(y.flatten_all()?.to_vec1::<f32>()?);
+        }
+        Ok(Some(wave))
+    }
 }
 
 impl CodecDecoder for XcodecDecoder {
@@ -192,12 +288,13 @@ impl CodecDecoder for XcodecDecoder {
             });
         }
         let wave = self
-            .decode_embedding(&embedding, &|| cancel.is_cancelled())?
+            .decode_embedding_chunked(
+                &embedding,
+                self.chunk_frames,
+                DECODER_CONTEXT_FRAMES,
+                &|| cancel.is_cancelled(),
+            )?
             .ok_or(gen_core::Error::Canceled)?;
-        let wave = wave
-            .flatten_all()
-            .and_then(|w| w.to_vec1::<f32>())
-            .map_err(AudioError::from)?;
         Ok(DecodedTrack { wave, embedding })
     }
 }
@@ -460,6 +557,76 @@ mod tests {
         let wave_rel = max_rel(&wave, &flat("ref.wave"));
         println!("tiny parity: embed {embed_rel:.3e}, wave {wave_rel:.3e}");
         assert!(wave_rel <= 1e-5, "decode diverges: {wave_rel:.3e}");
+        // One-frame chunks: every frame is its own chunk, the rest is context.
+        let dec = dec.with_chunk_frames(1);
+        let chunked = dec.decode(&frames, &CancelFlag::new()).unwrap().wave;
+        let chunked_rel = max_rel(&chunked, &flat("ref.wave"));
+        assert!(
+            chunked_rel <= 1e-5,
+            "chunked decode diverges: {chunked_rel:.3e}"
+        );
+    }
+
+    #[test]
+    fn decoder_context_covers_the_dac_receptive_field() {
+        // 3·320 + Σ_blocks (2·320/rate_in + 39·320/rate_out) + 3 = 3 692 samples → 12 frames.
+        assert_eq!(DECODER_CONTEXT_FRAMES, 12);
+        // One ×2 block: (3·2 + 2·2 + 39·1 + 3) = 52 samples → 26 frames.
+        assert_eq!(decoder_context_frames(&[2]), 26);
+    }
+
+    /// The production chunked decode over a long synthetic grid (240 frames, 50-frame chunks → four
+    /// seams) through the upstream-layout tiny checkpoint equals the whole-song decode. Measured
+    /// max relative difference 0 on CPU/f32 (the xcodec noise floor vs torch is 1e-5). Mutation: a
+    /// context narrower than the receptive field must fail the same bound.
+    #[test]
+    fn chunked_decode_equals_the_whole_song_decode_and_needs_its_context() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("xcodec_tiny_reference.safetensors");
+        let dec = XcodecDecoder::load(&path, &Device::Cpu).unwrap();
+        let frames = grid(240);
+        let embed = dec.get_embed(&frames).unwrap();
+        let whole: Vec<f32> = dec
+            .decode_embedding(&embed, &|| false)
+            .unwrap()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let chunked = dec
+            .with_chunk_frames(50)
+            .decode(&frames, &CancelFlag::new())
+            .unwrap()
+            .wave;
+        let rel = max_rel(&chunked, &whole);
+        println!("chunked vs whole xcodec: {rel:.3e}");
+        assert!(
+            rel <= 1e-6,
+            "chunked decode diverges from whole-song: {rel:.3e}"
+        );
+
+        // One chunk longer than the song (e.g. `usize::MAX`) is the whole-song pass.
+        let one = XcodecDecoder::load(&path, &Device::Cpu)
+            .unwrap()
+            .with_chunk_frames(usize::MAX)
+            .decode(&frames, &CancelFlag::new())
+            .unwrap()
+            .wave;
+        assert_eq!(one, whole);
+
+        let dec = XcodecDecoder::load(&path, &Device::Cpu).unwrap();
+        for context in [0, 2, DECODER_CONTEXT_FRAMES - 8] {
+            let short = dec
+                .decode_embedding_chunked(&embed, 50, context, &|| false)
+                .unwrap()
+                .unwrap();
+            let m = max_rel(&short, &whole);
+            println!("mutation context {context}: {m:.3e}");
+            assert!(m > 1e-5, "context {context} passed ({m:.3e})");
+        }
     }
 
     #[test]
