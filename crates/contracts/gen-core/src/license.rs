@@ -43,10 +43,12 @@
 //!
 //! ## The tables themselves (sc-16662, sc-16665)
 //!
-//! [`families`] carries the transcribed [`LicenseFamily`] rows — twenty-one upstream texts, each
+//! [`families`] carries the transcribed [`LicenseFamily`] rows — twenty-two upstream texts, each
 //! term backed by a verbatim quote in `docs/licensing/sc-16662-licence-family-evidence.md`,
-//! `docs/licensing/sc-16665-checkpoint-licence-evidence.md` or (Qwen Research, sc-24108) the
-//! family's own doc comment.
+//! `docs/licensing/sc-16665-checkpoint-licence-evidence.md` or (Qwen Research, sc-24108; Tongyi
+//! Qianwen, sc-22989) the family's own doc comment and its evidence note
+//! (`docs/licensing/sc-24108-qwen-research-licence-evidence.md`,
+//! `docs/licensing/sc-22989-tongyi-qianwen-licence-evidence.md`).
 //!
 //! [`components`] carries the media lane's shared [`ComponentLicense`] rows — one per upstream
 //! checkpoint, read by **both** media catalogs, because a licence is a property of the checkpoint

@@ -1601,12 +1601,52 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if re.search(r"\bpip\s+install\b", line) and not line.lstrip().startswith("#")
         ]
         locks = [re.search(r"\s-r\s+(\S+)", line).group(1) for line in installs]
-        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK])
+        # YuE-v1: the hub fetch and the reference-clip decode; YuE2 (sc-22995): the hub fetch.
+        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK, WINDOWS_HUB_LOCK])
         for line in installs:
             with self.subTest(install=line):
                 self.assertTrue(line.startswith(f"{WINDOWS_INTERPRETER} -m pip install "))
                 self.assertIn("--only-binary=:all: --require-hashes", line)
                 self.assertTrue(line.endswith("|| exit /b 1"))
+
+    def test_yue2_job_renders_through_the_registered_loader(self) -> None:
+        # sc-23002: the YuE2 job renders through the registry on its production device and replays
+        # the AR parity cases, sampled like the tier measurement, and keeps each summary line.
+        workflow = yaml.safe_load(YUE_WORKFLOW.read_text(encoding="utf-8"))
+        steps = {step.get("name"): step for step in workflow["jobs"]["candle-audio-yue2"]["steps"]}
+        build = steps["Build the YuE2 CUDA test binary"]
+        self.assertEqual(build["id"], "build-yue2")
+        self.assertIn(
+            "-p candle-audio-yue2 --features cuda --lib --test engine_real_weights --no-run",
+            build["run"],
+        )
+        render = steps["Render YuE2 through the registered loader and replay the AR parity cases"]
+        self.assertEqual(
+            render["if"], "${{ !cancelled() && steps.build-yue2.outcome == 'success' }}"
+        )
+        run = render["run"]
+        self.assertIn('set "YUE2_HF_HUB=%CANDLE_GEN_MODELS_ROOT%"', run)
+        for command in (
+            "cargo test --locked --release -p candle-audio-yue2 --features cuda --test "
+            "engine_real_weights registered_loader_generates_a_song_with_every_artifact "
+            "-- --ignored --exact --nocapture",
+            "cargo test --locked --release -p candle-audio-yue2 --features cuda --lib "
+            "parity::real_weight_decodes_match_upstream -- --ignored --exact --nocapture",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(run.count(command), 1)
+        quality = steps["Measure the YuE2 tiers against the F32 reference"]["run"]
+        sampler = [line for line in quality.splitlines() if "nvidia-smi --query-gpu" in line]
+        self.assertEqual(len(sampler), 1)
+        self.assertIn(sampler[0], run)
+        # The summary prefix the steps scrape is the one the harnesses print.
+        evidence = (
+            YUE_WORKFLOW.parents[2] / "crates/audio/candle-audio-yue2/src/evidence.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn('pub const SUMMARY_PREFIX: &str = "YUE2_EVIDENCE_SUMMARY ";', evidence)
+        for text in (quality, run):
+            self.assertIn('findstr /C:"YUE2_EVIDENCE_SUMMARY {"', text)
+        self.assertIn('findstr /C:"zh_full semantic:"', run)
 
     def test_ltx25_terminal_workflows_are_autonomous_and_artifact_bound(self) -> None:
         campaign = LTX25_QUANT_CAMPAIGN_WORKFLOW.read_text(encoding="utf-8")
