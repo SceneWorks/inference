@@ -47,6 +47,11 @@ candle-audio-yue = { path = "../candle-audio-yue" }
 # sc-22994: YuE2 (epic sc-22988) — the noncommercial, experimental symbolic-plan song generator
 # (`yue2`), a distinct provider beside YuE1's six `yue_*` generators, never an alias of them.
 candle-audio-yue2 = { path = "../candle-audio-yue2" }
+# sc-23002 (epic sc-22988): SheetSage2 + MERT-v2-FullSong recording → score transcription, the first
+# half of the noncommercial recording → transcription → cover path. Reached through its crate API
+# (not the registry); the catalog publishes its component licence rows under `sheetsage2`. CC BY-NC
+# 4.0 on the owner basis recorded 2026-09-27 (see its NOTICE and the scoped deny.toml exception).
+candle-audio-sheetsage2 = { path = "../candle-audio-sheetsage2" }
 # The audio lane's snapshot-preparer composition (sc-12836): the lane's single `candle`
 # registration recognizes audio snapshots and delegates everything else to candle-llm's
 # preparer unchanged. This crate is the composition owner (previously each bundle wired
@@ -74,6 +79,7 @@ metal = [
     "candle-audio-moss-tts/metal",
     "candle-audio-yue/metal",
     "candle-audio-yue2/metal",
+    "candle-audio-sheetsage2/metal",
 ]
 cuda = [
     "candle-audio/cuda",
@@ -91,6 +97,7 @@ cuda = [
     "candle-audio-moss-tts/cuda",
     "candle-audio-yue/cuda",
     "candle-audio-yue2/cuda",
+    "candle-audio-sheetsage2/cuda",
 ]
 
 [dev-dependencies]

@@ -23,8 +23,9 @@
 //!   [`license::authorize`], which refuses any intended use (commercial use, redistribution) that
 //!   has no recorded compatible basis. [`license::CODE_TERMS`] records which upstream code each
 //!   component's native port may derive from: the Apache-2.0 GitHub source for the LM, VAE and
-//!   tokenizer; the cover closure's code has no upstream licence (only its weights are licensed), is
-//!   provisionally kept at CC BY-NC 4.0, and its port is gated.
+//!   tokenizer; the cover closure's code has no upstream licence (only its weights are licensed),
+//!   and its native port is distributed under CC BY-NC 4.0 on the owner basis recorded 2026-09-27
+//!   ([`license::COVER_PORT_OWNER_DECISION`]; noncommercial only).
 //!
 //! The request slice (sc-22990) is the native text side of generation:
 //!
@@ -102,8 +103,9 @@
 //!   [`cover::abc`]), a target style and aligned source or translated lyrics → a `cot = melody` (chord
 //!   symbols removed) or `cot = full` [`SongRequest`] that plans from the score. Symbolic only: no
 //!   audio or in-context-learning prompt reaches the generator. Recording transcription is the
-//!   separate, gated `candle-audio-sheetsage2` crate (provisionally CC BY-NC 4.0; no upstream code
-//!   licence), which depends on this one.
+//!   separate `candle-audio-sheetsage2` crate (CC BY-NC 4.0 on the owner basis
+//!   [`license::COVER_PORT_OWNER_DECISION`]; no upstream code licence), which depends on this one
+//!   and ships in the runtime bundles beside it.
 //!
 //! Nothing here downloads anything: acquiring a snapshot is the application's job, and this crate
 //! only ever reads a snapshot that is already on disk.

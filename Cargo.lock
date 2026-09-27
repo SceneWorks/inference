@@ -223,6 +223,7 @@ dependencies = [
  "candle-audio-moss-tts",
  "candle-audio-moss-tts-realtime",
  "candle-audio-openvoice",
+ "candle-audio-sheetsage2",
  "candle-audio-stable-audio-3",
  "candle-audio-whisper",
  "candle-audio-yue",

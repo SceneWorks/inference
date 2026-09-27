@@ -353,21 +353,57 @@ Source: [`failures/case.json`](../../scripts/reference/sheetsage2/artifacts/fail
   - **UNTESTED**: the paper preset itself. Blocker: no FFmpeg 6.x shared libraries installed. Next
     test: `brew install ffmpeg@6`, put its `lib` on `DYLD_FALLBACK_LIBRARY_PATH`, rerun the
     `failures` case. This is low value, because the preset only serves benchmark reproduction.
-- **The YuE2 ABC-dialect validator was not run.**
+- **The YuE2 ABC-dialect validator accepts every committed SheetSage2 score, and the native
+  dialect check agrees with it** (OBSERVED, sc-23002, 2026-09-27; run as a reference validator with
+  Michael's approval — nothing in production calls it).
   - What the validator is: `skills/yue2-music/scripts/abc_tools.py`@`YuE@92a73cc`,
-    standard-library-only, sha256 `ea04b922dacebec7ad257a2f8d83bdb5dfecb7a23110c1a3121c5c41c313930e`.
-    It is the hand-off contract check upstream's cover skill applies to SheetSage2 output. It
-    requires, for example, the exact `V: Vocal …` / `V: Ins …` lines, chord symbols only in Vocal,
-    and identical bar grids.
-  - What happened: running it was **denied by this session's permission policy** (fetch and execute
-    an external script). It was not retried.
-  - **UNTESTED.** Blocker: executing upstream `abc_tools.py` needs Michael's approval. Alternatively,
-    its rules get ported natively in sc-22996.
-  - Next test, either of:
-    - with approval, run `python abc_tools.py inspect <case>/score.abc` on each committed
-      `score.abc`;
-    - with the rules ported natively, assert them on these fixtures.
-  - The committed ABC files do carry the required header lines (OBSERVED by inspection).
+    standard-library-only, sha256 `ea04b922dacebec7ad257a2f8d83bdb5dfecb7a23110c1a3121c5c41c313930e`
+    (re-verified on the copy that ran). It is the hand-off contract check upstream's cover skill
+    applies to SheetSage2 output. It requires, for example, the exact `V: Vocal …` / `V: Ins …`
+    lines, chord symbols only in Vocal, and identical bar grids. Its native port is
+    `candle_audio_yue2::cover::abc` (`parse`, `strip_chords`, `compare`).
+  - `python3 abc_tools.py inspect <case>/score.abc` (Python 3.14.7) exits 0 on all nine committed
+    `score.abc` files: `real_full` and `real_full_head` (identical bytes) 76 Vocal notes / 27 bars /
+    32 chords; `real_melody` 76 / 27 / 0; `silence` 0 notes / 7 bars; `synth_full` and
+    `synth_merged` (identical) 0 Vocal and 54 Ins notes / 17 bars / 17 chords; `synth_eb_head` and
+    `synth_eb_release` 54 Ins notes / 17 bars / 16 chords; `long_multiwindow` 325 Vocal and 136 Ins
+    notes / 125 bars / 185 chords. The three YuE2 protocol plan fixtures
+    (`crates/audio/candle-audio-yue2/tests/fixtures/protocol/plans/*/score.abc`, 7–9-line plan
+    fragments rather than whole scores) are refused by both with the same message
+    ("Incomplete native two-voice ABC").
+  - The native port's own transcription output: the real-weight tests assert its `score.abc` is
+    byte-identical to these committed files. One fresh CPU run through the public API after the
+    owner basis was recorded (`a_recording_becomes_a_new_cover_after_the_transcriber_is_unloaded`:
+    `Transcriber::load` on the verified cover closure, `transcribe` of `nav_ssb`'s first 20 s,
+    `Transcription::save`, `ReviewArtifact::open` + `replay`, `plan_cover` melody-only,
+    `run_cover` with 150 semantic tokens) wrote a `score.abc` (24 Vocal notes / 7 bars / 7 chords,
+    77 bpm) and a `score_melody.abc` (24 / 7 / 0) that `abc_tools.py inspect` accepts with the same
+    note content as the native `parse`, and 2,000 mutants of those two agree verdict for verdict
+    too. The run: closure verified 11.8 s, load 1.9 s (2.71 GB parameters), transcription 88.6 s
+    (warnings `octave_high_register`, `octave_f0_half_evidence`), unload released every model,
+    RSS 829 MiB when the engine load began, 6.0 s cover (rms 0.128) in 105.7 s, 194.6 s in all;
+    peak RSS 22.4 GB (`ru_maxrss`; the external guard sampled 16.8 GB under its 30 GB cap). CPU
+    only, float32; nothing ran on Metal.
+  - Differential, verdict for verdict: the nine committed scores plus 18,000 mutants of six of them
+    (random character, token, line, header, chord, key-change and line-ending edits; seeded) were
+    run through upstream `parse` + `strip_chords` (keep both / Vocal / Ins) and the native
+    `parse` + `strip_chords` on the same raw text. Compared: accept / refuse, and for accepted
+    scores the exact sounding notes, bar grid, chord and key timelines, and all three stripped texts.
+    - **Before the fix: 45 verdict divergences**, all from two text-handling differences. Upstream
+      splits the score with Python's `str.splitlines`, whose boundaries include a lone `\r`, `\v`,
+      `\f`, `\x1c`–`\x1e`, NEL and U+2028/U+2029; the native parser used `str::lines` (`\n` and
+      `\r\n` only). And Python's `str.isspace` counts `\x1f`, which `char::is_whitespace` does not.
+      Content and stripped texts agreed wherever both accepted.
+    - **Fixed on the native side** (`cover::abc`: Python `splitlines` boundaries in `parse` and in
+      `strip_chords`, which keeps each line ending verbatim; `str.isspace` between tokens and around
+      bars), with the fixture case
+      `cover::tests::line_boundaries_and_whitespace_follow_upstreams_python_semantics` whose every
+      expectation is upstream's verdict on the same text.
+    - **After the fix: 0 divergences** on the same 18,006 cases (1,329 accepted by both with
+      identical content and stripped texts, 16,677 refused by both).
+  - Not compared: upstream's error *wording* on refusals (the native messages are ports of it but
+    were not diffed), and upstream's CLI file I/O (`read_text` normalizes `\r\n` and lone `\r` to
+    `\n` before `parse`; the native API receives the text as given and keeps its line endings).
 - **`melody_only` and full ABC differ in more than chord symbols.** Both scores are compared as
   normalized line lists after removing chord symbols.
   - The melody-only score contains no chord symbols (`melody_only_has_chord_symbols: false`).
@@ -398,6 +434,12 @@ that way.
 **UNTESTED: Metal and CUDA memory and throughput.** Blocker: CPU-only lane, and the GPU is reserved.
 Next test: the native port's parity harness on Metal and CUDA. Upstream torch MPS is not a proxy for
 the native cost.
+
+- **Metal cannot run the native port as written** (sc-23002, DOCUMENTED from candle `1e6aa85`):
+  the ConvNeXt GRN reduces in float64, and candle's Metal backend has no float32 → float64 cast
+  kernel. `Transcriber::load` therefore refuses a Metal device before reading any weight; a macOS
+  host transcribes on the CPU. CUDA supports every operation the model uses, float64 included, but
+  no CUDA run has been made.
 
 ## Native portability
 
@@ -475,6 +517,13 @@ has signed them off, the same status as `docs/licensing/`.
   a derivative of that code. That would change nothing in practice: the weights are already
   noncommercial and the provider can only run under E2. Record this as an open item on the
   component license rows. It is not a blocker.
+  - **Owner basis recorded 2026-09-27 (epic sc-22988).** The native port
+    (`candle-audio-sheetsage2`) is distributed under CC BY-NC 4.0, the terms of the upstream
+    weights: noncommercial only, with attribution per the crate's `NOTICE`. It is an owner decision,
+    not an upstream code grant, and it covers the port code only; rehosting or redistributing the
+    weights or a derived tier stays gated. Recorded as `COVER_PORT_OWNER_DECISION` in
+    `crates/audio/candle-audio-yue2/src/license.rs`; recording → transcription → cover is a
+    supported noncommercial path, and the runtime bundles re-export the crate (sc-23002).
 - **YuE source (covers guide, skill, `abc_tools.py`): Apache-2.0** (`LICENSE`@`YuE@92a73cc`). YuE's
   `MODEL_LICENSE` covers YuE2-3B, YuE2-Vae and YuE2-Vae-legacy only, not SheetSage2 or MERT.
 - **Bundled third-party material in `render_assets/`.** This only matters if upstream rendering

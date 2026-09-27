@@ -55,6 +55,44 @@ fn the_dialect_parser_resolves_ties_and_bar_scoped_accidentals() {
     );
 }
 
+/// Upstream splits a score with Python's `str.splitlines` and skips `str.isspace` whitespace. The
+/// sc-23002 differential against `abc_tools.py`@`YuE@92a73cc` (18,006 mutated SheetSage2 scores)
+/// found 45 verdict divergences from `str::lines` / `char::is_whitespace`, all of them these
+/// characters, and none after. Every expectation here is upstream's verdict on the same text.
+///
+/// Mutation that must fail: split with `str::lines` again (lone `\r`, `\v`, `\f`, `\x1c`–`\x1e`,
+/// NEL, LS and PS stop being boundaries), or skip only `char::is_whitespace` (`\x1f` is refused).
+#[test]
+fn line_boundaries_and_whitespace_follow_upstreams_python_semantics() {
+    let base = small("% verse\nV: Vocal\n\"C\"C16D16|\nV: Ins\nZ|\n");
+    let expected = parse(&base).unwrap();
+    for sep in [
+        "\r\n", "\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\u{85}", "\u{2028}", "\u{2029}",
+    ] {
+        let text = base.replace('\n', sep);
+        let score = parse(&text).unwrap_or_else(|e| panic!("{sep:?}: {e}"));
+        assert_eq!(score.voices, expected.voices, "{sep:?}");
+        // Chord removal keeps every line ending verbatim.
+        let (stripped, removed) = strip_chords(&text, KeepVoice::Both).unwrap();
+        assert_eq!(removed, 1, "{sep:?}");
+        assert_eq!(
+            stripped,
+            base.replace("\"C\"", "").replace('\n', sep),
+            "{sep:?}"
+        );
+    }
+    // A boundary inside a music line splits it: the first half no longer ends with a barline.
+    let err = parse(&base.replace("C16D16|", "C16\x0cD16|")).unwrap_err();
+    assert!(
+        err.0.contains("music line must end with a plain barline"),
+        "{err}"
+    );
+    // `\x1f` is Python whitespace (not `char::is_whitespace`): skipped between tokens and stripped
+    // around bars.
+    let spaced = parse(&base.replace("C16D16|", "\x1fC16\x1fD16\x1f|")).unwrap();
+    assert_eq!(spaced.voices, expected.voices);
+}
+
 /// A real SheetSage2 score parses in the YuE2 dialect, and stripping its chords reproduces the
 /// sounding content of upstream's own melody-only rendering exactly.
 ///

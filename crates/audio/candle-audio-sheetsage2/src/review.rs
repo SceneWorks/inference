@@ -195,7 +195,7 @@ impl ClosureIdentity {
             "ported_code_revision": self.ported_code_revision,
             "tokenizer_fingerprint": self.tokenizer_fingerprint,
             "device": self.device,
-            "licence": "weights CC BY-NC 4.0 (upstream grant); the port has no upstream code licence and is provisionally CC BY-NC 4.0 (see NOTICE); noncommercial experimentation only",
+            "licence": "weights CC BY-NC 4.0 (upstream grant); the port has no upstream code licence and is distributed under CC BY-NC 4.0 on the owner basis recorded 2026-09-27 (see NOTICE); noncommercial experimentation only",
         })
     }
 
