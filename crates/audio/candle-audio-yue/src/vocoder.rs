@@ -17,6 +17,17 @@
 //! upstream `.pth` files). Widths are read from the tensors; the synthesis window is the
 //! checkpoint's own `head.istft.window` buffer. Precision: **float32** at every LM tier (the
 //! approved epic-R2 carve-out — the staged decoders are float32 and never tiered).
+//!
+//! **Chunked upsample.** Upstream `vocoder.process_audio` runs each stem's whole embedding through
+//! the decoder at once. [`VocosUpsampler`] instead runs
+//! [`DECODE_CHUNK_FRAMES`] frames at a time, each with
+//! [`vocos_context_frames`] frames of real embedding on each side (clipped at the song edges, where
+//! the conv padding and the ISTFT's edge envelope apply exactly as in the whole-song pass), and
+//! keeps only its own frames' `hop` samples. The backbone convs are frame-shift-equivariant and
+//! every other backbone/head op is per frame; an interior output sample's overlap-add (and its
+//! window-square envelope) reads only the `⌈n_fft / hop⌉` frames around it — so the stitched stem
+//! is the whole-song stem up to float summation order, with the working set bounded by one chunk.
+//!
 //! [`StubVocoder`] stays as the end-to-end seam test's weights-free double.
 
 use std::collections::HashMap;
@@ -29,6 +40,7 @@ use candle_audio::vocos::{Vocos, VocosConfig};
 use candle_audio::AudioError;
 use candle_nn::VarBuilder;
 
+use crate::codec::DECODE_CHUNK_FRAMES;
 use crate::config::Assets;
 use crate::tokens::FRAMES_PER_SECOND;
 
@@ -89,11 +101,49 @@ pub fn load_stub(_assets: &Assets) -> gen_core::Result<Box<dyn Vocoder>> {
     Ok(Box::new(StubVocoder))
 }
 
+/// Frames of embedding each side of a Vocos chunk for `cfg`'s decoder, cropped after decoding: the
+/// `k7` embed conv (3) plus each ConvNeXt block's `k7` depthwise conv (3 per block) plus the ISTFT
+/// overlap-add span (`⌈n_fft / hop⌉`, the frames whose windows cover an output sample). YuE's
+/// decoders (8 blocks, n_fft 3528, hop 882): 31 frames.
+pub fn vocos_context_frames(cfg: &VocosConfig) -> usize {
+    3 + 3 * cfg.num_layers + cfg.n_fft.div_ceil(cfg.hop)
+}
+
+/// A decoder's `[1, C, frames]` input upsampled `chunk_frames` frames at a time with
+/// `context_frames` frames of real embedding each side (clipped at the song edges), each chunk
+/// cropped to its own frames' `hop` samples (module docs). With `context_frames ≥`
+/// [`vocos_context_frames`] it equals [`Vocos::forward`] over the whole song. `None` when `cancel`
+/// trips.
+pub fn forward_chunked(
+    decoder: &Vocos,
+    x: &Tensor,
+    chunk_frames: usize,
+    context_frames: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<Vec<f32>>, AudioError> {
+    let total = x.dim(2)?;
+    let hop = decoder.config().hop;
+    let chunk = chunk_frames.max(1);
+    let mut wave = Vec::with_capacity(total * hop);
+    for f0 in (0..total).step_by(chunk) {
+        let f1 = f0.saturating_add(chunk).min(total);
+        let first = f0.saturating_sub(context_frames);
+        let last = f1.saturating_add(context_frames).min(total);
+        let part = x.narrow(2, first, last - first)?;
+        let Some(y) = decoder.forward_cancellable(&part, cancel)? else {
+            return Ok(None);
+        };
+        wave.extend_from_slice(&y[(f0 - first) * hop..(f1 - first) * hop]);
+    }
+    Ok(Some(wave))
+}
+
 /// The two native Vocos decoders.
 pub struct VocosUpsampler {
     vocals: Vocos,
     instrumental: Vocos,
     device: Device,
+    chunk_frames: usize,
 }
 
 impl VocosUpsampler {
@@ -104,7 +154,15 @@ impl VocosUpsampler {
             vocals: load_decoder(&root.join(VOCAL_CHECKPOINT), device)?,
             instrumental: load_decoder(&root.join(INSTRUMENTAL_CHECKPOINT), device)?,
             device: device.clone(),
+            chunk_frames: DECODE_CHUNK_FRAMES,
         })
+    }
+
+    /// Upsample `frames` codec frames at a time ([`DECODE_CHUNK_FRAMES`] by default; clamped to
+    /// ≥ 1). Only the working set changes — the chunk seams are exact (module docs).
+    pub fn with_chunk_frames(mut self, frames: usize) -> Self {
+        self.chunk_frames = frames.max(1);
+        self
     }
 
     /// The decoder a track renders through.
@@ -182,10 +240,14 @@ impl Vocoder for VocosUpsampler {
             .to_device(&self.device)
             .and_then(|x| x.to_dtype(DType::F32))
             .map_err(AudioError::from)?;
-        decoder
-            .forward_cancellable(&x, &|| cancel.is_cancelled())
-            .map_err(AudioError::from)?
-            .ok_or(gen_core::Error::Canceled)
+        forward_chunked(
+            decoder,
+            &x,
+            self.chunk_frames,
+            vocos_context_frames(decoder.config()),
+            &|| cancel.is_cancelled(),
+        )?
+        .ok_or(gen_core::Error::Canceled)
     }
 }
 
@@ -370,6 +432,86 @@ mod tests {
             / peak;
         println!("tiny YuE-geometry vocos: max|Δ|/max|ref| = {rel:.3e}");
         assert!(rel <= 1e-5, "vocos diverges from the reference: {rel:.3e}");
+        // One-frame chunks through the production context: still the reference.
+        let chunked = forward_chunked(
+            &vocos,
+            &t["ref.features"],
+            1,
+            vocos_context_frames(vocos.config()),
+            &|| false,
+        )
+        .unwrap()
+        .unwrap();
+        let rel = max_rel(&chunked, &want);
+        assert!(
+            rel <= 1e-5,
+            "chunked vocos diverges from the reference: {rel:.3e}"
+        );
+    }
+
+    /// max |got − want| / max |want|.
+    fn max_rel(got: &[f32], want: &[f32]) -> f64 {
+        assert_eq!(got.len(), want.len(), "length mismatch");
+        let peak = want.iter().fold(0f64, |m, &v| m.max(v.abs() as f64));
+        got.iter()
+            .zip(want)
+            .fold(0f64, |m, (&a, &b)| m.max((a as f64 - b as f64).abs()))
+            / peak
+    }
+
+    #[test]
+    fn vocos_context_covers_the_backbone_and_istft_span() {
+        let cfg = VocosConfig {
+            input_channels: 1024,
+            dim: 512,
+            intermediate_dim: 1536,
+            num_layers: 8,
+            n_fft: 3528,
+            hop: SAMPLES_PER_FRAME,
+            ln_eps: LN_EPS,
+        };
+        assert_eq!(vocos_context_frames(&cfg), 3 + 24 + 4);
+    }
+
+    /// The production chunked upsample over a long synthetic embedding (240 frames, 50-frame chunks
+    /// → four seams) at YuE's transform (n_fft 3528, hop 882) equals the whole-song upsample —
+    /// through the production [`Vocoder::decode`] for both tracks. Measured max relative difference
+    /// 0 on CPU/f32 (the Vocos noise floor vs torch is 2e-5). Mutation: a context narrower than
+    /// the backbone + ISTFT span must fail the same bound.
+    #[test]
+    fn chunked_upsample_equals_the_whole_song_upsample_and_needs_its_context() {
+        let snap = tiny_snapshot();
+        let up = VocosUpsampler::load(snap.path(), &Device::Cpu)
+            .unwrap()
+            .with_chunk_frames(50);
+        let x = embedding(240);
+        for track in [Track::Vocals, Track::Instrumental] {
+            let dec = up.decoder(track);
+            let whole = dec.forward(&x).unwrap();
+            let chunked = up.decode(track, &x, &CancelFlag::new()).unwrap();
+            let rel = max_rel(&chunked, &whole);
+            println!("{track:?} chunked vs whole vocos: {rel:.3e}");
+            assert!(rel <= 1e-6, "{track:?} chunked diverges: {rel:.3e}");
+            let one = forward_chunked(dec, &x, usize::MAX, 31, &|| false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                one, whole,
+                "one chunk longer than the song is the whole pass"
+            );
+            // The toy weights (±0.05) attenuate a backbone edge error below f32 resolution within a
+            // few frames, so the mutations cut into the ISTFT overlap-add span itself — the real
+            // decoders' backbone reach is exercised by the real-weight check
+            // (tests/chunked_decode_real_weights.rs).
+            for context in [0, 1, 2] {
+                let short = forward_chunked(dec, &x, 50, context, &|| false)
+                    .unwrap()
+                    .unwrap();
+                let m = max_rel(&short, &whole);
+                println!("{track:?} mutation context {context}: {m:.3e}");
+                assert!(m > 2e-5, "{track:?} context {context} passed ({m:.3e})");
+            }
+        }
     }
 
     #[test]

@@ -9,6 +9,12 @@
 //! stage-2 LM loads, and both are gone before the codec and the vocoders load. The ICL encoder
 //! (xcodec encoder + HuBERT) is released before stage 1 loads.
 //!
+//! The decode stage's working set does not grow with song length: the production codec decoder
+//! and Vocos upsampler evaluate [`DECODE_CHUNK_FRAMES`](crate::codec::DECODE_CHUNK_FRAMES) frames
+//! at a time with exact seams (see [`crate::codec`] / [`crate::vocoder`]); only the song-length
+//! f32 stems and codec embeddings are held whole. The low-band splice runs over the whole song, so
+//! its global low-band RMS match and the limiter's global peak are unchanged by the chunking.
+//!
 //! ## Progress and cancellation
 //!
 //! The engine owns the stage-1 decode loop and checks the render's [`CancelFlag`] before every
