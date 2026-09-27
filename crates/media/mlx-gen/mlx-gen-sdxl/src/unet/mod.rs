@@ -225,7 +225,7 @@ impl UNet2DConditionModel {
         self.time_embedding.quantize(bits)?;
         self.add_embedding.quantize(bits)?;
         if let Some(proj) = &mut self.encoder_hid_proj {
-            proj.quantize(bits, None)?; // Kolors context projection (sc-3096 validates)
+            crate::quant::quantize_linear(proj, bits)?; // Kolors context projection (sc-3096 validates)
         }
         for b in &mut self.down_blocks {
             b.quantize(bits)?;

@@ -46,7 +46,12 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
     let dir = root.join("text_encoder");
     let mut w = load_indexed_shards(&dir)?;
     w.cast_all(Dtype::Bfloat16)?;
-    T5TextEncoder::from_weights(&w, "")
+    let encoder = T5TextEncoder::from_weights(&w, "")?;
+    // Materialize at load (after the bf16 cast): left lazy, the first encode's command buffers wait
+    // on the safetensors reads — past the GPU watchdog on a cold page cache (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`).
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load only the safetensors shards referenced by `<dir>/model.safetensors.index.json` (the canonical

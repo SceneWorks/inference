@@ -136,16 +136,25 @@ pub(crate) fn load_text_encoder_from_weights(w: Weights) -> Result<TextEncoder> 
 /// to bf16 is the quantize path (`AdaptableLinear::quantize`, tagged PARITY-BF16) to byte-match the
 /// fork's Q8/Q4 golden; that too is a flip-to-f32 candidate once parity stops being the goal.
 pub fn load_transformer(root: &Path) -> Result<ZImageTransformer> {
-    load_transformer_with_stream(root, true)
+    // Armed, but its callers (training, fixtures) run the resident stack: materialize every block.
+    load_transformer_with_stream(root, true, false)
 }
 
 /// Load the transformer in the component form selected for this request.
+///
+/// `streamed` (the request's deferred-materialization shape, which always runs a block window)
+/// leaves the `layers.*` bodies lazy: the stream reads each block itself, and reading them here
+/// would defeat bounded residency. Everything else is materialized at load (sc-24245; see
+/// `mlx_gen_qwen_image::loader::load_transformer_with`).
 pub(crate) fn load_transformer_with_stream(
     root: &Path,
     streamable: bool,
+    streamed: bool,
 ) -> Result<ZImageTransformer> {
     let dir = root.join("transformer");
-    let transformer = load_transformer_from_weights(Weights::from_dir(&dir)?)?;
+    let mut w = Weights::from_dir(&dir)?;
+    let transformer = build_transformer(&mut w)?;
+    materialize_built(&w, streamed.then_some("layers."))?;
     // SC-15754: a snapshot directory is re-openable, so rung 4 (bounded transformer residency) can
     // rebuild `layers` per window from exactly these files. `remap_transformer_keys` only aliases the
     // timestep-embedder and final-layer keys — never a `layers.*` key — so a streamed block reads the
@@ -158,8 +167,29 @@ pub(crate) fn load_transformer_with_stream(
 }
 
 pub(crate) fn load_transformer_from_weights(mut w: Weights) -> Result<ZImageTransformer> {
-    remap_transformer_keys(&mut w);
-    ZImageTransformer::from_weights(&w, "", ZImageTransformerConfig::turbo())
+    build_transformer(&mut w)
+}
+
+fn build_transformer(w: &mut Weights) -> Result<ZImageTransformer> {
+    remap_transformer_keys(w);
+    ZImageTransformer::from_weights(w, "", ZImageTransformerConfig::turbo())
+}
+
+/// Materialize the tensors a build read, except a streamed block stack's bodies (`streamed_blocks`
+/// key prefix), which its block stream reads per window (sc-24245). Left lazy, the first forward's
+/// Metal command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache.
+fn materialize_built(w: &Weights, streamed_blocks: Option<&str>) -> Result<()> {
+    let Some(prefix) = streamed_blocks else {
+        return w.materialize_accessed();
+    };
+    let resident: Vec<(String, mlx_rs::Array)> = w
+        .accessed_entries()
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with(prefix))
+        .collect();
+    let mut named: Vec<(&str, &mlx_rs::Array)> =
+        resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+    Weights::materialize_named(&mut named)
 }
 
 /// Load the ControlNet transformer (sc-2349): the base DiT from the snapshot `root`, overlaid with
@@ -170,15 +200,18 @@ pub fn load_control_transformer(
     root: &Path,
     control: &WeightsSource,
 ) -> Result<ZImageControlTransformer> {
-    load_control_transformer_with_stream(root, control, true)
+    // Armed, but run resident by its callers: materialize every block (see `load_transformer`).
+    load_control_transformer_with_stream(root, control, true, false)
 }
 
+/// `streamed` as for [`load_transformer_with_stream`], for both the base and control stacks.
 pub(crate) fn load_control_transformer_with_stream(
     root: &Path,
     control: &WeightsSource,
     streamable: bool,
+    streamed: bool,
 ) -> Result<ZImageControlTransformer> {
-    let base = load_transformer_with_stream(root, streamable)?;
+    let base = load_transformer_with_stream(root, streamable, streamed)?;
     let control_weights = match control {
         WeightsSource::File(p) => Weights::from_file(p)?,
         WeightsSource::Dir(p) => Weights::from_dir(p)?,
@@ -187,6 +220,7 @@ pub(crate) fn load_control_transformer_with_stream(
     // its own rung-4 stream alongside the base DiT's. The control keys map 1:1 onto the tree (no
     // remap), so a streamed control block reads the same names the resident load did.
     let transformer = ZImageControlTransformer::from_weights(base, &control_weights, "")?;
+    materialize_built(&control_weights, streamed.then_some("control_layers."))?;
     Ok(if streamable {
         transformer.with_control_block_stream(control.clone(), "")
     } else {
@@ -197,14 +231,23 @@ pub(crate) fn load_control_transformer_with_stream(
 /// Load the full VAE (decoder + encoder), remapping both diffusers trees to the internal naming
 /// and transposing conv weights to NHWC. The encoder powers img2img (`Conditioning::Reference`).
 pub fn load_vae(root: &Path) -> Result<Vae> {
-    load_vae_from_weights(Weights::from_dir(root.join("vae"))?)
+    let mut w = Weights::from_dir(root.join("vae"))?;
+    let vae = build_vae(&mut w)?;
+    // Materialize at load (sc-24245; see `materialize_built`).
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
+/// The ComfyUI path: its source arrays are materialized by the caller (`model::ComfyUiSource`).
 pub(crate) fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
-    remap_vae_decoder(&mut w)?;
-    remap_vae_encoder(&mut w)?;
-    Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
-        &w,
+    build_vae(&mut w)
+}
+
+fn build_vae(w: &mut Weights) -> Result<Vae> {
+    remap_vae_decoder(w)?;
+    remap_vae_encoder(w)?;
+    Vae::from_weights(w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
+        w,
         "encoder",
         &VaeEncoderConfig::default_z_image(),
     )

@@ -180,18 +180,19 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         Ok(w)
     };
 
-    let vae = SvdVae::from_weights(
-        &load("vae", "diffusion_pytorch_model", Dtype::Float32)?,
-        &VaeConfig::default(),
-    )?;
-    let unet = SvdUnet::from_weights(
-        &load("unet", "diffusion_pytorch_model", dense)?,
-        &UnetConfig::default(),
-    )?;
-    let image_encoder = SvdImageEncoder::from_weights(
-        &load("image_encoder", "model", dense)?,
-        &ImageEncoderConfig::default(),
-    )?;
+    // Each component is materialized at load (after its cast): left lazy, the first forward's
+    // command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
+    // (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    let vae_w = load("vae", "diffusion_pytorch_model", Dtype::Float32)?;
+    let vae = SvdVae::from_weights(&vae_w, &VaeConfig::default())?;
+    vae_w.materialize_accessed()?;
+    let unet_w = load("unet", "diffusion_pytorch_model", dense)?;
+    let unet = SvdUnet::from_weights(&unet_w, &UnetConfig::default())?;
+    unet_w.materialize_accessed()?;
+    let image_encoder_w = load("image_encoder", "model", dense)?;
+    let image_encoder =
+        SvdImageEncoder::from_weights(&image_encoder_w, &ImageEncoderConfig::default())?;
+    image_encoder_w.materialize_accessed()?;
     if let Some(memory) = &memory {
         memory.ensure_unchanged()?;
     }

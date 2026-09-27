@@ -152,10 +152,11 @@ impl ClipTextEmbedder {
                 pad_to_max_length: true,
             },
         )?;
-        Ok(Self {
-            encoder: ClipTextEncoder::from_weights(&weights, "text_model", &clip_text_config())?,
-            tokenizer,
-        })
+        let encoder = ClipTextEncoder::from_weights(&weights, "text_model", &clip_text_config())?;
+        // Materialize at load — only the text tower this reads, not the snapshot's vision tower
+        // (sc-24245; see [`load`]).
+        weights.materialize_accessed()?;
+        Ok(Self { encoder, tokenizer })
     }
 
     /// `text` → projected CLIP `text_embeds` `[1, 768]` as f32. The SDXL encoder's projected path
@@ -202,7 +203,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
         }
     };
     let weights = Weights::from_dir(root)?;
-    Ok(Box::new(ClipImageEmbedder::from_weights(&weights)?))
+    let embedder = ClipImageEmbedder::from_weights(&weights)?;
+    // Materialize at load — only the vision tower this reads: left lazy, the first embed's command
+    // buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache (sc-24245;
+    // see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    weights.materialize_accessed()?;
+    Ok(Box::new(embedder))
 }
 
 /// Load the text embedder from a weights directory (the `openai/clip-vit-large-patch14` snapshot).

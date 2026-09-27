@@ -259,8 +259,13 @@ fn load_vl_encoder_only(
 /// byte-identical.
 fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHeavyOwned> {
     // Edit-2511 transformer (zero_cond_t on): clean-timestep modulation for the conditioning tokens.
-    let mut transformer = loader::load_transformer_edit(root)?;
-    if crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec) {
+    let streamed = crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec);
+    let mut transformer = loader::load_transformer_with(
+        root,
+        &crate::transformer::QwenTransformerConfig::qwen_image_edit(),
+        streamed,
+    )?;
+    if streamed {
         transformer =
             transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
     }

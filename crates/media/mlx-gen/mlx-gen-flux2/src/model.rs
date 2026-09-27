@@ -314,11 +314,16 @@ fn load_flux2_heavy(
     stream_transformer_blocks: bool,
 ) -> Result<Flux2HeavyOwned> {
     let root = resolve_root(variant, spec)?;
-    let mut transformer = if variant.is_dev() {
-        loader::load_transformer_dev(root)?
-    } else {
-        loader::load_transformer(root)?
-    };
+    let klein_streamable = matches!(
+        variant,
+        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
+    ) && crate::memory_strategy::klein_streamable(spec);
+    // Same predicate that arms the block stream below: a streamed load leaves the block bodies lazy.
+    let mut transformer = loader::load_transformer_with(
+        root,
+        &variant.config(),
+        klein_streamable && stream_transformer_blocks,
+    )?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
@@ -330,11 +335,7 @@ fn load_flux2_heavy(
     if !spec.adapters.is_empty() {
         crate::adapters::apply_flux2_adapters(&mut transformer, &spec.adapters)?;
     }
-    if matches!(
-        variant,
-        Flux2Variant::Klein9b | Flux2Variant::Klein9bEdit | Flux2Variant::Klein9bKvEdit
-    ) && crate::memory_strategy::klein_streamable(spec)
-    {
+    if klein_streamable {
         let inventory = crate::artifact_inventory::KleinArtifactInventory::verify_for_provider(
             variant.id(),
             spec,

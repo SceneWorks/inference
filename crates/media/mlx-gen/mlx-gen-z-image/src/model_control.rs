@@ -194,7 +194,8 @@ pub(crate) fn load_control_heavy(
     // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
     // before the overlay would replace the control Linears with QuantizedLinear that can't accept
     // the raw bf16 control weights.
-    let mut transformer = loader::load_control_transformer_with_stream(root, control, streamable)?;
+    let mut transformer =
+        loader::load_control_transformer_with_stream(root, control, streamable, streamable)?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();

@@ -27,7 +27,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
 
-use crate::config::DiffusionConfig;
+use crate::config::{DiffusionConfig, UNetConfig};
 use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
@@ -705,7 +705,14 @@ fn load_text_encoders(
 /// bundle up front. The operation order matches the pre-sc-10839 `load` (adapter merge before quant),
 /// and the components are independent of the text encoders, so both residencies are byte-identical.
 fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyOwned> {
-    let mut unet = loader::load_unet_dtype(root, DTYPE)?;
+    // Materialized at load (sc-24245); a load that arms rung 4 below leaves the streamed
+    // transformer-block bodies to the block stream.
+    let mut unet = loader::load_unet_with_config_streamed(
+        root,
+        DTYPE,
+        &UNetConfig::sdxl_base(),
+        crate::memory_strategy::streamable(spec),
+    )?;
     if !spec.adapters.is_empty() {
         // Merge LoRA (kohya `lora_unet_` / PEFT, sc-2639) and LoKr (sc-2640) into the dense fp16
         // U-Net weights at load — the production reference merges into the `float16=True` U-Net too,

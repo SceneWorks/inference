@@ -293,7 +293,9 @@ fn load_text_encoders_component(root: &Path, quant: Option<Quant>) -> Result<Sd3
 /// deterministic RNG-free quant/merge), so both residencies are byte-identical.
 fn load_heavy(spec: &LoadSpec, root: &Path, variant: Sd3Variant) -> Result<Sd3Heavy> {
     let arch = variant.arch();
-    let mut transformer = loader::load_transformer(root, &arch)?;
+    // Resolved before the load so the loader knows whether the block bodies stay lazy (sc-24245).
+    let inventory = crate::artifact_inventory::stream_inventory(variant.id(), spec)?;
+    let mut transformer = loader::load_transformer_with(root, &arch, inventory.is_some())?;
     let vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
@@ -311,7 +313,7 @@ fn load_heavy(spec: &LoadSpec, root: &Path, variant: Sd3Variant) -> Result<Sd3He
     // loader would then decline to attach — nor the reverse. `None` (an unstreamable selector or a
     // snapshot with no readable `transformer/` subtree) leaves the resident block stack in place,
     // exactly matching the rung-4-`Missing` contract the same spec produces.
-    if let Some(inventory) = crate::artifact_inventory::stream_inventory(variant.id(), spec)? {
+    if let Some(inventory) = inventory {
         transformer = transformer.with_block_stream(inventory, arch);
         transformer.finalize_block_stream()?;
     }

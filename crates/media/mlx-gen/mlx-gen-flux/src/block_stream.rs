@@ -98,6 +98,10 @@ impl FluxBlockStream {
                     "flux1 block stream: materialize joint block {index}: {error}"
                 ))
             })?;
+        // Read this block's bytes on the CPU stream now, before its forward is encoded; left lazy,
+        // the window's `eval` makes Metal command buffers wait on the disk read — past the GPU
+        // watchdog on a cold page cache (sc-24245).
+        view.materialize_accessed()?;
         // Array handles are refcounted. Drain precisely what this constructor read so dropping the
         // completed window can release its materialized weights instead of retaining a map copy.
         view.remove_accessed();
@@ -133,6 +137,8 @@ impl FluxBlockStream {
                         "flux1 block stream: materialize single block {index}: {error}"
                     ))
                 })?;
+        // Materialize before the forward is encoded, as for the joint blocks (sc-24245).
+        view.materialize_accessed()?;
         view.remove_accessed();
         if let Some(bits) = self.quant_bits {
             ensure_prepacked(&mut block, &format!("single block {index}"))?;

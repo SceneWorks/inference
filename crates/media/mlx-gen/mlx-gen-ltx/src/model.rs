@@ -1143,16 +1143,18 @@ impl Ltx {
                         .expect("transformer path has a parent")
                         .join("connector.safetensors"),
                 )?;
-                Ok(StagedTextEncoder::Gemma3(Box::new(
-                    LtxTextEncoder::from_weights_av(
-                        &gemma_w,
-                        &connector_w,
-                        GemmaConfig::gemma_3_12b(),
-                        *quant,
-                        &self.config,
-                        self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
-                    )?,
-                )))
+                let encoder = LtxTextEncoder::from_weights_av(
+                    &gemma_w,
+                    &connector_w,
+                    GemmaConfig::gemma_3_12b(),
+                    *quant,
+                    &self.config,
+                    self.dit_prec.with_compute_dtype(Dtype::Bfloat16),
+                )?;
+                // Materialize at load (sc-24245; see mlx_gen_qwen_image::loader::load_transformer_with).
+                gemma_w.materialize_accessed()?;
+                connector_w.materialize_accessed()?;
+                Ok(StagedTextEncoder::Gemma3(Box::new(encoder)))
             }
             TextAssets::Gemma4 {
                 bundle,
