@@ -334,16 +334,18 @@ jobs:
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Toolchain versions
-        run: rustc --version && cargo --version
       - name: Validate publication authorization
         if: inputs.publish_chroma_artifacts && (inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model)
+        env:
+          CHROMA_PUBLISH_CONFIRMATION: ${{ inputs.chroma_publish_confirmation }}
         run: |
-          if [[ "${{ inputs.chroma_publish_confirmation }}" != "sc-16462" ]]; then
+          if [[ "$CHROMA_PUBLISH_CONFIRMATION" != "sc-16462" ]]; then
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Toolchain versions
+        run: rustc --version && cargo --version
       - name: Materialize the exact shipped bf16 source
         if: inputs.chroma_model == 'all' || inputs.chroma_model == matrix.model
         env:
@@ -400,13 +402,15 @@ jobs:
       CHROMA_REPOSITORY: ${{ matrix.repository }}
       CHROMA_SOURCE_REVISION: ${{ matrix.source_revision }}
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Validate publication authorization
+        env:
+          CHROMA_PUBLISH_CONFIRMATION: ${{ inputs.chroma_publish_confirmation }}
         run: |
-          if [[ "${{ inputs.chroma_publish_confirmation }}" != "sc-16462" ]]; then
+          if [[ "$CHROMA_PUBLISH_CONFIRMATION" != "sc-16462" ]]; then
             echo "Publishing requires chroma_publish_confirmation=sc-16462" >&2
             exit 1
           fi
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Download the validated payload manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -910,6 +914,14 @@ jobs:
       # byte-exactness on every run.
       INFERENCE_REVISION: ${{ github.sha }}
     steps:
+      - name: Validate SceneWorks revision input
+        env:
+          REQUESTED_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}
+        run: |
+          if [[ ! "$REQUESTED_SCENEWORKS_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sceneworks_revision must be an exact lowercase commit SHA" >&2
+            exit 1
+          fi
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # Repository variables hold ONE value for every runner in a label pool, but the two
       # macOS boxes do not share a home directory. A `~/`-relative value is resolved here
@@ -928,13 +940,18 @@ jobs:
       - name: Resolve and bind exact SceneWorks provenance outside the inference worktree
         env:
           SCENEWORKS_PROVENANCE_ROOT: ${{ runner.temp }}/sceneworks-provenance
+          REQUESTED_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}
         run: |
+          if [[ ! "$REQUESTED_SCENEWORKS_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sceneworks_revision must be an exact lowercase commit SHA" >&2
+            exit 1
+          fi
           git init "$SCENEWORKS_PROVENANCE_ROOT"
           git -C "$SCENEWORKS_PROVENANCE_ROOT" remote add origin https://github.com/SceneWorks/SceneWorks.git
-          git -C "$SCENEWORKS_PROVENANCE_ROOT" fetch --depth=1 origin "${{ inputs.sceneworks_revision }}"
+          git -C "$SCENEWORKS_PROVENANCE_ROOT" fetch --depth=1 -- origin "$REQUESTED_SCENEWORKS_REVISION"
           git -C "$SCENEWORKS_PROVENANCE_ROOT" checkout --detach FETCH_HEAD
           resolved="$(git -C "$SCENEWORKS_PROVENANCE_ROOT" rev-parse HEAD)"
-          if [[ ! "$resolved" =~ ^[0-9a-f]{40}$ || "$resolved" != "${{ inputs.sceneworks_revision }}" ]]; then
+          if [[ ! "$resolved" =~ ^[0-9a-f]{40}$ || "$resolved" != "$REQUESTED_SCENEWORKS_REVISION" ]]; then
             echo "sceneworks_revision did not resolve to the exact requested commit" >&2
             exit 1
           fi
