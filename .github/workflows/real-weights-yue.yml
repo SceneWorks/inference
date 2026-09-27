@@ -29,6 +29,15 @@ name: YuE real-weight validation (CUDA)
 # YuE-v1 job above, as before. Both YuE2 decoders (standard and legacy) are materialized, so the
 # CUDA lane holds the complete generation closure.
 #
+# sc-23002 (the epic's terminal story) adds the registry render to `family: yue2`:
+# `tests/engine_real_weights.rs::registered_loader_generates_a_song_with_every_artifact` on the
+# registry's production device (CUDA, BF16 in a `--features cuda` build) -- the worker's LoadSpec, a
+# ~8 s planned song with every artifact, resume, and the legacy decoder over its cached latents --
+# then `parity::real_weight_decodes_match_upstream`, every AR mode including the Chinese `cot = full`
+# case against the pinned upstream (F32 on the runner's CPU by construction). Each harness prints
+# `YUE2_EVIDENCE_SUMMARY {json}` lines (candle_audio_yue2::evidence); the steps copy them into
+# `*-summary.txt` in the evidence artifact.
+#
 # `mode: memory` (sc-19387) replaces the three smokes with the device-memory measurement feeding the
 # SceneWorks CUDA admission estimate: `tests/cuda_memory_real_weights.rs::measure_one_case`, one
 # process per (case, tier), at the Metal capture's request shapes -- `cot_default`, `icl_default`,
@@ -281,8 +290,8 @@ jobs:
 
   # sc-22995: YuE2 precision tiers on CUDA (see the header). `timeout-minutes: 240` is a runaway
   # guard for a lane that has never executed: a cold `--features cuda` release build, a one-time
-  # ~7.4 GB fetch, the F32 CPU reference (~10 min on the dev Mac), two tier derivations and six
-  # measured configurations.
+  # ~7.4 GB fetch, the F32 CPU reference (~10 min on the dev Mac), two tier derivations, six
+  # measured configurations, one registry render and the CPU AR parity replay (sc-23002).
   candle-audio-yue2:
     name: Candle YuE2 precision tiers real weights (CUDA)
     if: inputs.family == 'yue2'
@@ -356,10 +365,11 @@ jobs:
           "%REVIEWED_PYTHON%" scripts/release/ensure_model_snapshot.py --model yue2-vae-legacy --snapshot "%CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT%" || exit /b 1
       # Its own step so the cold nvcc/MSVC build reads as build time in the run's step timings.
       - name: Build the YuE2 CUDA test binary
+        id: build-yue2
         shell: cmd
         run: |
           call "%VCVARS%"
-          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib --no-run || exit /b 1
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib --test engine_real_weights --no-run || exit /b 1
       - name: Run the YuE2 CUDA lib tests
         shell: cmd
         run: |
@@ -393,6 +403,38 @@ jobs:
           if exist "%YUE2_QUALITY_OUT%\quality-*.json" copy /y "%YUE2_QUALITY_OUT%\quality-*.json" "%YUE2_EVIDENCE%\" >nul
           if not "%rc%"=="0" (echo ::error::the YuE2 tier quality measurement failed& exit /b 1)
           findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::the quality test did not run exactly once& exit /b 1)
+          findstr /C:"YUE2_EVIDENCE_SUMMARY {" "%log%" > "%YUE2_EVIDENCE%\tier-quality-summary.txt" || (echo ::error::the quality test printed no evidence summary& exit /b 1)
+          exit /b 0
+      # sc-23002: the registered loader on the registry's production device (CUDA, BF16), with the
+      # same record-only nvidia-smi sampler as the tier measurement, then the AR parity replay (every
+      # mode, the Chinese case included; CPU F32 by construction). Runs even when the tier
+      # measurement failed, as long as the test binaries built.
+      - name: Render YuE2 through the registered loader and replay the AR parity cases
+        if: ${{ !cancelled() && steps.build-yue2.outcome == 'success' }}
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          set "YUE2_HF_HUB=%CANDLE_GEN_MODELS_ROOT%"
+          set "YUE2_FAILED=0"
+          set "log=%YUE2_EVIDENCE%\registry-render.log"
+          set "vram=%YUE2_EVIDENCE%\registry-render-vram.csv"
+          start "" /b powershell -NoProfile -Command "while (-not (Test-Path '%vram%.stop')) { nvidia-smi --query-gpu=timestamp,index,memory.used --format=csv,noheader,nounits | Add-Content -Path '%vram%'; Start-Sleep -Milliseconds 500 }"
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --test engine_real_weights registered_loader_generates_a_song_with_every_artifact -- --ignored --exact --nocapture > "%log%" 2>&1
+          set "rc=%ERRORLEVEL%"
+          echo stop> "%vram%.stop"
+          powershell -NoProfile -Command "Start-Sleep -Seconds 2; Import-Csv -Header t,i,m '%vram%' | Group-Object i | ForEach-Object { 'cuda:' + $_.Name + ' peak ' + ($_.Group | Measure-Object -Property m -Maximum).Maximum + ' MiB' }"
+          type "%log%"
+          if not "%rc%"=="0" (echo ::error::the YuE2 registry render failed& set "YUE2_FAILED=1")
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::the registry render did not run exactly once& set "YUE2_FAILED=1")
+          findstr /C:"YUE2_EVIDENCE_SUMMARY {" "%log%" > "%YUE2_EVIDENCE%\registry-render-summary.txt" || (echo ::error::the registry render printed no evidence summary& set "YUE2_FAILED=1")
+          set "log=%YUE2_EVIDENCE%\ar-parity.log"
+          cargo test --locked --release -p candle-audio-yue2 --features cuda --lib parity::real_weight_decodes_match_upstream -- --ignored --exact --nocapture > "%log%" 2>&1
+          set "rc=%ERRORLEVEL%"
+          type "%log%"
+          if not "%rc%"=="0" (echo ::error::the YuE2 AR parity replay failed& set "YUE2_FAILED=1")
+          findstr /C:"test result: ok. 1 passed" "%log%" >nul || (echo ::error::the AR parity replay did not run exactly once& set "YUE2_FAILED=1")
+          findstr /C:"zh_full semantic:" "%log%" >nul || (echo ::error::the AR parity replay did not reach the Chinese case& set "YUE2_FAILED=1")
+          if not "%YUE2_FAILED%"=="0" exit /b 1
           exit /b 0
       # Metrics and logs only: no weights, no latents, no audio (those derive from CC BY-NC 4.0
       # weights and stay on the runner).
