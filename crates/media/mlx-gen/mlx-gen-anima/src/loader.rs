@@ -156,6 +156,8 @@ pub fn load_text_phase(
     let root = resolve_split_files(source)?;
     let te_weights = Weights::from_file(root.join(TEXT_ENCODER_FILE))?;
     let text_encoder = AnimaQwen3::from_weights(&te_weights, "model", &Qwen3Config::anima())?;
+    // Materialize at load (sc-24245; see `load_heavy_phase_with_stream`).
+    te_weights.materialize_accessed()?;
     let tokenizers = AnimaTokenizers::load()?;
     Ok((text_encoder, tokenizers))
 }
@@ -216,6 +218,25 @@ pub fn load_heavy_phase_with_stream(
         &format!("{prefix}.llm_adapter"),
         ConditionerConfig::anima(),
     )?;
+    // Materialize at load (sc-24245): MLX runs a safetensors `Load` on its CPU stream; left lazy, the
+    // first forward's Metal command buffers wait on the disk read — past the GPU watchdog on a cold
+    // page cache (see `mlx_gen_qwen_image::loader::load_transformer_with`). A streamable load always
+    // runs a block window (`model.rs` arms it only when `window_size.is_some()`), so the
+    // `{prefix}.blocks.*` bodies stay lazy for the stream to read per window; the conditioner
+    // (`{prefix}.llm_adapter.*`) and the DiT's non-block tensors are read here.
+    if streamable {
+        let blocks = format!("{prefix}.blocks.");
+        let resident: Vec<(String, mlx_rs::Array)> = dit_weights
+            .accessed_entries()
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(&blocks))
+            .collect();
+        let mut named: Vec<(&str, &mlx_rs::Array)> =
+            resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Weights::materialize_named(&mut named)?;
+    } else {
+        dit_weights.materialize_accessed()?;
+    }
 
     let vae = load_vae(root.join(VAE_FILE))?;
     Ok((dit, conditioner, vae))
@@ -268,12 +289,15 @@ pub fn load_conditioning_at_dtype(
         &format!("{prefix}.llm_adapter"),
         ConditionerConfig::anima(),
     )?;
+    // Materialize at load (sc-24245; see `load_heavy_phase_with_stream`).
+    cond_weights.materialize_accessed()?;
 
     // Text encoder: its own file. The whole tower runs at `dtype`, so cast every weight.
     let mut te_weights = Weights::from_file(root.join(TEXT_ENCODER_FILE))?;
     te_weights.cast_all(dtype)?;
     let text_encoder =
         AnimaQwen3::from_weights_dtype(&te_weights, "model", &Qwen3Config::anima(), dtype)?;
+    te_weights.materialize_accessed()?;
 
     Ok((text_encoder, conditioner))
 }

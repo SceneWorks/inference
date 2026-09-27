@@ -50,6 +50,9 @@ impl Sd3BlockStream {
             self.arch.num_heads as i32,
             self.arch.head_dim as i32,
         )?;
+        // Read this block's bytes now, before its forward is encoded; left lazy, the window's `eval`
+        // makes Metal command buffers wait on the disk read (sc-24245; see `crate::loader`).
+        weights.materialize_accessed()?;
         weights.remove_accessed();
         Ok(block)
     }

@@ -455,6 +455,9 @@ pub fn load(dir: impl AsRef<std::path::Path>, part: VaePart, dtype: Dtype) -> Re
         VaePart::Decode => MageVae::from_weights(&w, dtype, true)?,
         VaePart::Both => MageVae::from_weights_full(&w, dtype)?,
     };
+    // Materialize at load, after the cast and before any `quantize` (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`).
+    w.materialize_accessed()?;
     // Remove exactly the tensors constructors proved they read. Wholesale requested-prefix removal
     // would hide a missing constructor field: with access tracking, one omitted read remains below
     // and is a hard load error.

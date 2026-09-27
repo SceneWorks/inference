@@ -120,6 +120,9 @@ impl TextBlockStream {
             self.cfg.head_dim,
             self.eps,
         )?;
+        // Read this layer's bytes on the CPU stream now, before its forward is encoded; left lazy,
+        // the window's `eval` makes Metal command buffers wait on the disk read (sc-24245).
+        view.materialize_accessed()?;
         view.remove_accessed();
         if let Some(bits) = self.layer_quant_bits {
             layer.quantize(bits)?;
@@ -208,8 +211,23 @@ impl Qwen3VlTextEncoder {
         eps: f32,
         rope_theta: f64,
     ) -> Result<Self> {
+        Self::from_weights_draining_with(w, prefix, cfg, eps, rope_theta, false)
+    }
+
+    /// [`Self::from_weights_draining`], materializing each tensor before its source handle is
+    /// drained (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`). `streamed`
+    /// leaves the decoder layers lazy: the armed block stream re-reads each one per window.
+    pub(crate) fn from_weights_draining_with(
+        w: &mut Weights,
+        prefix: &str,
+        cfg: &QwenVlTextConfig,
+        eps: f32,
+        rope_theta: f64,
+        streamed: bool,
+    ) -> Result<Self> {
         let embed_prefix = join(prefix, "embed_tokens");
         let embed_tokens = embedding(w, &embed_prefix)?;
+        w.materialize_accessed()?;
         w.remove_prefix(&format!("{embed_prefix}."));
         let mut layers = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
@@ -222,10 +240,14 @@ impl Qwen3VlTextEncoder {
                 cfg.head_dim,
                 eps,
             )?);
+            if !streamed {
+                w.materialize_accessed()?;
+            }
             w.remove_prefix(&format!("{layer_prefix}."));
         }
         let norm_key = join(prefix, "norm.weight");
         let norm = w.require(&norm_key)?.clone();
+        w.materialize_accessed()?;
         w.remove(&norm_key);
         Ok(Self {
             embed_tokens,

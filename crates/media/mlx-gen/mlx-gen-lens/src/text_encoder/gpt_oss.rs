@@ -650,6 +650,13 @@ impl GptOssMoe {
                 let blocks = w.require(&format!("{prefix}.experts.{name}_proj_blocks"))?;
                 let scales = w.require(&format!("{prefix}.experts.{name}_proj_scales"))?;
                 let bias = w.require(&format!("{prefix}.experts.{name}_proj_bias"))?;
+                // Materialize the MXFP4 source before the GPU dequant+quantize `eval` below, so it
+                // never waits on an unread `Load` (sc-24245).
+                Weights::materialize_named(&mut [
+                    ("blocks", blocks),
+                    ("scales", scales),
+                    ("bias", bias),
+                ])?;
                 let p = prequantize_expert_proj(blocks, scales, bias, bits, gs)?;
                 Ok(StackedQuant {
                     wq: p.weight,

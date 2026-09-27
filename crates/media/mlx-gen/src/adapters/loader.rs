@@ -1593,6 +1593,10 @@ pub fn apply_adapter_specs(
                 }
             }
         };
+        // Materialize the factors this file contributed at load (sc-24245): left lazy, the first
+        // forward's command buffers wait on the safetensors reads — past the GPU watchdog on a
+        // cold page cache (see `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
         combined.applied += report.applied;
         combined.unmatched_paths.extend(report.unmatched_paths);
     }
@@ -1795,6 +1799,10 @@ fn apply_adapter_specs_autoprefix_reported(
                 .into());
             }
         };
+        // Materialize the factors this file contributed at load (sc-24245): left lazy, the first
+        // forward's command buffers wait on the safetensors reads — past the GPU watchdog on a
+        // cold page cache (see `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
         reports.push(report);
     }
     Ok(reports)
@@ -1958,6 +1966,10 @@ fn fold_diff_patch_adapters_reported(
         for (stem, parts) in groups {
             fold_one_diff_module(host, &stem, &parts, spec.scale, &mut report)?;
         }
+        // Materialize the factors this file contributed at load (sc-24245): left lazy, the first
+        // forward's command buffers wait on the safetensors reads — past the GPU watchdog on a
+        // cold page cache (see `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
         reports.push(report);
     }
     Ok(reports)

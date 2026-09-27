@@ -90,6 +90,8 @@ fn load_neg_embed(dt: Dtype) -> Result<Array> {
     std::fs::write(&tmp, BYTES)?;
     std::fs::rename(&tmp, &path)?;
     let w = Weights::from_file(&path)?;
+    // Materialize at load (sc-24245) so the first denoise never waits on this read.
+    w.materialize()?;
     Ok(w.require("embedding")?.as_dtype(dt)?.expand_dims(0)?)
 }
 
@@ -129,6 +131,10 @@ impl Seedvr2Pipeline {
         // The VAE has no duplicated keys, so its order stays as-is.
         let dit_w = prepare_dit(&Weights::from_file(&dit_path)?, dt)?;
         let mut p = Self::from_weights(&vae_w, &dit_w, cfg)?;
+        // Materialize at load, after the cast and before the registry's `quantize` (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        vae_w.materialize_accessed()?;
+        dit_w.materialize_accessed()?;
         p.neg_embed = Some(load_neg_embed(dt)?);
         p.dtype = dt;
         p.weights_bytes = weights_bytes;

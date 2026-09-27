@@ -470,6 +470,10 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
         // exact path eager; the contract refuses rung 4 until the artifact is a pre-merged turnkey.
         T2iModel::from_weights(&weights, &cfg)?
     };
+    // Materialize at load, before the LoRA merge and `quantize` (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`). The deferred build never reads the
+    // generation-path block bodies, so they stay lazy for the Gen block stream.
+    weights.materialize_accessed()?;
     // The fast variant merges the 8-step distill LoRA into the dense generation path — UNLESS the
     // tier is a **pre-merged** turnkey (sc-8775: the packed/dense fast tiers bake the merge in at
     // convert time and drop `DISTILL_MERGED_MARKER`). A pre-merged tier must NOT re-merge: for a
@@ -483,6 +487,8 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
     if let Some(lora_path) = distill_lora_path {
         let lora = Weights::from_file(&lora_path)?;
         let applied = model.merge_distill_lora(&lora)?;
+        // The merge is lazy: read the LoRA factors now, before `quantize`/the first forward (sc-24245).
+        lora.materialize_accessed()?;
         let expected = cfg.llm.num_hidden_layers * 7 + 2;
         if applied != expected {
             return Err(Error::Msg(format!(

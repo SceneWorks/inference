@@ -211,6 +211,9 @@ impl Krea2Transformer {
             None if self.blocks.is_empty() && self.block_stream.is_some() => {
                 crate::block_memory_strategy::TRANSFORMER_WINDOW_SIZE as usize
             }
+            // An armed load whose resident blocks were built but never read at load (sc-24245)
+            // must not forward them lazily: route through the stream with one all-covering window.
+            None if self.block_stream.is_some() => self.cfg.num_layers,
             None => return Ok(None),
         };
         if self.block_stream.is_none() {

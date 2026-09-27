@@ -94,7 +94,10 @@ pub fn load_vae(path: impl AsRef<Path>) -> Result<QwenVae> {
     diff.cast_all(mlx_rs::Dtype::Float32)?;
     // 2. diffusers → internal (rename + conv transposes + gamma→1-D), then assemble.
     mlx_gen_qwen_image::loader::remap_vae_keys(&mut diff)?;
-    QwenVae::from_weights(&diff)
+    let vae = QwenVae::from_weights(&diff)?;
+    // Materialize at load (sc-24245; see `crate::loader::load_heavy_phase_with_stream`).
+    diff.materialize_accessed()?;
+    Ok(vae)
 }
 
 #[cfg(test)]

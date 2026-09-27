@@ -285,7 +285,11 @@ pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<KolorsText, K
         spec.offload_policy,
         move || {
             let root = resolve_root(&spec_text)?;
-            let mut text = KolorsText::load(&root, dtype)?;
+            let mut text = KolorsText::load_streamed(
+                &root,
+                dtype,
+                crate::memory_strategy::streamable(&spec_text),
+            )?;
             // Q4/Q8 quantizes the 6B ChatGLM3 encoder in place after the dense load (the U-Net
             // quantizes in `load_heavy_owned`). Deterministic, so byte-identical across residencies.
             if let Some(q) = spec_text.quantize {

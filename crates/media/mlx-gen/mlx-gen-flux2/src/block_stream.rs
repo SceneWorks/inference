@@ -77,6 +77,9 @@ impl Flux2BlockStream {
             self.cfg.head_dim as i32,
             self.quant,
         )?;
+        // Read this block's bytes on the CPU stream now, before its forward is encoded; left lazy,
+        // the window's `eval` waits on the disk read inside Metal command buffers (sc-24245).
+        view.materialize_accessed()?;
         view.remove_accessed();
         Ok(block)
     }
@@ -99,6 +102,9 @@ impl Flux2BlockStream {
             self.cfg.head_dim as i32,
             self.quant,
         )?;
+        // Read this block's bytes on the CPU stream now, before its forward is encoded; left lazy,
+        // the window's `eval` waits on the disk read inside Metal command buffers (sc-24245).
+        view.materialize_accessed()?;
         view.remove_accessed();
         Ok(block)
     }

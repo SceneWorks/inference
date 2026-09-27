@@ -300,6 +300,9 @@ fn merge_one(
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let lw = Weights::from_file(&spec.path)?;
+    // Adapter factors are lazy too: read them at load so neither the fold nor the first forward
+    // waits on the safetensors reads (sc-24245; the SDXL/LTX adapter loaders' precedent).
+    lw.materialize()?;
     if spec.kind == AdapterKind::Lokr || is_lokr(&lw) {
         // LoKr (sc-2393 — net-new; the reference Wan path is LoRA-only) merges through the same
         // in-place weight fold, with the delta reconstructed from Kronecker factors instead of B·A.
@@ -727,6 +730,9 @@ fn install_one_additive(
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let lw = Weights::from_file(&spec.path)?;
+    // Adapter factors are lazy too: read them at load so neither the fold nor the first forward
+    // waits on the safetensors reads (sc-24245; the SDXL/LTX adapter loaders' precedent).
+    lw.materialize()?;
     if spec.kind == AdapterKind::Lokr || is_lokr(&lw) {
         return install_one_lokr_additive(host, &lw, spec.scale, normalize, report);
     }
