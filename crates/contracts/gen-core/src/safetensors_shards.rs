@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::{Error, Result};
 
 /// Authorized physical roots for a caller-provisioned component directory. Ordinary directories
-/// authorize only themselves. A component beneath `models--*/snapshots/<revision>/` also
+/// authorize only themselves. A component at or beneath `models--*/snapshots/<revision>/` also
 /// authorizes that same repository's `blobs/` directory, if present.
 pub fn snapshot_shard_roots(dir: &Path) -> Result<Vec<PathBuf>> {
     let component = std::fs::canonicalize(dir)
@@ -21,7 +21,7 @@ pub fn snapshot_shard_roots(dir: &Path) -> Result<Vec<PathBuf>> {
         )));
     }
     let mut roots = vec![component.clone()];
-    for revision in component.ancestors().skip(1) {
+    for revision in component.ancestors() {
         let Some(snapshots) = revision.parent() else {
             continue;
         };
@@ -466,5 +466,46 @@ mod tests {
                 .to_string()
                 .contains("outside authorized shard roots")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_root_shards_can_resolve_only_own_repository_blobs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("models--org--root-weights");
+        let snapshot = repository.join("snapshots/revision");
+        let blobs = repository.join("blobs");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir(&blobs).unwrap();
+        std::fs::write(blobs.join("digest"), b"data").unwrap();
+        symlink("../../blobs/digest", snapshot.join("model.safetensors")).unwrap();
+
+        let roots = snapshot_shard_roots(&snapshot).unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                std::fs::canonicalize(&snapshot).unwrap(),
+                std::fs::canonicalize(&blobs).unwrap()
+            ]
+        );
+        assert_eq!(
+            resolve_safetensors_shards(&snapshot, "model", &roots).unwrap(),
+            vec![std::fs::canonicalize(blobs.join("digest")).unwrap()]
+        );
+
+        let outside = repository.join("outside.safetensors");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(
+            "../../outside.safetensors",
+            snapshot.join("outside.safetensors"),
+        )
+        .unwrap();
+        index(&snapshot, &["outside.safetensors"]);
+        assert!(resolve_safetensors_shards(&snapshot, "model", &roots)
+            .unwrap_err()
+            .to_string()
+            .contains("outside authorized shard roots"));
     }
 }
