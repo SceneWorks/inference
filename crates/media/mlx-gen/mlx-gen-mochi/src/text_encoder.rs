@@ -13,6 +13,9 @@
 
 use std::path::Path;
 
+use mlx_gen::gen_core::safetensors_shards::{
+    resolve_directory_safetensors_shards, resolve_indexed_safetensors_shards, snapshot_shard_roots,
+};
 use mlx_gen::tokenizer::to_arrays;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -58,30 +61,23 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
 /// shard set), merged into one [`Weights`]. Falls back to [`Weights::from_dir`] when no index is
 /// present (a single-file or unambiguous checkpoint).
 fn load_indexed_shards(dir: &Path) -> Result<Weights> {
-    let index = dir.join("model.safetensors.index.json");
-    if !index.exists() {
-        return Weights::from_dir(dir);
-    }
-    let text = std::fs::read_to_string(&index)
-        .map_err(|e| Error::Msg(format!("mochi t5 index {}: {e}", index.display())))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| Error::Msg(format!("mochi t5 index {}: {e}", index.display())))?;
-    let map = json
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .ok_or_else(|| Error::Msg(format!("mochi t5 index {}: no weight_map", index.display())))?;
-
-    // Unique shard filenames, sorted for determinism.
-    let mut shard_files: Vec<String> = map
-        .values()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
-    shard_files.sort();
-    shard_files.dedup();
+    let roots = snapshot_shard_roots(dir).map_err(|e| Error::Msg(e.to_string()))?;
+    let paths =
+        match resolve_indexed_safetensors_shards(dir, "model.safetensors.index.json", &roots)
+            .map_err(|e| Error::Msg(e.to_string()))?
+        {
+            Some(paths) => paths,
+            None => {
+                let paths = resolve_directory_safetensors_shards(dir, &roots)
+                    .map_err(|e| Error::Msg(e.to_string()))?;
+                let paths: Vec<_> = paths.into_iter().map(|path| path.loader_path).collect();
+                return Weights::from_paths(&paths, dir);
+            }
+        };
 
     let mut combined = Weights::empty();
-    for f in shard_files {
-        let shard = Weights::from_file(dir.join(&f))?;
+    for path in paths {
+        let shard = Weights::from_file(path.loader_path)?;
         let keys: Vec<String> = shard.keys().map(String::from).collect();
         for k in keys {
             // `get` is guaranteed to hit — we're iterating this shard's own keys.
@@ -143,6 +139,105 @@ pub fn encode_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shard(path: &Path, key: &str, value: f32) {
+        let header = format!(r#"{{"{key}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn index(dir: &Path, name: &str) {
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map":{"a":"a.safetensors","b":name,"c":"a.safetensors"}})
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn indexed_t5_loader_confines_all_shards_before_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("text_encoder");
+        std::fs::create_dir(&dir).unwrap();
+        shard(&dir.join("a.safetensors"), "a", 1.0);
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        shard(&dir.join("nested/b.safetensors"), "b", 2.0);
+        index(&dir, "nested/b.safetensors");
+        let weights = load_indexed_shards(&dir).unwrap();
+        assert!(weights.keys().any(|key| key == "a"));
+        assert!(weights.keys().any(|key| key == "b"));
+
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            index(&dir, name);
+            assert!(load_indexed_shards(&dir).is_err(), "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp.path().join("outside.safetensors");
+            shard(&outside, "b", 3.0);
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            index(&dir, "external.safetensors");
+            assert!(load_indexed_shards(&dir)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("outside authorized"));
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            index(&dir, "pipe.safetensors");
+            assert!(load_indexed_shards(&dir)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a regular file"));
+            std::fs::remove_file(&fifo).unwrap();
+
+            let repository = temp.path().join("models--org--mochi-t5");
+            let linked_dir = repository.join("snapshots/revision/text_encoder");
+            let blobs = repository.join("blobs");
+            std::fs::create_dir_all(&linked_dir).unwrap();
+            std::fs::create_dir(&blobs).unwrap();
+            shard(&blobs.join("digest"), "a", 4.0);
+            symlink("../../../blobs/digest", linked_dir.join("a.safetensors")).unwrap();
+            std::fs::write(
+                linked_dir.join("model.safetensors.index.json"),
+                r#"{"weight_map":{"a":"a.safetensors"}}"#,
+            )
+            .unwrap();
+            assert!(load_indexed_shards(&linked_dir)
+                .unwrap()
+                .keys()
+                .any(|key| key == "a"));
+
+            std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+            std::fs::remove_file(dir.join("external.safetensors")).unwrap();
+            assert!(load_indexed_shards(&dir)
+                .unwrap()
+                .keys()
+                .any(|key| key == "a"));
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            assert!(
+                load_indexed_shards(&dir).is_err(),
+                "fallback must reject FIFO before loading"
+            );
+        }
+    }
 
     /// The additive key mask is `0` for non-pad ids and [`T5_MASK_NEG`] for pad (id 0), shaped
     /// `[1, 1, 1, L]` for broadcast over the T5 attention scores.

@@ -48,6 +48,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import sys
 import tempfile
 from pathlib import Path
@@ -63,6 +64,15 @@ UPSTREAM_SHA256 = {
     "mmtokenizer.py": "1473edc703423b06ec404847f63fac4ceff0775c13d674e0d0b4d6e741c0cd05",
     "mm_tokenizer_v0.2_hf/tokenizer.model": "ee5c7cbf32da93989f14d9ba635e3e1d1ab2cc88a92908a5ed0f149375f6ee49",
 }
+
+
+def load_codec_state(path="./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth"):
+    import torch
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)["codec_model"]
+    except pickle.UnpicklingError as exc:
+        raise ValueError(f"{path}: xcodec checkpoint requires a tensor-only PyTorch export") from exc
 # The functions/classes lifted verbatim out of infer.py (the rest of it is a CLI script that loads
 # both models at import time).
 UPSTREAM_DEFS = ("BlockTokenRangeProcessor", "stage2_generate", "stage2_inference")
@@ -301,9 +311,7 @@ def encode_cb0(root: Path, np, torch) -> list[int]:
     try:
         cfg = OmegaConf.load("./xcodec_mini_infer/final_ckpt/config.yaml")
         codec = SoundStream(**cfg.generator.config)
-        state = torch.load("./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth", map_location="cpu",
-                           weights_only=False)
-        codec.load_state_dict(state["codec_model"])
+        codec.load_state_dict(load_codec_state())
         codec.eval()
         clip = torch.as_tensor(synthetic_clip(np, CLIP_SECONDS))[None, None, :]
         with torch.no_grad():

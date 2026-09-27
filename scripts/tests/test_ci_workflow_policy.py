@@ -2513,7 +2513,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("ensure_model_snapshot.py", job)
         self.assertIn("SCENEWORKS_PROVENANCE_ROOT: ${{ runner.temp }}/sceneworks-provenance", job)
         self.assertIn("https://github.com/SceneWorks/SceneWorks.git", job)
-        self.assertIn('fetch --depth=1 origin "${{ inputs.sceneworks_revision }}"', job)
+        self.assertIn(
+            "REQUESTED_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}", job
+        )
+        self.assertIn('fetch --depth=1 -- origin "$REQUESTED_SCENEWORKS_REVISION"', job)
         self.assertIn('git -C "$SCENEWORKS_PROVENANCE_ROOT" rev-parse HEAD', job)
         self.assertIn('echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"', job)
         self.assertGreaterEqual(

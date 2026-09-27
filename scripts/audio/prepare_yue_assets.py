@@ -68,6 +68,7 @@ import argparse
 import hashlib
 import json
 import os
+import pickle
 import random
 import shutil
 import signal
@@ -257,7 +258,13 @@ def build_tokenizer_json(model_file: Path, yue: Path, out: Path) -> dict:
 def _state_dict(path: Path, key: str | None):
     import torch
 
-    obj = torch.load(path, map_location="cpu", weights_only=False)
+    try:
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise ValueError(
+            f"{path}: safe tensor checkpoint load failed; provide a tensor-only PyTorch "
+            "checkpoint or a trusted safetensors export"
+        ) from exc
     sd = obj[key] if key else obj
     tensors = {k: v for k, v in sd.items() if torch.is_tensor(v)}
     if len(tensors) != len(sd):

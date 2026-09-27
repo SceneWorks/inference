@@ -62,6 +62,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -141,6 +142,24 @@ def reference_root() -> Path:
     return inf
 
 
+def load_codec_state(path="./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth"):
+    import torch
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)["codec_model"]
+    except pickle.UnpicklingError as exc:
+        raise ValueError(f"{path}: xcodec checkpoint requires a tensor-only PyTorch export") from exc
+
+
+def load_decoder_state(path):
+    import torch
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise ValueError(f"{path}: Vocos decoder checkpoint requires a tensor-only PyTorch export") from exc
+
+
 def tiny() -> None:
     """The weights-free toy-width fixtures (see the module docstring)."""
     reference_root()
@@ -202,14 +221,13 @@ def main() -> None:
     torch.manual_seed(0)
     cfg = OmegaConf.load("./xcodec_mini_infer/final_ckpt/config.yaml")
     codec = SoundStream(**cfg.generator.config)
-    codec.load_state_dict(torch.load("./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth",
-                                     map_location="cpu", weights_only=False)["codec_model"])
+    codec.load_state_dict(load_codec_state())
     codec.eval()
 
     def vocos(path: str):
         # Upstream `vocoder.build_codec_model`, minus its CUDA-only `torch.load` (no map_location).
         d = VocosDecoder.from_hparams(config_path="./xcodec_mini_infer/decoders/config.yaml")
-        d.load_state_dict(torch.load(path, map_location="cpu"))
+        d.load_state_dict(load_decoder_state(path))
         return d.eval()
 
     decoders = {

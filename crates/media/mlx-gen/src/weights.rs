@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mlx_rs::{Array, Dtype};
 
@@ -260,12 +260,21 @@ impl Weights {
         if files.is_empty() {
             return Err(format!("no .safetensors files in {}", dir.display()).into());
         }
+        Self::from_paths(&files, dir)
+    }
+
+    /// Load a previously selected shard set with the same disjoint-key and metadata behavior as
+    /// [`Self::from_dir`]. The caller chooses and validates the complete path list before loading.
+    pub fn from_paths(files: &[PathBuf], source_dir: &Path) -> Result<Self> {
+        if files.is_empty() {
+            return Err(format!("no .safetensors files in {}", source_dir.display()).into());
+        }
         let mut tensors = HashMap::new();
         let mut metadata = HashMap::new();
         for f in files {
             // Name the offending file: the underlying mlx-c error carries only its own C++ source
             // location, so a corrupt/foreign file in a shard dir was previously undiagnosable.
-            let (t, m) = Array::load_safetensors_with_metadata(&f)
+            let (t, m) = Array::load_safetensors_with_metadata(f)
                 .map_err(|e| Error::from(format!("loading shard {}: {e}", f.display())))?;
             // Shards are expected to be disjoint; a key collision means the shard set is wrong (e.g.
             // a stray extra file in the dir) and a plain `extend` would silently let the later shard
@@ -275,7 +284,7 @@ impl Weights {
                 if tensors.insert(k.clone(), v).is_some() {
                     return Err(format!(
                         "duplicate tensor key `{k}` across shards in {} (non-disjoint shard set)",
-                        dir.display()
+                        source_dir.display()
                     )
                     .into());
                 }
