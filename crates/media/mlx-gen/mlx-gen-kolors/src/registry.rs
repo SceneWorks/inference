@@ -318,7 +318,8 @@ fn load_heavy_owned(
     dtype: Dtype,
     use_pid: bool,
 ) -> Result<KolorsHeavyOwned> {
-    let mut heavy = KolorsHeavy::load(root, dtype)?;
+    let mut heavy =
+        KolorsHeavy::load_streamed(root, dtype, crate::memory_strategy::streamable(spec))?;
     if !spec.adapters.is_empty() {
         heavy.apply_lora(&spec.adapters)?;
     }

@@ -716,13 +716,18 @@ impl WanVae {
             None
         };
 
-        Ok(Self {
+        let vae = Self {
             conv2: CausalConv3d::from_weights(w, "conv2", 1)?,
             decoder: Decoder3d::from_weights(w)?,
             encoder,
             mean,
             inv_std,
-        })
+        };
+        // Materialize at load: left lazy, the first encode/decode's command buffers wait on the
+        // safetensors reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(vae)
     }
 
     /// Decode a normalized latent `[B, z, T, H, W]` → video `[B, 3, 4·T, 8·H, 8·W]` in `[-1, 1]`.

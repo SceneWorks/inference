@@ -36,9 +36,9 @@ use mlx_gen_sdxl::{
     denoise_curated_with_preview as denoise_curated_registered,
     denoise_ip_control_with_preview as denoise_ip_control_registered,
     denoise_ip_with_preview as denoise_ip_registered, denoise_with_preview as denoise_registered,
-    encode_init_latents, load_unet_kolors_dtype, load_vae, preprocess_control_image, Autoencoder,
-    ControlContext, ControlNet, Denoiser, IpImageEncoder, LoraCoverage, SdxlForwardPlan,
-    SdxlLoraReport, UNet2DConditionModel,
+    encode_init_latents, load_unet_with_config_streamed, load_vae, preprocess_control_image,
+    Autoencoder, ControlContext, ControlNet, Denoiser, IpImageEncoder, LoraCoverage,
+    SdxlForwardPlan, SdxlLoraReport, UNet2DConditionModel, UNetConfig,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -354,7 +354,19 @@ impl KolorsHeavy {
     /// `dtype`. The VAE always runs f32 (`sdxl-vae-fp16-fix`). Held after the ChatGLM3 encoder is
     /// dropped under `Sequential`.
     pub fn load(snapshot: &std::path::Path, dtype: Dtype) -> Result<Self> {
-        let unet = load_unet_kolors_dtype(snapshot, dtype)?;
+        Self::load_streamed(snapshot, dtype, false)
+    }
+
+    /// [`load`](Self::load) for a load that will [`arm_block_streams`](Self::arm_block_streams)
+    /// when `streamed` is set: the U-Net materializes at load (sc-24245) except the streamed
+    /// transformer-block bodies, which the block stream materializes per window.
+    pub(crate) fn load_streamed(
+        snapshot: &std::path::Path,
+        dtype: Dtype,
+        streamed: bool,
+    ) -> Result<Self> {
+        let unet =
+            load_unet_with_config_streamed(snapshot, dtype, &UNetConfig::kolors(), streamed)?;
         let vae = load_vae(snapshot)?; // SDXL VAE (sdxl-vae-fp16-fix), f32
         Ok(Self { unet, vae, dtype })
     }
