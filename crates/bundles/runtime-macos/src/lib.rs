@@ -215,13 +215,14 @@ mod tests {
             &ss2::cover::CoverOptions,
         ) -> Result<ss2::cover::CoverPlan, ss2::Error> = ss2::cover::plan_cover;
         type LoadEngine = fn() -> Result<ss2::cover::EngineCover, ss2::Error>;
-        let _run: fn(
+        type RunCover = fn(
             Option<ss2::provider::Transcriber>,
             &ss2::cover::CoverPlan,
             LoadEngine,
             &std::path::Path,
             &dyn Fn() -> bool,
-        ) -> Result<ss2::cover::CoverOutcome, ss2::Error> = ss2::cover::run_cover;
+        ) -> Result<ss2::cover::CoverOutcome, ss2::Error>;
+        let _run: RunCover = ss2::cover::run_cover;
         ss2::provider::check_device(&Device::Cpu).expect("the CPU is a transcription device");
 
         // Noncommercial only: the owner basis covers the port, never commercial use or
