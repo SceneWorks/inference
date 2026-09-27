@@ -10,6 +10,9 @@
 
 use std::path::Path;
 
+use candle_audio::gen_core::safetensors_shards::{
+    resolve_safetensors_shards, snapshot_shard_roots,
+};
 use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
 
 /// Relative path of the DiT shard index inside a snapshot.
@@ -69,30 +72,23 @@ fn safetensors_tensor_count(path: &Path) -> CoreResult<usize> {
 
 fn count_component(dir: &Path, stem: &str, total: &mut usize) -> CoreResult<()> {
     let index = dir.join(format!("{stem}.safetensors.index.json"));
-    if index.is_file() {
-        let text = std::fs::read_to_string(&index)
-            .map_err(|e| CoreError::Msg(format!("prepare: read {}: {e}", index.display())))?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| CoreError::Msg(format!("prepare: {}: {e}", index.display())))?;
-        let mut shards: Vec<String> = v
-            .get("weight_map")
-            .and_then(|m| m.as_object())
-            .map(|m| {
-                m.values()
-                    .filter_map(|s| s.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        shards.sort();
-        shards.dedup();
-        for shard in shards {
-            *total += safetensors_tensor_count(&dir.join(shard))?;
-        }
-    } else {
-        let single = dir.join(format!("{stem}.safetensors"));
-        if single.is_file() {
-            *total += safetensors_tensor_count(&single)?;
-        }
+    let single = dir.join(format!("{stem}.safetensors"));
+    let present = |path: &Path| match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CoreError::Msg(format!(
+            "prepare: inspect {}: {error}",
+            path.display()
+        ))),
+    };
+    if !present(&index)? && !present(&single)? {
+        return Ok(());
+    }
+    let roots = snapshot_shard_roots(dir).map_err(|e| CoreError::Msg(e.to_string()))?;
+    let shards =
+        resolve_safetensors_shards(dir, stem, &roots).map_err(|e| CoreError::Msg(e.to_string()))?;
+    for shard in shards {
+        *total += safetensors_tensor_count(&shard)?;
     }
     Ok(())
 }
@@ -215,5 +211,54 @@ mod tests {
         let mut s = spec(&dir);
         s.quantize = Some(core_llm::Quantize::Q4);
         assert!(matches!(prepare(&s), Err(CoreError::Unsupported(_))));
+    }
+
+    #[test]
+    fn preparer_rejects_index_paths_and_nonregular_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("text_encoder");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), tiny_safetensors(&["x"])).unwrap();
+        let index = dir.join("model.safetensors.index.json");
+        let mut total = 0;
+        std::fs::write(&index, r#"{"weight_map":{"x":"model.safetensors"}}"#).unwrap();
+        count_component(&dir, "model", &mut total).unwrap();
+        assert_eq!(total, 1);
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            std::fs::write(
+                &index,
+                serde_json::json!({"weight_map":{"x":name}}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                count_component(&dir, "model", &mut total).is_err(),
+                "{name}"
+            );
+            assert_eq!(total, 1);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp.path().join("outside.safetensors");
+            std::fs::write(&outside, tiny_safetensors(&["x"])).unwrap();
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            std::fs::write(&index, r#"{"weight_map":{"x":"external.safetensors"}}"#).unwrap();
+            assert!(count_component(&dir, "model", &mut total).is_err());
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(&index, r#"{"weight_map":{"x":"pipe.safetensors"}}"#).unwrap();
+            assert!(count_component(&dir, "model", &mut total)
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file"));
+        }
     }
 }
