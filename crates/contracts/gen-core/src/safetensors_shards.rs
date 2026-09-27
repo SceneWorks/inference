@@ -56,49 +56,76 @@ pub fn resolve_safetensors_shards(
     stem: &str,
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
-    if allowed_roots.is_empty() {
-        return Err(Error::Msg(
-            "safetensors shards have no authorized roots".into(),
-        ));
+    let index_name = format!("{stem}.safetensors.index.json");
+    if let Some(paths) = resolve_indexed_safetensors_shards(dir, &index_name, allowed_roots)? {
+        return Ok(paths.into_iter().map(|path| path.canonical_path).collect());
     }
-    let roots = allowed_roots
-        .iter()
-        .map(std::fs::canonicalize)
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let index = dir.join(format!("{stem}.safetensors.index.json"));
-    let names = match std::fs::symlink_metadata(&index) {
-        Ok(_) => {
-            let index_target = validate_file(&index, &roots)?;
-            let text = std::fs::read_to_string(&index_target)
-                .map_err(|e| Error::Msg(format!("read {}: {e}", index.display())))?;
-            let json: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| Error::Msg(format!("parse {}: {e}", index.display())))?;
-            let map = json
-                .get("weight_map")
-                .and_then(|value| value.as_object())
-                .ok_or_else(|| Error::Msg(format!("{}: no weight_map", index.display())))?;
-            if map.is_empty() {
-                return Err(Error::Msg(format!("{}: empty weight_map", index.display())));
-            }
-            let mut names = Vec::with_capacity(map.len());
-            for (tensor, value) in map {
-                let name = value.as_str().ok_or_else(|| {
-                    Error::Msg(format!(
-                        "{}: shard for {tensor:?} is not a filename",
-                        index.display()
-                    ))
-                })?;
-                names.push(name.to_owned());
-            }
-            names.sort();
-            names.dedup();
-            names
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            vec![format!("{stem}.safetensors")]
-        }
+    let roots = canonical_roots(allowed_roots)?;
+    Ok(vec![validate_file(
+        &dir.join(format!("{stem}.safetensors")),
+        &roots,
+    )?])
+}
+
+/// A selected shard's original loader path and authorized canonical target. Candle can mmap the
+/// target directly. MLX requires the `.safetensors` extension on the path passed to its loader,
+/// so it uses `loader_path` for repository `blobs/<digest>` symlinks after full-set validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedShardPath {
+    pub loader_path: PathBuf,
+    pub canonical_path: PathBuf,
+}
+
+/// Resolve every distinct shard named by a particular index, including variant indexes such as
+/// `diffusion_pytorch_model.safetensors.index.bf16.json`. Returns `None` only when the index does
+/// not exist; a present malformed or non-regular index is an error. Callers retain their existing
+/// no-index fallback. The entire selected set is checked before any path is returned for loading.
+pub fn resolve_indexed_safetensors_shards(
+    dir: &Path,
+    index_name: &str,
+    allowed_roots: &[PathBuf],
+) -> Result<Option<Vec<ResolvedShardPath>>> {
+    if !matches!(
+        Path::new(index_name)
+            .components()
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [Component::Normal(_)]
+    ) {
+        return Err(Error::Msg(format!(
+            "invalid shard index name {index_name:?}"
+        )));
+    }
+    let roots = canonical_roots(allowed_roots)?;
+    let index = dir.join(index_name);
+    let index_target = match std::fs::symlink_metadata(&index) {
+        Ok(_) => validate_file(&index, &roots)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::Msg(format!("inspect {}: {error}", index.display()))),
     };
+    let text = std::fs::read_to_string(&index_target)
+        .map_err(|e| Error::Msg(format!("read {}: {e}", index.display())))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::Msg(format!("parse {}: {e}", index.display())))?;
+    let map = json
+        .get("weight_map")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| Error::Msg(format!("{}: no weight_map", index.display())))?;
+    if map.is_empty() {
+        return Err(Error::Msg(format!("{}: empty weight_map", index.display())));
+    }
+    let mut names = Vec::with_capacity(map.len());
+    for (tensor, value) in map {
+        let name = value.as_str().ok_or_else(|| {
+            Error::Msg(format!(
+                "{}: shard for {tensor:?} is not a filename",
+                index.display()
+            ))
+        })?;
+        names.push(name.to_owned());
+    }
+    names.sort();
+    names.dedup();
     let mut paths = Vec::with_capacity(names.len());
     for name in names {
         let path = Path::new(&name);
@@ -115,10 +142,61 @@ pub fn resolve_safetensors_shards(
                 index.display()
             )));
         }
-        let shard = dir.join(path);
-        paths.push(validate_file(&shard, &roots)?);
+        let loader_path = dir.join(path);
+        paths.push(ResolvedShardPath {
+            canonical_path: validate_file(&loader_path, &roots)?,
+            loader_path,
+        });
     }
-    Ok(paths)
+    Ok(Some(paths))
+}
+
+fn canonical_roots(allowed_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if allowed_roots.is_empty() {
+        return Err(Error::Msg(
+            "safetensors shards have no authorized roots".into(),
+        ));
+    }
+    Ok(allowed_roots
+        .iter()
+        .map(std::fs::canonicalize)
+        .collect::<std::io::Result<Vec<_>>>()?)
+}
+
+/// Preserve the existing direct-child `.safetensors` fallback enumeration used by Candle and
+/// MLX: skip hidden sidecars, sort lexical paths, and require at least one shard. Validate the
+/// whole set before returning paths so no fallback loader can open a FIFO or an
+/// unauthorized symlink before discovering a later bad entry.
+pub fn resolve_directory_safetensors_shards(
+    dir: &Path,
+    allowed_roots: &[PathBuf],
+) -> Result<Vec<ResolvedShardPath>> {
+    let roots = canonical_roots(allowed_roots)?;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| Error::Msg(format!("read shard directory {}: {e}", dir.display())))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "safetensors")
+        })
+        .filter(|path| !crate::weightsmeta::is_hidden_file(path))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(Error::Msg(format!(
+            "no .safetensors files in {}",
+            dir.display()
+        )));
+    }
+    files
+        .into_iter()
+        .map(|loader_path| {
+            Ok(ResolvedShardPath {
+                canonical_path: validate_file(&loader_path, &roots)?,
+                loader_path,
+            })
+        })
+        .collect()
 }
 
 fn validate_file(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
@@ -191,6 +269,79 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing.safetensors"));
+    }
+
+    #[test]
+    fn named_variant_index_and_directory_fallback_keep_selection_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::write(dir.join("z.safetensors"), b"z").unwrap();
+        std::fs::write(dir.join("a.safetensors"), b"a").unwrap();
+        std::fs::write(dir.join("._sidecar.safetensors"), b"sidecar").unwrap();
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("nested/part.bin"), b"nested").unwrap();
+        let roots = snapshot_shard_roots(dir).unwrap();
+        let variant = "diffusion_pytorch_model.safetensors.index.bf16.json";
+        assert!(resolve_indexed_safetensors_shards(dir, variant, &roots)
+            .unwrap()
+            .is_none());
+        std::fs::write(
+            dir.join(variant),
+            r#"{"weight_map":{"a":"z.safetensors","b":"nested/part.bin","c":"z.safetensors"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_indexed_safetensors_shards(dir, variant, &roots)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|path| path.canonical_path)
+                .collect::<Vec<_>>(),
+            vec![
+                std::fs::canonicalize(dir.join("nested/part.bin")).unwrap(),
+                std::fs::canonicalize(dir.join("z.safetensors")).unwrap()
+            ]
+        );
+        assert_eq!(
+            resolve_directory_safetensors_shards(dir, &roots)
+                .unwrap()
+                .into_iter()
+                .map(|path| path.canonical_path)
+                .collect::<Vec<_>>(),
+            vec![
+                std::fs::canonicalize(dir.join("a.safetensors")).unwrap(),
+                std::fs::canonicalize(dir.join("z.safetensors")).unwrap()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_fallback_validates_every_target_before_loading() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("component");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.safetensors"), b"a").unwrap();
+        let roots = snapshot_shard_roots(&dir).unwrap();
+        let fifo = dir.join("z.safetensors");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(resolve_directory_safetensors_shards(&dir, &roots)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        std::fs::remove_file(&fifo).unwrap();
+        let outside = temp.path().join("outside.safetensors");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, dir.join("z.safetensors")).unwrap();
+        assert!(resolve_directory_safetensors_shards(&dir, &roots)
+            .unwrap_err()
+            .to_string()
+            .contains("outside authorized shard roots"));
     }
 
     #[test]

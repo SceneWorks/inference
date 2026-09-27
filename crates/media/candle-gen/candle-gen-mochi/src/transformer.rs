@@ -24,6 +24,9 @@
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::safetensors_shards::{
+    resolve_directory_safetensors_shards, resolve_indexed_safetensors_shards, snapshot_shard_roots,
+};
 use candle_gen::quant::QLinear;
 use candle_gen::{CandleError, Result};
 
@@ -655,53 +658,28 @@ pub fn load_transformer_var_builder(
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
     let dir = root.join("transformer");
-    let bf16_index = dir.join("diffusion_pytorch_model.safetensors.index.bf16.json");
-    if bf16_index.exists() {
-        return load_index_named(
-            &dir,
-            "diffusion_pytorch_model.safetensors.index.bf16.json",
-            dtype,
-            device,
-        );
-    }
-    let index = dir.join("diffusion_pytorch_model.safetensors.index.json");
-    if index.exists() {
-        return load_index_named(
-            &dir,
-            "diffusion_pytorch_model.safetensors.index.json",
-            dtype,
-            device,
-        );
-    }
-    candle_gen::load_sorted_mmap(&dir, dtype, device, "mochi dit")
-}
-
-/// mmap a VarBuilder over only the shards referenced by `<dir>/<index_name>`'s `weight_map`.
-fn load_index_named(
-    dir: &std::path::Path,
-    index_name: &str,
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>> {
-    let index = dir.join(index_name);
-    let text = std::fs::read_to_string(&index)
-        .map_err(|e| CandleError::Msg(format!("mochi dit index {}: {e}", index.display())))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| CandleError::Msg(format!("mochi dit index {}: {e}", index.display())))?;
-    let map = json
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .ok_or_else(|| {
-            CandleError::Msg(format!(
-                "mochi dit index {}: no weight_map",
-                index.display()
-            ))
-        })?;
-    let shard_files: std::collections::BTreeSet<String> = map
-        .values()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
-    let files: Vec<std::path::PathBuf> = shard_files.into_iter().map(|f| dir.join(f)).collect();
+    let roots = snapshot_shard_roots(&dir).map_err(|e| CandleError::Msg(e.to_string()))?;
+    let files = if let Some(files) = resolve_indexed_safetensors_shards(
+        &dir,
+        "diffusion_pytorch_model.safetensors.index.bf16.json",
+        &roots,
+    )
+    .map_err(|e| CandleError::Msg(e.to_string()))?
+    {
+        files
+    } else if let Some(files) = resolve_indexed_safetensors_shards(
+        &dir,
+        "diffusion_pytorch_model.safetensors.index.json",
+        &roots,
+    )
+    .map_err(|e| CandleError::Msg(e.to_string()))?
+    {
+        files
+    } else {
+        resolve_directory_safetensors_shards(&dir, &roots)
+            .map_err(|e| CandleError::Msg(format!("mochi dit: {e}")))?
+    };
+    let files: Vec<_> = files.into_iter().map(|path| path.canonical_path).collect();
     candle_gen::mmap_var_builder(&files, dtype, device)
 }
 
@@ -710,6 +688,134 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
     use std::collections::HashMap;
+
+    fn shard(path: &std::path::Path, key: &str, value: f32) {
+        let header = format!(r#"{{"{key}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn indexed_transformer_loader_confines_bf16_and_standard_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let dir = root.join("transformer");
+        std::fs::create_dir(&dir).unwrap();
+        shard(&dir.join("a.safetensors"), "a", 1.0);
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        shard(&dir.join("nested/b.bin"), "b", 2.0);
+        let bf16 = dir.join("diffusion_pytorch_model.safetensors.index.bf16.json");
+        let standard = dir.join("diffusion_pytorch_model.safetensors.index.json");
+        std::fs::write(
+            &bf16,
+            r#"{"weight_map":{"a":"a.safetensors","b":"nested/b.bin","c":"a.safetensors"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &standard,
+            r#"{"weight_map":{"a":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        let vb = load_transformer_var_builder(root, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(
+            vb.get((1,), "a").unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0]
+        );
+        assert_eq!(
+            vb.get((1,), "b").unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0]
+        );
+
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            std::fs::write(
+                &bf16,
+                serde_json::json!({"weight_map":{"a":"a.safetensors","b":name}}).to_string(),
+            )
+            .unwrap();
+            assert!(
+                load_transformer_var_builder(root, DType::F32, &Device::Cpu).is_err(),
+                "{name}"
+            );
+        }
+        std::fs::remove_file(&bf16).unwrap();
+        std::fs::write(&standard, r#"{"weight_map":{"a":"a.safetensors"}}"#).unwrap();
+        assert!(load_transformer_var_builder(root, DType::F32, &Device::Cpu).is_ok());
+        std::fs::write(
+            &standard,
+            r#"{"weight_map":{"a":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(load_transformer_var_builder(root, DType::F32, &Device::Cpu).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = root.join("outside.safetensors");
+            shard(&outside, "b", 3.0);
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            std::fs::write(&standard, r#"{"weight_map":{"a":"external.safetensors"}}"#).unwrap();
+            assert!(load_transformer_var_builder(root, DType::F32, &Device::Cpu)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("outside authorized"));
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(&standard, r#"{"weight_map":{"a":"pipe.safetensors"}}"#).unwrap();
+            assert!(load_transformer_var_builder(root, DType::F32, &Device::Cpu)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a regular file"));
+            std::fs::remove_file(&fifo).unwrap();
+
+            let repository = root.join("models--org--mochi-dit");
+            let cache_root = repository.join("snapshots/revision");
+            let cache_dir = cache_root.join("transformer");
+            let blobs = repository.join("blobs");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::create_dir(&blobs).unwrap();
+            shard(&blobs.join("digest"), "a", 4.0);
+            symlink("../../../blobs/digest", cache_dir.join("a.safetensors")).unwrap();
+            std::fs::write(
+                cache_dir.join("diffusion_pytorch_model.safetensors.index.bf16.json"),
+                r#"{"weight_map":{"a":"a.safetensors"}}"#,
+            )
+            .unwrap();
+            let vb = load_transformer_var_builder(&cache_root, DType::F32, &Device::Cpu).unwrap();
+            assert_eq!(
+                vb.get((1,), "a").unwrap().to_vec1::<f32>().unwrap(),
+                vec![4.0]
+            );
+
+            std::fs::remove_file(&standard).unwrap();
+            std::fs::remove_file(dir.join("external.safetensors")).unwrap();
+            let fallback = load_transformer_var_builder(root, DType::F32, &Device::Cpu).unwrap();
+            assert_eq!(
+                fallback.get((1,), "a").unwrap().to_vec1::<f32>().unwrap(),
+                vec![1.0]
+            );
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            assert!(
+                load_transformer_var_builder(root, DType::F32, &Device::Cpu).is_err(),
+                "fallback must reject FIFO before mmap"
+            );
+        }
+    }
 
     /// Deterministic small "random" fill, bounded so the block stays well-conditioned.
     fn rnd(shape: &[usize], seed: u64, dev: &Device) -> Tensor {
