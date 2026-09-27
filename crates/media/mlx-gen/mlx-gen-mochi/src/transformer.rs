@@ -33,6 +33,9 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::safetensors_shards::{
+    resolve_directory_safetensors_shards, resolve_indexed_safetensors_shards, snapshot_shard_roots,
+};
 use mlx_gen::nn::{conv2d, quantized_matmul_with_bias, silu, timestep_sincos};
 use mlx_gen::qkv::{
     self, AttnPrepSpec, NormDtype, QkNormSpec, QkvHeads, QkvSource, RopeDtype, RopeSpec, RopeStyle,
@@ -50,34 +53,26 @@ use crate::rope::MochiRope;
 /// block/model actually touches are upcast (block_parity builds one block → casts one block's weights).
 pub fn load_transformer_weights(root: &Path) -> Result<Weights> {
     let dir = root.join("transformer");
-    let index = dir.join("diffusion_pytorch_model.safetensors.index.bf16.json");
-    if !index.exists() {
-        return Weights::from_dir(&dir);
-    }
-    let text = std::fs::read_to_string(&index)
-        .map_err(|e| Error::Msg(format!("mochi dit index {}: {e}", index.display())))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| Error::Msg(format!("mochi dit index {}: {e}", index.display())))?;
-    let map = json
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .ok_or_else(|| {
-            Error::Msg(format!(
-                "mochi dit index {}: no weight_map",
-                index.display()
-            ))
-        })?;
-
-    let mut shard_files: Vec<String> = map
-        .values()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
-    shard_files.sort();
-    shard_files.dedup();
+    let roots = snapshot_shard_roots(&dir).map_err(|e| Error::Msg(e.to_string()))?;
+    let paths = match resolve_indexed_safetensors_shards(
+        &dir,
+        "diffusion_pytorch_model.safetensors.index.bf16.json",
+        &roots,
+    )
+    .map_err(|e| Error::Msg(e.to_string()))?
+    {
+        Some(paths) => paths,
+        None => {
+            let paths = resolve_directory_safetensors_shards(&dir, &roots)
+                .map_err(|e| Error::Msg(e.to_string()))?;
+            let paths: Vec<_> = paths.into_iter().map(|path| path.loader_path).collect();
+            return Weights::from_paths(&paths, &dir);
+        }
+    };
 
     let mut combined = Weights::empty();
-    for f in shard_files {
-        let shard = Weights::from_file(dir.join(&f))?;
+    for path in paths {
+        let shard = Weights::from_file(path.loader_path)?;
         let keys: Vec<String> = shard.keys().map(String::from).collect();
         for k in keys {
             if let Some(t) = shard.get(&k) {
@@ -963,6 +958,107 @@ impl MochiTransformer3DModel {
 mod tests {
     use super::*;
     use mlx_rs::ops::{abs, max as mx_max, quantize, subtract};
+
+    fn shard(path: &Path, key: &str, value: f32) {
+        let header = format!(r#"{{"{key}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn indexed_transformer_loader_confines_shards_before_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let dir = root.join("transformer");
+        std::fs::create_dir(&dir).unwrap();
+        shard(&dir.join("a.safetensors"), "a", 1.0);
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        shard(&dir.join("nested/b.safetensors"), "b", 2.0);
+        let index = dir.join("diffusion_pytorch_model.safetensors.index.bf16.json");
+        std::fs::write(
+            &index,
+            r#"{"weight_map":{"a":"a.safetensors","b":"nested/b.safetensors","c":"a.safetensors"}}"#,
+        )
+        .unwrap();
+        let weights = load_transformer_weights(root).unwrap();
+        assert!(weights.keys().any(|key| key == "a"));
+        assert!(weights.keys().any(|key| key == "b"));
+
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            std::fs::write(
+                &index,
+                serde_json::json!({"weight_map":{"a":"a.safetensors","b":name}}).to_string(),
+            )
+            .unwrap();
+            assert!(load_transformer_weights(root).is_err(), "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = root.join("outside.safetensors");
+            shard(&outside, "b", 3.0);
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            std::fs::write(&index, r#"{"weight_map":{"a":"external.safetensors"}}"#).unwrap();
+            assert!(load_transformer_weights(root)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("outside authorized"));
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(&index, r#"{"weight_map":{"a":"pipe.safetensors"}}"#).unwrap();
+            assert!(load_transformer_weights(root)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a regular file"));
+            std::fs::remove_file(&fifo).unwrap();
+
+            let repository = root.join("models--org--mochi-dit");
+            let cache_root = repository.join("snapshots/revision");
+            let cache_dir = cache_root.join("transformer");
+            let blobs = repository.join("blobs");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::create_dir(&blobs).unwrap();
+            shard(&blobs.join("digest"), "a", 4.0);
+            symlink("../../../blobs/digest", cache_dir.join("a.safetensors")).unwrap();
+            std::fs::write(
+                cache_dir.join("diffusion_pytorch_model.safetensors.index.bf16.json"),
+                r#"{"weight_map":{"a":"a.safetensors"}}"#,
+            )
+            .unwrap();
+            assert!(load_transformer_weights(&cache_root)
+                .unwrap()
+                .keys()
+                .any(|key| key == "a"));
+
+            std::fs::remove_file(&index).unwrap();
+            std::fs::remove_file(dir.join("external.safetensors")).unwrap();
+            assert!(load_transformer_weights(root)
+                .unwrap()
+                .keys()
+                .any(|key| key == "a"));
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            assert!(
+                load_transformer_weights(root).is_err(),
+                "fallback must reject FIFO before loading"
+            );
+        }
+    }
 
     /// Weightless packer round-trip: quantize a synthetic bf16 Linear, consume it through
     /// [`MochiLinear::load`] (the `.scales` probe), and check the packed forward is finite,
