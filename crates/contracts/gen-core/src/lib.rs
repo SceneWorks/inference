@@ -45,6 +45,7 @@ pub mod memory_strategy;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
+pub mod safetensors_shards;
 pub mod sampling;
 pub mod sd3_encoder_artifacts;
 pub mod sd3_request;
