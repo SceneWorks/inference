@@ -30,6 +30,7 @@ class RealWeightsDispatchInputTests(unittest.TestCase):
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", step["run"]],
             env={**os.environ, **environment},
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=False,
         )
@@ -128,8 +129,14 @@ class RealWeightsDispatchInputTests(unittest.TestCase):
                 step, environment={**base_env, "REQUESTED_SCENEWORKS_REVISION": REVISION}
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(f"fetch --depth=1 -- origin {REVISION}", git_log.read_text())
-            self.assertEqual(github_env.read_text(), f"SCENEWORKS_REVISION={REVISION}\n")
+            self.assertIn(
+                f"fetch --depth=1 -- origin {REVISION}",
+                git_log.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                github_env.read_text(encoding="utf-8"),
+                f"SCENEWORKS_REVISION={REVISION}\n",
+            )
 
             git_log.unlink()
             github_env.unlink()
