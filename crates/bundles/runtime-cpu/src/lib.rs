@@ -4,8 +4,10 @@
 pub use candle_audio_catalog::audio;
 /// The Candle audio provider crates this bundle ships, for their public APIs beyond the registry
 /// (sc-22988): e.g. `candle_audio_yue2`'s run verification, saved-plan restore, cover preparation
-/// and decode-budget helpers. Exactly the audio catalog's provider set, so a crate the catalog
-/// leaves out (the gated `candle-audio-sheetsage2` transcription crate) is not reachable here.
+/// and decode-budget helpers, and `candle_audio_sheetsage2`'s recording → score transcription,
+/// review artifact and cover sequencing (sc-23002; noncommercial, CC BY-NC 4.0 on the owner basis
+/// recorded 2026-09-27; transcription runs on the CPU or CUDA, never Metal). Exactly the audio
+/// catalog's provider set.
 #[cfg(feature = "audio")]
 pub mod audio_providers {
     pub use candle_audio_catalog::providers::*;
@@ -139,6 +141,82 @@ pub fn catalog() -> runtime_catalog::Result<RuntimeCatalog> {
 
 #[cfg(test)]
 mod tests {
+    /// SceneWorks reaches SheetSage2 transcription only through this bundle (sc-23002): the crate is
+    /// re-exported beside `candle_audio_yue2`, the whole recording → transcription → review → cover
+    /// path is public with the signatures a consumer calls, the cover closure is authorized for
+    /// noncommercial use only, and the audio catalog publishes the closure's licence rows under the
+    /// crate-API provider id `sheetsage2`.
+    #[cfg(feature = "audio")]
+    #[test]
+    fn the_bundle_reaches_sheetsage2_transcription_and_publishes_its_licence_rows() {
+        use super::audio_providers::candle_audio_sheetsage2 as ss2;
+        use super::audio_providers::candle_audio_yue2 as yue2;
+        use ss2::candle_core::Device;
+        use yue2::license::{authorize_closure, IntendedUse};
+
+        // The public path, as typed function items: a signature change fails to compile here.
+        let _resolve: fn(
+            yue2::Closure,
+            &yue2::SnapshotDirs,
+        ) -> Result<yue2::VerifiedClosure, yue2::AssetError> = yue2::snapshot::resolve_closure;
+        let _load: fn(
+            &yue2::VerifiedClosure,
+            &Device,
+        ) -> Result<ss2::provider::Transcriber, ss2::Error> = ss2::provider::Transcriber::load;
+        let _unload: fn(ss2::provider::Transcriber) -> ss2::provider::UnloadReceipt =
+            ss2::provider::Transcriber::unload;
+        let _save: fn(
+            &ss2::review::Transcription,
+            &std::path::Path,
+            &ss2::tokenizer::Tokenizer,
+        ) -> Result<String, ss2::Error> = ss2::review::Transcription::save;
+        let _open: fn(&std::path::Path) -> Result<ss2::review::ReviewArtifact, ss2::Error> =
+            ss2::review::ReviewArtifact::open;
+        let _replay: fn(
+            &ss2::review::ReviewArtifact,
+        ) -> Result<ss2::review::ReplayReport, ss2::Error> = ss2::review::ReviewArtifact::replay;
+        let _plan: fn(
+            &ss2::review::ReviewArtifact,
+            &ss2::cover::CoverOptions,
+        ) -> Result<ss2::cover::CoverPlan, ss2::Error> = ss2::cover::plan_cover;
+        type LoadEngine = fn() -> Result<ss2::cover::EngineCover, ss2::Error>;
+        let _run: fn(
+            Option<ss2::provider::Transcriber>,
+            &ss2::cover::CoverPlan,
+            LoadEngine,
+            &std::path::Path,
+            &dyn Fn() -> bool,
+        ) -> Result<ss2::cover::CoverOutcome, ss2::Error> = ss2::cover::run_cover;
+        ss2::provider::check_device(&Device::Cpu).expect("the CPU is a transcription device");
+
+        // Noncommercial only: the owner basis covers the port, never commercial use or
+        // redistribution of the weights.
+        authorize_closure(
+            yue2::Closure::Cover,
+            IntendedUse::NoncommercialExperimentation,
+        )
+        .expect("recording -> transcription -> cover is a supported noncommercial path");
+        for refused in [IntendedUse::CommercialUse, IntendedUse::Redistribution] {
+            assert!(authorize_closure(yue2::Closure::Cover, refused).is_err());
+        }
+
+        // The catalog publishes the cover closure's rows and the `sheetsage2` mapping.
+        let rows = candle_audio_catalog::component_licenses();
+        for row in ss2::provider::COMPONENT_LICENSES {
+            assert!(rows.contains(row), "{} is not published", row.component);
+        }
+        let mapping = candle_audio_catalog::provider_components();
+        let published = mapping
+            .iter()
+            .find(|p| p.provider_id == ss2::provider::TRANSCRIBER_ID)
+            .expect("the sheetsage2 mapping is published");
+        assert_eq!(
+            published.components,
+            ["yue2_sheetsage2", "yue2_mert_v2_fullsong"]
+        );
+        assert!(candle_audio_catalog::CRATE_API_PROVIDERS.contains(&ss2::provider::TRANSCRIBER_ID));
+    }
+
     /// SceneWorks reaches YuE2 only through this bundle (sc-22988): its registered provider, the
     /// memory controls it advertises, and the crate's own API (a decode budget in GiB → the
     /// request's `decode_tile_edge`) through the re-exported provider crates.

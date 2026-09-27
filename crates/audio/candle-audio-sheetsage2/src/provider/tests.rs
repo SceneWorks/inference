@@ -227,3 +227,32 @@ fn published_components_are_the_cover_closure_with_noncommercial_terms() {
         "{terms:?}"
     );
 }
+
+/// The CPU is accepted by the device check (and the tiny model loads on it — every test above).
+#[test]
+fn the_cpu_is_an_accepted_device() {
+    check_device(&Device::Cpu).unwrap();
+}
+
+/// A Metal device is refused before any model exists: candle's Metal backend cannot run the GRN's
+/// float64 reduction, so without this refusal a transcription would fail only on its first window,
+/// after the multi-GiB load. Creates a Metal device handle; runs no Metal computation.
+///
+/// Mutation that must fail: drop the `check_device` call from `from_files` (the tiny model then
+/// loads onto Metal and the live-model count rises), or make `check_device` accept every device.
+#[cfg(feature = "metal")]
+#[test]
+fn a_metal_device_is_refused_before_anything_loads() {
+    let _serial = crate::test_lock();
+    let metal = Device::new_metal(0).expect("a Metal device on a metal build");
+    let before = live_models();
+    let err = match Transcriber::from_files(tiny_files(), tiny_identity(), &metal) {
+        Ok(_) => panic!("a Metal transcriber was loaded"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, Error::Config(m) if m.contains("Metal") && m.contains("Device::Cpu")),
+        "{err}"
+    );
+    assert_eq!(live_models(), before);
+}
