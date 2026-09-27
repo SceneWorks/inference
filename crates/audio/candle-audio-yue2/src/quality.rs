@@ -575,6 +575,7 @@ fn tier_quality_against_the_f32_reference() {
         let residency = engine.weight_residency().unwrap();
         let fp8 = engine.fp8_status().unwrap();
         let record = engine_record(&engine, &fixture);
+        let bounds = bounds_record(name, on);
         let on = on.name();
         println!(
             "{name} on {on}: loaded in {load_seconds:.1} s; weights {:.2} GB on the \
@@ -612,6 +613,7 @@ fn tier_quality_against_the_f32_reference() {
                     .map(|(k, v)| (k.clone(), evidence::audio_record(v)))
                     .collect::<serde_json::Map<_, _>>(),
                 "truncated": outputs.truncated,
+                "bounds": bounds,
             }))
         );
         if name == "f32" {
@@ -664,6 +666,7 @@ fn tier_quality_against_the_f32_reference() {
             "dtype": record["dtype"],
             "rng": record["rng"],
             "reference": format!("f32 on {ref_device_name}"),
+            "bounds": bounds,
             "load_seconds": load_seconds,
             "seconds": outputs.seconds,
             "residency": {"device_bytes": residency.device_bytes, "host_bytes": residency.host_bytes},
@@ -701,7 +704,7 @@ fn tier_quality_against_the_f32_reference() {
         )
         .unwrap();
         // The bounds: see `BOUNDS`. Every output is finite (`signal_stats` asserts it).
-        let (_, top1_min, kl_mean_max, snr_min) = BOUNDS
+        let (_, top1_min, kl_mean_max, snr_min, _) = BOUNDS
             .iter()
             .copied()
             .find(|b| b.0 == name)
@@ -739,7 +742,8 @@ fn tier_quality_against_the_f32_reference() {
     }
 }
 
-/// `(config, top-1 agreement ≥, mean KL ≤, latents SNR ≥ dB)` against the F32 reference.
+/// `(config, top-1 agreement ≥, mean KL ≤, latents SNR ≥ dB, backends the bound was measured on)`
+/// against the F32 reference.
 ///
 /// Measured 2026-09-26 — Candle CPU (Apple M-series, F32 activations): q8 99.5 % / 1.5e-4 /
 /// 37.0 dB, q4 93.5 % / 9.0e-3 / 18.3 dB; Candle CUDA (RTX PRO 6000 Blackwell, BF16 activations,
@@ -749,13 +753,66 @@ fn tier_quality_against_the_f32_reference() {
 /// reduction order; each is far outside the next-coarser configuration's measurement (a q8 run
 /// that loaded q4 weights, an FP8 mode left active in the acoustic stage — the bit-identity check
 /// — or a BF16 run on the wrong weights fails).
-const BOUNDS: [(&str, f64, f64, f64); 5] = [
-    ("f32dev", 0.999, 1e-8, 90.0),
-    ("bf16", 0.95, 1e-3, 32.0),
-    ("fp8", 0.93, 6e-3, 32.0),
-    ("q8", 0.95, 1.5e-3, 30.0),
-    ("q4", 0.85, 3e-2, 14.0),
+///
+/// **Metal reuses these CPU/CUDA-derived bounds and is unmeasured until the first Metal run**
+/// (sc-23002): a Metal pass means "within the CPU/CUDA envelope", not "Metal-calibrated". Every
+/// result records the bounds it was judged against and where they were measured
+/// ([`bounds_record`]).
+const BOUNDS: [(&str, f64, f64, f64, &[&str]); 5] = [
+    ("f32dev", 0.999, 1e-8, 90.0, &["cuda"]),
+    ("bf16", 0.95, 1e-3, 32.0, &["cuda"]),
+    ("fp8", 0.93, 6e-3, 32.0, &["cuda"]),
+    ("q8", 0.95, 1.5e-3, 30.0, &["cpu", "cuda"]),
+    ("q4", 0.85, 3e-2, 14.0, &["cpu", "cuda"]),
 ];
+
+/// The bounds configuration `name` is judged against on `device`, with their provenance:
+/// `measured_on` (the backends the [`BOUNDS`] were derived from) and whether `device` is one of
+/// them. `null` for the `f32` reference, which is checked against upstream instead.
+fn bounds_record(name: &str, device: QualityDevice) -> Value {
+    match BOUNDS.iter().find(|b| b.0 == name) {
+        None => Value::Null,
+        Some(&(_, top1_min, kl_mean_max, snr_min, measured_on)) => json!({
+            "top1_agreement_min": top1_min,
+            "kl_mean_max": kl_mean_max,
+            "latents_snr_min_db": snr_min,
+            "measured_on": measured_on,
+            "measured_on_this_device": measured_on.contains(&device.name()),
+        }),
+    }
+}
+
+/// Weights-free: every result names where its bounds were measured, and a Metal result says its
+/// bounds were not measured on Metal.
+#[test]
+fn bounds_carry_their_provenance() {
+    use QualityDevice::{Cpu, Cuda, Metal};
+
+    assert_eq!(bounds_record("f32", Cpu), Value::Null);
+    for &(name, top1_min, ..) in &BOUNDS {
+        let metal = bounds_record(name, Metal);
+        assert_eq!(metal["top1_agreement_min"], top1_min, "{name}");
+        let on: Vec<&str> = metal["measured_on"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: no measured_on"))
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!on.is_empty(), "{name}");
+        assert!(
+            on.iter().all(|b| ["cpu", "cuda"].contains(b)),
+            "{name}: {on:?}"
+        );
+        assert_eq!(metal["measured_on_this_device"], false, "{name} on Metal");
+    }
+    for name in ["q8", "q4"] {
+        let record = bounds_record(name, Metal);
+        assert_eq!(record["measured_on"], json!(["cpu", "cuda"]), "{name}");
+        assert_eq!(bounds_record(name, Cpu)["measured_on_this_device"], true);
+    }
+    assert_eq!(bounds_record("bf16", Cuda)["measured_on_this_device"], true);
+    assert_eq!(bounds_record("bf16", Cpu)["measured_on"], json!(["cuda"]));
+}
 
 /// Weights-free (runs on the CPU): the device and configuration parsing the Metal run depends on.
 #[test]
