@@ -90,13 +90,26 @@ class SafeCheckpointLoadingTests(unittest.TestCase):
         self.assertFalse(self.marker.exists())
 
     def test_yue_reference_loaders(self):
-        for name in ("yue_icl_reference", "yue_stage2_reference", "yue_xcodec_reference"):
+        for name in (
+            "yue_icl_reference", "yue_stage2_reference", "yue_xcodec_reference",
+            "yue_vocos_reference",
+        ):
             with self.subTest(name=name):
                 module = _load(name, f"scripts/reference/{name}.py")
                 self.assert_tensor(module.load_codec_state(self.safe)["encoder.weight"])
                 with self.assertRaisesRegex(ValueError, "tensor-only PyTorch export"):
                     module.load_codec_state(self.unsafe)
                 self.assertFalse(self.marker.exists())
+
+        vocos = _load("yue_vocos_reference_decoder", "scripts/reference/yue_vocos_reference.py")
+        decoder = self.root / "decoder.pt"
+        torch.save({"decoder.weight": self.tensor}, decoder)
+        self.assert_tensor(vocos.load_decoder_state(decoder)["decoder.weight"])
+        with self.assertRaisesRegex(
+            ValueError, "Vocos decoder checkpoint requires a tensor-only PyTorch export"
+        ):
+            vocos.load_decoder_state(self.unsafe)
+        self.assertFalse(self.marker.exists())
 
     def test_vendored_bigvgan_and_mage_vae(self):
         paths = (
@@ -156,6 +169,7 @@ class SafeCheckpointLoadingTests(unittest.TestCase):
             "scripts/reference/yue_icl_reference.py",
             "scripts/reference/yue_stage2_reference.py",
             "scripts/reference/yue_xcodec_reference.py",
+            "scripts/reference/yue_vocos_reference.py",
             "crates/audio/candle-audio-mmaudio/_vendor/mmaudio/ext/bigvgan/utils.py",
             "crates/audio/candle-audio-mmaudio/_vendor/mmaudio/ext/bigvgan_v2/utils.py",
             "crates/audio/candle-audio-mmaudio/_vendor/mmaudio/ext/synchformer/motionformer.py",
@@ -169,9 +183,10 @@ class SafeCheckpointLoadingTests(unittest.TestCase):
                 calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                          and isinstance(node.func, ast.Attribute) and node.func.attr == "load"
                          and isinstance(node.func.value, ast.Name) and node.func.value.id == "torch"]
-                self.assertEqual(len(calls), 1)
-                self.assertTrue(any(keyword.arg == "weights_only" and isinstance(keyword.value, ast.Constant)
-                                    and keyword.value.value is True for keyword in calls[0].keywords))
+                self.assertEqual(len(calls), 2 if path.endswith("yue_vocos_reference.py") else 1)
+                for call in calls:
+                    self.assertTrue(any(keyword.arg == "weights_only" and isinstance(keyword.value, ast.Constant)
+                                        and keyword.value.value is True for keyword in call.keywords))
 
 
 if __name__ == "__main__":
