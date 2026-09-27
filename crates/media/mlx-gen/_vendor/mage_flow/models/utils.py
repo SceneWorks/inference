@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import pickle
 
 import torch
 from einops import rearrange
@@ -118,7 +119,12 @@ def load_model_weight(model, pretrain_path, device="cpu"):
             elif os.path.exists(os.path.join(pretrain_path, "diffusion_pytorch_model.safetensors.index.json")):
                 sd = load_hf_style_weight(pretrain_path, device)
             else:
-                sd = torch.load(pretrain_path, map_location="cpu")
+                try:
+                    sd = torch.load(pretrain_path, map_location="cpu", weights_only=True)
+                except pickle.UnpicklingError as exc:
+                    raise ValueError(
+                        f"{pretrain_path}: unsupported checkpoint object; provide tensor-only weights"
+                    ) from exc
 
             sd = correct_model_weight(sd)
             sd = optionally_expand_state_dict(model, sd)
