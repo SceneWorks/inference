@@ -252,24 +252,18 @@ impl KreaBlockStream {
             return Ok(block);
         }
         if let KreaBlockSource::Native(file) = &self.source {
-            return file.read_unchanged(|_| self.materialize_from_view(view, index, true));
+            return file.read_unchanged(|_| self.materialize_from_view(view, index));
         }
-        self.materialize_from_view(view, index, false)
+        self.materialize_from_view(view, index)
     }
 
-    fn materialize_from_view(
-        &self,
-        view: &mut Weights,
-        index: usize,
-        source_guarded: bool,
-    ) -> Result<SingleStreamBlock> {
+    fn materialize_from_view(&self, view: &mut Weights, index: usize) -> Result<SingleStreamBlock> {
         let mut block = self.assemble_block(view, index)?;
-        if source_guarded {
-            // Evaluate only this block's exact read set before the native pin's post-check. Evaluating
-            // the whole normalized map would make File reopening physically correct but memory-bound
-            // in name only; the accessed subset preserves the real windowed implementation.
-            view.materialize_accessed()?;
-        }
+        // Evaluate only this block's exact read set — before the native pin's post-check, and for
+        // every source before its forward is encoded (and before `quantize`): left lazy, the window's
+        // `eval` waits on the disk read inside Metal command buffers (sc-24245). Evaluating the whole
+        // map would make reopening memory-bound in name only.
+        view.materialize_accessed()?;
         // `Array` handles are refcounted. Removing the exact read set prevents the view from retaining
         // a second handle after the materialized window is dropped.
         view.remove_accessed();

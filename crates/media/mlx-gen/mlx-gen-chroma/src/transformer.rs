@@ -769,6 +769,12 @@ impl ChromaTransformer {
     /// Load from a diffusers `transformer/` weight map. Validates the Chroma key surface + the
     /// pruned-adaLN invariant, then materializes the typed modules.
     pub fn from_weights(w: Weights, cfg: ChromaTransformerConfig) -> Result<Self> {
+        Self::from_weights_ref(&w, cfg)
+    }
+
+    /// [`from_weights`](Self::from_weights) over a borrowed map, so the loader can read back which
+    /// tensors the build accessed and materialize them (sc-24245).
+    pub(crate) fn from_weights_ref(w: &Weights, cfg: ChromaTransformerConfig) -> Result<Self> {
         // Pruned-adaLN invariant: Chroma blocks have NO `.norm*.linear` weights.
         if let Some(k) = w
             .keys()
@@ -801,20 +807,20 @@ impl ChromaTransformer {
         }
 
         let double_blocks = (0..cfg.num_layers)
-            .map(|i| DoubleBlock::load(&w, i, &cfg))
+            .map(|i| DoubleBlock::load(w, i, &cfg))
             .collect::<Result<Vec<_>>>()?;
         let single_blocks = (0..cfg.num_single_layers)
-            .map(|i| SingleBlock::load(&w, i, &cfg))
+            .map(|i| SingleBlock::load(w, i, &cfg))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
-            x_embedder: Lin::load(&w, "x_embedder")?,
-            context_embedder: Lin::load(&w, "context_embedder")?,
+            x_embedder: Lin::load(w, "x_embedder")?,
+            context_embedder: Lin::load(w, "context_embedder")?,
             time_text_embed: TimestepTextProj::new(&cfg)?,
-            approximator: Approximator::load(&w, &cfg)?,
+            approximator: Approximator::load(w, &cfg)?,
             double_blocks,
             single_blocks,
-            proj_out: Lin::load(&w, "proj_out")?,
+            proj_out: Lin::load(w, "proj_out")?,
             cfg,
             block_stream: None,
         })

@@ -351,14 +351,17 @@ pub fn load_sd3_vae(vae_dir: &Path) -> Result<Vae> {
     let mut w = Weights::from_dir(vae_dir)?;
     remap_vae_decoder(&mut w)?;
     remap_vae_encoder(&mut w)?;
-    Vae::from_weights_with_factors(
+    let vae = Vae::from_weights_with_factors(
         &w,
         "",
         &arch.decoder_config(),
         SD3_VAE_SCALING_FACTOR,
         SD3_VAE_SHIFT_FACTOR,
     )?
-    .with_encoder(&w, "encoder", &arch.encoder_config())
+    .with_encoder(&w, "encoder", &arch.encoder_config())?;
+    // Materialize at load (sc-24245; see `crate::loader::load_transformer_with`).
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 #[cfg(test)]

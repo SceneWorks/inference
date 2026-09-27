@@ -52,11 +52,27 @@ pub mod providers {
     pub use candle_audio_moss_tts;
     pub use candle_audio_moss_tts_realtime;
     pub use candle_audio_openvoice;
+    /// SheetSage2 + MERT-v2-FullSong recording → score transcription (sc-23002): the first half of
+    /// the noncommercial recording → transcription → cover path. Reached through this crate's API,
+    /// not the registry (see [`CRATE_API_PROVIDERS`](crate::CRATE_API_PROVIDERS)). CC BY-NC 4.0 on
+    /// the owner basis recorded 2026-09-27; noncommercial only.
+    pub use candle_audio_sheetsage2;
     pub use candle_audio_stable_audio_3;
     pub use candle_audio_whisper;
     pub use candle_audio_yue;
     pub use candle_audio_yue2;
 }
+
+/// Providers whose weight-licence rows this catalog publishes but which are **not** registry
+/// providers: a consumer reaches them through their crate's own API, re-exported from [`providers`]
+/// and from each runtime bundle's `audio_providers`.
+///
+/// `sheetsage2` (sc-23002) is SheetSage2 + MERT-v2-FullSong transcription
+/// ([`candle_audio_sheetsage2::provider::Transcriber`]). Its output is a persisted, replayable
+/// score review artifact (ABC, MIDI, events, warnings) that feeds a YuE2 cover, not the text a
+/// [`gen_core::Transcriber`] returns, so it is not registered as one. Its rows are published all the
+/// same, so the release manifest discloses every artifact a shipped crate loads.
+pub const CRATE_API_PROVIDERS: &[&str] = &[candle_audio_sheetsage2::provider::TRANSCRIBER_ID];
 
 /// Add every provider shipped by the Candle audio lane to an explicit registry builder, in
 /// stable catalog order: the generators first (Kokoro TTS, MOSS SFX, ACE-Step music, Stable Audio 3
@@ -144,8 +160,11 @@ pub fn component_licenses() -> Vec<gen_core::ComponentLicense> {
     rows.extend_from_slice(candle_audio_mmaudio::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_moss_tts::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_yue::COMPONENT_LICENSES);
-    // The generation closure only; the cover closure's rows arrive with the provider that loads it.
+    // The generation closure; the cover closure's rows arrive with the transcriber that loads them.
     rows.extend_from_slice(candle_audio_yue2::PROVIDER_COMPONENT_LICENSES);
+    // The cover closure (SheetSage2 + MERT-v2-FullSong), loaded by the crate-API transcriber
+    // `sheetsage2` (sc-23002; see `CRATE_API_PROVIDERS`).
+    rows.extend_from_slice(candle_audio_sheetsage2::provider::COMPONENT_LICENSES);
     // Deliberately empty: `chatterbox_ve` loads the row `candle-audio-chatterbox` already owns.
     rows.extend_from_slice(candle_audio_chatterbox_ve::COMPONENT_LICENSES);
     rows.extend_from_slice(candle_audio_openvoice::COMPONENT_LICENSES);
@@ -168,6 +187,7 @@ pub fn provider_components() -> Vec<gen_core::ProviderComponents> {
     providers.extend_from_slice(candle_audio_moss_tts::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_yue::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_yue2::PROVIDER_COMPONENTS);
+    providers.extend_from_slice(candle_audio_sheetsage2::provider::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_chatterbox_ve::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_openvoice::PROVIDER_COMPONENTS);
     providers.extend_from_slice(candle_audio_whisper::PROVIDER_COMPONENTS);
@@ -603,9 +623,21 @@ mod tests {
                 "provider '{id}' ships without a recorded model-weight licence"
             );
         }
+        // A mapping without a registered provider is either a crate-API provider — published
+        // deliberately, and never also registered — or a mistake.
+        for id in super::CRATE_API_PROVIDERS {
+            assert!(
+                mapped.contains(*id),
+                "crate-API provider '{id}' has no weight-licence mapping"
+            );
+            assert!(
+                !registered.contains(*id),
+                "crate-API provider '{id}' is also a registered provider"
+            );
+        }
         for id in &mapped {
             assert!(
-                registered.contains(id),
+                registered.contains(id) || super::CRATE_API_PROVIDERS.contains(&id.as_str()),
                 "weight-licence mapping '{id}' has no registered provider"
             );
         }
@@ -866,6 +898,13 @@ mod tests {
                     "yue2_vae_legacy",
                 ],
                 YUE2.to_vec(),
+            ),
+            // sc-23002: the cover closure, loaded by the crate-API transcriber — CC BY-NC 4.0
+            // weights only (noncommercial, attribution); none of the tokenizer's terms.
+            (
+                "sheetsage2",
+                vec!["yue2_sheetsage2", "yue2_mert_v2_fullsong"],
+                vec!["attribution_required", "non_commercial_weights"],
             ),
             // The same artifact row the generator points at — one checkpoint, one row, two
             // providers.

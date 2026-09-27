@@ -864,12 +864,30 @@
       "retrieved": "2026-09-26"
     },
     {
+      "component": "yue2_mert_v2_fullsong",
+      "source_url": "https://huggingface.co/m-a-p/MERT-v2-FullSong",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "MERT-v2-FullSong — MERT2 by Multimodal Art Projection, https://huggingface.co/m-a-p/MERT-v2-FullSong — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
+      "retrieved": "2026-09-26"
+    },
+    {
       "component": "yue2_qwen_tiktoken",
       "source_url": "https://huggingface.co/Qwen/Qwen-7B",
       "gated": false,
       "declared": "tongyi-qianwen-license-agreement",
       "family": "tongyi-qianwen",
       "attribution": "Tongyi Qianwen is licensed under the Tongyi Qianwen LICENSE AGREEMENT, Copyright (c) Alibaba Cloud. All Rights Reserved.",
+      "retrieved": "2026-09-26"
+    },
+    {
+      "component": "yue2_sheetsage2",
+      "source_url": "https://huggingface.co/m-a-p/SheetSage2",
+      "gated": false,
+      "declared": "cc-by-nc-4.0",
+      "family": "cc-by-nc-4-0",
+      "attribution": "SheetSage2 by Multimodal Art Projection, https://huggingface.co/m-a-p/SheetSage2 (adapts MERT-v2-FullSong) — weights licensed under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/)",
       "retrieved": "2026-09-26"
     },
     {
@@ -1141,6 +1159,21 @@
       "terms": [
         {
           "term": "attribution_required"
+        }
+      ]
+    },
+    {
+      "provider_id": "sheetsage2",
+      "components": [
+        "yue2_mert_v2_fullsong",
+        "yue2_sheetsage2"
+      ],
+      "terms": [
+        {
+          "term": "attribution_required"
+        },
+        {
+          "term": "non_commercial_weights"
         }
       ]
     },

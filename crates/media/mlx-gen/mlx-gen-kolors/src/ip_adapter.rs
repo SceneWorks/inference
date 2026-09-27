@@ -51,6 +51,8 @@ pub fn load_kolors_ip_adapter(
         enc_w.cast_all(dtype)?;
     }
     let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_l_14_336())?;
+    // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    enc_w.materialize_accessed()?;
 
     let mut ip_w = Weights::from_file(snapshot.join("ip_adapter_plus_general.safetensors"))?;
     if !is_packed(&ip_w) {
@@ -58,6 +60,8 @@ pub fn load_kolors_ip_adapter(
     }
     let resampler = Resampler::from_weights(&ip_w, "image_proj", &ResamplerConfig::kolors_plus())?;
     let pairs = load_ip_kv_pairs(&ip_w)?;
+    // Materialize at load, before the pairs are installed and quantized with the U-Net (sc-24245).
+    ip_w.materialize_accessed()?;
 
     Ok((
         IpImageEncoder::with_image_size(encoder, resampler, KOLORS_IP_IMAGE_SIZE),

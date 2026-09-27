@@ -35,6 +35,52 @@ fn fail(condition: bool, message: impl FnOnce() -> String) -> Result<(), AbcErro
     }
 }
 
+/// A line boundary of Python's `str.splitlines` (upstream splits the score with it): `\n`, `\r`
+/// (`\r\n` is one boundary), `\v`, `\f`, `\x1c`–`\x1e`, NEL, and the Unicode line and paragraph
+/// separators. Rust's `str::lines` knows only `\n` and `\r\n`.
+fn is_line_boundary(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r'
+            | '\x0b'
+            | '\x0c'
+            | '\x1c'
+            | '\x1d'
+            | '\x1e'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// `str.splitlines(keepends=True)`, as `(content, line ending)` pairs.
+fn split_lines(text: &str) -> Vec<(&str, &str)> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if is_line_boundary(c) {
+            let mut end = i + c.len_utf8();
+            if c == '\r' && chars.next_if(|&(_, next)| next == '\n').is_some() {
+                end += 1;
+            }
+            lines.push((&text[start..i], &text[i..end]));
+            start = end;
+        }
+    }
+    if start < text.len() {
+        lines.push((&text[start..], ""));
+    }
+    lines
+}
+
+/// Python's `str.isspace` for one character: Unicode `White_Space` plus the four information
+/// separators `\x1c`–`\x1f`, which Python also counts as whitespace (upstream skips it between
+/// tokens and strips it around bars).
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+}
+
 /// An exact fraction of a quarter note (upstream uses `fractions.Fraction`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Frac {
@@ -373,7 +419,7 @@ fn parse_bar(body: &str, voice: &mut Voice, unit: Frac, context: &str) -> Result
         let mut cursor = 0;
         while cursor < body.len() {
             let c = body[cursor..].chars().next().expect("in bounds");
-            if c.is_whitespace() {
+            if is_py_space(c) {
                 cursor += c.len_utf8();
                 continue;
             }
@@ -490,7 +536,7 @@ fn parse_bar(body: &str, voice: &mut Voice, unit: Frac, context: &str) -> Result
 
 /// Upstream `parse`: fail closed on unsupported tokens; resolve sounding notes.
 pub fn parse(text: &str) -> Result<Score, AbcError> {
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = split_lines(text).into_iter().map(|(l, _)| l).collect();
     fail(lines.len() < 12, || {
         "Incomplete native two-voice ABC".into()
     })?;
@@ -572,7 +618,7 @@ pub fn parse(text: &str) -> Result<Score, AbcError> {
             cursor += 1;
             let mut bars = Vec::new();
             for bar in line[..line.len() - 1].split('|') {
-                let bar = bar.trim();
+                let bar = bar.trim_matches(is_py_space);
                 fail(bar.is_empty(), || {
                     format!("{context}: empty measure or unsupported double/repeat barline")
                 })?;
@@ -681,9 +727,10 @@ pub fn strip_chords(text: &str, keep: KeepVoice) -> Result<(String, usize), AbcE
     let source = parse(text)?;
     let mut removed = 0;
     let mut out_lines: Vec<String> = Vec::new();
-    for (index, line) in text.split_inclusive('\n').enumerate() {
+    // The same boundaries `parse` indexed its music lines by; line endings are kept verbatim.
+    for (index, (line, ending)) in split_lines(text).into_iter().enumerate() {
         let Some(&voice) = source.music_lines.get(&index) else {
-            out_lines.push(line.to_string());
+            out_lines.push(format!("{line}{ending}"));
             continue;
         };
         let name = VOICES[voice];
@@ -711,6 +758,7 @@ pub fn strip_chords(text: &str, keep: KeepVoice) -> Result<(String, usize), AbcE
                 }
             }
         }
+        result.push_str(ending);
         out_lines.push(result);
     }
     let output = out_lines.concat();

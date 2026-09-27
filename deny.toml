@@ -47,11 +47,13 @@ allow = ["WTFPL"]
 # licenses only the model weights (the "MERT2 model-weight license", CC BY-NC 4.0 for
 # model.safetensors, which "does not replace separately applicable licenses for code"); the remote
 # Python the crate reimplements has NO upstream licence grant. The crate's CC-BY-NC-4.0 field is the
-# provisional disposition sc-22989 recorded (`CODE_TERMS` / `COVER_PORT` in
-# crates/audio/candle-audio-yue2/src/license.rs, kept Gated) pending an owner decision — not an
-# upstream grant. It stays out of the Apache-2.0 `candle-audio-yue2`, the audio catalog and every
-# runtime bundle; see the crate's NOTICE. Scoped per-crate so any other noncommercial licence in the
-# graph still fails.
+# owner basis recorded 2026-09-27 on epic sc-22988 (`COVER_PORT_OWNER_DECISION`, `CODE_TERMS` /
+# `COVER_PORT` Permitted, in crates/audio/candle-audio-yue2/src/license.rs): the port code is
+# distributed under the weights' CC BY-NC 4.0 terms, noncommercial only — not an upstream grant, and
+# not a basis to redistribute the weights or a derived tier (still gated). It stays out of the
+# Apache-2.0 `candle-audio-yue2`; the audio catalog and the runtime bundles compose it as a
+# noncommercial provider; see the crate's NOTICE. Scoped per-crate so any other noncommercial licence
+# in the graph still fails.
 [[licenses.exceptions]]
 name = "candle-audio-sheetsage2"
 allow = ["CC-BY-NC-4.0"]

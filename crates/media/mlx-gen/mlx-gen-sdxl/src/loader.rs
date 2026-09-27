@@ -89,7 +89,12 @@ fn load_clip_dtype(
     if !is_packed(&w) {
         w.cast_all(dtype)?;
     }
-    ClipTextEncoder::from_weights(&w, "text_model", cfg)
+    let encoder = ClipTextEncoder::from_weights(&w, "text_model", cfg)?;
+    // Materialize at load (after the cast, before any `quantize`): left lazy, the first forward's
+    // command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
+    // (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 pub(crate) fn load_clip_from_weights(
@@ -163,13 +168,43 @@ pub fn load_unet_with_config(
     dtype: Dtype,
     cfg: &UNetConfig,
 ) -> Result<UNet2DConditionModel> {
+    load_unet_with_config_streamed(root, dtype, cfg, false)
+}
+
+/// [`load_unet_with_config`] for a load that will arm ladder rung 4
+/// ([`UNet2DConditionModel::arm_block_streams`]) when `streamed` is set.
+///
+/// Materializes at load (sc-24245): left lazy, the first denoise step's command buffers wait on the
+/// safetensors reads — past the GPU watchdog on a cold page cache (see
+/// `mlx_gen_qwen_image::loader::load_transformer_with`). `streamed` leaves every
+/// `*.transformer_blocks.*` body lazy: the block stream re-opens and materializes each block itself,
+/// so reading them here would defeat bounded residency.
+pub fn load_unet_with_config_streamed(
+    root: &Path,
+    dtype: Dtype,
+    cfg: &UNetConfig,
+    streamed: bool,
+) -> Result<UNet2DConditionModel> {
     let file = resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)?;
     let mut w = Weights::from_file(&file)?;
     // A packed (pre-quantized) snapshot keeps its on-disk dtypes; only a dense snapshot downcasts.
     if !is_packed(&w) {
         w.cast_all(dtype)?;
     }
-    UNet2DConditionModel::from_weights(&w, cfg)
+    let unet = UNet2DConditionModel::from_weights(&w, cfg)?;
+    if streamed {
+        let resident: Vec<(String, mlx_rs::Array)> = w
+            .accessed_entries()
+            .into_iter()
+            .filter(|(key, _)| !key.contains(".transformer_blocks."))
+            .collect();
+        let mut named: Vec<(&str, &mlx_rs::Array)> =
+            resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Weights::materialize_named(&mut named)?;
+    } else {
+        w.materialize_accessed()?;
+    }
+    Ok(unet)
 }
 
 /// f32 U-Net — the tight-stage-gate path (validated against the `float16=False` golden).
@@ -211,7 +246,10 @@ pub fn load_controlnet(
     if !is_packed(&w) {
         w.cast_all(dtype)?;
     }
-    crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())
+    let control = crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())?;
+    // Materialize at load, before any `quantize` (sc-24245; see [`load_unet_with_config_streamed`]).
+    w.materialize_accessed()?;
+    Ok(control)
 }
 
 /// The ViT-H image encoder inside an `h94/IP-Adapter`-layout snapshot, relative to its root.
@@ -246,6 +284,8 @@ pub fn load_ip_adapter(
         enc_w.cast_all(dtype)?;
     }
     let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_h_14())?;
+    // Materialize at load (sc-24245; see [`load_unet_with_config_streamed`]).
+    enc_w.materialize_accessed()?;
 
     let ip_file = IP_ADAPTER_WEIGHT_FILES
         .iter()
@@ -265,6 +305,8 @@ pub fn load_ip_adapter(
     let resampler =
         Resampler::from_weights(&ip_w, "image_proj", &ResamplerConfig::plus_sdxl_vit_h())?;
     let pairs = load_ip_kv_pairs(&ip_w)?;
+    // Materialize at load, before the pairs are installed and quantized with the U-Net (sc-24245).
+    ip_w.materialize_accessed()?;
 
     Ok((IpImageEncoder::new(encoder, resampler), pairs))
 }
@@ -278,7 +320,10 @@ pub fn load_vae(root: &Path) -> Result<Autoencoder> {
     let file = resolve_vae_weight_file(root)?;
     let mut w = Weights::from_file(&file)?;
     w.cast_all(Dtype::Float32)?;
-    Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())
+    let vae = Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())?;
+    // Materialize at load (sc-24245; see [`load_unet_with_config_streamed`]).
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 /// The **exact** VAE weight file [`load_vae`] would read out of `root`.

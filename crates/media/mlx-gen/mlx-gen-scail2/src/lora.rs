@@ -194,6 +194,9 @@ pub fn merge_diff_patch_adapters(
 
 fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut DiffPatchReport) -> Result<()> {
     let lw = Weights::from_file(&spec.path)?;
+    // Adapter factors are lazy too: read them at load so neither the fold nor the first forward
+    // waits on the safetensors reads (sc-24245; the SDXL/LTX adapter loaders' precedent).
+    lw.materialize()?;
     // Group every factor / diff key by its SCAIL-2 module path (namespace prefix stripped).
     let mut groups: BTreeMap<String, Parts> = BTreeMap::new();
     for key in lw.keys().map(str::to_string).collect::<Vec<_>>() {

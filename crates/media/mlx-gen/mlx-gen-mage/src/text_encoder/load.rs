@@ -104,7 +104,11 @@ pub fn load_lm(root: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
 
 /// As [`load_lm`], but addressing the `text_encoder/` directory itself.
 pub fn load_lm_dir(dir: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
-    let dir = dir.as_ref();
+    load_lm_dir_with(dir.as_ref(), false)
+}
+
+/// [`load_lm_dir`]; `streamed` (the LM block stream will be armed) leaves the decoder layers lazy.
+fn load_lm_dir_with(dir: &Path, streamed: bool) -> Result<Qwen3VlTextEncoder> {
     let config_path = dir.join("config.json");
     let published = std::fs::read_to_string(&config_path).map_err(|e| {
         Error::Msg(format!(
@@ -114,12 +118,13 @@ pub fn load_lm_dir(dir: impl AsRef<Path>) -> Result<Qwen3VlTextEncoder> {
     })?;
     let cfg = verify_text_config(&published)?;
     let mut w = Weights::from_dir(dir)?;
-    let model = Qwen3VlTextEncoder::from_weights_draining(
+    let model = Qwen3VlTextEncoder::from_weights_draining_with(
         &mut w,
         LM_PREFIX,
         &cfg,
         TE_RMS_NORM_EPS,
         TE_ROPE_THETA,
+        streamed,
     )?;
     let remaining_lm = w
         .keys()
@@ -140,10 +145,14 @@ pub fn load(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
 
 /// As [`load`], but addressing the `text_encoder/` directory itself.
 pub fn load_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
-    let dir = dir.as_ref();
+    load_dir_with(dir.as_ref(), false)
+}
+
+/// [`load_dir`]; `streamed` leaves the LM decoder layers lazy for the armed block stream.
+pub(crate) fn load_dir_with(dir: &Path, streamed: bool) -> Result<MageTextEncoder> {
     Ok(MageTextEncoder::new(
         load_tokenizer_dir(dir)?,
-        load_lm_dir(dir)?,
+        load_lm_dir_with(dir, streamed)?,
     ))
 }
 
@@ -179,7 +188,11 @@ pub fn load_multimodal(root: impl AsRef<Path>) -> Result<MageTextEncoder> {
 /// against a 1024-wide input) and `q8` was rejected at load as "corrupt or mis-converted" (bits 16).
 /// Only the 17.5 GB `bf16` tier, whose tower is dense, could edit at all.
 pub fn load_multimodal_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
-    let dir = dir.as_ref();
+    load_multimodal_dir_with(dir.as_ref(), false)
+}
+
+/// [`load_multimodal_dir`]; `streamed` leaves the LM decoder layers lazy for the armed block stream.
+pub(crate) fn load_multimodal_dir_with(dir: &Path, streamed: bool) -> Result<MageTextEncoder> {
     let weights = Weights::from_dir(dir)?;
     let vision = VisionTower::from_weights(
         &weights,
@@ -187,9 +200,12 @@ pub fn load_multimodal_dir(dir: impl AsRef<Path>) -> Result<MageTextEncoder> {
         "model.visual",
         QUANT_GROUP_SIZE,
     )?;
+    // Materialize at load — only the vision tower this reads (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`).
+    weights.materialize_accessed()?;
     Ok(MageTextEncoder::new_multimodal(
         load_tokenizer_dir(dir)?,
-        load_lm_dir(dir)?,
+        load_lm_dir_with(dir, streamed)?,
         vision,
     ))
 }

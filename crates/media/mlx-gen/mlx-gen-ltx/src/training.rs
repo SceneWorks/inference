@@ -2002,6 +2002,10 @@ pub fn load_trainer_25(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
             .to_path_buf()
     };
     let vae = LtxVideoVae::from_weights_lazy_encoder(&video_w, encoder_path, &vae_cfg)?;
+    // Materialize at load (sc-24245; see mlx_gen_qwen_image::loader::load_transformer_with).
+    for w in [&connector_w, &transformer_w, &video_w] {
+        w.materialize_accessed()?;
+    }
     Ok(Box::new(LtxTrainer {
         descriptor: trainer_descriptor_25(),
         tokenizer: Some(TrainingTokenizer::Gemma4(tokenizer)),
@@ -2056,6 +2060,16 @@ fn load_trainer_from_dir(root: &Path, te_override: Option<&WeightsSource>) -> Re
         Precision::quant_f32(split.bits, split.group),
     )?;
     let vae = LtxVideoVae::from_weights(&vae_dec_w, Some(&vae_enc_w), &vae_config)?;
+    // Materialize at load (sc-24245; see mlx_gen_qwen_image::loader::load_transformer_with).
+    for w in [
+        &gemma_w,
+        &connector_w,
+        &transformer_w,
+        &vae_dec_w,
+        &vae_enc_w,
+    ] {
+        w.materialize_accessed()?;
+    }
     let tokenizer = LtxTokenizer::from_dir(&gemma_dir)?;
 
     Ok(LtxTrainer {

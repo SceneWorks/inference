@@ -242,6 +242,23 @@ fn read_json(path: &std::path::Path) -> Result<(serde_json::Value, String), Erro
     Ok((value, digest))
 }
 
+/// Refuse a device the model cannot run on, before any weight is read.
+///
+/// The CPU is the validated device. CUDA supports every operation the model uses (including the
+/// ConvNeXt GRN's float64 reduction) but is not yet validated. Candle's Metal backend has no
+/// float32 → float64 cast, so the GRN would fail on the first window after a multi-GiB load; a
+/// Metal device is therefore refused here, and a macOS host transcribes on [`Device::Cpu`].
+pub fn check_device(device: &Device) -> Result<(), Error> {
+    if device.is_metal() {
+        return Err(Error::Config(
+            "SheetSage2 transcription cannot run on Metal (the GRN reduction is float64, which \
+             candle's Metal backend does not support); load it on Device::Cpu"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a SheetSage2 config whose pinned parent is not the inventory's MERT pin.
 pub fn check_parent_pin(sheetsage2_config: &serde_json::Value) -> Result<(), Error> {
     let mert = ComponentId::MertV2FullSong.component();
@@ -258,8 +275,10 @@ pub fn check_parent_pin(sheetsage2_config: &serde_json::Value) -> Result<(), Err
 }
 
 impl Transcriber {
-    /// Load from the verified cover closure (offline; reads only the verified paths).
+    /// Load from the verified cover closure (offline; reads only the verified paths) onto `device`:
+    /// the CPU (validated) or CUDA; a Metal device is refused ([`check_device`]).
     pub fn load(closure: &VerifiedClosure, device: &Device) -> Result<Self, Error> {
+        check_device(device)?;
         if closure.closure() != Closure::Cover {
             return Err(Error::Closure(
                 "the transcriber loads the cover closure".into(),
@@ -319,6 +338,7 @@ impl Transcriber {
         mut identity: ClosureIdentity,
         device: &Device,
     ) -> Result<Self, Error> {
+        check_device(device)?;
         let model = SheetSage2Model::load(
             &files.sheetsage2_config,
             &files.mert_config,

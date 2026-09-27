@@ -595,8 +595,9 @@ const REMOTE_CODE: &str = "remote Python model code; production runs natively (e
 
 const COVER_REMOTE_CODE: &str =
     "remote Python model / processing code with no code licence of its \
-                                 own; production runs natively (epic E3); provisionally CC BY-NC 4.0 \
-                                 and any native port gated (license::CODE_TERMS) — the pinned \
+                                 own; production runs natively (epic E3) through the port \
+                                 candle-audio-sheetsage2, distributed under CC BY-NC 4.0 on the \
+                                 owner basis recorded 2026-09-27 (license::CODE_TERMS) — the pinned \
                                  GitHub source has no SheetSage2 / MERT2 code";
 
 /// Files the pinned repositories ship that no closure loads.

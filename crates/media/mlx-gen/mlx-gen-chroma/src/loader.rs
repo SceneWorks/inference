@@ -42,11 +42,40 @@ pub fn load_tokenizer_with_max_len(max_length: usize) -> Result<TextTokenizer> {
 }
 
 pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
+    load_t5_encoder_streamed(root, false)
+}
+
+/// [`load_t5_encoder`] for a load that will arm the T5 block stream when `streamed` is set.
+///
+/// Materializes at load, before any load-time `quantize` (sc-24245): left lazy, the first encode's
+/// command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache (see
+/// `mlx_gen_qwen_image::loader::load_transformer_with`). `streamed` leaves the
+/// `encoder.block.*` bodies lazy: they are evicted once the stream is armed, and the stream
+/// materializes each block itself.
+pub fn load_t5_encoder_streamed(root: &Path, streamed: bool) -> Result<T5TextEncoder> {
     // Chroma diffusers layout: T5 is `text_encoder/` (FLUX puts it in `text_encoder_2/`).
     let component = root.join("text_encoder");
     let group_size = packed_group_size(&component, "T5")?;
     let w = Weights::from_dir(component)?;
-    T5TextEncoder::from_weights_with_group_size(&w, "", group_size)
+    let encoder = T5TextEncoder::from_weights_with_group_size(&w, "", group_size)?;
+    materialize_resident(&w, streamed.then_some(&["encoder.block."][..]))?;
+    Ok(encoder)
+}
+
+/// Materialize every tensor the build accessed, or — for a streamed load — every accessed tensor
+/// outside the streamed block prefixes (sc-24245).
+fn materialize_resident(w: &Weights, streamed_prefixes: Option<&[&str]>) -> Result<()> {
+    let Some(prefixes) = streamed_prefixes else {
+        return w.materialize_accessed();
+    };
+    let resident: Vec<(String, mlx_rs::Array)> = w
+        .accessed_entries()
+        .into_iter()
+        .filter(|(key, _)| !prefixes.iter().any(|prefix| key.starts_with(prefix)))
+        .collect();
+    let mut named: Vec<(&str, &mlx_rs::Array)> =
+        resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+    Weights::materialize_named(&mut named)
 }
 
 pub fn load_vae(root: &Path) -> Result<Vae> {
@@ -92,6 +121,22 @@ pub fn t5_block_stream(root: &Path) -> Result<mlx_gen_flux::T5BlockStream> {
 }
 
 pub fn load_transformer(root: &Path, cfg: ChromaTransformerConfig) -> Result<ChromaTransformer> {
+    load_transformer_streamed(root, cfg, false)
+}
+
+/// [`load_transformer`] for a load that will arm the DiT block stream when `streamed` is set —
+/// materialized at load like [`load_t5_encoder_streamed`], leaving the streamed
+/// `transformer_blocks.*` / `single_transformer_blocks.*` bodies to the stream.
+pub fn load_transformer_streamed(
+    root: &Path,
+    cfg: ChromaTransformerConfig,
+    streamed: bool,
+) -> Result<ChromaTransformer> {
     let w = Weights::from_dir(root.join("transformer"))?;
-    ChromaTransformer::from_weights(w, cfg)
+    let transformer = ChromaTransformer::from_weights_ref(&w, cfg)?;
+    materialize_resident(
+        &w,
+        streamed.then_some(&["transformer_blocks.", "single_transformer_blocks."][..]),
+    )?;
+    Ok(transformer)
 }

@@ -8,9 +8,11 @@
 //!    tokenizer may derive from. Its Oobleck VAE / SnakeBeta code carries two MIT notices of its
 //!    own. It contains **no** SheetSage2 or MERT2 code: the cover closure's only code is the remote
 //!    Python inside those model repositories. Upstream grants no licence for that code (their
-//!    LICENSE covers the weights only), so code derived from it is provisionally kept at CC BY-NC
-//!    4.0 and the port is gated until an owner records a basis ([`CODE_TERMS`]; the port is the
-//!    separate crate `candle-audio-sheetsage2`).
+//!    LICENSE covers the weights only). The owner recorded a basis on 2026-09-27 (epic sc-22988):
+//!    the native port — the separate crate `candle-audio-sheetsage2` — is distributed under CC
+//!    BY-NC 4.0, the terms of the upstream weights, noncommercial only with attribution per its
+//!    NOTICE ([`CODE_TERMS`], [`COVER_PORT_OWNER_DECISION`]). The decision covers the port code
+//!    only; redistributing the weights or a derived tier stays gated below.
 //! 2. **Model weights** — YuE2-3B, both VAEs, SheetSage2 and MERT-v2-FullSong are CC BY-NC 4.0
 //!    ([`COMPONENT_LICENSES`]): noncommercial use only, with attribution.
 //! 3. **`qwen.tiktoken`** — byte-identical to the Qwen-7B tokenizer file, so it carries the Tongyi
@@ -19,7 +21,8 @@
 //! 4. **Bundled archive and third-party terms** — the earlier `yue2-v0.1.6` release archives and the
 //!    wheels in the YuE2-3B repository license their *code* under CC BY-NC 4.0 (not Apache-2.0), and
 //!    SheetSage2's rendering assets carry MIT / font / CC BY 3.0 US terms ([`BUNDLED_TERMS`]). None
-//!    of it is in a closure, and none of it is an ungated port source.
+//!    of it is in a closure; none of it except the cover closure's remote Python (on the owner
+//!    basis above) is a port source.
 //!
 //! # The gate
 //!
@@ -35,7 +38,11 @@
 //! | [`IntendedUse::Redistribution`] | **gated** — no owner-recorded distribution basis | **gated** — no owner-recorded basis |
 //!
 //! Commercial routes therefore can never run YuE2 (they use YuE1), and nothing may rehost, bundle or
-//! share a YuE2 file until an owner records a basis here. The gate never strips an upstream access
+//! share a YuE2 file until an owner records a basis here. The cover closure (SheetSage2 +
+//! MERT-v2-FullSong) follows the same table: recording → transcription → cover is a supported
+//! **noncommercial** path, and its native port code is distributed under CC BY-NC 4.0 on the owner
+//! basis [`COVER_PORT_OWNER_DECISION`] ([`CODE_TERMS`]) — which covers that code only, never the
+//! weights or a derived tier. The gate never strips an upstream access
 //! gate and never relabels a licence.
 //!
 //! # Derived tier snapshots (sc-22995)
@@ -675,10 +682,11 @@ pub struct CodeTerms {
     pub location: &'static str,
     /// The terms the code carries, as inspected on [`inventory::RETRIEVED`].
     pub terms: &'static str,
-    /// SPDX id that code derived from it is treated as carrying — for the cover closure a provisional
-    /// disposition, not an upstream grant (see `port`).
+    /// SPDX id that code derived from it is treated as carrying — for the cover closure the
+    /// owner-recorded distribution terms, not an upstream grant (see `port`).
     pub treated_as: &'static str,
-    /// Whether a native port may be written into this crate (Apache-2.0): permitted on a recorded
+    /// Whether a native port may be written (into this Apache-2.0 crate, or — for the cover closure —
+    /// into the separate CC BY-NC 4.0 crate `candle-audio-sheetsage2`): permitted on a recorded
     /// basis, or gated with its unblock condition.
     pub port: UseDisposition,
 }
@@ -692,22 +700,23 @@ const APACHE_PORT: UseDisposition = UseDisposition::Permitted(Basis {
     evidence: "licenses/yue2-source/LICENSE",
 });
 
-const COVER_PORT: UseDisposition = UseDisposition::Gated {
-    reason: "the only SheetSage2 / MERT2 code is the remote Python published inside the model \
-             repositories, and upstream grants no licence for it: the LICENSE in both repositories \
-             is a model-weight licence (CC BY-NC 4.0 for model.safetensors) that does not replace \
-             separately applicable licences for code. Pending an owner decision, code derived from \
-             it is provisionally kept at the repositories' CC BY-NC 4.0 terms — noncommercial — and \
-             must not be relicensed into this Apache-2.0 crate. The native port (sc-22996) lives in \
-             the separate workspace crate `candle-audio-sheetsage2`, whose Cargo licence field \
-             records that provisional CC-BY-NC-4.0 disposition (admitted by one scoped `deny.toml` \
-             exception, with a NOTICE stating that no upstream code licence exists); it is not \
-             composed into the audio catalog or any runtime bundle",
-    unblock: "an owner-recorded basis for the cover port, recorded here: an explicit code licence \
-              from the rights holder (Multimodal Art Projection), or an owner decision to ship the \
-              derived code under CC BY-NC 4.0 with attribution, outside the crate's Apache-2.0 \
-              grant",
-};
+/// The owner decision that permits the cover port, as recorded on epic sc-22988.
+pub const COVER_PORT_OWNER_DECISION: &str =
+    "owner decision recorded 2026-09-27 on epic sc-22988 (Michael Trefry): the native \
+     SheetSage2 / MERT-v2-FullSong port code (crate candle-audio-sheetsage2) is distributed under \
+     CC BY-NC 4.0, the terms of the upstream weights; noncommercial only, with attribution per the \
+     crate's NOTICE. Upstream licenses only the weights (its Python code carries no licence), so \
+     this is an owner basis, not an upstream code grant. It covers the port code only: rehosting \
+     or redistributing the weights or any derived tier stays gated";
+
+/// The cover-closure port: permitted on the owner basis [`COVER_PORT_OWNER_DECISION`], under the CC
+/// BY-NC 4.0 terms of the upstream weights, in the separate crate `candle-audio-sheetsage2` (never
+/// relicensed into this Apache-2.0 crate).
+const COVER_PORT: UseDisposition = UseDisposition::Permitted(Basis {
+    family: "cc-by-nc-4-0",
+    clause: COVER_PORT_OWNER_DECISION,
+    evidence: "licenses/mert2-weights/LICENSE",
+});
 
 /// Per-component code terms, in [`ComponentId::ALL`] order. Every component a native port will be
 /// written for has an entry, so no port can land without its code terms being on record.
@@ -840,9 +849,9 @@ pub const BUNDLED_TERMS: &[BundledTerms] = &[
                 file; the repository card declares cc-by-nc-4.0; THIRD_PARTY_NOTICES.md cites \
                 Hugging Face Transformers (Apache 2.0) for the BART decoder, which the code \
                 imports rather than vendors",
-        disposition:
-            "excluded at runtime; no upstream code licence, so provisionally kept at CC BY-NC \
-                      4.0 pending an owner decision; the native port is gated (see CODE_TERMS)",
+        disposition: "excluded at runtime (never executed); no upstream code licence, so the \
+                      native port candle-audio-sheetsage2 is distributed under CC BY-NC 4.0 on the \
+                      owner basis recorded 2026-09-27 (see CODE_TERMS)",
     },
     BundledTerms {
         artifact: "MERT-v2-FullSong remote code (modeling_mert2.py, configuration_mert2.py)",
@@ -850,9 +859,9 @@ pub const BUNDLED_TERMS: &[BundledTerms] = &[
         terms: "no explicit code licence: no header or SPDX tag and no code licence file; the \
                 repository card declares cc-by-nc-4.0; THIRD_PARTY_NOTICES.md lists only \
                 separately installed dependencies",
-        disposition:
-            "excluded at runtime; no upstream code licence, so provisionally kept at CC BY-NC \
-                      4.0 pending an owner decision; the native port is gated (see CODE_TERMS)",
+        disposition: "excluded at runtime (never executed); no upstream code licence, so the \
+                      native port candle-audio-sheetsage2 is distributed under CC BY-NC 4.0 on the \
+                      owner basis recorded 2026-09-27 (see CODE_TERMS)",
     },
 ];
 
@@ -1050,6 +1059,28 @@ mod tests {
         }
     }
 
+    /// The owner basis permits the cover **port**; it grants nothing about the weights. The cover
+    /// closure is authorized for noncommercial experimentation (the recording → transcription →
+    /// cover path), and commercial use and redistribution of it — the weights, and so any derived
+    /// tier — are still refused, naming both components.
+    #[test]
+    fn the_cover_closure_runs_noncommercially_and_is_never_commercial_or_redistributed() {
+        let a = authorize_closure(Closure::Cover, IntendedUse::NoncommercialExperimentation)
+            .expect("the cover closure is permitted for noncommercial experimentation");
+        assert_eq!(
+            a.grants().iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [ComponentId::SheetSage2, ComponentId::MertV2FullSong]
+        );
+        for intended in [IntendedUse::CommercialUse, IntendedUse::Redistribution] {
+            let err = authorize_closure(Closure::Cover, intended).unwrap_err();
+            assert_eq!(
+                gated(err).iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                [ComponentId::SheetSage2, ComponentId::MertV2FullSong],
+                "{intended:?}"
+            );
+        }
+    }
+
     /// An empty list gets its own refusal — it is not blamed on any component.
     #[test]
     fn an_empty_component_list_is_refused() {
@@ -1064,31 +1095,44 @@ mod tests {
     }
 
     /// Every component — in particular every cover-closure component, whose only code is remote
-    /// Python with no code licence — has recorded code terms. Cover code is provisionally CC BY-NC 4.0
-    /// (no upstream code grant) with its port gated behind an owner-recorded basis; the YuE2 LM / tokenizer / VAE ports are
-    /// permitted only on the Apache-2.0 GitHub source.
+    /// Python with no code licence — has recorded code terms. The cover port is permitted on the
+    /// owner basis recorded 2026-09-27 (CC BY-NC 4.0, the weights' terms; noncommercial only), not on
+    /// an upstream code grant; the YuE2 LM / tokenizer / VAE ports are permitted only on the
+    /// Apache-2.0 GitHub source.
     #[test]
-    fn every_component_has_recorded_code_terms_and_cover_ports_are_gated() {
+    fn every_component_has_recorded_code_terms_and_cover_ports_rest_on_the_owner_basis() {
         let texts: Vec<&str> = LICENSE_TEXTS.iter().map(|t| t.path).collect();
         for id in Closure::Cover.components() {
             let t = code_terms(*id).unwrap_or_else(|| panic!("{id:?} has no recorded code terms"));
             assert_eq!(t.treated_as, "CC-BY-NC-4.0", "{id:?}");
             match t.port {
-                UseDisposition::Gated { reason, unblock } => {
-                    assert!(reason.contains("CC BY-NC 4.0"), "{id:?}: {reason}");
-                    assert!(
-                        unblock.contains("owner-recorded basis"),
-                        "{id:?}: {unblock}"
-                    );
+                UseDisposition::Permitted(b) => {
+                    assert_eq!(b.family, "cc-by-nc-4-0", "{id:?}");
+                    assert_eq!(b.clause, COVER_PORT_OWNER_DECISION, "{id:?}");
+                    assert!(texts.contains(&b.evidence), "{id:?} cites {}", b.evidence);
                 }
-                UseDisposition::Permitted(b) => panic!("{id:?} port is permitted on {b:?}"),
+                UseDisposition::Gated { reason, .. } => panic!("{id:?} port is gated: {reason}"),
             }
             assert!(
                 BUNDLED_TERMS
                     .iter()
                     .any(|b| b.location.contains(id.component().repo.id)
-                        && b.artifact.contains("remote code")),
-                "{id:?}: its remote code has no BUNDLED_TERMS entry"
+                        && b.artifact.contains("remote code")
+                        && b.disposition.contains("2026-09-27")),
+                "{id:?}: its remote code has no BUNDLED_TERMS entry recording the owner basis"
+            );
+        }
+        // The owner basis names its date, its terms and its scope (port code only).
+        for needle in [
+            "2026-09-27",
+            "CC BY-NC 4.0",
+            "noncommercial only",
+            "candle-audio-sheetsage2",
+            "port code only",
+        ] {
+            assert!(
+                COVER_PORT_OWNER_DECISION.contains(needle),
+                "the owner basis does not say {needle:?}"
             );
         }
         for id in ComponentId::ALL {

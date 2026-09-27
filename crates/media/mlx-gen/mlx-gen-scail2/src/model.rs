@@ -512,7 +512,7 @@ impl Scail2Dit {
         for i in 0..cfg.wan.num_layers {
             blocks.push(Block::load(w, i, cfg)?);
         }
-        Ok(Self {
+        let dit = Self {
             patch_embedding: load_conv(w, "patch_embedding")?,
             patch_embedding_pose: load_conv(w, "patch_embedding_pose")?,
             patch_embedding_mask: load_conv(w, "patch_embedding_mask")?,
@@ -534,7 +534,11 @@ impl Scail2Dit {
             cfg: cfg.clone(),
             compute_dtype: Dtype::Float32,
             mem: DitMemoryConfig::OFF,
-        })
+        };
+        // Materialize at load, before any `quantize` (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(dit)
     }
 
     /// Set the matmul compute dtype (f32 for parity, bf16 for production).

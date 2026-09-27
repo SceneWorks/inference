@@ -89,6 +89,10 @@ impl LensTextEncoder {
         let max_layer = validate_selected_layers(cfg, &selected_layers)?;
 
         let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
+        // Each source is materialized before it is drained: left lazy, the first encode's command
+        // buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
+        // (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
         // Source is dropped from the map as each component is built (sc-11030) — the load transient
         // stays ~= the built encoder rather than source(13 GB) + built.
         w.remove("model.embed_tokens.weight");
@@ -101,6 +105,7 @@ impl LensTextEncoder {
                 dtype,
                 quant,
             )?);
+            w.materialize_accessed()?;
             // Free this layer's source tensors now that the layer is built (its Linears/experts were
             // copied/quantized into fresh Arrays, so the source is unreferenced). MLX returns the
             // buffers to its reuse pool for the next layer's allocations.
@@ -135,6 +140,8 @@ impl LensTextEncoder {
     ) -> Result<Self> {
         validate_selected_layers(cfg, &selected_layers)?;
         let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
+        // Materialize the resident embedding at load (sc-24245); the layers stay in the stream.
+        w.materialize_accessed()?;
         // The view owns a refcounted handle to every tensor it returned. Drain the embedding handle
         // before dropping the otherwise-lazy view; the layer views use the same load-bearing rule.
         w.remove_accessed();

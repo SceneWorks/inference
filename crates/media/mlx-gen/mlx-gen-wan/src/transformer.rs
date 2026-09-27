@@ -1204,6 +1204,10 @@ impl WanTransformer {
         for i in 0..cfg.num_layers {
             dit.blocks.push(Block::load(w, i, cfg)?);
         }
+        // Materialize at load, before any `quantize`: left lazy, the first forward's command buffers
+        // wait on the safetensors reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
         Ok(dit)
     }
 
@@ -1298,6 +1302,9 @@ impl WanTransformer {
     pub fn from_weights_deferred(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
         let mut dit = Self::from_weights_without_blocks(w, cfg)?;
         dit.blocks_deferred = true;
+        // Materialize at load (sc-24245) — only the non-block tensors were read; the stream
+        // materializes each block itself ([`WanBlockStream`](crate::WanBlockStream)).
+        w.materialize_accessed()?;
         Ok(dit)
     }
 

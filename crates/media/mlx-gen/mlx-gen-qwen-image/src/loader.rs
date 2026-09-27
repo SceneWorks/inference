@@ -187,17 +187,50 @@ pub fn remap_vision_keys(w: &mut Weights) -> Result<()> {
 
 /// Load the 60-layer MMDiT transformer, applying the diffusers→internal key renames.
 pub fn load_transformer(root: &Path) -> Result<QwenTransformer> {
-    let mut w = Weights::from_dir(root.join("transformer"))?;
-    remap_transformer_keys(&mut w);
-    QwenTransformer::from_weights(&w, "", &QwenTransformerConfig::qwen_image())
+    load_transformer_with(root, &QwenTransformerConfig::qwen_image(), false)
 }
 
 /// Load the transformer for Qwen-Image-**Edit-2511** — identical to [`load_transformer`] but with
 /// `zero_cond_t` on (the conditioning-image latent tokens are modulated as clean / timestep 0).
 pub fn load_transformer_edit(root: &Path) -> Result<QwenTransformer> {
+    load_transformer_with(root, &QwenTransformerConfig::qwen_image_edit(), false)
+}
+
+/// Build the transformer and materialize its weights before returning.
+///
+/// # Materialize at load — do not remove as "unnecessary"
+///
+/// MLX runs a safetensors `Load` on its **CPU stream**; when a GPU kernel consumes a not-yet-read
+/// `Load`, `eval` encodes a GPU-timeline wait on that `pread` inside the Metal command buffer. Left
+/// lazy, the first denoise step *was* the ~40 GB DiT read: on a cold page cache it held command
+/// buffers past the **GPU watchdog** — `kIOGPUCommandBufferCallbackErrorTimeout`, then
+/// `SubmissionsIgnored` for the rest of the process (the real-weight lane's recurring failures).
+/// This is the Qwen-Image 2.1 loader's sc-24114 fix, applied to this crate's loaders.
+///
+/// `streamed` leaves the `transformer_blocks.*` bodies lazy: the block stream re-opens and
+/// materializes each block itself ([`crate::block_stream::QwenBlockStream::materialize`]), so
+/// reading them here would defeat bounded residency. Only the non-block tensors are read.
+pub(crate) fn load_transformer_with(
+    root: &Path,
+    config: &QwenTransformerConfig,
+    streamed: bool,
+) -> Result<QwenTransformer> {
     let mut w = Weights::from_dir(root.join("transformer"))?;
     remap_transformer_keys(&mut w);
-    QwenTransformer::from_weights(&w, "", &QwenTransformerConfig::qwen_image_edit())
+    let transformer = QwenTransformer::from_weights(&w, "", config)?;
+    if streamed {
+        let resident: Vec<(String, Array)> = w
+            .accessed_entries()
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with("transformer_blocks."))
+            .collect();
+        let mut named: Vec<(&str, &Array)> =
+            resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Weights::materialize_named(&mut named)?;
+    } else {
+        w.materialize_accessed()?;
+    }
+    Ok(transformer)
 }
 
 /// Load the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` VACE control branch (sc-8267 — this
@@ -213,7 +246,11 @@ pub fn load_controlnet(control: &WeightsSource) -> Result<QwenFunControlBranch> 
         WeightsSource::Dir(p) => Weights::from_dir(p)?,
     };
     remap_transformer_keys(&mut w);
-    QwenFunControlBranch::from_weights(&w, "", &QwenFunControlConfig::qwen_image_2512_fun())
+    let branch =
+        QwenFunControlBranch::from_weights(&w, "", &QwenFunControlConfig::qwen_image_2512_fun())?;
+    // Materialize at load for the same GPU-watchdog reason as [`load_transformer_with`].
+    w.materialize_accessed()?;
+    Ok(branch)
 }
 
 /// Load the causal-Conv3d VAE, applying the diffusers→internal key remap (structural renames +
@@ -221,7 +258,10 @@ pub fn load_controlnet(control: &WeightsSource) -> Result<QwenFunControlBranch> 
 pub fn load_vae(root: &Path) -> Result<QwenVae> {
     let mut w = Weights::from_dir(root.join("vae"))?;
     remap_vae_keys(&mut w)?;
-    QwenVae::from_weights(&w)
+    let vae = QwenVae::from_weights(&w)?;
+    // Materialize at load for the same GPU-watchdog reason as [`load_transformer_with`].
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 /// diffusers transformer checkpoint → internal names (port of `QwenWeightMapping`'s transformer

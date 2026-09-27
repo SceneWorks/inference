@@ -1077,7 +1077,8 @@ pub const PROVIDER_COMPONENT_LICENSES: &[gen_core::ComponentLicense] = &[
 
 /// Provider → component mapping: the generation closure (MoT, tokenizer, both decoders). The
 /// cover closure (SheetSage2 + MERT-v2-FullSong) is not loaded by this provider: a cover here plans
-/// from a reviewed score, and transcription stays in the gated `candle-audio-sheetsage2` crate.
+/// from a reviewed score; transcription is `candle-audio-sheetsage2`'s crate API, whose rows the
+/// audio catalog publishes under the provider id `sheetsage2`.
 pub const PROVIDER_COMPONENTS: &[gen_core::ProviderComponents] = &[gen_core::ProviderComponents {
     provider_id: PROVIDER_ID,
     components: &[
