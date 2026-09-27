@@ -71,7 +71,7 @@ class SafeCheckpointLoadingTests(unittest.TestCase):
 
         torch.save({"state_dict": {"net.patch_blocks.0.weight": self.tensor},
                     "extra": _Marker(self.marker)}, bad)
-        denied = subprocess.run([sys.executable, str(script), str(bad), "--dry-run"], capture_output=True, text=True)
+        denied = subprocess.run([sys.executable, str(script), str(bad), "--dry-run"], capture_output=True, text=True, encoding="utf-8")
         self.assertNotEqual(denied.returncode, 0)
         self.assertIn("safe tensor checkpoint load failed", denied.stderr)
         self.assertFalse(self.marker.exists())
