@@ -1228,3 +1228,55 @@ fn a_result_changing_request_still_refuses_to_resume() {
     }
     assert_eq!(std::fs::read(dir.join(RESULT_JSON)).unwrap(), before);
 }
+
+/// A cached decode binds its decoder: resuming a published legacy decode with the standard
+/// decoder is a different decode and is refused as an identity mismatch, leaving the published
+/// one as it was.
+///
+/// Mutation that must fail: drop `vae` from `IdentityKeys::cached_decode`.
+#[test]
+fn a_cached_decode_resumed_with_the_other_decoder_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let generator = load_synthetic(&spec(tmp.path(), true)).unwrap();
+    let source = tmp.path().join("song");
+    generator
+        .generate(&song_request(Some(&source)), &mut |_| {})
+        .unwrap();
+    let decode = |decoder: SongDecoder, resume: bool| GenerationRequest {
+        audio: Some(AudioParams {
+            song: Some(SongParams {
+                cached_latents: Some(source.clone()),
+                decoder: Some(decoder),
+                ..Default::default()
+            }),
+            artifacts: Some(AudioArtifacts {
+                dir: tmp.path().join("decoded"),
+                resume,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    generator
+        .generate(&decode(SongDecoder::Legacy, false), &mut |_| {})
+        .unwrap();
+    let before = std::fs::read(tmp.path().join("decoded").join(RESULT_JSON)).unwrap();
+    let mut decodes = 0;
+    let err = generator
+        .generate(&decode(SongDecoder::Standard, true), &mut |p| {
+            if p == Progress::Decoding {
+                decodes += 1
+            }
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("identity"), "{err}");
+    assert_eq!(decodes, 0, "nothing was decoded");
+    assert_eq!(
+        std::fs::read(tmp.path().join("decoded").join(RESULT_JSON)).unwrap(),
+        before
+    );
+    // The same decoder resumes.
+    generator
+        .generate(&decode(SongDecoder::Legacy, true), &mut |_| {})
+        .unwrap();
+}
