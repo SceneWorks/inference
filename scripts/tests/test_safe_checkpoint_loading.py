@@ -133,8 +133,10 @@ class SafeCheckpointLoadingTests(unittest.TestCase):
         mage_flow = types.ModuleType("checkpoint_test_mage.models.mage_flow")
         mage_flow.MageFlow = object
         mage_flow.MageFlowParams = object
+        checkpoint_paths = _load("checkpoint_test_mage.checkpoint_paths",
+                                 "crates/media/mlx-gen/_vendor/mage_flow/checkpoint_paths.py")
         modules = {"loguru": loguru, package.__name__: package, models.__name__: models,
-                   mage_flow.__name__: mage_flow}
+                   mage_flow.__name__: mage_flow, checkpoint_paths.__name__: checkpoint_paths}
         with patch.dict(sys.modules, modules):
             utils = _load("checkpoint_test_mage.models.utils",
                           "crates/media/mlx-gen/_vendor/mage_flow/models/utils.py")
