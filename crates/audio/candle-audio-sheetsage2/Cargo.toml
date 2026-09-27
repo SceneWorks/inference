@@ -1,0 +1,46 @@
+[package]
+name = "candle-audio-sheetsage2"
+version = "0.0.0"
+edition = "2021"
+description = "Native Candle port of SheetSage2 + MERT-v2-FullSong recording-to-score transcription (epic sc-22988, story sc-22996): MERT2 encoder, SheetSage2 grammar-constrained decoder, ABC/MIDI/LAB exports, the review artifact, and the YuE2 zero-shot cover path. GATED: upstream licenses only the model weights (CC BY-NC 4.0); the remote Python this port reimplements has no upstream licence grant, so the CC-BY-NC-4.0 field below is a provisional disposition awaiting an owner decision (see NOTICE)."
+# NOT Apache-2.0, and NOT a licence granted by the upstream authors. The upstream LICENSE in both
+# m-a-p/SheetSage2 and m-a-p/MERT-v2-FullSong is a *model-weight* licence (CC BY-NC 4.0 for
+# model.safetensors) that "does not replace separately applicable licenses for code"; the remote
+# Python this crate reimplements carries no licence at all. `CC-BY-NC-4.0` here is the provisional
+# disposition sc-22989 recorded in `candle_audio_yue2::license::CODE_TERMS` / `COVER_PORT` (kept
+# Gated): the most restrictive terms of the surrounding repositories, pending an owner decision or an
+# explicit code licence from Multimodal Art Projection. The crate stays out of the Apache-2.0
+# `candle-audio-yue2`, out of the audio catalog and out of every runtime bundle; `deny.toml` carries
+# the one scoped exception that admits it to the workspace. See NOTICE.
+license = "CC-BY-NC-4.0"
+publish = false
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "music", "transcription", "yue2"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons: re-exports `candle_core` and `gen_core`, so this crate resolves the
+# same candle build as every other audio provider.
+candle-audio = { path = "../candle-audio" }
+# The pinned cover closure (inventory + offline snapshot verification, sc-22989), the licence gate,
+# and the YuE2 request/plan protocol and cover-request construction (sc-22990 / this story). A
+# one-way dependency: the Apache-2.0 YuE2 crate never depends on this one.
+candle-audio-yue2 = { path = "../candle-audio-yue2" }
+# LayerNorm / softmax / conv helpers at the workspace's pinned candle revision.
+candle-nn = { workspace = true }
+# Source identity and artifact digests.
+sha2 = { workspace = true }
+# config.json parsing and the review manifest.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# RAII roots for persistence / replay / synthetic snapshot tests.
+tempfile = { workspace = true }
+
+[features]
+default = []
+# Apple Metal / NVIDIA CUDA backends, forwarded to the audio commons. Not in `default`; the lane
+# this story ran on is CPU-only.
+metal = ["candle-audio/metal", "candle-nn/metal", "candle-audio-yue2/metal"]
+cuda = ["candle-audio/cuda", "candle-nn/cuda", "candle-audio-yue2/cuda"]

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import yaml
 
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
 from scripts.release.resolve_snapshot_paths import resolve
 
 
@@ -53,8 +54,8 @@ class WorkflowWiringTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-        self.raw = WORKFLOW.read_text(encoding="utf-8")
+        self.workflow = yaml.safe_load(real_weights_inline_text())
+        self.raw = real_weights_inline_text()
 
     def macos_jobs_reading_variables(self) -> dict[str, set[str]]:
         """Map each macOS job to the ENV VAR NAMES it defines from a `vars.` reference.
@@ -200,7 +201,7 @@ class ReportHeadroomWiringTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        self.workflow = yaml.safe_load(real_weights_inline_text())
 
     def test_the_report_script_is_committed_executable(self) -> None:
         """`continue-on-error` keeps a lost exec bit from redding a lane, but the step would
@@ -343,7 +344,7 @@ class WeightSetLabelTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        self.workflow = yaml.safe_load(real_weights_inline_text())
 
     def test_every_macos_job_selects_exactly_one_known_weight_set(self) -> None:
         self.assertEqual(weight_set_label_errors(self.workflow), [])
@@ -401,7 +402,7 @@ class WeightSetLabelTests(unittest.TestCase):
 
     def test_every_declared_label_is_documented_with_its_host(self) -> None:
         """The header table is the only record of which box stores which set — keep it honest."""
-        header = WORKFLOW.read_text(encoding="utf-8").split("\non:", 1)[0]
+        header = real_weights_inline_text().split("\non:", 1)[0]
         used = {
             label
             for job in self.workflow["jobs"].values()

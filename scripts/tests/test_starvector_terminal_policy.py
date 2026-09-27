@@ -11,6 +11,8 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
+
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/real-weights.yml"
@@ -150,13 +152,13 @@ class StarVectorTerminalPolicyTests(unittest.TestCase):
                 self.assertEqual(len(model["expected_files"]), file_count)
 
     def test_terminal_workflow_is_serial_dispatch_only_and_exact_name_selected(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(terminal_workflow_errors(workflow), [])
         self.assertNotIn("inputs.profile == 'starvector-terminal'", workflow[workflow.index("  mlx-llm:"):])
         self.assertNotIn("inputs.profile == 'starvector-terminal'", workflow[workflow.index("  candle-llm:"):])
 
     def test_terminal_workflow_policy_detects_dispatch_serial_and_exact_command_mutations(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         mlx_start, _ = job_bounds(workflow, "starvector-terminal-mlx")
         candle_start, candle_end = job_bounds(workflow, "starvector-terminal-candle")
 

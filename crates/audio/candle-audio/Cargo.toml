@@ -18,6 +18,9 @@ sceneworks-gen-core = { workspace = true }
 # families use, so the whole on-device stack resolves ONE candle build. CPU by default; the
 # `metal` / `cuda` features select a GPU backend per platform.
 candle-core = { workspace = true }
+# candle-nn (same workspace pin) for the shared neural-codec layers (`neural_codec`: Conv1d /
+# ConvTranspose1d of the DAC decoder, sc-19377). Every audio provider already depends on it.
+candle-nn = { workspace = true }
 # Error plumbing for the engine surface (mirrors candle-gen's CandleError seam).
 thiserror = { workspace = true }
 # Repeatability hash over generated PCM bytes for the validation harness (`harness`, sc-12854).
@@ -42,9 +45,9 @@ default = []
 testkit = []
 # Apple Metal GPU backend — a per-model implementation option on runtime-macos (the audio lane
 # ships Candle-CPU there today; see audio-backend-strategy.md). NOT in `default`.
-metal = ["candle-core/metal"]
+metal = ["candle-core/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend (the Windows target). MUST NOT be in `default` — it needs the CUDA toolkit.
-cuda = ["candle-core/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

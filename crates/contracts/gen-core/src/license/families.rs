@@ -1,5 +1,5 @@
-//! The licence **family** table (sc-16662, extended by sc-16665 and sc-24108) — twenty-one upstream
-//! licence texts, transcribed.
+//! The licence **family** table (sc-16662, extended by sc-16665, sc-24108 and sc-22989) — twenty-two
+//! upstream licence texts, transcribed.
 //!
 //! # PROVISIONAL — gathered by an agent, not yet signed off by a human
 //!
@@ -766,6 +766,53 @@ pub const QWEN_RESEARCH: LicenseFamily = LicenseFamily {
     ],
 };
 
+/// `Qwen/Qwen-7B` — the **Tongyi Qianwen LICENSE AGREEMENT**, release date August 3, 2023
+/// (sc-22989).
+///
+/// Text read at
+/// <https://huggingface.co/Qwen/Qwen-7B/raw/ef3c5c9c57b252f3149c1408daf4d649ec8b6c85/LICENSE> on
+/// 2026-09-26 (the card declares `license_name: tongyi-qianwen-license-agreement`); a verbatim copy
+/// is vendored at `crates/audio/candle-audio-yue2/licenses/qwen-tiktoken/LICENSE`. It enters the
+/// catalog through YuE2's `qwen.tiktoken`, which is byte-identical (same git blob) to the Qwen-7B
+/// file. A different text from [`QWEN_RESEARCH`]: §2 grants use, reproduction, distribution and
+/// derivative works with no non-commercial limit, and §4 conditions only commercial use above a
+/// user-count threshold. The text does not address outputs beyond §5(b), transcribed verbatim.
+/// Quotes and judgement calls: `docs/licensing/sc-22989-tongyi-qianwen-licence-evidence.md`.
+pub const TONGYI_QIANWEN: LicenseFamily = LicenseFamily {
+    id: "tongyi-qianwen",
+    spdx_id: "LicenseRef-Tongyi-Qianwen-License-Agreement",
+    name: "Tongyi Qianwen License Agreement",
+    text_url:
+        "https://huggingface.co/Qwen/Qwen-7B/raw/ef3c5c9c57b252f3149c1408daf4d649ec8b6c85/LICENSE",
+    terms: &[
+        // §3(a) "You shall give any other recipients of the Materials or derivative works a copy
+        // of this Agreement".
+        LicenseTerm::DownstreamLicenseCopy {
+            family: "tongyi-qianwen",
+        },
+        // §3(b) "You shall cause any modified files to carry prominent notices stating that You
+        // changed the files" and §3(c) "…within a "Notice" text file distributed as a part of such
+        // copies".
+        LicenseTerm::NoticeFileRequired,
+        // §3(c), the notice itself: "Tongyi Qianwen is licensed under the Tongyi Qianwen LICENSE
+        // AGREEMENT, Copyright (c) Alibaba Cloud. All Rights Reserved."
+        LicenseTerm::AttributionRequired,
+        // §4, verbatim. The threshold is monthly active users, not revenue, so it is disclosed as
+        // text rather than as a RevenueCeiling — see LicenseTerm::DeployerObligation.
+        LicenseTerm::DeployerObligation {
+            text: "If you are commercially using the Materials, and your product or service has \
+                   more than 100 million monthly active users, You shall request a license from \
+                   Us. You cannot exercise your rights under this Agreement without our express \
+                   authorization.",
+        },
+        // §5(b), verbatim.
+        LicenseTerm::DeployerObligation {
+            text: "You can not use the Materials or any output therefrom to improve any other \
+                   large language model (excluding Tongyi Qianwen or derivative works thereof).",
+        },
+    ],
+};
+
 /// The ChatGLM3-6B License.
 ///
 /// Text read at <https://raw.githubusercontent.com/THUDM/ChatGLM3/main/MODEL_LICENSE> on
@@ -1035,6 +1082,7 @@ pub const LICENSE_FAMILIES: &[LicenseFamily] = &[
     NVIDIA_OPEN_MODEL,
     QWEN_RESEARCH,
     STABILITY_AI_COMMUNITY,
+    TONGYI_QIANWEN,
 ];
 
 #[cfg(test)]
@@ -1071,8 +1119,9 @@ mod tests {
             NVIDIA_OPEN_MODEL,
             QWEN_RESEARCH,
             STABILITY_AI_COMMUNITY,
+            TONGYI_QIANWEN,
         ];
-        assert_eq!(LICENSE_FAMILIES.len(), 21);
+        assert_eq!(LICENSE_FAMILIES.len(), 22);
         assert_eq!(LICENSE_FAMILIES, DECLARED);
 
         for family in LICENSE_FAMILIES {
@@ -1260,6 +1309,7 @@ mod tests {
                 "nvidia-open-model",
                 "qwen-research",
                 "stability-ai-community",
+                "tongyi-qianwen",
             ]
         );
 
@@ -1638,6 +1688,17 @@ mod tests {
                     "notice_file_required",
                     "downstream_license_copy:stability-ai-community",
                     "acceptable_use_policy:https://stability.ai/use-policy",
+                ],
+            ),
+            (
+                "tongyi-qianwen",
+                vec![
+                    "downstream_license_copy:tongyi-qianwen",
+                    "notice_file_required",
+                    "attribution_required",
+                    // §4, the 100-million-monthly-active-user condition, and §5(b).
+                    "deployer_obligation:If you are commercially using the Materials, and",
+                    "deployer_obligation:You can not use the Materials or any output ther",
                 ],
             ),
         ];

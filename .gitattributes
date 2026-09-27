@@ -21,6 +21,12 @@
 # paths — only the checkout was wrong.
 * text=auto eol=lf
 
+# Windows `shell: cmd` step bodies of `real-weights.yml`, externalized to stay under GitHub's
+# 512,000-byte workflow limit (see `scripts/ci/real_weights_workflow.py`). The runner writes an
+# inline `run:` body to its temp `.cmd` file with CRLF endings, and cmd.exe's batch parser
+# (labels, `goto`, block reads) is only reliable on CRLF, so the checked-out files must match.
+scripts/ci/real-weights/**/*.cmd text eol=crlf
+
 # Binary payloads: never convert, never diff.
 #
 # `text=auto` guesses from the first 8000 bytes, and a .safetensors file opens with a long ASCII

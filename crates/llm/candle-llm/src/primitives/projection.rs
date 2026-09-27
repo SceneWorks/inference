@@ -85,6 +85,28 @@ impl QuantSpec {
     pub fn group_size(&self) -> usize {
         self.group_size
     }
+
+    /// The GGML dtype a projection with input dimension `in_dim` is quantized to under this spec.
+    ///
+    /// Q4_K's 256-element super-block does not divide every model's MLP width (YuE stage-2's
+    /// `intermediate_size` 5504 = 21.5 × 256, so its `down_proj` has a 5504-wide input). A 4-bit
+    /// spec therefore falls back to Q4_0 — 32-element blocks, the same 4.5 bits/weight — for an
+    /// `in_dim` that is 32- but not 256-aligned; every other case keeps the spec's own dtype (a
+    /// dimension aligned to neither still fails loudly in the quantizer). The snapshot preparer and
+    /// quantize-on-load both resolve through here, so a prepared Q4 snapshot re-quantizes on load
+    /// to exactly the representation its persisted rounding came from.
+    pub fn dtype_for_in_dim(&self, in_dim: usize) -> GgmlDType {
+        let q4k_block = GgmlDType::Q4K.block_size();
+        let q4_0_block = GgmlDType::Q4_0.block_size();
+        if self.dtype == GgmlDType::Q4K
+            && !in_dim.is_multiple_of(q4k_block)
+            && in_dim.is_multiple_of(q4_0_block)
+        {
+            GgmlDType::Q4_0
+        } else {
+            self.dtype
+        }
+    }
 }
 
 /// The load-time storage format for a decoder's large projections — the weight-format selector
@@ -364,9 +386,14 @@ impl Projection {
     ) -> Result<Self> {
         match quant {
             None => Ok(Projection::Dense(Linear::new(weight, bias))),
-            Some(q) => Ok(Projection::Quantized(QuantizedLinear::quantize(
-                &weight, q.dtype, bias,
-            )?)),
+            Some(q) => {
+                let in_dim = weight.dims().last().copied().unwrap_or(0);
+                Ok(Projection::Quantized(QuantizedLinear::quantize(
+                    &weight,
+                    q.dtype_for_in_dim(in_dim),
+                    bias,
+                )?))
+            }
         }
     }
 
@@ -427,6 +454,58 @@ impl Projection {
         Ok(Self::Quantized(QuantizedLinear::from_qtensor(
             weight, bias,
         )?))
+    }
+
+    /// Load the stored GGML block tensor `source` ([`is_ggml_block_tensor`](
+    /// crate::primitives::quant::is_ggml_block_tensor)) as the projection its blocks hold (a
+    /// prepared Q4 / Q8 snapshot, sc-19375), rebuilt on `device` exactly as stored. `stem` names
+    /// the projection in a refusal.
+    ///
+    /// The blocks already are the lossy code, so `format` must be the GGML format of their bit
+    /// width: any other request would re-quantize a quantized weight, and is refused rather than
+    /// silently served at the stored precision. Every loader that reads a projection — the
+    /// separate, fused-part and stacked-expert sites of both decoders — comes through here.
+    pub(crate) fn load_stored_blocks(
+        stem: &str,
+        source: &Tensor,
+        bias: Option<Tensor>,
+        format: Option<&ProjectionFormat>,
+        device: &Device,
+    ) -> Result<Self> {
+        use crate::error::Error;
+        let Some((stored, _, _)) = crate::primitives::quant::ggml_block_storage(
+            source.dtype() == candle_core::DType::U8,
+            source.dims(),
+        ) else {
+            return Err(Error::Config(format!(
+                "projection `{stem}` is not a stored GGML block tensor"
+            )));
+        };
+        let bits = if stored == GgmlDType::Q8_0 { 8 } else { 4 };
+        match format {
+            Some(ProjectionFormat::Ggml(quant)) if quant.bits() == bits => {}
+            Some(ProjectionFormat::Ggml(quant)) => {
+                return Err(Error::Unsupported(format!(
+                    "projection `{stem}` is stored {stored:?} (a prepared Q{bits} snapshot); it \
+                     cannot be re-quantized to Q{}",
+                    quant.bits()
+                )))
+            }
+            Some(ProjectionFormat::Nvfp4(_)) => {
+                return Err(Error::Unsupported(format!(
+                    "nvfp4: projection `{stem}` is stored {stored:?} (a prepared Q{bits} \
+                     snapshot); NVFP4 projections are quantized from a dense snapshot"
+                )))
+            }
+            None => {
+                return Err(Error::Config(format!(
+                    "projection `{stem}` is stored {stored:?} but the model config has no \
+                     quantization block"
+                )))
+            }
+        }
+        let qt = crate::primitives::quant::from_ggml_block_tensor(source, device)?;
+        Self::load_qtensor(qt, bias)
     }
 
     /// Load a pre-quantized MLX affine Q8 triple without interpreting its shortened U32 code
@@ -611,6 +690,25 @@ mod tests {
             .sum();
         let den: f64 = want.iter().map(|w| (*w as f64).powi(2)).sum();
         (num / den.max(1e-30)).sqrt() as f32
+    }
+
+    /// sc-19375: a 4-bit spec serves a 32- but not 256-aligned input dimension (YuE stage-2's
+    /// 5504-wide `down_proj`) as Q4_0 instead of refusing the load; aligned dims and Q8 are unchanged.
+    #[test]
+    fn q4_falls_back_to_q4_0_for_non_256_aligned_inputs() {
+        let q4 = QuantSpec::q4();
+        assert_eq!(q4.dtype_for_in_dim(4096), GgmlDType::Q4K);
+        assert_eq!(q4.dtype_for_in_dim(5504), GgmlDType::Q4_0);
+        assert_eq!(q4.dtype_for_in_dim(100), GgmlDType::Q4K); // aligned to neither: quantizer refuses
+        assert_eq!(QuantSpec::q8().dtype_for_in_dim(5504), GgmlDType::Q8_0);
+
+        let p = Projection::load(ramp(8, 5504, 7, &Device::Cpu), Some(q4)).unwrap();
+        assert_eq!(p.kind(), ProjectionKind::Ggml);
+        let Projection::Quantized(q) = &p else {
+            panic!("expected a quantized projection")
+        };
+        assert_eq!(q.ggml_dtype(), Some(GgmlDType::Q4_0));
+        assert!(Projection::load(ramp(8, 100, 7, &Device::Cpu), Some(q4)).is_err());
     }
 
     /// sc-24135 AC2 at the primitive: an NVFP4 format for a CPU device is the typed refusal.

@@ -2534,3 +2534,269 @@ environment = ["BONSAI_BASELINE_SNAPSHOT"]
 expected_files = ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.json", "generation_config.json", "preprocessor_config.json", "video_preprocessor_config.json", "model.safetensors.index.json"]
 admission_language_weight_bytes = 16381470720
 admission_vision_weight_bytes = 1152776672
+
+# sc-19387 (epic sc-19373) -- YuE-v1 lyrics2song: the four published SceneWorks rehosts the
+# `candle-audio-yue` registered loader reads. Materialized on the Windows CUDA runner under
+# `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `real-weights-yue.yml`, which hard-links them into the
+# `YUE_SNAPSHOT_ROOT` layout `tests/registered_loader_real_weights.rs` expects. Each stage-1 row
+# fetches ONLY the tier its case runs (CoT at bf16, ICL at q4) rather than all three (~24 GB per
+# repo); stage 2 carries both of those tiers; xcodec fetches exactly the three checkpoints the
+# SceneWorks manifest provisions for the `xcodec` component.
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-bf16"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/generation_config.json",
+    "bf16/model.safetensors.index.json",
+    "bf16/tokenizer.json",
+    "bf16/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-q4"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q4/config.json",
+    "q4/generation_config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+    "q4/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s2-1b-general"
+repository = "SceneWorks/yue-s2-1b-general-candle"
+revision = "3d6a71c7f2af1010983fc9da7bcaba528f083da6"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_S2_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/model.safetensors",
+    "bf16/tokenizer.json",
+    "q4/config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+]
+
+[[models]]
+key = "yue-xcodec-mini-infer"
+repository = "SceneWorks/xcodec-mini-infer"
+revision = "8ca30a19de500892e23a6ee687fca030053db60d"
+license = "Apache-2.0"
+size_class = "medium"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_XCODEC_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "final_ckpt/ckpt_00360000.safetensors", "decoders/decoder_131000.safetensors", "decoders/decoder_151000.safetensors"]
+expected_files = [
+    "final_ckpt/ckpt_00360000.safetensors",
+    "decoders/decoder_131000.safetensors",
+    "decoders/decoder_151000.safetensors",
+]
+
+# sc-19387: the remaining tiers of the same pinned rehosts, fetched only by `real-weights-yue.yml`'s
+# `mode: memory` (every case at q4, q8 and bf16). Same repositories, revisions and snapshot
+# variables as the rows above; each row adds one tier directory to the same hub-cache snapshot.
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-q4"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q4/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q4/config.json",
+    "q4/generation_config.json",
+    "q4/model.safetensors",
+    "q4/tokenizer.json",
+    "q4/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-cot-q8"
+repository = "SceneWorks/yue-s1-7b-anneal-en-cot-candle"
+revision = "5842b8bc97d2a6dddc427a444920050dd3860949"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_COT_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/generation_config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+    "q8/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-q8"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/generation_config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+    "q8/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s1-7b-anneal-en-icl-bf16"
+repository = "SceneWorks/yue-s1-7b-anneal-en-icl-candle"
+revision = "fc8cb3515e654d419c2831dcdaf931b61a050179"
+license = "Apache-2.0"
+size_class = "very-large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_EN_ICL_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "bf16/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "bf16/config.json",
+    "bf16/generation_config.json",
+    "bf16/model.safetensors.index.json",
+    "bf16/tokenizer.json",
+    "bf16/tokenizer.model",
+]
+
+[[models]]
+key = "yue-s2-1b-general-q8"
+repository = "SceneWorks/yue-s2-1b-general-candle"
+revision = "3d6a71c7f2af1010983fc9da7bcaba528f083da6"
+license = "Apache-2.0"
+size_class = "large"
+profiles = ["yue"]
+environment = ["CANDLE_AUDIO_YUE_S2_SNAPSHOT"]
+download_files = ["LICENSE", "NOTICE", "SOURCE_REVISION.json", "sceneworks-tiers.json", "q8/*"]
+expected_files = [
+    "sceneworks-tiers.json",
+    "q8/config.json",
+    "q8/model.safetensors",
+    "q8/tokenizer.json",
+]
+
+# sc-22995 (epic sc-22988) -- YuE2 precision tiers: the pinned upstream originals (CC BY-NC 4.0,
+# ungated) the `candle-audio-yue2` quality harness loads on the Windows CUDA runner, materialized
+# under `CANDLE_GEN_MODELS_ROOT` by the dispatch-only `real-weights-yue.yml` (`family: yue2`). The
+# runner's copy is a local noncommercial test copy; nothing is rehosted, and the q8/q4 tiers are
+# derived on the runner by `candle_audio_yue2::tier::convert`. Only the pinned closure files are
+# fetched (the repository also carries wheels and example audio the runtime never reads).
+[[models]]
+key = "yue2-3b"
+repository = "m-a-p/YuE2-3B"
+revision = "1a96eca688d6ae5d7f0feb88573fec89920fcd19"
+license = "CC-BY-NC-4.0"
+size_class = "large"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_3B_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "generation_config.json",
+    "yue2_generation_config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "qwen.tiktoken",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "generation_config.json",
+    "yue2_generation_config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "qwen.tiktoken",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]
+
+[[models]]
+key = "yue2-vae"
+repository = "m-a-p/YuE2-Vae"
+revision = "95535e72a97bc0f09b8ada125d26b4009428c0e8"
+license = "CC-BY-NC-4.0"
+size_class = "small"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_VAE_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]
+
+# The legacy (evaluation) decoder of the same closure (sc-22988 feature review): the CUDA lane
+# materializes both decoders so a standard and a legacy decode of one cached latent run there.
+[[models]]
+key = "yue2-vae-legacy"
+repository = "m-a-p/YuE2-Vae-legacy"
+revision = "b54118f0fc462f08999d1ec07e88817f4ee3f770"
+license = "CC-BY-NC-4.0"
+size_class = "small"
+profiles = ["yue2"]
+environment = ["CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT"]
+download_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/*",
+]
+expected_files = [
+    "config.json",
+    "weights_manifest.json",
+    "model.safetensors",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/SnakeBeta-NVIDIA-MIT.txt",
+    "licenses/stable-audio-tools-MIT.txt",
+]
