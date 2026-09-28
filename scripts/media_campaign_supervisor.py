@@ -394,43 +394,71 @@ def run_guarded(
         peak_host = 0
         peak_gpu = 0
         samples: list[dict[str, object]] = []
+        def check_artifact_caps() -> None:
+            if stdout_path.stat().st_size > policy.stdout_cap_bytes or stderr_path.stat().st_size > policy.stderr_cap_bytes:
+                raise SupervisionError("log-cap", "child exceeded a bounded transcript file")
+            if event_path is not None:
+                if event_path.is_symlink():
+                    raise SupervisionError("event-path", "observer event file may not be a symlink")
+                if event_path.exists() and event_path.stat().st_size > policy.event_cap_bytes:
+                    raise SupervisionError("event-cap", "child exceeded a bounded observer event file")
+
+        def owned_processes() -> tuple[set[int], set[int]]:
+            if job is not None:
+                try:
+                    pids = job.members()
+                except windows.WindowsJobError as error:
+                    raise SupervisionError("probe-failure", str(error)) from error
+                return pids, pids
+            table = _process_table()
+            owned = _expand_owned(table, known)
+            pids = {pid for pid, (_parent, group) in table.items() if group == child.pid}
+            if any(table[pid][1] != child.pid for pid in owned):
+                raise SupervisionError("process-escape", "observed descendant left the owned process group")
+            return pids, owned
+
+        def finished_result(status: int | None, pids: set[int], owned: set[int]) -> RunResult | None:
+            if status is None or pids or owned:
+                return None
+            if clock() - started >= policy.deadline_seconds:
+                raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
+            # The root exit and an empty owned tree are both required. Recheck
+            # files here because the child can write between the loop's first
+            # cap check and this terminal observation.
+            check_artifact_caps()
+            if status != 0:
+                raise SupervisionError("child-exit", f"child exited with status {status}")
+            if policy.backend == "windows-cuda" and peak_gpu <= 0:
+                raise SupervisionError("probe-failure", "CUDA child had no attributable GPU-memory sample")
+            child.wait()
+            return RunResult(child.pid, status, peak_host, peak_gpu if gpu_free is not None else None,
+                             host_free, gpu_free, clock() - started, tuple(samples))
+
         try:
             while True:
                 if clock() - started >= policy.deadline_seconds:
                     raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
-                if stdout_path.stat().st_size > policy.stdout_cap_bytes or stderr_path.stat().st_size > policy.stderr_cap_bytes:
-                    raise SupervisionError("log-cap", "child exceeded a bounded transcript file")
-                if event_path is not None:
-                    if event_path.is_symlink():
-                        raise SupervisionError("event-path", "observer event file may not be a symlink")
-                    if event_path.exists() and event_path.stat().st_size > policy.event_cap_bytes:
-                        raise SupervisionError("event-cap", "child exceeded a bounded observer event file")
+                check_artifact_caps()
                 status = child.poll()
-                if job is not None:
-                    try:
-                        pids = job.members()
-                    except windows.WindowsJobError as error:
-                        raise SupervisionError("probe-failure", str(error)) from error
-                    owned = pids
-                else:
-                    table = _process_table()
-                    owned = _expand_owned(table, known)
-                    pids = {pid for pid, (_parent, group) in table.items() if group == child.pid}
-                    if any(table[pid][1] != child.pid for pid in owned):
-                        raise SupervisionError("process-escape", "observed descendant left the owned process group")
-                if status is not None and not pids and not owned:
-                    if status != 0:
-                        raise SupervisionError("child-exit", f"child exited with status {status}")
-                    if policy.backend == "windows-cuda" and peak_gpu <= 0:
-                        raise SupervisionError("probe-failure", "CUDA child had no attributable GPU-memory sample")
-                    child.wait()
-                    return RunResult(child.pid, status, peak_host, peak_gpu if gpu_free is not None else None,
-                                     host_free, gpu_free, clock() - started, tuple(samples))
+                pids, owned = owned_processes()
+                finished = finished_result(status, pids, owned)
+                if finished is not None:
+                    return finished
                 free = probe.host_free()
                 if free < policy.host_free_reserve_bytes:
                     raise SupervisionError("host-memory", "host free fell below reserve")
                 if pids:
-                    footprint = probe.tree_footprint(owner)
+                    try:
+                        footprint = probe.tree_footprint(owner)
+                    except SupervisionError:
+                        # A short-lived child may exit after the ownership
+                        # snapshot and before the footprint subprocess runs.
+                        # A live root, owned descendant, or uncertain ownership
+                        # retains the original fail-closed probe error.
+                        finished = finished_result(child.poll(), *owned_processes())
+                        if finished is not None:
+                            return finished
+                        raise
                     peak_host = max(peak_host, footprint)
                     samples.append({"phase": "process-sample", "sample_kind": "process",
                                     "peak_bytes": footprint, "at_ns": time.time_ns()})
