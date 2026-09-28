@@ -531,10 +531,101 @@ fn preflight_total_live_tokens(
     Ok((total, max_request))
 }
 
-/// A deliberately conservative planning budget, not a proven process peak. The two-times
-/// checkpoint load reservation matches this model type's source load admission; the pinned BF16
-/// config supplies a minimum dense KV geometry, and the fused route needs at least one score,
-/// mask, and softmax tile. The actual lazy graph may retain more, especially at long context.
+/// Infer the widest dense K/V scalar produced by this pinned loader route without loading MLX
+/// arrays. The embed is cast to BF16, but affine quantized projections promote BF16 activations
+/// with their stored scale dtype. An F16 or F32 scale anywhere in the decoder can make a later
+/// hidden state F32, even when that later layer's own K/V scales are BF16. Dense projections cast
+/// their stored weights to BF16; a prior F32 activation still produces F32. Use the widest width
+/// across the entire stack rather than assuming the config's `torch_dtype` is the cache dtype.
+/// Both parent preflight and worker validate the exact pinned snapshot inventory before this call.
+fn pinned_dense_kv_element_bytes(
+    spec: &BenchmarkModelSpec,
+    snapshot: &Path,
+    layers: u64,
+) -> Result<u64, String> {
+    let mut dtypes = std::collections::HashMap::<String, String>::new();
+    for required in spec
+        .required_files
+        .iter()
+        .filter(|file| file.path.ends_with(".safetensors"))
+    {
+        let path = snapshot.join(required.path);
+        let mut file = File::open(&path).map_err(|e| format!("read pinned weight header: {e}"))?;
+        let mut prefix = [0_u8; 8];
+        file.read_exact(&mut prefix)
+            .map_err(|e| format!("read pinned weight header length: {e}"))?;
+        let len = u64::from_le_bytes(prefix);
+        if len > 64 * 1024 * 1024 || len > required.bytes.saturating_sub(8) {
+            return Err("pinned safetensors header length is invalid".into());
+        }
+        let mut bytes = vec![0_u8; len as usize];
+        file.read_exact(&mut bytes)
+            .map_err(|e| format!("read pinned weight header: {e}"))?;
+        let header: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("parse pinned weight header: {e}"))?;
+        for (key, tensor) in header
+            .as_object()
+            .ok_or("pinned safetensors header is not an object")?
+        {
+            if key == "__metadata__" {
+                continue;
+            }
+            let dtype = tensor
+                .get("dtype")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("pinned tensor {key} lacks dtype"))?;
+            if dtypes.insert(key.clone(), dtype.to_owned()).is_some() {
+                return Err(format!("duplicate pinned tensor {key}"));
+            }
+        }
+    }
+    let mut width = 2_u64; // The loader casts the embedding output to BF16.
+    for layer in 0..layers {
+        for projection in [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ] {
+            let stem = format!("model.layers.{layer}.{projection}");
+            let weight = dtypes
+                .get(&format!("{stem}.weight"))
+                .ok_or_else(|| format!("pinned decoder lacks {stem}.weight"))?;
+            match dtypes.get(&format!("{stem}.scales")) {
+                Some(scales) => {
+                    let biases = dtypes
+                        .get(&format!("{stem}.biases"))
+                        .ok_or_else(|| format!("pinned decoder lacks {stem}.biases"))?;
+                    if !spec.quantized || weight != "U32" || scales != biases {
+                        return Err(format!("unsupported pinned quantized projection {stem}"));
+                    }
+                    match scales.as_str() {
+                        "BF16" => {}
+                        // MLX 0.32 affine quantized_matmul promotes BF16+F16 to F32.
+                        "F16" | "F32" => width = 4,
+                        _ => return Err(format!("unsupported pinned scale dtype for {stem}")),
+                    }
+                }
+                None => {
+                    if !matches!(weight.as_str(), "BF16" | "F16" | "F32")
+                        || dtypes.contains_key(&format!("{stem}.biases"))
+                    {
+                        return Err(format!("unsupported pinned dense projection {stem}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(width)
+}
+
+/// A deliberately conservative planning floor, not a proven process peak. The two-times
+/// checkpoint load reservation matches this model type's load admission; the pinned projection
+/// metadata supplies role-specific dense KV width. The actual lazy graph may retain more,
+/// especially at long context, so this floor alone does not admit material or fit rows.
 fn static_role_footprint_budget(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
@@ -565,13 +656,21 @@ fn static_role_footprint_budget(
         .and_then(serde_json::Value::as_str)
         != Some("bfloat16")
     {
-        return Err("pinned model cache dtype cannot be bounded from BF16 config".into());
+        return Err("pinned model loader input dtype is not BF16".into());
     }
     let layers = positive("num_hidden_layers")?;
     let kv_heads = positive("num_key_value_heads")?;
     let head_dim = positive("head_dim")?;
     let query_heads = positive("num_attention_heads")?;
-    let kv = dense_kv_bytes(1, layers, kv_heads, total_live_tokens, head_dim, 2)?;
+    let element_bytes = pinned_dense_kv_element_bytes(spec, snapshot, layers)?;
+    let kv = dense_kv_bytes(
+        1,
+        layers,
+        kv_heads,
+        total_live_tokens,
+        head_dim,
+        element_bytes,
+    )?;
     let tile = [3_u64, 8, request_tokens, query_heads, 4]
         .into_iter()
         .try_fold(1_u64, |value, factor| value.checked_mul(factor))
@@ -7284,14 +7383,66 @@ mod tests {
         }
     }
 
-    #[test]
-    fn impossible_child_cap_refuses_known_model_load_and_kv_before_spawn() {
-        let temporary = tempfile::tempdir().unwrap();
+    fn write_stub_dtype_snapshot(root: &Path, spec: &BenchmarkModelSpec, scale_dtype: &str) {
+        fs::create_dir_all(root).unwrap();
         fs::write(
-            temporary.path().join("config.json"),
+            root.join("config.json"),
             br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":24}"#,
         )
         .unwrap();
+        let mut header = serde_json::Map::new();
+        for layer in 0..28 {
+            for projection in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                let stem = format!("model.layers.{layer}.{projection}");
+                header.insert(
+                    format!("{stem}.weight"),
+                    serde_json::json!({"dtype": if spec.quantized { "U32" } else { "BF16" }}),
+                );
+                if spec.quantized {
+                    for suffix in ["scales", "biases"] {
+                        header.insert(
+                            format!("{stem}.{suffix}"),
+                            serde_json::json!({"dtype": scale_dtype}),
+                        );
+                    }
+                }
+            }
+        }
+        let empty = serde_json::Map::new();
+        for (index, required) in spec
+            .required_files
+            .iter()
+            .filter(|file| file.path.ends_with(".safetensors"))
+            .enumerate()
+        {
+            let bytes = serde_json::to_vec(if index == 0 {
+                &header
+            } else {
+                // Sharded references may put all tested tensors in the first shard.
+                &empty
+            })
+            .unwrap();
+            let mut file = Vec::from((bytes.len() as u64).to_le_bytes());
+            file.extend_from_slice(&bytes);
+            fs::write(root.join(required.path), file).unwrap();
+        }
+    }
+
+    #[test]
+    fn impossible_child_cap_refuses_known_model_load_and_kv_before_spawn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = temporary.path().join("candidate");
+        let reference = temporary.path().join("reference");
+        write_stub_dtype_snapshot(&candidate, &LLAMA_CANDIDATE, "F16");
+        write_stub_dtype_snapshot(&reference, &LLAMA_REFERENCE, "BF16");
         let mut policy = CampaignSafetyPolicy {
             schema_version: 1,
             row_deadline_seconds: 10,
@@ -7305,15 +7456,89 @@ mod tests {
             stderr_cap_bytes: 4_096,
         };
         let row = &required_coordinates()[0];
-        let refusal =
-            static_row_footprint_budget(row, temporary.path(), temporary.path(), 425, 318, &policy)
-                .unwrap_err();
+        let refusal = static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy)
+            .unwrap_err();
         assert!(refusal.contains("child footprint cap 2048 refuses before spawn"));
         policy.child_footprint_cap_bytes = u64::MAX - policy.host_free_reserve_bytes;
         let budget =
-            static_row_footprint_budget(row, temporary.path(), temporary.path(), 425, 318, &policy)
-                .unwrap();
+            static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy).unwrap();
         assert!(budget > 12_000_000_000); // BF16 reference dominates the sequential roles.
+    }
+
+    #[test]
+    fn pinned_projection_scales_set_role_kv_width_and_refuse_old_two_byte_cap() {
+        let temporary = tempfile::tempdir().unwrap();
+        let llama_candidate = temporary.path().join("llama-candidate");
+        let llama_reference = temporary.path().join("llama-reference");
+        let qwen_candidate = temporary.path().join("qwen-candidate");
+        let qwen_reference = temporary.path().join("qwen-reference");
+        write_stub_dtype_snapshot(&llama_candidate, &LLAMA_CANDIDATE, "F16");
+        write_stub_dtype_snapshot(&llama_reference, &LLAMA_REFERENCE, "BF16");
+        write_stub_dtype_snapshot(&qwen_candidate, &QWEN_CANDIDATE, "BF16");
+        write_stub_dtype_snapshot(&qwen_reference, &QWEN_REFERENCE, "BF16");
+        for (spec, path, expected) in [
+            (&LLAMA_CANDIDATE, &llama_candidate, 4),
+            (&LLAMA_REFERENCE, &llama_reference, 2),
+            (&QWEN_CANDIDATE, &qwen_candidate, 2),
+            (&QWEN_REFERENCE, &qwen_reference, 2),
+        ] {
+            assert_eq!(
+                pinned_dense_kv_element_bytes(spec, path, 28).unwrap(),
+                expected
+            );
+        }
+        let old_row_budget =
+            static_role_footprint_budget(&LLAMA_REFERENCE, &llama_reference, 262_144, 131_072)
+                .unwrap();
+        let new_candidate =
+            static_role_footprint_budget(&LLAMA_CANDIDATE, &llama_candidate, 262_144, 131_072)
+                .unwrap();
+        let cap = 50_u64 << 30;
+        // With the old 2-byte candidate estimate the larger reference set the row floor.
+        assert!(old_row_budget < cap && new_candidate > cap);
+        let mut policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1,
+            child_footprint_cap_bytes: cap,
+            max_context_tokens: u64::MAX,
+            max_request_tokens: u64::MAX,
+            stdout_cap_bytes: 100,
+            stderr_cap_bytes: 100,
+        };
+        let row = &required_coordinates()[0];
+        assert!(static_row_footprint_budget(
+            row,
+            &llama_candidate,
+            &llama_reference,
+            262_144,
+            131_072,
+            &policy,
+        )
+        .unwrap_err()
+        .contains("refuses before spawn"));
+        policy.child_footprint_cap_bytes = new_candidate;
+        assert_eq!(
+            static_row_footprint_budget(
+                row,
+                &llama_candidate,
+                &llama_reference,
+                262_144,
+                131_072,
+                &policy,
+            )
+            .unwrap(),
+            new_candidate
+        );
+        let unsupported = temporary.path().join("unsupported-scales");
+        write_stub_dtype_snapshot(&unsupported, &LLAMA_CANDIDATE, "F64");
+        assert!(
+            pinned_dense_kv_element_bytes(&LLAMA_CANDIDATE, &unsupported, 28)
+                .unwrap_err()
+                .contains("unsupported pinned scale dtype")
+        );
     }
 
     #[test]
