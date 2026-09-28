@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -39,12 +40,14 @@ class SupervisorTests(unittest.TestCase):
         policy_file.write_text(json.dumps(data), encoding="utf-8")
         self.policy = safety.load_policy(policy_file)
 
-    def run_child(self, script, *, probe=None, bound=1024, policy=None, event_path=None):
+    def run_child(self, script, *, probe=None, bound=1024, gpu_bound=None, policy=None,
+                  event_path=None, on_spawn=None):
         return safety.run_guarded(
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy or self.policy, stdout_path=self.root / "stdout",
             stderr_path=self.root / "stderr", source_peak_host_bytes=bound,
-            probe=probe or Probe(), event_path=event_path,
+            source_peak_gpu_bytes=gpu_bound, probe=probe or Probe(),
+            event_path=event_path, on_spawn=on_spawn,
         )
 
     def test_policy_parsing_and_preflight_refuse_before_spawn(self):
@@ -70,6 +73,110 @@ class SupervisorTests(unittest.TestCase):
         (self.root / "stderr").unlink()
         with self.assertRaisesRegex(safety.SupervisionError, "child-exit"):
             self.run_child("import sys; sys.exit(7)")
+
+    def test_on_spawn_persists_owned_identity_before_sampling(self):
+        status_path = self.root / "spawn-status.json"
+        callback_calls = []
+
+        def persist(pid, pgid):
+            callback_calls.append((pid, pgid))
+            self.assertEqual(pgid, pid)
+            self.assertIn(pid, safety._group_pids(pgid))
+            temporary = status_path.with_suffix(".tmp")
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump({"pid": pid, "pgid": pgid}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, status_path)
+
+        case = self
+
+        class PersistedProbe(Probe):
+            def tree_footprint(self, pgid):
+                self_status = json.loads(status_path.read_text(encoding="utf-8"))
+                case.assertEqual(self_status["pgid"], pgid)
+                return super().tree_footprint(pgid)
+
+        result = self.run_child("import time; time.sleep(.15)", probe=PersistedProbe(),
+                                on_spawn=persist)
+        self.assertEqual(callback_calls, [(result.pid, result.pid)])
+        self.assertEqual(json.loads(status_path.read_text(encoding="utf-8")),
+                         {"pid": result.pid, "pgid": result.pid})
+
+    def test_on_spawn_exception_reaps_owned_parent_and_descendant(self):
+        descendant_path = self.root / "descendant"
+        child_source = (
+            "import os,subprocess,time; "
+            "p=subprocess.Popen(['sleep','5']); "
+            "open('descendant','w').write(str(p.pid)); time.sleep(5)"
+        )
+        ownership = []
+
+        def fail_after_spawn(pid, pgid):
+            ownership.append((pid, pgid))
+            deadline = time.monotonic() + 1
+            while (not descendant_path.exists() or descendant_path.stat().st_size == 0
+                   ) and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(descendant_path.exists() and descendant_path.stat().st_size > 0)
+            raise OSError("status persistence failed")
+
+        with self.assertRaisesRegex(OSError, "status persistence failed"):
+            self.run_child(child_source, on_spawn=fail_after_spawn)
+        pid, pgid = ownership[0]
+        self.assertEqual(pgid, pid)
+        self.assertFalse(safety._group_pids(pgid))
+        self.assertNotIn(int(descendant_path.read_text(encoding="ascii")), safety._process_table())
+
+    def test_windows_on_spawn_exception_terminates_owned_job(self):
+        data = json.loads(self.policy.canonical_bytes)
+        data.update({"backend": "windows-cuda",
+                     "cudaDeviceUuid": "GPU-12345678-1234-1234-1234-123456789abc",
+                     "gpuFreeReserveBytes": 100, "childGpuCapBytes": 10**6})
+        policy_path = self.root / "windows-policy.json"
+        policy_path.write_text(json.dumps(data), encoding="utf-8")
+        policy = safety.load_policy(policy_path)
+
+        class FakeJob:
+            assigned = False
+            terminated = False
+            closed = False
+
+            def assign_and_resume(self, _child):
+                self.assigned = True
+
+            def terminate_and_reap(self, _child, _grace):
+                self.terminated = True
+
+            def close(self):
+                self.closed = True
+
+        class FakeChild:
+            pid = 43210
+
+            def wait(self, **_kwargs):
+                return 0
+
+        class CudaProbe(Probe):
+            def gpu_free(self):
+                return 10**12
+
+        job = FakeJob()
+        observed = []
+
+        def fail_after_owned(pid, pgid):
+            observed.append((pid, pgid, job.assigned))
+            raise OSError("status persistence failed")
+
+        with patch.object(safety.os, "name", "nt"), \
+             patch.object(safety.windows, "WindowsJob", return_value=job), \
+             patch.object(safety.subprocess, "Popen", return_value=FakeChild()):
+            with self.assertRaisesRegex(OSError, "status persistence failed"):
+                self.run_child("unused", policy=policy, probe=CudaProbe(),
+                               gpu_bound=1024, on_spawn=fail_after_owned)
+        self.assertEqual(observed, [(43210, None, True)])
+        self.assertTrue(job.terminated)
+        self.assertTrue(job.closed)
 
     def test_deadline_reaps_owned_process_group(self):
         script = (
@@ -275,7 +382,7 @@ class WindowsSupervisorTests(unittest.TestCase):
         self.assertGreater(windows.host_free_bytes(), 0)
         self.assertTrue(Path(windows.trusted_nvidia_smi()).is_absolute())
 
-    def _run(self, script, *, cap=None):
+    def _run(self, script, *, cap=None, on_spawn=None):
         policy_data = dict(self.data)
         if cap is not None:
             policy_data["childFootprintCapBytes"] = cap
@@ -299,7 +406,14 @@ class WindowsSupervisorTests(unittest.TestCase):
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy, stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
             source_peak_host_bytes=1024, source_peak_gpu_bytes=1024, probe=Probe(),
+            on_spawn=on_spawn,
         )
+
+    def test_on_spawn_reports_job_owned_root_without_posix_group(self):
+        calls = []
+        result = self._run("import time; time.sleep(.1)",
+                           on_spawn=lambda pid, pgid: calls.append((pid, pgid)))
+        self.assertEqual(calls, [(result.pid, None)])
 
     def _assert_exited(self, pid):
         import ctypes

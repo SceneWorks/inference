@@ -340,6 +340,7 @@ def run_guarded(
     stdout_path: Path, stderr_path: Path, source_peak_host_bytes: int | None,
     source_peak_gpu_bytes: int | None = None, event_path: Path | None = None,
     probe: object | None = None, clock: Callable[[], float] = time.monotonic,
+    on_spawn: Callable[[int, int | None], None] | None = None,
 ) -> RunResult:
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise SupervisionError("invalid-command", "argv is empty or malformed")
@@ -435,6 +436,9 @@ def run_guarded(
                              host_free, gpu_free, clock() - started, tuple(samples))
 
         try:
+            if on_spawn is not None:
+                # Windows ownership is a Job, not a POSIX process group.
+                on_spawn(child.pid, None if job is not None else child.pid)
             while True:
                 if clock() - started >= policy.deadline_seconds:
                     raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
