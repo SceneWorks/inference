@@ -8589,7 +8589,7 @@ mod tests {
         assert_eq!(identity.version, "0.25.8");
         assert_eq!(
             identity.revision,
-            "bd8f0e3c757195b17b2c34fae3073ab826fb7bc1"
+            "105a72fd7840dd81b3139728a90073d871572125"
         );
         assert_eq!(
             identity.source,

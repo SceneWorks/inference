@@ -2,7 +2,7 @@
 //!
 //! The decoders run GQA — fewer KV heads than query heads — so cached K/V must be expanded to the
 //! query head count before attention. [`repeat_kv`] is the `[b, hkv, s, hd] -> [b, hkv*groups, s, hd]`
-//! broadcast the mlx-gen stacks use. [`sdpa`] wraps MLX's fused `scaled_dot_product_attention`,
+//! head expansion the mlx-gen stacks use. [`sdpa`] wraps MLX's fused `scaled_dot_product_attention`,
 //! exposing the two masking modes the references need: implicit bottom-right [`AttnMask::Causal`]
 //! (decode) and an explicit [`AttnMask::Additive`] mask (the block-causal / bidirectional paths).
 
@@ -58,12 +58,22 @@ pub enum AttnMask<'a> {
 ///
 /// `x` is `[batch, n_kv_heads, seq, head_dim]`; the result is `[batch, n_kv_heads * groups, seq,
 /// head_dim]` where `groups = n_query_heads / n_kv_heads`. `groups == 1` (MHA) is a no-op clone.
+/// Long sequences gather the small head axis because the pinned fork's broadcast-reshape path can
+/// corrupt expanded values beyond 256 tokens.
 pub fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
     if groups == 1 {
         return Ok(x.clone());
     }
     let sh = x.shape();
     let (b, hkv, s, hd) = (sh[0], sh[1], sh[2], sh[3]);
+    if s > 256 {
+        // On the pinned MLX fork, broadcast -> reshape corrupts long expanded KV tensors.
+        // Gather on the small head axis keeps the original head order and finite values.
+        let heads: Vec<i32> = (0..hkv)
+            .flat_map(|head| std::iter::repeat_n(head, groups as usize))
+            .collect();
+        return Ok(x.take_axis(Array::from_slice(&heads, &[hkv * groups]), 1)?);
+    }
     let expanded = x.expand_dims(2)?; // [b, hkv, 1, s, hd]
     let broad = broadcast_to(&expanded, &[b, hkv, groups, s, hd])?;
     Ok(broad.reshape(&[b, hkv * groups, s, hd])?)
@@ -470,8 +480,8 @@ mod tests {
         }
     }
 
-    /// From-scratch host attention `softmax(scale·QKᵀ [+causal])·V` over `[1, h, ·, hd]` GQA tensors
-    /// (kv expanded to `h`), f64 accumulation — the ground truth the chunked-prefill mitigation is
+    /// From-scratch host attention `softmax(scale·QKᵀ [+causal])·V` over `[1, h, ·, hd]` GQA tensors,
+    /// f64 accumulation — the ground truth the chunked-prefill mitigation is
     /// gated against. Causal aligns the `ql` queries to the bottom-right of the `kl` keys
     /// (offset = kl − ql), so it also covers a cached prefix.
     fn host_attn_gqa(
@@ -482,20 +492,18 @@ mod tests {
         scale: f32,
         causal: bool,
     ) -> Vec<f32> {
-        let kx = repeat_kv(k, groups).unwrap();
-        let vx = repeat_kv(v, groups).unwrap();
-        let (qs, ks) = (q.shape(), kx.shape());
+        let (qs, ks) = (q.shape(), k.shape());
         let (h, ql, hd) = (qs[1] as usize, qs[2] as usize, qs[3] as usize);
         let kl = ks[2] as usize;
         let (qh, kh, vh) = (
             q.as_slice::<f32>(),
-            kx.as_slice::<f32>(),
-            vx.as_slice::<f32>(),
+            k.as_slice::<f32>(),
+            v.as_slice::<f32>(),
         );
         let offset = kl as isize - ql as isize;
         let mut out = vec![0f32; h * ql * hd];
         for head in 0..h {
-            let (qb, kb) = (head * ql * hd, head * kl * hd);
+            let (qb, kb) = (head * ql * hd, (head / groups as usize) * kl * hd);
             for i in 0..ql {
                 let jmax = if causal {
                     (offset + i as isize) as usize
@@ -572,6 +580,10 @@ mod tests {
     }
 
     fn rel_err(a: &[f32], host: &[f32]) -> f32 {
+        assert!(
+            a.iter().chain(host).all(|x| x.is_finite()),
+            "attention comparison contains nonfinite values"
+        );
         let maxd = a
             .iter()
             .zip(host)
@@ -579,6 +591,30 @@ mod tests {
             .fold(0.0f32, f32::max);
         let maxh = host.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
         maxd / (maxh + 1e-20)
+    }
+
+    #[test]
+    fn repeat_kv_long_sequence_preserves_finite_values() {
+        for seq in [256, 257, 268] {
+            let k = randf(&[1, 2, seq, 64], 2);
+            let expanded = repeat_kv(&k, 2).unwrap();
+            let source = k.as_slice::<f32>();
+            let observed = expanded.as_slice::<f32>();
+            let head_len = seq as usize * 64;
+            assert_eq!(observed.len(), 2 * source.len());
+            for head in 0..2 {
+                for copy in 0..2 {
+                    let start = (head * 2 + copy) * head_len;
+                    for offset in 0..head_len {
+                        assert_eq!(
+                            observed[start + offset],
+                            source[head * head_len + offset],
+                            "sequence {seq}, head {head}, copy {copy}, offset {offset}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// **The safe-path gate (sc-7430).** Fused `sdpa` is numerically correct vs a host reference for
@@ -594,6 +630,7 @@ mod tests {
             (32, 8, 1, 256, 128), // decode, long cache, hd=128 (Qwen3-like)
             (8, 2, 8, 8, 64),     // short prefill q_len=8 (chunk boundary)
             (8, 2, 8, 256, 64),   // chunked prefill: 8 new queries into a 256-key cache
+            (2, 1, 8, 268, 64),   // chunked prefill across the 256-key boundary
             (8, 2, 8, 8, 128),    // q_len=8 at hd=128 (chunk boundary for the Qwen3 head dim)
             (4, 4, 4, 64, 128),   // MHA, hd=128
         ];
@@ -646,6 +683,26 @@ mod tests {
                 assert!(
                     de < 2e-3,
                     "eager {b}/{nh}/{nkv}/{s}/{hd}/{vhd} causal={causal}: max|Δ| vs host = {de}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdpa_eager_long_gqa_matches_independent_host() {
+        for q_len in [1, 8] {
+            let (heads, kv_heads, k_len, head_dim) = (2, 1, 268, 64);
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let q = randf(&[1, heads, q_len, head_dim], 1);
+            let k = randf(&[1, kv_heads, k_len, head_dim], 2);
+            let v = randf(&[1, kv_heads, k_len, head_dim], 3);
+            for (causal, mask) in [(false, AttnMask::None), (true, AttnMask::Causal)] {
+                let out = sdpa_eager(&q, &k, &v, scale, None, mask).unwrap();
+                let host = host_attn_gqa(&q, &k, &v, heads / kv_heads, scale, causal);
+                let error = rel_err(out.as_slice::<f32>(), &host);
+                assert!(
+                    error < 2e-3,
+                    "eager long GQA q_len={q_len} causal={causal}: rel={error}"
                 );
             }
         }
