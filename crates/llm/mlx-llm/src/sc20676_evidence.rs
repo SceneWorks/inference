@@ -1,6 +1,6 @@
 //! Sealed real-model evidence harness for SC-20676 packed Metal decode attention.
 //!
-//! The dense SC-20671 campaign remains its own frozen 64-coordinate baseline.  This module
+//! The dense SC-20671 campaign remains its own frozen covering-set baseline. This module
 //! consumes a completed baseline receipt and records the much narrower product comparison needed
 //! for the opt-in packed reader: one Llama and one Qwen3 snapshot, each in fresh dense and packed
 //! workers.  It deliberately never accepts caller-authored cache counters or provenance.
@@ -16,6 +16,7 @@ use core_llm::Tokenizer;
 use serde::{Deserialize, Serialize};
 
 use crate::campaign;
+use crate::campaign_supervisor::{self, RunRequest, SystemProbe};
 use crate::config::Architecture;
 use crate::decode::{
     generate_from_prefill, generate_with_cache, CancelFlag, FinishReason, GenerationConfig,
@@ -61,6 +62,8 @@ impl Default for Sc20676Thresholds {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sc20676BaselineBinding {
     pub receipt_sha256: String,
+    pub campaign_manifest_sha256: String,
+    pub campaign_schedule_version: u64,
     pub model_file_sha256: String,
     pub model_id: String,
     pub model_repository: String,
@@ -384,7 +387,8 @@ fn validate_complete_matrix_receipts(
         .iter()
         .map(|receipt| {
             (
-                receipt.baseline.campaign_session_id.as_str(),
+                receipt.baseline.campaign_manifest_sha256.as_str(),
+                receipt.baseline.campaign_schedule_version,
                 receipt.baseline.campaign_global_identity_sha256.as_str(),
                 receipt.baseline.scene_works_revision.as_str(),
                 receipt.baseline.inference_revision.as_str(),
@@ -715,6 +719,8 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         || receipt.harness_version != SC20676_HARNESS_VERSION
         || receipt.thresholds.contract_hash != SC20676_CONTRACT_HASH
         || !is_digest(&receipt.baseline.receipt_sha256)
+        || !is_digest(&receipt.baseline.campaign_manifest_sha256)
+        || ![1, 2].contains(&receipt.baseline.campaign_schedule_version)
         || !is_digest(&receipt.baseline.model_file_sha256)
         || !is_digest(&receipt.baseline.snapshot_inventory_sha256)
         || receipt.baseline.model_id.is_empty()
@@ -883,7 +889,17 @@ pub fn bind_sc20671_baseline(
     snapshot: &Path,
     family: &str,
 ) -> std::result::Result<Sc20676BaselineBinding, String> {
-    let baseline = campaign::select_sc20676_baseline_row(campaign_directory.as_ref(), family)?;
+    let campaign_directory = campaign_directory.as_ref();
+    let baseline = campaign::select_sc20676_baseline_row(campaign_directory, family)?;
+    let manifest_bytes =
+        fs::read(campaign_directory.join("campaign.json")).map_err(|e| e.to_string())?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| e.to_string())?;
+    let campaign_schedule_version = manifest
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|version| [1, 2].contains(version))
+        .ok_or("SC-20671 baseline has no supported complete schedule version")?;
     let receipt = baseline.receipt;
     let campaign_global_identity_sha256 =
         campaign::seal_bytes(&campaign::campaign_global_identity(&receipt)?);
@@ -905,6 +921,8 @@ pub fn bind_sc20671_baseline(
     }
     Ok(Sc20676BaselineBinding {
         receipt_sha256: receipt.receipt_sha256,
+        campaign_manifest_sha256: campaign::seal_bytes(&manifest_bytes),
+        campaign_schedule_version,
         model_file_sha256: receipt.provenance.model_file_sha256,
         model_id: receipt.provenance.model_id.clone(),
         model_repository: spec.repository.into(),
@@ -1404,8 +1422,41 @@ fn measured_packed_timings(
         .collect()
 }
 
+fn sc20676_admitted_tokens(
+    mode: &str,
+    target_prompt_tokens: u64,
+    policy: &campaign::CampaignSafetyPolicy,
+) -> std::result::Result<(u64, u64), String> {
+    let request = target_prompt_tokens
+        .checked_add(16)
+        .ok_or("SC-20676 prompt plus generation overflows")?;
+    // The packed proof retains its measured cache while each warm/fallback/cancellation control
+    // runs in a second cache. Those controls are sequential, so two is the maximum live count.
+    let total = match mode {
+        "dense" => request,
+        "packed" => request
+            .checked_mul(2)
+            .ok_or("SC-20676 packed live context overflows")?,
+        _ => return Err("SC-20676 worker mode must be dense or packed".into()),
+    };
+    if request > policy.max_request_tokens || total > policy.max_context_tokens {
+        return Err(format!("SC-20676 {mode} requires request {request} and total-live {total} tokens; mandatory safety ceiling refuses"));
+    }
+    Ok((total, request))
+}
+
+fn require_validated_prefill_peak_bound(
+    family: &str,
+    mode: &str,
+) -> std::result::Result<(), String> {
+    Err(format!(
+        "SC-20676 {family}-{mode} incomplete: no validated source-backed transient prefill peak bound for the required material-context geometry; token and polling limits alone cannot admit it"
+    ))
+}
+
 /// Execute one fresh worker.  This is intentionally the only live model entry point; parent mode
 /// merely spawns separate processes and seals their output.
+#[allow(clippy::too_many_arguments)] // The worker boundary names every sealed parent input.
 pub fn run_sc20676_worker(
     snapshot: &Path,
     family: &str,
@@ -1413,6 +1464,8 @@ pub fn run_sc20676_worker(
     nonce: &str,
     expected_executable_sha256: &str,
     target_prompt_tokens: u64,
+    policy: &campaign::CampaignSafetyPolicy,
+    captured_provenance: &Sc20676Provenance,
 ) -> std::result::Result<Sc20676Arm, String> {
     let started = Instant::now();
     if !is_digest(nonce) || !is_digest(expected_executable_sha256) {
@@ -1423,9 +1476,19 @@ pub fn run_sc20676_worker(
     if executable_sha256 != expected_executable_sha256 {
         return Err("worker executable does not match parent-sealed executable".into());
     }
-    let provenance = worker_provenance()?;
+    let provenance = captured_provenance.clone();
     let before = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
     let cfg = ModelConfig::from_dir(snapshot).map_err(|e| e.to_string())?;
+    sc20676_admitted_tokens(mode, target_prompt_tokens, policy)?;
+    require_validated_prefill_peak_bound(family, mode)?;
+    let native = u64::try_from(cfg.max_position_embeddings)
+        .map_err(|_| "SC-20676 model native context is invalid")?;
+    if target_prompt_tokens
+        .checked_add(16)
+        .is_none_or(|total| total > native)
+    {
+        return Err("SC-20676 prompt plus generation exceeds pinned native context".into());
+    }
     let actual_family = match cfg.architecture {
         Architecture::Llama => "llama",
         Architecture::Qwen3 => "qwen",
@@ -2038,6 +2101,149 @@ fn parse_staged_receipt_bytes(
     Ok(receipt)
 }
 
+struct ArmFamilyInput {
+    family: &'static str,
+    snapshot: PathBuf,
+    baseline: Sc20676BaselineBinding,
+    snapshot_bytes: u64,
+    baseline_manifest_sha256: String,
+}
+
+fn arm_resume_identity(
+    inputs: &[ArmFamilyInput],
+    executable_sha256: &str,
+    policy_sha256: &str,
+    provenance: &Sc20676Provenance,
+    nonce: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    let families = inputs
+        .iter()
+        .map(|input| {
+            serde_json::json!({
+                "family": input.family,
+                "snapshotInventorySha256": input.baseline.snapshot_inventory_sha256,
+                "snapshotBytes": input.snapshot_bytes,
+                "baselineReceiptSha256": input.baseline.receipt_sha256,
+                "baselineManifestSha256": input.baseline_manifest_sha256,
+                "baseline": input.baseline,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schemaVersion": 1,
+        "kind": "sc-20676-arm-resume",
+        "schedule": ["llama-dense", "llama-packed", "qwen-dense", "qwen-packed"],
+        "executableSha256": executable_sha256,
+        "policySha256": policy_sha256,
+        "runNonce": nonce,
+        "provenance": provenance,
+        "families": families,
+    }))
+}
+
+fn arm_identity_bytes(value: &serde_json::Value) -> std::result::Result<Vec<u8>, String> {
+    campaign::canonical_json_bytes(value).map_err(|e| e.to_string())
+}
+
+fn prepare_arm_resume(
+    root: &Path,
+    identity: &mut serde_json::Value,
+) -> std::result::Result<(String, String, Sc20676Provenance), String> {
+    if root.exists() {
+        let prior: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("identity.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        for key in ["sceneWorksRevision", "inferenceRevision"] {
+            identity["provenance"][key] = prior
+                .get("provenance")
+                .and_then(|value| value.get(key))
+                .cloned()
+                .ok_or("SC-20676 resume identity lacks captured source revision")?;
+        }
+        identity["runNonce"] = prior
+            .get("runNonce")
+            .cloned()
+            .ok_or("SC-20676 resume identity lacks run nonce")?;
+    }
+    let bytes = arm_identity_bytes(identity)?;
+    let sha = campaign::seal_bytes(&bytes);
+    let sidecar = format!("{sha}  identity.json\n");
+    if root.exists() {
+        if !root.is_dir()
+            || fs::read(root.join("identity.json")).map_err(|e| e.to_string())? != bytes
+            || fs::read_to_string(root.join("identity.json.sha256")).map_err(|e| e.to_string())?
+                != sidecar
+        {
+            return Err("SC-20676 resume identity differs from executable, models, baseline, schedule, environment, or policy".into());
+        }
+    } else {
+        fs::create_dir(root).map_err(|e| e.to_string())?;
+        fs::write(root.join("identity.json"), bytes).map_err(|e| e.to_string())?;
+        fs::write(root.join("identity.json.sha256"), sidecar).map_err(|e| e.to_string())?;
+    }
+    let nonce = identity
+        .get("runNonce")
+        .and_then(serde_json::Value::as_str)
+        .filter(|nonce| is_digest(nonce))
+        .ok_or("SC-20676 resume nonce invalid")?
+        .to_owned();
+    let provenance = serde_json::from_value(
+        identity
+            .get("provenance")
+            .cloned()
+            .ok_or("SC-20676 resume provenance missing")?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((sha, nonce, provenance))
+}
+
+fn arm_binding(identity_sha256: &str, arm: &Sc20676Arm, bytes: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "resumeIdentitySha256": identity_sha256,
+        "armSha256": arm.arm_sha256,
+        "fileSha256": campaign::seal_bytes(bytes),
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // A resumed arm must check every independent binding.
+fn read_bound_arm(
+    root: &Path,
+    input: &ArmFamilyInput,
+    mode: &str,
+    identity_sha256: &str,
+    nonce: &str,
+    executable_sha256: &str,
+    provenance: &Sc20676Provenance,
+    seen_pids: &mut std::collections::BTreeSet<u32>,
+) -> std::result::Result<Sc20676Arm, String> {
+    let slug = format!("{}-{mode}", input.family);
+    let bytes = fs::read(root.join(format!("{slug}.json"))).map_err(|e| e.to_string())?;
+    let arm: Sc20676Arm = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    validate_worker_binding(
+        &arm,
+        input.family,
+        mode,
+        nonce,
+        executable_sha256,
+        provenance,
+        seen_pids,
+    )?;
+    if arm.snapshot_inventory_sha256 != input.baseline.snapshot_inventory_sha256 {
+        return Err(format!(
+            "SC-20676 resumed arm {slug} has stale snapshot inventory"
+        ));
+    }
+    let expected = arm_identity_bytes(&arm_binding(identity_sha256, &arm, &bytes))?;
+    if fs::read(root.join(format!("{slug}.binding.json"))).map_err(|e| e.to_string())? != expected {
+        return Err(format!(
+            "SC-20676 resumed arm {slug} has stale identity binding"
+        ));
+    }
+    Ok(arm)
+}
+
 /// Parent spawns a fresh dense and packed child for each family.  Workers write untrusted arm
 /// files; only this parent binds them to an already-sealed SC-20671 baseline and produces a seal.
 pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
@@ -2046,37 +2252,105 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
         .map(String::as_str)
         .ok_or("usage: sc20676-packed-evidence parent|worker ...")?;
     if mode == "worker" {
+        let policy = campaign::load_campaign_safety_policy(Path::new(&required_flag(
+            args,
+            "--safety-policy",
+        )?))?;
+        if policy.seal()? != required_flag(args, "--policy-sha256")? {
+            return Err("SC-20676 worker safety policy seal mismatch".into());
+        }
+        let requested_tokens: u64 = required_flag(args, "--context-payload-tokens")?
+            .parse()
+            .map_err(|_| "invalid --context-payload-tokens")?;
+        if requested_tokens == 0 {
+            return Err("SC-20676 requested context is zero".into());
+        }
+        sc20676_admitted_tokens(&required_flag(args, "--mode")?, requested_tokens, &policy)?;
+        let identity_bytes = fs::read(required_flag(args, "--resume-identity")?)
+            .map_err(|e| format!("read SC-20676 parent identity: {e}"))?;
+        if campaign::seal_bytes(&identity_bytes) != required_flag(args, "--resume-identity-sha256")?
+        {
+            return Err("SC-20676 worker resume identity seal mismatch".into());
+        }
+        let identity: serde_json::Value =
+            serde_json::from_slice(&identity_bytes).map_err(|e| e.to_string())?;
+        if identity
+            .get("policySha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(policy.seal()?.as_str())
+            || identity
+                .get("executableSha256")
+                .and_then(serde_json::Value::as_str)
+                != Some(required_flag(args, "--executable-sha256")?.as_str())
+            || identity.get("runNonce").and_then(serde_json::Value::as_str)
+                != Some(required_flag(args, "--run-nonce")?.as_str())
+        {
+            return Err(
+                "SC-20676 worker policy, executable, or nonce differs from resume identity".into(),
+            );
+        }
+        let captured: Sc20676Provenance = serde_json::from_value(
+            identity
+                .get("provenance")
+                .cloned()
+                .ok_or("SC-20676 resume provenance missing")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut current = worker_provenance()?;
+        current
+            .scene_works_revision
+            .clone_from(&captured.scene_works_revision);
+        current
+            .inference_revision
+            .clone_from(&captured.inference_revision);
+        if current != captured {
+            return Err(
+                "SC-20676 worker environment differs from captured resume provenance".into(),
+            );
+        }
         let arm = run_sc20676_worker(
             Path::new(&required_flag(args, "--snapshot")?),
             &required_flag(args, "--family")?,
             &required_flag(args, "--mode")?,
             &required_flag(args, "--run-nonce")?,
             &required_flag(args, "--executable-sha256")?,
-            required_flag(args, "--context-payload-tokens")?
-                .parse()
-                .map_err(|_| "invalid --context-payload-tokens")?,
+            requested_tokens,
+            &policy,
+            &captured,
         )?;
         validate_arm(&arm)?;
         let output = PathBuf::from(required_flag(args, "--out")?);
         if output.exists() {
             return Err("worker output path already exists".into());
         }
+        let staging = output.with_extension(format!("json.staging-{}", std::process::id()));
+        if staging.exists() {
+            return Err("SC-20676 worker staging path already exists".into());
+        }
         fs::write(
-            output,
+            &staging,
             campaign::canonical_json_bytes(&serde_json::to_value(arm).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        fs::rename(staging, output).map_err(|e| e.to_string())?;
         return Ok(());
     }
     if mode != "parent" {
         return Err("usage: sc20676-packed-evidence parent|worker ...".into());
     }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let policy_path = PathBuf::from(required_flag(args, "--safety-policy")?);
+    let policy = campaign::load_campaign_safety_policy(&policy_path)?;
+    let policy_sha256 = policy.seal()?;
     let executable_sha256 = file_sha256(&executable)?;
-    let nonce = run_nonce(&executable_sha256)?;
-    let expected_provenance = worker_provenance()?;
+    let proposed_nonce = run_nonce(&executable_sha256)?;
+    let current_provenance = worker_provenance()?;
     let destination = PathBuf::from(required_flag(args, "--out")?);
+    let worker_root = PathBuf::from(required_flag(args, "--resume-dir")?);
+    if !destination.is_absolute() || !worker_root.is_absolute() || destination == worker_root {
+        return Err("SC-20676 destination and distinct resume directory must be absolute".into());
+    }
     if destination.exists() {
         return Err(
             "SC-20676 final destination already exists; refusing stale receipt reuse".into(),
@@ -2084,13 +2358,42 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
     }
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let worker_root = parent.join(format!(
-        ".{}.sc20676-workers-{nonce}",
-        destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("evidence")
-    ));
+    let mut inputs = Vec::new();
+    for family in ["llama", "qwen"] {
+        let snapshot = PathBuf::from(required_flag(args, &format!("--{family}-snapshot"))?);
+        let baseline_campaign = PathBuf::from(required_flag(
+            args,
+            &format!("--{family}-baseline-campaign"),
+        )?);
+        let baseline = bind_sc20671_baseline(&baseline_campaign, &snapshot, family)?;
+        let inventory = campaign::validate_sc20676_candidate_snapshot(family, &snapshot)?;
+        let native = campaign::benchmark_model(family, false)?.native_context_tokens;
+        if baseline
+            .context_payload_tokens
+            .checked_add(16)
+            .is_none_or(|tokens| tokens > native)
+        {
+            return Err(format!(
+                "SC-20676 {family} baseline plus generation exceeds native context"
+            ));
+        }
+        inputs.push(ArmFamilyInput {
+            family,
+            snapshot,
+            baseline,
+            snapshot_bytes: inventory.bytes,
+            baseline_manifest_sha256: file_sha256(&baseline_campaign.join("campaign.json"))?,
+        });
+    }
+    let mut identity = arm_resume_identity(
+        &inputs,
+        &executable_sha256,
+        &policy_sha256,
+        &current_provenance,
+        &proposed_nonce,
+    )?;
+    let (identity_sha256, nonce, expected_provenance) =
+        prepare_arm_resume(&worker_root, &mut identity)?;
     let staging = parent.join(format!(
         ".{}.sc20676-staging-{nonce}",
         destination
@@ -2098,52 +2401,118 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
             .and_then(|name| name.to_str())
             .unwrap_or("evidence")
     ));
-    if worker_root.exists() || staging.exists() {
-        return Err("SC-20676 unique staging path already exists".into());
+    if staging.exists() {
+        return Err(
+            "SC-20676 partial final staging exists; remove it explicitly before resume".into(),
+        );
     }
-    fs::create_dir(&worker_root).map_err(|e| e.to_string())?;
+    let allowed = ["llama-dense", "llama-packed", "qwen-dense", "qwen-packed"];
+    for entry in fs::read_dir(&worker_root).map_err(|e| e.to_string())? {
+        let name = entry
+            .map_err(|e| e.to_string())?
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
+            && !allowed.iter().any(|slug| {
+                name == format!("{slug}.json") || name == format!("{slug}.binding.json")
+            })
+        {
+            return Err(format!(
+                "SC-20676 unexpected or partial resume artifact: {name}"
+            ));
+        }
+    }
     let result = (|| -> std::result::Result<(), String> {
         let mut receipts = Vec::new();
         let mut worker_pids = std::collections::BTreeSet::new();
-        for family in ["llama", "qwen"] {
-            let snapshot = required_flag(args, &format!("--{family}-snapshot"))?;
-            let baseline = bind_sc20671_baseline(
-                required_flag(args, &format!("--{family}-baseline-campaign"))?,
-                Path::new(&snapshot),
-                family,
-            )?;
-            let target_prompt_tokens = baseline.context_payload_tokens.to_string();
+        for input in &inputs {
+            let family = input.family;
+            let target_prompt_tokens = input.baseline.context_payload_tokens.to_string();
             let mut arms = Vec::new();
             for worker_mode in ["dense", "packed"] {
-                let arm_path = worker_root.join(format!("{family}-{worker_mode}.json"));
-                let status = Command::new(&executable)
-                    .args([
-                        "worker",
-                        "--snapshot",
-                        &snapshot,
-                        "--family",
-                        family,
-                        "--mode",
+                let slug = format!("{family}-{worker_mode}");
+                let arm_path = worker_root.join(format!("{slug}.json"));
+                let binding_path = worker_root.join(format!("{slug}.binding.json"));
+                if arm_path.exists() || binding_path.exists() {
+                    if !arm_path.exists() || !binding_path.exists() {
+                        return Err(format!(
+                            "SC-20676 partial resume arm {slug} must be repaired explicitly"
+                        ));
+                    }
+                    arms.push(read_bound_arm(
+                        &worker_root,
+                        input,
                         worker_mode,
-                        "--run-nonce",
+                        &identity_sha256,
                         &nonce,
-                        "--executable-sha256",
                         &executable_sha256,
-                        "--context-payload-tokens",
-                        &target_prompt_tokens,
-                        "--out",
-                        arm_path.to_str().ok_or("non-UTF8 output path")?,
-                    ])
-                    .status()
-                    .map_err(|e| e.to_string())?;
+                        &expected_provenance,
+                        &mut worker_pids,
+                    )?);
+                    eprintln!("SC-20676 resumed validated arm {slug}");
+                    continue;
+                }
+                let (total_tokens, request_tokens) = sc20676_admitted_tokens(
+                    worker_mode,
+                    input.baseline.context_payload_tokens,
+                    &policy,
+                )?;
+                require_validated_prefill_peak_bound(family, worker_mode)?;
+                let mut command = Command::new(&executable);
+                command
+                    .arg("worker")
+                    .arg("--snapshot")
+                    .arg(&input.snapshot)
+                    .arg("--family")
+                    .arg(family)
+                    .arg("--mode")
+                    .arg(worker_mode)
+                    .arg("--run-nonce")
+                    .arg(&nonce)
+                    .arg("--executable-sha256")
+                    .arg(&executable_sha256)
+                    .arg("--context-payload-tokens")
+                    .arg(&target_prompt_tokens)
+                    .arg("--out")
+                    .arg(&arm_path)
+                    .arg("--safety-policy")
+                    .arg(&policy_path)
+                    .arg("--policy-sha256")
+                    .arg(&policy_sha256)
+                    .arg("--resume-identity")
+                    .arg(worker_root.join("identity.json"))
+                    .arg("--resume-identity-sha256")
+                    .arg(&identity_sha256);
+                let logs = worker_root.join("logs");
+                let log_prefix = (0_u64..)
+                    .map(|attempt| format!("{slug}.attempt-{attempt}"))
+                    .find(|prefix| {
+                        !logs.join(format!("{prefix}.stdout.log")).exists()
+                            && !logs.join(format!("{prefix}.stderr.log")).exists()
+                    })
+                    .ok_or("SC-20676 no unused bounded worker log path")?;
+                let request = RunRequest {
+                    context_tokens: total_tokens,
+                    request_tokens,
+                    stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
+                    stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
+                };
+                let status = campaign_supervisor::run_guarded(
+                    &mut command, &request, &policy.supervisor(), &mut SystemProbe,
+                ).map_err(|failure| format!(
+                    "SC-20676 {slug} worker stopped ({:?}): {}; child {:?} reaped; stderr {}; valid arms remain in {}",
+                    failure.reason, failure.detail, failure.pid, request.stderr_path.display(), worker_root.display(),
+                ))?;
                 if !status.success() {
                     return Err(format!(
-                        "SC-20676 {family} {worker_mode} worker failed with {status}"
+                        "SC-20676 {slug} worker failed with {status}; stderr {}; valid arms remain in {}",
+                        request.stderr_path.display(), worker_root.display(),
                     ));
                 }
-                let arm: Sc20676Arm =
-                    serde_json::from_slice(&fs::read(&arm_path).map_err(|e| e.to_string())?)
-                        .map_err(|e| e.to_string())?;
+                let bytes = fs::read(&arm_path).map_err(|e| e.to_string())?;
+                let arm: Sc20676Arm = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                let mut candidate_pids = worker_pids.clone();
                 validate_worker_binding(
                     &arm,
                     family,
@@ -2151,16 +2520,37 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
                     &nonce,
                     &executable_sha256,
                     &expected_provenance,
-                    &mut worker_pids,
+                    &mut candidate_pids,
                 )?;
-                arms.push(arm);
+                if arm.snapshot_inventory_sha256 != input.baseline.snapshot_inventory_sha256 {
+                    return Err(format!("SC-20676 {slug} snapshot inventory changed"));
+                }
+                let binding = arm_identity_bytes(&arm_binding(&identity_sha256, &arm, &bytes))?;
+                let staging_binding =
+                    binding_path.with_extension(format!("json.staging-{}", std::process::id()));
+                if staging_binding.exists() {
+                    return Err(format!("SC-20676 partial binding staging for {slug}"));
+                }
+                fs::write(&staging_binding, binding).map_err(|e| e.to_string())?;
+                fs::rename(staging_binding, &binding_path).map_err(|e| e.to_string())?;
+                arms.push(read_bound_arm(
+                    &worker_root,
+                    input,
+                    worker_mode,
+                    &identity_sha256,
+                    &nonce,
+                    &executable_sha256,
+                    &expected_provenance,
+                    &mut worker_pids,
+                )?);
+                eprintln!("SC-20676 accepted validated arm {slug}");
             }
             let (dense, packed) = take_validated_family_arms(arms)?;
             let receipt = Sc20676Receipt {
                 schema_version: 0,
                 harness_version: String::new(),
                 receipt_sha256: String::new(),
-                baseline,
+                baseline: input.baseline.clone(),
                 thresholds: Sc20676Thresholds::default(),
                 dense,
                 packed,
@@ -2202,7 +2592,6 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
         publish_complete_matrix(&staging, &destination, &nonce, &executable_sha256)?;
         Ok(())
     })();
-    let _ = fs::remove_dir_all(&worker_root);
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
     }
@@ -2429,6 +2818,8 @@ mod tests {
             receipt_sha256: String::new(),
             baseline: Sc20676BaselineBinding {
                 receipt_sha256: digest(),
+                campaign_manifest_sha256: digest(),
+                campaign_schedule_version: 2,
                 model_file_sha256: digest(),
                 model_id: format!(
                     "{}@{};architecture={};inventory={}",
@@ -2594,6 +2985,8 @@ mod tests {
             model.architecture,
             qwen.baseline.snapshot_inventory_sha256
         );
+        // Each sealed SC-20671 family row ran in a distinct product child/session.
+        qwen.baseline.campaign_session_id = "d".repeat(64);
         qwen.dense.family = "qwen".into();
         qwen.packed.family = "qwen".into();
         reseal_arm(&mut qwen.dense);
@@ -2602,7 +2995,7 @@ mod tests {
         assert!(validate_complete_matrix_receipts(&[llama.clone(), qwen.clone()]).is_ok());
 
         let mut mixed_campaign = qwen;
-        mixed_campaign.baseline.campaign_global_identity_sha256 = "c".repeat(64);
+        mixed_campaign.baseline.campaign_schedule_version = 1;
         let mixed_campaign = mixed_campaign.finish().unwrap();
         assert!(validate_complete_matrix_receipts(&[llama, mixed_campaign]).is_err());
     }
@@ -2632,6 +3025,104 @@ mod tests {
         fs::write(staging.join("complete-matrix.json"), b"{}").unwrap();
         assert!(publish_complete_matrix(&staging, &destination, &digest(), &digest()).is_err());
         assert!(!destination.exists());
+    }
+    #[test]
+    fn arm_policy_counts_generated_tokens_and_retained_packed_cache() {
+        let mut policy = campaign::CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1,
+            child_footprint_cap_bytes: 2,
+            max_context_tokens: 1040,
+            max_request_tokens: 1040,
+            stdout_cap_bytes: 100,
+            stderr_cap_bytes: 100,
+        };
+        assert_eq!(
+            sc20676_admitted_tokens("dense", 1024, &policy).unwrap(),
+            (1040, 1040)
+        );
+        assert!(sc20676_admitted_tokens("packed", 1024, &policy).is_err());
+        policy.max_context_tokens = 2080;
+        assert_eq!(
+            sc20676_admitted_tokens("packed", 1024, &policy).unwrap(),
+            (2080, 1040)
+        );
+        assert!(sc20676_admitted_tokens("packed", u64::MAX, &policy).is_err());
+        for mode in ["dense", "packed"] {
+            let refusal = require_validated_prefill_peak_bound("llama", mode).unwrap_err();
+            assert!(refusal.contains("source-backed transient prefill peak bound"));
+        }
+    }
+
+    #[test]
+    fn sealed_arm_resume_rejects_partial_stale_and_corrupt_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("resume");
+        let input = ArmFamilyInput {
+            family: "llama",
+            snapshot: PathBuf::new(),
+            baseline: receipt().baseline,
+            snapshot_bytes: 100,
+            baseline_manifest_sha256: digest(),
+        };
+        let mut identity =
+            arm_resume_identity(&[input], &digest(), &digest(), &provenance(), &digest()).unwrap();
+        let (sha, nonce, captured) = prepare_arm_resume(&root, &mut identity).unwrap();
+        let mut moved_ref = identity.clone();
+        moved_ref["provenance"]["inferenceRevision"] = serde_json::json!("c".repeat(40));
+        assert_eq!(prepare_arm_resume(&root, &mut moved_ref).unwrap().0, sha);
+        let mut changed_exe = identity.clone();
+        changed_exe["executableSha256"] = serde_json::json!("d".repeat(64));
+        assert!(prepare_arm_resume(&root, &mut changed_exe).is_err());
+        let input = ArmFamilyInput {
+            family: "llama",
+            snapshot: PathBuf::new(),
+            baseline: receipt().baseline,
+            snapshot_bytes: 100,
+            baseline_manifest_sha256: digest(),
+        };
+        let arm = arm("dense");
+        let bytes = campaign::canonical_json_bytes(&serde_json::to_value(&arm).unwrap()).unwrap();
+        fs::write(root.join("llama-dense.json"), &bytes).unwrap();
+        assert!(read_bound_arm(
+            &root,
+            &input,
+            "dense",
+            &sha,
+            &nonce,
+            &digest(),
+            &captured,
+            &mut std::collections::BTreeSet::new()
+        )
+        .is_err());
+        let binding = arm_identity_bytes(&arm_binding(&sha, &arm, &bytes)).unwrap();
+        fs::write(root.join("llama-dense.binding.json"), binding).unwrap();
+        assert!(read_bound_arm(
+            &root,
+            &input,
+            "dense",
+            &sha,
+            &nonce,
+            &digest(),
+            &captured,
+            &mut std::collections::BTreeSet::new()
+        )
+        .is_ok());
+        fs::write(root.join("llama-dense.binding.json"), b"corrupt").unwrap();
+        assert!(read_bound_arm(
+            &root,
+            &input,
+            "dense",
+            &sha,
+            &nonce,
+            &digest(),
+            &captured,
+            &mut std::collections::BTreeSet::new()
+        )
+        .is_err());
     }
     #[test]
     fn staged_receipt_parser_requires_the_semantic_core_seal() {

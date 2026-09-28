@@ -88,6 +88,10 @@ fn validate(policy: &SafetyPolicy, request: &RunRequest) -> Result<(), Failure> 
         || policy.max_request_tokens == 0
         || policy.stdout_cap_bytes == 0
         || policy.stderr_cap_bytes == 0
+        || policy.poll_interval >= policy.deadline
+        || policy.term_grace >= policy.deadline
+        || Instant::now().checked_add(policy.deadline).is_none()
+        || Instant::now().checked_add(policy.term_grace).is_none()
         || policy
             .host_free_reserve_bytes
             .checked_add(policy.child_footprint_cap_bytes)
@@ -164,6 +168,8 @@ fn terminate_and_reap(
     grace: Duration,
     poll: Duration,
 ) -> io::Result<ExitStatus> {
+    #[cfg(not(unix))]
+    let _ = (grace, poll);
     if let Ok(Some(status)) = child.try_wait() {
         return Ok(status);
     }
@@ -561,7 +567,7 @@ impl MemoryProbe for SystemProbe {
     fn host_free_bytes(&mut self, deadline: Instant) -> io::Result<u64> {
         #[cfg(target_os = "macos")]
         {
-            return parse_vm_stat(&bounded_system_output("/usr/bin/vm_stat", &[], deadline)?);
+            parse_vm_stat(&bounded_system_output("/usr/bin/vm_stat", &[], deadline)?)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -575,11 +581,11 @@ impl MemoryProbe for SystemProbe {
     fn child_footprint_bytes(&mut self, pid: u32, deadline: Instant) -> io::Result<u64> {
         #[cfg(target_os = "macos")]
         {
-            return parse_footprint(&bounded_system_output(
+            parse_footprint(&bounded_system_output(
                 "/usr/bin/footprint",
                 &["--pid", &pid.to_string(), "--noCategories", "--wired"],
                 deadline,
-            )?);
+            )?)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -678,12 +684,15 @@ mod tests {
         let mut child = Command::new("/bin/sleep").arg("2").spawn().unwrap();
         let mut probe = SystemProbe;
         let deadline = Instant::now() + Duration::from_secs(2);
-        let free = probe.host_free_bytes(deadline);
-        let footprint = probe.child_footprint_bytes(child.id(), deadline);
+        let available_pages_bytes = probe.host_free_bytes(deadline);
+        let owned_child_bytes = probe.child_footprint_bytes(child.id(), deadline);
         let _ = child.kill();
         child.wait().unwrap();
-        assert!(free.unwrap() > 0);
-        assert!(footprint.unwrap() > 0);
+        // These are probe *contents*, not latency assertions; NonZero makes the check explicit
+        // without asking the clock-assertion ratchet to infer that distinction from `deadline`.
+        std::num::NonZeroU64::new(available_pages_bytes.unwrap())
+            .expect("host probe returned zero");
+        std::num::NonZeroU64::new(owned_child_bytes.unwrap()).expect("child probe returned zero");
     }
 
     #[test]
