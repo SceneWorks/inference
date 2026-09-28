@@ -527,7 +527,7 @@ class AttributionTests(unittest.TestCase):
             source.write_text(json.dumps(self.complete_rows()), encoding="utf-8")
             completed = subprocess.run(
                 [sys.executable, str(SCRIPT), str(source), str(output)],
-                check=False, capture_output=True, text=True,
+                check=False, capture_output=True, text=True, encoding="utf-8",
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("standalone raw-row reduction is forbidden", completed.stderr)
@@ -544,7 +544,7 @@ class AttributionTests(unittest.TestCase):
             sidecar_path.write_bytes(sidecar)
             completed = subprocess.run(
                 [sys.executable, str(SCRIPT), str(raw_path), str(output), "--sidecar", str(sidecar_path)],
-                check=False, capture_output=True, text=True,
+                check=False, capture_output=True, text=True, encoding="utf-8",
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("standalone raw-row reduction is forbidden", completed.stderr)

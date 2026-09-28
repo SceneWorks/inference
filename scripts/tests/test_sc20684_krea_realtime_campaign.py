@@ -387,7 +387,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         import subprocess
         import sys
 
-        result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, check=False)
+        result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, encoding="utf-8", check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--product-command", result.stdout)
         self.assertIn("SC20684_KREA_PROVIDER_OBSERVATION", result.stdout)
