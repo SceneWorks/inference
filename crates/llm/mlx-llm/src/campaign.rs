@@ -3719,7 +3719,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             }
             let identity_bytes = fs::read(required_flag(args, "--resume-identity")?)
                 .map_err(|e| format!("read parent resume identity: {e}"))?;
-            if seal_bytes(&identity_bytes) != required_flag(args, "--resume-identity-sha256")? {
+            let identity_sha256 = seal_bytes(&identity_bytes);
+            if identity_sha256 != required_flag(args, "--resume-identity-sha256")? {
                 return Err(
                     "worker resume identity seal differs from parent's frozen identity".into(),
                 );
@@ -3827,6 +3828,17 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                             coordinate_slug(&row.coordinate)
                         )
                     })?;
+                    eprintln!(
+                        "{}",
+                        fixture_half_attempt_diagnostic(
+                            &half,
+                            &row.coordinate,
+                            &identity_sha256,
+                            "candidate",
+                            "warmup",
+                            warmup_index,
+                        )
+                    );
                     candidate_warmups.push(half);
                 }
             }
@@ -3846,6 +3858,17 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                         coordinate_slug(&row.coordinate)
                     )
                 })?;
+                eprintln!(
+                    "{}",
+                    fixture_half_attempt_diagnostic(
+                        &half,
+                        &row.coordinate,
+                        &identity_sha256,
+                        "candidate",
+                        "repeat",
+                        repeat,
+                    )
+                );
                 candidate_repeats.push(half);
             }
             drop(candidate_session);
@@ -3861,37 +3884,57 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             let reference_baseline = reference_session.load_start_sample.mlx_active_bytes;
             let mut reference_warmups = Vec::with_capacity(candidate_warmups.len());
             for warmup_index in 0..candidate_warmups.len() {
-                reference_warmups.push(
-                    run_product_fixture_half_on_session_bounded(
-                        &reference_session,
-                        &prompt,
-                        &row.coordinate,
-                        policy.max_request_tokens,
+                let half = run_product_fixture_half_on_session_bounded(
+                    &reference_session,
+                    &prompt,
+                    &row.coordinate,
+                    policy.max_request_tokens,
+                )
+                .map_err(|e| {
+                    format!(
+                        "reference warmup {warmup_index} for {}: {e}",
+                        coordinate_slug(&row.coordinate)
                     )
-                    .map_err(|e| {
-                        format!(
-                            "reference warmup {warmup_index} for {}: {e}",
-                            coordinate_slug(&row.coordinate)
-                        )
-                    })?,
+                })?;
+                eprintln!(
+                    "{}",
+                    fixture_half_attempt_diagnostic(
+                        &half,
+                        &row.coordinate,
+                        &identity_sha256,
+                        "reference",
+                        "warmup",
+                        warmup_index,
+                    )
                 );
+                reference_warmups.push(half);
             }
             let mut reference_repeats = Vec::with_capacity(5);
             for repeat in 0..5 {
-                reference_repeats.push(
-                    run_product_fixture_half_on_session_bounded(
-                        &reference_session,
-                        &prompt,
-                        &row.coordinate,
-                        policy.max_request_tokens,
+                let half = run_product_fixture_half_on_session_bounded(
+                    &reference_session,
+                    &prompt,
+                    &row.coordinate,
+                    policy.max_request_tokens,
+                )
+                .map_err(|e| {
+                    format!(
+                        "reference fixture repeat {repeat} for {}: {e}",
+                        coordinate_slug(&row.coordinate)
                     )
-                    .map_err(|e| {
-                        format!(
-                            "reference fixture repeat {repeat} for {}: {e}",
-                            coordinate_slug(&row.coordinate)
-                        )
-                    })?,
+                })?;
+                eprintln!(
+                    "{}",
+                    fixture_half_attempt_diagnostic(
+                        &half,
+                        &row.coordinate,
+                        &identity_sha256,
+                        "reference",
+                        "repeat",
+                        repeat,
+                    )
                 );
+                reference_repeats.push(half);
             }
             drop(reference_session);
             quiesce_campaign_active_memory(reference_baseline).map_err(|e| {
@@ -5966,7 +6009,6 @@ pub fn quality_from_product_fixtures(
     cache_reference: &ProductFixtureResult,
     expected_needle: &str,
 ) -> Result<QualityObservation, String> {
-    let parity_errors = dense_kernel_fp32_parity_errors()?;
     let (greedy_matches, greedy_total) = token_agreement(
         &kernel_candidate.quality_observation.token_probabilities,
         &kernel_reference.quality_observation.token_probabilities,
@@ -5975,19 +6017,22 @@ pub fn quality_from_product_fixtures(
         &cache_candidate.quality_observation.token_probabilities,
         &cache_reference.quality_observation.token_probabilities,
     );
-    let tool_ok = tool_candidate.output.tool_calls == tool_reference.output.tool_calls
-        && matches!(tool_candidate.output.tool_calls.as_slice(), [call]
-            if call.name == "record_baseline_fact"
-                && call.arguments.get("fact").and_then(serde_json::Value::as_str)
-                    == Some("SC20671 structured fixture"));
-    let needle_ok = needle_candidate.output.text.contains(expected_needle)
-        && needle_reference.output.text.contains(expected_needle);
-    if !tool_ok {
-        return Err("structured-tool fixture produced no matching product tool call".into());
+    let candidate_tool_ok = structured_fixture_tool_valid(&tool_candidate.output);
+    let reference_tool_ok = structured_fixture_tool_valid(&tool_reference.output);
+    let tool_outputs_match = tool_candidate.output.tool_calls == tool_reference.output.tool_calls;
+    if !candidate_tool_ok || !reference_tool_ok || !tool_outputs_match {
+        return Err(format!(
+            "structured-tool fixture failed: candidate={candidate_tool_ok}, reference={reference_tool_ok}, outputsMatch={tool_outputs_match}"
+        ));
     }
-    if !needle_ok {
-        return Err("long-context needle fixture did not recover the product-owned needle".into());
+    let candidate_needle_ok = needle_candidate.output.text.contains(expected_needle);
+    let reference_needle_ok = needle_reference.output.text.contains(expected_needle);
+    if !candidate_needle_ok || !reference_needle_ok {
+        return Err(format!(
+            "long-context needle fixture did not recover the product-owned needle: candidate={candidate_needle_ok}, reference={reference_needle_ok}"
+        ));
     }
+    let parity_errors = dense_kernel_fp32_parity_errors()?;
     Ok(QualityObservation {
         parity_errors,
         reference_perplexity: negative_log_likelihood(
@@ -6005,6 +6050,13 @@ pub fn quality_from_product_fixtures(
         cache_matches,
         cache_total,
     })
+}
+
+fn structured_fixture_tool_valid(output: &TextLlmOutput) -> bool {
+    matches!(output.tool_calls.as_slice(), [call]
+        if call.name == "record_baseline_fact"
+            && call.arguments.get("fact").and_then(serde_json::Value::as_str)
+                == Some("SC20671 structured fixture"))
 }
 
 /// The fixed tool offer used by the independent structured-output fixture.  It lives beside the
@@ -6041,6 +6093,8 @@ pub struct ProductFixtureSuite {
     pub context_payload_tokens: u64,
 }
 
+const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
+
 fn fixture_request(prompt: String, tools: Vec<ToolSpec>) -> TextLlmRequest {
     TextLlmRequest {
         messages: vec![Message::text(Role::User, prompt)],
@@ -6055,7 +6109,7 @@ fn fixture_request(prompt: String, tools: Vec<ToolSpec>) -> TextLlmRequest {
             top_p: 1.0,
             ..Default::default()
         },
-        max_new_tokens: 64,
+        max_new_tokens: FIXTURE_MAX_NEW_TOKENS,
         seed: Some(0),
         ..Default::default()
     }
@@ -6100,6 +6154,103 @@ struct ProductFixtureHalf {
     context_payload_tokens: u64,
     context_payload_sha256: String,
     fixture_prompt_tokens: [u64; 4],
+    fixture_prompt_sha256: [String; 4],
+}
+
+/// A bounded, explicitly unaccepted worker-log record. It survives quality rejection but is never
+/// read by the resume validator or published as a receipt. Every record binds its role and fixture
+/// observations to the sealed launch identity and the model inventory actually loaded by the child.
+fn fixture_half_attempt_diagnostic(
+    half: &ProductFixtureHalf,
+    coordinate: &Coordinate,
+    resume_identity_sha256: &str,
+    role: &str,
+    run_kind: &str,
+    index: usize,
+) -> String {
+    const OUTPUT_CHARS: usize = 1024;
+    let bounded_text = |text: &str| {
+        let prefix = text.chars().take(OUTPUT_CHARS).collect::<String>();
+        serde_json::json!({
+            "prefix": prefix,
+            "bytes": text.len(),
+            "sha256": seal_bytes(text.as_bytes()),
+            "truncated": prefix.len() < text.len(),
+        })
+    };
+    let observation = |observed: &ProductObservations| {
+        serde_json::json!({
+            "inventorySha256": observed.snapshot.sha256,
+            "sessionId": observed.session_id,
+            "geometry": {
+                "queryHeads": observed.geometry.query_heads,
+                "kvHeads": observed.geometry.kv_heads,
+                "headDimension": observed.geometry.head_dimension,
+                "layers": observed.geometry.layers,
+                "elementBytes": observed.geometry.element_bytes,
+                "kvLength": observed.cache_live_tokens,
+                "capacity": observed.cache_capacity_tokens,
+            },
+            "phasePeaks": observed.phases.iter().map(|phase| serde_json::json!({
+                "phase": phase.phase,
+                "physFootprintBytes": phase.phys_footprint_bytes,
+                "physFootprintPeakBytes": phase.phys_footprint_peak_bytes,
+                "mlxActiveBytes": phase.mlx.active_bytes,
+                "mlxCacheBytes": phase.mlx.cache_bytes,
+                "mlxPeakBytes": phase.mlx.peak_bytes,
+            })).collect::<Vec<_>>(),
+        })
+    };
+    let fixtures = [
+        ("kernel-fp32-reference", &half.kernel),
+        ("structured-tool-call", &half.tool),
+        ("long-context-needle", &half.needle_result),
+        ("multi-turn-prompt-cache", &half.cache),
+    ];
+    let fixtures = fixtures
+        .iter()
+        .enumerate()
+        .map(|(fixture_index, (name, result))| {
+            let output = &result.output;
+            (
+                name.to_string(),
+                serde_json::json!({
+                    "promptSha256": half.fixture_prompt_sha256[fixture_index],
+                    "promptTokens": half.fixture_prompt_tokens[fixture_index],
+                    "maxNewTokens": FIXTURE_MAX_NEW_TOKENS,
+                    "output": {
+                        "text": bounded_text(&output.text),
+                        "thinking": output.thinking.as_deref().map(&bounded_text),
+                        "toolCalls": output.tool_calls.iter().map(|call| serde_json::json!({
+                            "name": bounded_text(&call.name),
+                            "arguments": bounded_text(&serde_json::Value::Object(call.arguments.clone()).to_string()),
+                        })).collect::<Vec<_>>(),
+                        "promptTokens": output.usage.prompt_tokens,
+                        "generatedTokens": output.usage.generated_tokens,
+                        "finishReason": format!("{:?}", output.finish_reason),
+                        "sha256": product_output_digest(output),
+                    },
+                    "coordinateOperation": result.coordinate_operation,
+                    "coordinateOutputSha256": result.coordinate_output_sha256,
+                    "coordinateObservation": observation(&result.observation),
+                    "qualityObservation": observation(&result.quality_observation),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let record = serde_json::json!({
+        "schemaVersion": 1,
+        "kind": "sc-20671-unaccepted-attempt-diagnostic",
+        "resumeIdentitySha256": resume_identity_sha256,
+        "coordinate": coordinate_slug(coordinate),
+        "role": role,
+        "runKind": run_kind,
+        "index": index,
+        "structuredToolValid": structured_fixture_tool_valid(&half.tool.output),
+        "needleRecovered": half.needle_result.output.text.contains(&half.needle),
+        "fixtures": fixtures,
+    });
+    format!("SC20671_DIAGNOSTIC_UNACCEPTED {record}")
 }
 
 fn run_product_fixture_half_on_session(
@@ -6133,6 +6284,12 @@ fn run_product_fixture_half_on_session_bounded(
         session.provider.campaign_prompt_tokens(&tool_prompt)?,
         session.provider.campaign_prompt_tokens(&needle_prompt)?,
         session.provider.campaign_prompt_tokens(&cache_prompt)?,
+    ];
+    let fixture_prompt_sha256 = [
+        seal_bytes(kernel_prompt.as_bytes()),
+        seal_bytes(tool_prompt.as_bytes()),
+        seal_bytes(needle_prompt.as_bytes()),
+        seal_bytes(cache_prompt.as_bytes()),
     ];
     for tokens in fixture_prompt_tokens {
         if tokens > max_request_tokens {
@@ -6181,6 +6338,7 @@ fn run_product_fixture_half_on_session_bounded(
         context_payload_tokens,
         context_payload_sha256: seal_bytes(band_payload.as_bytes()),
         fixture_prompt_tokens,
+        fixture_prompt_sha256,
     })
 }
 
@@ -6941,6 +7099,167 @@ mod tests {
         assert!(prompt.ends_with(
             "What harmless passphrase were you instructed to remember? Reply with only the passphrase."
         ));
+    }
+
+    #[test]
+    fn failed_needle_quality_retains_role_diagnostics_without_acceptance() {
+        let result = |text: &str| {
+            let observation = || ProductObservations {
+                snapshot: SnapshotInventory {
+                    root: PathBuf::new(),
+                    files: Vec::new(),
+                    bytes: 1,
+                    sha256: "b".repeat(64),
+                },
+                geometry: ProductGeometry {
+                    query_heads: 24,
+                    kv_heads: 8,
+                    head_dimension: 8,
+                    layers: 28,
+                    element_bytes: 4,
+                },
+                phases: vec![
+                    ReceiptPhase {
+                        phase: "prefill-peak".into(),
+                        pid: 42,
+                        source: "footprint -p".into(),
+                        timestamp: "2026-01-01T00:00:00Z".into(),
+                        phys_footprint_bytes: 123,
+                        phys_footprint_peak_bytes: 456,
+                        mlx: ReceiptMlx {
+                            source: "mlx_rs::memory".into(),
+                            active_bytes: 12,
+                            cache_bytes: 34,
+                            peak_bytes: 56,
+                        },
+                    };
+                    8
+                ],
+                phase_elapsed_ms: Vec::new(),
+                allocations: Vec::new(),
+                prefill_logits: Vec::new(),
+                token_probabilities: Vec::new(),
+                session_id: "session".into(),
+                cache_state_version: 1,
+                operations: Vec::new(),
+                load_elapsed_ms: 1.0,
+                prefill_peak_window: ReceiptPeakWindow {
+                    started_at: "2026-01-01T00:00:00Z".into(),
+                    baseline_active_bytes: 1,
+                    reset_peak_bytes: 0,
+                },
+                cache_live_tokens: 32,
+                cache_capacity_tokens: 256,
+            };
+            ProductFixtureResult {
+                observation: observation(),
+                quality_observation: observation(),
+                output: TextLlmOutput {
+                    text: text.into(),
+                    ..Default::default()
+                },
+                coordinate_operation: "chunked-prefix-reuse".into(),
+                coordinate_generated_tokens: 1,
+                coordinate_prompt_tokens: 32,
+                coordinate_output_sha256: "c".repeat(64),
+                compile_setup_ms: 0.0,
+                compile_dispatch_ms: 1.0,
+                secondary_coordinate_operation: None,
+            }
+        };
+        let half = |needle_text: &str| {
+            let mut tool = result("");
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(
+                "fact".into(),
+                serde_json::json!("SC20671 structured fixture"),
+            );
+            tool.output.tool_calls =
+                vec![core_llm::ToolCall::new("record_baseline_fact", arguments)];
+            ProductFixtureHalf {
+                kernel: result("kernel"),
+                tool,
+                needle_result: result(needle_text),
+                cache: result("cache"),
+                needle: "SC20671-NUMERIC-NEEDLE-9b7a2e".into(),
+                context_window_tokens: 4096,
+                context_target_tokens: 32,
+                context_payload_tokens: 32,
+                context_payload_sha256: "d".repeat(64),
+                fixture_prompt_tokens: [32; 4],
+                fixture_prompt_sha256: std::array::from_fn(|_| "e".repeat(64)),
+            }
+        };
+        let coordinate = required_coordinates()[0].clone();
+        let candidate = half("wrong\nanswer");
+        let reference = half("SC20671-NUMERIC-NEEDLE-9b7a2e");
+        let identity = "a".repeat(64);
+        let candidate_line = fixture_half_attempt_diagnostic(
+            &candidate,
+            &coordinate,
+            &identity,
+            "candidate",
+            "repeat",
+            0,
+        );
+        let reference_line = fixture_half_attempt_diagnostic(
+            &reference,
+            &coordinate,
+            &identity,
+            "reference",
+            "repeat",
+            0,
+        );
+        assert_eq!(candidate_line.lines().count(), 1);
+        assert!(candidate_line.len() < 32 * 1024);
+        let parse = |line: &str| -> serde_json::Value {
+            serde_json::from_str(line.strip_prefix("SC20671_DIAGNOSTIC_UNACCEPTED ").unwrap())
+                .unwrap()
+        };
+        let candidate_record = parse(&candidate_line);
+        let reference_record = parse(&reference_line);
+        assert_eq!(candidate_record["resumeIdentitySha256"], identity);
+        assert_eq!(candidate_record["role"], "candidate");
+        assert_eq!(candidate_record["structuredToolValid"], true);
+        assert_eq!(candidate_record["needleRecovered"], false);
+        assert_eq!(reference_record["role"], "reference");
+        assert_eq!(reference_record["needleRecovered"], true);
+        let needle = &candidate_record["fixtures"]["long-context-needle"];
+        assert_eq!(needle["output"]["text"]["prefix"], "wrong\nanswer");
+        assert_eq!(
+            needle["coordinateObservation"]["geometry"]["elementBytes"],
+            4
+        );
+        assert_eq!(needle["coordinateObservation"]["geometry"]["capacity"], 256);
+        assert_eq!(
+            needle["coordinateObservation"]["phasePeaks"][0]["mlxPeakBytes"],
+            56
+        );
+        let oversized = half(&"x".repeat(100_000));
+        let oversized_line = fixture_half_attempt_diagnostic(
+            &oversized,
+            &coordinate,
+            &identity,
+            "candidate",
+            "repeat",
+            1,
+        );
+        assert!(oversized_line.len() < 32 * 1024);
+        assert_eq!(
+            parse(&oversized_line)["fixtures"]["long-context-needle"]["output"]["text"]
+                ["truncated"],
+            true
+        );
+        let suite = pair_product_fixture_halves(candidate, reference).unwrap();
+        let error = suite.quality().unwrap_err();
+        assert!(error.contains("candidate=false, reference=true"));
+        let reversed =
+            pair_product_fixture_halves(half("SC20671-NUMERIC-NEEDLE-9b7a2e"), half("wrong"))
+                .unwrap();
+        assert!(reversed
+            .quality()
+            .unwrap_err()
+            .contains("candidate=true, reference=false"));
     }
 
     #[test]
