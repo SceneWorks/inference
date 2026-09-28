@@ -4021,12 +4021,12 @@ mod tests {
         assert!(packed.dense_active);
         assert!(packed.pending_step.is_none());
         assert_eq!(packed.staged.logical_len(), 0);
-        assert_eq!(packed.dense.peek(0).unwrap().0.shape()[2], 2);
-        assert_eq!(packed.dense.peek(1).unwrap().0.shape()[2], 1);
+        assert_eq!(packed.dense.peek(0).unwrap().unwrap().0.shape()[2], 2);
+        assert_eq!(packed.dense.peek(1).unwrap().unwrap().0.shape()[2], 1);
 
         packed.update(1, &kv, &kv).unwrap();
         assert_eq!(packed.offset(), 2);
-        assert_eq!(packed.dense.peek(1).unwrap().0.shape()[2], 2);
+        assert_eq!(packed.dense.peek(1).unwrap().unwrap().0.shape()[2], 2);
         assert_eq!(packed.staged.full_cache_dequantizations(), 1);
     }
 
@@ -4057,8 +4057,8 @@ mod tests {
                 .is_none());
             assert!(packed.dense_active);
             assert!(packed.pending_step.is_none());
-            assert_eq!(packed.dense.peek(0).unwrap().0.shape()[2], 1);
-            assert!(packed.dense.peek(1).is_none());
+            assert_eq!(packed.dense.peek(0).unwrap().unwrap().0.shape()[2], 1);
+            assert!(packed.dense.peek(1).unwrap().is_none());
             packed.update(1, &kv, &kv).unwrap();
             assert_eq!(packed.offset(), 1);
         }
@@ -4080,8 +4080,8 @@ mod tests {
         packed.update(1, &kv, &kv).unwrap();
         assert!(packed.dense_active);
         assert_eq!(packed.offset(), 1);
-        assert_eq!(packed.dense.peek(0).unwrap().0.shape()[2], 1);
-        assert_eq!(packed.dense.peek(1).unwrap().0.shape()[2], 1);
+        assert_eq!(packed.dense.peek(0).unwrap().unwrap().0.shape()[2], 1);
+        assert_eq!(packed.dense.peek(1).unwrap().unwrap().0.shape()[2], 1);
     }
 
     #[test]

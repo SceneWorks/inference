@@ -521,6 +521,31 @@ impl WanModelConfig {
     }
 }
 
+/// Keys that a converter once baked into `config.json` but that [`WanModelConfig::to_json`] no
+/// longer emits and `WanModelConfig::overlay_json` no longer reads.
+///
+/// `max_area` is the only such key: sc-12308 made it an engine-owned policy constant, dropped it
+/// from `to_json`, and made `overlay_json` ignore a baked one. The already-shipped rehosts still
+/// carry it — `SceneWorks/wan2.2-ti2v-5b-mlx` bakes `"max_area": 901120` in every tier's
+/// `config.json` — so a canonical-identity check that demands byte-for-byte equality with
+/// `to_json()` rejects the very checkpoints the engine ships. These keys are **inert**: nothing
+/// reads them, so neither their presence nor their value can change a loaded configuration.
+pub const LEGACY_INERT_CONFIG_KEYS: &[&str] = &["max_area"];
+
+/// A copy of `json` with every [`LEGACY_INERT_CONFIG_KEYS`] entry removed, so a canonical-identity
+/// check can compare a shipped snapshot against [`WanModelConfig::to_json`] without being defeated
+/// by a key the loader ignores. Every **meaningful** key still has to match exactly: this drops
+/// only keys `to_json` never emits and `overlay_json` never reads.
+pub fn without_legacy_inert_keys(json: &Value) -> Value {
+    let mut json = json.clone();
+    if let Some(map) = json.as_object_mut() {
+        for key in LEGACY_INERT_CONFIG_KEYS {
+            map.remove(*key);
+        }
+    }
+    json
+}
+
 /// Configuration for a **Wan-VACE** model (sc-3388 / epic 3040) — the base Wan DiT plus the two
 /// VACE-only fields. VACE (Video All-in-one Creation and Editing) is purely additive on the base
 /// `WanModelConfig`: the same dimension-parametric DiT, plus `vace_layers` (which main layers receive
@@ -865,6 +890,44 @@ mod tests {
                 .is_none(),
             "to_json must not bake max_area into new snapshots (sc-12308)"
         );
+    }
+
+    /// sc-22738: the legacy-inert allowlist has to stay honest — a key on it must be one `to_json`
+    /// never emits AND `overlay_json` never reads, or tolerating it in a canonical-identity check
+    /// would be tolerating real drift.
+    #[test]
+    fn every_legacy_inert_key_is_unemitted_unread_and_dropped_by_nothing_else() {
+        for preset in [
+            WanModelConfig::wan22_ti2v_5b(),
+            WanModelConfig::wan22_i2v_14b(),
+            WanModelConfig::wan22_t2v_14b(),
+        ] {
+            let canonical = preset.to_json();
+            for key in LEGACY_INERT_CONFIG_KEYS {
+                assert!(
+                    canonical.get(*key).is_none(),
+                    "to_json must not emit the legacy inert key {key}"
+                );
+                let mut baked = canonical.clone();
+                baked[*key] = serde_json::json!(1_234_567);
+                assert_eq!(
+                    WanModelConfig::from_config_json(&baked),
+                    WanModelConfig::from_config_json(&canonical),
+                    "a baked {key} must not change any loaded field"
+                );
+                assert_eq!(
+                    without_legacy_inert_keys(&baked),
+                    canonical,
+                    "without_legacy_inert_keys must drop {key} and restore the canonical snapshot"
+                );
+            }
+            // It drops ONLY those keys: a canonical snapshot survives untouched, and any other
+            // extra key is preserved so the caller's equality check still refuses it.
+            assert_eq!(without_legacy_inert_keys(&canonical), canonical);
+            let mut foreign = canonical.clone();
+            foreign["some_unknown_key"] = serde_json::json!(1);
+            assert_ne!(without_legacy_inert_keys(&foreign), canonical);
+        }
     }
 
     #[test]

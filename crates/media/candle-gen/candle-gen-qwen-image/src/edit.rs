@@ -1035,7 +1035,15 @@ fn validate_unique_adapter_paths(spec: &candle_gen::gen_core::LoadSpec) -> Resul
 }
 
 fn is_exact_lightning_path(path: &Path) -> bool {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    // HF snapshot files are symlinks into `blobs/`. Preserve the snapshot filename
+    // while resolving its parent, or a legitimate pinned distill loses its recipe
+    // identity. The prepared file receipt independently pins the resolved bytes.
+    let path = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_owned())
+            .join(name),
+        _ => return false,
+    };
     path_has_suffix(
         &path,
         &[
@@ -1592,6 +1600,60 @@ mod tests {
         ));
         duplicate_users.prepare_file_sources().unwrap();
         assert!(validate_memory_artifact_recipe(&duplicate_users).is_err());
+    }
+
+    #[test]
+    fn lightning_snapshot_symlink_preserves_recipe_and_prepared_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut spec, _, _) = admitted_edit_context(&tmp, 1, false);
+        spec.resolved_route = Some(EDIT_2511_LIGHTNING_ROUTE.to_owned());
+        let snapshot = tmp
+            .path()
+            .join(EDIT_2511_LIGHTNING_REPO_DIR)
+            .join("snapshots")
+            .join(EDIT_2511_LIGHTNING_REVISION)
+            .join(EDIT_2511_LIGHTNING_FILE);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        let blob = tmp
+            .path()
+            .join(EDIT_2511_LIGHTNING_REPO_DIR)
+            .join("blobs")
+            .join("fixture-blob");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"lightning-receipt").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&blob, &snapshot).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&blob, &snapshot).unwrap();
+        spec.adapters.push(AdapterSpec::new(
+            snapshot,
+            1.0,
+            candle_gen::gen_core::AdapterKind::Lora,
+        ));
+        spec.prepare_file_sources().unwrap();
+        assert_eq!(
+            validate_memory_artifact_recipe(&spec).unwrap(),
+            QwenEditArtifactRecipe::Lightning
+        );
+
+        let mut crossed = spec.clone();
+        crossed.resolved_route = Some(EDIT_2511_BASE_ROUTE.to_owned());
+        assert!(validate_memory_artifact_recipe(&crossed).is_err());
+        let mut raw_blob = candle_gen::gen_core::LoadSpec::new(spec.weights.clone())
+            .with_load_shape(spec.load_shape)
+            .with_resolved_route(EDIT_2511_LIGHTNING_ROUTE)
+            .with_adapters(vec![AdapterSpec::new(
+                blob.clone(),
+                1.0,
+                candle_gen::gen_core::AdapterKind::Lora,
+            )]);
+        raw_blob.prepare_file_sources().unwrap();
+        assert!(validate_memory_artifact_recipe(&raw_blob).is_err());
+        let mut wrong_scale = spec.clone();
+        wrong_scale.adapters[0].scale = 0.5;
+        assert!(validate_memory_artifact_recipe(&wrong_scale).is_err());
+        std::fs::write(&blob, b"changed-distill-receipt").unwrap();
+        assert!(validate_memory_artifact_recipe(&spec).is_err());
     }
 
     #[test]

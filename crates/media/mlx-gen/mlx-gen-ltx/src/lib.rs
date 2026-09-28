@@ -301,6 +301,10 @@ mod explicit_registry_tests {
             "vae_decoder.safetensors",
             "vae_encoder.safetensors",
             "audio_vae.safetensors",
+            // The vocoder, resolved beside the audio VAE and materialized on every 2.5 load
+            // (SC-22667). The 2.5 contract prices it now, so a bundle without it is not a bundle
+            // this provider can load.
+            "vocoder.safetensors",
             "duration.safetensors",
             "spatial.safetensors",
             "temporal.safetensors",

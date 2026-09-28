@@ -1,13 +1,6 @@
-//! CLIP byte-pair tokenizer — a faithful Rust port of the vendored Apple
-//! `_vendor/mlx_sd/tokenizer.py` (`Tokenizer`) + `model_io.load_tokenizer`. SDXL ships a CLIP
-//! tokenizer as `vocab.json` + `merges.txt` (no `tokenizer.json`), so the core `TextTokenizer`
-//! (which loads `tokenizer.json` and pads to a fixed `max_length`) does NOT apply. The vendored
-//! reference uses this **char-level** BPE (not the real CLIP byte-level BPE — a deliberate
-//! "95% of cases" simplification) with **dynamic batch-max padding** and no 77-token cap; matching
-//! it is what gives token-id parity with the reference path.
-//!
-//! Both SDXL tokenizers (`tokenizer/`, `tokenizer_2/`) ship byte-identical `vocab.json` +
-//! `merges.txt`, so one instance serves both CLIP-L and OpenCLIP-bigG encoders.
+//! CLIP byte-pair tokenizer for SDXL and its shared CLIP consumers.
+//! `vocab.json` + `merges.txt` encode UTF-8 bytes through CLIP's reversible byte alphabet.
+//! Keep the vendored pipeline's dynamic batch-max padding and long-prompt windowing.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,6 +36,21 @@ pub const PAD_ID: i32 = 0;
 /// sequence axis (the `long_prompt` module).
 pub const MAX_LENGTH: usize = 77;
 
+/// CLIP's reversible byte alphabet (OpenAI CLIP `bytes_to_unicode`).
+fn clip_byte_encoder() -> [char; 256] {
+    let mut next = 256;
+    std::array::from_fn(|byte| {
+        let code = if matches!(byte, 33..=126 | 161..=172 | 174..=255) {
+            byte as u32
+        } else {
+            let code = next;
+            next += 1;
+            code
+        };
+        char::from_u32(code).expect("CLIP byte alphabet is valid Unicode")
+    })
+}
+
 /// A loaded CLIP BPE tokenizer.
 pub struct ClipBpeTokenizer {
     /// Adjacent-symbol bigram → merge rank (lower = merged first).
@@ -50,6 +58,7 @@ pub struct ClipBpeTokenizer {
     /// Token string → id.
     vocab: HashMap<String, i32>,
     pat: Regex,
+    byte_encoder: [char; 256],
     bos_id: i32,
     eos_id: i32,
 }
@@ -95,6 +104,7 @@ impl ClipBpeTokenizer {
             bpe_ranks,
             vocab,
             pat,
+            byte_encoder: clip_byte_encoder(),
             bos_id,
             eos_id,
         })
@@ -162,8 +172,8 @@ impl ClipBpeTokenizer {
 
     /// Tokenize one prompt to CLIP token ids: lowercase + collapse whitespace, regex-split, BPE each
     /// word, map to ids, then prepend BOS and append EOS (the vendored `Tokenizer.tokenize`
-    /// defaults). Errors on an out-of-vocabulary sub-token — matching the vendored `self.vocab[t]`
-    /// (which would `KeyError`); the char-level BPE covers the ASCII prompt domain SDXL is used with.
+    /// defaults). Encode UTF-8 bytes with the CLIP alphabet before BPE, so punctuation, accents,
+    /// emoji, and non-Latin scripts use the same vocabulary as ASCII.
     ///
     /// **The full encoding, uncapped** (sc-20528). It used to truncate at [`MAX_LENGTH`], which
     /// silently dropped a long prompt's tail — the divergence from the candle lane this story
@@ -178,7 +188,16 @@ impl ClipBpeTokenizer {
         let mut ids = Vec::new();
         ids.push(self.bos_id);
         for m in self.pat.find_iter(&clean) {
-            for sub in self.bpe(m.as_str()) {
+            let word = m.as_str();
+            if word == "<|startoftext|>" || word == "<|endoftext|>" {
+                ids.push(self.vocab[word]);
+                continue;
+            }
+            let encoded: String = word
+                .bytes()
+                .map(|byte| self.byte_encoder[byte as usize])
+                .collect();
+            for sub in self.bpe(&encoded) {
                 let id = *self.vocab.get(&sub).ok_or_else(|| {
                     Error::Msg(format!("sdxl tokenizer: token {sub:?} not in vocab"))
                 })?;
@@ -270,9 +289,62 @@ mod tests {
             bpe_ranks: HashMap::new(),
             vocab,
             pat: Regex::new(CLIP_PATTERN).unwrap(),
+            byte_encoder: clip_byte_encoder(),
             bos_id: 49406,
             eos_id: 49407,
         }
+    }
+
+    #[test]
+    #[ignore = "requires installed CLIP vocabulary; set SDXL_TOKENIZER_DIR"]
+    fn installed_clip_vocabulary_encodes_unicode() {
+        let tok = ClipBpeTokenizer::from_dir(std::env::var("SDXL_TOKENIZER_DIR").unwrap()).unwrap();
+        // CLIP's published byte vocabulary/merges: independent known IDs for em dash and café.
+        assert_eq!(tok.tokenize("—").unwrap(), vec![49406, 2005, 49407]);
+        for prompt in ["portrait — textured bark", "café", "🙂 世界", "“quoted”"] {
+            assert!(tok.tokenize(prompt).unwrap().len() > 2, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn unicode_uses_clip_utf8_bytes_before_merging() {
+        let mut tok = tiny_tokenizer();
+        // Independent byte-alphabet fixture: UTF-8 em dash E2 80 94 -> â Ģ Ķ.
+        for (symbol, id) in [
+            ("â", 1),
+            ("Ģ", 2),
+            ("Ķ</w>", 3),
+            ("âĢĶ</w>", 4),
+            ("Ã", 5),
+            ("©</w>", 6),
+        ] {
+            tok.vocab.insert(symbol.to_owned(), id);
+        }
+        assert_eq!(tok.tokenize("—").unwrap(), vec![49406, 1, 2, 3, 49407]);
+        assert_eq!(tok.tokenize("É").unwrap(), vec![49406, 5, 6, 49407]);
+        tok.bpe_ranks.insert(("â".into(), "Ģ".into()), 0);
+        tok.bpe_ranks.insert(("âĢ".into(), "Ķ</w>".into()), 1);
+        assert_eq!(
+            tok.tokenize("a — a").unwrap(),
+            vec![49406, 320, 4, 320, 49407]
+        );
+    }
+
+    #[test]
+    fn byte_alphabet_covers_unicode_and_preserves_special_tokens() {
+        let mut tok = tiny_tokenizer();
+        for (byte, symbol) in clip_byte_encoder().iter().enumerate() {
+            tok.vocab.insert(symbol.to_string(), byte as i32);
+            tok.vocab.insert(format!("{symbol}</w>"), byte as i32 + 256);
+        }
+        for prompt in ["“hello”—世界", "café", "🙂", "日本語", "مرحبا"] {
+            let ids = tok.tokenize(prompt).unwrap();
+            assert!(ids.len() > 2, "{prompt}");
+        }
+        assert_eq!(
+            tok.tokenize("<|endoftext|>").unwrap(),
+            vec![49406, 49407, 49407]
+        );
     }
 
     #[test]

@@ -1009,6 +1009,17 @@ fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// summed from the exact snapshot subdirs [`crate::pipeline`] loads. The text encoder is the ~38 GB /
 /// 20B-param bulk the `Sequential` schedule drops before the DiT loads, so an accurate split here is
 /// what lets the fit-gate select staged residency for `lens` / `lens_turbo`.
+///
+/// `PerComponentBytes::from_spec_subdirs` sums
+/// on-disk `.safetensors` bytes, which is the materialized size only while the loader opens the
+/// tree at the width the checkpoint stores. `resolve_root` opens it at `Dtype::Float32` for
+/// `Precision::Fp32`, so on that tier every bf16-on-disk component materializes at twice its file
+/// length and the disk sum under-prices all three components 2x (epic SC-22657, E1). The f32 tier is
+/// therefore re-priced through `gen_core::materialized_path_bytes` at 4 B per float
+/// element, kept as a `max` against the disk sum so a component whose header cannot be read (an
+/// absent or partially materialized subdir) degrades to the old floor instead of to zero, and so a
+/// subdir carrying unused variant files keeps its larger on-disk upper bound. Both directions err
+/// large; neither can under-price.
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
@@ -1022,6 +1033,19 @@ pub(crate) fn component_footprint(
         mlx_gen::WeightsSource::Dir(root) => root,
         mlx_gen::WeightsSource::File(_) => return Ok(footprint),
     };
+    let float_width = u64::from(crate::memory_strategy::activation_width(spec.precision));
+    if spec.precision == Precision::Fp32 {
+        for (component, subdir) in [
+            (&mut footprint.text_encoder, "text_encoder"),
+            (&mut footprint.dit, "transformer"),
+            (&mut footprint.vae, "vae"),
+        ] {
+            let materialized =
+                mlx_gen::gen_core::materialized_path_bytes(root.join(subdir), float_width)
+                    .unwrap_or(0);
+            *component = (*component).max(materialized);
+        }
+    }
     let storage = text_encoder_storage(root)?;
     if spec.quantize.is_none()
         && matches!(
@@ -1034,8 +1058,16 @@ pub(crate) fn component_footprint(
         // for the encoder (vs 12.83 GiB on disk). Keep this provider- and FORMAT-specific: measured
         // q4/q8 and packed turnkeys retain their disk-derived footprint, an explicit bf16-on-disk
         // encoder is not inflated, and unknown metadata stays conservative so it cannot hide MXFP4.
+        //
+        // The floor scales with the load width: `GptOssMoe::from_weights`'s dense branch calls
+        // `dequantize_mxfp4(.., dtype)` with `resolve_root`'s dtype, so the same experts land at
+        // 4 B/element on `Precision::Fp32` — twice the measured bf16 residency. The packed MXFP4
+        // planes are integer code, so `materialized_path_bytes` above cannot see that expansion;
+        // this floor is the only thing that prices it.
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-        footprint.text_encoder = footprint.text_encoder.max((30.07 * GIB).ceil() as u64);
+        const MEASURED_BF16_ENCODER_GIB: f64 = 30.07;
+        let scaled = MEASURED_BF16_ENCODER_GIB * GIB * (float_width as f64) / 2.0;
+        footprint.text_encoder = footprint.text_encoder.max(scaled.ceil() as u64);
     }
     Ok(footprint)
 }
@@ -1369,6 +1401,113 @@ mod tests {
             component_footprint(&spec).expect("footprint").text_encoder,
             (30.07 * gib).ceil() as u64,
             "missing format metadata must not hide a possible MXFP4 materialization"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Write one component's `.safetensors` declaring `elements` BF16 values, so the file is a
+    /// readable header whose on-disk payload (`2 * elements`) and f32 materialization
+    /// (`4 * elements`) differ by exactly the factor the fp32 route has to price.
+    fn write_bf16_component(dir: &std::path::Path, elements: usize) -> u64 {
+        std::fs::create_dir_all(dir).expect("component dir");
+        let header = format!(
+            r#"{{"w":{{"dtype":"BF16","shape":[{elements}],"data_offsets":[0,{}]}}}}"#,
+            elements * 2
+        );
+        let mut json = header.into_bytes();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.resize(bytes.len() + elements * 2, 0);
+        let path = dir.join("model.safetensors");
+        let len = bytes.len() as u64;
+        std::fs::write(path, bytes).expect("fixture");
+        len
+    }
+
+    /// `resolve_root` opens every component at `Dtype::Float32` on `Precision::Fp32`, so each
+    /// component is priced at 4 B per float element instead of its bf16 on-disk length.
+    ///
+    /// Mutation: dropping the fp32 re-pricing (or asking for `float_width` 2) makes every component
+    /// fall back to the on-disk file length, which is under half of the asserted value; the
+    /// `base == conditioning + transformer + decoder` sum then under-prices with it.
+    #[test]
+    fn fp32_precision_prices_each_component_at_the_loaded_float_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(format!(
+            "mlx_gen_lens_sc22667_fp32_{}",
+            FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let elements = [
+            ("text_encoder", 4096_usize),
+            ("transformer", 2048),
+            ("vae", 512),
+        ];
+        let mut disk = Vec::new();
+        for (component, count) in elements {
+            disk.push(write_bf16_component(&root.join(component), count));
+        }
+        // An explicit bf16-on-disk encoder so the MXFP4 floor is not what is being measured here.
+        write_text_encoder_config(&root, r#"{"dtype":"bfloat16"}"#);
+
+        let mut spec = LoadSpec::new(mlx_gen::WeightsSource::Dir(root.clone()));
+        spec.precision = Precision::Bf16;
+        let bf16 = component_footprint(&spec).expect("bf16 footprint");
+        assert_eq!(
+            (bf16.text_encoder, bf16.dit, bf16.vae),
+            (disk[0], disk[1], disk[2]),
+            "the bf16 route keeps the on-disk sum"
+        );
+
+        spec.precision = Precision::Fp32;
+        let fp32 = component_footprint(&spec).expect("fp32 footprint");
+        assert_eq!(
+            (fp32.text_encoder, fp32.dit, fp32.vae),
+            (4 * 4096, 4 * 2048, 4 * 512),
+            "every component materializes at 4 B per float element on the fp32 route"
+        );
+        for (fp32_component, bf16_component) in [
+            (fp32.text_encoder, bf16.text_encoder),
+            (fp32.dit, bf16.dit),
+            (fp32.vae, bf16.vae),
+        ] {
+            assert!(
+                fp32_component > bf16_component,
+                "fp32 {fp32_component} must exceed the bf16 on-disk {bf16_component}"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The MXFP4 experts are dequantized to `resolve_root`'s dtype
+    /// (`GptOssMoe::from_weights` -> `dequantize_mxfp4(.., dtype)`), so the measured bf16 encoder
+    /// floor doubles on the fp32 route. The packed code planes are integer, so the header-derived
+    /// pricing above cannot see this expansion — the floor is the only thing that prices it.
+    ///
+    /// Mutation: pinning the floor back to a constant `30.07 GiB` halves the fp32 expectation.
+    #[test]
+    fn the_mxfp4_encoder_floor_follows_the_loaded_float_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, mut spec) = footprint_spec(&tmp, None);
+        write_text_encoder_config(
+            &root,
+            r#"{"dtype":"bfloat16","quantization_config":{"quant_method":"mxfp4"}}"#,
+        );
+        let gib: f64 = 1024.0 * 1024.0 * 1024.0;
+        spec.precision = Precision::Fp32;
+        // Doubled from the measured bf16 GiB rather than written as a second decimal literal, so
+        // the two expectations cannot disagree by a rounding ulp.
+        assert_eq!(
+            component_footprint(&spec).expect("footprint").text_encoder,
+            (30.07 * gib * 2.0).ceil() as u64,
+            "an f32 load dequantizes the same experts at twice the measured bf16 residency"
+        );
+        spec.precision = Precision::Bf16;
+        assert_eq!(
+            component_footprint(&spec).expect("footprint").text_encoder,
+            (30.07 * gib).ceil() as u64
         );
         std::fs::remove_dir_all(root).ok();
     }

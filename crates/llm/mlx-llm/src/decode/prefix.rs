@@ -139,9 +139,9 @@ impl PrefixCache {
 
     /// Store `tokens`' full per-layer KV (from the just-finished `cache`) for future reuse, freeing
     /// any LRU entries the insertion evicts. A no-op if the cache has no exportable state.
-    fn store(&mut self, tokens: Vec<i32>, cache: &ContiguousKvCache) {
-        let Some(layers) = cache.export() else {
-            return;
+    fn store(&mut self, tokens: Vec<i32>, cache: &ContiguousKvCache) -> Result<()> {
+        let Some(layers) = cache.export()? else {
+            return Ok(());
         };
         let out = self.index.insert(tokens);
         for evicted in &out.evicted {
@@ -152,6 +152,7 @@ impl PrefixCache {
         if self.index.contains(out.id) {
             self.kv.insert(out.id, layers);
         }
+        Ok(())
     }
 }
 
@@ -287,7 +288,7 @@ pub(crate) fn generate_cached_with_observer(
     let mut full = prompt_ids.to_vec();
     full.extend_from_slice(&out.tokens);
     full.truncate(cache.offset() as usize);
-    prefix_cache.store(full, &cache);
+    prefix_cache.store(full, &cache)?;
     cache.reset()?;
     if let Some(observer) = observer {
         observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;

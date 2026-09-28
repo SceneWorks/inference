@@ -275,7 +275,14 @@ pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
 /// Content identity for the CUDA resident/staged and ladder calibration harness.
 pub const RESIDENCY_CALIBRATION_FINGERPRINT: &str = "krea-cuda-residency-ladder-v1";
-/// Provider contract identity for the Krea Turbo five-rung phase curves.
+/// Provider contract identity for the Krea Turbo five-rung phase curves — the **measured q4 cell**.
+///
+/// sc-22735 (epic sc-22723 E1/E4). This string used to be published by `krea_2_turbo` at all three
+/// artifact tiers, so a bf16 or q8 turbo capture would have been filed under the same key as the
+/// only turbo record that exists. SceneWorks' `config/memory-anchors.json` holds exactly one turbo
+/// anchor — `krea_2_turbo:candle:q4` — recorded against this exact string, so it is preserved
+/// byte-identical and is now reachable only from the q4 arm of
+/// [`krea_turbo_production_calibration_fingerprint`]. bf16 and q8 get their own keys.
 pub const TURBO_MEMORY_CALIBRATION_FINGERPRINT: &str = "krea-turbo-cuda-phase-curves-v1";
 /// Provider contract identity for the Krea pose-control direct calibration.
 pub const CONTROL_MEMORY_CALIBRATION_FINGERPRINT: &str = "sc-16013-krea-control-direct-1024-v1";
@@ -1825,16 +1832,420 @@ candle_gen::register_generators! {
     pub(crate) const TURBO_EDIT_REGISTRATION = turbo_edit_descriptor => load_turbo_edit
 }
 
+/// Activation dtype every Krea route computes the DiT in. `pipeline.rs` pins `DIT_DTYPE =
+/// DType::BF16` for the dense, packed and convrot loads alike, so this is the provider's real
+/// activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-read architecture axes shared by every Krea 2 route (epic SC-22657, E2).
+///
+/// The DiT axes come from the **same** configuration the loader builds its model from:
+/// [`crate::config::Krea2Config::from_snapshot`] parses `<root>/transformer/config.json`
+/// (`num_attention_heads`, `attention_head_dim`, `num_layers`) plus `<root>/model_index.json`
+/// (`patch_size`), falling back per field to the published [`config::Krea2Config::turbo`] reference
+/// exactly as the loader does. Reading the axes back off that struct therefore publishes what the
+/// pipeline will actually execute — a snapshot whose config disagrees with the reference publishes
+/// what it says, and nothing is inferred from the model id.
+///
+/// Krea 2 is a **dense single-stream** DiT: `num_layers` is the whole trunk (there is no
+/// double/single split to add together), and `hidden_size` is *derived* as
+/// `num_attention_heads · attention_head_dim`, so `attention_head_dim` is already the per-head
+/// width and needs no divisibility check.
+///
+/// The decoder axes are the reused Qwen-Image `AutoencoderKLQwenImage` constants
+/// ([`vae::VAE_CHANNELS`], [`vae::VAE_COMPRESSION`]) rather than JSON: the loader constructs that
+/// VAE from code, so `<root>/vae/config.json` is not what runs and must not be read here.
+///
+/// A weights-free contract — the registry's sentinel surface path, a single-file import, or a
+/// snapshot whose transformer config cannot be parsed — publishes
+/// `MemoryArchitectureFacts::default()`.
+/// The materialized Krea snapshot this spec loads its config, tokenizer, TE and VAE from.
+///
+/// `spec.weights` on the snapshot routes, and the `BASE_SNAPSHOT_COMPONENT` directory on the
+/// single-file import routes — which is exactly what [`resolved_base_and_native`] resolves for the
+/// loader, restated here without the `id`-keyed validation so the weights-free surface stays quiet.
+///
+/// SC-22667 (E2): reading only `spec.weights` published `MemoryArchitectureFacts::default()` for
+/// every `load_from_native_dit_file` load, even though that route hands the loader a resident
+/// turnkey snapshot precisely *because* the single file omits the DiT architecture config — the
+/// axes are read from disk on that route, they were simply read from a directory this function was
+/// not looking at.
+fn materialized_snapshot_root(spec: &LoadSpec) -> Option<&std::path::Path> {
+    candle_gen::architecture_facts::snapshot_root(spec).or_else(|| {
+        match spec.components.get(BASE_SNAPSHOT_COMPONENT) {
+            Some(WeightsSource::Dir(root)) if root.is_dir() => Some(root.as_path()),
+            _ => None,
+        }
+    })
+}
+
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = materialized_snapshot_root(spec) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    let Ok(config) = crate::config::Krea2Config::from_snapshot(root) else {
+        return gen_core::MemoryArchitectureFacts::default();
+    };
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_attention_heads),
+        head_dim: af::declared(config.attention_head_dim),
+        transformer_blocks: af::declared(config.num_layers),
+        patch_size: af::declared(config.patch_size),
+        latent_channels: af::declared(crate::vae::VAE_CHANNELS as usize),
+        vae_spatial_scale: af::declared(crate::vae::VAE_COMPRESSION as usize),
+        // Structurally absent: Krea drives the Qwen-Image VAE collapsed to a single frame on the
+        // image path, so there is no frames-per-latent axis to declare (absent is `None`, never 0).
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
+/// The `language_model` tensor `pipeline::load_te_weights` probes to decide the TE **store** dtype
+/// (sc-12828): bf16 when the snapshot ships bf16, else an f32 store with no silent truncation.
+const TE_STORE_PROBE: &str = "language_model.layers.0.input_layernorm.weight";
+
+/// Bytes per element of the DiT's load dtype (`pipeline::DIT_DTYPE = DType::BF16`).
+const DIT_WIDTH: u64 = 2;
+
+/// Bytes per element of the autoencoder's load dtype — `vae::vae_varbuilder` opens the reused
+/// Qwen-Image VAE at `DType::F32` (decode-precision-sensitive), from a checkpoint that ships bf16.
+const VAE_WIDTH: u64 = 4;
+
+/// Bytes per element of the Edit-only Qwen3-VL vision tower's load dtype (SC-22667 review):
+/// `vision::load_vision_tower_from_source` opens it at [`vision::VISION_DTYPE`] = `DType::F32`
+/// unconditionally — **not** at the TE store width, which is 2 whenever the snapshot ships bf16. A
+/// test pins this constant to that dtype.
+const VISION_WIDTH: u64 = 4;
+
+/// Bytes per element of the text encoder on the **control** route: `control_provider::load_control_text`
+/// opens `Weights::from_dir(.., DType::F32)`, not the bf16-probed store the generation pipeline uses.
+const CONTROL_TE_WIDTH: u64 = 4;
+
+const KREA_2_TURBO_CONTROL_ID: &str = "krea_2_turbo_control";
+
+fn is_edit_route(provider_id: &str) -> bool {
+    matches!(provider_id, KREA_2_EDIT_ID | KREA_2_TURBO_EDIT_ID)
+}
+
+fn is_control_route(provider_id: &str) -> bool {
+    provider_id == KREA_2_TURBO_CONTROL_ID
+}
+
+/// The `vae/` tensors only `QwenVaeEncoder::new` reads: the `encoder.*` subtree and its
+/// `quant_conv`. `QwenVae::new` (decode) reads `post_quant_conv` and `decoder.*`; the prefix test is
+/// anchored so `post_quant_conv` cannot match it.
+fn vae_tensor_is_encoder_only(name: &str) -> bool {
+    name.starts_with("encoder.") || name.starts_with("quant_conv.")
+}
+
+/// Whether `provider_id`'s heavy phase materializes the Qwen-Image VAE **encoder** alongside the
+/// decoder — every Krea route does, on the load shapes that matter (SC-22667 review):
+///
+/// * the Edit routes VAE-encode their references (`pipeline::load_edit_components`, `lib.rs`'s
+///   `img2img_encoder`);
+/// * the control route builds `QwenVaeEncoder::new` eagerly in `load_control_heavy`
+///   (`control_provider.rs`), beside `load_vae`;
+/// * the text-to-image routes are **request-scoped**: their staged heavy twins
+///   (`pipeline::load_residency_heavy_for_request`, `load_residency_heavy_native`,
+///   `load_residency_heavy_convrot`) all construct `vae_encoder: load_vae_encoder(root, device)`
+///   eagerly on every `StagedResidency` request, whatever the request is, and the resident twin
+///   materializes the same encoder lazily on the first img2img request.
+///
+/// The only render that never holds the encoder is a resident-shape text-to-image request — a
+/// **request-time** fact this per-load declaration cannot see, and one whose absence is chosen
+/// precisely when memory is *not* tight. E3 (estimates only ever err large) settles the remaining
+/// choice: the staged path is the memory-tight path and it holds the encoder, so the encoder is
+/// charged on every route rather than under-declared on the one shape the fit gate exists for.
+/// The decode-only subtree is still separated by [`vae_tensor_is_encoder_only`], so a route whose
+/// loader is later shown never to materialize the encoder can drop it by name.
+fn vae_encoder_materialized(_provider_id: &str) -> bool {
+    true
+}
+
+/// Load-exact bytes of the Qwen-Image autoencoder as `provider_id` materializes it, opened at
+/// [`VAE_WIDTH`] from a bf16 checkpoint.
+fn vae_resident_bytes(root: &std::path::Path, provider_id: &str) -> gen_core::Result<u64> {
+    let dir = root.join("vae");
+    let with_encoder = vae_encoder_materialized(provider_id);
+    let kept = gen_core::safetensors_path_tensor_headers(&dir)?
+        .into_iter()
+        .filter(|header| with_encoder || !vae_tensor_is_encoder_only(&header.name))
+        .collect::<Vec<_>>();
+    gen_core::materialized_header_bytes(&kept, VAE_WIDTH, &dir)
+}
+
+/// The TE store width this snapshot resolves to, from the same probe the loader uses.
+fn te_store_width(headers: &[gen_core::SafetensorsTensorHeader]) -> u64 {
+    match headers.iter().find(|header| header.name == TE_STORE_PROBE) {
+        Some(header) if header.dtype == gen_core::weightsmeta::Dtype::BF16 => 2,
+        // Either the snapshot does not ship bf16 (the loader reopens at f32), or the probe key is
+        // absent and there is nothing to justify the halved store — both take the f32 branch, which
+        // is the loader's own fail-safe direction.
+        _ => 4,
+    }
+}
+
+/// Load-exact bytes of the DiT the loader will build from a **snapshot `transformer/`** or an
+/// **INT8-ConvRot** single file — the two DiT sources the shared `Weights` reader opens directly.
+///
+/// Candle's own `coerce_float` boundary is the rule for both: a float tensor is materialized at
+/// `DIT_DTYPE` and everything else keeps its stored width. That prices a dense diffusers
+/// `transformer/` at bf16 and an INT8-ConvRot file at its resident `i8` code planes; the ConvRot
+/// per-row `weight_scale` is read through `get_native_f32` and stays at its stored f32 width, so it
+/// is priced as stored rather than cast. The one source that needs more is an **MLX-packed tier**,
+/// whose affine triples Candle repacks into a device-format GGML tensor that is neither the source
+/// sidecars nor a dense matrix of the packed weight's shortened last dimension —
+/// `mlx_packed_qtensor_resident_bytes` is the shared pricing for exactly that conversion.
+///
+/// A **planned single-file native import** is NOT priced here (SC-22667 review): that route reads
+/// every projection through the checkpoint-codec plan, whose residency decides per row whether an
+/// fp8 / NVFP4 layer stays packed or decodes dense — see [`native_dit_resident_bytes`].
+fn dit_resident_bytes(path: &std::path::Path) -> gen_core::Result<u64> {
+    let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let group = loader::read_packed_config(path)
+        .ok()
+        .flatten()
+        .map(|config| config.group_size as usize)
+        .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE);
+    let mut total = 0_u64;
+    let mut dense = Vec::new();
+    for header in &headers {
+        if header.name.ends_with(".weight_scale") {
+            // ConvRot's per-output-row int8 scale: `get_native_f32` keeps it at its stored f32.
+            total = total
+                .checked_add(header.data_bytes)
+                .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))?;
+            continue;
+        }
+        if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
+            // Priced with the `.weight` of their triple; an orphan simply falls through as dense.
+            if let Some(base) = header
+                .name
+                .strip_suffix(".scales")
+                .or_else(|| header.name.strip_suffix(".biases"))
+            {
+                if by_name.contains_key(format!("{base}.weight").as_str()) {
+                    continue;
+                }
+            }
+            dense.push(header.clone());
+            continue;
+        }
+        let triple = header.name.strip_suffix(".weight").and_then(|base| {
+            Some((
+                *by_name.get(format!("{base}.scales").as_str())?,
+                *by_name.get(format!("{base}.biases").as_str())?,
+            ))
+        });
+        match triple {
+            Some((scales, biases)) => {
+                total = total
+                    .checked_add(candle_gen::quant::mlx_packed_qtensor_resident_bytes(
+                        header, scales, biases, group,
+                    )?)
+                    .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))?;
+            }
+            None => dense.push(header.clone()),
+        }
+    }
+    total
+        .checked_add(gen_core::materialized_header_bytes(
+            &dense, DIT_WIDTH, path,
+        )?)
+        .ok_or_else(|| gen_core::Error::Msg("krea: DiT byte overflow".into()))
+}
+
+/// The residency policy the memory contract prices a planned native import under: the SAME
+/// [`loader::native_import_residency`] the loader plans under, probed on the same process-default
+/// device the loader constructs on (`candle_gen::default_device`). A device that will not construct
+/// is priced dense — the larger of the two residencies, and also the truth: a loader that cannot
+/// build the device cannot take the native leg either.
+fn native_pricing_residency() -> candle_gen::logical_weights::CandleCodecResidency {
+    match candle_gen::default_device() {
+        Ok(device) => loader::native_import_residency(&device),
+        Err(_) => candle_gen::logical_weights::CandleCodecResidency::DENSE,
+    }
+}
+
+/// Load-exact bytes of a **planned single-file native DiT import**, priced from the compiled plan
+/// the loader consumes (SC-22667 review).
+///
+/// `Weights::from_pinned_native_file_for` compiles `plan_logical_weights` over this file under
+/// `residency` and reads every projection through it, so the per-row residency is the plan's, not
+/// the stored header's:
+///
+/// * a **Dense** row — a stored bf16/f32 projection, an fp8 row (the fp8 leg is masked for this
+///   import on every host, so an `F8_E4M3` weight takes the exact dense decode with its
+///   `weight_scale` applied), an int8-per-row projection, or an NVFP4 row on a host below the
+///   `sm_120` floor — lands as a dense `DIT_DTYPE` matrix over its **logical** shape, and its
+///   scale companions are consumed by the decode; pricing an fp8 row at its stored byte, as the
+///   `coerce_float` rule does, under-declares it by exactly half;
+/// * a **Packed** row — an NVFP4 projection on an `sm_120` host — stays in its stored container
+///   (`residency.resident_bytes`, nibbles already sliced for a transformed output) and **retains**
+///   its scale companions, *unless* Krea's own role table serves it W4A16: `Krea2Transformer::load`
+///   builds an NVFP4 import under `DitPlan::nvfp4(Nvfp4Quant::Mixed)`, whose `execution_role_for_layer`
+///   sends the edge blocks, the context readers, the post-nonlinearity leaves and the trunk head to
+///   dense bf16 (`demote_packed_row_to_dense`), which holds 2 B per logical element and consumes the
+///   companions in its one-time dequant.
+///
+/// `cfg` is the base snapshot's architecture config, exactly as the loader hands it in
+/// (`DeclaredLogicalShapes::FromConfig`), so a block-padded layer prices at its true geometry;
+/// `None` plans at the stored grid, which is what the loader does with no config in scope.
+fn native_dit_resident_bytes(
+    path: &std::path::Path,
+    cfg: Option<&crate::config::Krea2Config>,
+    residency: &candle_gen::logical_weights::CandleCodecResidency,
+) -> gen_core::Result<u64> {
+    use gen_core::checkpoint_codec::ResidencyMode;
+
+    let headers = gen_core::safetensors_path_tensor_headers(path)?;
+    let prefix = loader::detect_native_prefix_from_keys(headers.iter().map(|h| h.name.as_str()));
+    let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::new(
+        &prefix,
+        crate::native_mapping::DeclaredLogicalShapes::from_base(cfg),
+    );
+    let plan = candle_gen::logical_weights::plan_logical_weights(path, &mapping, residency)
+        .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+    let dit_plan = crate::nvfp4_dit::DitPlan::nvfp4(crate::nvfp4_dit::Nvfp4Quant::Mixed);
+    let dit_plan = match cfg {
+        Some(cfg) => dit_plan.with_num_layers(cfg.num_layers),
+        None => dit_plan,
+    };
+    let overflow = || gen_core::Error::Msg("krea: native DiT byte overflow".into());
+    let dense_bytes = |shape: &[usize]| -> gen_core::Result<u64> {
+        shape
+            .iter()
+            .try_fold(DIT_WIDTH, |acc, dim| acc.checked_mul(*dim as u64))
+            .ok_or_else(overflow)
+    };
+    let mut total = 0_u64;
+    let mut packed_owner = std::collections::BTreeSet::new();
+    for tensor in &plan.tensors {
+        let base = tensor
+            .logical_key
+            .strip_suffix(".weight")
+            .unwrap_or(&tensor.logical_key);
+        let bytes = match tensor.residency.mode {
+            ResidencyMode::Packed if dit_plan.execution_role_for_layer(base).is_packed_w4a4() => {
+                packed_owner.insert(tensor.physical_key.as_str());
+                tensor.residency.resident_bytes
+            }
+            // A Packed-priced row the role table serves W4A16: dense bf16 over the logical shape.
+            ResidencyMode::Packed | ResidencyMode::Dense => dense_bytes(&tensor.shape)?,
+        };
+        total = total.checked_add(bytes).ok_or_else(overflow)?;
+    }
+    for companion in &plan.companions {
+        if companion.resident_bytes == 0
+            || !packed_owner.contains(companion.owner_physical_key.as_str())
+        {
+            // Consumed by a dense decode (or a W4A16 dequant): nothing stays resident.
+            continue;
+        }
+        total = total
+            .checked_add(companion.resident_bytes)
+            .ok_or_else(overflow)?;
+    }
+    Ok(total)
+}
+
+/// Load-exact per-component asset facts for a validated Krea load (epic SC-22657, E1; feature-end
+/// sweep SC-22667).
+///
+/// Every Krea contract used to publish `MemoryAssetFacts::default()` — all zeros — on a fully
+/// materialized load, on the grounds that the manifest phase curves already carry the measured
+/// resident floors. That reasoning is about the *predicted peak*, which these fields do not feed:
+/// `predicted_peak_from_base` never reads `base_bytes`. What they do feed is
+/// `MemoryProviderContract::total_resident_bytes` and the E1 decomposition, and a zero there is not
+/// a conservative estimate but an absent fact — on the request-scoped routes it sat beside a formula
+/// that declares `MemoryFormulaVariable::AssetBytes`.
+///
+/// The three fields follow the *One network, one field* rule. The Qwen-Image autoencoder is charged
+/// once, in `decoder_bytes`, on every route including the Edit ones that VAE-encode their references
+/// through the same weights (its encoder half by [`vae_encoder_materialized`]); the Qwen3-VL vision
+/// tower is Edit-only residency and joins `conditioning_bytes` there and nowhere else, at the f32
+/// [`VISION_WIDTH`] its loader opens it in. The control route's text encoder is opened f32
+/// ([`CONTROL_TE_WIDTH`]) where the generation pipeline probes for a bf16 store.
+/// A component that is not readable yet contributes **no signal**, never a load failure.
+///
+/// Krea's `build` is lazy: it constructs a generator whose components open on first use, so a
+/// contract is legitimately built before a shard exists on disk (and the registry's own surface
+/// specs resolve nothing at all). Refusing a load because a pre-load admission fact could not be
+/// measured would be the strictly worse trade — the same call `candle-gen-ltx`'s
+/// `component_footprint_reports_no_signal_rather_than_failing` documents — so an unreadable
+/// component reads as 0 here and `load_components` surfaces the real error moments later.
+fn component_bytes_or_no_signal(bytes: gen_core::Result<u64>) -> u64 {
+    bytes.unwrap_or(0)
+}
+
+fn loaded_asset_facts(
+    provider_id: &str,
+    root: &std::path::Path,
+    native_dit: Option<&std::path::Path>,
+    convrot_dit: Option<&std::path::Path>,
+    encoder_source: &gen_core::ValidatedEncoderSource,
+) -> gen_core::Result<gen_core::MemoryAssetFacts> {
+    let language = encoder_source
+        .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+        .unwrap_or_default();
+    let te_width = if is_control_route(provider_id) {
+        CONTROL_TE_WIDTH
+    } else {
+        te_store_width(&language)
+    };
+    let mut conditioning = component_bytes_or_no_signal(gen_core::materialized_header_bytes(
+        &language, te_width, root,
+    ));
+    if is_edit_route(provider_id) {
+        // `pipeline::vision()` materializes the tower lazily on the Edit routes only — and at
+        // `vision::VISION_DTYPE` (f32), never at the TE's probed store width.
+        let vision = encoder_source
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .unwrap_or_default();
+        conditioning = conditioning.saturating_add(component_bytes_or_no_signal(
+            gen_core::materialized_header_bytes(&vision, VISION_WIDTH, root),
+        ));
+    }
+    let transformer = component_bytes_or_no_signal(match (convrot_dit, native_dit) {
+        (Some(convrot), _) => dit_resident_bytes(convrot),
+        (None, Some(native)) => native_dit_resident_bytes(
+            native,
+            crate::config::Krea2Config::from_snapshot(root)
+                .ok()
+                .as_ref(),
+            &native_pricing_residency(),
+        ),
+        (None, None) => dit_resident_bytes(&root.join("transformer")),
+    });
+    let decoder = component_bytes_or_no_signal(vae_resident_bytes(root, provider_id));
+    Ok(gen_core::MemoryAssetFacts {
+        base_bytes: conditioning
+            .saturating_add(transformer)
+            .saturating_add(decoder),
+        conditioning_bytes: conditioning,
+        transformer_bytes: transformer,
+        decoder_bytes: decoder,
+        // Krea's adapter/PiD/control overlays are outside this base declaration; the routes that
+        // accept them do so through their own request scope, and none is charged here.
+        overlay_bytes: 0,
+    })
+}
+
 /// Krea Turbo's provider-owned half of the shared memory-strategy handshake. The measured phase
 /// coefficients and exact fit boundaries stay in SceneWorks generated evidence; this declaration
 /// pins the executable structure that makes those measurements valid.
 fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::MemoryProviderContract {
     use gen_core::{
-        LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
-        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase,
-        MemoryPrerequisiteScope, MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy,
-        MemoryStrategyCapability, MemoryStrategyPrerequisite, MemoryStrategySupport,
-        MemoryWindowMaterialization,
+        LoadShape, MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
+        MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryPrerequisiteScope,
+        MemoryProviderContract, MemoryRuntimeSemantics, MemoryStrategy, MemoryStrategyCapability,
+        MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
     };
 
     // File and Dir execute through one provider identity, so the already-qualified resident/staged
@@ -1843,6 +2254,8 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
     // real imported-file run is measured rather than silently relabeling Dir evidence.
     let streamable = spec.adapters.is_empty() && matches!(spec.weights, WeightsSource::Dir(_));
     MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(spec),
         provider_id: KREA_2_TURBO_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1938,22 +2351,97 @@ fn build_krea_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
                 MemoryFormulaVariable::OverlayBytes,
             ],
         },
-        calibration: Some(MemoryCalibrationIdentity::new(
-            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
-            LoadShape::DeferredMaterialization,
-        )),
-        // The Krea manifest phase curves already contain the measured resident floors. Asset facts
-        // remain zero here rather than substituting on-disk shard sums for load-exact CUDA residency.
+        // sc-22735: no identity here. This builder serves BOTH the validated load and the
+        // weights-free surface, and the two must not publish the same key — the tier a production
+        // identity names has to be proven from the artifact, which only the validated path can do.
+        // `validated_krea_turbo_memory_strategy_contract` stamps the production (route, tier) cell;
+        // `weights_free_krea_turbo_memory_strategy_contract` stamps the registry-behavior key.
+        calibration: None,
+        // Zero here, and only here: this builder also serves the weights-free surface, which
+        // resolves no snapshot. A **validated** load stamps the load-exact decomposition over these
+        // through `loaded_asset_facts` (SC-22667, E1); see
+        // `validated_krea_turbo_memory_strategy_contract`.
         asset_facts: gen_core::MemoryAssetFacts::default(),
         runtime: MemoryRuntimeSemantics::default(),
     }
 }
 
+/// Production calibration identity of `krea_2_turbo`, keyed on the **artifact-proven tier**.
+///
+/// sc-22735 (epic sc-22723 E1/E4). Turbo shipped three tiers behind one string, so a bf16 or q8
+/// turbo capture would have been filed under the key of the single measured q4 record. Only the q4
+/// arm is measured, and it keeps [`TURBO_MEMORY_CALIBRATION_FINGERPRINT`] byte-identical — the
+/// SceneWorks anchor `krea_2_turbo:candle:q4` is bound by exactly that string. bf16 and q8 name
+/// their own cells in the same `phase-curves` family, so an anchor captured on either can never be
+/// read back as authority for the measured one.
+///
+/// `None` for a tier this lane does not ship (NVFP4 and the INT8-ConvRot rotated artifact): the
+/// honest answer is no identity, never another cell's.
+pub fn krea_turbo_production_calibration_fingerprint(tier: Option<Quant>) -> Option<String> {
+    match tier {
+        Some(Quant::Q4) => Some(TURBO_MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        None => Some("krea-2-turbo-bf16-cuda-phase-curves-v1".to_owned()),
+        Some(Quant::Q8) => Some("krea-2-turbo-q8-cuda-phase-curves-v1".to_owned()),
+        Some(_) => None,
+    }
+}
+
+/// Weights-free registry-behavior identity of `krea_2_turbo` at one declared surface tier.
+///
+/// Disjoint from every production string by construction, so a catalog surface — which resolves no
+/// snapshot and therefore measures nothing — can never read as evidence of the cell it describes.
+///
+/// Covers **every tier the turbo surface is declared at**, NVFP4 included — which is why this does
+/// not reuse [`request_scoped_tier_token`]. The two axes are different questions and must not share
+/// a token: a PRODUCTION identity answers "which measured cell is this", so NVFP4 correctly has
+/// none ([`krea_turbo_production_calibration_fingerprint`] returns `None`); a registry-behavior
+/// identity answers "which declared surface is this", and `krea_2_turbo` declares an NVFP4 import
+/// surface (`supported_quants` lists `Quant::Nvfp4`). Withholding a key there does not withhold
+/// evidence — there is none either way — it makes the surface builder fail and takes the whole
+/// declaration walk down with it, which is exactly what `raw_and_edit_catalog_surfaces_are_exact…`
+/// caught. Before sc-22735 every one of these surfaces published the MEASURED q4 string instead.
+fn krea_turbo_static_behavior_fingerprint(tier: Option<Quant>) -> Option<String> {
+    // Deliberately exhaustive over `Quant`: the declared surface covers every tier, so a new
+    // variant must fail to compile here rather than silently fall into a "no declaration" refusal.
+    let tier = match tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(Quant::Nvfp4) => "nvfp4",
+    };
+    Some(format!("krea-2-turbo-candle-registry-behavior-v1-{tier}"))
+}
+
 fn validated_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    validate_load_spec(spec, KREA_2_TURBO_ID)?;
-    Ok(build_krea_turbo_memory_strategy_contract(spec))
+    let (root, native_dit, convrot_dit, _, encoder_source) =
+        validate_load_spec(spec, KREA_2_TURBO_ID)?;
+    let mut contract = build_krea_turbo_memory_strategy_contract(spec);
+    // sc-22735: the tier comes from the ARTIFACT, never from `spec.quantize` — the SceneWorks
+    // worker forwards a default quant for the packed turnkeys at every tier, so keying on the
+    // request knob would collapse all three cells back onto one string. Unprovable (an unreadable
+    // packed marker, or the INT8-ConvRot rotated DiT, which is not one of the three measured
+    // tiers) publishes NO identity, which forces admission to name an explicit estimate authority.
+    contract.calibration = krea_provable_artifact_tier(spec, KREA_2_TURBO_ID)
+        .and_then(krea_turbo_production_calibration_fingerprint)
+        .map(|fingerprint| {
+            gen_core::MemoryCalibrationIdentity::new(
+                fingerprint,
+                gen_core::LoadShape::DeferredMaterialization,
+            )
+        });
+    // The pin is the sealed identity this load validated; price its path, not `spec.weights`.
+    contract.asset_facts = loaded_asset_facts(
+        KREA_2_TURBO_ID,
+        &root,
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )?;
+    Ok(contract)
 }
 
 fn registered_krea_turbo_memory_strategy_contract(
@@ -1965,10 +2453,35 @@ fn registered_krea_turbo_memory_strategy_contract(
 fn weights_free_krea_turbo_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    Ok(build_krea_turbo_memory_strategy_contract(spec))
+    let fingerprint = krea_turbo_static_behavior_fingerprint(spec.quantize).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{KREA_2_TURBO_ID}: no weights-free Krea turbo declaration is registered for tier {:?}",
+            spec.quantize
+        ))
+    })?;
+    let mut contract = build_krea_turbo_memory_strategy_contract(spec);
+    contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        gen_core::LoadShape::DeferredMaterialization,
+    ));
+    Ok(contract)
 }
 
-const REQUEST_SCOPED_MEMORY_FINGERPRINT: &str = "krea-candle-request-scoped-staged-residency-v1";
+/// Trailing stem of every request-scoped **production** calibration identity: the backend and the
+/// structural mechanism the string names, after the `{route}-{tier}` key.
+///
+/// sc-22735 (epic sc-22723 E1/E4). This used to be a whole, standalone fingerprint —
+/// `krea-candle-request-scoped-staged-residency-v1` — published verbatim by all three request-scoped
+/// routes at all three artifact tiers, and republished by the weights-free surfaces. Nine production
+/// cells and thirty-six weights-free surfaces shared one string, so a captured anchor could not say
+/// which cell it measured. It survives only as this stem; the full identity is composed by
+/// [`krea_request_scoped_production_calibration_fingerprint`].
+const REQUEST_SCOPED_MEMORY_FINGERPRINT_STEM: &str = "cuda-staged-residency-v1";
+
+/// Namespace of the **weights-free** request-scoped identities: registry-behavior declarations that
+/// resolve no snapshot and therefore measure nothing. Kept disjoint from every production string so
+/// a fixture or catalog surface can never read as evidence of a measured cell.
+const REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT: &str = "krea-2-candle-registry-behavior-v1";
 
 fn is_request_scoped_memory_provider(provider_id: &str) -> bool {
     matches!(
@@ -1977,19 +2490,124 @@ fn is_request_scoped_memory_provider(provider_id: &str) -> bool {
     )
 }
 
+/// Kebab token naming an artifact tier inside a calibration identity.
+fn request_scoped_tier_token(tier: Option<Quant>) -> Option<&'static str> {
+    match tier {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// Production calibration identity of one request-scoped Krea route, keyed on **(route, tier)**.
+///
+/// `krea_2_raw`, `krea_2_edit` and `krea_2_turbo_edit` execute the same structural staging seam but
+/// are three separate evidence domains, and each ships three artifact tiers — nine cells that an
+/// anchor must be able to tell apart. The string is
+/// `{route}-{tier}-cuda-staged-residency-v1` with `{route}` the provider id in kebab case and
+/// `{tier}` in `{q4, q8, bf16}`.
+///
+/// `None` for a provider no request-scoped route serves and for a tier this lane does not ship
+/// (NVFP4): publishing nothing is correct, publishing another cell's string is not.
+pub fn krea_request_scoped_production_calibration_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    if !is_request_scoped_memory_provider(provider_id) {
+        return None;
+    }
+    let tier = request_scoped_tier_token(tier)?;
+    Some(format!(
+        "{}-{tier}-{REQUEST_SCOPED_MEMORY_FINGERPRINT_STEM}",
+        provider_id.replace('_', "-")
+    ))
+}
+
+/// The tier a Krea load can **prove** from the artifact, or `None` when it cannot. Shared by the
+/// three request-scoped routes and by `krea_2_turbo`.
+///
+/// `LoadSpec::quantize` is not the answer: on a `WeightsSource::Dir` load this crate accepts it as a
+/// no-op recipe knob (the turnkey is already packed), and the SceneWorks worker forwards a default
+/// tier regardless of what is on disk. [`actual_quant_tier`] reads the transformer's own packed
+/// marker instead, so the tier named in a published identity is the tier that was opened.
+///
+/// Fails closed to `None` — never to an error, and never to a fabricated tier — for an unreadable or
+/// malformed packed config, an unsupported packed width, an imported single file whose companion
+/// snapshot disagrees with the request, and the INT8-ConvRot DiT path, whose rotated single-file
+/// artifact is not one of the three measured tiers.
+fn krea_provable_artifact_tier(spec: &LoadSpec, provider_id: &str) -> Option<Option<Quant>> {
+    match convrot_selector(spec, provider_id) {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(_) => return None,
+    }
+    actual_quant_tier(spec, provider_id).ok()
+}
+
+/// The production calibration identity a request-scoped load publishes, or `None` when the artifact
+/// tier cannot be proven.
+fn krea_request_scoped_production_calibration(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<gen_core::MemoryCalibrationIdentity> {
+    let tier = krea_provable_artifact_tier(spec, provider_id)?;
+    let fingerprint = krea_request_scoped_production_calibration_fingerprint(provider_id, tier)?;
+    Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ))
+}
+
+/// Weights-free registry-behavior identity of one request-scoped route at one **declared** surface
+/// tier: `krea-2-candle-registry-behavior-v1-{route}-{tier}`.
+///
+/// The tier comes from the surface selector, which names an already-resolved artifact tier — not
+/// from `LoadSpec::quantize` (the surface builder deliberately erases it) and not from the
+/// filesystem (there is no snapshot to read). `None` for a tier this lane does not declare.
+fn krea_request_scoped_static_behavior_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    if !is_request_scoped_memory_provider(provider_id) {
+        return None;
+    }
+    let tier = request_scoped_tier_token(tier)?;
+    Some(format!(
+        "{REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT}-{}-{tier}",
+        provider_id.replace('_', "-")
+    ))
+}
+
+/// The artifact tier a weights-free surface selector declares, as a [`Quant`] key.
+///
+/// NVFP4 is refused: this lane ships no NVFP4 request-scoped turnkey, which is the same refusal
+/// [`surface_selector_matches_request_scoped_spec`] already makes.
+fn request_scoped_surface_tier(tier: gen_core::MemoryContractSurfaceTier) -> Option<Option<Quant>> {
+    match tier {
+        gen_core::MemoryContractSurfaceTier::Bf16 => Some(None),
+        gen_core::MemoryContractSurfaceTier::Q4 => Some(Some(Quant::Q4)),
+        gen_core::MemoryContractSurfaceTier::Q8 => Some(Some(Quant::Q8)),
+        gen_core::MemoryContractSurfaceTier::Nvfp4 => None,
+    }
+}
+
 /// Source-derived contract shared by the Raw and both Edit execution paths.
 ///
 /// These generators all execute request-scoped component staging, but deliberately reject Turbo's
-/// decode tiling, attention chunking, and block-window controls. The fingerprint identifies this
+/// decode tiling, attention chunking, and block-window controls. The contract identifies this
 /// structural execution seam; it is not a performance, capacity, or real-weight claim.
+///
+/// The calibration identity it publishes is the **production** one, keyed on (route, tier) with the
+/// tier proven from the artifact. Weights-free callers overwrite it with the registry-behavior
+/// identity through [`weights_free_krea_request_scoped_contract`].
 fn build_krea_request_scoped_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     use gen_core::{
-        MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
-        MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract,
-        MemoryStrategy, MemoryStrategySupport, MemoryWindowMaterialization,
+        MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
+        MemoryLifecycleCapabilities, MemoryPhase, MemoryProviderContract, MemoryStrategy,
+        MemoryStrategySupport, MemoryWindowMaterialization,
     };
 
     if !is_request_scoped_memory_provider(provider_id) {
@@ -2006,6 +2624,7 @@ fn build_krea_request_scoped_memory_strategy_contract(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
+    contract.architecture_facts = architecture_facts(spec);
     contract.load_shape = spec.load_shape;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -2027,10 +2646,7 @@ fn build_krea_request_scoped_memory_strategy_contract(
             MemoryFormulaVariable::ConditioningTokenCount,
         ],
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        REQUEST_SCOPED_MEMORY_FINGERPRINT,
-        spec.load_shape,
-    ));
+    contract.calibration = krea_request_scoped_production_calibration(provider_id, spec);
     contract
         .strategies
         .iter_mut()
@@ -2044,8 +2660,21 @@ fn validated_krea_request_scoped_memory_strategy_contract(
     provider_id: &str,
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    validate_load_spec(spec, provider_id)?;
-    build_krea_request_scoped_memory_strategy_contract(provider_id, spec)
+    let (root, native_dit, convrot_dit, _, encoder_source) = validate_load_spec(spec, provider_id)?;
+    let mut contract = build_krea_request_scoped_memory_strategy_contract(provider_id, spec)?;
+    // SC-22667 (E1). This route's formula declares `MemoryFormulaVariable::AssetBytes`, so the
+    // all-zero `compatibility_default` facts it inherited were a formula input that was never
+    // supplied. The pin is the sealed identity this load validated; price its path.
+    contract.asset_facts = loaded_asset_facts(
+        provider_id,
+        &root,
+        native_dit
+            .as_ref()
+            .map(gen_core::PinnedWeightsFile::loader_path),
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )?;
+    Ok(contract)
 }
 
 fn surface_selector_matches_request_scoped_spec(
@@ -2083,26 +2712,83 @@ fn surface_selector_matches_request_scoped_spec(
     }
 }
 
+/// Structural declaration of one request-scoped route at one **declared** tier, resolving no
+/// snapshot.
+///
+/// The contract body is the production one; only the calibration identity differs, and it must:
+/// it names the registry-behavior namespace, so a catalog surface can never be mistaken for
+/// evidence of the production cell it describes. The identity stays `Some(..)` — a weights-free
+/// declaration that publishes none is indistinguishable from a route with no memory contract at
+/// all — and keeps `spec.load_shape` on the materialization axis.
+fn weights_free_krea_request_scoped_contract(
+    provider_id: &str,
+    spec: &LoadSpec,
+    tier: Option<Quant>,
+) -> gen_core::Result<gen_core::MemoryProviderContract> {
+    let fingerprint = krea_request_scoped_static_behavior_fingerprint(provider_id, tier)
+        .ok_or_else(|| {
+            gen_core::Error::Unsupported(format!(
+                "{provider_id}: no weights-free Krea request-scoped declaration is registered for tier {tier:?}"
+            ))
+        })?;
+    let mut contract = build_krea_request_scoped_memory_strategy_contract(provider_id, spec)?;
+    contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+        fingerprint,
+        spec.load_shape,
+    ));
+    Ok(contract)
+}
+
 fn weights_free_krea_request_scoped_surface_contract(
     provider_id: &str,
     surface: &gen_core::MemoryContractSurfaceSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     surface_selector_matches_request_scoped_spec(surface)?;
+    // The SELECTOR carries the resolved artifact tier; the spec's `quantize` is erased below, so it
+    // has to be read before that happens.
+    let tier = request_scoped_surface_tier(surface.resolved_artifact_tier()).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!(
+            "{provider_id}: Krea ships no request-scoped {:?} surface",
+            surface.resolved_artifact_tier()
+        ))
+    })?;
     let mut production_spec = surface.spec.clone();
     // Q4/Q8 are already-packed artifact tiers. The generic fixture uses this field only to make its
     // selector self-checking; the real Krea directory loader resolves the packed marker itself.
     production_spec.quantize = None;
-    build_krea_request_scoped_memory_strategy_contract(provider_id, &production_spec)
+    weights_free_krea_request_scoped_contract(provider_id, &production_spec, tier)
 }
 
+/// The turbo contract the safety-check tests grade against: the shape
+/// [`build_krea_turbo_memory_strategy_contract`] produces, carrying the identity a **validated q4**
+/// load would stamp on it.
+///
+/// sc-22735: the shared builder itself publishes no identity any more — it serves both the validated
+/// load and the weights-free surface, and only the validated path can prove a tier from the
+/// artifact. These tests exercise the tier/authority handshake, which needs a contract that actually
+/// names a calibration, and the q4 cell is the one turbo record that is measured. Stamping it here
+/// (rather than restoring it in the builder) keeps the production split intact: a builder that
+/// published this string again would re-file a bf16 or q8 capture under the measured q4 key, which
+/// is exactly the defect this story closes. The path is deliberately nonexistent, so nothing here
+/// can be mistaken for a real artifact-proven load.
 #[cfg(test)]
 fn krea_turbo_memory_strategy_contract() -> &'static gen_core::MemoryProviderContract {
     static CONTRACT: std::sync::OnceLock<gen_core::MemoryProviderContract> =
         std::sync::OnceLock::new();
     CONTRACT.get_or_init(|| {
-        build_krea_turbo_memory_strategy_contract(&LoadSpec::new(WeightsSource::Dir(
-            "/nonexistent/krea".into(),
-        )))
+        let mut contract = build_krea_turbo_memory_strategy_contract(&LoadSpec::new(
+            WeightsSource::Dir("/nonexistent/krea".into()),
+        ));
+        assert!(
+            contract.calibration.is_none(),
+            "the shared turbo builder must publish no identity; only a validated load proves a tier"
+        );
+        contract.calibration = Some(gen_core::MemoryCalibrationIdentity::new(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Q4))
+                .expect("krea_2_turbo publishes a production identity at q4"),
+            gen_core::LoadShape::DeferredMaterialization,
+        ));
+        contract
     })
 }
 
@@ -2306,11 +2992,10 @@ mod weights_free_behavior_tests {
 
     #[test]
     fn raw_and_edit_catalog_surfaces_are_exact_and_only_publish_request_scoped_staging() {
-        let registry = register_memory_contract_surfaces(register_providers(
-            gen_core::ProviderRegistryBuilder::new(),
-        ))
-        .build()
-        .unwrap();
+        let registry = register_providers(gen_core::ProviderRegistryBuilder::new());
+        #[cfg(not(feature = "cuda"))]
+        let registry = register_memory_contract_surfaces(registry);
+        let registry = registry.build().unwrap();
         assert_eq!(registry.memory_strategy_registrations().len(), 5);
         let surfaces = registry.memory_contract_surfaces().unwrap();
         assert_eq!(surfaces.len(), 2 * 16 + 3 * 12);
@@ -2327,10 +3012,14 @@ mod weights_free_behavior_tests {
                     gen_core::MemoryAssetFacts::default(),
                     "{provider_id}: weights-free catalog surfaces cannot claim inventory"
                 );
+                // A weights-free catalog surface declares the registry-behavior identity of its own
+                // (route, declared tier) — never a production cell's string.
+                let tier = request_scoped_surface_tier(surface.resolved_artifact_tier()).unwrap();
                 assert_eq!(
                     surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    REQUEST_SCOPED_MEMORY_FINGERPRINT,
-                    "{provider_id}"
+                    krea_request_scoped_static_behavior_fingerprint(provider_id, tier).unwrap(),
+                    "{provider_id}:{}",
+                    surface.selector.id()
                 );
                 for strategy in gen_core::MemoryStrategy::ALL {
                     let support = &surface.contract.capability(strategy).unwrap().support;
@@ -2505,6 +3194,23 @@ mod weights_free_behavior_tests {
     }
 
     #[test]
+    fn dense_turbo_fixture_publishes_bf16_production_calibration() {
+        let snapshot = tempfile::tempdir().unwrap();
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &snapshot.path().join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(snapshot.path().to_path_buf()));
+        let contract = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            contract.calibration.unwrap().fingerprint,
+            "krea-2-turbo-bf16-cuda-phase-curves-v1"
+        );
+    }
+
+    #[test]
     fn catalog_contract_fixture_is_weights_free_but_production_admission_stays_strict() {
         let spec = LoadSpec::new(WeightsSource::Dir(
             "Z:\\nonexistent\\krea-catalog-fixture".into(),
@@ -2529,7 +3235,10 @@ mod weights_free_behavior_tests {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
         for (contract, strategy) in [
             (
-                build_krea_turbo_memory_strategy_contract(&spec),
+                // sc-22735: the SHARED builder publishes no identity now (only a validated load can
+                // prove a tier), and an optimized behavior needs one. Grade against the turbo
+                // contract carrying the identity a validated q4 load stamps.
+                krea_turbo_memory_strategy_contract().clone(),
                 gen_core::MemoryStrategy::BoundedDecode,
             ),
             (
@@ -2652,12 +3361,56 @@ request_scoped_memory_registration!(
 fn build_krea_control_memory_strategy_contract(
     spec: &LoadSpec,
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
-    let quant = actual_quant_tier(spec, "krea_2_turbo_control")?;
-    Ok(build_krea_control_memory_strategy_contract_for_tier(quant))
+    let quant = actual_quant_tier(spec, KREA_2_TURBO_CONTROL_ID)?;
+    let mut contract = build_krea_control_memory_strategy_contract_for_tier(quant, spec);
+    // SC-22667 (E1, review round): this builder serves the registered contract and the real-load
+    // probe alike, and both used to publish `MemoryAssetFacts::default()` on a fully materialized
+    // control load. The weights-free surface keeps the zero facts by calling `_for_tier` directly.
+    contract.asset_facts = control_asset_facts(spec)?;
+    Ok(contract)
 }
 
+/// Load-exact per-component asset facts for a materialized **control** load (SC-22667 review).
+///
+/// The control route validates its own spec shape (`control_provider::load_with_spec`): the base is
+/// the runtime snapshot **directory** (a `File` base is rejected there), the ConvRot DiT arrives as
+/// `KREA_CONVROT_DIT_COMPONENT`, a native DiT only through runtime paths the spec cannot carry, and
+/// `spec.control` names the pose branch — an auxiliary overlay outside these base fields. The
+/// components it then materializes differ from the generation routes in two widths, both read off
+/// `control_provider.rs`: the text encoder opens f32 (`load_control_text`) and the autoencoder is
+/// built encoder-and-decoder (`load_control_heavy`: `load_vae` + `QwenVaeEncoder::new`).
+///
+/// A spec whose snapshot is not on disk — the registry's sentinel surface, a fixture — publishes
+/// the zero facts, exactly as the generation routes' weights-free builders do.
+fn control_asset_facts(spec: &LoadSpec) -> gen_core::Result<gen_core::MemoryAssetFacts> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    };
+    if !root.is_dir() {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    }
+    let convrot_dit = convrot_selector(spec, KREA_2_TURBO_CONTROL_ID)?;
+    // The same encoder-contract resolution `resolve_control_text_encoder_source` performs; a source
+    // that does not validate is a load `Krea2Control::load` refuses, and contributes no signal here.
+    let Ok(encoder_source) = ENCODER_CONTRACT.source_for_load(spec, root) else {
+        return Ok(gen_core::MemoryAssetFacts::default());
+    };
+    loaded_asset_facts(
+        KREA_2_TURBO_CONTROL_ID,
+        root,
+        None,
+        convrot_dit.as_deref(),
+        &encoder_source,
+    )
+}
+
+/// The control route runs the same Krea 2 DiT and Qwen-Image VAE as Turbo, so it reads the same
+/// snapshot axes. `spec` is threaded in alongside the already-resolved tier purely so those axes
+/// come from the snapshot actually being loaded; the weights-free surface passes the registry's
+/// sentinel spec and therefore still publishes no facts.
 fn build_krea_control_memory_strategy_contract_for_tier(
     quant: Option<Quant>,
+    spec: &LoadSpec,
 ) -> gen_core::MemoryProviderContract {
     use gen_core::{
         LoadShape, MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind,
@@ -2676,6 +3429,7 @@ fn build_krea_control_memory_strategy_contract_for_tier(
             block_materialization: MemoryWindowMaterialization::DeviceFormatTransfer,
         },
     );
+    contract.architecture_facts = architecture_facts(spec);
     contract.load_shape = LoadShape::EagerMaterialization;
     contract.lifecycle = MemoryLifecycleCapabilities {
         phases: vec![
@@ -2772,6 +3526,7 @@ fn weights_free_krea_control_memory_strategy_contract(
 ) -> gen_core::Result<gen_core::MemoryProviderContract> {
     Ok(build_krea_control_memory_strategy_contract_for_tier(
         spec.quantize,
+        spec,
     ))
 }
 
@@ -2858,7 +3613,10 @@ pub fn register_memory_contract_surfaces(
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: KREA_2_RAW_ID,
             contract: |spec| {
-                build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, spec)
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_RAW_ID, spec, spec.quantize)
             },
         })
         .register_memory_contract_surface_resolver(
@@ -2872,7 +3630,10 @@ pub fn register_memory_contract_surfaces(
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: KREA_2_EDIT_ID,
             contract: |spec| {
-                build_krea_request_scoped_memory_strategy_contract(KREA_2_EDIT_ID, spec)
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_EDIT_ID, spec, spec.quantize)
             },
         })
         .register_memory_contract_surface_resolver(
@@ -2886,7 +3647,10 @@ pub fn register_memory_contract_surfaces(
             surface_specs: gen_core::candle_memory_contract_surface_specs,
             provider_id: KREA_2_TURBO_EDIT_ID,
             contract: |spec| {
-                build_krea_request_scoped_memory_strategy_contract(KREA_2_TURBO_EDIT_ID, spec)
+                // A weights-free conformance witness, so it declares the registry-behavior
+                // identity rather than the production (route, tier) cell. Its tier is the one the
+                // witness spec names; there is no artifact to prove one from.
+                weights_free_krea_request_scoped_contract(KREA_2_TURBO_EDIT_ID, spec, spec.quantize)
             },
         })
         .register_memory_contract_surface_resolver(
@@ -2908,6 +3672,399 @@ pub fn register_memory_contract_surfaces(
 /// Build the complete explicit Candle Krea provider catalog.
 pub fn provider_registry() -> candle_gen::gen_core::Result<candle_gen::gen_core::ProviderRegistry> {
     register_providers(candle_gen::gen_core::ProviderRegistryBuilder::new()).build()
+}
+
+/// sc-22735 (epic sc-22723 E1/E4): the request-scoped calibration identities are the key a captured
+/// SceneWorks memory anchor is filed under, so every cell that can be measured separately must be
+/// nameable separately. Three routes x three artifact tiers = nine production cells, plus a disjoint
+/// weights-free namespace for the declarations that measure nothing.
+#[cfg(test)]
+mod request_scoped_calibration_identity_tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use super::*;
+
+    const ROUTES: [&str; 3] = [KREA_2_RAW_ID, KREA_2_EDIT_ID, KREA_2_TURBO_EDIT_ID];
+    const TIERS: [Option<Quant>; 3] = [None, Some(Quant::Q4), Some(Quant::Q8)];
+
+    fn tier_token(tier: Option<Quant>) -> &'static str {
+        match tier {
+            None => "bf16",
+            Some(Quant::Q4) => "q4",
+            Some(Quant::Q8) => "q8",
+            Some(other) => unreachable!("this lane ships no {other:?} request-scoped tier"),
+        }
+    }
+
+    /// A snapshot whose `transformer/config.json` declares `tier` — the marker
+    /// `loader::read_packed_config` reads and the only place the tier can be proven from.
+    fn snapshot_at_tier(root: &Path, tier: Option<Quant>) -> LoadSpec {
+        gen_core_testkit::write_multimodal_encoder_contract_fixture(
+            &root.join("text_encoder"),
+            ENCODER_CONTRACT,
+            VISION_ENCODER_CONTRACT,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        let config = match tier {
+            None => serde_json::json!({ "hidden_size": 6144 }),
+            Some(Quant::Q4) => {
+                serde_json::json!({ "quantization": { "bits": 4, "group_size": 64 } })
+            }
+            Some(Quant::Q8) => {
+                serde_json::json!({ "quantization": { "bits": 8, "group_size": 64 } })
+            }
+            Some(other) => unreachable!("this lane ships no {other:?} request-scoped tier"),
+        };
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+    }
+
+    fn published(provider_id: &str, spec: &LoadSpec) -> Option<String> {
+        build_krea_request_scoped_memory_strategy_contract(provider_id, spec)
+            .expect("the request-scoped contract builder never fails on a registered route")
+            .calibration
+            .map(|identity| identity.fingerprint)
+    }
+
+    /// The nine production strings, derived from the documented format rather than frozen here, so
+    /// the other tests can assert disjointness against a set that cannot silently shrink.
+    fn production_identities() -> BTreeSet<String> {
+        let set: BTreeSet<String> = ROUTES
+            .into_iter()
+            .flat_map(|route| {
+                TIERS.into_iter().map(move |tier| {
+                    krea_request_scoped_production_calibration_fingerprint(route, tier)
+                        .expect("every shipped (route, tier) cell has a production identity")
+                })
+            })
+            .collect();
+        assert_eq!(set.len(), ROUTES.len() * TIERS.len());
+        set
+    }
+
+    #[test]
+    fn every_request_scoped_cell_publishes_its_own_production_identity_keyed_on_the_artifact() {
+        let mut seen: std::collections::BTreeMap<String, (&str, Option<Quant>)> =
+            Default::default();
+        for route in ROUTES {
+            for tier in TIERS {
+                let tmp = tempfile::tempdir().unwrap();
+                let spec = snapshot_at_tier(tmp.path(), tier);
+                let fingerprint = published(route, &spec).unwrap_or_else(|| {
+                    panic!("{route}/{tier:?} must publish a production identity")
+                });
+                assert_eq!(
+                    fingerprint,
+                    format!(
+                        "{}-{}-cuda-staged-residency-v1",
+                        route.replace('_', "-"),
+                        tier_token(tier)
+                    ),
+                    "{route}/{tier:?}"
+                );
+                gen_core::validate_calibration_fingerprint(&fingerprint).unwrap();
+
+                // THE load-bearing property: the key is the tier on disk, not the request knob. A
+                // `Dir` load accepts `quantize` as a recipe-only no-op and the SceneWorks worker
+                // forwards a default tier regardless of the artifact, so a request-keyed identity
+                // would file three different artifacts under one string.
+                for requested in [Some(Quant::Q4), Some(Quant::Q8)] {
+                    let mut misrequested = spec.clone();
+                    misrequested.quantize = requested;
+                    assert_eq!(
+                        published(route, &misrequested).as_deref(),
+                        Some(fingerprint.as_str()),
+                        "{route}/{tier:?}: a {requested:?} request must not relabel the artifact"
+                    );
+                }
+
+                assert!(
+                    seen.insert(fingerprint.clone(), (route, tier)).is_none(),
+                    "{route}/{tier:?} collides with {:?} on '{fingerprint}'",
+                    seen.get(&fingerprint)
+                );
+            }
+        }
+        assert_eq!(seen.len(), ROUTES.len() * TIERS.len());
+        assert_eq!(
+            seen.keys().cloned().collect::<BTreeSet<_>>(),
+            production_identities()
+        );
+    }
+
+    #[test]
+    fn the_three_request_scoped_routes_never_share_an_identity_at_the_same_tier() {
+        for tier in TIERS {
+            let tmp = tempfile::tempdir().unwrap();
+            let spec = snapshot_at_tier(tmp.path(), tier);
+            let per_route: Vec<String> = ROUTES
+                .into_iter()
+                .map(|route| published(route, &spec).unwrap())
+                .collect();
+            assert_eq!(
+                per_route.iter().collect::<BTreeSet<_>>().len(),
+                ROUTES.len(),
+                "{tier:?}: raw/edit/turbo-edit must be distinguishable: {per_route:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_validated_production_path_carries_the_same_cell_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = snapshot_at_tier(tmp.path(), None);
+        for route in ROUTES {
+            let contract =
+                validated_krea_request_scoped_memory_strategy_contract(route, &spec).unwrap();
+            assert_eq!(
+                contract.calibration.as_ref().unwrap().fingerprint,
+                krea_request_scoped_production_calibration_fingerprint(route, None).unwrap(),
+                "{route}"
+            );
+            assert!(contract.conformance_errors().is_empty(), "{route}");
+        }
+    }
+
+    #[test]
+    fn turbo_and_control_keep_the_bound_measured_identities_they_already_published() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/krea".into()));
+        let turbo = build_krea_turbo_memory_strategy_contract(&spec);
+        // sc-22735 fix pass. The SHARED builder publishes nothing: it serves the weights-free
+        // surface as well as the validated load, and a surface that resolves no snapshot cannot
+        // prove which of the three tiers it is describing.
+        assert!(
+            turbo.calibration.is_none(),
+            "the shared turbo builder must not name a cell it cannot prove"
+        );
+        // The measured cell is q4 and ONLY q4, and it keeps its string byte-identical — the
+        // SceneWorks anchor `krea_2_turbo:candle:q4` is bound by exactly this literal.
+        assert_eq!(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Q4)).unwrap(),
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT, "krea-turbo-cuda-phase-curves-v1",
+            "the SceneWorks anchor plan and the packaged krea_2_turbo candle q4 record name this"
+        );
+        // The two unmeasured tiers name their own cells, so a bf16 or q8 capture can never be read
+        // back as authority for the measured one.
+        let bf16 = krea_turbo_production_calibration_fingerprint(None).unwrap();
+        let q8 = krea_turbo_production_calibration_fingerprint(Some(Quant::Q8)).unwrap();
+        for other in [&bf16, &q8] {
+            assert_ne!(
+                other, TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+                "an unmeasured turbo tier must not republish the measured q4 key"
+            );
+        }
+        assert_ne!(
+            bf16, q8,
+            "the two unmeasured turbo tiers are distinct cells"
+        );
+        // A tier this lane does not ship gets no identity rather than another cell's.
+        assert_eq!(
+            krea_turbo_production_calibration_fingerprint(Some(Quant::Nvfp4)),
+            None
+        );
+        assert_eq!(
+            turbo.load_shape,
+            gen_core::LoadShape::DeferredMaterialization
+        );
+
+        let control = build_krea_control_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            control.calibration.as_ref().unwrap().fingerprint,
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT
+        );
+        assert_eq!(
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
+            "sc-16013-krea-control-direct-1024-v1"
+        );
+
+        let production = production_identities();
+        for bound in [
+            TURBO_MEMORY_CALIBRATION_FINGERPRINT,
+            CONTROL_MEMORY_CALIBRATION_FINGERPRINT,
+        ] {
+            assert!(
+                !production.contains(bound),
+                "the request-scoped split must not reach into '{bound}'"
+            );
+            assert!(!bound.starts_with(REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT));
+        }
+    }
+
+    #[test]
+    fn weights_free_declarations_are_disjoint_from_every_production_identity() {
+        type SurfaceSeam = fn(
+            &gen_core::MemoryContractSurfaceSpec,
+        ) -> gen_core::Result<gen_core::MemoryProviderContract>;
+
+        let production = production_identities();
+        let surfaces = gen_core::candle_memory_contract_surface_specs();
+        assert!(!surfaces.is_empty());
+        let mut every_route = BTreeSet::new();
+        for (route, seam) in [
+            (
+                KREA_2_RAW_ID,
+                weights_free_krea_raw_surface_contract as SurfaceSeam,
+            ),
+            (KREA_2_EDIT_ID, weights_free_krea_edit_surface_contract),
+            (
+                KREA_2_TURBO_EDIT_ID,
+                weights_free_krea_turbo_edit_surface_contract,
+            ),
+        ] {
+            let mut per_route = BTreeSet::new();
+            for surface in &surfaces {
+                let contract = seam(surface).unwrap();
+                let fingerprint = contract.calibration.as_ref().unwrap().fingerprint.clone();
+                assert!(
+                    fingerprint.starts_with(REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT),
+                    "{route}: '{fingerprint}' is outside the registry-behavior namespace"
+                );
+                assert!(
+                    !production.contains(&fingerprint),
+                    "{route}: weights-free surface republished production identity '{fingerprint}'"
+                );
+                assert_eq!(
+                    fingerprint,
+                    format!(
+                        "{REQUEST_SCOPED_STATIC_BEHAVIOR_FINGERPRINT}-{}-{}",
+                        route.replace('_', "-"),
+                        tier_token(
+                            request_scoped_surface_tier(surface.resolved_artifact_tier()).unwrap()
+                        )
+                    )
+                );
+                assert!(contract.conformance_errors().is_empty(), "{route}");
+                // The macro-generated seam and the shared entry point are the same declaration.
+                assert_eq!(
+                    weights_free_krea_request_scoped_surface_contract(route, surface)
+                        .unwrap()
+                        .calibration
+                        .unwrap()
+                        .fingerprint,
+                    fingerprint
+                );
+                per_route.insert(fingerprint);
+            }
+            assert_eq!(
+                per_route.len(),
+                TIERS.len(),
+                "{route}: the three declared surface tiers must be distinguishable: {per_route:?}"
+            );
+            every_route.extend(per_route);
+        }
+        assert_eq!(every_route.len(), ROUTES.len() * TIERS.len());
+
+        // The conformance-fixture seam registered alongside the resolver is weights-free too.
+        let witness = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        for route in ROUTES {
+            for tier in TIERS {
+                let fingerprint = weights_free_krea_request_scoped_contract(route, &witness, tier)
+                    .unwrap()
+                    .calibration
+                    .unwrap()
+                    .fingerprint;
+                assert!(!production.contains(&fingerprint), "{route}/{tier:?}");
+                assert!(every_route.contains(&fingerprint), "{route}/{tier:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_has_no_request_scoped_identity_on_either_side_of_the_split() {
+        for route in ROUTES {
+            assert!(krea_request_scoped_production_calibration_fingerprint(
+                route,
+                Some(Quant::Nvfp4)
+            )
+            .is_none());
+            assert!(
+                krea_request_scoped_static_behavior_fingerprint(route, Some(Quant::Nvfp4))
+                    .is_none()
+            );
+        }
+        assert!(
+            request_scoped_surface_tier(gen_core::MemoryContractSurfaceTier::Nvfp4).is_none(),
+            "the NVFP4 surface refusal must stay"
+        );
+        for foreign in [KREA_2_TURBO_ID, "krea_2_turbo_control", "krea_2_raw_typo"] {
+            assert!(
+                krea_request_scoped_production_calibration_fingerprint(foreign, None).is_none()
+            );
+            assert!(krea_request_scoped_static_behavior_fingerprint(foreign, None).is_none());
+        }
+    }
+
+    #[test]
+    fn an_unprovable_artifact_tier_withholds_the_identity_without_failing_the_contract() {
+        // An unsupported packed width: the marker is present and readable, and names a tier this
+        // lane has never measured.
+        let unsupported = tempfile::tempdir().unwrap();
+        let spec = snapshot_at_tier(unsupported.path(), Some(Quant::Q4));
+        std::fs::write(
+            unsupported.path().join("transformer").join("config.json"),
+            br#"{"quantization": {"bits": 5, "group_size": 64}}"#,
+        )
+        .unwrap();
+
+        // A malformed marker: present but not JSON.
+        let corrupt = tempfile::tempdir().unwrap();
+        let corrupt_spec = snapshot_at_tier(corrupt.path(), None);
+        std::fs::write(
+            corrupt.path().join("transformer").join("config.json"),
+            b"{ not json",
+        )
+        .unwrap();
+
+        // The INT8-ConvRot single-file DiT: a rotated artifact that is none of the three tiers.
+        let convrot = tempfile::tempdir().unwrap();
+        let mut convrot_spec = snapshot_at_tier(convrot.path(), None);
+        convrot_spec.components.insert(
+            KREA_CONVROT_DIT_COMPONENT.to_owned(),
+            WeightsSource::File(convrot.path().join("krea2_int8_convrot.safetensors")),
+        );
+
+        // An imported single file with no base snapshot: nothing to read the marker from.
+        let imported = tempfile::tempdir().unwrap();
+        let native = imported.path().join("imported.safetensors");
+        std::fs::write(&native, b"pinned source fixture").unwrap();
+        let imported_spec = LoadSpec::new(WeightsSource::File(native));
+
+        for (label, spec) in [
+            ("unsupported packed width", &spec),
+            ("corrupt packed marker", &corrupt_spec),
+            ("convrot single-file DiT", &convrot_spec),
+            ("imported file without a base snapshot", &imported_spec),
+        ] {
+            for route in ROUTES {
+                let contract =
+                    build_krea_request_scoped_memory_strategy_contract(route, spec).unwrap();
+                assert!(
+                    contract.calibration.is_none(),
+                    "{route}: {label} must withhold the identity, not fabricate one"
+                );
+                assert!(contract.conformance_errors().is_empty(), "{route}: {label}");
+                assert_eq!(
+                    contract
+                        .capability(gen_core::MemoryStrategy::StagedResidency)
+                        .unwrap()
+                        .support,
+                    gen_core::MemoryStrategySupport::Implemented,
+                    "{route}: {label}: the structural declaration still stands"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3017,7 +4174,7 @@ mod explicit_registry_tests {
                 .expect("Krea Turbo must register its CUDA memory-strategy contract");
             assert_eq!(
                 contract.calibration.as_ref().unwrap().fingerprint,
-                "krea-turbo-cuda-phase-curves-v1"
+                "krea-2-turbo-bf16-cuda-phase-curves-v1"
             );
             assert_eq!(contract.strategies.len(), 5);
             assert!(contract.strategies.iter().all(|capability| matches!(
@@ -3054,9 +4211,15 @@ mod explicit_registry_tests {
                     .unwrap_or_else(|| {
                         panic!("{provider_id} must register its CUDA memory-strategy contract")
                     });
+                // A production load: the dense fixture snapshot proves the bf16 cell, and the
+                // identity names that route and that tier alone.
                 assert_eq!(
                     contract.calibration.as_ref().unwrap().fingerprint,
-                    super::REQUEST_SCOPED_MEMORY_FINGERPRINT,
+                    super::krea_request_scoped_production_calibration_fingerprint(
+                        provider_id,
+                        None
+                    )
+                    .unwrap(),
                     "{provider_id}"
                 );
                 for strategy in candle_gen::gen_core::MemoryStrategy::ALL {
@@ -3122,6 +4285,564 @@ mod tests {
             BASE_SNAPSHOT_COMPONENT,
             WeightsSource::Dir(root.to_path_buf()),
         )
+    }
+
+    /// The published Krea-2 Turbo `transformer/config.json` axes the loader actually reads through
+    /// [`config::Krea2Config::from_snapshot`], plus the `model_index.json` that carries
+    /// `patch_size`. `num_layers` is a parameter so a drifting snapshot can be exercised.
+    fn write_reference_dit_config(root: &Path, num_layers: usize) {
+        std::fs::create_dir_all(root.join("transformer")).unwrap();
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "num_attention_heads": 48,
+                "attention_head_dim": 128,
+                "num_key_value_heads": 12,
+                "num_layers": num_layers,
+                "in_channels": 64,
+                "intermediate_size": 16384,
+                "axes_dims_rope": [32, 48, 48],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("model_index.json"), br#"{"patch_size": 2}"#).unwrap();
+    }
+
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let fixture = tempfile::tempdir().unwrap();
+        write_reference_dit_config(fixture.path(), 28);
+        let spec = LoadSpec::new(WeightsSource::Dir(fixture.path().to_path_buf()));
+
+        let expected = gen_core::MemoryArchitectureFacts {
+            attention_heads: Some(48),
+            head_dim: Some(128),
+            transformer_blocks: Some(28),
+            patch_size: Some(2),
+            latent_channels: Some(16),
+            vae_spatial_scale: Some(8),
+            // Structurally absent: the reused Qwen-Image `AutoencoderKLQwenImage` decodes exactly
+            // one frame per image here, so Krea has no frames-per-latent axis to declare.
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(2),
+        };
+
+        let turbo = build_krea_turbo_memory_strategy_contract(&spec);
+        assert_eq!(turbo.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&turbo);
+
+        let raw = build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        assert_eq!(raw.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&raw);
+
+        let control = build_krea_control_memory_strategy_contract_for_tier(None, &spec);
+        assert_eq!(control.architecture_facts, expected);
+        gen_core_testkit::assert_memory_contract_facts_conform(&control);
+
+        // The axes are READ, not asserted: a snapshot declaring a different trunk publishes it.
+        let drifted = tempfile::tempdir().unwrap();
+        write_reference_dit_config(drifted.path(), 24);
+        let drifted_spec = LoadSpec::new(WeightsSource::Dir(drifted.path().to_path_buf()));
+        assert_eq!(
+            build_krea_turbo_memory_strategy_contract(&drifted_spec)
+                .architecture_facts
+                .transformer_blocks,
+            Some(24)
+        );
+
+        // The registry's weights-free surface names a sentinel that is not on disk: nothing about
+        // the pipeline is resolved there, so every axis stays undeclared.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert!(build_krea_turbo_memory_strategy_contract(&weights_free)
+            .architecture_facts
+            .is_empty());
+        assert!(
+            build_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &weights_free)
+                .unwrap()
+                .architecture_facts
+                .is_empty()
+        );
+        assert!(
+            weights_free_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .architecture_facts
+                .is_empty()
+        );
+    }
+
+    /// Header-only safetensors, for fixtures whose subject is tensor geometry rather than values.
+    fn write_tensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_u64;
+        for &(name, dtype, shape) in tensors {
+            let width = match dtype {
+                "U8" | "F8_E4M3" => 1_u64,
+                "BF16" | "F16" => 2,
+                "F32" | "U32" => 4,
+                other => panic!("unhandled fixture dtype {other}"),
+            };
+            let bytes = shape.iter().product::<usize>() as u64 * width;
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.extend(vec![0_u8; offset as usize]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Feature-end review (SC-22667, E2). `load_from_native_dit_file` routes a single-file DiT
+    /// import through a **resident turnkey snapshot** precisely because the single file omits the
+    /// DiT architecture config — so the axes on that route are read from disk exactly as they are on
+    /// a snapshot load, from the `BASE_SNAPSHOT_COMPONENT` directory.
+    ///
+    /// Mutation that fails this: narrowing `materialized_snapshot_root` back to
+    /// `architecture_facts::snapshot_root(spec)`, which sees a `WeightsSource::File` and publishes
+    /// `MemoryArchitectureFacts::default()` — every axis `None` on a fully materialized load.
+    #[test]
+    fn a_single_file_import_publishes_the_base_snapshots_architecture_axes() {
+        let fixture = tempfile::tempdir().unwrap();
+        write_reference_dit_config(fixture.path(), 28);
+        let imported = valid_imported_spec(fixture.path(), "kreamania_variant5.safetensors");
+
+        let facts = build_krea_turbo_memory_strategy_contract(&imported).architecture_facts;
+        assert!(
+            facts.has_declared_architecture_axis(),
+            "the base snapshot supplies the geometry this route loads"
+        );
+        assert_eq!(facts.attention_heads, Some(48));
+        assert_eq!(facts.head_dim, Some(128));
+        assert_eq!(facts.transformer_blocks, Some(28));
+        assert_eq!(facts.patch_size, Some(2));
+        // The decoder axes are the reused Qwen-Image constants either way.
+        assert_eq!(facts.latent_channels, Some(16));
+        assert_eq!(facts.vae_spatial_scale, Some(8));
+
+        // A single-file spec with NO base snapshot resolves nothing and declares nothing.
+        let bare = LoadSpec::new(WeightsSource::File(
+            fixture.path().join("kreamania_variant5.safetensors"),
+        ));
+        assert!(build_krea_turbo_memory_strategy_contract(&bare)
+            .architecture_facts
+            .is_empty());
+    }
+
+    /// Feature-end review (SC-22667, E1). Every loaded Krea contract used to publish
+    /// `MemoryAssetFacts::default()` — all zeros — including the request-scoped routes whose formula
+    /// declares `MemoryFormulaVariable::AssetBytes`. A validated load now publishes the per-component
+    /// decomposition at the widths the loader opens each component in.
+    ///
+    /// Mutation that fails this: dropping the `contract.asset_facts = loaded_asset_facts(…)` stamp
+    /// from `validated_krea_turbo_memory_strategy_contract`, which restores the all-zero facts.
+    #[test]
+    fn a_validated_load_publishes_its_per_component_decomposition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        // The reused Qwen-Image autoencoder ships bf16 and is opened f32.
+        write_tensors(
+            &root.join("vae/model.safetensors"),
+            &[("decoder.conv_out.weight", "BF16", &[8, 8])],
+        );
+
+        let contract = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        let facts = contract.asset_facts;
+        assert_eq!(facts.transformer_bytes, 4_096 * 2, "the DiT is opened bf16");
+        assert_eq!(
+            facts.decoder_bytes,
+            64 * 4,
+            "the autoencoder is opened f32; its shards weigh half this"
+        );
+        assert!(
+            facts.conditioning_bytes > 0,
+            "the validated encoder source is priced"
+        );
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&contract)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The request-scoped routes carry the same decomposition, and their formula declares
+        // `AssetBytes` — the variable that was never supplied before.
+        let raw =
+            validated_krea_request_scoped_memory_strategy_contract(KREA_2_RAW_ID, &spec).unwrap();
+        assert_eq!(raw.asset_facts, facts);
+        assert!(raw
+            .formula
+            .uses(gen_core::MemoryFormulaVariable::AssetBytes));
+        gen_core_testkit::check_memory_contract_asset_facts(&raw)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The weights-free surface resolves no snapshot and still declares nothing.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert_eq!(
+            weights_free_krea_turbo_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default()
+        );
+    }
+
+    /// The `vae/` shard every fixture below ships: the decode path (`post_quant_conv` + `decoder.*`,
+    /// 80 values) and the encoder half (`encoder.*` + `quant_conv`, 80 values), all bf16 on disk.
+    fn write_full_vae(root: &Path) {
+        write_tensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                ("decoder.conv_out.weight", "BF16", &[8, 8]),
+                ("post_quant_conv.weight", "BF16", &[4, 4]),
+                ("encoder.conv_in.weight", "BF16", &[8, 8]),
+                ("quant_conv.weight", "BF16", &[4, 4]),
+            ],
+        );
+    }
+
+    /// Re-stamp the testkit fixture's `language_model.*` tensors from F16 to **BF16** — the dtype the
+    /// shipping Krea snapshot stores its TE in, and the one `TE_STORE_PROBE` halves the store for.
+    /// Without this every language tensor reads F16, `te_store_width` answers the f32 fail-safe (4),
+    /// and a vision tower priced at `te_width` is indistinguishable from one priced at `VISION_WIDTH`.
+    ///
+    /// Only the header changes (F16 and BF16 are both 2 bytes per element): the header is rewritten
+    /// at the front of the file, the sparse zero payload shifts by the header's growth, and the file
+    /// is extended by the same amount so every `data_offsets` range still lands inside it.
+    fn restamp_language_store_bf16(root: &Path) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let path = root.join("text_encoder").join("model.safetensors");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut len = [0_u8; 8];
+        file.read_exact(&mut len).unwrap();
+        let old_len = u64::from_le_bytes(len) as usize;
+        let mut encoded = vec![0_u8; old_len];
+        file.read_exact(&mut encoded).unwrap();
+        let mut header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&encoded).unwrap();
+        for (name, entry) in header.iter_mut() {
+            if name.starts_with("language_model.")
+                && entry.get("dtype").and_then(|dtype| dtype.as_str()) == Some("F16")
+            {
+                entry["dtype"] = serde_json::json!("BF16");
+            }
+        }
+        let encoded = serde_json::to_vec(&header).unwrap();
+        assert!(
+            encoded.len() >= old_len,
+            "the re-stamp only grows the header"
+        );
+        let total = file.metadata().unwrap().len();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&(encoded.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&encoded).unwrap();
+        file.set_len(total + (encoded.len() - old_len) as u64)
+            .unwrap();
+    }
+
+    /// Feature-end review (SC-22667). Two width corrections on the generation routes:
+    ///
+    /// * the Qwen-Image autoencoder is priced **by name**, with the `encoder.*` / `quant_conv`
+    ///   subtree separated from the `post_quant_conv` / `decoder.*` decode path, and charged on the
+    ///   routes whose heavy loaders materialize it (`vae_encoder_materialized` — every route, see
+    ///   its doc for the four loader sites);
+    /// * the Edit-only Qwen3-VL vision tower is priced at `vision::VISION_DTYPE` (f32), not at the
+    ///   TE's probed store width: the Edit delta over Turbo is exactly 4 bytes per stored element.
+    ///
+    /// Mutations that fail this: charging the vision headers at `te_width` (the Edit delta halves
+    /// to 2 bytes per element); a `VISION_WIDTH` that drifts from `VISION_DTYPE`; and a
+    /// `vae_tensor_is_encoder_only` that matches `post_quant_conv` (the decode-only figure drops
+    /// to 64 values).
+    #[test]
+    fn the_vision_tower_is_priced_f32_and_the_autoencoder_by_name() {
+        assert_eq!(
+            VISION_WIDTH,
+            crate::vision::VISION_DTYPE.size_in_bytes() as u64,
+            "VISION_WIDTH must be the vision loader's own dtype"
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        write_full_vae(root);
+        restamp_language_store_bf16(root);
+
+        // The name split: the encoder half is exactly the tensors `QwenVaeEncoder::new` reads.
+        assert!(vae_tensor_is_encoder_only("encoder.conv_in.weight"));
+        assert!(vae_tensor_is_encoder_only("quant_conv.weight"));
+        assert!(!vae_tensor_is_encoder_only("post_quant_conv.weight"));
+        assert!(!vae_tensor_is_encoder_only("decoder.conv_out.weight"));
+        let vae_headers = gen_core::safetensors_path_tensor_headers(root.join("vae")).unwrap();
+        let decode_only = vae_headers
+            .iter()
+            .filter(|header| !vae_tensor_is_encoder_only(&header.name))
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        assert_eq!(decode_only, 64 + 16);
+
+        let turbo = validated_krea_turbo_memory_strategy_contract(&spec).unwrap();
+        assert_eq!(
+            turbo.asset_facts.decoder_bytes,
+            (64 + 16 + 64 + 16) * VAE_WIDTH,
+            "the whole autoencoder, opened f32, on a route whose staged heavy twin builds the encoder"
+        );
+
+        // The Edit route adds the vision tower and nothing else to conditioning, at 4 B/element.
+        let edit =
+            validated_krea_request_scoped_memory_strategy_contract(KREA_2_EDIT_ID, &spec).unwrap();
+        let encoder_source = ENCODER_CONTRACT.source_for_load(&spec, root).unwrap();
+        // The premise that makes the delta assertion discriminating: this snapshot's TE store is
+        // bf16, so the TE width is 2 and only a tower priced at its own f32 dtype reaches 4.
+        let language = encoder_source
+            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .unwrap();
+        assert_eq!(
+            te_store_width(&language),
+            2,
+            "the fixture's TE store is bf16"
+        );
+        let vision = encoder_source
+            .materialized_vision_tensor_headers(&VISION_ENCODER_CONTRACT, &ENCODER_CONTRACT)
+            .unwrap();
+        let vision_elements = vision
+            .iter()
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        let vision_stored = vision.iter().map(|header| header.data_bytes).sum::<u64>();
+        assert!(
+            vision_elements > 0,
+            "the multimodal fixture ships a vision tower"
+        );
+        assert_eq!(
+            vision_stored,
+            vision_elements * 2,
+            "the fixture stores the tower at a 2-byte width"
+        );
+        assert_eq!(
+            edit.asset_facts.conditioning_bytes - turbo.asset_facts.conditioning_bytes,
+            vision_elements * 4,
+            "the Edit delta is 4 bytes per stored element: VISION_DTYPE is f32"
+        );
+        assert_eq!(
+            edit.asset_facts.decoder_bytes,
+            turbo.asset_facts.decoder_bytes
+        );
+        assert_eq!(
+            edit.asset_facts.transformer_bytes,
+            turbo.asset_facts.transformer_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&edit)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+    }
+
+    /// Feature-end review (SC-22667). A planned single-file native import is priced from the
+    /// **compiled plan** under the loader's own residency, not from stored headers through the
+    /// `coerce_float` rule:
+    ///
+    /// * an `F8_E4M3` row takes the exact dense decode on every host (the fp8 leg is masked for this
+    ///   import) and lands as `DIT_DTYPE` — 2 bytes per element, where the stored header says 1;
+    /// * an NVFP4 row on a host below the `sm_120` floor decodes dense bf16 over its **logical**
+    ///   shape, and on an eligible host stays packed only where Krea's role table serves it W4A4 —
+    ///   the Kitchen fixture's block 0 is an edge block, so `Nvfp4Quant::Mixed` demotes it to dense
+    ///   bf16 even under a packed residency.
+    ///
+    /// Mutations that fail this: pricing the native leg with `dit_resident_bytes` (fp8 reads 256,
+    /// the NVFP4 nibbles read their stored 2_048 + scale planes); and pricing a Packed row at
+    /// `residency.resident_bytes` without consulting the role table (the packed-residency figure
+    /// drops below the dense one).
+    #[test]
+    fn a_planned_native_import_prices_fp8_and_nvfp4_rows_from_the_plan() {
+        use candle_gen::logical_weights::CandleCodecResidency;
+        use gen_core::checkpoint_codec::ResidencyMode;
+
+        let fixture = tempfile::tempdir().unwrap();
+
+        // ---- fp8: 256 stored bytes, 512 resident ------------------------------------------
+        let fp8 = fixture.path().join("kreamania_fp8.safetensors");
+        write_tensors(
+            &fp8,
+            &[(
+                "model.diffusion_model.blocks.0.attn.wq.weight",
+                "F8_E4M3",
+                &[16, 16],
+            )],
+        );
+        assert_eq!(
+            dit_resident_bytes(&fp8).unwrap(),
+            256,
+            "the stored-width rule (the figure under review)"
+        );
+        assert_eq!(
+            native_dit_resident_bytes(&fp8, None, &CandleCodecResidency::DENSE).unwrap(),
+            256 * DIT_WIDTH,
+            "the plan's dense decode of an fp8 row lands bf16"
+        );
+        let masked = CandleCodecResidency {
+            fp8_e4m3_native: true,
+            nvfp4_native: false,
+        }
+        .with_dense_fp8();
+        assert_eq!(
+            native_dit_resident_bytes(&fp8, None, &masked).unwrap(),
+            256 * DIT_WIDTH,
+            "the fp8 leg is masked for this import on every host"
+        );
+
+        // ---- NVFP4: dense fallback below the floor, role-table demotion above it ------------
+        let nvfp4 = fixture.path().join("kreamania_variant7.safetensors");
+        crate::testfix::write_kitchen_nvfp4_native_file(&nvfp4);
+        let cfg = crate::testfix::kitchen_nvfp4_config();
+        // `attn.wq` is `[q_dim = 64, hidden = 64]` logical; `first` is `[64, 16]` f32 on disk.
+        let dense_expected = (64 * 64 + 64 * 16) * DIT_WIDTH;
+        assert_eq!(
+            native_dit_resident_bytes(&nvfp4, Some(&cfg), &CandleCodecResidency::DENSE).unwrap(),
+            dense_expected
+        );
+        let stored = dit_resident_bytes(&nvfp4).unwrap();
+        assert!(
+            stored < dense_expected,
+            "the stored-width rule under-declares the dense fallback ({stored} < {dense_expected})"
+        );
+        let packed = CandleCodecResidency {
+            fp8_e4m3_native: false,
+            nvfp4_native: true,
+        };
+        let prefix = crate::native_mapping::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX;
+        let mapping = crate::native_mapping::KreaNativeToDiffusersMapping::for_config(prefix, &cfg);
+        let plan =
+            candle_gen::logical_weights::plan_logical_weights(&nvfp4, &mapping, &packed).unwrap();
+        assert!(
+            plan.tensors
+                .iter()
+                .any(|tensor| tensor.residency.mode == ResidencyMode::Packed),
+            "the premise: under the packed residency the plan prices the NVFP4 row Packed"
+        );
+        assert!(
+            plan.resident_bytes() < dense_expected,
+            "the plan's packed pricing is below the dense figure"
+        );
+        assert_eq!(
+            native_dit_resident_bytes(&nvfp4, Some(&cfg), &packed).unwrap(),
+            dense_expected,
+            "block 0 is an edge block: `Nvfp4Quant::Mixed` serves it W4A16, dense bf16, so the \
+             contract prices what the role table builds rather than what the plan priced"
+        );
+    }
+
+    /// Feature-end review (SC-22667). `krea_2_turbo_control` is a registered memory provider whose
+    /// contract was built from `compatibility_default` with no `asset_facts` stamp — the one Krea
+    /// route still publishing all-zero component bytes on a materialized load. It now prices what
+    /// `control_provider.rs` materializes: the text encoder opened **f32** (`load_control_text`),
+    /// the snapshot (or ConvRot) DiT, and the autoencoder encoder-and-decoder (`load_control_heavy`).
+    ///
+    /// Mutation that fails this: dropping the `contract.asset_facts = control_asset_facts(spec)?`
+    /// stamp from `build_krea_control_memory_strategy_contract` (all four fields read 0), or pricing
+    /// the control TE at the probed store width (conditioning halves on a bf16 fixture).
+    #[test]
+    fn the_control_route_publishes_its_materialized_decomposition() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let spec = valid_directory_spec(root);
+        write_reference_dit_config(root, 28);
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[("img_in.weight", "BF16", &[64, 64])],
+        );
+        write_full_vae(root);
+        restamp_language_store_bf16(root);
+
+        let control = build_krea_control_memory_strategy_contract(&spec).unwrap();
+        let facts = control.asset_facts;
+        let language = ENCODER_CONTRACT
+            .source_for_load(&spec, root)
+            .unwrap()
+            .materialized_language_tensor_headers(&ENCODER_CONTRACT)
+            .unwrap();
+        let language_elements = language
+            .iter()
+            .map(|header| header.element_count().unwrap())
+            .sum::<u64>();
+        assert!(language_elements > 0);
+        // The generation pipeline probes this bf16 store and opens it at 2 B; the control route's
+        // `load_control_text` opens `DType::F32` regardless.
+        assert_eq!(
+            te_store_width(&language),
+            2,
+            "the fixture's TE store is bf16"
+        );
+        assert_eq!(
+            validated_krea_turbo_memory_strategy_contract(&spec)
+                .unwrap()
+                .asset_facts
+                .conditioning_bytes,
+            language_elements * 2
+        );
+        assert_eq!(
+            facts.conditioning_bytes,
+            language_elements * CONTROL_TE_WIDTH,
+            "the control text encoder opens f32"
+        );
+        assert_eq!(facts.transformer_bytes, 64 * 64 * DIT_WIDTH);
+        assert_eq!(
+            facts.decoder_bytes,
+            (64 + 16 + 64 + 16) * VAE_WIDTH,
+            "`load_control_heavy` builds the decoder and the encoder"
+        );
+        assert_eq!(
+            facts.base_bytes,
+            facts.conditioning_bytes + facts.transformer_bytes + facts.decoder_bytes
+        );
+        gen_core_testkit::check_memory_contract_asset_facts(&control)
+            .unwrap_or_else(|errors| panic!("{errors:?}"));
+
+        // The weights-free surface still declares nothing.
+        let weights_free = LoadSpec::new(WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ));
+        assert_eq!(
+            weights_free_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default()
+        );
+        assert_eq!(
+            build_krea_control_memory_strategy_contract(&weights_free)
+                .unwrap()
+                .asset_facts,
+            gen_core::MemoryAssetFacts::default(),
+            "a snapshot that is not on disk contributes no signal"
+        );
     }
 
     #[test]
@@ -3621,6 +5342,7 @@ mod tests {
             component_precision_floors: &[],
         };
         let parameters = gen_core::MemoryStrategyParameters {
+            stage_residency: None,
             decode_tile_edge: Some(512),
             decode_overlap: Some(128),
             attention_chunk_size: Some(pipeline::CONSTRAINED_ATTN_SCORES_BUDGET as u32),

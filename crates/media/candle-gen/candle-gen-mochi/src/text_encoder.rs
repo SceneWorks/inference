@@ -15,11 +15,13 @@
 //! crate's own DiT regime. The residual `te_parity` gap reflects cross-backend kernel noise against a
 //! Metal-blessed golden, not a code delta.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::safetensors_shards::{
+    resolve_directory_safetensors_shards, resolve_indexed_safetensors_shards, snapshot_shard_roots,
+};
 use candle_gen::{CandleError, Result};
 use candle_gen_flux::packed_te::{PackedT5Encoder, T5Config};
 use tokenizers::Tokenizer;
@@ -97,33 +99,16 @@ pub fn load_indexed_var_builder(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    let index = dir.join("model.safetensors.index.json");
-    if !index.exists() {
-        return candle_gen::load_sorted_mmap(dir, dtype, device, "mochi t5");
-    }
-    let text = std::fs::read_to_string(&index)
-        .map_err(|e| CandleError::Msg(format!("mochi t5 index {}: {e}", index.display())))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| CandleError::Msg(format!("mochi t5 index {}: {e}", index.display())))?;
-    let map = json
-        .get("weight_map")
-        .and_then(|m| m.as_object())
-        .ok_or_else(|| {
-            CandleError::Msg(format!("mochi t5 index {}: no weight_map", index.display()))
-        })?;
-
-    // Unique shard filenames (BTreeSet → sorted + deduped), resolved under `dir`.
-    let shard_files: BTreeSet<String> = map
-        .values()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
-    if shard_files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "mochi t5 index {}: weight_map references no shards",
-            index.display()
-        )));
-    }
-    let files: Vec<PathBuf> = shard_files.into_iter().map(|f| dir.join(f)).collect();
+    let roots = snapshot_shard_roots(dir).map_err(|e| CandleError::Msg(e.to_string()))?;
+    let files =
+        match resolve_indexed_safetensors_shards(dir, "model.safetensors.index.json", &roots)
+            .map_err(|e| CandleError::Msg(e.to_string()))?
+        {
+            Some(files) => files,
+            None => resolve_directory_safetensors_shards(dir, &roots)
+                .map_err(|e| CandleError::Msg(format!("mochi t5: {e}")))?,
+        };
+    let files: Vec<_> = files.into_iter().map(|path| path.canonical_path).collect();
     candle_gen::mmap_var_builder(&files, dtype, device)
 }
 
@@ -194,6 +179,116 @@ pub fn encode_prompt(
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    fn shard(path: &Path, key: &str, value: f32) {
+        let header = format!(r#"{{"{key}":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#);
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn index(dir: &Path, name: &str) {
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map":{"a":"a.safetensors","b":name,"c":"a.safetensors"}})
+                .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn indexed_t5_loader_confines_all_shards_before_cpu_mmap() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("text_encoder");
+        std::fs::create_dir(&dir).unwrap();
+        shard(&dir.join("a.safetensors"), "a", 1.0);
+        std::fs::create_dir(dir.join("nested")).unwrap();
+        shard(&dir.join("nested/b.bin"), "b", 2.0);
+        index(&dir, "nested/b.bin");
+        let vb = load_indexed_var_builder(&dir, DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(
+            vb.get((1,), "a").unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0]
+        );
+        assert_eq!(
+            vb.get((1,), "b").unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0]
+        );
+
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            index(&dir, name);
+            assert!(
+                load_indexed_var_builder(&dir, DType::F32, &Device::Cpu).is_err(),
+                "{name}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp.path().join("outside.safetensors");
+            shard(&outside, "b", 3.0);
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            index(&dir, "external.safetensors");
+            assert!(load_indexed_var_builder(&dir, DType::F32, &Device::Cpu)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("outside authorized"));
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            index(&dir, "pipe.safetensors");
+            assert!(load_indexed_var_builder(&dir, DType::F32, &Device::Cpu)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a regular file"));
+            std::fs::remove_file(&fifo).unwrap();
+
+            let repository = temp.path().join("models--org--mochi-t5");
+            let linked_dir = repository.join("snapshots/revision/text_encoder");
+            let blobs = repository.join("blobs");
+            std::fs::create_dir_all(&linked_dir).unwrap();
+            std::fs::create_dir(&blobs).unwrap();
+            shard(&blobs.join("digest"), "a", 4.0);
+            symlink("../../../blobs/digest", linked_dir.join("a.safetensors")).unwrap();
+            std::fs::write(
+                linked_dir.join("model.safetensors.index.json"),
+                r#"{"weight_map":{"a":"a.safetensors"}}"#,
+            )
+            .unwrap();
+            let vb = load_indexed_var_builder(&linked_dir, DType::F32, &Device::Cpu).unwrap();
+            assert_eq!(
+                vb.get((1,), "a").unwrap().to_vec1::<f32>().unwrap(),
+                vec![4.0]
+            );
+
+            std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+            std::fs::remove_file(dir.join("external.safetensors")).unwrap();
+            let fallback = load_indexed_var_builder(&dir, DType::F32, &Device::Cpu).unwrap();
+            assert_eq!(
+                fallback.get((1,), "a").unwrap().to_vec1::<f32>().unwrap(),
+                vec![1.0]
+            );
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            assert!(
+                load_indexed_var_builder(&dir, DType::F32, &Device::Cpu).is_err(),
+                "fallback must reject FIFO before mmap"
+            );
+        }
+    }
 
     /// The additive key mask is `0` for real ids and [`T5_MASK_NEG`] for pad, shaped `[1, 1, 1, L]`.
     #[test]

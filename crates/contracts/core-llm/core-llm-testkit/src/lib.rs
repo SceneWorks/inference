@@ -28,6 +28,7 @@ use core_llm::{
 };
 use std::path::PathBuf;
 
+pub mod comparison;
 pub mod starvector;
 pub use starvector::{
     check_starvector_bounded_fixture, check_starvector_cancellation, check_starvector_descriptor,
@@ -70,6 +71,7 @@ impl TextLlmProfile {
                 temperature: 1.0,
                 top_p: 1.0,
                 top_k: 0,
+                presence_penalty: 0.0,
                 repetition_penalty: 1.0,
                 repetition_context: 0,
             },

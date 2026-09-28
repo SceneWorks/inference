@@ -1,0 +1,11 @@
+**RTX Pro 6000 / sm_120** — Qwen/Qwen3.8-27B @ 1d4bf0f2ff60 (`bonsai-qwen38-parent`, config sha256 191e0af23210), BF16 greedy, 97 prompt tokens, 256 new tokens per row.
+
+| run | row | tokens | match ref | match baseline ref | tok/s | acceptance | fwd/tok | syncs/tok | device used @ last token | cache live | cache checkpoints | fused primitives |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| head-297e0845c-fused-off | MTP off (reference) | 256 | (ref) | yes | 11.38 | n/a | 1.000 | 1.00 | 53.25 GiB | n/a | n/a | off: 0 fused / 69888 ref (disabled) |
+| head-297e0845c-fused-off | MTP off (StepModel) | 256 | yes | yes | 11.07 | n/a | 1.000 | 1.00 | 53.41 GiB | 168.8 MiB | 293.6 MiB | off: 0 fused / 69888 ref (disabled) |
+| head-297e0845c-fused-off | MTP K=1 | 256 | no @107 | no @107 | 12.15 | 0.827 | 0.645 | 1.64 | 53.31 GiB | n/a | n/a | off: 0 fused / 47093 ref (disabled) |
+| head-297e0845c-fused-off | MTP K=2 | 256 | no @107 | no @107 | 14.00 | 0.779 | 0.512 | 1.95 | 53.31 GiB | n/a | n/a | off: 0 fused / 38051 ref (disabled) |
+| head-297e0845c-fused-off | MTP K=3 | 256 | no @107 | no @107 | 12.84 | 0.607 | 0.559 | 2.47 | 53.31 GiB | n/a | n/a | off: 0 fused / 41775 ref (disabled) |
+
+match baseline ref = tokens identical to `head-297e0845c-fused-off`'s reference row; device used @ last token = cuMemGetInfo total-free sampled at the row's last generated token while its cache is alive (device-wide, weights included); cache live / checkpoints = the StepModel row's final cache's own accounting (rollback checkpoints separately); syncs/tok = device->host transfers issued by candle-llm per generated token (n/a where the binary predates the counter); fwd/tok = measured target forwards per generated token (n/a where the binary predates the counter); fused primitives = the switch the row ran under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the op-chain reference, with the last reference reason (n/a where the binary predates the fused primitives).

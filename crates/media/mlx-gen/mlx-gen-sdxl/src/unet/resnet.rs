@@ -82,7 +82,7 @@ impl ResnetBlock2D {
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         if let Some(t) = &mut self.time_emb_proj {
-            t.quantize(bits, None)?;
+            crate::quant::quantize_linear(t, bits)?;
         }
         // `shortcut` is the 1×1 `conv_shortcut` stored as a Linear (for the NHWC channel-matmul
         // forward), not a true Linear — so it stays DENSE like every other conv in the U-Net

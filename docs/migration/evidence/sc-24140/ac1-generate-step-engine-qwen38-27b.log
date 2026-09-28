@@ -1,0 +1,25 @@
+sc-24140 — Qwen3.8-27B, sc-24132 AC1 re-run with `generate_step` as the engine wrapper
+=========================================================================================
+commit 4180cec58a8222ec581f572f8742e1f86ee44c9d (clean tracked tree), release, --features cuda,
+GPU 0 (RTX Pro 6000 / sm_120), CUDA_VISIBLE_DEVICES=0, snapshot
+models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0, 256-token greedy fixture.
+
+`generate_step` is now `generate_speculative_with(NoProposer, Tokens, K = 0)` (review item 3). This row is
+the sc-24132 AC1 test, unchanged, over that engine. The engine is token-identical to the reference
+`Decode` loop on the static cache, and on the growing cache too. Its record uses the engine's convention:
+prefill_forwards 1, verify_steps 255, verify_host_syncs 255.
+
+  BONSAI_QWEN38_SNAPSHOT=E:\huggingface\hub\models--Qwen--Qwen3.8-27B\snapshots\1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+  cargo test --release --locked -p candle-llm --features cuda --test static_kv_parity -- --ignored --nocapture --exact ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv
+
+running 1 test
+[ac1] 256 tokens identical across reference / static / growing (gqa); growing record DecodeRecord { path: StepModel,
+target_forwards: 256, prefill_forwards: 1, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256,
+sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Growing,
+attn_formulation: Gqa, proposer: None, verify_steps: 255, direct_rollbacks: 0, replay_forwards: 0, verify_host_syncs: 255,
+fused_primitives: FusedTally { fused: 69888, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0,
+eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 0, cublaslt: 0,
+cublaslt_reason: None } }
+test ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 77.81s

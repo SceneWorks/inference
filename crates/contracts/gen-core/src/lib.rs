@@ -40,10 +40,12 @@ pub mod ltx_checkpoint;
 pub mod ltx_dfr;
 mod macros;
 pub mod media;
+pub mod memory_phases;
 pub mod memory_strategy;
 pub mod registry;
 pub mod residency;
 pub mod runtime;
+pub mod safetensors_shards;
 pub mod sampling;
 pub mod sd3_encoder_artifacts;
 pub mod sd3_request;
@@ -112,13 +114,14 @@ pub use control::{
     require_component_file, require_control, AcceptedControlKinds, ControlBranch,
 };
 pub use encoder_contract::{
-    read_text_encoder_source_unchanged, resolve_encoder_load_time_quant_bits,
-    text_encoder_packed_quant_bits, text_encoder_planning_facts_for_discovery,
-    text_encoder_source_bytes, EncoderConfigBool, EncoderConfigFloat, EncoderContract,
-    EncoderPackingContract, EncoderPromptExecutionContract, EncoderPromptLengthPolicy,
-    EncoderPromptPadding, EncoderPromptTemplate, EncoderRequiredToken, EncoderTokenizerBinding,
-    EncoderTokenizerContract, EncoderTokenizerDisposition, TextEncoderPlanningFacts,
-    TextEncoderSourceLayout, ValidatedEncoderSource, ValidatedTokenizerSource,
+    hf_cache_discovery_roots, read_text_encoder_source_unchanged,
+    resolve_encoder_load_time_quant_bits, text_encoder_packed_quant_bits,
+    text_encoder_planning_facts_for_discovery, text_encoder_source_bytes, EncoderConfigBool,
+    EncoderConfigFloat, EncoderContract, EncoderPackingContract, EncoderPromptExecutionContract,
+    EncoderPromptLengthPolicy, EncoderPromptPadding, EncoderPromptTemplate, EncoderRequiredToken,
+    EncoderTokenizerBinding, EncoderTokenizerContract, EncoderTokenizerDisposition,
+    TextEncoderPlanningFacts, TextEncoderSourceLayout, ValidatedEncoderSource,
+    ValidatedTokenizerSource,
 };
 pub use error::{Error, Result};
 pub use execution_domains::{
@@ -128,13 +131,18 @@ pub use execution_domains::{
 pub use exr_io::{read_rgb_exr, write_rgb_exr, ExrImage, EXR_COLOR_SPACE_ATTRIBUTE};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
-    default_seed, effective_component_quant, reject_unsupported_adapters, ActivationMemoryAnchor,
-    AudioEditMode, AudioEditRef, AudioParams, Capabilities, ComponentPrecisionFloor, Conditioning,
-    ConditioningKind, ControlClipRef, ControlKind, ConversationRole, ConversationSession,
-    ConversationTurn, GenerationMemory, GenerationOutput, GenerationPhase, GenerationRequest,
-    Generator, HdrRequest, KeyframeRef, Modality, ModelDescriptor, PhaseAdapter,
-    PrecisionFloorComponent, ReplacementMode, SizeFloor, SpeechSegment,
-    StagedResidencyAvailability, StepSupport, TimeRegion, VideoClipRef,
+    default_seed, effective_component_quant, effective_reference_image_short_edge,
+    reject_unsupported_adapters, validate_reference_image_short_edge, ActivationMemoryAnchor,
+    ArtifactRecord, AudioArtifacts, AudioEditMode, AudioEditRef, AudioParams, Capabilities,
+    ComponentPrecisionFloor, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
+    ConversationRole, ConversationSession, ConversationTurn, GenerationMemory, GenerationOutput,
+    GenerationPhase, GenerationReport, GenerationRequest, GenerationWarning, Generator, HdrRequest,
+    KeyframeRef, Modality, ModelDescriptor, OutputChannels, OutputLimiter, PhaseAdapter,
+    PrecisionFloorComponent, ReplacementMode, SavedPlan, SizeFloor, SongCover, SongCoverMode,
+    SongCoverVoice, SongDecoder, SongParams, SongPlanning, SpeechSegment,
+    StagedResidencyAvailability, StepSupport, TimeRegion, TokenSampling, VideoClipRef,
+    REFERENCE_IMAGE_SHORT_EDGE_DEFAULT, REFERENCE_IMAGE_SHORT_EDGE_MAX,
+    REFERENCE_IMAGE_SHORT_EDGE_MIN,
 };
 pub use hdr::{
     exr_conditioning_to_vae_range, from_vae_range, hlg_inverse_oetf, hlg_oetf,
@@ -149,10 +157,12 @@ pub use latent::{
     LatentNormalizationStats, LatentPatchLayout, LatentSpace, LatentTemporalLaw,
     SpatialCompression, DECODER_OPTIONS, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE,
     LTX_VIDEO_LATENT_SPACE, MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE,
-    QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN, QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD,
-    SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
-    SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID, WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
-    WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN, WAN_Z48_NORMALIZATION, WAN_Z48_STD,
+    QWEN_IMAGE_2_1_Z64_LATENT_SPACE, QWEN_IMAGE_2_1_Z64_MEAN, QWEN_IMAGE_2_1_Z64_NORMALIZATION,
+    QWEN_IMAGE_2_1_Z64_STD, QWEN_KREA_Z16_LATENT_SPACE, QWEN_WAN_Z16_MEAN,
+    QWEN_WAN_Z16_NORMALIZATION, QWEN_WAN_Z16_STD, SANA_LATENT_SPACE, SD3_LATENT_SPACE,
+    SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_2_1_VAE_DECODER_ID,
+    WAN_Z16_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE, WAN_Z48_MEAN,
+    WAN_Z48_NORMALIZATION, WAN_Z48_STD,
 };
 pub use license::components::MEDIA_COMPONENT_LICENSES;
 pub use license::families::LICENSE_FAMILIES;
@@ -161,26 +171,31 @@ pub use license::{
     license_table_conformance_errors, provider_terms, resolve_component, resolve_family,
     CeilingBoundary, ComponentLicense, LicenseFamily, LicenseTerm, ProviderComponents,
 };
-pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image};
+pub use media::{AudioChunk, AudioStem, AudioTrack, HdrFrame, Image, RgbaImage};
+pub use memory_phases::{
+    DecoderTilingRealization, DecoderWorkspaceFacts, ImagePipelineArchitecture, MemoryPhaseFacts,
+    StagedWeightSchedule, StreamedWeightFacts,
+};
 pub use memory_strategy::{
     adapter_stack_identity, adapter_stack_resident_bytes, default_memory_strategy_safety_check,
     default_registered_memory_strategy_safety_check, standard_memory_behavior_context,
     standard_memory_strategy_safety_check, validate_calibration_fingerprint, AdapterResidencyMode,
-    MemoryAssetFacts, MemoryBackend, MemoryBackendRealization, MemoryBehaviorRoute, MemoryBudget,
-    MemoryCacheSemantics, MemoryCacheState, MemoryCalibrationIdentity, MemoryCleanupSemantics,
-    MemoryComponentKind, MemoryComponentResidency, MemoryConformanceState,
-    MemoryDecodeArtifactIdentity, MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery,
-    MemoryDecodeQualityDisposition, MemoryDecodeQualityFixture, MemoryDecodeQualityRuntimeIdentity,
-    MemoryDecodeRouteDomain, MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions,
-    MemoryEvidenceKey, MemoryEvidenceLogRecord, MemoryEvidenceVerdict, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryOptimizationAuthority, MemoryParameterRanges, MemoryParityContract,
-    MemoryParityResult, MemoryPeakBreakdown, MemoryPhase, MemoryPidDecodeRoutes,
-    MemoryPrerequisiteScope, MemoryProviderContract, MemoryReferenceShape, MemoryRejection,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemoryRuntimeSemantics, MemorySafetyDecision, MemorySelection, MemoryStrategy,
-    MemoryStrategyCapability, MemoryStrategyEngagementExclusion, MemoryStrategyParameters,
-    MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryStructuralResidentEvidence,
+    MemoryArchitectureFacts, MemoryAssetFacts, MemoryBackend, MemoryBackendRealization,
+    MemoryBehaviorRoute, MemoryBudget, MemoryCacheSemantics, MemoryCacheState,
+    MemoryCalibrationIdentity, MemoryCleanupSemantics, MemoryComponentKind,
+    MemoryComponentResidency, MemoryConformanceState, MemoryDecodeArtifactIdentity,
+    MemoryDecodeGeometryPolicy, MemoryDecodePolicyQuery, MemoryDecodeQualityDisposition,
+    MemoryDecodeQualityFixture, MemoryDecodeQualityRuntimeIdentity, MemoryDecodeRouteDomain,
+    MemoryEvidence, MemoryEvidenceDimension, MemoryEvidenceDimensions, MemoryEvidenceKey,
+    MemoryEvidenceLogRecord, MemoryEvidenceVerdict, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryOptimizationAuthority, MemoryParameterRanges, MemoryParityContract, MemoryParityResult,
+    MemoryPeakBreakdown, MemoryPhase, MemoryPidDecodeRoutes, MemoryPrerequisiteScope,
+    MemoryProviderContract, MemoryReferenceShape, MemoryRejection, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome, MemoryRuntimeSemantics,
+    MemorySafetyDecision, MemorySelection, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategyEngagementExclusion, MemoryStrategyParameters, MemoryStrategyPrerequisite,
+    MemoryStrategySupport, MemoryStructuralResidentEvidence,
     MemoryStructuralResidentRequestIdentity, MemoryWarmRunSemantics, MemoryWindowMaterialization,
     ResidentRequestMemory, TransformerComponent, MEMORY_CALIBRATION_ABI, MEMORY_DECODE_QUALITY_ABI,
     MEMORY_EVIDENCE_SCHEMA_VERSION, MEMORY_EVIDENCE_V1_PREFIX,
@@ -227,10 +242,11 @@ pub use tiling::{TilingConfig, VaeTiling};
 pub use vision_encoder_contract::{VisionEncoderArchitecture, VisionEncoderContract};
 pub use voice_embed::{VoiceEmbedder, VoiceEmbedderDescriptor, VoiceEmbedding};
 pub use weightsmeta::{
-    read_safetensors_tensor_payloads, safetensors_dir_bytes, safetensors_file_metadata,
-    safetensors_file_tensor_locations, safetensors_path_bytes,
-    safetensors_path_quantization_metadata, safetensors_path_tensor_headers, SafetensorsFileLayout,
-    SafetensorsTensorHeader, SafetensorsTensorLocation,
+    materialized_header_bytes, materialized_path_bytes, read_safetensors_tensor_payloads,
+    safetensors_dir_bytes, safetensors_file_metadata, safetensors_file_tensor_locations,
+    safetensors_path_bytes, safetensors_path_quantization_metadata,
+    safetensors_path_tensor_headers, SafetensorsFileLayout, SafetensorsTensorHeader,
+    SafetensorsTensorLocation, CANDLE_DEVICE_FORMAT_CACHE_DIR,
 };
 // The LTX split-checkpoint component resolver (sc-18757), shared verbatim by mlx-gen-ltx and
 // candle-gen-ltx: layout selection keyed on `model_version`, per-component config isolation, and the

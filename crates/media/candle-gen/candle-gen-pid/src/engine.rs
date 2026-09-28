@@ -25,8 +25,18 @@ use crate::registry::{lookup, BackboneSpec};
 use crate::sampler::Sampler;
 
 /// Filename of the merged Gemma-2-2b-it checkpoint inside the gemma snapshot dir; falls back to
-/// loading every `*.safetensors` shard in the dir when absent.
-const GEMMA_MERGED_FILE: &str = "gemma-2-2b-it.safetensors";
+/// loading every `*.safetensors` shard in the dir when absent. `pub` so a memory contract that
+/// prices the caption encoder can select the very file [`PidEngine::load`] reads (merged first,
+/// else every shard) rather than summing both.
+pub const GEMMA_MERGED_FILE: &str = "gemma-2-2b-it.safetensors";
+
+/// The dtype [`PidEngine::load`] materializes **both** of its checkpoints at: the PiD student and
+/// the Gemma caption encoder are read through `Weights::from_file` / `Weights::from_files` at f32
+/// — the parity target and the dense-GEMM-safe path — regardless of the on-disk width, so a bf16
+/// checkpoint costs four bytes per float element once resident, not two. A named constant so a
+/// memory contract prices the resident engine against the width this loader actually uses and a
+/// unit test can pin the two together (epic SC-22657, E3).
+pub const LOAD_DTYPE: DType = DType::F32;
 
 /// Env override for the PiD decode memory-budget ceiling (`nvidia-smi` total × 0.85 otherwise).
 const PID_BUDGET_ENV: &str = "PID_DECODE_BUDGET_GIB";
@@ -65,8 +75,8 @@ impl PidEngine {
             ))
         })?;
 
-        // The PiD net runs f32 (the parity target + the dense-GEMM-safe path).
-        let weights = Weights::from_file(checkpoint, device, DType::F32)?;
+        // The PiD net runs f32 (the parity target + the dense-GEMM-safe path) — `LOAD_DTYPE`.
+        let weights = Weights::from_file(checkpoint, device, LOAD_DTYPE)?;
 
         // PiD v1.5 (sc-12143) ships a different LQ topology (wider trunk, per-token scalar gate,
         // replicate padding, PiT injection, 2048 RoPE ref) under the SAME per-space checkpoint slot, so
@@ -77,10 +87,10 @@ impl PidEngine {
         // Gemma: prefer the merged single-file checkpoint, else load the snapshot dir's shards.
         let merged = gemma_dir.join(GEMMA_MERGED_FILE);
         let gw = if merged.is_file() {
-            Weights::from_file(&merged, device, DType::F32)?
+            Weights::from_file(&merged, device, LOAD_DTYPE)?
         } else {
             let files = candle_gen::sorted_safetensors(gemma_dir, "pid gemma encoder")?;
-            Weights::from_files(&files, device, DType::F32)?
+            Weights::from_files(&files, device, LOAD_DTYPE)?
         };
         let gemma = Gemma2::from_weights(&gw, "model.", &Gemma2Config::gemma_2_2b())?;
         let caption = CaptionEncoder::new(gemma, gemma_dir.join("tokenizer.json"))?;

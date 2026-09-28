@@ -36,6 +36,7 @@ pub mod providers {
     pub use candle_gen_pid as pid;
     pub use candle_gen_pulid as pulid;
     pub use candle_gen_qwen_image as qwen_image;
+    pub use candle_gen_qwen_image_2_1 as qwen_image_2_1;
     pub use candle_gen_sam3 as sam3;
     pub use candle_gen_sana as sana;
     pub use candle_gen_scail2 as scail2;
@@ -112,6 +113,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = candle_gen_minimax_h3::register_providers(registry);
     let registry = candle_gen_mochi::register_providers(registry);
     let registry = candle_gen_qwen_image::register_providers(registry);
+    let registry = candle_gen_qwen_image_2_1::register_providers(registry);
     let registry = candle_gen_sana::register_providers(registry);
     let registry = candle_gen_scail2::register_providers(registry);
     let registry = candle_gen_sd3::register_providers(registry);
@@ -858,10 +860,18 @@ mod preview_advertising {
 
     /// The third class: registered routes that neither emit previews **nor** are no-gos.
     ///
-    /// The class is empty after sc-17218 wired Boogu, but keeping it explicit prevents a future
-    /// viable-but-unwired route from being silently absorbed into the no-go set. The total-partition
-    /// assertion below keeps all three classes honest as the registry grows.
-    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[];
+    /// The class was empty after sc-17218 wired Boogu; sc-24109 re-opened it with Qwen-Image 2.1.
+    /// Keeping it explicit prevents a viable-but-unwired route from being silently absorbed into
+    /// the no-go set. The total-partition assertion below keeps all three classes honest as the
+    /// registry grows.
+    ///
+    /// `qwen_image_2_1` is deferred, **not** a no-go: nothing about its 64-channel RGBA latent
+    /// space says a linear RGB fit cannot clear the epic-16624 bar — it is simply a space no fit
+    /// has been measured for, and it is the one candle latent space with a fourth (alpha) channel,
+    /// so the projection and the preview surface are the same question. sc-24111 is the story that
+    /// carries the RGBA output surface, and it is where the fit and the wiring belong together.
+    /// Its MLX twin (sc-24108) advertises `supports_preview: false` for the same reason.
+    const PREVIEW_DEFERRED_ROUTE_IDS: &[(&str, &str)] = &[("qwen_image_2_1", "sc-24111")];
 
     // ---- The derived half: what the provider sources actually do ---------------------------------
 
@@ -1232,6 +1242,17 @@ mod preview_advertising {
                     dark: &[],
                 },
             ],
+        },
+        ProviderCrate {
+            dir: "candle-gen-qwen-image-2-1",
+            register: candle_gen_qwen_image_2_1::register_providers,
+            denoise: Denoise::Shared,
+            // sc-24109: UNWIRED, hence the empty inventory. The crate's single
+            // `run_flow_sampler` site passes the literal `None` and it ships no `preview` module,
+            // so it emits nothing anywhere and is carried in DEFERRED_PREVIEW_ROUTE_IDS below
+            // rather than pinning a per-file inventory (an inventory only means something on a
+            // crate that emits).
+            routes: &[],
         },
         ProviderCrate {
             dir: "candle-gen-sana",
@@ -2288,6 +2309,24 @@ mod preview_advertising {
         }
 
         ModuleTree { shipped, test_only }
+    }
+
+    /// Whether one source file declares a `#[test] fn architecture_facts_*`.
+    ///
+    /// Deliberately reads the raw file rather than a stripped module tree: the declaration lives
+    /// inside `#[cfg(test)]`, which the shipped-code scan removes by design. Requiring the `#[test]`
+    /// attribute between the previous item and the name is what keeps a plain helper named
+    /// `architecture_facts_for(...)` from passing for a test that runs.
+    fn has_architecture_facts_test(path: &Path) -> bool {
+        let source = std::fs::read_to_string(path).unwrap_or_default();
+        source
+            .match_indices("fn architecture_facts_")
+            .any(|(index, _)| {
+                let window = &source[index.saturating_sub(200)..index];
+                window
+                    .rfind("#[test]")
+                    .is_some_and(|attribute| !window[attribute..].contains(" fn "))
+            })
     }
 
     /// Every `.rs` file under `dir`, in a deterministic order.
@@ -3474,6 +3513,14 @@ mod preview_advertising {
             register_surfaces: Some(candle_gen_qwen_image::register_memory_contract_surfaces),
             resident_only_on_cpu: false,
         },
+        // sc-24112: the Qwen-Image 2.1 route publishes the shared ladder (staged residency +
+        // bounded decode implemented, the two bounded-DiT rungs classified).
+        MemoryRouteCrate {
+            dir: "candle-gen-qwen-image-2-1",
+            register_providers: candle_gen_qwen_image_2_1::register_providers,
+            register_surfaces: Some(candle_gen_qwen_image_2_1::register_memory_contract_surfaces),
+            resident_only_on_cpu: false,
+        },
         MemoryRouteCrate {
             dir: "candle-gen-sana",
             register_providers: candle_gen_sana::register_providers,
@@ -3562,6 +3609,8 @@ mod preview_advertising {
         // --- What the sources say ------------------------------------------------------------
         let mut owns_memory_route = BTreeSet::new();
         let mut publishes_surfaces = BTreeSet::new();
+        let mut derives_architecture_facts = BTreeSet::new();
+        let mut tests_architecture_facts = BTreeSet::new();
         let mut crate_dirs: Vec<String> = std::fs::read_dir(candle_gen_root())
             .expect("crates/media/candle-gen is readable")
             .map(|entry| entry.expect("readable directory entry").path())
@@ -3591,10 +3640,49 @@ mod preview_advertising {
             if code.contains("fn register_memory_contract_surfaces") {
                 publishes_surfaces.insert(dir.clone());
             }
+            // The derivation itself is shipped code, so the stripped tree is the right source: a
+            // crate that only *mentions* `architecture_facts` in prose does not enrol.
+            if code.contains("fn architecture_facts") {
+                derives_architecture_facts.insert(dir.clone());
+            }
+            // Its test is not shipped code, so this reads the raw files — and requires the `#[test]`
+            // attribute right in front of the name, so a helper called `architecture_facts_for`
+            // cannot stand in for a test that runs.
+            if rust_sources(&src)
+                .iter()
+                .any(|path| has_architecture_facts_test(path))
+            {
+                tests_architecture_facts.insert(dir.clone());
+            }
         }
         assert!(
             !owns_memory_route.is_empty(),
             "no crate registers a memory route; the table comparison below would be vacuous"
+        );
+
+        // --- ...and every one of them must derive and test its architecture facts -------------
+        //
+        // AC (sc-22661 / epic SC-22657 E2). The registry-wide surface walk cannot see this: it
+        // requires `MemoryArchitectureFacts::default()` on every Candle weights-free surface, which
+        // is exactly what a crate with no derivation at all publishes. Scanning the sources instead
+        // catches the crate that never wrote one — and, because `catalog_ids == expected_ids` below
+        // pins `owns_memory_route` to precisely the crates behind the catalog's
+        // `memory_strategy_registrations()`, this is that provider set stated in crate terms.
+        assert_eq!(
+            owns_memory_route
+                .difference(&derives_architecture_facts)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            "every crate contributing a memory registration must derive its architecture facts \
+             (`fn architecture_facts`); these contribute one and derive nothing"
+        );
+        assert_eq!(
+            owns_memory_route
+                .difference(&tests_architecture_facts)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            "every crate contributing a memory registration must own a `#[test] fn \
+             architecture_facts_*` over that derivation; these derive facts nothing asserts"
         );
 
         // --- The wiring table must match them ------------------------------------------------
@@ -5019,9 +5107,10 @@ mod tests {
     fn every_registered_generator_advertises_its_exact_latent_space() {
         use candle_gen::gen_core::{
             LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
-            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
-            SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
-            SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_IMAGE_2_1_Z64_LATENT_SPACE,
+            QWEN_KREA_Z16_LATENT_SPACE, SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE,
+            SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
+            WAN_Z48_LATENT_SPACE,
         };
 
         fn expected(
@@ -5029,6 +5118,8 @@ mod tests {
         ) -> Option<&'static LatentSpace> {
             match descriptor.family {
                 "anima" | "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                // Qwen-Image 2.1's 64-channel RGBA autoencoder is its own lineage (sc-24109).
+                "qwen-image-2-1" => Some(&QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
                 "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
                 "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
                 "flux" | "boogu" | "chroma" | "z-image" => Some(&FLUX1_LATENT_SPACE),
@@ -5067,6 +5158,162 @@ mod tests {
             );
         }
     }
+
+    /// AC (sc-22661 / epic SC-22657 E1+E2): every registered contract surface in the composed media
+    /// catalog publishes an honest byte decomposition and no fabricated architecture axis.
+    ///
+    /// This is the registry-wide half of the story's acceptance test. The surfaces are built
+    /// **weights-free** — the registry names the sentinel snapshot
+    /// `/__sceneworks_memory_contract_surface__`, which is not on disk — so every provider here
+    /// lands on the walk's Candle arm: `check_memory_contract_asset_facts` is the byte half that
+    /// must hold, and `MemoryArchitectureFacts::default()` is the required E2 state. That second
+    /// rule catches the converse defect — a provider that published an architecture axis on a
+    /// contract built with nothing to read would have hardcoded it from its own provider id.
+    ///
+    /// It cannot, on its own, catch a provider that derives *nothing* — `default()` is exactly what
+    /// that provider publishes here too. `every_materializable_provider_derives_geometry_from_a_snapshot_root`
+    /// is the arm that does, and the two run over the same composed registry.
+    ///
+    /// `runtime-cuda` runs this walk over the CUDA bundle's registry; this one keeps the
+    /// composition root itself covered on a lane that needs no accelerator.
+    #[test]
+    fn every_registered_contract_surface_publishes_honest_facts() {
+        let registry = super::memory_contract_surface_registry().unwrap();
+        gen_core_testkit::memory_contract_surface_registry_facts_conformance(&registry, None);
+        // Non-vacuous: the walk must have had surfaces to reject.
+        assert!(
+            !registry.memory_contract_surfaces().unwrap().is_empty(),
+            "the composed catalog must publish contract surfaces for the facts walk to check"
+        );
+    }
+
+    /// The providers whose admission accepts a synthetic snapshot root, and which must therefore
+    /// derive at least one architecture axis from it (sc-22661).
+    ///
+    /// This is the non-vacuous half of the E2 story. A provider that returned
+    /// `MemoryArchitectureFacts::default()` unconditionally satisfies every weights-free assertion
+    /// in `every_registered_contract_surface_publishes_honest_facts` — that walk *requires*
+    /// `default()` on the Candle arm — so only rebuilding the contract against a materialized root
+    /// can separate "derives nothing" from "has nothing to derive yet". Reverting any one of these
+    /// crates' `architecture_facts` to `::default()` turns the assertion below red.
+    ///
+    /// The catalog's remaining providers are absent for one reason in four shapes, each a
+    /// *pre-existing admission rule* rather than anything about facts: the route demands an exact
+    /// resolved catalog route (chroma, sd3, sdxl, qwen-image-edit), an exact immutable turnkey
+    /// repo/revision (boogu, sana, ideogram, kolors' base tier), a specific tier subdirectory or
+    /// component file on disk (scail2's `dit.safetensors`, ltx-2.5's video VAE, anima's
+    /// `diffusion_models/`, sensenova's shards, svd's unquantized surface, ltx-2.3's plain split q4
+    /// tier), or a whole snapshot layout to walk (krea, bernini, qwen-image). Standing those up is
+    /// building each provider's own load fixture — which is exactly what each crate's own
+    /// `architecture_facts_*` test does, and which `every_memory_route_crate_reaches_the_catalog`
+    /// proves every memory-route crate has.
+    const MATERIALIZED_ROOT_PROVIDERS: &[&str] = &[
+        "candle_kolors_control",
+        "candle_kolors_ipadapter",
+        "flux1_dev",
+        "flux1_schnell",
+        "flux2_dev",
+        "flux2_klein_9b",
+        "krea_2_turbo_control",
+        "lens",
+        "lens_turbo",
+        "mage_flow",
+        "mage_flow_base",
+        "mage_flow_edit",
+        "mage_flow_edit_base",
+        "mage_flow_edit_turbo",
+        "mage_flow_turbo",
+        "minimax_h3",
+        "z_image",
+        "z_image_control",
+        "z_image_turbo",
+        "z_image_turbo_control",
+    ];
+
+    /// AC (sc-22661 / epic SC-22657 E2): the registry-level walk is non-vacuous. Every provider
+    /// that can be handed a materialized snapshot root must derive geometry from it — the assertion
+    /// an unconditional `MemoryArchitectureFacts::default()` fails, and the one the weights-free
+    /// walk structurally cannot make.
+    #[test]
+    fn every_materializable_provider_derives_geometry_from_a_snapshot_root() {
+        use std::collections::BTreeSet;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = synthetic_snapshot_root(tmp.path());
+        let expected = MATERIALIZED_ROOT_PROVIDERS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            expected.len(),
+            MATERIALIZED_ROOT_PROVIDERS.len(),
+            "the materialized-root list must not repeat a provider"
+        );
+        let registry = super::memory_contract_surface_registry().unwrap();
+        let registered = registry
+            .memory_strategy_registrations()
+            .map(|registration| registration.provider_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            expected.is_subset(&registered),
+            "the materialized-root list names providers this catalog does not register: {:?}",
+            expected.difference(&registered).collect::<Vec<_>>()
+        );
+
+        let lookup = |provider_id: &str| expected.contains(provider_id).then(|| root.clone());
+        let coverage = gen_core_testkit::memory_contract_surface_registry_facts_conformance(
+            &registry,
+            Some(&lookup),
+        );
+        assert_eq!(
+            coverage.materialized_providers_checked,
+            MATERIALIZED_ROOT_PROVIDERS.len(),
+            "every listed provider must have been rebuilt against the synthetic root"
+        );
+    }
+
+    /// A synthetic snapshot root carrying the component layouts and config keys the catalog's
+    /// providers read.
+    fn synthetic_snapshot_root(base: &std::path::Path) -> std::path::PathBuf {
+        let root = base.join("sc22661-synthetic-snapshot");
+        for (component, config) in SYNTHETIC_COMPONENT_CONFIGS {
+            let dir = if component.is_empty() {
+                root.clone()
+            } else {
+                root.join(component)
+            };
+            std::fs::create_dir_all(&dir).expect("synthetic component dir");
+            std::fs::write(dir.join("config.json"), config).expect("synthetic component config");
+        }
+        root
+    }
+
+    const SYNTHETIC_COMPONENT_CONFIGS: &[(&str, &str)] = &[
+        (
+            "",
+            r#"{"patch_size": 2, "llm_config": {"hidden_size": 4096, "num_hidden_layers": 32,
+                "num_attention_heads": 32, "head_dim": 128}}"#,
+        ),
+        (
+            "transformer",
+            r#"{"in_channels": 64, "out_channels": 64, "hidden_size": 3072, "num_heads": 24,
+                "num_attention_heads": 24, "attention_head_dim": 128, "depth": 12,
+                "num_layers": 19, "num_single_layers": 38, "patch_size": 2, "caption_channels": 2304,
+                "num_key_value_heads": 8, "cross_attention_dim": 2048, "context_in_dim": 2560,
+                "axes_dim": [16, 56, 56], "checkpoint": false}"#,
+        ),
+        (
+            "unet",
+            r#"{"in_channels": 4, "block_out_channels": [320, 640, 1280],
+                "attention_head_dim": [5, 10, 20], "layers_per_block": 2, "num_attention_heads": 20}"#,
+        ),
+        (
+            "vae",
+            r#"{"latent_channels": 16, "z_channels": 16, "block_out_channels": [128, 256, 512, 512],
+                "scale_factor_spatial": 8, "temperal_downsample": [false, true, true],
+                "patch_size": [1, 2, 2], "dim_mult": [1, 2, 4, 4]}"#,
+        ),
+    ];
 
     #[test]
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
@@ -5285,6 +5532,11 @@ mod tests {
                 .collect(),
                 "{provider_id}"
             );
+            // sc-22735: these are weights-free declarations, so their identities live in the
+            // registry-behavior namespace and carry their own (route, declared tier) key. The
+            // production strings — `krea-2-<route>-<tier>-cuda-staged-residency-v1` — are what a
+            // measured anchor binds to, and no catalog surface may republish one.
+            let mut declared = std::collections::BTreeSet::new();
             for surface in provider_surfaces {
                 assert!(!surface.composed, "{provider_id}");
                 assert_eq!(
@@ -5292,11 +5544,34 @@ mod tests {
                     candle_gen::gen_core::MemoryAssetFacts::default(),
                     "{provider_id}"
                 );
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                let tier = match surface.resolved_artifact_tier() {
+                    MemoryContractSurfaceTier::Bf16 => "bf16",
+                    MemoryContractSurfaceTier::Q4 => "q4",
+                    MemoryContractSurfaceTier::Q8 => "q8",
+                    other => panic!("{provider_id}: unexpected surface tier {other:?}"),
+                };
                 assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    "krea-candle-request-scoped-staged-residency-v1",
-                    "{provider_id}"
+                    fingerprint,
+                    &format!(
+                        "krea-2-candle-registry-behavior-v1-{}-{tier}",
+                        provider_id.replace('_', "-")
+                    ),
+                    "{provider_id}:{}",
+                    surface.selector.id()
                 );
+                for cell in ["q4", "q8", "bf16"] {
+                    assert_ne!(
+                        fingerprint,
+                        &format!(
+                            "{}-{cell}-cuda-staged-residency-v1",
+                            provider_id.replace('_', "-")
+                        ),
+                        "{provider_id}: a weights-free surface must never republish a production \
+                         calibration identity"
+                    );
+                }
+                declared.insert(fingerprint.clone());
                 for strategy in MemoryStrategy::ALL {
                     let expected = matches!(
                         strategy,
@@ -5311,6 +5586,11 @@ mod tests {
                     );
                 }
             }
+            assert_eq!(
+                declared.len(),
+                3,
+                "{provider_id}: one declaration per artifact tier: {declared:?}"
+            );
         }
     }
 
@@ -5348,17 +5628,15 @@ mod tests {
                 true,
                 "z-image-cuda-base-control-host-decode-streamed-device-format-blocks-v2",
             ),
-            (
-                "lens",
-                2,
-                false,
-                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
-            ),
+            // sc-22732: the Lens weights-free surfaces publish a per-cell static behavior identity
+            // instead of leaking the measured q4 Lens-Turbo production string onto all 24 of them,
+            // so these two entries are the route-exact PREFIX of that namespace.
+            ("lens", 2, false, "lens-candle-registry-behavior-v1-lens-"),
             (
                 "lens_turbo",
                 2,
                 false,
-                "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+                "lens-candle-registry-behavior-v1-lens-turbo-",
             ),
         ] {
             let provider_surfaces: Vec<_> = surfaces
@@ -5399,11 +5677,32 @@ mod tests {
                 );
                 implemented += usize::from(expected);
                 assert_eq!(surface.composed, composed, "{provider_id}");
-                assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    fingerprint,
-                    "{provider_id}"
-                );
+                let published = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                if provider_id.starts_with("lens") {
+                    assert!(
+                        published.starts_with(fingerprint),
+                        "{provider_id}:{} published {published}",
+                        surface.selector.id()
+                    );
+                    // `…-v1-lens-` is itself a prefix of `…-v1-lens-turbo-`, so the check above
+                    // cannot tell the base route's identity from the turbo route's. Pin the
+                    // discrimination explicitly rather than leaving it to prefix arithmetic.
+                    assert_eq!(
+                        published.starts_with("lens-candle-registry-behavior-v1-lens-turbo-"),
+                        provider_id == "lens_turbo",
+                        "{provider_id}:{} published {published}",
+                        surface.selector.id()
+                    );
+                    // The weights-free namespace must never be the measured production string.
+                    assert_ne!(
+                        published.as_str(),
+                        "lens-candle-cuda-shared-ladder-device-format-blocks-v1",
+                        "{provider_id}:{} leaks the measured production identity",
+                        surface.selector.id()
+                    );
+                } else {
+                    assert_eq!(published, fingerprint, "{provider_id}");
+                }
                 assert_eq!(
                     surface.contract.asset_facts,
                     candle_gen::gen_core::MemoryAssetFacts::default(),
@@ -5539,6 +5838,7 @@ mod tests {
                 "minimax_h3",
                 "mochi_1",
                 "qwen_image",
+                "qwen_image_2_1",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "scail2_14b",
@@ -5590,10 +5890,11 @@ mod tests {
 
         // sc-16667: the pinned surface and the model-weight licence mapping move together — this is
         // where a surface change and a mapping change meet. Five of the seven trainer ids are also
-        // generator ids, which is why 55 generators + 2 trainer-only ids + 1 captioner + 2
-        // embedders are 60 distinct ids.
+        // generator ids, which is why 56 generators + 2 trainer-only ids + 1 captioner + 2
+        // embedders are 61 distinct ids (sc-24109 adds `qwen_image_2_1`, a generator with its own
+        // component row).
         //
-        // Registration is never conditioned on the mapping: 50 < 60 because ten ids load nothing
+        // Registration is never conditioned on the mapping: 51 < 61 because ten ids load nothing
         // the shared checkpoint table covers, and they ship exactly as before. That gap is a hole in
         // our metadata for CI to report, and `licenses::tests` pins which ten and why — as
         // `#[cfg(test)]` data, so no gate can read it and suppress them.
@@ -5604,8 +5905,8 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 60);
-        assert_eq!(super::provider_components().len(), 50);
+        assert_eq!(distinct.len(), 61);
+        assert_eq!(super::provider_components().len(), 51);
     }
 
     /// The manifest emitter runs on **this** catalog's three slices, and its output is
@@ -5705,21 +6006,26 @@ mod tests {
     #[test]
     fn krea_cuda_memory_contract_is_not_exposed_by_the_cpu_catalog() {
         let registry = super::provider_registry().expect("catalog");
+        let registered = registry
+            .memory_strategy_registrations()
+            .any(|registration| registration.provider_id == "krea_2_turbo");
+        assert_eq!(registered, cfg!(feature = "cuda"));
+    }
+
+    #[test]
+    fn krea_catalog_rejects_missing_assets_when_cuda_contract_is_registered() {
+        let registry = super::provider_registry().expect("catalog");
+        let directory = tempfile::tempdir().unwrap();
         let spec = super::media::gen_core::LoadSpec::new(
-            super::media::gen_core::WeightsSource::Dir("/nonexistent".into()),
+            super::media::gen_core::WeightsSource::Dir(directory.path().join("missing")),
         );
-        let contract = registry
-            .memory_strategy_contract("krea_2_turbo", &spec)
-            .expect("known Krea generator");
+        let contract = registry.memory_strategy_contract("krea_2_turbo", &spec);
         #[cfg(feature = "cuda")]
         assert!(
-            contract.is_some(),
-            "CUDA catalog must expose the Krea CUDA contract"
+            contract.is_err(),
+            "CUDA production admission requires real assets"
         );
         #[cfg(not(feature = "cuda"))]
-        assert!(
-            contract.is_none(),
-            "CPU catalog must leave Krea on its compatibility default"
-        );
+        assert!(contract.expect("known Krea generator").is_none());
     }
 }

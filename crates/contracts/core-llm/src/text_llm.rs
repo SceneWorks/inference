@@ -28,6 +28,12 @@ pub trait TextLlm {
         None
     }
 
+    /// What the load produced: the requested weight format and the projection kinds the loaded
+    /// model actually holds (sc-24139). `None` (the default) when the provider does not report it.
+    fn load_report(&self) -> Option<crate::report::LoadReport> {
+        None
+    }
+
     /// Cheap, pre-inference validation of a request against this provider's capabilities. Must
     /// reject (not silently ignore) anything outside the declared surface.
     fn validate(&self, req: &TextLlmRequest) -> Result<()>;

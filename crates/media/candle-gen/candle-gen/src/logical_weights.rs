@@ -57,7 +57,7 @@ use gen_core::checkpoint_facts::{
 };
 use gen_core::ProviderRegistryBuilder;
 
-use crate::quant::Nvfp4Tensor;
+use crate::quant::{Nvfp4KitchenExt as _, Nvfp4Tensor};
 
 use crate::candle_core::safetensors::MmapedSafetensors;
 use crate::candle_core::{DType, Device, Tensor};

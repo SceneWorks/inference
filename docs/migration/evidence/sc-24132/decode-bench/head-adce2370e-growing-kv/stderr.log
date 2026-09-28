@@ -1,0 +1,3 @@
+[decode_bench] reference          10.17 tok/s  prefill 0.924s
+[decode_bench] step_model         10.12 tok/s  prefill 0.738s
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24132\docs\migration\evidence\sc-24132\decode-bench\head-adce2370e-growing-kv\decode_bench.json

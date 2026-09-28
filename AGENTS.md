@@ -4,8 +4,13 @@
 
 This is the unified SceneWorks inference workspace. `crates/contracts/` holds
 backend-neutral APIs and conformance testkits; `crates/llm/` contains MLX and
-Candle LLM engines; `crates/media/` contains MLX and Candle media-provider
-families; and `crates/bundles/` defines supported CPU, macOS, CUDA, and catalog
+Candle LLM engines; `crates/kernels/` holds shared low-precision Candle kernels
+(`candle-quant-kernels`: NVFP4 / FP8 / INT8 cuBLASLt paths, plus the fused decode
+primitives in `fused_decode` and the NVFP4 decode GEMV in `nvfp4_gemv`) used by
+candle-gen and candle-llm — new runtime-compiled
+CUDA kernels go through the nvrtc compile-once seam (`nvrtc::KernelSource::compiled`),
+never a private `compile_ptx` + `load_module`; `crates/media/` contains MLX and Candle media-provider families;
+and `crates/bundles/` defines supported CPU, macOS, CUDA, and catalog
 compositions. Keep implementation in a crate's `src/`, integration tests in
 `tests/`, examples in `examples/`, and model/tokenizer assets beside the owning
 provider. Architecture and migration evidence live under `docs/`; release

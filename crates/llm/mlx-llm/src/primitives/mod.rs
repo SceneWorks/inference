@@ -22,6 +22,7 @@ pub mod packed_attention;
 pub mod packed_group_affine_kv;
 pub mod packed_metal;
 pub mod paged_kv_cache;
+pub mod prism;
 pub mod projection;
 pub mod quant;
 pub mod rope;

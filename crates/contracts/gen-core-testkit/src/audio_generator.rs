@@ -281,6 +281,7 @@ pub(crate) fn validate_track(id: &str, op: &str, track: &AudioTrack) -> Result<(
 fn variant_name(out: &GenerationOutput) -> &'static str {
     match out {
         GenerationOutput::Images(_) => "GenerationOutput::Images",
+        GenerationOutput::ImagesRgba(_) => "GenerationOutput::ImagesRgba",
         GenerationOutput::Video { .. } => "GenerationOutput::Video",
         GenerationOutput::Audio(_) => "GenerationOutput::Audio",
     }

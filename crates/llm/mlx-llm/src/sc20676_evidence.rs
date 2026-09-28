@@ -2624,15 +2624,14 @@ mod tests {
     }
     #[test]
     fn partial_staging_never_publishes_a_final_matrix() {
-        let root = std::env::temp_dir().join(format!("sc20676-atomic-test-{}", std::process::id()));
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
         let staging = root.join("staging");
         let destination = root.join("published");
-        let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&staging).unwrap();
         fs::write(staging.join("complete-matrix.json"), b"{}").unwrap();
         assert!(publish_complete_matrix(&staging, &destination, &digest(), &digest()).is_err());
         assert!(!destination.exists());
-        let _ = fs::remove_dir_all(&root);
     }
     #[test]
     fn staged_receipt_parser_requires_the_semantic_core_seal() {

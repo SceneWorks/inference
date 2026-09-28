@@ -37,8 +37,9 @@
 // explicitly.
 use candle_gen::candle_core::{DType, Error, Result, Tensor, D};
 use candle_gen::candle_nn::ops::silu;
-use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module};
+use candle_gen::candle_nn::{Conv2dConfig, Module};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
+use candle_gen::BudgetedConv2d as Conv2d;
 use candle_gen::Weights;
 
 use crate::config::{BlockType, DcAeConfig};

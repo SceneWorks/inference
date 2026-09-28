@@ -19,14 +19,18 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{
-    conv2d, group_norm, linear, Conv2d, Conv2dConfig, GroupNorm, Linear, Module, VarBuilder,
+    group_norm, linear, Conv2dConfig, GroupNorm, Linear, Module, VarBuilder,
 };
+use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
 
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;
 const BN_EPS: f64 = 1e-4;
-const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
-const LATENT_CHANNELS: usize = 32;
+/// Channel width of each encoder/decoder stage. Public so a provider that decodes through this VAE
+/// (Lens) can publish its spatial scale from the stage count the decoder is actually built with.
+pub const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
+/// Latent channels this autoencoder produces and consumes. Public for the same reason.
+pub const LATENT_CHANNELS: usize = 32;
 /// Decoder up_blocks have `layers_per_block + 1 = 3` resnets each.
 const DECODER_RESNETS: usize = 3;
 /// Encoder down_blocks have `layers_per_block = 2` resnets each.

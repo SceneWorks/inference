@@ -1301,7 +1301,7 @@ impl Wan22Vae {
         } else {
             None
         };
-        Ok(Self {
+        let vae = Self {
             conv2: CausalConv3d22::from_weights(w, "conv2", 1, 0, 0, 0)?, // 1×1×1 pointwise
             decoder: Decoder3d::from_weights(w, topology)?,
             encoder,
@@ -1310,7 +1310,12 @@ impl Wan22Vae {
             std,
             // Infer the decode compute dtype from the loaded conv weights (bf16 when pre-cast).
             compute_dtype: w.require("conv2.weight")?.dtype(),
-        })
+        };
+        // Materialize at load: left lazy, the first encode/decode's command buffers wait on the
+        // safetensors reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(vae)
     }
 
     /// Per-channel mean/std as `[1,1,1,1,z]` (channels-last). For the production `z_dim == 48` these

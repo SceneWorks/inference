@@ -125,6 +125,10 @@ fn real_weight_instantid() {
         adapters: Vec::new(),
         sdxl: SdxlComponents::from_spec(&sdxl_spec)
             .expect("stage SDXL components (IID_TOKENIZER_CLIP_L / _BIGG, IID_VAE_FP16_FIX)"),
+        // Staged on the composition so the memory contract prices them; `with_face` /
+        // `with_openpose` below then attach the already-priced networks.
+        openpose: env_opt("IID_OPENPOSE").map(WeightsSource::Dir),
+        face_dir: Some(env_path("IID_FACE_DIR")),
     };
 
     eprintln!("loading InstantId (RealVisXL + IdentityNet + IP-Adapter + VAE) ...");

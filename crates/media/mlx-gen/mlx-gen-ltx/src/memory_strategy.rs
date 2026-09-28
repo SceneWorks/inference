@@ -39,7 +39,46 @@ use crate::gemma::GemmaQuant;
 
 /// Contract/execution identity introduced by SC-19109. The earlier SC-18808 capture predates this
 /// shared-contract carrier and therefore cannot be reused as if its calibration semantics matched.
+///
+/// Since sc-22737 this is the identity of the **q8** cell specifically — the tier this family's
+/// retained anchor is filed under — rather than one string shared by all three shipped tiers. See
+/// [`production_calibration_fingerprint`]. Retained byte-for-byte so that record keeps its key.
 pub const CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-mlx-memory-ladder-v2";
+
+/// The tier [`CALIBRATION_FINGERPRINT`] names.
+pub const CALIBRATED_TIER: &str = "q8";
+
+/// Artifact-tier label of an LTX-2.3 load: `bf16` dense, `q4`/`q8` prepacked.
+pub fn calibration_tier_label(quant: Option<Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The production calibration identity for one shipped tier.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4): the key is per TIER
+///
+/// It used to be one string for the whole route, so a q4 load and a bf16 load published the
+/// identity of the q8 cell. That is worse than publishing nothing: an anchor measured on one tier
+/// would be matched against loads of the other two, and the ladder for a 20GB checkpoint would be
+/// priced from a 47GB one's peaks.
+///
+/// The tier is the one the ARTIFACT carries. Callers pass the tier
+/// `numeric_tier_from_split` resolved, which reads the split checkpoint's own quantization and
+/// REFUSES a `spec.quantize` that disagrees with it, so a crossed request never reaches here.
+/// `None` for a packed width this family does not ship — withheld, never a failed load.
+pub fn production_calibration_fingerprint(tier: &MemoryNumericTier) -> Option<String> {
+    let label = calibration_tier_label(tier.quant)?;
+    Some(if label == CALIBRATED_TIER {
+        CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("sc-20772-ltx-2-3-{label}-mlx-memory-ladder-v2")
+    })
+}
 const STATIC_CALIBRATION_FINGERPRINT: &str = "sc-20772-ltx-2-3-mlx-registry-behavior-v2";
 
 pub const DECODE_OVERLAP: u32 = 64;
@@ -640,6 +679,102 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// Architecture axes shared by both registered LTX-2 routes (epic SC-22657, E2).
+///
+/// [`LtxConfig::video_only_defaults`](crate::config::LtxConfig::video_only_defaults) mirrors the
+/// `embedded_config.json` transformer block the loader parses on every load, and the measured 2.3 to
+/// 2.5 delta is two booleans — not a dimension — so both routes publish one set of axes.
+///
+/// `patch_size` is declared **absent**: LTX's AvDiT has no patchify at all. `patchify_proj` is a
+/// plain `Linear` over the 128-channel latent token, and every patch factor lives inside the VAE,
+/// already folded into `vae_spatial_scale`. A structurally absent axis is declared `None`, never a
+/// stand-in 1.
+///
+/// The VAE is a **video** autoencoder, so `vae_temporal_scale` is a real value here: eight frames
+/// per latent unit over a x32 spatial scale, which `diff_vae::VIDEO_SCALE_FACTORS` restates.
+///
+/// When `spec` names a materialized snapshot directory this re-runs `LtxConfig::from_model_dir` —
+/// the 2.3 loader's own `embedded_config.json` parse — so the published trunk axes are the
+/// snapshot's rather than the preset's. On the weights-free surface there is nothing to read, and
+/// the preset is what `from_model_dir` itself falls back to. The 2.5 route parses a different
+/// source (its split bundle's transformer `__metadata__`) and goes through
+/// [`architecture_facts_for`] with that config instead.
+///
+/// The three snapshot outcomes are kept apart because the loader keeps them apart (SC-22667):
+///
+/// * **absent** `embedded_config.json` — `from_model_dir` returns the preset itself
+///   (`config.rs`'s early `Ok(Self::video_only_defaults())`), and `model.rs`'s `?` accepts it, so
+///   the preset is the geometry the loader will build and publishing it is honest;
+/// * **present and parseable** — the snapshot's own axes, as before;
+/// * **present and unparseable** (malformed JSON, no `transformer` section, an unimplemented
+///   `rope_type`) — `model.rs`'s `?` *errors*, so no load of this snapshot has the preset's
+///   geometry. Falling back to the preset would publish 48 blocks x 3072 channels for a tree the
+///   engine refuses to open. The trunk axes are declared **absent** instead; the VAE axes are
+///   crate constants that no snapshot config can move, so they stand and the weights-free gate
+///   still sees a declared axis.
+pub(crate) fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {
+        return architecture_facts_for(&crate::config::LtxConfig::video_only_defaults(), spec);
+    };
+    match crate::config::LtxConfig::from_model_dir(root) {
+        Ok(dit) => architecture_facts_for(&dit, spec),
+        Err(_) => unreadable_trunk_architecture_facts(spec),
+    }
+}
+
+/// Axes for a materialized tree whose own transformer config the loader cannot parse.
+///
+/// Every trunk axis comes from that config, so none of them is knowable — and E2 declares an
+/// unknowable axis absent rather than substituting a preset the loader would never build. The VAE
+/// axes and the activation width are not config-derived (crate constants and [`LoadSpec`]'s own
+/// precision), so they remain declared.
+pub(crate) fn unreadable_trunk_architecture_facts(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: None,
+        head_dim: None,
+        transformer_blocks: None,
+        patch_size: None,
+        latent_channels: mlx_gen::architecture_facts::axis(crate::model::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::model::SPATIAL_SCALE),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::model::TEMPORAL_SCALE),
+        activation_dtype_width: Some(activation_dtype_width(spec)),
+    }
+}
+
+/// The shared LTX axis derivation over an already-resolved transformer config: the trunk axes off
+/// `dit`, the video-VAE axes off this crate's constants, and the activation width off the precision
+/// the loader will run `spec` at (SC-22667).
+///
+/// Both loaders select the DiT precision from `spec.precision` — `Bf16` (the `LoadSpec` default)
+/// computes bf16 activations over quantized weights, `Fp32` computes f32 activations over the same
+/// weights (`model.rs`, the quality target) — so the width is derived from that field rather than
+/// pinned to the half-precision literal, which described only the default path.
+pub(crate) fn architecture_facts_for(
+    dit: &crate::config::LtxConfig,
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: None,
+        latent_channels: mlx_gen::architecture_facts::axis(crate::model::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::model::SPATIAL_SCALE),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(crate::model::TEMPORAL_SCALE),
+        activation_dtype_width: Some(activation_dtype_width(spec)),
+    }
+}
+
+/// Bytes per activation element for the precision `model.rs` selects from `spec.precision`.
+pub(crate) fn activation_dtype_width(spec: &LoadSpec) -> u32 {
+    match spec.precision {
+        mlx_gen::Precision::Bf16 => mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH,
+        mlx_gen::Precision::Fp32 => mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH,
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     asset_declaration: AssetDeclaration,
@@ -677,6 +812,8 @@ fn build_contract(
         }
     };
     Ok(MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(spec),
         provider_id: crate::MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: true,
@@ -734,10 +871,14 @@ pub(crate) fn contract_for_loaded(
         return Ok(None);
     }
     let tier = numeric_tier_from_split(spec, split)?;
+    // sc-22737: the identity names the tier the checkpoint carries, not the route.
+    let Some(fingerprint) = production_calibration_fingerprint(&tier) else {
+        return Ok(None);
+    };
     let contract = build_contract(
         spec,
         production_asset_declaration(spec, gemma_dir)?,
-        CALIBRATION_FINGERPRINT,
+        &fingerprint,
     )?;
     Ok(Some((contract, tier, route_overlay(spec))))
 }
@@ -749,7 +890,7 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
         ));
     };
     let split = SplitModel::from_model_dir(root)?;
-    let _tier = numeric_tier_from_split(spec, &split)?;
+    let tier = numeric_tier_from_split(spec, &split)?;
     let gemma_dir = crate::model::resolve_gemma_dir(spec.text_encoder.as_ref())?;
     if let Some(quant) = crate::model::resolve_gemma_quant(&gemma_dir)? {
         return Err(mlx_gen::Error::Unsupported(format!(
@@ -765,10 +906,16 @@ pub fn memory_strategy_contract(spec: &LoadSpec) -> Result<MemoryProviderContrac
                 .into(),
         ));
     }
+    let fingerprint = production_calibration_fingerprint(&tier).ok_or_else(|| {
+        mlx_gen::Error::Unsupported(format!(
+            "ltx_2_3: the checkpoint declares an unshipped packed tier {:?}",
+            tier.quant
+        ))
+    })?;
     build_contract(
         spec,
         production_asset_declaration(spec, &gemma_dir)?,
-        CALIBRATION_FINGERPRINT,
+        &fingerprint,
     )
 }
 
@@ -1610,6 +1757,168 @@ mod tests {
         LoadSpec::new(WeightsSource::Dir("/nonexistent-ltx-fixture".into())).with_quant(Quant::Q8)
     }
 
+    /// AC (SC-22662): the LTX-2.3 route publishes the axes of the AvDiT and the video VAE this
+    /// crate declares, and passes the shared facts conformance check.
+    /// SC-22667: the activation width follows the precision `model.rs` selects the DiT path from —
+    /// `Bf16` runs bf16 activations, the `Fp32` opt-in runs f32 ones — rather than the
+    /// half-precision literal that described only the default path.
+    ///
+    /// Mutation that fails this: `activation_dtype_width: Some(HALF_ACTIVATION_WIDTH)` (the shape
+    /// under review) — the `Fp32` assertion then reads 2.
+    #[test]
+    fn activation_width_follows_the_selected_precision() {
+        let bf16 = fixture_spec();
+        assert_eq!(architecture_facts(&bf16).activation_dtype_width, Some(2));
+        let mut fp32 = bf16.clone();
+        fp32.precision = Precision::Fp32;
+        assert_eq!(architecture_facts(&fp32).activation_dtype_width, Some(4));
+        assert_eq!(
+            weights_free_memory_strategy_contract(&fp32)
+                .unwrap()
+                .architecture_facts
+                .activation_dtype_width,
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_and_vae_constants() {
+        let contract = weights_free_memory_strategy_contract(&fixture_spec()).unwrap();
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(32),
+                head_dim: Some(128),
+                transformer_blocks: Some(48),
+                // The AvDiT has no patchify: `patchify_proj` is a plain Linear over the
+                // 128-channel latent token, and every patch factor lives inside the VAE.
+                patch_size: None,
+                latent_channels: Some(128),
+                vae_spatial_scale: Some(32),
+                // A video autoencoder: eight frames per latent unit.
+                vae_temporal_scale: Some(8),
+                activation_dtype_width: Some(2),
+            },
+            "ltx_2_3 architecture facts"
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        // The published scales ARE the released DiffVAE's `(time, height, width)` factors.
+        assert_eq!(
+            [
+                contract.architecture_facts.vae_temporal_scale,
+                contract.architecture_facts.vae_spatial_scale,
+                contract.architecture_facts.vae_spatial_scale,
+            ],
+            crate::diff_vae::VIDEO_SCALE_FACTORS.map(|scale| Some(scale as u32))
+        );
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// The `embedded_config.json` keys `LtxConfig::from_model_dir` reads for the three trunk axes
+    /// this provider publishes. Emitted from a config value so the fixture cannot drift.
+    fn embedded_config_json(cfg: &crate::config::LtxConfig) -> serde_json::Value {
+        serde_json::json!({
+            "transformer": {
+                "num_attention_heads": cfg.num_attention_heads,
+                "attention_head_dim": cfg.attention_head_dim,
+                "num_layers": cfg.num_layers,
+            }
+        })
+    }
+
+    fn spec_for_embedded_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("embedded_config.json"), config.to_string()).unwrap();
+        LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes come from the
+    /// snapshot's own `embedded_config.json` — the file the loader parses — rather than from the
+    /// compile-time preset. The mirror fixture agrees with the weights-free path; a fixture with
+    /// mutated keys publishes the mutated axes, which is what the unconditional
+    /// `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_trunk_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::LtxConfig::video_only_defaults();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_embedded_config(
+                mirror.path(),
+                &embedded_config_json(&preset)
+            )),
+            architecture_facts(&fixture_spec()),
+            "a snapshot mirroring the reference config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = embedded_config_json(&preset);
+        mutated["transformer"]["num_layers"] = serde_json::json!(7);
+        mutated["transformer"]["attention_head_dim"] = serde_json::json!(64);
+        let mutated_facts =
+            architecture_facts(&spec_for_embedded_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(64)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+    }
+
+    /// SC-22667: the three snapshot outcomes are exactly the loader's. An ABSENT
+    /// `embedded_config.json` is the one case `LtxConfig::from_model_dir` itself answers with the
+    /// preset (and `model.rs`'s `?` accepts), so the preset is published there. A file that is
+    /// PRESENT and unparseable — malformed JSON, or no `transformer` section — errors at load, so
+    /// the trunk axes are declared absent instead of standing the preset in for a tree the engine
+    /// refuses to open. The VAE axes are crate constants no config can move, so they survive.
+    ///
+    /// Mutation that fails this: the `from_model_dir(root).ok().unwrap_or_else(video_only_defaults)`
+    /// shape under review — both unparseable fixtures then publish `Some(32)/Some(128)/Some(48)`.
+    #[test]
+    fn an_unparseable_embedded_config_declines_the_trunk_axes_instead_of_presetting() {
+        let absent = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+                absent.path().to_path_buf()
+            ))),
+            architecture_facts(&fixture_spec()),
+            "an absent embedded_config.json is the loader's own preset fall-back"
+        );
+
+        for body in [
+            "{ this is not json".to_owned(),
+            serde_json::json!({ "vae": { "num_layers": 3 } }).to_string(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("embedded_config.json"), &body).unwrap();
+            let spec = LoadSpec::new(WeightsSource::Dir(dir.path().to_path_buf()));
+            assert!(
+                crate::config::LtxConfig::from_model_dir(dir.path()).is_err(),
+                "fixture premise: the loader's own parse must reject {body}"
+            );
+            let facts = architecture_facts(&spec);
+            assert_eq!(
+                (
+                    facts.attention_heads,
+                    facts.head_dim,
+                    facts.transformer_blocks,
+                    facts.patch_size
+                ),
+                (None, None, None, None),
+                "an unparseable {body} must not publish preset trunk axes"
+            );
+            assert_eq!(
+                (
+                    facts.latent_channels,
+                    facts.vae_spatial_scale,
+                    facts.vae_temporal_scale,
+                    facts.activation_dtype_width
+                ),
+                (Some(128), Some(32), Some(8), Some(2)),
+                "the VAE axes and the activation width are not config-derived"
+            );
+            assert!(facts.has_declared_architecture_axis());
+        }
+    }
+
     /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the
     /// fixture publishes and fails the entire MLX catalog when one errors, so the published witness
     /// set must be exactly the set this provider can build. Asserting it here localizes the failure
@@ -2426,6 +2735,55 @@ mod tests {
         .unwrap();
         assert_eq!(contract.asset_facts.conditioning_bytes, enhancer_bytes);
         assert_eq!(contract.total_resident_bytes(), enhancer_bytes);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the identity is per TIER, not per route.
+    // ------------------------------------------------------------------------------------------
+
+    fn ltx_tier(quant: Option<Quant>) -> MemoryNumericTier {
+        MemoryNumericTier {
+            precision: mlx_gen::Precision::Bf16,
+            quant,
+            component_precision_floors: &[],
+        }
+    }
+
+    /// The retained q8 key is unchanged, and the other two shipped tiers publish their OWN keys —
+    /// so an anchor measured on one tier can never be matched against a load of another.
+    #[test]
+    fn each_shipped_tier_publishes_its_own_identity() {
+        assert_eq!(
+            production_calibration_fingerprint(&ltx_tier(Some(Quant::Q8))).as_deref(),
+            Some(CALIBRATION_FINGERPRINT),
+            "the measured cell keeps its retained key"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let fingerprint = production_calibration_fingerprint(&ltx_tier(quant))
+                .unwrap_or_else(|| panic!("{quant:?} publishes an identity"));
+            assert!(
+                seen.insert(fingerprint.clone()),
+                "{quant:?} reuses {fingerprint}"
+            );
+            assert_ne!(fingerprint, STATIC_CALIBRATION_FINGERPRINT);
+        }
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            production_calibration_fingerprint(&ltx_tier(None)).unwrap(),
+            "sc-20772-ltx-2-3-bf16-mlx-memory-ladder-v2"
+        );
+        assert_eq!(
+            production_calibration_fingerprint(&ltx_tier(Some(Quant::Q4))).unwrap(),
+            "sc-20772-ltx-2-3-q4-mlx-memory-ladder-v2"
+        );
+    }
+
+    /// A packed width this family does not ship publishes nothing rather than a plausible key.
+    /// NVFP4 is a real `Quant` variant with no MLX hardware behind it, so it is the honest probe.
+    #[test]
+    fn an_unshipped_packed_width_is_withheld() {
+        assert!(production_calibration_fingerprint(&ltx_tier(Some(Quant::Nvfp4))).is_none());
     }
 
     #[test]

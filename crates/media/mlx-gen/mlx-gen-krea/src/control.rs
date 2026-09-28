@@ -121,7 +121,13 @@ impl Krea2ControlBranch {
                 run_control_materialize_test_hook(ControlMaterializeTestStage::After, &w)?;
                 w
             }
-            WeightsSource::Dir(p) => Weights::from_dir(p)?,
+            WeightsSource::Dir(p) => {
+                let w = Weights::from_dir(p)?;
+                // Materialize at load, like the File arm (sc-24245; see
+                // mlx_gen_qwen_image::loader::load_transformer_with).
+                w.materialize()?;
+                w
+            }
         };
         Self::from_weights(&w, cfg)
     }
@@ -169,8 +175,16 @@ impl Krea2ControlBranch {
     fn from_weights_bounded(weights: Weights, cfg: &Krea2Config, bits: i32) -> Result<Self> {
         let mut branch = Self::from_weights(&weights, cfg)?;
         drop(weights);
-        branch.quantize(bits)?;
-        branch.materialize_weights()?;
+        // Per block: read the dense source (sc-24245 — before `quantize` consumes it, so no command
+        // buffer waits on the disk read), pack, and materialize the packs, bounding the dense transient.
+        for cb in &mut branch.blocks {
+            cb.block.materialize_weights()?;
+            cb.proj_out.materialize_weights()?;
+            cb.block.quantize(bits)?;
+            cb.proj_out.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+            cb.block.materialize_weights()?;
+            cb.proj_out.materialize_weights()?;
+        }
         Ok(branch)
     }
 
@@ -244,6 +258,7 @@ impl Krea2ControlBranch {
         Ok(())
     }
 
+    #[cfg(test)]
     fn materialize_weights(&self) -> Result<()> {
         for block in &self.blocks {
             block.block.materialize_weights()?;

@@ -1,0 +1,3 @@
+[decode_bench] reference           9.29 tok/s  prefill 0.881s
+[decode_bench] step_model          9.99 tok/s  prefill 0.816s
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24132\docs\migration\evidence\sc-24132\decode-bench\head-978307d88-expanded-attn\decode_bench.json

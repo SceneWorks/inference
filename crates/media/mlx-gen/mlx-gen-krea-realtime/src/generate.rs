@@ -50,6 +50,9 @@ pub struct ArGenParams {
     /// Output frames-per-second — carried onto the assembled clip at the pipeline level (S6); it does
     /// not affect the latent sequence produced here.
     pub fps: u32,
+    /// Request-scoped shared-ladder levers. Carried here so the denoise and decode boundaries can
+    /// honour an authorized calibration fault (sc-22738); the default arms nothing.
+    pub memory: mlx_gen::gen_core::GenerationMemory,
 }
 
 fn t2v_schedule(
@@ -620,6 +623,7 @@ mod tests {
             latent_height: 4,
             latent_width: 4,
             fps: 16,
+            memory: Default::default(),
         }
     }
 
@@ -1288,6 +1292,7 @@ mod tests {
             latent_height: latent_h,
             latent_width: latent_w,
             fps: 24,
+            memory: Default::default(),
         };
 
         let mut optimized = transformer.new_cache();

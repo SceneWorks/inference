@@ -1,0 +1,19 @@
+started 2026-09-23T17:07:11.2687687-04:00
+nvidia-smi -i 1 before:
+name, memory.used [MiB], memory.total [MiB], utilization.gpu [%]
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 880 MiB, 97887 MiB, 0 %
+
+running 5 tests
+test draft_speculative_llama ... draft-model: 48 tokens in 12 target forwards (4.00 tok/forward); 36/41 drafts accepted (quantized draft); tracks dense for 48/48 tokens
+ok
+test draft_speculative_qwen3 ... draft-model: 48 tokens in 12 target forwards (4.00 tok/forward); 36/43 drafts accepted (quantized draft); tracks dense for 48/48 tokens
+ok
+test draft_speculative_rejects_vocab_mismatch ... ok
+test prompt_lookup_llama ... 48 tokens in 13 target forwards (3.69 tok/forward); 35/35 drafts accepted; tracks non-spec for 48/48 tokens
+ok
+test prompt_lookup_qwen3 ... 48 tokens in 13 target forwards (3.69 tok/forward); 35/35 drafts accepted; tracks non-spec for 48/48 tokens
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 155.73s
+
+exit 0  finished 2026-09-23T17:09:47.2792522-04:00

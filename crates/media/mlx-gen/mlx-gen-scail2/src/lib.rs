@@ -38,6 +38,21 @@ pub mod rope;
 /// The single VAE implementation used by SCAIL-2.
 pub type ProviderVae = mlx_gen_wan::WanVae;
 /// SCAIL-2's provider-facing geometry, derived from its concrete VAE assignment.
+/// Whether the experimental bf16 denoiser-compute opt-in is set (`SCAIL2_COMPUTE_BF16=1`).
+///
+/// SCAIL-2 runs its DiT at `Dtype::Float32` by default: the bf16 quantized matmul overflows to NaN
+/// at this route's long sequences (sc-5681), so f32 is the validated path and bf16 is an opt-in
+/// experiment guarded per segment by the F-096 NaN check.
+///
+/// This lives on the crate root because TWO surfaces must agree about it and used not to (SC-22667):
+/// `generate` selects the compute dtype from it, and the memory contract's
+/// `MemoryArchitectureFacts::activation_dtype_width` describes that same dtype. The contract
+/// hardcoded 4 while its own comment named the hatch, so an opted-in run published a 2x
+/// over-estimate of every activation-sized term.
+pub fn compute_bf16_opt_in() -> bool {
+    std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|value| value == "1")
+}
+
 pub const VAE_TILING: mlx_gen::tiling::VaeTiling = ProviderVae::VAE_TILING;
 
 /// Resolve SCAIL-2 VAE geometry by registered generator id.

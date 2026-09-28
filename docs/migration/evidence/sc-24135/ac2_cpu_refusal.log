@@ -1,0 +1,13 @@
+operable program or batch file.
+warning: candle-kernels@0.10.2: Compiling 11 of 11 PTX kernels
+warning: candle-kernels@0.10.2: Using 24 threads for compilation
+warning: candle-kernels@0.10.2: Compiling 15 of 15 kernels
+    Finished `release` profile [optimized] target(s) in 3.55s
+     Running tests\nvfp4_evidence.rs (target\release\deps\nvfp4_evidence-5a4c1a25bcf6002f.exe)
+
+running 1 test
+test nvfp4_refused_on_cpu_for_the_real_snapshot ... [sc-24135] CPU NVFP4 refusal after 0.000s: Unsupported("nvfp4: NVFP4 projections need a CUDA device with compute capability >= sm_120 (cuBLASLt block-scaled FP4 GEMM); the load device is Cpu")
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+

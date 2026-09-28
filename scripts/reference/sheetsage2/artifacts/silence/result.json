@@ -1,0 +1,46 @@
+{
+  "audio": "audio",
+  "duration_seconds": 12.0,
+  "prompts": [
+    "timestamp",
+    "downbeat_meter",
+    "structure",
+    "key",
+    "chord_full",
+    "melody_full"
+  ],
+  "preset": "default",
+  "melody_only": false,
+  "dtype": "fp32",
+  "window_seconds": 300.0,
+  "overlap_seconds": 200.0,
+  "lookahead_seconds": 100.0,
+  "windows": [
+    {
+      "start": 0.0,
+      "end": 12.0,
+      "accept_start": 0.0,
+      "accept_end": 12.0,
+      "prefix_end": 0.0,
+      "generation_stop": null,
+      "window_index": 0,
+      "prefix_tokens": 0,
+      "tokens": 96,
+      "events": 26,
+      "accepted_events": 25,
+      "elapsed_seconds": 120.65230583399534
+    }
+  ],
+  "elapsed_seconds": 120.67457995796576,
+  "warnings": [],
+  "peak_gpu_mib": 0,
+  "melody_notes": 0,
+  "vocal_notes": 0,
+  "instrumental_notes": 0,
+  "events": 25,
+  "abc_measures": 7,
+  "abc_error": null,
+  "diagnostics": [
+    "measure 6: padded final 1/4 span to declared 4/4 with trailing rest"
+  ]
+}

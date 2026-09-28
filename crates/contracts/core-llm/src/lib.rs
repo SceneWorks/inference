@@ -22,7 +22,8 @@
 //! - [`IncrementalDetok`] — backend-neutral streaming-detokenization delta guard (holds back
 //!   lossy U+FFFD placeholders for multi-byte characters split across BPE tokens).
 //! - [`ThinkingSegmenter`] — backend-neutral reasoning/answer segmentation (`<think>…</think>`),
-//!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability.
+//!   paired with the [`ThinkingMode`] request control and `supports_thinking` capability. Qwen-specific
+//!   `reasoning_effort` and `preserve_thinking` controls require their own advertised capabilities.
 //! - [`ToolSpec`] / [`ToolCall`] / [`ToolCallSegmenter`] — backend-neutral tool ("function") calling:
 //!   offered tools render into the chat template (`tools` context), and the model's `<tool_call>`
 //!   output (Qwen3.6 XML or JSON/Hermes) is parsed back into structure; paired with the request
@@ -32,6 +33,10 @@
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
 //! - [`speculative`] — backend-neutral speculative-decoding policy (n-gram proposer + distribution-
 //!   preserving acceptance sampler).
+//! - [`report`] — backend-neutral evidence a product renders: [`DecodeReport`] (which decode path
+//!   served a generation, on [`TextLlmOutput::decode`]), [`LoadReport`] (what a load produced, via
+//!   [`TextLlm::load_report`]) and [`BackendCapabilities`] (what the host can serve — NVFP4, CUDA
+//!   graphs — with the refusal reason when it cannot).
 //! - [`registry`] — explicit provider composition, id-based routing, and **model-first** resolution
 //!   ([`TextLlmRegistry::load_for_model`] / [`ModelRequirements`] over a weightless `can_load`
 //!   probe).
@@ -49,8 +54,11 @@ pub mod output;
 pub mod paging;
 pub mod prefix;
 pub mod prepare;
+pub mod prism;
 pub mod registry;
+pub mod report;
 pub mod request;
+pub mod resource;
 pub mod schedule;
 pub mod speculative;
 pub mod starvector;
@@ -62,31 +70,61 @@ pub mod tokenizer;
 pub mod tool;
 
 pub use cancel::CancelFlag;
-pub use capabilities::{TextLlmCapabilities, TextLlmDescriptor};
+pub use capabilities::{
+    ModelSamplingDefaults, MtpCapabilities, TextLlmCapabilities, TextLlmDescriptor,
+};
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
 };
 pub use detok::IncrementalDetok;
-pub use error::{Error, Result};
+pub use error::{Error, RequestResourceExhausted, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
-pub use output::{Channel, FinishReason, StreamEvent, TextLlmOutput, Usage};
+pub use output::{
+    Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,
+};
 pub use paging::BlockAllocator;
 pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
     SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,
 };
+pub use prism::{
+    apply_hadamard_forward_in_place, apply_hadamard_inverse_in_place, decode_block_into,
+    gdn_reorder_last_axis_in_place, gguf_weight_name, is_gdn_ssm_out_weight,
+    normalized_fwht_in_place, transcode_block_to_affine, GdnLayout, PrismError,
+    PrismHadamardMetadata, PrismPackedKind, PrismPackedMatrixRef, PrismTransformRole,
+    PrismWeightTransform, PRISM_AFFINE_WORDS_PER_BLOCK, PRISM_GROUP_SIZE, PRISM_PQ2_0_GGML_TYPE,
+    PRISM_PTQ1_0_GGML_TYPE,
+};
 pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
-pub use request::{LoadSpec, Quantize, Sampling, TextLlmRequest, ThinkingMode};
+pub use report::{
+    BackendCapabilities, CudaGraphsReport, DecodeReport, FeatureSupport, LoadReport, PathReport,
+    ProjectionReport,
+};
+pub use request::{
+    HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
+    TextLlmRequest, ThinkingMode,
+};
+pub use resource::{
+    admit_request_memory, admit_request_memory_with_geometry, available_host_memory_bytes,
+    checkpoint_payload_bytes, checkpoint_staging_bytes, effective_memory_budget,
+    estimate_chunked_request_bytes, estimate_chunked_request_bytes_with_recurrent_copies,
+    estimate_request_bytes, operational_memory_override, LlmMemoryGeometry,
+    AVAILABLE_MEMORY_OVERRIDE,
+};
 pub use schedule::{Scheduler, SeqId, SeqSpec};
-pub use speculative::{accept_greedy_run, accept_token, ngram_propose, Acceptance};
+pub use speculative::{
+    accept_greedy_run, accept_token, greedy_commit, ngram_propose, resolve_mtp_plan, Acceptance,
+    MtpPlan, ProposerKind,
+};
 pub use starvector::{
-    DecoderArchitecture, ImagePreprocessing, ProjectionMetadata, StarVectorBoundedStream,
-    StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
-    StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier,
-    VisionEncoderArchitecture,
+    generated_token_budget, validate_advertised_generated_token_cap,
+    validate_generated_token_budget, DecoderArchitecture, ImagePreprocessing, ProjectionMetadata,
+    StarVectorBoundedStream, StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput,
+    StarVectorProvider, StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus,
+    StarVectorTier, VisionEncoderArchitecture,
 };
 pub use stop::{StopChunk, StopMatcher};
 pub use template::{
@@ -94,7 +132,7 @@ pub use template::{
 };
 pub use text_llm::TextLlm;
 pub use thinking::{ThinkingSegmenter, ThinkingSpan};
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{Tokenizer, TokenizerDecodeStream};
 pub use tool::{ToolCall, ToolCallSegmenter, ToolSpec};
 
 /// The crate version, surfaced in conformance / diagnostic messages.

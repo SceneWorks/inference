@@ -1380,13 +1380,15 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
+        // Admission binds the caller's request, including its address. Consume it before
+        // resolving defaults into an internal clone; that clone is not a second request.
+        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
+        self.memory_admission.consume_for_generate(req)?;
         // Resolve an omitted seed once for the whole request. The same value must drive both the
         // autoregressive caption sampler and diffusion so the persisted recipe is reproducible.
         let mut resolved_req = req.clone();
         resolved_req.seed = Some(req.seed.unwrap_or_else(gen_core::default_seed));
         let req = &resolved_req;
-        let _lifecycle = candle_gen::lock_recover(&self.lifecycle);
-        self.memory_admission.consume_for_generate(req)?;
         let stage_residency = req
             .memory
             .as_ref()
@@ -2061,8 +2063,10 @@ mod tests {
         assert!(
             matches!(
                 error,
-                CandleError::Msg(ref reason)
-                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+                // The seal mismatch is a typed `gen_core::Error::Unsupported`; the bridge keeps
+                // the class (sc-24114) instead of stringifying it into a `Msg`.
+                CandleError::Unsupported(ref reason)
+                    if reason.starts_with("artifact seal mismatch after load: ")
             ),
             "unexpected: {error:?}"
         );
@@ -2310,6 +2314,20 @@ mod tests {
         assert!(generator.generate(&copied, &mut |_| {}).is_err());
         configured.width /= 2;
         assert!(generator.generate(&configured, &mut |_| {}).is_err());
+        configured.width *= 2;
+        // The admitted original must get past admission and reach cancellation,
+        // without materializing the full-size metadata fixture's weights.
+        configured.cancel.cancel();
+        let error = generator
+            .generate(&configured, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("cancel"), "{error}");
+        let replay = generator
+            .generate(&configured, &mut |_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(replay.contains("already consumed"), "{replay}");
         scope
             .finish(gen_core::MemoryRunOutcome::Error {
                 message: "adversarial rejection".to_owned(),

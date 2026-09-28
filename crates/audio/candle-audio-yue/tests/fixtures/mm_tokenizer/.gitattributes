@@ -1,0 +1,2 @@
+# Byte-exact copy of the shipped tokenizer (SHA-256 in README.md): no eol rewrite, no diffs.
+tokenizer.json -text -diff

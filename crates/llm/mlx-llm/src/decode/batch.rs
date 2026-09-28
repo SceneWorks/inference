@@ -34,7 +34,7 @@ use core_llm::FinishReason as CoreFinish;
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{default_seed, Decode, FinishReason, GenerationOutput, StreamEvent};
-use crate::decode::{record_lane_token, LaneStep};
+use crate::decode::{record_lane_token, BufferRelease, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::ContiguousKvCache;
@@ -200,6 +200,12 @@ pub(crate) fn generate_batch_with_observer(
             active.push(lane);
         }
     }
+    // The first-row samples above evaluated the (lazy) prefill graph, but this binding lives to
+    // the end of the function and the decode loop only *shadows* it, so without an explicit drop
+    // the prompt-length logits are held for the whole generation. Retire them here; the release
+    // itself is taken on the loop's first `advance`.
+    drop(logits);
+    let mut release = BufferRelease::new();
     // Compact away any sequence that finished during prefill before the first decode step.
     if !keep.is_empty() && keep.len() < n {
         cache.retain_sequences(&keep)?;
@@ -259,6 +265,8 @@ pub(crate) fn generate_batch_with_observer(
                 next_active.push(lane);
             }
         }
+        // After sampling: the step's graph has been evaluated, so its transients are freeable.
+        release.advance(1);
         if next_active.is_empty() {
             break;
         }

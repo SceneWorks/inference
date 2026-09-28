@@ -1,0 +1,65 @@
+[package]
+name = "candle-audio-yue2"
+version = "0.0.0"
+edition = "2021"
+description = "YuE2 noncommercial music-generation provider for the SceneWorks Candle audio lane (epic sc-22988) — distinct from YuE1 (`candle-audio-yue`). This slice (sc-22989) is the pinned asset closure: an integrity-checked inventory of YuE2-3B, qwen.tiktoken, the standard/legacy VAEs and the SheetSage2 + MERT-v2-FullSong cover closure, offline snapshot verification against committed conversion manifests, and the licence policy that separates the Apache-2.0 source from the CC BY-NC 4.0 weights."
+# The crate's own code. The model WEIGHTS it resolves are CC BY-NC 4.0 (see `licenses/` and the
+# `license` module); the weights are never vendored here.
+license = "Apache-2.0"
+repository = "https://github.com/SceneWorks/inference"
+keywords = ["candle", "audio", "music", "yue2"]
+categories = ["science"]
+
+[dependencies]
+# Shared candle audio commons: re-exports `gen_core` (the `ComponentLicense` rows) and
+# `candle_core` (the native safetensors loader the tensor-value check runs through), so this crate
+# resolves the SAME candle build + gen-core rev as the catalog it will register into.
+candle-audio = { path = "../candle-audio" }
+# Shared decoder primitives the YuE2 MoT backbone reuses (sc-22991): the preallocated KV cache,
+# grouped-query SDPA, RoPE tables/rotation, linear/SwiGLU/embedding leaves, and the seeded
+# `TokenRng` stream. Same workspace candle pin as `candle-audio`.
+candle-llm = { workspace = true }
+# The workspace's cuBLASLt FP8 E4M3 GEMM and the sm_89 8-bit capability floor (sc-22995): the
+# experimental FP8 AR mode is upstream's `torch._scaled_mm`, which is that GEMM. CPU-only builds
+# compile only its capability constants; the handle is `cuda`-gated.
+candle-quant-kernels = { workspace = true }
+# `VarBuilder` over the verified safetensors (dtype conversion on load).
+candle-nn = { workspace = true }
+# Streaming SHA-256 over every pinned file as it is read from the snapshot.
+sha2 = { workspace = true }
+# Committed conversion manifests (`manifests/*.json`) and safetensors headers.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Native text tokenizer (sc-22990): upstream's pre-tokenizer pattern needs a lookahead
+# (`\s+(?!\S)`), which `regex` lacks — fancy-regex is the engine tiktoken itself uses. `regex`
+# supplies the Unicode-15.0 age class that pins NFC to the reference's Unicode version. Both, and
+# unicode-normalization, are already in the resolved graph.
+fancy-regex = "0.17"
+regex = { workspace = true }
+unicode-normalization = "0.1.25"
+
+[build-dependencies]
+# `build.rs` digests `src/` into `YUE2_SOURCE_DIGEST`, the runtime identity bound into every run and
+# stage identity (sc-22994).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+# RAII roots for the synthetic snapshot fixtures (missing / corrupt / truncated shards, cache miss).
+tempfile = { workspace = true }
+
+[features]
+default = []
+# Apple Metal / NVIDIA CUDA backends, forwarded to the audio commons. Not in `default`. `cuda` also
+# enables the experimental FP8 AR mode's cuBLASLt path (sc-22995).
+metal = [
+    "candle-audio/metal",
+    "candle-llm/metal",
+    "candle-nn/metal",
+    "candle-quant-kernels/metal",
+]
+cuda = [
+    "candle-audio/cuda",
+    "candle-llm/cuda",
+    "candle-nn/cuda",
+    "candle-quant-kernels/cuda",
+]

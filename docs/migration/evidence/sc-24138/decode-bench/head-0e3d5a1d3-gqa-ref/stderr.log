@@ -1,0 +1,6 @@
+[decode_bench] reference           71.05 tok/s  prefill 0.019s
+[decode_bench] step_model K=0          70.61 tok/s  accept 0.000  fwd/tok 1.000  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=2          71.72 tok/s  accept 0.147  fwd/tok 0.875  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=3          75.31 tok/s  accept 0.087  fwd/tok 0.887  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=4          75.39 tok/s  accept 0.076  fwd/tok 0.875  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] wrote C:\inf-target\evidence\head-0e3d5a1d3-gqa-ref\decode_bench.json

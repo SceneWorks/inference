@@ -26,6 +26,9 @@ pub use gen_core::{
 
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;
+// Narrowing helpers for the provider-declared architecture axes (epic SC-22657): shared so a
+// fabricated or zeroed axis cannot appear in one family and not another.
+pub mod architecture_facts;
 pub mod array;
 pub mod asset_facts;
 // Query-row bounded attention (SC-15615): the MLX half of ladder rung 3, shared so no family forks it.
@@ -116,10 +119,10 @@ pub use gen_core::weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 pub use generator::{
     default_seed, ActivationMemoryAnchor, Capabilities, Conditioning, ConditioningKind,
     ControlClipRef, ControlKind, GenerationOutput, GenerationPhase, GenerationRequest, Generator,
-    KeyframeRef, Modality, ModelDescriptor, PhaseAdapter, ReplacementMode, SizeFloor,
-    StagedResidencyAvailability, StepSupport, VideoClipRef,
+    KeyframeRef, Modality, ModelDescriptor, OutputChannels, PhaseAdapter, ReplacementMode,
+    SizeFloor, StagedResidencyAvailability, StepSupport, VideoClipRef,
 };
-pub use media::{AudioTrack, Image};
+pub use media::{AudioTrack, Image, RgbaImage};
 pub use registry::{
     CaptionerRegistration, ModelRegistration, PerComponentBytes, ProviderRegistry,
     ProviderRegistryBuilder, TrainerRegistration, TransformRegistration,

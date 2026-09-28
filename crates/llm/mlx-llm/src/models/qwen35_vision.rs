@@ -254,14 +254,35 @@ impl Qwen35VisionModel {
     /// Load from a checkpoint. `prefix` points at the visual tower module — `model.visual` for the
     /// `qwen3_5` checkpoint.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, false)
+    }
+
+    /// Load the frozen Bonsai MLX vision tower. Its Conv3d kernel is stored as
+    /// `[out, temporal, height, width, channels]`, while preprocessed patches are flattened in
+    /// `[channels, temporal, height, width]` order.
+    pub fn from_mlx_weights(w: &Weights, prefix: &str, cfg: Qwen35VisionConfig) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, true)
+    }
+
+    fn from_weights_layout(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35VisionConfig,
+        mlx_channels_last: bool,
+    ) -> Result<Self> {
         let p = |leaf: &str| join(prefix, leaf);
         let req = |k: String| -> Result<Array> { w.require(&k).cloned() };
         let opt = |k: String| -> Option<Array> { w.get(&k).cloned() };
 
         // Conv3d weight `[hidden, C, T, P, P]` → reshaped `[hidden, C·T·P·P]` linear.
+        let patch_weight = req(p("patch_embed.proj.weight"))?;
+        let patch_weight = if mlx_channels_last {
+            patch_weight.transpose_axes(&[0, 4, 1, 2, 3])?
+        } else {
+            patch_weight
+        };
         let patch_embed = PatchEmbed {
-            weight: req(p("patch_embed.proj.weight"))?
-                .reshape(&[cfg.hidden_size, cfg.patch_in()])?,
+            weight: patch_weight.reshape(&[cfg.hidden_size, cfg.patch_in()])?,
             bias: opt(p("patch_embed.proj.bias")),
         };
         let pos_embed = req(p("pos_embed.weight"))?;
@@ -883,14 +904,34 @@ mod tests {
             &[out_h],
         );
 
+        let mut mlx_map = HashMap::new();
+        for (name, value) in &m {
+            let target = name.replacen("model.visual", "vision_tower", 1);
+            let value = if name == "model.visual.patch_embed.proj.weight" {
+                value.transpose_axes(&[0, 2, 3, 4, 1]).unwrap()
+            } else {
+                value.clone()
+            };
+            mlx_map.insert(target, value);
+        }
+
         let w = Weights::from_map(m);
         let model = Qwen35VisionModel::from_weights(&w, "model.visual", cfg.clone()).unwrap();
+        let mlx_weights = Weights::from_map(mlx_map);
+        let mlx_model =
+            Qwen35VisionModel::from_mlx_weights(&mlx_weights, "vision_tower", cfg.clone()).unwrap();
 
         let pixel = Array::from_slice(&arr(&j, "pixel"), &[n, cfg.patch_in()]);
         let out = model.forward(&pixel, &grid).unwrap();
+        let mlx_out = mlx_model.forward(&pixel, &grid).unwrap();
         assert_eq!(out.shape(), &[n / 4, out_h]);
 
         let got = out
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let mlx_got = mlx_out
             .as_dtype(Dtype::Float32)
             .unwrap()
             .as_slice::<f32>()
@@ -907,6 +948,7 @@ mod tests {
             rel < 3e-3,
             "vision encoder vs reference: rel err {rel} (max|Δ| {max_abs}, max|exp| {max_mag})\n got {got:?}\n exp {exp:?}"
         );
+        assert_eq!(got, mlx_got, "MLX channels-last Conv3d conversion drifted");
     }
 
     fn qwen3vl_oracle() -> serde_json::Value {

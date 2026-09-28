@@ -11,8 +11,13 @@
 //! *mid-stream* stops promptly and returns the partial output marked
 //! [`FinishReason::Cancelled`].
 
+use std::time::Instant;
+
+use core_llm::GenerationTimings;
+use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
 
+use super::BufferRelease;
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::ContiguousKvCache;
@@ -96,6 +101,65 @@ pub struct GenerationOutput {
     pub tokens: Vec<i32>,
     /// Why generation stopped.
     pub finish_reason: FinishReason,
+}
+
+/// A generation result whose synchronized phase timer remains live until provider-side stream
+/// processing has completed. The provider finishes the timer after detokenization, stop handling,
+/// and the terminal callback so `decode` includes the complete stream-dispatch path.
+pub(crate) struct TimedGenerationOutput {
+    pub(crate) output: GenerationOutput,
+    pub(crate) timer: GenerationTimer,
+}
+
+/// Two-phase timer with an explicit accelerator synchronization boundary between prefill and
+/// decode. Keeping this stateful prevents a caller from accidentally measuring lazy MLX graph
+/// submission as completed prefill work.
+pub(crate) struct GenerationTimer {
+    prefill_started: Instant,
+    prefill: Option<std::time::Duration>,
+    decode_started: Option<Instant>,
+}
+
+impl GenerationTimer {
+    pub(crate) fn start() -> Self {
+        Self::start_at(Instant::now())
+    }
+
+    pub(crate) fn start_at(prefill_started: Instant) -> Self {
+        Self {
+            prefill_started,
+            prefill: None,
+            decode_started: None,
+        }
+    }
+
+    /// Evaluate every prefill result/cache sentinel before closing the prefill phase.
+    pub(crate) fn finish_prefill<'a>(
+        &mut self,
+        arrays: impl IntoIterator<Item = &'a Array>,
+    ) -> Result<()> {
+        self.finish_prefill_after(|| Ok(eval(arrays)?))
+    }
+
+    fn finish_prefill_after(&mut self, synchronize: impl FnOnce() -> Result<()>) -> Result<()> {
+        synchronize()?;
+        self.prefill = Some(self.prefill_started.elapsed());
+        self.decode_started = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Finish after the provider has dispatched its terminal stream event.
+    pub(crate) fn finish(self) -> GenerationTimings {
+        GenerationTimings {
+            prefill: self
+                .prefill
+                .expect("prefill must be synchronized before decode starts"),
+            decode: self
+                .decode_started
+                .expect("prefill must be synchronized before decode starts")
+                .elapsed(),
+        }
+    }
 }
 
 /// A per-step logit constraint (e.g. JSON grammar). Before each token the loop asks for the
@@ -254,6 +318,48 @@ fn observe_cache_events(
     Ok(())
 }
 
+/// Synchronized two-phase variant of [`generate_with`]. Tokenization and template rendering happen
+/// before this function; the returned timer deliberately remains live for provider-side stream
+/// processing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_with_timings(
+    decoder: &dyn Decode,
+    prompt_ids: &[i32],
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<TimedGenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    if prompt_ids.is_empty() {
+        return Err(Error::Msg("generate_with_timings: empty prompt".into()));
+    }
+
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let mut cache = decoder.make_cache();
+    let prompt = input_ids(prompt_ids);
+    let mut timer = GenerationTimer::start();
+    let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
+    timer.finish_prefill([&logits])?;
+    let output = decode_loop(
+        decoder,
+        cache.as_mut(),
+        logits,
+        rng,
+        prompt_ids.to_vec(),
+        config,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        &mut None,
+    )?;
+    Ok(TimedGenerationOutput { output, timer })
+}
+
 /// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
 /// (e.g. a [`PagedKvCache`](crate::primitives::PagedKvCache) seeded with shared blocks). Prefills
 /// only `prompt_ids[cache.offset()..]` at that offset, then decodes. The cache is borrowed (not
@@ -343,6 +449,43 @@ pub fn generate_from_prefill(
     )
 }
 
+/// Synchronized variant of [`generate_from_prefill`] for a prefill whose conditioning began at
+/// `prefill_started`. Qwen-VL starts this clock before image/video encoding and fusion.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_from_prefill_with_timings(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    first_logits: Array,
+    history: Vec<i32>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    prefill_started: Instant,
+) -> Result<TimedGenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let mut timer = GenerationTimer::start_at(prefill_started);
+    timer.finish_prefill([&first_logits])?;
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let output = decode_loop(
+        decoder,
+        cache,
+        first_logits,
+        rng,
+        history,
+        config,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        &mut None,
+    )?;
+    Ok(TimedGenerationOutput { output, timer })
+}
+
 /// The token-by-token decode loop shared by [`generate_with`] and the prefix-cached path
 /// ([`crate::decode::generate_cached`]): given the prefill `logits`, an RNG, the seeded `history`
 /// (the prompt — the repetition-penalty window), and a `cache` already positioned past the prompt,
@@ -367,6 +510,11 @@ pub(crate) fn decode_loop(
 ) -> Result<GenerationOutput> {
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
+    // Every caller hands us `logits` straight from its prefill — still lazy. The first `sample`
+    // below evaluates that graph, but the prefill `logits` array itself stays live until step 0
+    // reassigns the binding at the bottom of this loop; the post-prefill release therefore rides
+    // the first `release.advance`, which sits just after that reassignment.
+    let mut release = BufferRelease::new();
 
     for step in 0..config.max_new_tokens {
         // Pulling logits to host for sampling forces a graph eval each step, so this check is
@@ -419,7 +567,10 @@ pub(crate) fn decode_loop(
         // Feed the new token back; its absolute position is the current cache length.
         let offset = cache.offset();
         let tok = input_ids(&[next]);
+        // This reassignment drops the previous `logits`; on step 0 that is the prefill's
+        // prompt-length logits, so the release below is the first moment they are freeable.
         logits = decoder.step(&tok, cache, offset)?;
+        release.advance(1);
     }
 
     on_event(StreamEvent::Done {
@@ -562,6 +713,37 @@ mod tests {
         let mut attached: Option<&mut dyn crate::campaign::Observer> = Some(&mut observer);
         observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
         observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
-        assert_eq!(observer.cache_snapshots, vec![(16, 1, 4), (16, 1, 4)]);
+        assert_eq!(observer.cache_snapshots, vec![(4096, 1, 4), (4096, 1, 4)]);
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn prefill_boundary_advances_only_after_synchronization_succeeds() {
+        let mut failed = GenerationTimer::start();
+        let error = failed
+            .finish_prefill_after(|| Err(Error::Msg("sync failed".into())))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "sync failed");
+        assert!(failed.prefill.is_none());
+        assert!(failed.decode_started.is_none());
+
+        let synchronized = Cell::new(false);
+        let mut completed = GenerationTimer::start();
+        completed
+            .finish_prefill_after(|| {
+                synchronized.set(true);
+                Ok(())
+            })
+            .unwrap();
+        assert!(synchronized.get());
+        assert!(completed.prefill.is_some());
+        assert!(completed.decode_started.is_some());
+        let _measured = completed.finish();
     }
 }

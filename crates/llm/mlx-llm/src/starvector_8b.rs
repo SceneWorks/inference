@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use core_llm::{
     Channel, Content, DecoderArchitecture, Error as CoreError, FinishReason, ImagePreprocessing,
-    IncrementalDetok, LoadSpec, ProjectionMetadata, Result as CoreResult, StarVectorBoundedStream,
+    LoadSpec, ProjectionMetadata, Result as CoreResult, StarVectorBoundedStream,
     StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
     StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier, StreamEvent,
     TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer,
@@ -41,6 +41,12 @@ const IMAGE_SIZE: usize = 384;
 const IMAGE_TOKENS: i32 = 576;
 const VISION_HIDDEN: i32 = 1024;
 const DECODER_HIDDEN: i32 = 4608;
+const MAX_CONTEXT_TOKENS: usize = 16_000;
+// The exact snapshot tokenizer encodes the fixed `<svg` decoder prompt as two IDs; `load`
+// verifies this against the local snapshot before provider advertisement is trusted.
+const SVG_PROMPT_TOKEN_COUNT: usize = 2;
+const MAX_NEW_TOKENS: u32 =
+    (MAX_CONTEXT_TOKENS - (IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT)) as u32;
 
 /// A fully loaded StarVector-8B MLX model. Dropping it releases all MLX array handles; reload is
 /// an ordinary new explicit-registry load.
@@ -157,15 +163,23 @@ impl StarVector8bProvider {
         }
         let dir = Path::new(&spec.source);
         validate_snapshot(dir).map_err(to_core)?;
+        let descriptor = descriptor();
+        let starvector = starvector_descriptor();
+        let tokenizer = Tokenizer::from_hf_byte_level_bpe(
+            dir.join("vocab.json"),
+            dir.join("merges.txt"),
+            dir.join("tokenizer_config.json"),
+        )?;
+        validate_loaded_context_cap(
+            &descriptor,
+            &starvector,
+            tokenizer.encode(SVG_PROMPT, false)?.len(),
+        )?;
         Ok(Self {
-            descriptor: descriptor(),
-            starvector: starvector_descriptor(),
+            descriptor,
+            starvector,
             model: StarVector8bModel::from_dir(dir).map_err(to_core)?,
-            tokenizer: Tokenizer::from_hf_byte_level_bpe(
-                dir.join("vocab.json"),
-                dir.join("merges.txt"),
-                dir.join("tokenizer_config.json"),
-            )?,
+            tokenizer,
         })
     }
 
@@ -227,20 +241,20 @@ impl StarVector8bProvider {
             seed: request.text_request.seed,
             stop_tokens: vec![EOS_TOKEN_ID],
         };
-        let mut tokens = Vec::new();
-        let mut detok = IncrementalDetok::new();
+        let mut detok = self.tokenizer.decode_stream(true);
         let stopped = Cell::new(false);
         let stream_error = RefCell::new(None);
-        let tokenizer = &self.tokenizer;
         let mut decode_event = |event: DecodeEvent| {
             if let DecodeEvent::Token { id, step } = event {
-                tokens.push(id as u32);
-                let Ok(text) = tokenizer.decode(&tokens, true) else {
-                    return;
+                let delta = match detok.step(id as u32) {
+                    Ok(delta) => delta,
+                    Err(error) => {
+                        *stream_error.borrow_mut() = Some(error);
+                        stopped.set(true);
+                        return;
+                    }
                 };
-                let Some(delta) = detok.push(&text) else {
-                    return;
-                };
+                let delta = delta.as_deref().unwrap_or("");
                 let status = match guard.push(delta, began.elapsed()) {
                     Ok(status) => status,
                     Err(error) => {
@@ -249,13 +263,18 @@ impl StarVector8bProvider {
                         return;
                     }
                 };
+                on_event(StarVectorStreamEvent::Progress {
+                    generated_tokens: guard.generated_tokens(),
+                });
                 match status {
                     StarVectorStreamStatus::Continue
                     | StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot) => {
-                        on_event(StarVectorStreamEvent::Source {
-                            text: delta.to_owned(),
-                            index: step as u32 + 1,
-                        });
+                        if !delta.is_empty() {
+                            on_event(StarVectorStreamEvent::Source {
+                                text: delta.to_owned(),
+                                index: step as u32 + 1,
+                            });
+                        }
                     }
                     StarVectorStreamStatus::Stop(_) => {}
                 }
@@ -276,6 +295,22 @@ impl StarVector8bProvider {
         .map_err(to_core)?;
         if let Some(error) = stream_error.into_inner() {
             return Err(error);
+        }
+        if !stopped.get() {
+            if let Some(delta) = detok.finish()? {
+                let status = guard.push_decoded_suffix(&delta, began.elapsed())?;
+                match status {
+                    StarVectorStreamStatus::Continue
+                    | StarVectorStreamStatus::Stop(StarVectorFinishReason::CompleteRoot) => {
+                        on_event(StarVectorStreamEvent::Source {
+                            text: delta,
+                            index: generated.tokens.len() as u32,
+                        });
+                    }
+                    StarVectorStreamStatus::Stop(_) => {}
+                }
+                stopped.set(!matches!(status, StarVectorStreamStatus::Continue));
+            }
         }
         if !stopped.get() {
             match generated.finish_reason {
@@ -360,6 +395,7 @@ impl TextLlm for StarVector8bProvider {
                     channel: Channel::Content,
                 });
             }
+            StarVectorStreamEvent::Progress { .. } => {}
             StarVectorStreamEvent::Done {
                 finish_reason,
                 generated_tokens,
@@ -375,6 +411,7 @@ impl TextLlm for StarVector8bProvider {
             }
         })?;
         Ok(TextLlmOutput {
+            timings: None,
             text: output.svg.unwrap_or_default(),
             thinking: None,
             tool_calls: Vec::new(),
@@ -382,6 +419,8 @@ impl TextLlm for StarVector8bProvider {
                 prompt_tokens: IMAGE_TOKENS as u32 + prompt_tokens,
                 generated_tokens: output.generated_tokens,
             },
+            mtp: None,
+            decode: None,
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
@@ -408,17 +447,42 @@ pub fn descriptor() -> TextLlmDescriptor {
         family: "starvector".into(),
         backend: "mlx".into(),
         capabilities: TextLlmCapabilities {
-            max_context_tokens: 16_000,
-            max_new_tokens: 4_000,
+            max_context_tokens: MAX_CONTEXT_TOKENS,
+            max_new_tokens: MAX_NEW_TOKENS,
             supports_system_prompt: false,
             supports_vision: true,
             supports_video: false,
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: Vec::new(),
         },
     }
+}
+
+fn validate_loaded_context_cap(
+    descriptor: &TextLlmDescriptor,
+    starvector: &StarVectorDescriptor,
+    prompt_tokens: usize,
+) -> CoreResult<()> {
+    let prefill_tokens = usize::try_from(starvector.projection.image_token_count)
+        .map_err(|_| {
+            CoreError::InvalidRequest("StarVector-8B image prefix does not fit usize".into())
+        })?
+        .checked_add(prompt_tokens)
+        .ok_or_else(|| {
+            CoreError::InvalidRequest("StarVector-8B prefill token count overflow".into())
+        })?;
+    core_llm::validate_advertised_generated_token_cap(
+        descriptor.capabilities.max_new_tokens,
+        descriptor.capabilities.max_context_tokens,
+        prefill_tokens,
+    )
 }
 
 /// Tensor-neutral model facts visible through the shared StarVector contract.
@@ -523,6 +587,7 @@ fn sampling(value: &core_llm::Sampling) -> SamplingParams {
         temperature: value.temperature,
         top_p: value.top_p,
         top_k: value.top_k,
+        presence_penalty: value.presence_penalty,
         repetition_penalty: value.repetition_penalty,
         repetition_context: value.repetition_context,
     }
@@ -582,6 +647,14 @@ mod tests {
         let star = starvector_descriptor();
         assert_eq!(text.id, PROVIDER_ID);
         assert!(text.capabilities.supports_vision);
+        assert_eq!(text.capabilities.max_context_tokens, MAX_CONTEXT_TOKENS);
+        assert_eq!(text.capabilities.max_new_tokens, 15_422);
+        core_llm::validate_advertised_generated_token_cap(
+            text.capabilities.max_new_tokens,
+            text.capabilities.max_context_tokens,
+            IMAGE_TOKENS as usize + SVG_PROMPT_TOKEN_COUNT,
+        )
+        .unwrap();
         assert_eq!(star.tier, StarVectorTier::EightB);
         assert_eq!(star.preprocessing.image_size, 384);
         assert!(!star.preprocessing.preserve_aspect_ratio);

@@ -393,6 +393,10 @@ fn build_contract(
         variant,
         spec,
         format!("{PHYSICAL_RECEIPT_PREFIX}{}", hex(&assembly.finalize())),
+        Some(MemoryCalibrationIdentity::new(
+            production_calibration_fingerprint(variant),
+            spec.load_shape,
+        )),
         MemoryAssetFacts {
             base_bytes: conditioning
                 .saturating_add(transformer)
@@ -405,13 +409,40 @@ fn build_contract(
     ))
 }
 
+/// The route label the identity strings carry.
+const fn route_label(variant: SanaVariant) -> &'static str {
+    match variant {
+        SanaVariant::Base => "base",
+        SanaVariant::Sprint => "sprint",
+    }
+}
+
+/// The PRODUCTION calibration identity of one Candle SANA route (sc-22731, epic sc-22723 E1/E4):
+/// `sana-candle-dense-{base|sprint}-full-ladder-v1`, the strings the SceneWorks manifest declares.
+/// The lane loads exactly one tier (`validate_load_spec` refuses `quantize = Some(_)`), so the
+/// tier is spelled `dense` rather than carried as an axis.
+pub fn production_calibration_fingerprint(variant: SanaVariant) -> String {
+    format!("sana-candle-dense-{}-full-ladder-v1", route_label(variant))
+}
+
+/// The weights-free registry-conformance identity: the same route in a namespace that can never
+/// collide with [`production_calibration_fingerprint`], so a fixture contract can never be mistaken
+/// for measured evidence of the load it describes.
+pub fn weights_free_calibration_fingerprint(variant: SanaVariant) -> String {
+    format!(
+        "sana-candle-dense-{}-weights-free-conformance-v1",
+        route_label(variant)
+    )
+}
+
 /// The registry-only, weights-free contract: the exact route declaration the sealed contract
 /// publishes, with zero asset facts injected and no filesystem traversal.
 ///
 /// The physical receipt is deliberately absent rather than synthesized — it is a digest OF the
 /// pinned assets, and a stand-in would be a machine-independent-looking value standing for facts
 /// nobody measured. The route stays distinguishable through `contract.calibration`, which is keyed
-/// on the variant.
+/// on the variant — in the [`weights_free_calibration_fingerprint`] namespace, never the production
+/// one, so this contract cannot be filed as evidence of a real load.
 pub fn weights_free_contract(
     variant: SanaVariant,
     spec: &LoadSpec,
@@ -421,14 +452,72 @@ pub fn weights_free_contract(
         variant,
         spec,
         String::new(),
+        Some(MemoryCalibrationIdentity::new(
+            weights_free_calibration_fingerprint(variant),
+            spec.load_shape,
+        )),
         MemoryAssetFacts::default(),
     ))
+}
+
+/// Activation dtype the loaded SANA pipeline computes in. `pipeline.rs` coerces the trunk, the
+/// DC-AE and the gemma-2-2b-it caption encoder to `DType::F32` on load — the parity precision and
+/// the dense-GEMM-safe path — so this is the provider's real activation width.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F32;
+
+/// Architecture axes for one SANA variant (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: `SanaTransformer::from_weights` is handed the
+/// hardcoded [`crate::config::SanaTransformerConfig`] the variant selects, and the decoder is built
+/// from [`crate::config::DcAeConfig::sana_f32c32`]. Reading those same declarations keeps the
+/// published geometry identical to the model actually built. Base and Sprint share the Linear-DiT
+/// backbone byte-for-byte — Sprint differs only in `guidance_embeds` / `qk_norm` — so the trunk
+/// axes are the same for both, and the variant is still threaded through rather than assumed.
+///
+/// `vae_spatial_scale` comes from the DC-AE's own [`DcAeConfig::spatial_compression`] (x32), not
+/// from a KL-VAE stage list: SANA's autoencoder is a deep-compression autoencoder whose deepest
+/// stage carries no resample, which is exactly why the shared `spatial_scale_from_stages` helper
+/// would read it wrong. `vae_temporal_scale` stays `None` — the DC-AE is an **image**
+/// autoencoder with no temporal axis, and a structurally absent axis is declared absent, never
+/// zero (E2).
+fn architecture_facts(variant: SanaVariant, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    /// The config fields are `i32`; a negative or zero value is not an axis.
+    fn declared_i32(value: i32) -> Option<u32> {
+        usize::try_from(value).ok().and_then(af::declared)
+    }
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`.
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = match variant {
+        SanaVariant::Base => crate::config::SanaTransformerConfig::sana_1600m(),
+        SanaVariant::Sprint => crate::config::SanaTransformerConfig::sana_sprint_1600m(),
+    };
+    let dc_ae = crate::config::DcAeConfig::sana_f32c32();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: declared_i32(dit.num_attention_heads),
+        head_dim: declared_i32(dit.attention_head_dim),
+        transformer_blocks: declared_i32(dit.num_layers),
+        // SANA patchifies 1x1: the DC-AE has already compressed x32, so the trunk takes the latent
+        // grid as-is.
+        patch_size: declared_i32(dit.patch_size),
+        latent_channels: declared_i32(dc_ae.latent_channels),
+        vae_spatial_scale: declared_i32(dc_ae.spatial_compression()),
+        // Structurally absent: the DC-AE is an image autoencoder with no frames-per-latent axis.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
 }
 
 fn assemble_contract(
     variant: SanaVariant,
     spec: &LoadSpec,
     receipt: String,
+    calibration: Option<MemoryCalibrationIdentity>,
     asset_facts: MemoryAssetFacts,
 ) -> MemoryProviderContract {
     let transformer = asset_facts.transformer_bytes;
@@ -443,6 +532,7 @@ fn assemble_contract(
         },
     );
     contract.load_shape = spec.load_shape;
+    contract.architecture_facts = architecture_facts(variant, spec);
     for capability in &mut contract.strategies {
         capability.support =
             if capability.strategy == MemoryStrategy::BoundedTransformerResidency && !streamable {
@@ -522,16 +612,7 @@ fn assemble_contract(
             }]
         },
     };
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        format!(
-            "sana-candle-dense-{}-full-ladder-v1",
-            match variant {
-                SanaVariant::Base => "base",
-                SanaVariant::Sprint => "sprint",
-            }
-        ),
-        spec.load_shape,
-    ));
+    contract.calibration = calibration;
     contract.asset_facts = asset_facts;
     contract
 }
@@ -1190,6 +1271,61 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::{LoadShape, Quant};
 
+    /// AC (epic SC-22657, E2): both SANA variants publish the geometry the loader actually builds —
+    /// the `SanaTransformerConfig` trunk and the `DcAeConfig` decoder — the contract passes the
+    /// shared facts conformance check, and the weights-free surface (whose sentinel root is not on
+    /// disk) publishes nothing at all.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        for variant in [SanaVariant::Base, SanaVariant::Sprint] {
+            let (_temp, root) = fixture_snapshot(variant);
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root));
+            spec.load_shape = LoadShape::DeferredMaterialization;
+            let contract = provider_contract(variant, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `SanaTransformerConfig::sana_1600m()` — Sprint inherits the same trunk.
+                    attention_heads: Some(70),
+                    head_dim: Some(32),
+                    transformer_blocks: Some(20),
+                    // 1x1: the DC-AE already applied the x32 compression.
+                    patch_size: Some(1),
+                    // `DcAeConfig::sana_f32c32().latent_channels`.
+                    latent_channels: Some(32),
+                    // `DcAeConfig::spatial_compression()` — six stages, five x2 rungs.
+                    vae_spatial_scale: Some(32),
+                    // Structurally absent: the DC-AE is an image autoencoder, no temporal axis.
+                    vae_temporal_scale: None,
+                    // `pipeline.rs` loads every component at `DType::F32`.
+                    activation_dtype_width: Some(4),
+                },
+                "{variant:?} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            // The facts walk also re-checks the E1 byte decomposition, and `fixture_snapshot`
+            // writes every component at the same synthetic size — a fixture artifact, not a
+            // contract defect. Run the full walk over the same-facts contract that publishes no
+            // asset bytes at all, so the E2 gate is exercised without that collision.
+            let axes_only = weights_free_contract(variant, &spec).unwrap();
+            assert_eq!(axes_only.architecture_facts, contract.architecture_facts);
+            gen_core_testkit::assert_memory_contract_facts_conform(&axes_only);
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract = weights_free_contract(variant, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{variant:?} weights-free facts must be empty"
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+        }
+    }
+
     fn sealed(variant: SanaVariant) -> (tempfile::TempDir, Arc<SanaLoadSeal>) {
         let (temp, root) = fixture_snapshot(variant);
         let mut spec = LoadSpec::new(WeightsSource::Dir(root));
@@ -1385,6 +1521,49 @@ mod tests {
                 "{}: a weights-free contract has no measured resident bytes to attest",
                 contract.provider_id
             );
+        }
+    }
+
+    /// **A weights-free declaration never publishes the string a production load publishes**
+    /// (sc-22731). The sealed contract carries `sana-candle-dense-{base|sprint}-full-ladder-v1` —
+    /// the strings the SceneWorks manifest declares — and the registry-only contract carries the
+    /// same route in the `…-weights-free-conformance-v1` namespace, so a fixture contract can never
+    /// be filed as evidence of a real load.
+    ///
+    /// Mutation that fails this: passing `production_calibration_fingerprint` from
+    /// `weights_free_contract` (or hard-coding the string back into `assemble_contract`) — the
+    /// two contracts publish one identity.
+    #[test]
+    fn the_weights_free_identity_is_never_the_production_identity() {
+        for (variant, production, conformance) in [
+            (
+                SanaVariant::Base,
+                "sana-candle-dense-base-full-ladder-v1",
+                "sana-candle-dense-base-weights-free-conformance-v1",
+            ),
+            (
+                SanaVariant::Sprint,
+                "sana-candle-dense-sprint-full-ladder-v1",
+                "sana-candle-dense-sprint-weights-free-conformance-v1",
+            ),
+        ] {
+            let (_temp, seal) = sealed(variant);
+            let sealed_identity = seal.contract().calibration.clone().unwrap();
+            assert_eq!(sealed_identity.fingerprint, production);
+            assert_eq!(
+                sealed_identity.load_shape,
+                LoadShape::DeferredMaterialization
+            );
+
+            let mut spec = LoadSpec::new(WeightsSource::Dir("unused".into()));
+            spec.load_shape = LoadShape::EagerMaterialization;
+            let fixture = weights_free_contract(variant, &spec).unwrap();
+            let fixture_identity = fixture.calibration.clone().unwrap();
+            assert_eq!(fixture_identity.fingerprint, conformance);
+            assert_eq!(fixture_identity.load_shape, LoadShape::EagerMaterialization);
+            assert_ne!(fixture_identity.fingerprint, sealed_identity.fingerprint);
+            assert_eq!(production_calibration_fingerprint(variant), production);
+            assert_eq!(weights_free_calibration_fingerprint(variant), conformance);
         }
     }
 

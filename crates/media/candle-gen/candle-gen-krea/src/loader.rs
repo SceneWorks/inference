@@ -340,16 +340,7 @@ impl Weights {
         dtype: DType,
         shapes: DeclaredLogicalShapes<'_>,
     ) -> Result<Self> {
-        // The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the
-        // packed rows packed, everything else prices the dense fallback. Passing the real device
-        // (rather than a fixed policy) keeps the plan's pricing the pricing of *this* load.
-        //
-        // The fp8 native leg is MASKED (sc-11045 fix round, MAJOR 10): this import constructs no
-        // `Fp8Linear` from a packed fp8 row — `linear_detect_planned`'s arm is a typed refusal —
-        // so pricing fp8 `Packed` on an sm_89+ host would hard-error a mixed fp8+NVFP4 file on a
-        // plan this loader itself priced. Masked, an fp8 row takes the exact dense decode
-        // (`weight_scale` applied) through the shared reader on every host.
-        let residency = CandleCodecResidency::probe(device).with_dense_fp8();
+        let residency = native_import_residency(device);
         Self::from_pinned_native_file_with_residency(
             pinned_source,
             device,
@@ -1388,12 +1379,41 @@ pub fn convrot_diffusers_to_native(key: &str) -> Option<String> {
 /// (the ConvRot export, and the reason [`from_convrot_file`](Weights::from_convrot_file) is behavior-
 /// preserving: it detects an empty prefix and remaps exactly as before).
 fn detect_native_prefix(st: &MmapedSafetensors) -> String {
-    const PREFIX: &str = "model.diffusion_model.";
-    if st.tensors().iter().any(|(k, _)| k.starts_with(PREFIX)) {
+    detect_native_prefix_from_keys(st.tensors().iter().map(|(k, _)| k.as_str()))
+}
+
+/// [`detect_native_prefix`] over a bare key iterator, so the memory contract can classify a file
+/// from its headers alone — without an mmap, and with the same rule the loader applies.
+pub(crate) fn detect_native_prefix_from_keys<'a>(
+    mut keys: impl Iterator<Item = &'a str>,
+) -> String {
+    const PREFIX: &str =
+        crate::native_mapping::KreaNativeToDiffusersMapping::DIFFUSION_MODEL_PREFIX;
+    if keys.any(|k| k.starts_with(PREFIX)) {
         PREFIX.to_string()
     } else {
         String::new()
     }
+}
+
+/// The residency policy every planned single-file Krea import — the loader AND the memory
+/// contract that prices it — plans under (sc-20651; SC-22667 review).
+///
+/// The engine's own residency policy: a CUDA device at the NVFP4 `sm_120` floor prices the packed
+/// rows packed, everything else prices the dense fallback. Passing the real device (rather than a
+/// fixed policy) keeps the plan's pricing the pricing of *this* load.
+///
+/// The fp8 native leg is MASKED (sc-11045 fix round, MAJOR 10): this import constructs no
+/// `Fp8Linear` from a packed fp8 row — `linear_detect_planned`'s arm is a typed refusal — so
+/// pricing fp8 `Packed` on an sm_89+ host would hard-error a mixed fp8+NVFP4 file on a plan this
+/// loader itself priced. Masked, an fp8 row takes the exact dense decode (`weight_scale` applied)
+/// through the shared reader on every host — which is why a memory contract must price an fp8 row
+/// at the DiT's dense width, never at its stored byte.
+///
+/// One definition for both callers is the point: pricing and loading cannot disagree about which
+/// rows stay packed, because that disagreement *is* the fit gate falsely admitting or rejecting.
+pub(crate) fn native_import_residency(device: &Device) -> CandleCodecResidency {
+    CandleCodecResidency::probe(device).with_dense_fp8()
 }
 
 /// Read `{dir}/config.json`'s `quantization` block: `Ok(Some(cfg))` for a packed tier, `Ok(None)` for

@@ -4,7 +4,7 @@
 //! absolute positions and multi-query attention, and treating it as a Llama alias would load the
 //! checkpoint while producing numerically unrelated SVG source.
 
-use mlx_rs::ops::{add, split_sections};
+use mlx_rs::ops::{add, matmul, split_sections};
 use mlx_rs::Array;
 
 use crate::decode::Decode;
@@ -13,6 +13,37 @@ use crate::primitives::attention::sdpa_causal;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::nn::{embed, gelu_tanh, layer_norm, linear};
 use crate::primitives::Weights;
+
+/// Project a multi-row GPTBigCode prefill as a batch of independent matrix-vector products.
+///
+/// The StarVector-1B decoder weights are f32. On NAX-capable Metal, an ordinary `[B, S, K] @
+/// [K, N]` projection flattens `B * S` into the matrix row dimension and permits the TF32 NAX GEMM
+/// path. Inserting a singleton row dimension gives MLX `[B, S, 1, K] @ [1, K, N]`: the pinned
+/// backend retains `M = 1` and dispatches its float-accumulating batched GEMV kernel. The views do
+/// not replicate the shared weight, and the result is reshaped back to the ordinary linear layout.
+/// One-row decode already dispatches GEMV, so it stays on the shared linear helper.
+fn linear_batched_gemv(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> {
+    let shape = x.shape();
+    if shape.len() != 3 || weight.shape().len() != 2 || shape[2] != weight.shape()[1] {
+        return Err(Error::Msg(format!(
+            "gpt_bigcode: invalid projection shapes {:?} and {:?}",
+            shape,
+            weight.shape()
+        )));
+    }
+    if shape[0] == 1 && shape[1] == 1 {
+        return linear(x, weight, bias);
+    }
+
+    let vectors = x.expand_dims(-2)?;
+    let matrices = weight.t().expand_dims(0)?;
+    let projected =
+        matmul(&vectors, &matrices)?.reshape(&[shape[0], shape[1], weight.shape()[0]])?;
+    match bias {
+        Some(bias) => Ok(add(&projected, bias)?),
+        None => Ok(projected),
+    }
+}
 
 /// Fixed decoder geometry of `starvector/starvector-1b-im2svg`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,9 +222,9 @@ impl GptBigCodeLayer {
         )?;
         // The published StarVector safetensors store every GPTBigCode projection in ordinary
         // `[out, in]` layout, matching the shared linear helper.
-        let mlp = linear(&normed, &self.fc_weight, Some(&self.fc_bias))?;
+        let mlp = linear_batched_gemv(&normed, &self.fc_weight, Some(&self.fc_bias))?;
         let mlp = gelu_tanh(&mlp)?;
-        let mlp = linear(&mlp, &self.proj_weight, Some(&self.proj_bias))?;
+        let mlp = linear_batched_gemv(&mlp, &self.proj_weight, Some(&self.proj_bias))?;
         Ok(add(&hidden, &mlp)?)
     }
 }
@@ -220,7 +251,7 @@ impl GptBigCodeAttention {
     fn forward(&self, hidden: &Array, cache: &mut dyn KvCache, index: usize) -> Result<Array> {
         let shape = hidden.shape();
         let (batch, sequence) = (shape[0], shape[1]);
-        let qkv = linear(hidden, &self.qkv_weight, Some(&self.qkv_bias))?;
+        let qkv = linear_batched_gemv(hidden, &self.qkv_weight, Some(&self.qkv_bias))?;
         let head_dim = self.cfg.head_dim();
         // StarCoderBase-1B is `multi_query=true`: one K and one V head.
         let parts = split_sections(
@@ -241,7 +272,7 @@ impl GptBigCodeAttention {
         let attended = sdpa_causal(&query, &keys, &values, 1.0 / (head_dim as f32).sqrt())?
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[batch, sequence, self.cfg.hidden_size])?;
-        linear(&attended, &self.out_weight, Some(&self.out_bias))
+        linear_batched_gemv(&attended, &self.out_weight, Some(&self.out_bias))
     }
 }
 
@@ -250,6 +281,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use mlx_rs::{with_new_default_stream, Stream};
+
     use crate::decode::{generate, GenerationConfig};
     use crate::primitives::input_ids;
     use crate::primitives::sampler::SamplingParams;
@@ -257,6 +290,44 @@ mod tests {
 
     fn put(map: &mut HashMap<String, Array>, key: &str, values: &[f32], shape: &[i32]) {
         map.insert(key.into(), Array::from_slice(values, shape));
+    }
+
+    #[test]
+    fn batched_gemv_projection_preserves_matrix_dimensions_rows_and_decode() {
+        with_new_default_stream(Stream::cpu(), || {
+            let x = Array::from_slice(
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, 0.5, 2.0, -3.0, 0.0, 0.0],
+                &[2, 3, 2],
+            );
+            let weight = Array::from_slice(&[1.0, 10.0, -2.0, 0.5, 0.25, -4.0], &[3, 2]);
+            let bias = Array::from_slice(&[0.5, -1.0, 2.0], &[3]);
+
+            let projected = linear_batched_gemv(&x, &weight, Some(&bias)).unwrap();
+            assert_eq!(projected.shape(), &[2, 3, 3]);
+            assert_eq!(
+                projected.as_slice::<f32>(),
+                &[
+                    21.5, -2.0, -5.75, 43.5, -5.0, -13.25, 65.5, -8.0, -20.75, 4.5, 1.25, -0.25,
+                    -27.5, -6.5, 14.5, 0.5, -1.0, 2.0,
+                ]
+            );
+
+            let decode = Array::from_slice(&[1.0, 2.0], &[1, 1, 2]);
+            let actual = linear_batched_gemv(&decode, &weight, Some(&bias)).unwrap();
+            let reference = linear(&decode, &weight, Some(&bias)).unwrap();
+            assert_eq!(actual.shape(), &[1, 1, 3]);
+            assert_eq!(actual.as_slice::<f32>(), reference.as_slice::<f32>());
+
+            // `sequence == 1` is not sufficient to use the ordinary linear path when batch > 1:
+            // every batch item is still an independent row that must retain the GEMV shape.
+            let batched_decode = Array::from_slice(&[-1.0, 0.5, 2.0, -3.0], &[2, 1, 2]);
+            let projected = linear_batched_gemv(&batched_decode, &weight, Some(&bias)).unwrap();
+            assert_eq!(projected.shape(), &[2, 1, 3]);
+            assert_eq!(
+                projected.as_slice::<f32>(),
+                &[4.5, 1.25, -0.25, -27.5, -6.5, 14.5]
+            );
+        });
     }
 
     /// A tiny shape-valid GPTBigCode checkpoint. It is intentionally not StarVector-sized: this

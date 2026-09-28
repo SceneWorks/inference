@@ -27,6 +27,7 @@ pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod loader;
+pub mod memory_strategy;
 pub mod model;
 pub mod pipeline;
 pub mod scheduler;
@@ -59,7 +60,23 @@ pub fn register_providers(
 ) -> mlx_gen::gen_core::ProviderRegistryBuilder {
     registry
         .register_generator(model::QUALITY_REGISTRATION)
+        .register_memory_strategy(model::QUALITY_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: MODEL_ID,
+            contract: |spec| memory_strategy::weights_free_memory_strategy_contract(MODEL_ID, spec),
+        })
+        .register_memory_behavior(model::QUALITY_MEMORY_BEHAVIOR)
         .register_generator(model::TURBO_REGISTRATION)
+        .register_memory_strategy(model::TURBO_MEMORY_REGISTRATION)
+        .register_memory_contract_fixture(mlx_gen::gen_core::MemoryContractFixtureRegistration {
+            surface_specs: mlx_gen::gen_core::mlx_memory_contract_surface_specs,
+            provider_id: MODEL_ID_TURBO,
+            contract: |spec| {
+                memory_strategy::weights_free_memory_strategy_contract(MODEL_ID_TURBO, spec)
+            },
+        })
+        .register_memory_behavior(model::TURBO_MEMORY_BEHAVIOR)
 }
 
 /// Build the complete explicit MLX Ideogram provider catalog.
@@ -92,5 +109,17 @@ mod explicit_registry_tests {
             preview_ids, explicit,
             "every and only Ideogram 4 route previews"
         );
+    }
+
+    /// sc-22732: both routes now carry a memory-strategy registration, a weights-free contract
+    /// fixture and a behavior seam, so the shared conformance walk grades the published ladder.
+    #[test]
+    fn memory_strategy_registrations_pass_the_weights_free_conformance_walk() {
+        let registry = super::provider_registry().unwrap();
+        let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
+            .with_offload_policy(mlx_gen::OffloadPolicy::Sequential)
+            .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
+        gen_core_testkit::memory_strategy::memory_strategy_registry_conformance(&registry, &spec);
+        gen_core_testkit::memory_strategy::memory_contract_surface_registry_conformance(&registry);
     }
 }

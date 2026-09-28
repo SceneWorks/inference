@@ -3315,8 +3315,8 @@ mod tests {
         assert!(
             matches!(
                 error,
-                CandleError::Msg(ref reason)
-                    if reason.starts_with("unsupported: artifact seal mismatch after load: ")
+                CandleError::Unsupported(ref reason)
+                    if reason.starts_with("artifact seal mismatch after load: ")
             ),
             "unexpected: {error:?}"
         );

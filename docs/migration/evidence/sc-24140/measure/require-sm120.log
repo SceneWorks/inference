@@ -1,0 +1,181 @@
+# REQUIRE_SM120 guard (sc-24140 E), commit e155acb090be06d49e7fca6a53fdd176abaae875; CUDA_VISIBLE_DEVICES=-1 hides every GPU
+
+## 1. no CUDA device visible (CUDA_VISIBLE_DEVICES=-1), REQUIRE_SM120 unset: skip, pass: nvfp4_gemv-0f7926be264ccc6b.exe --test-threads=1
+test dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly ... ok
+test gemv_compiles_once_per_device_through_the_seam ... ok
+test gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape ... ok
+test nvfp4_gemv_microbench ... ignored, microbench: run in release on an idle sm_120 GPU (NVFP4_GEMV_BENCH_OUTPUT=<json>)
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+exit 0
+
+## 1. no CUDA device visible (CUDA_VISIBLE_DEVICES=-1), REQUIRE_SM120 unset: skip, pass: candle_quant_kernels-48a592dba731e936.exe nvfp4 --test-threads=1
+test nvfp4::tests::a_row_slice_is_lossless_and_refuses_a_boundary_that_cuts_a_scale_atom ... ok
+test nvfp4::tests::e2m1_grid_and_ties ... ok
+test nvfp4::tests::e4m3_known_values ... ok
+test nvfp4::tests::nibble_low_high_order_matches_mxfp4 ... ok
+test nvfp4::tests::non_multiple_of_16_k_padding ... ok
+test nvfp4::tests::pack_from_slice_refuses_non_finite_inputs ... ok
+test nvfp4::tests::packed_size_matches_4p5_bits ... ok
+test nvfp4::tests::roundtrip_bf16_tensor_path ... ok
+test nvfp4::tests::roundtrip_within_tolerance_with_outliers_and_zeros ... ok
+test nvfp4::tests::scale_swizzle_padding_and_bijection ... ok
+test nvfp4_gemv::cuda_tests::gemv_compiles_once_through_the_seam ... ok
+test nvfp4_gemv::cuda_tests::gemv_is_closer_to_the_dense_product_than_w4a4 ... ok
+test nvfp4_gemv::cuda_tests::gemv_matches_the_dequant_reference_on_edge_shapes ... ok
+test nvfp4_gemv::cuda_tests::gemv_serves_rank3_views_and_bias ... ok
+test nvfp4_gemv::cuda_tests::refusals_are_typed ... ok
+test nvfp4_gemv::tests::checks_declare_their_constraints_on_any_lane ... ok
+test nvfp4_gemv::tests::declared_abs_bound_grows_with_k_and_the_reference ... ok
+test nvfp4_gemv::tests::the_source_declares_the_entry_point_and_its_true_floor ... ok
+test nvfp4_linear::tests::cpu_selects_dequant_fallback_and_forwards ... ok
+test nvfp4_linear::tests::dequant_forward_rank3_and_bias_and_dtype ... ok
+test nvfp4_linear::tests::differential_widening_is_strictly_safe ... ok
+test nvfp4_linear::tests::final_proj_anchor_does_not_fire_on_per_block_names ... ok
+test nvfp4_linear::tests::footprint_is_far_below_bf16 ... ok
+test nvfp4_linear::tests::outlier_policy_classification ... ok
+test nvfp4_linear::tests::partition_layers_matches_spike_policy ... ok
+test nvfp4_linear::tests::resident_weight_bytes_reads_the_declared_regimes_leg ... ok
+test nvfp4_linear::tests::w4a4_forward_never_routes_to_the_unfused_quantizer ... ok
+test nvfp4_outlier::tests::benign_activation_is_w4a4_viable ... ok
+test nvfp4_outlier::tests::dense_outliers_flag_collapse_not_viable ... ok
+test nvfp4_outlier::tests::from_tensor_matches_slice ... ok
+test nvfp4_outlier::tests::sparse_massive_activations_are_sparse_class ... ok
+test nvfp4_weight::tests::a_row_narrowed_f32_view_quantizes_its_own_rows ... ok
+test nvfp4_weight::tests::a_shape_past_the_quantizers_32_bit_indexing_is_refused ... ok
+test nvfp4_weight::tests::cpu_device_is_refused_before_any_handle_is_built ... ok
+test nvfp4_weight::tests::load_time_quantization_matches_the_cpu_packer_byte_for_byte ... ok
+test nvfp4_weight::tests::load_time_quantization_of_an_unaligned_k_matches_the_packer_on_the_padded_input ... ok
+test nvfp4_weight::tests::only_the_output_dimension_can_disqualify_a_shape ... ok
+test nvfp4_weight::tests::quantize_on_cpu_is_an_error_not_a_dense_fallback ... ok
+test nvfp4_weight::tests::sub_sm120_capabilities_are_refused_by_name ... ok
+test nvfp4_weight::tests::the_fused_quantizer_compiles_once_per_device_through_the_seam ... ok
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.25s
+exit 0
+
+## 2. no CUDA device visible (CUDA_VISIBLE_DEVICES=-1), REQUIRE_SM120=1: hard failure: nvfp4_gemv-0f7926be264ccc6b.exe --test-threads=1
+test dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly ... FAILED
+test gemv_compiles_once_per_device_through_the_seam ... FAILED
+test gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape ... FAILED
+test nvfp4_gemv_microbench ... ignored, microbench: run in release on an idle sm_120 GPU (NVFP4_GEMV_BENCH_OUTPUT=<json>)
+thread 'dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly' (12580) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'gemv_compiles_once_per_device_through_the_seam' (25900) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape' (37520) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+test result: FAILED. 0 passed; 3 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+exit 101
+
+## 2. no CUDA device visible (CUDA_VISIBLE_DEVICES=-1), REQUIRE_SM120=1: hard failure: candle_quant_kernels-48a592dba731e936.exe nvfp4 --test-threads=1
+test nvfp4::tests::a_row_slice_is_lossless_and_refuses_a_boundary_that_cuts_a_scale_atom ... ok
+test nvfp4::tests::e2m1_grid_and_ties ... ok
+test nvfp4::tests::e4m3_known_values ... ok
+test nvfp4::tests::nibble_low_high_order_matches_mxfp4 ... ok
+test nvfp4::tests::non_multiple_of_16_k_padding ... ok
+test nvfp4::tests::pack_from_slice_refuses_non_finite_inputs ... ok
+test nvfp4::tests::packed_size_matches_4p5_bits ... ok
+test nvfp4::tests::roundtrip_bf16_tensor_path ... ok
+test nvfp4::tests::roundtrip_within_tolerance_with_outliers_and_zeros ... ok
+test nvfp4::tests::scale_swizzle_padding_and_bijection ... ok
+test nvfp4_gemv::cuda_tests::gemv_compiles_once_through_the_seam ... FAILED
+test nvfp4_gemv::cuda_tests::gemv_is_closer_to_the_dense_product_than_w4a4 ... FAILED
+test nvfp4_gemv::cuda_tests::gemv_matches_the_dequant_reference_on_edge_shapes ... FAILED
+test nvfp4_gemv::cuda_tests::gemv_serves_rank3_views_and_bias ... FAILED
+test nvfp4_gemv::cuda_tests::refusals_are_typed ... FAILED
+test nvfp4_gemv::tests::checks_declare_their_constraints_on_any_lane ... ok
+test nvfp4_gemv::tests::declared_abs_bound_grows_with_k_and_the_reference ... ok
+test nvfp4_gemv::tests::the_source_declares_the_entry_point_and_its_true_floor ... ok
+test nvfp4_linear::tests::cpu_selects_dequant_fallback_and_forwards ... ok
+test nvfp4_linear::tests::dequant_forward_rank3_and_bias_and_dtype ... ok
+test nvfp4_linear::tests::differential_widening_is_strictly_safe ... ok
+test nvfp4_linear::tests::final_proj_anchor_does_not_fire_on_per_block_names ... ok
+test nvfp4_linear::tests::footprint_is_far_below_bf16 ... ok
+test nvfp4_linear::tests::outlier_policy_classification ... ok
+test nvfp4_linear::tests::partition_layers_matches_spike_policy ... ok
+test nvfp4_linear::tests::resident_weight_bytes_reads_the_declared_regimes_leg ... ok
+test nvfp4_linear::tests::w4a4_forward_never_routes_to_the_unfused_quantizer ... ok
+test nvfp4_outlier::tests::benign_activation_is_w4a4_viable ... ok
+test nvfp4_outlier::tests::dense_outliers_flag_collapse_not_viable ... ok
+test nvfp4_outlier::tests::from_tensor_matches_slice ... ok
+test nvfp4_outlier::tests::sparse_massive_activations_are_sparse_class ... ok
+test nvfp4_weight::tests::a_row_narrowed_f32_view_quantizes_its_own_rows ... FAILED
+test nvfp4_weight::tests::a_shape_past_the_quantizers_32_bit_indexing_is_refused ... ok
+test nvfp4_weight::tests::cpu_device_is_refused_before_any_handle_is_built ... ok
+test nvfp4_weight::tests::load_time_quantization_matches_the_cpu_packer_byte_for_byte ... FAILED
+test nvfp4_weight::tests::load_time_quantization_of_an_unaligned_k_matches_the_packer_on_the_padded_input ... FAILED
+test nvfp4_weight::tests::only_the_output_dimension_can_disqualify_a_shape ... ok
+test nvfp4_weight::tests::quantize_on_cpu_is_an_error_not_a_dense_fallback ... ok
+test nvfp4_weight::tests::sub_sm120_capabilities_are_refused_by_name ... ok
+test nvfp4_weight::tests::the_fused_quantizer_compiles_once_per_device_through_the_seam ... FAILED
+thread 'nvfp4_gemv::cuda_tests::gemv_compiles_once_through_the_seam' (33344) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_gemv::cuda_tests::gemv_is_closer_to_the_dense_product_than_w4a4' (33024) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_gemv::cuda_tests::gemv_matches_the_dequant_reference_on_edge_shapes' (33980) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_gemv::cuda_tests::gemv_serves_rank3_views_and_bias' (39164) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_gemv::cuda_tests::refusals_are_typed' (39808) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_weight::tests::a_row_narrowed_f32_view_quantizes_its_own_rows' (13824) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_weight::tests::load_time_quantization_matches_the_cpu_packer_byte_for_byte' (33192) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_weight::tests::load_time_quantization_of_an_unaligned_k_matches_the_packer_on_the_padded_input' (4660) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+thread 'nvfp4_weight::tests::the_fused_quantizer_compiles_once_per_device_through_the_seam' (3424) panicked at crates\kernels\candle-quant-kernels\src\sm120_gate.rs:32:9:
+REQUIRE_SM120 is set but no sm_120 CUDA device: this sm_120 test must run, not skip, on this host
+test result: FAILED. 31 passed; 9 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.27s
+exit 101
+
+## 3. GPU 1 (sm_120) visible, REQUIRE_SM120=1: the tests run and pass: nvfp4_gemv-0f7926be264ccc6b.exe --test-threads=1
+test dispatch_takes_the_gemv_for_decode_rows_and_cublaslt_otherwise_visibly ... ok
+test gemv_compiles_once_per_device_through_the_seam ... ok
+test gemv_matches_the_dequant_reference_on_every_qwen38_27b_projection_shape ... ok
+test nvfp4_gemv_microbench ... ignored, microbench: run in release on an idle sm_120 GPU (NVFP4_GEMV_BENCH_OUTPUT=<json>)
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 26.66s
+exit 0
+
+## 3. GPU 1 (sm_120) visible, REQUIRE_SM120=1: the tests run and pass: candle_quant_kernels-48a592dba731e936.exe nvfp4 --test-threads=1
+test nvfp4::tests::a_row_slice_is_lossless_and_refuses_a_boundary_that_cuts_a_scale_atom ... ok
+test nvfp4::tests::e2m1_grid_and_ties ... ok
+test nvfp4::tests::e4m3_known_values ... ok
+test nvfp4::tests::nibble_low_high_order_matches_mxfp4 ... ok
+test nvfp4::tests::non_multiple_of_16_k_padding ... ok
+test nvfp4::tests::pack_from_slice_refuses_non_finite_inputs ... ok
+test nvfp4::tests::packed_size_matches_4p5_bits ... ok
+test nvfp4::tests::roundtrip_bf16_tensor_path ... ok
+test nvfp4::tests::roundtrip_within_tolerance_with_outliers_and_zeros ... ok
+test nvfp4::tests::scale_swizzle_padding_and_bijection ... ok
+test nvfp4_gemv::cuda_tests::gemv_compiles_once_through_the_seam ... ok
+test nvfp4_gemv::cuda_tests::gemv_is_closer_to_the_dense_product_than_w4a4 ... ok
+test nvfp4_gemv::cuda_tests::gemv_matches_the_dequant_reference_on_edge_shapes ... ok
+test nvfp4_gemv::cuda_tests::gemv_serves_rank3_views_and_bias ... ok
+test nvfp4_gemv::cuda_tests::refusals_are_typed ... ok
+test nvfp4_gemv::tests::checks_declare_their_constraints_on_any_lane ... ok
+test nvfp4_gemv::tests::declared_abs_bound_grows_with_k_and_the_reference ... ok
+test nvfp4_gemv::tests::the_source_declares_the_entry_point_and_its_true_floor ... ok
+test nvfp4_linear::tests::cpu_selects_dequant_fallback_and_forwards ... ok
+test nvfp4_linear::tests::dequant_forward_rank3_and_bias_and_dtype ... ok
+test nvfp4_linear::tests::differential_widening_is_strictly_safe ... ok
+test nvfp4_linear::tests::final_proj_anchor_does_not_fire_on_per_block_names ... ok
+test nvfp4_linear::tests::footprint_is_far_below_bf16 ... ok
+test nvfp4_linear::tests::outlier_policy_classification ... ok
+test nvfp4_linear::tests::partition_layers_matches_spike_policy ... ok
+test nvfp4_linear::tests::resident_weight_bytes_reads_the_declared_regimes_leg ... ok
+test nvfp4_linear::tests::w4a4_forward_never_routes_to_the_unfused_quantizer ... ok
+test nvfp4_outlier::tests::benign_activation_is_w4a4_viable ... ok
+test nvfp4_outlier::tests::dense_outliers_flag_collapse_not_viable ... ok
+test nvfp4_outlier::tests::from_tensor_matches_slice ... ok
+test nvfp4_outlier::tests::sparse_massive_activations_are_sparse_class ... ok
+test nvfp4_weight::tests::a_row_narrowed_f32_view_quantizes_its_own_rows ... ok
+test nvfp4_weight::tests::a_shape_past_the_quantizers_32_bit_indexing_is_refused ... ok
+test nvfp4_weight::tests::cpu_device_is_refused_before_any_handle_is_built ... ok
+test nvfp4_weight::tests::load_time_quantization_matches_the_cpu_packer_byte_for_byte ... ok
+test nvfp4_weight::tests::load_time_quantization_of_an_unaligned_k_matches_the_packer_on_the_padded_input ... ok
+test nvfp4_weight::tests::only_the_output_dimension_can_disqualify_a_shape ... ok
+test nvfp4_weight::tests::quantize_on_cpu_is_an_error_not_a_dense_fallback ... ok
+test nvfp4_weight::tests::sub_sm120_capabilities_are_refused_by_name ... ok
+test nvfp4_weight::tests::the_fused_quantizer_compiles_once_per_device_through_the_seam ... ok
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.42s
+exit 0

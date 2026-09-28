@@ -1,0 +1,7 @@
+[decode_bench] reference           64.34 tok/s  prefill 0.020s
+[decode_bench] reference_unfused   28.93 tok/s  prefill 0.039s
+[decode_bench] step_model K=0          74.62 tok/s  accept 0.000  fwd/tok 1.000  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=2          75.22 tok/s  accept 0.147  fwd/tok 0.875  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=3          72.72 tok/s  accept 0.087  fwd/tok 0.887  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] ngram K=4          72.55 tok/s  accept 0.076  fwd/tok 0.875  syncs/verify 1.00  kv static  attn gqa
+[decode_bench] wrote C:\inf-target\evidence\head-c5cfe30a3-expanded-ref\decode_bench.json
