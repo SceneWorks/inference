@@ -531,13 +531,95 @@ fn preflight_total_live_tokens(
     Ok((total, max_request))
 }
 
-fn admitted_row_tokens(
+/// A deliberately conservative planning budget, not a proven process peak. The two-times
+/// checkpoint load reservation matches this model type's source load admission; the pinned BF16
+/// config supplies a minimum dense KV geometry, and the fused route needs at least one score,
+/// mask, and softmax tile. The actual lazy graph may retain more, especially at long context.
+fn static_role_footprint_budget(
+    spec: &BenchmarkModelSpec,
+    snapshot: &Path,
+    total_live_tokens: u64,
+    request_tokens: u64,
+) -> Result<u64, String> {
+    let payload = spec
+        .required_files
+        .iter()
+        .filter(|file| file.path.ends_with(".safetensors"))
+        .try_fold(0_u64, |sum, file| sum.checked_add(file.bytes))
+        .ok_or("pinned checkpoint payload overflows")?;
+    if payload == 0 {
+        return Err("pinned model has no checkpoint payload".into());
+    }
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(snapshot.join("config.json")).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let positive = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| format!("pinned model lacks positive {key} for footprint preflight"))
+    };
+    if config
+        .get("torch_dtype")
+        .and_then(serde_json::Value::as_str)
+        != Some("bfloat16")
+    {
+        return Err("pinned model cache dtype cannot be bounded from BF16 config".into());
+    }
+    let layers = positive("num_hidden_layers")?;
+    let kv_heads = positive("num_key_value_heads")?;
+    let head_dim = positive("head_dim")?;
+    let query_heads = positive("num_attention_heads")?;
+    let kv = dense_kv_bytes(1, layers, kv_heads, total_live_tokens, head_dim, 2)?;
+    let tile = [3_u64, 8, request_tokens, query_heads, 4]
+        .into_iter()
+        .try_fold(1_u64, |value, factor| value.checked_mul(factor))
+        .ok_or("fused prefill tile footprint overflows")?;
+    payload
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(kv))
+        .and_then(|bytes| bytes.checked_add(tile))
+        .ok_or("static model-load plus KV/working budget overflows".into())
+}
+
+fn static_row_footprint_budget(
+    coordinate: &Coordinate,
+    candidate_snapshot: &Path,
+    reference_snapshot: &Path,
+    total_live_tokens: u64,
+    request_tokens: u64,
+    policy: &CampaignSafetyPolicy,
+) -> Result<u64, String> {
+    let candidate = static_role_footprint_budget(
+        benchmark_model(coordinate.family, false)?,
+        candidate_snapshot,
+        total_live_tokens,
+        request_tokens,
+    )?;
+    let reference = static_role_footprint_budget(
+        benchmark_model(coordinate.family, true)?,
+        reference_snapshot,
+        total_live_tokens,
+        request_tokens,
+    )?;
+    let required = candidate.max(reference);
+    if required > policy.child_footprint_cap_bytes {
+        return Err(format!(
+            "{} needs at least {required} bytes of source-based model-load plus KV/working budget; child footprint cap {} refuses before spawn",
+            coordinate_slug(coordinate), policy.child_footprint_cap_bytes,
+        ));
+    }
+    Ok(required)
+}
+
+fn static_row_requirements(
     coordinate: &Coordinate,
     candidate_snapshot: &Path,
     reference_snapshot: &Path,
     prompt: &str,
     policy: &CampaignSafetyPolicy,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64, u64), String> {
     if ["memory-material", "fit-boundary"].contains(&coordinate.context_band) {
         return Err(format!(
             "{} incomplete: no validated source-backed transient prefill peak bound for this required long-context geometry; token and polling limits alone cannot admit it",
@@ -564,7 +646,15 @@ fn admitted_row_tokens(
             coordinate_slug(coordinate)
         ));
     }
-    Ok((total, max_request))
+    let known_footprint_budget = static_row_footprint_budget(
+        coordinate,
+        candidate_snapshot,
+        reference_snapshot,
+        total,
+        max_request,
+        policy,
+    )?;
+    Ok((total, max_request, known_footprint_budget))
 }
 
 fn valid_locked_mlx_fields(version: &str, source: &str, revision: &str) -> bool {
@@ -3175,13 +3265,14 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
             (&launch.qwen_snapshot, &launch.qwen_fp32_reference_snapshot)
         };
         let coordinate = coordinate_slug(&row.coordinate);
-        match admitted_row_tokens(&row.coordinate, candidate, reference, &prompt, &policy) {
-            Ok((total, request)) => row_admission.push(serde_json::json!({
-                "coordinate": coordinate, "admitted": true,
+        match static_row_requirements(&row.coordinate, candidate, reference, &prompt, &policy) {
+            Ok((total, request, footprint)) => row_admission.push(serde_json::json!({
+                "coordinate": coordinate, "staticPreflightPassed": true,
                 "totalLiveTokenBound": total, "requestTokenBound": request,
+                "knownFootprintBudgetBytes": footprint,
             })),
             Err(reason) => row_admission.push(serde_json::json!({
-                "coordinate": coordinate, "admitted": false, "reason": reason,
+                "coordinate": coordinate, "staticPreflightPassed": false, "reason": reason,
             })),
         }
     }
@@ -3205,8 +3296,9 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
         "policySha256": policy_sha256,
         "resumeIdentitySha256": resume_identity_sha256,
         "identity": identity,
-        "completeAdmitted": row_admission.iter().all(|row|
-            row.get("admitted").and_then(serde_json::Value::as_bool) == Some(true)),
+        "completeStaticPreflightPassed": row_admission.iter().all(|row|
+            row.get("staticPreflightPassed").and_then(serde_json::Value::as_bool) == Some(true)),
+        "runtimeAdmission": "not-evaluated-by-read-only-preflight",
         "rows": row_admission,
     }))
 }
@@ -3392,7 +3484,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
         } else {
             &launch.qwen_fp32_reference_snapshot
         };
-        let (total_tokens, request_tokens) = admitted_row_tokens(
+        let (total_tokens, request_tokens, _) = static_row_requirements(
             &row.coordinate,
             snapshot,
             reference_snapshot,
@@ -3609,7 +3701,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                     ));
                 }
             }
-            admitted_row_tokens(
+            static_row_requirements(
                 &row.coordinate,
                 &snapshot,
                 &reference_snapshot,
@@ -7180,7 +7272,7 @@ mod tests {
         for coordinate in required_coordinates().into_iter().filter(|coordinate| {
             ["memory-material", "fit-boundary"].contains(&coordinate.context_band)
         }) {
-            let error = admitted_row_tokens(
+            let error = static_row_requirements(
                 &coordinate,
                 Path::new("/nonexistent-candidate"),
                 Path::new("/nonexistent-reference"),
@@ -7190,6 +7282,38 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("source-backed transient prefill peak bound"));
         }
+    }
+
+    #[test]
+    fn impossible_child_cap_refuses_known_model_load_and_kv_before_spawn() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(
+            temporary.path().join("config.json"),
+            br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":24}"#,
+        )
+        .unwrap();
+        let mut policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1,
+            child_footprint_cap_bytes: 2_048,
+            max_context_tokens: 4_096,
+            max_request_tokens: 4_096,
+            stdout_cap_bytes: 4_096,
+            stderr_cap_bytes: 4_096,
+        };
+        let row = &required_coordinates()[0];
+        let refusal =
+            static_row_footprint_budget(row, temporary.path(), temporary.path(), 425, 318, &policy)
+                .unwrap_err();
+        assert!(refusal.contains("child footprint cap 2048 refuses before spawn"));
+        policy.child_footprint_cap_bytes = u64::MAX - policy.host_free_reserve_bytes;
+        let budget =
+            static_row_footprint_budget(row, temporary.path(), temporary.path(), 425, 318, &policy)
+                .unwrap();
+        assert!(budget > 12_000_000_000); // BF16 reference dominates the sequential roles.
     }
 
     #[test]
