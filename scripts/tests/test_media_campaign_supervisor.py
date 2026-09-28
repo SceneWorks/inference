@@ -39,12 +39,12 @@ class SupervisorTests(unittest.TestCase):
         policy_file.write_text(json.dumps(data), encoding="utf-8")
         self.policy = safety.load_policy(policy_file)
 
-    def run_child(self, script, *, probe=None, bound=1024, policy=None):
+    def run_child(self, script, *, probe=None, bound=1024, policy=None, event_path=None):
         return safety.run_guarded(
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy or self.policy, stdout_path=self.root / "stdout",
             stderr_path=self.root / "stderr", source_peak_host_bytes=bound,
-            probe=probe or Probe(),
+            probe=probe or Probe(), event_path=event_path,
         )
 
     def test_policy_parsing_and_preflight_refuse_before_spawn(self):
@@ -127,6 +127,89 @@ class SupervisorTests(unittest.TestCase):
                 raise safety.SupervisionError("probe-failure", "synthetic fault")
         with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
             self.run_child("import time; time.sleep(5)", probe=FailedProbe())
+
+    def test_footprint_exit_race_requires_terminal_root_and_empty_owned_tree(self):
+        class FailedProbe(Probe):
+            def __init__(self, after_snapshot=None):
+                super().__init__()
+                self.after_snapshot = after_snapshot
+            def tree_footprint(self, _pgid):
+                if self.after_snapshot:
+                    self.after_snapshot()
+                raise safety.SupervisionError("probe-failure", "process exited during sample")
+
+        class Child:
+            pid = 43210
+            def __init__(self, second_status):
+                self.statuses = iter((None, second_status))
+                self.waited = False
+            def poll(self):
+                return next(self.statuses)
+            def wait(self, **_kwargs):
+                self.waited = True
+                return 0
+
+        def invoke(child, second_table, *, after_snapshot=None, event_path=None):
+            tables = ({child.pid: (1, child.pid)}, second_table)
+            with patch.object(safety.subprocess, "Popen", return_value=child), \
+                 patch.object(safety, "_process_table", side_effect=tables), \
+                 patch.object(safety, "_stop_tree") as stop:
+                try:
+                    result = self.run_child("unused", probe=FailedProbe(after_snapshot), event_path=event_path)
+                except safety.SupervisionError as error:
+                    result = error
+                return result, stop.called
+
+        exited = Child(0)
+        result, stopped = invoke(exited, {})
+        self.assertIsInstance(result, safety.RunResult)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(exited.waited)
+        self.assertFalse(stopped)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        live = Child(None)
+        result, stopped = invoke(live, {live.pid: (1, live.pid)})
+        self.assertIsInstance(result, safety.SupervisionError)
+        self.assertEqual(result.reason, "probe-failure")
+        self.assertTrue(stopped)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        nonzero = Child(7)
+        result, stopped = invoke(nonzero, {})
+        self.assertIsInstance(result, safety.SupervisionError)
+        self.assertEqual(result.reason, "child-exit")
+        self.assertTrue(stopped)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        capped = Child(0)
+        result, stopped = invoke(capped, {}, after_snapshot=lambda: (self.root / "stdout").write_bytes(b"x" * 5000))
+        self.assertIsInstance(result, safety.SupervisionError)
+        self.assertEqual(result.reason, "log-cap")
+        self.assertTrue(stopped)
+        self.assertLessEqual((self.root / "stdout").stat().st_size, self.policy.stdout_cap_bytes)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        event = self.root / "events"
+        capped_event = Child(0)
+        result, stopped = invoke(capped_event, {}, after_snapshot=lambda: event.write_bytes(b"x" * (10**6 + 1)),
+                                 event_path=event)
+        self.assertIsInstance(result, safety.SupervisionError)
+        self.assertEqual(result.reason, "event-cap")
+        self.assertTrue(stopped)
+        self.assertLessEqual(event.stat().st_size, self.policy.event_cap_bytes)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        descendant = Child(0)
+        result, stopped = invoke(descendant, {44444: (descendant.pid, descendant.pid)})
+        self.assertIsInstance(result, safety.SupervisionError)
+        self.assertEqual(result.reason, "probe-failure")
+        self.assertTrue(stopped)
 
     def test_cuda_probe_parses_selected_uuid_and_owned_pid_only(self):
         gpu = "GPU-12345678-1234-1234-1234-123456789abc"
