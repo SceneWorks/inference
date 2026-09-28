@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from scripts import media_campaign_windows as windows
+
 
 class SupervisionError(ValueError):
     def __init__(self, reason: str, detail: str):
@@ -68,8 +70,8 @@ def load_policy(path: Path) -> SafetyPolicy:
     if not isinstance(data, dict) or type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 1:
         raise SupervisionError("invalid-policy", "schemaVersion must be 1")
     backend = data.get("backend")
-    expected = base | (cuda if backend == "linux-cuda" else set())
-    if backend not in {"darwin-mlx", "linux-cuda"} or set(data) != expected:
+    expected = base | (cuda if backend in {"linux-cuda", "windows-cuda"} else set())
+    if backend not in {"darwin-mlx", "linux-cuda", "windows-cuda"} or set(data) != expected:
         raise SupervisionError("invalid-policy", "backend or exact policy fields are invalid")
     deadline = data["deadlineSeconds"]
     if type(deadline) not in (int, float) or deadline <= 0 or deadline >= 2**53 or not math.isfinite(deadline):
@@ -82,7 +84,7 @@ def load_policy(path: Path) -> SafetyPolicy:
         raise SupervisionError("invalid-policy", "poll and grace must be below deadline")
     if data["hostFreeReserveBytes"] + data["childFootprintCapBytes"] >= 2**63:
         raise SupervisionError("invalid-policy", "host reserve plus child cap overflows")
-    if backend == "linux-cuda":
+    if backend in {"linux-cuda", "windows-cuda"}:
         if not isinstance(data["cudaDeviceUuid"], str) or not re.fullmatch(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", data["cudaDeviceUuid"]):
             raise SupervisionError("invalid-policy", "cudaDeviceUuid must be a GPU UUID")
         if data["gpuFreeReserveBytes"] + data["childGpuCapBytes"] >= 2**63:
@@ -188,15 +190,23 @@ def _expand_owned(table: dict[int, tuple[int, int]], known: set[int]) -> set[int
 class SystemProbe:
     def __init__(self, policy: SafetyPolicy):
         self.policy = policy
-        actual = "darwin-mlx" if platform.system() == "Darwin" else (
-            "linux-cuda" if platform.system() == "Linux" else "unsupported"
-        )
+        actual = {"Darwin": "darwin-mlx", "Linux": "linux-cuda",
+                  "Windows": "windows-cuda"}.get(platform.system(), "unsupported")
         if actual != policy.backend:
             raise SupervisionError("unsupported-host", f"{policy.backend} cannot run on {actual}")
+        try:
+            self._smi = windows.trusted_nvidia_smi() if actual == "windows-cuda" else "nvidia-smi"
+        except windows.WindowsJobError as error:
+            raise SupervisionError("probe-failure", str(error)) from error
 
     def host_free(self) -> int:
         if self.policy.backend == "darwin-mlx":
             return darwin_free_bytes(_bounded_output(["/usr/bin/vm_stat"]))
+        if self.policy.backend == "windows-cuda":
+            try:
+                return windows.host_free_bytes()
+            except windows.WindowsJobError as error:
+                raise SupervisionError("probe-failure", str(error)) from error
         free = linux_free_bytes(Path("/proc/meminfo").read_text(encoding="ascii"))
         # A delegated cgroup limit can be smaller than host MemAvailable.
         try:
@@ -211,7 +221,13 @@ class SystemProbe:
             raise SupervisionError("probe-failure", f"cgroup memory budget unavailable: {error}") from error
         return free
 
-    def tree_footprint(self, pgid: int) -> int:
+    def tree_footprint(self, owner: int | windows.WindowsJob) -> int:
+        if self.policy.backend == "windows-cuda":
+            try:
+                return owner.footprint_bytes()
+            except windows.WindowsJobError as error:
+                raise SupervisionError("probe-failure", str(error)) from error
+        pgid = owner
         pids = _group_pids(pgid)
         if not pids:
             raise SupervisionError("probe-failure", "owned process group disappeared during footprint sample")
@@ -230,12 +246,12 @@ class SystemProbe:
                 total += int(match.group(1)) * 1024
         return total
 
-    def gpu_free_and_tree_bytes(self, pgid: int) -> tuple[int, int]:
+    def gpu_free_and_tree_bytes(self, owner: int | windows.WindowsJob) -> tuple[int, int]:
         free = self.gpu_free()
         assert self.policy.cuda_device_uuid
         uuid = self.policy.cuda_device_uuid
-        pids = _group_pids(pgid)
-        usage = _bounded_output(["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
+        pids = owner.members() if self.policy.backend == "windows-cuda" else _group_pids(owner)
+        usage = _bounded_output([self._smi, "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
                                  "--format=csv,noheader,nounits"])
         used = 0
         for line in usage.splitlines():
@@ -250,7 +266,7 @@ class SystemProbe:
 
     def gpu_free(self) -> int:
         assert self.policy.cuda_device_uuid
-        rows = _bounded_output(["nvidia-smi", "--query-gpu=uuid,memory.free", "--format=csv,noheader,nounits"])
+        rows = _bounded_output([self._smi, "--query-gpu=uuid,memory.free", "--format=csv,noheader,nounits"])
         values = []
         for line in rows.splitlines():
             parts = [item.strip() for item in line.split(",")]
@@ -327,13 +343,13 @@ def run_guarded(
 ) -> RunResult:
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise SupervisionError("invalid-command", "argv is empty or malformed")
-    if os.name != "posix":
-        raise SupervisionError("unsupported-host", "owned process groups require POSIX")
+    if (policy.backend == "windows-cuda") != (os.name == "nt"):
+        raise SupervisionError("unsupported-host", "safety backend differs from process host")
     if type(source_peak_host_bytes) is not int or source_peak_host_bytes <= 0:
         raise SupervisionError("unbounded-source", "no source-backed host peak bound; refusing before spawn")
     if source_peak_host_bytes > policy.child_footprint_cap_bytes:
         raise SupervisionError("preflight-memory", "source host peak exceeds child footprint cap")
-    if policy.backend == "linux-cuda" and (
+    if policy.backend in {"linux-cuda", "windows-cuda"} and (
         type(source_peak_gpu_bytes) is not int or source_peak_gpu_bytes <= 0
         or source_peak_gpu_bytes > policy.child_gpu_cap_bytes
     ):
@@ -346,15 +362,34 @@ def run_guarded(
     if host_free < policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes:
         raise SupervisionError("preflight-memory", "host free is below reserve plus child cap")
     gpu_free = None
-    if policy.backend == "linux-cuda":
+    if policy.backend in {"linux-cuda", "windows-cuda"}:
         gpu_free = probe.gpu_free()
         if gpu_free < policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes:
             raise SupervisionError("preflight-memory", "CUDA free is below reserve plus child cap")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:
-        child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
-                                 start_new_session=True)
+        job = None
+        if policy.backend == "windows-cuda":
+            try:
+                job = windows.WindowsJob()
+                # CREATE_SUSPENDED: no descendant can start before Job ownership is installed.
+                child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
+                                         creationflags=0x00000004)
+                try:
+                    job.assign_and_resume(child)
+                except BaseException:
+                    child.kill()  # Still suspended if assignment failed.
+                    child.wait(timeout=policy.term_grace_millis / 1000)
+                    raise
+            except BaseException as error:
+                if job is not None:
+                    job.close()
+                raise SupervisionError("spawn-failure", str(error)) from error
+        else:
+            child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
+                                     start_new_session=True)
+        owner = job if job is not None else child.pid
         known = {child.pid}
         peak_host = 0
         peak_gpu = 0
@@ -371,21 +406,31 @@ def run_guarded(
                     if event_path.exists() and event_path.stat().st_size > policy.event_cap_bytes:
                         raise SupervisionError("event-cap", "child exceeded a bounded observer event file")
                 status = child.poll()
-                table = _process_table()
-                owned = _expand_owned(table, known)
-                pids = {pid for pid, (_parent, group) in table.items() if group == child.pid}
-                if any(table[pid][1] != child.pid for pid in owned):
-                    raise SupervisionError("process-escape", "observed descendant left the owned process group")
+                if job is not None:
+                    try:
+                        pids = job.members()
+                    except windows.WindowsJobError as error:
+                        raise SupervisionError("probe-failure", str(error)) from error
+                    owned = pids
+                else:
+                    table = _process_table()
+                    owned = _expand_owned(table, known)
+                    pids = {pid for pid, (_parent, group) in table.items() if group == child.pid}
+                    if any(table[pid][1] != child.pid for pid in owned):
+                        raise SupervisionError("process-escape", "observed descendant left the owned process group")
                 if status is not None and not pids and not owned:
                     if status != 0:
                         raise SupervisionError("child-exit", f"child exited with status {status}")
+                    if policy.backend == "windows-cuda" and peak_gpu <= 0:
+                        raise SupervisionError("probe-failure", "CUDA child had no attributable GPU-memory sample")
+                    child.wait()
                     return RunResult(child.pid, status, peak_host, peak_gpu if gpu_free is not None else None,
                                      host_free, gpu_free, clock() - started, tuple(samples))
                 free = probe.host_free()
                 if free < policy.host_free_reserve_bytes:
                     raise SupervisionError("host-memory", "host free fell below reserve")
                 if pids:
-                    footprint = probe.tree_footprint(child.pid)
+                    footprint = probe.tree_footprint(owner)
                     peak_host = max(peak_host, footprint)
                     samples.append({"phase": "process-sample", "sample_kind": "process",
                                     "peak_bytes": footprint, "at_ns": time.time_ns()})
@@ -393,15 +438,18 @@ def run_guarded(
                         raise SupervisionError("event-cap", "process sample spool exceeded cap")
                     if footprint > policy.child_footprint_cap_bytes:
                         raise SupervisionError("child-footprint", "owned tree exceeded child cap")
-                    if policy.backend == "linux-cuda":
-                        device_free, device_used = probe.gpu_free_and_tree_bytes(child.pid)
+                    if policy.backend in {"linux-cuda", "windows-cuda"}:
+                        device_free, device_used = probe.gpu_free_and_tree_bytes(owner)
                         peak_gpu = max(peak_gpu, device_used)
                         if device_free < policy.gpu_free_reserve_bytes or device_used > policy.child_gpu_cap_bytes:
                             raise SupervisionError("device-memory", "owned CUDA use or free reserve exceeded cap")
                 time.sleep(policy.poll_millis / 1000)
         except BaseException:
             try:
-                _stop_tree(child, policy.term_grace_millis / 1000, known)
+                if job is not None:
+                    job.terminate_and_reap(child, policy.term_grace_millis / 1000)
+                else:
+                    _stop_tree(child, policy.term_grace_millis / 1000, known)
             finally:
                 for path, cap in ((stdout_path, policy.stdout_cap_bytes),
                                   (stderr_path, policy.stderr_cap_bytes),
@@ -410,3 +458,10 @@ def run_guarded(
                         with path.open("r+b") as stream:
                             stream.truncate(cap)
             raise
+        finally:
+            if job is not None:
+                job.close()
+                try:
+                    child.wait(timeout=policy.term_grace_millis / 1000)
+                except subprocess.TimeoutExpired as error:
+                    raise SupervisionError("cleanup-failure", "Job close did not reap root") from error

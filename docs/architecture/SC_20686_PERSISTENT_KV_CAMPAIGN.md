@@ -28,13 +28,22 @@ identical completed arm. The repository revision is never inferred from a model 
 
 Both single and matrix launch modes require `--safety-policy` and an absolute
 external `--resume-dir`. The policy is strict schema version 1 with backend
-`linux-cuda`; it sets positive deadline, poll, TERM grace, host reserve, child
+`linux-cuda` or `windows-cuda` matching the execution host; it sets positive deadline, poll, termination grace, host reserve, child
 footprint cap, stdout/stderr/event caps, selected CUDA GPU UUID, GPU-free reserve,
 and child GPU cap. Each validated normal/cancel arm is preserved in a sealed
 unit with observer events, bounded logs, generated media or verified absence,
 process samples, supervisor exit and cleanup, and exact campaign identity. A
 later watchdog failure leaves the bundle incomplete; it cannot serve as the
 product cancellation oracle or a terminal No-go.
+
+On Windows, the supervisor starts the child suspended, assigns it to a native
+kill-on-close Job Object, then resumes it. The Job owns descendants even after
+the root exits; incompatible enclosing Jobs refuse the launch. Windows host
+availability comes from `GlobalMemoryStatusEx`, while Job-member working sets
+and the Job's peak private commit feed the child cap. CUDA sampling uses the
+trusted System32 `nvidia-smi.exe` and the policy's exact GPU UUID. Unknown,
+`N/A`, missing, or un-attributable process GPU memory fails closed; a Windows
+run without a positive attributable GPU sample cannot publish success.
 
 At this source revision no defensible peak bound covers the route-specific
 loader, transient graphs, and output coexistence. The supervisor refuses an
