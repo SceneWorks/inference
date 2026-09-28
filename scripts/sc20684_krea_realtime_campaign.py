@@ -47,8 +47,8 @@ from scripts import media_campaign_supervisor as supervisor
 
 ROOT = Path(__file__).resolve().parents[1]
 STORY = "SC-20684"
-SCHEMA_VERSION = 5
-RECEIPT_SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+RECEIPT_SCHEMA_VERSION = 6
 MODEL_REPOSITORY = "SceneWorks/krea-realtime-14b-mlx"
 MODEL_REVISION = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
 OBSERVATION_PREFIX = "SC20684_KREA_PROVIDER_OBSERVATION "
@@ -81,6 +81,14 @@ PACKED_GEOMETRY_IDENTITY = {
         "accumulator": "float32",
     },
 }
+DECODE_PLAN_IDENTITY = {
+    "kind": "wan-z16-spatial-tail-v1",
+    "spatialTilePx": 256,
+    "spatialOverlapPx": 64,
+    "temporalTileFrames": 32,
+    "temporalOverlapFrames": 16,
+    "rawDecodedFrames": 28,
+}
 SOURCE_FILES = (
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs",
@@ -99,7 +107,8 @@ class CampaignError(ValueError):
 def decision_policy() -> dict[str, Any]:
     """Return the source-frozen policy captured before any product process runs."""
     return {
-        "identity": "sc20684-krea-packed-affine-decision-v2",
+        "identity": "sc20684-krea-packed-affine-decision-v3",
+        "decodePlan": DECODE_PLAN_IDENTITY,
         "materialMemory": {
             "minimumReductionBytes": MINIMUM_MEMORY_REDUCTION_BYTES,
             "minimumReductionFraction": MINIMUM_MEMORY_REDUCTION_FRACTION,
@@ -186,6 +195,58 @@ def _sha256_file(path: Path) -> str:
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _validate_source_budget(value: object, mode: str, tier: str, model: dict[str, Any]) -> dict[str, Any]:
+    budget = _object(value, "sourceBudget", {
+        "modelLogicalBytes", "terminalKvBytes", "appendOldStagedAndNewDenseBytes",
+        "decodeWorkingSetEstimateBytes", "runtimeOverheadBytes", "wholeProcessPeakBoundBytes",
+        "decodePlan",
+    })
+    if budget["decodePlan"] != DECODE_PLAN_IDENTITY:
+        raise CampaignError("source budget decode plan differs from frozen campaign plan")
+    if budget["runtimeOverheadBytes"] is not None or budget["wholeProcessPeakBoundBytes"] is not None:
+        raise CampaignError("source budget must leave unmeasured runtime overhead and whole-process peak unknown")
+    logical = sum(model["files"][name]["size"] for name in
+                  ("dit.safetensors", "t5_encoder.safetensors", "vae.safetensors"))
+    if budget["modelLogicalBytes"] != logical:
+        raise CampaignError("source budget logical model bytes differ from sealed inventory")
+    per_token = 435_200 if tier == "q8" else 230_400
+    schedule = (1, 3, 3) if mode == "i2v" else (3, 3, 1)
+    previous = 0
+    append_coexistence = 0
+    for frames in schedule:
+        current = frames * 1_560
+        staged = previous + current
+        append_coexistence = max(append_coexistence,
+                                 (previous + staged) * per_token + current * 819_200)
+        previous = staged
+    if budget["terminalKvBytes"] != previous * per_token or budget["appendOldStagedAndNewDenseBytes"] != append_coexistence:
+        raise CampaignError("source budget KV shape arithmetic differs from campaign geometry")
+    output_voxels = 28 * 480 * 832
+    tile_voxels = 28 * 256 * 256
+    if budget["decodeWorkingSetEstimateBytes"] != 64 * output_voxels + 6_500 * tile_voxels:
+        raise CampaignError("source budget decode estimate differs from frozen z16 plan")
+    return budget
+
+
+def _validate_phase_memory(value: object, phases: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(phases):
+        raise CampaignError("phaseMemory must cover every required phase")
+    previous_peak = 0
+    for index, (record, name) in enumerate(zip(value, phases)):
+        record = _object(record, f"phaseMemory[{index}]", {"phase", "process", "mlxActiveBytes", "mlxCacheBytes"})
+        if record["phase"] != name:
+            raise CampaignError("phaseMemory order or label changed")
+        process = _object(record["process"], f"phaseMemory[{index}].process", {"physFootprintBytes", "physFootprintPeakBytes"})
+        current = _integer(process["physFootprintBytes"], f"phaseMemory[{index}].physFootprintBytes", minimum=1)
+        peak = _integer(process["physFootprintPeakBytes"], f"phaseMemory[{index}].physFootprintPeakBytes", minimum=current)
+        if peak < previous_peak:
+            raise CampaignError("phaseMemory process peak regressed")
+        previous_peak = peak
+        _integer(record["mlxActiveBytes"], f"phaseMemory[{index}].mlxActiveBytes")
+        _integer(record["mlxCacheBytes"], f"phaseMemory[{index}].mlxCacheBytes")
+    return value
 
 
 def _route_lifecycle_snapshot(value: object, name: str) -> dict[str, Any]:
@@ -357,7 +418,7 @@ def _validate_observation(
         {
             "schemaVersion", "producer", "runId", "case", "source", "model", "input",
             "schedule", "toolchain", "geometry", "compiledHandle", "bytes", "timing",
-            "memory", "parity", "quality", "fallback", "cancellation", "output",
+            "memory", "sourceBudget", "phaseMemory", "parity", "quality", "fallback", "cancellation", "output",
         },
     )
     if row["schemaVersion"] != SCHEMA_VERSION or row["producer"] != "mlx-gen-krea-realtime/sc20684":
@@ -371,6 +432,12 @@ def _validate_observation(
         raise CampaignError("provider observation source identity drift")
     if row["model"] != expected_snapshot:
         raise CampaignError("provider observation model identity drift")
+    _validate_source_budget(row["sourceBudget"], expected_mode, expected_tier, expected_snapshot)
+    _validate_phase_memory(row["phaseMemory"], (
+        "weights-loaded", "conditioning-complete", "packed-generation-complete",
+        "packed-decode-complete", "dense-generation-complete", "dense-decode-complete",
+        "cancellation-complete", "release",
+    ))
 
     input_ = _object(
         row["input"],
@@ -747,15 +814,21 @@ def _validate_baseline_observation(
         {
             "schemaVersion", "producer", "runId", "case", "source", "model", "input",
             "schedule", "toolchain", "geometry", "timing", "memory", "output",
+            "sourceBudget", "phaseMemory",
         },
     )
     if row["schemaVersion"] != SCHEMA_VERSION or row["producer"] != "mlx-gen-krea-realtime/sc20684-dense-baseline":
         raise CampaignError("dense baseline schema or producer mismatch")
     if row["runId"] != run_id or row["case"] != {"mode": expected_mode, "cacheTier": expected_tier}:
         raise CampaignError("dense baseline did not report its launched identity")
-    for key in ("source", "model", "input", "schedule", "toolchain"):
+    for key in ("source", "model", "input", "schedule", "toolchain", "sourceBudget"):
         if row[key] != candidate[key]:
             raise CampaignError(f"dense baseline {key} differs from its paired candidate")
+    _validate_source_budget(row["sourceBudget"], expected_mode, expected_tier, candidate["model"])
+    _validate_phase_memory(row["phaseMemory"], (
+        "weights-loaded", "conditioning-complete", "dense-generation-complete",
+        "dense-decode-complete", "release",
+    ))
 
     baseline_geometry = _object(
         row["geometry"],

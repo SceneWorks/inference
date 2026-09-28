@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import hashlib
 import json
 import tempfile
@@ -42,6 +43,38 @@ MODEL = {
 }
 
 
+def source_budget(mode: str, tier: str) -> dict:
+    per_token = 435_200 if tier == "q8" else 230_400
+    previous = 0
+    append = 0
+    for frames in ((1, 3, 3) if mode == "i2v" else (3, 3, 1)):
+        current = frames * 1_560
+        staged = previous + current
+        append = max(append, (previous + staged) * per_token + current * 819_200)
+        previous = staged
+    return {
+        "modelLogicalBytes": 3,
+        "terminalKvBytes": previous * per_token,
+        "appendOldStagedAndNewDenseBytes": append,
+        "decodeWorkingSetEstimateBytes": 64 * 28 * 480 * 832 + 6_500 * 28 * 256 * 256,
+        "runtimeOverheadBytes": None,
+        "wholeProcessPeakBoundBytes": None,
+        "decodePlan": campaign.DECODE_PLAN_IDENTITY,
+    }
+
+
+def phase_memory(phases: tuple[str, ...]) -> list[dict]:
+    return [
+        {
+            "phase": phase,
+            "process": {"physFootprintBytes": 6 * GIB, "physFootprintPeakBytes": 8 * GIB},
+            "mlxActiveBytes": 5 * GIB,
+            "mlxCacheBytes": GIB // 2,
+        }
+        for phase in phases
+    ]
+
+
 def observation(mode: str, tier: str, run_id: str) -> dict:
     input_by_mode = {
         "t2v": {"kind": "text-only", "frameCount": 0, "vaeEncoding": "none", "v2vStrength": None},
@@ -72,12 +105,18 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
         ],
     }
     return {
-        "schemaVersion": 5,
+        "schemaVersion": 6,
         "producer": "mlx-gen-krea-realtime/sc20684",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
         "source": SOURCE,
         "model": MODEL,
+        "sourceBudget": source_budget(mode, tier),
+        "phaseMemory": phase_memory((
+            "weights-loaded", "conditioning-complete", "packed-generation-complete",
+            "packed-decode-complete", "dense-generation-complete", "dense-decode-complete",
+            "cancellation-complete", "release",
+        )),
         "input": {**input_by_mode[mode], "sha256": "1" * 64, "width": 832, "height": 480},
         "schedule": {
             "kind": "source-owned-self-forcing",
@@ -249,11 +288,15 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
 
 def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> dict:
     return {
-        "schemaVersion": 5,
+        "schemaVersion": 6,
         "producer": "mlx-gen-krea-realtime/sc20684-dense-baseline",
         "runId": run_id,
         "case": {"mode": mode, "cacheTier": tier},
-        **{key: candidate[key] for key in ("source", "model", "input", "schedule", "toolchain")},
+        **{key: candidate[key] for key in ("source", "model", "input", "schedule", "toolchain", "sourceBudget")},
+        "phaseMemory": phase_memory((
+            "weights-loaded", "conditioning-complete", "dense-generation-complete",
+            "dense-decode-complete", "release",
+        )),
         "geometry": {**candidate["geometry"], "dispatchGeometries": []},
         "timing": {
             "label": "fresh-process-full-schedule-dense-read-window-baseline",
@@ -305,6 +348,32 @@ def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> 
 
 
 class KreaRealtimeCampaignTests(unittest.TestCase):
+    def test_fixed_decode_plan_and_unknown_peak_are_required(self) -> None:
+        row = observation("i2v", "q8", "run")
+        self.assertEqual(row["sourceBudget"]["appendOldStagedAndNewDenseBytes"], 11_301_888_000)
+        self.assertEqual(row["sourceBudget"]["decodeWorkingSetEstimateBytes"], 12_643_205_120)
+        for field, value in (
+            ("decodePlan", {**campaign.DECODE_PLAN_IDENTITY, "spatialTilePx": 320}),
+            ("runtimeOverheadBytes", 0),
+            ("terminalKvBytes", 0),
+        ):
+            altered = copy.deepcopy(row)
+            altered["sourceBudget"][field] = value
+            with self.subTest(field=field), self.assertRaises(campaign.CampaignError):
+                campaign._validate_observation(
+                    altered, expected_mode="i2v", expected_tier="q8", run_id="run",
+                    expected_source=SOURCE, expected_snapshot=MODEL,
+                )
+
+    def test_phase_ledger_rejects_missing_or_reordered_phase(self) -> None:
+        row = observation("t2v", "q4", "run")
+        row["phaseMemory"].pop(3)
+        with self.assertRaises(campaign.CampaignError):
+            campaign._validate_observation(
+                row, expected_mode="t2v", expected_tier="q4", run_id="run",
+                expected_source=SOURCE, expected_snapshot=MODEL,
+            )
+
     def validate(self, mode: str = "t2v", tier: str = "q8", run_id: str = "run") -> dict:
         return campaign._validate_observation(
             observation(mode, tier, run_id),
