@@ -13,7 +13,8 @@
 //! 3. Shortcut naming: `conv_shortcut.*` vs `nin_shortcut.*`
 
 use candle_gen::candle_core::{Module, Result, Tensor, D};
-use candle_gen::candle_nn::{conv2d, group_norm, Conv2d, Conv2dConfig, GroupNorm, VarBuilder};
+use candle_gen::candle_nn::{group_norm, Conv2dConfig, GroupNorm, VarBuilder};
+use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
 
 // ==================== Config ====================
 

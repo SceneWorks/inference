@@ -114,7 +114,7 @@ impl SiglipVisionTower {
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| SiglipEncoderLayer::from_weights(w, &p(&format!("encoder.layers.{i}")), &cfg))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
+        let model = Self {
             patch_embedding,
             patch_bias,
             position_embedding,
@@ -122,7 +122,9 @@ impl SiglipVisionTower {
             post_ln_w: w.require(&p("post_layernorm.weight"))?.clone(),
             post_ln_b: w.require(&p("post_layernorm.bias"))?.clone(),
             cfg,
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Patch + position embeddings of preprocessed NHWC `pixel_values` → `[b, num_patches, hidden]`.

@@ -203,7 +203,7 @@ fn load_text_only(
     streamable: bool,
 ) -> Result<ChromaTextOwned> {
     let root = resolve_root(variant, spec)?;
-    let mut t5 = loader::load_t5_encoder(root)?;
+    let mut t5 = loader::load_t5_encoder_streamed(root, streamable)?;
     if let Some(q) = spec.quantize {
         loader::quantize_t5_for_dense_source(&mut t5, q.bits())?;
     }
@@ -247,7 +247,7 @@ fn load_heavy(
         )));
     }
     let cfg = ChromaTransformerConfig::default();
-    let mut transformer = loader::load_transformer(root, cfg)?;
+    let mut transformer = loader::load_transformer_streamed(root, cfg, streamable)?;
     let mut vae = loader::load_vae(root)?;
 
     // Q4/Q8 over the DiT's heavy block linears (sc-3841 / sc-8777). Two paths, both correct:

@@ -15,8 +15,12 @@ use candle_gen::candle_nn::{
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result as GenResult};
 
-const VISION_PREFIX: &str = "vision_tower";
-const PROJECTOR_PREFIX: &str = "multi_modal_projector";
+/// Checkpoint namespace of the Pixtral vision tower inside the multimodal `text_encoder/`
+/// checkpoint. `memory_strategy` prices the same namespace, so it is crate-visible.
+pub(crate) const VISION_PREFIX: &str = "vision_tower";
+/// Checkpoint namespace of the Mistral3 multimodal projector — loaded with the tower, priced with
+/// it.
+pub(crate) const PROJECTOR_PREFIX: &str = "multi_modal_projector";
 const PROJECTOR_TEXT_HIDDEN: usize = 5120;
 const PROJECTOR_SPATIAL_MERGE: usize = 2;
 const PROJECTOR_RMS_EPS: f64 = 1e-5;

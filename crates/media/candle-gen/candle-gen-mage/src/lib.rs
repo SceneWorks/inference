@@ -106,33 +106,27 @@ fn resolve_component_dirs(root: &Path, spec: &LoadSpec) -> gen_core::Result<Mage
     })
 }
 
-/// On-disk footprint of the exact component directories resolved by the production loader.
+/// The component directories the production loader will resolve for `spec`.
 ///
 /// SceneWorks stages the shared text encoder and VAE through `LoadSpec::components`, outside the
-/// route-local transformer snapshot. Computing from `spec.weights` alone therefore under-counts
-/// split installs. Keep this resolver coupled to [`resolve_component_dirs`] so admission and load
-/// cannot silently disagree about which assets participate in the request.
-pub(crate) fn component_footprint(
-    spec: &LoadSpec,
-) -> gen_core::Result<gen_core::PerComponentBytes> {
+/// route-local transformer snapshot, so resolving from `spec.weights` alone misses a split install
+/// entirely. Keep this coupled to [`resolve_component_dirs`] so admission and load cannot silently
+/// disagree about which assets participate in the request.
+///
+/// SC-22667 retired the `component_footprint` on-disk sum that used to wrap this: it was consumed
+/// only by the memory contract, which now prices these same directories at the widths the loader
+/// materializes them in ([`memory_strategy::loaded_component_bytes`]). This crate registers no
+/// `footprint =` seam, so nothing else wanted the file-length sum.
+pub(crate) fn resolved_component_dirs(spec: &LoadSpec) -> gen_core::Result<MageComponentDirs> {
     let root = match &spec.weights {
         WeightsSource::Dir(root) => root,
         WeightsSource::File(_) => {
             return Err(gen_core::Error::Msg(
-                "mage-flow component footprint requires a snapshot directory".to_owned(),
+                "mage-flow component resolution requires a snapshot directory".to_owned(),
             ))
         }
     };
-    let dirs = resolve_component_dirs(root, spec)?;
-    Ok(component_footprint_from_dirs(&dirs))
-}
-
-fn component_footprint_from_dirs(dirs: &MageComponentDirs) -> gen_core::PerComponentBytes {
-    gen_core::PerComponentBytes {
-        text_encoder: gen_core::safetensors_path_bytes(&dirs.text_encoder),
-        dit: gen_core::safetensors_path_bytes(&dirs.transformer),
-        vae: gen_core::safetensors_path_bytes(&dirs.vae),
-    }
+    resolve_component_dirs(root, spec)
 }
 
 fn generation_descriptor(
@@ -785,10 +779,10 @@ fn load_generation_from_dirs(
     }
     let device = candle_gen::default_device()?;
     #[cfg(any(feature = "cuda", test))]
-    let memory_strategy = Some(memory_strategy::provider_contract_with_components(
+    let memory_strategy = Some(memory_strategy::provider_contract_with_dirs(
         descriptor.id,
         spec,
-        component_footprint_from_dirs(&component_dirs),
+        &component_dirs,
     )?);
     #[cfg(not(any(feature = "cuda", test)))]
     let memory_strategy = None;
@@ -1365,8 +1359,15 @@ mod registry_tests {
             .contains("must be staged as a directory"));
     }
 
+    /// SceneWorks stages the shared text encoder and VAE outside the route-local transformer
+    /// snapshot, and the contract must price the directories the loader will actually open.
+    ///
+    /// SC-22667: the fixture writes real (header-only) safetensors rather than raw byte blobs,
+    /// because the contract now reads tensor geometry instead of file lengths — and the byte
+    /// assertions are the **materialized** bf16 widths, not the on-disk sums the retired
+    /// `component_footprint` helper produced.
     #[test]
-    fn split_component_footprint_follows_the_production_loader_paths() {
+    fn split_component_layout_follows_the_production_loader_paths() {
         let root_tmp = tempfile::tempdir().unwrap();
         let root = root_tmp.path();
         let transformer = root.join("tier/transformer");
@@ -1375,27 +1376,77 @@ mod registry_tests {
         for directory in [&transformer, &text, &vae] {
             std::fs::create_dir_all(directory).unwrap();
         }
-        std::fs::write(transformer.join("model.safetensors"), vec![0u8; 11]).unwrap();
-        std::fs::write(text.join("model.safetensors"), vec![0u8; 13]).unwrap();
-        std::fs::write(vae.join("model.safetensors"), vec![0u8; 17]).unwrap();
+        // A dense trunk config, so nothing folds and every component prices at bf16.
+        std::fs::write(
+            transformer.join("config.json"),
+            br#"{"in_channels":128,"out_channels":128,"context_in_dim":2560,"hidden_size":3072,"num_heads":24,"depth":12,"axes_dim":[16,56,56],"checkpoint":false,"patch_size":1}"#,
+        )
+        .unwrap();
+        // Rank-1 tensors: nothing here is a projection, so the folded/dense distinction is out of
+        // the way and the assertion is purely about which directory each component came from.
+        write_bf16_fixture(
+            &transformer.join("model.safetensors"),
+            &[("norm.weight", 11)],
+        );
+        write_bf16_fixture(
+            &text.join("model.safetensors"),
+            &[("model.language_model.norm.weight", 13)],
+        );
+        write_bf16_fixture(
+            &vae.join("model.safetensors"),
+            &[("student.norm.weight", 17)],
+        );
 
         let spec = LoadSpec::new(WeightsSource::Dir(root.join("tier")))
-            .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(text))
-            .with_component(COMPONENT_VAE, WeightsSource::Dir(vae));
+            .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(text.clone()))
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(vae.clone()));
         assert_eq!(
-            component_footprint(&spec).unwrap(),
-            gen_core::PerComponentBytes {
-                text_encoder: 13,
-                dit: 11,
-                vae: 17,
+            resolved_component_dirs(&spec).unwrap(),
+            MageComponentDirs {
+                transformer: transformer.clone(),
+                text_encoder: text,
+                vae,
             }
         );
         let generation = memory_strategy::contract_rl(&spec).unwrap();
         let edit = memory_strategy::contract_edit(&spec).unwrap();
-        assert_eq!(generation.asset_facts.conditioning_bytes, 13);
-        assert_eq!(edit.asset_facts.conditioning_bytes, 30);
-        assert_eq!(generation.asset_facts.base_bytes, 41);
-        assert_eq!(edit.asset_facts.base_bytes, 41);
+        // The language stack's final norm is one of the leaves `candle_gen_boogu::text_encoder`
+        // reads through `get_f32` (SC-22667 review), so its 13 elements price at 4 B, not 2.
+        assert_eq!(generation.asset_facts.conditioning_bytes, 4 * 13);
+        // SC-22667: the Edit route's conditioning is the text encoder alone; the shared VAE is
+        // charged once, in `decoder_bytes` (this assertion previously pinned 13 + 17 = 30, which
+        // left `base_bytes` 41 short of its own 13 + 11 + 30 decomposition).
+        assert_eq!(edit.asset_facts.conditioning_bytes, 4 * 13);
+        assert_eq!(edit.asset_facts.decoder_bytes, 34);
+        assert_eq!(generation.asset_facts.base_bytes, 2 * 11 + 4 * 13 + 2 * 17);
+        assert_eq!(edit.asset_facts.base_bytes, 2 * 11 + 4 * 13 + 2 * 17);
+    }
+
+    /// Header-only bf16 safetensors of rank-1 tensors, for fixtures that only care about which
+    /// directory a component's bytes came from.
+    fn write_bf16_fixture(path: &Path, tensors: &[(&str, usize)]) {
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_u64;
+        for &(name, len) in tensors {
+            let bytes = len as u64 * 2;
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": "BF16",
+                    "shape": [len],
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.extend(vec![0_u8; offset as usize]);
+        std::fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -1408,13 +1459,18 @@ mod registry_tests {
             std::fs::create_dir_all(directory).unwrap();
         }
         std::fs::write(transformer.join("config.json"), b"{}").unwrap();
-        std::fs::write(
-            transformer.join("diffusion_pytorch_model.safetensors"),
-            vec![0u8; 23],
-        )
-        .unwrap();
-        std::fs::write(text.join("model.safetensors"), vec![0u8; 13]).unwrap();
-        std::fs::write(vae.join("model.safetensors"), vec![0u8; 17]).unwrap();
+        write_bf16_fixture(
+            &transformer.join("diffusion_pytorch_model.safetensors"),
+            &[("norm.weight", 23)],
+        );
+        write_bf16_fixture(
+            &text.join("model.safetensors"),
+            &[("model.language_model.norm.weight", 13)],
+        );
+        write_bf16_fixture(
+            &vae.join("model.safetensors"),
+            &[("student.norm.weight", 17)],
+        );
 
         let spec = LoadSpec::new(WeightsSource::Dir(transformer.clone()))
             .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(text))
@@ -1425,8 +1481,10 @@ mod registry_tests {
         let contract = generator
             .memory_strategy_contract()
             .expect("fine-tuned load publishes exact admission facts");
-        assert_eq!(contract.asset_facts.base_bytes, 53);
-        assert_eq!(contract.asset_facts.conditioning_bytes, 13);
+        // Materialized widths (SC-22667), not the on-disk file lengths: the DiT and VAE norms at
+        // bf16, the language stack's final norm at the f32 its loader reads it in (review round).
+        assert_eq!(contract.asset_facts.base_bytes, 2 * 23 + 4 * 13 + 2 * 17);
+        assert_eq!(contract.asset_facts.conditioning_bytes, 4 * 13);
 
         let old_shape = LoadSpec::new(WeightsSource::Dir(root.path().join("missing")))
             .with_component(
@@ -1454,13 +1512,18 @@ mod registry_tests {
             std::fs::create_dir_all(directory).unwrap();
         }
         std::fs::write(transformer.join("config.json"), b"{}").unwrap();
-        std::fs::write(
-            transformer.join("diffusion_pytorch_model.safetensors"),
-            vec![0u8; 23],
-        )
-        .unwrap();
-        std::fs::write(text.join("model.safetensors"), vec![0u8; 13]).unwrap();
-        std::fs::write(vae.join("model.safetensors"), vec![0u8; 17]).unwrap();
+        write_bf16_fixture(
+            &transformer.join("diffusion_pytorch_model.safetensors"),
+            &[("norm.weight", 23)],
+        );
+        write_bf16_fixture(
+            &text.join("model.safetensors"),
+            &[("model.language_model.norm.weight", 13)],
+        );
+        write_bf16_fixture(
+            &vae.join("model.safetensors"),
+            &[("student.norm.weight", 17)],
+        );
 
         let spec = LoadSpec::new(WeightsSource::Dir(transformer))
             .with_component(COMPONENT_TEXT_ENCODER, WeightsSource::Dir(text))

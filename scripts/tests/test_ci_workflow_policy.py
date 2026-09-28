@@ -1,17 +1,23 @@
 """Regression tests for trust boundaries around persistent self-hosted CI runners."""
 
+import copy
 import functools
+import json
 import ntpath
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import tomllib
 import unittest
 
 import yaml
+
+from scripts.ci.real_weights_workflow import inline_text as real_weights_inline_text
+from scripts.ci.real_weights_workflow import script_references as real_weights_script_references
 from pathlib import Path
 
 
@@ -51,6 +57,12 @@ WINDOWS_MAGE_LOCK = (
 )
 MACOS_MAGE_LOCK = (
     "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt"
+)
+# sc-19387: the dispatch-only YuE CUDA lane, in its own file because `real-weights.yml` is at
+# GitHub's 500 KB workflow-size limit, and the lock that decodes YuE's upstream ICL reference clip.
+YUE_WORKFLOW = WORKFLOW.with_name("real-weights-yue.yml")
+WINDOWS_YUE_LOCK = (
+    ".github/requirements/real-weights-yue-reference-windows-x64-py312.txt"
 )
 MACOS_INTERPRETER = "python3.12"
 WINDOWS_SETUP_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
@@ -206,7 +218,7 @@ def bash_syntax_check(shell: str, script: str) -> subprocess.CompletedProcess:
 
 
 def chroma_packed_build_script() -> str:
-    workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+    workflow = real_weights_inline_text()
     step = re.search(
         r"(?ms)^      - name: Build and validate packed q4/q8 tiers\n"
         r".*?^        run: \|\n(?P<script>.*?)^      - name:",
@@ -483,8 +495,9 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
     ``windows_reviewed_interpreter_exemption_errors`` rather than skipped outright.
     """
     errors: list[str] = []
+    powershell_interpreter = r"$env:REVIEWED_PYTHON"
     interpreter = re.compile(
-        rf"({re.escape(WINDOWS_INTERPRETER)}|"
+        rf"({re.escape(WINDOWS_INTERPRETER)}|{re.escape(powershell_interpreter)}|"
         r"(?<![\w./$\"'-])py(?:\s+-\d+(?:\.\d+)?)?(?![\w-])|"
         r"(?<![\w./$\"'-])python[0-9.]*(?:\.exe)?(?![\w-]))",
         re.IGNORECASE,
@@ -574,14 +587,16 @@ def real_weight_windows_interpreter_errors(workflow: str) -> list[str]:
             looks_like_python_command = bool(
                 re.search(r"\s-m\s+pip\b|scripts[/\\][^\s]+\.py\b", command, re.IGNORECASE)
             )
-            if looks_like_python_command and WINDOWS_INTERPRETER not in command:
+            if looks_like_python_command and not any(
+                reviewed in command for reviewed in (WINDOWS_INTERPRETER, powershell_interpreter)
+            ):
                 errors.append(
                     f"{job}: Windows Python command must use {WINDOWS_INTERPRETER}: "
                     f"{command.strip()!r}"
                 )
             for found in found_interpreters:
                 name = found.group(1)
-                if name != WINDOWS_INTERPRETER:
+                if name not in (WINDOWS_INTERPRETER, powershell_interpreter):
                     errors.append(
                         f"{job}: Windows steps must name {WINDOWS_INTERPRETER}, found "
                         f"{name!r} in {command.strip()!r}"
@@ -696,7 +711,7 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
             errors.append(f"{prefix}: unexpected argument after requirement lock")
 
     expected_lock_counts = {
-        # 35 since SC-22261 added the StarVector terminal MLX lane;
+        # 35 since SC-23942 added the Qwen/Bonsai MLX materialization lane;
         # 34 since sc-18932's `mlx-minimax-h3` merged alongside main's 33
         # (33 since sc-18325 added the three correctness-only decode-quality jobs;
         # 30 since sc-18315 added pinned Krea license materialization;
@@ -706,9 +721,10 @@ def real_weight_pip_policy_errors(workflow: str) -> list[str]:
         # `mlx-qwen-image-producers` jobs; 24 since sc-17250 added the JoyCaption and
         # MOSS-TTS-Realtime jobs; 22 before).
         MACOS_HUB_LOCK: 35,
-        # 12 since SC-22261 added the StarVector terminal Candle lane;
+        # 13 since sc-24114 added the `candle-qwen-image-2-1` job;
+        # 12 since SC-23942 added the Qwen/Bonsai Candle materialization lane;
         # 11 since sc-18932 added the `candle-minimax-h3` job.
-        WINDOWS_HUB_LOCK: 12,
+        WINDOWS_HUB_LOCK: 13,
         # `candle-scail2-shared` is the only lane on the py314 Windows lock.
         WINDOWS_SCAIL_HUB_LOCK: 1,
         WINDOWS_MAGE_LOCK: 1,
@@ -990,15 +1006,16 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("nohup", steps[names.index(reclaim)]["run"])
 
     def test_real_weight_python_installs_are_binary_hash_locked(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_pip_policy_errors(workflow), [])
-        # 35 / 12 after SC-22261 added the serialized StarVector terminal pair on top of
-        # sc-18932's `mlx-minimax-h3` and `candle-minimax-h3` materialization lanes. These counts
+        # 35 / 12 after SC-23942 added one pinned materialization lane per native backend; 13 Windows
+        # after sc-24114 added `candle-qwen-image-2-1`.
+        # The remaining jobs retain their materialization lanes. These counts
         # are the anti-drift half of the policy above: the shape checks pass on a job that installs
         # nothing, so only a count notices a lane that quietly stopped materializing its snapshot.
         # Bump them when you add or remove a lane.
         self.assertEqual(workflow.count(MACOS_HUB_LOCK), 35)
-        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 12)
+        self.assertEqual(workflow.count(WINDOWS_HUB_LOCK), 13)
         self.assertEqual(workflow.count(WINDOWS_SCAIL_HUB_LOCK), 1)
         self.assertEqual(workflow.count(WINDOWS_MAGE_LOCK), 1)
         self.assertNotRegex(
@@ -1007,7 +1024,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
 
     def test_decode_quality_candidates_stay_inside_family_geometry_domains(self) -> None:
-        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow_text = real_weights_inline_text()
         self.assertEqual(decode_quality_candidate_policy_errors(workflow_text), [])
         workflow = yaml.safe_load(workflow_text)
         jobs = workflow["jobs"]
@@ -1087,7 +1104,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                 self.assertTrue(decode_quality_candidate_policy_errors(mutated))
 
     def test_real_weight_macos_steps_name_the_reviewed_cpython(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_macos_interpreter_errors(workflow), [])
         # The gate is worthless if it inspected nothing, and `count` alone would pass on a file
         # whose installs are all Windows. Pin both: the reviewed interpreter appears on every
@@ -1104,7 +1121,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertNotRegex(code, r"(?<![\w.])python3(?!\.12)(?![\w-])")
 
     def test_real_weight_windows_steps_name_reviewed_cpython_and_fail_fast(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
         windows_python_lines = [
             line
@@ -1209,7 +1226,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         mutated ONE AT A TIME: mutating them together would only prove the set is load-bearing,
         not that any individual member is.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertEqual(real_weight_windows_interpreter_errors(workflow), [])
         bodies = workflow_job_bodies(workflow)
         for job in WINDOWS_REVIEWED_INTERPRETER_EXEMPT_JOBS:
@@ -1235,7 +1252,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     )
 
     def test_real_weight_macos_interpreter_policy_discriminates_mutations(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         mutations = {
             "bare python3 installer": workflow.replace(
                 f"{MACOS_INTERPRETER} -m pip install", "python3 -m pip install", 1
@@ -1279,7 +1296,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
 
     def test_real_weight_pip_policy_discriminates_bypass_mutations(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         canonical_macos_install = (
             f"{MACOS_INTERPRETER} -m pip install --disable-pip-version-check "
             "--only-binary=:all: --require-hashes --target \"$PYTHONPATH\" "
@@ -1361,6 +1378,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ),
             {"numpy", "safetensors"},
         )
+        validate_binary_hashed_lock(
+            (REAL_WEIGHT_REQUIREMENTS / Path(WINDOWS_YUE_LOCK).name).read_text(
+                encoding="utf-8"
+            ),
+            {"cffi", "numpy", "pycparser", "soundfile", "typing-extensions"},
+        )
         self.assertEqual(macos["huggingface-hub"][0], "1.20.1")
         self.assertEqual(windows["huggingface-hub"][0], "1.20.1")
         self.assertEqual(scail_windows["huggingface-hub"][0], "1.20.1")
@@ -1439,7 +1462,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         transformer, so the workflow must expose no knob that could reintroduce a divergence,
         and must verify the published artifact declares exactly its tier's width.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         # No dispatch input or env var may select an auxiliary width or T5 geometry.
         for forbidden in (
             "chroma_t5_group_size:",
@@ -1463,7 +1486,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn('if "residual_bits" in quantization:', workflow)
 
     def test_sa3_snapshot_paths_are_manifest_derived(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         self.assertNotRegex(workflow, r"SA3_[A-Z0-9_]+[^\n]*[0-9a-f]{40}")
         # Thirteen SA3/SAME exporters, SC-18309's exact SDXL-VAE projection, and SC-18315's
         # q4 Krea correctness projection and standalone Wan donor plus exact-file materialization.
@@ -1561,6 +1584,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             REAL_WEIGHTS_WORKFLOW,
             LTX25_QUANT_CAMPAIGN_WORKFLOW,
             LTX25_QUANT_PROMOTION_WORKFLOW,
+            YUE_WORKFLOW,
         ):
             with self.subTest(workflow=path.name):
                 workflow = path.read_text(encoding="utf-8")
@@ -1569,6 +1593,60 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     1,
                 )
                 self.assertIn("cancel-in-progress: false", workflow)
+
+    def test_yue_workflow_python_installs_are_binary_hash_locked(self) -> None:
+        installs = [
+            line.strip()
+            for line in YUE_WORKFLOW.read_text(encoding="utf-8").splitlines()
+            if re.search(r"\bpip\s+install\b", line) and not line.lstrip().startswith("#")
+        ]
+        locks = [re.search(r"\s-r\s+(\S+)", line).group(1) for line in installs]
+        # YuE-v1: the hub fetch and the reference-clip decode; YuE2 (sc-22995): the hub fetch.
+        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK, WINDOWS_HUB_LOCK])
+        for line in installs:
+            with self.subTest(install=line):
+                self.assertTrue(line.startswith(f"{WINDOWS_INTERPRETER} -m pip install "))
+                self.assertIn("--only-binary=:all: --require-hashes", line)
+                self.assertTrue(line.endswith("|| exit /b 1"))
+
+    def test_yue2_job_renders_through_the_registered_loader(self) -> None:
+        # sc-23002: the YuE2 job renders through the registry on its production device and replays
+        # the AR parity cases, sampled like the tier measurement, and keeps each summary line.
+        workflow = yaml.safe_load(YUE_WORKFLOW.read_text(encoding="utf-8"))
+        steps = {step.get("name"): step for step in workflow["jobs"]["candle-audio-yue2"]["steps"]}
+        build = steps["Build the YuE2 CUDA test binary"]
+        self.assertEqual(build["id"], "build-yue2")
+        self.assertIn(
+            "-p candle-audio-yue2 --features cuda --lib --test engine_real_weights --no-run",
+            build["run"],
+        )
+        render = steps["Render YuE2 through the registered loader and replay the AR parity cases"]
+        self.assertEqual(
+            render["if"], "${{ !cancelled() && steps.build-yue2.outcome == 'success' }}"
+        )
+        run = render["run"]
+        self.assertIn('set "YUE2_HF_HUB=%CANDLE_GEN_MODELS_ROOT%"', run)
+        for command in (
+            "cargo test --locked --release -p candle-audio-yue2 --features cuda --test "
+            "engine_real_weights registered_loader_generates_a_song_with_every_artifact "
+            "-- --ignored --exact --nocapture",
+            "cargo test --locked --release -p candle-audio-yue2 --features cuda --lib "
+            "parity::real_weight_decodes_match_upstream -- --ignored --exact --nocapture",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(run.count(command), 1)
+        quality = steps["Measure the YuE2 tiers against the F32 reference"]["run"]
+        sampler = [line for line in quality.splitlines() if "nvidia-smi --query-gpu" in line]
+        self.assertEqual(len(sampler), 1)
+        self.assertIn(sampler[0], run)
+        # The summary prefix the steps scrape is the one the harnesses print.
+        evidence = (
+            YUE_WORKFLOW.parents[2] / "crates/audio/candle-audio-yue2/src/evidence.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn('pub const SUMMARY_PREFIX: &str = "YUE2_EVIDENCE_SUMMARY ";', evidence)
+        for text in (quality, run):
+            self.assertIn('findstr /C:"YUE2_EVIDENCE_SUMMARY {"', text)
+        self.assertIn('findstr /C:"zh_full semantic:"', run)
 
     def test_ltx25_terminal_workflows_are_autonomous_and_artifact_bound(self) -> None:
         campaign = LTX25_QUANT_CAMPAIGN_WORKFLOW.read_text(encoding="utf-8")
@@ -1626,7 +1704,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("prepare_ltx25_quant_campaign.py promotion", promotion)
 
     def test_mage_media_lane_requires_verified_operator_cpu_oracles(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         mlx_media = "\n".join(workflow_job_bodies(workflow)["mlx-media"])
         self.assertIn('MAGE_REQUIRE_GOLDENS: "1"', workflow)
         self.assertIn(
@@ -1770,6 +1848,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
         for fingerprint_input in (
             ".github/workflows/real-weights.yml",
+            "scripts/ci/real-weights/mlx-media/**",
             "crates/media/mlx-gen/_vendor/mage_flow/**",
             "crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg",
             "crates/media/mlx-gen/_vendor/mage_flow/requirements-oracles.txt",
@@ -2112,7 +2191,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                         model["materialization_expected_files"], flux_materialization_files
                     )
 
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
 
         # Shape, not population. Two `count("--require-materialization-provenance") == 6` pins used
         # to stand here: a second lane for an already-covered model turned them RED for no reason,
@@ -2199,7 +2278,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Over CODE, not prose: `mlx-qwen-image`'s header comment has to name QWEN_IMAGE_SNAPSHOT to
         # explain why the MLX half was renamed off it. Same reason `workflow_code` exists for the
         # wiring gate — a comment can document a variable but can never wire one.
-        workflow = workflow_code(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))
+        workflow = workflow_code(real_weights_inline_text())
         self.assertNotIn("residency-ab", workflow)
         self.assertNotIn("QWEN_IMAGE_SNAPSHOT", workflow)
 
@@ -2240,13 +2319,15 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # Every workflow, not just the two that exist today: a lane added in a third file must
         # count as wiring, or this gate would start reporting phantom orphans.
         workflows = "\n".join(
-            path.read_text(encoding="utf-8")
+            real_weights_inline_text()
+            if path == REAL_WEIGHTS_WORKFLOW
+            else path.read_text(encoding="utf-8")
             for path in sorted(WORKFLOW.parent.glob("*.yml"))
         )
         self.assertEqual(manifest_environment_wiring_errors(models, workflows), [])
 
     def test_native_decode_seam_real_weight_gates_are_exact_and_golden_free(self) -> None:
-        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow_text = real_weights_inline_text()
         workflow = yaml.safe_load(workflow_text)
         cases = {
             "mlx-media": (
@@ -2406,9 +2487,12 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         )
 
     def test_memory_evidence_v1_lane_is_artifact_bound_tolerance_pinned_and_operator_dispatched(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("  mlx-memory-evidence-v1:")
-        end = workflow.index("\n  mlx-llm:", start)
+        end = min(
+            workflow.index("\n  qwen38-bonsai-mlx:", start),
+            workflow.index("\n  mlx-llm:", start),
+        )
         job = workflow[start:end]
 
         self.assertIn("memory-evidence-v1", workflow.split("jobs:", 1)[0])
@@ -2429,7 +2513,10 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("ensure_model_snapshot.py", job)
         self.assertIn("SCENEWORKS_PROVENANCE_ROOT: ${{ runner.temp }}/sceneworks-provenance", job)
         self.assertIn("https://github.com/SceneWorks/SceneWorks.git", job)
-        self.assertIn('fetch --depth=1 origin "${{ inputs.sceneworks_revision }}"', job)
+        self.assertIn(
+            "REQUESTED_SCENEWORKS_REVISION: ${{ inputs.sceneworks_revision }}", job
+        )
+        self.assertIn('fetch --depth=1 -- origin "$REQUESTED_SCENEWORKS_REVISION"', job)
         self.assertIn('git -C "$SCENEWORKS_PROVENANCE_ROOT" rev-parse HEAD', job)
         self.assertIn('echo "SCENEWORKS_REVISION=$resolved" >> "$GITHUB_ENV"', job)
         self.assertGreaterEqual(
@@ -2471,7 +2558,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("memory-evidence-v1-z-image-${{ github.sha }}", job)
 
     def test_scail2_shared_cuda_lane_is_exact_revision_provider_exercised_and_measured(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("  candle-scail2-shared:")
         end = workflow.index("\n  candle-media:", start)
         job = workflow[start:end]
@@ -2610,7 +2697,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         NO `verify_residency_ab.py` pin here: no SANA verifier exists, and the adjudicated contract
         (sc-17863) is asserted INSIDE the tests, so the exit code is the verdict.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("  mlx-sana-drift-ceiling:")
         end = workflow.index("\n  mlx-memory-evidence-v1:", start)
         job = workflow[start:end]
@@ -2672,7 +2759,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_krea_alternate_decoder_smoke_is_explicit_and_correctness_only(self) -> None:
         """SC-18315 keeps its model smoke distinct from memory/calibration capture."""
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         jobs = workflow_job_bodies(workflow)
         job = "\n".join(jobs["mlx-krea-alternate-decoder"])
         job_header = job.split("steps:", 1)[0]
@@ -2765,7 +2852,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         exactly the outcome whose measured cells someone needs to read, and re-running costs
         hours.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         # Bounded by the job map, not by the NAME OF THE NEXT JOB. The hard-coded
         # `candle-audio-kokoro` anchor this used to carry silently swallowed any job inserted
         # between the two, which is exactly what happened when sc-18932 added `mlx-minimax-h3`
@@ -2796,7 +2883,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         # are false greens twice over: `assertIn("krea_s18_rows:", ...)` matches the key inside a
         # `#` comment, and `assertIn("default: ABCDFEZ", ...)` is unanchored, so swapping the two
         # defaults between the rows and seeds inputs still passed. Both were demonstrated.
-        inputs = yaml.safe_load(REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8"))[True][
+        inputs = yaml.safe_load(real_weights_inline_text())[True][
             "workflow_dispatch"
         ]["inputs"]
         # NOT the full ABCDFEZ. sc-17324 established by measurement that two rows cannot run on
@@ -2907,7 +2994,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         subsystem form returns nothing at all. A capture that silently matches nothing is worse than
         no capture, because an empty file reads as evidence of absence.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         bounds = {
             "  mlx-krea-realtime:": "\n  mlx-krea-realtime-s18-sweep:",
             "  mlx-krea-realtime-s18-sweep:": "\n  candle-audio-kokoro:",
@@ -3053,7 +3140,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         85-minute research sweep ended up inside a 20-minute regression lane. The run-count assertion
         is what makes the next such addition loud instead of silent.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         start = workflow.index("      - name: Run Krea Realtime real-weight e2e (Q4 tier)")
         step = workflow[
             start : workflow.index("      - name: Run Krea Realtime KV-cache residency", start)
@@ -3068,7 +3155,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
 
     def test_krea_kv_residency_step_runs_the_identity_and_retention_gates(self) -> None:
         """sc-17894: both real-weight acceptance arms must be name-selected and count-pinned."""
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         header = workflow.split("jobs:", 1)[0]
         job_start = workflow.index("  mlx-krea-realtime:")
         job = workflow[job_start : workflow.index("\n  mlx-krea-realtime-s18-sweep:", job_start)]
@@ -3166,7 +3253,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         on a missing fixture should be wired the moment the fixture exists, and listing it here would
         create a second place to remember to unlist it. The manifest row carries the accounting.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         jobs = ("mlx-qwen-image", "mlx-qwen-image-pid", "mlx-qwen-image-producers")
         # Slice to the NEXT job key at the same indentation, not to the next Qwen job — the last of
         # the three would otherwise swallow the rest of the file and read other lanes' commands.
@@ -3332,7 +3419,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         3. `--exact` after the `--`, one `set -o pipefail` per cargo step, and one run-count
            assertion per selection -- the sc-17250 false-green shape.
         """
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         repository = REAL_WEIGHTS_WORKFLOW.parents[2]
         # job -> the (source file, selected names) pairs it draws from. A job may select out of more
         # than ONE test binary: sc-17156 added the VRAM probe, which lives in its own `vram_probe.rs`
@@ -3591,7 +3678,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             )
 
     def test_minimax_h3_vram_campaign_policy_rejects_unsafe_staging_and_shared_processes(self) -> None:
-        workflow = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        workflow = real_weights_inline_text()
         manifest = MODEL_MANIFEST.read_text(encoding="utf-8")
         self.assertEqual(minimax_h3_vram_policy_errors(workflow, manifest), [])
 
@@ -3643,6 +3730,62 @@ class CiWorkflowPolicyTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_windows_cuda_dispatch_schedules_no_macos_lane(self) -> None:
+        """sc-24164: `lanes: windows-cuda` selects only the Windows CUDA lane set, and every macOS
+        job (including self-hosted `macos-nax`) is gated on the macOS lane it leaves unselected."""
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(workflow)
+        lanes_input = parsed[True]["workflow_dispatch"]["inputs"]["lanes"]
+        self.assertEqual(lanes_input["default"], "all", "a bare dispatch must keep running every lane")
+        self.assertEqual(lanes_input["options"], ["all", "windows-cuda"])
+        select = next(
+            step for step in parsed["jobs"]["changes"]["steps"] if step.get("id") == "select"
+        )
+        self.assertEqual(select["env"]["DISPATCH_LANES"], "${{ inputs.lanes }}")
+        run = select["run"]
+        scoped = (
+            'if [[ "$EVENT_NAME" == "workflow_dispatch" && "$DISPATCH_LANES" == "windows-cuda" ]]; then\n'
+            '  python3 scripts/ci/select_lanes.py --only windows_cuda --github-output "$GITHUB_OUTPUT"\n'
+            'elif [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then'
+        )
+        self.assertTrue(run.startswith(scoped), run)
+
+        output = Path(self.enterContext(tempfile.TemporaryDirectory())) / "github-output"
+        subprocess.run(
+            [sys.executable, "scripts/ci/select_lanes.py", "--only", "windows_cuda",
+             "--github-output", str(output)],
+            cwd=WORKFLOW.parents[2],
+            check=True,
+            capture_output=True,
+        )
+        selected = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").split())
+        self.assertEqual({lane for lane, value in selected.items() if value == "true"}, {"windows_cuda"})
+
+        macos_jobs = {
+            name
+            for name, job in parsed["jobs"].items()
+            if "macos" in json.dumps(job.get("runs-on", "")).lower()
+        }
+        self.assertIn("macos-nax", macos_jobs)
+        for name in macos_jobs:
+            with self.subTest(job=name):
+                self.assertIn(
+                    "needs.changes.outputs.macos_metal == 'true'",
+                    parsed["jobs"][name].get("if", ""),
+                    f"{name} could be scheduled by a dispatch that did not select the macOS lane",
+                )
+
+    def test_manual_cuda_package_tests_collect_all_failures_without_masking_exit(self) -> None:
+        jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        job = jobs["windows-cuda"]
+        step = next(step for step in job["steps"] if step.get("name") == "Test Candle CUDA packages")
+        command = step["run"].strip().splitlines()[-1]
+        self.assertIn("cargo test --locked --lib --tests", command)
+        self.assertIn("--no-fail-fast", command)
+        self.assertNotIn("||", command)
+        self.assertFalse(step.get("continue-on-error", False))
+        self.assertFalse(job.get("continue-on-error", False))
 
     def test_windows_cuda_jobs_cap_cargo_parallelism_for_shared_host(self) -> None:
         jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
@@ -3719,6 +3862,19 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             workflow["jobs"]["gate"]["needs"],
             "CI gate must fail when the topology policy in changes fails",
         )
+        checkouts = [
+            step
+            for step in changes["steps"]
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
+        self.assertEqual(
+            [(step.get("with") or {}).get("fetch-depth") for step in checkouts],
+            [0],
+            "an annotated tag push names the tag object in `after`; a fetch-depth: 0 checkout "
+            "fetches refs/tags/* so the policy can peel that object to GITHUB_SHA, while a "
+            "shallow tag checkout fetches only the peeled commit and fails every annotated "
+            "runtime-* tag closed",
+        )
 
         triggers = workflow[True]
         self.assertIn("pull_request", triggers)
@@ -3750,6 +3906,215 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("success|skipped)", step["run"])
         self.assertIn("exit 1", step["run"])
         self.assertIn("join(needs.*.result", step["env"]["RESULTS"])
+
+    def assert_qwen38_candle_requires_successful_mlx(self, workflow: dict) -> None:
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        self.assertEqual(candle["needs"], "qwen38-bonsai-mlx")
+        self.assertEqual(
+            candle["if"],
+            "${{ !cancelled() && needs.qwen38-bonsai-mlx.result == 'success' && "
+            "github.event_name == 'workflow_dispatch' && "
+            "inputs.profile == 'qwen38-bonsai' }}",
+        )
+
+    def test_qwen38_candle_skips_after_failed_or_cancelled_mlx(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
+        candle = workflow["jobs"]["qwen38-bonsai-candle"]
+        for unsafe_condition in (
+            candle["if"].replace("needs.qwen38-bonsai-mlx.result == 'success' && ", ""),
+            candle["if"].replace("== 'success'", "!= 'success'"),
+            candle["if"].replace("needs.qwen38-bonsai-mlx", "needs.qwen38-bonsai-candle"),
+        ):
+            with self.subTest(unsafe_condition=unsafe_condition):
+                mutated = copy.deepcopy(workflow)
+                mutated["jobs"]["qwen38-bonsai-candle"]["if"] = unsafe_condition
+                with self.assertRaises(AssertionError):
+                    self.assert_qwen38_candle_requires_successful_mlx(mutated)
+
+    def test_qwen38_bonsai_terminal_profile_is_accelerator_only_and_sealed(self) -> None:
+        workflow = yaml.safe_load(real_weights_inline_text())
+        options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        self.assertIn("qwen38-bonsai", options)
+        for name in ("qwen38_bonsai_preflight_only", "qwen38_bonsai_provision_only"):
+            setting = workflow[True]["workflow_dispatch"]["inputs"][name]
+            self.assertEqual(setting["type"], "boolean")
+            self.assertFalse(setting["default"])
+        jobs = workflow["jobs"]
+        mlx = jobs["qwen38-bonsai-mlx"]
+        cuda = jobs["qwen38-bonsai-candle"]
+        aggregate = jobs["qwen38-bonsai-aggregate"]
+        self.assertNotIn("qwen38-bonsai-candle-cpu", jobs)
+        self.assertEqual(mlx["runs-on"], ["self-hosted", "macOS", "ARM64", "nax", "real-weights"])
+        self.assertEqual(cuda["runs-on"], ["self-hosted", "windows", "cuda", "real-weights"])
+        self.assert_qwen38_candle_requires_successful_mlx(workflow)
+        self.assertEqual(aggregate["needs"], ["qwen38-bonsai-mlx", "qwen38-bonsai-candle"])
+        self.assertEqual(aggregate["permissions"]["actions"], "read")
+        matrix = json.loads((WORKFLOW.parents[2] / "release" / "qwen38-bonsai-matrix.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(matrix["cells"]), 16)
+        self.assertFalse(any(cell["device"] == "cpu" for cell in matrix["cells"]))
+        mlx_commands = "\n".join(step.get("run", "") for step in mlx["steps"])
+        cuda_commands = "\n".join(step.get("run", "") for step in cuda["steps"])
+        aggregate_commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
+        for cell in matrix["cells"]:
+            commands = mlx_commands if cell["backend"] == "mlx" else cuda_commands
+            self.assertIn(cell["id"], commands)
+        self.assertEqual((mlx_commands + cuda_commands).count("--preflight "), 16)
+        self.assertNotIn("candle-packed-cpu", mlx_commands + cuda_commands)
+        self.assertNotIn("candle-dense-cpu", mlx_commands + cuda_commands)
+        self.assertNotIn("--candle-device cpu", mlx_commands + cuda_commands)
+        self.assertIn("--candle-device auto", cuda_commands)
+        for job in (mlx, cuda):
+            steps = job["steps"]
+            phase = next(step for step in steps if step.get("name") == "Validate exclusive qualification phase")
+            provision = next(step for step in steps if " provision-assets " in step.get("run", ""))
+            self.assertIn("--preflight-only", phase["run"])
+            self.assertIn("--provision-only", phase["run"])
+            self.assertLess(steps.index(phase), steps.index(provision))
+            self.assertNotIn("continue-on-error", provision)
+        self.assertIn("check-partition --role mlx", mlx_commands)
+        self.assertIn("check-partition --role cuda", cuda_commands)
+        self.assertIn("--role matrix", aggregate_commands)
+        self.assertIn("qwen38_bonsai_artifacts.py aggregate", aggregate_commands)
+        self.assertFalse(next(step for step in aggregate["steps"] if step.get("name") == "Download only the selected artifact IDs without merging roots")["with"]["merge-multiple"])
+        self.assertEqual(next(step for step in aggregate["steps"] if step.get("name") == "Upload the selected roots and sealed terminal report")["if"], "always()")
+
+
+    def qwen_image_2_1_lane_errors(self, workflow: dict, source: str) -> list[str]:
+        """Everything `test_qwen_image_2_1_cuda_lane_…` below binds, as a list of findings."""
+        errors: list[str] = []
+        options = workflow[True]["workflow_dispatch"]["inputs"]["profile"]["options"]
+        if "qwen-image-2-1" not in options:
+            errors.append("`qwen-image-2-1` is not a dispatchable profile")
+        job = workflow["jobs"].get("candle-qwen-image-2-1")
+        if job is None:
+            return errors + ["no `candle-qwen-image-2-1` job"]
+        if job["if"] != "github.event_name == 'workflow_dispatch' && inputs.profile == 'qwen-image-2-1'":
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        if job["runs-on"] != ["self-hosted", "windows", "cuda", "real-weights"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+
+        models = {
+            model["key"]: model
+            for model in tomllib.loads(MODEL_MANIFEST.read_text(encoding="utf-8"))["models"]
+        }
+        for key, variable in (
+            ("qwen-image-2-1-cuda", "CANDLE_GEN_QWEN_IMAGE_2_1_SNAPSHOT"),
+            ("qwen-image-2-1-mlx", "CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT"),
+        ):
+            model = models[key]
+            expected = (
+                "${{ vars.CANDLE_GEN_MODELS_ROOT }}\\models--"
+                + model["repository"].replace("/", "--")
+                + "\\snapshots\\"
+                + model["revision"]
+            )
+            if job["env"].get(variable) != expected:
+                errors.append(f"{variable} is not the pinned cache path {expected!r}")
+            if model["environment"] != [variable]:
+                errors.append(f"{key} does not declare exactly {variable}")
+            materialize = (
+                f'scripts/release/ensure_model_snapshot.py --model {key} --snapshot "%{variable}%"'
+            )
+            if not any(materialize in step.get("run", "") for step in job["steps"]):
+                errors.append(f"{key} is never materialized")
+
+        steps = {step.get("name"): step for step in job["steps"]}
+        run = steps.get("Run the Qwen-Image 2.1 real-weight renders", {}).get("run", "")
+        selected = re.findall(r"call :run_one (\w+) \|\| set \"QWEN21_FAILED=1\"", run)
+        ignored = re.findall(r"#\[test\]\s*#\[ignore\]\s*fn (\w+)\(", source)
+        if sorted(selected) != sorted(ignored) or len(selected) != len(set(selected)):
+            errors.append(
+                f"the lane selects {sorted(selected)} but the file's ignored tests are {sorted(ignored)}"
+            )
+        for fragment in (
+            "cargo test --locked --release -p candle-gen-qwen-image-2-1 --features cuda "
+            "--test integration e2e_real_weights::%~1 -- --ignored --exact --nocapture",
+            'findstr /C:"test result: ok. 1 passed" "%log%"',
+            'if not "%QWEN21_FAILED%"=="0" exit /b 1',
+        ):
+            if run.count(fragment) != 1:
+                errors.append(f"the render step must carry exactly one {fragment!r}")
+
+        upload = steps.get("Keep the Qwen-Image 2.1 CUDA evidence", {})
+        if upload.get("with", {}).get("name") != "qwen-image-2-1-cuda-evidence":
+            errors.append("the evidence artifact is not `qwen-image-2-1-cuda-evidence`")
+        if upload.get("if") != "${{ !cancelled() }}":
+            errors.append("the evidence upload must survive a failed render")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty evidence upload must red")
+        return errors
+
+    def test_qwen_image_2_1_cuda_lane_runs_every_real_weight_test_on_pinned_snapshots(self) -> None:
+        """sc-24114: the dispatch-only Qwen-Image 2.1 CUDA lane runs EVERY `#[ignore]`d test in
+        `candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs` -- no more, no fewer -- against the two
+        pinned cache paths it materializes, and keeps its evidence even when a render reds.
+
+        Binding the selection to the file's own `#[ignore]` set is what stops a test added there
+        from silently running nowhere, and a rename from turning into "0 passed" + exit 0.
+        """
+        workflow_text = real_weights_inline_text()
+        workflow = yaml.safe_load(workflow_text)
+        source = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/media/candle-gen/candle-gen-qwen-image-2-1/tests/e2e_real_weights.rs"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(self.qwen_image_2_1_lane_errors(workflow, source), [])
+
+        # The detector has to detect.
+        renamed = source.replace(
+            "fn validation_render_transparency(", "fn validation_render_rgba("
+        )
+        self.assertTrue(self.qwen_image_2_1_lane_errors(workflow, renamed))
+        added = source + "\n#[test]\n#[ignore]\nfn an_unwired_render() {}\n"
+        self.assertTrue(self.qwen_image_2_1_lane_errors(workflow, added))
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'qwen-image-2-1'"}),
+            lambda job: job["env"].update(
+                {"CANDLE_GEN_QWEN_IMAGE_2_1_TIER_SNAPSHOT": "E:\\somewhere\\else"}
+            ),
+            lambda job: job["steps"][-1].pop("if"),
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["candle-qwen-image-2-1"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.qwen_image_2_1_lane_errors(mutated, source))
+
+
+class WorkflowFileSizeTests(unittest.TestCase):
+    # GitHub refuses any workflow file over 512,000 bytes and every run of it then startup-fails
+    # ("Workflow file exceeds the maximum allowed size of 500 KB"). real-weights.yml reached
+    # 509,886 bytes before its larger step bodies moved to scripts/ci/real-weights/. The margin
+    # leaves room for more lanes before the next extraction is due, instead of finding out from a
+    # run that never starts.
+    MAXIMUM_WORKFLOW_BYTES = 450_000
+
+    def test_every_workflow_file_stays_well_under_the_github_size_limit(self) -> None:
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            with self.subTest(workflow=path.name):
+                self.assertLess(
+                    path.stat().st_size,
+                    self.MAXIMUM_WORKFLOW_BYTES,
+                    "move large step bodies into checked-in scripts "
+                    "(see scripts/ci/real_weights_workflow.py)",
+                )
+
+    def test_real_weights_externalized_step_bodies_resolve_exactly_once(self) -> None:
+        repository = WORKFLOW.parents[2]
+        workflow_text = REAL_WEIGHTS_WORKFLOW.read_text(encoding="utf-8")
+        references = real_weights_script_references(workflow_text)
+        on_disk = sorted(
+            path.relative_to(repository).as_posix()
+            for path in (repository / "scripts" / "ci" / "real-weights").rglob("*")
+            if path.is_file()
+        )
+        self.assertTrue(references)
+        self.assertEqual(len(references), len(set(references)), "a step body is shared")
+        self.assertEqual(sorted(references), on_disk, "orphaned or missing step body")
+        self.assertEqual(
+            set(yaml.safe_load(real_weights_inline_text())["jobs"]),
+            set(yaml.safe_load(workflow_text)["jobs"]),
+        )
 
 
 if __name__ == "__main__":

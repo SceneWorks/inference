@@ -177,6 +177,28 @@ pub fn is_hidden_file(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.'))
 }
 
+/// The hidden directory Candle writes its content-addressed **device-format weight cache** into,
+/// beside the source component it was derived from (`<component>/.candle-device-format-v1/`,
+/// SC-16096). Every packed q4/q8 component that has ever been opened for block streaming carries
+/// one, holding a GGML `*.q4_1.safetensors` / `*.q8_0.safetensors` sidecar per projection —
+/// **derived** bytes of the same tensors the source file already stores, never a second component.
+///
+/// Owned here rather than in candle-gen so the tensor-free walkers below
+/// ([`safetensors_dir_bytes`], [`safetensors_path_tensor_headers`]) and the writer agree on the
+/// name by construction: the cache lives inside the component tree those walkers recurse, and
+/// summing it alongside the source file it was derived from priced the Z-Image q4 transformer at
+/// 2.1x its loaded size (SC-22667, E1).
+pub const CANDLE_DEVICE_FORMAT_CACHE_DIR: &str = ".candle-device-format-v1";
+
+/// Whether a directory entry is a **hidden directory** the weight walkers must not descend into:
+/// the Candle device-format cache ([`CANDLE_DEVICE_FORMAT_CACHE_DIR`]) and any other dot-directory
+/// (`.cache`, `.locks`, `.git`). A snapshot's component tree never names a component with a leading
+/// dot, so nothing a loader opens as a shard lives under one; what does live there is derived or
+/// bookkeeping data whose `.safetensors` files would double-count the source they were made from.
+pub fn is_hidden_dir(path: &Path) -> bool {
+    is_hidden_file(path)
+}
+
 /// Read one `.safetensors` file's `__metadata__` map **from the header alone** — no tensor data and
 /// no whole-file buffer.
 ///
@@ -414,11 +436,16 @@ impl SafetensorsTensorHeader {
     /// compute dtype. Integer and boolean tensors remain stored-width.
     ///
     /// `F8_E4M3` is deliberately **excluded**: `candle_gen::weights::coerce_float` only casts
-    /// `F16 | BF16 | F32 | F64`, so an fp8 payload stays at its stored width and needs an explicit,
-    /// route-owned dequantization contract (paired `weight_scale`/`scales` companions) before it can
-    /// be priced. Admission guards therefore fail closed on fp8 through this predicate; a route that
-    /// genuinely accepts fp8 declares it explicitly, the way
-    /// [`crate::encoder_contract`]'s ComfyUI fp8 policy does.
+    /// `F16 | BF16 | F32 | F64`, so through the shared loader an fp8 payload stays at its stored
+    /// width and needs an explicit, route-owned dequantization contract (paired
+    /// `weight_scale`/`scales` companions) before it can be priced. Admission guards therefore fail
+    /// closed on fp8 through this predicate; a route that genuinely accepts fp8 declares it
+    /// explicitly, the way [`crate::encoder_contract`]'s ComfyUI fp8 policy does.
+    ///
+    /// What the row occupies *after* such a route loads it is that route's fact, not this
+    /// predicate's: a planned single-file import (`candle_gen::logical_weights`) decodes an fp8 row
+    /// to dense bf16 wherever its residency policy masks the packed fp8 leg, so a pricing built on
+    /// `is_float()` alone under-declares those rows by half — see [`materialized_path_bytes`].
     pub fn is_float(&self) -> bool {
         matches!(
             self.dtype,
@@ -455,8 +482,9 @@ impl SafetensorsTensorHeader {
 /// Read tensor shapes/dtypes/byte ranges from one safetensors file or one recursively sharded
 /// directory without reading tensor data. Directory duplicate-key semantics match
 /// [`CheckpointMeta::from_dir`]: files are sorted and the later shard wins. File symlinks are
-/// followed (as required by the Hugging Face cache), directory symlinks are skipped, and malformed
-/// or unreadable trees fail closed instead of silently producing partial facts.
+/// followed (as required by the Hugging Face cache), directory symlinks and hidden directories
+/// ([`is_hidden_dir`] — the Candle device-format cache) are skipped, and malformed or unreadable
+/// trees fail closed instead of silently producing partial facts.
 pub fn safetensors_path_tensor_headers(
     path: impl AsRef<Path>,
 ) -> Result<Vec<SafetensorsTensorHeader>> {
@@ -474,7 +502,11 @@ pub fn safetensors_path_tensor_headers(
             let path = entry.path();
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                collect_files(&path, files)?;
+                // Same rule as `safetensors_dir_bytes`: a hidden directory is derived data (the
+                // Candle device-format cache) or bookkeeping, never a shard the loader opens.
+                if !is_hidden_dir(&path) {
+                    collect_files(&path, files)?;
+                }
                 continue;
             }
             let metadata = std::fs::metadata(&path)?;
@@ -786,7 +818,10 @@ pub fn read_safetensors_tensor_payloads(
 /// File symlinks are followed (the HF cache stores each shard as a symlink into `blobs/`), while
 /// directory symlinks are skipped to prevent a malformed snapshot from creating a recursive cycle.
 /// AppleDouble `._*` sidecars and other hidden entries are skipped ([`is_hidden_file`]) — a
-/// `._model.safetensors` masquerades as a shard and would double-count. Returns `0` when `dir` is
+/// `._model.safetensors` masquerades as a shard and would double-count. Hidden **directories** are
+/// skipped for the same reason ([`is_hidden_dir`]): the Candle device-format cache
+/// ([`CANDLE_DEVICE_FORMAT_CACHE_DIR`]) sits inside the component it was derived from and holds a
+/// GGML copy of every packed projection the sibling source file already stores. Returns `0` when `dir` is
 /// missing or holds no weights, so an absent component contributes nothing. This is the same
 /// accounting the worker's whole-model sum uses, so a component's bytes and the whole-model total
 /// stay directly comparable (`rest = total − text_encoder`).
@@ -803,7 +838,11 @@ pub fn safetensors_dir_bytes(dir: impl AsRef<Path>) -> u64 {
                 continue;
             };
             if file_type.is_dir() {
-                walk(&path, total);
+                // A hidden directory is never a component: it is the Candle device-format cache
+                // (derived copies of the sibling source file) or snapshot bookkeeping.
+                if !is_hidden_dir(&path) {
+                    walk(&path, total);
+                }
                 continue;
             }
             let Ok(meta) = std::fs::metadata(&path) else {
@@ -850,6 +889,75 @@ pub fn safetensors_path_bytes(path: impl AsRef<Path>) -> u64 {
     } else {
         0
     }
+}
+
+/// Bytes a loader materializes for every tensor at `path`, when it opens that component at a single
+/// float width (epic SC-22657, E1; feature-end sweep SC-22667).
+///
+/// [`safetensors_path_bytes`] answers a *different* question — how many bytes the component occupies
+/// **on disk** — and the two disagree by a factor of two on every component whose loader opens it at
+/// a width the checkpoint does not store in. The canonical cases in this workspace are a bf16 VAE
+/// opened f32 (under-priced 2x by an on-disk sum) and an f32-on-disk text encoder opened bf16
+/// (over-priced 2x). E1 asks for the bytes the loader materializes, so a provider whose component
+/// dtype is pinned in code prices it here rather than from file lengths.
+///
+/// The per-tensor rule is Candle's own `coerce_float` boundary, mirrored:
+///
+/// * `F16 | BF16 | F32 | F64` are **cast** to `float_width`, so they contribute
+///   `element_count * float_width`;
+/// * every other dtype — the integer code planes of a packed tier, `U8`, `BOOL`, and `F8_E4M3` —
+///   contributes its **stored** `data_bytes`.
+///
+/// That second arm is what makes one call correct for a dense snapshot and for an already-packed
+/// q4/q8 tier of the same component: the packed code planes keep their stored width while the dense
+/// residual (norms, biases, embeddings) is priced at the width it is opened in.
+///
+/// **The fp8 arm is a floor, not a universal fact.** What an `F8_E4M3` row occupies after load is
+/// **loader-specific**: the shared `coerce_float` never casts it, so a loader that reads the raw
+/// mmap holds it at 1 B/element — but a loader that routes the file through the checkpoint-codec
+/// plan (`candle_gen::logical_weights`, which every planned single-file import uses) decodes an fp8
+/// row to its codec's dense resident encoding, bf16, at 2 B/element with the `weight_scale` applied,
+/// on every host whose residency policy masks the packed fp8 leg. A provider whose route takes that
+/// decode must price the fp8 rows itself (from the plan, or at its dense width) rather than through
+/// this function, which would under-declare them by exactly half.
+///
+/// `path` may be a single `.safetensors` file or a sharded directory, with
+/// [`safetensors_path_tensor_headers`]'s duplicate-key semantics (later shard wins), so a component
+/// that ships several shards is counted once per logical tensor. Only headers are read; no tensor
+/// payload is touched, which keeps this usable inside a pre-load admission gate.
+///
+/// Errors when `path` cannot be read as safetensors — a missing path, a directory with no
+/// `.safetensors` file in it (`safetensors_path_tensor_headers` refuses that rather than answering an
+/// empty header list), or a malformed header — so a caller that must tolerate an absent component
+/// decides that itself rather than being handed a silent `0`. A well-formed file that declares zero
+/// tensors is readable and prices `0`.
+pub fn materialized_path_bytes(path: impl AsRef<Path>, float_width: u64) -> Result<u64> {
+    let path = path.as_ref();
+    let headers = safetensors_path_tensor_headers(path)?;
+    materialized_header_bytes(&headers, float_width, path)
+}
+
+/// [`materialized_path_bytes`] over headers a caller has already read — and possibly filtered to the
+/// subset its own route materializes, which is the point of exposing this half. `origin` only names
+/// the component in the overflow error.
+pub fn materialized_header_bytes(
+    headers: &[SafetensorsTensorHeader],
+    float_width: u64,
+    origin: &Path,
+) -> Result<u64> {
+    headers.iter().try_fold(0_u64, |total, header| {
+        let resident = if header.is_float() {
+            header.materialized_bytes(float_width)?
+        } else {
+            header.data_bytes
+        };
+        total.checked_add(resident).ok_or_else(|| {
+            Error::Msg(format!(
+                "{} materialized byte sum overflow",
+                origin.display()
+            ))
+        })
+    })
 }
 
 // =================================================================================================
@@ -2205,6 +2313,67 @@ mod tests {
         assert_eq!(safetensors_dir_bytes(root.join("nope")), 0);
     }
 
+    /// SC-22667 (epic SC-22657, E1): a packed component that has been opened for block streaming
+    /// carries `.candle-device-format-v1/` beside its source file, holding a GGML copy of every
+    /// packed projection. Both tensor-free walkers must price the **source** alone — summing the
+    /// cache too priced the Z-Image q4 transformer at 7.31 GB against a 3.47 GB checkpoint.
+    #[test]
+    fn weight_walkers_skip_the_candle_device_format_cache_beside_the_source_file() {
+        let tmp = fixture_dir("gencore_devfmt_cache_");
+        let transformer = tmp.path().join("transformer");
+        let cache = transformer.join(CANDLE_DEVICE_FORMAT_CACHE_DIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        write_single_tensor_file(&transformer.join("model.safetensors"), "layers.0.w", 3000);
+        write_single_tensor_file(
+            &cache.join(
+                "0104af902ed702222b65c9b031dfe9f905e5335d7c1a624200a66e2ea7718102.q4_1.safetensors",
+            ),
+            "weight",
+            4000,
+        );
+        write_single_tensor_file(
+            &cache.join("3b0cf731d8d1de876e28323e1463c44.q8_0.safetensors"),
+            "weight",
+            500,
+        );
+        // Sanity: the cache really is populated, so the assertions below are not vacuous.
+        assert!(safetensors_dir_bytes(&cache) > 4500);
+
+        let source_len = std::fs::metadata(transformer.join("model.safetensors"))
+            .unwrap()
+            .len();
+        assert_eq!(safetensors_dir_bytes(&transformer), source_len);
+        assert_eq!(safetensors_path_bytes(&transformer), source_len);
+        let headers = safetensors_path_tensor_headers(&transformer).unwrap();
+        assert_eq!(
+            headers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            vec!["layers.0.w"],
+            "the cache's `weight` payloads must not enter the header inventory"
+        );
+        // A legitimately nested (non-hidden) shard directory still counts.
+        let nested = transformer.join("shards");
+        std::fs::create_dir_all(&nested).unwrap();
+        write_single_tensor_file(&nested.join("part.safetensors"), "layers.1.w", 100);
+        assert!(safetensors_dir_bytes(&transformer) > source_len);
+        assert!(is_hidden_dir(&cache));
+        assert!(!is_hidden_dir(&nested));
+    }
+
+    /// One U8 tensor of `bytes` payload bytes, so a walker that reads headers sees a real shard.
+    fn write_single_tensor_file(path: &Path, name: &str, bytes: usize) {
+        let header = format!(
+            r#"{{"{name}":{{"dtype":"U8","shape":[{bytes}],"data_offsets":[0,{bytes}]}}}}"#
+        );
+        let mut header = header.into_bytes();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        file.extend(vec![0_u8; bytes]);
+        std::fs::write(path, file).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn safetensors_dir_bytes_skips_directory_symlink_cycles_but_follows_file_symlinks() {
@@ -2266,5 +2435,49 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("no .safetensors files"), "unexpected: {err}");
+    }
+
+    /// SC-22667 review: the doc on [`materialized_path_bytes`] promises an error, never a silent `0`,
+    /// for a path with nothing readable. Pin each half of that sentence.
+    ///
+    /// Mutation that fails this: making `safetensors_path_tensor_headers` return `Ok(vec![])` for a
+    /// directory with no `.safetensors` file (the reading under review), which turns the first
+    /// assertion into `Ok(0)`.
+    #[test]
+    fn materialized_path_bytes_errors_on_unreadable_paths_and_prices_readable_ones() {
+        let tmp = fixture_dir("gencore_materialized_path_");
+        let root = tmp.path();
+
+        // An existing directory with no `.safetensors` in it is unreadable, not empty.
+        let empty = root.join("empty-component");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("config.json"), b"{}").unwrap();
+        let err = materialized_path_bytes(&empty, 4)
+            .expect_err("a directory holding no shard must error")
+            .to_string();
+        assert!(err.contains("no .safetensors files"), "unexpected: {err}");
+
+        // A missing path errors too.
+        assert!(materialized_path_bytes(root.join("absent"), 4).is_err());
+
+        // A well-formed shard that declares zero tensors IS readable and prices 0 — the doc's
+        // stated exception.
+        let zero = root.join("zero.safetensors");
+        let mut bytes = (2_u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&zero, bytes).unwrap();
+        assert_eq!(materialized_path_bytes(&zero, 4).unwrap(), 0);
+
+        // And a float tensor is priced at the requested width, not its stored one.
+        let bf16 = root.join("component").join("model.safetensors");
+        std::fs::create_dir_all(bf16.parent().unwrap()).unwrap();
+        write_header(
+            &bf16,
+            r#"{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#,
+        );
+        assert_eq!(
+            materialized_path_bytes(bf16.parent().unwrap(), 4).unwrap(),
+            8
+        );
     }
 }

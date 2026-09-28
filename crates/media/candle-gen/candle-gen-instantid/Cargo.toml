@@ -36,6 +36,8 @@ rand = "0.9"
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # RAII fixture roots for the synthetic weights trees the memory-contract tests price.
 tempfile = { workspace = true }
+# Shared memory-contract conformance assertions (epic SC-22657: the architecture-facts honesty rules).
+sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
 # Pass the backend selection through to the core crate AND the composed provider crates so a downstream

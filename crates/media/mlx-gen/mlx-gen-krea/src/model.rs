@@ -1382,7 +1382,7 @@ impl Krea {
             req.use_pid,
             on_progress,
             |text: &KreaText| {
-                self.encode_contexts(
+                let ctx = self.encode_contexts(
                     text,
                     req,
                     is_raw,
@@ -1390,7 +1390,26 @@ impl Krea {
                     encode_guidance,
                     &negative,
                     &edit_sources,
-                )
+                )?;
+                // SC-15449/sc-22738: the conditioning phase physically completes here. `Residency::run`
+                // materializes only under `Sequential`, so an armed fault evaluates the contexts itself
+                // — the boundary is then identical under both residencies, and an ordinary render (both
+                // controls unset) keeps its laziness untouched.
+                if crate::memory_strategy::calibration_fault_armed(
+                    req.memory,
+                    mlx_gen::gen_core::MemoryPhase::Conditioning,
+                ) {
+                    match &ctx.neg {
+                        Some(neg) => mlx_rs::transforms::eval([&ctx.pos, neg])?,
+                        None => mlx_rs::transforms::eval([&ctx.pos])?,
+                    }
+                    crate::memory_strategy::calibration_fault(
+                        req,
+                        mlx_gen::gen_core::MemoryPhase::Conditioning,
+                        self.descriptor.id,
+                    )?;
+                }
+                Ok(ctx)
             },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
@@ -1458,7 +1477,12 @@ impl Krea {
                             scheduler: req.scheduler.clone(),
                             transformer_window_size,
                             memory: req.memory.unwrap_or_default(),
+                            provider_id: self.descriptor.id,
                         };
+                        // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+                        // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
+                        // decoded image actually exist; `opts` above carries the request-scoped
+                        // `memory` + `provider_id` those hooks read.
                         images.push(heavy.heavy.render_multiphase(
                             &plans,
                             full,
@@ -1543,7 +1567,12 @@ impl Krea {
                         scheduler: req.scheduler.clone(),
                         transformer_window_size,
                         memory: req.memory.unwrap_or_default(),
+                        provider_id: self.descriptor.id,
                     };
+                    // sc-22738: the Denoise + Decode phase EXITS live inside the render body
+                    // (`KreaHeavy::decode_latents`, pipeline.rs), where the produced latent and
+                    // decoded image actually exist; `opts` above carries the request-scoped `memory`
+                    // + `provider_id` those hooks read.
                     // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
                     // both residencies, so a Sequential job (text phase already dropped) is byte-identical
                     // to Resident.
@@ -2024,6 +2053,95 @@ mod tests {
     use super::*;
     use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
     use std::path::PathBuf;
+
+    /// The `generate_impl` body — the base t2i/img2img/edit/multi-phase render — as source text.
+    /// The calibration-fault boundaries are structural claims about *where* in this body the fault
+    /// fires; a weights-free test cannot drive the real DiT, so the placement is pinned here and the
+    /// gating behaviour by `memory_strategy`'s own tests.
+    fn generate_impl_source() -> &'static str {
+        let source = include_str!("model.rs");
+        let body = source
+            .split_once("    fn generate_impl(")
+            .expect("generate_impl")
+            .1;
+        body.split_once("\n#[cfg(test)]")
+            .map(|(head, _)| head)
+            .unwrap_or(body)
+    }
+
+    /// Conditioning: the fault fires at the conditioning phase's EXIT — after `encode_contexts` has
+    /// produced (and, when armed, evaluated) the contexts, and before the heavy phase begins.
+    #[test]
+    fn the_conditioning_calibration_fault_fires_after_the_encode_and_before_the_heavy_phase() {
+        let body = generate_impl_source();
+        let encode = body
+            .find("self.encode_contexts(")
+            .expect("generate_impl must encode the contexts");
+        let fault = body
+            .find("MemoryPhase::Conditioning")
+            .expect("generate_impl must carry a Conditioning calibration fault");
+        let heavy = body
+            .find("// Phase B: heavy render components")
+            .expect("phase B marker");
+        assert!(
+            encode < fault,
+            "the Conditioning fault must FOLLOW the text encode, not precede it"
+        );
+        assert!(
+            fault < heavy,
+            "the Conditioning fault must fire in the text-encode phase, not after it"
+        );
+    }
+
+    /// sc-22738 (coordinator decision): `generate_impl` no longer carries an entry-convention Denoise
+    /// hook before its render dispatches. The Denoise and Decode faults are phase EXITS and live in
+    /// `pipeline.rs` (`denoise_exit_fault` after the sampler, `decode_exit_fault` after the VAE),
+    /// where the produced latent and decoded image actually exist. A hook re-added here would fire
+    /// before the first DiT step and certify a pre-denoise heap.
+    #[test]
+    fn generate_impl_carries_no_entry_convention_render_hook() {
+        let body = generate_impl_source();
+        for phase in ["MemoryPhase::Denoise", "MemoryPhase::Decode"] {
+            assert!(
+                !body.contains(phase),
+                "{phase} must fire at its phase exit in pipeline.rs, not in generate_impl"
+            );
+        }
+    }
+
+    /// sc-22738: every `TurboOptions` `generate_impl` builds threads the **request-scoped** memory
+    /// selection and this provider's id down to the render body. `pipeline.rs`'s `denoise_exit_fault`
+    /// / `decode_exit_fault` read exactly those two fields, so replacing
+    /// `req.memory.unwrap_or_default()` with `Default::default()` (or hardcoding the id) makes every
+    /// render-side hook unreachable — and would leave the ordering tests above green. Pinned as
+    /// source text because driving the real render needs the Krea 2 snapshot.
+    #[test]
+    fn every_turbo_options_threads_the_request_scoped_memory_and_provider_id() {
+        let body = generate_impl_source();
+        let mut count = 0usize;
+        let mut rest = body;
+        while let Some(at) = rest.find("TurboOptions {") {
+            let tail = &rest[at..];
+            let region = tail
+                .split_once("};")
+                .expect("TurboOptions literal must be terminated")
+                .0;
+            assert!(
+                region.contains("memory: req.memory.unwrap_or_default(),"),
+                "a TurboOptions literal drops the request-scoped memory: {region}"
+            );
+            assert!(
+                region.contains("provider_id: self.descriptor.id,"),
+                "a TurboOptions literal drops the provider id: {region}"
+            );
+            count += 1;
+            rest = &tail["TurboOptions {".len()..];
+        }
+        assert_eq!(
+            count, 2,
+            "generate_impl builds one TurboOptions per render dispatch (multi-phase + single-phase)"
+        );
+    }
 
     #[test]
     fn bounded_encoder_contracts_retain_production_policy_and_production_headers_stay_exact() {

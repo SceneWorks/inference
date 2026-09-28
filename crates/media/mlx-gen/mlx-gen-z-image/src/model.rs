@@ -511,7 +511,7 @@ fn load_heavy(
     if let Some(q) = spec.quantize {
         mlx_gen::quant::needs_load_time_quant(root, "transformer", q.bits(), model_id)?;
     }
-    let mut transformer = loader::load_transformer_with_stream(root, streamable)?;
+    let mut transformer = loader::load_transformer_with_stream(root, streamable, streamable)?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();

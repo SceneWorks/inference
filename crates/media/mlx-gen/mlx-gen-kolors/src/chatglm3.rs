@@ -649,6 +649,19 @@ impl ChatGlmModel {
         attention_mask: &Array,
         position_ids: Option<&Array>,
     ) -> Result<(Array, Array)> {
+        // An armed load keeps its resident `encoder.layers.*` lazy (never read at load), so a request
+        // that selected no window still runs through the stream, one window covering the whole
+        // tower — bit-identical, and no forward ever waits on an unread safetensors `Load`
+        // (sc-24245).
+        if let Some(stream) = &self.block_stream {
+            return self.encode_prompt_windowed(
+                input_ids,
+                attention_mask,
+                position_ids,
+                stream.n_blocks(),
+                &mlx_gen::CancelFlag::default(),
+            );
+        }
         let hs = self.forward_with_positions(input_ids, attention_mask, position_ids)?;
         let n = hs.len();
         let context = hs[n - 2].clone();

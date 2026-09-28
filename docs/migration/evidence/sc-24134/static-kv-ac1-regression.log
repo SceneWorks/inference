@@ -1,0 +1,7 @@
+
+running 1 test
+test ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv ... [ac1] 256 tokens identical across reference / static / growing (gqa); growing record DecodeRecord { path: StepModel, target_forwards: 256, proposed_tokens: 0, accepted_tokens: 0, generated_tokens: 256, host_syncs: 256, sampler: SamplerTelemetry { path: Some(Device), device_draws: 256, host_draws: 0, logits_to_host: 0 }, kv_cache: Growing, attn_formulation: Gqa, proposer: None, verify_steps: 0, replay_forwards: 0, verify_host_syncs: 0, fused_primitives: FusedTally { fused: 69888, reference: 0, reference_reason: None }, cuda_graphs: GraphTally { replayed: 0, eager: 0, captured: 0, fallback_reason: None }, nvfp4_projections: Nvfp4PathTally { gemv: 0, cublaslt: 0, cublaslt_reason: None } }
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 70.66s
+

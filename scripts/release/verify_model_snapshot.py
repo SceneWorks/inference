@@ -112,7 +112,9 @@ def materialization_payload_files(model: dict, snapshot: Path) -> list[Path]:
     root = snapshot.resolve()
     files: list[Path] = []
     provenance_names = {MARKER, MATERIALIZATION_RECEIPT, MATERIALIZATION_INCOMPLETE}
-    for item in sorted(root.rglob("*")):
+    for item in sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    ):
         relative = item.relative_to(root).as_posix()
         if relative in provenance_names or relative.startswith(".cache/"):
             continue
@@ -256,7 +258,9 @@ def snapshot_inventory(model: dict, snapshot: Path) -> dict:
     verify_snapshot(model, snapshot)
     root = snapshot.resolve()
     files = []
-    for item in sorted(root.rglob("*")):
+    for item in sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    ):
         if not (item.is_file() or item.is_symlink()):
             continue
         relative = item.relative_to(root).as_posix()

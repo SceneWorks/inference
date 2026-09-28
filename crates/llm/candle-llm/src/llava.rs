@@ -30,8 +30,10 @@ use core_llm::{
 };
 
 use crate::config::{Architecture, ModelConfig};
-use crate::decode::stream::default_seed;
-use crate::decode::{CancelFlag, FinishReason};
+use crate::decode::{
+    generate_step_from_prefill, CancelFlag, DecodeRecord, FinishReason, GenerationConfig,
+    RequestSpan, StreamEvent,
+};
 use crate::device::select_device;
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
@@ -39,8 +41,8 @@ use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVis
 use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_erf, linear};
 use crate::primitives::projection::QuantSpec;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
-use crate::primitives::{input_ids, Weights};
+use crate::primitives::sampler::SamplingParams;
+use crate::primitives::{input_ids, AttnFormulation, Weights};
 
 /// The registry id of the LLaVA provider.
 pub const PROVIDER_ID: &str = "candle-llava";
@@ -240,6 +242,10 @@ pub struct LlavaGeneration {
     pub tokens: Vec<i32>,
     /// Why generation stopped.
     pub finish_reason: FinishReason,
+    /// The measured decode record (sc-24139): the engine's record of the caption decode, with the
+    /// host-side counters and the fused / CUDA-graph / NVFP4 tallies of the whole request from
+    /// the spliced prefill on — what [`LlavaProvider`] reports on `TextLlmOutput::decode`.
+    pub record: DecodeRecord,
 }
 
 /// A loaded LLaVA VLM: vision tower, projector, language decoder, and image preprocessor.
@@ -307,6 +313,14 @@ impl LlavaModel {
         &self.language
     }
 
+    /// Select how the language decoder attends on its reference paths and growing step cache —
+    /// the caption loop's backing ([`CausalLm::set_attn_formulation`]): [`AttnFormulation::Gqa`]
+    /// by default, [`AttnFormulation::Expanded`] for the pre-migration arithmetic (a labelled
+    /// comparison, e.g. against goldens captured before sc-24138).
+    pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
+        self.language.set_attn_formulation(formulation);
+    }
+
     /// The device the model is loaded on.
     pub fn device(&self) -> &Device {
         &self.device
@@ -333,6 +347,11 @@ impl LlavaModel {
 
     /// Generate a caption from a tokenized prompt (containing a single `image_token_id`) and the
     /// projected image features. Emits each token through `on_token(id, step)`.
+    ///
+    /// The spliced embeddings are prefilled into the decoder's shared step cache and the caption
+    /// decodes through the step seam — the engine's token-at-a-time loop (sc-24138) — on the
+    /// cache's growing backing: this provider has no admission surface to price a preallocation of
+    /// the whole (unbounded) caption budget. Same sampler, stop tokens and cancellation as before.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -352,6 +371,8 @@ impl LlavaModel {
             return Err(Error::Canceled);
         }
 
+        // The whole request from the spliced prefill on: the engine measures only its own loop.
+        let span = RequestSpan::begin();
         // Splice the image rows (in the decoder's dtype) into the token embeddings, then decode.
         let expanded = expand_image_tokens(
             prompt_ids,
@@ -363,43 +384,53 @@ impl LlavaModel {
         let feat = image_features.to_dtype(self.language.compute_dtype())?;
         let spliced = splice_image_features(&embeds, &expanded, &feat, self.cfg.image_token_id)?;
 
-        let mut cache = self.language.new_cache();
-        let mut rng = SplitMix64::new(seed.unwrap_or_else(default_seed));
-        let mut history = expanded.clone();
-        let mut generated: Vec<i32> = Vec::new();
-        let prompt_len = expanded.len() as i32;
-        let mut logits = self
+        let mut cache = self.language.new_step_cache();
+        let logits = self
             .language
-            .decode_logits_from_embeds(&spliced, &mut cache, 0)?;
-        let mut finish = FinishReason::MaxTokens;
-
-        for step in 0..max_new_tokens {
-            if cancel.is_cancelled() {
-                finish = FinishReason::Cancelled;
-                break;
-            }
-            let next = sample(&logits, &history, params, &mut rng, None)?;
-            if stop_tokens.contains(&next) {
-                finish = FinishReason::StopToken;
-                break;
-            }
-            on_token(next, step);
-            generated.push(next);
-            history.push(next);
-            if step + 1 == max_new_tokens {
-                break;
-            }
-            let tok = input_ids(&[next], &self.device)?;
-            logits = self
-                .language
-                .decode_logits(&tok, &mut cache, prompt_len + step as i32)?;
-        }
-
+            .step_prefill_from_embeds(&spliced, &mut cache)?;
+        let config = GenerationConfig {
+            max_new_tokens,
+            sampling: *params,
+            seed,
+            stop_tokens: stop_tokens.to_vec(),
+        };
+        let (out, record) = generate_step_from_prefill(
+            &self.language,
+            &mut cache,
+            logits,
+            &expanded,
+            &config,
+            cancel,
+            &mut |event| {
+                if let StreamEvent::Token { id, step } = event {
+                    on_token(id, step);
+                }
+            },
+            None,
+        )?;
         Ok(LlavaGeneration {
-            tokens: generated,
-            finish_reason: finish,
+            tokens: out.tokens,
+            finish_reason: out.finish_reason,
+            record: record.with_request_span(&span),
         })
     }
+}
+
+/// The weight format a LLaVA load quantizes its language decoder to, or the typed refusal. The
+/// load runs it first, and [`crate::backend::nvfp4_support`] answers a product's per-snapshot
+/// NVFP4 question with it (sc-24139): the Llama provider serves NVFP4 (the qwen3_5 hybrid,
+/// sc-24135, and the llama family, sc-24140), but LLaVA — whose provider owns the vision-tower
+/// load — does not, so it is refused here by name.
+pub(crate) fn requested_quantization(spec: &LoadSpec) -> CoreResult<Option<QuantSpec>> {
+    spec.quantize
+        .map(|q| match q {
+            Quantize::Q4 => Ok(QuantSpec::q4()),
+            Quantize::Q8 => Ok(QuantSpec::q8()),
+            Quantize::Nvfp4 => Err(CoreError::Unsupported(
+                "nvfp4: NVFP4 projections are not served for LLaVA".into(),
+            )),
+        })
+        .transpose()
 }
 
 /// LLaVA served as a multimodal [`core_llm::TextLlm`] provider.
@@ -416,10 +447,7 @@ impl LlavaProvider {
     /// `spec.quantize` (or the snapshot's persisted `quantization` block) quantizes the language
     /// decoder's projections; the vision tower and projector stay dense.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
-        let requested = spec.quantize.map(|q| match q {
-            Quantize::Q4 => QuantSpec::q4(),
-            Quantize::Q8 => QuantSpec::q8(),
-        });
+        let requested = requested_quantization(spec)?;
         let dir = Path::new(&spec.source);
         let device = select_device().map_err(to_core)?;
         let model = LlavaModel::from_dir_with(dir, &device, requested).map_err(to_core)?;
@@ -583,11 +611,17 @@ impl TextLlm for LlavaProvider {
             usage,
         });
         Ok(TextLlmOutput {
+            timings: None,
             text,
             thinking: None,
             // No tool calling on the vision path (its chat template renders captions, not tools).
             tool_calls: Vec::new(),
             usage,
+            mtp: None,
+            // The caption decodes through the shared engine (sc-24138), so it reports its path
+            // like every engine request. The CUDA-graph switch is not wired into this provider
+            // (no graph runner wraps its decoder), so the report says the switch was off here.
+            decode: Some(gen.record.report(false)),
             finish_reason: Some(finish),
         })
     }
@@ -609,8 +643,13 @@ pub fn descriptor() -> TextLlmDescriptor {
             // Text+vision captioner; no audio path at all.
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
+            mtp: None,
             supported_constraints: Vec::new(),
         },
     }
@@ -630,6 +669,7 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
     }
@@ -637,7 +677,7 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
 
 fn map_finish(f: FinishReason) -> CoreFinish {
     match f {
-        FinishReason::StopToken => CoreFinish::Stop,
+        FinishReason::StopToken | FinishReason::Stopped => CoreFinish::Stop,
         FinishReason::MaxTokens => CoreFinish::Length,
         FinishReason::Cancelled => CoreFinish::Cancelled,
     }
@@ -671,20 +711,22 @@ fn load_registered(spec: &LoadSpec) -> CoreResult<Box<dyn TextLlm>> {
 }
 
 /// Weightless model-first probe (story 7406): can the `candle-llava` vision provider serve the
-/// snapshot at `spec.source`? Reads **only** `config.json` and keys on the LLaVA structural
+/// snapshot directory at `spec.source`? Reads **only** `config.json` and keys on the LLaVA structural
 /// signature — a nested `text_config` (the language decoder) plus a `vision_config` (the SigLIP
 /// tower) — which [`LlavaConfig::from_json`] requires. Never opens a safetensors shard.
 pub fn can_load(spec: &LoadSpec) -> bool {
-    let dir = Path::new(&spec.source);
-    let path = if dir.is_dir() {
-        dir.join("config.json")
-    } else {
-        dir.to_path_buf()
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    can_load_with(Path::new(&spec.source), |path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    })
+}
+
+fn can_load_with(source: &Path, read_config: impl FnOnce(&Path) -> Option<Value>) -> bool {
+    if !source.is_dir() {
         return false;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+    }
+    let Some(v) = read_config(&source.join("config.json")) else {
         return false;
     };
     // LLaVA = a SigLIP/CLIP vision tower + a `text_config` decoder. Decline Qwen3.6 (`qwen3_5`): its
@@ -699,6 +741,7 @@ pub fn can_load(spec: &LoadSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     const IMG: i32 = 128077;
 
@@ -771,5 +814,30 @@ mod tests {
         let d = descriptor();
         assert_eq!(d.id, PROVIDER_ID);
         assert!(d.capabilities.supports_vision);
+    }
+
+    #[test]
+    fn model_probe_rejects_file_sources_before_reading_them() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            serde_json::json!({
+                "text_config": {"model_type": "llama"},
+                "vision_config": {"model_type": "clip_vision_model"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let read_attempted = Cell::new(false);
+        let result = can_load_with(file.path(), |_| {
+            read_attempted.set(true);
+            Some(Value::Null)
+        });
+
+        assert!(!result);
+        assert!(!read_attempted.get(), "file payload must not be read");
+        assert!(!can_load(&LoadSpec::dense(
+            file.path().display().to_string()
+        )));
     }
 }

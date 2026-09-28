@@ -212,6 +212,16 @@ struct MemoryScopeHandle {
     shared: Rc<SharedMemoryScope>,
 }
 
+/// Build the SCRFD + ArcFace face-analysis stack and materialize its weights at load: left lazy,
+/// the first detection's command buffers wait on the safetensors reads — past the GPU watchdog on a
+/// cold page cache (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+fn load_face_analysis(scrfd: &Weights, arcface: &Weights) -> Result<FaceAnalysis> {
+    let face = FaceAnalysis::load(scrfd, arcface)?;
+    scrfd.materialize_accessed()?;
+    arcface.materialize_accessed()?;
+    Ok(face)
+}
+
 fn drop_resident_component<T>(slot: &mut Option<T>) {
     drop(slot.take());
 }
@@ -369,8 +379,10 @@ impl InstantId {
         ipa.cast_all(DTYPE)?;
         let resampler =
             Resampler::from_weights(&ipa, "image_proj", &ResamplerConfig::instantid_face())?;
+        // Materialize at load (sc-24245; see `load_face_analysis`).
+        ipa.materialize_accessed()?;
         let face = match &self.reload.face_paths {
-            Some((scrfd, arcface)) => Some(FaceAnalysis::load(
+            Some((scrfd, arcface)) => Some(load_face_analysis(
                 &Weights::from_file(scrfd)?,
                 &Weights::from_file(arcface)?,
             )?),
@@ -405,7 +417,10 @@ impl InstantId {
             ))
         })?;
         ipa.cast_all(DTYPE)?;
-        unet.install_ip_adapter(load_ip_kv_pairs(&ipa)?)?;
+        let pairs = load_ip_kv_pairs(&ipa)?;
+        // Materialize at load, before the pairs quantize with the U-Net (sc-24245).
+        ipa.materialize_accessed()?;
+        unet.install_ip_adapter(pairs)?;
         let mut identitynet = load_controlnet(&self.reload.paths.identitynet, DTYPE)?;
         let mut openpose = match &self.reload.openpose {
             Some(source) => Some(load_controlnet(source, DTYPE)?),
@@ -547,6 +562,8 @@ impl InstantId {
         let resampler =
             Resampler::from_weights(&ipa, "image_proj", &ResamplerConfig::instantid_face())?;
         let pairs = load_ip_kv_pairs(&ipa)?;
+        // Materialize at load, before the pairs quantize with the U-Net (sc-24245).
+        ipa.materialize_accessed()?;
         unet.install_ip_adapter(pairs)?;
 
         let cfg = DiffusionConfig::sdxl_base();
@@ -584,7 +601,10 @@ impl InstantId {
         identity: crate::memory_strategy::InstantIdMemoryIdentity,
         context: MemoryRunContext,
     ) -> Result<Self> {
-        let contract = crate::memory_strategy::provider_contract(tier);
+        // SC-22667: the LOADED contract prices what this load materializes. `provider_contract`
+        // takes only a numeric tier and published `MemoryAssetFacts::default()` — five zeros for a
+        // route that holds a whole SDXL base plus the IdentityNet and face IP-Adapter.
+        let contract = crate::memory_strategy::provider_contract_for_paths(paths, tier);
         crate::memory_strategy::validate_context(&contract, tier, &identity, &context)?;
         let staged_residency = context.selection.strategy == MemoryStrategy::StagedResidency;
         let mut model = if staged_residency {
@@ -721,7 +741,7 @@ impl InstantId {
                     .into(),
             ));
         }
-        self.face = Some(FaceAnalysis::load(scrfd, arcface)?);
+        self.face = Some(load_face_analysis(scrfd, arcface)?);
         Ok(self)
     }
 
@@ -735,7 +755,7 @@ impl InstantId {
         if !self.staged_residency {
             let scrfd_weights = Weights::from_file(scrfd)?;
             let arcface_weights = Weights::from_file(arcface)?;
-            self.face = Some(FaceAnalysis::load(&scrfd_weights, &arcface_weights)?);
+            self.face = Some(load_face_analysis(&scrfd_weights, &arcface_weights)?);
         }
         Ok(self)
     }

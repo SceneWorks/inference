@@ -62,10 +62,10 @@ fn extend_use_only(
     k: &Array,
     v: &Array,
 ) -> Result<(Array, Array)> {
-    match cache.peek(layer) {
+    match cache.peek(layer).map_err(mll)? {
         Some((pk, pv)) => Ok((
-            concatenate_axis(&[pk, k], 2)?,
-            concatenate_axis(&[pv, v], 2)?,
+            concatenate_axis(&[&pk, k], 2)?,
+            concatenate_axis(&[&pv, v], 2)?,
         )),
         None => Ok((k.clone(), v.clone())),
     }
@@ -296,6 +296,9 @@ impl GenBlockStream {
             )));
         }
         let mut layer = GenLayer::from_weights(view, &format!("{}.{index}", self.base))?;
+        // Read this block's bytes on the CPU stream now, before its quantize/forward is encoded; left
+        // lazy, the window's `eval` makes Metal command buffers wait on the disk read (sc-24245).
+        view.materialize_accessed()?;
         if let Some(quant) = self.quant {
             layer.quantize(quant.bits())?;
         }

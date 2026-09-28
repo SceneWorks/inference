@@ -44,3 +44,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # `#[ignore]`d img2img real-weight validation (sc-11786). Cargo unifies this with the `[dependencies]`
 # `candle-gen` entry, but the `testkit` feature is dev-only so it never reaches the shipped provider.
 candle-gen = { path = "../candle-gen", features = ["testkit"] }
+# Backend-neutral gen-core contract conformance — the SC-22657 architecture-facts honesty gate.
+sceneworks-gen-core-testkit = { workspace = true }

@@ -617,8 +617,13 @@ mod tests {
         Array::from_slice(&data, &[1, h, s, d])
     }
 
+    /// Host copy in logical order. The contiguous cache returns strided views and `as_slice`
+    /// ignores strides, so materialize through an elementwise op (always a fresh contiguous
+    /// buffer) first.
     fn host(a: &Array) -> Vec<f32> {
-        a.as_dtype(Dtype::Float32)
+        mlx_rs::ops::add(a, Array::from_f32(0.0))
+            .unwrap()
+            .as_dtype(Dtype::Float32)
             .unwrap()
             .as_slice::<f32>()
             .to_vec()

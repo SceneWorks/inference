@@ -12,9 +12,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AdapterKind, Conditioning, GenerationRequest, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
-    MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemorySelection,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
+    MemoryGeometry, MemoryLifecycleCapabilities, MemoryNumericTier, MemoryParameterRanges,
+    MemoryPhase, MemoryProviderContract, MemoryRunContext, MemorySafetyDecision, MemorySelection,
     MemoryStrategy, MemoryStrategyCapability, MemoryStrategyParameters, MemoryStrategySupport,
     MoeExpert, OffloadPolicy, Precision, Quant, ResidentRequestMemory, WeightsSource,
 };
@@ -189,15 +189,39 @@ fn vace_fun_source_receipt_revision(root: &Path, backend: WanI2vBackend) -> crat
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WanI2vRoute {
     Ti2v5b,
+    /// Dual-expert A14B **text**-to-video (`wan2_2_t2v_14b`).
+    ///
+    /// It is a member of this authority for its *physical* identity, which is the I2V-A14B's
+    /// exactly: one snapshot layout, one inventory, one repository policy family, one adapter
+    /// multiplicity rule. Its *request* surface is the one thing that differs — it carries no
+    /// image conditioning at all — so it admits [`WanPublicMode::TextToVideo`] and refuses every
+    /// image-conditioned carrier (`accepts_first_last_rate`, and the `image_to_video`
+    /// arms of `request_mode` / `contract_for_mode_key` / `validate_context`, all of which
+    /// exclude it by name).
+    T2v14b,
     I2v14b,
     Vace,
     VaceFun,
 }
 
 impl WanI2vRoute {
+    /// Every route this authority seals, in a fixed order.
+    ///
+    /// Sweeps derive their cell count from this instead of freezing a literal, so adding a route
+    /// without giving it a repository policy, an inventory and its own calibration cell is a
+    /// compile error or a red test rather than a silently unswept row.
+    pub const ALL: [Self; 5] = [
+        Self::Ti2v5b,
+        Self::T2v14b,
+        Self::I2v14b,
+        Self::Vace,
+        Self::VaceFun,
+    ];
+
     pub fn for_provider(provider_id: &str) -> crate::Result<Self> {
         match provider_id {
             "wan2_2_ti2v_5b" => Ok(Self::Ti2v5b),
+            "wan2_2_t2v_14b" => Ok(Self::T2v14b),
             "wan2_2_i2v_14b" => Ok(Self::I2v14b),
             "wan_vace" => Ok(Self::Vace),
             "wan2_2_vace_fun_14b" => Ok(Self::VaceFun),
@@ -210,32 +234,53 @@ impl WanI2vRoute {
     pub fn provider_id(self) -> &'static str {
         match self {
             Self::Ti2v5b => "wan2_2_ti2v_5b",
+            Self::T2v14b => "wan2_2_t2v_14b",
             Self::I2v14b => "wan2_2_i2v_14b",
             Self::Vace => "wan_vace",
             Self::VaceFun => "wan2_2_vace_fun_14b",
         }
     }
 
+    /// Whether this route's transformer is a dual-expert MoE pair (`transformer` +
+    /// `transformer_2`, or `high_noise_model` + `low_noise_model`).
+    fn dual_expert(self) -> bool {
+        matches!(self, Self::T2v14b | Self::I2v14b | Self::VaceFun)
+    }
+
     pub fn public_geometries(self) -> &'static [(u32, u32)] {
         match self {
             Self::Ti2v5b => &[(832, 480), (1280, 704), (704, 1280)],
-            Self::I2v14b => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
+            // `builtin.models.jsonc` gives `wan_2_2_t2v_14b` and `wan_2_2_i2v_14b` the same
+            // `resolutions` list; they are the same A14B geometry cap (`maxPixels` 921_600).
+            Self::T2v14b | Self::I2v14b => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
             Self::Vace | Self::VaceFun => &[(832, 480), (480, 832), (1280, 720), (720, 1280)],
         }
     }
 
-    fn accepts_rate(self, fps: u32, frames: u32) -> bool {
+    /// The public `(fps, frames)` rate menu this route admits.
+    ///
+    /// `pub` since sc-22736 so a measurement harness can validate a planned video geometry against
+    /// the ENGINE's own menu instead of restating the manifest's `fps` / `durations` lists in a
+    /// second place — the two would then be free to drift, and the drift would only ever surface as
+    /// a refused capture on a host that already holds the weights.
+    pub fn accepts_rate(self, fps: u32, frames: u32) -> bool {
         match self {
             Self::Ti2v5b => match fps {
                 16 => [65, 81, 97, 113, 129].contains(&frames),
                 24 => [97, 121, 145, 169, 193].contains(&frames),
                 _ => false,
             },
-            Self::I2v14b => fps == 16 && [45, 61, 77].contains(&frames),
+            // Same `fps: [16]` / `durations: [3, 4, 5]` manifest menu as the I2V-A14B.
+            Self::T2v14b | Self::I2v14b => fps == 16 && [45, 61, 77].contains(&frames),
             Self::Vace | Self::VaceFun => fps == 16 && [45, 61, 77].contains(&frames),
         }
     }
 
+    /// The first/last-frame rate menu. Only Ti2V-5B has one.
+    ///
+    /// `T2v14b` is `false` for a structural reason, not an unimplemented one: a text-to-video
+    /// route has no frame to pin at either boundary, so a first/last carrier is not a rate this
+    /// route could ever accept.
     fn accepts_first_last_rate(self, fps: u32, frames: u32) -> bool {
         self == Self::Ti2v5b
             && match fps {
@@ -248,6 +293,9 @@ impl WanI2vRoute {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WanPublicMode {
+    /// The one carrier-free public mode: a prompt and nothing else. Only [`WanI2vRoute::T2v14b`]
+    /// admits it, and it is the only mode that route admits.
+    TextToVideo,
     ImageToVideo,
     FirstLastFrame,
     ExtendClip,
@@ -258,6 +306,7 @@ pub enum WanPublicMode {
 impl WanPublicMode {
     fn key(self) -> &'static str {
         match self {
+            Self::TextToVideo => "text_to_video",
             Self::ImageToVideo => "image_to_video",
             Self::FirstLastFrame => "first_last_frame",
             Self::ExtendClip => "extend_clip",
@@ -380,6 +429,251 @@ fn tier(spec: &LoadSpec, backend: WanI2vBackend) -> crate::Result<MemoryNumericT
     })
 }
 
+/// Sentinel [`repository_policy`] revision for a repository the SceneWorks manifest downloads
+/// **without** a `revision` key.
+///
+/// [`repository_revision`] still requires an HF-cache-shaped
+/// `models--<owner>--<name>/snapshots/<40 lowercase hex>[/ <tier>]` path and still returns the
+/// concrete snapshot id it found, which the artifact identity hashes — so the seal stays bound to
+/// exact content. What it does not do is demand one *particular* id the manifest never promised.
+///
+/// Every Candle dense leg uses it (sc-22736 review): the manifest ships all three `Wan-AI/…-Diffusers`
+/// bf16 downloads (`Wan2.2-TI2V-5B`, `Wan2.2-T2V-A14B`, `Wan2.2-I2V-A14B`) with NO `revision` key
+/// and the SceneWorks resolver binds whichever snapshot is staged, so a hard pin here is a promise
+/// the manifest never made: the cell reports `runnable` and then fails inside
+/// [`repository_revision`] mid-campaign the moment the staged snapshot is any other commit. The
+/// content pin is the snapshot id the receipt hashes, exactly as on the T2V leg. The MLX legs and
+/// every packed `SceneWorks/…-candle` tier keep their hard revisions: those the manifest DOES pin.
+const UNPINNED_UPSTREAM_REVISION: &str = "unpinned-upstream-snapshot";
+
+/// The concrete 40-hex snapshot id a synthetic fixture tree must use for a route whose policy
+/// revision is [`UNPINNED_UPSTREAM_REVISION`] — the sentinel itself is not a valid snapshot id.
+#[doc(hidden)]
+pub const FIXTURE_UNPINNED_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The directory name a fixture (or any caller building a synthetic snapshot tree) must use for
+/// `revision`: itself when the policy pins one, and [`FIXTURE_UNPINNED_REVISION`] when it does not.
+#[doc(hidden)]
+pub fn fixture_revision(revision: &str) -> &str {
+    if revision == UNPINNED_UPSTREAM_REVISION {
+        FIXTURE_UNPINNED_REVISION
+    } else {
+        revision
+    }
+}
+
+/// The production calibration identity this authority publishes for a **sealed** receipt.
+///
+/// Returns `None` — an opaque, unmeasurable contract — for every route whose identity is owned
+/// elsewhere or which ships no tier ladder:
+///
+/// * [`WanI2vRoute::Ti2v5b`]'s production identity belongs to the per-crate `memory_strategy`
+///   modules (`sc-19236-…-mlx-…` in `mlx-gen-wan`, `sc-19223-…-candle-…` in `candle-gen-wan`),
+///   which are the registered `MemoryRegistration::contract` for `wan_2_2` on both lanes. Minting a
+///   second string here would give one manifest cell two production identities.
+/// * The VACE routes are sealed from an artifact *receipt* rather than a tier-suffixed snapshot;
+///   the manifest ships them no q4/q8/bf16 ladder, so there is no per-tier cell to name.
+///
+/// The tier this keys on is **proven against the artifact**, not requested: `repository_revision`
+/// refuses a root whose `snapshots/<rev>/<tier>` suffix disagrees with the selected tier (and
+/// refuses any suffix at all on a Candle dense root), and `physical_resident_bytes` refuses a
+/// packed marker that does not encode the selected Q4/Q8 group-64 layout. A caller cannot reach
+/// this function with a tier the on-disk snapshot does not carry.
+pub fn production_calibration_fingerprint(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<String> {
+    let (route_token, backend_token, tier_token) = a14b_cell_tokens(route, backend, tier)?;
+    Some(format!(
+        "sc-22736-{route_token}-{backend_token}-{tier_token}-v1"
+    ))
+}
+
+/// The numeric tier a load spec names on `backend`, without opening anything.
+///
+/// This is the same `tier` resolution every sealed receipt runs — MLX reads the tier off the
+/// snapshot's own directory name when `quantize` is unset, Candle reads only `quantize` — exposed
+/// so a weights-free registry surface can key on the witness selector's tier rather than
+/// reimplementing that split (sc-22736).
+pub fn spec_numeric_tier(
+    spec: &LoadSpec,
+    backend: WanI2vBackend,
+) -> crate::Result<MemoryNumericTier> {
+    tier(spec, backend)
+}
+
+/// The `(route, backend, tier)` coordinate every A14B identity minted here is keyed on, or `None`
+/// for a cell this authority does not name. [`production_calibration_fingerprint`] documents why
+/// each token is part of the key and why the other three routes are silent.
+fn a14b_cell_tokens(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let route_token = match route {
+        WanI2vRoute::T2v14b => "wan2-2-t2v-a14b",
+        WanI2vRoute::I2v14b => "wan2-2-i2v-a14b",
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => return None,
+    };
+    // The backend token is load-bearing: both lanes seal the same route from *different*
+    // repositories with different layouts and different resident arithmetic, so one string across
+    // both would let a measurement taken on one lane be read as evidence for the other.
+    let backend_token = match backend {
+        WanI2vBackend::Mlx => "mlx",
+        WanI2vBackend::Candle => "candle",
+    };
+    let tier_token = match tier.quant {
+        None => "dense",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        // `tier` refuses every other quant before a receipt can seal.
+        Some(_) => return None,
+    };
+    Some((route_token, backend_token, tier_token))
+}
+
+/// The **weights-free** registry-conformance identity of one A14B cell (sc-22736).
+///
+/// A catalog walk reads no artifact, so it can never prove a tier and must never publish a
+/// measurable identity. The `-weights-free-conformance-` infix puts every string minted here in a
+/// namespace no production string can enter, and the disjointness is asserted over the derived cell
+/// grid rather than over a frozen list.
+pub fn weights_free_calibration_fingerprint(
+    route: WanI2vRoute,
+    backend: WanI2vBackend,
+    tier: MemoryNumericTier,
+) -> Option<String> {
+    let (route_token, backend_token, tier_token) = a14b_cell_tokens(route, backend, tier)?;
+    Some(format!(
+        "sc-22736-{route_token}-{backend_token}-{tier_token}-weights-free-conformance-v1"
+    ))
+}
+
+/// The contract a registry catalog walk resolves for an A14B route whose root is **not**
+/// materialized (sc-22736, epic sc-22723 E1).
+///
+/// Identical in shape to the sealed contract — same strategy support, same lifecycle, same formula,
+/// same load shape — with [`MemoryAssetFacts::default`] in place of the header-derived facts and the
+/// isolated [`weights_free_calibration_fingerprint`] in place of the production identity. It touches
+/// no filesystem at all, which is the whole point: a [`crate::MemoryContractFixtureRegistration`] is
+/// consulted exactly when the weights are unavailable.
+///
+/// Only the two A14B routes are served. Ti2V-5B's weights-free fixture belongs to the per-crate
+/// `memory_strategy` modules that own its production identity, and the VACE routes register no
+/// memory strategy at all, so answering for either here would publish a second fixture for a cell
+/// that already has one.
+pub fn weights_free_contract(
+    provider_id: &str,
+    backend: WanI2vBackend,
+    spec: &LoadSpec,
+) -> crate::Result<MemoryProviderContract> {
+    let route = WanI2vRoute::for_provider(provider_id)?;
+    if !matches!(route, WanI2vRoute::T2v14b | WanI2vRoute::I2v14b) {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: this authority publishes no weights-free contract for it"
+        )));
+    }
+    let tier = tier(spec, backend)?;
+    let mut contract = contract(
+        provider_id,
+        route,
+        backend,
+        spec,
+        MemoryAssetFacts::default(),
+    );
+    contract.calibration = weights_free_calibration_fingerprint(route, backend, tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
+    Ok(contract)
+}
+
+/// The one public mode an A14B route admits: T2V carries nothing, I2V carries one Reference.
+///
+/// Named here rather than at three call sites so the weights-free admission surface and the
+/// weights-free behavior fixtures cannot disagree about which carrier the route takes.
+pub fn a14b_public_mode_key(route: WanI2vRoute) -> Option<&'static str> {
+    match route {
+        WanI2vRoute::T2v14b => Some("text_to_video"),
+        WanI2vRoute::I2v14b => Some("image_to_video"),
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => None,
+    }
+}
+
+/// The single frame rate the A14B manifest menu publishes (`fps: [16]` on both routes).
+///
+/// [`WanI2vRoute::accepts_rate`] is still the authority on the `(fps, frames)` pair; this only says
+/// which of the rates that authority might admit an A14B cell actually ships, and it is asserted
+/// against `accepts_rate` rather than trusted.
+pub const A14B_PUBLIC_FPS: u32 = 16;
+
+/// Admission for an A14B route whose weights are **not** materialized (sc-22736, epic sc-22723 E1).
+///
+/// This is [`validate_context`] with exactly the artifact-bound clauses removed, and nothing else:
+///
+/// * `ensure_unchanged`, the `artifact_identity` receipt-tail prefix and the `adapter_identity`
+///   overlay comparison are all statements about a sealed snapshot, and there is no snapshot here.
+///   A weights-free context therefore carries no overlay at all rather than an overlay this
+///   function cannot check.
+/// * the receipt's embedded frame rate is likewise unavailable, so the rate menu is asked at
+///   [`A14B_PUBLIC_FPS`] — which is the only rate either A14B route's manifest ships, and
+///   `accepts_rate` still owns whether the frame count belongs to it.
+///
+/// Everything else — mode, carrier, geometry bucket, batch, PiD/phase exclusion, the selected
+/// strategy, and the whole of [`crate::standard_memory_strategy_safety_check`] (calibration ABI,
+/// fingerprint, load shape and tier) — is the same check the sealed path runs, which is what makes
+/// a registry conformance walk's mutation probes bite.
+pub fn validate_weights_free_context(
+    provider_id: &str,
+    backend: WanI2vBackend,
+    spec: &LoadSpec,
+    contract: &MemoryProviderContract,
+    context: &MemoryRunContext,
+) -> crate::Result<()> {
+    let route = WanI2vRoute::for_provider(provider_id)?;
+    let Some(mode_key) = a14b_public_mode_key(route) else {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: this authority has no weights-free admission surface for it"
+        )));
+    };
+    let tier = tier(spec, backend)?;
+    let geometry = context.geometry;
+    let expected_references = u32::from(route == WanI2vRoute::I2v14b);
+    if context.mode.as_key() != mode_key
+        || geometry.batch != 1
+        || geometry.reference_count != expected_references
+        || context.has_reference != (expected_references > 0)
+        || context.use_pid
+        || context.has_phases
+        || context.overlay.is_some()
+        || !route
+            .public_geometries()
+            .contains(&(geometry.width, geometry.height))
+        || !route.accepts_rate(A14B_PUBLIC_FPS, geometry.frames)
+        || !matches!(
+            context.selection.strategy,
+            MemoryStrategy::Resident
+                | MemoryStrategy::StagedResidency
+                | MemoryStrategy::BoundedDecode
+        )
+    {
+        return Err(crate::Error::Unsupported(format!(
+            "{provider_id}: crossed weights-free Wan A14B memory context"
+        )));
+    }
+    match crate::standard_memory_strategy_safety_check(contract, context, Some(tier), None) {
+        MemorySafetyDecision::Accept => Ok(()),
+        MemorySafetyDecision::Reject { reason } => Err(crate::Error::Unsupported(reason)),
+    }
+}
+
+/// A geometry every A14B cell admits, for a weights-free behavior fixture: the manifest's own
+/// default resolution at its shortest published duration.
+///
+/// Read back through [`WanI2vRoute::public_geometries`] and [`WanI2vRoute::accepts_rate`] by
+/// `a14b_weights_free_fixture_geometry_is_admissible`, so a menu change cannot leave this naming a
+/// bucket the route stopped admitting.
+pub const A14B_FIXTURE_GEOMETRY: (u32, u32, u32) = (1280, 720, 45);
+
 fn repository_policy(
     backend: WanI2vBackend,
     route: WanI2vRoute,
@@ -394,6 +688,10 @@ fn repository_policy(
             "SceneWorks/wan2.2-i2v-a14b-mlx",
             "c6c786170031eccc3a1fac0f98f1ad4ff988271e",
         ),
+        (WanI2vBackend::Mlx, WanI2vRoute::T2v14b, _) => (
+            "SceneWorks/wan2.2-t2v-a14b-mlx",
+            "991eb255c544bbb2e1f1e07da4355c2f0a5337b7",
+        ),
         (WanI2vBackend::Candle, WanI2vRoute::Ti2v5b, Some(_)) => (
             "SceneWorks/wan2.2-ti2v-5b-candle",
             "9b173dc8660334a87a11e67de58939afe68f8cb2",
@@ -402,13 +700,24 @@ fn repository_policy(
             "SceneWorks/wan2.2-i2v-a14b-candle",
             "d01bf1ea995c01a5bc545cefb977a320c9cb9fd0",
         ),
+        (WanI2vBackend::Candle, WanI2vRoute::T2v14b, Some(_)) => (
+            "SceneWorks/wan2.2-t2v-a14b-candle",
+            "da1909b66b360e1ea8cdeb3e39e40dca172cfa32",
+        ),
+        // The manifest pins no revision for any of the three upstream dense snapshots, so the
+        // policy names the repository and lets the snapshot id itself be the content pin — see
+        // [`UNPINNED_UPSTREAM_REVISION`].
         (WanI2vBackend::Candle, WanI2vRoute::Ti2v5b, None) => (
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-            "b8fff7315c768468a5333511427288870b2e9635",
+            UNPINNED_UPSTREAM_REVISION,
         ),
         (WanI2vBackend::Candle, WanI2vRoute::I2v14b, None) => (
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-            "596658fd9ca6b7b71d5057529bbf319ecbc61d74",
+            UNPINNED_UPSTREAM_REVISION,
+        ),
+        (WanI2vBackend::Candle, WanI2vRoute::T2v14b, None) => (
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            UNPINNED_UPSTREAM_REVISION,
         ),
         (WanI2vBackend::Mlx, WanI2vRoute::Vace, _) => (
             "Wan-AI/Wan2.1-VACE-1.3B-diffusers+shared-wan-components",
@@ -438,6 +747,36 @@ fn repo_dir(repository: &str) -> String {
     format!("models--{}", repository.replace('/', "--"))
 }
 
+/// Where a converted snapshot for `route` on `backend` must live under an HF-cache-shaped `base`
+/// for the dense (bf16) tier to pass [`PreparedWanI2vMemory::prepare`]'s repository/revision check:
+/// `<base>/models--<owner>--<name>/snapshots/<pinned revision>[/bf16]`.
+///
+/// The VACE routes carry an artifact receipt instead of a pinned revision, so any directory is a
+/// valid root for them and `base.join("vace")` is returned.
+///
+/// Test-support only: the backend crates' loaded-contract tests seal a receipt over a tiny synthetic
+/// snapshot, and this is the one piece of the layout they cannot express through the public API.
+#[doc(hidden)]
+pub fn fixture_snapshot_root(base: &Path, backend: WanI2vBackend, route: WanI2vRoute) -> PathBuf {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+        return base.join("vace");
+    }
+    let tier = MemoryNumericTier {
+        precision: Precision::Bf16,
+        quant: None,
+        component_precision_floors: &[],
+    };
+    let (repository, revision) = repository_policy(backend, route, tier);
+    let root = base
+        .join(repo_dir(repository))
+        .join("snapshots")
+        .join(fixture_revision(revision));
+    match backend {
+        WanI2vBackend::Mlx => root.join("bf16"),
+        WanI2vBackend::Candle => root,
+    }
+}
+
 fn repository_revision(
     root: &Path,
     repository: &str,
@@ -464,7 +803,11 @@ fn repository_revision(
         )));
     }
     let revision = parts.get(index + 2).cloned().unwrap_or_default();
-    if revision != expected_revision
+    // An unpinned upstream repository still has to be a well-formed HF snapshot; only the
+    // *identity* of the snapshot is left to the artifact rather than to this table.
+    let revision_matches =
+        expected_revision == UNPINNED_UPSTREAM_REVISION || revision == expected_revision;
+    if !revision_matches
         || revision.len() != 40
         || !revision
             .bytes()
@@ -572,7 +915,7 @@ fn validate_mlx_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<Vec<
             "t5_encoder.safetensors",
             "vae.safetensors",
         ],
-        WanI2vRoute::I2v14b => &[
+        WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => &[
             "high_noise_model.safetensors",
             "low_noise_model.safetensors",
             "t5_encoder.safetensors",
@@ -674,7 +1017,9 @@ fn validate_candle_inventory(root: &Path, route: WanI2vRoute) -> crate::Result<V
     }
     let components: &[&str] = match route {
         WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
-        WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
+        WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
+            &["text_encoder", "transformer", "transformer_2", "vae"]
+        }
         WanI2vRoute::Vace => &["text_encoder", "transformer", "vae"],
         WanI2vRoute::VaceFun => &["text_encoder", "transformer", "transformer_2", "vae"],
     };
@@ -751,7 +1096,9 @@ fn structural_files(
         WanI2vBackend::Candle => {
             let components: &[&str] = match route {
                 WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
-                WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
+                WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
+                    &["text_encoder", "transformer", "transformer_2", "vae"]
+                }
                 WanI2vRoute::Vace => unreachable!("handled above"),
                 WanI2vRoute::VaceFun => unreachable!("handled above"),
             };
@@ -791,7 +1138,7 @@ fn structural_files(
         } {
             let components: &[&str] = match route {
                 WanI2vRoute::Ti2v5b => &["transformer"],
-                WanI2vRoute::I2v14b => &["transformer", "transformer_2"],
+                WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => &["transformer", "transformer_2"],
                 WanI2vRoute::Vace => unreachable!("handled above"),
                 WanI2vRoute::VaceFun => unreachable!("handled above"),
             };
@@ -933,6 +1280,22 @@ fn packed_transformer_bytes(
         .filter(|header| header.name.ends_with(".weight") && header.shape.len() == 2)
     {
         let base = weight.name.strip_suffix(".weight").expect("suffix checked");
+        // A 2-D `.weight` that is stored float AND carries no quant metadata at all is dense by
+        // pipeline convention, not a packed tensor that lost its leaves: the converter leaves the
+        // output projection (`head.head`) dense BF16 on every packed tier of the shipped rehosts
+        // (`SceneWorks/wan2.2-i2v-a14b-mlx`, `wan2.2-t2v-a14b-mlx`). Skip it here and let the dense
+        // residual pass below price it at the resident float width, exactly as it already prices
+        // every non-2-D dense tensor.
+        //
+        // The discriminator is deliberately conjunctive so genuine corruption still fails closed:
+        // a `U32` weight is unambiguously packed storage and must carry both leaves, and a weight
+        // with a lone `.scales` or `.biases` sibling is a packed tensor missing metadata. Either
+        // case falls through to the errors below.
+        let has_scales = tensors.contains_key(&format!("{base}.scales"));
+        let has_biases = tensors.contains_key(&format!("{base}.biases"));
+        if weight.is_float() && !has_scales && !has_biases {
+            continue;
+        }
         let scales = tensors.get(&format!("{base}.scales")).ok_or_else(|| {
             crate::Error::Unsupported(format!("{} packed {base} lacks scales", path.display()))
         })?;
@@ -1050,17 +1413,41 @@ fn physical_resident_bytes(
     tier: MemoryNumericTier,
     phase: MemoryPhase,
 ) -> crate::Result<u64> {
-    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) && phase == MemoryPhase::Denoise {
         // VACE's public q4/q8 tiers are selected at load but materialized from the sealed dense
         // diffusers transformer after adapter folding. Charge the complete dense construction
         // surface rather than pretending the on-disk artifact is prepacked.
+        //
+        // SC-22667: this arm is scoped to the **denoise** component, which is the only one the
+        // sentence above is about. It used to return for every phase of a VACE route, which routed
+        // the route's decoder past the `Decode` arm below and priced a VAE that `model_vace.rs` /
+        // `model_vace_fun.rs` open at `VAE_DTYPE = DType::F32` as if it were materialized bf16 —
+        // half the bytes the render actually holds.
         return projected_dense_bytes(path, 2);
     }
     match (phase, tier.quant) {
         (MemoryPhase::Denoise, Some(quant)) => packed_transformer_bytes(path, quant, backend),
+        // The UMT5 encoder is packed at load on every MLX-affine quantized tier (sc-12831): the
+        // seven attention/FFN projections per block go to the Q8 floor `model::effective_te_quant`
+        // resolves, while the token embedding, the per-block norms and position-bias tables and the
+        // final norm stay dense. Charging the dense bf16 projection stack here — which is what the
+        // `_` arm below did — over-declared the largest staged component of the 5B and 14B routes
+        // by the whole packing win (measured 11.83 -> 7.72 GiB on the 5B).
+        (MemoryPhase::Conditioning, Some(quant))
+            if backend == WanI2vBackend::Mlx && matches!(quant, Quant::Q4 | Quant::Q8) =>
+        {
+            mlx_text_encoder_bytes(path, Some(MLX_TE_QUANT_BITS))
+        }
+        // The dense MLX tier keeps the seven projections bf16, but `Umt5Block::from_weights` and
+        // `assemble` upcast the same leaves on BOTH paths (`text_encoder.rs`: `norm1`, `norm2`, the
+        // per-layer `pos_embedding` table and the final `norm` are `as_dtype(Float32)` regardless of
+        // quant), so the dense arm prices those four leaves f32 too (SC-22667 review).
+        (MemoryPhase::Conditioning, None) if backend == WanI2vBackend::Mlx => {
+            mlx_text_encoder_bytes(path, None)
+        }
         (MemoryPhase::Decode, _) => projected_dense_bytes(
             path,
-            if backend == WanI2vBackend::Candle && route == WanI2vRoute::Ti2v5b {
+            if backend == WanI2vBackend::Candle && candle_decodes_f32(route) {
                 4
             } else {
                 2
@@ -1068,6 +1455,149 @@ fn physical_resident_bytes(
         ),
         _ => projected_dense_bytes(path, 2),
     }
+}
+
+/// Whether the **candle** provider for `route` opens its video autoencoder f32.
+///
+/// Three of the four do — `lib.rs` (TI2V-5B), `model_vace.rs` and `model_vace_fun.rs` all pin
+/// `VAE_DTYPE = DType::F32` — while `wan14b.rs` pins bf16 for the I2V-14B route (sc-12818). The
+/// split is per crate module rather than per family, so it is enumerated rather than derived.
+fn candle_decodes_f32(route: WanI2vRoute) -> bool {
+    match route {
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => true,
+        // `wan14b.rs` is the module behind BOTH A14B routes, and it pins bf16 for both.
+        WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => false,
+    }
+}
+
+/// The width `mlx_gen_wan::model::effective_te_quant` floors the UMT5 encoder to whenever the DiT
+/// is on an MLX-affine quantized tier. It is deliberately **not** the DiT's own width: Q4 costs the
+/// encoder measurable prompt fidelity, so the encoder floors at Q8 for a Q4 DiT as well.
+const MLX_TE_QUANT_BITS: u64 = 8;
+
+/// MLX affine group size, the same 64 [`packed_transformer_bytes`] assumes.
+const MLX_GROUP: u64 = 64;
+
+/// Bytes the MLX loader materializes for the UMT5 text encoder — packed to `packed_bits` on a
+/// quantized tier, dense bf16 projections on the dense tier (`None`).
+///
+/// `mlx_gen_wan::text_encoder` packs exactly the seven bias-less projections of each block —
+/// `attn.{q,k,v,o}` and `ffn.{gate_proj,fc1,fc2}` — into an MLX affine triple on a quantized tier,
+/// and leaves everything else dense. The families are priced separately because they materialize at
+/// different widths, and the f32 family does so **on both tiers** (`Umt5Block::from_weights` and
+/// `assemble` upcast unconditionally, before `quantize` runs):
+///
+/// * a packed `[out, in]` projection becomes `out * in * bits / 8` code bytes plus a `scales` and a
+///   `biases` plane of `out * in / group` elements each, at the source tensor's own width; on the
+///   dense tier the same projection is the shared `quant::lin` dense arm — its stored bf16 bytes;
+/// * the per-block norms, the position-bias tables and the final `norm.weight` are upcast to **f32**
+///   by the loader (`as_dtype(Dtype::Float32)`), so they are priced at 4 bytes per element rather
+///   than at their stored bf16 width — on the dense tier as much as on a packed one;
+/// * `token_embedding.weight` is cloned as stored — the loader never casts it — so it contributes
+///   its stored bytes.
+///
+/// On a quantized tier this fails closed on any key outside those families, and on a packed
+/// projection whose input width is not a whole number of groups: either means the encoder layout
+/// moved and this pricing no longer describes what loads. The dense tier has no packing geometry to
+/// get wrong, so a leaf outside the families keeps the `projected_dense_bytes(path, 2)` treatment
+/// it always had (float at 2 B per element; packed/non-float storage refused).
+fn mlx_text_encoder_bytes(path: &Path, packed_bits: Option<u64>) -> crate::Result<u64> {
+    const PACKED_LEAVES: [&str; 7] = [
+        ".attn.q.weight",
+        ".attn.k.weight",
+        ".attn.v.weight",
+        ".attn.o.weight",
+        ".ffn.gate_proj.weight",
+        ".ffn.fc1.weight",
+        ".ffn.fc2.weight",
+    ];
+    const F32_LEAVES: [&str; 3] = [
+        ".norm1.weight",
+        ".norm2.weight",
+        ".pos_embedding.embedding.weight",
+    ];
+
+    let headers = crate::weightsmeta::safetensors_path_tensor_headers(path)?;
+    if headers.is_empty() {
+        return Err(crate::Error::Unsupported(format!(
+            "{} contains no tensors",
+            path.display()
+        )));
+    }
+    headers.iter().try_fold(0_u64, |sum, header| {
+        let name = header.name.as_str();
+        let projection =
+            name.starts_with("blocks.") && PACKED_LEAVES.iter().any(|leaf| name.ends_with(leaf));
+        let bytes = if let (true, Some(bits)) = (projection, packed_bits) {
+            let [out, input] = header.shape[..] else {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} packed projection {name} is not a 2-D weight",
+                    path.display()
+                )));
+            };
+            let (out, input) = (out as u64, input as u64);
+            if input == 0 || !input.is_multiple_of(MLX_GROUP) {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} projection {name} has {input} input columns, not a whole number of \
+                     {MLX_GROUP}-wide affine groups",
+                    path.display()
+                )));
+            }
+            let elements = tensor_elements(path, header)?;
+            let codes = elements
+                .checked_mul(bits)
+                .and_then(|bits| bits.checked_div(8))
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan packed encoder code bytes overflow".to_owned())
+                })?;
+            // One `scales` and one `biases` plane, each `[out, input / group]` at the source width.
+            let planes = out
+                .checked_mul(input / MLX_GROUP)
+                .and_then(|entries| entries.checked_mul(2))
+                .and_then(|entries| entries.checked_mul(header.dtype.size() as u64))
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan packed encoder scale bytes overflow".to_owned())
+                })?;
+            codes.checked_add(planes).ok_or_else(|| {
+                crate::Error::Msg("Wan packed encoder projection bytes overflow".to_owned())
+            })?
+        } else if projection {
+            // The dense tier: `quant::lin`'s dense arm loads the projection as stored (bf16).
+            header.data_bytes
+        } else if name == "norm.weight"
+            || (name.starts_with("blocks.") && F32_LEAVES.iter().any(|leaf| name.ends_with(leaf)))
+        {
+            tensor_elements(path, header)?
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan encoder f32 tensor bytes overflow".to_owned())
+                })?
+        } else if name == "token_embedding.weight" {
+            header.data_bytes
+        } else if packed_bits.is_none() {
+            // The dense tier has no packing geometry to get wrong, so a leaf outside the named
+            // families is what `projected_dense_bytes(path, 2)` always made of it: a float tensor
+            // at 2 B per element, and a refusal for packed/non-float storage.
+            if !header.is_float() || name.ends_with(".scales") || name.ends_with(".biases") {
+                return Err(crate::Error::Unsupported(format!(
+                    "{} dense tensor {name} has unsupported packed/non-float storage",
+                    path.display()
+                )));
+            }
+            tensor_elements(path, header)?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    crate::Error::Msg("Wan projected tensor bytes overflow".to_owned())
+                })?
+        } else {
+            return Err(crate::Error::Unsupported(format!(
+                "{} encoder tensor {name} is outside the packed UMT5 key surface",
+                path.display()
+            )));
+        };
+        sum.checked_add(bytes)
+            .ok_or_else(|| crate::Error::Msg("Wan encoder byte total overflow".to_owned()))
+    })
 }
 
 fn adapter_receipts(
@@ -1123,9 +1653,7 @@ fn adapter_receipts(
                 "Wan adapter has zero tensor bytes".to_owned(),
             ));
         }
-        let multiplicity = if matches!(route, WanI2vRoute::I2v14b | WanI2vRoute::VaceFun)
-            && adapter.moe_expert.is_none()
-        {
+        let multiplicity = if route.dual_expert() && adapter.moe_expert.is_none() {
             2
         } else {
             1
@@ -1151,7 +1679,7 @@ fn adapter_receipts(
             .unwrap_or(crate::PinnedWeightsFile::pin(&adapter.path)?);
         pin.ensure_unchanged()?;
         let digest = sha256_file(&adapter.path)?;
-        let kind = if lightning_role(&adapter.path).is_some_and(|(_, exact)| exact) {
+        let kind = if lightning_role(&adapter.path, route).is_some_and(|(_, exact)| exact) {
             "lightning_lora"
         } else if adapter.kind == AdapterKind::Lokr || has_lokr_keys {
             "lokr"
@@ -1219,7 +1747,20 @@ fn adapter_receipts(
     ))
 }
 
-fn lightning_role(path: &Path) -> Option<(MoeExpert, bool)> {
+/// The Lightning distill subdirectory `lightx2v/Wan2.2-Lightning` ships for `route`.
+///
+/// The two A14B recipes are **not** cross-compatible (the manifest says so where it declares the
+/// `coRequisite`), so the exact subdir is part of the recipe's identity: T2V is `Seko-V1.1`, I2V is
+/// `Seko-V1`. A route with no Lightning recipe returns `None`.
+fn lightning_subdir(route: WanI2vRoute) -> Option<&'static str> {
+    match route {
+        WanI2vRoute::T2v14b => Some("Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1"),
+        WanI2vRoute::I2v14b => Some("Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1"),
+        WanI2vRoute::Ti2v5b | WanI2vRoute::Vace | WanI2vRoute::VaceFun => None,
+    }
+}
+
+fn lightning_role(path: &Path, route: WanI2vRoute) -> Option<(MoeExpert, bool)> {
     let canonical = std::fs::canonicalize(path).ok()?;
     let marker = repo_dir(LIGHTNING_REPOSITORY);
     let parts = canonical
@@ -1233,9 +1774,12 @@ fn lightning_role(path: &Path) -> Option<(MoeExpert, bool)> {
         return Some((MoeExpert::High, false));
     }
     let suffix = parts[index + 3..].join("/");
-    if suffix == "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors" {
+    let Some(subdir) = lightning_subdir(route) else {
+        return Some((MoeExpert::High, false));
+    };
+    if suffix == format!("{subdir}/high_noise_model.safetensors") {
         Some((MoeExpert::High, true))
-    } else if suffix == "Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors" {
+    } else if suffix == format!("{subdir}/low_noise_model.safetensors") {
         Some((MoeExpert::Low, true))
     } else {
         Some((MoeExpert::High, false))
@@ -1248,7 +1792,7 @@ fn validate_lightning_recipe(spec: &LoadSpec, route: WanI2vRoute) -> crate::Resu
         .iter()
         .enumerate()
         .filter_map(|(index, adapter)| {
-            lightning_role(&adapter.path).map(|role| (index, adapter, role))
+            lightning_role(&adapter.path, route).map(|role| (index, adapter, role))
         })
         .collect::<Vec<_>>();
     if matches!(route, WanI2vRoute::Ti2v5b | WanI2vRoute::Vace) && !roles.is_empty() {
@@ -1482,7 +2026,11 @@ impl PreparedWanI2vMemory {
         identity.update(adapter_identity.as_bytes());
         let artifact_identity = format!("{:x}", identity.finalize());
         files.extend(adapter_files);
-        let contract = contract(provider_id, route, backend, spec, facts);
+        let mut contract = contract(provider_id, route, backend, spec, facts);
+        // Published only now, after the whole receipt sealed: the tier is the artifact's, not the
+        // request's, and a snapshot that failed any inventory/marker check never reaches here.
+        contract.calibration = production_calibration_fingerprint(route, backend, tier)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
         let prepared = Self {
             contract,
             artifact_identity,
@@ -1498,6 +2046,24 @@ impl PreparedWanI2vMemory {
         };
         prepared.ensure_unchanged()?;
         Ok(prepared)
+    }
+
+    /// The materialized snapshot directory this receipt was sealed over — the same `WeightsSource::Dir`
+    /// root the backend loader parses its model config from.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Stamp the backend's architecture axes onto the sealed contract (epic SC-22657, E2).
+    ///
+    /// This module is backend-neutral and holds no model config, so its `contract` builder can only
+    /// publish `MemoryArchitectureFacts::default()`. The contract a loaded generator hands back through
+    /// `Generator::memory_strategy_contract()` **is** `self.contract`, so a backend that only
+    /// overlays its axes on the per-request contract leaves the loaded path publishing the empty
+    /// default. Each backend's `prepare` therefore stamps its route facts here, once, at seal time.
+    pub fn with_architecture_facts(mut self, facts: crate::MemoryArchitectureFacts) -> Self {
+        self.contract.architecture_facts = facts;
+        self
     }
 
     pub fn ensure_unchanged(&self) -> crate::Result<()> {
@@ -1561,6 +2127,8 @@ fn contract(
         MemoryPhase::Decode,
     ];
     MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: crate::MemoryArchitectureFacts::default(),
         provider_id: provider_id.to_owned(),
         backend: backend.realization(),
         strategies: MemoryStrategy::ALL
@@ -1860,12 +2428,34 @@ fn replace_person_carrier(
     Ok((clip, references))
 }
 
+/// The text-to-video carrier: a prompt and **nothing else**.
+///
+/// `T2v14b` is the only route that admits it, and it admits no other carrier — so this is where an
+/// image sneaked onto a text-only route is refused, rather than silently priced against a resident
+/// set that never materializes a VAE encoder.
+fn text_to_video_carrier(request: &GenerationRequest) -> crate::Result<()> {
+    if !request.conditioning.is_empty() || request.control_clip().is_some() {
+        return Err(crate::Error::Unsupported(
+            "Wan public text_to_video admits no conditioning carrier".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn request_mode(
     prepared: &PreparedWanI2vMemory,
     request: &GenerationRequest,
 ) -> crate::Result<WanPublicMode> {
     match request.video_mode.as_deref() {
-        Some("image_to_video") if prepared.route != WanI2vRoute::Vace => {
+        // A text-only route publishes its mode either way: the worker may spell it, or leave
+        // `video_mode` unset the way the T2V generator's own request path does.
+        None | Some("text_to_video") if prepared.route == WanI2vRoute::T2v14b => {
+            text_to_video_carrier(request)?;
+            Ok(WanPublicMode::TextToVideo)
+        }
+        Some("image_to_video")
+            if prepared.route != WanI2vRoute::Vace && prepared.route != WanI2vRoute::T2v14b =>
+        {
             reference(request)?;
             Ok(WanPublicMode::ImageToVideo)
         }
@@ -1906,7 +2496,8 @@ fn request_mode(
         }
         _ => Err(crate::Error::Unsupported(format!(
             "{}: request matches no exact public Wan carrier — this route admits \
-             image_to_video/one Reference (non-VACE), first_last_frame/two ordered Keyframes \
+             text_to_video/no carrier (T2V-A14B only), \
+             image_to_video/one Reference (non-VACE, non-T2V), first_last_frame/two ordered Keyframes \
              (Ti2V-5B, no video_mode), extend_clip and video_bridge (Ti2V-5B MLX keyframes or \
              VACE ControlClip), and replace_person@<64-hex identity> (VACE / VACE-Fun)",
             prepared.route.provider_id()
@@ -1940,7 +2531,12 @@ pub fn contract_for_mode_key(
     mode: &str,
 ) -> crate::Result<MemoryProviderContract> {
     let mode = match mode {
-        "image_to_video" if prepared.route != WanI2vRoute::Vace => WanPublicMode::ImageToVideo,
+        "text_to_video" if prepared.route == WanI2vRoute::T2v14b => WanPublicMode::TextToVideo,
+        "image_to_video"
+            if prepared.route != WanI2vRoute::Vace && prepared.route != WanI2vRoute::T2v14b =>
+        {
+            WanPublicMode::ImageToVideo
+        }
         "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
             WanPublicMode::FirstLastFrame
         }
@@ -2003,7 +2599,7 @@ pub fn validate_request(
                 .get(1)
                 .is_some_and(|low| low.kind == "lightning_lora" && low.expert == "low")
     });
-    let lightning_sampling = if prepared.route == WanI2vRoute::I2v14b
+    let lightning_sampling = if lightning_subdir(prepared.route).is_some()
         && steps == 4
         && request
             .guidance
@@ -2014,19 +2610,19 @@ pub fn validate_request(
         !has_lightning
     };
     let exact_rate = match mode {
-        WanPublicMode::ImageToVideo => prepared.route.accepts_rate(fps, frames),
+        WanPublicMode::TextToVideo | WanPublicMode::ImageToVideo => {
+            prepared.route.accepts_rate(fps, frames)
+        }
         WanPublicMode::FirstLastFrame => prepared.route.accepts_first_last_rate(fps, frames),
         WanPublicMode::ExtendClip => match prepared.route {
             WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
             WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
-            WanI2vRoute::I2v14b => false,
-            WanI2vRoute::VaceFun => false,
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b | WanI2vRoute::VaceFun => false,
         },
         WanPublicMode::VideoBridge => match prepared.route {
             WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, frames),
             WanI2vRoute::Vace => prepared.route.accepts_rate(fps, frames),
-            WanI2vRoute::I2v14b => false,
-            WanI2vRoute::VaceFun => false,
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b | WanI2vRoute::VaceFun => false,
         },
         WanPublicMode::ReplacePerson => {
             matches!(prepared.route, WanI2vRoute::Vace | WanI2vRoute::VaceFun)
@@ -2034,7 +2630,7 @@ pub fn validate_request(
         }
     };
     let sampler_ok = match mode {
-        WanPublicMode::ImageToVideo => true,
+        WanPublicMode::TextToVideo | WanPublicMode::ImageToVideo => true,
         WanPublicMode::FirstLastFrame
         | WanPublicMode::ExtendClip
         | WanPublicMode::VideoBridge
@@ -2197,6 +2793,12 @@ fn request_evidence_revision_for_selection(
     update_optional_str(&mut hash, request.video_mode.as_deref());
     hash.update(NATIVE_SCHEDULE.as_bytes());
     match mode {
+        WanPublicMode::TextToVideo => {
+            text_to_video_carrier(request)?;
+            // Named explicitly so a text-only receipt can never collide with an image-carrying one
+            // whose carrier happened to hash to nothing.
+            hash.update(b"text-only-no-carrier");
+        }
         WanPublicMode::ImageToVideo => {
             let image = reference(request)?;
             hash.update(b"reference");
@@ -2319,7 +2921,12 @@ pub fn validate_context(
         // The VACE routes have no exact public I2V request contract (`request_mode` and
         // `contract_for_mode_key` both refuse it), so admission must refuse it here too rather
         // than admit a row no request can ever execute against.
-        "image_to_video" if prepared.route != WanI2vRoute::Vace => WanPublicMode::ImageToVideo,
+        "text_to_video" if prepared.route == WanI2vRoute::T2v14b => WanPublicMode::TextToVideo,
+        "image_to_video"
+            if prepared.route != WanI2vRoute::Vace && prepared.route != WanI2vRoute::T2v14b =>
+        {
+            WanPublicMode::ImageToVideo
+        }
         "first_last_frame" if prepared.route == WanI2vRoute::Ti2v5b => {
             WanPublicMode::FirstLastFrame
         }
@@ -2359,19 +2966,21 @@ pub fn validate_context(
     };
     let tail_prefix = format!("{}:{selection_receipt}:", prepared.artifact_identity);
     let rate_ok = match mode {
-        WanPublicMode::ImageToVideo => prepared.route.accepts_rate(fps, geometry.frames),
+        WanPublicMode::TextToVideo | WanPublicMode::ImageToVideo => {
+            prepared.route.accepts_rate(fps, geometry.frames)
+        }
         WanPublicMode::FirstLastFrame => {
             prepared.route.accepts_first_last_rate(fps, geometry.frames)
         }
         WanPublicMode::ExtendClip | WanPublicMode::VideoBridge => match prepared.route {
             WanI2vRoute::Ti2v5b => prepared.route.accepts_first_last_rate(fps, geometry.frames),
             WanI2vRoute::Vace => prepared.route.accepts_rate(fps, geometry.frames),
-            WanI2vRoute::I2v14b => false,
-            WanI2vRoute::VaceFun => false,
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b | WanI2vRoute::VaceFun => false,
         },
         WanPublicMode::ReplacePerson => prepared.route.accepts_rate(fps, geometry.frames),
     };
     let carrier_ok = match mode {
+        WanPublicMode::TextToVideo => geometry.reference_count == 0,
         WanPublicMode::ImageToVideo => geometry.reference_count == 1,
         WanPublicMode::FirstLastFrame => geometry.reference_count == 2,
         WanPublicMode::ExtendClip => geometry.reference_count == 1,
@@ -2401,17 +3010,26 @@ pub fn validate_context(
             context.selection.strategy,
             MemoryStrategy::Resident | MemoryStrategy::BoundedDecode
         ),
-        WanPublicMode::ImageToVideo | WanPublicMode::FirstLastFrame => matches!(
+        WanPublicMode::TextToVideo
+        | WanPublicMode::ImageToVideo
+        | WanPublicMode::FirstLastFrame => matches!(
             context.selection.strategy,
             MemoryStrategy::Resident
                 | MemoryStrategy::StagedResidency
                 | MemoryStrategy::BoundedDecode
         ),
     };
+    // Which public modes carry a reference still, named rather than written as the negation of the
+    // two that do not: `has_reference != !matches!(..)` said the same thing and read as a typo, and
+    // `-D clippy::nonminimal_bool` refuses it on the CUDA lane.
+    let carries_reference = !matches!(
+        mode,
+        WanPublicMode::VideoBridge | WanPublicMode::TextToVideo
+    );
     if !selection_ok
         || geometry.batch != 1
         || !carrier_ok
-        || (context.has_reference != (mode != WanPublicMode::VideoBridge))
+        || context.has_reference != carries_reference
         || !prepared
             .route
             .public_geometries()
@@ -2466,6 +3084,7 @@ pub fn selection_from_request(
     let selection = MemorySelection {
         strategy,
         parameters: MemoryStrategyParameters {
+            stage_residency: None,
             decode_tile_edge: memory.decode_tile_edge,
             decode_overlap: memory.decode_overlap,
             attention_chunk_size: memory.attention_chunk_size,
@@ -2586,6 +3205,56 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// Write a structurally real converted `t5_encoder.safetensors` (SC-22667).
+    ///
+    /// The MLX loader packs exactly the seven bias-less projections of each block and leaves the
+    /// token embedding, the per-block norms and position-bias tables and the final norm dense, so a
+    /// fixture carrying a single tensor named `weight` cannot exercise
+    /// [`mlx_text_encoder_bytes`] at all — every arm it distinguishes needs its own key.
+    /// `dim` is a whole number of MLX affine groups, as the real encoder's is.
+    fn write_umt5_encoder(path: &Path, blocks: usize, dim: usize) {
+        let square = vec![dim, dim];
+        let vector = vec![dim];
+        let mut owned: Vec<(String, &str, Vec<usize>)> = vec![
+            (
+                "token_embedding.weight".to_owned(),
+                "BF16",
+                vec![dim * 4, dim],
+            ),
+            ("norm.weight".to_owned(), "BF16", vector.clone()),
+        ];
+        for block in 0..blocks {
+            for leaf in [
+                "attn.q",
+                "attn.k",
+                "attn.v",
+                "attn.o",
+                "ffn.gate_proj",
+                "ffn.fc1",
+                "ffn.fc2",
+            ] {
+                owned.push((
+                    format!("blocks.{block}.{leaf}.weight"),
+                    "BF16",
+                    square.clone(),
+                ));
+            }
+            for leaf in ["norm1.weight", "norm2.weight"] {
+                owned.push((format!("blocks.{block}.{leaf}"), "BF16", vector.clone()));
+            }
+            owned.push((
+                format!("blocks.{block}.pos_embedding.embedding.weight"),
+                "BF16",
+                vec![32, 8],
+            ));
+        }
+        let tensors = owned
+            .iter()
+            .map(|(name, dtype, shape)| (name.as_str(), *dtype, shape.as_slice()))
+            .collect::<Vec<_>>();
+        write_safetensors(path, &tensors);
+    }
+
     fn mlx_fixture(route: WanI2vRoute, quant: Option<Quant>) -> (tempfile::TempDir, LoadSpec) {
         let tmp = tempfile::tempdir().unwrap();
         let tier = MemoryNumericTier {
@@ -2604,7 +3273,7 @@ mod tests {
             .path()
             .join(repo_dir(repository))
             .join("snapshots")
-            .join(revision)
+            .join(fixture_revision(revision))
             .join(tier_name);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
@@ -2622,7 +3291,7 @@ mod tests {
                 ("t5_encoder.safetensors", 7),
                 ("vae.safetensors", 5),
             ],
-            WanI2vRoute::I2v14b => &[
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => &[
                 ("high_noise_model.safetensors", 13),
                 ("low_noise_model.safetensors", 17),
                 ("t5_encoder.safetensors", 7),
@@ -2642,6 +3311,8 @@ mod tests {
                         ("proj.biases", "BF16", &[logical, 1]),
                     ],
                 );
+            } else if name == "t5_encoder.safetensors" {
+                write_umt5_encoder(&root.join(name), logical, 64);
             } else {
                 write_safetensors(&root.join(name), &[("weight", "BF16", &[logical, 64])]);
             }
@@ -2665,7 +3336,7 @@ mod tests {
             .path()
             .join(repo_dir(repository))
             .join("snapshots")
-            .join(revision);
+            .join(fixture_revision(revision));
         if let Some(quant) = quant {
             root = root.join(if quant == Quant::Q4 { "q4" } else { "q8" });
         }
@@ -2674,7 +3345,9 @@ mod tests {
         std::fs::write(root.join("tokenizer/tokenizer.json"), "{}").unwrap();
         let components: &[&str] = match route {
             WanI2vRoute::Ti2v5b => &["text_encoder", "transformer", "vae"],
-            WanI2vRoute::I2v14b => &["text_encoder", "transformer", "transformer_2", "vae"],
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => {
+                &["text_encoder", "transformer", "transformer_2", "vae"]
+            }
             WanI2vRoute::Vace => panic!("use a dedicated VACE fixture"),
             WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun fixture"),
         };
@@ -2742,10 +3415,7 @@ mod tests {
                     &root.join("transformer/model.safetensors"),
                     &[("blocks.0.self_attn.to_q.weight", "BF16", &[8, 8])],
                 );
-                write_safetensors(
-                    &root.join("t5_encoder.safetensors"),
-                    &[("weight", "BF16", &[4, 4])],
-                );
+                write_umt5_encoder(&root.join("t5_encoder.safetensors"), 1, 64);
                 write_safetensors(
                     &root.join("vae.safetensors"),
                     &[("weight", "BF16", &[4, 4])],
@@ -3444,6 +4114,79 @@ mod tests {
         assert!(validate_request(&prepared, &ti2v_extend_request()).is_err());
     }
 
+    /// Every Candle dense leg is bound to the snapshot it is STAGED at, not to a revision the
+    /// manifest never pinned (sc-22736 review): a well-formed snapshot id other than the fixture's
+    /// prepares and is the receipt's revision, and a malformed one is still refused. Mutation that
+    /// reds this: restoring a hard revision on any of the three `(Candle, route, None)` arms of
+    /// `repository_policy`.
+    #[test]
+    fn every_candle_dense_leg_accepts_the_staged_snapshot_and_refuses_a_malformed_one() {
+        const STAGED: &str = "fedcba9876543210fedcba9876543210fedcba98";
+        for route in [
+            WanI2vRoute::Ti2v5b,
+            WanI2vRoute::T2v14b,
+            WanI2vRoute::I2v14b,
+        ] {
+            let tier = MemoryNumericTier {
+                precision: Precision::Bf16,
+                quant: None,
+                component_precision_floors: &[],
+            };
+            let (repository, policy_revision) =
+                repository_policy(WanI2vBackend::Candle, route, tier);
+            assert_eq!(policy_revision, UNPINNED_UPSTREAM_REVISION, "{route:?}");
+            let (tmp, _spec) = candle_fixture(route, None);
+            let snapshots = tmp.path().join(repo_dir(repository)).join("snapshots");
+            for (staged, expected) in [
+                (STAGED, Ok(STAGED)),
+                (
+                    "FEDCBA9876543210FEDCBA9876543210FEDCBA98",
+                    Err("upper-case"),
+                ),
+                ("fedcba9876543210fedcba9876543210fedcba9", Err("39 chars")),
+            ] {
+                let root = snapshots.join(staged);
+                if root.exists() {
+                    std::fs::remove_dir_all(&root).unwrap();
+                }
+                std::fs::rename(snapshots.join(FIXTURE_UNPINNED_REVISION), &root).unwrap();
+                // A fresh spec over the moved root: the fixture's own pins name absolute paths
+                // under the directory that was just renamed away.
+                let mut moved = LoadSpec::new(WeightsSource::Dir(root.clone()))
+                    .with_resolved_route(route.provider_id());
+                moved.quantize = None;
+                let prepared =
+                    prepare_load_spec(&mut moved, WanI2vBackend::Candle, route.provider_id())
+                        .and_then(|()| {
+                            PreparedWanI2vMemory::prepare(
+                                &moved,
+                                WanI2vBackend::Candle,
+                                route.provider_id(),
+                            )
+                        });
+                match expected {
+                    Ok(revision) => {
+                        let prepared = prepared
+                            .unwrap_or_else(|error| panic!("{route:?} at {staged}: {error}"));
+                        assert_eq!(prepared.revision, revision, "{route:?}");
+                        assert_eq!(prepared.repository, repository, "{route:?}");
+                    }
+                    Err(why) => {
+                        let error = prepared
+                            .err()
+                            .unwrap_or_else(|| panic!("{route:?}: {why} must be refused"))
+                            .to_string();
+                        assert!(
+                            error.contains("does not match immutable"),
+                            "{route:?} {why}: {error}"
+                        );
+                    }
+                }
+                std::fs::rename(&root, snapshots.join(FIXTURE_UNPINNED_REVISION)).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn mlx_q4_q8_bf16_facts_are_nonzero_differentiated_and_rsd_only() {
         let mut totals = Vec::new();
@@ -3482,6 +4225,94 @@ mod tests {
         )
         .expect("the production worker selects a prepacked MLX q4 directory with quantize=None");
         assert_eq!(prepared.tier.quant, Some(Quant::Q4));
+    }
+
+    /// Feature-end review (SC-22667, E1). `mlx_gen_wan::text_encoder` packs the UMT5 encoder's seven
+    /// bias-less projections per block to the Q8 floor on **every** MLX-affine quantized tier, and
+    /// the sealed receipt must charge the packed encoder rather than the dense bf16 stack it was
+    /// built from — the largest staged component of both the 5B and 14B routes.
+    ///
+    /// The expected total is spelled out from the fixture's own geometry rather than captured, so
+    /// the test is an oracle and not a snapshot. Mutations that fail this: restoring the single
+    /// `_ => projected_dense_bytes(path, 2)` arm for the quantized `MemoryPhase::Conditioning`
+    /// case, which reports the 439_680 B shard sum on the quantized assertions; and dropping the
+    /// dense-MLX conditioning arm (SC-22667 review), which reports that same 439_680 B on the dense
+    /// assertion instead of the 445_184 B the f32 leaf upcasts make it.
+    #[test]
+    fn the_mlx_encoder_is_charged_packed_on_every_quantized_tier() {
+        // `write_umt5_encoder(_, blocks = 7, dim = 64)`, Q8 at MLX group 64:
+        //   token embedding  [256, 64] bf16, cloned as stored              = 32_768
+        //   final norm       [64]      upcast f32                          =    256
+        //   per block:  7 projections [64, 64]
+        //                 codes  4096 * 8 / 8                              =  4_096
+        //                 scales+biases  64 * (64/64) * 2 planes * 2 B     =    256
+        //               2 norms [64] upcast f32                            =    512
+        //               pos-bias [32, 8] upcast f32                        =  1_024
+        //                                                       per block  = 32_000
+        const PACKED_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * 32_000;
+        // The dense tier (SC-22667 review): the seven projections stay bf16 as stored
+        // (7 * 4096 * 2 = 57_344 per block), but `Umt5Block::from_weights` / `assemble` upcast the
+        // same leaves on this path too — the final norm (256), the two block norms (512) and the
+        // pos-bias table (1_024) — so the dense figure is NOT the plain bf16 shard sum
+        // (32_768 + 128 + 7 * 58_112 = 439_680); it is 445_184.
+        const DENSE_ENCODER_BYTES: u64 = 32_768 + 256 + 7 * (57_344 + 512 + 1_024);
+
+        let mut dense_conditioning = 0;
+        for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::I2v14b] {
+            for quant in [Some(Quant::Q4), Some(Quant::Q8), None] {
+                let (_tmp, spec) = mlx_fixture(route, quant);
+                let prepared =
+                    PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Mlx, route.provider_id())
+                        .unwrap();
+                let conditioning = prepared.contract.asset_facts.conditioning_bytes;
+                match quant {
+                    // Q4 and Q8 agree: `effective_te_quant` floors the encoder at Q8 for both.
+                    Some(_) => assert_eq!(
+                        conditioning, PACKED_ENCODER_BYTES,
+                        "{route:?} {quant:?} conditioning"
+                    ),
+                    None => {
+                        assert_eq!(
+                            conditioning, DENSE_ENCODER_BYTES,
+                            "{route:?} dense conditioning"
+                        );
+                        dense_conditioning = conditioning;
+                    }
+                }
+            }
+        }
+        assert!(
+            PACKED_ENCODER_BYTES < dense_conditioning,
+            "packing the encoder must reduce its charged residency"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E1). Both candle VACE routes open their video autoencoder at
+    /// `VAE_DTYPE = DType::F32` (`model_vace.rs`, `model_vace_fun.rs`), so the sealed decoder bytes
+    /// are four per stored bf16 element, not two.
+    ///
+    /// Mutation that fails this: widening the VACE early return in `physical_resident_bytes` back to
+    /// every phase, which routes the decoder past the `Decode` arm and halves this number.
+    #[test]
+    fn candle_vace_decodes_f32_and_is_charged_at_that_width() {
+        for route in [WanI2vRoute::Vace, WanI2vRoute::VaceFun] {
+            let (_tmp, spec) = vace_route_fixture(WanI2vBackend::Candle, None, route);
+            let prepared =
+                PreparedWanI2vMemory::prepare(&spec, WanI2vBackend::Candle, route.provider_id())
+                    .unwrap();
+            // The fixture's `vae/model.safetensors` is one bf16 [4, 4] tensor: 16 elements.
+            assert_eq!(
+                prepared.contract.asset_facts.decoder_bytes,
+                16 * 4,
+                "{route:?} decoder is materialized f32"
+            );
+            // The conditioning encoder and the transformer stay bf16 on this route.
+            assert_eq!(
+                prepared.contract.asset_facts.conditioning_bytes,
+                16 * 2,
+                "{route:?} conditioning is materialized bf16"
+            );
+        }
     }
 
     #[test]
@@ -3543,13 +4374,120 @@ mod tests {
         );
     }
 
+    /// sc-22738 (defect B): every packed file of the shipped a14b rehosts
+    /// (`SceneWorks/wan2.2-i2v-a14b-mlx@c6c786170031eccc3a1fac0f98f1ad4ff988271e` and its t2v
+    /// sibling) leaves the output projection `head.head.weight` dense BF16 `[64, 5120]` with no
+    /// `.scales`/`.biases` — the standing converter convention. The first pass demanded scales for
+    /// every 2-D `.weight` and refused before the second pass, which already prices a dense
+    /// residual correctly.
+    #[test]
+    fn a_packed_file_prices_a_dense_output_head_but_still_refuses_stripped_quant_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shipped: &[(&str, &str, &[usize])] = &[
+            ("blocks.0.self_attn.q.weight", "U32", &[64, 8]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+            ("blocks.0.norm1.weight", "BF16", &[64]),
+            // Dense by convention on every packed tier — no quant metadata at all.
+            ("head.head.weight", "BF16", &[64, 64]),
+            ("head.head.bias", "BF16", &[64]),
+        ];
+        let path = tmp.path().join("high_noise_model.safetensors");
+        write_safetensors(&path, shipped);
+
+        // Packed triple (MLX prices stored bytes): 64*8*4 + 64*2 + 64*2 = 2304.
+        // Dense residual at the bf16 resident width: (64*64 + 64 + 64) * 2 = 8448.
+        let mlx = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).unwrap();
+        assert_eq!(mlx, 2304 + 8448);
+        // Candle prices the packed block form (20 bytes / 32 Q4 elements) and the same residual.
+        let candle = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Candle).unwrap();
+        assert_eq!(candle, (64 * 64 / 32) * 20 + 8448);
+
+        // The discriminator is "float storage AND no quant metadata at all", so genuine corruption
+        // still fails closed: packed U32 storage that lost both leaves, that lost one of them, and
+        // a float weight carrying a lone leaf are each refused.
+        // Each case pairs the corruption with the message that has to name it, so a guard loosened
+        // to any one of its three conjuncts is caught rather than being absorbed by the second
+        // pass's orphan-leaf backstop.
+        let valid_triple: &[(&str, &str, &[usize])] = &[
+            ("blocks.0.self_attn.q.weight", "U32", &[64, 8]),
+            ("blocks.0.self_attn.q.scales", "BF16", &[64, 1]),
+            ("blocks.0.self_attn.q.biases", "BF16", &[64, 1]),
+        ];
+        for (corruption, expected) in [
+            // U32 storage with both leaves stripped, alongside a healthy packed sibling: packed
+            // storage is unambiguous, so this can never be read as dense by convention.
+            (
+                vec![
+                    ("blocks.0.ffn.0.weight", "U32", &[64, 8][..]),
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                ],
+                "packed blocks.0.ffn.0 lacks scales",
+            ),
+            // A float weight with a lone `.biases` leaf carries quant metadata, so it is a packed
+            // tensor missing its scales — not a dense head.
+            (
+                vec![
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                    ("head.head.biases", "BF16", &[64, 1][..]),
+                ],
+                "packed head.head lacks scales",
+            ),
+            // …and the mirror case, a lone `.scales` leaf.
+            (
+                vec![
+                    ("head.head.weight", "BF16", &[64, 64][..]),
+                    ("head.head.scales", "BF16", &[64, 1][..]),
+                ],
+                "packed head.head lacks biases",
+            ),
+        ] {
+            let mut mutated = valid_triple.to_vec();
+            mutated.extend(corruption.iter().copied());
+            let path = tmp.path().join("mutated.safetensors");
+            write_safetensors(&path, &mutated);
+            let error = packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx)
+                .expect_err("a packed tensor missing quant metadata must still be refused")
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+
+        // A file whose only 2-D weight is the dense head has no packed weights at all and is not a
+        // packed tier — the emptiness guard must still catch it.
+        let path = tmp.path().join("dense_only.safetensors");
+        write_safetensors(&path, &[("head.head.weight", "BF16", &[64, 64])]);
+        assert!(packed_transformer_bytes(&path, Quant::Q4, WanI2vBackend::Mlx).is_err());
+    }
+
     fn request(route: WanI2vRoute) -> GenerationRequest {
         let (width, height, frames, fps, steps, guidance) = match route {
             WanI2vRoute::Ti2v5b => (832, 480, 121, 24, 20, Some(5.0)),
-            WanI2vRoute::I2v14b => (1280, 720, 77, 16, 40, None),
+            WanI2vRoute::T2v14b | WanI2vRoute::I2v14b => (1280, 720, 77, 16, 40, None),
             WanI2vRoute::Vace => panic!("use a dedicated VACE request"),
             WanI2vRoute::VaceFun => panic!("use a dedicated VACE-Fun request"),
         };
+        // T2V-A14B is the one carrier-free route: it spells `text_to_video` and carries no
+        // conditioning at all. Building it from the same helper keeps the two A14B routes' geometry
+        // in one place, which is the point — they differ only in the carrier.
+        if route == WanI2vRoute::T2v14b {
+            return GenerationRequest {
+                prompt: "a slow dolly across an empty room".to_owned(),
+                width,
+                height,
+                count: 1,
+                seed: Some(17),
+                steps: Some(steps),
+                guidance,
+                frames: Some(frames),
+                fps: Some(fps),
+                video_mode: Some("text_to_video".to_owned()),
+                conditioning: Vec::new(),
+                ..Default::default()
+            };
+        }
         GenerationRequest {
             prompt: "animate the still".to_owned(),
             width,
@@ -4185,6 +5123,248 @@ mod tests {
             "replace_person",
         ] {
             assert!(error.contains(mode), "{mode} missing from: {error}");
+        }
+    }
+
+    /// Every A14B cell this authority seals publishes its own production identity, and no two
+    /// cells share one.
+    ///
+    /// The cell set is **derived** from `WanI2vRoute::ALL` x both backends x the shipped tier
+    /// ladder rather than frozen as a count, so a new route or a new tier is swept the moment it
+    /// exists instead of silently sitting outside a literal.
+    #[test]
+    fn every_sealed_a14b_cell_publishes_a_distinct_production_identity() {
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for route in WanI2vRoute::ALL {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    // Candle ships no dense tier under a tier suffix and MLX ships no untiered
+                    // root; the fixture writers mirror that, and VACE has its own receipt shape.
+                    if matches!(route, WanI2vRoute::Vace | WanI2vRoute::VaceFun) {
+                        continue;
+                    }
+                    let (_tmp, spec) = match backend {
+                        WanI2vBackend::Mlx => mlx_fixture(route, quant),
+                        WanI2vBackend::Candle => candle_fixture(route, quant),
+                    };
+                    let prepared =
+                        PreparedWanI2vMemory::prepare(&spec, backend, route.provider_id())
+                            .unwrap_or_else(|error| {
+                                panic!("{:?} {} {quant:?}: {error}", backend, route.provider_id())
+                            });
+                    let expected =
+                        production_calibration_fingerprint(route, backend, prepared.tier);
+                    let published = prepared
+                        .contract
+                        .calibration
+                        .as_ref()
+                        .map(|identity| identity.fingerprint.clone());
+                    assert_eq!(
+                        published,
+                        expected,
+                        "{:?} {} {quant:?} publishes the wrong identity",
+                        backend,
+                        route.provider_id()
+                    );
+                    if route == WanI2vRoute::Ti2v5b {
+                        // Owned by the per-crate modules; this authority must stay silent.
+                        assert!(
+                            published.is_none(),
+                            "Ti2V-5B must not mint a second production identity here"
+                        );
+                        continue;
+                    }
+                    let fingerprint = published.expect("an A14B cell publishes an identity");
+                    let cell = format!("{backend:?}/{}/{quant:?}", route.provider_id());
+                    for (other_cell, other) in &seen {
+                        assert_ne!(
+                            &fingerprint, other,
+                            "{cell} and {other_cell} share one identity"
+                        );
+                    }
+                    seen.push((cell, fingerprint));
+                }
+            }
+        }
+        // Two A14B routes x two backends x three tiers, all derived above.
+        assert_eq!(seen.len(), 12, "swept cells: {seen:?}");
+    }
+
+    /// A root of one tier presented as another is refused, and the refusal names the tier.
+    #[test]
+    fn a_crossed_tier_root_is_refused_by_name() {
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            let (_tmp, q4) = mlx_fixture(route, Some(Quant::Q4));
+            let mut crossed = q4.clone();
+            crossed.quantize = Some(Quant::Q8);
+            let error =
+                PreparedWanI2vMemory::prepare(&crossed, WanI2vBackend::Mlx, route.provider_id())
+                    .expect_err("a q4 root selected as q8 must be refused")
+                    .to_string();
+            assert!(
+                error.contains("Q8") || error.contains("q8") || error.contains("Q8"),
+                "{}: refusal does not name the tier: {error}",
+                route.provider_id()
+            );
+        }
+    }
+
+    /// sc-22736 (epic sc-22723, E1): the weights-free registry surface is per-cell, and no string it
+    /// mints can ever be mistaken for a measured production identity.
+    ///
+    /// Both sets are DERIVED from the same route x backend x tier grid rather than frozen, so a new
+    /// route or a new tier is swept the moment `WanI2vRoute::ALL` or the tier ladder moves.
+    ///
+    /// Mutation that fails this: dropping the `-weights-free-conformance-` infix (the two sets then
+    /// collide cell for cell), or keying the weights-free string on fewer coordinates than the
+    /// production one (two cells then share one fixture identity).
+    #[test]
+    fn the_weights_free_a14b_namespace_is_per_cell_and_disjoint_from_production() {
+        let mut production = BTreeSet::new();
+        let mut weights_free = BTreeSet::new();
+        let mut cells = 0_usize;
+        for route in WanI2vRoute::ALL {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    let tier = MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    };
+                    let Some(free) = weights_free_calibration_fingerprint(route, backend, tier)
+                    else {
+                        // A route this authority does not name has neither string.
+                        assert_eq!(
+                            production_calibration_fingerprint(route, backend, tier),
+                            None,
+                            "{} has a production string but no weights-free sibling",
+                            route.provider_id()
+                        );
+                        continue;
+                    };
+                    let named = production_calibration_fingerprint(route, backend, tier)
+                        .expect("a named cell has both strings");
+                    assert!(
+                        weights_free.insert(free.clone()),
+                        "{free} names more than one cell"
+                    );
+                    assert!(
+                        production.insert(named.clone()),
+                        "{named} names more than one cell"
+                    );
+                    cells += 1;
+                }
+            }
+        }
+        assert_eq!(cells, 12, "two A14B routes x two backends x three tiers");
+        assert!(
+            production.is_disjoint(&weights_free),
+            "the weights-free namespace overlaps production: {:?}",
+            production.intersection(&weights_free).collect::<Vec<_>>()
+        );
+    }
+
+    /// The weights-free contract touches no filesystem, keeps the route's declared shape, and
+    /// publishes the isolated identity at the spec's own load shape — which is exactly what a
+    /// registry catalog walk on a host with no weights consumes.
+    #[test]
+    fn the_weights_free_contract_is_filesystem_free_and_publishes_the_isolated_identity() {
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            for backend in [WanI2vBackend::Mlx, WanI2vBackend::Candle] {
+                for (quant, spec_of) in [
+                    (
+                        None,
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        )),
+                    ),
+                    (
+                        Some(Quant::Q4),
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        ))
+                        .with_quant(Quant::Q4),
+                    ),
+                    (
+                        Some(Quant::Q8),
+                        LoadSpec::new(WeightsSource::Dir(
+                            "/__sceneworks_memory_contract_surface__".into(),
+                        ))
+                        .with_quant(Quant::Q8),
+                    ),
+                ] {
+                    let contract = weights_free_contract(route.provider_id(), backend, &spec_of)
+                        .unwrap_or_else(|error| {
+                            panic!("{:?} {} {quant:?}: {error}", backend, route.provider_id())
+                        });
+                    assert_eq!(contract.provider_id, route.provider_id());
+                    assert_eq!(contract.backend, backend.realization());
+                    assert_eq!(contract.load_shape, spec_of.load_shape);
+                    assert_eq!(contract.asset_facts, MemoryAssetFacts::default());
+                    let tier = MemoryNumericTier {
+                        precision: Precision::Bf16,
+                        quant,
+                        component_precision_floors: &[],
+                    };
+                    let identity = contract
+                        .calibration
+                        .as_ref()
+                        .expect("a weights-free A14B contract is calibratable");
+                    assert_eq!(
+                        identity.fingerprint,
+                        weights_free_calibration_fingerprint(route, backend, tier).unwrap()
+                    );
+                    assert_eq!(identity.load_shape, spec_of.load_shape);
+                }
+            }
+        }
+        // Ti2V-5B and the VACE routes are owned elsewhere and must be refused rather than answered.
+        for route in [WanI2vRoute::Ti2v5b, WanI2vRoute::Vace, WanI2vRoute::VaceFun] {
+            let spec = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            assert!(
+                weights_free_contract(route.provider_id(), WanI2vBackend::Mlx, &spec).is_err(),
+                "{} must not resolve a weights-free contract here",
+                route.provider_id()
+            );
+        }
+    }
+
+    /// The constants the weights-free surface hands a behavior fixture are READ BACK through the
+    /// route's own menus, so a manifest/menu change cannot leave them naming a bucket or a rate the
+    /// route stopped admitting.
+    #[test]
+    fn a14b_weights_free_fixture_geometry_is_admissible() {
+        let (width, height, frames) = A14B_FIXTURE_GEOMETRY;
+        for route in [WanI2vRoute::T2v14b, WanI2vRoute::I2v14b] {
+            assert!(
+                route.public_geometries().contains(&(width, height)),
+                "{}: {width}x{height} left the public bucket list",
+                route.provider_id()
+            );
+            assert!(
+                route.accepts_rate(A14B_PUBLIC_FPS, frames),
+                "{}: {frames}@{A14B_PUBLIC_FPS} left the public rate menu",
+                route.provider_id()
+            );
+            // The A14B menu really is single-rate; if that ever stops being true the weights-free
+            // surface has to carry the rate instead of assuming it.
+            for other in [8_u32, 24, 25, 30] {
+                assert!(
+                    !route.accepts_rate(other, frames),
+                    "{}: the A14B rate menu gained {other} fps",
+                    route.provider_id()
+                );
+            }
+            assert_eq!(
+                a14b_public_mode_key(route),
+                Some(if route == WanI2vRoute::T2v14b {
+                    "text_to_video"
+                } else {
+                    "image_to_video"
+                })
+            );
         }
     }
 }

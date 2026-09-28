@@ -265,7 +265,9 @@ fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> 
 fn decode_preview(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
     // Drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w).
     let latents = latents.squeeze(2)?;
-    let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+    let decoded =
+        candle_gen::bounded_kl_decode(&crate::common::VAE_DECODER, &latents, |l| vae.decode(l))?
+            .to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
     let img = postprocess_image(&decoded)? // u8 (1, 3, H, W)
         .i(0)?
         .to_device(&Device::Cpu)?;

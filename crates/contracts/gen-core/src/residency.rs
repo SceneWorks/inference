@@ -202,7 +202,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 );
                 {
                     let mut warm = residency.warm()?;
-                    residency.ensure_warm_locked(&mut warm, false, &mut |_| {})?;
+                    residency.ensure_warm_locked(&mut warm, false)?;
                 }
                 Ok(residency)
             }
@@ -232,7 +232,7 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         match policy {
             OffloadPolicy::Resident => {
                 let mut warm = residency.warm()?;
-                residency.ensure_warm_locked(&mut warm, false, &mut |_| {})?;
+                residency.ensure_warm_locked(&mut warm, false)?;
                 drop(warm);
             }
             OffloadPolicy::Sequential => residency.default_stage_residency = true,
@@ -315,11 +315,32 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         true
     }
 
+    /// Whether the next [`Self::ensure_warm_locked`] on this pair will actually load components.
+    ///
+    /// The warm arms consult this **before** calling it so the phase boundaries they emit precede
+    /// the load they describe, and so a request that hits a populated warm pair keeps reporting no
+    /// load at all — `Progress::Loading(_)` stays a load event, which is what every consumer of it
+    /// (the desktop UI's "loading" state, the real-weight residency instrumentation that counts
+    /// loads per request) reads it as.
+    fn warm_needs_load(warm: &Option<ResidentPair<Text, Heavy>>, streamable: bool) -> bool {
+        match warm {
+            None => true,
+            Some(pair) => pair.streamable != streamable,
+        }
+    }
+
+    /// Populate the warm pair if it is missing.
+    ///
+    /// **This deliberately emits no [`Progress`].** A warm load puts both components in memory
+    /// before the prompt encode, so emitting from here produced back-to-back
+    /// `Loading(TextEncoder)`/`Loading(Renderer)` ahead of the encode and left the
+    /// conditioning/denoise boundary the memory contracts declare unobservable (sc-22738). The
+    /// `run_*_request_scoped` warm arms own that emission instead, gated on
+    /// [`Self::warm_needs_load`] so the events still mean "a load happened".
     fn ensure_warm_locked(
         &self,
         warm: &mut Option<ResidentPair<Text, Heavy>>,
         streamable: bool,
-        on_progress: &mut dyn FnMut(Progress),
     ) -> RuntimeResult<R, ()> {
         if !self.rebuildable && (streamable || warm.is_none()) {
             return Err(Error::Unsupported(
@@ -339,7 +360,6 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         }
 
         let (text, heavy) = if let Some(load_warm) = &self.loaders.load_warm {
-            on_progress(Progress::Loading(LoadPhase::TextEncoder));
             match load_warm(streamable) {
                 Ok(pair) => pair,
                 Err(error) => {
@@ -348,7 +368,6 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 }
             }
         } else {
-            on_progress(Progress::Loading(LoadPhase::TextEncoder));
             let text = match (self.loaders.load_text)(streamable, None) {
                 Ok(text) => text,
                 Err(error) => {
@@ -356,7 +375,6 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                     return Err(error);
                 }
             };
-            on_progress(Progress::Loading(LoadPhase::Renderer));
             // Warm residents deliberately load the reusable PiD superset once. Per-request
             // `use_pid` selects the decode path; it must not narrow the cross-request warm pair.
             let heavy = match (self.loaders.load_heavy)(true, streamable, None) {
@@ -419,7 +437,18 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         }
         let mut warm = self.warm()?;
         if !stage_residency {
-            self.ensure_warm_locked(&mut warm, streamable, on_progress)?;
+            // A warm load puts BOTH components in memory before the prompt encode, which is why
+            // this arm used to report `Loading(TextEncoder)` and `Loading(Renderer)` back to back
+            // ahead of the encode and left the conditioning/denoise boundary the memory contract
+            // declares unobservable (sc-22738). The renderer boundary now falls where the renderer
+            // phase begins — after the encode — matching the staged arm below and
+            // `run_two_phase`. A request that hits a populated warm pair loads nothing and so
+            // still reports nothing.
+            let loading = Self::warm_needs_load(&warm, streamable);
+            if loading {
+                on_progress(Progress::Loading(LoadPhase::TextEncoder));
+            }
+            self.ensure_warm_locked(&mut warm, streamable)?;
             let pair = warm
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
@@ -432,6 +461,9 @@ impl<Text, Heavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 }
             };
             check_cancel::<R>(cancel)?;
+            if loading {
+                on_progress(Progress::Loading(LoadPhase::Renderer));
+            }
             let result = render(&pair.heavy, encoded, on_progress);
             drop(warm);
             return result;
@@ -529,7 +561,12 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
         }
         let mut warm = self.warm()?;
         if !stage_residency {
-            self.ensure_warm_locked(&mut warm, streamable, on_progress)?;
+            // Same boundary placement as the two-phase warm arm above (sc-22738).
+            let loading = Self::warm_needs_load(&warm, streamable);
+            if loading {
+                on_progress(Progress::Loading(LoadPhase::TextEncoder));
+            }
+            self.ensure_warm_locked(&mut warm, streamable)?;
             let pair = warm
                 .as_ref()
                 .ok_or_else(|| Error::Msg("warm residency was not populated".into()))
@@ -542,6 +579,9 @@ impl<Text, Heavy: StagedHeavy, R: ResidencyRuntime> Residency<Text, Heavy, R> {
                 }
             };
             check_cancel::<R>(cancel)?;
+            if loading {
+                on_progress(Progress::Loading(LoadPhase::Renderer));
+            }
             let mid = denoise(&pair.heavy, encoded, on_progress)?;
             let result = decode(pair.heavy.decode_view(), mid, on_progress);
             drop(warm);
@@ -1084,5 +1124,152 @@ mod tests {
                 "release",
             ]
         );
+    }
+
+    /// The warm (resident) arm's per-request lifecycle boundaries (sc-22738).
+    ///
+    /// Every shipped MLX Mage-Flow tier runs `MemoryStrategy::Resident`, i.e. this arm. It used to
+    /// emit `Loading(TextEncoder)` and `Loading(Renderer)` back to back from the warm *load*, so
+    /// the conditioning/denoise boundary the memory contract declares did not exist on a cold
+    /// request, and no boundary at all existed on a warm one. Both `run_request_scoped` and
+    /// `run_staged_request_scoped` now open conditioning before the text component is touched and
+    /// the renderer phase after the prompt encode, on every request.
+    fn warm_arm_boundary_log(
+        residency: &Residency<u8, u8, Runtime>,
+        log: &Arc<Mutex<Vec<&'static str>>>,
+    ) {
+        let sink_log = Arc::clone(log);
+        let encode_log = Arc::clone(log);
+        let render_log = Arc::clone(log);
+        let output = residency
+            .run_request_scoped(
+                false,
+                false,
+                &CancelFlag::new(),
+                false,
+                &mut |progress| match progress {
+                    Progress::Loading(LoadPhase::TextEncoder) => {
+                        sink_log.lock().unwrap().push("open-conditioning")
+                    }
+                    Progress::Loading(LoadPhase::Renderer) => {
+                        sink_log.lock().unwrap().push("open-renderer")
+                    }
+                    _ => {}
+                },
+                |text| {
+                    encode_log.lock().unwrap().push("encode");
+                    Ok(*text)
+                },
+                |_| Ok(()),
+                |heavy, encoded, _| {
+                    render_log.lock().unwrap().push("render");
+                    Ok(*heavy + encoded)
+                },
+            )
+            .unwrap();
+        assert_eq!(output, 5);
+    }
+
+    #[test]
+    fn the_warm_arm_opens_the_renderer_phase_after_the_prompt_encode() {
+        let residency = Residency::<u8, u8, Runtime>::request_scoped(|_| Ok(2), |_, _| Ok(3));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        warm_arm_boundary_log(&residency, &log);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["open-conditioning", "encode", "open-renderer", "render"],
+            "the renderer boundary must not be paired with the text-encoder one ahead of the encode"
+        );
+    }
+
+    /// `Progress::Loading(_)` stays a **load** event: a request that reuses the warm pair loads
+    /// nothing and reports nothing, exactly as before sc-22738. Only the placement of the renderer
+    /// boundary on the loading request changed.
+    #[test]
+    fn a_warm_cache_hit_reports_no_load_boundary() {
+        let residency = Residency::<u8, u8, Runtime>::request_scoped(|_| Ok(2), |_, _| Ok(3));
+        let first = Arc::new(Mutex::new(Vec::new()));
+        warm_arm_boundary_log(&residency, &first);
+        assert_eq!(
+            *first.lock().unwrap(),
+            vec!["open-conditioning", "encode", "open-renderer", "render"]
+        );
+        let second = Arc::new(Mutex::new(Vec::new()));
+        warm_arm_boundary_log(&residency, &second);
+        assert_eq!(*second.lock().unwrap(), vec!["encode", "render"]);
+    }
+
+    /// A minimal [`StagedHeavy`] so the three-phase driver can be exercised without a backend.
+    struct StagedByte(u8);
+    impl StagedHeavy for StagedByte {
+        type Light = u8;
+        type DecodeView<'a> = u8;
+
+        fn shed_dit(self) -> u8 {
+            self.0
+        }
+        fn decode_view(&self) -> u8 {
+            self.0
+        }
+        fn light_view(light: &u8) -> u8 {
+            *light
+        }
+    }
+
+    #[test]
+    fn both_arms_of_the_three_phase_driver_report_the_same_boundary_sequence() {
+        let boundaries = |stage_residency: bool| -> Vec<&'static str> {
+            let residency = Residency::<u8, StagedByte, Runtime>::request_scoped(
+                |_| Ok(2),
+                |_, _| Ok(StagedByte(3)),
+            );
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let sink_log = Arc::clone(&log);
+            let encode_log = Arc::clone(&log);
+            let denoise_log = Arc::clone(&log);
+            let decode_log = Arc::clone(&log);
+            residency
+                .run_staged_request_scoped(
+                    stage_residency,
+                    false,
+                    &CancelFlag::new(),
+                    false,
+                    &mut |progress| match progress {
+                        Progress::Loading(LoadPhase::TextEncoder) => {
+                            sink_log.lock().unwrap().push("open-conditioning")
+                        }
+                        Progress::Loading(LoadPhase::Renderer) => {
+                            sink_log.lock().unwrap().push("open-renderer")
+                        }
+                        _ => {}
+                    },
+                    |text| {
+                        encode_log.lock().unwrap().push("encode");
+                        Ok(*text)
+                    },
+                    |_| Ok(()),
+                    |heavy: &StagedByte, encoded, _| {
+                        denoise_log.lock().unwrap().push("denoise");
+                        Ok(heavy.0 + encoded)
+                    },
+                    |_| Ok(()),
+                    |_, mid, _| {
+                        decode_log.lock().unwrap().push("decode");
+                        Ok(mid)
+                    },
+                )
+                .unwrap();
+            let out = log.lock().unwrap().clone();
+            out
+        };
+        let expected = vec![
+            "open-conditioning",
+            "encode",
+            "open-renderer",
+            "denoise",
+            "decode",
+        ];
+        assert_eq!(boundaries(false), expected, "warm arm");
+        assert_eq!(boundaries(true), expected, "staged arm");
     }
 }

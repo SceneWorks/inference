@@ -89,7 +89,7 @@ impl ClipEncoderLayer {
             &mut self.linear1,
             &mut self.linear2,
         ] {
-            lin.quantize(bits, None)?;
+            crate::quant::quantize_linear(lin, bits)?;
         }
         Ok(())
     }
@@ -208,7 +208,7 @@ impl ClipTextEncoder {
             l.quantize(bits)?;
         }
         if let Some(p) = &mut self.text_projection {
-            p.quantize(bits, None)?;
+            crate::quant::quantize_linear(p, bits)?;
         }
         Ok(())
     }

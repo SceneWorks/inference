@@ -140,13 +140,15 @@ impl LlavaProjector {
     ) -> Result<Self> {
         let bf16 =
             |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(Dtype::Bfloat16)?) };
-        Ok(Self {
+        let model = Self {
             linear1_w: bf16(format!("{prefix}.linear_1.weight"))?,
             linear1_b: bf16(format!("{prefix}.linear_1.bias"))?,
             linear2_w: bf16(format!("{prefix}.linear_2.weight"))?,
             linear2_b: bf16(format!("{prefix}.linear_2.bias"))?,
             activation,
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Project SigLIP features `[b, seq, 1152]` to language features `[b, seq, hidden]`. The f32
@@ -505,10 +507,13 @@ impl TextLlm for JoyCaptionProvider {
             usage,
         });
         Ok(TextLlmOutput {
+            timings: None,
             text,
             thinking: None,
             tool_calls: Vec::new(),
             usage,
+            mtp: None,
+            decode: None,
             finish_reason: Some(finish),
         })
     }
@@ -529,7 +534,12 @@ pub fn descriptor() -> TextLlmDescriptor {
             // Text+vision captioner; no audio path at all.
             supports_audio: false,
             supports_thinking: false,
+            supports_reasoning_effort: false,
+            reasoning_efforts: Vec::new(),
+            model_sampling_defaults: None,
+            supports_preserve_thinking: false,
             supports_tools: false,
+            mtp: None,
             supported_constraints: Vec::new(),
         },
     }
@@ -540,6 +550,7 @@ fn map_sampling(s: &Sampling) -> SamplingParams {
         temperature: s.temperature,
         top_p: s.top_p,
         top_k: s.top_k,
+        presence_penalty: s.presence_penalty,
         repetition_penalty: s.repetition_penalty,
         repetition_context: s.repetition_context,
     }

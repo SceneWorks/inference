@@ -1,0 +1,13 @@
+
+running 2 tests
+test ac1_graphs_on_is_token_identical_to_eager_for_spec_off_and_mtp_k3 ... [cuda_graphs] spec off, graphs on: graph: eager replayed=0 eager=256 captured=0 fallback=deltanet_state_unstable (256 tokens)
+[cuda_graphs] MTP K=3, graphs on: graph: eager replayed=0 eager=137 captured=0 fallback=deltanet_state_unstable (accepted 167 / proposed 261, verify steps 88)
+ok
+test qwen38_27b_step_census ... [cuda-graph] census: drained a recorded driver error after the rollback: DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")
+[cuda-graph] census: drained a recorded driver error after the rollback: DriverError(CUDA_ERROR_INVALID_VALUE, "invalid argument")
+[cuda_graphs] 27B decode (1 token) step, 64 layers: nodes=14206 kernels=3927 memcpy(dtod=0, htod=851, dtoh=0) memset=0 alloc=4762 free=4666 escaped=96 other=0 — per layer ~61.4 kernels, 13.3 host uploads
+[cuda_graphs] 27B verify (4 tokens) step, 64 layers: nodes=23995 kernels=5751 memcpy(dtod=0, htod=2386, dtoh=0) memset=0 alloc=7977 free=7881 escaped=96 other=0 — per layer ~89.9 kernels, 37.3 host uploads
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 100.66s
+

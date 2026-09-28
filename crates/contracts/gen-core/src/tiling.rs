@@ -144,6 +144,19 @@ impl VaeTiling {
         causal_temporal: false,
         full_res_channels: 96,
     };
+    /// Qwen-Image 2.1 `AutoencoderKLQwenImage21` RGBA VAE (sc-24108): a still-image VAE — spatial
+    /// ×16 (five stages, `dim_mult [1, 2, 4, 8, 8]`), singleton temporal axis, non-causal.
+    ///
+    /// `full_res_channels: 144` — the last decoder stage runs `decoder_base_dim × 1 = 144` channels
+    /// at full output resolution (its residual blocks + `norm_out` input) before `conv_out` drops
+    /// 144 → 4. Err-high like the siblings: at the 2752² preset cap that is 144 × 2752² = 1.1e9
+    /// elements, under [`MAX_WRITABLE_ELEMS`], so the cap never binds at the shipped sizes.
+    pub const QWEN_IMAGE_2_1: Self = Self {
+        spatial_scale: 16,
+        temporal_scale: 1,
+        causal_temporal: false,
+        full_res_channels: 144,
+    };
 
     /// The most **output frames** this VAE can decode in one pass at `out_h × out_w` while keeping its
     /// widest full-resolution write under [`MAX_WRITABLE_ELEMS`]. 0 when a single frame already

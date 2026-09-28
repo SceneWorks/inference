@@ -79,7 +79,18 @@ impl PidEngine {
             Weights::from_dir(gemma_dir)?
         };
         let gemma = Gemma2::from_weights(&gw, "model.", &Gemma2Config::gemma_2_2b())?;
+        // Materialize at load: left lazy, the first decode's command buffers wait on the safetensors
+        // reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        gw.materialize_accessed()?;
         let caption = CaptionEncoder::new(gemma, gemma_dir.join("tokenizer.json"))?;
+
+        // Materialize the student once here too: [`Self::decoder`] rebuilds a `PidNet` per generation
+        // from these same (refcounted) handles, so a probe build marks exactly the tensors it reads and
+        // every later rebuild consumes already-read buffers.
+        let ckpt_prefix = "";
+        PidNet::from_weights(&weights, ckpt_prefix, &cfg)?;
+        weights.materialize_accessed()?;
 
         Ok(Self {
             weights,
@@ -87,7 +98,7 @@ impl PidEngine {
             input_latent_space: spec.input_latent_space,
             sampler_cfg: SamplerConfig::distill_4step(),
             caption,
-            ckpt_prefix: "",
+            ckpt_prefix,
         })
     }
 

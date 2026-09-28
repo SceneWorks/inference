@@ -158,7 +158,7 @@ impl ScailClip {
         for i in 0..cfg.run_layers() {
             blocks.push(ClipBlock::load(w, i, cfg)?);
         }
-        Ok(Self {
+        let clip = Self {
             patch_embedding: AdaptableLinear::dense(pe, None),
             cls: to_f32(w.require("cls_embedding")?)?,
             pos: to_f32(w.require("pos_embedding")?)?,
@@ -167,7 +167,10 @@ impl ScailClip {
             blocks,
             cfg: cfg.clone(),
             compute_dtype: Dtype::Float32,
-        })
+        };
+        // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(clip)
     }
 
     /// Set the matmul compute dtype (f32 default; bf16 for production).

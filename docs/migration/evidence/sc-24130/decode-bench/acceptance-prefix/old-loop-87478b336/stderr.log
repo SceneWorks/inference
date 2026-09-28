@@ -1,0 +1,7 @@
+[decode_bench] reference          11.56 tok/s  prefill 0.973s
+[decode_bench] mtp K=1            14.70 tok/s  accept 0.877  fwd/tok 0.605
+[decode_bench] mtp K=2            17.92 tok/s  accept 0.846  fwd/tok 0.460
+[decode_bench] mtp K=3            17.40 tok/s  accept 0.709  fwd/tok 0.468
+[decode_bench] mtp K=4            17.55 tok/s  accept 0.682  fwd/tok 0.427
+[decode_bench] mtp K=5            17.05 tok/s  accept 0.597  fwd/tok 0.435
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24130\docs\migration\evidence\sc-24130\decode-bench\acceptance-prefix\old-loop-87478b336\decode_bench.json

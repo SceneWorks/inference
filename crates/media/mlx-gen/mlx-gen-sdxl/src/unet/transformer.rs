@@ -93,10 +93,10 @@ impl AttentionMHA {
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
         for lin in [&mut self.q, &mut self.k, &mut self.v, &mut self.out] {
-            lin.quantize(bits, None)?;
+            crate::quant::quantize_linear(lin, bits)?;
         }
         for lin in [&mut self.to_k_ip, &mut self.to_v_ip].into_iter().flatten() {
-            lin.quantize(bits, None)?;
+            crate::quant::quantize_linear(lin, bits)?;
         }
         Ok(())
     }
@@ -277,9 +277,9 @@ impl TransformerBlock {
     pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn1.quantize(bits)?;
         self.attn2.quantize(bits)?;
-        self.linear1.quantize(bits, None)?;
-        self.linear2.quantize(bits, None)?;
-        self.linear3.quantize(bits, None)?;
+        crate::quant::quantize_linear(&mut self.linear1, bits)?;
+        crate::quant::quantize_linear(&mut self.linear2, bits)?;
+        crate::quant::quantize_linear(&mut self.linear3, bits)?;
         Ok(())
     }
 
@@ -493,8 +493,8 @@ impl Transformer2D {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.proj_in.quantize(bits, None)?;
-        self.proj_out.quantize(bits, None)?;
+        crate::quant::quantize_linear(&mut self.proj_in, bits)?;
+        crate::quant::quantize_linear(&mut self.proj_out, bits)?;
         for b in &mut self.blocks {
             b.quantize(bits)?;
         }
@@ -555,7 +555,20 @@ impl Transformer2D {
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
         let y = group_norm(x, &self.norm_w, &self.norm_b, GN_GROUPS, GN_EPS)?;
         let y = self.proj_in.forward(&y.reshape(&[b, h * w_, c])?)?;
-        let y = match plan.window {
+        // An armed load keeps its resident `transformer_blocks.*` lazy (never read at load), so a
+        // request that selected no window still runs through the stream, one window covering this
+        // sub-stack — bit-identical, and no forward ever waits on an unread safetensors `Load`
+        // (sc-24245).
+        let full_cover_cancel = mlx_gen::CancelFlag::default();
+        let window = plan.window.or_else(|| {
+            self.block_stream
+                .as_ref()
+                .map(|_| crate::plan::SdxlBlockWindow {
+                    size: self.blocks.len().max(1),
+                    cancel: &full_cover_cancel,
+                })
+        });
+        let y = match window {
             Some(window) => self.run_windowed_blocks(y, encoder_x, ip, plan, window)?,
             None => {
                 let mut y = y;

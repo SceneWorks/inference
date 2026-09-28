@@ -667,6 +667,7 @@ impl LtxVideoVae {
                 .as_ref()
                 .ok_or_else(|| Error::Msg("LtxVideoVae: encode requires encoder weights".into()))?;
             let weights = Weights::from_file(path)?;
+            weights.materialize()?;
             *encoder = Some(VideoEncoder::from_weights(&weights, cfg)?);
         }
         contiguous(

@@ -1,0 +1,2 @@
+SA3_CHUNKED_CASE=same_s cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test chunked_oracle chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics -- --ignored --nocapture
+SA3_CHUNKED_CASE=same_l cargo test --locked --release -p candle-audio-stable-audio-3 --features metal --test chunked_oracle chunked_same_s_and_same_l_match_frozen_torch_and_boundary_metrics -- --ignored --nocapture

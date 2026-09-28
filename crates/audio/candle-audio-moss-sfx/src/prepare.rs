@@ -14,6 +14,9 @@
 use std::path::Path;
 
 use candle_audio::candle_core::pickle::read_pth_tensor_info;
+use candle_audio::gen_core::safetensors_shards::{
+    resolve_safetensors_shards, snapshot_shard_roots,
+};
 use core_llm::{Error as CoreError, ModelFormat, PrepareReport, PrepareSpec, Result as CoreResult};
 
 /// Relative path of the DiT checkpoint inside a snapshot.
@@ -74,6 +77,16 @@ fn safetensors_tensor_count(path: &Path) -> CoreResult<usize> {
     Ok(obj.keys().filter(|k| *k != "__metadata__").count())
 }
 
+fn text_encoder_tensor_count(dir: &Path) -> CoreResult<usize> {
+    let roots = snapshot_shard_roots(dir).map_err(|e| CoreError::Msg(e.to_string()))?;
+    let shards = resolve_safetensors_shards(dir, "model", &roots)
+        .map_err(|e| CoreError::Msg(e.to_string()))?;
+    shards
+        .iter()
+        .map(|shard| safetensors_tensor_count(shard))
+        .sum()
+}
+
 /// Prepare (verify + passthrough) a MOSS-SoundEffect snapshot. Counts the DiT and text-encoder
 /// safetensors tensors from their headers and the VAE checkpoint's tensors from pickle
 /// metadata (no storage reads) so the report is honest about what the snapshot holds.
@@ -92,29 +105,8 @@ pub fn prepare(spec: &PrepareSpec) -> CoreResult<PrepareReport> {
     }
     let mut num_tensors = safetensors_tensor_count(&spec.source.join(DIT_WEIGHTS))?;
 
-    // Text-encoder shards (whatever the index lists).
-    let te_dir = spec.source.join("text_encoder");
-    let index_path = te_dir.join("model.safetensors.index.json");
-    if index_path.is_file() {
-        let text = std::fs::read_to_string(&index_path)
-            .map_err(|e| CoreError::Msg(format!("prepare: read {}: {e}", index_path.display())))?;
-        let v: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| CoreError::Msg(format!("prepare: {}: {e}", index_path.display())))?;
-        let mut shards: Vec<String> = v
-            .get("weight_map")
-            .and_then(|m| m.as_object())
-            .map(|m| {
-                m.values()
-                    .filter_map(|s| s.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        shards.sort();
-        shards.dedup();
-        for shard in shards {
-            num_tensors += safetensors_tensor_count(&te_dir.join(shard))?;
-        }
-    }
+    // Resolve the full text-encoder set before reading any shard headers.
+    num_tensors += text_encoder_tensor_count(&spec.source.join("text_encoder"))?;
 
     // The VAE torch checkpoint (state_dict section, metadata only).
     let vae = spec.source.join("vae").join(crate::vae::VAE_FILE);
@@ -222,5 +214,48 @@ mod tests {
         let p = dir.join("x.safetensors");
         std::fs::write(&p, tiny_safetensors(&["a", "b", "__metadata__"])).unwrap();
         assert_eq!(safetensors_tensor_count(&p).unwrap(), 2);
+    }
+
+    #[test]
+    fn preparer_rejects_index_paths_and_nonregular_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("text_encoder");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), tiny_safetensors(&["x"])).unwrap();
+        let index = dir.join("model.safetensors.index.json");
+        std::fs::write(&index, r#"{"weight_map":{"x":"model.safetensors"}}"#).unwrap();
+        assert_eq!(text_encoder_tensor_count(&dir).unwrap(), 1);
+        for name in [
+            "../outside.safetensors",
+            "/tmp/outside.safetensors",
+            "missing.safetensors",
+        ] {
+            std::fs::write(
+                &index,
+                serde_json::json!({"weight_map":{"x":name}}).to_string(),
+            )
+            .unwrap();
+            assert!(text_encoder_tensor_count(&dir).is_err(), "{name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = temp.path().join("outside.safetensors");
+            std::fs::write(&outside, tiny_safetensors(&["x"])).unwrap();
+            symlink(&outside, dir.join("external.safetensors")).unwrap();
+            std::fs::write(&index, r#"{"weight_map":{"x":"external.safetensors"}}"#).unwrap();
+            assert!(text_encoder_tensor_count(&dir).is_err());
+            let fifo = dir.join("pipe.safetensors");
+            assert!(std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(&index, r#"{"weight_map":{"x":"pipe.safetensors"}}"#).unwrap();
+            assert!(text_encoder_tensor_count(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file"));
+        }
     }
 }

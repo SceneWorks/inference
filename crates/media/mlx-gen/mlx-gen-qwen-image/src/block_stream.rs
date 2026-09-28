@@ -127,6 +127,10 @@ impl QwenBlockStream {
         let prefix = format!("{}.{index}", self.base);
         let mut block =
             QwenTransformerBlock::from_weights(view, &prefix, self.num_heads, self.head_dim)?;
+        // Read this block's bytes on the CPU stream now, before its forward is encoded. Left lazy,
+        // the window's `eval` makes Metal command buffers wait on the disk read — past the GPU
+        // watchdog on a cold page cache (see `crate::loader::load_transformer_with`).
+        view.materialize_accessed()?;
         // Array handles are refcounted. Removing exactly the accessed keys is what lets dropping a
         // completed window release its materialized buffers instead of retaining a second reference.
         view.remove_accessed();

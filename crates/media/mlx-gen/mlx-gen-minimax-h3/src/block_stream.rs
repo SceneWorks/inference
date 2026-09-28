@@ -135,6 +135,9 @@ impl DitBlockStream {
     pub fn materialize(&self, view: &mut Weights, index: usize) -> Result<DitBlock> {
         let prefix = format!("transformer_blocks.{index}");
         let block = DitBlock::from_weights_body_only(view, &prefix, &self.cfg, self.dtype)?;
+        // sc-23402: force + GPU-verify this block's ten source tensors (sc-22414) before its
+        // prefix is drained — one block per eval, which is also the sc-23108 submission bound.
+        view.materialize_accessed()?;
         view.remove_prefix(&format!("{prefix}."));
         Ok(block)
     }
@@ -146,6 +149,9 @@ impl DitBlockStream {
     pub fn materialize_adaln(&self, view: &mut Weights, index: usize) -> Result<AdaLnProjection> {
         let prefix = format!("transformer_blocks.{index}.adaln_proj.linear");
         let projection = AdaLnProjection::from_weights(view, &prefix, &self.cfg, self.dtype)?;
+        // sc-23402: the projection's two source tensors, forced and GPU-verified (sc-22414) before
+        // the precompute consumes them and the prefix is drained.
+        view.materialize_accessed()?;
         view.remove_prefix(&format!("{prefix}."));
         Ok(projection)
     }
@@ -202,10 +208,13 @@ pub fn precompute_adaln_windowed(
         // LOAD-BEARING, and it must cover the tables produced **so far** rather than only this
         // window's: `AdaLnModulation` is six lazy arrays, and one left unevaluated pins its
         // projection's 520 MB (bf16) past the release. Re-evaluating an already-materialized array
-        // is free.
+        // is free. Keep each eval to one block: a large window must not combine cold reads into
+        // the same Metal submission and reintroduce the resident-stack timeout (sc-23108).
         |acc: &Vec<AdaLnModulation>| {
-            let flat: Vec<&Array> = acc.iter().flat_map(AdaLnModulation::tables).collect();
-            mlx_rs::transforms::eval(flat).map_err(Into::into)
+            for layer in acc {
+                mlx_rs::transforms::eval(layer.tables())?;
+            }
+            Ok(())
         },
     )?;
     if layers.len() != stream.n_blocks() {
@@ -356,6 +365,10 @@ impl TeBlockStream {
             self.cfg.head_dim,
             self.cfg.rms_norm_eps,
         )?;
+        // sc-23402: force + GPU-verify this layer's source tensors (sc-22414) before the window
+        // runs it and the prefix is drained — the windowed twin of the resident constructor's
+        // `materialize_accessed` in `text_encoder::encoder`.
+        view.materialize_accessed()?;
         view.remove_prefix(&format!("{prefix}."));
         Ok(layer)
     }

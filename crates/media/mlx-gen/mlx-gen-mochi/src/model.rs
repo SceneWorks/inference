@@ -173,6 +173,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let t5 = load_t5_encoder(&te_root)?;
     let dit_w = load_transformer_weights(&root)?;
     let transformer = MochiTransformer3DModel::from_weights(&dit_w, &dit_cfg, compute_dtype)?;
+    // Materialize at load: left lazy, the first denoise step's command buffers wait on the ~20 GB
+    // DiT read — past the GPU watchdog on a cold page cache (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`).
+    dit_w.materialize_accessed()?;
     let vae = load_vae_decoder(&vae_root)?;
 
     Ok(Box::new(Mochi {

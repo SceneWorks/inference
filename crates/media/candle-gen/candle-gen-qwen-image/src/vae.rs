@@ -12,9 +12,10 @@
 //! de-normalized as `z·std + mean` with per-channel constants before `post_quant_conv`.
 
 use candle_gen::candle_core::{DType, Error as CandleError, IndexOp, Result, Tensor};
-use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
+use candle_gen::candle_nn::{Conv2dConfig, Module, VarBuilder};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{QWEN_WAN_Z16_MEAN as LATENTS_MEAN, QWEN_WAN_Z16_STD as LATENTS_STD};
+use candle_gen::BudgetedConv2d as Conv2d;
 use candle_gen::LatentDecoder;
 
 const NORM_EPS: f64 = 1e-12;
@@ -223,8 +224,9 @@ fn should_tile_tail(out_px_max: usize, force_tile: bool) -> bool {
 }
 
 /// Tail-decode tiling geometry (sc-10023): the decoder tail upsamples ×8 spatially, an image VAE has no
-/// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`.
-const TAIL_TILING: VaeTiling = VaeTiling {
+/// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`. `pub(crate)` so the memory
+/// contract publishes `vae_spatial_scale` from this geometry rather than from a literal.
+pub(crate) const TAIL_TILING: VaeTiling = VaeTiling {
     spatial_scale: 8,
     temporal_scale: 1,
     causal_temporal: false,

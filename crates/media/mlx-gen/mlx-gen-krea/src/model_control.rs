@@ -200,6 +200,7 @@ impl AdmittedControlGeometry {
             scheduler: req.scheduler.clone(),
             transformer_window_size,
             memory: req.memory.unwrap_or_default(),
+            provider_id: KREA_2_TURBO_CONTROL_ID,
         }
     }
 }
@@ -644,19 +645,15 @@ impl ControlBranch for KreaTurboControl {
 }
 
 impl KreaTurboControl {
+    /// The shared authorized phase-boundary fault (sc-22738). Before this the pose-control arm
+    /// honoured `calibration_error_phase` WITHOUT the `calibration_fault_harness_authorized`
+    /// conjunct, so an unauthorized phase selection refused an otherwise valid render.
     fn calibration_fault(
         &self,
         req: &GenerationRequest,
         phase: gen_core::MemoryPhase,
     ) -> Result<()> {
-        match req.memory {
-            Some(memory) if memory.calibration_error_phase == Some(phase) => {
-                Err(Error::Msg(format!(
-                    "{KREA_2_TURBO_CONTROL_ID}: injected memory-strategy calibration error at {phase:?}"
-                )))
-            }
-            _ => Ok(()),
-        }
+        crate::memory_strategy::calibration_fault(req, phase, KREA_2_TURBO_CONTROL_ID)
     }
 
     /// The rich-`Result` body behind [`Generator::generate`] (the crate's own [`mlx_gen::Error`] so `?`
@@ -699,9 +696,10 @@ impl KreaTurboControl {
                 // `Residency::run` materializes only under Sequential. For calibration fault
                 // injection, evaluate at the conditioning boundary here as well so Resident and
                 // Sequential exercise the same physical phase without changing ordinary renders.
-                if req.memory.is_some_and(|memory| {
-                    memory.calibration_error_phase == Some(gen_core::MemoryPhase::Conditioning)
-                }) {
+                if crate::memory_strategy::calibration_fault_armed(
+                    req.memory,
+                    gen_core::MemoryPhase::Conditioning,
+                ) {
                     mlx_rs::transforms::eval([&context])?;
                     self.calibration_fault(req, gen_core::MemoryPhase::Conditioning)?;
                 }
@@ -716,7 +714,10 @@ impl KreaTurboControl {
             // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
             // identically for both residencies.
             |heavy_owned, context, on_progress| {
-                self.calibration_fault(req, gen_core::MemoryPhase::Denoise)?;
+                // sc-22738: the Denoise + Decode phase EXITS live inside `render_control_from`
+                // (pipeline.rs), where this image's produced latent and decoded image actually
+                // exist; `turbo_options` below carries the request-scoped `memory` + `provider_id`
+                // those hooks read.
                 let heavy = heavy_owned.as_ref();
                 let safe_gib = mlx_gen::memory::safe_budget_gib();
 
@@ -773,7 +774,6 @@ impl KreaTurboControl {
                             .alternate_decoder
                             .map(|decoder| decoder as &dyn LatentDecoder),
                         decode_tiling.as_ref(),
-                        req.memory.and_then(|memory| memory.calibration_error_phase),
                         &opts,
                         &req.cancel,
                         &req.preview,
@@ -873,6 +873,78 @@ mod tests {
     use super::*;
     use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
     use std::path::PathBuf;
+
+    /// sc-22738: the pose-control `TurboOptions` threads the **request-scoped** memory selection and
+    /// this provider's id down to `render_control_from`, whose `denoise_exit_fault` /
+    /// `decode_exit_fault` (pipeline.rs) read exactly those two fields. Replacing
+    /// `req.memory.unwrap_or_default()` with `Default::default()` makes both hooks unreachable while
+    /// leaving every ordering test green, so it is pinned as source text here.
+    #[test]
+    fn the_control_turbo_options_thread_the_request_scoped_memory_and_provider_id() {
+        let source = include_str!("model_control.rs");
+        // The construction literal, not the `-> TurboOptions {` return type on the line above it.
+        const LITERAL: &str = "\n        TurboOptions {\n";
+        let region = source
+            .split_once("    fn turbo_options(")
+            .expect("turbo_options")
+            .1
+            .split_once(LITERAL)
+            .expect("TurboOptions literal")
+            .1
+            .split_once("}")
+            .expect("TurboOptions literal end")
+            .0;
+        assert!(
+            region.contains("memory: req.memory.unwrap_or_default(),"),
+            "turbo_options must take its memory from the request, not a default: {region}"
+        );
+        assert!(
+            region.contains("provider_id: KREA_2_TURBO_CONTROL_ID,"),
+            "turbo_options must carry this provider's id: {region}"
+        );
+        let production = source
+            .split_once("\n#[cfg(test)]\n")
+            .map(|(head, _)| head)
+            .unwrap_or(source);
+        assert_eq!(
+            production.matches(LITERAL).count(),
+            1,
+            "one production TurboOptions construction — add the assertions above to any new one"
+        );
+    }
+
+    /// sc-22738 (coordinator decision): the control `generate_impl` carries the Conditioning fault at
+    /// the conditioning phase EXIT (after the encode) and NO entry-convention Denoise hook — the
+    /// Denoise and Decode faults are phase exits inside `render_control_from` (pipeline.rs).
+    #[test]
+    fn the_control_generate_impl_faults_only_at_the_conditioning_exit() {
+        let source = include_str!("model_control.rs");
+        let body = source
+            .split_once("    fn generate_impl(")
+            .expect("generate_impl")
+            .1
+            .split_once("\n    }\n")
+            .expect("function end")
+            .0;
+        let encode = body
+            .find("text.encode(&req.prompt)")
+            .expect("prompt encode");
+        let fault = body
+            .find("MemoryPhase::Conditioning)?")
+            .expect("Conditioning fault");
+        assert!(
+            encode < fault,
+            "the Conditioning fault must FOLLOW the text encode"
+        );
+        assert!(
+            !body.contains("MemoryPhase::Denoise"),
+            "the Denoise fault must fire at its phase exit in pipeline.rs, not in generate_impl"
+        );
+        assert!(
+            !body.contains("MemoryPhase::Decode"),
+            "the Decode fault must fire at its phase exit in pipeline.rs, not in generate_impl"
+        );
+    }
 
     fn write_minimal_safetensors(path: &Path) {
         let mut header = br#"{"model.diffusion_model.first.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#.to_vec();

@@ -30,6 +30,12 @@
 //! Neither hazard is visible in the output: a stream with hazard 1 or 2 unfixed returns numbers
 //! identical to a correct one and merely fails to save any memory.
 //!
+//! 3. **Verify the GPU's view before the forward.** Every pass loads the layer into fresh Metal
+//!    buffers, and under page-cache pressure the GPU can read a fresh buffer as zeros while the
+//!    CPU already holds the bytes (sc-22414; see `crate::primitives::coherence`). Unlike 1 and 2
+//!    this one *is* visible in the output — as deterministic garbage, not a crash — so
+//!    `SequentialStack::run_layer` holds at the load boundary until the two views agree.
+//!
 //! # What it does not bound
 //!
 //! Only the **layer stack**. Token embeddings, the final norm and the LM head stay resident — on
@@ -223,6 +229,10 @@ impl SequentialStack {
     ) -> Result<Array> {
         let out = {
             let layer = self.plan.load(view, cfg, self.quant, i)?;
+            // Hazard 3 (sc-22414): the layer's buffers are freshly loaded on every pass, and the
+            // GPU's view of a fresh buffer can lag the CPU's. Force them resident and hold until
+            // the GPU reads the same bytes before the forward consumes them.
+            view.verify_accessed_gpu_view()?;
             self.observation.record_layer();
             let out = layer.forward(h, ropes, mask, cache, i, shared)?;
             eval([&out])?;

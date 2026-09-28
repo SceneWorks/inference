@@ -277,6 +277,8 @@ impl LensReasoner {
         let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
         let w = Weights::from_dir(root.join("text_encoder"))?;
         let model = LensReasonerModel::from_weights(&w, &GptOssConfig::lens(), dtype, quant)?;
+        // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
         Ok(Self { model, tokenizer })
     }
 

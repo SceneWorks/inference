@@ -50,13 +50,124 @@ use crate::pipeline::MageComponentDirs;
 use crate::{resolve_gs_key, GenerationSample};
 use mlx_gen::residency::{Residency, StagedHeavy};
 
-/// Exact SC-15509 Apple/Metal calibration identity. At 768²/one step, the full cumulative rung-4
-/// request reduced q4 Edit from 7.714 to 1.794 GiB and bf16 text-to-image from 16.594 to 1.306 GiB.
-/// Staging was byte-identical; bounded decode at the single measured 512/256 geometry retained luma
-/// correlation 0.996013 (q4 Edit) and 0.991627 (bf16 t2i), and attention/block streaming introduced
-/// no additional pixel drift. Clean-warm cancellation and decode-fault recovery retained 0 bytes
-/// after cache clear and remained within 2% of the clean rung-4 peak.
-pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "mage-flow-mlx-shared-ladder-2026-08-03-v1";
+/// The weights-free registry-conformance identity family (sc-22733, epic sc-22723 E1/E4).
+///
+/// A registry surface has no artifact to prove a tier against, so it publishes
+/// `<STATIC_BEHAVIOR_FINGERPRINT>-<provider>-<tier>` — a namespace that can never equal a
+/// [`production_calibration_fingerprint`] string, so a conformance contract is never mistaken for
+/// the identity of a load a memory anchor measured.
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "mage-flow-mlx-registry-behavior-v1";
+
+/// The label a tier carries inside a calibration string. `None` for a tier this family does not
+/// ship, so an unshipped tier is unnameable rather than collapsed onto a neighbour.
+pub fn calibration_tier_label(tier: Option<Quant>) -> Option<&'static str> {
+    match tier {
+        None => Some("bf16"),
+        Some(Quant::Q4) => Some("q4"),
+        Some(Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// Production calibration identity table of the six Mage-Flow routes, keyed on
+/// (route, PROVEN artifact tier): `mage-flow-<route>-<tier>-mlx-shared-ladder-v1`, eighteen
+/// distinct cells (sc-22733, epic sc-22723 E1/E4).
+///
+/// This is the TABLE, not the binding: only `production_calibration_identity` — which reads the
+/// tier off the component directories the loader itself opens — may turn one of these strings into
+/// a contract identity. The three tiers of one route are three different resident sets and one
+/// anchor cannot price all three, which is why the tier is an axis of the key; the offload policy
+/// and the load shape are deliberately NOT axes (Mage never reads `LoadSpec::offload_policy`, and
+/// `MemoryCalibrationIdentity::load_shape` carries the materialization axis separately).
+///
+/// The pre-sc-22733 single string `mage-flow-mlx-shared-ladder-2026-08-03-v1` (SC-15509: 768²/one
+/// step, q4 Edit 7.714→1.794 GiB and bf16 text-to-image 16.594→1.306 GiB under the cumulative
+/// rung-4 request; staging byte-identical; bounded decode luma correlation 0.996013 / 0.991627;
+/// clean-warm cancellation and decode-fault recovery within 2% of the clean rung-4 peak) is
+/// RETIRED rather than folded in behind the tier proof: it was published unconditionally for six
+/// routes × three tiers, no memory record retains it, and the artifacts it measured predate the
+/// prepacked per-tier rehosts and the split text-encoder/VAE component layout every shipped load
+/// opens today, so there is no cell of this table it could truthfully name.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    artifact_tier: Option<Quant>,
+) -> Option<String> {
+    let variant = MageVariant::from_id(provider_id)?;
+    let tier = calibration_tier_label(artifact_tier)?;
+    Some(format!(
+        "mage-flow-{}-{tier}-mlx-shared-ladder-v1",
+        variant.route_label()
+    ))
+}
+
+/// The weights-free registry-conformance identity for one (provider, tier) surface: the same route
+/// and tier in the [`STATIC_BEHAVIOR_FINGERPRINT`] namespace. Never a production string.
+pub fn weights_free_calibration_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    let variant = MageVariant::from_id(provider_id)?;
+    let tier = calibration_tier_label(tier)?;
+    Some(format!(
+        "{STATIC_BEHAVIOR_FINGERPRINT}-{}-{tier}",
+        variant.route_label()
+    ))
+}
+
+/// The packed tier a resolved component directory IS, read from the marker the loader itself
+/// consults (`crate::pipeline::load_time_quant_bits` → `mlx_gen::quant::packed_quant_bits_at`, the
+/// `quantization.bits` manifest the converter writes into `<component>/config.json`).
+///
+/// `Ok(None)` is a dense (bf16) component. An unreadable or malformed marker is an error, which the
+/// identity binding turns into a WITHHELD identity rather than a failed load.
+fn packed_component_tier(dir: &Path) -> Result<Option<Quant>> {
+    Ok(match mlx_gen::quant::packed_quant_bits_at(dir)? {
+        None => None,
+        Some(4) => Some(Quant::Q4),
+        Some(8) => Some(Quant::Q8),
+        Some(bits) => {
+            return Err(Error::Unsupported(format!(
+                "mage_flow: {} declares an unshipped {bits}-bit packing",
+                dir.display()
+            )))
+        }
+    })
+}
+
+/// The identity a LOADED Mage route publishes, bound to the artifact it opens.
+///
+/// Two gates, both fail-closed and both withholding rather than failing the load
+/// (`assemble` propagates `memory_strategy_contract_for_resolved_components`'s error, so an
+/// escaping error would turn a loadable snapshot into a refused one):
+///
+/// * the DiT and the text encoder must carry the SAME packed marker — a split-layout load whose
+///   two heavy components disagree on their tier is not a shipped cell; and
+/// * `spec.quantize` must be the tier the artifact already is. This engine quantizes DENSE AT LOAD
+///   (`crate::pipeline::load_heavy_components`), so a dense snapshot opened with a `Q4`/`Q8` knob —
+///   an imported fine-tune, an upstream flat snapshot — is a genuine runtime requantization whose
+///   load peak no anchor measured, and publishes nothing. A packed artifact opened at its own tier
+///   is the checked no-op the worker performs (`load_time_quant_bits` returns `None`); a packed
+///   artifact opened at ANY other knob never reaches this point, because the loader refuses it.
+///
+/// The request knob therefore never reaches a string on its own: for every load that succeeds, the
+/// tier in the string is the tier on disk. Adapters are allowed: Mage installs them as forward-time
+/// residuals and the shared contract builder prices the stack into the predicted peak as its own
+/// resident component, so the base cell's identity is unchanged by them.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+    dirs: &MageComponentDirs,
+) -> Option<MemoryCalibrationIdentity> {
+    let artifact_tier = packed_component_tier(&dirs.transformer).ok()?;
+    if packed_component_tier(&dirs.text_encoder).ok()? != artifact_tier {
+        return None;
+    }
+    if artifact_tier != spec.quantize {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, artifact_tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
 /// Only the physically exercised 768→512 output-pixel tiling cell is publishable. Wider candidates
 /// are intentionally absent until Mage-specific real-weight measurement exists for them.
 pub const DECODE_TILE_EDGES: &[u32] = &[512];
@@ -116,13 +227,20 @@ pub fn validate_load_contract(provider_id: &str, spec: &LoadSpec) -> CoreResult<
 /// Build the eager Mage shared-memory contract. Every executable eager rung is declared here;
 /// snapshot-backed language-model and DiT block windows additionally require the deferred load
 /// shape exposed by [`memory_strategy_contract_for_spec`].
-pub fn memory_strategy_contract(provider_id: &str, _tier: Option<Quant>) -> MemoryProviderContract {
+///
+/// Handed no load identity at all, this publishes the weights-free conformance identity for
+/// `tier` (sc-22733): there is no artifact here to prove a production tier against.
+pub fn memory_strategy_contract(provider_id: &str, tier: Option<Quant>) -> MemoryProviderContract {
+    let load_shape = mlx_gen::LoadShape::EagerMaterialization;
     memory_strategy_contract_with_adapters(
         provider_id,
+        None,
         &[],
         Default::default(),
-        mlx_gen::LoadShape::EagerMaterialization,
+        load_shape,
         false,
+        weights_free_calibration_fingerprint(provider_id, tier)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, load_shape)),
     )
 }
 
@@ -138,12 +256,18 @@ pub(crate) fn weights_free_memory_strategy_contract(
 ) -> CoreResult<MemoryProviderContract> {
     validate_load_contract(provider_id, spec)?;
     let streamable = streamable_spec(spec)?;
+    // No artifact is opened on this probe, so the tier is the caller's `quantize` knob — which is
+    // exactly why this is a conformance identity and never a production one.
+    let calibration = weights_free_calibration_fingerprint(provider_id, spec.quantize)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
+        Some(spec),
         &spec.adapters,
         Default::default(),
         spec.load_shape,
         streamable,
+        calibration,
     ))
 }
 
@@ -217,12 +341,25 @@ pub fn weights_free_memory_surface_contract(
 ) -> CoreResult<MemoryProviderContract> {
     surface_selector_matches_spec(surface)?;
     validate_load_contract(provider_id, &surface.spec)?;
+    // The selector's already-resolved artifact tier is the tier this surface names
+    // (`surface_selector_matches_spec` has just proven the spec agrees with it); the identity is
+    // still the weights-free one, because no artifact was opened to measure anything.
+    let tier = match surface.resolved_artifact_tier() {
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Bf16 => None,
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q4 => Some(Quant::Q4),
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Q8 => Some(Quant::Q8),
+        mlx_gen::gen_core::MemoryContractSurfaceTier::Nvfp4 => Some(Quant::Nvfp4),
+    };
+    let calibration = weights_free_calibration_fingerprint(provider_id, tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, surface.spec.load_shape));
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
+        Some(&surface.spec),
         &surface.spec.adapters,
         Default::default(),
         surface.spec.load_shape,
         surface_streamable(surface),
+        calibration,
     ))
 }
 
@@ -324,19 +461,112 @@ fn memory_strategy_contract_for_resolved_components(
     let streamable = streamable_resolved_components(spec, dirs)?;
     Ok(memory_strategy_contract_with_adapters(
         provider_id,
+        Some(spec),
         &spec.adapters,
         components,
         spec.load_shape,
         streamable,
+        production_calibration_identity(provider_id, spec, dirs),
     ))
+}
+
+/// Architecture axes shared by all six registered Mage-Flow routes (epic SC-22657, E2).
+///
+/// [`MageFlowConfig::mage_flow`](crate::config::MageFlowConfig::mage_flow) is this crate's mirror of
+/// the `transformer/config.json` shipped by every `microsoft/Mage-Flow*` repo, and
+/// `MageFlowConfig::from_transformer_config_json` parses that same file at load; the six routes
+/// (base/turbo x t2i/edit) differ only in weights and sampling profile, so they publish one set of
+/// axes.
+///
+/// `patch_size` is 1 — Mage flattens token-per-latent-cell with no patchify, so this is a real
+/// declared value and not a stand-in for an absent axis. `vae_temporal_scale` stays `None`:
+/// Mage-Flow is an image model whose autoencoder has no temporal axis.
+///
+/// When `spec` names a materialized snapshot directory, [`dit_config`] re-runs the loader's own
+/// `from_transformer_config_json` parse over that snapshot's `transformer/config.json`, so the
+/// published trunk axes are the snapshot's rather than the preset's. `None` is the eager
+/// [`memory_strategy_contract`] entry point, which is handed no load identity at all and therefore
+/// has no snapshot to read: it publishes the preset, exactly as it did before.
+///
+/// SC-22667: a materialized snapshot whose config is **present but unparseable or partial** no
+/// longer degrades into the preset. `MageTransformer::load` propagates that same parse failure —
+/// every key is required precisely so a partial file cannot half-default into this model's numbers
+/// — so a preset published here would describe a model this load will never build. A provider falls
+/// back to a preset only where the LOADER falls back to that preset; otherwise the axis is declared
+/// absent. The two latent axes below survive because they are the loader's own crate constants, not
+/// config reads, so the contract still declares a real architecture axis.
+fn architecture_facts(spec: Option<&LoadSpec>) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let Some(dit) = dit_config(spec) else {
+        return mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: None,
+            head_dim: None,
+            transformer_blocks: None,
+            patch_size: None,
+            latent_channels: mlx_gen::architecture_facts::axis(crate::config::LATENT_CHANNELS),
+            vae_spatial_scale: mlx_gen::architecture_facts::axis(
+                crate::config::VAE_DOWNSAMPLE_FACTOR,
+            ),
+            vae_temporal_scale: None,
+            activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+        };
+    };
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_heads),
+        // The exactness-gated helper, not `axis(dit.head_dim())`: `head_dim()` is a plain
+        // `hidden_size / num_heads`, and a rounded quotient would invent a width a non-uniform
+        // stack does not have.
+        head_dim: mlx_gen::architecture_facts::head_dim(dit.hidden_size, dit.num_heads),
+        // `DEPTH_SINGLE_BLOCKS` is 0: every block is dual-stream, so `depth` IS the trunk.
+        transformer_blocks: mlx_gen::architecture_facts::axis(
+            dit.depth.saturating_add(crate::config::DEPTH_SINGLE_BLOCKS),
+        ),
+        patch_size: mlx_gen::architecture_facts::axis(dit.patch_size),
+        latent_channels: mlx_gen::architecture_facts::axis(crate::config::LATENT_CHANNELS),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(crate::config::VAE_DOWNSAMPLE_FACTOR),
+        vae_temporal_scale: None,
+        // `pipeline.rs` builds the latent tokens and loads the VAE at `Dtype::Bfloat16`.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
+/// The trunk geometry a contract should describe: the materialized snapshot's own
+/// `transformer/config.json` when one exists, else this crate's mirror of it.
+///
+/// Both snapshot layouts are accepted, because both are loadable: the pipeline's
+/// `<root>/transformer/config.json`, and a caller-owned fine-tuned transformer directory whose
+/// own `config.json` sits at the root (`is_finetuned_transformer_dir`).
+///
+/// `from_transformer_config_json` requires every consumed key and pins the ones this port
+/// hardcodes, so a partial or divergent file declines rather than half-defaulting into this
+/// model's numbers.
+///
+/// `None` means: a snapshot IS materialized and none of its accepted layouts yielded a config this
+/// crate can parse. That is exactly the case `MageTransformer::load` refuses, so the caller declares
+/// the trunk axes absent rather than substituting the preset (SC-22667). With no materialized
+/// snapshot at all there is no load to describe and the preset is returned, which is what the
+/// registry contract surface has always published.
+fn dit_config(spec: Option<&LoadSpec>) -> Option<crate::config::MageFlowConfig> {
+    let Some(root) = spec.and_then(mlx_gen::architecture_facts::materialized_root) else {
+        return Some(crate::config::MageFlowConfig::mage_flow());
+    };
+    [root.join("transformer"), root.to_path_buf()]
+        .into_iter()
+        .find_map(|dir| {
+            let json =
+                std::fs::read_to_string(dir.join(crate::transformer::TRANSFORMER_CONFIG_FILE))
+                    .ok()?;
+            crate::config::MageFlowConfig::from_transformer_config_json(&json).ok()
+        })
 }
 
 fn memory_strategy_contract_with_adapters(
     provider_id: &str,
+    spec: Option<&LoadSpec>,
     adapters: &[mlx_gen::AdapterSpec],
     components: mlx_gen::PerComponentBytes,
     load_shape: mlx_gen::LoadShape,
     streamable: bool,
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> MemoryProviderContract {
     let mut contract = MemoryProviderContract::compatibility_default(
         provider_id,
@@ -379,10 +609,14 @@ fn memory_strategy_contract_with_adapters(
         MemoryFormulaKind::PhaseEnvelope { phases, variables }
     };
     contract.load_shape = load_shape;
-    contract.calibration = Some(MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
-        load_shape,
+    contract.phase_facts = Some(mlx_gen::gen_core::MemoryPhaseFacts::staged(
+        mlx_gen::gen_core::StagedWeightSchedule::ThreeStage,
     ));
+    contract.architecture_facts = architecture_facts(spec);
+    // Decided by the caller, never here: a loaded route binds its identity to the artifact it
+    // opened (`production_calibration_identity`), a weights-free surface publishes the conformance
+    // family, and a withheld identity stays withheld (sc-22733).
+    contract.calibration = calibration;
     // Mage's loaded resident generator uses sequential defaults internally. An explicit shared
     // Resident selection must therefore carry an all-disabled memory block to override them.
     contract.resident_request_memory = mlx_gen::gen_core::ResidentRequestMemory::ExplicitResident;
@@ -490,6 +724,20 @@ impl MageVariant {
             Self::Edit => "microsoft/Mage-Flow-Edit",
             Self::EditBase => "microsoft/Mage-Flow-Edit-Base",
             Self::EditTurbo => "microsoft/Mage-Flow-Edit-Turbo",
+        }
+    }
+
+    /// The route label a calibration string carries: the registry id with `_` spelled `-`
+    /// (`mage-flow`, `mage-flow-edit-turbo`, …). A `const` table rather than a runtime
+    /// `replace`, so the six labels are visible in one place.
+    pub const fn route_label(self) -> &'static str {
+        match self {
+            Self::Rl => "mage-flow",
+            Self::Base => "mage-flow-base",
+            Self::Turbo => "mage-flow-turbo",
+            Self::Edit => "mage-flow-edit",
+            Self::EditBase => "mage-flow-edit-base",
+            Self::EditTurbo => "mage-flow-edit-turbo",
         }
     }
 
@@ -1284,13 +1532,14 @@ impl Generator for MageFlow {
                         )
                     },
                     crate::pipeline::materialize_edit_denoised,
-                    |view, denoised, _| {
+                    |view, denoised, progress| {
                         calibration_fault(req, MemoryPhase::Decode)?;
                         crate::pipeline::decode_edit_phase(
                             view.vae,
                             denoised,
                             req.memory,
                             &req.cancel,
+                            progress,
                         )
                     },
                 )?;
@@ -1354,13 +1603,14 @@ impl Generator for MageFlow {
                     )
                 },
                 crate::pipeline::materialize_generation_denoised,
-                |view, denoised, _| {
+                |view, denoised, progress| {
                     calibration_fault(req, MemoryPhase::Decode)?;
                     crate::pipeline::decode_generation_phase(
                         view.vae,
                         denoised,
                         req.memory,
                         &req.cancel,
+                        progress,
                     )
                 },
             )?
@@ -1713,6 +1963,213 @@ mod tests {
         }
     }
 
+    /// Stamp the packed-tier marker the converter writes (`<component>/config.json`
+    /// `quantization.bits`) onto the two heavy components of a `write_memory_snapshot` root, which
+    /// is what makes it a prepacked `q<bits>` tier to the loader (`pipeline::load_time_quant_bits`).
+    fn mark_packed(root: &Path, bits: u32) {
+        let marker = format!(r#"{{"quantization":{{"bits":{bits},"group_size":64}}}}"#);
+        for component in ["text_encoder", "transformer"] {
+            std::fs::write(root.join(component).join("config.json"), &marker).unwrap();
+        }
+    }
+
+    /// The worker's production still-image spec over a split-layout snapshot: the tier knob on the
+    /// spec, both shared components staged explicitly.
+    fn tier_spec(root: &Path, quant: Option<Quant>) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()))
+            .with_component(
+                COMPONENT_TEXT_ENCODER,
+                WeightsSource::Dir(root.join("text_encoder")),
+            )
+            .with_component(COMPONENT_VAE, WeightsSource::Dir(root.join("vae")));
+        if let Some(quant) = quant {
+            spec = spec.with_quant(quant);
+        }
+        spec
+    }
+
+    /// sc-22733 (epic sc-22723, E1 measurable / E4 production loader): every shipped Mage cell —
+    /// six routes × three tiers — publishes its OWN production identity off the loaded contract,
+    /// keyed on the route and the tier the artifact on disk IS, under both offload policies and both
+    /// load shapes. Before this the crate published one string for all eighteen cells
+    /// (`mage-flow-mlx-shared-ladder-2026-08-03-v1`), so no memory anchor could name the cell it
+    /// measured.
+    ///
+    /// *Mutations this kills:* restoring the single const (eighteen strings collapse to one and the
+    /// distinctness assert fails); dropping the tier from the key (collapse to six); keying on the
+    /// offload policy or the load shape (the four specs per cell disagree); replaying one route's
+    /// string on another; publishing the weights-free conformance string in production; and
+    /// reading the tier off `spec.quantize` instead of the artifact — the last block opens a DENSE
+    /// snapshot with a `Q4`/`Q8` knob (a runtime requantization) and must publish nothing, and a
+    /// snapshot whose two heavy components disagree on their packing publishes nothing either.
+    #[test]
+    fn every_shipped_cell_publishes_its_own_production_identity_off_the_artifact_tier() {
+        let mut published = std::collections::BTreeSet::new();
+        for provider in MODEL_IDS {
+            for (bits, quant) in [
+                (None, None),
+                (Some(4), Some(Quant::Q4)),
+                (Some(8), Some(Quant::Q8)),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                write_memory_snapshot(tmp.path());
+                if let Some(bits) = bits {
+                    mark_packed(tmp.path(), bits);
+                }
+                let expected = production_calibration_fingerprint(provider, quant).unwrap();
+                let tier = calibration_tier_label(quant).unwrap();
+                assert!(expected.contains(tier), "{provider} {tier}: {expected}");
+                assert_ne!(
+                    expected,
+                    weights_free_calibration_fingerprint(provider, quant).unwrap()
+                );
+                assert_ne!(expected, "mage-flow-mlx-shared-ladder-2026-08-03-v1");
+                for (offload, load_shape) in [
+                    (
+                        mlx_gen::OffloadPolicy::Resident,
+                        mlx_gen::LoadShape::EagerMaterialization,
+                    ),
+                    (
+                        mlx_gen::OffloadPolicy::Sequential,
+                        mlx_gen::LoadShape::EagerMaterialization,
+                    ),
+                    (
+                        mlx_gen::OffloadPolicy::Resident,
+                        mlx_gen::LoadShape::DeferredMaterialization,
+                    ),
+                    (
+                        mlx_gen::OffloadPolicy::Sequential,
+                        mlx_gen::LoadShape::DeferredMaterialization,
+                    ),
+                ] {
+                    let spec = tier_spec(tmp.path(), quant)
+                        .with_offload_policy(offload)
+                        .with_load_shape(load_shape);
+                    let contract = memory_strategy_contract_for_spec(provider, &spec).unwrap();
+                    let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                        panic!("{provider} {tier} {offload:?} {load_shape:?} publishes none")
+                    });
+                    assert_eq!(identity.fingerprint, expected, "{provider} {tier}");
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert_eq!(contract.load_shape, load_shape);
+                    assert!(contract.conformance_errors().is_empty());
+                }
+                // The knob never outranks the artifact: every tier the snapshot is NOT.
+                for wrong in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    if wrong == quant {
+                        continue;
+                    }
+                    let spec = tier_spec(tmp.path(), wrong);
+                    // A packed artifact under the wrong knob is refused by the loader's own tier
+                    // gate; only the dense-with-knob shape (runtime requantization) reaches a
+                    // contract, and it must publish nothing.
+                    if let Ok(contract) = memory_strategy_contract_for_spec(provider, &spec) {
+                        assert!(
+                            contract.calibration.is_none(),
+                            "{provider} {tier} published an identity for a {wrong:?} knob"
+                        );
+                    }
+                }
+                assert!(
+                    published.insert(expected.clone()),
+                    "{provider} {tier} repeats another cell's identity: {expected}"
+                );
+            }
+        }
+        // Eighteen distinct strings: six routes × three tiers.
+        assert_eq!(published.len(), MODEL_IDS.len() * 3);
+
+        // Two heavy components that disagree on their packing are not a shipped cell.
+        let tmp = tempfile::tempdir().unwrap();
+        write_memory_snapshot(tmp.path());
+        mark_packed(tmp.path(), 4);
+        std::fs::write(tmp.path().join("text_encoder/config.json"), "{}").unwrap();
+        let contract =
+            memory_strategy_contract_for_spec("mage_flow", &tier_spec(tmp.path(), Some(Quant::Q4)))
+                .unwrap();
+        assert!(contract.calibration.is_none());
+    }
+
+    /// sc-22733: an unreadable tier marker WITHHOLDS the identity rather than failing the load —
+    /// `assemble` propagates the contract builder's error, so an escaping error would turn a
+    /// loadable snapshot into a refused one.
+    ///
+    /// *Mutation this kills:* `packed_component_tier(..).ok()?` → `.unwrap()` (the contract builder
+    /// panics / the load fails instead of publishing a contract without an identity).
+    #[test]
+    fn an_unreadable_tier_marker_withholds_the_identity_without_failing_the_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_memory_snapshot(tmp.path());
+        mark_packed(tmp.path(), 4);
+        std::fs::write(
+            tmp.path().join("transformer/config.json"),
+            r#"{"quantization":{"bits":"four"}}"#,
+        )
+        .unwrap();
+        // The loader's own gate refuses this marker outright, so the contract never reaches a
+        // quant knob; probe the identity binding directly with the dirs the loader would resolve.
+        let dirs = MageComponentDirs {
+            transformer: tmp.path().join("transformer"),
+            text_encoder: tmp.path().join("text_encoder"),
+            vae: tmp.path().join("vae"),
+        };
+        assert!(packed_component_tier(&dirs.transformer).is_err());
+        assert!(production_calibration_identity(
+            "mage_flow",
+            &tier_spec(tmp.path(), Some(Quant::Q4)),
+            &dirs
+        )
+        .is_none());
+    }
+
+    /// The registry-conformance surfaces publish the weights-free family, one string per
+    /// (route, resolved tier), and never a production string — so a fixture contract can never be
+    /// mistaken for measured evidence.
+    ///
+    /// *Mutation this kills:* handing `weights_free_memory_surface_contract` the production table.
+    #[test]
+    fn weights_free_surfaces_publish_the_conformance_family_per_tier() {
+        use mlx_gen::gen_core::MemoryContractSurfaceTier;
+
+        let mut published = std::collections::BTreeSet::new();
+        for provider in MODEL_IDS {
+            for surface in mlx_gen::gen_core::mlx_memory_contract_surface_specs() {
+                let quant = match surface.resolved_artifact_tier() {
+                    MemoryContractSurfaceTier::Bf16 => None,
+                    MemoryContractSurfaceTier::Q4 => Some(Quant::Q4),
+                    MemoryContractSurfaceTier::Q8 => Some(Quant::Q8),
+                    MemoryContractSurfaceTier::Nvfp4 => continue,
+                };
+                let contract = weights_free_memory_surface_contract(provider, &surface).unwrap();
+                let identity = contract.calibration.as_ref().unwrap();
+                assert_eq!(
+                    identity.fingerprint,
+                    weights_free_calibration_fingerprint(provider, quant).unwrap(),
+                    "{provider} {}",
+                    surface.selector.id()
+                );
+                assert!(identity
+                    .fingerprint
+                    .starts_with(STATIC_BEHAVIOR_FINGERPRINT));
+                assert_ne!(
+                    identity.fingerprint,
+                    production_calibration_fingerprint(provider, quant).unwrap()
+                );
+                published.insert(identity.fingerprint.clone());
+            }
+            // The legacy single-spec probe and the eager entry point agree with the surface family.
+            for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                let expected = weights_free_calibration_fingerprint(provider, quant).unwrap();
+                let spec = tier_spec(Path::new("/__sceneworks_memory_contract_surface__"), quant);
+                let probe = weights_free_memory_strategy_contract(provider, &spec).unwrap();
+                assert_eq!(probe.calibration.as_ref().unwrap().fingerprint, expected);
+                let eager = memory_strategy_contract(provider, quant);
+                assert_eq!(eager.calibration.as_ref().unwrap().fingerprint, expected);
+            }
+        }
+        assert_eq!(published.len(), MODEL_IDS.len() * 3);
+    }
+
     #[test]
     fn finetuned_contract_projects_the_supplied_transformer_directory_itself() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1760,8 +2217,11 @@ mod tests {
             contract
                 .calibration
                 .as_ref()
-                .map(|identity| (identity.abi, identity.fingerprint.as_str())),
-            Some((MEMORY_CALIBRATION_ABI, MEMORY_CALIBRATION_FINGERPRINT))
+                .map(|identity| (identity.abi, identity.fingerprint.clone())),
+            Some((
+                MEMORY_CALIBRATION_ABI,
+                weights_free_calibration_fingerprint("mage_flow", Some(Quant::Q4)).unwrap()
+            ))
         );
         assert!(matches!(
             contract
@@ -1857,10 +2317,12 @@ mod tests {
 
         let mut deferred = memory_strategy_contract_with_adapters(
             "mage_flow",
+            None,
             &[],
             Default::default(),
             mlx_gen::LoadShape::DeferredMaterialization,
             true,
+            None,
         );
         let mut selected = deferred
             .representative_selection(MemoryStrategy::BoundedTransformerResidency, tier, false)
@@ -2014,6 +2476,164 @@ mod tests {
         assert!(contract.conformance_errors().is_empty());
     }
 
+    /// AC (SC-22662): every registered Mage-Flow route publishes the axes of the one NR-MMDiT they
+    /// share, derived from this crate's own config constants, and passes the shared facts check.
+    #[test]
+    fn architecture_facts_follow_the_crate_transformer_config() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/mage-contract".into()));
+        for provider_id in MODEL_IDS {
+            let contract = weights_free_memory_strategy_contract(provider_id, &spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(24),
+                    // 3072 / 24, derived by `MageFlowConfig::head_dim`.
+                    head_dim: Some(128),
+                    // 12 dual-stream blocks and no single-stream tail.
+                    transformer_blocks: Some(12),
+                    // Mage flattens token-per-latent-cell: a real 1, not an absent axis.
+                    patch_size: Some(1),
+                    latent_channels: Some(128),
+                    vae_spatial_scale: Some(16),
+                    vae_temporal_scale: None,
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+    }
+
+    /// The `transformer/config.json` keys `from_transformer_config_json` requires, emitted from a
+    /// config value so the fixture cannot drift from the struct it mirrors.
+    fn transformer_config_json(cfg: &crate::config::MageFlowConfig) -> serde_json::Value {
+        serde_json::json!({
+            "in_channels": cfg.in_channels,
+            "out_channels": cfg.out_channels,
+            "context_in_dim": cfg.context_in_dim,
+            "hidden_size": cfg.hidden_size,
+            "num_heads": cfg.num_heads,
+            "depth": cfg.depth,
+            "axes_dim": cfg.axes_dim,
+            "checkpoint": cfg.checkpoint,
+            "patch_size": cfg.patch_size,
+        })
+    }
+
+    fn spec_for_transformer_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        let transformer = dir.join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join(crate::transformer::TRANSFORMER_CONFIG_FILE),
+            config.to_string(),
+        )
+        .unwrap();
+        LoadSpec::new(WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes are read out of
+    /// the snapshot's own `transformer/config.json` — the file `MageTransformer::load` parses —
+    /// rather than published from the compile-time preset. The mirror fixture agrees with the
+    /// weights-free path; a fixture whose `depth` is mutated publishes the mutated block count,
+    /// which is what the unconditional `architecture_facts()` this replaced would fail.
+    ///
+    /// `depth` is the mutated key because it is the trunk axis a snapshot can move on its own:
+    /// `MageFlowConfig::validate` ties `hidden_size`/`num_heads` to `sum(axes_dim)`, so mutating
+    /// the head width alone is rejected by the parser rather than published.
+    #[test]
+    fn materialized_trunk_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::MageFlowConfig::mage_flow();
+        let weights_free = LoadSpec::new(WeightsSource::Dir("/nonexistent/mage-contract".into()));
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(Some(&spec_for_transformer_config(
+                mirror.path(),
+                &transformer_config_json(&preset)
+            ))),
+            architecture_facts(Some(&weights_free)),
+            "a snapshot mirroring the published config must publish the preset's axes"
+        );
+        // The eager entry point carries no load identity at all and still publishes the preset.
+        assert_eq!(
+            architecture_facts(None),
+            architecture_facts(Some(&weights_free))
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = transformer_config_json(&preset);
+        mutated["depth"] = serde_json::json!(7);
+        let mutated_facts = architecture_facts(Some(&spec_for_transformer_config(
+            mutated_dir.path(),
+            &mutated,
+        )));
+        assert_eq!(
+            mutated_facts.transformer_blocks,
+            Some(7),
+            "the materialized path must publish the snapshot's depth, not the preset's"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E2): a materialized snapshot whose `transformer/config.json`
+    /// is present but unparseable or partial must declare its trunk axes ABSENT, not fall back to
+    /// the compile-time preset. `MageTransformer::load` propagates the same parse failure — every
+    /// consumed key is required exactly so a partial file cannot half-default into this model's
+    /// numbers — so a preset published here describes a model this load will never build. The rule
+    /// is: fall back to a preset only where the LOADER falls back to that preset.
+    ///
+    /// Mutation that fails this: restoring
+    /// `.unwrap_or_else(crate::config::MageFlowConfig::mage_flow)` in `dit_config` — both fixtures
+    /// then publish the preset's `attention_heads`/`head_dim`/`transformer_blocks` as if they had
+    /// been read off the snapshot.
+    #[test]
+    fn an_unparseable_snapshot_config_declares_the_trunk_axes_absent() {
+        let preset = crate::config::MageFlowConfig::mage_flow();
+        let declared = architecture_facts(None);
+
+        // (1) Present but not JSON at all.
+        let malformed = tempfile::tempdir().unwrap();
+        let transformer = malformed.path().join("transformer");
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join(crate::transformer::TRANSFORMER_CONFIG_FILE),
+            b"{not json",
+        )
+        .unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(malformed.path().to_path_buf()));
+
+        // (2) Valid JSON, but missing a required key.
+        let partial_dir = tempfile::tempdir().unwrap();
+        let mut partial = transformer_config_json(&preset);
+        partial
+            .as_object_mut()
+            .unwrap()
+            .remove("depth")
+            .expect("the fixture must have carried a depth to remove");
+        let partial_spec = spec_for_transformer_config(partial_dir.path(), &partial);
+
+        for (label, spec) in [("malformed", &spec), ("partial", &partial_spec)] {
+            let facts = architecture_facts(Some(spec));
+            assert_eq!(facts.attention_heads, None, "{label}");
+            assert_eq!(facts.head_dim, None, "{label}");
+            assert_eq!(facts.transformer_blocks, None, "{label}");
+            assert_eq!(facts.patch_size, None, "{label}");
+            assert_ne!(
+                facts, declared,
+                "{label}: an unreadable config must not publish the preset's trunk"
+            );
+            // The two latent axes are the loader's own crate constants rather than config reads, so
+            // they survive and the contract still declares a real architecture axis.
+            assert_eq!(facts.latent_channels, declared.latent_channels, "{label}");
+            assert_eq!(
+                facts.vae_spatial_scale, declared.vae_spatial_scale,
+                "{label}"
+            );
+            assert!(facts.has_declared_architecture_axis(), "{label}");
+            assert!(facts.zero_valued_axes().is_empty(), "{label}");
+        }
+    }
+
     #[test]
     fn empty_mage_component_directory_cannot_be_reported_as_zero() {
         let root_tmp = tempfile::tempdir().unwrap();
@@ -2072,9 +2692,13 @@ mod tests {
         let mismatch_root_tmp = tempfile::tempdir().unwrap();
         let mismatch_root = mismatch_root_tmp.path().to_path_buf();
         write_memory_snapshot(&mismatch_root);
+        // A prepacked q4 snapshot at its own tier, so the loaded contract carries the q4 cell's
+        // production identity (sc-22733) and the context below can bind to it.
+        mark_packed(&mismatch_root, 4);
         let loaded_spec =
             LoadSpec::new(WeightsSource::Dir(mismatch_root.clone())).with_quant(Quant::Q4);
         let contract = memory_strategy_contract_for_spec("mage_flow", &loaded_spec).unwrap();
+        let loaded_fingerprint = contract.calibration.as_ref().unwrap().fingerprint.clone();
         let required = (crate::memory::generation_peak_gb(Some(Quant::Q4), 512, 512, 1)
             * 1_000_000_000.0)
             .round() as u64;
@@ -2090,7 +2714,7 @@ mod tests {
                 },
             },
             calibration_abi: MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            calibration_fingerprint: loaded_fingerprint.clone(),
             load_shape: mlx_gen::LoadShape::EagerMaterialization,
             mode: MemoryMode::TextToImage,
             has_reference: false,
@@ -2286,7 +2910,7 @@ mod tests {
             optimization_authority: mlx_gen::gen_core::MemoryOptimizationAuthority::Calibrated,
             selection,
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            calibration_fingerprint: contract.calibration.as_ref().unwrap().fingerprint.clone(),
             load_shape: mlx_gen::LoadShape::EagerMaterialization,
             mode: MemoryMode::TextToImage,
             has_reference: false,

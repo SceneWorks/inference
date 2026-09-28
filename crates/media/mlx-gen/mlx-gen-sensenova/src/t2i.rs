@@ -24,6 +24,7 @@ use mlx_rs::ops::{add, divide, matmul, minimum, multiply, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::attention::{AttentionBudget, AttentionPlan};
+use mlx_gen::gen_core::LoadPhase;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, Progress, Quant, Result};
@@ -46,6 +47,25 @@ use mlx_llm::primitives::{KvCache as _, SplitMix64};
 /// production [`SenseNova`](crate::SenseNova) path passes the request's flag and the worker's progress
 /// callback so a multi-minute 8B run is cancellable and reports **denoise steps**, not the image index
 /// (F-128).
+///
+/// ## Lifecycle boundaries (sc-22738)
+///
+/// The reporter also owns the two **phase boundaries** a consumer segments a run by — the
+/// SceneWorks memory-measurement adapter cuts its conditioning/denoise/decode windows on exactly
+/// these, the same events `mlx-gen-bernini` and `mlx-gen-mage` emit:
+///
+/// * [`Progress::Loading`]`(`[`LoadPhase::Renderer`]`)` opens the **denoise** phase. It is emitted
+///   by the denoise loops ([`T2iModel::denoise`], [`T2iModel::it2i_denoise`]) after every prefill —
+///   the conditioning work — and before the first step. On the deferred load shape this is
+///   literally a load: the generation half of every dual-path block is materialized in bounded
+///   windows only from here on. On the resident shape it is the phase marker.
+/// * [`Progress::Decoding`] opens the **decode** phase: emitted after the last step, before the
+///   final RGB patches are converted to an image (`unpatchify` + the host copy).
+///
+/// Both are emitted **once per request**, never once per image: a multi-image request (`count >
+/// 1`, or the model-driven interleave loop) restarts neither the bar nor the phases. That is what
+/// the `opens_denoise` / `opens_decode` flags carry — the route that owns the request decides
+/// which of its per-image reporters opens which phase ([`Self::with_phase_bounds`]).
 pub struct StepReporter<'a> {
     cancel: &'a CancelFlag,
     on_progress: &'a mut dyn FnMut(Progress),
@@ -55,16 +75,35 @@ pub struct StepReporter<'a> {
     /// When set, overrides the per-denoise `total` with the aggregate grand total so the interleave
     /// bar is one monotone `1..=(max_images × num_steps)` sweep instead of restarting per image.
     total_override: Option<usize>,
+    /// Whether this reporter's denoise loop opens the request's denoise phase
+    /// (`Loading(Renderer)` before its first step). See the type docs.
+    opens_denoise: bool,
+    /// Whether this reporter's denoise loop opens the request's decode phase (`Decoding` after its
+    /// last step). See the type docs.
+    opens_decode: bool,
 }
 
 impl<'a> StepReporter<'a> {
+    /// A reporter for a single-image request: opens both phases around its one denoise loop.
     pub fn new(cancel: &'a CancelFlag, on_progress: &'a mut dyn FnMut(Progress)) -> Self {
         Self {
             cancel,
             on_progress,
             offset: 0,
             total_override: None,
+            opens_denoise: true,
+            opens_decode: true,
         }
+    }
+
+    /// Choose which of the request's phase boundaries this reporter's denoise loop opens
+    /// (sc-22738). A route that runs several denoise loops per request hands the first loop
+    /// `opens_denoise` and the last loop `opens_decode`, so the request reports each boundary
+    /// exactly once — see [`request_phase_bounds`] and the interleave loop.
+    pub fn with_phase_bounds(mut self, opens_denoise: bool, opens_decode: bool) -> Self {
+        self.opens_denoise = opens_denoise;
+        self.opens_decode = opens_decode;
+        self
     }
 
     /// A reporter for one image of a multi-image aggregate (F-136, sc-11133): its `current` is
@@ -81,6 +120,8 @@ impl<'a> StepReporter<'a> {
             on_progress,
             offset,
             total_override: Some(total),
+            opens_denoise: true,
+            opens_decode: true,
         }
     }
 
@@ -107,6 +148,38 @@ impl<'a> StepReporter<'a> {
             total: total as u32,
         });
     }
+
+    /// Open the denoise phase — `Progress::Loading(LoadPhase::Renderer)` — if this reporter owns
+    /// that boundary (sc-22738). Called by the denoise loops after every prefill and before their
+    /// first step.
+    fn open_denoise_phase(&mut self) {
+        if self.opens_denoise {
+            (self.on_progress)(Progress::Loading(LoadPhase::Renderer));
+        }
+    }
+
+    /// Open the decode phase — `Progress::Decoding` — if this reporter owns that boundary
+    /// (sc-22738). Called by the denoise loops after their last step.
+    fn open_decode_phase(&mut self) {
+        if self.opens_decode {
+            open_decode_phase(self.on_progress);
+        }
+    }
+}
+
+/// The one place the decode boundary is spelled: [`Progress::Decoding`], emitted after the last
+/// denoise step of a request and before its RGB patches become an image (sc-22738).
+fn open_decode_phase(on_progress: &mut dyn FnMut(Progress)) {
+    on_progress(Progress::Decoding);
+}
+
+/// Which of a request's phase boundaries the denoise loop for image `index` of `count` opens
+/// (sc-22738): the first loop opens the denoise phase, the last opens the decode phase, and a
+/// single-image request opens both. Each boundary is reported exactly once per request whatever the
+/// count, so a multi-image request does not restart the phases the way it would if every image
+/// opened its own.
+pub fn request_phase_bounds(index: u32, count: u32) -> (bool, bool) {
+    (index == 0, index + 1 >= count)
 }
 
 /// F-136 residual (sc-11133): `interleave_gen`'s loop is model-driven and can stop before
@@ -131,6 +204,24 @@ fn fill_interleave_bar(
         current: grand_total,
         total: grand_total,
     });
+}
+
+/// Close the interleave run's progress stream (sc-22738): fill the folded bar to its total
+/// ([`fill_interleave_bar`]) and then, if the run denoised at least one image, open the decode
+/// phase — once, after the last step of the last image, so the stream ends `…Step, Decoding` like
+/// the single-image routes. The per-image reporters inside the loop never open it themselves: the
+/// loop is model-driven and cannot know which image is the last. A text-only run (no image) ran no
+/// denoise and opens no decode phase either.
+fn finish_interleave_progress(
+    on_progress: &mut dyn FnMut(Progress),
+    realized_images: usize,
+    max_images: usize,
+    num_steps: usize,
+) {
+    fill_interleave_bar(on_progress, realized_images, max_images, num_steps);
+    if realized_images > 0 {
+        open_decode_phase(on_progress);
+    }
 }
 
 /// Classifier-free-guidance velocity-blend normalisation (`t2i_generate`'s `cfg_norm`).
@@ -669,6 +760,11 @@ impl T2iModel {
             None => None,
         };
         let mut traj = Vec::with_capacity(steps);
+        // Conditioning (the prefills) is complete: open the denoise phase before the first step
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_denoise_phase();
+        }
         for i in 0..steps {
             if let Some(r) = reporter.as_ref() {
                 r.check_cancel()?;
@@ -738,6 +834,11 @@ impl T2iModel {
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);
             }
+        }
+        // The last step is done: open the decode phase before the RGB patches become an image
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_decode_phase();
         }
         Ok(traj)
     }
@@ -1605,12 +1706,13 @@ impl T2iModel {
                 height,
                 &base_noise,
                 opts,
-                Some(StepReporter::new_folded(
-                    cancel,
-                    on_progress,
-                    offset,
-                    grand_total,
-                )),
+                // sc-22738: only the FIRST image's loop opens the denoise phase, and no per-image
+                // loop opens the decode phase — the loop is model-driven, so which image is last
+                // is only known once it exits (`finish_interleave_progress`).
+                Some(
+                    StepReporter::new_folded(cancel, on_progress, offset, grand_total)
+                        .with_phase_bounds(images.is_empty(), false),
+                ),
             )?;
             let image = traj.into_iter().last().expect("at least one step");
 
@@ -1641,7 +1743,8 @@ impl T2iModel {
         // `max_images` images, freezing the folded bar below its pinned grand total. Fill it to total
         // on completion so the aggregate progression finishes instead of hanging (no-op for a 0-image
         // or full-`max_images` run).
-        fill_interleave_bar(on_progress, images.len(), max_images, opts.num_steps);
+        // Then open the decode phase once, after the last image's last step (sc-22738).
+        finish_interleave_progress(on_progress, images.len(), max_images, opts.num_steps);
 
         Ok(InterleaveOutput { text, images })
     }
@@ -1710,6 +1813,11 @@ impl T2iModel {
             None => None,
         };
         let mut traj = Vec::with_capacity(steps);
+        // Conditioning (the prefills) is complete: open the denoise phase before the first step
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_denoise_phase();
+        }
         for i in 0..steps {
             if let Some(r) = reporter.as_ref() {
                 r.check_cancel()?;
@@ -1834,6 +1942,11 @@ impl T2iModel {
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);
             }
+        }
+        // The last step is done: open the decode phase before the RGB patches become an image
+        // (sc-22738).
+        if let Some(r) = reporter.as_mut() {
+            r.open_decode_phase();
         }
         Ok(traj)
     }
@@ -2124,6 +2237,127 @@ mod tests {
         r.step(1, 4);
         r.step(4, 4);
         assert_eq!(*seen.borrow(), vec![(1u32, 4u32), (4, 4)]);
+    }
+
+    /// sc-22738: a single-image reporter brackets its denoise loop with the two lifecycle
+    /// boundaries — `Loading(Renderer)` before the first step, `Decoding` after the last — and
+    /// [`request_phase_bounds`] hands a multi-image request each boundary exactly once.
+    #[test]
+    fn step_reporter_opens_each_phase_once_per_request() {
+        let live = CancelFlag::new();
+        let mut events: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| events.push(p);
+            let mut r = StepReporter::new(&live, &mut sink);
+            r.open_denoise_phase();
+            r.step(1, 2);
+            r.step(2, 2);
+            r.open_decode_phase();
+        }
+        assert_eq!(
+            events,
+            vec![
+                Progress::Loading(LoadPhase::Renderer),
+                Progress::Step {
+                    current: 1,
+                    total: 2
+                },
+                Progress::Step {
+                    current: 2,
+                    total: 2
+                },
+                Progress::Decoding,
+            ]
+        );
+
+        // A reporter that owns neither boundary reports only its steps.
+        let mut events: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| events.push(p);
+            let mut r = StepReporter::new(&live, &mut sink).with_phase_bounds(false, false);
+            r.open_denoise_phase();
+            r.step(1, 1);
+            r.open_decode_phase();
+        }
+        assert_eq!(
+            events,
+            vec![Progress::Step {
+                current: 1,
+                total: 1
+            }]
+        );
+
+        // The first image opens denoise, the last opens decode, a single image opens both.
+        assert_eq!(request_phase_bounds(0, 1), (true, true));
+        assert_eq!(request_phase_bounds(0, 3), (true, false));
+        assert_eq!(request_phase_bounds(1, 3), (false, false));
+        assert_eq!(request_phase_bounds(2, 3), (false, true));
+        // Every boundary opens exactly once across any count.
+        for count in 1..=8u32 {
+            let opened: Vec<(bool, bool)> =
+                (0..count).map(|i| request_phase_bounds(i, count)).collect();
+            assert_eq!(opened.iter().filter(|(d, _)| *d).count(), 1, "{count}");
+            assert_eq!(opened.iter().filter(|(_, d)| *d).count(), 1, "{count}");
+        }
+    }
+
+    /// sc-22738: the interleave loop's per-image reporters open the denoise phase on the first
+    /// image only and never the decode phase; [`finish_interleave_progress`] closes the run with
+    /// exactly one `Decoding`, after the bar fill, and only when an image was denoised.
+    #[test]
+    fn interleave_run_opens_denoise_once_and_closes_with_one_decode_boundary() {
+        let cancel = CancelFlag::default();
+        let num_steps = 2usize;
+        let max_images = 3usize;
+        let grand_total = max_images * num_steps;
+
+        // Two of three images realized, driven the way `interleave_gen` drives its reporters.
+        let mut events: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| events.push(p);
+            for image_idx in 0..2usize {
+                let mut r = StepReporter::new_folded(
+                    &cancel,
+                    &mut sink,
+                    image_idx * num_steps,
+                    grand_total,
+                )
+                .with_phase_bounds(image_idx == 0, false);
+                r.open_denoise_phase();
+                for i in 0..num_steps {
+                    r.step(i + 1, num_steps);
+                }
+                r.open_decode_phase();
+            }
+            finish_interleave_progress(&mut sink, 2, max_images, num_steps);
+        }
+        let step = |current: u32| Progress::Step {
+            current,
+            total: grand_total as u32,
+        };
+        assert_eq!(
+            events,
+            vec![
+                Progress::Loading(LoadPhase::Renderer),
+                step(1),
+                step(2),
+                step(3),
+                step(4),
+                step(6),
+                Progress::Decoding,
+            ],
+            "one denoise boundary before the first step, one decode boundary after the fill"
+        );
+
+        // A full run: no fill, still exactly one terminal `Decoding`.
+        let mut full: Vec<Progress> = Vec::new();
+        finish_interleave_progress(&mut |p| full.push(p), max_images, max_images, num_steps);
+        assert_eq!(full, vec![Progress::Decoding]);
+
+        // A text-only run denoised nothing and opens no decode phase.
+        let mut none: Vec<Progress> = Vec::new();
+        finish_interleave_progress(&mut |p| none.push(p), 0, max_images, num_steps);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]

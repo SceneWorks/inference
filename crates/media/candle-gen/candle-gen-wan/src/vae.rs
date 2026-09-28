@@ -68,7 +68,7 @@ pub(crate) fn candle_error(error: CandleError) -> candle_gen::candle_core::Error
     match error {
         CandleError::Candle(error) => error,
         CandleError::Msg(message) => candle_gen::candle_core::Error::Msg(message),
-        error @ CandleError::GeometryRefused { .. } => {
+        error @ (CandleError::Unsupported(_) | CandleError::GeometryRefused { .. }) => {
             candle_gen::candle_core::Error::Msg(error.to_string())
         }
         // Compatibility wrappers use a fresh, never-cancelled flag, so this arm is defensive only.

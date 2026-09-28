@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterKind, GenerationMemory, GenerationRequest, LoadSpec, MemoryAssetFacts,
-    MemoryBackendRealization, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
-    MemoryFormulaVariable, MemoryGeometry, MemoryLifecycleCapabilities, MemoryMode,
-    MemoryNumericTier, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
-    MemoryRequestScope, MemoryResidentComponent, MemoryRunContext, MemoryRunOutcome,
-    MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability, MemoryStrategySupport,
-    MemoryWindowMaterialization, Precision, Quant, WeightsSource,
+    MemoryBackendRealization, MemoryCalibrationIdentity, MemoryComponentKind,
+    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable, MemoryGeometry,
+    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
+    MemoryProviderContract, MemoryRequestScope, MemoryResidentComponent, MemoryRunContext,
+    MemoryRunOutcome, MemorySafetyDecision, MemoryStrategy, MemoryStrategyCapability,
+    MemoryStrategySupport, MemoryWindowMaterialization, Precision, Quant, WeightsSource,
 };
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
@@ -966,14 +966,46 @@ pub(crate) fn contract_from_receipt(
             residency: MemoryComponentResidency::WholeRender,
         });
     }
+    let calibration = production_calibration_fingerprint(provider_id, receipt.tier)
+        .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, spec.load_shape));
     build_contract(
         provider_id,
         spec,
         receipt.tier,
+        calibration,
         receipt.components,
         overlays,
     )
 }
+
+/// Production calibration identity table of the Candle Chroma routes, keyed on
+/// **(provider, tier)** — sc-22731, epic sc-22723 E1/E4.
+///
+/// `tier` is the LOAD RECEIPT's, never a request knob: `ChromaLoadReceipt::capture` reads the path
+/// tier and cross-checks it against the transformer's own packed marker, refusing the crossing by
+/// name, so a string published here always names the artifact that was actually opened. That is why
+/// this takes the tier rather than the `LoadSpec` — there is no way to call it with an unproven one.
+///
+/// `None` only for an id no route serves. The three routes are separate receipt/evidence domains
+/// (SC-20788), so they take three separate identities, and each tier takes its own.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    tier: Option<Quant>,
+) -> Option<String> {
+    let route = route_identity(provider_id).ok()?.provider.replace('_', "-");
+    let tier = match tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(_) => return None,
+    };
+    Some(format!("{route}-{tier}-cuda-{CANDLE_LADDER_REVISION}"))
+}
+
+/// The shape of the Candle Chroma ladder every identity above names: the request-scoped
+/// Resident/Staged surface SC-20788 sealed. Bump it when that shape changes, which is what makes
+/// every Chroma anchor recaptured rather than silently re-bound.
+const CANDLE_LADDER_REVISION: &str = "request-scoped-staged-residency-v1";
 
 #[cfg(test)]
 pub(crate) fn uncalibrated_contract(
@@ -985,6 +1017,7 @@ pub(crate) fn uncalibrated_contract(
         provider_id,
         spec,
         physical_tier_hint(spec),
+        None,
         Default::default(),
         Vec::new(),
     ))
@@ -1012,6 +1045,8 @@ pub(crate) fn weights_free_contract(
         provider_id,
         &normalized,
         tier,
+        // No artifact, so no proven tier: a weights-free declaration stays unmeasured (sc-22731).
+        None,
         Default::default(),
         Vec::new(),
     ))
@@ -1058,15 +1093,71 @@ pub(crate) fn weights_free_surface_contract(
         provider_id,
         &spec,
         tier,
+        // Same: the finite surface describes a tier, it does not open one (sc-22731).
+        None,
         Default::default(),
         Vec::new(),
     ))
+}
+
+/// Activation dtype the loaded Chroma DiT computes in. `pipeline.rs` builds the transformer's
+/// `VarBuilder` at `DType::F32` (`load_denoise_components`), so this is the provider's real
+/// activation width rather than a memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::F32;
+
+/// Architecture axes for the Chroma1 routes (epic SC-22657, E2).
+///
+/// The loader never parses `transformer/config.json`: `ChromaTransformer::new_gs` is handed the
+/// hardcoded [`crate::config::ChromaTransformerConfig::default`] (HD, Base and Flash are one
+/// architecture — only the weights and the sampling profile differ), and the decoder is built from
+/// `crate::vae`'s own constants. Reading those same declarations keeps the published geometry
+/// identical to the model actually built.
+///
+/// `transformer_blocks` is the **total** trunk depth: Chroma stacks the 19 double-stream blocks and
+/// then the 38 single-stream blocks in one sequence. `patch_size` has no config field, so it is
+/// *derived* from the pair that implies it: the FLUX-style packing outside the trunk is what makes
+/// `in_channels` 64 = 16 latent channels x 2x2, and
+/// [`candle_gen::architecture_facts::patch_size_from_channels`] recovers the packing edge from that
+/// ratio rather than restating it as a literal that would survive a repack.
+/// `vae_temporal_scale` stays `None`: Chroma decodes through the FLUX.1 image `AutoencoderKL`,
+/// which has no temporal axis at all, and a structurally absent axis is declared absent, never
+/// zero (E2).
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    // Weights-free contract surfaces name a sentinel path that is deliberately not on disk: no
+    // pipeline has been resolved there, so no axis is knowable and every one stays `None`. Chroma's
+    // real snapshot root is a tier subdirectory (`q4` / `q8` / `bf16`); the gate is the same.
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    let dit = crate::config::ChromaTransformerConfig::default();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_attention_heads),
+        head_dim: af::declared(dit.attention_head_dim),
+        transformer_blocks: af::declared(dit.num_layers + dit.num_single_layers),
+        // The packing edge the trunk's own input width implies: `in_channels / LATENT_CHANNELS` is
+        // the neighbourhood area, and its square root is the axis.
+        patch_size: af::patch_size_from_channels(
+            af::declared(dit.in_channels),
+            af::declared(crate::vae::LATENT_CHANNELS),
+        ),
+        latent_channels: af::declared(crate::vae::LATENT_CHANNELS),
+        // `vae::BLOCK_OUT` is four stages, so three halvings: x8.
+        vae_spatial_scale: af::declared(crate::vae::BLOCK_OUT.len())
+            .and_then(|stages| stages.checked_sub(1))
+            .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples)),
+        // Structurally absent: the FLUX.1 image autoencoder has no frames-per-latent axis.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
 }
 
 fn build_contract(
     provider_id: &str,
     spec: &LoadSpec,
     _tier: Option<Quant>,
+    calibration: Option<MemoryCalibrationIdentity>,
     components: gen_core::PerComponentBytes,
     overlays: Vec<MemoryResidentComponent>,
 ) -> MemoryProviderContract {
@@ -1089,6 +1180,8 @@ fn build_contract(
         })
         .collect();
     MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1136,9 +1229,19 @@ fn build_contract(
                 resident_components: overlays.clone(),
             }
         },
-        // Chroma has no promoted measured curve. These bounds are structural estimates, so an
-        // invented calibration identity must never upgrade selector authority to Calibrated.
-        calibration: None,
+        // sc-22731 (epic sc-22723 E1/E4). This used to be an unconditional `None`, on the reasoning
+        // that "Chroma has no promoted measured curve, so an invented calibration identity must
+        // never upgrade selector authority to Calibrated". The reasoning conflated two things: an
+        // identity is the KEY evidence is filed under, not a claim that evidence exists. With `None`
+        // the anchor capture had nothing to record against and the lane could never BECOME measured
+        // — the false negative the epic exists to close.
+        //
+        // What keeps the original guarantee is the caller: only [`contract_from_receipt`], whose
+        // tier is the load receipt's — the path tier cross-checked against the transformer's own
+        // packed marker — passes an identity. The weights-free and finite-surface contracts still
+        // pass `None`, so the generated structural declarations remain exactly as unmeasured as they
+        // were, and `Calibrated` authority still requires a matching anchor to exist.
+        calibration,
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -1697,8 +1800,18 @@ fn estimated_behavior_context(
     Ok(MemoryRunContext {
         selection: contract.representative_selection(strategy, numeric, route.use_pid)?,
         optimization_authority: MemoryOptimizationAuthority::Estimated,
-        calibration_abi: 0,
-        calibration_fingerprint: String::new(),
+        // sc-22731: the handshake half is the contract's OWN identity, whatever it is — the empty
+        // pair for a weights-free declaration that publishes none, and the production
+        // (provider, tier) string for a load that does. It was hard-coded to the empty pair while
+        // the production contract could never publish, which stopped being true here.
+        calibration_abi: contract
+            .calibration
+            .as_ref()
+            .map_or(0, |identity| identity.abi),
+        calibration_fingerprint: contract
+            .calibration
+            .as_ref()
+            .map_or_else(String::new, |identity| identity.fingerprint.clone()),
         load_shape: contract.load_shape,
         mode: route.mode,
         has_reference: route.reference_count > 0,
@@ -1818,6 +1931,60 @@ mod tests {
         spec
     }
 
+    /// AC (epic SC-22657, E2): every Chroma route publishes the geometry the loader actually builds
+    /// — the `ChromaTransformerConfig::default` trunk and the `crate::vae` decoder constants — the
+    /// contract passes the shared facts conformance check, and the weights-free surface (whose
+    /// sentinel root is not on disk) publishes nothing at all.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Chroma's real snapshot root is a tier subdirectory; the gate only asks that it exists.
+        let root = tmp.path().join("bf16");
+        std::fs::create_dir_all(&root).unwrap();
+        for route in ROUTES {
+            let contract =
+                uncalibrated_contract(route.provider, &spec(root.clone(), route.provider)).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `ChromaTransformerConfig::default()`.
+                    attention_heads: Some(24),
+                    head_dim: Some(128),
+                    // 19 double-stream + 38 single-stream blocks in one trunk.
+                    transformer_blocks: Some(57),
+                    // The 2x2 packing outside the trunk (`in_channels 64 = 16 * 2 * 2`).
+                    patch_size: Some(2),
+                    // `vae::LATENT_CHANNELS`.
+                    latent_channels: Some(16),
+                    // `vae::BLOCK_OUT` is four stages, so three halvings.
+                    vae_spatial_scale: Some(8),
+                    // Structurally absent: the FLUX.1 image autoencoder has no temporal axis.
+                    vae_temporal_scale: None,
+                    // `pipeline.rs` builds the DiT `VarBuilder` at `DType::F32`.
+                    activation_dtype_width: Some(4),
+                },
+                "{} architecture facts",
+                route.provider
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves nothing on disk, so no axis is knowable.
+            let weights_free = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            let contract = weights_free_contract(route.provider, &weights_free).unwrap();
+            assert!(
+                contract.architecture_facts.is_empty(),
+                "{} weights-free facts must be empty",
+                route.provider
+            );
+            // A weights-free contract legitimately declares nothing, so the E2 config-derived gate
+            // does not apply to it; the byte-decomposition half of the conformance walk still does.
+            gen_core_testkit::assert_memory_contract_asset_facts_conform(&contract);
+        }
+    }
+
     #[test]
     fn registry_behavior_fixtures_bind_each_exact_route_and_estimate_handshake() {
         let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -1868,6 +2035,70 @@ mod tests {
                 assert!(receipt.pid.is_none());
             }
         }
+    }
+
+    /// sc-22731 (epic sc-22723 E1/E4): every one of the nine shipped Candle Chroma cells (three
+    /// routes x three tiers) publishes its OWN production calibration identity through the
+    /// production contract builder, and the weights-free and finite-surface declarations still
+    /// publish none.
+    ///
+    /// Before sc-22731 `build_contract` hard-coded `calibration: None`, so no Chroma anchor could
+    /// be recorded on this lane at all — the lane could never become measured. The identity is a
+    /// KEY, not a claim of measurement: whether a cell HAS evidence is the anchor store's answer,
+    /// which is why the unmeasured weights-free declarations are unchanged.
+    ///
+    /// Mutation that fails this: restoring the unconditional `calibration: None` in
+    /// `build_contract` — all nine cells lose their identity; or passing the identity through in
+    /// `weights_free_contract` too — the declarations stop being unmeasured.
+    #[test]
+    fn every_shipped_candle_chroma_cell_publishes_its_own_identity_from_its_load_receipt() {
+        let mut published = std::collections::BTreeSet::new();
+        for route in ROUTES {
+            for (tier, expected_quant) in [
+                ("q4", Some(Quant::Q4)),
+                ("q8", Some(Quant::Q8)),
+                ("bf16", None),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = fixture_root(tmp.path(), *route, tier);
+                let load = spec(root, route.provider);
+                let label = format!("{} {tier}", route.provider);
+                let contract = provider_contract(route.provider, &load).unwrap();
+                let identity = contract
+                    .calibration
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{label}: no production identity"));
+                assert_eq!(identity.load_shape, contract.load_shape, "{label}");
+                assert_eq!(
+                    Some(identity.fingerprint.clone()),
+                    production_calibration_fingerprint(route.provider, expected_quant),
+                    "{label}"
+                );
+                assert!(
+                    identity.fingerprint.contains(tier),
+                    "{label}: names its tier"
+                );
+                // The declarations the capability dumps are generated from stay unmeasured.
+                assert!(
+                    weights_free_contract(route.provider, &load)
+                        .unwrap()
+                        .calibration
+                        .is_none(),
+                    "{label}: the weights-free declaration must publish no identity"
+                );
+                published.insert(identity.fingerprint.clone());
+            }
+        }
+        assert_eq!(
+            published.len(),
+            ROUTES.len() * 3,
+            "two (provider, tier) cells share one identity: {published:?}"
+        );
+        // An id no route serves, and a tier this family does not ship, have no cell at all.
+        assert!(production_calibration_fingerprint("chroma1_unknown", None).is_none());
+        assert!(
+            production_calibration_fingerprint(crate::CHROMA1_HD_ID, Some(Quant::Nvfp4)).is_none()
+        );
     }
 
     #[test]
@@ -2084,8 +2315,16 @@ mod tests {
                 },
             },
             optimization_authority: gen_core::MemoryOptimizationAuthority::Estimated,
-            calibration_abi: 0,
-            calibration_fingerprint: String::new(),
+            // sc-22731: the contract's own identity, so this helper follows the production contract
+            // whether or not it publishes one.
+            calibration_abi: contract
+                .calibration
+                .as_ref()
+                .map_or(0, |identity| identity.abi),
+            calibration_fingerprint: contract
+                .calibration
+                .as_ref()
+                .map_or_else(String::new, |identity| identity.fingerprint.clone()),
             load_shape: contract.load_shape,
             geometry: gen_core::MemoryGeometry {
                 width: 1024,
