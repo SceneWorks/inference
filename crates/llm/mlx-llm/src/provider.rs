@@ -1868,6 +1868,36 @@ fn load_chat_template(
     }
 }
 
+/// Match the text-only `generate_inner` rendering/tokenization path without loading weights.
+/// Campaign preflight uses this before MLX admission; the product still revalidates at dispatch.
+pub(crate) fn campaign_preflight_request_tokens(
+    snapshot: &Path,
+    request: &TextLlmRequest,
+) -> CoreResult<u64> {
+    let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json"))?;
+    let (template, ..) = load_chat_template(snapshot);
+    let prompt = template.render_with(
+        &request.messages,
+        &RenderOptions {
+            add_generation_prompt: true,
+            enable_thinking: request.enable_thinking_kwarg(),
+            reasoning_effort: request.reasoning_effort,
+            preserve_thinking: request.preserve_thinking,
+            tools: &request.tools,
+        },
+    )?;
+    u64::try_from(tokenizer.encode(&prompt, false)?.len())
+        .ok()
+        .and_then(|tokens| tokens.checked_add(u64::from(request.max_new_tokens)))
+        .ok_or_else(|| {
+            CoreError::InvalidRequest("campaign rendered request token count overflow".into())
+        })
+}
+
+pub(crate) fn campaign_preflight_cancellation_tokens(snapshot: &Path) -> CoreResult<u64> {
+    campaign_preflight_request_tokens(snapshot, &campaign_cancellation_probe_request())
+}
+
 /// The modern HF layout ships the chat template as a **separate `chat_template.jinja`** beside
 /// `tokenizer_config.json` rather than inside it (transformers writes it that way for newer
 /// releases — `google/gemma-4-12B-it` is one, and its `tokenizer_config.json` carries no

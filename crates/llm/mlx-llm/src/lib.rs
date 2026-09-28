@@ -41,6 +41,7 @@
 //! therefore neither `Send` nor `Sync`. Drive one engine from one thread (or behind a mutex).
 
 pub mod campaign;
+pub mod campaign_supervisor;
 pub mod config;
 pub mod decode;
 pub mod error;

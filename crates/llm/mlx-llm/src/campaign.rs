@@ -12,9 +12,85 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+
+use crate::campaign_supervisor::{self, RunRequest, SafetyPolicy, SystemProbe};
+
+pub const SC20671_SCHEDULE_VERSION: u64 = 2;
+pub const SC20671_CAMPAIGN_KIND: &str = "sc-20671-complete-covering-set";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CampaignSafetyPolicy {
+    pub schema_version: u64,
+    pub row_deadline_seconds: u64,
+    pub poll_millis: u64,
+    pub term_grace_millis: u64,
+    pub host_free_reserve_bytes: u64,
+    pub child_footprint_cap_bytes: u64,
+    pub max_context_tokens: u64,
+    pub max_request_tokens: u64,
+    pub stdout_cap_bytes: u64,
+    pub stderr_cap_bytes: u64,
+}
+
+impl CampaignSafetyPolicy {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1
+            || self.row_deadline_seconds == 0
+            || self.poll_millis == 0
+            || self.term_grace_millis == 0
+            || self.host_free_reserve_bytes == 0
+            || self.child_footprint_cap_bytes == 0
+            || self.max_context_tokens == 0
+            || self.max_request_tokens == 0
+            || self.stdout_cap_bytes == 0
+            || self.stderr_cap_bytes == 0
+            || self
+                .host_free_reserve_bytes
+                .checked_add(self.child_footprint_cap_bytes)
+                .is_none()
+            || self.poll_millis >= self.row_deadline_seconds.saturating_mul(1_000)
+            || self.term_grace_millis >= self.row_deadline_seconds.saturating_mul(1_000)
+        {
+            return Err("SC-20671/76 safety policy is missing, unsupported, or invalid".into());
+        }
+        Ok(())
+    }
+
+    pub fn supervisor(&self) -> SafetyPolicy {
+        SafetyPolicy {
+            deadline: Duration::from_secs(self.row_deadline_seconds),
+            poll_interval: Duration::from_millis(self.poll_millis),
+            term_grace: Duration::from_millis(self.term_grace_millis),
+            host_free_reserve_bytes: self.host_free_reserve_bytes,
+            child_footprint_cap_bytes: self.child_footprint_cap_bytes,
+            max_context_tokens: self.max_context_tokens,
+            max_request_tokens: self.max_request_tokens,
+            stdout_cap_bytes: self.stdout_cap_bytes,
+            stderr_cap_bytes: self.stderr_cap_bytes,
+        }
+    }
+
+    pub fn seal(&self) -> Result<String, String> {
+        let value = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        Ok(seal_bytes(
+            &canonical_json_bytes(&value).map_err(|e| e.to_string())?,
+        ))
+    }
+}
+
+pub fn load_campaign_safety_policy(path: &Path) -> Result<CampaignSafetyPolicy, String> {
+    let bytes = fs::read(path).map_err(|e| format!("read mandatory safety policy: {e}"))?;
+    let policy: CampaignSafetyPolicy = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("decode mandatory safety policy: {e}"))?;
+    policy.validate()?;
+    Ok(policy)
+}
 
 use core_llm::{
-    Message, Role, Sampling, StreamEvent, TextLlmOutput, TextLlmRequest, ThinkingMode, ToolSpec,
+    Message, Role, Sampling, StreamEvent, TextLlmOutput, TextLlmRequest, ThinkingMode, Tokenizer,
+    ToolSpec,
 };
 
 pub const REQUIRED_PHASES: [&str; 8] = [
@@ -337,6 +413,158 @@ pub fn context_band_target(context_window: u64, context_band: &str) -> Result<u6
         "fit-boundary" => Ok(fit_boundary),
         _ => Err(format!("unknown context band {context_band}")),
     }
+}
+
+/// Compute a conservative total-live-token bound using only the pinned tokenizer and source
+/// fixture construction. Product chat rendering is separately capped by the native window; the
+/// prefix/batch paths bypass that renderer, so their exact raw prompt lengths are checked here.
+/// A lifecycle can hold one prefix cache alongside one full native-window request, while a batch
+/// can hold two prefix-length lanes. This is checked before any weights or Metal model is loaded.
+fn preflight_total_live_tokens(
+    snapshot: &Path,
+    spec: &BenchmarkModelSpec,
+    coordinate: &Coordinate,
+    prompt: &str,
+) -> Result<(u64, u64), String> {
+    let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json"))
+        .map_err(|e| format!("load pinned tokenizer for safety preflight: {e}"))?;
+    let target = context_band_target(spec.native_context_tokens, coordinate.context_band)?;
+    let header = format!("SC20671-CONTEXT-BAND-{}", coordinate.context_band);
+    let token_count = |text: &str| -> Result<u64, String> {
+        u64::try_from(
+            tokenizer
+                .encode(text, false)
+                .map_err(|e| e.to_string())?
+                .len(),
+        )
+        .map_err(|_| "preflight token count overflows u64".into())
+    };
+    let mut lower = 0_usize;
+    let mut upper = usize::try_from(target).map_err(|_| "target overflows usize")?;
+    while lower < upper {
+        let midpoint = lower + (upper - lower).div_ceil(2);
+        let candidate = format!("{header}{}", " context".repeat(midpoint));
+        if token_count(&candidate)? <= target {
+            lower = midpoint;
+        } else {
+            upper = midpoint - 1;
+        }
+    }
+    let payload = format!("{header}{}", " context".repeat(lower));
+    let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e";
+    let prompts = [
+        format!("{prompt}\n{payload}\nReturn a concise deterministic answer."),
+        format!("{prompt}\n{payload}\nCall record_baseline_fact with fact exactly `SC20671 structured fixture`."),
+        needle_fixture_prompt(prompt, &payload, needle),
+        format!("{prompt}\n{payload}\nRepeat the stable baseline fact."),
+    ];
+    let max_prefix = prompts
+        .iter()
+        .map(|text| token_count(text))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or("no fixture prompts")?;
+    let direct_request = max_prefix
+        .checked_add(2)
+        .ok_or("direct request token count overflows")?;
+    if max_prefix > spec.native_context_tokens.saturating_sub(256) {
+        return Err(format!(
+            "{} fixture prompt exceeds the producer's native-context reserve before model load",
+            coordinate_slug(coordinate)
+        ));
+    }
+    // Direct prefix and batch paths bypass the chat renderer but generate at most one/two tokens.
+    if direct_request > spec.native_context_tokens {
+        return Err(format!(
+            "{} prefix/batch prompt exceeds native context before model load",
+            coordinate_slug(coordinate)
+        ));
+    }
+    let rendered = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let tools = if index == 1 {
+                vec![structured_fixture_tool()]
+            } else {
+                Vec::new()
+            };
+            crate::provider::campaign_preflight_request_tokens(
+                snapshot,
+                &fixture_request(text.clone(), tools),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .ok_or("no rendered requests")?;
+    let cancellation = crate::provider::campaign_preflight_cancellation_tokens(snapshot)
+        .map_err(|e| e.to_string())?;
+    if rendered > spec.native_context_tokens || cancellation > spec.native_context_tokens {
+        return Err(format!(
+            "{} rendered request exceeds native context before model load",
+            coordinate_slug(coordinate)
+        ));
+    }
+    let max_request = rendered.max(direct_request).max(cancellation);
+    let prefix_plus_request = max_prefix
+        .checked_add(1)
+        .and_then(|prefix| prefix.checked_add(rendered.max(cancellation)))
+        .ok_or("total live context overflows u64")?;
+    let batch = max_prefix
+        .checked_add(2)
+        .and_then(|tokens| tokens.checked_mul(2))
+        .ok_or("batch live context overflows u64")?;
+    let total = if coordinate.request_mode == "supported-batch" {
+        if coordinate.prefill_mode == "chunked" {
+            prefix_plus_request.max(batch)
+        } else {
+            max_request.max(batch)
+        }
+    } else if coordinate.prefill_mode == "chunked" {
+        prefix_plus_request
+    } else {
+        max_request
+    };
+    Ok((total, max_request))
+}
+
+fn admitted_row_tokens(
+    coordinate: &Coordinate,
+    candidate_snapshot: &Path,
+    reference_snapshot: &Path,
+    prompt: &str,
+    policy: &CampaignSafetyPolicy,
+) -> Result<(u64, u64), String> {
+    if ["memory-material", "fit-boundary"].contains(&coordinate.context_band) {
+        return Err(format!(
+            "{} incomplete: no validated source-backed transient prefill peak bound for this required long-context geometry; token and polling limits alone cannot admit it",
+            coordinate_slug(coordinate)
+        ));
+    }
+    let candidate = benchmark_model(coordinate.family, false)?;
+    let reference = benchmark_model(coordinate.family, true)?;
+    let candidate_tokens =
+        preflight_total_live_tokens(candidate_snapshot, candidate, coordinate, prompt)?;
+    let reference_tokens =
+        preflight_total_live_tokens(reference_snapshot, reference, coordinate, prompt)?;
+    let total = candidate_tokens.0.max(reference_tokens.0);
+    let max_request = candidate_tokens.1.max(reference_tokens.1);
+    if max_request > policy.max_request_tokens {
+        return Err(format!(
+            "{} requires actual request ceiling {max_request}; policy refuses before model load",
+            coordinate_slug(coordinate)
+        ));
+    }
+    if total > policy.max_context_tokens {
+        return Err(format!(
+            "{} requires conservative total-live ceiling {total}; policy refuses before model load",
+            coordinate_slug(coordinate)
+        ));
+    }
+    Ok((total, max_request))
 }
 
 fn valid_locked_mlx_fields(version: &str, source: &str, revision: &str) -> bool {
@@ -2304,19 +2532,22 @@ pub fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
     .map_err(|error| error.to_string())
 }
 
-/// Atomically publish the *whole* 64-coordinate receipt collection.  Individual worker output is
+/// Atomically publish the whole eight-coordinate receipt collection. Individual worker output is
 /// intentionally not a campaign result; only this function creates `destination`, and it does so
 /// after every receipt, sidecar, coordinate, and product-owned worker PID has been validated.
 pub fn publish_complete_campaign(
     destination: &Path,
     prepared: &[PreparedCoordinateReceipt],
+    resume_identity: &serde_json::Value,
+    policy: &CampaignSafetyPolicy,
 ) -> Result<(), String> {
+    let policy_sha256 = policy.seal()?;
     if destination.exists() {
         return Err("campaign destination must be absent for atomic publication".into());
     }
     let schedule = required_schedule();
     if prepared.len() != schedule.len() {
-        return Err("complete campaign requires exactly 64 prepared receipts".into());
+        return Err("complete campaign requires exactly eight prepared receipts".into());
     }
     let mut outcomes = Vec::with_capacity(prepared.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -2436,10 +2667,24 @@ pub fn publish_complete_campaign(
             }));
         }
         let manifest = serde_json::json!({
-            "schemaVersion": 1,
-            "kind": "sc-20671-complete-coordinate-set",
+            "schemaVersion": 2,
+            "kind": SC20671_CAMPAIGN_KIND,
+            "scheduleVersion": SC20671_SCHEDULE_VERSION,
+            "policySha256": policy_sha256,
+            "resumeIdentitySha256": seal_bytes(&canonical_json_bytes(resume_identity).map_err(|e| e.to_string())?),
             "coordinates": manifest_rows,
         });
+        let (identity_bytes, identity_sha) = seal_json(resume_identity)?;
+        let (policy_bytes, _) =
+            seal_json(&serde_json::to_value(policy).map_err(|e| e.to_string())?)?;
+        fs::write(staging.join("safety-policy.json"), policy_bytes).map_err(|e| e.to_string())?;
+        fs::write(staging.join("resume-identity.json"), identity_bytes)
+            .map_err(|e| e.to_string())?;
+        fs::write(
+            staging.join("resume-identity.json.sha256"),
+            format!("{identity_sha}  resume-identity.json\n"),
+        )
+        .map_err(|e| e.to_string())?;
         let manifest_bytes = canonical_json_bytes(&manifest).map_err(|e| e.to_string())?;
         fs::write(staging.join("campaign.json"), &manifest_bytes).map_err(|e| e.to_string())?;
         fs::write(
@@ -2460,7 +2705,7 @@ pub fn publish_complete_campaign(
 /// memory-material long-context row, not the campaign's near-fit calibration row.
 pub const SC20676_BASELINE_CONTEXT_BAND: &str = "memory-material";
 
-/// A sealed candidate baseline selected from a complete SC-20671 64-coordinate publication.
+/// A sealed candidate baseline selected from a complete SC-20671 publication.
 /// `inventory` is recomputed from the tested snapshot by the consumer and compared byte-for-byte.
 #[derive(Clone, Debug)]
 pub struct Sc20676BaselineRow {
@@ -2500,7 +2745,7 @@ fn manifest_file_bindings(
 
 /// Reconstruct and validate the exact published SC-20671 campaign, including every artifact
 /// bundle named by the campaign manifest.  This is stricter than a receipt-only consumer: a
-/// selected row is trusted only after all 64 receipt/human/fixture bytes, sidecars, identities,
+/// selected row is trusted only after all receipt/human/fixture bytes, sidecars, identities,
 /// and product worker PIDs have been bound back to the whole campaign.
 pub fn load_validated_complete_campaign(
     campaign_directory: &Path,
@@ -2512,22 +2757,90 @@ pub fn load_validated_complete_campaign(
         return Err("SC-20671 campaign manifest sidecar does not match exact bytes".into());
     }
     let value: serde_json::Value = serde_json::from_slice(&manifest).map_err(|e| e.to_string())?;
-    if value
-        .get("schemaVersion")
-        .and_then(serde_json::Value::as_u64)
-        != Some(1)
-        || value.get("kind").and_then(serde_json::Value::as_str)
-            != Some("sc-20671-complete-coordinate-set")
-    {
-        return Err("SC-20671 campaign manifest identity is invalid".into());
-    }
+    let (schedule, resume_identity, safety_policy) = match (
+        value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64),
+        value.get("kind").and_then(serde_json::Value::as_str),
+    ) {
+        (Some(1), Some("sc-20671-complete-coordinate-set")) => {
+            (legacy_required_schedule(), None, None)
+        }
+        (Some(2), Some(SC20671_CAMPAIGN_KIND))
+            if value
+                .get("scheduleVersion")
+                .and_then(serde_json::Value::as_u64)
+                == Some(SC20671_SCHEDULE_VERSION) =>
+        {
+            for key in ["policySha256", "resumeIdentitySha256"] {
+                let digest = value
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("SC-20671 v2 manifest lacks safety identity")?;
+                if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err("SC-20671 v2 manifest has malformed safety identity".into());
+                }
+            }
+            let identity_bytes = fs::read(campaign_directory.join("resume-identity.json"))
+                .map_err(|e| e.to_string())?;
+            let identity_sha = seal_bytes(&identity_bytes);
+            if value
+                .get("resumeIdentitySha256")
+                .and_then(serde_json::Value::as_str)
+                != Some(identity_sha.as_str())
+                || fs::read_to_string(campaign_directory.join("resume-identity.json.sha256"))
+                    .map_err(|e| e.to_string())?
+                    != format!("{identity_sha}  resume-identity.json\n")
+            {
+                return Err("SC-20671 published resume identity bytes or sidecar drifted".into());
+            }
+            let identity: serde_json::Value =
+                serde_json::from_slice(&identity_bytes).map_err(|e| e.to_string())?;
+            if value.get("policySha256") != identity.get("policySha256")
+                || identity
+                    .get("scheduleVersion")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(SC20671_SCHEDULE_VERSION)
+                || identity
+                    .get("schemaVersion")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(1)
+                || identity.get("kind").and_then(serde_json::Value::as_str)
+                    != Some("sc-20671-resume-identity")
+                || identity.get("coordinates")
+                    != Some(&serde_json::json!(required_coordinates()
+                        .iter()
+                        .map(coordinate_slug)
+                        .collect::<Vec<_>>()))
+                || seal_json(&identity)?.0 != identity_bytes
+            {
+                return Err("SC-20671 published resume identity semantics drifted".into());
+            }
+            let policy_bytes = fs::read(campaign_directory.join("safety-policy.json"))
+                .map_err(|e| e.to_string())?;
+            let policy: CampaignSafetyPolicy =
+                serde_json::from_slice(&policy_bytes).map_err(|e| e.to_string())?;
+            policy.validate()?;
+            if policy.seal()?.as_str()
+                != value
+                    .get("policySha256")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                || seal_json(&serde_json::to_value(&policy).map_err(|e| e.to_string())?)?.0
+                    != policy_bytes
+            {
+                return Err("SC-20671 published safety policy bytes drifted".into());
+            }
+            (required_schedule(), Some(identity), Some(policy))
+        }
+        _ => return Err("SC-20671 campaign manifest identity is invalid".into()),
+    };
     let rows = value
         .get("coordinates")
         .and_then(serde_json::Value::as_array)
         .ok_or("SC-20671 campaign manifest has no coordinate rows")?;
-    let schedule = required_schedule();
     if rows.len() != schedule.len() {
-        return Err("SC-20671 campaign manifest is not a complete 64-coordinate set".into());
+        return Err("SC-20671 campaign manifest is not a complete scheduled set".into());
     }
     let mut prepared = Vec::with_capacity(schedule.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -2556,6 +2869,16 @@ pub fn load_validated_complete_campaign(
         let receipt: Receipt =
             serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
         validate_sealed_receipt(&receipt)?;
+        if let Some(identity) = &resume_identity {
+            validate_receipt_launch_identity(&receipt, &coordinate, identity)?;
+        }
+        if let Some(policy) = &safety_policy {
+            if receipt.geometry.context_target_tokens > policy.max_context_tokens
+                || receipt.geometry.query_length > policy.max_request_tokens
+            {
+                return Err("SC-20671 published row exceeds declared safety ceilings".into());
+            }
+        }
         let worker_pid = receipt
             .memory
             .phase_samples
@@ -2633,7 +2956,7 @@ pub fn load_validated_complete_campaign(
 }
 
 /// Load and validate a whole published SC-20671 campaign before selecting the one exact long-
-/// context candidate row for `family`.  This never accepts a standalone receipt: all 64 immutable
+/// context candidate row for `family`. This never accepts a standalone receipt: all immutable
 /// schedule rows, manifest hashes, receipt seals, and coordinate/family matches must be present.
 pub fn select_sc20676_baseline_row(
     campaign_directory: &Path,
@@ -2729,16 +3052,264 @@ pub struct CampaignLaunch {
     pub qwen_fp32_reference_snapshot: PathBuf,
     pub prompt_file: PathBuf,
     pub destination: PathBuf,
+    pub resume_dir: PathBuf,
+    pub safety_policy: PathBuf,
 }
 
-/// Spawn every immutable matrix row.  A cold row receives a brand-new child process.  Warm rows
-/// also run in a child, but that child is required to perform an in-process warm-up before its
-/// measured lifecycle; its receipt PID is later checked by [`publish_complete_campaign`].  Child
-/// results live in a hidden staging root and are deleted on *any* failure, so incomplete sets can
-/// never appear at the requested destination.
+fn file_seal(path: &Path) -> Result<String, String> {
+    let mut input = File::open(path).map_err(|e| e.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = input.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex(&digest.finalize()))
+}
+
+fn resume_identity(
+    launch: &CampaignLaunch,
+    policy_sha256: &str,
+    inventories: &[SnapshotInventory; 4],
+) -> Result<serde_json::Value, String> {
+    let inference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .ok_or("inference root")?;
+    let scene_works_root = PathBuf::from(required_campaign_env("SCENEWORKS_ROOT")?);
+    checked_repository_identity(inference_root, INFERENCE_REPOSITORY)?;
+    checked_repository_identity(&scene_works_root, SCENEWORKS_REPOSITORY)?;
+    let inventory_value = |index: usize| {
+        serde_json::json!({
+            "sha256": inventories[index].sha256,
+            "bytes": inventories[index].bytes,
+        })
+    };
+    Ok(serde_json::json!({
+        "schemaVersion": 1,
+        "kind": "sc-20671-resume-identity",
+        "scheduleVersion": SC20671_SCHEDULE_VERSION,
+        "coordinates": required_coordinates().iter().map(coordinate_slug).collect::<Vec<_>>(),
+        "inferenceRevision": checked_git_revision(inference_root)?,
+        "sceneWorksRevision": checked_git_revision(&scene_works_root)?,
+        "executableSha256": file_seal(&launch.executable)?,
+        "promptSha256": file_seal(&launch.prompt_file)?,
+        "policySha256": policy_sha256,
+        "llamaCandidate": inventory_value(0),
+        "qwenCandidate": inventory_value(1),
+        "llamaReference": inventory_value(2),
+        "qwenReference": inventory_value(3),
+    }))
+}
+
+fn seal_json(value: &serde_json::Value) -> Result<(Vec<u8>, String), String> {
+    let bytes = canonical_json_bytes(value).map_err(|e| e.to_string())?;
+    let sha = seal_bytes(&bytes);
+    Ok((bytes, sha))
+}
+
+fn preserve_captured_source(root: &Path, identity: &mut serde_json::Value) -> Result<(), String> {
+    if root.exists() {
+        let prior: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("identity.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        // A moved source ref cannot stale identical executable/model/contract bytes. Preserve the
+        // captured refs as provenance; all new rows must stamp that same executable provenance.
+        for key in ["inferenceRevision", "sceneWorksRevision"] {
+            let captured = prior
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or("resume identity lacks captured source revision")?;
+            identity[key] = serde_json::Value::String(captured.to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn prepare_resume_root(root: &Path, identity: &mut serde_json::Value) -> Result<String, String> {
+    preserve_captured_source(root, identity)?;
+    let (bytes, sha) = seal_json(identity)?;
+    let sidecar = format!("{sha}  identity.json\n");
+    if root.exists() {
+        if !root.is_dir()
+            || fs::read(root.join("identity.json")).map_err(|e| e.to_string())? != bytes
+            || fs::read_to_string(root.join("identity.json.sha256")).map_err(|e| e.to_string())?
+                != sidecar
+        {
+            return Err("SC-20671 resume identity differs from current source, models, executable, schedule, prompt, or policy".into());
+        }
+    } else {
+        fs::create_dir(root).map_err(|e| e.to_string())?;
+        fs::write(root.join("identity.json"), &bytes).map_err(|e| e.to_string())?;
+        fs::write(root.join("identity.json.sha256"), sidecar).map_err(|e| e.to_string())?;
+    }
+    Ok(sha)
+}
+
+/// Read-only preflight used to hand the exact producer-calculated identity and policy seal to
+/// an independent consumer before any model child is started.
+pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json::Value, String> {
+    let policy = load_campaign_safety_policy(&launch.safety_policy)?;
+    let inventories = [
+        validate_benchmark_snapshot(&launch.llama_snapshot, &LLAMA_CANDIDATE)?,
+        validate_benchmark_snapshot(&launch.qwen_snapshot, &QWEN_CANDIDATE)?,
+        validate_benchmark_snapshot(&launch.llama_fp32_reference_snapshot, &LLAMA_REFERENCE)?,
+        validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?,
+    ];
+    let prompt = fs::read_to_string(&launch.prompt_file).map_err(|e| e.to_string())?;
+    if prompt.trim().is_empty() {
+        return Err("campaign prompt must not be empty".into());
+    }
+    let mut row_admission = Vec::new();
+    for row in required_schedule() {
+        let (candidate, reference) = if row.coordinate.family == "llama" {
+            (
+                &launch.llama_snapshot,
+                &launch.llama_fp32_reference_snapshot,
+            )
+        } else {
+            (&launch.qwen_snapshot, &launch.qwen_fp32_reference_snapshot)
+        };
+        let coordinate = coordinate_slug(&row.coordinate);
+        match admitted_row_tokens(&row.coordinate, candidate, reference, &prompt, &policy) {
+            Ok((total, request)) => row_admission.push(serde_json::json!({
+                "coordinate": coordinate, "admitted": true,
+                "totalLiveTokenBound": total, "requestTokenBound": request,
+            })),
+            Err(reason) => row_admission.push(serde_json::json!({
+                "coordinate": coordinate, "admitted": false, "reason": reason,
+            })),
+        }
+    }
+    let policy_sha256 = policy.seal()?;
+    let mut identity = resume_identity(launch, &policy_sha256, &inventories)?;
+    preserve_captured_source(&launch.resume_dir, &mut identity)?;
+    let (identity_bytes, resume_identity_sha256) = seal_json(&identity)?;
+    if launch.resume_dir.exists()
+        && (fs::read(launch.resume_dir.join("identity.json")).map_err(|e| e.to_string())?
+            != identity_bytes
+            || fs::read_to_string(launch.resume_dir.join("identity.json.sha256"))
+                .map_err(|e| e.to_string())?
+                != format!("{resume_identity_sha256}  identity.json\n"))
+    {
+        return Err(
+            "SC-20671 existing resume identity does not match current behavior inputs".into(),
+        );
+    }
+    Ok(serde_json::json!({
+        "schemaVersion": 1,
+        "policySha256": policy_sha256,
+        "resumeIdentitySha256": resume_identity_sha256,
+        "identity": identity,
+        "completeAdmitted": row_admission.iter().all(|row|
+            row.get("admitted").and_then(serde_json::Value::as_bool) == Some(true)),
+        "rows": row_admission,
+    }))
+}
+
+fn row_binding_path(root: &Path, slug: &str) -> PathBuf {
+    root.join(format!("{slug}.binding.json"))
+}
+
+fn row_binding(
+    identity_sha256: &str,
+    receipt: &Receipt,
+    receipt_bytes: &[u8],
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "resumeIdentitySha256": identity_sha256,
+        "receiptSha256": receipt.receipt_sha256,
+        "receiptFileSha256": seal_bytes(receipt_bytes),
+    })
+}
+
+fn validate_receipt_launch_identity(
+    receipt: &Receipt,
+    coordinate: &Coordinate,
+    identity: &serde_json::Value,
+) -> Result<(), String> {
+    let slug = coordinate_slug(coordinate);
+    let p = &receipt.provenance;
+    let field = |key| identity.get(key).and_then(serde_json::Value::as_str);
+    let inventory = |key: &str| {
+        identity
+            .get(key)
+            .and_then(|v| v.get("sha256"))
+            .and_then(serde_json::Value::as_str)
+    };
+    let inventory_bytes = |key: &str| {
+        identity
+            .get(key)
+            .and_then(|v| v.get("bytes"))
+            .and_then(serde_json::Value::as_u64)
+    };
+    let (candidate, reference) = if coordinate.family == "llama" {
+        ("llamaCandidate", "llamaReference")
+    } else {
+        ("qwenCandidate", "qwenReference")
+    };
+    if p.inference_revision != field("inferenceRevision").unwrap_or("")
+        || p.scene_works_revision != field("sceneWorksRevision").unwrap_or("")
+        || p.model_file_sha256 != inventory(candidate).unwrap_or("")
+        || Some(p.model_file_bytes) != inventory_bytes(candidate)
+        || p.reference_model_sha256 != inventory(reference).unwrap_or("")
+        || Some(p.reference_model_bytes) != inventory_bytes(reference)
+        || receipt.matrix.family != coordinate.family
+        || receipt.matrix.context_band != coordinate.context_band
+        || receipt.matrix.request_mode != coordinate.request_mode
+        || receipt.matrix.prefill_mode != coordinate.prefill_mode
+        || receipt.matrix.process_temperature != coordinate.process_temperature
+    {
+        return Err(format!(
+            "resume row {slug} has stale source, model, or coordinate identity"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_resume_row(
+    root: &Path,
+    coordinate: &Coordinate,
+    identity: &serde_json::Value,
+    identity_sha256: &str,
+) -> Result<PreparedCoordinateReceipt, String> {
+    let slug = coordinate_slug(coordinate);
+    let item = load_prepared_coordinate_receipt(&root.join(&slug), coordinate.clone())?;
+    let receipt: Receipt =
+        serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+    validate_sealed_receipt(&receipt)?;
+    validate_receipt_launch_identity(&receipt, coordinate, identity)?;
+    let expected = seal_json(&row_binding(
+        identity_sha256,
+        &receipt,
+        &item.bundle.receipt,
+    ))?
+    .0;
+    if fs::read(row_binding_path(root, &slug)).map_err(|e| e.to_string())? != expected {
+        return Err(format!(
+            "resume row {slug} has missing or stale identity binding"
+        ));
+    }
+    Ok(item)
+}
+
+/// Run one row at a time under a mandatory bounded policy. Valid sealed rows stay in an
+/// identity-bound resume directory after a failure; the destination appears only after all eight
+/// scheduled rows have been accepted.
 pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
     if launch.destination.exists() {
         return Err("campaign destination already exists".into());
+    }
+    if !launch.resume_dir.is_absolute() || !launch.destination.is_absolute() {
+        return Err("campaign destination and resume directory must be absolute paths".into());
+    }
+    if launch.resume_dir == launch.destination {
+        return Err("campaign resume directory must differ from destination".into());
     }
     for path in [
         &launch.executable,
@@ -2747,6 +3318,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
         &launch.llama_fp32_reference_snapshot,
         &launch.qwen_fp32_reference_snapshot,
         &launch.prompt_file,
+        &launch.safety_policy,
     ] {
         if !path.exists() {
             return Err(format!(
@@ -2755,83 +3327,150 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
             ));
         }
     }
-    // Validate every role before a single worker is spawned.  The worker repeats the family-local
-    // check before loading, so neither command boundary can smuggle in an arbitrary snapshot.
-    validate_benchmark_snapshot(&launch.llama_snapshot, &LLAMA_CANDIDATE)?;
-    validate_benchmark_snapshot(&launch.qwen_snapshot, &QWEN_CANDIDATE)?;
-    validate_benchmark_snapshot(&launch.llama_fp32_reference_snapshot, &LLAMA_REFERENCE)?;
-    validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?;
-    let parent = launch
-        .destination
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let worker_root = parent.join(format!(".sc20671-workers-{}", std::process::id()));
-    if worker_root.exists() {
-        return Err("worker staging root already exists".into());
-    }
-    fs::create_dir(&worker_root).map_err(|e| e.to_string())?;
+    let policy = load_campaign_safety_policy(&launch.safety_policy)?;
+    let policy_sha256 = policy.seal()?;
+    let inventories = [
+        validate_benchmark_snapshot(&launch.llama_snapshot, &LLAMA_CANDIDATE)?,
+        validate_benchmark_snapshot(&launch.qwen_snapshot, &QWEN_CANDIDATE)?,
+        validate_benchmark_snapshot(&launch.llama_fp32_reference_snapshot, &LLAMA_REFERENCE)?,
+        validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?,
+    ];
     let schedule = required_schedule();
-    let result = (|| -> Result<(), String> {
-        let mut prepared = Vec::with_capacity(schedule.len());
-        let mut failures = Vec::new();
-        for (index, row) in schedule.iter().enumerate() {
-            let child_dir = worker_root.join(coordinate_slug(&row.coordinate));
-            let snapshot = if row.coordinate.family == "llama" {
-                &launch.llama_snapshot
-            } else {
-                &launch.qwen_snapshot
-            };
-            let reference_snapshot = if row.coordinate.family == "llama" {
-                &launch.llama_fp32_reference_snapshot
-            } else {
-                &launch.qwen_fp32_reference_snapshot
-            };
-            let output = Command::new(&launch.executable)
-                .arg("worker")
-                .arg("--coordinate-index")
-                .arg(index.to_string())
-                .arg("--snapshot")
-                .arg(snapshot)
-                .arg("--prompt-file")
-                .arg(&launch.prompt_file)
-                .arg("--fp32-reference-snapshot")
-                .arg(reference_snapshot)
-                .arg("--out")
-                .arg(&child_dir)
-                .output()
-                .map_err(|e| format!("launch worker {index}: {e}"))?;
-            if !output.status.success() {
-                let failure = format!(
-                    "{}: {}",
-                    coordinate_slug(&row.coordinate),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                eprintln!("coordinate {}/64 failed: {failure}", index + 1);
-                failures.push(failure);
-                continue;
+    let prompt = fs::read_to_string(&launch.prompt_file).map_err(|e| e.to_string())?;
+    if prompt.trim().is_empty() {
+        return Err("campaign prompt must not be empty".into());
+    }
+    let mut identity = resume_identity(launch, &policy_sha256, &inventories)?;
+    let identity_sha256 = prepare_resume_root(&launch.resume_dir, &mut identity)?;
+    let allowed = schedule
+        .iter()
+        .map(|row| coordinate_slug(&row.coordinate))
+        .collect::<std::collections::BTreeSet<_>>();
+    for entry in fs::read_dir(&launch.resume_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
+            && !allowed.contains(&name)
+            && !allowed
+                .iter()
+                .any(|slug| name == format!("{slug}.binding.json"))
+        {
+            return Err(format!("unexpected or partial resume artifact: {name}"));
+        }
+    }
+    let mut prepared = Vec::with_capacity(schedule.len());
+    for (index, row) in schedule.iter().enumerate() {
+        let slug = coordinate_slug(&row.coordinate);
+        let child_dir = launch.resume_dir.join(&slug);
+        let binding_path = row_binding_path(&launch.resume_dir, &slug);
+        if child_dir.exists() || binding_path.exists() {
+            if !child_dir.exists() || !binding_path.exists() {
+                return Err(format!(
+                    "partial resume row {slug} must be repaired explicitly"
+                ));
             }
-            prepared.push(load_prepared_coordinate_receipt(
-                &child_dir,
-                row.coordinate.clone(),
+            prepared.push(validate_resume_row(
+                &launch.resume_dir,
+                &row.coordinate,
+                &identity,
+                &identity_sha256,
             )?);
             eprintln!(
-                "coordinate {}/64 accepted: {}",
+                "coordinate {}/{} resumed: {slug}",
                 index + 1,
-                coordinate_slug(&row.coordinate)
+                schedule.len()
             );
+            continue;
         }
-        if !failures.is_empty() {
+        let snapshot = if row.coordinate.family == "llama" {
+            &launch.llama_snapshot
+        } else {
+            &launch.qwen_snapshot
+        };
+        let reference_snapshot = if row.coordinate.family == "llama" {
+            &launch.llama_fp32_reference_snapshot
+        } else {
+            &launch.qwen_fp32_reference_snapshot
+        };
+        let (total_tokens, request_tokens) = admitted_row_tokens(
+            &row.coordinate,
+            snapshot,
+            reference_snapshot,
+            &prompt,
+            &policy,
+        )?;
+        let mut command = Command::new(&launch.executable);
+        command
+            .arg("worker")
+            .arg("--coordinate-index")
+            .arg(index.to_string())
+            .arg("--snapshot")
+            .arg(snapshot)
+            .arg("--prompt-file")
+            .arg(&launch.prompt_file)
+            .arg("--fp32-reference-snapshot")
+            .arg(reference_snapshot)
+            .arg("--safety-policy")
+            .arg(&launch.safety_policy)
+            .arg("--policy-sha256")
+            .arg(&policy_sha256)
+            .arg("--resume-identity")
+            .arg(launch.resume_dir.join("identity.json"))
+            .arg("--resume-identity-sha256")
+            .arg(&identity_sha256)
+            .arg("--out")
+            .arg(&child_dir);
+        let logs = launch.resume_dir.join("logs");
+        let log_prefix = (0_u64..)
+            .map(|attempt| format!("{slug}.attempt-{attempt}"))
+            .find(|prefix| {
+                !logs.join(format!("{prefix}.stdout.log")).exists()
+                    && !logs.join(format!("{prefix}.stderr.log")).exists()
+            })
+            .ok_or("no unused bounded worker log path")?;
+        let request = RunRequest {
+            context_tokens: total_tokens,
+            request_tokens,
+            stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
+            stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
+        };
+        let status = campaign_supervisor::run_guarded(
+            &mut command, &request, &policy.supervisor(), &mut SystemProbe,
+        ).map_err(|failure| format!(
+            "coordinate {slug} stopped ({:?}): {}; child {:?} reaped; valid earlier rows remain in {}",
+            failure.reason, failure.detail, failure.pid, launch.resume_dir.display(),
+        ))?;
+        if !status.success() {
             return Err(format!(
-                "{} of 64 product workers failed; no campaign was published: {}",
-                failures.len(),
-                failures.join("; ")
+                "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
+                request.stderr_path.display(), launch.resume_dir.display(),
             ));
         }
-        publish_complete_campaign(&launch.destination, &prepared)
-    })();
-    let _ = fs::remove_dir_all(&worker_root);
-    result
+        // Child publication itself is atomic. Bind the row to this exact immutable launch before
+        // permitting a future resume to accept it.
+        let item = load_prepared_coordinate_receipt(&child_dir, row.coordinate.clone())?;
+        let receipt: Receipt =
+            serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+        let binding = seal_json(&row_binding(
+            &identity_sha256,
+            &receipt,
+            &item.bundle.receipt,
+        ))?
+        .0;
+        fs::write(&binding_path, binding).map_err(|e| e.to_string())?;
+        prepared.push(validate_resume_row(
+            &launch.resume_dir,
+            &row.coordinate,
+            &identity,
+            &identity_sha256,
+        )?);
+        eprintln!(
+            "coordinate {}/{} accepted: {slug}",
+            index + 1,
+            schedule.len()
+        );
+    }
+    publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)
 }
 
 fn required_flag(args: &[String], name: &str) -> Result<String, String> {
@@ -2849,38 +3488,134 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
         return Err("usage: sc20671-kv-baseline parent|worker [options]".into());
     };
     match mode {
-        "parent" => launch_complete_campaign(&CampaignLaunch {
-            executable: std::env::current_exe().map_err(|e| e.to_string())?,
-            llama_snapshot: PathBuf::from(required_flag(args, "--llama-snapshot")?),
-            qwen_snapshot: PathBuf::from(required_flag(args, "--qwen-snapshot")?),
-            llama_fp32_reference_snapshot: PathBuf::from(required_flag(
-                args,
-                "--llama-fp32-reference-snapshot",
-            )?),
-            qwen_fp32_reference_snapshot: PathBuf::from(required_flag(
-                args,
-                "--qwen-fp32-reference-snapshot",
-            )?),
-            prompt_file: PathBuf::from(required_flag(args, "--prompt-file")?),
-            destination: PathBuf::from(required_flag(args, "--out")?),
-        }),
+        "parent" | "preflight" => {
+            let launch = CampaignLaunch {
+                executable: std::env::current_exe().map_err(|e| e.to_string())?,
+                llama_snapshot: PathBuf::from(required_flag(args, "--llama-snapshot")?),
+                qwen_snapshot: PathBuf::from(required_flag(args, "--qwen-snapshot")?),
+                llama_fp32_reference_snapshot: PathBuf::from(required_flag(
+                    args,
+                    "--llama-fp32-reference-snapshot",
+                )?),
+                qwen_fp32_reference_snapshot: PathBuf::from(required_flag(
+                    args,
+                    "--qwen-fp32-reference-snapshot",
+                )?),
+                prompt_file: PathBuf::from(required_flag(args, "--prompt-file")?),
+                destination: PathBuf::from(required_flag(args, "--out")?),
+                resume_dir: PathBuf::from(required_flag(args, "--resume-dir")?),
+                safety_policy: PathBuf::from(required_flag(args, "--safety-policy")?),
+            };
+            if mode == "preflight" {
+                let value = preflight_complete_campaign(&launch)?;
+                println!(
+                    "{}",
+                    String::from_utf8(canonical_json_bytes(&value).map_err(|e| e.to_string())?)
+                        .map_err(|e| e.to_string())?
+                );
+                Ok(())
+            } else {
+                launch_complete_campaign(&launch)
+            }
+        }
         "worker" => {
+            let policy = load_campaign_safety_policy(&PathBuf::from(required_flag(
+                args,
+                "--safety-policy",
+            )?))?;
+            if policy.seal()? != required_flag(args, "--policy-sha256")? {
+                return Err("worker safety policy seal differs from parent's frozen policy".into());
+            }
+            let identity_bytes = fs::read(required_flag(args, "--resume-identity")?)
+                .map_err(|e| format!("read parent resume identity: {e}"))?;
+            if seal_bytes(&identity_bytes) != required_flag(args, "--resume-identity-sha256")? {
+                return Err(
+                    "worker resume identity seal differs from parent's frozen identity".into(),
+                );
+            }
+            let identity: serde_json::Value =
+                serde_json::from_slice(&identity_bytes).map_err(|e| e.to_string())?;
+            let identity_field = |key| {
+                identity
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("resume identity lacks {key}"))
+            };
+            if identity_field("policySha256")? != policy.seal()?
+                || identity_field("executableSha256")?
+                    != file_seal(&std::env::current_exe().map_err(|e| e.to_string())?)?
+                || identity
+                    .get("scheduleVersion")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(SC20671_SCHEDULE_VERSION)
+            {
+                return Err(
+                    "worker executable, policy, or schedule differs from resume identity".into(),
+                );
+            }
+            let captured_source = (
+                identity_field("sceneWorksRevision")?,
+                identity_field("inferenceRevision")?,
+            );
             let index = required_flag(args, "--coordinate-index")?
                 .parse::<usize>()
                 .map_err(|_| "--coordinate-index must be an integer".to_string())?;
             let row = required_schedule()
                 .get(index)
                 .cloned()
-                .ok_or("--coordinate-index is outside the frozen 64-coordinate matrix")?;
+                .ok_or("--coordinate-index is outside the frozen eight-coordinate schedule")?;
             let snapshot = PathBuf::from(required_flag(args, "--snapshot")?);
             let reference_snapshot =
                 PathBuf::from(required_flag(args, "--fp32-reference-snapshot")?);
-            let prompt = fs::read_to_string(required_flag(args, "--prompt-file")?)
-                .map_err(|e| format!("read prompt file: {e}"))?;
+            let prompt_path = PathBuf::from(required_flag(args, "--prompt-file")?);
+            if file_seal(&prompt_path)? != identity_field("promptSha256")? {
+                return Err(
+                    "worker prompt bytes differ from the parent-sealed resume identity".into(),
+                );
+            }
+            let prompt =
+                fs::read_to_string(&prompt_path).map_err(|e| format!("read prompt file: {e}"))?;
             if prompt.trim().is_empty() {
                 return Err("campaign prompt must not be empty".into());
             }
-            validate_coordinate_model_contract(&row.coordinate, &snapshot, &reference_snapshot)?;
+            let (candidate_inventory, reference_inventory) = validate_coordinate_model_contract(
+                &row.coordinate,
+                &snapshot,
+                &reference_snapshot,
+            )?;
+            let (candidate_key, reference_key) = if row.coordinate.family == "llama" {
+                ("llamaCandidate", "llamaReference")
+            } else {
+                ("qwenCandidate", "qwenReference")
+            };
+            for (key, inventory) in [
+                (candidate_key, &candidate_inventory),
+                (reference_key, &reference_inventory),
+            ] {
+                if identity
+                    .get(key)
+                    .and_then(|model| model.get("sha256"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(inventory.sha256.as_str())
+                    || identity
+                        .get(key)
+                        .and_then(|model| model.get("bytes"))
+                        .and_then(serde_json::Value::as_u64)
+                        != Some(inventory.bytes)
+                {
+                    return Err(format!(
+                        "worker {key} inventory differs from parent-sealed resume identity"
+                    ));
+                }
+            }
+            admitted_row_tokens(
+                &row.coordinate,
+                &snapshot,
+                &reference_snapshot,
+                &prompt,
+                &policy,
+            )?;
             let candidate_session = CampaignSession::load(&snapshot)
                 .map_err(|e| format!("load candidate campaign session: {e}"))?;
             let candidate_baseline = candidate_session.load_start_sample.mlx_active_bytes;
@@ -2889,10 +3624,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             let mut candidate_warmups = Vec::new();
             if row.coordinate.process_temperature == "warm" {
                 for warmup_index in 0..2 {
-                    let half = run_product_fixture_half_on_session(
+                    let half = run_product_fixture_half_on_session_bounded(
                         &candidate_session,
                         &prompt,
                         &row.coordinate,
+                        policy.max_request_tokens,
                     )
                     .map_err(|e| {
                         format!(
@@ -2907,10 +3643,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 (!candidate_warmups.is_empty()).then(|| candidate_session.cache_state_version());
             let mut candidate_repeats = Vec::with_capacity(5);
             for repeat in 0..5 {
-                let half = run_product_fixture_half_on_session(
+                let half = run_product_fixture_half_on_session_bounded(
                     &candidate_session,
                     &prompt,
                     &row.coordinate,
+                    policy.max_request_tokens,
                 )
                 .map_err(|e| {
                     format!(
@@ -2934,10 +3671,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             let mut reference_warmups = Vec::with_capacity(candidate_warmups.len());
             for warmup_index in 0..candidate_warmups.len() {
                 reference_warmups.push(
-                    run_product_fixture_half_on_session(
+                    run_product_fixture_half_on_session_bounded(
                         &reference_session,
                         &prompt,
                         &row.coordinate,
+                        policy.max_request_tokens,
                     )
                     .map_err(|e| {
                         format!(
@@ -2950,10 +3688,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             let mut reference_repeats = Vec::with_capacity(5);
             for repeat in 0..5 {
                 reference_repeats.push(
-                    run_product_fixture_half_on_session(
+                    run_product_fixture_half_on_session_bounded(
                         &reference_session,
                         &prompt,
                         &row.coordinate,
+                        policy.max_request_tokens,
                     )
                     .map_err(|e| {
                         format!(
@@ -3026,6 +3765,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 &executable,
                 &fixtures,
                 warmup_cache_state_version,
+                &captured_source,
             )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
@@ -3049,8 +3789,35 @@ pub struct Coordinate {
     pub process_temperature: &'static str,
 }
 
-/// The exact required dense campaign frontier (2 × 4 × 2 × 2 × 2).
+/// The frozen covering set: each family runs every context band, while cold/warm,
+/// chunked/single-shot, and single/batch each have observable rows. The material baseline for
+/// SC-20676 remains warm, single, and single-shot in both families.
 pub fn required_coordinates() -> Vec<Coordinate> {
+    [
+        ("llama", "short", "single", "chunked", "cold"),
+        ("llama", "medium", "supported-batch", "single-shot", "warm"),
+        ("llama", "memory-material", "single", "single-shot", "warm"),
+        ("llama", "fit-boundary", "single", "chunked", "cold"),
+        ("qwen", "short", "single", "single-shot", "cold"),
+        ("qwen", "medium", "supported-batch", "chunked", "warm"),
+        ("qwen", "memory-material", "single", "single-shot", "warm"),
+        ("qwen", "fit-boundary", "single", "chunked", "cold"),
+    ]
+    .into_iter()
+    .map(
+        |(family, context_band, request_mode, prefill_mode, process_temperature)| Coordinate {
+            family,
+            context_band,
+            request_mode,
+            prefill_mode,
+            process_temperature,
+        },
+    )
+    .collect()
+}
+
+/// Historical v1 publications remain readable as their original complete 64-row matrix.
+fn legacy_required_coordinates() -> Vec<Coordinate> {
     ["llama", "qwen"]
         .into_iter()
         .flat_map(|family| {
@@ -3114,6 +3881,20 @@ pub fn required_schedule() -> Vec<ScheduledCoordinate> {
         .collect()
 }
 
+fn legacy_required_schedule() -> Vec<ScheduledCoordinate> {
+    legacy_required_coordinates()
+        .into_iter()
+        .map(|coordinate| ScheduledCoordinate {
+            discipline: if coordinate.process_temperature == "cold" {
+                ProcessDiscipline::FreshChild
+            } else {
+                ProcessDiscipline::ReusedWarmWorker
+            },
+            coordinate,
+        })
+        .collect()
+}
+
 /// Validate worker outcomes before aggregate publication.  `pid` is read from the product-owned
 /// receipt phase samples, never supplied separately by the orchestrator.  Cold worker PID reuse is
 /// rejected so a warmed model cannot be relabelled as cold.
@@ -3121,8 +3902,8 @@ pub fn validate_schedule_outcomes(
     scheduled: &[ScheduledCoordinate],
     outcomes: &[(Coordinate, ProcessDiscipline, u32)],
 ) -> Result<(), String> {
-    if scheduled.len() != 64 || outcomes.len() != scheduled.len() {
-        return Err("campaign schedule must contain exactly 64 outcomes".into());
+    if ![8, 64].contains(&scheduled.len()) || outcomes.len() != scheduled.len() {
+        return Err("campaign schedule must contain exactly 8 or 64 outcomes".into());
     }
     let key = |coordinate: &Coordinate| {
         format!(
@@ -3138,7 +3919,7 @@ pub fn validate_schedule_outcomes(
         .iter()
         .map(|row| (key(&row.coordinate), row.discipline))
         .collect::<std::collections::BTreeMap<_, _>>();
-    if expected.len() != 64 {
+    if expected.len() != scheduled.len() {
         return Err("campaign schedule contains duplicate coordinates".into());
     }
     let mut actual = std::collections::BTreeMap::new();
@@ -3356,15 +4137,16 @@ fn validate_coordinate_model_contract(
     coordinate: &Coordinate,
     snapshot: &Path,
     reference_snapshot: &Path,
-) -> Result<(), String> {
+) -> Result<(SnapshotInventory, SnapshotInventory), String> {
     let candidate = benchmark_model(coordinate.family, false)?;
     let reference = benchmark_model(coordinate.family, true)?;
     if snapshot == reference_snapshot {
         return Err("candidate and higher-precision reference paths must be distinct".into());
     }
-    validate_benchmark_snapshot(snapshot, candidate)?;
-    validate_benchmark_snapshot(reference_snapshot, reference)?;
-    Ok(())
+    Ok((
+        validate_benchmark_snapshot(snapshot, candidate)?,
+        validate_benchmark_snapshot(reference_snapshot, reference)?,
+    ))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -4419,7 +5201,7 @@ pub fn run_dense_coordinate(
     Ok(output)
 }
 
-/// Full one-process product lifecycle used by a worker in the 64-coordinate runner.  The parent
+/// Full one-process product lifecycle used by a worker in the covering-set runner. The parent
 /// runner is responsible for spawning a fresh process for every `cold` coordinate; this function
 /// refuses to manufacture a receipt when an unsupported family cannot exercise a required cache
 /// lifecycle.
@@ -5134,6 +5916,15 @@ fn run_product_fixture_half_on_session(
     prompt: &str,
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureHalf> {
+    run_product_fixture_half_on_session_bounded(session, prompt, coordinate, u64::MAX)
+}
+
+fn run_product_fixture_half_on_session_bounded(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+    max_request_tokens: u64,
+) -> core_llm::Result<ProductFixtureHalf> {
     session.validate_coordinate_family(coordinate)?;
     let context_window_tokens = session.provider.campaign_context_window()?;
     let (band_payload, context_target_tokens, context_payload_tokens) = session
@@ -5153,6 +5944,11 @@ fn run_product_fixture_half_on_session(
         session.provider.campaign_prompt_tokens(&cache_prompt)?,
     ];
     for tokens in fixture_prompt_tokens {
+        if tokens > max_request_tokens {
+            return Err(core_llm::Error::InvalidRequest(format!(
+                "fixture raw prompt has {tokens} tokens, exceeding explicit safety ceiling {max_request_tokens}"
+            )));
+        }
         if tokens > context_window_tokens.saturating_sub(256) {
             return Err(core_llm::Error::InvalidRequest(format!(
                 "fixture prompt tokenization exceeds the loaded context: {tokens}/{context_window_tokens}"
@@ -5727,6 +6523,7 @@ fn product_receipt(
     executable: &Path,
     fixtures: &[SealedFixtureArtifact],
     warmup_cache_state_version: Option<u64>,
+    captured_source: &(String, String),
 ) -> Result<Receipt, String> {
     let ProductTimingMeasurements {
         samples: timing_samples,
@@ -5790,8 +6587,8 @@ fn product_receipt(
     let scene_works_repository =
         checked_repository_identity(&scene_works_root, SCENEWORKS_REPOSITORY)?;
     let inference_repository = checked_repository_identity(inference_root, INFERENCE_REPOSITORY)?;
-    let scene_works_revision = checked_git_revision(&scene_works_root)?;
-    let inference_revision = checked_git_revision(inference_root)?;
+    let scene_works_revision = captured_source.0.clone();
+    let inference_revision = captured_source.1.clone();
     let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
     let xcode = probed_command("xcodebuild", &["-version"], "xcode")?;
     let power_mode = probed_command("pmset", &["-g", "custom"], "power mode")?;
@@ -6308,24 +7105,120 @@ mod tests {
     }
 
     #[test]
-    fn required_matrix_is_exactly_64_coordinates() {
+    fn required_covering_set_is_exactly_eight_coordinates() {
         let coordinates = required_coordinates();
-        assert_eq!(coordinates.len(), 64);
+        assert_eq!(coordinates.len(), 8);
+        assert_eq!(
+            coordinates.iter().map(coordinate_slug).collect::<Vec<_>>(),
+            [
+                "llama-short-single-chunked-cold",
+                "llama-medium-supported-batch-single-shot-warm",
+                "llama-memory-material-single-single-shot-warm",
+                "llama-fit-boundary-single-chunked-cold",
+                "qwen-short-single-single-shot-cold",
+                "qwen-medium-supported-batch-chunked-warm",
+                "qwen-memory-material-single-single-shot-warm",
+                "qwen-fit-boundary-single-chunked-cold",
+            ]
+        );
+        assert_eq!(legacy_required_schedule().len(), 64);
         for (index, coordinate) in coordinates.iter().enumerate() {
             assert!(!coordinates[index + 1..].contains(coordinate));
         }
     }
 
     #[test]
+    fn safety_policy_and_resume_identity_hashes_match_cross_language_fixture() {
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1024,
+            child_footprint_cap_bytes: 2048,
+            max_context_tokens: 4096,
+            max_request_tokens: 4096,
+            stdout_cap_bytes: 4096,
+            stderr_cap_bytes: 4096,
+        };
+        policy.validate().unwrap();
+        assert_eq!(
+            policy.seal().unwrap(),
+            "03b18fb4b6e8e729189ad1243fecc31934ff1b4aa011cdf00fb6489029a17d2a"
+        );
+        let identity = serde_json::json!({
+            "schemaVersion": 1, "kind": "sc-20671-resume-identity", "scheduleVersion": 2,
+            "coordinates": required_coordinates().iter().map(coordinate_slug).collect::<Vec<_>>(),
+            "inferenceRevision": "a".repeat(40), "sceneWorksRevision": "b".repeat(40),
+            "executableSha256": "c".repeat(64), "promptSha256": "d".repeat(64),
+            "policySha256": policy.seal().unwrap(),
+            "llamaCandidate": {"sha256": "e".repeat(64), "bytes": 101},
+            "qwenCandidate": {"sha256": "f".repeat(64), "bytes": 102},
+            "llamaReference": {"sha256": "1".repeat(64), "bytes": 103},
+            "qwenReference": {"sha256": "2".repeat(64), "bytes": 104},
+        });
+        assert_eq!(
+            seal_json(&identity).unwrap().1,
+            "a9bcc30bc11a2c86a4057489e1e0c9bc1519f0802b6f576200562406a8d02112"
+        );
+    }
+
+    #[test]
+    fn long_context_requires_a_source_backed_prefill_bound_before_model_load() {
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1,
+            child_footprint_cap_bytes: 2,
+            max_context_tokens: u64::MAX,
+            max_request_tokens: u64::MAX,
+            stdout_cap_bytes: 100,
+            stderr_cap_bytes: 100,
+        };
+        for coordinate in required_coordinates().into_iter().filter(|coordinate| {
+            ["memory-material", "fit-boundary"].contains(&coordinate.context_band)
+        }) {
+            let error = admitted_row_tokens(
+                &coordinate,
+                Path::new("/nonexistent-candidate"),
+                Path::new("/nonexistent-reference"),
+                "prompt",
+                &policy,
+            )
+            .unwrap_err();
+            assert!(error.contains("source-backed transient prefill peak bound"));
+        }
+    }
+
+    #[test]
+    fn resume_identity_rejects_changed_behavior_and_corrupted_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resume");
+        let mut identity = serde_json::json!({"inferenceRevision": "a".repeat(40), "sceneWorksRevision": "b".repeat(40), "executableSha256": "c".repeat(64)});
+        let sha = prepare_resume_root(&root, &mut identity).unwrap();
+        assert_eq!(prepare_resume_root(&root, &mut identity).unwrap(), sha);
+        let mut moved_ref = identity.clone();
+        moved_ref["inferenceRevision"] = serde_json::Value::String("d".repeat(40));
+        assert_eq!(prepare_resume_root(&root, &mut moved_ref).unwrap(), sha);
+        let mut changed_executable = identity.clone();
+        changed_executable["executableSha256"] = serde_json::Value::String("e".repeat(64));
+        assert!(prepare_resume_root(&root, &mut changed_executable).is_err());
+        fs::write(root.join("identity.json.sha256"), "corrupt").unwrap();
+        assert!(prepare_resume_root(&root, &mut identity).is_err());
+    }
+
+    #[test]
     fn schedule_is_exact_and_rejects_duplicate_or_reused_cold_workers() {
         let schedule = required_schedule();
-        assert_eq!(schedule.len(), 64);
+        assert_eq!(schedule.len(), 8);
         assert_eq!(
             schedule
                 .iter()
                 .filter(|row| row.discipline == ProcessDiscipline::FreshChild)
                 .count(),
-            32
+            4
         );
         let outcomes = schedule
             .iter()
@@ -6359,13 +7252,13 @@ mod tests {
             Ok((seen.len() + 100) as u32)
         })
         .unwrap();
-        assert_eq!(seen.len(), 64);
-        assert_eq!(outcomes.len(), 64);
+        assert_eq!(seen.len(), 8);
+        assert_eq!(outcomes.len(), 8);
         assert_eq!(
             seen.iter()
                 .filter(|(_, discipline)| *discipline == ProcessDiscipline::ReusedWarmWorker)
                 .count(),
-            32
+            4
         );
     }
 
