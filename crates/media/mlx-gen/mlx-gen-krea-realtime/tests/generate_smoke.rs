@@ -1445,6 +1445,7 @@ fn sc20684_packed_campaign_observer() {
         latent_height: latent_h,
         latent_width: latent_w,
         fps: 24,
+        memory: Default::default(),
     };
     let expected_chunks = generated_latent_frames.div_ceil(config.ar.num_frames_per_block);
     let full_chunks = generated_latent_frames / config.ar.num_frames_per_block;
