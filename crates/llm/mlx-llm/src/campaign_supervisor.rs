@@ -164,6 +164,8 @@ fn terminate_and_reap(
     grace: Duration,
     poll: Duration,
 ) -> io::Result<ExitStatus> {
+    #[cfg(not(unix))]
+    let _ = (grace, poll);
     if let Ok(Some(status)) = child.try_wait() {
         return Ok(status);
     }
