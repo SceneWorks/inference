@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 ADAPTER = Path(__file__).parents[1] / "sc20686_campaign_adapter.py"
 REDUCER = Path(__file__).parents[1] / "sc20686_cache_attribution.py"
@@ -24,6 +25,23 @@ class CampaignAdapterTests(unittest.TestCase):
         cls.reducer = load(REDUCER, "sc20686_reducer_test")
         cls.coverage = json.loads(cls.adapter.COVERAGE.read_text(encoding="utf-8"))
         cls.source_map_hash = cls.adapter.digest(cls.adapter.SOURCE_MAP.read_bytes())
+
+    def runner_safety(self, deadline=3):
+        class Probe:
+            def host_free(self):
+                return 10**12
+            def tree_footprint(self, _pgid):
+                return 1024
+            def gpu_free(self):
+                return 10**12
+            def gpu_free_and_tree_bytes(self, _pgid):
+                return 10**12, 1024
+        policy = self.adapter.supervisor.SafetyPolicy(
+            "linux-cuda", deadline, 10, 20, 1024, 10**9, 10**6, 10**6, 10**7,
+            "GPU-12345678-1234-1234-1234-123456789abc", 1024, 10**9, "test", b"{}\n",
+        )
+        return {"safety_policy": policy, "source_peak_host_bytes": 1024,
+                "source_peak_gpu_bytes": 1024, "probe": Probe()}
 
     def flux_events(self, *, variant="flux2_klein_9b_edit", cancel=False):
         geometry = {
@@ -220,6 +238,7 @@ class CampaignAdapterTests(unittest.TestCase):
             run = self.adapter.run_entrypoint(
                 executable, snapshot, "route", "normal", "a" * 40, "sequential",
                 timeout_seconds=5,
+                **self.runner_safety(),
             )
             self.assertEqual(len(run.events) - len(run.process_samples), 10000)
             self.assertGreater(len(run.stdout), 64 * 1024)
@@ -261,6 +280,7 @@ class CampaignAdapterTests(unittest.TestCase):
                     self.adapter.run_entrypoint(
                         executable, snapshot, "route", "normal", "a" * 40,
                         "sequential", timeout_seconds=5,
+                        **self.runner_safety(),
                     )
 
     def test_streaming_runner_enforces_timeout_and_terminates(self):
@@ -274,10 +294,11 @@ class CampaignAdapterTests(unittest.TestCase):
             executable.chmod(0o755)
             snapshot = root / "snapshot"
             snapshot.mkdir()
-            with self.assertRaisesRegex(ValueError, "timed out"):
+            with self.assertRaisesRegex(ValueError, "deadline"):
                 self.adapter.run_entrypoint(
                     executable, snapshot, "route", "normal", "a" * 40,
                     "sequential", timeout_seconds=0.1,
+                    **self.runner_safety(deadline=0.08),
                 )
 
     def _manifest_fixture(self, root):
@@ -579,6 +600,48 @@ class CampaignAdapterTests(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertFalse(any(Path(directory).glob(".campaign.staging-*")))
 
+    def test_resume_preserves_validated_normal_arm_and_rejects_corruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resume = root / "resume"
+            spec = SimpleNamespace(variant="wan_vace")
+            media = root / "media"
+            media.mkdir()
+            (media / "frame.png").write_bytes(b"real output bytes")
+            event = self.adapter.canonical({"phase": "metadata"})
+            calls = []
+            identity_sha = "f" * 64
+
+            def runner(_spec, arm):
+                calls.append(arm)
+                if arm == "cancel":
+                    raise ValueError("interrupted")
+                return self.adapter.CampaignRun(
+                    [{"phase": "metadata"}, {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 1}],
+                    b"stdout", b"", ("producer", "--sc20686-events", str(root / "events"), "--out", str(media)),
+                    ({"phase": "process-sample", "sample_kind": "process", "peak_bytes": 1},),
+                    event, media, None,
+                    {"pid": 123, "exitCode": 0, "ownedProcessGroupReaped": True},
+                )
+
+            def row_builder(_spec, arm, _events, _hashes):
+                return {"family": "wan", "variant": "wan_vace", "coordinate_name": "small", "arm": arm}
+
+            resume.mkdir()
+            (resume / "units").mkdir()
+            for _ in range(2):
+                with self.assertRaisesRegex(ValueError, "interrupted"):
+                    self.adapter.publish_campaign(
+                        [spec], runner, row_builder, root / "final",
+                        resume_root=resume, resume_identity_sha=identity_sha,
+                    )
+            self.assertEqual(calls, ["normal", "cancel", "cancel"])
+            unit = resume / "units" / "run-00-normal"
+            self.assertTrue((unit / "record.json").is_file())
+            (unit / "stdout").write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "corrupted"):
+                self.adapter._load_unit(resume, "run-00-normal", identity_sha, "wan_vace", "normal")
+
     def test_complete_bundle_is_reproducible_and_tampering_fails(self):
         coordinates = []
         for family, variants in self.coverage["families"].items():
@@ -791,6 +854,8 @@ class CampaignAdapterTests(unittest.TestCase):
                     "campaign-inputs.resolved.json": (
                         json.dumps(resolved, indent=2, sort_keys=True) + "\n"
                     ).encode("utf-8"),
+                    "safety-policy.json": b"{\"schemaVersion\":1}\n",
+                    "resume-identity.json": b"{\"schema\":\"test\"}\n",
                 }
             )
             result = self.reducer.verify_campaign_bundle(destination)

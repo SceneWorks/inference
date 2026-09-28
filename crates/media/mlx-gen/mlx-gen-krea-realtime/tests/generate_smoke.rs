@@ -890,7 +890,22 @@ fn sc20684_metal_device() -> String {
 }
 
 fn sc20684_source_identity(root: &Path) -> serde_json::Value {
-    let head = sc20684_command("git", &["-C", root.to_str().unwrap(), "rev-parse", "HEAD"]);
+    // The launcher freezes provenance before the first arm. Verify its captured
+    // behavior bytes and executable before stamping a later resumed observation.
+    let identity_path = std::env::var("KREA_SC20684_IDENTITY_PATH")
+        .expect("SC-20684 launcher must supply its sealed resume identity");
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(identity_path).expect("read SC-20684 resume identity"),
+    )
+    .expect("parse SC-20684 resume identity");
+    let executable = std::env::current_exe().expect("resolve SC-20684 observer executable");
+    let executable_sha =
+        sc20684_sha256(&std::fs::read(executable).expect("hash observer executable"));
+    assert_eq!(
+        identity["executableSha256"].as_str(),
+        Some(executable_sha.as_str()),
+        "SC-20684 observer executable differs from captured resume identity"
+    );
     let files = [
         "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
         "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs",
@@ -909,7 +924,13 @@ fn sc20684_source_identity(root: &Path) -> serde_json::Value {
             )),
         );
     }
-    serde_json::json!({"repositoryHead": head, "files": hashes})
+    let source = identity["source"].clone();
+    let head = source["repositoryHead"]
+        .as_str()
+        .expect("SC-20684 captured source revision");
+    assert!(head.len() == 40 && head.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(source["files"], serde_json::Value::Object(hashes));
+    source
 }
 
 fn sc20684_model_identity(snapshot: &Path) -> serde_json::Value {

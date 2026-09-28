@@ -54,8 +54,28 @@ The publisher preserves hash-identified raw stdout/stderr and all six verified a
 python3 scripts/sc20684_krea_realtime_campaign.py \
   --snapshot /Volumes/Models/huggingface/hub/models--SceneWorks--krea-realtime-14b-mlx/snapshots/e68e9a3d98187fdf6936838ffcf6df5aa48d6626/q4 \
   --output /Users/michael/.codex/worktrees/epic20669/evidence/sc20684/campaign-$(date +%Y%m%dT%H%M%S) \
-  --product-command 'cargo test -p mlx-gen-krea-realtime --test integration generate_smoke::sc20684_packed_campaign_observer -- --ignored --nocapture'
+  --safety-policy /absolute/path/sc20684-safety-policy.json \
+  --resume-dir /absolute/external/path/sc20684-resume \
+  --product-command '/absolute/path/to/prebuilt/generate_smoke --ignored --nocapture sc20684_packed_campaign_observer'
 ```
+
+The product command must be an already-built observer binary: the launcher seals its
+exact executable bytes and argv before the first role. The resume directory preserves
+validated paired and dense-baseline roles independently, including transcript hashes,
+product artifacts, supervisor exit/footprint evidence, and the captured source identity.
+A changed executable, model inventory, behavior source, schedule, or safety policy
+invalidates resume. Moving Git HEAD alone does not; the observer independently checks
+the captured executable and source-file hashes before stamping the preserved source ref.
+
+The safety policy is mandatory and uses schema version 1 with backend `darwin-mlx`,
+positive `deadlineSeconds`, `pollMillis`, `termGraceMillis`,
+`hostFreeReserveBytes`, `childFootprintCapBytes`, `stdoutCapBytes`,
+`stderrCapBytes`, and `eventCapBytes`. It rejects unknown fields and impossible caps.
+At this source revision there is **no justified whole-process transient peak bound**
+for the six Krea cells. The launcher therefore refuses each unresolved role before
+starting the model, retains already validated roles, and cannot publish a terminal
+Go or No-go receipt. Live polling cannot prevent an instantaneous memory spike; an
+operator-entered cap or historical RSS is not a source-backed peak bound.
 
 ## Pre-campaign validation
 

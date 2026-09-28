@@ -749,6 +749,55 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
         self.assertEqual(decision["eligibleGeometry"]["build"]["repositoryHead"], SOURCE["repositoryHead"])
         self.assertEqual(decision["eligibleGeometry"]["build"]["toolchain"]["rustc"], "rustc 1.90")
 
+    def test_role_resume_binds_identity_and_rejects_file_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "observer"
+            executable.write_bytes(b"prebuilt observer")
+            policy = campaign.supervisor.SafetyPolicy(
+                "darwin-mlx", 10, 100, 100, 1, 10**9, 10**5, 10**5,
+                10**5, None, None, None, "f" * 64, b"{}\n",
+            )
+            resume = root / "resume"
+            identity = campaign._prepare_media_resume(
+                resume, source=json.loads(json.dumps(SOURCE)), model=MODEL,
+                policy=policy, argv=[str(executable)], timeout=10,
+            )
+            moved_ref = json.loads(json.dumps(SOURCE))
+            moved_ref["repositoryHead"] = "d" * 40
+            self.assertEqual(identity, campaign._prepare_media_resume(
+                resume, source=moved_ref, model=MODEL,
+                policy=policy, argv=[str(executable)], timeout=10,
+            ))
+            transcripts = resume / "transcripts"
+            transcripts.mkdir()
+            stdout = transcripts / "t2v-q8.dense-baseline.stdout.log"
+            stderr = transcripts / "t2v-q8.dense-baseline.stderr.log"
+            stdout.write_bytes(b"validated observation")
+            stderr.write_bytes(b"")
+            record = {
+                "runId": "run-1", "exitCode": 0,
+                "transcripts": {
+                    "stdout": campaign._file_identity(stdout, f"transcripts/{stdout.name}"),
+                    "stderr": campaign._file_identity(stderr, f"transcripts/{stderr.name}"),
+                },
+                "observationSha256": "a" * 64,
+                "supervision": {"pid": 123, "peakHostBytes": 1024, "hostFreeAtLaunch": 10**9, "ownedProcessGroupReaped": True},
+            }
+            campaign._save_resumed_role(resume, "t2v-q8.dense-baseline", identity, record)
+            self.assertEqual(campaign._load_resumed_role(
+                resume, "t2v-q8.dense-baseline", identity,
+            )["runId"], "run-1")
+            stdout.write_bytes(b"tampered")
+            with self.assertRaisesRegex(campaign.CampaignError, "changed|drift"):
+                campaign._load_resumed_role(resume, "t2v-q8.dense-baseline", identity)
+            executable.write_bytes(b"changed observer")
+            with self.assertRaisesRegex(campaign.CampaignError, "resume identity changed"):
+                campaign._prepare_media_resume(
+                    resume, source=moved_ref, model=MODEL,
+                    policy=policy, argv=[str(executable)], timeout=10,
+                )
+
     def validate_from(self, row: dict, mode: str = "t2v", tier: str = "q8") -> dict:
         return campaign._validate_observation(
             row,

@@ -18,10 +18,29 @@ final evidence remains independently reproducible after that private directory i
 
 ## Sealed provenance and snapshot layouts
 
-Invoke the adapter with `--inference-revision <40-hex-commit>` from the exact inference checkout
-being measured. The adapter verifies that value against `git rev-parse HEAD`, passes it separately
-as `--sc20686-source-ref`, and requires observer metadata to reproduce it. This repository revision
-is never inferred from a model path.
+Invoke the adapter with `--inference-revision <40-hex-commit>` for the initial
+capture. It verifies the initial checkout, freezes that revision as provenance,
+passes it as `--sc20686-source-ref`, and requires observer metadata to reproduce
+it. A restart reads the sealed resolved inputs from `--resume-dir` and rechecks
+the actual entrypoint binaries, model snapshots, route inputs, coverage, source
+map, and adapter bytes; Git HEAD movement alone does not invalidate an otherwise
+identical completed arm. The repository revision is never inferred from a model path.
+
+Both single and matrix launch modes require `--safety-policy` and an absolute
+external `--resume-dir`. The policy is strict schema version 1 with backend
+`linux-cuda`; it sets positive deadline, poll, TERM grace, host reserve, child
+footprint cap, stdout/stderr/event caps, selected CUDA GPU UUID, GPU-free reserve,
+and child GPU cap. Each validated normal/cancel arm is preserved in a sealed
+unit with observer events, bounded logs, generated media or verified absence,
+process samples, supervisor exit and cleanup, and exact campaign identity. A
+later watchdog failure leaves the bundle incomplete; it cannot serve as the
+product cancellation oracle or a terminal No-go.
+
+At this source revision no defensible peak bound covers the route-specific
+loader, transient graphs, and output coexistence. The supervisor refuses an
+unbounded arm before model spawn even if the operator policy cap looks ample.
+Host and CUDA polling are necessary but cannot prevent an instantaneous spike.
+The fixed route geometry and normal/cancel schedule are never shortened to fit.
 
 Model identity has two independent fields: `model_snapshot_revision` is the immutable Hugging Face
 revision, while `model_snapshot_sha256` hashes only the selected model/tier root. A selected root may
