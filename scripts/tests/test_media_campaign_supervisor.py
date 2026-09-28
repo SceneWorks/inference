@@ -147,6 +147,112 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(probe.gpu_free(), 8192 * 1024**2)
             self.assertEqual(probe.gpu_free_and_tree_bytes(999), (8192 * 1024**2, 256 * 1024**2))
 
+    def test_windows_policy_and_unknown_gpu_memory_refuse(self):
+        data = json.loads(self.policy.canonical_bytes)
+        data.update({"backend": "windows-cuda",
+                     "cudaDeviceUuid": "GPU-12345678-1234-1234-1234-123456789abc",
+                     "gpuFreeReserveBytes": 1024, "childGpuCapBytes": 1024})
+        path = self.root / "windows-policy.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        policy = safety.load_policy(path)
+        self.assertEqual(policy.backend, "windows-cuda")
+        def output(argv, **_kwargs):
+            if "--query-gpu=uuid,memory.free" in argv:
+                return "GPU-12345678-1234-1234-1234-123456789abc, 8192\n"
+            return "123, N/A, GPU-12345678-1234-1234-1234-123456789abc\n"
+        with patch.object(safety.platform, "system", return_value="Windows"), \
+             patch.object(safety.windows, "trusted_nvidia_smi", return_value="C:\\Windows\\System32\\nvidia-smi.exe"), \
+             patch.object(safety, "_bounded_output", side_effect=output):
+            probe = safety.SystemProbe(policy)
+            owner = type("Owner", (), {"members": lambda self: {123}})()
+            with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
+                probe.gpu_free_and_tree_bytes(owner)
+
+
+@unittest.skipUnless(os.name == "nt", "real Job Object smoke requires Windows")
+class WindowsSupervisorTests(unittest.TestCase):
+    """Real owned child/grandchild, real Windows memory APIs; no GPU/model use."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.data = {
+            "schemaVersion": 1, "backend": "windows-cuda", "deadlineSeconds": 3,
+            "pollMillis": 20, "termGraceMillis": 300,
+            "hostFreeReserveBytes": 1024, "childFootprintCapBytes": 512 * 1024**2,
+            "stdoutCapBytes": 4096, "stderrCapBytes": 4096, "eventCapBytes": 10**6,
+            "cudaDeviceUuid": "GPU-12345678-1234-1234-1234-123456789abc",
+            "gpuFreeReserveBytes": 1024, "childGpuCapBytes": 1024**2,
+        }
+        self.sampled = []
+
+    def test_native_host_probe_and_trusted_cuda_probe_path(self):
+        from scripts import media_campaign_windows as windows
+        self.assertGreater(windows.host_free_bytes(), 0)
+        self.assertTrue(Path(windows.trusted_nvidia_smi()).is_absolute())
+
+    def _run(self, script, *, cap=None):
+        policy_data = dict(self.data)
+        if cap is not None:
+            policy_data["childFootprintCapBytes"] = cap
+        path = self.root / "policy.json"
+        path.write_text(json.dumps(policy_data), encoding="utf-8")
+        policy = safety.load_policy(path)
+        parent = self
+        class Probe:
+            def host_free(self):
+                return 10**12
+            def gpu_free(self):
+                return 10**12
+            def tree_footprint(self, owner):
+                amount = owner.footprint_bytes()
+                parent.sampled.append(amount)
+                return amount
+            def gpu_free_and_tree_bytes(self, owner):
+                # GPU collection is separately fixture-tested; these children never touch CUDA.
+                return 10**12, 1024
+        return safety.run_guarded(
+            [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
+            policy=policy, stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
+            source_peak_host_bytes=1024, source_peak_gpu_bytes=1024, probe=Probe(),
+        )
+
+    def _assert_exited(self, pid):
+        import ctypes
+        from scripts import media_campaign_windows as windows
+        kernel, _ = windows._apis()
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            self.assertEqual(ctypes.get_last_error(), 87)  # PID no longer exists.
+            return
+        try:
+            kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel.WaitForSingleObject.restype = ctypes.c_uint32
+            self.assertEqual(kernel.WaitForSingleObject(handle, 0), 0)
+        finally:
+            kernel.CloseHandle(handle)
+
+    def test_deadline_reaps_root_and_grandchild_after_root_exit(self):
+        grandchild = "import os,time; b=bytearray(4*1024*1024); open('grandchild-pid','w').write(str(os.getpid())); time.sleep(10)"
+        script = (
+            "import os,subprocess,sys,time; "
+            f"p=subprocess.Popen([sys.executable,'-c',{grandchild!r}]); "
+            "open('root-pid','w').write(str(os.getpid())); time.sleep(.5)"
+        )
+        with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
+            self._run(script)
+        self.assertTrue(any(amount > 0 for amount in self.sampled))
+        self._assert_exited(int((self.root / "root-pid").read_text()))
+        self._assert_exited(int((self.root / "grandchild-pid").read_text()))
+
+    def test_child_cap_aborts_and_reaps(self):
+        with self.assertRaisesRegex(safety.SupervisionError, "child-footprint"):
+            self._run("import os,time; open('root-pid','w').write(str(os.getpid())); b=bytearray(128*1024*1024); time.sleep(10)",
+                      cap=64 * 1024**2)
+        self.assertTrue(any(amount > 64 * 1024**2 for amount in self.sampled))
+        self._assert_exited(int((self.root / "root-pid").read_text()))
+
 
 if __name__ == "__main__":
     unittest.main()

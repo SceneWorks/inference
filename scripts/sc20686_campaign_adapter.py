@@ -1329,8 +1329,8 @@ def main():
         parser.error("synthetic evidence cannot enter the campaign adapter")
     try:
         safety_policy = supervisor.load_policy(args.safety_policy)
-        if safety_policy.backend != "linux-cuda":
-            raise ValueError("SC-20686 Candle media campaigns require the Linux/CUDA safety backend")
+        if safety_policy.backend not in {"linux-cuda", "windows-cuda"}:
+            raise ValueError("SC-20686 Candle media campaigns require a Linux/Windows CUDA safety backend")
         if not args.resume_dir.is_absolute() or args.resume_dir.is_symlink():
             raise ValueError("resume directory must be an absolute, nonsymlink path")
         if args.run_timeout_seconds <= 0 or safety_policy.deadline_seconds > args.run_timeout_seconds:
