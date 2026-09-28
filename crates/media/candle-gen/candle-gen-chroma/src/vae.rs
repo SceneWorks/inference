@@ -18,14 +18,16 @@
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{
-    conv2d, group_norm, linear, ops::softmax_last_dim, Conv2d, Conv2dConfig, GroupNorm, Linear,
-    Module, VarBuilder,
+    group_norm, linear, ops::softmax_last_dim, Conv2dConfig, GroupNorm, Linear, Module, VarBuilder,
 };
+use candle_gen::{budgeted_conv2d as conv2d, BudgetedConv2d as Conv2d};
 
 const GN_GROUPS: usize = 32;
 const GN_EPS: f64 = 1e-6;
-const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
-const LATENT_CHANNELS: usize = 16;
+/// Decoder stage channel widths. Four stages, so three x2 halvings: the x8 spatial scale the
+/// memory contract publishes as an architecture axis (epic SC-22657).
+pub(crate) const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
+pub(crate) const LATENT_CHANNELS: usize = 16;
 /// Decoder up_blocks have `layers_per_block + 1 = 3` resnets each.
 const DECODER_RESNETS: usize = 3;
 /// FLUX AutoencoderKL scaling/shift (the Chroma `vae/config.json` values). The DiT works in the

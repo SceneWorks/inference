@@ -37,7 +37,7 @@ use mlx_gen::{
 use crate::config::NeoChatConfig;
 use crate::distill::{resolve_distill_lora, DISTILL_MERGED_MARKER};
 use crate::loader::{check_coverage, load_raw};
-use crate::t2i::{smart_resize, StepReporter, T2iModel, T2iOptions};
+use crate::t2i::{request_phase_bounds, smart_resize, StepReporter, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
 use mlx_gen::weights::Weights;
 
@@ -470,6 +470,10 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
         // exact path eager; the contract refuses rung 4 until the artifact is a pre-merged turnkey.
         T2iModel::from_weights(&weights, &cfg)?
     };
+    // Materialize at load, before the LoRA merge and `quantize` (sc-24245; see
+    // `mlx_gen_qwen_image::loader::load_transformer_with`). The deferred build never reads the
+    // generation-path block bodies, so they stay lazy for the Gen block stream.
+    weights.materialize_accessed()?;
     // The fast variant merges the 8-step distill LoRA into the dense generation path — UNLESS the
     // tier is a **pre-merged** turnkey (sc-8775: the packed/dense fast tiers bake the merge in at
     // convert time and drop `DISTILL_MERGED_MARKER`). A pre-merged tier must NOT re-merge: for a
@@ -483,6 +487,8 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<SenseNova> {
     if let Some(lora_path) = distill_lora_path {
         let lora = Weights::from_file(&lora_path)?;
         let applied = model.merge_distill_lora(&lora)?;
+        // The merge is lazy: read the LoRA factors now, before `quantize`/the first forward (sc-24245).
+        lora.materialize_accessed()?;
         let expected = cfg.llm.num_hidden_layers * 7 + 2;
         if applied != expected {
             return Err(Error::Msg(format!(
@@ -638,7 +644,11 @@ impl SenseNova {
             let opts = self.options(req, base_seed.wrapping_add(i as u64));
             // Thread cancellation + per-step progress into the denoise loop. Progress now reports the
             // denoise step (Kolors/SDXL semantics), not the image index as the old single tick did.
-            let reporter = StepReporter::new(&req.cancel, on_progress);
+            // The request's two phase boundaries are opened once each — by the first image's loop
+            // and the last image's loop — not once per image (sc-22738).
+            let (opens_denoise, opens_decode) = request_phase_bounds(i, req.count);
+            let reporter = StepReporter::new(&req.cancel, on_progress)
+                .with_phase_bounds(opens_denoise, opens_decode);
             let out = if references.is_empty() {
                 self.model.generate(
                     &self.tokenizer,

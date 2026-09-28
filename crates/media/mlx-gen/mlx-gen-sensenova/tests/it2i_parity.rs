@@ -132,3 +132,72 @@ fn it2i_denoise_matches_reference() {
         "it2i final-frame peak-rel {rel:.3e} exceeds 2e-2"
     );
 }
+
+/// sc-22738 — the it2i (edit / Character Studio / interleave-image) denoise loop brackets its
+/// steps with the same two lifecycle boundaries as the T2I loop: `Loading(Renderer)` after the
+/// prefills and before step 1, `Decoding` after the last step. Pinned on the synthetic fixture
+/// through the production reporter; deleting or moving either emit in `T2iModel::it2i_denoise`
+/// changes this sequence.
+#[test]
+fn it2i_denoise_emits_its_phase_boundaries_around_the_loop() {
+    use mlx_gen::gen_core::{LoadPhase, Progress};
+    use mlx_gen::CancelFlag;
+    use mlx_gen_sensenova::t2i::StepReporter;
+
+    let (w, case) = crate::compact_fixture::load(CASE_FIXTURE);
+    let cfg = config_from_meta(&case);
+    let img_context_id: i32 = case.metadata("img_context_id").unwrap().parse().unwrap();
+    let img_start_id: i32 = case.metadata("img_start_id").unwrap().parse().unwrap();
+    let model = T2iModel::from_weights(&w, &cfg)
+        .expect("build T2iModel")
+        .with_image_token_ids(img_context_id, img_start_id, 12);
+    let width: i32 = case.metadata("width").unwrap().parse().unwrap();
+    let height: i32 = case.metadata("height").unwrap().parse().unwrap();
+    let num_steps: usize = case.metadata("num_steps").unwrap().parse().unwrap();
+    let src_gh: i32 = case.metadata("src_grid_h").unwrap().parse().unwrap();
+    let src_gw: i32 = case.metadata("src_grid_w").unwrap().parse().unwrap();
+    let ids: Vec<i32> = w
+        .require("prefix.input_ids")
+        .unwrap()
+        .as_slice::<i32>()
+        .to_vec();
+    let pixel_values = w.require("pixel_values").unwrap().clone();
+    let raw_noise = w.require("raw_noise").unwrap().clone();
+    let (mut cache, img_temporal) = model
+        .prefill_it2i(&ids, Some(&pixel_values), &[(src_gh, src_gw)])
+        .expect("prefill_it2i");
+    let opts = T2iOptions {
+        cfg_scale: 1.0,
+        num_steps,
+        ..Default::default()
+    };
+
+    let cancel = CancelFlag::new();
+    let mut events: Vec<Progress> = Vec::new();
+    {
+        let mut sink = |p: Progress| events.push(p);
+        model
+            .it2i_denoise(
+                (&mut cache, img_temporal),
+                None,
+                None,
+                width,
+                height,
+                &raw_noise,
+                &opts,
+                Some(StepReporter::new(&cancel, &mut sink)),
+            )
+            .expect("it2i_denoise");
+    }
+
+    let mut expected = vec![Progress::Loading(LoadPhase::Renderer)];
+    expected.extend((1..=num_steps).map(|current| Progress::Step {
+        current: current as u32,
+        total: num_steps as u32,
+    }));
+    expected.push(Progress::Decoding);
+    assert_eq!(
+        events, expected,
+        "the denoise phase opens before step 1 and the decode phase after step {num_steps}"
+    );
+}

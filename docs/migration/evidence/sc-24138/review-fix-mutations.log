@@ -1,0 +1,138 @@
+# sc-24138 review-fix mutations: one source mutation at a time (file touched), the named test selection run, the source restored.
+# CPU lane (Git Bash, Windows) unless marked; RED = the selection failed under the mutation.
+# M1-M28 ran on the test tree before `causal_after`'s growing-vs-static comparison was fixed to build its static cache
+# explicitly (M25 exposed it); the fix touched only that comparison and the CUDA-conditional token checks, and M25 was
+# re-run after it (second M25 entry), as were M29-M31. Every source was restored after its run; the suites pass restored.
+
+RED   M1 causal default Gqa -> Expanded (llama/qwen3/gemma4 seam tests)  [crates/llm/candle-llm/src/models/llama.rs]
+        test gemma4_decodes_to_its_golden_on_every_seam_path ... FAILED
+        test gemma4_mm_splice_decodes_to_its_golden_through_the_seam ... FAILED
+        test llama_decodes_to_its_golden_on_every_seam_path ... FAILED
+RED   M2 growing cache ignores the selector (always Gqa)  [crates/llm/candle-llm/src/models/llama.rs]
+        test llama_decodes_to_its_golden_on_every_seam_path ... FAILED
+        thread 'llama_decodes_to_its_golden_on_every_seam_path' (5448) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1139:5:
+        assertion `left == right` failed
+RED   M3 causal_before does not select Expanded  [crates/llm/candle-llm/tests/step_seam_migration.rs]
+        test qwen3_dense_reference_matches_its_pre_migration_golden ... FAILED
+        thread 'qwen3_dense_reference_matches_its_pre_migration_golden' (28856) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:161:9:
+        assertion `left == right` failed: qwen3_dense: the pre-migration (expanded) path: the golden's logits, bit for bit
+RED   M4 goldens_bit_exact true everywhere  [crates/llm/candle-llm/tests/step_seam_migration.rs]
+        test golden_bit_exactness_is_limited_to_the_measured_configuration ... FAILED
+        thread 'golden_bit_exactness_is_limited_to_the_measured_configuration' (35248) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:154:9:
+        test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+RED   M5 widest_layer independent maxima (step_kv_cache unit tests)  [crates/llm/candle-llm/src/primitives/step_kv_cache.rs]
+        test primitives::step_kv_cache::tests::layout_prices_every_caching_layer_and_skips_the_shared_tail ... FAILED
+        test primitives::step_kv_cache::tests::widest_layer_is_one_layers_geometry ... FAILED
+        thread 'primitives::step_kv_cache::tests::layout_prices_every_caching_layer_and_skips_the_shared_tail' (35632) panicked at crates\llm\candle-llm\src\primitives\step_kv_cache.rs:408:9:
+RED   M6 widest_layer independent maxima (provider admission test)  [crates/llm/candle-llm/src/primitives/step_kv_cache.rs]
+        test provider::tests::causal_admission_covers_the_static_kv_preallocation ... FAILED
+        thread 'provider::tests::causal_admission_covers_the_static_kv_preallocation' (26856) panicked at crates\llm\candle-llm\src\provider.rs:4142:13:
+        assertion `left == right` failed: gemma4 k_eq_v: one layer's heads × width, never the maxima of two layer types
+RED   M7 causal geometry uses scalar num_kv_heads x head_dim  [crates/llm/candle-llm/src/provider.rs]
+        test provider::tests::causal_admission_covers_the_static_kv_preallocation ... FAILED
+        thread 'provider::tests::causal_admission_covers_the_static_kv_preallocation' (29576) panicked at crates\llm\candle-llm\src\provider.rs:4134:13:
+        assertion `left == right` failed: gemma4 full wider: the geometry is the widest layer's
+RED   M8 priced_request_bytes drops the KV term  [crates/llm/candle-llm/src/provider.rs]
+        test provider::tests::causal_admission_covers_the_static_kv_preallocation ... FAILED
+        thread 'provider::tests::causal_admission_covers_the_static_kv_preallocation' (29640) panicked at crates\llm\candle-llm\src\provider.rs:4182:13:
+        test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 327 filtered out; finished in 0.07s
+RED   M9 CausalLm::new_cache_for ignores the overshoot  [crates/llm/candle-llm/src/models/llama.rs]
+        test provider::tests::causal_admission_covers_the_static_kv_preallocation ... FAILED
+        thread 'provider::tests::causal_admission_covers_the_static_kv_preallocation' (35280) panicked at crates\llm\candle-llm\src\provider.rs:4190:13:
+        assertion `left == right` failed: llama
+RED   M10 StarCoder2 default Gqa -> Expanded  [crates/llm/candle-llm/src/models/starcoder2.rs]
+        test starcoder2_decodes_to_its_golden_through_the_seam ... FAILED
+        thread 'starcoder2_decodes_to_its_golden_through_the_seam' (9068) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1415:5:
+        assertion `left == right` failed
+RED   M11 StarCoder2 growing cache ignores the selector (always Gqa)  [crates/llm/candle-llm/src/models/starcoder2.rs]
+        test starcoder2_decodes_to_its_golden_through_the_seam ... FAILED
+        thread 'starcoder2_decodes_to_its_golden_through_the_seam' (28784) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1477:5:
+        assertion `left == right` failed
+RED   M12 StarCoder2 logits_from_embeds hard-codes Expanded  [crates/llm/candle-llm/src/models/starcoder2.rs]
+        test starcoder2_decodes_to_its_golden_through_the_seam ... FAILED
+        thread 'starcoder2_decodes_to_its_golden_through_the_seam' (28540) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1470:5:
+        assertion `left == right` failed: starcoder2: the default reference loop is the static cache's arithmetic, bit for bit
+RED   M13 LlavaModel::set_attn_formulation no-op  [crates/llm/candle-llm/src/llava.rs]
+        test llava_caption_matches_its_pre_migration_golden ... FAILED
+        thread 'llava_caption_matches_its_pre_migration_golden' (33908) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:161:9:
+        assertion `left == right` failed: llava: the pre-migration (expanded) path: the golden's logits, bit for bit
+RED   M14 provider never routes the causal family to the engine (thinking.rs)  [crates/llm/candle-llm/src/provider.rs]
+        test provider_records_the_decode_path_it_ran ... FAILED
+        thread 'provider_records_the_decode_path_it_ran' (37716) panicked at crates\llm\candle-llm\tests\thinking.rs:145:5:
+        assertion `left == right` failed: the engine ran
+RED   M15 set_causal_decode_path does not store the path (thinking.rs)  [crates/llm/candle-llm/src/provider.rs]
+        test provider_records_the_decode_path_it_ran ... FAILED
+        thread 'provider_records_the_decode_path_it_ran' (39900) panicked at crates\llm\candle-llm\tests\thinking.rs:174:5:
+        assertion `left == right` failed: the reference loop ran
+RED   M16 set_causal_decode_path accepts PromptLookup  [crates/llm/candle-llm/src/provider.rs]
+        test provider_records_the_decode_path_it_ran ... FAILED
+        thread 'provider_records_the_decode_path_it_ran' (23344) panicked at crates\llm\candle-llm\tests\thinking.rs:181:5:
+        assertion failed: p.set_causal_decode_path(DecodePath::PromptLookup).is_err()
+RED   M17 Gemma 4 multimodal request routed to the reference loop  [crates/llm/candle-llm/src/provider.rs]
+        test gemma4_decodes_through_the_engine_and_the_reference_stays_selectable ... FAILED
+        thread 'gemma4_decodes_through_the_engine_and_the_reference_stays_selectable' (36544) panicked at crates\llm\candle-llm\tests\gemma4_multimodal.rs:672:9:
+        assertion `left == right` failed: request 0: the engine ran
+RED   M18 set_causal_decode_path does not store (gemma4_multimodal)  [crates/llm/candle-llm/src/provider.rs]
+        test gemma4_decodes_through_the_engine_and_the_reference_stays_selectable ... FAILED
+        thread 'gemma4_decodes_through_the_engine_and_the_reference_stays_selectable' (39056) panicked at crates\llm\candle-llm\tests\gemma4_multimodal.rs:689:9:
+        assertion `left == right` failed: request 0: the oracle ran
+RED   M19 causal default Expanded (gemma4_mm splice test)  [crates/llm/candle-llm/src/models/llama.rs]
+        test gemma4_mm_splice_decodes_to_its_golden_through_the_seam ... FAILED
+        thread 'gemma4_mm_splice_decodes_to_its_golden_through_the_seam' (24452) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1304:13:
+        assertion `left == right` failed: gemma4_mm: the default growing backing is the static cache's arithmetic
+RED   M20 gemma4_mm_before does not select Expanded  [crates/llm/candle-llm/tests/step_seam_migration.rs]
+        test gemma4_mm_reference_matches_its_pre_migration_golden ... FAILED
+        thread 'gemma4_mm_reference_matches_its_pre_migration_golden' (27820) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:161:9:
+        assertion `left == right` failed: gemma4_mm: the pre-migration (expanded) path: the golden's logits, bit for bit
+RED   M21 starcoder2_before does not select Expanded  [crates/llm/candle-llm/tests/step_seam_migration.rs]
+        test starcoder2_reference_matches_its_pre_migration_golden ... FAILED
+        thread 'starcoder2_reference_matches_its_pre_migration_golden' (32164) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:161:9:
+        assertion `left == right` failed: starcoder2: the pre-migration (expanded) path: the golden's logits, bit for bit
+RED   M22 causal default Expanded (llava seam test)  [crates/llm/candle-llm/src/models/llama.rs]
+        test llava_caption_decodes_to_its_golden_through_the_seam ... FAILED
+        thread 'llava_caption_decodes_to_its_golden_through_the_seam' (32948) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1328:5:
+        assertion `left == right` failed
+RED   M23 growing/paged ignores Expanded (gemma4 seam test)  [crates/llm/candle-llm/src/models/llama.rs]
+        test gemma4_decodes_to_its_golden_on_every_seam_path ... FAILED
+        thread 'gemma4_decodes_to_its_golden_on_every_seam_path' (29080) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:161:9:
+        assertion `left == right` failed: gemma4: growing, expanded: the golden's logits, bit for bit
+RED   M24 llava_before does not select Expanded  [crates/llm/candle-llm/tests/step_seam_migration.rs]
+        test llava_caption_matches_its_pre_migration_golden ... FAILED
+        thread 'llava_caption_matches_its_pre_migration_golden' (32728) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:161:9:
+        assertion `left == right` failed: llava: the pre-migration (expanded) path: the golden's logits, bit for bit
+RED   M25 CausalLm growing step runs Expanded while labelled Gqa  [crates/llm/candle-llm/src/models/llama.rs]  -- first run: fell on the later paged assertion, which exposed that the growing-block comparison built its 'static' cache through new_cache_for while the growing backing was selected (a growing-vs-growing compare); the test now builds it with new_static_cache, and the re-run below falls on the intended assertion
+        test llama_decodes_to_its_golden_on_every_seam_path ... FAILED
+        thread 'llama_decodes_to_its_golden_on_every_seam_path' (34344) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1227:5:
+        assertion `left == right` failed: paged (default) = static, bit for bit
+RED   M26 CausalLm reference loop runs Expanded (default selector ignored)  [crates/llm/candle-llm/src/models/llama.rs]
+        test qwen3_dense_decodes_to_its_golden_on_every_seam_path ... FAILED
+        thread 'qwen3_dense_decodes_to_its_golden_on_every_seam_path' (39208) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1211:5:
+        assertion `left == right` failed: qwen3_dense: the default reference loop is the static cache's arithmetic, bit for bit
+RED   M27 CausalLm reference loop runs Expanded (llava seam test)  [crates/llm/candle-llm/src/models/llama.rs]
+        test llava_caption_decodes_to_its_golden_through_the_seam ... FAILED
+        thread 'llava_caption_decodes_to_its_golden_through_the_seam' (36872) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1379:5:
+        assertion `left == right` failed: llava: the default caption rows are the static cache's, bit for bit
+RED   M28 StarCoder2 growing step runs Expanded while labelled Gqa  [crates/llm/candle-llm/src/models/starcoder2.rs]
+        test starcoder2_decodes_to_its_golden_through_the_seam ... FAILED
+        thread 'starcoder2_decodes_to_its_golden_through_the_seam' (35048) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1460:13:
+        assertion `left == right` failed: starcoder2: the default growing backing is the static cache's arithmetic
+RED   M25 CausalLm growing step runs Expanded while labelled Gqa  [crates/llm/candle-llm/src/models/llama.rs]  -- re-run after the test fix
+        test llama_decodes_to_its_golden_on_every_seam_path ... FAILED
+        thread 'llama_decodes_to_its_golden_on_every_seam_path' (33604) panicked at crates\llm\candle-llm\tests\step_seam_migration.rs:1119:5:
+        assertion `left == right` failed: llama: the default growing backing is the static cache's arithmetic, bit for bit
+RED   M29 the reference loop draws with another seed (thinking.rs same-text assertion)  [crates/llm/candle-llm/src/provider.rs]
+        test provider_records_the_decode_path_it_ran ... FAILED
+        thread 'provider_records_the_decode_path_it_ran' (37936) panicked at crates\llm\candle-llm\tests\thinking.rs:184:9:
+        assertion `left == right` failed: the same tokens on both loops
+GREEN M30 the Gemma 4 reference arm decodes one token fewer (gemma4 same-tokens assertion)  [crates/llm/candle-llm/src/provider.rs]  -- ineffective mutation: the fixture stops on its EOS before the budget, so one token fewer changes nothing; replaced by M30b
+RED   M30b the Gemma 4 reference arm prefills halved embeddings (gemma4 same-tokens assertion)  [crates/llm/candle-llm/src/provider.rs]
+        test gemma4_decodes_through_the_engine_and_the_reference_stays_selectable ... FAILED
+        test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.63s
+        thread 'gemma4_decodes_through_the_engine_and_the_reference_stays_selectable' (36212) panicked at crates\llm\candle-llm\tests\gemma4_multimodal.rs:692:13:
+
+# CUDA lane (PowerShell, MSVC 14.44, --features cuda, GPU 1)
+RED   M31 architecture_forward does not select Expanded (Windows+CUDA golden)  [crates/llm/candle-llm/tests/architecture_forward.rs]
+        test every_architecture_forward_is_bit_identical_to_the_base_branch ... FAILED
+        thread 'every_architecture_forward_is_bit_identical_to_the_base_branch' (37100) panicked at crates\llm\candle-llm\tests\architecture_forward.rs:81:9:
+        test result: FAILED. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+restored: test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s

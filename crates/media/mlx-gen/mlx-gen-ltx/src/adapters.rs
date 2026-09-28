@@ -515,6 +515,7 @@ pub fn apply_ltx_adapters(
     for spec in specs {
         let applied_before = report.applied;
         let w = Weights::from_file(&spec.path)?;
+        w.materialize()?;
         // The file's metadata is authoritative; the spec kind is an additional hint. A spec that
         // declares Lora but whose file says `networkType=lokr` is a caller error (the LoRA loader
         // would find no `lora_A/B` and apply nothing) — route by the file so it is never mis-applied.
@@ -568,6 +569,7 @@ pub fn apply_ltx25_adapters(
             )));
         }
         let w = Weights::from_file(&spec.path)?;
+        w.materialize()?;
         if is_lokr(&w) || is_lokr_keys(&w) || is_loha_keys(&w) {
             return Err(Error::Msg(format!(
                 "ltx_2_5 adapter {} is not a PEFT/Kohya LoRA file",

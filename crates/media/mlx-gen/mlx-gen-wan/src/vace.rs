@@ -395,7 +395,7 @@ impl WanVaceTransformer {
         let inv: Vec<f32> = (0..half)
             .map(|j| (10000.0_f64.powf(-(j as f64) / half as f64)) as f32)
             .collect();
-        Ok(Self {
+        let dit = Self {
             patch_embedding: load_patch_embedding(w, "patch_embedding")?,
             vace_patch_embedding: load_patch_embedding(w, "vace_patch_embedding")?,
             time_embedding_0: load_linear(w, "condition_embedder.time_embedder.linear_1", true)?,
@@ -411,7 +411,12 @@ impl WanVaceTransformer {
             inv_freq: Array::from_slice(&inv, &[half as i32]),
             cfg: cfg.clone(),
             compute_dtype,
-        })
+        };
+        // Materialize at load, before any `quantize`: left lazy, the first forward's command buffers
+        // wait on the safetensors reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(dit)
     }
 
     /// Quantize the DiT's `_quantize_predicate` surface to Q4/Q8 in place (sc-3440): every base block

@@ -180,7 +180,12 @@ impl Umt5Encoder {
             blocks.push(Umt5Block::from_weights(w, i)?);
         }
         let token_embedding = quant::embedding(w, "token_embedding", DEFAULT_GROUP_SIZE)?;
-        Self::assemble(token_embedding, blocks, w, cfg)
+        let encoder = Self::assemble(token_embedding, blocks, w, cfg)?;
+        // Materialize at load: left lazy, the first encode's command buffers wait on the safetensors
+        // reads — past the GPU watchdog on a cold page cache (sc-24245; see
+        // `mlx_gen_qwen_image::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(encoder)
     }
 
     /// **Quantized** build (sc-12831): pack the projection/FFN linears to `q.bits` while **consuming**
@@ -200,6 +205,9 @@ impl Umt5Encoder {
         let mut blocks = Vec::with_capacity(cfg.t5_num_layers);
         for i in 0..cfg.t5_num_layers {
             let mut block = Umt5Block::from_weights(w, i)?;
+            // Materialize at load (sc-24245): read this block's source bytes on the CPU stream before
+            // the GPU `quantize` consumes them (earlier blocks' keys are already drained from `w`).
+            w.materialize_accessed()?;
             block.quantize(q.bits, q.group_size)?;
             // Force the packs (+ the tiny f32 norm/pos tables, so they stop referencing their bf16
             // source) now, THEN drop w's dense refs for this block — releasing the block's bf16 before
@@ -217,7 +225,10 @@ impl Umt5Encoder {
         }
         // Token embedding stays dense (its ~2.1 GB bf16 clone materializes at gather-time during encode).
         let token_embedding = quant::embedding(w, "token_embedding", q.group_size)?;
-        Self::assemble(token_embedding, blocks, w, cfg)
+        let encoder = Self::assemble(token_embedding, blocks, w, cfg)?;
+        // Materialize the dense remainder (token embedding, final norm) at load (sc-24245).
+        w.materialize_accessed()?;
+        Ok(encoder)
     }
 
     /// Finish assembling the encoder from its built parts + the (still-dense) final norm. Shared by the

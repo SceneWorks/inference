@@ -1,0 +1,11 @@
+operable program or batch file.
+    Finished `release` profile [optimized] target(s) in 8.88s
+     Running tests\nvfp4_evidence.rs (target\release\deps\nvfp4_evidence-5a4c1a25bcf6002f.exe)
+
+running 1 test
+test nvfp4_real_weight_evidence ... [sc-24135] bf16: load 17.4s, resident weights 53791996928 B (Some(16.0) bits/param; projections Some(16.0)), ppl 7.8366 over 2048 tokens, first divergence vs bf16 None
+[sc-24135] nvfp4: load 17.0s, resident weights 16994352128 B (Some(5.054834354113086) bits/param; projections Some(4.510589318600369)), ppl 8.4140 over 2048 tokens, first divergence vs bf16 Some(Some(48))
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 142.39s
+

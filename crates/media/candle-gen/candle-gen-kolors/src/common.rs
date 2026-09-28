@@ -24,6 +24,17 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::pipeline::{kolors_alpha_schedule, VAE_SCALE};
 
+/// `sdxl_vae_config().block_out_channels` — the decoder geometry [`VAE_DECODER`] bounds.
+const VAE_BLOCK_OUT_CHANNELS: [usize; 4] = [128, 256, 512, 512];
+
+/// The external SDXL `AutoEncoderKL` decoder's shape for the sc-24114 launch-bound guard: past
+/// candle's 32-bit CUDA im2col/softmax indices (a 2048² decode) the native decode is tiled, since
+/// that decoder's convs cannot be chunked in-tree ([`candle_gen::bounded_kl_decode`]).
+pub(crate) const VAE_DECODER: candle_gen::KlDecoderShape<'static> = candle_gen::KlDecoderShape {
+    latent_channels: 4,
+    block_out_channels: &VAE_BLOCK_OUT_CHANNELS,
+};
+
 /// Reject `steps == 0` loudly instead of the silent 1-step render it would otherwise produce: the
 /// curated unified-sampler path feeds `req.steps` into gen-core `schedule_sigmas`, which clamps
 /// `steps.max(1)` — so an explicit 0 silently becomes a single-step decode of near-pure noise (the
@@ -95,7 +106,9 @@ pub(crate) fn decode(
             )?;
             pid.decode(latents)?
         }
-        None => vae.decode(&(latents / VAE_SCALE)?)?,
+        None => {
+            candle_gen::bounded_kl_decode(&VAE_DECODER, &(latents / VAE_SCALE)?, |l| vae.decode(l))?
+        }
     };
     to_image(&img)
 }
@@ -247,6 +260,21 @@ impl CuratedSetup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-24114: the guard's decoder geometry is the loaded VAE's, and it tiles a 2048² decode
+    /// (past the CUDA im2col u32 bound) while 1024² stays the single pass.
+    #[test]
+    fn native_decode_is_bounded_at_2048_and_single_pass_at_1024() {
+        let cfg = crate::pipeline::sdxl_vae_config();
+        assert_eq!(
+            VAE_DECODER.block_out_channels,
+            cfg.block_out_channels.as_slice()
+        );
+        assert_eq!(VAE_DECODER.latent_channels, cfg.latent_channels);
+        let latent = |px: usize| px / 8;
+        assert!(VAE_DECODER.exceeds_launch_bounds(latent(2048), latent(2048)));
+        assert!(!VAE_DECODER.exceeds_launch_bounds(latent(1024), latent(1024)));
+    }
 
     fn cpu() -> Device {
         Device::Cpu

@@ -107,6 +107,13 @@ pub const TRANSFORMER_WINDOW_SIZES: &[u32] = &[1, 2, 4, 8, 12, 24];
 pub const TRANSFORMER_BLOCK_COUNT: u32 = 48;
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str =
     "lens-candle-cuda-shared-ladder-device-format-blocks-v1";
+/// Static, weights-free identity namespace for the registry declaration walk. Never a measurement.
+///
+/// A contract built from a real load leaves an unnameable route's calibration `None`, so admission
+/// must name an explicit estimate authority. The weights-free surfaces cannot do that: the shared
+/// conformance walk needs *some* identity. This namespace supplies one whose value is structural,
+/// and it is asserted disjoint from every production string.
+pub const STATIC_BEHAVIOR_FINGERPRINT: &str = "lens-candle-registry-behavior-v1";
 /// Fixed harmony-preamble `Current date:`. The preamble is the first [`TXT_OFFSET`] tokens, which are
 /// **sliced off** before the DiT conditioning, so the date never reaches the image path — a fixed
 /// constant keeps generation deterministic regardless of wall-clock.
@@ -931,6 +938,7 @@ fn build_lens_turbo_memory_strategy_contract(spec: &LoadSpec) -> gen_core::Memor
         MODEL_ID_TURBO,
         spec,
         streams_dit_blocks(spec),
+        production_calibration_identity(MODEL_ID_TURBO, spec),
     )
 }
 
@@ -939,7 +947,384 @@ fn build_lens_turbo_memory_strategy_contract_with_eligibility(
     spec: &LoadSpec,
     streamable: bool,
 ) -> gen_core::MemoryProviderContract {
-    build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_TURBO, spec, streamable)
+    build_lens_memory_strategy_contract_with_eligibility(
+        MODEL_ID_TURBO,
+        spec,
+        streamable,
+        production_calibration_identity(MODEL_ID_TURBO, spec),
+    )
+}
+
+/// Architecture axes for the Lens / Lens-Turbo routes (epic SC-22657, E2).
+///
+/// Lens' geometry is not read from `transformer/config.json`: the loader builds the dual-stream
+/// MMDiT from the crate's own [`transformer::LensDitConfig::lens`] preset, which both routes share.
+/// Reading a config the loader ignores would describe a model this provider never constructs, so
+/// the axes come off the same struct handed to the DiT builder.
+///
+/// The decoder axes describe the shared FLUX.2 `AutoencoderKL` (`vae.rs` is a thin shim over
+/// `candle_gen_flux2::vae::Flux2Vae`) and are read off that crate's own constants rather than
+/// restated here (SC-22667): its `LATENT_CHANNELS` (32, exactly the DiT's `out_channels`) and its
+/// `BLOCK_OUT` stage list, whose four stages — three halvings — give the x8 scale.
+///
+/// `vae_temporal_scale` stays `None`: FLUX.2 ships an image VAE with no temporal axis at all. A
+/// structurally absent axis is declared absent, never zero (E2).
+///
+/// A weights-free contract — the registry's sentinel surface path, or a single-file import —
+/// publishes `MemoryArchitectureFacts::default()`: nothing that *would* be loaded is resolved
+/// there, so no axis is knowable.
+fn architecture_facts(spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    // The exact preset the DiT builder receives; Lens and Lens-Turbo share one geometry.
+    let dit = crate::transformer::LensDitConfig::lens();
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(dit.num_heads),
+        head_dim: af::declared(dit.head_dim),
+        transformer_blocks: af::declared(dit.num_layers),
+        patch_size: af::declared(dit.patch_size),
+        // The decoder's own latent width — which the DiT's `out_channels` must equal, a pin the
+        // tests hold — read off the crate that builds the decoder.
+        latent_channels: af::declared(candle_gen_flux2::vae::LATENT_CHANNELS),
+        // Each `BLOCK_OUT` stage after the first halves both spatial axes.
+        vae_spatial_scale: af::declared(candle_gen_flux2::vae::BLOCK_OUT.len())
+            .and_then(|stages| stages.checked_sub(1))
+            .and_then(|downsamples| (downsamples <= 5).then(|| 1_u32 << downsamples)),
+        // FLUX.2 ships an image `AutoencoderKL`: there is no temporal axis to declare.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(DIT_DTYPE),
+    }
+}
+
+/// Bytes per element of each component's **load** dtype (SC-22667, E1).
+///
+/// These are the three constants at the top of this file, restated as widths so the contract can
+/// price what `mmap_var_builder` materializes rather than what the shards weigh on disk. The VAE is
+/// the one that moves a real number: `Flux2Vae` is opened at [`VAE_DTYPE`] = `DType::F32` from a
+/// bf16 checkpoint, so an on-disk sum under-declared the decoder by exactly half.
+const ENC_WIDTH: u64 = 2;
+const DIT_WIDTH: u64 = 2;
+const VAE_WIDTH: u64 = 4;
+/// The width `QLinear::fold` promotes a folded projection's `.bias` to (f32, for the post-matmul
+/// add) — the one DiT leaf a Q4/Q8 request moves *up* from [`DIT_WIDTH`] (SC-22667 review).
+const FOLDED_BIAS_WIDTH: u64 = 4;
+
+/// MLX affine group size the packed Lens tiers ship and the shared loaders assume
+/// (`guard_packed_group_size` rejects anything else at load).
+const PACKED_GROUP: usize = candle_gen::quant::MLX_GROUP_SIZE;
+
+/// The DiT projections `LensTransformer::quantize` folds, by checkpoint leaf name.
+///
+/// Everything else in `transformer/` stays dense at [`DIT_WIDTH`]: the AdaLN modulations
+/// (`img_mod.1` / `txt_mod.1` are plain `Linear`, deliberately outside the `QLinear` surface), every
+/// RMSNorm, and the timestep embedder.
+const DIT_FOLDED_LEAVES: [&str; 10] = [
+    "img_in.weight",
+    "txt_in.weight",
+    "proj_out.weight",
+    ".img_qkv.weight",
+    ".txt_qkv.weight",
+    ".to_out.0.weight",
+    ".to_add_out.weight",
+    ".w1.weight",
+    ".w2.weight",
+    ".w3.weight",
+];
+
+/// Headers of one component directory, or none when it is not on disk — an unresolved component
+/// contributes `0` exactly as `PerComponentBytes::from_spec_subdirs` made it.
+fn component_headers(path: &Path) -> gen_core::Result<Vec<gen_core::SafetensorsTensorHeader>> {
+    if gen_core::safetensors_path_bytes(path) == 0 {
+        return Ok(Vec::new());
+    }
+    gen_core::safetensors_path_tensor_headers(path)
+}
+
+/// GGML block bytes for `elements` values at `dtype`.
+fn ggml_bytes(
+    elements: u64,
+    dtype: candle_gen::candle_core::quantized::GgmlDType,
+    what: &str,
+) -> gen_core::Result<u64> {
+    let block = dtype.block_size() as u64;
+    if block == 0 || !elements.is_multiple_of(block) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "lens: {what} has {elements} elements, not a whole number of {block}-wide {dtype:?} \
+             blocks"
+        )));
+    }
+    (elements / block)
+        .checked_mul(dtype.type_size() as u64)
+        .ok_or_else(|| gen_core::Error::Msg(format!("lens: {what} resident bytes overflow")))
+}
+
+/// Resident bytes of one MLX affine triple after Candle repacks it to its device format.
+///
+/// The rank-2 case is `candle_gen::quant::mlx_packed_qtensor_resident_bytes` exactly; this accepts
+/// the **rank-3** fused expert triples the packed Lens text encoder ships
+/// (`experts.gate_up_proj.{weight,scales,biases}`, `[experts, out, in]`) by folding the leading
+/// dimensions into `out`, which is what `packed_experts` does per expert anyway.
+fn repacked_triple_bytes(
+    weight: &gen_core::SafetensorsTensorHeader,
+    scales: &gen_core::SafetensorsTensorHeader,
+    biases: &gen_core::SafetensorsTensorHeader,
+) -> gen_core::Result<u64> {
+    let split = |shape: &[usize]| -> Option<(u64, u64)> {
+        let (last, lead) = shape.split_last()?;
+        let rows = lead.iter().try_fold(1_u64, |rows, dimension| {
+            rows.checked_mul(u64::try_from(*dimension).ok()?)
+        })?;
+        Some((rows, u64::try_from(*last).ok()?))
+    };
+    let describe = || format!("packed triple {:?}", weight.name);
+    let (rows, packed_columns) = split(&weight.shape).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!("lens: {} has no packed shape", describe()))
+    })?;
+    let (scale_rows, groups) = split(&scales.shape).ok_or_else(|| {
+        gen_core::Error::Unsupported(format!("lens: {} has no scale shape", describe()))
+    })?;
+    if scales.shape != biases.shape
+        || rows != scale_rows
+        || weight.dtype != gen_core::weightsmeta::Dtype::U32
+        || groups == 0
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "lens: {} has incompatible shapes or dtype",
+            describe()
+        )));
+    }
+    let input = groups
+        .checked_mul(PACKED_GROUP as u64)
+        .ok_or_else(|| gen_core::Error::Msg(format!("lens: {} width overflow", describe())))?;
+    let encoded_bits = packed_columns
+        .checked_mul(32)
+        .ok_or_else(|| gen_core::Error::Msg(format!("lens: {} bit overflow", describe())))?;
+    if input == 0 || !encoded_bits.is_multiple_of(input) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "lens: {} cannot infer a Q4/Q8 width",
+            describe()
+        )));
+    }
+    // Candle's repack lands Q4 as `Q4_1` (20 B per 32 values) and Q8 as `Q8_0` (34 B), the widths
+    // `candle_gen::quant::mlx_packed_qtensor_resident_bytes` documents for this exact conversion.
+    let bytes_per_block = match encoded_bits / input {
+        4 => 20_u64,
+        8 => 34_u64,
+        bits => {
+            return Err(gen_core::Error::Unsupported(format!(
+                "lens: {} has unsupported Q{bits} width",
+                describe()
+            )))
+        }
+    };
+    let elements = rows
+        .checked_mul(input)
+        .ok_or_else(|| gen_core::Error::Msg(format!("lens: {} element overflow", describe())))?;
+    if !elements.is_multiple_of(32) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "lens: {} has {elements} elements, not a multiple of 32",
+            describe()
+        )));
+    }
+    (elements / 32)
+        .checked_mul(bytes_per_block)
+        .ok_or_else(|| gen_core::Error::Msg(format!("lens: {} resident overflow", describe())))
+}
+
+/// Load-exact bytes of the `transformer/` component (SC-22667, E1).
+///
+/// Three source layouts reach one resident form and each is priced as what lands on the device:
+///
+/// * a **packed MLX tier** — `LensTransformer::new` builds each projection straight from its affine
+///   triple, which Candle repacks to a GGML tensor;
+/// * a **dense tier with `spec.quantize`** — `transformer.quantize(quant)` folds the ten projection
+///   families in [`DIT_FOLDED_LEAVES`] to `Q4_0`/`Q8_0` and leaves the modulations and norms alone;
+/// * a **dense tier without a request** — everything is bf16.
+fn transformer_component_bytes(dir: &Path, quant: Option<Quant>) -> gen_core::Result<u64> {
+    let headers = component_headers(dir)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    // A dense float projection in the fold surface: what `transformer.quantize(quant)` folds.
+    let folds_at_request = |header: &gen_core::SafetensorsTensorHeader| {
+        header.is_float()
+            && DIT_FOLDED_LEAVES
+                .iter()
+                .any(|leaf| header.name.ends_with(leaf))
+    };
+    let mut total = 0_u64;
+    let mut dense = Vec::new();
+    let mut promoted = Vec::new();
+    for header in &headers {
+        if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
+            // Priced with the `.weight` they belong to; an orphan is caught there.
+            continue;
+        }
+        let base = header.name.strip_suffix(".weight");
+        let triple = base.and_then(|base| {
+            Some((
+                *by_name.get(format!("{base}.scales").as_str())?,
+                *by_name.get(format!("{base}.biases").as_str())?,
+            ))
+        });
+        let bytes = match (triple, quant) {
+            (Some((scales, biases)), _) => repacked_triple_bytes(header, scales, biases)?,
+            (None, Some(quant)) if folds_at_request(header) => {
+                let dtype = candle_gen::quant::ggml_dtype(quant)
+                    .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+                let elements = header
+                    .element_count()
+                    .map_err(|error| gen_core::Error::Msg(error.to_string()))?;
+                ggml_bytes(elements, dtype, &header.name)?
+            }
+            // The `.bias` of a projection the request-time fold quantizes is promoted to f32 by
+            // that fold (`QLinear::fold`: "the bias follows the weight's device and is promoted to
+            // f32"), so it is priced at 4 B rather than at `DIT_WIDTH` (SC-22667 review). A packed
+            // tier's `.bias` stays at the store width: `fold` returns early on a quantized base.
+            (None, Some(_))
+                if header.name.strip_suffix(".bias").is_some_and(|base| {
+                    by_name
+                        .get(format!("{base}.weight").as_str())
+                        .is_some_and(|weight| folds_at_request(weight))
+                }) =>
+            {
+                promoted.push(header.clone());
+                continue;
+            }
+            _ => {
+                dense.push(header.clone());
+                continue;
+            }
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| gen_core::Error::Msg("lens: transformer byte overflow".into()))?;
+    }
+    total
+        .checked_add(gen_core::materialized_header_bytes(&dense, DIT_WIDTH, dir)?)
+        .ok_or_else(|| gen_core::Error::Msg("lens: transformer byte overflow".into()))?
+        .checked_add(gen_core::materialized_header_bytes(
+            &promoted,
+            FOLDED_BIAS_WIDTH,
+            dir,
+        )?)
+        .ok_or_else(|| gen_core::Error::Msg("lens: transformer byte overflow".into()))
+}
+
+/// Load-exact bytes of the `text_encoder/` component (SC-22667, E1).
+///
+/// The gpt-oss encoder's fused MoE experts are the whole story here, and an on-disk sum is wrong for
+/// them in **both** directions. The hosted dense tier ships them **MXFP4** — two 4-bit codes per
+/// stored byte — so `text_encoder.rs`'s three routes land at very different sizes from the same
+/// shards:
+///
+/// * `quantization` present (a packed `SceneWorks/lens-mlx` tier): each expert triple is repacked to
+///   its device GGML format, whatever `spec.quantize` asked for;
+/// * MXFP4 with `spec.quantize` (sc-5111): each expert is dequantized host-side and re-quantized to
+///   `Q4_0`/`Q8_0` — roughly 13 GB at Q4, against an on-disk sum that reads the packed shards;
+/// * MXFP4 without one (sc-5108): the experts dequantize to bf16 and settle at **twice the logical
+///   element count in bytes**, roughly 40 GB — the case an on-disk sum under-declared by ~4x.
+///
+/// Every non-expert tensor (embeddings, attention projections, norms, the router) is opened at
+/// [`ENC_WIDTH`] like the rest of the component.
+fn text_encoder_component_bytes(dir: &Path, quant: Option<Quant>) -> gen_core::Result<u64> {
+    let headers = component_headers(dir)?;
+    let by_name = headers
+        .iter()
+        .map(|header| (header.name.as_str(), header))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut total = 0_u64;
+    let mut dense = Vec::new();
+    for header in &headers {
+        if header.name.ends_with(".scales") || header.name.ends_with(".biases") {
+            continue;
+        }
+        if let Some(base) = header.name.strip_suffix(".weight") {
+            if let (Some(scales), Some(biases)) = (
+                by_name.get(format!("{base}.scales").as_str()),
+                by_name.get(format!("{base}.biases").as_str()),
+            ) {
+                total = total
+                    .checked_add(repacked_triple_bytes(header, scales, biases)?)
+                    .ok_or_else(|| {
+                        gen_core::Error::Msg("lens: text encoder byte overflow".into())
+                    })?;
+                continue;
+            }
+        }
+        // `_scales` is the MXFP4 e8m0 exponent plane; it is consumed by the unpack and never lands.
+        if header.name.ends_with("_scales") {
+            continue;
+        }
+        let Some(_) = header.name.strip_suffix("_blocks") else {
+            dense.push(header.clone());
+            continue;
+        };
+        // Each stored byte of an MXFP4 block plane carries two 4-bit e2m1 codes.
+        let elements = header
+            .element_count()
+            .map_err(|error| gen_core::Error::Msg(error.to_string()))?
+            .checked_mul(2)
+            .ok_or_else(|| gen_core::Error::Msg("lens: MXFP4 element overflow".into()))?;
+        let bytes = match quant {
+            Some(quant) => {
+                let dtype = candle_gen::quant::ggml_dtype(quant)
+                    .map_err(|error| gen_core::Error::Unsupported(error.to_string()))?;
+                ggml_bytes(elements, dtype, &header.name)?
+            }
+            None => elements.checked_mul(ENC_WIDTH).ok_or_else(|| {
+                gen_core::Error::Msg("lens: dequantized expert byte overflow".into())
+            })?,
+        };
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| gen_core::Error::Msg("lens: text encoder byte overflow".into()))?;
+    }
+    total
+        .checked_add(gen_core::materialized_header_bytes(&dense, ENC_WIDTH, dir)?)
+        .ok_or_else(|| gen_core::Error::Msg("lens: text encoder byte overflow".into()))
+}
+
+/// The bytes each Lens component **materializes** for this load (epic SC-22657, E1; feature-end
+/// sweep SC-22667).
+///
+/// Replaces `PerComponentBytes::from_spec_subdirs`, whose on-disk shard sums were wrong for all
+/// three components at once: the VAE by a factor of two (opened f32, stored bf16), the DiT by the
+/// whole quantization win on any Q4/Q8 request, and the MXFP4 text encoder in whichever direction
+/// the requested tier happened to fall.
+fn loaded_component_bytes(spec: &LoadSpec) -> gen_core::Result<gen_core::PerComponentBytes> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Ok(gen_core::PerComponentBytes::default());
+    };
+    Ok(gen_core::PerComponentBytes {
+        text_encoder: text_encoder_component_bytes(&root.join("text_encoder"), spec.quantize)?,
+        dit: transformer_component_bytes(&root.join("transformer"), spec.quantize)?,
+        vae: vae_component_bytes(&root.join("vae"))?,
+    })
+}
+
+/// The `vae/` tensors an **inference** construction of `Flux2Vae` leaves on disk (SC-22667 review).
+///
+/// Both inference sites (`LensBuilder::build` resident and streamed) call `Flux2Vae::new`, which is
+/// `build(vb, false)` — decode-only: the `encoder.*` subtree and its `quant_conv` are never read.
+/// Only `training.rs` calls `new_with_encoder`. `post_quant_conv` is part of the decode path and is
+/// kept; the prefix test is anchored so it cannot match it.
+fn vae_tensor_is_encoder_only(name: &str) -> bool {
+    name.starts_with("encoder.") || name.starts_with("quant_conv.")
+}
+
+/// Load-exact bytes of the `vae/` component (SC-22667, E1): the decode-only surface
+/// [`vae_tensor_is_encoder_only`] leaves behind, opened at [`VAE_WIDTH`].
+fn vae_component_bytes(dir: &Path) -> gen_core::Result<u64> {
+    let decode_only = component_headers(dir)?
+        .into_iter()
+        .filter(|header| !vae_tensor_is_encoder_only(&header.name))
+        .collect::<Vec<_>>();
+    gen_core::materialized_header_bytes(&decode_only, VAE_WIDTH, dir)
 }
 
 fn build_lens_memory_strategy_contract(
@@ -950,13 +1335,18 @@ fn build_lens_memory_strategy_contract(
         provider_id,
         spec,
         streams_dit_blocks(spec),
+        production_calibration_identity(provider_id, spec),
     )
 }
 
+/// `streamable` drives the RUNG declarations; `calibration` is decided by the caller, because the
+/// production paths bind it to the artifact on disk while the weights-free surfaces — which have no
+/// artifact — must publish the static behavior namespace instead (sc-22732).
 fn build_lens_memory_strategy_contract_with_eligibility(
     provider_id: &'static str,
     spec: &LoadSpec,
     streamable: bool,
+    calibration: Option<gen_core::MemoryCalibrationIdentity>,
 ) -> gen_core::MemoryProviderContract {
     use gen_core::{
         MemoryBackendRealization, MemoryFormulaKind, MemoryFormulaVariable,
@@ -965,13 +1355,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
         MemoryStrategyPrerequisite, MemoryStrategySupport, MemoryWindowMaterialization,
     };
 
-    let components = gen_core::PerComponentBytes::from_spec_subdirs(
-        spec,
-        &["text_encoder"],
-        &["transformer"],
-        &["vae"],
-    )
-    .unwrap_or_default();
+    let components = loaded_component_bytes(spec).unwrap_or_default();
     let phases = vec![
         MemoryPhase::Conditioning,
         MemoryPhase::Denoise,
@@ -1011,6 +1395,8 @@ fn build_lens_memory_strategy_contract_with_eligibility(
         .collect();
 
     MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(spec),
         provider_id: provider_id.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -1063,7 +1449,7 @@ fn build_lens_memory_strategy_contract_with_eligibility(
                 MemoryFormulaVariable::TransformerWindowSize,
             ],
         },
-        calibration: memory_calibration(spec, streamable),
+        calibration,
         asset_facts: gen_core::MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -1796,19 +2182,188 @@ fn streams_dit_blocks(spec: &LoadSpec) -> bool {
     streams_text_encoder(spec) && transformer_numeric_tier_matches(spec, expected_bits)
 }
 
-fn memory_calibration(
-    spec: &LoadSpec,
-    _streamable: bool,
-) -> Option<gen_core::MemoryCalibrationIdentity> {
-    // The base resident envelope does not carry typed adapter/PiD component bytes. Refuse calibrated
-    // admission for those load shapes until they have their own measured component accounting.
-    if !is_plain_measured_load(spec) {
+/// The declared packed tier of one component, read from its `config.json` `quantization` marker.
+///
+/// `None` means "no packed marker" — either a dense component or a missing/unreadable config, both
+/// of which fail closed at the caller. This is the marker only; the safetensors cross-check for the
+/// transformer is [`transformer_numeric_tier_matches`].
+fn component_marker_bits(spec: &LoadSpec, component: &str) -> Option<i32> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return None;
+    };
+    let json = std::fs::read_to_string(root.join(component).join("config.json")).ok()?;
+    let config = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    candle_gen::quant::PackedConfig::from_config(&config).map(|packed| packed.bits)
+}
+
+/// Whether a component is PROVABLY dense: its shards are readable and carry no packed affine
+/// triple.
+///
+/// Both halves matter. A `.scales` tensor is the packed marker in the tensor inventory itself, so a
+/// component with no declared tier but packed triples on disk is self-inconsistent, not dense. And
+/// an ABSENT component proves nothing at all: without the shard read, a `LoadSpec` pointing at a
+/// path that does not exist would read as "no marker, no triples" and borrow the bf16 cell's string.
+fn component_is_provably_dense(spec: &LoadSpec, component: &str) -> bool {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return false;
+    };
+    let Ok(files) = candle_gen::sorted_safetensors(&root.join(component), "lens") else {
+        return false;
+    };
+    if files.is_empty() {
+        return false;
+    }
+    // SAFETY: read-only model artifacts, mapped only long enough to inspect the immutable headers.
+    let Ok(source) = (unsafe { MmapedSafetensors::multi(&files) }) else {
+        return false;
+    };
+    !source
+        .tensors()
+        .iter()
+        .any(|(name, _)| name.ends_with(".scales"))
+}
+
+/// The tier the snapshot on disk actually is: the declared `config.json` marker cross-checked
+/// against the packed triples in the safetensors headers, both components.
+///
+/// `None` — nothing nameable: not a directory, the components are absent or unreadable, or the two
+/// disagree. `Some(None)` — dense bf16: both components are readable, neither declares a tier and
+/// neither carries a `.scales` triple. `Some(Some(_))` —
+/// both components declare the same 4/8-bit tier AND [`transformer_numeric_tier_matches`] confirms
+/// the DiT's packed triples against that declaration (dtypes, matching rows, exact packed-column
+/// arithmetic, and every U32 weight belonging to a validated triple).
+///
+/// The encoder side is proven by its declared marker rather than by
+/// [`packed_text_encoder_config`]'s full expert-inventory walk. That walk stays exactly where it is,
+/// as the rung-4 streamability gate ([`streams_text_encoder`]) — but it demands the complete
+/// gpt-oss-20b packed inventory, roughly 10 GB of expert tensors, so it is not something a fixture
+/// can stand up. Naming the (route, tier) CELL does not need it: the DiT half is fully cross-checked
+/// here, and the two halves must agree.
+fn resolved_artifact_tier(spec: &LoadSpec) -> Option<Option<Quant>> {
+    if !matches!(spec.weights, WeightsSource::Dir(_)) {
         return None;
     }
-    Some(gen_core::MemoryCalibrationIdentity::new(
-        MEMORY_CALIBRATION_FINGERPRINT,
+    let text = component_marker_bits(spec, "text_encoder");
+    let dit = component_marker_bits(spec, "transformer");
+    match (text, dit) {
+        (Some(text_bits), Some(dit_bits)) if text_bits == dit_bits => {
+            let quant = match dit_bits {
+                4 => Quant::Q4,
+                8 => Quant::Q8,
+                _ => return None,
+            };
+            transformer_numeric_tier_matches(spec, dit_bits as usize).then_some(Some(quant))
+        }
+        (None, None) => (component_is_provably_dense(spec, "text_encoder")
+            && component_is_provably_dense(spec, "transformer"))
+        .then_some(None),
+        _ => None,
+    }
+}
+
+/// Production calibration identity table of the clean Lens base routes, keyed on
+/// (route, proven artifact tier) (sc-22732, epic sc-22723 E1/E4).
+///
+/// This is the TABLE, not the binding: only `production_calibration_identity` — which proves the
+/// tier against the artifact on disk first — may turn one of these strings into a contract identity.
+///
+/// Before sc-22732 this crate published ONE string, [`MEMORY_CALIBRATION_FINGERPRINT`], for all six
+/// (route, tier) cells and for all 24 weights-free registry surfaces, gated on nothing but
+/// `is_plain_measured_load`. That is an identity collision: a memory anchor binding to it could
+/// not tell which cell it had priced. The crate's own measurement record — the
+/// [`DEFAULT_TEXT_ENCODER_WINDOW`] doc comment — names exactly one shape behind that string: "An
+/// end-to-end q4 Lens-Turbo request (512x512, one denoise step, seed 15800) produced byte-identical
+/// pixels while reducing RESERVED request peak from 21.875 GiB resident to 8.281 GiB
+/// Sequential+Deferred/window-1 (62.1%)", and it records the dense/MXFP4 control as "deliberately
+/// ineligible". So `(lens_turbo, q4)` keeps that string byte-for-byte and the other eight cells —
+/// which never had evidence behind it — get their own keys, which no anchor has priced yet but which
+/// an anchor can now bind to.
+///
+/// Offload policy and load shape are deliberately NOT inputs:
+/// [`gen_core::MemoryCalibrationIdentity::load_shape`] carries the materialization axis, and the
+/// rung declarations this crate gates on `streamable` are unaffected by the identity.
+pub fn production_calibration_fingerprint(
+    provider_id: &str,
+    artifact_tier: Option<Quant>,
+) -> Option<String> {
+    let tier = match artifact_tier {
+        None => "bf16",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(_) => return None,
+    };
+    match (provider_id, artifact_tier) {
+        // The one measured Candle/CUDA cell, preserved byte-for-byte at exactly the cell the
+        // SC-15800 end-to-end result measured.
+        (MODEL_ID_TURBO, Some(Quant::Q4)) => Some(MEMORY_CALIBRATION_FINGERPRINT.to_owned()),
+        (MODEL_ID_BASE, _) => Some(format!("lens-base-{tier}-candle-cuda-shared-ladder-v1")),
+        (MODEL_ID_TURBO, _) => Some(format!("lens-turbo-{tier}-candle-cuda-shared-ladder-v1")),
+        _ => None,
+    }
+}
+
+/// The identity a loaded Lens route publishes, bound to the artifact it opens.
+///
+/// Three fail-closed gates, all of which the single `is_plain_measured_load` check this replaces
+/// left open:
+///
+/// * [`is_plain_measured_load`] — the base resident envelope carries no typed adapter/PiD component
+///   bytes, so an overlay stack is a different resident set. Kept exactly as it was;
+/// * bf16 execution precision — the anchors priced the checkpoint dtype; and
+/// * the tier must be PROVEN from disk ([`resolved_artifact_tier`]) and must equal `spec.quantize`.
+///   `spec.quantize` transcodes the encoder experts and the DiT linears AT LOAD when the snapshot is
+///   not already that tier, and no anchor measured that peak.
+///
+/// Withholding is never fatal: the contract builder is infallible and simply publishes no identity,
+/// which leaves admission to explicit estimate authority.
+fn production_calibration_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> Option<gen_core::MemoryCalibrationIdentity> {
+    if !is_plain_measured_load(spec) || spec.precision != Precision::Bf16 {
+        return None;
+    }
+    let artifact_tier = resolved_artifact_tier(spec)?;
+    if artifact_tier != spec.quantize {
+        return None;
+    }
+    production_calibration_fingerprint(provider_id, artifact_tier)
+        .map(|fingerprint| gen_core::MemoryCalibrationIdentity::new(fingerprint, spec.load_shape))
+}
+
+/// Per-route static behavior identity for the weights-free declaration surfaces.
+///
+/// Those surfaces have no snapshot to prove anything against, so they must never carry a production
+/// string — before sc-22732 all 24 of them published [`MEMORY_CALIBRATION_FINGERPRINT`], which is a
+/// measured q4 Lens-Turbo result. Keying the static identity on the exact axes the contract shape
+/// depends on — provider, numeric tier, offload policy, plus the load shape the identity already
+/// carries — keeps the declaration walk fail-closed the way the production identities are.
+/// Modelled on `mlx-gen-lens/src/memory_strategy.rs`'s `static_behavior_identity`.
+fn static_behavior_identity(
+    provider_id: &str,
+    spec: &LoadSpec,
+) -> gen_core::MemoryCalibrationIdentity {
+    let precision = match spec.precision {
+        Precision::Bf16 => "bf16",
+        Precision::Fp32 => "fp32",
+    };
+    let quant = match spec.quantize {
+        None => "dense",
+        Some(Quant::Q4) => "q4",
+        Some(Quant::Q8) => "q8",
+        Some(Quant::Nvfp4) => "nvfp4",
+    };
+    let policy = match spec.offload_policy {
+        OffloadPolicy::Resident => "resident",
+        OffloadPolicy::Sequential => "sequential",
+    };
+    // `MemoryProviderContract::conformance_errors` requires lowercase kebab tokens, and the provider
+    // ids are snake_case, so `lens_turbo` has to be spelled `lens-turbo` here.
+    let route = provider_id.replace('_', "-");
+    gen_core::MemoryCalibrationIdentity::new(
+        format!("{STATIC_BEHAVIOR_FINGERPRINT}-{route}-{precision}-{quant}-{policy}"),
         spec.load_shape,
-    ))
+    )
 }
 
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
@@ -1934,7 +2489,12 @@ fn weights_free_lens_memory_strategy_contract(
             gen_core::LoadShape::DeferredMaterialization
         )
         && is_plain_measured_load(spec);
-    build_lens_memory_strategy_contract_with_eligibility(provider_id, spec, streamable)
+    build_lens_memory_strategy_contract_with_eligibility(
+        provider_id,
+        spec,
+        streamable,
+        Some(static_behavior_identity(provider_id, spec)),
+    )
 }
 
 fn surface_selector_matches_spec(
@@ -1986,6 +2546,7 @@ fn weights_free_lens_surface_contract(
         provider_id,
         spec,
         streamable,
+        Some(static_behavior_identity(provider_id, spec)),
     ))
 }
 
@@ -2089,6 +2650,134 @@ fn registered_lens_begin_request(
 mod weights_free_behavior_tests {
     use super::*;
 
+    /// Header-only safetensors: every assertion below is over tensor geometry, which lives in the
+    /// header, and nothing reads a payload value.
+    fn write_tensors(path: &Path, tensors: &[(&str, &str, &[usize])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0_u64;
+        for &(name, dtype, shape) in tensors {
+            let width = match dtype {
+                "U8" => 1_u64,
+                "BF16" | "F16" => 2,
+                "F32" | "U32" => 4,
+                other => panic!("unhandled fixture dtype {other}"),
+            };
+            let bytes = shape.iter().product::<usize>() as u64 * width;
+            header.insert(
+                name.to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + bytes],
+                }),
+            );
+            offset += bytes;
+        }
+        let mut json = serde_json::to_vec(&header).unwrap();
+        while !json.len().is_multiple_of(8) {
+            json.push(b' ');
+        }
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(json);
+        bytes.extend(vec![0_u8; offset as usize]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A snapshot in the hosted **dense** layout: bf16 DiT and VAE, MXFP4 fused experts.
+    fn dense_snapshot(root: &Path) {
+        write_tensors(
+            &root.join("text_encoder/model.safetensors"),
+            &[
+                ("model.embed_tokens.weight", "BF16", &[64, 8]),
+                // gpt-oss ships the fused experts MXFP4: two 4-bit codes per stored byte, plus an
+                // e8m0 exponent plane the unpack consumes.
+                (
+                    "model.layers.0.mlp.experts.gate_up_proj_blocks",
+                    "U8",
+                    &[2, 64, 16],
+                ),
+                (
+                    "model.layers.0.mlp.experts.gate_up_proj_scales",
+                    "U8",
+                    &[2, 64, 1],
+                ),
+            ],
+        );
+        write_tensors(
+            &root.join("transformer/model.safetensors"),
+            &[
+                ("img_in.weight", "BF16", &[64, 64]),
+                ("blocks.0.attn.img_qkv.weight", "BF16", &[64, 64]),
+                // The fused-QKV projection carries a bias; `QLinear::fold` promotes it to f32 when
+                // the weight folds and leaves it bf16 otherwise.
+                ("blocks.0.attn.img_qkv.bias", "BF16", &[64]),
+                // An AdaLN modulation: a plain `Linear`, outside the `QLinear` fold surface.
+                ("blocks.0.img_mod.1.weight", "BF16", &[64, 64]),
+            ],
+        );
+        write_tensors(
+            &root.join("vae/model.safetensors"),
+            &[
+                // The decode path `Flux2Vae::new` materializes: 64 + 16 values.
+                ("decoder.conv_out.weight", "BF16", &[8, 8]),
+                ("post_quant_conv.weight", "BF16", &[4, 4]),
+                // The encoder half ships in the same shard and is never read by an inference
+                // construction (`build(vb, false)`); a decoder sum that includes it is wrong.
+                ("encoder.conv_in.weight", "BF16", &[8, 8]),
+                ("quant_conv.weight", "BF16", &[4, 4]),
+            ],
+        );
+    }
+
+    /// Feature-end review (SC-22667, E1). The three Lens components are opened at three different
+    /// widths and two of them are re-encoded at load, so an on-disk shard sum is wrong for all
+    /// three at once. Each expectation below is derived from the fixture's own geometry.
+    ///
+    /// Mutation that fails this: restoring `PerComponentBytes::from_spec_subdirs` as the contract's
+    /// byte source — the decoder halves to 128 B, the DiT reads its bf16 file length at every tier,
+    /// and the MXFP4 encoder reads its packed shard length instead of what it unpacks to.
+    #[test]
+    fn asset_facts_follow_the_loaded_widths_not_the_on_disk_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        dense_snapshot(&root);
+
+        // The decode path is 64 + 16 = 80 values, opened f32 from bf16: 320 B (the whole `vae/`
+        // shard weighs 320 B on disk, half of it the encoder the render never reads). Mutations
+        // that fail the decoder assertions: dropping `vae_tensor_is_encoder_only` from
+        // `vae_component_bytes` (640 B — the encoder charged), or pricing at `data_bytes` (160 B).
+        const DECODER_BYTES: u64 = (64 + 16) * 4;
+        for (quant, encoder, dit) in [
+            // Dense: the MXFP4 experts dequantize to bf16 (4_096 logical values), no DiT
+            // projection folds, and the qkv bias stays bf16 (128 B).
+            (None, 1_024 + 8_192, 3 * 8_192 + 128),
+            // Q4_0 is 18 B per 32 values; the modulation stays bf16 either way, and the folded
+            // qkv's bias is promoted to f32 (256 B) — mutation that fails this: pricing `.bias`
+            // through the dense arm at `DIT_WIDTH`.
+            (Some(Quant::Q4), 1_024 + 2_304, 2_304 + 2_304 + 8_192 + 256),
+            // Q8_0 is 34 B per 32 values.
+            (Some(Quant::Q8), 1_024 + 4_352, 4_352 + 4_352 + 8_192 + 256),
+        ] {
+            let mut spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+            spec.quantize = quant;
+            let facts = loaded_component_bytes(&spec).unwrap();
+            assert_eq!(facts.text_encoder, encoder, "{quant:?} text encoder");
+            assert_eq!(facts.dit, dit, "{quant:?} transformer");
+            assert_eq!(facts.vae, DECODER_BYTES, "{quant:?} decoder");
+
+            let contract = build_lens_memory_strategy_contract(MODEL_ID_TURBO, &spec);
+            assert_eq!(contract.asset_facts.decoder_bytes, DECODER_BYTES);
+            assert_eq!(
+                contract.asset_facts.base_bytes,
+                encoder + dit + DECODER_BYTES,
+                "{quant:?} base is its own decomposition"
+            );
+            gen_core_testkit::check_memory_contract_asset_facts(&contract)
+                .unwrap_or_else(|errors| panic!("{quant:?}: {errors:?}"));
+        }
+    }
+
     fn rung_four(
         contract: &gen_core::MemoryProviderContract,
     ) -> &gen_core::MemoryStrategyCapability {
@@ -2097,12 +2786,74 @@ mod weights_free_behavior_tests {
             .expect("Lens contracts carry the complete ladder")
     }
 
+    /// AC (epic SC-22657, E2): both Lens routes publish the axes of the `LensDitConfig` preset and
+    /// the shared FLUX.2 VAE their loader actually builds, and the weights-free surface publishes
+    /// none.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = LoadSpec::new(WeightsSource::Dir(temp.path().to_path_buf()));
+        for provider_id in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            let contract = build_lens_memory_strategy_contract(provider_id, &spec);
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `LensDitConfig::lens()`: `num_heads`, `head_dim`, `num_layers`, `patch_size`.
+                    attention_heads: Some(24),
+                    head_dim: Some(64),
+                    transformer_blocks: Some(48),
+                    patch_size: Some(2),
+                    // The DiT's `out_channels` is the FLUX.2 latent width the decoder consumes.
+                    latent_channels: Some(32),
+                    // The shared FLUX.2 VAE has 4 `BLOCK_OUT` stages => 3 halvings => x8.
+                    vae_spatial_scale: Some(8),
+                    // FLUX.2 ships an image `AutoencoderKL`: no temporal axis exists to declare.
+                    vae_temporal_scale: None,
+                    // `DIT_DTYPE` is `DType::BF16`.
+                    activation_dtype_width: Some(2),
+                },
+                "{provider_id} architecture facts"
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+            // SC-22667: the decoder axes are `candle_gen_flux2::vae`'s own constants — the crate
+            // that builds the decoder — and the DiT's `out_channels` agrees with them rather than
+            // standing in for them. Mutation that fails this: a local `VAE_STAGES` literal (the
+            // shape under review) that drifts from `BLOCK_OUT.len()`.
+            let facts = contract.architecture_facts;
+            assert_eq!(
+                facts.latent_channels,
+                Some(candle_gen_flux2::vae::LATENT_CHANNELS as u32)
+            );
+            assert_eq!(
+                facts.latent_channels,
+                Some(crate::transformer::LensDitConfig::lens().out_channels as u32)
+            );
+            assert_eq!(
+                facts.vae_spatial_scale,
+                Some(1 << (candle_gen_flux2::vae::BLOCK_OUT.len() - 1))
+            );
+
+            // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
+            let surface = LoadSpec::new(WeightsSource::Dir(
+                "/__sceneworks_memory_contract_surface__".into(),
+            ));
+            assert!(build_lens_memory_strategy_contract(provider_id, &surface)
+                .architecture_facts
+                .is_empty());
+        }
+    }
+
     #[test]
     fn cpu_scope_executes_the_registered_lens_behavior() {
+        // The weights-free declaration surface, not the production builder: this path resolves no
+        // snapshot, so after sc-22732 a production contract over it proves no tier and publishes no
+        // identity, and `standard_memory_behavior_context` needs one. The static behavior namespace
+        // is exactly what the declaration walk exists to supply.
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/lens".into()))
+            .with_quant(Quant::Q4)
             .with_offload_policy(candle_gen::gen_core::OffloadPolicy::Sequential)
             .with_load_shape(candle_gen::gen_core::LoadShape::DeferredMaterialization);
-        let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&spec, true);
+        let contract = weights_free_lens_memory_strategy_contract(MODEL_ID_TURBO, &spec);
         let mut fixture = registered_lens_valid_fixture(
             &spec,
             &contract,
@@ -2426,11 +3177,85 @@ mod integration_tests {
         ]);
         candle_gen::candle_core::safetensors::save(&tensors, text.join("model.safetensors"))
             .unwrap();
+        write_packed_transformer(&root, bits);
         let spec = LoadSpec::new(WeightsSource::Dir(root.clone()))
             .with_quant(quant)
             .with_offload_policy(OffloadPolicy::Sequential)
             .with_load_shape(gen_core::LoadShape::DeferredMaterialization);
         (root, spec)
+    }
+
+    /// A `transformer/` half whose declared marker and packed triple satisfy
+    /// `transformer_numeric_tier_matches` at `bits`.
+    ///
+    /// That predicate's arithmetic is `weight_cols * (32 / bits) == scales_cols * group_size`, so at
+    /// group size 64 and one scales column the U32 codes column count is exactly `2 * bits`: 8 for
+    /// q4, 16 for q8. Every U32 `.weight` must belong to a validated triple, so the shard carries
+    /// exactly one.
+    fn write_packed_transformer(root: &Path, bits: i32) {
+        let component = root.join("transformer");
+        std::fs::create_dir_all(&component).unwrap();
+        std::fs::write(
+            component.join("config.json"),
+            format!(r#"{{"quantization": {{"bits": {bits}, "group_size": 64}}}}"#),
+        )
+        .unwrap();
+        let cols = 2 * bits as usize;
+        let tensors = std::collections::HashMap::from([
+            (
+                "proj.weight".to_owned(),
+                Tensor::zeros((4, cols), DType::U32, &Device::Cpu).unwrap(),
+            ),
+            (
+                "proj.scales".to_owned(),
+                Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+            (
+                "proj.biases".to_owned(),
+                Tensor::zeros((4, 1), DType::BF16, &Device::Cpu).unwrap(),
+            ),
+        ]);
+        candle_gen::candle_core::safetensors::save(&tensors, component.join("model.safetensors"))
+            .unwrap();
+    }
+
+    /// The dense/bf16 tier of the same fixture family: no `quantization` marker and no packed
+    /// triple in either component, which is what `resolved_artifact_tier` proves `Some(None)` from.
+    fn dense_memory_spec(tmp: &tempfile::TempDir) -> (PathBuf, LoadSpec) {
+        let root = tmp.path().join("sc22732_lens_contract_dense");
+        for component in ["text_encoder", "transformer"] {
+            let dir = root.join(component);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("config.json"), r#"{"dtype": "bfloat16"}"#).unwrap();
+            let tensors = std::collections::HashMap::from([(
+                "proj.weight".to_owned(),
+                Tensor::zeros((4, 64), DType::BF16, &Device::Cpu).unwrap(),
+            )]);
+            candle_gen::candle_core::safetensors::save(&tensors, dir.join("model.safetensors"))
+                .unwrap();
+        }
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        (root, spec)
+    }
+
+    /// One snapshot per production tier, in the layout `resolved_artifact_tier` proves.
+    fn tier_fixture(tmp: &tempfile::TempDir, quant: Option<Quant>) -> PathBuf {
+        match quant {
+            None => dense_memory_spec(tmp).0,
+            Some(quant) => packed_memory_spec(tmp, quant).0,
+        }
+    }
+
+    fn tier_spec(
+        root: &Path,
+        quant: Option<Quant>,
+        offload: OffloadPolicy,
+        load_shape: gen_core::LoadShape,
+    ) -> LoadSpec {
+        let mut spec = LoadSpec::new(WeightsSource::Dir(root.to_path_buf()));
+        spec.quantize = quant;
+        spec.with_offload_policy(offload)
+            .with_load_shape(load_shape)
     }
 
     fn mini_packed_inventory(tmp: &tempfile::TempDir, complete: bool) -> (PathBuf, EncoderConfig) {
@@ -2478,6 +3303,273 @@ mod integration_tests {
         candle_gen::candle_core::safetensors::save(&tensors, root.join("model.safetensors"))
             .unwrap();
         (root, cfg)
+    }
+
+    /// Every (route, tier) cell the six-cell Candle/CUDA table names.
+    const PRODUCTION_TIERS: [(&str, Option<Quant>); 3] = [
+        ("bf16", None),
+        ("q4", Some(Quant::Q4)),
+        ("q8", Some(Quant::Q8)),
+    ];
+
+    /// The two shapes an anchor capture drives: the worker's Resident/Eager still-image shape, and
+    /// the staged Sequential/Deferred one.
+    const CAPTURE_SHAPES: [(OffloadPolicy, gen_core::LoadShape); 2] = [
+        (
+            OffloadPolicy::Resident,
+            gen_core::LoadShape::EagerMaterialization,
+        ),
+        (
+            OffloadPolicy::Sequential,
+            gen_core::LoadShape::DeferredMaterialization,
+        ),
+    ];
+
+    fn production_fingerprints() -> std::collections::BTreeSet<String> {
+        [MODEL_ID_BASE, MODEL_ID_TURBO]
+            .into_iter()
+            .flat_map(|provider| {
+                PRODUCTION_TIERS.into_iter().map(move |(_, quant)| {
+                    production_calibration_fingerprint(provider, quant).unwrap()
+                })
+            })
+            .collect()
+    }
+
+    /// sc-22732 (epic sc-22723, E1 measurable / E4 production loader): all six Candle/CUDA cells —
+    /// two routes x three artifact tiers — publish their OWN production calibration identity through
+    /// the production builder the loader calls, under the worker's Resident/Eager shape and under
+    /// the staged Sequential/Deferred one. Before sc-22732 all six published one string,
+    /// `MEMORY_CALIBRATION_FINGERPRINT`, gated on nothing but `is_plain_measured_load`.
+    ///
+    /// *Mutations this kills:* restoring `memory_calibration`'s `is_plain_measured_load`-only body
+    /// (the six strings collapse to one and the distinctness assert reds, and the wrong-quant loop
+    /// reds too); dropping the `{tier}` token from the table's format string (the six collapse to
+    /// two); dropping the route token (they collapse to three); keying the string on the offload
+    /// policy or the load shape (the two shapes below disagree); and deleting the
+    /// `artifact_tier != spec.quantize` refusal (the wrong-quant loop reds, because a
+    /// requantize-at-load peak is nobody's anchor).
+    #[test]
+    fn every_lens_tier_publishes_its_routes_production_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut published = std::collections::BTreeSet::new();
+        for provider in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            for (tier, quant) in PRODUCTION_TIERS {
+                let expected = production_calibration_fingerprint(provider, quant).unwrap();
+                assert!(
+                    expected.contains(tier) || expected == MEMORY_CALIBRATION_FINGERPRINT,
+                    "{provider} {tier}: {expected}"
+                );
+                let root = tier_fixture(&tmp, quant);
+                for (offload, load_shape) in CAPTURE_SHAPES {
+                    let spec = tier_spec(&root, quant, offload, load_shape);
+                    let contract = build_lens_memory_strategy_contract(provider, &spec);
+                    let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                        panic!("{provider} {tier} {offload:?} {load_shape:?} publishes none")
+                    });
+                    assert_eq!(
+                        identity.fingerprint, expected,
+                        "{provider} {tier} {offload:?} {load_shape:?}"
+                    );
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert!(contract.conformance_errors().is_empty());
+                }
+
+                // The request knob never outranks the artifact: every tier the snapshot is NOT.
+                for wrong in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+                    if wrong == quant {
+                        continue;
+                    }
+                    let spec = tier_spec(
+                        &root,
+                        wrong,
+                        OffloadPolicy::Sequential,
+                        gen_core::LoadShape::DeferredMaterialization,
+                    );
+                    assert!(
+                        build_lens_memory_strategy_contract(provider, &spec)
+                            .calibration
+                            .is_none(),
+                        "{provider} {tier} must publish nothing for a {wrong:?} load quant"
+                    );
+                }
+                assert!(
+                    published.insert(expected.clone()),
+                    "{provider} {tier} repeats another cell's identity: {expected}"
+                );
+                std::fs::remove_dir_all(root).ok();
+            }
+        }
+        // Six distinct strings: two routes x three tiers. A route-only key collapses this to 3, a
+        // tier-only key to 2.
+        assert_eq!(published.len(), 6);
+    }
+
+    /// The preserved measured string stays on the one cell its evidence covers, the weights-free
+    /// namespace is disjoint from the whole production set, and an overlay-carrying load publishes
+    /// nothing.
+    ///
+    /// The evidence for the `(lens_turbo, q4)` cell is this crate's own measurement record, the
+    /// `DEFAULT_TEXT_ENCODER_WINDOW` doc comment: an end-to-end q4 Lens-Turbo request at 512x512,
+    /// one denoise step, seed 15800, with the dense/MXFP4 control called out as deliberately
+    /// ineligible. The other eight (route, tier, lane) cells never had evidence behind that string.
+    ///
+    /// *Mutations this kills:* moving `MEMORY_CALIBRATION_FINGERPRINT` off the `(lens_turbo, q4)`
+    /// cell or letting a second cell reach it; handing a weights-free path a production identity
+    /// (the disjointness loops red — this is the leak that put a measured q4 string on all 24
+    /// registry surfaces); and dropping `is_plain_measured_load` (the adapter and PiD loads publish
+    /// a clean-base string).
+    #[test]
+    fn the_preserved_lens_fingerprint_is_reachable_at_exactly_one_cell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let production = production_fingerprints();
+        assert_eq!(production.len(), 6);
+
+        let mut measured_cells = Vec::new();
+        for provider in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            for (tier, quant) in PRODUCTION_TIERS {
+                let root = tier_fixture(&tmp, quant);
+                for (offload, load_shape) in CAPTURE_SHAPES {
+                    let spec = tier_spec(&root, quant, offload, load_shape);
+                    let fingerprint = build_lens_memory_strategy_contract(provider, &spec)
+                        .calibration
+                        .unwrap()
+                        .fingerprint;
+                    if fingerprint == MEMORY_CALIBRATION_FINGERPRINT {
+                        measured_cells.push((provider, tier));
+                    }
+                }
+                std::fs::remove_dir_all(root).ok();
+            }
+        }
+        assert_eq!(
+            measured_cells,
+            vec![(MODEL_ID_TURBO, "q4"), (MODEL_ID_TURBO, "q4")],
+            "the measured string covers the q4 Lens-Turbo cell on both capture shapes and nothing \
+             else"
+        );
+
+        // Both weights-free surfaces publish the static namespace, never a production string.
+        let registry = register_memory_contract_surfaces(
+            candle_gen::gen_core::ProviderRegistryBuilder::new()
+                .register_generator(TURBO_REGISTRATION)
+                .register_generator(BASE_REGISTRATION),
+        )
+        .build()
+        .expect("Lens surface registry");
+        let surfaces = registry
+            .memory_contract_surfaces()
+            .expect("weights-free Lens surfaces");
+        assert_eq!(surfaces.len(), 24);
+        let mut static_seen = std::collections::BTreeSet::new();
+        for surface in &surfaces {
+            let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+            assert!(
+                fingerprint.starts_with(STATIC_BEHAVIOR_FINGERPRINT),
+                "{} carries {fingerprint}",
+                surface.selector.id()
+            );
+            assert!(
+                !production.contains(fingerprint),
+                "{} leaks a production string: {fingerprint}",
+                surface.selector.id()
+            );
+            static_seen.insert(fingerprint.clone());
+        }
+        // 12 distinct static keys: 3 tiers x 2 policies per route, the load shape riding the
+        // identity's own `load_shape` field rather than the string.
+        assert_eq!(static_seen.len(), 12);
+        for provider_id in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+            for (_, quant) in PRODUCTION_TIERS {
+                let spec = tier_spec(
+                    Path::new("/nonexistent/lens"),
+                    quant,
+                    OffloadPolicy::Sequential,
+                    gen_core::LoadShape::DeferredMaterialization,
+                );
+                let fingerprint = weights_free_lens_memory_strategy_contract(provider_id, &spec)
+                    .calibration
+                    .unwrap()
+                    .fingerprint;
+                assert!(!production.contains(&fingerprint), "{fingerprint}");
+            }
+        }
+
+        // An overlay stack is a different resident set than any clean-base anchor priced.
+        let (root, base) = packed_memory_spec(&tmp, Quant::Q4);
+        assert!(build_lens_turbo_memory_strategy_contract(&base)
+            .calibration
+            .is_some());
+        let mut adapted = base.clone();
+        adapted.adapters.push(AdapterSpec::new(
+            root.join("adapter.safetensors"),
+            1.0,
+            gen_core::AdapterKind::Lora,
+        ));
+        let mut external_text = base.clone();
+        external_text.text_encoder = Some(WeightsSource::Dir(root.join("te")));
+        for (label, spec) in [("adapter", &adapted), ("external encoder", &external_text)] {
+            assert!(
+                build_lens_turbo_memory_strategy_contract(spec)
+                    .calibration
+                    .is_none(),
+                "an {label} load publishes no clean-base identity"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A snapshot whose two components declare different tiers publishes NO identity, and the
+    /// contract builder still returns a usable contract — nothing about a self-inconsistent tree may
+    /// turn a loadable snapshot into a refused one.
+    ///
+    /// *Mutations this kills:* dropping the `text_bits == dit_bits` agreement arm (a half-packed
+    /// tree borrows a tier's string); and dropping `transformer_numeric_tier_matches` from the
+    /// packed arm (a tree whose DiT declares q4 while its tensors are dense borrows the q4 string).
+    #[test]
+    fn a_disagreeing_component_marker_withholds_the_identity_without_failing_the_contract() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, _) = packed_memory_spec(&tmp, Quant::Q4);
+        // The DiT half now declares q8 while the text encoder still declares q4.
+        write_packed_transformer(&root, 8);
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            for provider in [MODEL_ID_BASE, MODEL_ID_TURBO] {
+                let spec = tier_spec(
+                    &root,
+                    quant,
+                    OffloadPolicy::Sequential,
+                    gen_core::LoadShape::DeferredMaterialization,
+                );
+                assert!(resolved_artifact_tier(&spec).is_none());
+                let contract = build_lens_memory_strategy_contract(provider, &spec);
+                assert!(
+                    contract.calibration.is_none(),
+                    "{provider} {quant:?} must publish no identity for a disagreeing tree"
+                );
+                assert!(contract.conformance_errors().is_empty());
+            }
+        }
+
+        // A declared tier whose tensors do not back it is likewise unnameable.
+        std::fs::write(
+            root.join("transformer").join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        let spec = tier_spec(
+            &root,
+            Some(Quant::Q4),
+            OffloadPolicy::Sequential,
+            gen_core::LoadShape::DeferredMaterialization,
+        );
+        assert!(
+            resolved_artifact_tier(&spec).is_none(),
+            "the q8-shaped packed triple does not back a q4 declaration"
+        );
+        assert!(build_lens_memory_strategy_contract(MODEL_ID_TURBO, &spec)
+            .calibration
+            .is_none());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -2800,7 +3892,13 @@ mod integration_tests {
                         images.len()
                     )))
                 }
-                GenerationOutput::Video { .. } | GenerationOutput::Audio(_) => {
+                // `ImagesRgba` is unreachable here — this harness never sets
+                // `output_channels: Rgba`, and lens does not advertise `supports_alpha_output`,
+                // so the shared floor would refuse it (sc-24111). Named rather than wildcarded so
+                // a future output variant still breaks this match.
+                GenerationOutput::ImagesRgba(_)
+                | GenerationOutput::Video { .. }
+                | GenerationOutput::Audio(_) => {
                     return Err(CandleError::Msg("expected image output".to_owned()))
                 }
             };
@@ -3140,8 +4238,12 @@ mod integration_tests {
         let (eligible_root, eligible) = packed_memory_spec(&tmp, Quant::Q4);
         let contract = build_lens_turbo_memory_strategy_contract_with_eligibility(&eligible, true);
         let _detected_contract = build_lens_memory_strategy_contract(MODEL_ID_BASE, &eligible);
-        let base_contract =
-            build_lens_memory_strategy_contract_with_eligibility(MODEL_ID_BASE, &eligible, true);
+        let base_contract = build_lens_memory_strategy_contract_with_eligibility(
+            MODEL_ID_BASE,
+            &eligible,
+            true,
+            production_calibration_identity(MODEL_ID_BASE, &eligible),
+        );
         assert_eq!(base_contract.provider_id, MODEL_ID_BASE);
         assert!(base_contract.conformance_errors().is_empty());
         gen_core_testkit::check_memory_strategy_contract(&contract).unwrap();
@@ -3188,10 +4290,16 @@ mod integration_tests {
             contract.calibration.as_ref().unwrap().fingerprint,
             MEMORY_CALIBRATION_FINGERPRINT
         );
+        // sc-22732: q4 and q8 are two different resident sets, so they are two different cells. The
+        // pre-sc-22732 `assert_eq!` here was the identity collision itself, asserted as a property.
         let (q8_root, q8_spec) = packed_memory_spec(&tmp, Quant::Q8);
         let q8_contract =
             build_lens_turbo_memory_strategy_contract_with_eligibility(&q8_spec, true);
-        assert_eq!(contract.calibration, q8_contract.calibration);
+        assert_ne!(contract.calibration, q8_contract.calibration);
+        assert_eq!(
+            q8_contract.calibration.as_ref().unwrap().fingerprint,
+            "lens-turbo-q8-candle-cuda-shared-ladder-v1"
+        );
         let mut adapted = eligible.clone();
         adapted.adapters.push(AdapterSpec::new(
             eligible_root.join("adapter.safetensors"),
@@ -3223,10 +4331,10 @@ mod integration_tests {
                     .support,
                 MemoryStrategySupport::Missing
             ));
-            assert_eq!(
-                contract.calibration.as_ref().unwrap().fingerprint,
-                MEMORY_CALIBRATION_FINGERPRINT
-            );
+            // sc-22732: these three specs point at `/nonexistent/lens`, so no tier is provable and
+            // no cell is nameable. Before sc-22732 they all published the measured q4 Lens-Turbo
+            // string, which is the weights-free/unprovable leak this story closes.
+            assert!(contract.calibration.is_none());
         }
         std::fs::remove_dir_all(eligible_root).ok();
         std::fs::remove_dir_all(q8_root).ok();
@@ -3256,6 +4364,7 @@ mod integration_tests {
             selection: gen_core::MemorySelection {
                 strategy: gen_core::MemoryStrategy::BoundedTransformerResidency,
                 parameters: gen_core::MemoryStrategyParameters {
+                    stage_residency: None,
                     decode_tile_edge: Some(DECODE_TILE_EDGE),
                     decode_overlap: Some(DECODE_OVERLAP),
                     attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),
@@ -3354,6 +4463,7 @@ mod integration_tests {
         let selection = select(
             gen_core::MemoryStrategy::BoundedTransformerResidency,
             gen_core::MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: Some(DECODE_TILE_EDGE),
                 decode_overlap: Some(DECODE_OVERLAP),
                 attention_chunk_size: Some(ATTENTION_CHUNK_SIZE),

@@ -126,6 +126,50 @@ impl Weights {
         Ok(())
     }
 
+    /// Materialize the tensors read since the last [`Weights::remove_accessed`] in bounded batches
+    /// and verify that the GPU reads each one as the bytes the CPU holds (sc-22414).
+    ///
+    /// This is the load boundary every model constructor and the streaming loader cross before a
+    /// graph consumes the bytes: a lazy `Load` is forced here, on its own (CPU) stream, in batches
+    /// of at most [`Weights::VERIFY_BATCH_BYTES`] so a cold multi-gigabyte file never becomes one
+    /// submission, and each batch is then checked through
+    /// [`coherence::verify_gpu_view`](crate::primitives::coherence::verify_gpu_view). Keys are
+    /// visited in sorted order so the batching is deterministic.
+    ///
+    /// Only the *accessed* set is touched, for the same reason [`Weights::materialize_accessed`]
+    /// restricts itself: evaluating the rest of a checkpoint would defeat bounded residency.
+    pub fn verify_accessed_gpu_view(&self) -> Result<()> {
+        let accessed = self.accessed.borrow();
+        let mut keys: Vec<&str> = accessed.iter().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut batch: Vec<(&str, &Array)> = Vec::new();
+        let mut bytes = 0usize;
+        for key in keys {
+            let Some(array) = self.tensors.get(key) else {
+                continue;
+            };
+            bytes = bytes.saturating_add(array.nbytes());
+            batch.push((key, array));
+            if bytes >= Self::VERIFY_BATCH_BYTES {
+                Self::verify_batch(&batch)?;
+                batch.clear();
+                bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            Self::verify_batch(&batch)?;
+        }
+        Ok(())
+    }
+
+    /// Upper bound on the bytes one [`Weights::verify_accessed_gpu_view`] batch evaluates at once.
+    pub const VERIFY_BATCH_BYTES: usize = 512 * 1024 * 1024;
+
+    fn verify_batch(batch: &[(&str, &Array)]) -> Result<()> {
+        mlx_rs::transforms::eval(batch.iter().map(|(_, a)| *a))?;
+        crate::primitives::coherence::verify_gpu_view(batch.iter().copied())
+    }
+
     /// Drop every tensor read through [`Weights::require`] / [`Weights::get`] since the previous
     /// call, and reset the access set.
     ///

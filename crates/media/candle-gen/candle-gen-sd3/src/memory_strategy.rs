@@ -17,7 +17,7 @@ use candle_gen::gen_core::{
 };
 use candle_gen::gen_core::{
     MemoryBehaviorFixture, MemoryBehaviorRoute, MemoryBudget, MemoryCacheState,
-    MemoryOptimizationAuthority,
+    MemoryCalibrationIdentity, MemoryOptimizationAuthority,
 };
 use sha2::{Digest, Sha256};
 
@@ -88,6 +88,29 @@ impl Sd35Route {
             Self::Large => "0cf819d00d30d296cee58e02c59b0daa5b8ede89",
             Self::LargeTurbo => "e9166f4632ec64f74d560be3ac778d346f89a364",
             Self::Medium => "5413e962bb326db248be2026a93b147c323392b6",
+        }
+    }
+
+    /// The production calibration identity this route publishes once a physical load receipt has
+    /// admitted its artifact (sc-22730, epic sc-22723 E1/E4).
+    ///
+    /// These are exactly the strings the SceneWorks manifest already declares for the three
+    /// `candle.memoryStrategyContract` blocks. Until now the provider published
+    /// `calibration: None` on every path, so the declaration named an identity the loaded contract
+    /// could never return and a memory anchor had nothing to bind: the SceneWorks capture arm reads
+    /// `contract.calibration` off the loaded generator and refuses a contract without one.
+    ///
+    /// The identity is keyed on the ROUTE, not on the tier, and deliberately not on the offload
+    /// policy or the load shape: `Sd35Route::repository()`/`revision()` pin one artifact family per
+    /// route, `MemoryCalibrationIdentity::load_shape` carries the materialization axis separately,
+    /// and the tier is carried by the receipt that authorises publication at all (see
+    /// `production_calibration_identity`). All three tiers of one route share the shipped
+    /// snapshot's ladder, which is why one row in the manifest covers `["q4", "q8", "bf16"]`.
+    pub const fn production_calibration_fingerprint(self) -> &'static str {
+        match self {
+            Self::Large => "sd35-large-candle-resident-staged-v1",
+            Self::LargeTurbo => "sd35-large-turbo-candle-resident-staged-v1",
+            Self::Medium => "sd35-medium-candle-resident-staged-v1",
         }
     }
 
@@ -219,15 +242,31 @@ impl Sd35LoadReceipt {
                     .and_then(|bytes| checked_add(total, bytes, "text encoder bytes"))
             })?;
         let vae_paths = direct_safetensors(&root.join("vae"))?;
-        let vae_bf16 = selected_float_bytes(&vae_paths, 2)?;
-        let vae_f32 = selected_float_bytes(&vae_paths, 4)?;
+        // The autoencoder is materialized TWICE, at two widths, over two different key subsets
+        // (epic SC-22657, E1):
+        //
+        // * `pipeline::load_decoder` builds the whole `AutoEncoderKL` at the pipeline dtype —
+        //   bf16 — on every route, and
+        // * `pipeline::load_vae_encoder` builds a *separate* raw `VaeEncoder` over the `encoder.`
+        //   prefix at `vae::ENC_DTYPE` (f32) on the img2img / `Reference` route, which the
+        //   generator caches for the rest of the load.
+        //
+        // Both are charged, each at the width its own loader lands it at. The previous
+        // `vae_bf16.max(vae_f32)` was neither: `max` always selects the f32 total, so the decoder
+        // field carried exactly twice the bf16 `AutoEncoderKL` a t2i load holds — a stamped
+        // "widest phase" literal rather than any quantity the loader materializes. A txt2img-only
+        // load never builds the f32 encoder, but the contract carries no route discriminator, and
+        // the conservative direction is to declare the encoder that a cached img2img load does
+        // hold. One network, one field: both materializations are the autoencoder, so they are
+        // charged once, together, in `decoder_bytes`.
+        let vae_decoder_bf16 = selected_float_bytes(&vae_paths, 2)?;
+        let vae_encoder_f32 =
+            selected_float_bytes_where(&vae_paths, 4, |name| name.starts_with("encoder."))?;
         let adapters = capture_adapters(spec)?;
         let components = gen_core::PerComponentBytes {
             text_encoder,
             dit: transformer_bytes,
-            // The I2I encoder materializes the same sealed VAE tensors in F32 before the BF16
-            // decoder phase. Price the widest VAE phase, not merely the resident decoder width.
-            vae: vae_bf16.max(vae_f32),
+            vae: checked_add(vae_decoder_bf16, vae_encoder_f32, "VAE bytes")?,
         };
         let physical_identity = physical_identity(route, tier, &inventory, &adapters);
         let receipt = Self {
@@ -536,15 +575,28 @@ fn selected_headers(
 }
 
 fn selected_float_bytes(paths: &[PathBuf], realized_width: u64) -> gen_core::Result<u64> {
+    selected_float_bytes_where(paths, realized_width, |_| true)
+}
+
+/// [`selected_float_bytes`] restricted to the tensors `keep` admits — the seam a component that is
+/// materialized twice, at two widths, over two different key subsets needs.
+fn selected_float_bytes_where(
+    paths: &[PathBuf],
+    realized_width: u64,
+    keep: impl Fn(&str) -> bool,
+) -> gen_core::Result<u64> {
     use gen_core::weightsmeta::Dtype;
     selected_headers(paths)?
         .values()
         .try_fold(0_u64, |total, header| {
-            if header.dtype != Dtype::BF16 {
+            if !matches!(header.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32) {
                 return Err(gen_core::Error::Unsupported(format!(
-                    "SD3.5 dense component tensor {} must be BF16, got {:?}",
+                    "SD3.5 dense component tensor {} must be floating point, got {:?}",
                     header.name, header.dtype
                 )));
+            }
+            if !keep(&header.name) {
+                return Ok(total);
             }
             checked_add(
                 total,
@@ -808,6 +860,32 @@ pub fn provider_contract(
     Ok(contract_from_receipt(spec, &receipt))
 }
 
+/// The production calibration identity a loaded SD3.5 route publishes, bound to the artifact the
+/// receipt admitted (sc-22730).
+///
+/// This is the BINDING; [`Sd35Route::production_calibration_fingerprint`] is the table. A
+/// `Sd35LoadReceipt` only exists for a snapshot that passed [`validate_snapshot_binding`] (the exact
+/// `SceneWorks/<repository>@<revision>/<tier>` path for THIS route) and whose transformer packing
+/// was read off the safetensors headers and cross-checked against the path tier
+/// (`Sd35LoadReceipt::capture`), so the tier in the identity is the tier on disk and never a request
+/// knob — `validate_load_shape` refuses `LoadSpec::quantize` outright on these turnkeys.
+///
+/// A LOADED ADAPTER STACK publishes no identity: it adds resident bytes no anchor measured, and the
+/// clean base cell is the one the memory anchor prices. The weights-free contract paths publish
+/// none either, so a registry-conformance surface can never be mistaken for a measured route.
+fn production_calibration_identity(
+    spec: &LoadSpec,
+    receipt: &Sd35LoadReceipt,
+) -> Option<MemoryCalibrationIdentity> {
+    if !receipt.adapters.is_empty() {
+        return None;
+    }
+    Some(MemoryCalibrationIdentity::new(
+        receipt.route.production_calibration_fingerprint(),
+        spec.load_shape,
+    ))
+}
+
 pub fn contract_from_receipt(spec: &LoadSpec, receipt: &Sd35LoadReceipt) -> MemoryProviderContract {
     let mut components = vec![MemoryResidentComponent {
         id: receipt.physical_identity().to_owned(),
@@ -830,7 +908,13 @@ pub fn contract_from_receipt(spec: &LoadSpec, receipt: &Sd35LoadReceipt) -> Memo
             residency: MemoryComponentResidency::WholeRender,
         });
     }
-    build_contract(receipt.route, spec, receipt.components, components)
+    build_contract(
+        receipt.route,
+        spec,
+        receipt.components,
+        components,
+        production_calibration_identity(spec, receipt),
+    )
 }
 
 pub fn weights_free_contract(
@@ -852,11 +936,15 @@ pub fn weights_free_contract(
     normalized.quantize = None;
     normalized.resolved_route = Some(provider_id.to_owned());
     let _ = tier;
+    // No receipt, no artifact: a registry-conformance surface never publishes a production identity
+    // (sc-22730). `validate_context` holds a `None` contract to the empty handshake, which is what
+    // keeps the weights-free surface from being admitted as measured evidence.
     Ok(build_contract(
         route,
         &normalized,
         Default::default(),
         Vec::new(),
+        None,
     ))
 }
 
@@ -878,11 +966,54 @@ pub fn weights_free_surface_contract(
     weights_free_contract(provider_id, &spec)
 }
 
+/// Activation dtype the loaded SD3.5 pipeline computes in. `lib.rs` pins `DType::BF16`
+/// unconditionally on every route, so this is the provider's real activation width rather than a
+/// memory-model literal.
+const ACTIVATION_DTYPE: candle_gen::candle_core::DType = candle_gen::candle_core::DType::BF16;
+
+/// Snapshot-scoped architecture axes for an SD3.5 route (epic SC-22657, E2).
+///
+/// SD3.5's geometry is deliberately *not* read from `transformer/config.json`: the loader builds
+/// the MMDiT from the crate's own [`crate::config::Sd3Config`] preset, selected from the variant
+/// exactly as `pipeline::Variant::config` does (Large/Turbo share the Large preset; Medium is the
+/// MMDiT-X preset). Reading a config the loader ignores would describe a model this provider never
+/// constructs, so the axes come off the same struct the loader hands to the transformer builder.
+///
+/// A weights-free contract — the registry's sentinel surface path, or a single-file import —
+/// publishes `MemoryArchitectureFacts::default()`: nothing that *would* be loaded is resolved
+/// there, so no axis is knowable.
+fn architecture_facts(route: Sd35Route, spec: &LoadSpec) -> gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    if af::snapshot_root(spec).is_none() {
+        return gen_core::MemoryArchitectureFacts::default();
+    }
+    // The same variant -> preset selection `pipeline::Variant::config` performs at load.
+    let config = match route {
+        Sd35Route::Large | Sd35Route::LargeTurbo => crate::config::Sd3Config::large(),
+        Sd35Route::Medium => crate::config::Sd3Config::medium(),
+    };
+    gen_core::MemoryArchitectureFacts {
+        attention_heads: af::declared(config.num_heads),
+        head_dim: af::declared(config.head_dim),
+        transformer_blocks: af::declared(config.num_layers),
+        patch_size: af::declared(config.patch_size),
+        // `vae::LATENT_CHANNELS` is the encoder's own declaration of what it produces; the DiT's
+        // `in_channels` is the consumer's view of the same 16 channels.
+        latent_channels: af::declared(crate::vae::LATENT_CHANNELS),
+        vae_spatial_scale: af::declared(crate::vae::SPATIAL_SCALE as usize),
+        // SD3.5 ships the image `AutoencoderKL`: there is no temporal axis to declare at all.
+        vae_temporal_scale: None,
+        activation_dtype_width: af::dtype_width(ACTIVATION_DTYPE),
+    }
+}
+
 fn build_contract(
     route: Sd35Route,
     spec: &LoadSpec,
     components: gen_core::PerComponentBytes,
     resident_components: Vec<MemoryResidentComponent>,
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> MemoryProviderContract {
     let phases = vec![
         MemoryPhase::Conditioning,
@@ -909,6 +1040,8 @@ fn build_contract(
             total.saturating_add(component.resident_bytes)
         });
     MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(route, spec),
         provider_id: route.provider_id().to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -954,7 +1087,7 @@ fn build_contract(
                 resident_components,
             }
         },
-        calibration: None,
+        calibration,
         asset_facts: MemoryAssetFacts {
             base_bytes: components
                 .text_encoder
@@ -1460,6 +1593,35 @@ pub fn registered_begin_request(
     )?)))
 }
 
+/// The calibration ABI a context must claim to satisfy `contract` — `0` when the contract publishes
+/// no identity, which is the structural-estimate handshake `validate_context` requires.
+fn calibration_abi(contract: &MemoryProviderContract) -> u32 {
+    contract
+        .calibration
+        .as_ref()
+        .map_or(0, |identity| identity.abi)
+}
+
+/// The calibration fingerprint a context must claim to satisfy `contract` — empty when it publishes
+/// no identity.
+fn calibration_fingerprint(contract: &MemoryProviderContract) -> String {
+    contract
+        .calibration
+        .as_ref()
+        .map_or_else(String::new, |identity| identity.fingerprint.clone())
+}
+
+/// The load shape a context must claim. A published identity carries its own materialization axis,
+/// and `standard_memory_strategy_safety_check` compares the context against THAT, not against
+/// `contract.load_shape`; the two agree on every route this crate builds, and reading the identity
+/// keeps them from silently diverging if one ever moves.
+fn declared_load_shape(contract: &MemoryProviderContract) -> gen_core::LoadShape {
+    contract
+        .calibration
+        .as_ref()
+        .map_or(contract.load_shape, |identity| identity.load_shape)
+}
+
 pub fn registered_valid_fixture(
     spec: &LoadSpec,
     contract: &MemoryProviderContract,
@@ -1500,9 +1662,13 @@ pub fn registered_valid_fixture(
                 false,
             )?,
             optimization_authority: MemoryOptimizationAuthority::Estimated,
-            calibration_abi: 0,
-            calibration_fingerprint: String::new(),
-            load_shape: contract.load_shape,
+            // The handshake is READ OFF the contract rather than stamped empty (sc-22730). A
+            // receipt-backed contract now publishes a production calibration identity, and
+            // `validate_context` holds a context to whichever handshake its contract declares:
+            // empty for the weights-free surface, the published identity for a loaded route.
+            calibration_abi: calibration_abi(contract),
+            calibration_fingerprint: calibration_fingerprint(contract),
+            load_shape: declared_load_shape(contract),
             mode: request_route.mode,
             has_reference: request_route.reference_count == 1,
             use_pid: false,
@@ -1700,6 +1866,231 @@ mod tests {
         spec
     }
 
+    /// sc-22730 (epic sc-22723, E1 measurable / E4 production loader): every clean SD3.5 base load
+    /// publishes its route's production calibration identity, on every shipped tier and under both
+    /// worker load shapes, so a memory anchor has something to bind. Before this, `build_contract`
+    /// wrote `calibration: None` on every path, and the SceneWorks capture arm — which reads
+    /// `contract.calibration` off the LOADED generator — refused all nine candle cells.
+    ///
+    /// *Mutations this kills:* restoring `calibration: None`; keying the identity on the load shape
+    /// or the offload policy (the resident and staged specs would then disagree); replaying one
+    /// route's string on another; publishing an identity for an adapter-carrying load, whose
+    /// resident set no anchor measured; and letting the weights-free surface hand out a production
+    /// string.
+    #[test]
+    fn component_storage_dtype_does_not_change_realized_memory_or_tier() {
+        for route in [Sd35Route::Large, Sd35Route::LargeTurbo, Sd35Route::Medium] {
+            for tier in ["bf16", "q4", "q8"] {
+                let (_temp, root) = fixture(route, tier);
+                let load = spec(route, &root, Vec::new());
+                let baseline = Sd35LoadReceipt::capture(route, &load).unwrap();
+                let path = direct_safetensors(&root.join("text_encoder")).unwrap()[0].clone();
+                for (dtype, width) in [("F16", 2), ("F32", 4), ("BF16", 2)] {
+                    write_safetensors(
+                        &path,
+                        None,
+                        &[(
+                            "text_model.embeddings.position_embedding.weight",
+                            dtype,
+                            &[1],
+                            width,
+                        )],
+                    );
+                    let receipt = Sd35LoadReceipt::capture(route, &load).unwrap();
+                    assert_eq!(receipt.tier, baseline.tier);
+                    assert_eq!(
+                        contract_from_receipt(&load, &receipt).asset_facts,
+                        contract_from_receipt(&load, &baseline).asset_facts
+                    );
+                }
+                write_safetensors(
+                    &path,
+                    None,
+                    &[(
+                        "text_model.embeddings.position_embedding.weight",
+                        "I32",
+                        &[1],
+                        4,
+                    )],
+                );
+                assert!(Sd35LoadReceipt::capture(route, &load).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn every_clean_base_load_publishes_its_routes_production_identity() {
+        let mut published = BTreeSet::new();
+        for route in [Sd35Route::Large, Sd35Route::LargeTurbo, Sd35Route::Medium] {
+            let expected = route.production_calibration_fingerprint();
+            for tier in ["q4", "q8", "bf16"] {
+                let (temp, root) = fixture(route, tier);
+                for load_shape in [
+                    LoadShape::EagerMaterialization,
+                    LoadShape::DeferredMaterialization,
+                ] {
+                    let load = spec(route, &root, Vec::new()).with_load_shape(load_shape);
+                    let receipt = Sd35LoadReceipt::capture(route, &load).unwrap();
+                    let contract = contract_from_receipt(&load, &receipt);
+                    let identity = contract.calibration.as_ref().unwrap_or_else(|| {
+                        panic!("{} {tier} publishes an identity", route.provider_id())
+                    });
+                    assert_eq!(identity.fingerprint, expected, "{tier} {load_shape:?}");
+                    assert_eq!(identity.load_shape, load_shape);
+                    assert_eq!(contract.load_shape, load_shape);
+                    assert!(contract.conformance_errors().is_empty());
+                    // The published contract must admit its own fixture; the empty handshake a
+                    // `None` contract requires must now be refused.
+                    let mut stale = context(&receipt, MemoryMode::TextToImage);
+                    stale.calibration_fingerprint = "stale-sd35-fingerprint".to_owned();
+                    assert!(validate_context(route, &contract, &stale, receipt.tier).is_err());
+                }
+
+                // A loaded adapter stack is a different resident set and publishes no identity.
+                let overlaid = spec(
+                    route,
+                    &root,
+                    vec![AdapterSpec::new(
+                        adapter(
+                            temp.path(),
+                            AdapterKind::Lora,
+                            &format!("{tier}-identity.safetensors"),
+                        ),
+                        0.75,
+                        AdapterKind::Lora,
+                    )],
+                );
+                let receipt = Sd35LoadReceipt::capture(route, &overlaid).unwrap();
+                assert!(contract_from_receipt(&overlaid, &receipt)
+                    .calibration
+                    .is_none());
+
+                // The registry-conformance surface never hands out a production string.
+                let weights_free =
+                    weights_free_contract(route.provider_id(), &spec(route, &root, Vec::new()))
+                        .unwrap();
+                assert!(
+                    weights_free.calibration.is_none(),
+                    "{}",
+                    route.provider_id()
+                );
+            }
+            published.insert(expected);
+        }
+        assert_eq!(
+            published.len(),
+            3,
+            "no route replays another route's identity"
+        );
+    }
+
+    /// AC (epic SC-22657, E1): `decoder_bytes` is what the two VAE loaders materialize — the whole
+    /// `AutoEncoderKL` at the pipeline's bf16 plus the img2img route's separate f32 `VaeEncoder`
+    /// over the `encoder.` prefix — never a `max()` of two hypothetical widths.
+    ///
+    /// *Mutation that reds this:* restoring `vae: vae_bf16.max(vae_f32)`, the shape under review,
+    /// which always resolves to the f32 total (twice the bf16 decoder a t2i load holds) and is
+    /// blind to which half of the component the second materialization actually covers.
+    #[test]
+    fn the_decoder_field_prices_both_vae_materializations_at_their_own_widths() {
+        let route = Sd35Route::Large;
+        let (_temp, root) = fixture(route, "bf16");
+        // An asymmetric VAE: the encoder half is deliberately NOT half the file, so a `max()` over
+        // whole-component widths cannot coincide with the honest sum.
+        write_safetensors(
+            &root.join("vae/diffusion_pytorch_model.safetensors"),
+            None,
+            &[
+                ("encoder.conv_in.weight", "BF16", &[4, 4], 32),
+                ("decoder.conv_out.weight", "BF16", &[16, 4], 128),
+            ],
+        );
+        let load = spec(route, &root, Vec::new());
+        let receipt = Sd35LoadReceipt::capture(route, &load).unwrap();
+
+        let whole_component_elements = 4 * 4 + 16 * 4;
+        let encoder_elements = 4 * 4;
+        assert_eq!(
+            receipt.components.vae,
+            whole_component_elements * 2 + encoder_elements * 4,
+            "bf16 AutoEncoderKL + the f32 encoder-half the img2img route caches"
+        );
+        assert_ne!(
+            receipt.components.vae,
+            whole_component_elements * 4,
+            "the decoder field must not be the whole component stamped at f32"
+        );
+        let contract = contract_from_receipt(&load, &receipt);
+        assert_eq!(contract.asset_facts.decoder_bytes, receipt.components.vae);
+        assert_eq!(
+            contract.asset_facts.base_bytes,
+            contract.asset_facts.conditioning_bytes
+                + contract.asset_facts.transformer_bytes
+                + contract.asset_facts.decoder_bytes
+        );
+    }
+
+    /// AC (epic SC-22657, E2): every SD3.5 route publishes the architecture axes of the
+    /// `Sd3Config` preset its loader actually builds, and the weights-free surface publishes none.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        for (route, heads, layers) in [
+            (Sd35Route::Large, 38, 38),
+            (Sd35Route::LargeTurbo, 38, 38),
+            (Sd35Route::Medium, 24, 24),
+        ] {
+            let (_temp, root) = fixture(route, "bf16");
+            // The shared fixture gives the encoders and the DiT the same byte total, which the
+            // conformance check reads as one component borrowing another's price. Widen the DiT
+            // shards so every component is priced from its own distinct bytes.
+            for (index, path) in direct_safetensors(&root.join("transformer"))
+                .unwrap()
+                .into_iter()
+                .enumerate()
+            {
+                write_safetensors(
+                    &path,
+                    None,
+                    &[(&format!("blocks.{index}.weight"), "BF16", &[8, 8], 128)],
+                );
+            }
+            let load = spec(route, &root, Vec::new());
+            let receipt = Sd35LoadReceipt::capture(route, &load).unwrap();
+            let contract = contract_from_receipt(&load, &receipt);
+            assert_eq!(
+                contract.architecture_facts,
+                gen_core::MemoryArchitectureFacts {
+                    // `Sd3Config::large()` / `::medium()`: `num_heads`, `head_dim`, `num_layers`,
+                    // `patch_size` — the exact struct `Variant::config` hands the MMDiT builder.
+                    attention_heads: Some(heads),
+                    head_dim: Some(64),
+                    transformer_blocks: Some(layers),
+                    patch_size: Some(2),
+                    // `vae::LATENT_CHANNELS` / `vae::SPATIAL_SCALE`.
+                    latent_channels: Some(16),
+                    vae_spatial_scale: Some(8),
+                    // SD3.5 ships the image `AutoencoderKL`: no temporal axis exists to declare.
+                    vae_temporal_scale: None,
+                    // `lib.rs` pins `DType::BF16` on every route.
+                    activation_dtype_width: Some(2),
+                },
+                "{} architecture facts",
+                route.provider_id()
+            );
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+            // The registry's weights-free surface resolves no snapshot, so no axis is knowable.
+            let weights_free = weights_free_contract(
+                route.provider_id(),
+                &LoadSpec::new(WeightsSource::Dir(
+                    "/__sceneworks_memory_contract_surface__".into(),
+                )),
+            )
+            .unwrap();
+            assert!(weights_free.architecture_facts.is_empty());
+        }
+    }
+
     #[test]
     fn registry_behavior_fixtures_bind_each_exact_route_and_estimate_handshake() {
         let generic = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
@@ -1743,9 +2134,11 @@ mod tests {
                 },
             },
             optimization_authority: gen_core::MemoryOptimizationAuthority::Estimated,
-            calibration_abi: 0,
-            calibration_fingerprint: String::new(),
-            load_shape: contract.load_shape,
+            // Echo whatever handshake this receipt's contract publishes: a clean base load now
+            // carries the route's production identity, an adapter-carrying load still carries none.
+            calibration_abi: calibration_abi(&contract),
+            calibration_fingerprint: calibration_fingerprint(&contract),
+            load_shape: declared_load_shape(&contract),
             mode,
             has_reference: refs == 1,
             use_pid: false,
@@ -1873,7 +2266,7 @@ mod tests {
                 .unwrap()
                 .pop()
                 .unwrap();
-            write_safetensors(&path, None, &[("forged.weight", "F32", &[1], 4)]);
+            write_safetensors(&path, None, &[("forged.weight", "I32", &[1], 4)]);
             let load = spec(Sd35Route::LargeTurbo, &root, Vec::new());
             assert!(
                 Sd35LoadReceipt::capture(Sd35Route::LargeTurbo, &load).is_err(),

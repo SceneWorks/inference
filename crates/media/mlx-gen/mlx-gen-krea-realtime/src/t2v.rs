@@ -48,6 +48,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use mlx_gen::gen_core::MemoryPhase;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -96,6 +97,9 @@ pub struct KreaRealtimeJob<'a> {
     pub seed: u64,
     /// Few-step denoise-count override (`None` = the config's `denoising_step_list`).
     pub steps: Option<usize>,
+    /// Request-scoped shared-ladder levers, carried from the `GenerationRequest`. Only the
+    /// authorized calibration-fault pair is consumed today (sc-22738); the default arms nothing.
+    pub memory: mlx_gen::gen_core::GenerationMemory,
 }
 
 /// The **Mac memory-feasible** AR config: bound the KV read/store window to the streaming frame count
@@ -286,6 +290,32 @@ pub fn decode_tiling(out_h: usize, out_w: usize, out_frames: i32) -> Result<Opti
     // T2V/I2V/VACE decodes and with `mlx-gen-scail2`. The budget is free-aware
     // (`free × 0.85`, `free = MLX limit − resident`) and pinnable via `WAN_VAE_BUDGET_GIB`.
     auto_tiling_budgeted_z16_quality_overlap(out_h as i32, out_w as i32, out_frames)
+}
+
+/// **Denoise phase EXIT** (sc-22738): the AR loop has produced this clip's latents; materialize them
+/// and then raise an authorized calibration fault for [`MemoryPhase::Denoise`].
+///
+/// The exit convention is the FLUX/Chroma/Qwen one, not the entry convention. The SceneWorks memory
+/// adapter certifies an anchor's lifecycle by injecting an authorized fault at a phase boundary and
+/// then reading the engine's retained bytes, so the phase's real allocation must already exist when
+/// the fault is returned. Faulting on the phase's *entry* would hand the adapter a pre-denoise heap
+/// and certify nothing. Mirrors `mlx-gen-chroma/src/model.rs` (`eval` of `final_latents`, then the
+/// `Denoise` fault).
+///
+/// The `eval` is armed-only, mirroring `mlx-gen-flux/src/model.rs`'s guarded force-eval of its lazy
+/// decode: an ordinary render (both controls unset) keeps its laziness byte-for-byte untouched.
+fn denoise_exit_fault(latents: &Array, memory: &mlx_gen::gen_core::GenerationMemory) -> Result<()> {
+    if crate::memory_strategy::calibration_fault_armed(memory, MemoryPhase::Denoise) {
+        mlx_rs::transforms::eval([latents])?;
+    }
+    crate::memory_strategy::calibration_fault(memory, MemoryPhase::Denoise)
+}
+
+/// **Decode phase EXIT** (sc-22738): the z16 VAE decode has completed and `frames_to_images` has read
+/// it back into host RGB frames, so the decode's allocation is already materialized — there is no
+/// lazy array left to force. Same convention and rationale as [`denoise_exit_fault`].
+fn decode_exit_fault(memory: &mlx_gen::gen_core::GenerationMemory) -> Result<()> {
+    crate::memory_strategy::calibration_fault(memory, MemoryPhase::Decode)
 }
 
 /// Decode the AR latent sequence `[z16, T_lat, lat_h, lat_w]` (f32) through the reused z16 Wan
@@ -479,12 +509,15 @@ pub fn generate_t2v_from_components(
     // `Progress::Step` per denoise step, so a mid-clip cancel bails within ~one step (not just here at
     // the stage boundary).
     let latents = generate_latents(transformer, cfg, context, params, cancel, on_progress)?;
+    denoise_exit_fault(&latents, &params.memory)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
     on_progress(Progress::Decoding);
     // `out_frames` trims the z16 decode's leading over-delivery back to the requested output count.
-    decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
+    let output = decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)?;
+    decode_exit_fault(&params.memory)?;
+    Ok(output)
 }
 
 /// VAE-encode a reference **still** → clean i2v context latent `[in_dim, 1, latent_h, latent_w]` (f32)
@@ -582,11 +615,14 @@ pub fn generate_i2v_from_components(
         cancel,
         on_progress,
     )?;
+    denoise_exit_fault(&latents, &params.memory)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
     on_progress(Progress::Decoding);
-    decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
+    let output = decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)?;
+    decode_exit_fault(&params.memory)?;
+    Ok(output)
 }
 
 /// Component-level **video-to-video** (sc-8440 S7): VAE-encode the source clip (`.sample()`), generate
@@ -634,11 +670,14 @@ pub fn generate_v2v_from_components(
         cancel,
         on_progress,
     )?;
+    denoise_exit_fault(&latents, &params.memory)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
     on_progress(Progress::Decoding);
-    decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)
+    let output = decode_latents_to_video(vae, &latents, params.fps, out_frames, tiling, cancel)?;
+    decode_exit_fault(&params.memory)?;
+    Ok(output)
 }
 
 /// Load the reused stock-Wan UMT5-XXL text encoder from the snapshot `root` and encode `prompt` →
@@ -850,10 +889,18 @@ pub(crate) fn generate_t2v_reported(
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent_frames)?;
 
     // Stage the reused components (UMT5 prompt encode + Krea DiT + z16 Wan VAE); any inference LoRA(s)
-    // are installed onto the DiT inside `stage_components` (sc-15015, S14).
-    let (context, transformer, vae, adapter_reports) =
-        stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
-
+    // are installed onto the DiT inside `stage_components` (sc-15015, S14). The Conditioning
+    // calibration boundary lives INSIDE that function, between the prompt encode and the DiT load —
+    // see its doc comment.
+    let (context, transformer, vae, adapter_reports) = stage_components(
+        root,
+        &cfg,
+        job.prompt,
+        &job.memory,
+        adapters,
+        quant,
+        on_progress,
+    )?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -861,6 +908,7 @@ pub(crate) fn generate_t2v_reported(
         latent_height: latent_h,
         latent_width: latent_w,
         fps: job.fps,
+        memory: job.memory,
     };
     let decoded_frames = (num_latent_frames * TEMPORAL_STRIDE) as i32;
     let tiling = decode_tiling(
@@ -892,10 +940,20 @@ pub(crate) fn generate_t2v_reported(
 /// applies whenever the DiT tier is quantized, but the encoder is loaded first, so the tier has to be
 /// known up front. The probe reads only safetensors shape metadata (MLX loads are lazy), so opening and
 /// dropping the DiT handle here costs nothing and materializes nothing.
+///
+/// **The Conditioning calibration boundary lives inside this function** (sc-22738), not at the call
+/// sites. `stage_components` is not one phase: it encodes the prompt *and then* loads the 14B DiT and
+/// builds the z16 VAE. A fault raised after it returns would already have paid for both heavy
+/// components, so it would certify a lifecycle the adapter never asked about. Raising it between
+/// [`encode_prompt`] (which materializes the context and drops the UMT5) and [`load_transformer`] is
+/// the phase EXIT — the conditioning work has run, its produced tensor is evaluated, and no heavy
+/// component is resident yet — matching how `mlx-gen-chroma`'s text-phase closure faults
+/// (`mlx-gen-chroma/src/model.rs`, `eval` of the embeds then the `Conditioning` fault).
 fn stage_components(
     root: &Path,
     cfg: &KreaRealtimeConfig,
     prompt: &str,
+    memory: &mlx_gen::gen_core::GenerationMemory,
     adapters: &[AdapterSpec],
     quant: Option<Quant>,
     on_progress: &mut dyn FnMut(Progress),
@@ -908,6 +966,9 @@ fn stage_components(
     let te_quant = resolve_te_quant(root, cfg, quant)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::TextEncoder));
     let context = encode_prompt(root, cfg, prompt, te_quant)?;
+    // SC-15449/sc-22738: the conditioning phase EXIT. `encode_prompt` has evaluated the context and
+    // released the UMT5; the DiT and VAE below are not loaded yet.
+    crate::memory_strategy::calibration_fault(memory, MemoryPhase::Conditioning)?;
     on_progress(Progress::Loading(mlx_gen::LoadPhase::Renderer));
     let (transformer, adapter_reports) = load_transformer(root, cfg, adapters, quant)?;
     let w = Weights::from_file(root.join("vae.safetensors"))?;
@@ -1023,8 +1084,17 @@ pub(crate) fn generate_i2v_reported(
             )
         })?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, total_latent)?;
-    let (context, transformer, vae, adapter_reports) =
-        stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
+    // The Conditioning calibration boundary lives INSIDE `stage_components`, between the prompt
+    // encode and the DiT load — see its doc comment.
+    let (context, transformer, vae, adapter_reports) = stage_components(
+        root,
+        &cfg,
+        job.prompt,
+        &job.memory,
+        adapters,
+        quant,
+        on_progress,
+    )?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -1032,6 +1102,7 @@ pub(crate) fn generate_i2v_reported(
         latent_height: latent_h,
         latent_width: latent_w,
         fps: job.fps,
+        memory: job.memory,
     };
     let decoded_frames = ((F_REF + num_generate) * TEMPORAL_STRIDE) as i32;
     let tiling = decode_tiling(
@@ -1106,8 +1177,17 @@ pub(crate) fn generate_v2v_reported(
     }
     let (latent_h, latent_w) = resolve_latent_size(root, job, "v2v")?;
     let cfg = resolve_request_config(base_cfg, latent_h, latent_w, num_latent)?;
-    let (context, transformer, vae, adapter_reports) =
-        stage_components(root, &cfg, job.prompt, adapters, quant, on_progress)?;
+    // The Conditioning calibration boundary lives INSIDE `stage_components`, between the prompt
+    // encode and the DiT load — see its doc comment.
+    let (context, transformer, vae, adapter_reports) = stage_components(
+        root,
+        &cfg,
+        job.prompt,
+        &job.memory,
+        adapters,
+        quant,
+        on_progress,
+    )?;
     let params = ArGenParams {
         seed: job.seed,
         steps: job.steps,
@@ -1115,6 +1195,7 @@ pub(crate) fn generate_v2v_reported(
         latent_height: latent_h,
         latent_width: latent_w,
         fps: job.fps,
+        memory: job.memory,
     };
     let decoded_frames = (num_latent * TEMPORAL_STRIDE) as i32;
     let tiling = decode_tiling(
@@ -1142,6 +1223,157 @@ pub(crate) fn generate_v2v_reported(
 mod tests {
     use super::*;
 
+    /// sc-22738 (coordinator decision): the Conditioning fault fires at the conditioning phase's
+    /// EXIT — inside `stage_components`, after `encode_prompt` has evaluated the context and released
+    /// the UMT5, and BEFORE `load_transformer` brings the 14B DiT (and the z16 VAE below it) into
+    /// residence. The former placement was at the three call sites, i.e. after `stage_components`
+    /// returned, by which point the DiT and VAE were already resident.
+    ///
+    /// Pinned as source text because the encode itself needs the snapshot.
+    #[test]
+    fn the_conditioning_calibration_fault_sits_between_the_prompt_encode_and_the_heavy_load() {
+        let source = include_str!("t2v.rs");
+        let body = source
+            .split_once("fn stage_components(")
+            .expect("stage_components")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let encode = body.find("encode_prompt(root").expect("prompt encode");
+        let fault = body
+            .find("MemoryPhase::Conditioning")
+            .expect("stage_components must carry the Conditioning calibration fault");
+        let transformer = body
+            .find("load_transformer(root")
+            .expect("heavy transformer load");
+        assert!(
+            encode < fault,
+            "the Conditioning fault must follow the prompt encode, not precede it"
+        );
+        assert!(
+            fault < transformer,
+            "the Conditioning fault must precede the 14B DiT load, not follow it"
+        );
+        // The z16 `ProviderVae` is built after the transformer, so bounding on `load_transformer`
+        // bounds the whole heavy stage.
+        assert!(
+            transformer < body.find("ProviderVae::from_weights(").expect("vae build"),
+            "the VAE build must follow the transformer load"
+        );
+    }
+
+    /// sc-22738: no reported route re-raises the Conditioning fault at its own call site (that was
+    /// the reviewed defect — it fired with the 14B DiT and the VAE already resident), and each one
+    /// threads its request-scoped `job.memory` into `stage_components` so the hook can see it.
+    #[test]
+    fn every_reported_route_delegates_the_conditioning_fault_to_stage_components() {
+        let source = include_str!("t2v.rs");
+        for route in [
+            "pub(crate) fn generate_t2v_reported(",
+            "pub(crate) fn generate_i2v_reported(",
+            "pub(crate) fn generate_v2v_reported(",
+        ] {
+            let body = source
+                .split_once(route)
+                .unwrap_or_else(|| panic!("missing {route}"))
+                .1
+                .split_once("\n}\n")
+                .expect("function end")
+                .0;
+            assert!(
+                !body.contains("MemoryPhase::Conditioning"),
+                "{route} must not raise the Conditioning fault after `stage_components` returned"
+            );
+            assert!(
+                body.contains("&job.memory,"),
+                "{route} must thread its request-scoped memory into `stage_components`"
+            );
+        }
+    }
+
+    /// sc-22738 (coordinator decision): each `*_from_components` seam faults at each phase's EXIT —
+    /// the denoise fault AFTER the AR loop produced the latents, the decode fault AFTER the VAE
+    /// decode produced the frames — the FLUX/Chroma/Qwen convention.
+    #[test]
+    fn the_denoise_and_decode_faults_fire_at_each_phase_exit_on_every_component_seam() {
+        let source = include_str!("t2v.rs");
+        for (route, start, generate) in [
+            (
+                "t2v",
+                "pub fn generate_t2v_from_components(",
+                "let latents = generate_latents(",
+            ),
+            (
+                "i2v",
+                "pub fn generate_i2v_from_components(",
+                "let latents = generate_i2v_latents(",
+            ),
+            (
+                "v2v",
+                "pub fn generate_v2v_from_components(",
+                "let latents = generate_v2v_latents(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route}"))
+                .1
+                .split_once("\n}\n")
+                .expect("function end")
+                .0;
+            let ar = body.find(generate).expect("AR generation");
+            let denoise = body
+                .find("denoise_exit_fault(")
+                .unwrap_or_else(|| panic!("{route} has no Denoise exit fault"));
+            let decode = body.find("decode_latents_to_video(").expect("VAE decode");
+            let decode_fault = body
+                .find("decode_exit_fault(")
+                .unwrap_or_else(|| panic!("{route} has no Decode exit fault"));
+            assert!(
+                ar < denoise,
+                "{route}: the Denoise fault must FOLLOW the AR loop, not precede it"
+            );
+            assert!(
+                denoise < decode,
+                "{route}: the Denoise fault must precede the VAE decode"
+            );
+            assert!(
+                decode < decode_fault,
+                "{route}: the Decode fault must FOLLOW the VAE decode, not precede it"
+            );
+        }
+    }
+
+    /// sc-22738: the denoise exit helper materializes the produced latents before it raises the
+    /// fault, so the adapter reads a real allocation (chroma's `eval([&final_latents])` then its
+    /// `Denoise` fault). The `eval` is armed-only, so an ordinary render keeps its laziness.
+    #[test]
+    fn the_denoise_exit_fault_evaluates_the_latents_before_refusing() {
+        let source = include_str!("t2v.rs");
+        let body = source
+            .split_once("fn denoise_exit_fault(")
+            .expect("denoise_exit_fault")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let armed = body
+            .find("calibration_fault_armed(")
+            .expect("armed-only guard");
+        let eval = body
+            .find("eval([latents])")
+            .expect("latent materialization");
+        let fault = body
+            .rfind("calibration_fault(memory, MemoryPhase::Denoise)")
+            .expect("the fault itself");
+        assert!(armed < eval, "the eval must be gated on an armed fault");
+        assert!(
+            eval < fault,
+            "the latents must be evaluated before the fault"
+        );
+    }
+
     #[test]
     fn latent_frame_count_uses_causal_convention() {
         // (frames − 1)/4 + 1: 1→1, 4→1, 5→2, 8→2, 9→3, 21 latent for 81 frames.
@@ -1167,6 +1399,7 @@ mod tests {
             fps: 16,
             seed: 0,
             steps: None,
+            memory: Default::default(),
         };
         let missing = Path::new("/nonexistent-krea-realtime-snapshot");
         let t2v_error = generate_t2v(

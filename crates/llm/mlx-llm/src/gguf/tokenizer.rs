@@ -339,6 +339,8 @@ fn derive_merges_from_scores(tokens: &[&str], scores: &[f32]) -> Vec<Value> {
 
 /// The Qwen2 pre-tokenizer split regex (verbatim from a Qwen `tokenizer.json`).
 const QWEN2_SPLIT_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Qwen3.5/3.8 adds combining marks (`\p{M}`) to the Qwen split classes.
+const QWEN35_SPLIT_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// The Llama-3 pre-tokenizer split regex — like Qwen2 but with `\p{N}{1,3}` (digit groups of ≤3).
 const LLAMA3_SPLIT_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
@@ -364,6 +366,12 @@ fn bpe_components(pre: &str) -> (Value, Value, Value, Value) {
     let bytelevel = |apsf: bool, trim: bool, use_regex: bool| json!({ "type": "ByteLevel", "add_prefix_space": apsf, "trim_offsets": trim, "use_regex": use_regex });
 
     match pre {
+        "qwen35" => (
+            json!({ "type": "NFC" }),
+            split_then_bytelevel(QWEN35_SPLIT_REGEX),
+            bytelevel(false, false, false),
+            bytelevel(false, false, false),
+        ),
         "qwen2" => (
             json!({ "type": "NFC" }),
             split_then_bytelevel(QWEN2_SPLIT_REGEX),

@@ -91,8 +91,8 @@ use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
 use candle_gen::gen_core::{
     adapter_stack_resident_bytes, safetensors_path_bytes, AdapterResidencyMode, Error as CoreError,
-    LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryComponentKind,
-    MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
+    LoadShape, LoadSpec, MemoryAssetFacts, MemoryBackendRealization, MemoryCalibrationIdentity,
+    MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind, MemoryFormulaVariable,
     MemoryLifecycleCapabilities, MemoryParameterRanges, MemoryPhase, MemoryProviderContract,
     MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
     MemoryStrategyCapability, MemoryStrategySupport, MemoryWindowMaterialization,
@@ -265,6 +265,22 @@ pub const LOAD_SHAPE: LoadShape = LoadShape::EagerMaterialization;
 const DIT_PARTITIONS: [&str; 2] = [BASE_DIT_PARTITION, REFERENCE_DIT_PARTITION];
 
 struct ComponentBytes {
+    /// The materialized snapshot directory the components were resolved from, when there is one.
+    ///
+    /// Carried alongside the bytes for [`architecture_facts`] (epic SC-22657, E2): the contract's
+    /// architecture axes are read out of the very `config.json` files this crate's loaders parse,
+    /// and `resolve` is the only place that knows where they live. `None` for the weights-free
+    /// fixture, which resolves no snapshot at all and therefore knows no axis.
+    root: Option<std::path::PathBuf>,
+    /// The DiT partition directory that was actually charged — the staged override when one is
+    /// installed, else `<root>/<partition>`.
+    ///
+    /// Carried for [`architecture_facts`] (SC-22667, E2): a split install stages the DiT **outside**
+    /// the snapshot, so `<root>/transformer/config.json` may not exist at all and reading the trunk
+    /// axes from there published `None` for four axes the load reads from a file it holds open.
+    /// `resolve` is the only place that knows which of the two partitions won, and reading the
+    /// config off the loser would describe a partition that is not being charged.
+    dit_dir: Option<std::path::PathBuf>,
     text_encoder: u64,
     dit: u64,
     /// The AdaLN sub-stack's residency **on the DiT that was actually resolved** — see
@@ -298,13 +314,21 @@ impl ComponentBytes {
         // — `crate::convert` packs `transformer/` and `transformer_ref/` at the same width, so their
         // markers agree — but leaving the choice to iteration order would make the declaration depend
         // on it.
+        let staged_dit = match spec.components.get(BASE_DIT_PARTITION) {
+            Some(WeightsSource::Dir(staged)) => Some(staged.as_path()),
+            _ => None,
+        };
+        // Use the loader's sibling rule. An upstream dense reference partition is not
+        // loaded when the base DiT was redirected to a packed tier directory.
+        let paths = crate::tier::MiniMaxH3TierPaths::resolve(&root, staged_dit, None);
         let (dit_dir, dit) = DIT_PARTITIONS
             .iter()
             .rev()
             .map(|partition| {
-                let dir = match spec.components.get(*partition) {
-                    Some(WeightsSource::Dir(staged)) => staged.clone(),
-                    _ => root.join(partition),
+                let dir = if *partition == BASE_DIT_PARTITION {
+                    paths.dit_dir.clone()
+                } else {
+                    paths.reference_dit_dir.clone()
                 };
                 let bytes = safetensors_path_bytes(&dir);
                 (dir, bytes)
@@ -323,6 +347,14 @@ impl ComponentBytes {
             _ => root.join(crate::tier::TEXT_ENCODER_COMPONENT),
         };
         Ok(Self {
+            // The weights-free gate: only a materialized snapshot directory carries readable
+            // component configs. The registry's contract surface names a sentinel that is not on
+            // disk, and a single-file import is not a component snapshot.
+            root: candle_gen::architecture_facts::snapshot_root(spec)
+                .map(std::path::Path::to_path_buf),
+            // Only when it is on disk: the registry's sentinel surface names a partition nobody
+            // creates, and an unresolved partition knows no axis.
+            dit_dir: dit_dir.is_dir().then(|| dit_dir.clone()),
             text_encoder: safetensors_path_bytes(text_encoder),
             dit,
             // Resolved against the partition that was actually charged, whichever of the two won the
@@ -686,8 +718,120 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// The product of a list-valued downsample factor, exactly as
+/// [`crate::config::MiniMaxH3VaeConfig::from_diffusers_json`] computes it (`prod`).
+///
+/// A missing or non-integer list is `None` rather than an invented 1: an unread list is not a
+/// compression factor of one.
+fn downsample_product(vae: Option<&serde_json::Value>, key: &str) -> Option<u32> {
+    let factors = vae?.get(key)?.as_array().filter(|list| !list.is_empty())?;
+    factors
+        .iter()
+        .try_fold(1_u32, |product, factor| {
+            product.checked_mul(u32::try_from(factor.as_u64()?).ok()?)
+        })
+        .filter(|product| *product != 0)
+}
+
+/// Snapshot-read architecture facts for the MiniMax-H3 route (epic SC-22657, E2).
+///
+/// Every axis is read from the same two files this crate's own config readers parse:
+/// `<root>/transformer/config.json` through
+/// [`crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json`] (`num_attention_heads`,
+/// `attention_head_dim`, `num_layers`, `patch_size`) and `<root>/vae/config.json` through
+/// [`crate::config::MiniMaxH3VaeConfig::from_diffusers_json`] (`latent_channels`, and the products
+/// of `spatial_downsample_factors` / `temporal_downsample_factors`). Nothing is inferred from the
+/// model id, so a snapshot whose config disagrees with the published H3 config publishes what it
+/// actually says.
+///
+/// **`head_dim` is read, never derived.** H3's DiT is *not* uniform-head in the usual sense:
+/// `num_attention_heads · attention_head_dim` is `56 · 128 = 7168`, while `hidden_size` is `5376`.
+/// Dividing the hidden size by the head count would publish `96`, a width no attention head in this
+/// model has.
+///
+/// The VAE ratios are computed from the parsed factor lists rather than restating
+/// [`crate::config::VAE_RATIO`] / [`crate::config::VAE_RATIO_T`], which are themselves documented as
+/// the products of those lists. Those constants are **not** a fallback here: a snapshot that ships
+/// no VAE config (or an unreadable factor list) leaves [`downsample_product`] returning `None` and
+/// both scale axes unpublished, per E2 — the pipeline's own canvas alignment still uses the
+/// constants, but this contract never presents them as a fact about a snapshot it could not read.
+///
+/// A weights-free contract — no resolved snapshot directory — publishes
+/// `MemoryArchitectureFacts::default()`.
+fn architecture_facts(
+    components: &ComponentBytes,
+) -> candle_gen::gen_core::MemoryArchitectureFacts {
+    use candle_gen::architecture_facts as af;
+
+    let Some(root) = components.root.as_deref() else {
+        return candle_gen::gen_core::MemoryArchitectureFacts::default();
+    };
+    // SC-22667: read the trunk axes from the partition `ComponentBytes::resolve` actually charged.
+    // A split `q4`/`q8` install stages the DiT outside the snapshot through `spec.components`, so
+    // `<root>/transformer/config.json` need not exist — and reading only there published `None` for
+    // `attention_heads`, `head_dim`, `transformer_blocks` and `patch_size` on exactly the installs
+    // whose config the loader has open. `<root>/<partition>` remains the fallback, which is what
+    // `resolve` itself falls back to, so a flat snapshot is unchanged.
+    let dit = components
+        .dit_dir
+        .as_deref()
+        .and_then(|dir| af::config_file(&dir.join("config.json")))
+        .or_else(|| af::component_config(root, BASE_DIT_PARTITION));
+    let vae = af::component_config(root, "vae");
+    if dit.is_none() && vae.is_none() {
+        return candle_gen::gen_core::MemoryArchitectureFacts::default();
+    }
+    candle_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: af::axis_of(dit.as_ref(), &["num_attention_heads"]),
+        // Read, not divided out of `hidden_size` — see the note above.
+        head_dim: af::axis_of(dit.as_ref(), &["attention_head_dim"]),
+        transformer_blocks: af::axis_of(dit.as_ref(), &["num_layers"]),
+        // `patch_size` is `(temporal, height, width)`; index 1 is the spatial entry this fact names.
+        patch_size: af::axis_at(dit.as_ref(), "patch_size", 1),
+        latent_channels: af::axis_of(vae.as_ref(), &["latent_channels"]),
+        vae_spatial_scale: downsample_product(vae.as_ref(), "spatial_downsample_factors"),
+        vae_temporal_scale: downsample_product(vae.as_ref(), "temporal_downsample_factors"),
+        // `compute_dtype_bytes()` — the bf16 width the DiT actually computes in.
+        activation_dtype_width: u32::try_from(compute_dtype_bytes()).ok(),
+    }
+}
+
+/// Artifact-tier label of a MiniMax-H3 Candle load: `bf16` dense, `q4`/`q8` packed.
+pub fn calibration_tier_label(bits: Option<i32>) -> Option<&'static str> {
+    match bits {
+        None => Some("bf16"),
+        Some(4) => Some("q4"),
+        Some(8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The production calibration identity for one `artifact-proven tier` on the Candle lane.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4)
+///
+/// This lane published `None` for every load, on the reasoning that no fitted curve exists for the
+/// backend. But a fingerprint is a KEY for evidence, not a claim that evidence exists — and while
+/// nothing was published, no anchor could bind to a Candle MiniMax-H3 load at all, so the lane was
+/// permanently unmeasurable rather than merely unmeasured. Optimized selection still fails closed at
+/// admission for any cell without a record, so nothing here claims an unproven saving.
+///
+/// The tier is the one the ARTIFACT carries: [`ComponentBytes::resolve`] sets `dit_dir` only for a
+/// partition directory that exists, and the packed width is read from that partition's own
+/// `config.json` — the same marker `crate::tier` parses on the load path. A spec that resolved no
+/// snapshot has no `dit_dir` and therefore no identity, which is what keeps the weights-free
+/// fixture from publishing one.
+fn production_calibration_fingerprint(components: &ComponentBytes) -> Option<String> {
+    let dit_dir = components.dit_dir.as_ref()?;
+    let bits = crate::tier::MiniMaxH3TierPaths::staged_bits(dit_dir).ok()?;
+    let tier = calibration_tier_label(bits)?;
+    Some(format!("minimax-h3-{tier}-candle-staged-joint-av-v1"))
+}
+
 fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
     MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(components),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::CandleCuda {
             device_residency: true,
@@ -803,9 +947,12 @@ fn build_contract(components: &ComponentBytes) -> MemoryProviderContract {
                 resident
             },
         },
-        // No fitted curve exists for this backend. `None` is the honest state, and it is load
-        // bearing: it makes every optimized selection fail closed at admission.
-        calibration: None,
+        // sc-22737: the per-(artifact-proven tier) production identity. `None` only when the tier
+        // is not proven — see `production_calibration_fingerprint`. Publishing a KEY is not a
+        // claim that a fitted curve exists: with no evidence record filed under it, every
+        // optimized selection still fails closed at admission exactly as before.
+        calibration: production_calibration_fingerprint(components)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, LOAD_SHAPE)),
         asset_facts: MemoryAssetFacts {
             base_bytes: components.base(),
             conditioning_bytes: components.text_encoder,
@@ -839,6 +986,9 @@ pub fn weights_free_contract(
     _spec: &LoadSpec,
 ) -> candle_gen::gen_core::Result<MemoryProviderContract> {
     Ok(build_contract(&ComponentBytes {
+        // No snapshot is resolved and none is traversed, so no architecture axis is knowable.
+        root: None,
+        dit_dir: None,
         text_encoder: 0,
         dit: 0,
         // The declaration-only footprint resolves no DiT, so the sub-stack states the architecture's
@@ -968,6 +1118,226 @@ mod tests {
                 ("transformer_ref", DIT_BF16_BYTES),
             ],
         );
+    }
+
+    /// Write the charged DiT partition's own `quantization` marker — the same `config.json`
+    /// `crate::tier` parses on the load path. `None` writes a marker-free `config.json`, the dense
+    /// `bf16` tier.
+    fn write_dit_tier_marker(root: &Path, bits: Option<i32>) {
+        for partition in DIT_PARTITIONS {
+            let dir = root.join(partition);
+            std::fs::create_dir_all(&dir).expect("dit dir");
+            let body = match bits {
+                Some(bits) => format!("{{\"quantization\":{{\"bits\":{bits}}}}}"),
+                None => "{}".to_owned(),
+            };
+            std::fs::write(dir.join("config.json"), body).expect("marker");
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the Candle lane publishes a per-(artifact tier) identity.
+    // Before it this crate published `None` for every load, so no anchor could name a Candle
+    // MiniMax-H3 cell at all and the lane was unmeasurable rather than merely unmeasured.
+    // ------------------------------------------------------------------------------------------
+
+    /// Three shipped tiers, three DISTINCT identities, each reaching the production contract.
+    #[test]
+    fn each_shipped_tier_publishes_its_own_candle_identity() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (bits, tier) in [(None, "bf16"), (Some(4), "q4"), (Some(8), "q8")] {
+            let root = tempfile::tempdir().expect("tempdir");
+            full_snapshot(root.path());
+            write_dit_tier_marker(root.path(), bits);
+            let contract = contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into())))
+                .expect("contract");
+            let identity = contract
+                .calibration
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier} publishes an identity"));
+            assert_eq!(
+                identity.fingerprint,
+                format!("minimax-h3-{tier}-candle-staged-joint-av-v1")
+            );
+            // The lane is part of the key: a Candle cell may never collide with its MLX twin,
+            // whose strings all carry `-mlx-`.
+            assert!(identity.fingerprint.contains("-candle-"));
+            assert!(seen.insert(identity.fingerprint.clone()));
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    /// **Withheld, never failed.** A spec that resolves no DiT partition proves no tier, so it
+    /// publishes nothing — and the contract still builds.
+    #[test]
+    fn a_tier_the_artifact_does_not_prove_is_withheld_on_candle() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let contract = contract_for(&LoadSpec::new(WeightsSource::Dir(empty.path().into())))
+            .expect("a withheld identity must not fail the load");
+        assert_eq!(contract.calibration, None);
+
+        // `contract_for` on the registry's never-created sentinel path is the same story.
+        assert_eq!(
+            contract_for(&LoadSpec::new(WeightsSource::Dir("/nonexistent".into())))
+                .expect("contract")
+                .calibration,
+            None
+        );
+    }
+
+    /// Both MiniMax-H3 catalog routes ride ONE Candle provider whose contract declares the LARGER
+    /// of the two DiT partitions, so the reference route resolves the SAME identity as the base
+    /// one. That is the engine's deliberate over-declaration, and binding it here means a future
+    /// change that made the partitions diverge cannot pass silently.
+    #[test]
+    fn the_reference_partition_resolves_the_same_candle_identity_as_the_base() {
+        let root = tempfile::tempdir().expect("tempdir");
+        full_snapshot(root.path());
+        write_dit_tier_marker(root.path(), Some(8));
+        let flat =
+            contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into()))).expect("contract");
+
+        let staged = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+            REFERENCE_DIT_PARTITION,
+            WeightsSource::Dir(root.path().join(REFERENCE_DIT_PARTITION)),
+        );
+        let referenced = contract_for(&staged).expect("contract");
+        assert_eq!(flat.calibration, referenced.calibration);
+        assert_eq!(
+            referenced.calibration.unwrap().fingerprint,
+            "minimax-h3-q8-candle-staged-joint-av-v1"
+        );
+    }
+
+    /// The two published component configs, cut down to exactly the keys
+    /// [`architecture_facts`] reads. `num_layers` is a parameter so a second snapshot can prove the
+    /// axes are read rather than asserted.
+    fn write_component_configs(root: &Path, num_layers: u32) {
+        std::fs::create_dir_all(root.join(BASE_DIT_PARTITION)).expect("dit dir");
+        std::fs::write(
+            root.join(BASE_DIT_PARTITION).join("config.json"),
+            format!(
+                r#"{{
+                    "_class_name": "MiniMaxH3Transformer3DModel",
+                    "num_attention_heads": 56,
+                    "attention_head_dim": 128,
+                    "hidden_size": 5376,
+                    "num_layers": {num_layers},
+                    "patch_size": [1, 2, 2]
+                }}"#
+            ),
+        )
+        .expect("dit config");
+        std::fs::create_dir_all(root.join("vae")).expect("vae dir");
+        std::fs::write(
+            root.join("vae/config.json"),
+            br#"{
+                "_class_name": "AutoencoderKLMiniMaxH3",
+                "latent_channels": 24,
+                "spatial_downsample_factors": [2, 2, 2, 2, 1, 1],
+                "temporal_downsample_factors": [1, 2, 2, 1, 1, 1]
+            }"#,
+        )
+        .expect("vae config");
+    }
+
+    /// AC (epic SC-22657, E2): the contract publishes the architecture axes read from the snapshot's
+    /// own component `config.json` files, and the weights-free surface publishes none of them.
+    #[test]
+    fn architecture_facts_match_the_loader_config_and_pass_conformance() {
+        let root = tempfile::tempdir().expect("tempdir");
+        full_snapshot(root.path());
+        write_component_configs(root.path(), 50);
+        let contract = contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into())))
+            .expect("production contract");
+        assert_eq!(
+            contract.architecture_facts,
+            candle_gen::gen_core::MemoryArchitectureFacts {
+                // `transformer/config.json`: `num_attention_heads`, `attention_head_dim`.
+                attention_heads: Some(56),
+                // Read, never derived: 56 x 128 = 7168, but `hidden_size` is 5376, so the quotient
+                // would publish 96 — a width no attention head in this model has.
+                head_dim: Some(128),
+                transformer_blocks: Some(50),
+                // `patch_size` is `[temporal, height, width]`; index 1 is the spatial entry.
+                patch_size: Some(2),
+                // `vae/config.json`: `latent_channels`.
+                latent_channels: Some(24),
+                // Products of `spatial_downsample_factors` / `temporal_downsample_factors`, the
+                // same computation `MiniMaxH3VaeConfig::from_diffusers_json` performs.
+                vae_spatial_scale: Some(16),
+                vae_temporal_scale: Some(4),
+                // `compute_dtype_bytes()` — bf16.
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+
+        // The facts are read, not asserted: a config declaring a different depth publishes what it
+        // actually says.
+        write_component_configs(root.path(), 32);
+        let mutated = contract_for(&LoadSpec::new(WeightsSource::Dir(root.path().into())))
+            .expect("production contract");
+        assert_eq!(mutated.architecture_facts.transformer_blocks, Some(32));
+
+        // The registry surface resolves no snapshot at all.
+        assert!(declared().architecture_facts.is_empty());
+    }
+
+    /// Feature-end review (SC-22667, E2). A split `q4`/`q8` install stages the DiT **outside** the
+    /// snapshot through `spec.components`, so `<root>/transformer/` need not exist — but the loader
+    /// still parses a `config.json`, the staged one, and the four trunk axes are therefore known.
+    ///
+    /// Mutation that fails this: reading only `af::component_config(root, BASE_DIT_PARTITION)`, the
+    /// shape under review — `attention_heads`, `head_dim`, `transformer_blocks` and `patch_size` all
+    /// read `None` on this install while the VAE axes beside them read fine, which is the exact
+    /// asymmetry that made the omission invisible.
+    #[test]
+    fn a_staged_dit_publishes_the_trunk_axes_of_the_partition_it_charges() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let staged = tempfile::tempdir().expect("staged tempdir");
+        // The snapshot carries everything EXCEPT the transformer partition.
+        sparse_snapshot(
+            root.path(),
+            &[
+                ("text_encoder", TEXT_ENCODER_BYTES),
+                ("vae", VIDEO_VAE_BYTES),
+                ("audio_vae", AUDIO_VAE_BYTES),
+            ],
+        );
+        write_component_configs(root.path(), 50);
+        // `write_component_configs` also writes `<root>/transformer/config.json`; drop the whole
+        // partition so this fixture is the split install it claims to be.
+        std::fs::remove_dir_all(root.path().join(BASE_DIT_PARTITION)).expect("drop the partition");
+        assert!(!root.path().join(BASE_DIT_PARTITION).is_dir());
+
+        // The staged partition carries its own config, with a depth the snapshot never declared.
+        sparse_snapshot(staged.path(), &[(BASE_DIT_PARTITION, DIT_Q8_BYTES)]);
+        std::fs::write(
+            staged.path().join(BASE_DIT_PARTITION).join("config.json"),
+            r#"{"_class_name":"MiniMaxH3Transformer3DModel","num_attention_heads":56,
+                "attention_head_dim":128,"hidden_size":5376,"num_layers":41,
+                "patch_size":[1,2,2],"quantization":{"bits":8,"group_size":64}}"#,
+        )
+        .expect("staged dit config");
+
+        let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+            BASE_DIT_PARTITION,
+            WeightsSource::Dir(staged.path().join(BASE_DIT_PARTITION)),
+        );
+        let facts = contract_for(&spec).expect("contract").architecture_facts;
+        assert_eq!(facts.attention_heads, Some(56));
+        assert_eq!(facts.head_dim, Some(128));
+        assert_eq!(
+            facts.transformer_blocks,
+            Some(41),
+            "the depth comes from the STAGED partition, not the snapshot"
+        );
+        assert_eq!(facts.patch_size, Some(2));
+        // The VAE axes still come from the snapshot, which is where that component lives.
+        assert_eq!(facts.latent_channels, Some(24));
+        assert_eq!(facts.vae_spatial_scale, Some(16));
     }
 
     // --- AC1: declared Resident, not fallen-back Resident ---------------------------------------
@@ -1324,7 +1694,12 @@ mod tests {
         assert_eq!(fixture.strategies, production.strategies);
         assert_eq!(fixture.lifecycle, production.lifecycle);
         assert_eq!(fixture.formula, production.formula);
-        assert_eq!(fixture.calibration, production.calibration);
+        // sc-22737: the identities must DIFFER, and this is the strongest form of that — the
+        // weights-free fixture resolves no snapshot, so it has no `dit_dir`, so it proves no tier
+        // and publishes NOTHING, while the production contract publishes the resolved tier's key.
+        // A plan row naming a production cell therefore cannot be satisfied by the fixture.
+        assert_eq!(fixture.calibration, None);
+        assert!(production.calibration.is_some());
         assert_eq!(fixture.load_shape, production.load_shape);
         assert_eq!(fixture.backend, production.backend);
     }
@@ -1883,6 +2258,43 @@ mod tests {
         )
         .expect("contract");
         assert_eq!(contract.asset_facts.transformer_bytes, Q4_BYTES);
+    }
+
+    #[test]
+    fn a_split_packed_tier_ignores_the_upstream_dense_reference_partition() {
+        let root = tempfile::tempdir().unwrap();
+        sparse_snapshot(
+            root.path(),
+            &[
+                (BASE_DIT_PARTITION, DIT_BF16_BYTES),
+                (REFERENCE_DIT_PARTITION, DIT_BF16_BYTES),
+            ],
+        );
+        for bits in [4, 8] {
+            let staged = tempfile::tempdir().unwrap();
+            let base_bytes = 1_000_000;
+            let reference_bytes = 2_000_000;
+            sparse_snapshot(
+                staged.path(),
+                &[
+                    (BASE_DIT_PARTITION, base_bytes),
+                    (REFERENCE_DIT_PARTITION, reference_bytes),
+                ],
+            );
+            for partition in DIT_PARTITIONS {
+                write_tier_marker(&staged.path().join(partition), bits);
+            }
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into())).with_component(
+                BASE_DIT_PARTITION,
+                WeightsSource::Dir(staged.path().join(BASE_DIT_PARTITION)),
+            );
+            let contract = contract_for(&spec).unwrap();
+            assert_eq!(contract.asset_facts.transformer_bytes, reference_bytes);
+            assert_eq!(
+                contract.calibration.unwrap().fingerprint,
+                format!("minimax-h3-q{bits}-candle-staged-joint-av-v1")
+            );
+        }
     }
 
     /// **A `ref2va` snapshot is charged for the partition a `ref2va` render actually reads.**

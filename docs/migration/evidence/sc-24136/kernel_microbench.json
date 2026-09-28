@@ -1,0 +1,1161 @@
+{
+  "suite": "nvfp4_gemv_microbench",
+  "story": "sc-24136",
+  "label": "RTX Pro 6000 / sm_120",
+  "timing": "wall clock over N back-to-back calls between two device synchronizes, after 5 warm-up calls",
+  "effective_bytes": "packed NVFP4 weight + UE4M3 scales + bf16 activation + bf16 output, per call",
+  "rows": [
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 1,
+      "bytes_per_call": 35424256.0,
+      "gemv": {
+        "us_per_call": 23.241500000000002,
+        "effective_gb_per_s": 1524.1811414925885
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 127.05950000000001,
+        "effective_gb_per_s": 278.80053046013876
+      },
+      "speedup_vs_cublaslt": 5.4669233913473745
+    },
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 2,
+      "bytes_per_call": 35459072.0,
+      "gemv": {
+        "us_per_call": 22.569000000000003,
+        "effective_gb_per_s": 1571.1405910762549
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 128.702,
+        "effective_gb_per_s": 275.5129834812202
+      },
+      "speedup_vs_cublaslt": 5.702600912756435
+    },
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 3,
+      "bytes_per_call": 35493888.0,
+      "gemv": {
+        "us_per_call": 22.593000000000004,
+        "effective_gb_per_s": 1571.012614526623
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 118.3515,
+        "effective_gb_per_s": 299.9023079555392
+      },
+      "speedup_vs_cublaslt": 5.238414553180188
+    },
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 4,
+      "bytes_per_call": 35528704.0,
+      "gemv": {
+        "us_per_call": 23.1575,
+        "effective_gb_per_s": 1534.220187844111
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 114.10150000000002,
+        "effective_gb_per_s": 311.37806251451553
+      },
+      "speedup_vs_cublaslt": 4.927194213537732
+    },
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 5,
+      "bytes_per_call": 35563520.0,
+      "gemv": {
+        "us_per_call": 24.995500000000003,
+        "effective_gb_per_s": 1422.7969034426194
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 120.33550000000001,
+        "effective_gb_per_s": 295.5363961590719
+      },
+      "speedup_vs_cublaslt": 4.814286571582885
+    },
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 6,
+      "bytes_per_call": 35598336.0,
+      "gemv": {
+        "us_per_call": 24.708999999999996,
+        "effective_gb_per_s": 1440.7032255453482
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 116.29350000000001,
+        "effective_gb_per_s": 306.10770163422717
+      },
+      "speedup_vs_cublaslt": 4.706523938645839
+    },
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 7,
+      "bytes_per_call": 35633152.0,
+      "gemv": {
+        "us_per_call": 24.601,
+        "effective_gb_per_s": 1448.4432340148776
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 116.54,
+        "effective_gb_per_s": 305.7589840398146
+      },
+      "speedup_vs_cublaslt": 4.737205804642088
+    },
+    {
+      "projection": "self_attn.q_proj (+gate)",
+      "n": 12288,
+      "k": 5120,
+      "rows": 8,
+      "bytes_per_call": 35667968.0,
+      "gemv": {
+        "us_per_call": 24.9685,
+        "effective_gb_per_s": 1428.5186535034145
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 115.179,
+        "effective_gb_per_s": 309.67422880907105
+      },
+      "speedup_vs_cublaslt": 4.612972345154896
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 1,
+      "bytes_per_call": 2961408.0,
+      "gemv": {
+        "us_per_call": 9.951,
+        "effective_gb_per_s": 297.5990352728369
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 131.64,
+        "effective_gb_per_s": 22.49626253418414
+      },
+      "speedup_vs_cublaslt": 13.228821223997587
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 2,
+      "bytes_per_call": 2973696.0,
+      "gemv": {
+        "us_per_call": 12.2805,
+        "effective_gb_per_s": 242.14779528520828
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 131.761,
+        "effective_gb_per_s": 22.568863320709468
+      },
+      "speedup_vs_cublaslt": 10.729286266845811
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 3,
+      "bytes_per_call": 2985984.0,
+      "gemv": {
+        "us_per_call": 10.29,
+        "effective_gb_per_s": 290.1830903790088
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 135.78549999999998,
+        "effective_gb_per_s": 21.9904481700918
+      },
+      "speedup_vs_cublaslt": 13.195869776482022
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 4,
+      "bytes_per_call": 2998272.0,
+      "gemv": {
+        "us_per_call": 10.399000000000001,
+        "effective_gb_per_s": 288.323107991153
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 137.924,
+        "effective_gb_per_s": 21.738580667614045
+      },
+      "speedup_vs_cublaslt": 13.263198384460043
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 5,
+      "bytes_per_call": 3010560.0,
+      "gemv": {
+        "us_per_call": 10.4585,
+        "effective_gb_per_s": 287.8577233828943
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 142.1565,
+        "effective_gb_per_s": 21.177786453661984
+      },
+      "speedup_vs_cublaslt": 13.592436773915951
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 6,
+      "bytes_per_call": 3022848.0,
+      "gemv": {
+        "us_per_call": 10.3455,
+        "effective_gb_per_s": 292.1896476729013
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 133.98,
+        "effective_gb_per_s": 22.56193461710703
+      },
+      "speedup_vs_cublaslt": 12.950558213716109
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 7,
+      "bytes_per_call": 3035136.0,
+      "gemv": {
+        "us_per_call": 9.9475,
+        "effective_gb_per_s": 305.11545614476
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 135.90949999999998,
+        "effective_gb_per_s": 22.332037127647443
+      },
+      "speedup_vs_cublaslt": 13.66267906509173
+    },
+    {
+      "projection": "self_attn.k_proj",
+      "n": 1024,
+      "k": 5120,
+      "rows": 8,
+      "bytes_per_call": 3047424.0,
+      "gemv": {
+        "us_per_call": 11.1755,
+        "effective_gb_per_s": 272.6879334257975
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 139.1975,
+        "effective_gb_per_s": 21.892806982884036
+      },
+      "speedup_vs_cublaslt": 12.455594827971902
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 1,
+      "bytes_per_call": 17717248.0,
+      "gemv": {
+        "us_per_call": 12.561499999999999,
+        "effective_gb_per_s": 1410.4404728734626
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 129.61,
+        "effective_gb_per_s": 136.69661291567007
+      },
+      "speedup_vs_cublaslt": 10.318035266488877
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 2,
+      "bytes_per_call": 17739776.0,
+      "gemv": {
+        "us_per_call": 13.133000000000003,
+        "effective_gb_per_s": 1350.7786492042942
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 130.9025,
+        "effective_gb_per_s": 135.51900078302552
+      },
+      "speedup_vs_cublaslt": 9.967448412396251
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 3,
+      "bytes_per_call": 17762304.0,
+      "gemv": {
+        "us_per_call": 14.42,
+        "effective_gb_per_s": 1231.7825242718447
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 128.93,
+        "effective_gb_per_s": 137.76703637632824
+      },
+      "speedup_vs_cublaslt": 8.94105409153953
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 4,
+      "bytes_per_call": 17784832.0,
+      "gemv": {
+        "us_per_call": 14.358999999999998,
+        "effective_gb_per_s": 1238.5843025280315
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 132.092,
+        "effective_gb_per_s": 134.63973594161644
+      },
+      "speedup_vs_cublaslt": 9.199247858485968
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 5,
+      "bytes_per_call": 17807360.0,
+      "gemv": {
+        "us_per_call": 14.373000000000001,
+        "effective_gb_per_s": 1238.945244555764
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 132.7925,
+        "effective_gb_per_s": 134.09913963514506
+      },
+      "speedup_vs_cublaslt": 9.239024559938773
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 6,
+      "bytes_per_call": 17829888.0,
+      "gemv": {
+        "us_per_call": 14.7475,
+        "effective_gb_per_s": 1209.0108832005426
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 130.4365,
+        "effective_gb_per_s": 136.69400819555878
+      },
+      "speedup_vs_cublaslt": 8.844651635870486
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 7,
+      "bytes_per_call": 17852416.0,
+      "gemv": {
+        "us_per_call": 14.966999999999999,
+        "effective_gb_per_s": 1192.7851940936728
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 128.3525,
+        "effective_gb_per_s": 139.08896203813717
+      },
+      "speedup_vs_cublaslt": 8.575699873054052
+    },
+    {
+      "projection": "self_attn.o_proj",
+      "n": 5120,
+      "k": 6144,
+      "rows": 8,
+      "bytes_per_call": 17874944.0,
+      "gemv": {
+        "us_per_call": 14.51,
+        "effective_gb_per_s": 1231.9051688490697
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 108.05199999999999,
+        "effective_gb_per_s": 165.42908969755305
+      },
+      "speedup_vs_cublaslt": 7.446726395589248
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 1,
+      "bytes_per_call": 29521920.0,
+      "gemv": {
+        "us_per_call": 18.593,
+        "effective_gb_per_s": 1587.797558220836
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 110.22449999999999,
+        "effective_gb_per_s": 267.83446511438024
+      },
+      "speedup_vs_cublaslt": 5.928279460011832
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 2,
+      "bytes_per_call": 29552640.0,
+      "gemv": {
+        "us_per_call": 19.4255,
+        "effective_gb_per_s": 1521.3322694396543
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 152.12099999999998,
+        "effective_gb_per_s": 194.2706135247599
+      },
+      "speedup_vs_cublaslt": 7.830995341175258
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 3,
+      "bytes_per_call": 29583360.0,
+      "gemv": {
+        "us_per_call": 24.3695,
+        "effective_gb_per_s": 1213.9502246660786
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 262.6395,
+        "effective_gb_per_s": 112.63865488626044
+      },
+      "speedup_vs_cublaslt": 10.777385666509367
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 4,
+      "bytes_per_call": 29614080.0,
+      "gemv": {
+        "us_per_call": 24.839499999999997,
+        "effective_gb_per_s": 1192.2172346464301
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 258.2855,
+        "effective_gb_per_s": 114.65637831004837
+      },
+      "speedup_vs_cublaslt": 10.398176291793314
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 5,
+      "bytes_per_call": 29644800.0,
+      "gemv": {
+        "us_per_call": 24.153000000000002,
+        "effective_gb_per_s": 1227.3754813066698
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 259.111,
+        "effective_gb_per_s": 114.40965454959458
+      },
+      "speedup_vs_cublaslt": 10.72790129590527
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 6,
+      "bytes_per_call": 29675520.0,
+      "gemv": {
+        "us_per_call": 24.691,
+        "effective_gb_per_s": 1201.8759872018145
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 256.17,
+        "effective_gb_per_s": 115.84307295936293
+      },
+      "speedup_vs_cublaslt": 10.375035438013851
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 7,
+      "bytes_per_call": 29706240.0,
+      "gemv": {
+        "us_per_call": 24.4725,
+        "effective_gb_per_s": 1213.862090101134
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 258.2785,
+        "effective_gb_per_s": 115.01630991352359
+      },
+      "speedup_vs_cublaslt": 10.553825722750025
+    },
+    {
+      "projection": "linear_attn.in_proj_qkv",
+      "n": 10240,
+      "k": 5120,
+      "rows": 8,
+      "bytes_per_call": 29736960.0,
+      "gemv": {
+        "us_per_call": 24.2965,
+        "effective_gb_per_s": 1223.9194945774082
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 257.2605,
+        "effective_gb_per_s": 115.5908505192208
+      },
+      "speedup_vs_cublaslt": 10.588376926717839
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 1,
+      "bytes_per_call": 17717248.0,
+      "gemv": {
+        "us_per_call": 17.290499999999998,
+        "effective_gb_per_s": 1024.6810676382986
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 115.3475,
+        "effective_gb_per_s": 153.5988903097163
+      },
+      "speedup_vs_cublaslt": 6.671148896793037
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 2,
+      "bytes_per_call": 17739776.0,
+      "gemv": {
+        "us_per_call": 14.5615,
+        "effective_gb_per_s": 1218.2657006489717
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 122.73299999999999,
+        "effective_gb_per_s": 144.53957778266647
+      },
+      "speedup_vs_cublaslt": 8.428595955087044
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 3,
+      "bytes_per_call": 17762304.0,
+      "gemv": {
+        "us_per_call": 14.909500000000001,
+        "effective_gb_per_s": 1191.341359535866
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 115.2315,
+        "effective_gb_per_s": 154.14451777508756
+      },
+      "speedup_vs_cublaslt": 7.728730004359636
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 4,
+      "bytes_per_call": 17784832.0,
+      "gemv": {
+        "us_per_call": 15.283,
+        "effective_gb_per_s": 1163.7003206176798
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 117.273,
+        "effective_gb_per_s": 151.65325351956545
+      },
+      "speedup_vs_cublaslt": 7.67342799188641
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 5,
+      "bytes_per_call": 17807360.0,
+      "gemv": {
+        "us_per_call": 16.480500000000003,
+        "effective_gb_per_s": 1080.510906829283
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 115.4965,
+        "effective_gb_per_s": 154.18094920625302
+      },
+      "speedup_vs_cublaslt": 7.008070143502926
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 6,
+      "bytes_per_call": 17829888.0,
+      "gemv": {
+        "us_per_call": 17.808,
+        "effective_gb_per_s": 1001.2291105121294
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 117.3575,
+        "effective_gb_per_s": 151.92798074260273
+      },
+      "speedup_vs_cublaslt": 6.590156109613657
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 7,
+      "bytes_per_call": 17852416.0,
+      "gemv": {
+        "us_per_call": 18.0125,
+        "effective_gb_per_s": 991.1126162387231
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 117.27799999999999,
+        "effective_gb_per_s": 152.22305973839937
+      },
+      "speedup_vs_cublaslt": 6.510922970159611
+    },
+    {
+      "projection": "linear_attn.in_proj_z",
+      "n": 6144,
+      "k": 5120,
+      "rows": 8,
+      "bytes_per_call": 17874944.0,
+      "gemv": {
+        "us_per_call": 14.444,
+        "effective_gb_per_s": 1237.53420105234
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 142.6625,
+        "effective_gb_per_s": 125.29532287742049
+      },
+      "speedup_vs_cublaslt": 9.876938521185266
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 1,
+      "bytes_per_call": 50180096.0,
+      "gemv": {
+        "us_per_call": 30.168500000000005,
+        "effective_gb_per_s": 1663.327510482788
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 130.53199999999998,
+        "effective_gb_per_s": 384.4275426715289
+      },
+      "speedup_vs_cublaslt": 4.326764671760278
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 2,
+      "bytes_per_call": 50225152.0,
+      "gemv": {
+        "us_per_call": 27.826499999999996,
+        "effective_gb_per_s": 1804.939607927695
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 124.7965,
+        "effective_gb_per_s": 402.45641504369115
+      },
+      "speedup_vs_cublaslt": 4.484807647386485
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 3,
+      "bytes_per_call": 50270208.0,
+      "gemv": {
+        "us_per_call": 28.7025,
+        "effective_gb_per_s": 1751.4226286908804
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 125.6885,
+        "effective_gb_per_s": 399.9586915270689
+      },
+      "speedup_vs_cublaslt": 4.379008797143106
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 4,
+      "bytes_per_call": 50315264.0,
+      "gemv": {
+        "us_per_call": 28.7075,
+        "effective_gb_per_s": 1752.6870678394148
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 125.56450000000001,
+        "effective_gb_per_s": 400.71249437540064
+      },
+      "speedup_vs_cublaslt": 4.373926674214056
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 5,
+      "bytes_per_call": 50360320.0,
+      "gemv": {
+        "us_per_call": 32.7075,
+        "effective_gb_per_s": 1539.7178017274323
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 125.09450000000001,
+        "effective_gb_per_s": 402.5782108725803
+      },
+      "speedup_vs_cublaslt": 3.824642666055186
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 6,
+      "bytes_per_call": 50405376.0,
+      "gemv": {
+        "us_per_call": 31.918499999999998,
+        "effective_gb_per_s": 1579.1899995300532
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 124.6375,
+        "effective_gb_per_s": 404.4158138601946
+      },
+      "speedup_vs_cublaslt": 3.9048670833529147
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 7,
+      "bytes_per_call": 50450432.0,
+      "gemv": {
+        "us_per_call": 30.715500000000002,
+        "effective_gb_per_s": 1642.507268317299
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 127.465,
+        "effective_gb_per_s": 395.7983132624642
+      },
+      "speedup_vs_cublaslt": 4.149859191613355
+    },
+    {
+      "projection": "mlp.gate_proj / up_proj",
+      "n": 17408,
+      "k": 5120,
+      "rows": 8,
+      "bytes_per_call": 50495488.0,
+      "gemv": {
+        "us_per_call": 30.76,
+        "effective_gb_per_s": 1641.5958387516255
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 126.26350000000001,
+        "effective_gb_per_s": 399.9214975032373
+      },
+      "speedup_vs_cublaslt": 4.104795188556567
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 1,
+      "bytes_per_call": 50180096.0,
+      "gemv": {
+        "us_per_call": 29.8305,
+        "effective_gb_per_s": 1682.1741506176563
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 140.7615,
+        "effective_gb_per_s": 356.4902050631742
+      },
+      "speedup_vs_cublaslt": 4.718710715542818
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 2,
+      "bytes_per_call": 50225152.0,
+      "gemv": {
+        "us_per_call": 30.730499999999996,
+        "effective_gb_per_s": 1634.374709165162
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 142.5275,
+        "effective_gb_per_s": 352.38920208380836
+      },
+      "speedup_vs_cublaslt": 4.637981809602838
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 3,
+      "bytes_per_call": 50270208.0,
+      "gemv": {
+        "us_per_call": 30.766499999999997,
+        "effective_gb_per_s": 1633.9267710009265
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 138.2045,
+        "effective_gb_per_s": 363.7378522407013
+      },
+      "speedup_vs_cublaslt": 4.4920449189865606
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 4,
+      "bytes_per_call": 50315264.0,
+      "gemv": {
+        "us_per_call": 31.207000000000004,
+        "effective_gb_per_s": 1612.306982407793
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 143.12800000000001,
+        "effective_gb_per_s": 351.54032753898605
+      },
+      "speedup_vs_cublaslt": 4.586406895888743
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 5,
+      "bytes_per_call": 50360320.0,
+      "gemv": {
+        "us_per_call": 32.7555,
+        "effective_gb_per_s": 1537.4614950161042
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 140.74450000000002,
+        "effective_gb_per_s": 357.8137689216985
+      },
+      "speedup_vs_cublaslt": 4.29682038131001
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 6,
+      "bytes_per_call": 50405376.0,
+      "gemv": {
+        "us_per_call": 32.7845,
+        "effective_gb_per_s": 1537.4758193658588
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 142.395,
+        "effective_gb_per_s": 353.98276624881487
+      },
+      "speedup_vs_cublaslt": 4.3433634796931475
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 7,
+      "bytes_per_call": 50450432.0,
+      "gemv": {
+        "us_per_call": 33.5305,
+        "effective_gb_per_s": 1504.6131730812244
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 151.586,
+        "effective_gb_per_s": 332.81722586518543
+      },
+      "speedup_vs_cublaslt": 4.520839235919536
+    },
+    {
+      "projection": "mlp.down_proj",
+      "n": 5120,
+      "k": 17408,
+      "rows": 8,
+      "bytes_per_call": 50495488.0,
+      "gemv": {
+        "us_per_call": 30.951,
+        "effective_gb_per_s": 1631.4654776905431
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 142.91549999999998,
+        "effective_gb_per_s": 353.3240831120488
+      },
+      "speedup_vs_cublaslt": 4.617476010468159
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 1,
+      "bytes_per_call": 29521920.0,
+      "gemv": {
+        "us_per_call": 18.589,
+        "effective_gb_per_s": 1588.1392221206092
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 125.01299999999999,
+        "effective_gb_per_s": 236.15080031676706
+      },
+      "speedup_vs_cublaslt": 6.725106245629136
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 2,
+      "bytes_per_call": 29552640.0,
+      "gemv": {
+        "us_per_call": 19.113000000000003,
+        "effective_gb_per_s": 1546.2062470569767
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 122.40700000000001,
+        "effective_gb_per_s": 241.42933002197586
+      },
+      "speedup_vs_cublaslt": 6.40438445037409
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 3,
+      "bytes_per_call": 29583360.0,
+      "gemv": {
+        "us_per_call": 20.127,
+        "effective_gb_per_s": 1469.834550603667
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 118.22399999999999,
+        "effective_gb_per_s": 250.23142509135204
+      },
+      "speedup_vs_cublaslt": 5.8739007303622
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 4,
+      "bytes_per_call": 29614080.0,
+      "gemv": {
+        "us_per_call": 20.505499999999998,
+        "effective_gb_per_s": 1444.201799517203
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 119.31300000000002,
+        "effective_gb_per_s": 248.20497347313366
+      },
+      "speedup_vs_cublaslt": 5.818585257613813
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 5,
+      "bytes_per_call": 29644800.0,
+      "gemv": {
+        "us_per_call": 20.788999999999998,
+        "effective_gb_per_s": 1425.9848958583868
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 119.837,
+        "effective_gb_per_s": 247.37601909260076
+      },
+      "speedup_vs_cublaslt": 5.764442734138247
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 6,
+      "bytes_per_call": 29675520.0,
+      "gemv": {
+        "us_per_call": 22.109500000000004,
+        "effective_gb_per_s": 1342.2067437074559
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 118.6825,
+        "effective_gb_per_s": 250.04124449687188
+      },
+      "speedup_vs_cublaslt": 5.3679413826635605
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 7,
+      "bytes_per_call": 29706240.0,
+      "gemv": {
+        "us_per_call": 22.3235,
+        "effective_gb_per_s": 1330.7160615494881
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 117.675,
+        "effective_gb_per_s": 252.44308476736774
+      },
+      "speedup_vs_cublaslt": 5.27135081864403
+    },
+    {
+      "projection": "mtp.fc",
+      "n": 5120,
+      "k": 10240,
+      "rows": 8,
+      "bytes_per_call": 29736960.0,
+      "gemv": {
+        "us_per_call": 20.6135,
+        "effective_gb_per_s": 1442.5963567564945
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 122.6025,
+        "effective_gb_per_s": 242.54774576374868
+      },
+      "speedup_vs_cublaslt": 5.947679918500013
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 1,
+      "bytes_per_call": 715668480.0,
+      "gemv": {
+        "us_per_call": 522.05,
+        "effective_gb_per_s": 1370.8811033425918
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 733.854,
+        "effective_gb_per_s": 975.2191580341594
+      },
+      "speedup_vs_cublaslt": 1.4057159275931426
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 2,
+      "bytes_per_call": 716175360.0,
+      "gemv": {
+        "us_per_call": 532.64,
+        "effective_gb_per_s": 1344.5767497747072
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 687.238,
+        "effective_gb_per_s": 1042.1067519549267
+      },
+      "speedup_vs_cublaslt": 1.2902485731450888
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 3,
+      "bytes_per_call": 716682240.0,
+      "gemv": {
+        "us_per_call": 559.596,
+        "effective_gb_per_s": 1280.7136577102053
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 772.924,
+        "effective_gb_per_s": 927.2350709772242
+      },
+      "speedup_vs_cublaslt": 1.3812178786124274
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 4,
+      "bytes_per_call": 717189120.0,
+      "gemv": {
+        "us_per_call": 586.1759999999999,
+        "effective_gb_per_s": 1223.5047494267935
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 684.2260000000001,
+        "effective_gb_per_s": 1048.1757781785548
+      },
+      "speedup_vs_cublaslt": 1.1672705808494381
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 5,
+      "bytes_per_call": 717696000.0,
+      "gemv": {
+        "us_per_call": 599.786,
+        "effective_gb_per_s": 1196.5867826191343
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 764.2080000000001,
+        "effective_gb_per_s": 939.1369888826077
+      },
+      "speedup_vs_cublaslt": 1.2741344412840583
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 6,
+      "bytes_per_call": 718202880.0,
+      "gemv": {
+        "us_per_call": 617.056,
+        "effective_gb_per_s": 1163.9184774153398
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 689.664,
+        "effective_gb_per_s": 1041.380846325167
+      },
+      "speedup_vs_cublaslt": 1.1176684125914016
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 7,
+      "bytes_per_call": 718709760.0,
+      "gemv": {
+        "us_per_call": 627.4100000000001,
+        "effective_gb_per_s": 1145.518496676814
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 769.6759999999999,
+        "effective_gb_per_s": 933.7822148540425
+      },
+      "speedup_vs_cublaslt": 1.226751247190832
+    },
+    {
+      "projection": "lm_head",
+      "n": 248320,
+      "k": 5120,
+      "rows": 8,
+      "bytes_per_call": 719216640.0,
+      "gemv": {
+        "us_per_call": 606.18,
+        "effective_gb_per_s": 1186.4737206770267
+      },
+      "cublaslt_w4a4": {
+        "us_per_call": 774.03,
+        "effective_gb_per_s": 929.184450215108
+      },
+      "speedup_vs_cublaslt": 1.2768979511036327
+    }
+  ]
+}

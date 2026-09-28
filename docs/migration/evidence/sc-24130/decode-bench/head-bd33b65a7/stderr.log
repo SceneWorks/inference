@@ -1,0 +1,9 @@
+[decode_bench] reference          11.21 tok/s  prefill 0.736s
+[decode_bench] step_model         11.37 tok/s  prefill 0.874s
+[decode_bench] mtp K=1            14.18 tok/s  accept 0.827  fwd/tok 0.645  syncs/verify 1.00
+[decode_bench] mtp K=2            14.60 tok/s  accept 0.668  fwd/tok 0.613  syncs/verify 1.00
+[decode_bench] mtp K=3            14.53 tok/s  accept 0.640  fwd/tok 0.535  syncs/verify 1.00
+[decode_bench] mtp K=4            14.67 tok/s  accept 0.549  fwd/tok 0.535  syncs/verify 1.00
+[decode_bench] mtp K=5            13.66 tok/s  accept 0.480  fwd/tok 0.547  syncs/verify 1.00
+[decode_bench] ngram K=3           8.86 tok/s  accept 0.167  fwd/tok 1.145  syncs/verify 1.00
+[decode_bench] wrote D:\repos\inference\.claude\worktrees\sc-24130\docs\migration\evidence\sc-24130\decode-bench\head-bd33b65a7\decode_bench.json

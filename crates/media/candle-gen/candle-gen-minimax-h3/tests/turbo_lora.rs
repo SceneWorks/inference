@@ -2014,7 +2014,12 @@ fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
         0,
         "the control must be un-adapted"
     );
-    let y0 = bare_dit.adaptable_mut(&segs).unwrap().forward(&x).unwrap();
+    let bare_x = x.to_device(bare.device()).unwrap();
+    let y0 = bare_dit
+        .adaptable_mut(&segs)
+        .unwrap()
+        .forward(&bare_x)
+        .unwrap();
 
     // The real path: a spec carrying the adapter.
     let spec_loaded = candle_gen_minimax_h3::model::MiniMaxH3::load(
@@ -2028,7 +2033,15 @@ fn the_render_seam_folds_the_staged_adapter_onto_the_dit() {
         adapter_target_paths(&cfg).len(),
         "EVERY enumerated target must carry a residual after the render seam ran"
     );
-    let y1 = adapted.adaptable_mut(&segs).unwrap().forward(&x).unwrap();
+    let adapted_x = x.to_device(spec_loaded.device()).unwrap();
+    let y1 = adapted
+        .adaptable_mut(&segs)
+        .unwrap()
+        .forward(&adapted_x)
+        .unwrap();
+    // Separate loads can own distinct CUDA contexts even on the same GPU.
+    let y0 = y0.to_device(&Device::Cpu).unwrap();
+    let y1 = y1.to_device(&Device::Cpu).unwrap();
     let residual = max_abs(&(y1 - y0).unwrap());
     assert!(
         residual > 1e-4,

@@ -61,37 +61,74 @@ pub(crate) fn load_t5_tokenizer_from_file(
     Ok(TextTokenizer::from_file(path, config)?)
 }
 
+// Every loader below materializes what it built before returning (sc-24245). MLX runs a safetensors
+// `Load` on its CPU stream; left lazy, the first forward's Metal command buffers wait on the disk
+// read — past the GPU watchdog on a cold page cache (`kIOGPUCommandBufferCallbackErrorTimeout`, then
+// `SubmissionsIgnored`). See `mlx_gen_qwen_image::loader::load_transformer_with`. It runs before any
+// load-time `quantize`, so the GPU quantize never waits on an unread `Load` either.
+
 pub fn load_clip_encoder(root: &Path) -> Result<ClipTextEncoder> {
-    let w = Weights::from_dir(root.join("text_encoder"))?;
-    ClipTextEncoder::from_weights(&w, "")
+    load_clip_encoder_from(Weights::from_dir(root.join("text_encoder"))?)
 }
 
 pub(crate) fn load_clip_encoder_from_file(path: &Path) -> Result<ClipTextEncoder> {
-    ClipTextEncoder::from_weights(&Weights::from_file(path)?, "")
+    load_clip_encoder_from(Weights::from_file(path)?)
+}
+
+fn load_clip_encoder_from(w: Weights) -> Result<ClipTextEncoder> {
+    let encoder = ClipTextEncoder::from_weights(&w, "")?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
-    let w = Weights::from_dir(root.join("text_encoder_2"))?;
-    T5TextEncoder::from_weights(&w, "")
+    load_t5_encoder_from(Weights::from_dir(root.join("text_encoder_2"))?)
 }
 
 pub(crate) fn load_t5_encoder_from_file(path: &Path) -> Result<T5TextEncoder> {
-    T5TextEncoder::from_weights(&Weights::from_file(path)?, "")
+    load_t5_encoder_from(Weights::from_file(path)?)
+}
+
+fn load_t5_encoder_from(w: Weights) -> Result<T5TextEncoder> {
+    let encoder = T5TextEncoder::from_weights(&w, "")?;
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 pub fn load_transformer(root: &Path, variant: FluxVariant) -> Result<FluxTransformer> {
     let w = Weights::from_dir(root.join("transformer"))?;
-    FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
+    let transformer =
+        FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))?;
+    w.materialize_accessed()?;
+    Ok(transformer)
 }
 
 /// Load the FLUX.1 transformer from an already-admitted exact single-file source. Deferred block
 /// residency must never rediscover its transformer through a directory scan after inventory pinning.
+///
+/// Only the deferred (block-streamed) path loads through here, and it drops every resident block
+/// once the stream is armed, so only the non-block tensors are materialized: the stream reads each
+/// block's bytes itself ([`crate::block_stream`]), and reading them here would defeat bounded
+/// residency.
 pub(crate) fn load_transformer_from_file(
     path: &Path,
     variant: FluxVariant,
 ) -> Result<FluxTransformer> {
     let w = Weights::from_file(path)?;
-    FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
+    let transformer =
+        FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))?;
+    let resident: Vec<(String, mlx_rs::Array)> = w
+        .accessed_entries()
+        .into_iter()
+        .filter(|(key, _)| {
+            !key.starts_with("transformer_blocks.")
+                && !key.starts_with("single_transformer_blocks.")
+        })
+        .collect();
+    let mut named: Vec<(&str, &mlx_rs::Array)> =
+        resident.iter().map(|(k, a)| (k.as_str(), a)).collect();
+    Weights::materialize_named(&mut named)?;
+    Ok(transformer)
 }
 
 /// Load the FLUX.1-dev base transformer + the Shakker Fun-Controlnet-Union control branch and assemble
@@ -114,6 +151,7 @@ pub fn load_control_transformer_dev(
         "",
         &FluxControlNetConfig::shakker_union_pro_2_0(),
     )?;
+    control_weights.materialize_accessed()?;
     Ok(FluxControlTransformer::new(base, branch))
 }
 
@@ -129,11 +167,12 @@ pub fn load_control_transformer_dev(
 /// SceneWorks stages the CLIP tower next to the adapter (sc-3625); the engine only resolves the two
 /// files here. Returns the image encoder (sc-3622) and the adapter modules (sc-3623).
 pub fn load_flux_ip_adapter(dir: &Path) -> Result<(FluxIpImageEncoder, FluxIpAdapter)> {
-    let adapter =
-        FluxIpAdapter::from_weights(&Weights::from_file(dir.join("ip_adapter.safetensors"))?)?;
-    let encoder = FluxIpImageEncoder::from_weights(&Weights::from_file(
-        dir.join("image_encoder/model.safetensors"),
-    )?)?;
+    let adapter_weights = Weights::from_file(dir.join("ip_adapter.safetensors"))?;
+    let adapter = FluxIpAdapter::from_weights(&adapter_weights)?;
+    adapter_weights.materialize_accessed()?;
+    let encoder_weights = Weights::from_file(dir.join("image_encoder/model.safetensors"))?;
+    let encoder = FluxIpImageEncoder::from_weights(&encoder_weights)?;
+    encoder_weights.materialize_accessed()?;
     Ok((encoder, adapter))
 }
 
@@ -146,11 +185,13 @@ pub fn load_flux_ip_adapter(dir: &Path) -> Result<(FluxIpImageEncoder, FluxIpAda
 pub fn load_vae_from_weights(mut w: Weights) -> Result<Vae> {
     remap_vae_decoder(&mut w)?;
     remap_vae_encoder(&mut w)?;
-    Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
+    let vae = Vae::from_weights(&w, "", &VaeDecoderConfig::default_z_image())?.with_encoder(
         &w,
         "encoder",
         &VaeEncoderConfig::default_z_image(),
-    )
+    )?;
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 pub fn load_vae(root: &Path) -> Result<Vae> {

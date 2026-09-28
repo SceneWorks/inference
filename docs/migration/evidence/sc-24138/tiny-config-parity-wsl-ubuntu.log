@@ -1,0 +1,49 @@
+# WSL Ubuntu 24.04 (glibc), Rust 1.96.0, CPU f32 - candle-llm at c5cfe30a3 (sources synced from the Windows worktree)
+# cargo test --locked -p candle-llm --no-fail-fast: step_seam_migration section
+     Running tests/step_seam_migration.rs (~/sc24138-target/debug/deps/step_seam_migration-6e416cb1b974e4df)
+
+running 18 tests
+test causal_static_cache_fails_closed_past_the_model_bound ... ok
+test engine_refuses_a_draft_with_another_vocabulary ... ok
+test gemma4_decodes_to_its_golden_on_every_seam_path ... ok
+test gemma4_mm_reference_matches_its_pre_migration_golden ... ok
+test gemma4_mm_splice_decodes_to_its_golden_through_the_seam ... ok
+test gemma4_reference_matches_its_pre_migration_golden ... ok
+test golden_bit_exactness_is_limited_to_the_measured_configuration ... ok
+test llama_decodes_to_its_golden_on_every_seam_path ... ok
+test llama_reference_matches_its_pre_migration_golden ... ok
+test llava_caption_decodes_to_its_golden_through_the_seam ... ok
+test llava_caption_matches_its_pre_migration_golden ... ok
+test qwen3_dense_decodes_to_its_golden_on_every_seam_path ... ok
+test qwen3_dense_reference_matches_its_pre_migration_golden ... ok
+test speculative_rs_holds_no_decode_loop ... ok
+test starcoder2_decodes_to_its_golden_through_the_seam ... ok
+test starcoder2_reference_matches_its_pre_migration_golden ... ok
+test starvector_1b_decoder_matches_its_pre_migration_golden ... ok
+test starvector_1b_decodes_to_its_golden_through_the_seam ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+
+# the only failing test of the full run (pre-existing: identical on the untouched pre-fix head 90fa2a1d2 on this platform)
+test every_architecture_forward_is_bit_identical_to_the_base_branch ... FAILED
+llama: forward output moved at index 1: got -1.0069708 (0xbf80e46b), the base branch produced -1.0069709 (0xbf80e46c). The shared decoder or config changed this architecture's numerics.
+
+# mutation: goldens_bit_exact forced true on every platform (the pre-fix behaviour), then restored
+mutated
+== mutated (bit-exact everywhere)
+test gemma4_decodes_to_its_golden_on_every_seam_path ... FAILED
+test gemma4_mm_reference_matches_its_pre_migration_golden ... FAILED
+test gemma4_mm_splice_decodes_to_its_golden_through_the_seam ... FAILED
+test gemma4_reference_matches_its_pre_migration_golden ... FAILED
+test golden_bit_exactness_is_limited_to_the_measured_configuration ... FAILED
+test llava_caption_decodes_to_its_golden_through_the_seam ... FAILED
+test llava_caption_matches_its_pre_migration_golden ... FAILED
+test qwen3_dense_decodes_to_its_golden_on_every_seam_path ... FAILED
+test qwen3_dense_reference_matches_its_pre_migration_golden ... FAILED
+test starcoder2_decodes_to_its_golden_through_the_seam ... FAILED
+test starcoder2_reference_matches_its_pre_migration_golden ... FAILED
+test starvector_1b_decoder_matches_its_pre_migration_golden ... FAILED
+test starvector_1b_decodes_to_its_golden_through_the_seam ... FAILED
+test result: FAILED. 5 passed; 13 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s
+== restored
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.88s

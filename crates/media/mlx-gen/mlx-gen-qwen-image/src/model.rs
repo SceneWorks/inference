@@ -252,8 +252,13 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenHeavyO
     // `Conv3d` lack `to_quantized`), so the fork's `nn.quantize(vae)` is a no-op. The transformer is
     // the only component with quantizable leaves. (Z-Image differs — its fork *does* quantize the
     // TE+VAE, hence sc-2532; do not generalize that here.)
-    let mut transformer = loader::load_transformer(root)?;
-    if crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec) {
+    let streamed = crate::memory_strategy::should_arm_block_stream(MODEL_ID, spec);
+    let mut transformer = loader::load_transformer_with(
+        root,
+        &crate::transformer::QwenTransformerConfig::qwen_image(),
+        streamed,
+    )?;
+    if streamed {
         transformer =
             transformer.with_block_stream(WeightsSource::Dir(root.join("transformer")), "");
     }

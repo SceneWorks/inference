@@ -1151,7 +1151,10 @@ impl Sd3Transformer {
     /// is auto-detected per Linear from the on-disk tensor set (no `quantization` manifest needed).
     pub fn from_dir(transformer_dir: &std::path::Path, arch: &Sd3Arch) -> Result<Self> {
         let w = Weights::from_dir(transformer_dir)?;
-        Self::from_weights(&w, arch)
+        let transformer = Self::from_weights(&w, arch)?;
+        // Materialize at load (sc-24245; see `crate::loader::load_transformer_with`).
+        w.materialize_accessed()?;
+        Ok(transformer)
     }
 
     /// Quantize every Linear in the transformer to Q4/Q8 in place (group_size 64) — the consume-side

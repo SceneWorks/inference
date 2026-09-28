@@ -131,9 +131,19 @@ pub(crate) struct PackedArtifactInventory {
     components: [ComponentInventory; 4],
     t5_tokenizer: PinnedArtifact,
     composite_sha256: String,
+    /// Tier every pinned component's quantization marker and packed content encode. Equal to the
+    /// admitting `LoadSpec::quantize` by construction — `discover_inventory` refuses a marker that
+    /// disagrees with the selected tier — but carried on the inventory so the calibration identity
+    /// is derived from the admitted artifact, never from the request knob (sc-22726).
+    quant: Option<Quant>,
 }
 
 impl PackedArtifactInventory {
+    /// Artifact tier of the admitted packed inventory, read from its pinned quantization markers.
+    pub(crate) fn resolved_quant(&self) -> Option<Quant> {
+        self.quant
+    }
+
     pub(crate) fn transformer_source(&self) -> &PinnedArtifact {
         &self.components[2].model
     }
@@ -435,19 +445,19 @@ fn single_component_artifact(
 
 fn pinned_quant_marker(component: &ComponentInventory) -> CoreResult<Option<i32>> {
     component.config.ensure_unchanged()?;
-    let bytes = std::fs::read(component.config.canonical_path()).map_err(|error| {
-        CoreError::Msg(format!(
-            "flux1: read pinned {} config: {error}",
-            component.name
-        ))
-    })?;
+    let marker = quant_marker_at(component.name, component.config.canonical_path())?;
     component.config.ensure_unchanged()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-        CoreError::Msg(format!(
-            "flux1: parse pinned {} config: {error}",
-            component.name
-        ))
-    })?;
+    Ok(marker)
+}
+
+/// Packed quantization marker (`{"quantization":{"bits":4|8,"group_size":64}}`) of one component
+/// `config.json`, or `None` for a dense component. Shared by the pinned inventory and the
+/// header-only tier resolver.
+fn quant_marker_at(component: &str, config: &Path) -> CoreResult<Option<i32>> {
+    let bytes = std::fs::read(config)
+        .map_err(|error| CoreError::Msg(format!("flux1: read {component} config: {error}")))?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| CoreError::Msg(format!("flux1: parse {component} config: {error}")))?;
     let Some(marker) = json.get("quantization") else {
         return Ok(None);
     };
@@ -456,10 +466,76 @@ fn pinned_quant_marker(component: &ComponentInventory) -> CoreResult<Option<i32>
     match (bits, group_size) {
         (Some(bits @ (4 | 8)), Some(64)) => Ok(Some(bits as i32)),
         _ => Err(CoreError::Unsupported(format!(
-            "flux1: {} has an invalid packed quantization marker",
-            component.name
+            "flux1: {component} has an invalid packed quantization marker"
         ))),
     }
+}
+
+fn quant_for_marker(component: &str, marker: Option<i32>) -> CoreResult<Option<Quant>> {
+    match marker {
+        None => Ok(None),
+        Some(4) => Ok(Some(Quant::Q4)),
+        Some(8) => Ok(Some(Quant::Q8)),
+        Some(bits) => Err(CoreError::Unsupported(format!(
+            "flux1: {component} carries an unshipped Q{bits} marker"
+        ))),
+    }
+}
+
+/// Artifact tier a FLUX.1 snapshot directory actually encodes, proven from every component's
+/// quantization marker and safetensors headers without pinning or hashing a byte of weight data
+/// (sc-22726). `Ok(None)` is a dense snapshot; `Ok(Some(_))` a snapshot whose four components all
+/// carry the same Q4/Q8 marker with matching packed content. `Err` when a component is unreadable,
+/// its content does not encode its marker, or the components disagree — such a snapshot has no
+/// measurable tier.
+///
+/// The pinned inventory is only discovered on the streamable route; the worker's
+/// `Resident + EagerMaterialization` base load never has one, yet it must publish the same
+/// per-tier identity as the deferred evidence shape. This resolver is what ties that identity to
+/// the loaded artifact: a dense snapshot loaded with `LoadSpec::quantize = Some(_)` is a runtime
+/// requantization the loader supports but no anchor measured, and it resolves here to `None`,
+/// never to the requested tier.
+pub(crate) fn resolved_artifact_tier(spec: &LoadSpec) -> CoreResult<Option<Quant>> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(CoreError::Unsupported(
+            "flux1: artifact tier resolution needs a snapshot directory".to_owned(),
+        ));
+    };
+    let mut resolved: Option<Option<Quant>> = None;
+    for component in COMPONENTS {
+        let dir = root.join(component);
+        let marker = quant_marker_at(component, &dir.join("config.json"))?;
+        let mut tensors = BTreeMap::new();
+        for file in visible_safetensors(&dir)? {
+            let headers = safetensors_path_tensor_headers(dir.join(&file)).map_err(|error| {
+                CoreError::Unsupported(format!(
+                    "flux1: {component} {} is not a valid header-readable artifact: {error}",
+                    Path::new(&file).display()
+                ))
+            })?;
+            for tensor in headers {
+                validate_tensor_extent(component, &tensor)?;
+                tensors.insert(tensor.name.clone(), tensor);
+            }
+        }
+        if tensors.is_empty() {
+            return Err(CoreError::Unsupported(format!(
+                "flux1: {component} contains no tensors"
+            )));
+        }
+        validate_component_tensors(component, &tensors, marker)?;
+        let quant = quant_for_marker(component, marker)?;
+        match resolved {
+            None => resolved = Some(quant),
+            Some(previous) if previous == quant => {}
+            Some(previous) => {
+                return Err(CoreError::Unsupported(format!(
+                    "flux1: {component} tier {quant:?} disagrees with {previous:?} in an earlier component"
+                )));
+            }
+        }
+    }
+    Ok(resolved.flatten())
 }
 
 fn validate_tensor_extent(component: &str, tensor: &SafetensorsTensorHeader) -> CoreResult<()> {
@@ -567,7 +643,17 @@ fn validate_component_content(
             component.name
         )));
     }
+    validate_component_tensors(component.name, &tensors, expected)
+}
 
+/// Content half of the tier check: the tensor headers of one component must encode exactly the
+/// dense (`None`) or packed Q4/Q8 (`Some(bits)`) tier its marker declares. Shared by the pinned
+/// inventory and [`resolved_artifact_tier`].
+fn validate_component_tensors(
+    component: &str,
+    tensors: &BTreeMap<String, SafetensorsTensorHeader>,
+    expected: Option<i32>,
+) -> CoreResult<()> {
     if expected.is_none() {
         if tensors.values().any(|tensor| {
             tensor.name.ends_with(".scales")
@@ -576,7 +662,7 @@ fn validate_component_content(
         }) {
             return Err(CoreError::Unsupported(format!(
                 "flux1: dense {} contains packed quantization leaves",
-                component.name
+                component
             )));
         }
         return Ok(());
@@ -588,7 +674,7 @@ fn validate_component_content(
                 if !tensors.contains_key(&format!("{base}.weight")) {
                     return Err(CoreError::Unsupported(format!(
                         "flux1: {} has orphan packed leaf {}",
-                        component.name, tensor.name
+                        component, tensor.name
                     )));
                 }
             }
@@ -596,7 +682,7 @@ fn validate_component_content(
     }
 
     let expected_bits = expected.expect("quantized branch checked above");
-    let vae = component.name == "vae";
+    let vae = component == "vae";
     let mut packed_count = 0_usize;
     for weight in tensors
         .values()
@@ -615,20 +701,13 @@ fn validate_component_content(
                         "flux1: VAE has unexpected packed non-attention target {base}"
                     )));
                 }
-                validate_packed_triple(
-                    component.name,
-                    base,
-                    weight,
-                    scales,
-                    biases,
-                    expected_bits,
-                )?;
+                validate_packed_triple(component, base, weight, scales, biases, expected_bits)?;
                 packed_count += 1;
             }
             (Some(_), None) | (None, Some(_)) => {
                 return Err(CoreError::Unsupported(format!(
                     "flux1: {} has a partial packed triple for {base}",
-                    component.name
+                    component
                 )));
             }
             (None, None) => {
@@ -637,7 +716,7 @@ fn validate_component_content(
                 if weight.dtype == Dtype::U32 || required {
                     return Err(CoreError::Unsupported(format!(
                         "flux1: {} quantized tier has an unpacked or incomplete eligible weight {base}",
-                        component.name
+                        component
                     )));
                 }
             }
@@ -646,7 +725,7 @@ fn validate_component_content(
     if packed_count == 0 {
         return Err(CoreError::Unsupported(format!(
             "flux1: {} quantization marker has no packed content",
-            component.name
+            component
         )));
     }
     Ok(())
@@ -688,6 +767,8 @@ fn discover_inventory(spec: &LoadSpec) -> CoreResult<PackedArtifactInventory> {
         components,
         t5_tokenizer,
         composite_sha256: String::new(),
+        // Proven equal to every component's pinned marker by `validate_component_content` above.
+        quant: spec.quantize,
     };
     inventory.ensure_unchanged()?;
     let composite_sha256 = composite_digest(&inventory.components, &inventory.t5_tokenizer);
@@ -771,6 +852,33 @@ fn packed_test_tensors(component: &str, bits: i32) -> Vec<TestTensor> {
             shape: vec![2, 1],
         },
     ]
+}
+
+/// A second, header-valid shard for one component of a [`write_test_snapshot`] snapshot: it
+/// encodes the same tier as the snapshot (so the header-only tier resolver still proves it) while
+/// making the component sharded, which the pinned single-file inventory refuses.
+#[cfg(test)]
+pub(crate) fn write_test_shard(root: &Path, component: &str, quant: Option<Quant>) {
+    let tensors = match quant {
+        Some(quant) => packed_test_tensors(component, quant.bits())
+            .into_iter()
+            .map(|tensor| TestTensor {
+                name: format!("shard2.{}", tensor.name),
+                ..tensor
+            })
+            .collect(),
+        None => vec![TestTensor {
+            name: "shard2.probe.weight".to_owned(),
+            dtype: "BF16",
+            shape: vec![2, 64],
+        }],
+    };
+    write_test_safetensors(
+        &root
+            .join(component)
+            .join("model-00002-of-00002.safetensors"),
+        &tensors,
+    );
 }
 
 #[cfg(test)]

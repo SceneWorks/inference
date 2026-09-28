@@ -45,7 +45,9 @@ use sha2::{Digest, Sha256};
 use super::{repack_packed_weight, PackedConfig};
 use crate::gen_core::CancelFlag;
 
-const CACHE_DIR: &str = ".candle-device-format-v1";
+// Shared with gen-core's tensor-free weight walkers, which must skip this directory: it holds derived
+// copies of the sibling source file, and pricing both double-counted the component (SC-22667).
+const CACHE_DIR: &str = crate::gen_core::weightsmeta::CANDLE_DEVICE_FORMAT_CACHE_DIR;
 const PREPARE_LOCK: &str = ".prepare.lock";
 const PAYLOAD_KEY: &str = "weight";
 const PAYLOAD_HASH_KEY: &str = "payload_sha256";

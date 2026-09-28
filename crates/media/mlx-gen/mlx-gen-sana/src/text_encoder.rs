@@ -72,6 +72,8 @@ impl SanaTextEncoder {
         let dir = dir.as_ref();
         let w = mlx_gen::weights::Weights::from_file(dir.join("gemma-2-2b-it.safetensors"))?;
         let gemma = Gemma2::from_weights(&w, "model.", &Gemma2Config::gemma_2_2b())?;
+        // Materialize at load (sc-24245; see `crate::model::load_heavy`).
+        w.materialize_accessed()?;
         Self::new(gemma, dir.join("tokenizer.json"))
     }
 

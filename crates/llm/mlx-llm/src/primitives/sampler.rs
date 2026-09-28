@@ -8,10 +8,11 @@
 //! * JoyCaption parity: `top_k = 0`, `repetition_penalty = 1.05` → penalty + temperature + top-p.
 //! * sensenova parity: `repetition_penalty = 1.0`, `top_k > 0` → temperature + top-k + top-p.
 //!
-//! The math matches the references exactly: a stabilised, **unnormalised** `exp((logit - max)/T)`
-//! weight per token (equivalent to softmax for nucleus selection and for the inverse-CDF draw,
-//! since both scale by the total), heap-based nucleus selection (verified against a full sort), and
-//! a categorical inverse-CDF draw from the pluggable [`TokenRng`]. Greedy (`temperature <= 0`) with
+//! The math matches the references (except the nucleus mass, accumulated in f64 — see
+//! `nucleus_select`): a stabilised, **unnormalised** `exp((logit - max)/T)` weight per token
+//! (equivalent to softmax for nucleus selection and for the inverse-CDF draw, since both scale by
+//! the total), heap-based nucleus selection (verified against a full sort), and a categorical
+//! inverse-CDF draw from the pluggable [`TokenRng`]. Greedy (`temperature <= 0`) with
 //! no penalty and no constraint takes the on-device argmax fast path (a single-element host
 //! transfer) like sensenova's `decode_argmax`; otherwise logits are pulled to host f32.
 
@@ -69,7 +70,11 @@ pub struct SamplingParams {
     pub top_p: f32,
     /// Keep only the `top_k` highest-logit tokens before nucleus selection. `0` disables top-k.
     pub top_k: usize,
-    /// CTRL/HF repetition penalty. `1.0` disables it.
+    /// Additive once-per-seen-token presence penalty over the full prompt + generated history.
+    pub presence_penalty: f32,
+    /// CTRL/HF repetition penalty. `1.0` disables it. Applied **once per distinct id** in the
+    /// window (Hugging Face `RepetitionPenaltyLogitsProcessor` gathers and scatters, so a repeated
+    /// id is divided / multiplied once, never compounded by its count).
     pub repetition_penalty: f32,
     /// How many recent history tokens the repetition penalty looks back over.
     pub repetition_context: usize,
@@ -81,6 +86,7 @@ impl Default for SamplingParams {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             repetition_context: 0,
         }
@@ -91,7 +97,7 @@ impl SamplingParams {
     /// True when this configuration is pure greedy with no penalty and (caller-checked) no
     /// constraint mask — eligible for the on-device argmax fast path.
     fn is_plain_greedy(&self) -> bool {
-        self.temperature <= 0.0 && self.repetition_penalty == 1.0
+        self.temperature <= 0.0 && self.presence_penalty == 0.0 && self.repetition_penalty == 1.0
     }
 }
 
@@ -165,7 +171,18 @@ fn penalized_logits(
 ) -> Result<Vec<f32>> {
     let lf = logits.as_dtype(Dtype::Float32)?;
     let mut v: Vec<f32> = lf.as_slice::<f32>().to_vec();
+    penalize_host(&mut v, history, params, allowed);
+    Ok(v)
+}
 
+/// The constraint mask plus repetition and presence penalties over host logits, in place (the
+/// position-shaping [`penalized_logits`] applies after the device read).
+fn penalize_host(
+    v: &mut [f32],
+    history: &[i32],
+    params: &SamplingParams,
+    allowed: Option<&[bool]>,
+) {
     // Constraint mask: forbid disallowed ids.
     if let Some(mask) = allowed {
         for (i, val) in v.iter_mut().enumerate() {
@@ -175,10 +192,13 @@ fn penalized_logits(
         }
     }
 
-    // Repetition penalty (Keskar et al. 2019 / HF CTRL formulation) over the recent window.
+    // Repetition penalty (Keskar et al. 2019 / HF CTRL formulation) over the recent window,
+    // once per distinct id: HF gathers each id's logit and scatters the transformed value back,
+    // so an id repeated in the window is penalised exactly once.
     if params.repetition_penalty != 1.0 && params.repetition_context > 0 {
         let start = history.len().saturating_sub(params.repetition_context);
-        for &tok in &history[start..] {
+        let mut penalized = std::collections::HashSet::with_capacity(history.len() - start);
+        for &tok in history[start..].iter().filter(|&&t| penalized.insert(t)) {
             if let Some(slot) = usize::try_from(tok).ok().and_then(|i| v.get_mut(i)) {
                 *slot = if *slot < 0.0 {
                     *slot * params.repetition_penalty
@@ -188,7 +208,18 @@ fn penalized_logits(
             }
         }
     }
-    Ok(v)
+    // Presence penalty is additive and count-independent: every id seen anywhere in the prompt or
+    // generated history is adjusted exactly once, even when it occurs repeatedly.
+    if params.presence_penalty != 0.0 {
+        let mut seen = std::collections::HashSet::with_capacity(history.len());
+        for &tok in history {
+            if seen.insert(tok) {
+                if let Some(slot) = usize::try_from(tok).ok().and_then(|i| v.get_mut(i)) {
+                    *slot -= params.presence_penalty;
+                }
+            }
+        }
+    }
 }
 
 /// Temperature + top-k + top-p shaping into `(index, unnormalised_weight)` candidates. Assumes
@@ -248,15 +279,19 @@ fn weight_desc_index_asc(a: (usize, f32), b: (usize, f32)) -> Ordering {
 /// Heap-ordered nucleus: pop highest-weight tokens until the cumulative weight reaches
 /// `top_p * total`, always keeping at least one. Equivalent to a descending sort + prefix for
 /// distinct weights (the references verify this against a full sort); ties break to lower index.
+/// The mass is accumulated in f64 (sc-24133, matching `candle-llm`'s `nucleus_select`): an f32
+/// running sum over a wide vocabulary drifts by more than a tail token's weight and moved the
+/// nucleus boundary by rounding alone, so knife-edge boundaries may differ from the f32 mlx-gen
+/// references by one token.
 fn nucleus_select(weights: &[(usize, f32)], top_p: f32) -> Vec<(usize, f32)> {
-    let total: f32 = weights.iter().map(|x| x.1).sum();
-    let threshold = top_p.max(0.0) * total;
+    let total: f64 = weights.iter().map(|x| f64::from(x.1)).sum();
+    let threshold = f64::from(top_p.max(0.0)) * total;
     let mut heap: BinaryHeap<ByWeight> = weights.iter().map(|&(i, w)| ByWeight(i, w)).collect();
     let mut kept = Vec::new();
-    let mut cum = 0.0f32;
+    let mut cum = 0.0f64;
     while let Some(ByWeight(i, w)) = heap.pop() {
         kept.push((i, w));
-        cum += w;
+        cum += f64::from(w);
         if cum >= threshold {
             break;
         }
@@ -426,6 +461,55 @@ mod tests {
         let mut rng = SplitMix64::new(0);
         let t = sample(&l, &history, &params, &mut rng, Some(&[true, true, true])).unwrap();
         assert_eq!(t, 1);
+    }
+
+    #[test]
+    fn repetition_penalty_is_applied_once_per_distinct_id() {
+        // Hugging Face `RepetitionPenaltyLogitsProcessor` gathers each id's logit and scatters the
+        // transformed value back: an id repeated in the window is penalised once, not per count.
+        // Host-only (no MLX array), so it needs no Metal device.
+        let params = SamplingParams {
+            repetition_penalty: 2.0,
+            repetition_context: 8,
+            ..Default::default()
+        };
+        let mut row = vec![4.0, -2.0, 3.0];
+        penalize_host(&mut row, &[0, 0, 0, 1, 1], &params, None);
+        assert_eq!(row, vec![2.0, -4.0, 3.0]);
+    }
+
+    #[test]
+    fn presence_penalty_applies_once_to_every_seen_token() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            presence_penalty: 0.75,
+            ..Default::default()
+        };
+        let l = logits(&[2.0, 1.5, 0.5]);
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(sample(&l, &[0], &params, &mut rng, None).unwrap(), 1);
+        assert_eq!(
+            sample(&l, &[0, 0, 0], &params, &mut rng, None).unwrap(),
+            1,
+            "repeat count must not multiply a presence penalty"
+        );
+    }
+
+    #[test]
+    fn repetition_transform_precedes_additive_presence_penalty() {
+        let params = SamplingParams {
+            temperature: 0.0,
+            presence_penalty: 0.75,
+            repetition_penalty: 2.0,
+            repetition_context: 1,
+            ..Default::default()
+        };
+        // Repetition-first transforms token 0 from 2.0 -> 1.0, then presence subtracts to 0.25,
+        // so token 1 wins at 0.5. Additive-first would produce (2.0 - 0.75) / 2 = 0.625 and
+        // incorrectly keep token 0.
+        let l = logits(&[2.0, 0.5]);
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(sample(&l, &[0], &params, &mut rng, None).unwrap(), 1);
     }
 
     #[test]

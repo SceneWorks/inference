@@ -101,6 +101,10 @@ impl MageBlockStream {
             &format!("transformer_blocks.{index}"),
             &self.cfg,
         )?;
+        // Read this block's bytes on the CPU stream now, before its forward is encoded; left lazy,
+        // the window's `eval` makes Metal command buffers wait on the disk read — past the GPU
+        // watchdog on a cold page cache (sc-24245).
+        view.materialize_accessed()?;
         view.remove_accessed();
         if let Some(bits) = self.quant_bits {
             block.quantize(bits)?;

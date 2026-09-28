@@ -1,0 +1,43 @@
+**RTX Pro 6000 / sm_120** — Qwen/Qwen3-8B @ b968826d9c46 (`qwen3-8b`, config sha256 f7c4eadfbbf5), BF16 greedy, 53 prompt tokens, 256 new tokens per row.
+
+| run | row | tokens | match ref | match baseline ref | tok/s | acceptance | fwd/tok | syncs/tok | syncs/verify | device used @ last token | cache live | cache checkpoints | fused primitives | nvfp4 path |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| head-c5cfe30a3-gqa-ref | MTP off (reference, growing kv, gqa attn) | 256 | (ref) | yes | 72.09 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | on: 46336 fused / 0 ref | n/a |
+| head-c5cfe30a3-gqa-ref | MTP off (reference, fused off, growing kv, gqa attn) | 256 | yes | yes | 32.60 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | off: 0 fused / 46336 ref (disabled) | n/a |
+| head-c5cfe30a3-gqa-ref | MTP off (StepModel, static kv, gqa attn) | 256 | yes | yes | 75.23 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref | n/a |
+| head-c5cfe30a3-gqa-ref | n-gram K=2 (static kv, gqa attn) | 256 | no @65 | no @65 | 74.98 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-c5cfe30a3-gqa-ref | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 73.29 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref | n/a |
+| head-c5cfe30a3-gqa-ref | n-gram K=4 (static kv, gqa attn) | 256 | no @132 | no @132 | 74.05 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-c5cfe30a3-expanded-ref | MTP off (reference, growing kv, expanded attn) | 256 | (ref) | no @65 | 64.34 | n/a | 1.000 | 1.00 | n/a | 17.16 GiB | n/a | n/a | on: 46336 fused / 0 ref | n/a |
+| head-c5cfe30a3-expanded-ref | MTP off (reference, fused off, growing kv, expanded attn) | 256 | yes | no @65 | 28.93 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | off: 0 fused / 46336 ref (disabled) | n/a |
+| head-c5cfe30a3-expanded-ref | MTP off (StepModel, static kv, gqa attn) | 256 | no @65 | yes | 74.62 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref | n/a |
+| head-c5cfe30a3-expanded-ref | n-gram K=2 (static kv, gqa attn) | 256 | no @132 | no @65 | 75.22 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-c5cfe30a3-expanded-ref | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 72.72 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref | n/a |
+| head-c5cfe30a3-expanded-ref | n-gram K=4 (static kv, gqa attn) | 256 | no @65 | no @132 | 72.55 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-0e3d5a1d3-gqa-ref | MTP off (reference, growing kv, gqa attn) | 256 | (ref) | yes | 71.05 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | on: 46336 fused / 0 ref | n/a |
+| head-0e3d5a1d3-gqa-ref | MTP off (StepModel, static kv, gqa attn) | 256 | yes | yes | 70.61 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref | n/a |
+| head-0e3d5a1d3-gqa-ref | n-gram K=2 (static kv, gqa attn) | 256 | no @65 | no @65 | 71.72 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-0e3d5a1d3-gqa-ref | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 75.31 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref | n/a |
+| head-0e3d5a1d3-gqa-ref | n-gram K=4 (static kv, gqa attn) | 256 | no @132 | no @132 | 75.39 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-0e3d5a1d3-expanded-ref | MTP off (reference, growing kv, expanded attn) | 256 | (ref) | no @65 | 60.83 | n/a | 1.000 | 1.00 | n/a | 17.16 GiB | n/a | n/a | on: 46336 fused / 0 ref | n/a |
+| head-0e3d5a1d3-expanded-ref | MTP off (StepModel, static kv, gqa attn) | 256 | no @65 | yes | 74.42 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref | n/a |
+| head-0e3d5a1d3-expanded-ref | n-gram K=2 (static kv, gqa attn) | 256 | no @132 | no @65 | 72.25 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-0e3d5a1d3-expanded-ref | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 68.23 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref | n/a |
+| head-0e3d5a1d3-expanded-ref | n-gram K=4 (static kv, gqa attn) | 256 | no @65 | no @132 | 74.31 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-833e61542-gqa-ref | MTP off (reference, growing kv, gqa attn) | 256 | (ref) | yes | 70.87 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | on: 46336 fused / 0 ref | n/a |
+| head-833e61542-gqa-ref | MTP off (StepModel, static kv, gqa attn) | 256 | yes | yes | 72.74 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref | n/a |
+| head-833e61542-gqa-ref | n-gram K=2 (static kv, gqa attn) | 256 | no @65 | no @65 | 74.09 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-833e61542-gqa-ref | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 67.97 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref | n/a |
+| head-833e61542-gqa-ref | n-gram K=4 (static kv, gqa attn) | 256 | no @132 | no @132 | 73.15 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-833e61542-expanded-ref | MTP off (reference, growing kv, expanded attn) | 256 | (ref) | no @65 | 64.09 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | on: 46336 fused / 0 ref | n/a |
+| head-833e61542-expanded-ref | MTP off (StepModel, static kv, gqa attn) | 256 | no @65 | yes | 74.33 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref | n/a |
+| head-833e61542-expanded-ref | n-gram K=2 (static kv, gqa attn) | 256 | no @132 | no @65 | 74.18 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-833e61542-expanded-ref | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 75.15 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref | n/a |
+| head-833e61542-expanded-ref | n-gram K=4 (static kv, gqa attn) | 256 | no @65 | no @132 | 75.56 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-833e61542 | MTP off (reference, growing kv, expanded attn) | 256 | (ref) | no @65 | 17.94 | n/a | 1.000 | 1.00 | n/a | 17.13 GiB | n/a | n/a | on: 46336 fused / 0 ref | n/a |
+| head-833e61542 | MTP off (StepModel, static kv, gqa attn) | 256 | no @65 | yes | 38.98 | n/a | 1.000 | 1.00 | 1.00 | 17.09 GiB | 43.5 MiB | 0.0 MiB | on: 46336 fused / 0 ref | n/a |
+| head-833e61542 | n-gram K=2 (static kv, gqa attn) | 256 | no @132 | no @65 | 20.26 | 0.147 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 43.7 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+| head-833e61542 | n-gram K=3 (static kv, gqa attn) | 256 | no @51 | no @51 | 20.16 | 0.087 | 0.887 | 0.89 | 1.00 | 17.09 GiB | 43.9 MiB | 0.0 MiB | on: 41087 fused / 0 ref | n/a |
+| head-833e61542 | n-gram K=4 (static kv, gqa attn) | 256 | no @65 | no @132 | 22.13 | 0.076 | 0.875 | 0.88 | 1.00 | 17.09 GiB | 44.0 MiB | 0.0 MiB | on: 40544 fused / 0 ref | n/a |
+
+match baseline ref = tokens identical to `head-c5cfe30a3-gqa-ref`'s reference row; device used @ last token = cuMemGetInfo total-free sampled at the row's last generated token while its cache is alive (device-wide, weights included); cache live / checkpoints = the StepModel row's final cache's own accounting (rollback checkpoints separately); syncs/tok = device->host transfers issued by candle-llm per generated token (n/a where the binary predates the counter); syncs/verify = the speculative engine's transfers per verify step (n/a for non-speculative rows and where the binary predates the engine); fwd/tok = measured target forwards per generated token (n/a where the binary predates the counter); fused primitives = the switch the row ran under and how many RMSNorm / SwiGLU / QK-norm+RoPE leaves ran the fused kernel vs the op-chain reference, with the last reference reason (n/a where the binary predates the fused primitives); nvfp4 path = the NVFP4 decode-GEMV switch the row ran under and how many NVFP4 projection calls ran the fused GEMV vs the cuBLASLt W4A4 GEMM, with the last cuBLASLt reason (`rows` = a prefill; none = no NVFP4 projections; n/a where the binary predates the GEMV).

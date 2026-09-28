@@ -142,7 +142,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let spec = LoadSpec {
         source: args.model.clone(),
+        projector_source: None,
         quantize: args.quantize,
+        cuda_graphs: None,
     };
     let provider = registry.load_textllm(&provider_id, &spec)?;
 

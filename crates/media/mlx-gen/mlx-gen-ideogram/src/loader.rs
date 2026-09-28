@@ -45,31 +45,46 @@ const PAD_TOKEN_ID: i32 = 151643;
 /// Load the Qwen3-VL text encoder from the converted `text_encoder` component.
 pub fn load_text_encoder(root: &Path) -> Result<Ideogram4TextEncoder> {
     let w = prepare_text_weights(Weights::from_dir(root.join("text_encoder"))?)?;
-    Ideogram4TextEncoder::from_weights(
+    let encoder = Ideogram4TextEncoder::from_weights(
         &w,
         "language_model",
         &Ideogram4TextEncoderConfig::qwen3_vl_8b(),
-    )
+    )?;
+    // Materialize at load (after the casts, before any `quantize`): left lazy, the first forward's
+    // command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
+    // (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    w.materialize_accessed()?;
+    Ok(encoder)
 }
 
 /// Load the conditional DiT (`transformer` component). Keys are top-level (empty prefix).
 pub fn load_transformer(root: &Path) -> Result<Ideogram4Transformer> {
     let w = Weights::from_dir(root.join("transformer"))?;
-    Ideogram4Transformer::from_weights(&w, "", &Ideogram4DitConfig::v4())
+    let dit = Ideogram4Transformer::from_weights(&w, "", &Ideogram4DitConfig::v4())?;
+    // Materialize at load, for the same GPU-watchdog reason as [`load_text_encoder`] (sc-24245).
+    w.materialize_accessed()?;
+    Ok(dit)
 }
 
 /// Load the unconditional DiT (`unconditional_transformer` component) — the asymmetric-CFG
 /// negative branch. Same architecture, separately trained weights.
 pub fn load_unconditional_transformer(root: &Path) -> Result<Ideogram4Transformer> {
     let w = Weights::from_dir(root.join("unconditional_transformer"))?;
-    Ideogram4Transformer::from_weights(&w, "", &Ideogram4DitConfig::v4())
+    let dit = Ideogram4Transformer::from_weights(&w, "", &Ideogram4DitConfig::v4())?;
+    // Materialize at load, for the same GPU-watchdog reason as [`load_text_encoder`] (sc-24245).
+    w.materialize_accessed()?;
+    Ok(dit)
 }
 
 /// Load the VAE (`vae` component) as a `Flux2Vae` — Ideogram's `AutoencoderKLFlux2` weights map
 /// directly onto the FLUX.2 VAE (same architecture; `encoder.*`/`decoder.*`/`quant_conv`/`bn.*`,
 /// conv weights transposed `[O,I,H,W]→[O,H,W,I]` at construction).
 pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
-    Flux2Vae::from_weights(&Weights::from_dir(root.join("vae"))?)
+    let w = Weights::from_dir(root.join("vae"))?;
+    let vae = Flux2Vae::from_weights(&w)?;
+    // Materialize at load, for the same GPU-watchdog reason as [`load_text_encoder`] (sc-24245).
+    w.materialize_accessed()?;
+    Ok(vae)
 }
 
 /// Load the Qwen3-VL tokenizer with Ideogram 4's tokenization policy. The reference `_tokenize`

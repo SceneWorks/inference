@@ -126,6 +126,25 @@ impl<'a> JsonConstraint<'a> {
         }
     }
 
+    /// Whether `text` can be appended while preserving a valid JSON prefix.
+    ///
+    /// Providers use this at a reasoning-to-answer boundary when one decoded token contains both
+    /// the closing reasoning marker and the first bytes of the JSON answer.
+    pub fn allows_text(&self, text: &str) -> bool {
+        self.state.advance(text).is_some()
+    }
+
+    /// Append already-decoded JSON text, returning whether it preserved a valid prefix.
+    pub fn accept_text(&mut self, text: &str) -> bool {
+        match self.state.advance(text) {
+            Some(next) => {
+                self.state = next;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether the JSON value is currently complete (a stop token would be valid here).
     pub fn can_stop(&self) -> bool {
         self.state.can_stop()

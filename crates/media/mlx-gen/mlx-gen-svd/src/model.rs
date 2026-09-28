@@ -46,6 +46,9 @@ const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
 const CLIP_SIZE: usize = 224;
 /// VAE spatial compression (8×).
 pub const VAE_SCALE: u32 = 8;
+/// Latent channels the `AutoencoderKLTemporalDecoder` produces and the U-Net consumes. Fixed by the
+/// weight shapes rather than by [`crate::config::VaeConfig`], which carries only the block topology.
+pub const LATENT_CHANNELS: u32 = 4;
 /// Upper bound on a `Reference` image's dimensions. The reference is resized to the output size, but
 /// the source buffer (and the resize's intermediate f32 work) scale with the *input* dims, so an
 /// unbounded reference drives multi-GB host allocations (F-164). 8192 is far above any real photo
@@ -177,18 +180,19 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         Ok(w)
     };
 
-    let vae = SvdVae::from_weights(
-        &load("vae", "diffusion_pytorch_model", Dtype::Float32)?,
-        &VaeConfig::default(),
-    )?;
-    let unet = SvdUnet::from_weights(
-        &load("unet", "diffusion_pytorch_model", dense)?,
-        &UnetConfig::default(),
-    )?;
-    let image_encoder = SvdImageEncoder::from_weights(
-        &load("image_encoder", "model", dense)?,
-        &ImageEncoderConfig::default(),
-    )?;
+    // Each component is materialized at load (after its cast): left lazy, the first forward's
+    // command buffers wait on the safetensors reads — past the GPU watchdog on a cold page cache
+    // (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    let vae_w = load("vae", "diffusion_pytorch_model", Dtype::Float32)?;
+    let vae = SvdVae::from_weights(&vae_w, &VaeConfig::default())?;
+    vae_w.materialize_accessed()?;
+    let unet_w = load("unet", "diffusion_pytorch_model", dense)?;
+    let unet = SvdUnet::from_weights(&unet_w, &UnetConfig::default())?;
+    unet_w.materialize_accessed()?;
+    let image_encoder_w = load("image_encoder", "model", dense)?;
+    let image_encoder =
+        SvdImageEncoder::from_weights(&image_encoder_w, &ImageEncoderConfig::default())?;
+    image_encoder_w.materialize_accessed()?;
     if let Some(memory) = &memory {
         memory.ensure_unchanged()?;
     }
@@ -521,8 +525,12 @@ impl Svd {
             (req.width / VAE_SCALE) as i32,
         );
         let key = random::key(seed)?;
-        let noise =
-            random::normal::<f32>(&[1, params.num_frames, h, w, 4], None, None, Some(&key))?;
+        let noise = random::normal::<f32>(
+            &[1, params.num_frames, h, w, LATENT_CHANNELS as i32],
+            None,
+            None,
+            Some(&key),
+        )?;
         let latents = multiply(&noise, mlx_gen::array::scalar(sched.init_noise_sigma()))?;
 
         let total_steps = params.num_inference_steps as u32;

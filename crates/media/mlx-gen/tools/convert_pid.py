@@ -22,6 +22,7 @@ spike, not committed).
 """
 
 import argparse
+import pickle
 import sys
 
 
@@ -102,7 +103,13 @@ def main():
     import torch
     from safetensors.torch import save_file
 
-    obj = torch.load(args.input, map_location="cpu", weights_only=False)
+    try:
+        obj = torch.load(args.input, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError as exc:
+        raise SystemExit(
+            f"{args.input}: safe tensor checkpoint load failed; use a tensor-only PyTorch "
+            "checkpoint or a trusted safetensors export"
+        ) from exc
     sd = _unwrap(obj)
     kept, dropped = transform_keys(sd)
 

@@ -408,7 +408,14 @@ fn canonical_config(root: &Path) -> gen_core::Result<WanModelConfig> {
     let config = WanModelConfig::from_config_json(&json);
     let mut canonical = WanModelConfig::wan22_ti2v_5b();
     canonical.quantization = quantization;
-    if config != canonical || json != canonical.to_json() {
+    // Compare the snapshot with the inert legacy keys dropped. The shipped rehost
+    // `SceneWorks/wan2.2-ti2v-5b-mlx` still bakes `"max_area": 901120` in every tier's config.json
+    // and `to_json()` stopped emitting it in sc-12308; nothing reads a baked `max_area`, so neither
+    // its presence nor its value can change the loaded configuration. Everything else must still
+    // match `to_json()` exactly, and `config` is the overlaid struct, so any drifted *meaningful*
+    // value is still refused.
+    if config != canonical || crate::config::without_legacy_inert_keys(&json) != canonical.to_json()
+    {
         return Err(gen_core::Error::Unsupported(format!(
             "{MODEL_ID}: config.json is not the complete canonical dense Wan2.2 TI2V-5B configuration"
         )));
@@ -699,6 +706,48 @@ fn strategies() -> Vec<MemoryStrategyCapability> {
         .collect()
 }
 
+/// Architecture axes for the Wan 2.2 TI2V-5B route this module contracts for (epic SC-22657, E2).
+///
+/// [`WanModelConfig::wan22_ti2v_5b`](crate::config::WanModelConfig::wan22_ti2v_5b) is this crate's
+/// preset for that variant's `config.json`, which `WanModelConfig::from_model_dir` overlays a
+/// snapshot's own keys onto at load. **This is the 5B route only** — the 14B trunks are a different
+/// shape (dim 5120, 40 heads, 40 layers over the z16 VAE), which is why the axes are keyed on the
+/// 5B preset rather than on `base()`.
+///
+/// TI2V-5B pairs a wider latent (48 channels) with the z48 autoencoder's x16 spatial and x4 temporal
+/// scales, both read from the same preset's `vae_stride`/`vae_z_dim`. Being a **video** autoencoder,
+/// `vae_temporal_scale` is a real value here rather than a structurally absent one.
+///
+/// When `spec` names a materialized snapshot directory this re-runs `from_model_dir` — the loader's
+/// own parse — so the published axes are the snapshot's, not the preset's. On the weights-free
+/// surface there is nothing to read and the preset is what the loader would start from anyway.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    let wan = mlx_gen::architecture_facts::materialized_root(spec)
+        .and_then(|root| crate::config::WanModelConfig::from_model_dir(root).ok())
+        .unwrap_or_else(crate::config::WanModelConfig::wan22_ti2v_5b);
+    let (_, patch_h, patch_w) = wan.patch_size;
+    let (temporal_stride, spatial_stride, _) = wan.vae_stride;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(wan.num_heads),
+        // The exactness-gated helper, NOT `axis(wan.head_dim())` (SC-22667): `head_dim()` is a
+        // plain `dim / num_heads`, which rounds a non-uniform stack into a fabricated width and
+        // panics on a `"num_heads": 0` snapshot key before `axis` can decline it.
+        head_dim: mlx_gen::architecture_facts::head_dim(wan.dim, wan.num_heads),
+        transformer_blocks: mlx_gen::architecture_facts::axis(wan.num_layers),
+        // A single scalar can only describe a square patch; an anisotropic one has no honest value.
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels: mlx_gen::architecture_facts::axis(wan.vae_z_dim),
+        vae_spatial_scale: mlx_gen::architecture_facts::axis(spatial_stride),
+        vae_temporal_scale: mlx_gen::architecture_facts::axis(temporal_stride),
+        // gen-core documents `activation_dtype_width` as the DENOISE-phase width, explicitly not a
+        // per-component byte fact, so the f32 autoencoder and the f32 UMT5-XXL activations do NOT
+        // widen it. Wan is bf16-native: every denoise matmul runs bf16 over an f32 residual stream.
+        activation_dtype_width: Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH),
+    }
+}
+
 fn build_contract(
     spec: &LoadSpec,
     facts: MemoryAssetFacts,
@@ -712,6 +761,8 @@ fn build_contract(
         MemoryPhase::Decode,
     ];
     Ok(MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             bounded_wired_residency: false,
@@ -1269,6 +1320,90 @@ mod tests {
     };
     use std::io::Write;
     use std::path::PathBuf;
+
+    /// AC (SC-22662): the TI2V-5B contract publishes the axes of the 5B trunk and z48 video VAE this
+    /// crate's preset declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_ti2v_5b_preset_and_its_z48_vae() {
+        for surface in (MEMORY_FIXTURE.surface_specs)() {
+            let contract = (MEMORY_FIXTURE.contract)(&surface.spec).unwrap();
+            assert_eq!(
+                contract.architecture_facts,
+                mlx_gen::gen_core::MemoryArchitectureFacts {
+                    attention_heads: Some(24),
+                    // 3072 / 24, derived by `WanModelConfig::head_dim`.
+                    head_dim: Some(128),
+                    transformer_blocks: Some(30),
+                    // `patch_size` is `(1, 2, 2)`: the square spatial patch is 2.
+                    patch_size: Some(2),
+                    // The z48 autoencoder, not the 14B routes' z16 one.
+                    latent_channels: Some(48),
+                    vae_spatial_scale: Some(16),
+                    // A video autoencoder: four frames per latent unit.
+                    vae_temporal_scale: Some(4),
+                    activation_dtype_width: Some(2),
+                },
+                "{} architecture facts",
+                surface.selector.id()
+            );
+            assert!(contract.architecture_facts.has_declared_architecture_axis());
+            gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+        }
+        // The published pair IS the z48 tiling geometry this provider's VAE assignment declares.
+        let preset_facts = architecture_facts(&weights_free_spec());
+        assert_eq!(
+            crate::WAN_Z48_VAE_TILING.spatial_scale as u32,
+            preset_facts.vae_spatial_scale.unwrap()
+        );
+        assert_eq!(
+            crate::WAN_Z48_VAE_TILING.temporal_scale as u32,
+            preset_facts.vae_temporal_scale.unwrap()
+        );
+    }
+
+    /// A spec whose weights directory is the registry's never-created contract-surface sentinel:
+    /// the weights-free path, where the preset is the only geometry there is.
+    fn weights_free_spec() -> LoadSpec {
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            "/__sceneworks_memory_contract_surface__".into(),
+        ))
+    }
+
+    fn spec_for_config(dir: &std::path::Path, config: &serde_json::Value) -> LoadSpec {
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the axes are the snapshot's
+    /// own, because the loader overlays that snapshot's `config.json` over the preset. A fixture
+    /// mirroring the reference config agrees with the weights-free preset path; a fixture with one
+    /// mutated key publishes the mutated axis. The second half is what an unconditional
+    /// `architecture_facts()` — the shape this function had before review — fails.
+    #[test]
+    fn materialized_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::WanModelConfig::wan22_ti2v_5b();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_config(mirror.path(), &preset.to_json())),
+            architecture_facts(&weights_free_spec()),
+            "a snapshot mirroring the reference config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = preset.to_json();
+        mutated["num_layers"] = serde_json::json!(7);
+        mutated["vae_z_dim"] = serde_json::json!(32);
+        let mutated_facts = architecture_facts(&spec_for_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (
+                mutated_facts.transformer_blocks,
+                mutated_facts.latent_channels
+            ),
+            (Some(7), Some(32)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+    }
 
     /// `ProviderRegistry::memory_contract_surfaces` constructs a contract for **every** selector the
     /// fixture publishes and fails the entire MLX catalog when one errors, so the published witness
@@ -1876,6 +2011,56 @@ mod tests {
         }];
         write_parts(temp.path(), &config, &transformer, &t5, &vae);
         assert!(memory_strategy_contract(&spec(temp.path().to_path_buf())).is_err());
+    }
+
+    /// sc-22738 (defect C): the shipped rehost
+    /// `SceneWorks/wan2.2-ti2v-5b-mlx@bb1b055249614cf9d7cf4373fbdbc184b77dee88` bakes
+    /// `"max_area": 901120` into every tier's `config.json`, and `to_json()` stopped emitting the
+    /// key in sc-12308. Because `model::load` calls `contract_for_loaded` unconditionally and
+    /// propagates its error, the byte-for-byte `json != canonical.to_json()` check refused every
+    /// ordinary production load of all three tiers. The key is inert; the tolerance is exactly it.
+    #[test]
+    fn the_shipped_rehosts_baked_inert_max_area_loads_while_real_drift_is_still_refused() {
+        for quant in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut config, transformer, t5, vae) = checkpoint_parts(quant);
+            config["max_area"] = serde_json::json!(901_120);
+            write_parts(temp.path(), &config, &transformer, &t5, &vae);
+            let load_spec = spec(temp.path().to_path_buf());
+            memory_strategy_contract(&load_spec).expect("the inert legacy key must be tolerated");
+            // The production path: `model::load` propagates `contract_for_loaded`'s error, so the
+            // refusal was an ordinary Resident/Eager job failing to load at all.
+            crate::model::load(&load_spec)
+                .expect("the production load path must accept the rehost");
+        }
+
+        // The tolerance is a key allowlist, not a relaxation of the identity: a drifted meaningful
+        // value, an unknown extra key, and a missing canonical key are all still refused — with the
+        // legacy key present, so this cannot pass by the check having been disabled wholesale.
+        for mutate in [
+            (|config: &mut serde_json::Value| config["ffn_dim"] = serde_json::json!(14335))
+                as fn(&mut serde_json::Value),
+            |config: &mut serde_json::Value| config["dim"] = serde_json::json!(3073),
+            |config: &mut serde_json::Value| config["sample_steps"] = serde_json::json!(49),
+            |config: &mut serde_json::Value| {
+                config["sample_neg_prompt"] = serde_json::json!("drifted")
+            },
+            |config: &mut serde_json::Value| config["an_unknown_key"] = serde_json::json!(1),
+            |config: &mut serde_json::Value| {
+                config.as_object_mut().unwrap().remove("t5_num_buckets");
+            },
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut config, transformer, t5, vae) = checkpoint_parts(None);
+            config["max_area"] = serde_json::json!(901_120);
+            mutate(&mut config);
+            write_parts(temp.path(), &config, &transformer, &t5, &vae);
+            let load_spec = spec(temp.path().to_path_buf());
+            assert!(
+                memory_strategy_contract(&load_spec).is_err(),
+                "only the inert legacy key may be tolerated"
+            );
+        }
     }
 
     #[test]

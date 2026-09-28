@@ -203,6 +203,99 @@ use crate::pipeline::{CANVAS_MAX_PIXELS, SPATIAL_STRIDE};
 /// changes — every one of those invalidates the measured stage peaks above.
 pub const MEMORY_CALIBRATION_FINGERPRINT: &str = "minimax-h3-mlx-staged-joint-av-eager-abi3-v1";
 
+/// The tier [`MEMORY_CALIBRATION_FINGERPRINT`] was measured on, and whose key it therefore keeps.
+pub const CALIBRATED_TIER: &str = "bf16";
+
+/// Calibration identity of the weights-free registry conformance walk.
+///
+/// **sc-22737.** [`weights_free_contract`] used to publish [`MEMORY_CALIBRATION_FINGERPRINT`],
+/// because it shares `build_contract` with the production path. That is a false green in the worst
+/// direction: a contract that read no weights at all reported the identity of a MEASURED production
+/// cell, so an evidence runner could satisfy a plan row naming that cell without ever loading the
+/// artifact. The declaration now carries its own key, and
+/// `the_weights_free_declaration_cannot_publish_a_production_string` holds the two apart.
+pub const STATIC_CALIBRATION_FINGERPRINT: &str = "minimax-h3-mlx-registry-behavior-v1";
+
+/// Artifact-tier label of a MiniMax-H3 load: `bf16` dense, `q4`/`q8` packed.
+pub fn calibration_tier_label(quant: Option<mlx_gen::Quant>) -> Option<&'static str> {
+    match quant {
+        None => Some("bf16"),
+        Some(mlx_gen::Quant::Q4) => Some("q4"),
+        Some(mlx_gen::Quant::Q8) => Some("q8"),
+        Some(_) => None,
+    }
+}
+
+/// The DiT directory a load resolves — the staged override when one is configured, the snapshot's
+/// own `transformer` otherwise. Shared with [`ComponentBytes::resolve`] so the tier is read off the
+/// same directory whose bytes are counted.
+fn dit_dir(spec: &LoadSpec) -> std::path::PathBuf {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root.clone(),
+        WeightsSource::File(path) => path.parent().unwrap_or(path).to_path_buf(),
+    };
+    match spec.components.get(DIT_COMPONENT) {
+        Some(WeightsSource::Dir(staged)) => staged.clone(),
+        _ => root.join(DIT_COMPONENT),
+    }
+}
+
+/// The tier the ARTIFACT carries, read from the DiT's own packed marker.
+///
+/// `Err` for an unreadable marker — `packed_quant_bits_at` answers `Ok(None)` for a MISSING
+/// `config.json`, which would make an absent snapshot look like a dense tier and publish the bf16
+/// identity for weights nobody can see. Fail closed instead.
+pub fn resolved_artifact_tier(
+    spec: &LoadSpec,
+) -> mlx_gen::gen_core::Result<Option<mlx_gen::Quant>> {
+    let dir = dit_dir(spec);
+    if !dir.join("config.json").is_file() {
+        return Err(CoreError::Unsupported(format!(
+            "{MODEL_ID} artifact tier: {} has no readable transformer config.json marker",
+            dir.display()
+        )));
+    }
+    Ok(
+        match mlx_gen::quant::packed_quant_bits_at(&dir)
+            .map_err(|error| CoreError::Unsupported(format!("{MODEL_ID} artifact tier: {error}")))?
+        {
+            None => None,
+            Some(4) => Some(mlx_gen::Quant::Q4),
+            Some(8) => Some(mlx_gen::Quant::Q8),
+            Some(bits) => {
+                return Err(CoreError::Unsupported(format!(
+                "{MODEL_ID} artifact tier: {} declares an unshipped packed width of {bits} bits",
+                dir.display()
+            )))
+            }
+        },
+    )
+}
+
+/// The production calibration identity for one artifact-proven tier.
+///
+/// ## sc-22737 (epic sc-22723 E1/E4): the key is per TIER
+///
+/// It used to be one string for every load, so a q4 render and a bf16 render published the same
+/// identity and an anchor measured on one tier would be matched against loads of the other two.
+///
+/// The tier is proven, not requested: the DiT's own packed marker decides, and a `spec.quantize`
+/// that disagrees with it publishes `None` — a dense snapshot asked for as q4 is a load-time
+/// requantization whose peak no anchor measured. Withheld, never a failed load; `contract_for`
+/// still returns a contract, just an uncalibrated one.
+pub fn production_calibration_fingerprint(spec: &LoadSpec) -> Option<String> {
+    let resolved = resolved_artifact_tier(spec).ok()?;
+    if spec.quantize.is_some() && spec.quantize != resolved {
+        return None;
+    }
+    let tier = calibration_tier_label(resolved)?;
+    Some(if tier == CALIBRATED_TIER {
+        MEMORY_CALIBRATION_FINGERPRINT.to_owned()
+    } else {
+        format!("minimax-h3-{tier}-mlx-staged-joint-av-eager-abi3-v1")
+    })
+}
+
 /// The DiT block count, mirrored from `MiniMaxH3DitConfig::default().num_layers`.
 pub const DIT_BLOCKS: u32 = 50;
 
@@ -675,6 +768,36 @@ struct ComponentBytes {
     overlay: u64,
 }
 
+/// Bytes a `spec.precision`-following component occupies once loaded (SC-22667).
+///
+/// `LinearNoBias::from_weights` and the DiT block builder call `cast_weights(dtype)` on every
+/// **dense** base, and `model.rs` selects that dtype as `Float32` under `Precision::Fp32` and
+/// `Bfloat16` otherwise. A bf16-stored dense checkpoint loaded at Fp32 therefore materializes twice
+/// its on-disk size, which the plain `safetensors_path_bytes` sum could not see. A packed q4/q8
+/// tier is unaffected: `cast_weights` is deliberately not applied to a packed base, and the shared
+/// projection detects an existing affine pack by its `.scales` companion and leaves it at stored
+/// width.
+fn materialized_component_bytes(path: &std::path::Path, precision: mlx_gen::Precision) -> u64 {
+    if precision == mlx_gen::Precision::Fp32 {
+        materialized_f32_bytes(path)
+    } else {
+        safetensors_path_bytes(path)
+    }
+}
+
+/// Bytes a component that is materialized f32 regardless of `spec.precision` occupies.
+///
+/// Falls back to the on-disk sum when the source cannot be read as safetensors. This runs at
+/// contract time, ahead of any component load, so an absent or not-yet-staged component must keep
+/// its previous accounting rather than turn the contract into a refusal.
+fn materialized_f32_bytes(path: &std::path::Path) -> u64 {
+    let stored = safetensors_path_bytes(path);
+    mlx_gen::asset_facts::projected_safetensors_bytes(path, |_| {
+        mlx_gen::asset_facts::ResidentProjection::Float32
+    })
+    .unwrap_or(stored)
+}
+
 impl ComponentBytes {
     fn resolve(spec: &LoadSpec) -> mlx_gen::gen_core::Result<Self> {
         let root = match &spec.weights {
@@ -685,7 +808,7 @@ impl ComponentBytes {
             Some(WeightsSource::Dir(staged)) => staged.clone(),
             _ => root.join(DIT_COMPONENT),
         };
-        let dit_bytes = safetensors_path_bytes(&dit);
+        let dit_bytes = materialized_component_bytes(&dit, spec.precision);
         // **The condition encoder honors its own staged override too** (sc-19120 / sc-20267). It did
         // NOT before, and the omission was `DIT_COMPONENT`'s own bug one component over: sc-19120
         // made the text encoder per-tier and staged **independently** of the DiT, so a split `q4`
@@ -714,11 +837,15 @@ impl ComponentBytes {
             )));
         };
         Ok(Self {
+            // The Qwen3 condition encoder is built at `Dtype::Bfloat16` on every path
+            // (`text_encoder/encoder.rs`), so it does not follow `spec.precision`.
             text_encoder: safetensors_path_bytes(text_encoder),
             dit: dit_bytes,
             adaln: resolved_adaln_bytes(&dit, dit_bytes),
-            video_vae: safetensors_path_bytes(root.join("vae")),
-            audio_vae: safetensors_path_bytes(root.join("audio_vae")),
+            video_vae: materialized_component_bytes(&root.join("vae"), spec.precision),
+            // The audio VAE is a BigVGAN stack built at `Dtype::Float32` unconditionally, on both
+            // the encode and the decode side (`model.rs`) — never at `self.dtype`.
+            audio_vae: materialized_f32_bytes(&root.join("audio_vae")),
             overlay,
         })
     }
@@ -994,12 +1121,176 @@ pub fn streamable(spec: &LoadSpec) -> bool {
     resolved_load_shape(spec) == LoadShape::DeferredMaterialization && spec.adapters.is_empty()
 }
 
+/// Architecture axes for the MiniMax-H3 route (epic SC-22657, E2).
+///
+/// [`MiniMaxH3DitConfig::default`](crate::dit::config::MiniMaxH3DitConfig) mirrors the reference
+/// `transformer/config.json`, and `MiniMaxH3DitConfig::from_diffusers_json` parses that same file —
+/// every key required, no defaults — at load, so the two cannot disagree silently.
+///
+/// `head_dim` is the config's declared `attention_head_dim`, not `hidden_size / num_heads`: this DiT
+/// is deliberately non-uniform (`inner_dim` 7168 is wider than `hidden_size` 5376), so the quotient
+/// would be neither integral nor the head width the attention actually uses.
+///
+/// The VAE is a **video** autoencoder: `patch_size` pixels and `patch_size_t` frames per latent
+/// unit as `MiniMaxH3VaeConfig` states them (the products of the per-level downsample factors), so
+/// `vae_temporal_scale` is a real value here.
+///
+/// When `spec` names a materialized snapshot directory, [`dit_config`] and [`vae_config`] re-run the
+/// loaders' own `from_diffusers_json` parses over that snapshot's `transformer/config.json` and
+/// `vae/config.json`, so every published axis is the snapshot's rather than the preset's
+/// (SC-22667: the VAE axes were preset constants although `vae.rs` parses the snapshot config).
+///
+/// SC-22667 review: an install that HAS a DiT to load — a materialized snapshot, or a staged
+/// [`DIT_COMPONENT`] directory — but whose `transformer/config.json` is missing, partial or
+/// unparseable no longer degrades into the preset. `MiniMaxH3Dit::load_dir` errors on exactly that
+/// file, so a preset published here would describe a model this load will never build. A provider
+/// falls back to a preset only where the LOADER falls back to it; otherwise the trunk axes are
+/// declared absent. The VAE axes are their own config read (see [`vae_config`]) and normally survive
+/// that branch, so the contract still declares a real architecture axis and the MLX weights-free
+/// gate stays satisfied.
+fn architecture_facts(spec: &LoadSpec) -> mlx_gen::gen_core::MemoryArchitectureFacts {
+    // SC-22667 review: a `vae/config.json` that is present but does not parse declines the VAE axes
+    // rather than substituting the crate mirror — `vae.rs` reads that same file through the same
+    // `from_diffusers_json` and propagates the failure, so no load of this snapshot has the mirror's
+    // geometry. An ABSENT file keeps the mirror: that is the shape the weights-free surface and an
+    // unmaterialized VAE both have, and it is the only branch where there is nothing to contradict.
+    let vae = vae_config(spec);
+    let latent_channels = vae
+        .as_ref()
+        .and_then(|vae| mlx_gen::architecture_facts::axis(vae.latent_channels));
+    let vae_spatial_scale = vae
+        .as_ref()
+        .and_then(|vae| mlx_gen::architecture_facts::axis(vae.patch_size));
+    let vae_temporal_scale = vae
+        .as_ref()
+        .and_then(|vae| mlx_gen::architecture_facts::axis(vae.patch_size_t));
+    let Some(dit) = dit_config(spec) else {
+        return mlx_gen::gen_core::MemoryArchitectureFacts {
+            attention_heads: None,
+            head_dim: None,
+            transformer_blocks: None,
+            patch_size: None,
+            latent_channels,
+            vae_spatial_scale,
+            vae_temporal_scale,
+            activation_dtype_width: Some(if spec.precision == mlx_gen::Precision::Fp32 {
+                mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH
+            } else {
+                mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH
+            }),
+        };
+    };
+    // `patch_size` is `(t, h, w)`; only the square spatial patch has a single honest scalar, and
+    // the temporal factor is already carried by `vae_temporal_scale`.
+    let [_, patch_h, patch_w] = dit.patch_size;
+    mlx_gen::gen_core::MemoryArchitectureFacts {
+        attention_heads: mlx_gen::architecture_facts::axis(dit.num_attention_heads),
+        head_dim: mlx_gen::architecture_facts::axis(dit.attention_head_dim),
+        transformer_blocks: mlx_gen::architecture_facts::axis(dit.num_layers),
+        patch_size: (patch_h == patch_w)
+            .then(|| mlx_gen::architecture_facts::axis(patch_h))
+            .flatten(),
+        latent_channels,
+        vae_spatial_scale,
+        vae_temporal_scale,
+        // SC-22667: this hardcoded `HALF_ACTIVATION_WIDTH` while its own comment named the
+        // exception. gen-core documents the axis as the DENOISE-phase width — explicitly not a
+        // per-component byte fact — and `model.rs` selects `Dtype::Float32` for the DiT under
+        // `Precision::Fp32` and `Dtype::Bfloat16` otherwise, so an Fp32 load published half the
+        // width its own denoise loop computes at. The f32 audio VAE is deliberately NOT folded in
+        // here: it belongs to the decode phase, which this axis does not describe.
+        activation_dtype_width: Some(if spec.precision == mlx_gen::Precision::Fp32 {
+            mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH
+        } else {
+            mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH
+        }),
+    }
+}
+
+/// The DiT geometry a contract should describe: the config the loader would parse, or `None` when
+/// there IS a DiT to load and that config cannot be read.
+///
+/// `from_diffusers_json` requires every key, so a partial or variant file declines rather than
+/// half-defaulting into this model's numbers.
+///
+/// SC-22667: the DiT is honored at its **resolved** location, not under the snapshot root. It is
+/// the one tiered component, so a split `q4` install stages [`DIT_COMPONENT`] outside the snapshot
+/// and has no `root/transformer` at all — `model.rs` says exactly that where it probes the same
+/// file, and `ComponentBytes::resolve` already applies the staged override for both the DiT and the
+/// text encoder. Reading only under the root made the probe miss on every split install, so the
+/// preset was published although the loaded config was one `spec.components` lookup away.
+///
+/// SC-22667 review: the preset is returned only where the LOADER would use it — a spec that names
+/// neither a materialized root nor a staged DiT directory, i.e. the weights-free registry surface
+/// with no load to describe. Once either is present, `MiniMaxH3Dit::load_dir` reads
+/// `<resolved>/config.json` and propagates any read or parse failure, so this returns `None` and the
+/// caller declares the trunk axes absent instead of substituting numbers the load cannot produce.
+fn dit_config(spec: &LoadSpec) -> Option<crate::dit::config::MiniMaxH3DitConfig> {
+    let staged = matches!(
+        spec.components.get(DIT_COMPONENT),
+        Some(WeightsSource::Dir(_))
+    );
+    if !staged && mlx_gen::architecture_facts::materialized_root(spec).is_none() {
+        return Some(crate::dit::config::MiniMaxH3DitConfig::default());
+    }
+    resolved_dit_config(spec)
+}
+
+/// The DiT config as the loader would resolve it, or `None` when that directory carries no
+/// parseable one.
+///
+/// The directory precedence is `resolve_dit_dir`'s exactly: a staged [`DIT_COMPONENT`] directory
+/// WINS OUTRIGHT and is never followed by a root fallback, because the loader does not fall back
+/// either — a staged tier whose `config.json` is unreadable fails the load rather than silently
+/// building the snapshot's base geometry.
+fn resolved_dit_config(spec: &LoadSpec) -> Option<crate::dit::config::MiniMaxH3DitConfig> {
+    let dir = match spec.components.get(DIT_COMPONENT) {
+        Some(WeightsSource::Dir(staged)) => staged.clone(),
+        _ => mlx_gen::architecture_facts::materialized_root(spec)?
+            .join(crate::model::BASE_DIT_PARTITION),
+    };
+    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    crate::dit::config::MiniMaxH3DitConfig::from_diffusers_json(&text).ok()
+}
+
+/// The video-VAE geometry a contract should describe: the materialized snapshot's own
+/// `vae/config.json` — the file `vae.rs` parses through this same
+/// `MiniMaxH3VaeConfig::from_diffusers_json` at load — when one exists and parses, this crate's
+/// mirror of the shipped VAE when there is no such file to read, and `None` when the file is there
+/// and does not parse.
+///
+/// That last arm is the SC-22667 review fix, and it mirrors [`dit_config`]: `from_diffusers_json`
+/// requires every key, so a partial or variant file declines whole rather than half-defaulting —
+/// but declining used to mean `unwrap_or_default()`, i.e. publishing the crate mirror's geometry
+/// for a snapshot whose own file says something else. `MiniMaxH3Vae::load` reads that exact path
+/// and propagates both the read and the parse failure, so a load of such a tree does not exist to
+/// describe, and E2 declares the axes absent instead.
+///
+/// An ABSENT file keeps the mirror deliberately: the weights-free registry surface has no snapshot
+/// at all, and a caller building a contract before the VAE component is materialized is in the same
+/// position — nothing there contradicts the shipped geometry.
+fn vae_config(spec: &LoadSpec) -> Option<crate::config::MiniMaxH3VaeConfig> {
+    let Some(root) = mlx_gen::architecture_facts::materialized_root(spec) else {
+        return Some(crate::config::MiniMaxH3VaeConfig::default());
+    };
+    let Ok(text) = std::fs::read_to_string(root.join("vae").join("config.json")) else {
+        return Some(crate::config::MiniMaxH3VaeConfig::default());
+    };
+    crate::config::MiniMaxH3VaeConfig::from_diffusers_json(&text).ok()
+}
+
 fn build_contract(
+    spec: &LoadSpec,
     components: &ComponentBytes,
     load_shape: LoadShape,
     streamable: bool,
+    // sc-22737: passed in rather than hard-coded, so the weights-free surface cannot publish the
+    // production identity and the production one is keyed on the artifact's own tier.
+    calibration: Option<MemoryCalibrationIdentity>,
 ) -> MemoryProviderContract {
     MemoryProviderContract {
+        phase_facts: None,
+        architecture_facts: architecture_facts(spec),
         provider_id: MODEL_ID.to_owned(),
         backend: MemoryBackendRealization::MlxMetal {
             // This flag rests on the AdaLN evict and nothing else. That evict drains the allocator
@@ -1123,10 +1414,7 @@ fn build_contract(
         // The calibration identity carries the RESOLVED shape, not the resident default: a
         // deferred load's peaks are a different curve from a resident load's, and an evidence
         // record that named the wrong one would be matched against measurements of the other.
-        calibration: Some(MemoryCalibrationIdentity::new(
-            MEMORY_CALIBRATION_FINGERPRINT,
-            load_shape,
-        )),
+        calibration,
         asset_facts: MemoryAssetFacts {
             base_bytes: components.base(),
             conditioning_bytes: components.text_encoder,
@@ -1154,22 +1442,38 @@ fn build_contract(
 
 /// The production contract: asset facts read off the resolved snapshot.
 pub fn contract_for(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    let load_shape = resolved_load_shape(spec);
     Ok(build_contract(
+        spec,
         &ComponentBytes::resolve(spec)?,
-        resolved_load_shape(spec),
+        load_shape,
         streamable(spec),
+        // The identity carries the RESOLVED shape, not the resident default: a deferred load's
+        // peaks are a different curve from a resident load's.
+        production_calibration_fingerprint(spec)
+            .map(|fingerprint| MemoryCalibrationIdentity::new(fingerprint, load_shape)),
     ))
 }
 
 /// The weights-free fixture contract: the identical route declaration with zero asset facts.
 ///
-/// Catalog conformance uses this when the snapshot is unavailable. It must **not** touch the
-/// filesystem, and it must not diverge from [`contract_for`] in anything but the byte counts.
+/// Catalog conformance uses this when the snapshot is unavailable. It must **not** require the
+/// snapshot to exist — no byte count is read off disk here — and it must not diverge from
+/// [`contract_for`] in anything but the byte counts. It does consult the spec's weights directory
+/// for the DiT config when one is materialized (see the crate-private `dit_config`); that is not a
+/// byte count, and on the registry's never-created sentinel path it reads nothing and publishes
+/// the preset.
 pub fn weights_free_contract(spec: &LoadSpec) -> mlx_gen::gen_core::Result<MemoryProviderContract> {
+    let load_shape = resolved_load_shape(spec);
     Ok(build_contract(
+        spec,
         &ComponentBytes::weights_free(),
-        resolved_load_shape(spec),
+        load_shape,
         streamable(spec),
+        Some(MemoryCalibrationIdentity::new(
+            STATIC_CALIBRATION_FINGERPRINT,
+            load_shape,
+        )),
     ))
 }
 
@@ -1506,6 +1810,445 @@ mod tests {
         weights_free_contract(&weightless_spec()).expect("weights-free contract")
     }
 
+    /// AC (SC-22662): the MiniMax-H3 contract publishes the axes of the DiT and video VAE this crate
+    /// declares, and passes the shared facts conformance check.
+    #[test]
+    fn architecture_facts_follow_the_crate_dit_and_vae_constants() {
+        let contract = declared();
+        assert_eq!(
+            contract.architecture_facts,
+            mlx_gen::gen_core::MemoryArchitectureFacts {
+                attention_heads: Some(56),
+                // The config's declared head width. `hidden_size` 5376 / 56 is NOT it: this DiT's
+                // `inner_dim` (7168) is deliberately wider than its `hidden_size`.
+                head_dim: Some(128),
+                transformer_blocks: Some(50),
+                // `patch_size` is `[1, 2, 2]`: the square spatial patch is 2.
+                patch_size: Some(2),
+                latent_channels: Some(24),
+                vae_spatial_scale: Some(16),
+                // A video autoencoder: four frames per latent unit.
+                vae_temporal_scale: Some(4),
+                // The bf16 denoise loop. SC-22667 also pins the `Precision::Fp32` leg below.
+                activation_dtype_width: Some(2),
+            }
+        );
+        assert!(contract.architecture_facts.has_declared_architecture_axis());
+        gen_core_testkit::assert_memory_contract_facts_conform(&contract);
+    }
+
+    /// Feature-end review (SC-22667, E2): `activation_dtype_width` is the DENOISE-phase width, and
+    /// `model.rs` selects `Dtype::Float32` for the DiT under `Precision::Fp32` and
+    /// `Dtype::Bfloat16` otherwise. The literal used to be an unconditional 2 while its own comment
+    /// named that exception, so an Fp32 load published half the width its denoise loop computes at.
+    ///
+    /// Mutation that fails this: hardcoding `HALF_ACTIVATION_WIDTH` again — the Fp32 leg reads back
+    /// 2. Hardcoding `FLOAT32_ACTIVATION_WIDTH` instead reds the bf16 leg, which is what stops the
+    /// fix from being "declare the widest phase": the f32 audio VAE belongs to the decode phase,
+    /// which this axis does not describe.
+    #[test]
+    fn the_denoise_activation_width_follows_the_loaded_precision() {
+        let bf16 = weightless_spec();
+        assert_eq!(
+            architecture_facts(&bf16).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::HALF_ACTIVATION_WIDTH)
+        );
+        let mut fp32 = bf16.clone();
+        fp32.precision = mlx_gen::Precision::Fp32;
+        assert_eq!(
+            architecture_facts(&fp32).activation_dtype_width,
+            Some(mlx_gen::architecture_facts::FLOAT32_ACTIVATION_WIDTH)
+        );
+        // Nothing else on the axis set moves with the precision.
+        let widened = architecture_facts(&fp32);
+        let narrow = architecture_facts(&bf16);
+        assert_eq!(widened.attention_heads, narrow.attention_heads);
+        assert_eq!(widened.head_dim, narrow.head_dim);
+        assert_eq!(widened.transformer_blocks, narrow.transformer_blocks);
+        assert_eq!(widened.latent_channels, narrow.latent_channels);
+    }
+
+    /// The published `transformer/config.json` layout, emitted from a config value so the fixture
+    /// cannot drift from the struct it mirrors. Every key is required by `from_diffusers_json`.
+    fn dit_config_json(cfg: &crate::dit::config::MiniMaxH3DitConfig) -> serde_json::Value {
+        serde_json::json!({
+            "_class_name": "MiniMaxH3Transformer3DModel",
+            "num_attention_heads": cfg.num_attention_heads,
+            "attention_head_dim": cfg.attention_head_dim,
+            "hidden_size": cfg.hidden_size,
+            "num_layers": cfg.num_layers,
+            "num_refiner_layers": cfg.num_refiner_layers,
+            "ffn_dim": cfg.ffn_dim,
+            "in_channels": cfg.in_channels,
+            "audio_in_channels": cfg.audio_in_channels,
+            "patch_size": cfg.patch_size,
+            "text_dim": cfg.text_dim,
+            "freq_dim": cfg.freq_dim,
+            "time_embed_hidden_dim": cfg.time_embed_hidden_dim,
+            "time_embed_dim": cfg.time_embed_dim,
+            "rope_freq_dim": cfg.rope_freq_dim,
+            "rope_theta": cfg.rope_theta,
+            "norm_eps": cfg.norm_eps,
+            "qk_norm_eps": cfg.qk_norm_eps,
+            "final_norm_eps": cfg.final_norm_eps,
+        })
+    }
+
+    fn spec_for_dit_config(dir: &Path, config: &serde_json::Value) -> LoadSpec {
+        let transformer = dir.join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(transformer.join("config.json"), config.to_string()).unwrap();
+        LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(dir.to_path_buf()))
+    }
+
+    /// AC (SC-22662, review follow-up): on the **materialized** path the trunk axes are read out of
+    /// the snapshot's own `transformer/config.json` — the file `DitBlockStream` parses at load —
+    /// rather than published from the compile-time preset. The mirror fixture agrees with the
+    /// weights-free path; a fixture with mutated keys publishes the mutated axes, which is the
+    /// assertion the unconditional `architecture_facts()` this replaced would fail.
+    #[test]
+    fn materialized_dit_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::dit::config::MiniMaxH3DitConfig::default();
+
+        let mirror = tempfile::tempdir().unwrap();
+        assert_eq!(
+            architecture_facts(&spec_for_dit_config(
+                mirror.path(),
+                &dit_config_json(&preset)
+            )),
+            architecture_facts(&weightless_spec()),
+            "a snapshot mirroring the published config must publish the preset's axes"
+        );
+
+        let mutated_dir = tempfile::tempdir().unwrap();
+        let mut mutated = dit_config_json(&preset);
+        mutated["num_layers"] = serde_json::json!(7);
+        // 160, not a smaller width: `MiniMaxH3DitConfig::validate` requires the partial rotary
+        // (`2 * 3 * rope_freq_dim` = 96) to fit inside a head, and a rejected config would fall
+        // back to the preset and hide the mutation rather than publish it.
+        mutated["attention_head_dim"] = serde_json::json!(160);
+        let mutated_facts = architecture_facts(&spec_for_dit_config(mutated_dir.path(), &mutated));
+        assert_eq!(
+            (mutated_facts.transformer_blocks, mutated_facts.head_dim),
+            (Some(7), Some(160)),
+            "the materialized path must publish the snapshot's geometry, not the preset's"
+        );
+    }
+
+    /// Feature-end review (SC-22667, E2): the DiT is the one tiered component, so a split `q4`
+    /// install stages [`DIT_COMPONENT`] OUTSIDE the snapshot and carries no `root/transformer` at
+    /// all — `model.rs` says exactly that where it probes the same file, and
+    /// `ComponentBytes::resolve` already honours the staged override for the DiT and the text
+    /// encoder. `dit_config` read only under the root, so every split install fell back to the
+    /// preset although the loaded config was one `spec.components` lookup away.
+    ///
+    /// Mutation that fails this: dropping the staged leg from `resolved_dit_config` — the split
+    /// fixture then publishes the preset's 50 blocks instead of the staged config's 7.
+    #[test]
+    fn a_split_tier_install_reads_the_dit_config_at_its_staged_location() {
+        let preset = crate::dit::config::MiniMaxH3DitConfig::default();
+        let mut staged_config = dit_config_json(&preset);
+        staged_config["num_layers"] = serde_json::json!(7);
+
+        // A snapshot root with NO `transformer/` at all, plus the DiT staged elsewhere.
+        let root = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        std::fs::write(staged.path().join("config.json"), staged_config.to_string()).unwrap();
+        let mut spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            root.path().to_path_buf(),
+        ));
+        spec.components.insert(
+            DIT_COMPONENT.to_owned(),
+            mlx_gen::gen_core::WeightsSource::Dir(staged.path().to_path_buf()),
+        );
+        assert_eq!(
+            architecture_facts(&spec).transformer_blocks,
+            Some(7),
+            "a staged DiT partition must be read where `resolve_dit_dir` would read it"
+        );
+
+        // The staged partition WINS over a root partition, exactly as `resolve_dit_dir` prefers it.
+        let both = tempfile::tempdir().unwrap();
+        let transformer = both.path().join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&transformer).unwrap();
+        std::fs::write(
+            transformer.join("config.json"),
+            dit_config_json(&preset).to_string(),
+        )
+        .unwrap();
+        let mut both_spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            both.path().to_path_buf(),
+        ));
+        both_spec.components.insert(
+            DIT_COMPONENT.to_owned(),
+            mlx_gen::gen_core::WeightsSource::Dir(staged.path().to_path_buf()),
+        );
+        assert_eq!(architecture_facts(&both_spec).transformer_blocks, Some(7));
+
+        // A flat snapshot with no staged component is unchanged.
+        let flat = tempfile::tempdir().unwrap();
+        let flat_spec = spec_for_dit_config(flat.path(), &dit_config_json(&preset));
+        assert_eq!(
+            architecture_facts(&flat_spec).transformer_blocks,
+            architecture_facts(&weightless_spec()).transformer_blocks
+        );
+    }
+
+    /// Feature-end review (SC-22667, E2): a spec that HAS a DiT to load but no readable
+    /// `transformer/config.json` must declare the trunk axes ABSENT, not publish the preset.
+    /// `MiniMaxH3Dit::load_dir` errors on exactly that file, so the preset would describe a model
+    /// this load can never build — the same rule Mage's `dit_config` follows. The VAE axes survive,
+    /// so the contract still declares a real architecture axis.
+    ///
+    /// Mutations that fail this:
+    /// * restoring `resolved_dit_config(spec).unwrap_or_default()` — every leg below reads back the
+    ///   preset's 50 blocks instead of `None`;
+    /// * chaining a root fallback after the staged directory in `resolved_dit_config` — the third
+    ///   leg reads back `Some(50)` from the root partition that `resolve_dit_dir` never opens.
+    #[test]
+    fn an_unreadable_dit_config_declares_the_trunk_absent_rather_than_the_preset() {
+        let preset = crate::dit::config::MiniMaxH3DitConfig::default();
+        let vae_preset = crate::config::MiniMaxH3VaeConfig::default();
+
+        // A materialized snapshot with no `transformer/config.json` at all.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_facts = architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+            bare.path().to_path_buf(),
+        )));
+        assert_eq!(
+            (
+                bare_facts.attention_heads,
+                bare_facts.head_dim,
+                bare_facts.transformer_blocks,
+                bare_facts.patch_size
+            ),
+            (None, None, None, None),
+            "a materialized snapshot the loader would reject must not publish the preset trunk"
+        );
+        assert_eq!(
+            bare_facts.latent_channels,
+            mlx_gen::architecture_facts::axis(vae_preset.latent_channels),
+            "the VAE axes are their own read and must survive the absent trunk"
+        );
+
+        // A materialized snapshot whose config is present but unparseable.
+        let partial = tempfile::tempdir().unwrap();
+        let transformer = partial.path().join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&transformer).unwrap();
+        let mut missing_key = dit_config_json(&preset);
+        missing_key
+            .as_object_mut()
+            .unwrap()
+            .remove("num_attention_heads");
+        std::fs::write(transformer.join("config.json"), missing_key.to_string()).unwrap();
+        assert_eq!(
+            architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+                partial.path().to_path_buf()
+            )))
+            .transformer_blocks,
+            None,
+            "a partial config declines whole; `from_diffusers_json` requires every key"
+        );
+
+        // A STAGED DiT whose config is unreadable does not fall back to a readable root partition:
+        // `resolve_dit_dir` returns the staged directory outright and `load_dir` fails there.
+        let both = tempfile::tempdir().unwrap();
+        let root_transformer = both.path().join(crate::model::BASE_DIT_PARTITION);
+        std::fs::create_dir_all(&root_transformer).unwrap();
+        std::fs::write(
+            root_transformer.join("config.json"),
+            dit_config_json(&preset).to_string(),
+        )
+        .unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let mut staged_spec = LoadSpec::new(WeightsSource::Dir(both.path().to_path_buf()));
+        staged_spec.components.insert(
+            DIT_COMPONENT.to_owned(),
+            WeightsSource::Dir(staged.path().to_path_buf()),
+        );
+        assert_eq!(
+            architecture_facts(&staged_spec).transformer_blocks,
+            None,
+            "a staged DiT wins outright; the root partition is not a fallback for it"
+        );
+
+        // And with NO load to describe at all, the preset is still what the registry publishes.
+        assert_eq!(
+            architecture_facts(&weightless_spec()).transformer_blocks,
+            mlx_gen::architecture_facts::axis(preset.num_layers),
+        );
+    }
+
+    /// The published `vae/config.json` layout, emitted from a config value so the fixture cannot
+    /// drift from the struct it mirrors. Every key is required by
+    /// `MiniMaxH3VaeConfig::from_diffusers_json`, which also re-derives `patch_size` /
+    /// `patch_size_t` as the products of the two per-level factor lists.
+    fn vae_config_json(cfg: &crate::config::MiniMaxH3VaeConfig) -> serde_json::Value {
+        serde_json::json!({
+            "latent_channels": cfg.latent_channels,
+            "out_channels": cfg.out_channels,
+            "decoder_num_layers": cfg.num_layers,
+            "decoder_num_attention_heads": cfg.num_heads,
+            "decoder_attention_head_dim": cfg.head_dim,
+            "decoder_num_register_tokens": cfg.num_register_tokens,
+            "decoder_ffn_mult": cfg.ffn_mult,
+            "decoder_rope_theta": cfg.rope_theta,
+            "decoder_rope_dim_ratio": cfg.rope_dim_ratio,
+            "decoder_norm_eps": cfg.norm_eps,
+            "clip_length": cfg.clip_length,
+            "token_drop": cfg.token_drop,
+            "latents_mean": cfg.latents_mean,
+            "latents_std": cfg.latents_std,
+            "in_channels": cfg.in_channels,
+            "block_out_channels": cfg.block_out_channels,
+            "layers_per_block": cfg.layers_per_block,
+            "spatial_downsample_factors": cfg.spatial_downsample_factors,
+            "temporal_downsample_factors": cfg.temporal_downsample_factors,
+            "norm_num_groups": cfg.norm_num_groups,
+            "norm_eps": cfg.encoder_norm_eps,
+        })
+    }
+
+    /// SC-22667: the VAE axes are read out of the snapshot's own `vae/config.json` — the file the
+    /// VAE loader parses — rather than published from the `VAE_RATIO` / `LATENT_CHANNELS` preset
+    /// constants. The mirror fixture agrees with the weights-free path; a fixture with mutated
+    /// factor lists and latent width publishes the mutated axes.
+    ///
+    /// Mutation that fails this: `latent_channels: axis(LATENT_CHANNELS)`,
+    /// `vae_spatial_scale: axis(VAE_RATIO)`, `vae_temporal_scale: axis(VAE_RATIO_T)` (the preset
+    /// shape under review) — the mutated fixture then reads back 24 / 16 / 4.
+    #[test]
+    fn materialized_vae_axes_come_from_the_snapshot_rather_than_the_preset() {
+        let preset = crate::config::MiniMaxH3VaeConfig::default();
+        // SC-22667 review: both fixtures below mirror the DiT config too. A materialized snapshot
+        // with no readable `transformer/config.json` now declares its TRUNK axes absent (the loader
+        // errors on that file), so a VAE-only fixture can no longer be compared against the
+        // weights-free preset — and an absent trunk would say nothing about the VAE axes this test
+        // is for.
+        let mirror_dit = |root: &std::path::Path| {
+            let transformer = root.join(crate::model::BASE_DIT_PARTITION);
+            std::fs::create_dir_all(&transformer).unwrap();
+            std::fs::write(
+                transformer.join("config.json"),
+                dit_config_json(&crate::dit::config::MiniMaxH3DitConfig::default()).to_string(),
+            )
+            .unwrap();
+        };
+
+        let mirror = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(mirror.path().join("vae")).unwrap();
+        std::fs::write(
+            mirror.path().join("vae/config.json"),
+            vae_config_json(&preset).to_string(),
+        )
+        .unwrap();
+        mirror_dit(mirror.path());
+        let mirror_spec = LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            mirror.path().to_path_buf(),
+        ));
+        assert_eq!(
+            architecture_facts(&mirror_spec),
+            architecture_facts(&weightless_spec()),
+            "a snapshot mirroring the published VAE config must publish the preset's axes"
+        );
+
+        // Halve the latent width and the spatial compression, keep everything the validator
+        // cross-checks consistent (`latents_mean/std` per channel, one factor per level).
+        let mut mutated = preset.clone();
+        mutated.latent_channels = 12;
+        mutated.latents_mean = vec![0.0; 12];
+        mutated.latents_std = vec![1.0; 12];
+        let levels = mutated.spatial_downsample_factors.len();
+        mutated.spatial_downsample_factors = vec![1; levels];
+        mutated.spatial_downsample_factors[0] = 8;
+        mutated.temporal_downsample_factors = vec![1; levels];
+        mutated.temporal_downsample_factors[0] = 2;
+        let mutated_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(mutated_dir.path().join("vae")).unwrap();
+        std::fs::write(
+            mutated_dir.path().join("vae/config.json"),
+            vae_config_json(&mutated).to_string(),
+        )
+        .unwrap();
+        mirror_dit(mutated_dir.path());
+        let facts = architecture_facts(&LoadSpec::new(mlx_gen::gen_core::WeightsSource::Dir(
+            mutated_dir.path().to_path_buf(),
+        )));
+        assert_eq!(
+            (
+                facts.latent_channels,
+                facts.vae_spatial_scale,
+                facts.vae_temporal_scale
+            ),
+            (Some(12), Some(8), Some(2)),
+            "the materialized path must publish the snapshot's VAE geometry, not the preset's"
+        );
+        // The trunk axes are untouched by a VAE-only fixture.
+        assert_eq!(
+            facts.transformer_blocks,
+            architecture_facts(&weightless_spec()).transformer_blocks
+        );
+    }
+
+    /// SC-22667 review: the VAE branch now mirrors the DiT branch. `MiniMaxH3Vae::load` reads
+    /// `vae/config.json` and propagates both its read and its parse failure, so a file that is
+    /// PRESENT and unparseable describes no load — its axes are declared absent rather than filled
+    /// in from this crate's mirror. An ABSENT file keeps the mirror: that is the weights-free shape
+    /// and the shape of a snapshot whose VAE component is not materialized yet, and nothing there
+    /// contradicts the shipped geometry.
+    ///
+    /// Mutation that fails this: restoring `.unwrap_or_default()` in `vae_config` — the unparseable
+    /// leg then reads back the mirror's `latent_channels` instead of `None`.
+    #[test]
+    fn an_unparseable_vae_config_declines_the_vae_axes_instead_of_the_mirror() {
+        let preset_facts = architecture_facts(&weightless_spec());
+        let mirror_dit = |root: &std::path::Path| {
+            let transformer = root.join(crate::model::BASE_DIT_PARTITION);
+            std::fs::create_dir_all(&transformer).unwrap();
+            std::fs::write(
+                transformer.join("config.json"),
+                dit_config_json(&crate::dit::config::MiniMaxH3DitConfig::default()).to_string(),
+            )
+            .unwrap();
+        };
+
+        // Present but missing a required key: `from_diffusers_json` declines it whole.
+        let broken = tempfile::tempdir().unwrap();
+        mirror_dit(broken.path());
+        std::fs::create_dir_all(broken.path().join("vae")).unwrap();
+        let mut partial = vae_config_json(&crate::config::MiniMaxH3VaeConfig::default());
+        partial.as_object_mut().unwrap().remove("latent_channels");
+        std::fs::write(broken.path().join("vae/config.json"), partial.to_string()).unwrap();
+        let facts = architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+            broken.path().to_path_buf(),
+        )));
+        assert_eq!(
+            (
+                facts.latent_channels,
+                facts.vae_spatial_scale,
+                facts.vae_temporal_scale
+            ),
+            (None, None, None),
+            "an unparseable vae/config.json must not publish the crate mirror's geometry"
+        );
+        assert_eq!(
+            facts.transformer_blocks, preset_facts.transformer_blocks,
+            "the DiT read is independent and survives"
+        );
+        assert!(facts.has_declared_architecture_axis());
+
+        // Absent: the mirror still stands, which is what the weights-free surface publishes.
+        let absent = tempfile::tempdir().unwrap();
+        mirror_dit(absent.path());
+        assert_eq!(
+            architecture_facts(&LoadSpec::new(WeightsSource::Dir(
+                absent.path().to_path_buf()
+            ))),
+            preset_facts,
+            "no vae/config.json to read keeps the shipped mirror"
+        );
+    }
+
     fn support(
         contract: &MemoryProviderContract,
         strategy: MemoryStrategy,
@@ -1526,6 +2269,136 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("component dir");
             let file = std::fs::File::create(dir.join("model.safetensors")).expect("shard");
             file.set_len(*bytes).expect("sparse shard");
+        }
+    }
+
+    /// Write the DiT's own `quantization` marker into a snapshot tree — the same `config.json`
+    /// `mlx_gen::quant::packed_quant_bits_at` parses on the load path, and therefore the file
+    /// `resolved_artifact_tier` reads. `None` writes a DENSE marker (a real `config.json` with no
+    /// `quantization` block), which is what makes a bf16 root distinguishable from an absent one.
+    fn write_tier_marker(root: &Path, bits: Option<i32>) {
+        let dir = root.join(DIT_COMPONENT);
+        std::fs::create_dir_all(&dir).expect("component dir");
+        let body = match bits {
+            Some(bits) => format!(
+                "{{\"quantization\":{{\"bits\":{bits},\"group_size\":{}}}}}",
+                crate::quant::GROUP_SIZE
+            ),
+            None => "{}".to_owned(),
+        };
+        std::fs::write(dir.join("config.json"), body).expect("quantization marker");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // sc-22737 (epic sc-22723 E1/E4): the identity is per ARTIFACT-PROVEN tier, and the
+    // weights-free surface may not publish it.
+    // ------------------------------------------------------------------------------------------
+
+    /// A snapshot root whose DiT carries a real tier marker.
+    fn minimax_tier_root(bits: Option<i32>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        write_tier_marker(root.path(), bits);
+        root
+    }
+
+    /// Three shipped tiers, three DISTINCT identities, each reaching the production contract — and
+    /// the measured bf16 cell keeping its retained key. Before sc-22737 all three published the
+    /// SAME string, so an anchor measured on bf16 would have been matched against q4 and q8 loads.
+    #[test]
+    fn each_shipped_tier_publishes_its_own_identity() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (bits, expected_tier) in [(None, "bf16"), (Some(4), "q4"), (Some(8), "q8")] {
+            let root = minimax_tier_root(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+            let fingerprint = production_calibration_fingerprint(&spec)
+                .unwrap_or_else(|| panic!("{expected_tier} publishes an identity"));
+            assert!(
+                fingerprint.contains(expected_tier) || expected_tier == "bf16",
+                "{fingerprint} must name {expected_tier}"
+            );
+            assert!(
+                seen.insert(fingerprint.clone()),
+                "{expected_tier} reuses {fingerprint}"
+            );
+            assert_ne!(fingerprint, STATIC_CALIBRATION_FINGERPRINT);
+            assert_eq!(
+                contract_for(&spec)
+                    .unwrap()
+                    .calibration
+                    .as_ref()
+                    .map(|identity| identity.fingerprint.as_str()),
+                Some(fingerprint.as_str()),
+                "{expected_tier}: the identity must reach the CONTRACT, not just the table"
+            );
+        }
+        assert_eq!(seen.len(), 3);
+        // The measured cell keeps its retained key byte-for-byte.
+        let bf16 = minimax_tier_root(None);
+        assert_eq!(
+            production_calibration_fingerprint(&LoadSpec::new(WeightsSource::Dir(
+                bf16.path().into()
+            )))
+            .as_deref(),
+            Some(MEMORY_CALIBRATION_FINGERPRINT)
+        );
+    }
+
+    /// **The tier is proven, not requested.** A dense root asked for as q4 is a load-time
+    /// requantization no anchor measured, and an absent snapshot proves nothing at all. Both
+    /// withhold — and neither fails the load.
+    #[test]
+    fn a_tier_the_artifact_does_not_prove_is_withheld() {
+        let dense = minimax_tier_root(None);
+        let crossed =
+            LoadSpec::new(WeightsSource::Dir(dense.path().into())).with_quant(mlx_gen::Quant::Q4);
+        assert!(production_calibration_fingerprint(&crossed).is_none());
+        assert!(
+            contract_for(&crossed).unwrap().calibration.is_none(),
+            "a withheld identity must not fail the load"
+        );
+
+        // An honest request for the tier the artifact carries does publish.
+        let packed = minimax_tier_root(Some(8));
+        let honest =
+            LoadSpec::new(WeightsSource::Dir(packed.path().into())).with_quant(mlx_gen::Quant::Q8);
+        assert_eq!(
+            production_calibration_fingerprint(&honest).as_deref(),
+            Some("minimax-h3-q8-mlx-staged-joint-av-eager-abi3-v1")
+        );
+
+        // No marker at all is an UNREADABLE tier, not a dense one — fail closed.
+        assert!(production_calibration_fingerprint(&weightless_spec()).is_none());
+        let unmarked = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(unmarked.path(), &[("transformer", DIT_BF16_BYTES)]);
+        assert!(
+            production_calibration_fingerprint(&LoadSpec::new(WeightsSource::Dir(
+                unmarked.path().into()
+            )))
+            .is_none(),
+            "a snapshot with no config.json marker must not read as the dense tier"
+        );
+    }
+
+    /// The weights-free declaration may never publish a production string — the leak sc-22737
+    /// closed. A plan row naming a measured cell could otherwise be satisfied by a contract that
+    /// loaded no weights at all.
+    #[test]
+    fn the_weights_free_declaration_cannot_publish_a_production_string() {
+        for bits in [None, Some(4), Some(8)] {
+            let root = minimax_tier_root(bits);
+            let spec = LoadSpec::new(WeightsSource::Dir(root.path().into()));
+            let declared = weights_free_contract(&spec)
+                .unwrap()
+                .calibration
+                .unwrap()
+                .fingerprint;
+            assert_eq!(declared, STATIC_CALIBRATION_FINGERPRINT);
+            assert_ne!(
+                production_calibration_fingerprint(&spec).unwrap(),
+                declared,
+                "q{bits:?}"
+            );
         }
     }
 
@@ -1564,9 +2437,22 @@ mod tests {
             MemoryStrategySupport::Implemented,
             "the fallback declares every optimized rung Missing"
         );
+        // sc-22737: `contract_for` on a weightless spec proves no artifact tier and so publishes no
+        // identity, which the compatibility fallback also does — so this is no longer a
+        // discriminator on THIS spec. The claim it was making is kept, against a spec that resolves
+        // a real tier: a resolved declaration publishes a per-tier identity, the fallback never
+        // publishes one at all.
+        assert_eq!(fallback.calibration, None);
+        let resolved_root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(resolved_root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        write_tier_marker(resolved_root.path(), None);
+        let resolved = (registration.contract)(&LoadSpec::new(WeightsSource::Dir(
+            resolved_root.path().into(),
+        )))
+        .expect("registered contract");
         assert!(
-            contract.calibration.is_some(),
-            "the fallback carries no calibration identity"
+            resolved.calibration.is_some(),
+            "a resolved declaration publishes a per-tier identity; the fallback never does"
         );
         assert!(
             matches!(
@@ -1657,7 +2543,18 @@ mod tests {
         assert_eq!(fixture.strategies, production.strategies);
         assert_eq!(fixture.lifecycle, production.lifecycle);
         assert_eq!(fixture.formula, production.formula);
-        assert_eq!(fixture.calibration, production.calibration);
+        // sc-22737: the two identities must DIFFER. This asserted they were equal, which is what
+        // let a contract that read no weights report the identity of a measured production cell.
+        // On this weightless spec the production side proves no tier at all and so publishes
+        // nothing; the declaration publishes its own registry-behaviour key.
+        assert_eq!(
+            fixture
+                .calibration
+                .as_ref()
+                .map(|id| id.fingerprint.as_str()),
+            Some(STATIC_CALIBRATION_FINGERPRINT)
+        );
+        assert_eq!(production.calibration, None);
         assert_eq!(fixture.load_shape, production.load_shape);
         assert_eq!(fixture.backend, production.backend);
     }
@@ -2020,7 +2917,15 @@ mod tests {
                 parameters: MemoryStrategyParameters::default(),
             },
             calibration_abi: mlx_gen::gen_core::MEMORY_CALIBRATION_ABI,
-            calibration_fingerprint: MEMORY_CALIBRATION_FINGERPRINT.to_owned(),
+            // sc-22737: read off the contract under test for exactly the reason `load_shape` is.
+            // The identity is per-(artifact tier) now, and the weights-free declaration carries its
+            // own key, so a context pinned to the production constant fails the handshake and makes
+            // every geometry rejection below vacuous.
+            calibration_fingerprint: contract
+                .calibration
+                .as_ref()
+                .map(|identity| identity.fingerprint.clone())
+                .unwrap_or_default(),
             // sc-18662: the contract's shape now follows the spec, so a context pinned to
             // `LOAD_SHAPE` would fail the calibration handshake on a deferred spec and make every
             // geometry rejection below vacuous. Read it off the contract under test.
@@ -3168,7 +4073,16 @@ mod tests {
         // loaders exist now (`load_dir_deferred`, `MiniMaxH3TextEncoder::from_dir_deferred`), so the
         // honest answer is the spec's — and the test that has to exist is that the two shapes give
         // DIFFERENT contracts rather than one silently winning.
-        let deferred = contract_for(&weightless_spec()).expect("contract");
+        // sc-22737: a weightless spec proves no artifact tier and so publishes no identity at all,
+        // and the claim under test is about the identity's shape — so it needs a resolvable root.
+        let root = tempfile::tempdir().expect("tempdir");
+        sparse_snapshot(root.path(), &[("transformer", DIT_BF16_BYTES)]);
+        write_tier_marker(root.path(), None);
+        let deferred = contract_for(
+            &LoadSpec::new(WeightsSource::Dir(root.path().into()))
+                .with_load_shape(LoadShape::DeferredMaterialization),
+        )
+        .expect("contract");
         assert_eq!(deferred.load_shape, LoadShape::DeferredMaterialization);
         assert_eq!(
             deferred.calibration.as_ref().unwrap().load_shape,

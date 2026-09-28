@@ -1280,6 +1280,7 @@ fn evidence(
             // The exact parameters the measured row RAN with, taken from the request block rather
             // than from the declared defaults, so a record can never claim a cell it did not drive.
             parameters: MemoryStrategyParameters {
+                stage_residency: None,
                 decode_tile_edge: memory.tile_vae_decode.then(|| {
                     memory
                         .decode_tile_edge
@@ -1305,8 +1306,11 @@ fn evidence(
                     .then_some(ms::TRANSFORMER_WINDOW_COMPONENT),
             },
         },
+        // sc-22731: the identity is per (provider, tier, policy), so the DECLARED half is asked of
+        // this row's own entry and its own loaded tier rather than of the offload policy alone.
         declared_calibration: MemoryCalibrationIdentity::new(
-            ms::calibration_fingerprint(load.offload_policy),
+            ms::production_calibration_fingerprint(entry, load)
+                .expect("a shipped SANA route at a shipped tier declares an identity"),
             load.load_shape,
         ),
         observed_calibration: contract

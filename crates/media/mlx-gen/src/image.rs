@@ -11,7 +11,7 @@ use mlx_rs::ops::{add, maximum, minimum, multiply, round};
 use mlx_rs::Array;
 
 use crate::array::scalar;
-use crate::media::Image;
+use crate::media::{Image, RgbaImage};
 use crate::{Error, Result};
 
 pub use gen_core::imageops::*;
@@ -20,6 +20,54 @@ pub use gen_core::imageops::*;
 /// singleton temporal axis (5-D → 4-D) → NCHW→NHWC → `(x·255).round()` → `u8` (batch must be 1).
 /// Identical across the Z-Image and Qwen-Image pipelines (the decoded tensor must already be f32).
 pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
+    let (width, height, channels, pixels) = decoded_to_interleaved_u8(decoded, "decoded_to_image")?;
+    if channels != Image::CHANNELS {
+        return Err(Error::Msg(format!(
+            "decoded_to_image: expected a 3-channel (RGB) tensor, got {channels} channels; use \
+             decoded_to_rgba_image for the four-channel decode"
+        )));
+    }
+    Ok(Image {
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// The four-channel sibling of [`decoded_to_image`] (sc-24111): denormalize a VAE-decoded **RGBA**
+/// tensor to an [`RgbaImage`] with **straight (un-premultiplied)** alpha.
+///
+/// Bit-for-bit the same denormalize/quantize chain as [`decoded_to_image`], applied to four
+/// channels instead of three — which is exactly upstream's own arithmetic. diffusers'
+/// `VaeImageProcessor.postprocess` runs `(x / 2 + 0.5).clamp(0, 1)` per channel *independently*,
+/// then `(v · 255).round().astype(uint8)` and `PIL.Image.fromarray(..., mode="RGBA")`; nothing
+/// premultiplies and the alpha is clamped by the same clamp as the colour. So the RGB emission and
+/// the RGBA emission of one decode differ only in whether the alpha is applied (over white) or
+/// carried.
+pub fn decoded_to_rgba_image(decoded: &Array) -> Result<RgbaImage> {
+    let (width, height, channels, pixels) =
+        decoded_to_interleaved_u8(decoded, "decoded_to_rgba_image")?;
+    if channels != RgbaImage::CHANNELS {
+        return Err(Error::Msg(format!(
+            "decoded_to_rgba_image: expected a 4-channel (RGBA) tensor, got {channels} channels"
+        )));
+    }
+    Ok(RgbaImage {
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// The shared denormalize/quantize core of [`decoded_to_image`] and [`decoded_to_rgba_image`]:
+/// `clip(x·0.5 + 0.5, 0, 1)` → drop the singleton temporal axis (5-D → 4-D) → NCHW→NHWC →
+/// `(x·255).round()` → `u8`. Returns `(width, height, channels, interleaved pixels)`; the channel
+/// count is whatever the tensor carried, and the callers above are what bind it to a type.
+///
+/// One body, so the two emissions can never drift in rounding: a provider that emits RGB for one
+/// request and RGBA for the next must quantize both identically, or the "RGB is the RGBA decode
+/// composited over white" claim in the provider `UPSTREAM.md`s stops being checkable.
+fn decoded_to_interleaved_u8(decoded: &Array, who: &str) -> Result<(u32, u32, usize, Vec<u8>)> {
     // Rank + dtype hardening (F-064): the readback below is `as_slice::<f32>()`, which reinterprets
     // the raw buffer — a bf16/f16 tensor (one missed `.as_dtype(Float32)` in any of ~20 provider
     // decode paths) would mis-read the bytes and abort the process. Reject a wrong rank up front, and
@@ -27,7 +75,7 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
     let rank = decoded.shape().len();
     if rank != 4 && rank != 5 {
         return Err(Error::Msg(format!(
-            "decoded_to_image: expected a 4-D (NCHW) or 5-D (NCTHW) tensor, got rank {rank}"
+            "{who}: expected a 4-D (NCHW) or 5-D (NCTHW) tensor, got rank {rank}"
         )));
     }
     let decoded = decoded.as_dtype(mlx_rs::Dtype::Float32)?;
@@ -52,7 +100,7 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
     // usize / flatten via -1 to avoid the u32/i32 product overflow at large resolutions.
     if sh[0] != 1 {
         return Err(Error::Msg(format!(
-            "decoded_to_image: expected batch size 1, got {}",
+            "{who}: expected batch size 1, got {}",
             sh[0]
         )));
     }
@@ -65,11 +113,7 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
         .iter()
         .map(|&v| v as u8)
         .collect();
-    Ok(Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    })
+    Ok((w as u32, h as u32, c, pixels))
 }
 
 /// Reject pipeline dimensions that aren't multiples of `multiple` — the latent-pack requirement

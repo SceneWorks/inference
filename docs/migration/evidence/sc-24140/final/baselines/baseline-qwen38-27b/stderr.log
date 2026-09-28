@@ -1,0 +1,8 @@
+[decode_bench] reference          10.71 tok/s  prefill 1.001s  fused n/a  nvfp4 n/a
+[decode_bench] mtp K=1            12.74 tok/s  accept 0.827  fwd/tok 0.645  syncs/verify n/a  fwd/verify n/a  graphs n/a
+[decode_bench] mtp K=2            16.06 tok/s  accept 0.779  fwd/tok 0.512  syncs/verify n/a  fwd/verify n/a  graphs n/a
+[decode_bench] mtp K=3            14.65 tok/s  accept 0.607  fwd/tok 0.559  syncs/verify n/a  fwd/verify n/a  graphs n/a
+[decode_bench] mtp K=4            11.45 tok/s  accept 0.493  fwd/tok 0.609  syncs/verify n/a  fwd/verify n/a  graphs n/a
+[decode_bench] mtp K=5            12.88 tok/s  accept 0.480  fwd/tok 0.547  syncs/verify n/a  fwd/verify n/a  graphs n/a
+[decode_bench] sampled            10.14 tok/s  prefill 0.996s  sampler n/a
+[decode_bench] wrote C:\evidence\sc-24128\baseline-qwen38-27b\decode_bench.json

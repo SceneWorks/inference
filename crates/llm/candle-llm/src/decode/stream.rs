@@ -37,6 +37,8 @@ pub enum FinishReason {
     StopToken,
     /// The `max_new_tokens` budget was reached.
     MaxTokens,
+    /// The caller stopped decoding (for example, a complete structured output).
+    Stopped,
     /// Cancellation tripped mid-stream.
     Cancelled,
 }
@@ -225,12 +227,41 @@ pub fn generate_from_prefill(
     on_event: &mut dyn FnMut(StreamEvent),
     constraint: Option<&mut dyn ConstraintMask>,
 ) -> Result<GenerationOutput> {
+    generate_from_prefill_with_stop(
+        decoder, cache, first, history, config, cancel, on_event, constraint, None,
+    )
+}
+
+/// Like [`generate_from_prefill`], with a cooperative caller stop checked before sampling and
+/// immediately after each token callback, before another decoder step. Caller stops are distinct
+/// from user cancellation; the caller retains its more specific structured-output finish reason.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_from_prefill_with_stop(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    first: Tensor,
+    history: Vec<i32>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
     }
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    decode_loop(
-        decoder, cache, first, rng, history, config, cancel, on_event, constraint,
+    decode_loop_with_stop(
+        decoder,
+        cache,
+        first,
+        rng,
+        history,
+        config,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
     )
 }
 
@@ -246,6 +277,23 @@ pub fn generate_from_prefill(
 pub(crate) fn decode_loop(
     decoder: &dyn Decode,
     cache: &mut dyn KvCache,
+    logits: Tensor,
+    rng: SplitMix64,
+    history: Vec<i32>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn ConstraintMask>,
+) -> Result<GenerationOutput> {
+    decode_loop_with_stop(
+        decoder, cache, logits, rng, history, config, cancel, on_event, constraint, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_loop_with_stop(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
     mut logits: Tensor,
     mut rng: SplitMix64,
     mut history: Vec<i32>,
@@ -253,6 +301,7 @@ pub(crate) fn decode_loop(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn ConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
 ) -> Result<GenerationOutput> {
     let device = decoder.device();
     let mut generated: Vec<i32> = Vec::new();
@@ -261,6 +310,11 @@ pub(crate) fn decode_loop(
     for step in 0..config.max_new_tokens {
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
+            break;
+        }
+
+        if should_stop.is_some_and(|stop| stop()) {
+            finish = FinishReason::Stopped;
             break;
         }
 
@@ -283,6 +337,15 @@ pub(crate) fn decode_loop(
         on_event(StreamEvent::Token { id: next, step });
         generated.push(next);
         history.push(next);
+
+        if cancel.is_cancelled() {
+            finish = FinishReason::Cancelled;
+            break;
+        }
+        if should_stop.is_some_and(|stop| stop()) {
+            finish = FinishReason::Stopped;
+            break;
+        }
 
         if step + 1 == config.max_new_tokens {
             break; // budget reached; finish stays MaxTokens
@@ -311,4 +374,185 @@ pub(crate) fn default_seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0x9E37_79B9_7F4A_7C15)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::primitives::kv_cache::ContiguousKvCache;
+    use core_llm::{
+        Message, StarVectorBoundedStream, StarVectorFinishReason, StarVectorRequest,
+        StarVectorStreamStatus, TextLlmRequest,
+    };
+    use std::{cell::Cell, time::Duration};
+
+    struct CountedDecoder {
+        device: Device,
+        steps: Cell<usize>,
+    }
+    impl Decode for CountedDecoder {
+        fn make_cache(&self) -> Box<dyn KvCache> {
+            Box::new(ContiguousKvCache::new(0))
+        }
+        fn device(&self) -> &Device {
+            &self.device
+        }
+        fn step(&self, _: &Tensor, _: &mut dyn KvCache, _: i32) -> Result<Tensor> {
+            self.steps.set(self.steps.get() + 1);
+            Ok(Tensor::new(&[[0f32, 10.]], &self.device)?)
+        }
+    }
+
+    #[test]
+    fn starvector_guard_stops_before_next_decoder_step_and_preserves_reason() {
+        // Inject fixed clock-free ticks: this tests control flow, never host scheduling.
+        const START: Duration = Duration::ZERO;
+        const DEADLINE: Duration = Duration::from_secs(1);
+        for (fragment, bytes, tick, expected) in [
+            (
+                "<svg></svg>",
+                128,
+                START,
+                StarVectorFinishReason::CompleteRoot,
+            ),
+            ("<svg></svg>", 5, START, StarVectorFinishReason::ByteLimit),
+            (
+                "<svg>",
+                128,
+                DEADLINE,
+                StarVectorFinishReason::WallTimeLimit,
+            ),
+        ] {
+            let req = StarVectorRequest::new(
+                TextLlmRequest::new(vec![Message::user("vector")], 64),
+                bytes,
+                DEADLINE,
+            );
+            let mut guard = StarVectorBoundedStream::new(&req);
+            let decoder = CountedDecoder {
+                device: Device::Cpu,
+                steps: Cell::new(0),
+            };
+            let stopped = Cell::new(false);
+            let mut done = None;
+            let output = generate_from_prefill_with_stop(
+                &decoder,
+                decoder.make_cache().as_mut(),
+                Tensor::new(&[[0f32, 10.]], &Device::Cpu).unwrap(),
+                vec![0],
+                &GenerationConfig {
+                    max_new_tokens: 64,
+                    ..Default::default()
+                },
+                &req.text_request.cancel,
+                &mut |event| match event {
+                    StreamEvent::Token { .. } => {
+                        let status = guard.push(fragment, tick).unwrap();
+                        assert_eq!(status, StarVectorStreamStatus::Stop(expected));
+                        stopped.set(true);
+                    }
+                    StreamEvent::Done { reason, generated } => done = Some((reason, generated)),
+                },
+                None,
+                Some(&|| stopped.get()),
+            )
+            .unwrap();
+            assert_eq!(
+                decoder.steps.get(),
+                0,
+                "no forward computation after {expected:?}"
+            );
+            assert_eq!(output.tokens.len(), 1);
+            assert_eq!(output.finish_reason, FinishReason::Stopped);
+            assert_eq!(done, Some((FinishReason::Stopped, 1)));
+            assert_eq!(guard.output().unwrap().finish_reason, expected);
+            assert!(!req.text_request.cancel.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn starvector_callback_failure_stop_and_user_cancel_are_distinct() {
+        for user_cancel in [false, true] {
+            let decoder = CountedDecoder {
+                device: Device::Cpu,
+                steps: Cell::new(0),
+            };
+            let cancel = CancelFlag::new();
+            let stopped = Cell::new(false);
+            let output = generate_from_prefill_with_stop(
+                &decoder,
+                decoder.make_cache().as_mut(),
+                Tensor::new(&[[0f32, 10.]], &Device::Cpu).unwrap(),
+                vec![0],
+                &GenerationConfig::default(),
+                &cancel,
+                &mut |event| {
+                    if matches!(event, StreamEvent::Token { .. }) {
+                        // A tokenizer failure trips the same callback stop without cancelling the user.
+                        stopped.set(true);
+                        if user_cancel {
+                            cancel.cancel();
+                        }
+                    }
+                },
+                None,
+                Some(&|| stopped.get()),
+            )
+            .unwrap();
+            assert_eq!(decoder.steps.get(), 0);
+            assert_eq!(output.tokens.len(), 1);
+            assert_eq!(
+                output.finish_reason,
+                if user_cancel {
+                    FinishReason::Cancelled
+                } else {
+                    FinishReason::Stopped
+                }
+            );
+            assert_eq!(cancel.is_cancelled(), user_cancel);
+        }
+        let decoder = CountedDecoder {
+            device: Device::Cpu,
+            steps: Cell::new(0),
+        };
+        let cancel = CancelFlag::new();
+        let config = GenerationConfig {
+            max_new_tokens: 3,
+            ..Default::default()
+        };
+        let output = generate_from_prefill(
+            &decoder,
+            decoder.make_cache().as_mut(),
+            Tensor::new(&[[0f32, 10.]], &Device::Cpu).unwrap(),
+            vec![0],
+            &config,
+            &cancel,
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(output.tokens.len(), 3);
+        assert_eq!(
+            decoder.steps.get(),
+            2,
+            "existing callers still decode their full budget"
+        );
+        cancel.cancel();
+        assert!(matches!(
+            generate_from_prefill_with_stop(
+                &decoder,
+                decoder.make_cache().as_mut(),
+                Tensor::new(&[[0f32, 10.]], &Device::Cpu).unwrap(),
+                vec![0],
+                &config,
+                &cancel,
+                &mut |_| {},
+                None,
+                Some(&|| true)
+            ),
+            Err(Error::Canceled)
+        ));
+        assert_eq!(decoder.steps.get(), 2);
+    }
 }

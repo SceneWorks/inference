@@ -1,0 +1,2 @@
+$HF_HUB_CACHE/models--m-a-p--SheetSage2/snapshots/eab522a8168e8b8b8c4856bf8609cd86198f01fe/audio_sheetsage2.py:46: UserWarning: torchaudio._backend.utils.info has been deprecated. This deprecation is part of a large refactoring effort to transition TorchAudio into a maintenance phase. The decoding and encoding capabilities of PyTorch for both audio and video are being consolidated into TorchCodec. Please see https://github.com/pytorch/audio/issues/3902 for more information. It will be removed from the 2.9 release. 
+  info = torchaudio.info(source, backend="ffmpeg")

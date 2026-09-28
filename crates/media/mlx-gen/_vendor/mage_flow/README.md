@@ -217,9 +217,9 @@ Install everything **except** `flash-attn` first, then install `flash-attn` sepa
 cd Mage/mage_flow
 uv venv && source .venv/bin/activate
 
-# 1) Pinned, tested dependency set (torch 2.13, transformers 5.5, diffusers 0.38, pillow 12.3, …).
-#    Recommended for reproducibility. `uv pip install -e .` also works, but its loose
-#    bounds may resolve to a newer torch/transformers than the code was tested against.
+# 1) Pinned, tested dependency set (torch 2.13, transformers 5.10.4, diffusers 0.38, pillow 12.3, …).
+#    Recommended for reproducibility. `uv pip install -e .` uses the same
+#    Transformers and Accelerate pins but may resolve newer versions of other packages.
 uv pip install -r requirements.txt
 uv pip install -e . --no-deps           # the mage-flow package itself
 

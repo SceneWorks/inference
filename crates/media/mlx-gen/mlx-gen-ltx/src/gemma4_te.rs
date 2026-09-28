@@ -137,6 +137,19 @@ fn from_llm(e: mlx_llm::Error) -> Error {
         mlx_llm::Error::Canceled => Error::Canceled,
         mlx_llm::Error::MissingTensor(k) => Error::MissingTensor(k),
         mlx_llm::Error::Io(e) => Error::Io(e),
+        mlx_llm::Error::IncoherentLoad {
+            name,
+            bytes,
+            cpu,
+            gpu,
+            attempts,
+        } => Error::IncoherentLoad {
+            name,
+            bytes,
+            cpu,
+            gpu,
+            attempts,
+        },
         other => Error::Msg(other.to_string()),
     }
 }

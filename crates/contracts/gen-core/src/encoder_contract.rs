@@ -223,7 +223,7 @@ pub struct ValidatedEncoderSource {
     requested_source: WeightsSource,
     weights: WeightsSource,
     config_path: Option<PathBuf>,
-    packed_quant_bits: Option<i32>,
+    packed_quant: Option<PackedQuantization>,
     pinned: PinnedEncoderSource,
     tokenizer: Option<ValidatedTokenizerSource>,
 }
@@ -463,6 +463,18 @@ impl ValidatedEncoderSource {
         self.config_path.is_some()
     }
 
+    /// The packed Q4/Q8 tier this exact validated source stores, or `None` for a dense source.
+    pub fn packed_quant_bits(&self) -> Option<i32> {
+        self.packed_quant.map(|quant| quant.bits as i32)
+    }
+
+    /// The affine group size of the packed tier this exact validated source stores, or `None` for
+    /// a dense source. Paired with [`Self::packed_quant_bits`] so a backend can build the packed
+    /// parts from the validated source instead of re-reading the on-disk `quantization` block.
+    pub fn packed_quant_group_size(&self) -> Option<i32> {
+        self.packed_quant.map(|quant| quant.group_size as i32)
+    }
+
     /// Derive the load-time conversion from the quantization evidence retained by this exact
     /// validated source. This prevents a swap/restore between a second metadata read and payload
     /// load from selecting the conversion for different bytes.
@@ -472,7 +484,7 @@ impl ValidatedEncoderSource {
         provider_id: &str,
     ) -> Result<Option<i32>> {
         self.ensure_unchanged()?;
-        resolve_encoder_load_time_quant_bits(self.packed_quant_bits, expected_bits, provider_id)
+        resolve_encoder_load_time_quant_bits(self.packed_quant_bits(), expected_bits, provider_id)
     }
 
     /// Exact bytes in the direct shard inventory accepted by both backends. Nested files are not
@@ -571,7 +583,7 @@ impl ValidatedEncoderSource {
     ) -> Result<Vec<SafetensorsTensorHeader>> {
         self.ensure_unchanged()?;
         let headers = self.pinned.headers()?;
-        let packing = if self.packed_quant_bits.is_some() {
+        let packing = if self.packed_quant.is_some() {
             Some(contract.packing.ok_or_else(|| {
                 Error::Unsupported(format!(
                     "validated packed encoder has no packing contract for architecture {}",
@@ -853,6 +865,8 @@ fn collect_unique_encoder_headers(
     Ok(headers.into_values().collect())
 }
 
+/// One affine packed-quantization marker as a selected encoder's `config.json` declares it
+/// (`quantization: {bits, group_size}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PackedQuantization {
     bits: usize,
@@ -872,6 +886,12 @@ enum EncoderConfigPolicy {
     /// Legacy ComfyUI exports contain only tensors. Their consuming route freezes the provider's
     /// config/tokenizer policy, so a present sibling config is checked but its absence is allowed.
     ProviderOwnedComfyUi,
+}
+
+impl EncoderConfigPolicy {
+    fn requires_config(self) -> bool {
+        matches!(self, Self::Required)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1380,7 +1400,7 @@ impl EncoderContract {
         let inspected = inspect_encoder_source_for_discovery(
             source,
             allowed_roots,
-            config_policy == EncoderConfigPolicy::Required,
+            config_policy.requires_config(),
             true,
         )?;
         let packed_quant = self.validate_inspected_source(
@@ -1575,7 +1595,7 @@ impl EncoderContract {
             requested_source: source.clone(),
             weights,
             config_path,
-            packed_quant_bits: packed_quant.map(|quant| quant.bits as i32),
+            packed_quant,
             pinned,
             tokenizer,
         })
@@ -1593,7 +1613,7 @@ impl EncoderContract {
         let declared_quant = if let Some((config_path, config)) = config {
             self.validate_config(config, config_path)?;
             parse_packed_quantization(config, config_path)?
-        } else if config_policy == EncoderConfigPolicy::Required {
+        } else if config_policy.requires_config() {
             return Err(Error::Msg(format!(
                 "text encoder substitution has no config.json (source {}); exact behavior, tokenizer, head-topology, and precision compatibility cannot be proven from tensor shapes alone",
                 source_path(requested_source).display()
@@ -1601,7 +1621,6 @@ impl EncoderContract {
         } else {
             None
         };
-
         let language_headers = language_quantization_evidence_headers(headers);
         let packed_quant = validate_quantization_evidence(
             &language_headers,
@@ -1677,7 +1696,7 @@ impl EncoderContract {
                 file.display()
             ))
             })?;
-        if config_policy == EncoderConfigPolicy::Required && !config_path.is_file() {
+        if config_policy.requires_config() && !config_path.is_file() {
             return Err(Error::Unsupported(format!(
                 "embedded text encoder {} requires sibling config.json; tensor headers cannot prove behavior, tokenizer, or head topology",
                 file.display()
@@ -3478,6 +3497,62 @@ fn ensure_discovery_paths_lexically_confined(
         }
     }
     Ok(())
+}
+
+/// The authorized discovery roots for an encoder source living at `path`.
+///
+/// Every root set carries the path itself, lexically absolute and canonical. When `path` lies
+/// inside a Hugging Face cache snapshot — `<hub>/models--<org>--<repo>/snapshots/<revision>/…` —
+/// the repository directory is authorized as well, because a snapshot's files are symlinks into the
+/// sibling `blobs/` tree: the canonical target of `<snapshot>/text_encoder/model-00001.safetensors`
+/// is `<hub>/models--<org>--<repo>/blobs/<sha256>`, which the snapshot directory alone can never
+/// contain. Nothing above the repository directory is authorized, so a symlink escaping it (another
+/// repository, another volume, an arbitrary file) still fails `ensure_discovery_paths_confined`.
+/// The repository directory must lie strictly above the snapshot revision on `path`; a directory
+/// merely *named* `snapshots` elsewhere on the path does not widen the roots.
+///
+/// The repository is derived from the **canonical** path, never the lexical one:
+/// `std::path::absolute` keeps `..` components, so a lexical path such as
+/// `<hub>/models--org--repo/snapshots/<rev>/../../../models--evil--x/text_encoder` names a
+/// `models--org--repo` snapshot ancestor while its real location is an unrelated repository.
+/// Deriving from the canonical path authorizes only the repository the source actually lives in.
+pub fn hf_cache_discovery_roots(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let absolute = std::path::absolute(path)?;
+    let canonical = std::fs::canonicalize(&absolute)?;
+    let mut roots = vec![absolute.clone(), canonical.clone()];
+    if let Some(repository) = hf_cache_repository_dir(&canonical) {
+        roots.push(repository.to_path_buf());
+        // The lexical repository is authorized only when it denotes the same directory as the
+        // canonical one, so a `..`-bearing path cannot smuggle in a sibling repository.
+        if let Some(lexical_repository) = hf_cache_repository_dir(&absolute) {
+            if std::fs::canonicalize(lexical_repository)
+                .is_ok_and(|resolved| resolved == repository)
+            {
+                roots.push(lexical_repository.to_path_buf());
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// `<hub>/models--<org>--<repo>` for an absolute path strictly below that repository's
+/// `snapshots/<revision>` directory, else `None`.
+fn hf_cache_repository_dir(absolute: &Path) -> Option<&Path> {
+    absolute.ancestors().skip(1).find_map(|ancestor| {
+        let snapshots = ancestor.parent()?;
+        let repository = snapshots.parent()?;
+        let is_snapshot_revision = snapshots
+            .file_name()
+            .is_some_and(|name| name == "snapshots")
+            && repository
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("models--"))
+            && ancestor.file_name().is_some();
+        is_snapshot_revision.then_some(repository)
+    })
 }
 
 fn ensure_discovery_paths_confined(paths: &[PathBuf], allowed_roots: &[PathBuf]) -> Result<()> {
@@ -5321,6 +5396,108 @@ mod tests {
             .to_string();
         assert!(error.contains("config declares Q4"), "{error}");
         assert!(error.contains("direct-shard surface is dense"), "{error}");
+    }
+
+    /// sc-22727: a Hugging Face cache snapshot's files are symlinks into the repository's sibling
+    /// `blobs/` tree, so the snapshot directory alone can never confine their canonical targets.
+    /// [`hf_cache_discovery_roots`] authorizes the `models--<org>--<repo>` directory for a path
+    /// below its `snapshots/<revision>`, and nothing above it.
+    #[cfg(unix)]
+    #[test]
+    fn hf_cache_discovery_roots_authorize_the_repository_blobs_and_nothing_above() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let hub = temp.path().join("hub");
+        let repository = hub.join("models--org--repo");
+        let blobs = repository.join("blobs");
+        let snapshot = repository.join("snapshots/0123456789abcdef");
+        let component = snapshot.join("q4/text_encoder");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&component).unwrap();
+        let staged = temp.path().join("staged");
+        write_fixture(&staged, 8);
+        for (name, blob) in [("config.json", "aaaa"), ("model.safetensors", "bbbb")] {
+            std::fs::copy(staged.join(name), blobs.join(blob)).unwrap();
+            symlink(
+                Path::new("../../../../blobs").join(blob),
+                component.join(name),
+            )
+            .unwrap();
+        }
+
+        let roots = hf_cache_discovery_roots(&component).unwrap();
+        assert!(roots.contains(&std::path::absolute(&component).unwrap()));
+        assert!(roots.contains(&std::path::absolute(&repository).unwrap()));
+        assert!(!roots.contains(&hub));
+        // The snapshot-only roots the old callers computed still refuse the blobs target …
+        let error = CONTRACT
+            .validate_source_for_discovery(
+                &WeightsSource::Dir(component.clone()),
+                &authorized_test_roots(&component),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escapes authorized model roots"), "{error}");
+        // … and the repository-aware roots admit it.
+        CONTRACT
+            .validate_source_for_discovery(&WeightsSource::Dir(component.clone()), &roots)
+            .unwrap();
+
+        // A symlink escaping the repository directory stays refused under the wider roots.
+        let outside = temp.path().join("outside");
+        write_fixture(&outside, 8);
+        std::fs::remove_file(component.join("model.safetensors")).unwrap();
+        symlink(
+            outside.join("model.safetensors"),
+            component.join("model.safetensors"),
+        )
+        .unwrap();
+        let error = CONTRACT
+            .validate_source_for_discovery(&WeightsSource::Dir(component.clone()), &roots)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("canonical target"), "{error}");
+        assert!(error.contains("escapes authorized model roots"), "{error}");
+
+        // Outside a cache snapshot the roots are just the path itself.
+        let plain = hf_cache_discovery_roots(&staged).unwrap();
+        assert_eq!(plain, authorized_test_roots(&staged));
+        // A directory merely named `snapshots` above the path does not widen the roots either.
+        let decoy = temp.path().join("models--x--y/snapshots");
+        std::fs::create_dir_all(&decoy).unwrap();
+        assert_eq!(
+            hf_cache_discovery_roots(&decoy).unwrap(),
+            authorized_test_roots(&decoy)
+        );
+        let bare_repository = temp.path().join("models--x--y");
+        assert_eq!(
+            hf_cache_discovery_roots(&bare_repository).unwrap(),
+            authorized_test_roots(&bare_repository)
+        );
+
+        // A `..`-bearing path whose real location is a *different* repository must not authorize
+        // the repository its lexical ancestors name. `std::path::absolute` keeps `..`, so the
+        // repository has to be derived from the canonical path.
+        let sibling = hub.join("models--evil--x/text_encoder");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let traversal = snapshot.join("../../../models--evil--x/text_encoder");
+        let traversal_roots = hf_cache_discovery_roots(&traversal).unwrap();
+        assert!(
+            !traversal_roots.contains(&std::path::absolute(&repository).unwrap()),
+            "{traversal_roots:?}"
+        );
+        assert!(
+            !traversal_roots
+                .iter()
+                .any(|root| std::fs::canonicalize(root).unwrap()
+                    == std::fs::canonicalize(&repository).unwrap()),
+            "{traversal_roots:?}"
+        );
+        assert!(
+            traversal_roots.contains(&std::fs::canonicalize(&sibling).unwrap()),
+            "{traversal_roots:?}"
+        );
     }
 
     #[test]

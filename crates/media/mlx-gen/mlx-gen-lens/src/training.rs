@@ -193,6 +193,8 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     let dit_cfg = LensDitConfig::lens();
     let dit_w = Weights::from_dir(root.join("transformer"))?;
     let transformer = LensTransformer::from_weights(&dit_w, &dit_cfg, dtype)?;
+    // Materialize at load (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`).
+    dit_w.materialize_accessed()?;
     let vae = load_vae(&root)?;
     Ok(Box::new(LensTrainer {
         descriptor: trainer_descriptor(),

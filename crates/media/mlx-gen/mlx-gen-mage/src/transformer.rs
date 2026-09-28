@@ -218,6 +218,16 @@ impl MageTransformer {
         Self::from_weights_draining(&mut weights, cfg)
     }
 
+    /// [`Self::load`] for a load that will arm the block stream: the `transformer_blocks.*` bodies
+    /// stay lazy (the stream re-reads each per window) and only the non-block tensors materialize.
+    pub(crate) fn load_streamed(transformer_dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = transformer_dir.as_ref();
+        let json = std::fs::read_to_string(dir.join(TRANSFORMER_CONFIG_FILE))?;
+        let cfg = MageFlowConfig::from_transformer_config_json(&json)?;
+        let mut weights = Weights::from_file(dir.join(TRANSFORMER_WEIGHTS_FILE))?;
+        Self::from_weights_draining_with(&mut weights, cfg, true)
+    }
+
     /// Build from an already-loaded checkpoint. Keys follow the published diffusers layout
     /// (`img_in`, `txt_norm`, `txt_in`, `time_text_embed.timestep_embedder.linear_{1,2}`,
     /// `transformer_blocks.{i}.*`, `norm_out.linear`, `proj_out`) — no remapping is needed.
@@ -252,23 +262,40 @@ impl MageTransformer {
     /// handle therefore avoids retaining a second full-checkpoint reference while later Q4/Q8
     /// packing materializes replacement buffers.
     pub fn from_weights_draining(w: &mut Weights, cfg: MageFlowConfig) -> Result<Self> {
+        Self::from_weights_draining_with(w, cfg, false)
+    }
+
+    /// Each tensor is materialized before its source handle is drained: left lazy, the first
+    /// forward's command buffers wait on the safetensors reads — past the GPU watchdog on a cold
+    /// page cache (sc-24245; see `mlx_gen_qwen_image::loader::load_transformer_with`). `streamed`
+    /// leaves the block bodies lazy for the block stream to read per window.
+    fn from_weights_draining_with(
+        w: &mut Weights,
+        cfg: MageFlowConfig,
+        streamed: bool,
+    ) -> Result<Self> {
         cfg.validate()?;
         let rope = MsRope::from_config(&cfg)?;
         let img_in = Linear::from_weights(w, "img_in")?;
-        w.remove_prefix("img_in.");
         let txt_norm = w.require("txt_norm.weight")?.clone();
-        w.remove("txt_norm.weight");
         let txt_in = Linear::from_weights(w, "txt_in")?;
-        w.remove_prefix("txt_in.");
         let time_embed = MageTimestepEmbedder::from_weights(w, "time_text_embed")?;
+        w.materialize_accessed()?;
+        w.remove_prefix("img_in.");
+        w.remove("txt_norm.weight");
+        w.remove_prefix("txt_in.");
         w.remove_prefix("time_text_embed.");
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
             let prefix = format!("transformer_blocks.{i}");
             blocks.push(MageTransformerBlock::from_weights(w, &prefix, &cfg)?);
+            if !streamed {
+                w.materialize_accessed()?;
+            }
             w.remove_prefix(&format!("{prefix}."));
         }
         let final_layer = MageFinalLayer::from_weights(w, "norm_out", "proj_out")?;
+        w.materialize_accessed()?;
         w.remove_prefix("norm_out.");
         w.remove_prefix("proj_out.");
         let model = Self {

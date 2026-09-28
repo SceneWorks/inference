@@ -42,6 +42,7 @@ pub use model::{
 pub use model_control::{descriptor_dev_control, load_dev_control, Flux1DevControl};
 pub use pipeline::{
     build_linear_sigmas, create_noise, image_seq_len, pack_latents, unpack_latents,
+    LATENT_CHANNELS, LATENT_PATCH_SIZE, PACKED_TOKEN_WIDTH,
 };
 pub use text_encoder::{
     ClipTextEncoder, FluxTextEncoders, T5BlockStream, T5TextEncoder, T5_BLOCKS,

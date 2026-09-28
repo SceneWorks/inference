@@ -57,9 +57,12 @@
 //! nothing had been evicted at all. A timer wrapped around an unforced precompute reads ~0 for the
 //! same reason.
 //!
-//! [`AdaLnCache::precompute`] therefore calls [`mlx_rs::transforms::eval`] over all
-//! `6 · num_layers` tables **before** returning, and [`AdaLnCache::precompute_and_evict`] only
-//! takes the projections after that call has returned.
+//! [`AdaLnCache::precompute`] therefore calls [`mlx_rs::transforms::eval`] over each block's six
+//! tables **before** returning, and [`AdaLnCache::precompute_and_evict`] only takes the projections
+//! after all those calls have returned. Evaluating all blocks together timed out on a cold load
+//! of the 26 GB projection stack (sc-23108), while the same work succeeded with warm weights.
+//! A separate evaluation per block bounds the lazy read/projection work without warming the
+//! entire model first; the exact driver/kernel timeout mechanism remains unproven.
 //!
 //! # What the two memory measurements each prove
 //!
@@ -499,16 +502,18 @@ impl AdaLnCache {
     /// node holding a reference to its block's `adaln_proj.weight`, so dropping the projection would
     /// free nothing at all and the first denoise step would re-materialize all 26 GB. It is also the
     /// only point at which the precompute's cost is actually incurred — a timer that does not span
-    /// this call reads ~0. The windowed caller evals **per window** for the same reason and is not
-    /// excused by this call: by the time it reaches here its windows have already been released.
+    /// this call reads ~0. Evaluate one block at a time so lazy projection reads cannot accumulate
+    /// across the stack in one Metal submission. The windowed caller enforces the same bound
+    /// before releasing each window; by the time it reaches here its windows are already released.
     pub fn from_layers(schedule: TimestepSchedule, layers: Vec<AdaLnModulation>) -> Result<Self> {
         if layers.is_empty() {
             return Err(Error::Msg(
                 "minimax-h3 adaln cache: no modulation layers were projected".into(),
             ));
         }
-        let flat: Vec<&Array> = layers.iter().flat_map(AdaLnModulation::tables).collect();
-        mlx_rs::transforms::eval(flat)?;
+        for layer in &layers {
+            mlx_rs::transforms::eval(layer.tables())?;
+        }
 
         let bytes = layers
             .iter()

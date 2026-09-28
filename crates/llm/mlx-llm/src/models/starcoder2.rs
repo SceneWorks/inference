@@ -84,13 +84,15 @@ impl StarCoder2 {
                 cfg,
             )?);
         }
-        Ok(Self {
+        let model = Self {
             embed_tokens,
             layers,
             final_norm_weight: w.require(&key("model.norm.weight"))?.clone(),
             final_norm_bias: w.require(&key("model.norm.bias"))?.clone(),
             cfg,
-        })
+        };
+        w.verify_accessed_gpu_view()?;
+        Ok(model)
     }
 
     /// Embed token ids without any positional addition; StarCoder2 positions are RoPE-only.

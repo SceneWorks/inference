@@ -22,3 +22,8 @@ media = ["dep:candle-gen-catalog"]
 # text + TTS via `--no-default-features --features audio` without the image/video provider graph.
 audio = ["dep:candle-audio-catalog"]
 flash-attn = ["candle-llm/flash-attn"]
+
+[dev-dependencies]
+# The registry-wide memory-contract facts walk (sc-22661): the bundle's own acceptance test for
+# epic SC-22657 E1/E2 over every generator this platform registers.
+gen-core-testkit = { package = "sceneworks-gen-core-testkit", path = "../../contracts/gen-core-testkit" }

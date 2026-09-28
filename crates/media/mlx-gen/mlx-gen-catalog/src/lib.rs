@@ -42,6 +42,7 @@ pub mod providers {
     pub use mlx_gen_pid as pid;
     pub use mlx_gen_pulid as pulid;
     pub use mlx_gen_qwen_image as qwen_image;
+    pub use mlx_gen_qwen_image_2_1 as qwen_image_2_1;
     pub use mlx_gen_sam2 as sam2;
     pub use mlx_gen_sam3 as sam3;
     pub use mlx_gen_sana as sana;
@@ -106,6 +107,7 @@ pub fn register_providers(registry: ProviderRegistryBuilder) -> ProviderRegistry
     let registry = mlx_gen_mochi::register_providers(registry);
     let registry = mlx_gen_pulid::register_providers(registry);
     let registry = mlx_gen_qwen_image::register_providers(registry);
+    let registry = mlx_gen_qwen_image_2_1::register_providers(registry);
     let registry = mlx_gen_sana::register_providers(registry);
     let registry = mlx_gen_scail2::register_providers(registry);
     let registry = mlx_gen_sd3::register_providers(registry);
@@ -759,9 +761,10 @@ mod tests {
     fn every_registered_generator_advertises_its_exact_latent_space() {
         use mlx_gen::gen_core::{
             LatentSpace, FLUX1_LATENT_SPACE, FLUX2_PACKED_LATENT_SPACE, LTX_VIDEO_LATENT_SPACE,
-            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_KREA_Z16_LATENT_SPACE,
-            SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE, SEEDVR2_VIDEO_LATENT_SPACE,
-            SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE, WAN_Z48_LATENT_SPACE,
+            MAGE_LATENT_SPACE, MOCHI_VIDEO_LATENT_SPACE, QWEN_IMAGE_2_1_Z64_LATENT_SPACE,
+            QWEN_KREA_Z16_LATENT_SPACE, SANA_LATENT_SPACE, SD3_LATENT_SPACE, SDXL_LATENT_SPACE,
+            SEEDVR2_VIDEO_LATENT_SPACE, SVD_LATENT_SPACE, WAN_Z16_VIDEO_LATENT_SPACE,
+            WAN_Z48_LATENT_SPACE,
         };
 
         fn expected(
@@ -769,6 +772,8 @@ mod tests {
         ) -> Option<&'static LatentSpace> {
             match descriptor.family {
                 "anima" | "qwen-image" | "krea_2" => Some(&QWEN_KREA_Z16_LATENT_SPACE),
+                // Qwen-Image 2.1's 64-channel RGBA autoencoder is its own lineage (sc-24108).
+                "qwen-image-2-1" => Some(&QWEN_IMAGE_2_1_Z64_LATENT_SPACE),
                 "krea_realtime" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
                 "wan" if descriptor.id == "wan2_2_ti2v_5b" => Some(&WAN_Z48_LATENT_SPACE),
                 "bernini" | "scail2" | "wan" => Some(&WAN_Z16_VIDEO_LATENT_SPACE),
@@ -909,6 +914,10 @@ mod tests {
             );
         }
         for id in [
+            // sc-24112: Qwen-Image 2.1 publishes a DERIVED memory model and deliberately registers
+            // no activation anchor — the carrier is measurement-only by contract, so the consumer
+            // fallback is the honest answer until the terminal story measures one.
+            "qwen_image_2_1",
             "sana_1600m",
             "anima_turbo",
             "sensenova_u1_8b_fast",
@@ -932,17 +941,26 @@ mod tests {
     fn every_registered_memory_strategy_rejects_cross_route_decode_geometry() {
         let registry = super::provider_registry().unwrap();
         gen_core_testkit::memory_contract_surface_registry_conformance(&registry);
-        assert_eq!(registry.memory_strategy_registrations().len(), 54);
-        assert_eq!(registry.memory_contract_fixture_registrations().len(), 51);
+        // 58/55 = 54/51 plus two independent sibling additions on this epic branch:
+        // `ideogram_4` and `ideogram_4_turbo` joined the memory registry in sc-22732 — the crate
+        // had no `MemoryProviderContract` at all before, so both ids were absent from every count
+        // below — and sc-22736 added `wan2_2_t2v_14b` and `wan2_2_i2v_14b`, which now carry the
+        // pre-load half of what their loaded generators already publish.
+        // sc-24112 adds `qwen_image_2_1`: the MLX Qwen-Image 2.1 route now publishes the shared
+        // ladder (Resident / StagedResidency / BoundedDecode implemented, the two bounded-DiT rungs
+        // classified `StructurallyNotApplicable`), so it joins both registries — 58/55 -> 59/56.
+        assert_eq!(registry.memory_strategy_registrations().len(), 59);
+        assert_eq!(registry.memory_contract_fixture_registrations().len(), 56);
         let resident_only: Vec<_> = registry
             .resident_only_memory_contract_registrations()
             .map(|registration| registration.provider_id)
             .collect();
         assert_eq!(resident_only, ["krea_realtime_14b", "scail2_14b", "svd_xt"]);
         let surfaces = registry.memory_contract_surfaces().unwrap();
-        // 49 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
-        // joined them in the sc-17137 sync, FLUX.2 Dev Control has its exact fixture, and LTX-2.5
-        // now publishes its physical-tier-aware ladder): these
+        // 51 providers witness the complete 3-tier x 2-policy x 2-shape MLX surface (MiniMax-H3
+        // joined them in the sc-17137 sync, FLUX.2 Dev Control has its exact fixture, LTX-2.5
+        // now publishes its physical-tier-aware ladder, and `ideogram_4` / `ideogram_4_turbo`
+        // joined in sc-22732 with the crate's first memory contract): these
         // providers publish every tier and materialization selector, even where a provider correctly
         // classifies a strategy as Missing. Two video providers publish narrower, truthful
         // inventories instead: LTX has no deferred/block-window loader, so it witnesses the eager
@@ -950,7 +968,16 @@ mod tests {
         // tier. SVD is instead covered by the separate resident-only witness assertion above.
         // Spelling the sum out this way keeps a future provider's narrowing visible in the diff
         // rather than folded into a single total.
-        assert_eq!(surfaces.len(), 49 * 12 + 6 + 3);
+        //
+        // sc-22736 adds the two A14B routes as a THIRD narrowed shape: both ship all three tiers,
+        // and the MLX worker loads every one of them Resident + eagerly materialized, so each
+        // witnesses one selector per tier — 3 apiece, not 12.
+        //
+        // sc-24112's `qwen_image_2_1` is a full-surface provider: it admits all three tiers under
+        // both offload policies and both materialization shapes (its contract classifies the
+        // bounded-DiT rungs rather than narrowing its selector universe), so it joins the 12-apiece
+        // group — 51 -> 52.
+        assert_eq!(surfaces.len(), 52 * 12 + 6 + 3 + 2 * 3);
         assert!(surfaces.iter().all(|surface| !surface.composed));
         let spec = mlx_gen::LoadSpec::new(mlx_gen::WeightsSource::Dir("/nonexistent".into()))
             .with_load_shape(mlx_gen::LoadShape::DeferredMaterialization);
@@ -1076,9 +1103,28 @@ mod tests {
                 implemented += usize::from(expected);
                 assert!(!surface.composed);
                 assert_eq!(surface.contract.asset_facts, Default::default());
+                // sc-22733: a weights-free surface publishes the conformance family for ITS
+                // resolved tier — never the single pre-sc-22733 string, and never a production
+                // `mage-flow-<route>-<tier>-mlx-shared-ladder-v1` cell, which only a loaded
+                // artifact may name.
+                let tier = match surface.resolved_artifact_tier() {
+                    MemoryContractSurfaceTier::Bf16 => None,
+                    MemoryContractSurfaceTier::Q4 => Some(mlx_gen::Quant::Q4),
+                    MemoryContractSurfaceTier::Q8 => Some(mlx_gen::Quant::Q8),
+                    MemoryContractSurfaceTier::Nvfp4 => Some(mlx_gen::Quant::Nvfp4),
+                };
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
                 assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    mlx_gen_mage::model::MEMORY_CALIBRATION_FINGERPRINT
+                    *fingerprint,
+                    mlx_gen_mage::model::weights_free_calibration_fingerprint(provider_id, tier)
+                        .unwrap(),
+                    "{provider_id}: {}",
+                    surface.selector.id()
+                );
+                assert_ne!(
+                    *fingerprint,
+                    mlx_gen_mage::model::production_calibration_fingerprint(provider_id, tier)
+                        .unwrap()
                 );
             }
             assert_eq!(
@@ -1203,10 +1249,27 @@ mod tests {
                 implemented += usize::from(expected);
                 assert!(!surface.composed);
                 assert_eq!(surface.contract.asset_facts, Default::default());
-                assert_eq!(
-                    surface.contract.calibration.as_ref().unwrap().fingerprint,
-                    mlx_gen_krea::block_memory_strategy::MEMORY_CALIBRATION_FINGERPRINT
+                // sc-22735: the weights-free declaration surface publishes a per-(route, tier,
+                // policy) STATIC identity, never a production calibration key. It used to
+                // republish the measured turbo string on all four routes at all three tiers.
+                let fingerprint = &surface.contract.calibration.as_ref().unwrap().fingerprint;
+                assert!(
+                    fingerprint.starts_with(
+                        mlx_gen_krea::block_memory_strategy::STATIC_BEHAVIOR_FINGERPRINT
+                    ),
+                    "{provider_id}: {fingerprint}"
                 );
+                for tier in ["bf16", "q4", "q8"] {
+                    assert_ne!(
+                        *fingerprint,
+                        mlx_gen_krea::block_memory_strategy::production_calibration_fingerprint(
+                            provider_id,
+                            tier
+                        )
+                        .expect("every base route ships every tier"),
+                        "{provider_id}: declaration surface republished a production key"
+                    );
+                }
             }
             assert_eq!(implemented, 3, "{provider_id}");
         }
@@ -1727,6 +1790,7 @@ mod tests {
                 "qwen_image",
                 "qwen_image_control",
                 "qwen_image_edit",
+                "qwen_image_2_1",
                 "sana_1600m",
                 "sana_sprint_1600m",
                 "scail2_14b",
@@ -1794,8 +1858,9 @@ mod tests {
             .chain(&image_embedders)
             .chain(&text_embedders)
             .collect();
-        assert_eq!(distinct.len(), 70);
-        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 60);
+        // sc-24108 adds `qwen_image_2_1` (a generator with its own component row): 71 / 61.
+        assert_eq!(distinct.len(), 71);
+        assert_eq!(super::MLX_MEDIA_PROVIDER_COMPONENTS.len(), 61);
     }
 
     /// Mage-Flow's base, turbo, and RL variants are registered on the shipped MLX platform surface

@@ -35,6 +35,100 @@ pub struct ResidentTensorBytes {
     pub resident_bytes: u64,
 }
 
+/// Describe the exact tensors a provider's block loader streams. Classification belongs to
+/// that loader; this helper only groups already projected bytes and preserves the remainder.
+pub fn streamed_weight_facts(
+    tensors: &[ResidentTensorBytes],
+    classify: impl Fn(&str) -> Option<(String, u32)>,
+) -> Result<Option<gen_core::StreamedWeightFacts>> {
+    use std::collections::BTreeMap;
+    let mut resident_bytes = 0_u64;
+    let mut stacks: BTreeMap<String, BTreeMap<u32, u64>> = BTreeMap::new();
+    for tensor in tensors {
+        let bytes = match classify(&tensor.name) {
+            Some((stack, index)) => stacks.entry(stack).or_default().entry(index).or_default(),
+            None => &mut resident_bytes,
+        };
+        *bytes = bytes
+            .checked_add(tensor.resident_bytes)
+            .ok_or_else(|| Error::Msg("streamed component byte count overflow".to_owned()))?;
+    }
+    if stacks.is_empty() {
+        return Ok(None);
+    }
+    let stacks = stacks
+        .into_iter()
+        .map(|(name, blocks)| {
+            if !blocks.keys().copied().eq(0..blocks.len() as u32) {
+                return Err(Error::Msg(format!(
+                    "streamed stack {name:?} has non-contiguous block indices"
+                )));
+            }
+            Ok(blocks.into_values().collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(gen_core::StreamedWeightFacts {
+        resident_bytes,
+        stacks,
+    }))
+}
+
+/// Split an exact dotted block-stack prefix (`layers.` or `transformer_blocks.`). A provider
+/// that has nested stacks passes the full prefix selected by its loader, including the parent.
+pub fn indexed_block_key(key: &str, prefix: &str) -> Option<(String, u32)> {
+    let (index, _) = key.strip_prefix(prefix)?.split_once('.')?;
+    Some((prefix.to_owned(), index.parse().ok()?))
+}
+
+/// Channel geometry for a provider that executes the shared layer-wise convolution decoder.
+/// The provider supplies its actual upsampling schedule and compute dtype; neither is inferred
+/// from the file's precision or from the denoiser. Missing headers leave the profile unknown.
+pub fn layerwise_decoder_workspace(
+    tensors: &[SafetensorsTensorHeader],
+    block_prefix: &str,
+    spatial_divisors: &[u32],
+    activation_dtype_width: u32,
+) -> Option<gen_core::DecoderWorkspaceFacts> {
+    let channels = spatial_divisors
+        .iter()
+        .enumerate()
+        .map(|(index, divisor)| {
+            if *divisor == 0 {
+                return None;
+            }
+            let key = format!("{block_prefix}{index}.resnets.0.conv1.weight");
+            let tensor = tensors.iter().find(|tensor| tensor.name == key)?;
+            if tensor.shape.len() != 4 {
+                return None;
+            }
+            u32::try_from(tensor.shape[0])
+                .ok()
+                .filter(|channels| *channels > 0)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if channels.is_empty() || activation_dtype_width == 0 {
+        return None;
+    }
+    let input_channels = spatial_divisors
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let key = format!("{block_prefix}{index}.resnets.0.conv1.weight");
+            let tensor = tensors.iter().find(|tensor| tensor.name == key)?;
+            u32::try_from(tensor.shape[1])
+                .ok()
+                .filter(|channels| *channels > 0)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(gen_core::DecoderWorkspaceFacts {
+        tiling: gen_core::DecoderTilingRealization::LayerwiseConvolution,
+        activation_dtype_width,
+        channels,
+        input_channels,
+        spatial_divisors: spatial_divisors.to_vec(),
+    })
+}
+
 pub fn projected_safetensors_tensors(
     path: impl AsRef<Path>,
     projection: impl Fn(&SafetensorsTensorHeader) -> ResidentProjection,
@@ -194,6 +288,60 @@ pub fn projected_tensor_headers_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_inventory_keeps_fixed_tensors_and_rejects_incomplete_stacks() {
+        let tensor = |name: &str, resident_bytes| ResidentTensorBytes {
+            name: name.into(),
+            resident_bytes,
+        };
+        let tensors = vec![
+            tensor("projection.weight", 100),
+            tensor("layers.0.weight", 20),
+            tensor("layers.0.scales", 2),
+            tensor("layers.1.weight", 50),
+        ];
+        let facts = streamed_weight_facts(&tensors, |key| indexed_block_key(key, "layers."))
+            .unwrap()
+            .unwrap();
+        assert_eq!(facts.resident_bytes, 100);
+        assert_eq!(facts.stacks, vec![vec![22, 50]]);
+        assert_eq!(facts.peak_bytes(Some(1)), 150);
+        assert_eq!(facts.peak_bytes(None), 172);
+        assert!(
+            streamed_weight_facts(&[tensor("layers.1.weight", 50)], |key| indexed_block_key(
+                key, "layers."
+            ))
+            .is_err()
+        );
+        assert!(streamed_weight_facts(&tensors, |_| None).unwrap().is_none());
+    }
+
+    #[test]
+    fn decoder_profile_preserves_input_width_and_rejects_missing_stages() {
+        let headers = [(512, 512), (512, 512), (256, 512), (128, 256)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (out, input))| SafetensorsTensorHeader {
+                name: format!("decoder.up_blocks.{i}.resnets.0.conv1.weight"),
+                dtype: gen_core::weightsmeta::Dtype::F16,
+                shape: vec![out, input, 3, 3],
+                data_bytes: (out * input * 9 * 2) as u64,
+            })
+            .collect::<Vec<_>>();
+        let facts =
+            layerwise_decoder_workspace(&headers, "decoder.up_blocks.", &[8, 4, 2, 1], 4).unwrap();
+        assert_eq!(facts.channels, [512, 512, 256, 128]);
+        assert_eq!(facts.input_channels, [512, 512, 512, 256]);
+        assert_eq!(facts.activation_dtype_width, 4);
+        assert!(
+            layerwise_decoder_workspace(&headers[..3], "decoder.up_blocks.", &[8, 4, 2, 1], 4)
+                .is_none()
+        );
+        assert!(
+            layerwise_decoder_workspace(&headers, "decoder.up_blocks.", &[8, 4, 2, 0], 4).is_none()
+        );
+    }
 
     fn write_file(path: &Path, entries: &[(&str, &str, &[usize], usize)]) {
         let mut offset = 0usize;

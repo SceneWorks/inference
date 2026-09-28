@@ -218,6 +218,10 @@ impl ChromaBlockStream {
                 "chroma block stream: materialize double block {index}: {error}"
             ))
         })?;
+        // Read this block's bytes on the CPU stream now, before its forward is encoded; left lazy,
+        // the window's `eval` makes Metal command buffers wait on the disk read — past the GPU
+        // watchdog on a cold page cache (sc-24245).
+        view.materialize_accessed()?;
         // The shared drain (SC-15750): the view keeps its own refcounted handle to every tensor the
         // constructor cloned, so draining exactly the accessed keys is what lets the window's drop
         // release them. **Measured on this family it does not move the request peak** — removing
@@ -253,6 +257,8 @@ impl ChromaBlockStream {
                 "chroma block stream: materialize single block {index}: {error}"
             ))
         })?;
+        // Materialize before the forward is encoded, as for the double blocks (sc-24245).
+        view.materialize_accessed()?;
         view.remove_accessed();
         self.replay(
             &self.single[index],
@@ -737,6 +743,9 @@ mod tests {
             );
             named.push((format!("{p}.norms.{i}.weight"), tensor(vec![hidden], 1.0)));
         }
+        // Saving truncates the same file backing `existing`'s lazy arrays.
+        // Finish those reads first; otherwise the fixture reads its own EOF.
+        mlx_rs::transforms::eval(named.iter().map(|(_, array)| array)).unwrap();
         let refs: Vec<(&str, &Array)> = named.iter().map(|(k, v)| (k.as_str(), v)).collect();
         Array::save_safetensors(refs, None, &path).unwrap();
         (path, cfg)

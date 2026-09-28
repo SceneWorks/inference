@@ -126,6 +126,9 @@ pub struct TurboOptions {
     pub transformer_window_size: Option<usize>,
     /// Request-scoped shared-ladder levers. The default preserves the historical unbounded paths.
     pub memory: mlx_gen::gen_core::GenerationMemory,
+    /// Descriptor id of the provider driving this render. Names the provider in the decode-boundary
+    /// calibration fault (sc-22738), where the model layer's descriptor is out of scope.
+    pub provider_id: &'static str,
 }
 
 impl TurboOptions {
@@ -741,7 +744,6 @@ impl KreaHeavy {
             control_scale,
             None,
             None,
-            None,
             opts,
             cancel,
             &PreviewSink::default(),
@@ -789,7 +791,6 @@ impl KreaHeavy {
         control_scale: f32,
         decoder: Option<&dyn LatentDecoder>,
         decode_tiling: Option<&TilingConfig>,
-        calibration_error_phase: Option<mlx_gen::gen_core::MemoryPhase>,
         opts: &TurboOptions,
         cancel: &CancelFlag,
         preview: &PreviewSink,
@@ -826,17 +827,18 @@ impl KreaHeavy {
             },
         )?;
 
+        // SC-15449/sc-22738: the pose-control denoise exit — `lat` is this image's produced latent —
+        // through the same authorized gate as every other Krea route (the former literal here
+        // honoured the phase without the harness authorization conjunct, so an unauthorized phase
+        // selection could refuse a real render).
+        denoise_exit_fault(&lat, opts)?;
         on_progress(Progress::Decoding);
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        if calibration_error_phase == Some(mlx_gen::gen_core::MemoryPhase::Decode) {
-            return Err(Error::Msg(
-                "krea_2_turbo_control: injected memory-strategy calibration error at Decode"
-                    .to_owned(),
-            ));
-        }
-        self.decode_latents_with_tiling(&lat, decoder, decode_tiling, cancel)
+        let image = self.decode_latents_with_tiling(&lat, decoder, decode_tiling, cancel)?;
+        decode_exit_fault(opts)?;
+        Ok(image)
     }
 
     /// **img2img latent-init Turbo render** (epic 8588 slice A; sc-8589/sc-8590) — the denoise/decode
@@ -1478,7 +1480,14 @@ impl KreaHeavy {
         opts: &TurboOptions,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        self.decode_latents_with_tiling(lat, decoder, opts.decode_tiling()?.as_ref(), cancel)
+        // SC-15449/sc-22738: both phase EXITS for every t2i/img2img/edit/multi-phase route. `lat` is
+        // the denoise phase's produced tensor and every route calls this immediately after its
+        // `run_krea_sampler`, so this is the denoise exit; the decode exit follows the VAE below.
+        denoise_exit_fault(lat, opts)?;
+        let image =
+            self.decode_latents_with_tiling(lat, decoder, opts.decode_tiling()?.as_ref(), cancel)?;
+        decode_exit_fault(opts)?;
+        Ok(image)
     }
 
     /// Decode through the shared trait seam. The native Qwen VAE implements tiled decode; PiD inherits
@@ -1494,6 +1503,47 @@ impl KreaHeavy {
     ) -> Result<Image> {
         decode_latents_via_seam(&self.vae, decoder, lat, decode_tiling, cancel)
     }
+}
+
+/// **Denoise phase EXIT** (sc-22738): the sampler has produced `lat`; materialize it and then raise
+/// an authorized calibration fault for [`mlx_gen::gen_core::MemoryPhase::Denoise`].
+///
+/// The exit convention is the FLUX/Chroma/Qwen one, not the entry convention. The SceneWorks memory
+/// adapter certifies an anchor's lifecycle by injecting an authorized fault at a phase boundary and
+/// then reading the engine's retained bytes, so the phase's real allocation must already exist when
+/// the fault is returned; faulting on the phase's *entry* would hand the adapter a pre-denoise heap
+/// and certify nothing. Mirrors `mlx-gen-chroma/src/model.rs` (`eval` of `final_latents`, then the
+/// `Denoise` fault).
+///
+/// The `eval` is armed-only, mirroring `mlx-gen-flux/src/model.rs`'s guarded force-eval of its lazy
+/// decode: an ordinary render (both controls unset) keeps its laziness byte-for-byte untouched.
+///
+/// `opts.memory` / `opts.provider_id` are the request-scoped selection threaded down from
+/// `model.rs`'s and `model_control.rs`'s `TurboOptions` construction — this is the only place the
+/// base-Krea render body reads them, so a request that loses its memory scope stops faulting.
+fn denoise_exit_fault(lat: &Array, opts: &TurboOptions) -> Result<()> {
+    if crate::memory_strategy::calibration_fault_armed(
+        Some(opts.memory),
+        mlx_gen::gen_core::MemoryPhase::Denoise,
+    ) {
+        mlx_rs::transforms::eval([lat])?;
+    }
+    crate::memory_strategy::calibration_fault_for_memory(
+        Some(opts.memory),
+        mlx_gen::gen_core::MemoryPhase::Denoise,
+        opts.provider_id,
+    )
+}
+
+/// **Decode phase EXIT** (sc-22738): the VAE decode has completed and `decoded_to_image` has read it
+/// back into a host RGB [`Image`], so the decode's allocation is already materialized — there is no
+/// lazy array left to force. Same convention and rationale as [`denoise_exit_fault`].
+fn decode_exit_fault(opts: &TurboOptions) -> Result<()> {
+    crate::memory_strategy::calibration_fault_for_memory(
+        Some(opts.memory),
+        mlx_gen::gen_core::MemoryPhase::Decode,
+        opts.provider_id,
+    )
 }
 
 /// Engine-level decode route shared by Krea's resident, sequential, control, img2img, and edit
@@ -2145,6 +2195,131 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("out_hidden_size"), "{error}");
+    }
+
+    /// sc-22738 (coordinator decision): both render-side faults fire at their phase's EXIT — the
+    /// Denoise fault after the sampler produced the latent, the Decode fault after the VAE produced
+    /// the image — the FLUX/Chroma/Qwen convention (`mlx-gen-chroma/src/model.rs` evals
+    /// `final_latents` then faults; `mlx-gen-flux/src/model.rs` force-evals its lazy decode then
+    /// faults). `decode_latents` is the one denoise-exit/decode-exit pair for the
+    /// t2i/img2img/edit/multi-phase routes; the pose-control route decodes through
+    /// `decode_latents_with_tiling` directly and carries its own pair.
+    #[test]
+    fn both_render_faults_fire_at_their_phase_exit_on_every_route() {
+        let source = include_str!("pipeline.rs");
+        for (route, start, end) in [
+            (
+                "base routes",
+                "    fn decode_latents(\n",
+                "    /// Decode through the shared trait seam.",
+            ),
+            (
+                "pose control",
+                "    pub fn render_control_from(",
+                "    /// **img2img latent-init Turbo render**",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {route} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {route} end"))
+                .0;
+            let denoise = body
+                .find("denoise_exit_fault(")
+                .unwrap_or_else(|| panic!("{route} has no Denoise exit fault"));
+            let decode = body
+                .find("self.decode_latents_with_tiling(")
+                .unwrap_or_else(|| panic!("{route} has no decode call"));
+            let decode_fault = body
+                .find("decode_exit_fault(")
+                .unwrap_or_else(|| panic!("{route} has no Decode exit fault"));
+            assert!(
+                denoise < decode,
+                "{route}: the Denoise fault must precede the VAE decode"
+            );
+            assert!(
+                decode < decode_fault,
+                "{route}: the Decode fault must FOLLOW the VAE decode, not precede it"
+            );
+        }
+        // The pose-control route's Denoise fault must also FOLLOW its own sampler.
+        let control = source
+            .split_once("    pub fn render_control_from(")
+            .expect("render_control_from")
+            .1
+            .split_once("    /// **img2img latent-init Turbo render**")
+            .expect("render_control_from end")
+            .0;
+        assert!(
+            control
+                .find(concat!("run_krea_sampler", "("))
+                .expect("sampler")
+                < control.find("denoise_exit_fault(").expect("denoise exit"),
+            "pose control: the Denoise fault must FOLLOW the sampler, not precede it"
+        );
+    }
+
+    /// sc-22738: every non-control route reaches the exit pair, because each one calls the sampler
+    /// and then hands the produced latent straight to `decode_latents` — nothing between them.
+    #[test]
+    fn every_sampler_route_hands_its_latent_to_the_exit_pair() {
+        let source = include_str!("pipeline.rs");
+        for route in [
+            "    pub fn render_turbo_from(",
+            "    pub fn render_turbo_img2img_from(",
+            "    pub fn render_base_from(",
+            "    pub fn render_base_img2img_from(",
+            "    pub fn render_edit_from(",
+            "    pub fn render_multiphase(",
+        ] {
+            let body = source
+                .split_once(route)
+                .unwrap_or_else(|| panic!("missing {route}"))
+                .1
+                .split_once("\n    }\n")
+                .expect("function end")
+                .0;
+            let decode = body
+                .find("self.decode_latents(")
+                .unwrap_or_else(|| panic!("{route} must decode through `decode_latents`"));
+            // Split literals: `every_krea_sampler_site_flows_through_preview_wrapper` pins the exact
+            // occurrence count of the sampler call in this file, so these probes must not add to it.
+            let sampler = concat!("run_krea_sampler", "(");
+            let phase = concat!("Self::denoise_phase_from", "(");
+            assert!(
+                body[..decode].contains(sampler) || body[..decode].contains(phase),
+                "{route} must denoise before it reaches the exit pair"
+            );
+        }
+    }
+
+    /// sc-22738: the denoise exit helper materializes the produced latent before it raises the fault,
+    /// so the adapter reads a real allocation. The `eval` is armed-only (flux's guarded force-eval),
+    /// so an ordinary render keeps its laziness untouched.
+    #[test]
+    fn the_denoise_exit_fault_evaluates_the_latent_before_refusing() {
+        let source = include_str!("pipeline.rs");
+        let body = source
+            .split_once("fn denoise_exit_fault(")
+            .expect("denoise_exit_fault")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let armed = body
+            .find("calibration_fault_armed(")
+            .expect("armed-only guard");
+        let eval = body.find("eval([lat])").expect("latent materialization");
+        let fault = body
+            .rfind("calibration_fault_for_memory(")
+            .expect("the fault itself");
+        assert!(armed < eval, "the eval must be gated on an armed fault");
+        assert!(
+            eval < fault,
+            "the latent must be evaluated before the fault"
+        );
     }
 
     #[test]
