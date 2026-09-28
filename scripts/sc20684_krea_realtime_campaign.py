@@ -274,12 +274,12 @@ def _checked_output(output: Path) -> Path:
 
 def source_identity(root: Path = ROOT) -> dict[str, Any]:
     status = subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True, check=False
+        ["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True, encoding="utf-8", check=False
     )
     if status.returncode or status.stdout:
         raise CampaignError("campaign source must be a clean git checkout")
     head = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=False
+        ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8", check=False
     )
     if head.returncode or len(head.stdout.strip()) != 40:
         raise CampaignError("cannot resolve checked-out source revision")
