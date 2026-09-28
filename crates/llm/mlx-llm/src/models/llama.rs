@@ -53,7 +53,9 @@ use mlx_rs::{Array, Dtype};
 use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, ModelConfig};
 use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
-use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
+use crate::primitives::attention::{
+    sdpa_capped, sliding_causal_mask, AttnMask, SDPA_EVAL_GROUP_QLEN,
+};
 use crate::primitives::kv_cache::{KvCache, PackedAttentionMask, PackedCacheEvidence};
 use crate::primitives::nn::{
     embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
@@ -957,8 +959,17 @@ impl CausalLm {
         let mut shared = SharedKv::default();
         match &self.stack {
             Stack::Resident(layers) => {
+                let checkpoint_prefill = input_embeds.shape()[1] > SDPA_EVAL_GROUP_QLEN;
                 for (i, layer) in layers.iter().enumerate() {
                     h = layer.forward(&h, ropes, mask, cache, i, &mut shared)?;
+                    if checkpoint_prefill {
+                        // The sequential stack already evaluates its carry per layer. Do the
+                        // same for a long resident prefill: evaluating h also materializes this
+                        // layer's K/V ancestors (residency.rs), then the previous layer's graph
+                        // can be released before the next one is constructed. Decode and short
+                        // prefills keep the existing lazy execution path.
+                        h.eval()?;
+                    }
                     if let Some(sink) = collect.as_deref_mut() {
                         sink.push(h.clone());
                     }

@@ -26,6 +26,10 @@ const MASK_NEG: f32 = -1e30;
 /// `sc7430_*` tripwire test starts failing, the fork is fixed and this whole mitigation can go.
 pub(crate) const SDPA_MAX_FUSED_QLEN: i32 = 8;
 
+/// Maximum query rows left in one unevaluated fused-attention graph during long prefill.
+/// A group is exactly 32 correct-kernel calls; shorter prefills keep their existing lazy path.
+pub(crate) const SDPA_EVAL_GROUP_QLEN: i32 = 256;
+
 /// How attention should be masked.
 #[derive(Debug, Clone, Copy)]
 pub enum AttnMask<'a> {
@@ -156,14 +160,14 @@ fn range_index(start: i32, end: i32) -> Array {
 /// - **Additive**: the mask already encodes visibility, so pass full K/V and slice the mask's query
 ///   axis to `[c0, c1)` (when that axis isn't broadcast).
 ///
-/// The chunk outputs stay **lazy** and are concatenated into one graph for the caller to `eval` — the
-/// same contract as [`sdpa_fused`]. sc-7469 measured the original per-chunk `eval` (a GPU sync every
-/// chunk × every layer, ~1900 syncs for a 512-token 30-layer prefill) at **~95% of total prefill
-/// time**, collapsing a 135M prefill from ~57k to ~1.1k tok/s. It bounded nothing the single forward
-/// `eval` doesn't already bound: MLX frees each chunk's K/V gather as it streams the graph, so peak
-/// transient is one chunk's key prefix, not the sum — exactly as the pre-mitigation fused prefill
-/// (which never OOM'd) behaved ([[mlx-benchmarks-must-bound-memory]] is about unbounded *multi-eval*
-/// sweeps, not one forward's intermediates).
+/// For at most [`SDPA_EVAL_GROUP_QLEN`] query rows the outputs retain the established lazy
+/// concatenate contract. Longer prefills evaluate groups of at most that many query rows before
+/// constructing the next group. This keeps all 8-row outputs from remaining unevaluated in one
+/// graph; the final concatenation still returns one output with identical token semantics. The
+/// group result remains live because the next layer needs every query position. The old per-8-row
+/// `eval` cost roughly 95% of a 512-token, 30-layer prefill (sc-7469); one sync per 256 rows avoids
+/// that specific overhead, but long-prefill throughput still needs measurement. This bounds graph
+/// lifetime, not MLX allocator or process peak bytes.
 fn sdpa_chunked_prefill(
     queries: &Array,
     keys: &Array,
@@ -175,8 +179,12 @@ fn sdpa_chunked_prefill(
     let k_len = keys.shape()[2];
     let offset = k_len - q_len; // cached prefix before the new queries; ≥ 0 for cached decode/prefill
 
-    let mut outs: Vec<Array> =
-        Vec::with_capacity(((q_len + SDPA_MAX_FUSED_QLEN - 1) / SDPA_MAX_FUSED_QLEN) as usize);
+    let checkpoint = q_len > SDPA_EVAL_GROUP_QLEN;
+    let mut outs: Vec<Array> = Vec::with_capacity(
+        ((q_len.min(SDPA_EVAL_GROUP_QLEN) + SDPA_MAX_FUSED_QLEN - 1) / SDPA_MAX_FUSED_QLEN)
+            as usize,
+    );
+    let mut groups = Vec::new();
     let mut c0 = 0;
     while c0 < q_len {
         let c1 = (c0 + SDPA_MAX_FUSED_QLEN).min(q_len);
@@ -201,11 +209,23 @@ fn sdpa_chunked_prefill(
             // `sdpa` materializes the window into `Additive` before it ever reaches here.
             AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
         };
-        outs.push(out); // stay lazy: the caller's single forward `eval` streams + frees each chunk's
-                        // K/V prefix slice, so peak transient is one chunk (sc-7469 — no per-chunk sync)
+        outs.push(out);
+        if checkpoint && (c1 % SDPA_EVAL_GROUP_QLEN == 0 || c1 == q_len) {
+            let refs: Vec<&Array> = outs.iter().collect();
+            let group = concatenate_axis(&refs, 2)?;
+            // Evaluate before dropping the chunk handles. Otherwise the final concat retains the
+            // full prefill's lazy attention graph despite each fused call using only eight rows.
+            group.eval()?;
+            groups.push(group);
+            outs.clear();
+        }
         c0 = c1;
     }
-    let refs: Vec<&Array> = outs.iter().collect();
+    let refs: Vec<&Array> = if checkpoint {
+        groups.iter().collect()
+    } else {
+        outs.iter().collect()
+    };
     Ok(concatenate_axis(&refs, 2)?)
 }
 
@@ -679,6 +699,7 @@ mod tests {
             (32, 8, 40, 40, 128), // Qwen3-like
             (8, 2, 16, 80, 64),   // 16 new queries into a 64-key cache (offset = 64)
             (9, 3, 26, 26, 64),   // SmolLM2-135M prefill shape (the sc-7430 real-model case)
+            (2, 1, 264, 268, 64), // crosses the 256-query evaluation boundary with cached keys
         ];
         for (nh, nkv, ql, kl, hd) in cases {
             let scale = 1.0 / (hd as f32).sqrt();
