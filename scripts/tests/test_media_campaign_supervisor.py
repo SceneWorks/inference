@@ -243,15 +243,15 @@ class WindowsSupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
             self._run(script)
         self.assertTrue(any(amount > 0 for amount in self.sampled))
-        self._assert_exited(int((self.root / "root-pid").read_text()))
-        self._assert_exited(int((self.root / "grandchild-pid").read_text()))
+        self._assert_exited(int((self.root / "root-pid").read_text(encoding="ascii")))
+        self._assert_exited(int((self.root / "grandchild-pid").read_text(encoding="ascii")))
 
     def test_child_cap_aborts_and_reaps(self):
         with self.assertRaisesRegex(safety.SupervisionError, "child-footprint"):
             self._run("import os,time; open('root-pid','w').write(str(os.getpid())); b=bytearray(128*1024*1024); time.sleep(10)",
                       cap=64 * 1024**2)
         self.assertTrue(any(amount > 64 * 1024**2 for amount in self.sampled))
-        self._assert_exited(int((self.root / "root-pid").read_text()))
+        self._assert_exited(int((self.root / "root-pid").read_text(encoding="ascii")))
 
 
 if __name__ == "__main__":
