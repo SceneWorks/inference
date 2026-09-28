@@ -595,21 +595,29 @@ mod tests {
 
     #[test]
     fn repeat_kv_long_sequence_preserves_finite_values() {
-        for seq in [256, 257, 268] {
-            let k = randf(&[1, 2, seq, 64], 2);
-            let expanded = repeat_kv(&k, 2).unwrap();
+        // Include the Llama GQA head ratio (8 KV heads -> 24 query heads) on both sides
+        // of the 256-token expansion boundary, using a small head dimension.
+        for (kv_heads, groups, seq, head_dim) in [
+            (2, 2, 256, 64),
+            (2, 2, 257, 64),
+            (2, 2, 268, 64),
+            (8, 3, 257, 8),
+            (8, 3, 268, 8),
+        ] {
+            let k = randf(&[1, kv_heads, seq, head_dim], 2);
+            let expanded = repeat_kv(&k, groups).unwrap();
             let source = k.as_slice::<f32>();
             let observed = expanded.as_slice::<f32>();
-            let head_len = seq as usize * 64;
-            assert_eq!(observed.len(), 2 * source.len());
-            for head in 0..2 {
-                for copy in 0..2 {
-                    let start = (head * 2 + copy) * head_len;
+            let head_len = seq as usize * head_dim as usize;
+            assert_eq!(observed.len(), groups as usize * source.len());
+            for head in 0..kv_heads as usize {
+                for copy in 0..groups as usize {
+                    let start = (head * groups as usize + copy) * head_len;
                     for offset in 0..head_len {
                         assert_eq!(
                             observed[start + offset],
                             source[head * head_len + offset],
-                            "sequence {seq}, head {head}, copy {copy}, offset {offset}"
+                            "KV heads {kv_heads}, groups {groups}, sequence {seq}, head {head}, copy {copy}, offset {offset}"
                         );
                     }
                 }
