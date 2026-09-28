@@ -10,6 +10,10 @@ Its exact bytes are sealed by
 and validated by
 [`scripts/check_veloxquant_source_audit.py`](../../scripts/check_veloxquant_source_audit.py).
 
+For the separately checked 2026-09-28 upstream state, see the
+[latest-source delta](SC_20672_VELOXQUANT_RESUME_2026_09_28.md). This frozen
+v0.65.0 audit remains a dated source claim.
+
 ## Immutable source and local provenance
 
 The frozen upstream is the annotated **VeloxQuant-MLX v0.65.0** tag object
