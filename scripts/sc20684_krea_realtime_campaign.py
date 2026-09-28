@@ -13,8 +13,15 @@ Example (on the coordinator's held Metal lane, never ordinary CI):
   python3 scripts/sc20684_krea_realtime_campaign.py \
     --snapshot /Volumes/Models/huggingface/hub/models--SceneWorks--krea-realtime-14b-mlx/snapshots/e68e9a3d98187fdf6936838ffcf6df5aa48d6626/q4 \
     --output /Users/michael/.codex/worktrees/epic20669/evidence/sc20684/campaign-$(date +%Y%m%dT%H%M%S) \
-    --product-command 'cargo test -p mlx-gen-krea-realtime --test integration \
-      generate_smoke::sc20684_packed_campaign_observer -- --ignored --nocapture'
+    --safety-policy /absolute/path/sc20684-safety-policy.json \
+    --resume-dir /absolute/external/path/sc20684-resume \
+    --product-command '/absolute/path/to/prebuilt/generate_smoke \
+      --ignored --nocapture sc20684_packed_campaign_observer'
+
+The executable must be built and sealed before invoking this launcher. At the
+current source revision, no defensible whole-process peak bound is established;
+the supervisor therefore refuses each role before spawn, leaving the campaign
+incomplete rather than claiming a runnable or terminal result.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ import math
 import os
 import platform
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -34,11 +42,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts import media_campaign_supervisor as supervisor
 
 ROOT = Path(__file__).resolve().parents[1]
 STORY = "SC-20684"
-SCHEMA_VERSION = 5
-RECEIPT_SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+RECEIPT_SCHEMA_VERSION = 6
 MODEL_REPOSITORY = "SceneWorks/krea-realtime-14b-mlx"
 MODEL_REVISION = "e68e9a3d98187fdf6936838ffcf6df5aa48d6626"
 OBSERVATION_PREFIX = "SC20684_KREA_PROVIDER_OBSERVATION "
@@ -71,6 +81,14 @@ PACKED_GEOMETRY_IDENTITY = {
         "accumulator": "float32",
     },
 }
+DECODE_PLAN_IDENTITY = {
+    "kind": "wan-z16-spatial-tail-v1",
+    "spatialTilePx": 256,
+    "spatialOverlapPx": 64,
+    "temporalTileFrames": 32,
+    "temporalOverlapFrames": 16,
+    "rawDecodedFrames": 28,
+}
 SOURCE_FILES = (
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
     "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs",
@@ -89,7 +107,8 @@ class CampaignError(ValueError):
 def decision_policy() -> dict[str, Any]:
     """Return the source-frozen policy captured before any product process runs."""
     return {
-        "identity": "sc20684-krea-packed-affine-decision-v2",
+        "identity": "sc20684-krea-packed-affine-decision-v3",
+        "decodePlan": DECODE_PLAN_IDENTITY,
         "materialMemory": {
             "minimumReductionBytes": MINIMUM_MEMORY_REDUCTION_BYTES,
             "minimumReductionFraction": MINIMUM_MEMORY_REDUCTION_FRACTION,
@@ -176,6 +195,58 @@ def _sha256_file(path: Path) -> str:
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _validate_source_budget(value: object, mode: str, tier: str, model: dict[str, Any]) -> dict[str, Any]:
+    budget = _object(value, "sourceBudget", {
+        "modelLogicalBytes", "terminalKvBytes", "appendOldStagedAndNewDenseBytes",
+        "decodeWorkingSetEstimateBytes", "runtimeOverheadBytes", "wholeProcessPeakBoundBytes",
+        "decodePlan",
+    })
+    if budget["decodePlan"] != DECODE_PLAN_IDENTITY:
+        raise CampaignError("source budget decode plan differs from frozen campaign plan")
+    if budget["runtimeOverheadBytes"] is not None or budget["wholeProcessPeakBoundBytes"] is not None:
+        raise CampaignError("source budget must leave unmeasured runtime overhead and whole-process peak unknown")
+    logical = sum(model["files"][name]["size"] for name in
+                  ("dit.safetensors", "t5_encoder.safetensors", "vae.safetensors"))
+    if budget["modelLogicalBytes"] != logical:
+        raise CampaignError("source budget logical model bytes differ from sealed inventory")
+    per_token = 435_200 if tier == "q8" else 230_400
+    schedule = (1, 3, 3) if mode == "i2v" else (3, 3, 1)
+    previous = 0
+    append_coexistence = 0
+    for frames in schedule:
+        current = frames * 1_560
+        staged = previous + current
+        append_coexistence = max(append_coexistence,
+                                 (previous + staged) * per_token + current * 819_200)
+        previous = staged
+    if budget["terminalKvBytes"] != previous * per_token or budget["appendOldStagedAndNewDenseBytes"] != append_coexistence:
+        raise CampaignError("source budget KV shape arithmetic differs from campaign geometry")
+    output_voxels = 28 * 480 * 832
+    tile_voxels = 28 * 256 * 256
+    if budget["decodeWorkingSetEstimateBytes"] != 64 * output_voxels + 6_500 * tile_voxels:
+        raise CampaignError("source budget decode estimate differs from frozen z16 plan")
+    return budget
+
+
+def _validate_phase_memory(value: object, phases: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(phases):
+        raise CampaignError("phaseMemory must cover every required phase")
+    previous_peak = 0
+    for index, (record, name) in enumerate(zip(value, phases)):
+        record = _object(record, f"phaseMemory[{index}]", {"phase", "process", "mlxActiveBytes", "mlxCacheBytes"})
+        if record["phase"] != name:
+            raise CampaignError("phaseMemory order or label changed")
+        process = _object(record["process"], f"phaseMemory[{index}].process", {"physFootprintBytes", "physFootprintPeakBytes"})
+        current = _integer(process["physFootprintBytes"], f"phaseMemory[{index}].physFootprintBytes", minimum=1)
+        peak = _integer(process["physFootprintPeakBytes"], f"phaseMemory[{index}].physFootprintPeakBytes", minimum=current)
+        if peak < previous_peak:
+            raise CampaignError("phaseMemory process peak regressed")
+        previous_peak = peak
+        _integer(record["mlxActiveBytes"], f"phaseMemory[{index}].mlxActiveBytes")
+        _integer(record["mlxCacheBytes"], f"phaseMemory[{index}].mlxCacheBytes")
+    return value
 
 
 def _route_lifecycle_snapshot(value: object, name: str) -> dict[str, Any]:
@@ -347,7 +418,7 @@ def _validate_observation(
         {
             "schemaVersion", "producer", "runId", "case", "source", "model", "input",
             "schedule", "toolchain", "geometry", "compiledHandle", "bytes", "timing",
-            "memory", "parity", "quality", "fallback", "cancellation", "output",
+            "memory", "sourceBudget", "phaseMemory", "parity", "quality", "fallback", "cancellation", "output",
         },
     )
     if row["schemaVersion"] != SCHEMA_VERSION or row["producer"] != "mlx-gen-krea-realtime/sc20684":
@@ -361,6 +432,12 @@ def _validate_observation(
         raise CampaignError("provider observation source identity drift")
     if row["model"] != expected_snapshot:
         raise CampaignError("provider observation model identity drift")
+    _validate_source_budget(row["sourceBudget"], expected_mode, expected_tier, expected_snapshot)
+    _validate_phase_memory(row["phaseMemory"], (
+        "weights-loaded", "conditioning-complete", "packed-generation-complete",
+        "packed-decode-complete", "dense-generation-complete", "dense-decode-complete",
+        "cancellation-complete", "release",
+    ))
 
     input_ = _object(
         row["input"],
@@ -737,15 +814,21 @@ def _validate_baseline_observation(
         {
             "schemaVersion", "producer", "runId", "case", "source", "model", "input",
             "schedule", "toolchain", "geometry", "timing", "memory", "output",
+            "sourceBudget", "phaseMemory",
         },
     )
     if row["schemaVersion"] != SCHEMA_VERSION or row["producer"] != "mlx-gen-krea-realtime/sc20684-dense-baseline":
         raise CampaignError("dense baseline schema or producer mismatch")
     if row["runId"] != run_id or row["case"] != {"mode": expected_mode, "cacheTier": expected_tier}:
         raise CampaignError("dense baseline did not report its launched identity")
-    for key in ("source", "model", "input", "schedule", "toolchain"):
+    for key in ("source", "model", "input", "schedule", "toolchain", "sourceBudget"):
         if row[key] != candidate[key]:
             raise CampaignError(f"dense baseline {key} differs from its paired candidate")
+    _validate_source_budget(row["sourceBudget"], expected_mode, expected_tier, candidate["model"])
+    _validate_phase_memory(row["phaseMemory"], (
+        "weights-loaded", "conditioning-complete", "dense-generation-complete",
+        "dense-decode-complete", "release",
+    ))
 
     baseline_geometry = _object(
         row["geometry"],
@@ -852,6 +935,113 @@ def _validate_artifact_directory(row: dict[str, Any], directory: Path) -> None:
 def _file_identity(path: Path, relative: str) -> dict[str, Any]:
     raw = path.read_bytes()
     return {"path": relative, "sha256": _sha256(raw), "bytes": len(raw)}
+
+
+def _prepare_media_resume(
+    root: Path, *, source: dict[str, Any], model: dict[str, Any],
+    policy: supervisor.SafetyPolicy, argv: list[str], timeout: int,
+) -> dict[str, Any]:
+    if not root.is_absolute() or root.is_symlink() or root.resolve() == ROOT.resolve() or ROOT.resolve() in root.resolve().parents:
+        raise CampaignError("resume directory must be absolute, nonsymlink, and outside the repository")
+    executable = Path(argv[0]).resolve()
+    if not executable.is_file() or executable.name == "cargo":
+        raise CampaignError("product command must name a prebuilt sealed observer executable, not cargo")
+    identity = {
+        "schemaVersion": 1, "kind": "sc20684-media-resume",
+        "source": source, "model": model, "policySha256": policy.sha256,
+        "decisionPolicySha256": _canonical_sha256(decision_policy()),
+        "schedule": [list(item) for item in CASES],
+        "executableSha256": _sha256_file(executable), "argv": argv,
+        "timeoutSeconds": timeout,
+    }
+    identity_path = root / "identity.json"
+    if root.exists():
+        try:
+            prior = json.loads(identity_path.read_bytes())
+            identity["source"]["repositoryHead"] = prior["source"]["repositoryHead"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise CampaignError(f"resume identity is malformed: {error}") from error
+    else:
+        root.mkdir(parents=False)
+    encoded = supervisor.canonical(identity)
+    sidecar = f"{_sha256(encoded)}  identity.json\n"
+    if identity_path.exists():
+        if identity_path.read_bytes() != encoded or (root / "identity.json.sha256").read_text(encoding="utf-8") != sidecar:
+            raise CampaignError("resume identity changed executable, model, policy, behavior source, or schedule")
+    else:
+        identity_path.write_bytes(encoded)
+        (root / "identity.json.sha256").write_text(sidecar, encoding="utf-8")
+    for entry in root.iterdir():
+        if entry.is_symlink():
+            raise CampaignError(f"symlinked resume artifact: {entry.name}")
+        if entry.name not in {"identity.json", "identity.json.sha256", "roles", "artifacts", "transcripts", "logs"}:
+            raise CampaignError(f"unexpected resume artifact: {entry.name}")
+    return identity
+
+
+def _role_file_bindings(root: Path, name: str, transcripts: dict[str, Any]) -> list[dict[str, Any]]:
+    files = [transcripts["stdout"], transcripts["stderr"]]
+    cell, role = name.rsplit(".", 1)
+    if role == "paired":
+        artifact_dir = root / "artifacts" / cell
+        if not artifact_dir.is_dir() or artifact_dir.is_symlink():
+            raise CampaignError(f"paired role {name} lacks product artifacts")
+        for path in sorted(item for item in artifact_dir.rglob("*") if item.is_file()):
+            if path.is_symlink():
+                raise CampaignError("resume artifact may not be a symlink")
+            files.append({
+                "path": path.relative_to(root).as_posix(),
+                "sha256": _sha256_file(path), "bytes": path.stat().st_size,
+            })
+    return files
+
+
+def _save_resumed_role(root: Path, name: str, identity: dict[str, Any], record: dict[str, Any]) -> None:
+    roles = root / "roles"
+    roles.mkdir(exist_ok=True)
+    if roles.is_symlink():
+        raise CampaignError("resume role directory may not be symlinked")
+    path = roles / f"{name}.json"
+    if path.exists():
+        raise CampaignError(f"role {name} already has a resume binding")
+    record = dict(record)
+    record.update({
+        "resumeIdentitySha256": _sha256(supervisor.canonical(identity)),
+        "files": _role_file_bindings(root, name, record["transcripts"]),
+    })
+    encoded = supervisor.canonical(record)
+    partial = roles / f".{name}.partial"
+    with partial.open("xb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, path)
+    (roles / f"{name}.json.sha256").write_text(f"{_sha256(encoded)}  {name}.json\n", encoding="utf-8")
+
+
+def _load_resumed_role(root: Path, name: str, identity: dict[str, Any]) -> dict[str, Any] | None:
+    path = root / "roles" / f"{name}.json"
+    sidecar = root / "roles" / f"{name}.json.sha256"
+    if not path.exists() and not sidecar.exists():
+        return None
+    if not path.is_file() or not sidecar.is_file() or path.is_symlink() or sidecar.is_symlink():
+        raise CampaignError(f"partial resume binding for {name}")
+    raw = path.read_bytes()
+    if sidecar.read_text(encoding="utf-8") != f"{_sha256(raw)}  {name}.json\n":
+        raise CampaignError(f"resume role {name} sidecar is corrupt")
+    record = json.loads(raw)
+    if raw != supervisor.canonical(record) or record.get("resumeIdentitySha256") != _sha256(supervisor.canonical(identity)):
+        raise CampaignError(f"resume role {name} is stale or noncanonical")
+    if record.get("exitCode") != 0 or not isinstance(record.get("runId"), str):
+        raise CampaignError(f"resume role {name} did not exit successfully")
+    supervision = record.get("supervision")
+    if not isinstance(supervision, dict) or type(supervision.get("pid")) is not int or supervision["pid"] <= 0 or supervision.get("ownedProcessGroupReaped") is not True:
+        raise CampaignError(f"resume role {name} lacks an owned process identity")
+    if record.get("files") != _role_file_bindings(root, name, record["transcripts"]):
+        raise CampaignError(f"resume role {name} artifact bytes changed")
+    for file in record["files"]:
+        _validate_evidence_file(file, root, f"resume {name} file")
+    return record
 
 
 def _validate_evidence_file(identity: object, root: Path, name: str) -> None:
@@ -1036,14 +1226,20 @@ def run_matrix(
     policy: dict[str, Any],
     timeout: int,
     evidence_root: Path,
+    safety_policy: supervisor.SafetyPolicy,
+    resume_identity: dict[str, Any],
 ) -> list[dict[str, Any]]:
     try:
-        argv = __import__("shlex").split(command)
+        argv = shlex.split(command)
     except ValueError as error:
         raise CampaignError(f"invalid --product-command: {error}") from error
     if not argv:
         raise CampaignError("--product-command must not be empty")
+    if safety_policy.deadline_seconds > timeout:
+        raise CampaignError("safety deadline must not exceed the requested per-role timeout")
     rows: list[dict[str, Any]] = []
+    used_run_ids: set[str] = set()
+    used_pids: set[int] = set()
     for mode, tier in CASES:
         cell_name = f"{mode}-{tier}"
         artifact_dir = evidence_root / "artifacts" / cell_name
@@ -1053,6 +1249,34 @@ def run_matrix(
         observations: dict[str, Any] = {}
         transcripts: dict[str, dict[str, Any]] = {}
         for role in ("paired", "dense-baseline"):
+            role_name = f"{cell_name}.{role}"
+            saved = _load_resumed_role(evidence_root, role_name, resume_identity)
+            if saved is not None:
+                run_id = saved["runId"]
+                pid = saved["supervision"]["pid"]
+                if run_id in used_run_ids or pid in used_pids:
+                    raise CampaignError(f"resume role {role_name} reuses a process identity")
+                used_run_ids.add(run_id)
+                used_pids.add(pid)
+                stdout_path = evidence_root / saved["transcripts"]["stdout"]["path"]
+                stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+                transcripts[role] = saved["transcripts"]
+                observations[f"{role}-process-exit-code"] = saved["exitCode"]
+                if role == "paired":
+                    observations[role] = _validate_observation(
+                        _read_observation(stdout), expected_mode=mode, expected_tier=tier,
+                        run_id=run_id, expected_source=source, expected_snapshot=model,
+                    )
+                    _validate_artifact_directory(observations[role], artifact_dir)
+                else:
+                    observations[role] = _validate_baseline_observation(
+                        _read_observation(stdout, BASELINE_PREFIX),
+                        expected_mode=mode, expected_tier=tier, run_id=run_id,
+                        candidate=observations["paired"],
+                    )
+                if saved["observationSha256"] != _canonical_sha256(observations[role]):
+                    raise CampaignError(f"resume role {role_name} observation identity changed")
+                continue
             run_id = str(uuid.uuid4())
             env = os.environ.copy()
             env.update({
@@ -1064,25 +1288,36 @@ def run_matrix(
                 "KREA_SC20684_MODEL_REVISION": MODEL_REVISION,
                 "KREA_SC20684_MEASUREMENT_ROLE": role,
                 "KREA_SC20684_ARTIFACT_DIR": str(artifact_dir),
+                "KREA_SC20684_IDENTITY_PATH": str(evidence_root / "identity.json"),
             })
             if tier == "q4":
                 # The Q4 arm is a separately named experiment.  This is a selector only; measured
                 # quality still has to arrive from the provider-owned observer and pass reduction.
                 env["KREA_SC20684_Q4_QUALITY_ARM"] = "acknowledged"
-            try:
-                result = subprocess.run(argv, cwd=ROOT, env=env, capture_output=True, timeout=timeout, check=False)
-            except subprocess.TimeoutExpired as error:
-                raise CampaignError(f"{mode}/{tier}/{role} product command timed out after {timeout}s") from error
             stdout_path = transcript_dir / f"{cell_name}.{role}.stdout.log"
             stderr_path = transcript_dir / f"{cell_name}.{role}.stderr.log"
-            stdout_path.write_bytes(result.stdout)
-            stderr_path.write_bytes(result.stderr)
+            if stdout_path.exists() or stderr_path.exists():
+                raise CampaignError(f"partial {role_name} transcript exists without valid resume binding")
+            attempt = len(list((evidence_root / "logs").glob(f"{role_name}.*.stdout.log")))
+            logs = evidence_root / "logs"
+            result = supervisor.run_guarded(
+                argv, cwd=ROOT, env=env, policy=safety_policy,
+                stdout_path=logs / f"{role_name}.{attempt}.stdout.log",
+                stderr_path=logs / f"{role_name}.{attempt}.stderr.log",
+                source_peak_host_bytes=None,  # No justified whole-process peak bound at this HEAD.
+            )
+            if run_id in used_run_ids or result.pid in used_pids:
+                raise CampaignError(f"role {role_name} reuses a process identity")
+            used_run_ids.add(run_id)
+            used_pids.add(result.pid)
+            shutil.copyfile(logs / f"{role_name}.{attempt}.stdout.log", stdout_path)
+            shutil.copyfile(logs / f"{role_name}.{attempt}.stderr.log", stderr_path)
             transcripts[role] = {
                 "stdout": _file_identity(stdout_path, f"transcripts/{stdout_path.name}"),
                 "stderr": _file_identity(stderr_path, f"transcripts/{stderr_path.name}"),
             }
             observations[f"{role}-process-exit-code"] = result.returncode
-            stdout = result.stdout.decode("utf-8", errors="replace")
+            stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
             if role == "paired":
                 observations[role] = _validate_observation(
                     _read_observation(stdout),
@@ -1101,6 +1336,18 @@ def run_matrix(
                     run_id=run_id,
                     candidate=observations["paired"],
                 )
+            _save_resumed_role(evidence_root, role_name, resume_identity, {
+                "runId": run_id, "exitCode": result.returncode,
+                "transcripts": transcripts[role],
+                "observationSha256": _canonical_sha256(observations[role]),
+                "supervision": {
+                    "pid": result.pid, "peakHostBytes": result.peak_host_bytes,
+                    "peakGpuBytes": result.peak_gpu_bytes,
+                    "hostFreeAtLaunch": result.host_free_at_launch,
+                    "elapsedSeconds": result.elapsed_seconds,
+                    "ownedProcessGroupReaped": True,
+                },
+            })
         candidate = observations["paired"]
         baseline = observations["dense-baseline"]
         candidate_phys = candidate["memory"]["candidateTerminal"]["physFootprintPeakBytes"]
@@ -1227,6 +1474,8 @@ def publish(
     rows: list[dict[str, Any]],
     evidence_root: Path,
     policy: dict[str, Any] | None = None,
+    safety_policy: supervisor.SafetyPolicy | None = None,
+    resume_identity: dict[str, Any] | None = None,
 ) -> Path:
     output = _checked_output(output)
     policy = policy if policy is not None else decision_policy()
@@ -1253,9 +1502,14 @@ def publish(
                 _validate_evidence_file(row["transcripts"][role]["stderr"], evidence_root, f"{role} stderr transcript")
         shutil.copytree(evidence_root / "artifacts", temporary / "artifacts")
         shutil.copytree(evidence_root / "transcripts", temporary / "transcripts")
+        if safety_policy is not None and resume_identity is not None:
+            shutil.copytree(evidence_root / "roles", temporary / "roles")
         encoded = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
         (temporary / "receipt.json").write_bytes(encoded)
         (temporary / "receipt.json.sha256").write_text(f"{_sha256(encoded)}  receipt.json\n", encoding="utf-8")
+        if safety_policy is not None and resume_identity is not None:
+            (temporary / "safety-policy.json").write_bytes(safety_policy.canonical_bytes)
+            (temporary / "resume-identity.json").write_bytes(supervisor.canonical(resume_identity))
         manifest_rows = []
         for path in sorted(path for path in temporary.rglob("*") if path.is_file()):
             relative = path.relative_to(temporary).as_posix()
@@ -1274,6 +1528,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True, help="new external receipt directory")
     parser.add_argument("--product-command", required=True, help="product-owned observer command, executed in fresh paired and dense-baseline processes per matrix cell")
     parser.add_argument("--timeout", type=int, default=7200, help="per-cell command timeout in seconds")
+    parser.add_argument("--safety-policy", type=Path, required=True, help="mandatory source-bound process safety policy")
+    parser.add_argument("--resume-dir", type=Path, required=True, help="absolute external identity-bound role staging")
     args = parser.parse_args()
     try:
         if args.timeout <= 0:
@@ -1282,32 +1538,33 @@ def main() -> int:
         policy = decision_policy()
         source = source_identity()
         model = snapshot_identity(args.snapshot)
-        evidence_root = Path(tempfile.mkdtemp(prefix=f".{output.name}.evidence-", dir=output.parent))
+        safety_policy = supervisor.load_policy(args.safety_policy)
+        if safety_policy.backend != "darwin-mlx":
+            raise CampaignError("Krea SC-20684 requires the Darwin/MLX safety backend")
+        if not args.resume_dir.is_absolute() or args.resume_dir.resolve() == output:
+            raise CampaignError("resume directory must be absolute and distinct from output")
         try:
-            rows = run_matrix(
-                args.product_command,
-                args.snapshot.resolve(),
-                source,
-                model,
-                policy,
-                args.timeout,
-                evidence_root,
-            )
-            if source_identity() != source:
-                raise CampaignError("campaign source changed after decision policy was frozen")
-            if snapshot_identity(args.snapshot) != model:
-                raise CampaignError("model snapshot changed during the campaign")
-            publish(
-                output,
-                source=source,
-                model=model,
-                rows=rows,
-                evidence_root=evidence_root,
-                policy=policy,
-            )
-        finally:
-            shutil.rmtree(evidence_root, ignore_errors=True)
-    except CampaignError as error:
+            command = shlex.split(args.product_command)
+        except ValueError as error:
+            raise CampaignError(f"invalid product command: {error}") from error
+        resume_identity = _prepare_media_resume(
+            args.resume_dir, source=source, model=model, policy=safety_policy,
+            argv=command, timeout=args.timeout,
+        )
+        source = resume_identity["source"]
+        rows = run_matrix(
+            args.product_command, args.snapshot.resolve(), source, model, policy,
+            args.timeout, args.resume_dir, safety_policy, resume_identity,
+        )
+        if source_identity()["files"] != source["files"]:
+            raise CampaignError("campaign behavior source changed after identity was frozen")
+        if snapshot_identity(args.snapshot) != model:
+            raise CampaignError("model snapshot changed during the campaign")
+        publish(
+            output, source=source, model=model, rows=rows, evidence_root=args.resume_dir,
+            policy=policy, safety_policy=safety_policy, resume_identity=resume_identity,
+        )
+    except (CampaignError, supervisor.SupervisionError) as error:
         print(f"SC-20684 campaign refused: {error}", file=sys.stderr)
         return 1
     result = campaign_decision(rows, policy)

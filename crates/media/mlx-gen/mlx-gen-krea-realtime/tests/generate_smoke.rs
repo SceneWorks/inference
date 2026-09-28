@@ -797,6 +797,126 @@ const SC20684_Q4_MEAN_ABS_RGB_U8: f64 = 3.0;
 const SC20684_Q8_TEMPORAL_DELTA_DRIFT: f64 = 4.0;
 const SC20684_Q4_TEMPORAL_DELTA_DRIFT: f64 = 12.0;
 
+// This is the measured z16 spatial candidate from the real-latent sweep below. The
+// 28-frame decode fits in one temporal tile; the spatial upsample tail is bounded.
+// Keep this exact plan common to packed, paired dense, and fresh dense baseline.
+fn sc20684_decode_plan() -> mlx_gen::tiling::TilingConfig {
+    mlx_gen::tiling::TilingConfig {
+        spatial: Some(mlx_gen::tiling::SpatialTiling {
+            tile_px: 256,
+            overlap_px: 64,
+        }),
+        temporal: Some(mlx_gen::tiling::TemporalTiling {
+            tile_frames: 32,
+            overlap_frames: 16,
+        }),
+    }
+}
+
+fn sc20684_decode_plan_identity(raw_decoded_frames: usize) -> serde_json::Value {
+    let plan = sc20684_decode_plan();
+    let spatial = plan.spatial.expect("SC-20684 spatial decode tile");
+    let temporal = plan.temporal.expect("SC-20684 temporal decode tile");
+    serde_json::json!({
+        "kind": "wan-z16-spatial-tail-v1",
+        "spatialTilePx": spatial.tile_px,
+        "spatialOverlapPx": spatial.overlap_px,
+        "temporalTileFrames": temporal.tile_frames,
+        "temporalOverlapFrames": temporal.overlap_frames,
+        "rawDecodedFrames": raw_decoded_frames,
+    })
+}
+
+#[test]
+fn sc20684_decode_plan_prices_the_full_raw_frame_count() {
+    let plan = sc20684_decode_plan();
+    let identity = sc20684_decode_plan_identity(28);
+    assert_eq!(plan.spatial.as_ref().expect("spatial bound").tile_px, 256);
+    assert_eq!(
+        plan.temporal.as_ref().expect("temporal bound").tile_frames,
+        32
+    );
+    assert_eq!(identity["rawDecodedFrames"], 28);
+    let estimate = mlx_gen_wan::pipeline::video_decode_peak_bytes_for_vae_and_tiling(
+        mlx_gen_wan::WanVae::VAE_TILING,
+        832,
+        480,
+        28,
+        Some(&sc20684_decode_plan()),
+    );
+    assert_eq!(estimate, Some(12_643_205_120));
+}
+
+fn sc20684_phase_memory(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "phase": name,
+        "process": sc20684_process_memory(),
+        "mlxActiveBytes": mlx_rs::memory::get_active_memory() as u64,
+        "mlxCacheBytes": mlx_rs::memory::get_cache_memory() as u64,
+    })
+}
+
+fn sc20684_source_budget(
+    config: &KreaRealtimeConfig,
+    mode: Sc20684Mode,
+    root: &Path,
+    width: usize,
+    height: usize,
+    frames: usize,
+) -> serde_json::Value {
+    let frame_tokens = config.ar.frame_seq_length;
+    let frame_schedule: &[usize] = if mode == Sc20684Mode::I2v {
+        &[1, 3, 3]
+    } else {
+        &[3, 3, 1]
+    };
+    let packed_bytes_per_token = config.kv_bytes_per_token().expect("valid SC-20684 KV tier");
+    let dense_bytes_per_token = 2 * config.wan.num_layers * config.wan.dim * 2;
+    let mut previous_tokens = 0usize;
+    let mut append_coexistence = 0usize;
+    for &chunk_frames in frame_schedule {
+        let new_tokens = frame_tokens * chunk_frames;
+        let staged_tokens = previous_tokens + new_tokens;
+        append_coexistence = append_coexistence.max(
+            (previous_tokens + staged_tokens) * packed_bytes_per_token
+                + new_tokens * dense_bytes_per_token,
+        );
+        previous_tokens = staged_tokens;
+    }
+    let logical_model_bytes: u64 = [
+        "dit.safetensors",
+        "t5_encoder.safetensors",
+        "vae.safetensors",
+    ]
+    .iter()
+    .map(|name| {
+        std::fs::metadata(root.join(name))
+            .expect("SC-20684 model metadata")
+            .len()
+    })
+    .sum();
+    let raw_decoded_frames = 4 * ((frames - 1) / 4 + 1);
+    let decode_plan = sc20684_decode_plan();
+    let decode_working_set_estimate =
+        mlx_gen_wan::pipeline::video_decode_peak_bytes_for_vae_and_tiling(
+            mlx_gen_wan::WanVae::VAE_TILING,
+            width as u32,
+            height as u32,
+            raw_decoded_frames as u32,
+            Some(&decode_plan),
+        )
+        .expect("SC-20684 fixed z16 decode estimate");
+    serde_json::json!({
+        "modelLogicalBytes": logical_model_bytes,
+        "terminalKvBytes": previous_tokens * packed_bytes_per_token,
+        "appendOldStagedAndNewDenseBytes": append_coexistence,
+        "decodeWorkingSetEstimateBytes": decode_working_set_estimate,
+        "runtimeOverheadBytes": null,
+        "wholeProcessPeakBoundBytes": null,
+        "decodePlan": sc20684_decode_plan_identity(raw_decoded_frames),
+    })
+}
+
 impl Sc20684Mode {
     fn parse() -> Self {
         match std::env::var("KREA_SC20684_REQUEST_MODE").as_deref() {
@@ -890,7 +1010,22 @@ fn sc20684_metal_device() -> String {
 }
 
 fn sc20684_source_identity(root: &Path) -> serde_json::Value {
-    let head = sc20684_command("git", &["-C", root.to_str().unwrap(), "rev-parse", "HEAD"]);
+    // The launcher freezes provenance before the first arm. Verify its captured
+    // behavior bytes and executable before stamping a later resumed observation.
+    let identity_path = std::env::var("KREA_SC20684_IDENTITY_PATH")
+        .expect("SC-20684 launcher must supply its sealed resume identity");
+    let identity: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(identity_path).expect("read SC-20684 resume identity"),
+    )
+    .expect("parse SC-20684 resume identity");
+    let executable = std::env::current_exe().expect("resolve SC-20684 observer executable");
+    let executable_sha =
+        sc20684_sha256(&std::fs::read(executable).expect("hash observer executable"));
+    assert_eq!(
+        identity["executableSha256"].as_str(),
+        Some(executable_sha.as_str()),
+        "SC-20684 observer executable differs from captured resume identity"
+    );
     let files = [
         "crates/media/mlx-gen/mlx-gen-krea-realtime/src/causal.rs",
         "crates/media/mlx-gen/mlx-gen-krea-realtime/src/compressed_kv.rs",
@@ -909,7 +1044,13 @@ fn sc20684_source_identity(root: &Path) -> serde_json::Value {
             )),
         );
     }
-    serde_json::json!({"repositoryHead": head, "files": hashes})
+    let source = identity["source"].clone();
+    let head = source["repositoryHead"]
+        .as_str()
+        .expect("SC-20684 captured source revision");
+    assert!(head.len() == 40 && head.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(source["files"], serde_json::Value::Object(hashes));
+    source
 }
 
 fn sc20684_model_identity(snapshot: &Path) -> serde_json::Value {
@@ -1406,6 +1547,8 @@ fn sc20684_packed_campaign_observer() {
         mlx_rs::transforms::eval([&value]).expect("materialize product prompt context");
         value
     };
+    drop(text_weights);
+    drop(tokenizer);
     let dit_weights = mlx_gen::weights::Weights::from_file(root.join("dit.safetensors"))
         .expect("open product DiT");
     let raw: std::collections::HashMap<String, Array> = dit_weights
@@ -1419,18 +1562,24 @@ fn sc20684_packed_campaign_observer() {
         .collect();
     let (dit, _) = load_krea_realtime_transformer_with_quant(raw, &config)
         .expect("load product Krea transformer");
+    drop(dit_weights);
     let transformer = CausalKreaTransformer::new(dit, &config);
     let vae_weights = mlx_gen::weights::Weights::from_file(root.join("vae.safetensors"))
         .expect("open product VAE");
     let vae = WanVae::from_weights(&vae_weights).expect("load product VAE");
+    drop(vae_weights);
     let load_elapsed = load_started.elapsed();
     let weights_loaded = sc20684_process_memory();
     let weights_loaded_active = mlx_rs::memory::get_active_memory() as u64;
     let weights_loaded_cache = mlx_rs::memory::get_cache_memory() as u64;
+    let mut phase_memory = vec![sc20684_phase_memory("weights-loaded")];
+    let source_budget = sc20684_source_budget(&config, mode, &root, width, height, frames);
+    let decode_plan = sc20684_decode_plan();
 
     let conditioning_started = Instant::now();
     let (conditioning, input) = sc20684_conditioning(mode, &vae, &config, width, height, frames, 7);
     let conditioning_elapsed = conditioning_started.elapsed();
+    phase_memory.push(sc20684_phase_memory("conditioning-complete"));
     let generated_latent_frames = if mode == Sc20684Mode::I2v {
         latent_frames
             .checked_sub(1)
@@ -1485,27 +1634,33 @@ fn sc20684_packed_campaign_observer() {
             steps_per_chunk,
             config.ar.num_frames_per_block,
         );
+        phase_memory.push(sc20684_phase_memory("dense-generation-complete"));
         let decode_started = Instant::now();
         let dense_media = decode_latents_to_video(
             &vae,
             &dense_latents,
             24,
             Some(frames),
-            None,
+            Some(&decode_plan),
             &mlx_gen::CancelFlag::default(),
         )
         .expect("decode dense SC-20684 baseline media");
         let decode_elapsed = decode_started.elapsed();
+        phase_memory.push(sc20684_phase_memory("dense-decode-complete"));
         let (output_sha256, dense_frames) = sc20684_hash_video(&dense_media);
+        let output_frame_count = dense_frames.len();
         let key_tokens = dense_cache.stored_tokens();
         let terminal_process = sc20684_process_memory();
         let terminal_active = mlx_rs::memory::get_active_memory() as u64;
         let terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
         let exact_active_peak = mlx_rs::memory::get_peak_memory() as u64;
+        drop(dense_media);
+        drop(dense_frames);
         drop(dense_cache);
         drop(dense_latents);
         drop(conditioning);
         mlx_rs::memory::clear_cache();
+        phase_memory.push(sc20684_phase_memory("release"));
         let release_process = sc20684_process_memory();
         let release_active = mlx_rs::memory::get_active_memory() as u64;
         let release_cache = mlx_rs::memory::get_cache_memory() as u64;
@@ -1528,11 +1683,11 @@ fn sc20684_packed_campaign_observer() {
         let request_first_frame_ms =
             (conditioning_elapsed + generation_elapsed + decode_elapsed).as_secs_f64() * 1000.0;
         let mean_output_frame_ms = (generation_elapsed + decode_elapsed).as_secs_f64() * 1000.0
-            / dense_frames.len() as f64;
+            / output_frame_count as f64;
         let repository = sc20684_repository_root();
         let tool = |program: &str, args: &[&str]| sc20684_command(program, args);
         let observation = serde_json::json!({
-            "schemaVersion": 5,
+            "schemaVersion": 6,
             "producer": "mlx-gen-krea-realtime/sc20684-dense-baseline",
             "runId": run_id,
             "case": {"mode": mode.name(), "cacheTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }},
@@ -1547,6 +1702,8 @@ fn sc20684_packed_campaign_observer() {
             },
             "toolchain": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "rustc": tool("rustc", &["--version"]), "cargo": tool("cargo", &["--version"]), "mlx": "mlx-rs-linked", "hardwareModel": tool("sysctl", &["-n", "hw.model"]), "metalDevice": sc20684_metal_device()},
             "geometry": {"batch": 1, "heads": config.wan.num_heads, "queryTokens": config.ar.frame_seq_length * config.ar.num_frames_per_block, "keyTokens": key_tokens, "dispatchGeometries": [], "headDim": config.wan.head_dim(), "groupSize": 64, "queryTile": 8, "keyTile": 8, "dtypes": {"packedCodes": "uint32", "packedMetadata": "bfloat16", "queryAndCurrentKv": "bfloat16", "accumulator": "float32"}, "mask": "block-causal", "width": width, "height": height, "frames": frames, "latentFrames": latent_frames, "generatedLatentFrames": generated_latent_frames},
+            "sourceBudget": source_budget,
+            "phaseMemory": phase_memory,
             "timing": {
                 "label": "fresh-process-full-schedule-dense-read-window-baseline",
                 "processWallMs": campaign_started.elapsed().as_secs_f64() * 1000.0,
@@ -1614,6 +1771,7 @@ fn sc20684_packed_campaign_observer() {
         steps_per_chunk,
         config.ar.num_frames_per_block,
     );
+    phase_memory.push(sc20684_phase_memory("packed-generation-complete"));
     let packed_terminal = sc20684_process_memory();
     let packed_decode_started = Instant::now();
     let packed_media = decode_latents_to_video(
@@ -1621,16 +1779,19 @@ fn sc20684_packed_campaign_observer() {
         &packed_latents,
         24,
         Some(frames),
-        None,
+        Some(&decode_plan),
         &mlx_gen::CancelFlag::default(),
     )
     .expect("decode packed product media");
     let packed_decode_elapsed = packed_decode_started.elapsed();
+    phase_memory.push(sc20684_phase_memory("packed-decode-complete"));
     let (output_sha256, packed_frames) = sc20684_hash_video(&packed_media);
+    let packed_frame_count = packed_frames.len();
     let candidate_terminal = sc20684_process_memory();
     let candidate_terminal_active = mlx_rs::memory::get_active_memory() as u64;
     let candidate_terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
     let exact_active_peak = mlx_rs::memory::get_peak_memory() as u64;
+    drop(packed_media);
     let allocator = allocator_probe.finish();
     let candidate_wall_ms = campaign_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -1642,6 +1803,8 @@ fn sc20684_packed_campaign_observer() {
         &conditioning,
         false,
     );
+    drop(conditioning);
+    phase_memory.push(sc20684_phase_memory("dense-generation-complete"));
     mlx_rs::transforms::eval([&packed_latents, &dense_latents])
         .expect("materialize paired parity latents");
     let parity_error = mlx_rs::ops::subtract(&packed_latents, &dense_latents)
@@ -1663,17 +1826,21 @@ fn sc20684_packed_campaign_observer() {
         &dense_latents,
         24,
         Some(frames),
-        None,
+        Some(&decode_plan),
         &mlx_gen::CancelFlag::default(),
     )
     .expect("decode dense product media");
     let dense_decode_elapsed = dense_decode_started.elapsed();
+    phase_memory.push(sc20684_phase_memory("dense-decode-complete"));
     let (dense_output_sha256, dense_frames) = sc20684_hash_video(&dense_media);
+    drop(dense_media);
+    drop(dense_latents);
     let quality_error = sc20684_max_rgb_error(&packed_frames, &dense_frames);
     let quality_mean_error = mean_abs_delta(&packed_frames, &dense_frames);
     let packed_temporal_delta = sc20684_mean_temporal_delta(&packed_frames);
     let dense_temporal_delta = sc20684_mean_temporal_delta(&dense_frames);
     let temporal_delta_drift = (packed_temporal_delta - dense_temporal_delta).abs();
+    drop(dense_frames);
     let quality_tolerance = if matches!(tier, KvCacheQuant { bits: 8, .. }) {
         SC20684_Q8_MAX_ABS_RGB_U8
     } else {
@@ -1714,10 +1881,13 @@ fn sc20684_packed_campaign_observer() {
             "bytes": bytes.len(),
         }));
     }
+    drop(packed_frames);
 
     let receipt = packed_cache
         .packed_metal_route_receipt()
         .expect("packed route owns its retained kernel");
+    let key_tokens = packed_cache.stored_tokens();
+    drop(packed_cache);
     let mut cancelled_cache = transformer.new_cache();
     cancelled_cache
         .enable_experimental_packed_metal(matches!(tier, KvCacheQuant { bits: 4, .. }))
@@ -1730,6 +1900,7 @@ fn sc20684_packed_campaign_observer() {
         .expect("select deterministic cancellation context latent");
     mlx_rs::transforms::eval([&cancellation_context_latents])
         .expect("materialize deterministic cancellation context latent");
+    drop(packed_latents);
     let cancellation_conditioning = RefConditioning {
         context_latents: Some(cancellation_context_latents),
         source: None,
@@ -1791,6 +1962,7 @@ fn sc20684_packed_campaign_observer() {
         && cancellation_route_allocation_observed
         && cancellation_state_unchanged
         && cancellation_scratch_released;
+    phase_memory.push(sc20684_phase_memory("cancellation-complete"));
 
     let steady_forward_ns = u64::try_from(receipt.steady_evaluated_forward_count)
         .ok()
@@ -1809,18 +1981,14 @@ fn sc20684_packed_campaign_observer() {
     let request_first_frame_ms =
         (conditioning_elapsed + packed_elapsed + packed_decode_elapsed).as_secs_f64() * 1000.0;
     let cold_process_first_frame_ms = load_elapsed.as_secs_f64() * 1000.0 + request_first_frame_ms;
-    let mean_output_frame_ms = (packed_elapsed + packed_decode_elapsed).as_secs_f64() * 1000.0
-        / packed_frames.len() as f64;
+    let mean_output_frame_ms =
+        (packed_elapsed + packed_decode_elapsed).as_secs_f64() * 1000.0 / packed_frame_count as f64;
 
     let verification_terminal = sc20684_process_memory();
     let verification_terminal_active = mlx_rs::memory::get_active_memory() as u64;
     let verification_terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
-    let key_tokens = packed_cache.stored_tokens();
-    drop(packed_cache);
-    drop(packed_latents);
-    drop(dense_latents);
-    drop(conditioning);
     mlx_rs::memory::clear_cache();
+    phase_memory.push(sc20684_phase_memory("release"));
     let release_process = sc20684_process_memory();
     let release_active = mlx_rs::memory::get_active_memory() as u64;
     let release_cache = mlx_rs::memory::get_cache_memory() as u64;
@@ -1844,7 +2012,7 @@ fn sc20684_packed_campaign_observer() {
     let repository = sc20684_repository_root();
     let tool = |program: &str, args: &[&str]| sc20684_command(program, args);
     let observation = serde_json::json!({
-        "schemaVersion": 5,
+        "schemaVersion": 6,
         "producer": "mlx-gen-krea-realtime/sc20684",
         "runId": run_id,
         "case": {"mode": mode.name(), "cacheTier": if matches!(tier, KvCacheQuant { bits: 8, .. }) { "q8" } else { "q4" }},
@@ -1859,6 +2027,8 @@ fn sc20684_packed_campaign_observer() {
         },
         "toolchain": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH, "rustc": tool("rustc", &["--version"]), "cargo": tool("cargo", &["--version"]), "mlx": "mlx-rs-linked", "hardwareModel": tool("sysctl", &["-n", "hw.model"]), "metalDevice": sc20684_metal_device()},
         "geometry": {"batch": 1, "heads": config.wan.num_heads, "queryTokens": config.ar.frame_seq_length * config.ar.num_frames_per_block, "keyTokens": key_tokens, "dispatchGeometries": receipt.dispatch_geometries.iter().map(|geometry| serde_json::json!({"queryTokens": geometry.query_tokens, "keyTokens": geometry.key_tokens, "acceptedForwards": geometry.accepted_forwards})).collect::<Vec<_>>(), "headDim": config.wan.head_dim(), "groupSize": 64, "queryTile": 8, "keyTile": 8, "dtypes": {"packedCodes": "uint32", "packedMetadata": "bfloat16", "queryAndCurrentKv": "bfloat16", "accumulator": "float32"}, "mask": "block-causal", "width": width, "height": height, "frames": frames, "latentFrames": latent_frames, "generatedLatentFrames": generated_latent_frames},
+        "sourceBudget": source_budget,
+        "phaseMemory": phase_memory,
         "compiledHandle": {"identity": receipt.compiled_handle_identity, "retainedBytes": receipt.retained_handle_bytes, "compiled": receipt.accepted_forwards > 0, "acceptedDispatches": receipt.accepted_forwards},
         "bytes": {"persistent": receipt.persistent_bytes, "retainedHandle": receipt.retained_handle_bytes, "boundedScratch": receipt.bounded_scratch_bytes, "denseWindow": receipt.dense_window_bytes, "scoreMatrix": receipt.score_matrix_bytes},
         "timing": {

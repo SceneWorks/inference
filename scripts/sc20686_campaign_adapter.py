@@ -14,12 +14,13 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
-import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts import media_campaign_supervisor as supervisor
 REDUCER = Path(__file__).with_name("sc20686_cache_attribution.py")
 COVERAGE = Path(__file__).with_name("sc20686_coverage_manifest.json")
 SOURCE_MAP = Path(__file__).with_name("sc20686_source_map.json")
@@ -72,6 +73,7 @@ class CampaignRun:
     event_transcript: bytes = b""
     media_output: Optional[Path] = None
     cleanup_root: Optional[Path] = None
+    supervision: Optional[dict] = None
 
 
 @dataclass(frozen=True)
@@ -588,7 +590,8 @@ def parse_event_transcript(payload, variant, arm):
 
 def run_entrypoint(
     entrypoint, snapshot, variant, arm, inference_revision, residency_strategy,
-    extra_args=(), timeout_seconds=21600,
+    extra_args=(), timeout_seconds=21600, *, safety_policy, source_peak_host_bytes=None,
+    source_peak_gpu_bytes=None, probe=None, failure_root=None,
 ):
     # Provider stdout is free to contain progress bars (including carriage returns).  The adapter
     # owns this private file and accepts observer events only from it, never by filtering stdout.
@@ -610,47 +613,20 @@ def run_entrypoint(
         if arm == "cancel":
             command.append("--sc20686-cancel")
         command.extend(("--out", str(media_output)))
-        child = subprocess.Popen(
-            command, cwd=run_directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        if safety_policy.deadline_seconds > timeout_seconds:
+            raise ValueError("safety deadline exceeds requested run timeout")
+        result = supervisor.run_guarded(
+            command, cwd=run_directory, env=os.environ.copy(), policy=safety_policy,
+            stdout_path=run_directory / "stdout.log", stderr_path=run_directory / "stderr.log",
+            event_path=event_path, source_peak_host_bytes=source_peak_host_bytes,
+            source_peak_gpu_bytes=source_peak_gpu_bytes, probe=probe,
         )
-        stdout_chunks, stderr_chunks = [], []
-        stdout_thread = threading.Thread(target=_drain, args=(child.stdout, stdout_chunks), daemon=True)
-        stderr_thread = threading.Thread(target=_drain, args=(child.stderr, stderr_chunks), daemon=True)
-        stdout_thread.start()
-        stderr_thread.start()
-        process_samples = []
-        deadline = time.monotonic() + timeout_seconds
-        timed_out = False
-        while child.poll() is None:
-            rss = _sample_rss(child.pid)
-            if rss:
-                process_samples.append({
-                    "phase": "process-sample", "sample_kind": "process", "peak_bytes": rss,
-                    "at_ns": time.time_ns(),
-                })
-            if time.monotonic() >= deadline:
-                timed_out = True
-                child.terminate()
-                try:
-                    child.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                break
-            time.sleep(0.05)
-        child.wait()
-        stdout_thread.join(timeout=10)
-        stderr_thread.join(timeout=10)
-        if stdout_thread.is_alive() or stderr_thread.is_alive():
-            child.kill()
-            raise ValueError(f"{variant}/{arm} transcript drain did not terminate")
-        stdout = b"".join(stdout_chunks)
-        stderr = b"".join(stderr_chunks)
-        if timed_out:
-            raise ValueError(f"{variant}/{arm} entrypoint timed out after {timeout_seconds}s")
-        if child.returncode:
-            message = stderr.decode("utf-8", errors="replace")[-4096:].strip()
-            raise ValueError(f"{variant}/{arm} entrypoint failed: {message}")
+        stdout = (run_directory / "stdout.log").read_bytes()
+        stderr = (run_directory / "stderr.log").read_bytes()
+        process_samples = list(result.samples)
         try:
+            if event_path.is_symlink():
+                raise ValueError(f"{variant}/{arm} observer transcript is a symlink")
             event_transcript = event_path.read_bytes()
         except OSError as exc:
             raise ValueError(f"{variant}/{arm} emitted a missing or malformed observer transcript") from exc
@@ -660,9 +636,26 @@ def run_entrypoint(
             raise ValueError(f"{variant}/{arm} lacks observer or process evidence")
         return CampaignRun(
             events, stdout, stderr, tuple(command), tuple(process_samples), event_transcript,
-            media_output, directory,
+            media_output, directory, {
+                "pid": result.pid, "exitCode": result.returncode,
+                "peakHostBytes": result.peak_host_bytes,
+                "peakGpuBytes": result.peak_gpu_bytes,
+                "hostFreeAtLaunch": result.host_free_at_launch,
+                "gpuFreeAtLaunch": result.gpu_free_at_launch,
+                "elapsedSeconds": result.elapsed_seconds,
+                "ownedProcessGroupReaped": True,
+            },
         )
-    except Exception:
+    except Exception as error:
+        if failure_root is not None and run_directory.is_dir() and any(run_directory.iterdir()):
+            failure_root = Path(failure_root)
+            failure_root.mkdir(exist_ok=True)
+            retained = failure_root / f"incomplete-{uuid.uuid4()}"
+            try:
+                shutil.move(str(directory), retained)
+            except OSError as move_error:
+                raise ValueError(f"{error}; incomplete diagnostics remain at {directory}; move failed: {move_error}") from error
+            raise ValueError(f"{error}; incomplete diagnostics retained at {retained}") from error
         shutil.rmtree(directory, ignore_errors=True)
         raise
 
@@ -1040,11 +1033,130 @@ def render_markdown(keys, decision, source_map):
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def publish_campaign(coordinates, runner, row_builder, destination, input_artifacts=None):
+def _prepare_resume(root, resolved, policy):
+    root = Path(root)
+    if not root.is_absolute() or root.is_symlink():
+        raise ValueError("resume directory must be an absolute, nonsymlink path")
+    if root.resolve() == INFERENCE_ROOT.resolve() or INFERENCE_ROOT.resolve() in root.resolve().parents:
+        raise ValueError("resume directory must be outside the repository")
+    identity = {
+        "schema": "sc-20686-media-resume-v1",
+        "resolvedInputsSha256": digest(canonical(resolved)),
+        "safetyPolicySha256": policy.sha256,
+        "coverageSha256": file_identity(COVERAGE),
+        "sourceMapSha256": file_identity(SOURCE_MAP),
+        "adapterSha256": file_identity(Path(__file__)),
+    }
+    raw = canonical(identity)
+    resolved_raw = canonical(resolved)
+    if root.exists():
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("resume path is not an exact directory")
+        if (root / "identity.json").read_bytes() != raw or (root / "identity.json.sha256").read_text(encoding="ascii") != f"{digest(raw)}  identity.json\n":
+            raise ValueError("resume identity is missing, corrupt, or stale")
+        if (root / "resolved.json").read_bytes() != resolved_raw or (root / "resolved.json.sha256").read_text(encoding="ascii") != f"{digest(resolved_raw)}  resolved.json\n":
+            raise ValueError("resume resolved inputs changed")
+        unexpected = {item.name for item in root.iterdir()} - {"identity.json", "identity.json.sha256", "resolved.json", "resolved.json.sha256", "units", "failed"}
+        if unexpected:
+            raise ValueError(f"resume directory has unexpected entries: {sorted(unexpected)}")
+    else:
+        root.mkdir(parents=True)
+        (root / "identity.json").write_bytes(raw)
+        (root / "identity.json.sha256").write_text(f"{digest(raw)}  identity.json\n", encoding="ascii")
+        (root / "resolved.json").write_bytes(resolved_raw)
+        (root / "resolved.json.sha256").write_text(f"{digest(resolved_raw)}  resolved.json\n", encoding="ascii")
+    (root / "units").mkdir(exist_ok=True)
+    if (root / "units").is_symlink():
+        raise ValueError("resume unit directory may not be symlinked")
+    return digest(raw)
+
+
+def _unit_files(root):
+    files = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("resume unit contains a symlink")
+        if path.is_file() and path not in {root / "record.json", root / "record.json.sha256"}:
+            files[path.relative_to(root).as_posix()] = file_identity(path)
+    return files
+
+
+def _load_unit(root, stem, identity_sha, variant, arm):
+    unit = root / "units" / stem
+    if not unit.exists():
+        if (root / "units" / f".{stem}.partial").exists():
+            raise ValueError(f"{stem} resume unit was interrupted")
+        return None
+    if unit.is_symlink() or not unit.is_dir():
+        raise ValueError(f"{stem} resume unit is not a directory")
+    record_raw = (unit / "record.json").read_bytes()
+    record = json.loads(record_raw)
+    if record_raw != canonical(record) or (unit / "record.json.sha256").read_text(encoding="ascii") != f"{digest(record_raw)}  record.json\n":
+        raise ValueError(f"{stem} resume record seal is corrupt")
+    if set(record) != {"schema", "identitySha256", "stem", "files"} or record.get("schema") != "sc-20686-resume-unit-v1" or record.get("identitySha256") != identity_sha or record.get("stem") != stem:
+        raise ValueError(f"{stem} resume record identity is invalid")
+    if record.get("files") != _unit_files(unit):
+        raise ValueError(f"{stem} resume files are missing, extra, or corrupted")
+    command = tuple(json.loads((unit / "command.json").read_bytes())["argv"])
+    samples = tuple(json.loads((unit / "process.json").read_bytes())["samples"])
+    supervision = json.loads((unit / "supervision.json").read_bytes())
+    if supervision.get("exitCode") != 0 or supervision.get("ownedProcessGroupReaped") is not True or not isinstance(supervision.get("pid"), int) or supervision["pid"] <= 0:
+        raise ValueError(f"{stem} resume supervision is not a clean, reaped exit")
+    transcript = (unit / "events.jsonl").read_bytes()
+    events = parse_event_transcript(transcript, variant, arm)
+    events.extend(samples)
+    if not samples:
+        raise ValueError(f"{stem} resume process evidence is missing")
+    return CampaignRun(events, (unit / "stdout").read_bytes(), (unit / "stderr").read_bytes(),
+                       command, samples, transcript, unit / "media_output", None, supervision)
+
+
+def _save_unit(root, stem, identity_sha, variant, arm, run):
+    units = root / "units"
+    unit = units / stem
+    partial = units / f".{stem}.partial"
+    if unit.exists() or partial.exists():
+        raise ValueError(f"{stem} resume unit already exists or was interrupted")
+    if run.supervision is None or run.supervision.get("exitCode") != 0 or run.supervision.get("ownedProcessGroupReaped") is not True:
+        raise ValueError(f"{stem} lacks successful supervisor and cleanup evidence")
+    partial.mkdir()
+    try:
+        output = Path(run.media_output)
+        saved_output = partial / "media_output"
+        if output.is_dir():
+            shutil.copytree(output, saved_output, symlinks=False)
+        elif output.is_file():
+            shutil.copyfile(output, saved_output)
+        elif arm != "cancel":
+            raise ValueError(f"{stem} generated media is missing")
+        command = list(run.command)
+        command[command.index("--sc20686-events") + 1] = str(unit / "events.jsonl")
+        command[command.index("--out") + 1] = str(unit / "media_output")
+        (partial / "command.json").write_bytes(canonical({"argv": command}))
+        (partial / "process.json").write_bytes(canonical({"samples": list(run.process_samples)}))
+        (partial / "supervision.json").write_bytes(canonical(run.supervision))
+        (partial / "events.jsonl").write_bytes(run.event_transcript)
+        (partial / "stdout").write_bytes(run.stdout)
+        (partial / "stderr").write_bytes(run.stderr)
+        record = {"schema": "sc-20686-resume-unit-v1", "identitySha256": identity_sha,
+                  "stem": stem, "files": _unit_files(partial)}
+        record_raw = canonical(record)
+        (partial / "record.json").write_bytes(record_raw)
+        (partial / "record.json.sha256").write_text(f"{digest(record_raw)}  record.json\n", encoding="ascii")
+        os.replace(partial, unit)
+    except BaseException:
+        # A partial unit is intentionally retained for explicit inspection/refusal.
+        raise
+    return _load_unit(root, stem, identity_sha, variant, arm)
+
+
+def publish_campaign(coordinates, runner, row_builder, destination, input_artifacts=None,
+                     *, resume_root=None, resume_identity_sha=None, preflight=None):
     rows = []
     run_artifacts = {}
     run_sources = {}
     captured_runs = []
+    used_pids = set()
     final = Path(destination)
     staging = final.with_name(f".{final.name}.staging-{os.getpid()}")
     if final.exists() or staging.exists():
@@ -1052,11 +1164,40 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
     try:
         for index, coordinate in enumerate(coordinates):
             for arm in ("normal", "cancel"):
-                run = runner(coordinate, arm)
+                if preflight is not None:
+                    preflight(coordinate)
+                stem = f"run-{index:02d}-{arm}"
+                run = (_load_unit(Path(resume_root), stem, resume_identity_sha,
+                                  coordinate.variant, arm) if resume_root is not None else None)
+                resumed = run is not None
+                if run is None:
+                    run = runner(coordinate, arm)
+                    if preflight is not None:
+                        preflight(coordinate)
                 if not isinstance(run, CampaignRun):
                     raise ValueError("campaign runner must return a sealed transcript capture")
+                if run.supervision is not None:
+                    pid = run.supervision.get("pid")
+                    if type(pid) is not int or pid <= 0 or pid in used_pids:
+                        raise ValueError(f"{stem} reuses or lacks an owned process identity")
+                    used_pids.add(pid)
                 captured_runs.append(run)
-                stem = f"run-{index:02d}-{arm}"
+                # Validate the fresh transcript before preserving this expensive arm.
+                if not resumed and resume_root is not None:
+                    preview_manifest, preview_sources = media_artifacts(run, stem, arm)
+                    preview = {f"{stem}.events.jsonl": run.event_transcript,
+                               f"{stem}.stdout": run.stdout, f"{stem}.stderr": run.stderr,
+                               f"{stem}.command.json": canonical({"argv": list(run.command)}),
+                               f"{stem}.process.json": canonical({"samples": list(run.process_samples)}),
+                               f"{stem}.supervision.json": canonical(run.supervision),
+                               f"{stem}.media.json": preview_manifest}
+                    preview_hashes = {name: digest(raw) for name, raw in preview.items()}
+                    preview_hashes.update({name: file_identity(path) for name, path in preview_sources.items()})
+                    row_builder(coordinate, arm, run.events, preview_hashes)
+                    saved = _save_unit(Path(resume_root), stem, resume_identity_sha,
+                                       coordinate.variant, arm, run)
+                    cleanup_campaign_run(run)
+                    run = saved
                 command_payload = canonical({"argv": list(run.command)})
                 process_payload = canonical({"samples": list(run.process_samples)})
                 media_manifest, media_sources = media_artifacts(run, stem, arm)
@@ -1068,6 +1209,8 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                     f"{stem}.process.json": process_payload,
                     f"{stem}.media.json": media_manifest,
                 }
+                if run.supervision is not None:
+                    artifacts[f"{stem}.supervision.json"] = canonical(run.supervision)
                 evidence_hashes = {
                     name: digest(payload) for name, payload in artifacts.items()
                 }
@@ -1177,13 +1320,28 @@ def main():
     parser.add_argument("--cancel-campaign", action="store_true")
     parser.add_argument("--fake", action="store_true")
     parser.add_argument("--run-timeout-seconds", type=float, default=21600)
+    parser.add_argument("--safety-policy", type=Path, required=True)
+    parser.add_argument("--resume-dir", type=Path, required=True)
     args = parser.parse_args()
     if not args.campaign:
         parser.error("SC-20686 adapter requires explicit --campaign")
     if args.fake:
         parser.error("synthetic evidence cannot enter the campaign adapter")
     try:
-        inference_revision = verify_inference_revision(args.inference_revision)
+        safety_policy = supervisor.load_policy(args.safety_policy)
+        if safety_policy.backend != "linux-cuda":
+            raise ValueError("SC-20686 Candle media campaigns require the Linux/CUDA safety backend")
+        if not args.resume_dir.is_absolute() or args.resume_dir.is_symlink():
+            raise ValueError("resume directory must be an absolute, nonsymlink path")
+        if args.run_timeout_seconds <= 0 or safety_policy.deadline_seconds > args.run_timeout_seconds:
+            raise ValueError("run timeout must cover the mandatory safety deadline")
+        if args.resume_dir.exists():
+            captured = json.loads((args.resume_dir / "resolved.json").read_bytes())
+            inference_revision = require_revision(captured["inference_revision"], "captured inference revision")
+            if args.inference_revision is not None and args.inference_revision != inference_revision:
+                raise ValueError("requested inference revision differs from captured resume provenance")
+        else:
+            inference_revision = verify_inference_revision(args.inference_revision)
         source_map_hash = digest(SOURCE_MAP.read_bytes())
         if args.matrix:
             if not all((args.wan_manifest, args.flux_entrypoint, args.flux_snapshot, args.flux_reference, args.flux_reference2, args.matrix_output)):
@@ -1213,21 +1371,20 @@ def main():
                     for spec in coordinates
                 ],
             }
+            resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy)
 
             def runner(spec, arm):
-                expected_snapshot = snapshot_identities[str(spec.snapshot)]
-                verify_inference_revision(inference_revision)
-                verify_coordinate_inputs(spec)
-                verify_snapshot_identity(spec, expected_snapshot)
                 run = run_entrypoint(
                     spec.entrypoint, spec.snapshot, spec.variant, arm,
                     inference_revision, spec.residency_strategy, spec.args,
-                    args.run_timeout_seconds,
+                    args.run_timeout_seconds, safety_policy=safety_policy,
+                    failure_root=args.resume_dir / "failed",
                 )
-                verify_coordinate_inputs(spec)
-                verify_snapshot_identity(spec, expected_snapshot)
-                verify_inference_revision(inference_revision)
                 return run
+
+            def preflight(spec):
+                verify_coordinate_inputs(spec)
+                verify_snapshot_identity(spec, snapshot_identities[str(spec.snapshot)])
 
             def build_row(spec, arm, events, evidence_hashes):
                 snapshot_hash, snapshot_bytes = snapshot_identities[str(spec.snapshot)]
@@ -1248,7 +1405,10 @@ def main():
             publish_campaign(coordinates, runner, build_row, args.matrix_output, {
                 "wan-manifest.source.json": args.wan_manifest.read_bytes(),
                 "campaign-inputs.resolved.json": (json.dumps(resolved, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-            })
+                "safety-policy.json": safety_policy.canonical_bytes,
+                "resume-identity.json": (args.resume_dir / "identity.json").read_bytes(),
+            }, resume_root=args.resume_dir, resume_identity_sha=resume_identity_sha,
+                preflight=preflight)
             return 0
 
         if not all((args.family, args.snapshot, args.output, args.variant, args.coordinate_name, args.entrypoint)):
@@ -1276,18 +1436,17 @@ def main():
         snapshot_hash, snapshot_bytes = snapshot_identity(spec.snapshot)
 
         def runner(single_spec, arm):
-            verify_inference_revision(inference_revision)
-            verify_coordinate_inputs(single_spec)
-            verify_snapshot_identity(single_spec, (snapshot_hash, snapshot_bytes))
             run = run_entrypoint(
                 single_spec.entrypoint, single_spec.snapshot, single_spec.variant, arm,
                 inference_revision, single_spec.residency_strategy, single_spec.args,
-                args.run_timeout_seconds,
+                args.run_timeout_seconds, safety_policy=safety_policy,
+                failure_root=args.resume_dir / "failed",
             )
+            return run
+
+        def preflight(single_spec):
             verify_coordinate_inputs(single_spec)
             verify_snapshot_identity(single_spec, (snapshot_hash, snapshot_bytes))
-            verify_inference_revision(inference_revision)
-            return run
 
         def build_row(single_spec, arm, events, evidence_hashes):
             row_args = argparse.Namespace(
@@ -1321,11 +1480,15 @@ def main():
                 "input_files": list(spec.input_file_inventory),
             }],
         }
+        resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy)
         publish_campaign([spec], runner, build_row, args.output, {
             "campaign-inputs.resolved.json": (
                 json.dumps(resolved, indent=2, sort_keys=True) + "\n"
             ).encode("utf-8"),
-        })
+            "safety-policy.json": safety_policy.canonical_bytes,
+            "resume-identity.json": (args.resume_dir / "identity.json").read_bytes(),
+        }, resume_root=args.resume_dir, resume_identity_sha=resume_identity_sha,
+            preflight=preflight)
         return 0
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"SC-20686 adapter refused: {exc}", file=sys.stderr)
