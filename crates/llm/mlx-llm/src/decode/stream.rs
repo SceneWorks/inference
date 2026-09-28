@@ -312,8 +312,8 @@ fn observe_cache_events(
         }
     }
     *seen = cache.events().len();
-    if let Some((bytes, tokens, element_bytes)) = cache.retained_snapshot()? {
-        observer.cache_snapshot(bytes, tokens, element_bytes);
+    if let Some((bytes, tokens, capacity, element_bytes)) = cache.retained_snapshot()? {
+        observer.cache_snapshot(bytes, tokens, capacity, element_bytes);
     }
     Ok(())
 }
@@ -649,7 +649,7 @@ mod tests {
         phases: Vec<&'static str>,
         logits: usize,
         probabilities: Vec<(i32, f64)>,
-        cache_snapshots: Vec<(u64, u64, u64)>,
+        cache_snapshots: Vec<(u64, u64, u64, u64)>,
     }
 
     impl crate::campaign::Observer for DecodeObserver {
@@ -670,8 +670,9 @@ mod tests {
             self.probabilities.push((token, probability));
         }
 
-        fn cache_snapshot(&mut self, bytes: u64, tokens: u64, element_bytes: u64) {
-            self.cache_snapshots.push((bytes, tokens, element_bytes));
+        fn cache_snapshot(&mut self, bytes: u64, tokens: u64, capacity: u64, element_bytes: u64) {
+            self.cache_snapshots
+                .push((bytes, tokens, capacity, element_bytes));
         }
     }
 
@@ -713,7 +714,10 @@ mod tests {
         let mut attached: Option<&mut dyn crate::campaign::Observer> = Some(&mut observer);
         observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
         observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
-        assert_eq!(observer.cache_snapshots, vec![(4096, 1, 4), (4096, 1, 4)]);
+        assert_eq!(
+            observer.cache_snapshots,
+            vec![(4096, 1, 256, 4), (4096, 1, 256, 4)]
+        );
     }
 }
 

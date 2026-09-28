@@ -297,8 +297,8 @@ impl ContiguousKvCache {
     }
 
     /// Count the resident K/V buffers, including the block padding allocated by this cache;
-    /// report the live token offset separately for the receipt geometry.
-    pub(crate) fn retained_snapshot(&self) -> Result<Option<(u64, u64, u64)>> {
+    /// report the live token offset and allocated capacity separately for receipt geometry.
+    pub(crate) fn retained_snapshot(&self) -> Result<Option<(u64, u64, u64, u64)>> {
         if self.layers.iter().all(Option::is_none) {
             return Ok(None);
         }
@@ -309,6 +309,7 @@ impl ContiguousKvCache {
         }
         let mut total_bytes = 0_u64;
         let mut retained_tokens = None;
+        let mut allocated_tokens = None;
         for slot in self.layers.iter().flatten() {
             let key_tokens = u64::try_from(slot.offset)
                 .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?;
@@ -318,6 +319,15 @@ impl ContiguousKvCache {
                 ));
             }
             retained_tokens = Some(key_tokens);
+            let capacity = u64::try_from(slot.capacity()).map_err(|_| {
+                crate::error::Error::Msg("KV allocated capacity overflows u64".into())
+            })?;
+            if allocated_tokens.is_some_and(|tokens| tokens != capacity) {
+                return Err(crate::error::Error::Msg(
+                    "dense KV cache has inconsistent allocated capacities".into(),
+                ));
+            }
+            allocated_tokens = Some(capacity);
             let pair_bytes = array_bytes(&slot.keys)?
                 .checked_add(array_bytes(&slot.values)?)
                 .ok_or_else(|| {
@@ -333,6 +343,7 @@ impl ContiguousKvCache {
         Ok(Some((
             total_bytes,
             retained_tokens.unwrap_or_default(),
+            allocated_tokens.unwrap_or_default(),
             element_bytes,
         )))
     }
@@ -681,7 +692,10 @@ mod tests {
         assert!(cache.retained_snapshot().is_err());
         cache.update(1, &k, &v).unwrap();
         // Two physical 256-token K/V blocks, although only three positions are live.
-        assert_eq!(cache.retained_snapshot().unwrap(), Some((32_768, 3, 4)));
+        assert_eq!(
+            cache.retained_snapshot().unwrap(),
+            Some((32_768, 3, 256, 4))
+        );
     }
 
     #[test]
@@ -694,14 +708,14 @@ mod tests {
         let (ka, _) = cache.update(0, &k1, &k1).unwrap();
         assert_eq!(ka.shape(), &[1, 2, 4, 4]); // 3 + 1 along seq
         assert_eq!(cache.offset(), 4);
-        assert_eq!(cache.retained_snapshot().unwrap(), Some((256, 4, 4)));
+        assert_eq!(cache.retained_snapshot().unwrap(), Some((256, 4, 4, 4)));
         assert!(cache
             .events()
             .iter()
             .all(|event| event.lifetime != "transient"));
 
         cache.update(0, &k1, &k1).unwrap();
-        assert_eq!(cache.retained_snapshot().unwrap(), Some((512, 5, 4)));
+        assert_eq!(cache.retained_snapshot().unwrap(), Some((512, 5, 8, 4)));
         let event = cache
             .events()
             .iter()
@@ -802,6 +816,7 @@ mod tests {
         let (k, _) = cache.update(0, &b, &b).unwrap();
         assert_eq!(k.shape(), &[1, 1, 9, 2]);
         assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 3 + 8);
+        assert_eq!(cache.retained_snapshot().unwrap(), Some((176, 9, 11, 4)));
         let expected: Vec<f32> = host(&a).into_iter().chain(host(&b)).collect();
         assert_eq!(host(&k), expected);
     }

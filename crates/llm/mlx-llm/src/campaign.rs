@@ -1342,8 +1342,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("memory-material dense KV is below the frozen process-footprint share".into());
     }
     if receipt.matrix.context_band == "fit-boundary"
-        && (receipt.geometry.capacity > receipt.geometry.context_window_tokens
-            || u128::from(receipt.geometry.capacity).saturating_mul(10_000)
+        && (receipt.geometry.kv_length > receipt.geometry.context_window_tokens
+            || u128::from(receipt.geometry.kv_length).saturating_mul(10_000)
                 < u128::from(receipt.geometry.context_window_tokens)
                     .saturating_mul(u128::from(FIT_BOUNDARY_MIN_CONTEXT_BPS)))
     {
@@ -1469,11 +1469,11 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         }
     }
     if receipt.mode == "dense"
-        && receipt.memory.persistent_kv_bytes.abs_diff(dense)
-            > receipt.memory.reconciliation.tolerance_bytes
+        && (receipt.memory.reconciliation.tolerance_bytes != 0
+            || receipt.memory.persistent_kv_bytes != dense)
     {
         return Err(format!(
-            "dense KV exceeds tolerance: observed={}, theoretical={}, tolerance={}",
+            "dense KV physical bytes do not reconcile: observed={}, allocated={}, tolerance={}",
             receipt.memory.persistent_kv_bytes,
             dense,
             receipt.memory.reconciliation.tolerance_bytes,
@@ -3730,9 +3730,9 @@ pub trait Observer {
     /// active-memory baseline independently from the historical model-load boundary.
     fn begin_prefill_memory_window(&mut self) {}
     /// Current cumulative cache ownership at a decoder boundary. The product cache supplies bytes,
-    /// sequence capacity, and the actual MLX array scalar width so repeated append events are not
+    /// live length, allocated capacity, and actual MLX array scalar width so append events are not
     /// summed and the receipt cannot confuse model-weight dtype with cache dtype.
-    fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _element_bytes: u64) {
+    fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, _element_bytes: u64) {
         self.allocation("cache", "persistent", bytes);
     }
     /// Bind a product-owned provider-load identity before the first phase.  The default preserves
@@ -3775,6 +3775,7 @@ pub struct ProductObserver {
     load_elapsed_ms: Option<f64>,
     load_boundary: Option<(MemorySample, MemorySample)>,
     prefill_peak_window: Option<ReceiptPeakWindow>,
+    cache_live_tokens: u64,
     cache_capacity_tokens: u64,
     sampling_elapsed_ms: f64,
 }
@@ -3799,6 +3800,7 @@ impl ProductObserver {
             load_elapsed_ms: None,
             load_boundary: None,
             prefill_peak_window: None,
+            cache_live_tokens: 0,
             cache_capacity_tokens: 0,
             sampling_elapsed_ms: 0.0,
         }
@@ -3849,7 +3851,7 @@ impl ProductObserver {
         let prefill_peak_window = self
             .prefill_peak_window
             .ok_or("product observer did not reset the MLX prefill peak window")?;
-        if self.cache_capacity_tokens == 0 {
+        if self.cache_live_tokens == 0 || self.cache_capacity_tokens == 0 {
             return Err("product observer did not capture a cumulative cache snapshot".into());
         }
         let mut live_cache = None;
@@ -3892,6 +3894,7 @@ impl ProductObserver {
                 .load_elapsed_ms
                 .ok_or("product observer is missing measured snapshot load duration")?,
             prefill_peak_window,
+            cache_live_tokens: self.cache_live_tokens,
             cache_capacity_tokens: self.cache_capacity_tokens,
         })
     }
@@ -3916,6 +3919,7 @@ pub struct ProductObservations {
     pub operations: Vec<String>,
     pub load_elapsed_ms: f64,
     pub prefill_peak_window: ReceiptPeakWindow,
+    pub cache_live_tokens: u64,
     pub cache_capacity_tokens: u64,
 }
 
@@ -3969,10 +3973,10 @@ impl Observer for ProductObserver {
         }
     }
 
-    fn cache_snapshot(&mut self, bytes: u64, tokens: u64, element_bytes: u64) {
-        if bytes == 0 || tokens == 0 || element_bytes == 0 {
+    fn cache_snapshot(&mut self, bytes: u64, tokens: u64, capacity: u64, element_bytes: u64) {
+        if bytes == 0 || tokens == 0 || capacity < tokens || element_bytes == 0 {
             self.error = Some(
-                "product cache snapshot must have positive bytes, tokens, and element width".into(),
+                "product cache snapshot must have positive bytes, valid live/capacity tokens, and element width".into(),
             );
             return;
         }
@@ -3986,7 +3990,8 @@ impl Observer for ProductObserver {
             self.error = Some("product cache element width changed within one coordinate".into());
             return;
         }
-        self.cache_capacity_tokens = self.cache_capacity_tokens.max(tokens);
+        self.cache_live_tokens = self.cache_live_tokens.max(tokens);
+        self.cache_capacity_tokens = self.cache_capacity_tokens.max(capacity);
         self.allocation("cache", "persistent", bytes);
     }
 
@@ -5876,7 +5881,7 @@ fn product_receipt(
         schema_version: 4, harness_version: "sc-20671-kv-baseline-v4".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
         provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
-        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_capacity_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
+        geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
         quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() } };
@@ -6249,7 +6254,7 @@ mod tests {
     }
 
     #[test]
-    fn product_observer_sources_element_width_from_retained_cache_arrays() {
+    fn product_observer_preserves_live_and_allocated_cache_geometry() {
         let mut observer = ProductObserver::new();
         Observer::geometry(
             &mut observer,
@@ -6262,9 +6267,22 @@ mod tests {
             },
         );
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 4);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 256, 4);
         assert_eq!(observer.geometry.unwrap().element_bytes, 4);
+        assert_eq!(observer.cache_live_tokens, 2);
+        assert_eq!(observer.cache_capacity_tokens, 256);
         assert!(observer.error.is_none());
+    }
+
+    #[test]
+    fn product_observer_rejects_capacity_below_live_length() {
+        let mut observer = ProductObserver::new();
+        observer.phase = Some("prefill-peak");
+        Observer::cache_snapshot(&mut observer, 4096, 2, 1, 4);
+        assert_eq!(
+            observer.error.as_deref(),
+            Some("product cache snapshot must have positive bytes, valid live/capacity tokens, and element width")
+        );
     }
 
     #[test]
@@ -6281,8 +6299,8 @@ mod tests {
             },
         );
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 4);
-        Observer::cache_snapshot(&mut observer, 8192, 4, 2);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 2, 4);
+        Observer::cache_snapshot(&mut observer, 8192, 4, 4, 2);
         assert_eq!(
             observer.error.as_deref(),
             Some("product cache element width changed within one coordinate")
@@ -6754,6 +6772,27 @@ mod tests {
         .expect("builder must produce a complete v4 receipt");
         assert_eq!(receipt.provenance.model_file_bytes, 100);
         assert_eq!(receipt.memory.model_weights_bytes, 1);
+        let mut padded = receipt.clone();
+        padded.geometry.capacity = 256;
+        padded.memory.persistent_kv_bytes = 1024;
+        padded.memory.dense_theoretical_kv_bytes = 1024;
+        padded.memory.reconciliation.expected_dense_kv_bytes = 1024;
+        padded.memory.reconciliation.observed_persistent_kv_bytes = 1024;
+        for event in &mut padded.memory.allocation_events {
+            if event.role == "cache" {
+                event.bytes = 1024;
+            }
+        }
+        for sample in padded.memory.phase_samples.iter_mut().take(6).skip(2) {
+            sample.mlx.active_bytes = 1027;
+            sample.phys_footprint_bytes = 2000;
+        }
+        for sample in padded.memory.phase_samples.iter_mut().skip(2) {
+            sample.mlx.peak_bytes = 1028;
+            sample.phys_footprint_peak_bytes = 2000;
+        }
+        padded.receipt_sha256 = receipt_semantic_seal(&padded).unwrap();
+        validate_receipt_semantics(&padded).expect("physical block capacity reconciles exactly");
         let mut loosened_release = receipt.clone();
         loosened_release
             .memory
@@ -6804,6 +6843,9 @@ mod tests {
         let mut tampered = receipt.clone();
         tampered.geometry.capacity = 2;
         assert!(validate_receipt_semantics(&tampered).is_err());
+        let mut widened = receipt.clone();
+        widened.memory.reconciliation.tolerance_bytes = 1;
+        assert!(validate_receipt_semantics(&widened).is_err());
         let mut timing_tampered = receipt.clone();
         timing_tampered.timings.decode_tokens_per_second += 1.0;
         assert!(validate_receipt_semantics(&timing_tampered).is_err());

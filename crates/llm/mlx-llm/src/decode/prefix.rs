@@ -315,8 +315,8 @@ fn observe_cache_events(
         }
     }
     *seen = cache.events().len();
-    if let Some((bytes, tokens, element_bytes)) = cache.retained_snapshot()? {
-        observer.cache_snapshot(bytes, tokens, element_bytes);
+    if let Some((bytes, tokens, capacity, element_bytes)) = cache.retained_snapshot()? {
+        observer.cache_snapshot(bytes, tokens, capacity, element_bytes);
     }
     Ok(())
 }
