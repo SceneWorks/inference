@@ -54,7 +54,7 @@ on:
         type: choice
         required: false
         default: yue
-        options: [yue, yue2, yue2-metal]
+        options: [yue, yue2, yue2-metal, yue2-metal-evidence]
       mode:
         description: "smoke = the three real-weight renders; memory = the device-memory measurement"
         type: choice
@@ -488,6 +488,7 @@ jobs:
           test -x "$(command -v python3.12)"
           hub="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
           mkdir -p "$hub" "$YUE2_QUALITY_OUT" "$YUE2_EVIDENCE"
+          echo "YUE2_EVIDENCE=$(cd "$YUE2_EVIDENCE" && pwd -P)" >> "$GITHUB_ENV"
           {
             echo "YUE2_HF_HUB=$hub"
             echo "CANDLE_AUDIO_YUE2_3B_SNAPSHOT=$hub/models--m-a-p--YuE2-3B/snapshots/1a96eca688d6ae5d7f0feb88573fec89920fcd19"
@@ -553,10 +554,44 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: yue2-metal-quality-evidence
-          path: ${{ github.workspace }}/../yue2-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.YUE2_EVIDENCE }}
           if-no-files-found: error
           retention-days: 30
       - name: Remove run-owned build, derived tiers, and tensor reference
         if: ${{ always() && steps.upload-metal-evidence.outcome == 'success' }}
         run: |
           rm -rf -- "$CARGO_TARGET_DIR" "$YUE2_TIER_DIR" "$YUE2_QUALITY_OUT" "$RUNNER_TEMP/yue2-metal-hub-tools"
+
+  collect-yue2-metal-evidence:
+    name: Collect existing YuE2 Metal evidence (no model execution)
+    if: inputs.family == 'yue2-metal-evidence'
+    runs-on: [self-hosted, macOS, ARM64, rw-audio]
+    timeout-minutes: 10
+    steps:
+      - name: Locate completed run evidence on its original host
+        id: locate
+        env:
+          EVIDENCE_DIR: ${{ github.workspace }}/../yue2-metal-evidence-36559069894-1
+        run: |
+          test "$RUNNER_NAME" = nax-macos-2
+          EVIDENCE_DIR=$(cd "$EVIDENCE_DIR" && pwd -P)
+          test -s "$EVIDENCE_DIR/identity.txt"
+          grep -Fx 'engine_sha=99a60541a73706fb67b4e78f44458774423ffb8e' "$EVIDENCE_DIR/identity.txt"
+          grep -F 'test result: ok. 1 passed' "$EVIDENCE_DIR/metal-quality.log"
+          for config in f32dev bf16 q8 q4; do
+            test -s "$EVIDENCE_DIR/quality-$config-metal.json"
+          done
+          echo "evidence=$EVIDENCE_DIR" >> "$GITHUB_OUTPUT"
+      - name: Upload existing logs and metrics
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-metal-quality-evidence-36559069894
+          path: ${{ steps.locate.outputs.evidence }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove only the completed run's large temporary files
+        env:
+          RUN_ROOT: ${{ github.workspace }}
+        run: |
+          RUN_ROOT=$(dirname "$RUN_ROOT")
+          rm -rf -- "$RUN_ROOT/yue2-metal-target-36559069894-1" "$RUN_ROOT/yue2-metal-tiers-36559069894-1" "$RUN_ROOT/yue2-metal-quality-36559069894-1"
