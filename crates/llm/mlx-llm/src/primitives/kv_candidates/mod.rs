@@ -223,6 +223,39 @@ impl CandidateRepresentation {
     }
 }
 
+/// Dispatch shape of one candidate's attention call, reported beside its timing so a reader can
+/// see what the numbers compare.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct KernelProfile {
+    pub kernel: String,
+    pub threads_per_threadgroup: usize,
+    pub simd_groups: usize,
+    pub gpu_family: String,
+    pub threadgroup_barriers_per_kv_token: usize,
+    /// Where the online-softmax running max/normalizer live.
+    pub softmax_state: String,
+    /// MLX ops dispatched around the kernel on every attend (query/output rotation and casts).
+    pub extra_mlx_ops_per_attend: usize,
+    /// Whether `attend` itself performs host-side argument staging before the kernel.
+    pub host_staging_inside_attend: bool,
+}
+
+/// The rotated candidates share one geometry: a single 32-lane SIMD group per query row with
+/// softmax state in registers (`simd_sum` only), plus `astype·multiply·hadamard` on the query and
+/// `hadamard·multiply·astype` on the output.
+pub(crate) fn rotated_kernel_profile(kernel: &str) -> KernelProfile {
+    KernelProfile {
+        kernel: kernel.into(),
+        threads_per_threadgroup: 32,
+        simd_groups: 1,
+        gpu_family: "any-apple (fixed one-SIMD-group geometry)".into(),
+        threadgroup_barriers_per_kv_token: 0,
+        softmax_state: "registers (simd_sum)".into(),
+        extra_mlx_ops_per_attend: 6,
+        host_staging_inside_attend: false,
+    }
+}
+
 /// A minimal comparable compressed KV representation for one attention layer.
 pub trait CompressedKvCandidate {
     fn family(&self) -> &'static str;
@@ -238,12 +271,26 @@ pub trait CompressedKvCandidate {
     fn sync_device(&mut self) -> Result<()>;
     /// Compressed-domain attention. Callers must have passed [`Self::preflight`].
     fn attend(&mut self, query: &Array, request: &CandidateAttentionRequest) -> Result<Array>;
+    /// The same attention with any per-dispatch host staging hoisted out, when the reader has
+    /// such staging and it is separable. `None` means [`Self::attend`] already excludes it.
+    fn attend_excluding_staging(
+        &mut self,
+        _query: &Array,
+        _request: &CandidateAttentionRequest,
+    ) -> Option<Result<Array>> {
+        None
+    }
+    fn kernel_profile(&self) -> KernelProfile;
     /// Oracle-only full reconstruction `[B,Hkv,S,D]` in the original domain. Counted.
     fn dequantize_dense_for_oracle(&mut self) -> Result<(Vec<f32>, Vec<f32>)>;
     /// The query the representation's score estimator effectively uses (identity unless the
     /// method also quantizes the query).
-    fn oracle_query(&self, query: &[f32], _request: &CandidateAttentionRequest) -> Vec<f32> {
-        query.to_vec()
+    fn oracle_query(
+        &self,
+        query: &[f32],
+        _request: &CandidateAttentionRequest,
+    ) -> Result<Vec<f32>> {
+        Ok(query.to_vec())
     }
     fn full_cache_dequantizations(&self) -> usize;
     fn fallback_events(&self) -> &[DenseFallbackEvent];

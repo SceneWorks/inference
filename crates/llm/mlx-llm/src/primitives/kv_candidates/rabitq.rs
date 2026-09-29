@@ -1,7 +1,14 @@
 //! Asymmetric RaBitQ KV candidate: packed 1-bit keys, nibble-packed 4-bit values (SC-20677).
 //!
 //! Keys follow upstream `rabitq_encode`: `y = H(s ⊙ k)/sqrt(D)`, one sign bit per coordinate
-//! (`y >= 0 -> 1`, little-endian within a byte) and `mag = L1(y)/D`, so `k̂_rot = mag · sign`.
+//! (`y >= 0 -> 1`, little-endian within a byte) and one f16 factor `f` per key, so
+//! `k̂_rot = f · sign`. Two factors occupy the same bytes ([`RabitqMagnitude`]):
+//! * upstream `f = L1(y)/D` — the least-squares projection onto `sign(y)`. Its inner-product
+//!   estimate is biased low: for Gaussian-like rotated coordinates `E[<q,k̂>] ≈ (2/π)·<q,k>`.
+//! * RaBitQ's unbiased `f = ‖y‖²/L1(y)`. With `x = y/‖y‖` and `x̄ = sign(y)/√D`, RaBitQ
+//!   estimates `<q,x> ≈ <q,x̄>/<x̄,x>` where `<x̄,x> = L1(y)/(√D‖y‖)`; multiplying by `‖y‖`
+//!   gives `<q,y> ≈ (‖y‖²/L1(y))·<q,sign(y)>`.
+//!
 //! Upstream ships no RaBitQ serving cache and its fused decode takes a single global scalar value
 //! codebook, which cannot track per-token value magnitudes. The value side here uses the same
 //! rotation, an fp16 per-vector norm and a 16-level Lloyd-Max `N(0,1/d)` codebook over the unit
@@ -11,8 +18,9 @@
 //! Two score estimators are compared because upstream's kernel mechanism is not the only
 //! credible one:
 //! * [`RabitqScore::BinarizedQuery`] — upstream `rabitq_fused_attend`: the query is binarized
-//!   too and the score is `(D - 2·popcount(q_bits ^ k_bits)) · L1(q_rot)/D · mag · scale`.
-//! * [`RabitqScore::FullPrecisionQuery`] — `<q_rot, sign> · mag · scale` with the fp32 query.
+//!   too and the score is `(D - 2·popcount(q_bits ^ k_bits)) · g · f · scale`, where the query
+//!   factor `g` follows the same magnitude rule (`L1(q_rot)/D` or `‖q‖²/L1(q_rot)`).
+//! * [`RabitqScore::FullPrecisionQuery`] — `<q_rot, sign> · f · scale` with the fp32 query.
 //!
 //! Byte layout: key bits `[S,B,Hkv,D/8]` u8, key magnitudes `[S,B,Hkv]` f16, value nibbles
 //! `[S,B,Hkv,D/2]` u8, value norms `[S,B,Hkv]` f16.
@@ -44,12 +52,6 @@ pub enum RabitqScore {
 }
 
 impl RabitqScore {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::BinarizedQuery => "k1-hamming-v4",
-            Self::FullPrecisionQuery => "k1-fpq-v4",
-        }
-    }
     fn template(self) -> i32 {
         match self {
             Self::BinarizedQuery => 0,
@@ -58,8 +60,70 @@ impl RabitqScore {
     }
 }
 
+/// Per-vector sign-code factor (see the module docs for the algebra).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RabitqMagnitude {
+    /// Upstream `L1(y)/D`: biased low by about `2/π` per quantized operand.
+    UpstreamL1Mean,
+    /// RaBitQ's unbiased `‖y‖²/L1(y)`.
+    Unbiased,
+}
+
+impl RabitqMagnitude {
+    fn template(self) -> i32 {
+        match self {
+            Self::UpstreamL1Mean => 0,
+            Self::Unbiased => 1,
+        }
+    }
+
+    /// Factor for one rotated vector.
+    pub fn factor(self, rotated: &[f32]) -> f32 {
+        let l1 = rotated.iter().map(|v| v.abs()).sum::<f32>();
+        match self {
+            Self::UpstreamL1Mean => l1 / rotated.len() as f32,
+            Self::Unbiased if l1 > 0.0 => rotated.iter().map(|v| v * v).sum::<f32>() / l1,
+            Self::Unbiased => 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RabitqConfig {
+    pub score: RabitqScore,
+    pub magnitude: RabitqMagnitude,
+}
+
+impl RabitqConfig {
+    pub fn label(self) -> String {
+        let score = match self.score {
+            RabitqScore::BinarizedQuery => "hamming",
+            RabitqScore::FullPrecisionQuery => "fpq",
+        };
+        let magnitude = match self.magnitude {
+            RabitqMagnitude::UpstreamL1Mean => "l1mean",
+            RabitqMagnitude::Unbiased => "unbiased",
+        };
+        format!("k1-{score}-{magnitude}-v4")
+    }
+
+    /// Every comparable configuration: both estimators x both magnitude rules.
+    pub fn all() -> [Self; 4] {
+        [
+            (RabitqScore::BinarizedQuery, RabitqMagnitude::UpstreamL1Mean),
+            (RabitqScore::BinarizedQuery, RabitqMagnitude::Unbiased),
+            (
+                RabitqScore::FullPrecisionQuery,
+                RabitqMagnitude::UpstreamL1Mean,
+            ),
+            (RabitqScore::FullPrecisionQuery, RabitqMagnitude::Unbiased),
+        ]
+        .map(|(score, magnitude)| Self { score, magnitude })
+    }
+}
+
 pub struct RabitqKvCandidate {
-    score: RabitqScore,
+    config: RabitqConfig,
     geometry: CacheGeometry,
     rotation: HadamardRotation,
     value_codebook: ScalarCodebook,
@@ -77,14 +141,19 @@ pub struct RabitqKvCandidate {
 impl std::fmt::Debug for RabitqKvCandidate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RabitqKvCandidate")
-            .field("score", &self.score)
+            .field("config", &self.config)
             .field("geometry", &self.geometry)
             .finish_non_exhaustive()
     }
 }
 
 impl RabitqKvCandidate {
-    pub fn new(score: RabitqScore, batch: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
+    pub fn new(
+        config: RabitqConfig,
+        batch: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
         if batch == 0 || kv_heads == 0 || !candidate_head_dimension_supported(head_dim) {
             return Err(Error::Unsupported(format!(
                 "RaBitQ candidate geometry unsupported: {}",
@@ -101,7 +170,7 @@ impl RabitqKvCandidate {
             ),
         ];
         Ok(Self {
-            score,
+            config,
             geometry: CacheGeometry {
                 batch,
                 kv_heads,
@@ -126,9 +195,37 @@ impl RabitqKvCandidate {
         self.geometry.batch * self.geometry.kv_heads
     }
 
+    /// Rotated-domain binarized query estimate `g · sign(q_rot)` exactly as the kernel forms it:
+    /// `q_rot` is taken from the MLX rotation, not a host re-rotation.
+    pub fn binarized_rotated_query(
+        &self,
+        query: &[f32],
+        request: &CandidateAttentionRequest,
+    ) -> Result<Vec<f32>> {
+        let shape = mlx_dims(&[
+            request.batch,
+            request.query_heads,
+            request.query_len,
+            request.head_dim,
+        ])?;
+        let rotated = self
+            .rotation
+            .forward_mlx(&Array::from_slice(query, &shape), &self.constants[0])?;
+        Ok(rotated
+            .as_slice::<f32>()
+            .chunks(request.head_dim)
+            .flat_map(|row| {
+                let factor = self.config.magnitude.factor(row);
+                row.iter()
+                    .map(move |v| if *v >= 0.0 { factor } else { -factor })
+                    .collect::<Vec<_>>()
+            })
+            .collect())
+    }
+
     fn encode_key(&self, x: &[f32], bits: &mut Vec<u8>, mags: &mut Vec<f16>) -> Result<()> {
         let y = self.rotation.forward(x);
-        let mag = f16::from_f32(y.iter().map(|v| v.abs()).sum::<f32>() / y.len() as f32);
+        let mag = f16::from_f32(self.config.magnitude.factor(&y));
         if !mag.is_finite() {
             return Err(Error::Unsupported(
                 "RaBitQ key magnitude exceeds f16".into(),
@@ -219,7 +316,7 @@ impl CompressedKvCandidate for RabitqKvCandidate {
     }
 
     fn config(&self) -> String {
-        self.score.label().into()
+        self.config.label()
     }
 
     fn representation(&self) -> CandidateRepresentation {
@@ -231,7 +328,7 @@ impl CompressedKvCandidate for RabitqKvCandidate {
         CandidateRepresentation {
             family: self.family().into(),
             config: self.config(),
-            identity: format!("sc-20677-rabitq-{}", self.score.label()),
+            identity: format!("sc-20677-rabitq-{}", self.config.label()),
             version: VERSION,
             batch: self.geometry.batch,
             kv_heads: self.geometry.kv_heads,
@@ -359,7 +456,7 @@ impl CompressedKvCandidate for RabitqKvCandidate {
             ));
         }
         self.sync_device()?;
-        let (mask_mode, window) = mask_template(request.mask)?;
+        let (mask_mode, window) = mask_template(request.mask, request.kv_len)?;
         let dim = request.head_dim;
         let signs = self.constants[0].clone();
         let codebook = self.constants[1].clone();
@@ -369,7 +466,8 @@ impl CompressedKvCandidate for RabitqKvCandidate {
         let grid_x = i32::try_from(queries * 32)
             .map_err(|_| Error::Unsupported("RaBitQ Metal grid exceeds i32".into()))?;
         let device = self.device.clone().expect("synced");
-        let score_mode = self.score.template();
+        let score_mode = self.config.score.template();
+        let magnitude_mode = self.config.magnitude.template();
         let out = self
             .kernel()?
             .apply()
@@ -387,6 +485,7 @@ impl CompressedKvCandidate for RabitqKvCandidate {
             .template_arg("VPT", (dim / 32) as i32)
             .template_arg("NB", (dim / 8) as i32)
             .template_arg("SCORE_MODE", score_mode)
+            .template_arg("QMAG_MODE", magnitude_mode)
             .template_arg("MASK_MODE", mask_mode)
             .template_arg("WINDOW", window)
             .run()?
@@ -397,6 +496,10 @@ impl CompressedKvCandidate for RabitqKvCandidate {
             .rotation
             .inverse_mlx(&out, &signs)?
             .as_dtype(query.dtype())?)
+    }
+
+    fn kernel_profile(&self) -> super::KernelProfile {
+        super::rotated_kernel_profile("sc20677_rabitq_online")
     }
 
     fn dequantize_dense_for_oracle(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -421,22 +524,17 @@ impl CompressedKvCandidate for RabitqKvCandidate {
         Ok((keys, values))
     }
 
-    /// The binarized estimator scores against `q̂ = R^T(L1(q_rot)/D · sign(q_rot))`.
-    fn oracle_query(&self, query: &[f32], request: &CandidateAttentionRequest) -> Vec<f32> {
-        match self.score {
-            RabitqScore::FullPrecisionQuery => query.to_vec(),
-            RabitqScore::BinarizedQuery => query
+    /// The binarized estimator scores against `q̂ = R^T(g · sign(q_rot))`. `q_rot` comes from the
+    /// same MLX rotation the kernel consumes, so a near-zero coordinate cannot take a different
+    /// sign in the oracle than on the device.
+    fn oracle_query(&self, query: &[f32], request: &CandidateAttentionRequest) -> Result<Vec<f32>> {
+        match self.config.score {
+            RabitqScore::FullPrecisionQuery => Ok(query.to_vec()),
+            RabitqScore::BinarizedQuery => Ok(self
+                .binarized_rotated_query(query, request)?
                 .chunks(request.head_dim)
-                .flat_map(|row| {
-                    let rotated = self.rotation.forward(row);
-                    let scale = rotated.iter().map(|v| v.abs()).sum::<f32>() / rotated.len() as f32;
-                    let estimate: Vec<f32> = rotated
-                        .iter()
-                        .map(|v| if *v >= 0.0 { scale } else { -scale })
-                        .collect();
-                    self.rotation.inverse(&estimate)
-                })
-                .collect(),
+                .flat_map(|row| self.rotation.inverse(row))
+                .collect()),
         }
     }
 
@@ -474,7 +572,11 @@ const RABITQ_MSL: &str = r#"
         l1 += fabs(qv[o]);
         acc[o] = 0.0f;
     }
-    const float q_scale = simd_sum(l1) / float(D);
+    float sum_squares = 0.0f;
+    for (uint o = 0; o < VPT; ++o) sum_squares += qv[o] * qv[o];
+    const float q_l1 = simd_sum(l1);
+    const float q_sq = simd_sum(sum_squares);
+    const float q_scale = QMAG_MODE == 0 ? q_l1 / float(D) : (q_l1 > 0.0f ? q_sq / q_l1 : 0.0f);
     uint q_byte = 0;
     if (lane < NB) {
         for (uint t = 0; t < 8; ++t) {
@@ -526,45 +628,149 @@ mod tests {
     use super::*;
     use crate::primitives::kv_cache::PackedAttentionMask;
 
+    const FPQ_UNBIASED: RabitqConfig = RabitqConfig {
+        score: RabitqScore::FullPrecisionQuery,
+        magnitude: RabitqMagnitude::Unbiased,
+    };
+    const HAMMING_UPSTREAM: RabitqConfig = RabitqConfig {
+        score: RabitqScore::BinarizedQuery,
+        magnitude: RabitqMagnitude::UpstreamL1Mean,
+    };
+
     #[test]
-    fn byte_accounting_is_exact_per_token() {
-        for dim in [64, 128, 256] {
-            let (batch, heads, len) = (2, 3, 7);
-            let n = batch * heads * len * dim;
-            let mut cache =
-                RabitqKvCandidate::new(RabitqScore::FullPrecisionQuery, batch, heads, dim).unwrap();
-            cache.append(&gaussian(1, n), &gaussian(2, n), len).unwrap();
-            let rep = cache.representation();
-            let vectors = batch * heads * len;
-            assert_eq!(rep.key_code_bytes, vectors * dim / 8);
-            assert_eq!(rep.key_metadata_bytes, vectors * 2);
-            assert_eq!(rep.value_code_bytes, vectors * dim / 2);
-            assert_eq!(rep.value_metadata_bytes, vectors * 2);
-            assert_eq!(rep.shared_constant_bytes, dim * 4 + 16 * 4);
-            assert_eq!(
-                rep.representation_bytes,
-                vectors * (dim / 8 + 2 + dim / 2 + 2) + dim * 4 + 64
+    fn byte_accounting_is_exact_per_token_for_every_config() {
+        for config in RabitqConfig::all() {
+            for dim in [64, 128, 256] {
+                let (batch, heads, len) = (2, 3, 7);
+                let n = batch * heads * len * dim;
+                let mut cache = RabitqKvCandidate::new(config, batch, heads, dim).unwrap();
+                cache.append(&gaussian(1, n), &gaussian(2, n), len).unwrap();
+                let rep = cache.representation();
+                let vectors = batch * heads * len;
+                assert_eq!(rep.key_code_bytes, vectors * dim / 8);
+                assert_eq!(rep.key_metadata_bytes, vectors * 2);
+                assert_eq!(rep.value_code_bytes, vectors * dim / 2);
+                assert_eq!(rep.value_metadata_bytes, vectors * 2);
+                assert_eq!(rep.shared_constant_bytes, dim * 4 + 16 * 4);
+                assert_eq!(
+                    rep.representation_bytes,
+                    vectors * (dim / 8 + 2 + dim / 2 + 2) + dim * 4 + 64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_bits_follow_upstream_convention_and_factor_follows_magnitude_rule() {
+        let key = gaussian(5, 64);
+        for config in [HAMMING_UPSTREAM, FPQ_UNBIASED] {
+            let mut cache = RabitqKvCandidate::new(config, 1, 1, 64).unwrap();
+            cache.append(&key, &key, 1).unwrap();
+            let rotated = cache.rotation.forward(&key);
+            for (d, value) in rotated.iter().enumerate() {
+                let bit = (cache.key_bits[d / 8] >> (d % 8)) & 1;
+                assert_eq!(bit == 1, *value >= 0.0, "channel {d}");
+            }
+            let l1 = rotated.iter().map(|v| v.abs()).sum::<f32>();
+            let expected = match config.magnitude {
+                RabitqMagnitude::UpstreamL1Mean => l1 / 64.0,
+                RabitqMagnitude::Unbiased => rotated.iter().map(|v| v * v).sum::<f32>() / l1,
+            };
+            assert_eq!(cache.key_mags[0], f16::from_f32(expected), "{config:?}");
+        }
+    }
+
+    /// Value side: 16-level Lloyd-Max over the unit rotated vector, scaled by the stored norm.
+    /// A Gaussian 4-bit Lloyd-Max quantizer is ~20 dB; rows span a 100x magnitude range so a
+    /// missing per-vector normalization or a mis-scaled codebook cannot hide.
+    #[test]
+    fn value_round_trip_meets_four_bit_lloyd_max_snr_across_magnitudes() {
+        let (rows, len, dim) = (4, 16, 128);
+        let mut values = gaussian(9, rows * len * dim);
+        for (i, v) in values.iter_mut().enumerate() {
+            *v *= [0.05f32, 0.5, 1.0, 5.0][(i / dim) % 4];
+        }
+        for config in RabitqConfig::all() {
+            let mut cache = RabitqKvCandidate::new(config, 1, rows, dim).unwrap();
+            cache.append(&values, &values, len).unwrap();
+            let (_, decoded) = cache.dequantize_dense_for_oracle().unwrap();
+            for (index, (original, decoded)) in
+                values.chunks(dim).zip(decoded.chunks(dim)).enumerate()
+            {
+                let error: f32 = original
+                    .iter()
+                    .zip(decoded)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
+                let energy: f32 = original.iter().map(|a| a * a).sum();
+                assert!(
+                    error / energy < 0.02,
+                    "{config:?} vector {index}: relative MSE {}",
+                    error / energy
+                );
+            }
+        }
+    }
+
+    /// Least-squares slope of estimated vs true dot products over random Gaussian (q, k) pairs.
+    fn estimator_slope(config: RabitqConfig) -> f64 {
+        let (keys_n, queries_n, dim) = (64, 64, 128);
+        let keys = gaussian(41, keys_n * dim);
+        let queries = gaussian(42, queries_n * dim);
+        let mut cache = RabitqKvCandidate::new(config, 1, 1, dim).unwrap();
+        cache.append(&keys, &keys, keys_n).unwrap();
+        let (mut cross, mut energy) = (0.0f64, 0.0f64);
+        for q in queries.chunks(dim) {
+            let q_rot = cache.rotation.forward(q);
+            let q_est: Vec<f32> = match config.score {
+                RabitqScore::FullPrecisionQuery => q_rot,
+                RabitqScore::BinarizedQuery => {
+                    let factor = config.magnitude.factor(&q_rot);
+                    q_rot
+                        .iter()
+                        .map(|v| if *v >= 0.0 { factor } else { -factor })
+                        .collect()
+                }
+            };
+            for (index, k) in keys.chunks(dim).enumerate() {
+                let truth: f64 = q.iter().zip(k).map(|(a, b)| f64::from(a * b)).sum();
+                let estimate: f64 = q_est
+                    .iter()
+                    .zip(cache.rotated_key(index))
+                    .map(|(a, b)| f64::from(a * b))
+                    .sum();
+                cross += estimate * truth;
+                energy += truth * truth;
+            }
+        }
+        cross / energy
+    }
+
+    #[test]
+    fn unbiased_factor_removes_the_two_over_pi_logit_shrink() {
+        let two_over_pi = 2.0 / std::f64::consts::PI;
+        let slopes = RabitqConfig::all().map(|config| (config, estimator_slope(config)));
+        println!("RaBitQ estimator slopes (estimate vs true dot): {slopes:?}");
+        for (config, slope) in slopes {
+            let expected = match (config.score, config.magnitude) {
+                (RabitqScore::FullPrecisionQuery, RabitqMagnitude::Unbiased) => 1.0,
+                (RabitqScore::FullPrecisionQuery, RabitqMagnitude::UpstreamL1Mean) => two_over_pi,
+                // Both operands binarized: the upstream shrink compounds.
+                (RabitqScore::BinarizedQuery, RabitqMagnitude::UpstreamL1Mean) => {
+                    two_over_pi * two_over_pi
+                }
+                (RabitqScore::BinarizedQuery, RabitqMagnitude::Unbiased) => 1.0,
+            };
+            assert!(
+                (slope - expected).abs() < 0.06,
+                "{config:?}: slope {slope}, expected {expected}"
             );
         }
     }
 
     #[test]
-    fn key_bits_follow_upstream_sign_and_little_endian_convention() {
-        let mut cache = RabitqKvCandidate::new(RabitqScore::BinarizedQuery, 1, 1, 64).unwrap();
-        let key = gaussian(5, 64);
-        cache.append(&key, &key, 1).unwrap();
-        let rotated = cache.rotation.forward(&key);
-        for (d, value) in rotated.iter().enumerate() {
-            let bit = (cache.key_bits[d / 8] >> (d % 8)) & 1;
-            assert_eq!(bit == 1, *value >= 0.0, "channel {d}");
-        }
-        let l1 = rotated.iter().map(|v| v.abs()).sum::<f32>() / 64.0;
-        assert_eq!(cache.key_mags[0], f16::from_f32(l1));
-    }
-
-    #[test]
     fn preflight_rejects_additive_and_unsupported_geometry_without_mutation() {
-        let mut cache = RabitqKvCandidate::new(RabitqScore::FullPrecisionQuery, 1, 2, 64).unwrap();
+        let mut cache = RabitqKvCandidate::new(FPQ_UNBIASED, 1, 2, 64).unwrap();
         cache
             .append(&gaussian(3, 2 * 3 * 64), &gaussian(4, 2 * 3 * 64), 3)
             .unwrap();
@@ -587,20 +793,26 @@ mod tests {
         );
         assert_eq!(cache.representation(), before);
         assert_eq!(cache.fallback_events().len(), 2);
-        assert!(RabitqKvCandidate::new(RabitqScore::BinarizedQuery, 1, 2, 512).is_err());
+        assert!(RabitqKvCandidate::new(HAMMING_UPSTREAM, 1, 2, 512).is_err());
     }
 
     #[cfg(target_os = "macos")]
-    fn metal_parity(score: RabitqScore, request: CandidateAttentionRequest) {
+    fn metal_parity(
+        config: RabitqConfig,
+        request: CandidateAttentionRequest,
+        query: Option<Vec<f32>>,
+    ) {
         let n = request.batch * request.kv_heads * request.kv_len * request.head_dim;
         let keys = gaussian(31, n);
         let values = gaussian(32, n);
-        let query_host = gaussian(
-            33,
-            request.batch * request.query_heads * request.query_len * request.head_dim,
-        );
+        let query_host = query.unwrap_or_else(|| {
+            gaussian(
+                33,
+                request.batch * request.query_heads * request.query_len * request.head_dim,
+            )
+        });
         let mut cache =
-            RabitqKvCandidate::new(score, request.batch, request.kv_heads, request.head_dim)
+            RabitqKvCandidate::new(config, request.batch, request.kv_heads, request.head_dim)
                 .unwrap();
         cache.append(&keys, &values, request.kv_len).unwrap();
         assert_eq!(cache.preflight(&request), CacheRoute::ExperimentalPacked);
@@ -621,33 +833,77 @@ mod tests {
             .to_vec();
         assert_eq!(cache.full_cache_dequantizations(), 0);
         let (dense_keys, dense_values) = cache.dequantize_dense_for_oracle().unwrap();
-        let oracle_query = cache.oracle_query(&query_host, &request);
+        let oracle_query = cache.oracle_query(&query_host, &request).unwrap();
         let expected =
             dense_attention_oracle(&request, &oracle_query, &dense_keys, &dense_values).unwrap();
         let diff = max_abs_diff(&actual, &expected);
-        assert!(diff < 2e-4, "{score:?} {request:?}: max abs diff {diff}");
+        assert!(diff < 2e-4, "{config:?} {request:?}: max abs diff {diff}");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn metal_matches_fp32_dequantize_then_attend_oracle_for_both_estimators() {
-        for score in [RabitqScore::BinarizedQuery, RabitqScore::FullPrecisionQuery] {
-            metal_parity(score, request(2, 4, 2, 3, 29, 64));
-            metal_parity(score, request(1, 8, 2, 1, 17, 128));
+    fn metal_matches_fp32_dequantize_then_attend_oracle_for_every_config() {
+        for config in RabitqConfig::all() {
+            metal_parity(config, request(2, 4, 2, 3, 29, 64), None);
+            metal_parity(config, request(1, 8, 2, 1, 17, 128), None);
             metal_parity(
-                score,
+                config,
                 CandidateAttentionRequest {
                     mask: PackedAttentionMask::SlidingWindow(4),
                     scale: 0.2,
                     ..request(1, 2, 1, 2, 11, 256)
                 },
+                None,
             );
             metal_parity(
-                score,
+                config,
                 CandidateAttentionRequest {
                     mask: PackedAttentionMask::None,
                     ..request(1, 2, 2, 5, 9, 64)
                 },
+                None,
+            );
+        }
+    }
+
+    /// Half the rotated query coordinates are ±1e-9: host and MLX rotations round them to
+    /// different signs, so an oracle that re-rotates on the host would disagree with the kernel's
+    /// Hamming distance. The oracle must binarize the MLX-rotated query.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn binarized_oracle_uses_the_device_rotation_for_near_zero_coordinates() {
+        let dim = 64;
+        let rotation = HadamardRotation::new(dim, ROTATION_SEED).unwrap();
+        let signs = gaussian(51, 2 * dim);
+        let query: Vec<f32> = signs
+            .chunks(dim)
+            .flat_map(|row| {
+                let rotated: Vec<f32> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(d, g)| {
+                        let magnitude = if d % 2 == 0 { 1.0 } else { 1e-9 };
+                        if *g >= 0.0 {
+                            magnitude
+                        } else {
+                            -magnitude
+                        }
+                    })
+                    .collect();
+                rotation.inverse(&rotated)
+            })
+            .collect();
+        for magnitude in [RabitqMagnitude::UpstreamL1Mean, RabitqMagnitude::Unbiased] {
+            metal_parity(
+                RabitqConfig {
+                    score: RabitqScore::BinarizedQuery,
+                    magnitude,
+                },
+                CandidateAttentionRequest {
+                    scale: 2.0,
+                    ..request(1, 2, 1, 1, 24, dim)
+                },
+                Some(query.clone()),
             );
         }
     }

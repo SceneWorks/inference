@@ -2269,6 +2269,21 @@ impl PackedGroupAffineKvCache {
             self.retained_device_packed_logical_bytes() as u64;
     }
 
+    /// The six evaluated reader arguments for `layer`, staged exactly as `dispatch_packed` stages
+    /// them but without publishing device state or telemetry. SC-20677 uses this to time the
+    /// retained reader separately from its per-dispatch host staging.
+    pub(crate) fn staged_reader_arguments(&self, layer: usize) -> Result<[Array; 6]> {
+        let staged = self.stage_packed_mlx_arguments(layer)?;
+        Ok([
+            staged.key_codes,
+            staged.key_scales,
+            staged.key_zeros,
+            staged.value_codes,
+            staged.value_scales,
+            staged.value_zeros,
+        ])
+    }
+
     /// Internal source-test seam: publish only after every packed argument has evaluated. Live
     /// dispatch stages privately until the reader output also evaluates successfully.
     #[cfg(test)]

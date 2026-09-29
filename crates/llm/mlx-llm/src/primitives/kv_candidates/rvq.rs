@@ -372,7 +372,7 @@ impl CompressedKvCandidate for RvqKvCandidate {
             return Err(Error::Config("RVQ query shape differs from request".into()));
         }
         self.sync_device()?;
-        let (mask_mode, window) = mask_template(request.mask)?;
+        let (mask_mode, window) = mask_template(request.mask, request.kv_len)?;
         let dim = request.head_dim;
         let signs = self.constants[0].clone();
         let rotated = self.rotation.forward_mlx(query, &signs)?;
@@ -415,6 +415,10 @@ impl CompressedKvCandidate for RvqKvCandidate {
             .as_dtype(query.dtype())?)
     }
 
+    fn kernel_profile(&self) -> super::KernelProfile {
+        super::rotated_kernel_profile("sc20677_rvq_online")
+    }
+
     fn dequantize_dense_for_oracle(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
         self.full_cache_dequantizations += 1;
         let (rows, len, dim) = (
@@ -452,13 +456,15 @@ impl CompressedKvCandidate for RvqKvCandidate {
     }
 }
 
-pub(crate) fn mask_template(mask: PackedAttentionMask) -> Result<(i32, i32)> {
+/// A window of at least `kv_len` keys admits exactly the causal set, so it is clamped to
+/// `kv_len` (already validated to fit MLX `i32`) instead of failing after preflight accepted it.
+pub(crate) fn mask_template(mask: PackedAttentionMask, kv_len: usize) -> Result<(i32, i32)> {
     match mask {
         PackedAttentionMask::None => Ok((0, 0)),
         PackedAttentionMask::Causal => Ok((1, 0)),
         PackedAttentionMask::SlidingWindow(window) if window > 0 => Ok((
             2,
-            i32::try_from(window)
+            i32::try_from(window.min(kv_len))
                 .map_err(|_| Error::Unsupported("sliding window exceeds i32".into()))?,
         )),
         PackedAttentionMask::SlidingWindow(_) => {
@@ -609,6 +615,58 @@ mod tests {
             cache.representation().key_code_bytes,
             prefix.representation().key_code_bytes
         );
+    }
+
+    /// Value-side round trip: upstream reports ~7.5 dB (b=1) and ~13 dB (b=2) for two-stage RVQ
+    /// on Gaussian input; the mean over 64 vectors must meet that and no vector may exceed twice it. Rows span a 100x magnitude range so a dropped per-vector normalization
+    /// or a mis-scaled codebook cannot hide, and more bits must strictly help.
+    #[test]
+    fn value_round_trip_meets_rvq_snr_and_improves_with_bits() {
+        let (rows, len, dim) = (4, 16, 128);
+        let mut values = gaussian(19, rows * len * dim);
+        for (i, v) in values.iter_mut().enumerate() {
+            *v *= [0.05f32, 0.5, 1.0, 5.0][(i / dim) % 4];
+        }
+        let mut previous = f32::INFINITY;
+        for (bits, bound) in [(1, 0.20f32), (2, 0.063), (3, 0.025)] {
+            let mut cache = RvqKvCandidate::new(
+                RvqConfig {
+                    key_bits: 1,
+                    value_bits: bits,
+                },
+                1,
+                rows,
+                dim,
+            )
+            .unwrap();
+            cache.append(&values, &values, len).unwrap();
+            let (_, decoded) = cache.dequantize_dense_for_oracle().unwrap();
+            let per_vector: Vec<f32> = values
+                .chunks(dim)
+                .zip(decoded.chunks(dim))
+                .map(|(original, decoded)| {
+                    let error: f32 = original
+                        .iter()
+                        .zip(decoded)
+                        .map(|(a, b)| (a - b).powi(2))
+                        .sum();
+                    error / original.iter().map(|a| a * a).sum::<f32>()
+                })
+                .collect();
+            let mean = per_vector.iter().sum::<f32>() / per_vector.len() as f32;
+            let worst = per_vector.iter().copied().fold(0.0, f32::max);
+            println!("RVQ value bits {bits}: mean relative MSE {mean}, worst {worst}");
+            assert!(mean < bound, "value bits {bits}: mean relative MSE {mean}");
+            assert!(
+                worst < 2.0 * bound,
+                "value bits {bits}: worst relative MSE {worst}"
+            );
+            assert!(
+                mean < previous,
+                "value bits {bits} did not improve on fewer bits"
+            );
+            previous = mean;
+        }
     }
 
     #[test]

@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::rabitq::{RabitqKvCandidate, RabitqScore};
+use super::rabitq::{RabitqConfig, RabitqKvCandidate};
 use super::rvq::{RvqConfig, RvqKvCandidate};
 use super::{
     candidate_head_dimension_supported, candidate_request_support, decline, dense_attention_oracle,
@@ -52,6 +52,8 @@ const GROUP_AFFINE_IDENTITY: &str = "sc-20677-group-affine-b2-g32";
 
 pub struct GroupAffineCandidate {
     cache: PackedGroupAffineKvCache,
+    kernel: Arc<PackedMetalKernel>,
+    staged_arguments: Option<[Array; 6]>,
     geometry: CacheGeometry,
     fallback_events: Vec<DenseFallbackEvent>,
 }
@@ -74,11 +76,12 @@ impl GroupAffineCandidate {
             head_dim,
             PACKED_METAL_QUANT_GROUP_SIZE,
         )?;
-        cache.bind_compiled_handle(CompiledKernelHandle::new(Arc::new(
-            PackedMetalKernel::for_identity(GROUP_AFFINE_IDENTITY)?,
-        )))?;
+        let kernel = Arc::new(PackedMetalKernel::for_identity(GROUP_AFFINE_IDENTITY)?);
+        cache.bind_compiled_handle(CompiledKernelHandle::new(kernel.clone()))?;
         Ok(Self {
             cache,
+            kernel,
+            staged_arguments: None,
             geometry: CacheGeometry {
                 batch,
                 kv_heads,
@@ -161,12 +164,14 @@ impl CompressedKvCandidate for GroupAffineCandidate {
         super::validate_step(self.geometry, keys, values, step)?;
         self.cache.append(0, keys, values, step)?;
         self.geometry.logical_len = self.cache.logical_len();
+        self.staged_arguments = None;
         Ok(())
     }
 
     fn trim(&mut self, len: usize) -> Result<()> {
         self.cache.trim(len)?;
         self.geometry.logical_len = len;
+        self.staged_arguments = None;
         Ok(())
     }
 
@@ -182,13 +187,39 @@ impl CompressedKvCandidate for GroupAffineCandidate {
                 reason.as_str()
             )));
         }
-        let mask = match request.mask {
-            PackedAttentionMask::None => PackedMask::None,
-            PackedAttentionMask::Causal => PackedMask::Causal,
-            PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
-            PackedAttentionMask::Additive => PackedMask::AdditiveUnsupported,
-        };
+        let mask = group_affine_mask(request)?;
         self.cache.dispatch_packed(0, query, mask)
+    }
+
+    /// Stage the six reader arguments once (untimed) and dispatch the retained SC-20676 kernel
+    /// directly, so the per-dispatch pending-tail padding/concatenate/eval is excluded.
+    fn attend_excluding_staging(
+        &mut self,
+        query: &Array,
+        request: &CandidateAttentionRequest,
+    ) -> Option<Result<Array>> {
+        Some((|| {
+            let mask = group_affine_mask(request)?;
+            if self.staged_arguments.is_none() {
+                self.staged_arguments = Some(self.cache.staged_reader_arguments(0)?);
+            }
+            let [kc, ks, kz, vc, vs, vz] = self.staged_arguments.as_ref().expect("staged");
+            self.kernel.dispatch(query, kc, ks, kz, vc, vs, vz, mask)
+        })())
+    }
+
+    fn kernel_profile(&self) -> super::KernelProfile {
+        let tuning = self.kernel.tuning_profile(self.geometry.head_dim);
+        super::KernelProfile {
+            kernel: "sc20676_group_affine_online".into(),
+            threads_per_threadgroup: tuning.map_or(0, |t| t.threads),
+            simd_groups: tuning.map_or(0, |t| t.simd_groups),
+            gpu_family: tuning.map_or("unsupported".into(), |t| t.gpu_family.into()),
+            threadgroup_barriers_per_kv_token: 3,
+            softmax_state: "threadgroup memory".into(),
+            extra_mlx_ops_per_attend: 0,
+            host_staging_inside_attend: true,
+        }
     }
 
     fn dequantize_dense_for_oracle(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -204,6 +235,22 @@ impl CompressedKvCandidate for GroupAffineCandidate {
     fn fallback_events(&self) -> &[DenseFallbackEvent] {
         &self.fallback_events
     }
+}
+
+fn group_affine_mask(request: &CandidateAttentionRequest) -> Result<PackedMask> {
+    Ok(match request.mask {
+        PackedAttentionMask::None => PackedMask::None,
+        PackedAttentionMask::Causal => PackedMask::Causal,
+        // Clamp as the rotated candidates do: a window >= kv_len admits exactly the causal set.
+        PackedAttentionMask::SlidingWindow(window) => {
+            PackedMask::SlidingWindow(window.min(request.kv_len))
+        }
+        PackedAttentionMask::Additive => {
+            return Err(Error::Unsupported(
+                CandidateFallbackReason::AdditiveMask.as_str().into(),
+            ))
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -434,6 +481,9 @@ pub struct Timing {
     pub attend_cold_ms: f64,
     pub attend_warm_median_ms: f64,
     pub attend_warm_min_ms: f64,
+    /// Warm median with the reader's per-dispatch host staging hoisted out (group-affine only;
+    /// the rotated candidates stage nothing inside `attend`).
+    pub attend_excluding_staging_warm_median_ms: Option<f64>,
     pub warm_iterations: usize,
 }
 
@@ -446,6 +496,7 @@ pub struct CandidateResult {
     pub fallback_reason: Option<String>,
     pub error: Option<String>,
     pub representation: Option<CandidateRepresentation>,
+    pub kernel: Option<super::KernelProfile>,
     pub bytes_per_token_per_kv_head: Option<f64>,
     pub compression_vs_dense_fp16: Option<f64>,
     pub timing: Option<Timing>,
@@ -464,6 +515,7 @@ impl CandidateResult {
             fallback_reason: Some(reason),
             error: None,
             representation: None,
+            kernel: None,
             bytes_per_token_per_kv_head: None,
             compression_vs_dense_fp16: None,
             timing: None,
@@ -555,12 +607,24 @@ fn measure_accepted(
         warm.push(elapsed_ms(started));
     }
     warm.sort_by(f64::total_cmp);
+    let mut excluding_staging = Vec::new();
+    if let Some(first) = candidate.attend_excluding_staging(&query, request) {
+        first?.eval()?; // stages the reader arguments once, outside the timed loop
+        for _ in 0..warm_iterations {
+            let started = Instant::now();
+            if let Some(output) = candidate.attend_excluding_staging(&query, request) {
+                output?.eval()?;
+            }
+            excluding_staging.push(elapsed_ms(started));
+        }
+        excluding_staging.sort_by(f64::total_cmp);
+    }
     let dequantizations_during_attend =
         candidate.full_cache_dequantizations() - dequantizations_before;
     let representation = candidate.representation();
 
     let (dense_keys, dense_values) = candidate.dequantize_dense_for_oracle()?;
-    let oracle_query = candidate.oracle_query(&case.query, request);
+    let oracle_query = candidate.oracle_query(&case.query, request)?;
     let oracle = dense_attention_oracle(request, &oracle_query, &dense_keys, &dense_values)?;
 
     let vectors = (request.batch * request.kv_heads * request.kv_len) as f64;
@@ -575,12 +639,16 @@ fn measure_accepted(
             dense_fp16_kv_bytes(request) as f64 / representation.representation_bytes as f64,
         ),
         representation: Some(representation),
+        kernel: Some(candidate.kernel_profile()),
         timing: Some(Timing {
             encode_ms,
             device_sync_ms: (candidate.family() != "group-affine").then_some(sync_ms),
             attend_cold_ms,
             attend_warm_median_ms: warm.get(warm.len() / 2).copied().unwrap_or(f64::NAN),
             attend_warm_min_ms: warm.first().copied().unwrap_or(f64::NAN),
+            attend_excluding_staging_warm_median_ms: excluding_staging
+                .get(excluding_staging.len() / 2)
+                .copied(),
             warm_iterations,
         }),
         quality_vs_exact: Some(error_metrics(&output, exact)),
@@ -617,11 +685,11 @@ pub fn candidate_set(batch: usize, kv_heads: usize, head_dim: usize) -> Vec<Cand
             ));
         }
     }
-    for score in [RabitqScore::BinarizedQuery, RabitqScore::FullPrecisionQuery] {
+    for config in RabitqConfig::all() {
         set.push((
             "rabitq".into(),
-            score.label().into(),
-            RabitqKvCandidate::new(score, batch, kv_heads, head_dim)
+            config.label(),
+            RabitqKvCandidate::new(config, batch, kv_heads, head_dim)
                 .map(|c| Box::new(c) as Box<dyn CompressedKvCandidate>),
         ));
     }
@@ -637,6 +705,9 @@ pub struct Pick {
     pub config: String,
     pub representation_bytes: usize,
     pub relative_l2_error: f64,
+    /// `representation_bytes / budget_bytes` for a budget match: picks are the best fit
+    /// *within* the budget, which for coarse bit grids can be well below it.
+    pub budget_fraction: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -669,6 +740,7 @@ fn picks(results: &[CandidateResult]) -> BTreeMap<String, Vec<Pick>> {
                     config: result.config.clone(),
                     representation_bytes: rep.representation_bytes,
                     relative_l2_error: quality.relative_l2_error,
+                    budget_fraction: None,
                 });
         }
     }
@@ -688,7 +760,12 @@ pub fn match_budgets(results: &[CandidateResult], budgets: &[usize]) -> Vec<Budg
                         .iter()
                         .filter(|p| p.representation_bytes <= budget_bytes)
                         .min_by(|a, b| a.relative_l2_error.total_cmp(&b.relative_l2_error))
-                        .cloned();
+                        .map(|pick| Pick {
+                            budget_fraction: Some(
+                                pick.representation_bytes as f64 / budget_bytes as f64,
+                            ),
+                            ..pick.clone()
+                        });
                     (family.clone(), best)
                 })
                 .collect(),
@@ -750,6 +827,7 @@ pub struct CaseReport {
 pub struct ComparisonReport {
     pub schema: String,
     pub provenance: Provenance,
+    pub caveats: Vec<String>,
     pub cases: Vec<CaseReport>,
 }
 
@@ -799,6 +877,34 @@ pub fn provenance(command_line: Vec<String>) -> Result<Provenance> {
     })
 }
 
+/// Matched-budget points: the incumbent's bytes plus any requested budgets, sorted and unique.
+pub fn budget_points(incumbent: Option<usize>, extra: &[usize]) -> Vec<usize> {
+    let mut budgets: Vec<usize> = incumbent.into_iter().chain(extra.iter().copied()).collect();
+    budgets.sort_unstable();
+    budgets.dedup();
+    budgets
+}
+
+/// Interpretation limits every report carries.
+pub fn report_caveats() -> Vec<String> {
+    vec![
+        "timing is not kernel-for-kernel: the group-affine incumbent is the SC-20676 reader \
+         (threadgroup-memory softmax state, 3 threadgroup barriers per KV token, per-dispatch \
+         host staging of the pending key tail inside attend; see attend_excluding_staging_warm_\
+         median_ms), while packed-rvq/rabitq use one SIMD group with register state and add 6 \
+         MLX rotation/cast ops per attend. Each result's `kernel` block records its geometry."
+            .into(),
+        "the dense-materialization probe only trips on a transient at least one whole dense K \
+         (or V) at fp16 or a whole S_q x S_kv fp16 score tensor; a chunked reconstruction below \
+         those sizes would evade it, so the probe complements, not replaces, source review and \
+         the full_cache_dequantizations counter."
+            .into(),
+        "budget picks are the best configuration within the budget; see budget_fraction for \
+         how much of the budget each pick uses."
+            .into(),
+    ]
+}
+
 /// Compare every candidate on one case.
 pub fn compare_case(
     case: &KvCase,
@@ -823,13 +929,12 @@ pub fn compare_case(
     let incumbent = results
         .iter()
         .find(|r| r.family == "group-affine" && r.is_compressed());
-    let mut budgets: Vec<usize> = incumbent
-        .and_then(|r| r.representation.as_ref())
-        .map(|rep| rep.representation_bytes)
-        .into_iter()
-        .chain(extra_budgets.iter().copied())
-        .collect();
-    budgets.dedup();
+    let budgets = budget_points(
+        incumbent
+            .and_then(|r| r.representation.as_ref())
+            .map(|rep| rep.representation_bytes),
+        extra_budgets,
+    );
     let targets: Vec<f64> = incumbent
         .and_then(|r| r.quality_vs_exact)
         .map(|q| q.relative_l2_error)
@@ -988,6 +1093,7 @@ pub fn cli(args: &[String]) -> Result<()> {
     let report = ComparisonReport {
         schema: REPORT_SCHEMA.into(),
         provenance: provenance(command_line)?,
+        caveats: report_caveats(),
         cases: cases
             .iter()
             .map(|case| {
@@ -1011,8 +1117,92 @@ pub fn cli(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::rabitq::{RabitqMagnitude, RabitqScore};
     use super::super::MaterializationVerdict;
     use super::*;
+
+    /// Per-config ceilings on relative L2 attention error vs exact fp32 for the fixed synthetic
+    /// case in `synthetic_comparison_runs_every_candidate_compressed_and_matches_budgets`
+    /// (measured values plus ~10% headroom; the kernels are deterministic). An encoder/codebook regression that parity cannot
+    /// see (parity decodes the same codes) trips these. RaBitQ attention error is dominated by its
+    /// 1-bit keys, so value-side RaBitQ regressions are caught by the value round-trip SNR test.
+    const QUALITY_CEILINGS: &[(&str, f64)] = &[
+        ("b2-g32", 0.82),
+        ("k1x2-v1x2", 0.62),
+        ("k1x2-v2x2", 0.49),
+        ("k1x2-v3x2", 0.46),
+        ("k2x2-v1x2", 0.54),
+        ("k2x2-v2x2", 0.41),
+        ("k2x2-v3x2", 0.33),
+        ("k3x2-v1x2", 0.49),
+        ("k3x2-v2x2", 0.28),
+        ("k3x2-v3x2", 0.20),
+        ("k1-hamming-l1mean-v4", 0.87),
+        ("k1-hamming-unbiased-v4", 1.70),
+        ("k1-fpq-l1mean-v4", 0.76),
+        ("k1-fpq-unbiased-v4", 1.03),
+    ];
+
+    #[test]
+    fn budget_points_are_sorted_and_unique() {
+        assert_eq!(
+            budget_points(Some(96), &[200, 50, 96, 200]),
+            vec![50, 96, 200]
+        );
+        assert_eq!(budget_points(None, &[3, 1]), vec![1, 3]);
+    }
+
+    /// A sliding window wider than the cache (even beyond MLX i32) admits the causal set: every
+    /// family must accept it and match its causal output exactly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oversized_sliding_window_is_clamped_and_staging_excluded_dispatch_matches() {
+        let shape = SyntheticShape {
+            batch: 1,
+            query_heads: 2,
+            kv_heads: 1,
+            query_len: 2,
+            kv_len: 40,
+            head_dim: 64,
+        };
+        let causal = synthetic_case(shape, 5, PackedAttentionMask::Causal, None);
+        let wide = CandidateAttentionRequest {
+            mask: PackedAttentionMask::SlidingWindow(usize::MAX),
+            ..causal.request.clone()
+        };
+        let query = Array::from_slice(&causal.query, &[1, 2, 2, 64]);
+        for (family, config, candidate) in candidate_set(1, 1, 64) {
+            let mut candidate = candidate.unwrap();
+            candidate
+                .append(&causal.keys, &causal.values, shape.kv_len)
+                .unwrap();
+            assert_eq!(
+                candidate.preflight(&wide),
+                CacheRoute::ExperimentalPacked,
+                "{family}/{config}"
+            );
+            candidate.sync_device().unwrap();
+            let expected = candidate.attend(&query, &causal.request).unwrap();
+            let actual = candidate.attend(&query, &wide).unwrap();
+            // Only the group-affine reader stages inside `attend`; its staging-excluded dispatch
+            // must produce the identical output.
+            match candidate.attend_excluding_staging(&query, &causal.request) {
+                Some(hoisted) => {
+                    assert_eq!(family, "group-affine");
+                    assert_eq!(
+                        hoisted.unwrap().as_slice::<f32>(),
+                        expected.as_slice::<f32>()
+                    );
+                }
+                None => assert_ne!(family, "group-affine"),
+            }
+            assert_eq!(
+                actual.as_slice::<f32>(),
+                expected.as_slice::<f32>(),
+                "{family}/{config}"
+            );
+        }
+    }
 
     fn row(family: &str, config: &str, bytes: usize, error: f64) -> CandidateResult {
         CandidateResult {
@@ -1065,8 +1255,8 @@ mod tests {
             row("packed-rvq", "worse-within-budget", 80, 0.90),
             row("packed-rvq", "k2x2-v1x2", 100, 0.08),
             row("packed-rvq", "k2x2-v2x2", 132, 0.03),
-            row("rabitq", "k1-fpq-v4", 84, 0.30),
-            CandidateResult::declined("rabitq", "k1-hamming-v4", "declined".into()),
+            row("rabitq", "k1-fpq-unbiased-v4", 84, 0.30),
+            CandidateResult::declined("rabitq", "k1-hamming-l1mean-v4", "declined".into()),
         ];
         let budget = &match_budgets(&results, &[96])[0];
         assert_eq!(
@@ -1077,13 +1267,26 @@ mod tests {
             budget.picks["packed-rvq"].as_ref().unwrap().config,
             "k1x2-v1x2"
         );
-        assert_eq!(budget.picks["rabitq"].as_ref().unwrap().config, "k1-fpq-v4");
+        let rabitq = budget.picks["rabitq"].as_ref().unwrap();
+        assert_eq!(rabitq.config, "k1-fpq-unbiased-v4");
+        assert_eq!(rabitq.budget_fraction, Some(84.0 / 96.0));
+        assert_eq!(
+            budget.picks["packed-rvq"].as_ref().unwrap().budget_fraction,
+            Some(68.0 / 96.0)
+        );
         let quality = &match_quality(&results, &[0.10])[0];
         assert_eq!(
             quality.picks["packed-rvq"].as_ref().unwrap().config,
             "k2x2-v1x2"
         );
         assert_eq!(quality.picks["rabitq"], None);
+        assert_eq!(
+            quality.picks["packed-rvq"]
+                .as_ref()
+                .unwrap()
+                .budget_fraction,
+            None
+        );
     }
 
     #[test]
@@ -1121,8 +1324,49 @@ mod tests {
         };
         let case = synthetic_case(shape, 7, PackedAttentionMask::Causal, None);
         let report = compare_case(&case, 1, &[], &[]).unwrap();
-        assert_eq!(report.results.len(), 1 + 9 + 2);
+        assert_eq!(report.results.len(), 1 + 9 + 4);
+        let error = |config: &str| {
+            report
+                .results
+                .iter()
+                .find(|r| r.config == config)
+                .and_then(|r| r.quality_vs_exact)
+                .unwrap()
+                .relative_l2_error
+        };
         for result in &report.results {
+            println!(
+                "{}/{}: quality {:?}",
+                result.family, result.config, result.quality_vs_exact
+            );
+        }
+        // More RVQ bits must strictly reduce attention error.
+        assert!(error("k3x2-v3x2") < error("k2x2-v2x2"));
+        assert!(error("k2x2-v2x2") < error("k1x2-v1x2"));
+        for result in &report.results {
+            let ceiling = QUALITY_CEILINGS
+                .iter()
+                .find(|(config, _)| *config == result.config)
+                .map(|(_, ceiling)| *ceiling)
+                .unwrap_or_else(|| panic!("no ceiling for {}", result.config));
+            let quality = result.quality_vs_exact.unwrap().relative_l2_error;
+            assert!(
+                quality < ceiling,
+                "{}/{}: relative L2 {quality} >= ceiling {ceiling}",
+                result.family,
+                result.config
+            );
+            let kernel = result.kernel.as_ref().unwrap();
+            let group_affine = result.family == "group-affine";
+            assert_eq!(kernel.host_staging_inside_attend, group_affine);
+            assert_eq!(
+                kernel.threadgroup_barriers_per_kv_token,
+                if group_affine { 3 } else { 0 }
+            );
+            assert_eq!(
+                kernel.extra_mlx_ops_per_attend,
+                if group_affine { 0 } else { 6 }
+            );
             assert!(result.is_compressed(), "{result:?}");
             assert_eq!(result.full_cache_dequantizations_during_attend, Some(0));
             let parity = result.parity_vs_dequantize_oracle.unwrap();
@@ -1141,6 +1385,10 @@ mod tests {
         assert_eq!(report.quality_matches.len(), 1);
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["request"]["mask"], "causal");
+        assert_eq!(
+            json["results"][0]["kernel"]["gpu_family"],
+            "conservative-unknown-apple"
+        );
     }
 
     /// SC-20671/SC-20676 detection reused: the cache-owned full-dequantization counter plus the
@@ -1177,7 +1425,18 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            Box::new(RabitqKvCandidate::new(RabitqScore::FullPrecisionQuery, 1, 2, 128).unwrap()),
+            Box::new(
+                RabitqKvCandidate::new(
+                    RabitqConfig {
+                        score: RabitqScore::FullPrecisionQuery,
+                        magnitude: RabitqMagnitude::Unbiased,
+                    },
+                    1,
+                    2,
+                    128,
+                )
+                .unwrap(),
+            ),
         ];
         for mut candidate in families {
             candidate
