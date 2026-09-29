@@ -138,6 +138,36 @@ nothing is narrowed to fit.
 | `wan_vace` | `sc20686_wan` | recomputed text K/V | `resident` |
 | `wan2_2_vace_fun_14b` | `sc20686_wan` | recomputed text K/V | `sequential` |
 
+### Product load
+
+Both MLX entrypoints build their `LoadSpec` through the product constructors
+(`mlx_gen_wan::product_load::product_load_spec`, `mlx_gen_flux2::product_load::product_load_spec`),
+which carry the SceneWorks Mac worker's default-request load decisions; the source map records them
+per route as `product_load`. Only residency comes from the sealed axis above.
+
+| Route | Snapshot (`SC20686_MLX_*` / `--flux-*-snapshot`) | Load quantization |
+| --- | --- | --- |
+| `flux2_klein_9b_edit`, `flux2_klein_9b_kv_edit` | the pre-packed Klein tier root (`resolved_route` `flux2_klein_9b` / `flux2_klein_9b_kv`) | none: the tier is packed |
+| `wan2_2_ti2v_5b`, `wan2_2_t2v_14b`, `wan2_2_i2v_14b` | the pre-packed quant-matrix tier root (`q4/` is the product default) | none: the tier's `config.json` is authoritative |
+| `wan_vace` | the worker-assembled `wan_vace` snapshot: the dense **Wan2.1-VACE-1.3B** transformer plus the base-Wan 14B UMT5, z16 VAE and tokenizer | none: dense bf16 |
+| `wan2_2_vace_fun_14b` | the worker-assembled dense VACE-Fun 14B high/low experts plus the same shared components | **Q4**, forced by the worker at load |
+
+The Mac product's `wan_vace` is the 1.3B transformer, not the Wan2.1-VACE-14B tree the Candle lane
+reads; the Wan entrypoint refuses a `wan_vace` snapshot of any other transformer size.
+
+The two VACE snapshots are assembled exactly as the worker assembles them
+(`mlx_gen_wan::convert::assemble_wan_vace_snapshot` / `assemble_wan_vace_fun_snapshot`, linked):
+`transformer/` (and `transformer_2/`) from `Wan-AI/Wan2.1-VACE-1.3B-diffusers`
+(`linoyts/Wan2.2-VACE-Fun-14B-diffusers`), and `t5_encoder.safetensors`, `vae.safetensors`,
+`tokenizer.json` from the dense `bf16/` tier of `SceneWorks/wan2.2-t2v-a14b-mlx` (the worker reads
+the repository root's legacy flat dense copies, which a tier-only install does not download). Each
+assembled root carries a `.snapshot-revision` holding the VACE repository revision.
+
+The A14B coordinates (explicit steps and guidance > 1) are the product's Lightning-off request
+(`advanced.lightning: false`), which loads no adapter. The worker's default A14B request instead
+loads the Lightning high/low LoRA pair and runs 4 steps at guidance 1; that configuration is not in
+the frozen coordinate set.
+
 Three source facts differ from the Candle lane and are recorded as cache kinds in the lane's source map
 (`sc20686_source_map.json`, `lanes.mlx-metal`), not smoothed over:
 
@@ -245,4 +275,8 @@ The policy is the strict `darwin-mlx` schema (`schemaVersion`, `backend`, `deadl
 `pollMillis`, `termGraceMillis`, `hostFreeReserveBytes`, `childFootprintCapBytes`, `stdoutCapBytes`,
 `stderrCapBytes`, `eventCapBytes`); the caps must be chosen for the host that runs it, and every arm
 is refused before spawn unless free memory covers cap plus reserve. The run needs the Metal GPU for
-its duration. Each snapshot is an immutable tier root (`<revision>/q4` or a revision directory).
+its duration. Each snapshot is an immutable tier root (`<revision>/q4` or a revision directory),
+except the two Metal VACE routes, which take the worker-assembled snapshot (`transformer/` beside
+`t5_encoder.safetensors`, `vae.safetensors`, `tokenizer.json`; VACE-Fun adds `transformer_2/`)
+carrying a `.snapshot-revision` file with the VACE repository's 40-hex revision. Its identity hash
+follows the assembly's symlinked transformer directories.

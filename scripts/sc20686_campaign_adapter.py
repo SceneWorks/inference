@@ -123,8 +123,15 @@ def file_identity(path):
 
 
 def snapshot_identity(root):
+    # Follow symlinked directories: the Mac worker assembles its Wan-VACE snapshots by linking the
+    # transformer directories into place, and an identity that skipped them would omit the weights.
     root = Path(root).resolve()
-    files = sorted(path for path in root.rglob("*") if path.is_file() and ".git" not in path.parts)
+    files = sorted(
+        path
+        for directory, _, names in os.walk(root, followlinks=True)
+        for path in (Path(directory) / name for name in names)
+        if path.is_file() and ".git" not in path.relative_to(root).parts
+    )
     if not files:
         raise ValueError("snapshot inventory is empty")
     aggregate = hashlib.sha256()
@@ -180,12 +187,22 @@ def verify_inference_revision(expected):
     return actual
 
 
+# The Mac worker's assembled Wan-VACE snapshot (`wan_vace_dir_is_complete`): a diffusers VACE
+# transformer beside the base-Wan UMT5, z16 VAE and tokenizer, with no root config or model index.
+WAN_VACE_ASSEMBLED_FILES = (
+    "transformer/config.json", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json",
+)
+
+
 def validate_snapshot_layout(root, label):
-    """Accept an exact component/tier root or a real Diffusers pipeline root."""
+    """Accept an exact component/tier root, a real Diffusers pipeline root, or the Mac worker's
+    assembled Wan-VACE snapshot."""
     root = Path(root).resolve()
     if not root.is_dir():
         raise ValueError(f"{label} snapshot directory is missing")
     if (root / "config.json").is_file():
+        return
+    if all((root / name).is_file() for name in WAN_VACE_ASSEMBLED_FILES):
         return
     component_configs = sorted(
         path for path in root.glob("*/config.json") if path.is_file()
@@ -193,8 +210,9 @@ def validate_snapshot_layout(root, label):
     if (root / "model_index.json").is_file() and component_configs:
         return
     raise ValueError(
-        f"{label} snapshot must be an exact component/tier root with config.json or a "
-        "Diffusers root with model_index.json plus component configs"
+        f"{label} snapshot must be an exact component/tier root with config.json, a "
+        "Diffusers root with model_index.json plus component configs, or an assembled Wan-VACE "
+        "snapshot"
     )
 
 

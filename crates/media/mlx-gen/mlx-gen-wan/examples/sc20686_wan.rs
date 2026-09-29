@@ -1,7 +1,9 @@
 //! SC-20686 Metal-lane product entrypoint for the five registered Wan routes (MLX).
 //!
-//! Loads the requested route through the same MLX provider loader the SceneWorks worker uses,
-//! builds the request from the frozen campaign coordinate, runs one real `generate`, and writes the
+//! Loads the requested route through the same MLX provider loader the SceneWorks worker uses, with
+//! the worker's `LoadSpec` for that route ([`mlx_gen_wan::product_load::product_load_spec`]: the
+//! forced Q4 on VACE-Fun, the dense Wan2.1-VACE-1.3B `wan_vace`, the packed tier roots), builds the
+//! request from the frozen campaign coordinate, runs one real `generate`, and writes the
 //! decoded frames as PNGs below `--out`. With `--sc20686-campaign` it arms the Metal-lane observer
 //! (`mlx_gen::sc20686`) on this thread; without it the observer stays inert and this is an ordinary
 //! render.
@@ -21,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress,
-    ReplacementMode, WeightsSource,
+    ReplacementMode,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -159,6 +161,15 @@ fn product_policy(route: &str, residency: &str) -> Result<OffloadPolicy> {
     })
 }
 
+/// The route's `LoadSpec`: the worker's own load decisions (`product_load_spec`) at the frozen
+/// campaign residency. Never assembled here, so the campaign measures the product's memory shape.
+fn route_load_spec(route: &str, residency: &str, snapshot: &Path) -> Result<LoadSpec> {
+    let policy = product_policy(route, residency)?;
+    Ok(mlx_gen_wan::product_load::product_load_spec(
+        route, snapshot, policy,
+    )?)
+}
+
 fn load(route: &str, spec: &LoadSpec) -> Result<Box<dyn mlx_gen::Generator>> {
     Ok(match route {
         "wan2_2_ti2v_5b" => mlx_gen_wan::model::load(spec)?,
@@ -227,7 +238,8 @@ fn main() -> Result<()> {
             .map(|(_, residency)| (*residency).to_owned())
             .ok_or_else(|| format!("unsupported SC-20686 Wan route: {route}"))?
     };
-    let policy = product_policy(&route, &residency)?;
+    // Refuse a non-product residency before arming the observer.
+    product_policy(&route, &residency)?;
     let _campaign_request = if campaign {
         let events = args
             .get("--sc20686-events")
@@ -268,7 +280,7 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let spec = LoadSpec::new(WeightsSource::Dir(snapshot)).with_offload_policy(policy);
+    let spec = route_load_spec(&route, &residency, &snapshot)?;
     let generator = load(&route, &spec)?;
     let mut on_progress = |progress: Progress| match progress {
         Progress::Step { current, total } => eprintln!("[sc20686-wan] step {current}/{total}"),
@@ -306,4 +318,58 @@ fn main() -> Result<()> {
         out.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::gen_core::{Precision, Quant, WeightsSource};
+
+    /// The SceneWorks Mac worker's default-request load quantization per route
+    /// (`video_jobs/wan.rs::resolve_wan_tier_dir_and_quant`, `video_jobs/vace.rs`).
+    const WORKER_QUANT: [(&str, Option<Quant>); 5] = [
+        ("wan2_2_ti2v_5b", None),
+        ("wan2_2_t2v_14b", None),
+        ("wan2_2_i2v_14b", None),
+        ("wan_vace", None),
+        ("wan2_2_vace_fun_14b", Some(Quant::Q4)),
+    ];
+
+    #[test]
+    fn every_route_loads_with_the_product_settings() {
+        // The Mac product's `wan_vace` transformer is Wan2.1-VACE-1.3B (12 x 128 heads, 30 layers).
+        let vace = tempfile::tempdir().expect("temp root");
+        std::fs::create_dir_all(vace.path().join("transformer")).expect("transformer dir");
+        std::fs::write(
+            vace.path().join("transformer/config.json"),
+            r#"{"num_attention_heads": 12, "attention_head_dim": 128, "num_layers": 30}"#,
+        )
+        .expect("config");
+        assert_eq!(ROUTES.len(), WORKER_QUANT.len());
+        for (route, residency) in ROUTES {
+            let snapshot = if route == "wan_vace" {
+                vace.path().to_path_buf()
+            } else {
+                PathBuf::from("/snapshots/rev/q4")
+            };
+            let spec = route_load_spec(route, residency, &snapshot).expect(route);
+            let quant = WORKER_QUANT
+                .iter()
+                .find(|(id, _)| *id == route)
+                .map(|(_, quant)| *quant)
+                .expect(route);
+            assert_eq!(spec.quantize, quant, "{route}");
+            assert_eq!(spec.precision, Precision::Bf16, "{route}");
+            let policy = match residency {
+                "sequential" => OffloadPolicy::Sequential,
+                _ => OffloadPolicy::Resident,
+            };
+            assert_eq!(spec.offload_policy, policy, "{route}");
+            assert!(matches!(&spec.weights, WeightsSource::Dir(dir) if *dir == snapshot));
+            assert!(spec.adapters.is_empty(), "{route}");
+            assert!(spec.text_encoder.is_none(), "{route}");
+            assert!(spec.components.is_empty(), "{route}");
+            assert!(spec.resolved_route.is_none(), "{route}");
+        }
+    }
 }

@@ -61,6 +61,7 @@ pub mod model;
 pub mod model_vace;
 pub mod patchify;
 pub mod pipeline;
+pub mod product_load;
 pub mod pth;
 pub mod rope;
 pub mod scheduler;

@@ -15,10 +15,14 @@ Example (on the coordinator's held Metal lane, never ordinary CI):
     --output /Users/michael/.codex/worktrees/epic20669/evidence/sc20684/campaign-$(date +%Y%m%dT%H%M%S) \
     --safety-policy /absolute/path/sc20684-safety-policy.json \
     --resume-dir /absolute/external/path/sc20684-resume \
-    --product-command '/absolute/path/to/prebuilt/generate_smoke \
-      --ignored --nocapture sc20684_packed_campaign_observer'
+    --product-command '/absolute/path/to/target/release/deps/integration-<hash> \
+      --exact --ignored --nocapture generate_smoke::sc20684_packed_campaign_observer'
 
-The executable must be built and sealed before invoking this launcher. No static
+The observer is the ignored ``generate_smoke::sc20684_packed_campaign_observer`` test inside the
+crate's single ``integration`` test binary (there is no ``generate_smoke`` binary). Build it with
+``cargo test --locked --release -p mlx-gen-krea-realtime --test integration --no-run`` and pass
+the ``Executable`` path that command prints. The executable must be built and sealed before
+invoking this launcher. No static
 whole-process peak bound exists for these cells; each role is admitted by the
 supervisor's runtime guards (watchdog cap, host reserve, deadline, sampling) when
 pre-spawn host free RAM covers cap plus reserve. The admission, with the unknown

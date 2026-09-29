@@ -2,7 +2,8 @@
 //! `flux2_klein_9b_edit` (reference K/V recomputed every denoise evaluation) and
 //! `flux2_klein_9b_kv_edit` (persistent reference-K/V cache extracted on step 0).
 //!
-//! Loads the route through the MLX provider loader the SceneWorks worker uses, runs one real edit
+//! Loads the route through the MLX provider loader the SceneWorks worker uses, with the worker's
+//! `LoadSpec` for it ([`mlx_gen_flux2::product_load::product_load_spec`]), runs one real edit
 //! with the given reference(s), and writes the image to `--out` (a `.png` path). With
 //! `--sc20686-campaign` it arms the Metal-lane observer (`mlx_gen::sc20686`); without it the
 //! observer stays inert and this is an ordinary edit.
@@ -23,7 +24,6 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, LoadSpec, OffloadPolicy, Progress,
-    WeightsSource,
 };
 use mlx_gen::media::Image;
 
@@ -123,6 +123,16 @@ fn load_image(path: &Path) -> Result<Image> {
     })
 }
 
+/// The route's `LoadSpec`: the worker's own load decisions (`product_load_spec`) at the frozen
+/// campaign residency. Never assembled here, so the campaign measures the product's memory shape.
+fn route_load_spec(route: &str, snapshot: &Path) -> Result<LoadSpec> {
+    Ok(mlx_gen_flux2::product_load::product_load_spec(
+        route,
+        snapshot,
+        OffloadPolicy::Sequential,
+    )?)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse(&std::env::args().collect::<Vec<_>>())?;
     let route = args.required("--variant")?;
@@ -188,10 +198,7 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(
-        args.required("--snapshot")?,
-    )))
-    .with_offload_policy(OffloadPolicy::Sequential);
+    let spec = route_load_spec(&route, Path::new(&args.required("--snapshot")?))?;
     let generator = match route.as_str() {
         "flux2_klein_9b_edit" => mlx_gen_flux2::load_klein_9b_edit(&spec)?,
         "flux2_klein_9b_kv_edit" => mlx_gen_flux2::load_klein_9b_kv_edit(&spec)?,
@@ -225,4 +232,31 @@ fn main() -> Result<()> {
         .save(&out)?;
     eprintln!("[sc20686-flux2] wrote {}", out.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_gen::gen_core::{Precision, WeightsSource};
+
+    /// The SceneWorks Mac worker's Klein edit load: the packed tier root, no load-time quant, and the
+    /// catalog model id as `resolved_route` (`image_jobs/flux2.rs::generate_flux2_edit_stream`).
+    #[test]
+    fn both_routes_load_with_the_product_settings() {
+        let snapshot = Path::new("/snapshots/rev/q8");
+        for (route, catalog) in [
+            ("flux2_klein_9b_edit", "flux2_klein_9b"),
+            ("flux2_klein_9b_kv_edit", "flux2_klein_9b_kv"),
+        ] {
+            let spec = route_load_spec(route, snapshot).expect(route);
+            assert!(matches!(&spec.weights, WeightsSource::Dir(dir) if dir == snapshot));
+            assert_eq!(spec.resolved_route.as_deref(), Some(catalog), "{route}");
+            assert_eq!(spec.quantize, None, "{route}");
+            assert_eq!(spec.precision, Precision::Bf16, "{route}");
+            assert_eq!(spec.offload_policy, OffloadPolicy::Sequential, "{route}");
+            assert!(spec.adapters.is_empty(), "{route}");
+            assert!(spec.pid.is_none(), "{route}");
+            assert!(spec.components.is_empty(), "{route}");
+        }
+    }
 }
