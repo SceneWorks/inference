@@ -37,7 +37,7 @@ use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
-use crate::primitives::attention::SDPA_MAX_FUSED_QLEN;
+use crate::primitives::attention::prefill_attention_tile_bytes;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -2992,16 +2992,12 @@ fn estimate_qwen35_workspace_extra_bytes(
         evaluator_elements,
     ])?;
     let prompt_workspace = checked_product([prompt, per_token_elements, 4])?;
-    // The shared tiled estimate prices one score/mask/softmax set. MLX can retain the same three
-    // buffers for the rest of its evaluator window, so price those additional tiles here.
-    let attention_window = checked_product([
-        prompt,
-        prompt.min(SDPA_MAX_FUSED_QLEN as u64),
-        query_heads,
-        3,
-        MLX_EVAL_BUFFER_WINDOW.checked_sub(1)?,
-        4,
-    ])?;
+    // The shared tiled estimate prices one attention tile (F32 scores). MLX can retain the same
+    // tile's buffers for the rest of its evaluator window, so price those additional tiles here.
+    let kv_heads = nonnegative(config.num_kv_heads)?;
+    let attention_window =
+        prefill_attention_tile_bytes(prompt, query_heads, kv_heads, head_dim, 4)?
+            .checked_mul(MLX_EVAL_BUFFER_WINDOW.checked_sub(1)?)?;
 
     // Each retained recurrence row owns a separate allocator buffer; price its VM-page rounding.
     let y_row_bytes = value_width.checked_mul(4)?;
@@ -3053,6 +3049,34 @@ fn priced_compute_element_bytes(compute: Dtype, prism: bool) -> u64 {
     }
 }
 
+/// The shared tiled estimate with the attention term priced from the tile `sdpa` actually runs for
+/// this geometry ([`prefill_attention_tile_bytes`]): a `rows × k_len` mask slice for fused
+/// full-kernel blocks, a per-head score/mask/softmax set for row chunks (sc-20676).
+fn estimate_routed_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+) -> Option<u64> {
+    let attention = prefill_attention_tile_bytes(
+        u64::try_from(prompt_tokens).ok()?,
+        geometry.query_heads,
+        geometry.kv_heads,
+        geometry.head_dim,
+        geometry.score_element_bytes,
+    )?;
+    core_llm::estimate_tiled_request_bytes_with_recurrent_copies(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        attention,
+        if mtp_width > 0 { 3 } else { 1 },
+    )
+}
+
 /// Select the estimate matching the complete decoder execution graph. Generic fused attention uses
 /// the shared tiled estimate. Dense Qwen3.5 adds its F32 recurrence, packed-Hadamard, allocator, and
 /// lazy-evaluator lifetimes; eager/otherwise-unbounded implementations retain the quadratic model.
@@ -3072,22 +3096,20 @@ fn estimate_mlx_request_bytes(
             vision_workspace_bytes,
             mtp_width,
         ),
-        MlxWorkspaceContract::Chunked => core_llm::estimate_chunked_request_bytes(
+        MlxWorkspaceContract::Chunked => estimate_routed_request_bytes(
             prompt_tokens,
             max_new_tokens,
             geometry,
             vision_workspace_bytes,
             mtp_width,
-            SDPA_MAX_FUSED_QLEN as usize,
         ),
         MlxWorkspaceContract::Qwen35 { config, prism } => {
-            let base = core_llm::estimate_chunked_request_bytes(
+            let base = estimate_routed_request_bytes(
                 prompt_tokens,
                 max_new_tokens,
                 geometry,
                 vision_workspace_bytes,
                 mtp_width,
-                SDPA_MAX_FUSED_QLEN as usize,
             )?;
             base.checked_add(estimate_qwen35_workspace_extra_bytes(
                 prompt_tokens,
@@ -3448,6 +3470,71 @@ mod tests {
         );
     }
 
+    /// The shared tiled estimate with the attention term `sdpa`'s routing implies for `geometry`.
+    fn routed_estimate(prompt: usize, new_tokens: u32, geometry: LlmMemoryGeometry) -> u64 {
+        let attention = prefill_attention_tile_bytes(
+            prompt as u64,
+            geometry.query_heads,
+            geometry.kv_heads,
+            geometry.head_dim,
+            geometry.score_element_bytes,
+        )
+        .unwrap();
+        core_llm::estimate_tiled_request_bytes_with_recurrent_copies(
+            prompt, new_tokens, geometry, 0, 0, attention, 1,
+        )
+        .unwrap()
+    }
+
+    /// sc-20676: the chunked contract prices the tile `sdpa` actually runs — a `rows × k_len` mask
+    /// slice for a full-kernel head dim, a per-head score set over `rows · gqa ≤ 32` rows otherwise
+    /// (Phi-3's head dim 96 used to be priced as 8-row tiles while running one unfused call).
+    #[test]
+    fn chunked_contract_prices_the_routed_attention_tile() {
+        let with_head_dim = |head_dim, query_heads, kv_heads| LlmMemoryGeometry {
+            query_heads,
+            kv_heads,
+            head_dim,
+            layers: 32,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, false),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
+            hidden_size: 3072,
+            intermediate_size: 8192,
+            vocab_size: 32_064,
+            recurrent_bytes: 0,
+        };
+        let prompt = 16_384usize;
+        for (head_dim, query_heads, kv_heads) in [(128, 24, 8), (96, 32, 32), (256, 16, 2)] {
+            let geometry = with_head_dim(head_dim, query_heads, kv_heads);
+            let estimate = estimate_mlx_request_bytes(
+                prompt,
+                16,
+                geometry,
+                0,
+                0,
+                MlxWorkspaceContract::Chunked,
+            )
+            .unwrap();
+            assert_eq!(
+                estimate,
+                routed_estimate(prompt, 16, geometry),
+                "head_dim {head_dim}"
+            );
+        }
+        // The full-kernel block's mask slice (16k × 2048 × 4 B) outweighs the old 8-row tile.
+        let block = routed_estimate(prompt, 16, with_head_dim(128, 24, 8));
+        let old_tile = core_llm::estimate_chunked_request_bytes(
+            prompt,
+            16,
+            with_head_dim(128, 24, 8),
+            0,
+            0,
+            8,
+        )
+        .unwrap();
+        assert!(block > old_tile);
+    }
+
     #[test]
     fn fused_request_estimate_is_checked_and_preserves_mtp_and_media_costs() {
         let geometry = LlmMemoryGeometry {
@@ -3583,15 +3670,7 @@ mod tests {
         for (prompt, new_tokens, estimate) in [(1, 1, scalar), (128, 128, ordinary)] {
             assert_eq!(
                 estimate,
-                core_llm::estimate_chunked_request_bytes(
-                    prompt,
-                    new_tokens,
-                    geometry,
-                    0,
-                    0,
-                    SDPA_MAX_FUSED_QLEN as usize,
-                )
-                .unwrap()
+                routed_estimate(prompt, new_tokens, geometry)
                     + estimate_qwen35_workspace_extra_bytes(prompt, &config, true).unwrap(),
                 "prompt {prompt}"
             );

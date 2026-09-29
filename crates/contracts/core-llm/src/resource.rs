@@ -130,17 +130,47 @@ pub fn estimate_chunked_request_bytes_with_recurrent_copies(
     max_attention_query_tokens: usize,
     recurrent_copies: u64,
 ) -> Option<u64> {
-    if max_attention_query_tokens == 0 || recurrent_copies == 0 {
+    if max_attention_query_tokens == 0 {
         return None;
     }
     let prompt = u64::try_from(prompt_tokens).ok()?;
-    let total = prompt.checked_add(u64::from(max_new_tokens))?;
     let attention_rows = prompt.min(u64::try_from(max_attention_query_tokens).ok()?);
     let attention = prompt
         .checked_mul(attention_rows)?
         .checked_mul(geometry.query_heads)?
         .checked_mul(geometry.score_element_bytes)?
         .checked_mul(3)?;
+    estimate_tiled_request_bytes_with_recurrent_copies(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        attention,
+        recurrent_copies,
+    )
+}
+
+/// [`estimate_chunked_request_bytes_with_recurrent_copies`] with the prompt-scaled attention
+/// workspace supplied by the backend instead of derived from a row bound: for an attention runtime
+/// whose per-tile transient is not a per-head score/mask/softmax set (e.g. a fused kernel that
+/// keeps scores on chip and only slices an explicit mask per tile). Every other term is identical;
+/// `recurrent_copies == 0` is refused (`None`).
+pub fn estimate_tiled_request_bytes_with_recurrent_copies(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    attention_workspace_bytes: u64,
+    recurrent_copies: u64,
+) -> Option<u64> {
+    if recurrent_copies == 0 {
+        return None;
+    }
+    let attention = attention_workspace_bytes;
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let total = prompt.checked_add(u64::from(max_new_tokens))?;
     let kv = total
         .checked_mul(geometry.layers)?
         .checked_mul(geometry.kv_heads)?
@@ -365,6 +395,38 @@ mod tests {
             "architecturally valid long context must still fail closed when current capacity is insufficient"
         );
         assert!(estimate_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3).is_none());
+    }
+
+    /// The tiled estimate is the chunked one with the attention term replaced by the caller's bytes:
+    /// equal at the chunked term, and it moves one-for-one with the supplied workspace.
+    #[test]
+    fn tiled_estimate_is_the_chunked_estimate_with_a_supplied_attention_term() {
+        let g = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 8,
+            head_dim: 128,
+            layers: 28,
+            element_bytes: 2,
+            score_element_bytes: 4,
+            hidden_size: 3072,
+            intermediate_size: 8192,
+            vocab_size: 128_256,
+            recurrent_bytes: 0,
+        };
+        let (prompt, rows) = (4096u64, 8u64);
+        let chunked_term = prompt * rows * g.query_heads * g.score_element_bytes * 3;
+        let chunked =
+            estimate_chunked_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, 8, 1).unwrap();
+        let tiled = |attention| {
+            estimate_tiled_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, attention, 1)
+                .unwrap()
+        };
+        assert_eq!(tiled(chunked_term), chunked);
+        assert_eq!(tiled(chunked_term + 12_345), chunked + 12_345);
+        assert_eq!(
+            estimate_tiled_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, 0, 0),
+            None
+        );
     }
 
     #[test]

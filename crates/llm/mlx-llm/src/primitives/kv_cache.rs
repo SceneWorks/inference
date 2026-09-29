@@ -260,9 +260,12 @@ impl LayerSlot {
 /// A row-contiguous copy of `a` holding only `a`'s own elements. A `[.., ..offset]` view keeps
 /// the whole padded block buffer alive and, while it lives, forces the next in-place update to
 /// copy rather than donate; anything that outlives the step (the prefix store) takes this instead.
-/// `x * 1` is bit-exact for every float (unlike `x + 0`, which folds `-0.0`).
+/// `x * 1` is bit-exact for every float (unlike `x + 0`, which folds `-0.0`) and owns its buffer,
+/// but keeps a permuted-dense input's strides; [`contiguous`] then makes it row-major.
+///
+/// [`contiguous`]: crate::primitives::nn::contiguous
 fn materialize(a: &Array) -> Result<Array> {
-    Ok(multiply(a, Array::from_f32(1.0).as_dtype(a.dtype())?)?)
+    crate::primitives::nn::contiguous(&multiply(a, Array::from_f32(1.0).as_dtype(a.dtype())?)?)
 }
 
 /// Block-allocated KV cache: one `(K, V)` buffer pair per layer, grown by [`KV_BLOCK_TOKENS`]

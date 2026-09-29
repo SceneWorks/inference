@@ -258,7 +258,7 @@ fn breakdown(name: &str, model: &CausalLm) {
 //
 // sc-7455 made [`sdpa`] split a `q_len > 8` prefill (multi-head × pow2 head_dim) into `ceil(q_len/8)`
 // fused calls. This measured the throughput cost (correctness is gated in `attention.rs`) and drove
-// the sc-7469 fixes now in `sdpa_chunked_prefill`: the original per-chunk `eval` was ~95% of prefill
+// the sc-7469 fixes now in `sdpa_tiled_prefill`: the original per-chunk `eval` was ~95% of prefill
 // (a GPU sync per chunk × layer), and the causal K/V `take_axis` gathers eagerly copied the growing
 // prefix — both gone (lazy chunks + strided slice views), recovering ~8.5–9× at S=512.
 //
@@ -365,7 +365,7 @@ fn prefill_breakdown(name: &str, model: &CausalLm) {
         "\n================ {name}: {layers} layers, {h} heads / {kvh} kv (groups {}), head_dim {hd} ================",
         h / kvh
     );
-    println!("Prefill throughput before (raw fused, pre-sc-7455) vs after (chunked sdpa). chunks = ceil(S/8) on the broken envelope.");
+    println!("Prefill throughput before (raw fused, pre-sc-7455) vs after (shipping sdpa). chunks = ceil(S/8) is the pre-sc-20676 8-row tiling; head dims 64/80/128 now run 2048-row fused blocks.");
     println!("S=1,8 are below the chunk gate (q_len>8) ⇒ sdpa==fused ⇒ slowdown≈1.0 = decode/short prefill untouched.");
     println!(
         "    {:>5} | {:>7} | {:>9} | {:>9} | {:>9} | {:>8} | {:>8} | {:>10} | {:>10} | {:>7}",

@@ -8,7 +8,7 @@
 //! why short-prompt smoke tests passed.
 //!
 //! Point `MLX_LLM_TEST_MODEL` at a HF snapshot (config.json + tokenizer.json + *.safetensors), e.g.
-//! SmolLM2-135M (hidden 576 / 9 heads / head_dim 64 — in the broken envelope), and run:
+//! SmolLM2-135M (hidden 576 / 9 heads / head_dim 64 — the sc-7430 "broken envelope"), and run:
 //!   MLX_LLM_TEST_MODEL=/path/to/smollm2-135m cargo run --release --example sdpa_prefill_real_model
 //!
 //! The numerical bug itself is proven by `examples/sdpa_f32_repro.rs` (mlx-rs only) and the

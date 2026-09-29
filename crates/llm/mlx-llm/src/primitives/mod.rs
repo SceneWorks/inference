@@ -40,8 +40,8 @@ pub use kv_cache::{
     PackedCacheEvidence,
 };
 pub use nn::{
-    conv2d, dtype_bytes, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm,
-    rms_norm_unscaled, soft_cap,
+    contiguous, conv2d, dtype_bytes, embed, input_ids, input_ids_batch, layer_norm, linear,
+    rms_norm, rms_norm_unscaled, soft_cap,
 };
 pub use packed_group_affine_kv::{
     group_affine_kernel_fp32_parity_errors, select_decoder_cache, select_decoder_cache_with_reader,
