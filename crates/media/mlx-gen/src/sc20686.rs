@@ -104,8 +104,7 @@ impl FootprintProbe for DarwinFootprint {
     }
 }
 
-/// This process's `(phys_footprint, lifetime peak)` from one `proc_pid_rusage(RUSAGE_INFO_V4)`
-/// syscall: the ledger `/usr/bin/footprint` prints, read without spawning it (sc-20671).
+/// Own `(phys_footprint, lifetime peak)` via `proc_pid_rusage`, not a footprint subprocess.
 #[cfg(target_os = "macos")]
 fn own_phys_footprint() -> Option<(u64, u64)> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
