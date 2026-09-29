@@ -16,13 +16,13 @@
 //! | | a plain snapshot stages **at least one** of the two decoders ([`DECODER_COMPONENTS`]); every request's decoder is checked before any compute |
 //! | `precision` | `Fp32` ⇒ F32; the default ⇒ BF16 on an accelerator, F32 on the CPU (no BF16 matmul) |
 //! | `quantize` | `None` loads the staged tier (the original is `bf16`); `Q8` / `Q4` assert that tier — the `weights` directory must be that derived tier snapshot, anything else is refused. Exactly [`SUPPORTED_QUANTS`] (advertised as `supported_quants`, the audio lane's convention: the unquantized `bf16` load is `None`) is accepted; `Nvfp4` is refused ([`crate::precision`]) |
+//! | `yue2_ar_mode` | `Native` (default) runs the loaded tier; `ExperimentalFp8` uses E4M3 for the AR projections of the original BF16 tier on CUDA sm_89+, retaining exact BF16 originals for the acoustic stage. This is separate from `quantize`. |
 //! | `offload_policy` | `Sequential` ⇒ the AR-only weights move to host memory while the acoustic stage runs (upstream `offload_ar`) for every request that does not choose otherwise; `Resident` ⇒ they stay |
 //! | `load_shape` | only the eager materialization YuE2 loads with; `DeferredMaterialization` is refused |
 //!
-//! The experimental FP8 AR mode ([`crate::fp8`]) is a native engine option
-//! ([`crate::engine::ModelPrecision`]); `LoadSpec` has no FP8 value, so the registered provider
-//! cannot request it (recorded owner decision `fp8_not_on_the_load_spec` in
-//! [`crate::precision::OWNER_DECISIONS`]).
+//! The experimental FP8 AR mode ([`crate::fp8`]) is an explicit, provider-scoped load option,
+//! not a whole-model quantization tier. Unsupported tier, dtype, build and device requests fail
+//! before the model weights load.
 //!
 //! Every snapshot is local and verified against its pins when loaded; a missing one is an explicit
 //! cache-miss error, never a download.
@@ -87,7 +87,7 @@ use candle_audio::gen_core::{
     GenerationOutput, GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadShape,
     LoadSpec, MemoryStrategy, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
     SongCover, SongCoverMode, SongCoverVoice, SongDecoder, SongPlanning, TokenSampling,
-    WeightsSource,
+    WeightsSource, Yue2ArMode,
 };
 use serde_json::{json, Value};
 
@@ -99,6 +99,7 @@ use crate::engine::{
     EngineHooks, EngineObserver, EngineOptions, ModelPrecision, SongSettings, Stage, StageEvent,
     Yue2Engine,
 };
+use crate::fp8::{self, ArPrecision};
 use crate::inventory::{ComponentId, VaeVariant};
 use crate::nar::{NarOptions, QueryTile};
 use crate::plan::SymbolicPlan;
@@ -1033,10 +1034,20 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<Yue2Generator> {
     let (dirs, generation, tier) = resolve_spec(spec)?;
     let (device, dtype) = device_and_dtype(spec)?;
-    let precision = ModelPrecision {
-        tier,
-        ..ModelPrecision::default()
+    let ar = match spec.yue2_ar_mode {
+        Yue2ArMode::Native => ArPrecision::Native,
+        Yue2ArMode::ExperimentalFp8 => {
+            let weights = dirs.snapshot_dir(&ComponentId::Lm.component().repo)?;
+            if crate::tier::is_tier_snapshot(&weights) {
+                return Err(gen_core::Error::Unsupported(
+                    "yue2: the experimental FP8 AR mode needs the original bf16 weights, not a derived tier snapshot".into(),
+                ));
+            }
+            fp8::check_fp8_request(tier.unwrap_or(Tier::Bf16), dtype, &device)?;
+            ArPrecision::Fp8
+        }
     };
+    let precision = ModelPrecision { tier, ar };
     let options = engine_options(spec);
     #[cfg(test)]
     if SYNTHETIC_ENGINE.with(|s| s.get()) {

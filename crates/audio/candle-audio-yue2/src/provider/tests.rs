@@ -414,6 +414,89 @@ fn the_load_gate_refuses_what_it_cannot_honour() {
     assert!(load_synthetic(&file).is_err());
 }
 
+/// The registered load option is distinct from a weight tier and fails before touching weights
+/// when the required accelerator, BF16 compute or original tier is unavailable.
+#[test]
+fn registered_fp8_mode_refuses_unsupported_loads_before_weights() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = spec(tmp.path(), false);
+    assert_eq!(base.yue2_ar_mode, Yue2ArMode::Native);
+    assert!(load_synthetic(&base).is_ok());
+
+    let fp8 = base.with_yue2_ar_mode(Yue2ArMode::ExperimentalFp8);
+    let err = load_synthetic(&fp8).err().unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("experimental FP8 AR") && message.contains("BF16 compute dtype")),
+        "{err}"
+    );
+
+    let err = load_synthetic(&fp8.clone().with_quant(Quant::Q8))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("original BF16 AR weights")),
+        "{err}"
+    );
+
+    let mut f32 = fp8.clone();
+    f32.precision = gen_core::Precision::Fp32;
+    let err = load_synthetic(&f32).err().unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("BF16 compute dtype")),
+        "{err}"
+    );
+
+    // A derived snapshot must not be treated as the original when quantize is omitted.
+    std::fs::write(
+        tmp.path().join("YuE2-3B").join(crate::tier::TIER_MANIFEST),
+        b"{}",
+    )
+    .unwrap();
+    let err = load_synthetic(&fp8).err().unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("not a derived tier snapshot")),
+        "{err}"
+    );
+}
+
+/// A targeted CUDA acceptance test: the registry, not a direct `Yue2Engine` call, must select
+/// experimental FP8 and bind it into the published run identity/configuration. Requires pinned
+/// real snapshots and a CUDA sm_89+ runner; ordinary CPU tests never touch the GPU.
+#[test]
+#[ignore = "requires pinned YuE2 snapshots in YUE2_HF_HUB and CUDA sm_89+"]
+fn registered_fp8_load_publishes_a_mode_bound_run() {
+    let hub = std::path::PathBuf::from(std::env::var("YUE2_HF_HUB").expect("YUE2_HF_HUB"));
+    let snapshot = |component: ComponentId| {
+        let repo = component.component().repo;
+        hub.join(format!("models--{}", repo.id.replace('/', "--")))
+            .join("snapshots")
+            .join(repo.revision)
+    };
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot(ComponentId::Lm)))
+        .with_component(
+            VAE_COMPONENT_ID,
+            WeightsSource::Dir(snapshot(ComponentId::VaeStandard)),
+        )
+        .with_yue2_ar_mode(Yue2ArMode::ExperimentalFp8);
+    let registry = crate::provider_registry().unwrap();
+    let generator = registry.load(PROVIDER_ID, &spec).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let run = tmp.path().join("fp8-run");
+    let (report, _) = reported(generator.as_ref(), &song_request(Some(&run)));
+    assert!(report.output.is_some());
+    let config = read_json(&run.join(CONFIG_JSON));
+    assert_eq!(config["quantization"], "fp8");
+    assert_eq!(config["weight_tier"], "bf16");
+    assert_eq!(
+        verify_run(&run, None).unwrap()["identity"],
+        report.artifacts.unwrap().identity
+    );
+}
+
 /// The advertised tiers are exactly the accepted ones: every `Quant` the descriptor lists passes
 /// the `LoadSpec` gate and reaches the tier assertion (refused only because the synthetic model
 /// holds `bf16` weights — a derived tier snapshot loads, see `engine_real_weights`), and every

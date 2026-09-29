@@ -94,8 +94,13 @@
 //!
 //! **BF16 whole-model device parity** (open since sc-22991, whose Candle CPU has no BF16 matmul) is
 //! the CUDA `bf16` row: 98.4 % top-1, mean KL 3.1e-4, latents 37 dB. `bf16` on the CPU *is* the
-//! reference (the CPU computes the BF16 checkpoint in F32 exactly). Metal BF16 parity is
-//! terminal-story evidence on the owner's GPU ([`OWNER_DECISIONS`]' `metal_bf16_parity`).
+//! reference (the CPU computes the BF16 checkpoint in F32 exactly). Metal BF16 parity was then
+//! measured on nax-macos-2 at the M2 source revision: [runtime 36559069894](https://github.com/SceneWorks/inference/actions/runs/36559069894)
+//! and [artifact-only recovery 36560050786](https://github.com/SceneWorks/inference/actions/runs/36560050786).
+//! Against the fresh CPU F32 reference, Metal BF16 reached 98.3333% aggregate top-1, mean KL
+//! 0.00029809 and minimum latent SNR 37.03 dB; all unchanged quality thresholds passed. Those
+//! records measure numeric parity, not a listening verdict, and their bounds remain marked as
+//! previously characterized rather than measured on that device.
 //!
 //! The derived tier snapshots were byte-identical on both machines (the pins in
 //! [`crate::tier::TIER_PINS`]).
@@ -520,18 +525,19 @@ pub const OWNER_DECISIONS: &[OwnerDecision] = &[
     },
     OwnerDecision {
         id: "fp8_not_on_the_load_spec",
-        status: DecisionStatus::Unresolved,
-        summary: "The experimental FP8 AR mode is a native engine option (ArPrecision::Fp8). \
-                  gen-core's LoadSpec has no FP8 quantize value, so the registered provider \
-                  cannot request it; adding one is a cross-workspace contract change for the \
-                  owner to decide.",
+        status: DecisionStatus::Recorded,
+        summary: "The experimental FP8 AR mode is a typed, separate LoadSpec::yue2_ar_mode \
+                  option, not a whole-model Quant tier. The registered provider maps it to \
+                  ArPrecision::Fp8 and refuses non-BF16 or unsupported hardware before weights \
+                  load; BF16 originals remain host-resident and are restored before acoustic.",
     },
     OwnerDecision {
         id: "metal_bf16_parity",
-        status: DecisionStatus::Unresolved,
-        summary: "BF16 whole-model device parity is measured on CUDA here; Metal BF16 parity is \
-                  terminal-story evidence on the owner's GPU (never measured on the dev Mac's \
-                  GPU by this story).",
+        status: DecisionStatus::Recorded,
+        summary: "Metal BF16 fidelity passed against a fresh CPU F32 reference on nax-macos-2 \
+                  at M2 (runtime 36559069894, artifact-only recovery 36560050786): 98.3333% \
+                  aggregate top-1, mean KL 0.00029809, minimum latent SNR 37.03 dB. \
+                  Previously characterized bounds remain labeled as such; this is not listening.",
     },
 ];
 
