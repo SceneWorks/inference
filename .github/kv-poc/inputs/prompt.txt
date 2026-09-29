@@ -1,0 +1,1 @@
+You are validating deterministic long-context language-model behavior for the sealed SC-20671 dense KV baseline. Follow each fixture instruction exactly.
