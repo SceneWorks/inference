@@ -121,6 +121,14 @@ pub const NEEDLE_FIXTURE_QUESTION: &str =
 /// Every campaign row is admitted by its runtime guards (supervised worker, footprint watchdog cap,
 /// host reserve, deadline, sampling), never by a static whole-process peak proof.
 pub const RUNTIME_GUARDED_ADMISSION: &str = "runtime-guarded";
+/// Allocation kinds that explicitly witness a dense full-cache temporary. Mirrors SceneWorks'
+/// `detectFullCacheTemporary`; a compressed receipt carrying either is rejected regardless of size.
+pub const FULL_CACHE_MATERIALIZATION_KIND: &str = "full_cache_materialization";
+pub const DENSE_CACHE_TEMPORARY_KIND: &str = "dense_cache_temporary";
+/// Compressed-arm operations the compressed representation has no route for. They run on the
+/// explicit dense path and every execution is recorded as a reasoned fallback in the receipt.
+pub const COMPRESSED_PREFIX_REUSE_FALLBACK_REASON: &str = "the provider prefix cache stores dense contiguous K/V; importing a reused prefix into the compressed representation is unsupported";
+pub const COMPRESSED_BATCH_FALLBACK_REASON: &str = "batched prefill attends through additive padding masks, which the compressed fused reader cannot apply; the synchronous batch decoder keeps its dense cache";
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
 pub const MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS: u64 = 1_000;
@@ -980,6 +988,221 @@ pub struct ProductGeometry {
     pub element_bytes: u64,
 }
 
+/// Compressed KV representations the SC-20671 harness can run as a `compressed` row. The
+/// producer, receipt, and validators are method-agnostic: a further candidate (for example the
+/// SC-20677 RVQ/RaBitQ caches) is one variant here plus its cache selection and kernel parity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressedKvMethod {
+    /// SC-20675 packed 2-bit group-affine cache read by the SC-20676 fused Metal kernel.
+    GroupAffine,
+}
+
+impl CompressedKvMethod {
+    pub const ALL: [Self; 1] = [Self::GroupAffine];
+
+    /// Stable receipt/CLI identifier.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::GroupAffine => "group-affine",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|method| method.id() == value)
+            .ok_or_else(|| {
+                format!(
+                    "unknown compressed KV method {value:?}; expected one of {:?}",
+                    Self::ALL.map(Self::id)
+                )
+            })
+    }
+
+    /// Build this method's retained fused reader once per campaign session.
+    pub fn arm(self) -> Result<CompressedKvArm, String> {
+        let reader = match self {
+            Self::GroupAffine => {
+                let kernel =
+                    crate::primitives::PackedMetalKernel::new().map_err(|e| e.to_string())?;
+                // The single-threaded campaign worker owns this non-Send Metal object through the
+                // cache handle's `Arc`, exactly as the SC-20676 evidence worker does.
+                #[allow(clippy::arc_with_non_send_sync)]
+                let kernel = std::sync::Arc::new(kernel);
+                crate::primitives::CompiledKernelHandle::new(kernel)
+            }
+        };
+        Ok(CompressedKvArm {
+            method: self,
+            reader,
+        })
+    }
+}
+
+/// The compressed arm of one campaign session: its method and retained fused reader.
+pub struct CompressedKvArm {
+    method: CompressedKvMethod,
+    reader: crate::primitives::CompiledKernelHandle,
+}
+
+impl CompressedKvArm {
+    pub fn method(&self) -> CompressedKvMethod {
+        self.method
+    }
+
+    /// The decoder cache for one compressed request, chosen before any K/V mutation. A refusal is
+    /// returned as a dense route with its reason, which the caller must record.
+    pub(crate) fn select_cache(
+        &self,
+        model: &crate::models::CausalLm,
+    ) -> crate::primitives::DecoderCacheSelection {
+        match self.method {
+            CompressedKvMethod::GroupAffine => {
+                model.select_cache_with_packed_reader(self.reader.clone(), 1, 1, false)
+            }
+        }
+    }
+
+    /// Kernel parity of this method's fused reader against an independent host-fp32
+    /// dequantize-then-attend reference over the exact stored codes.
+    pub fn kernel_parity_errors(&self) -> Result<Vec<f64>, String> {
+        match self.method {
+            CompressedKvMethod::GroupAffine => group_affine_kernel_fp32_parity_errors(&self.reader),
+        }
+    }
+}
+
+/// Fused packed-reader parity fixture: synthetic query/K/V large enough that attention is peaked
+/// and 2-bit quantization error is visible, stored in the packed group-affine cache, dispatched
+/// through the retained Metal reader, and compared with host-fp32 attention over the dequantized
+/// values the reader actually consumed.
+fn group_affine_kernel_fp32_parity_errors(
+    reader: &crate::primitives::CompiledKernelHandle,
+) -> Result<Vec<f64>, String> {
+    const QUERY_HEADS: usize = 4;
+    const KV_HEADS: usize = 2;
+    const TOKENS: usize = 32;
+    const WIDTH: usize = 128;
+    let query = (0..QUERY_HEADS * WIDTH)
+        .map(|index| (index as i32 % 17 - 8) as f32 * 0.05)
+        .collect::<Vec<_>>();
+    let keys = (0..KV_HEADS * TOKENS * WIDTH)
+        .map(|index| (index as i32 % 29 - 14) as f32 * 0.05)
+        .collect::<Vec<_>>();
+    let values = (0..KV_HEADS * TOKENS * WIDTH)
+        .map(|index| (index as i32 % 23 - 11) as f32 * 0.05)
+        .collect::<Vec<_>>();
+    let mut cache = crate::primitives::PackedGroupAffineKvCache::new(
+        reader.cache_identity(),
+        1,
+        1,
+        KV_HEADS,
+        WIDTH,
+        crate::primitives::PACKED_METAL_QUANT_GROUP_SIZE,
+    )
+    .map_err(|e| format!("packed kernel parity cache: {e}"))?;
+    cache
+        .append(0, &keys, &values, TOKENS)
+        .map_err(|e| format!("packed kernel parity append: {e}"))?;
+    cache
+        .bind_compiled_handle(reader.clone())
+        .map_err(|e| format!("packed kernel parity reader: {e}"))?;
+    // Host reference over the values the reader consumes: `read_row` dequantizes the exact codes.
+    let mut dequantized_keys = vec![0.0f32; KV_HEADS * TOKENS * WIDTH];
+    let mut dequantized_values = vec![0.0f32; KV_HEADS * TOKENS * WIDTH];
+    for head in 0..KV_HEADS {
+        for token in 0..TOKENS {
+            let (key, value) = cache
+                .read_row(0, token, head)
+                .map_err(|e| format!("packed kernel parity read: {e}"))?;
+            let base = (head * TOKENS + token) * WIDTH;
+            dequantized_keys[base..base + WIDTH].copy_from_slice(&key);
+            dequantized_values[base..base + WIDTH].copy_from_slice(&value);
+        }
+    }
+    let q = mlx_rs::Array::from_slice(&query, &[1, QUERY_HEADS as i32, 1, WIDTH as i32]);
+    let output = cache
+        .dispatch_packed(0, &q, crate::primitives::PackedMask::None)
+        .map_err(|e| format!("packed kernel parity dispatch: {e}"))?;
+    let output = output
+        .as_dtype(mlx_rs::Dtype::Float32)
+        .map_err(|e| format!("packed kernel parity dtype: {e}"))?;
+    output
+        .eval()
+        .map_err(|e| format!("packed kernel parity evaluation: {e}"))?;
+    if cache.direct_dispatches() != 1 || cache.full_cache_dequantizations() != 0 {
+        return Err("packed kernel parity did not run exactly one fused dispatch".into());
+    }
+    let expected = host_fp32_attention(
+        &query,
+        &dequantized_keys,
+        &dequantized_values,
+        QUERY_HEADS,
+        KV_HEADS,
+        TOKENS,
+        WIDTH,
+    );
+    let errors = output
+        .as_slice::<f32>()
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| f64::from((*actual - expected).abs()))
+        .collect::<Vec<_>>();
+    if errors.len() != QUERY_HEADS * WIDTH {
+        return Err("packed kernel parity output has the wrong shape".into());
+    }
+    drop((output, q, cache));
+    mlx_rs::memory::clear_cache();
+    Ok(errors)
+}
+
+/// Independent host-fp32 single-query attention over `[kv_heads, tokens, width]` K/V.
+fn host_fp32_attention(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    query_heads: usize,
+    kv_heads: usize,
+    tokens: usize,
+    width: usize,
+) -> Vec<f32> {
+    let scale = 1.0 / (width as f32).sqrt();
+    let groups = query_heads / kv_heads;
+    let mut expected = Vec::with_capacity(query_heads * width);
+    for query_head in 0..query_heads {
+        let kv_base = (query_head / groups) * tokens * width;
+        let query_base = query_head * width;
+        let scores = (0..tokens)
+            .map(|token| {
+                (0..width)
+                    .map(|channel| {
+                        query[query_base + channel] * keys[kv_base + token * width + channel]
+                    })
+                    .sum::<f32>()
+                    * scale
+            })
+            .collect::<Vec<_>>();
+        let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let denominator = scores
+            .iter()
+            .map(|score| (*score - maximum).exp())
+            .sum::<f32>();
+        for channel in 0..width {
+            expected.push(
+                scores
+                    .iter()
+                    .enumerate()
+                    .map(|(token, score)| {
+                        ((*score - maximum).exp() / denominator)
+                            * values[kv_base + token * width + channel]
+                    })
+                    .sum::<f32>(),
+            );
+        }
+    }
+    expected
+}
+
 /// A campaign-only loaded product session. The provider and prefix cache remain resident across
 /// warmup and measured repeats; ordinary serving continues to use the provider directly.
 pub struct CampaignSession {
@@ -992,9 +1215,36 @@ pub struct CampaignSession {
     model_weights_bytes: u64,
     session_id: String,
     cache_state_version: Cell<u64>,
+    /// `Some` for a compressed row's measured arm: every observed decode runs on this method's
+    /// compressed cache. `None` for dense rows and the same-weights dense-KV reference arm.
+    compressed: Option<CompressedKvArm>,
 }
 
 impl CampaignSession {
+    /// Load the compressed arm of a compressed row: the product session with `method`'s retained
+    /// fused reader. The reader is built after the weights-loaded sample so its (small) retained
+    /// state is not attributed to model weights.
+    pub fn load_compressed(
+        snapshot: impl AsRef<Path>,
+        method: CompressedKvMethod,
+    ) -> core_llm::Result<Self> {
+        let mut session = Self::load(snapshot)?;
+        session.compressed = Some(method.arm().map_err(core_llm::Error::Load)?);
+        Ok(session)
+    }
+
+    pub fn compressed(&self) -> Option<&CompressedKvArm> {
+        self.compressed.as_ref()
+    }
+
+    /// Record, on the compressed arm only, that a product operation runs on the explicit dense
+    /// path because the compressed representation has no route for it.
+    fn dense_fallback(&self, observer: &mut dyn Observer, operation: &str, reason: &str) {
+        if self.compressed.is_some() {
+            observer.dense_fallback(operation, reason);
+        }
+    }
+
     pub fn load(snapshot: impl AsRef<Path>) -> core_llm::Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -1041,6 +1291,7 @@ impl CampaignSession {
             model_weights_bytes,
             session_id,
             cache_state_version: Cell::new(0),
+            compressed: None,
         })
     }
 
@@ -1297,6 +1548,51 @@ pub struct ReceiptWarmup {
     pub session_id: String,
     pub cache_state_version: u64,
 }
+/// One reasoned dense-fallback site of a compressed arm and how many times it executed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCompressionFallback {
+    pub operation: String,
+    pub reason: String,
+    pub calls: u64,
+}
+
+/// Compressed-row evidence (SC-20676). Present exactly on `compressed` receipts; counts cover
+/// every compressed-arm dispatch of the row (warmups and all five repeats).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCompression {
+    /// Campaign method parameter (`--kv-method`).
+    pub method: String,
+    /// Representation identity/version exported by the cache itself.
+    pub representation_identity: String,
+    pub representation_version: u64,
+    pub bits: u64,
+    pub quantization_group_size: u64,
+    /// Peak live compressed storage, measured from the retained device arrays and allocated host
+    /// staging payload of one cache: `physicalKvBytes` is exactly their sum.
+    pub device_code_bytes: u64,
+    pub device_metadata_bytes: u64,
+    pub host_payload_bytes: u64,
+    pub physical_kv_bytes: u64,
+    /// Whether `memory.persistentKvBytes` (the coordinate operation) measured the compressed
+    /// representation or an explicit dense fallback of that operation.
+    pub persistent_kv_representation: String,
+    /// Fused compressed-domain attention calls accepted by the cache (per layer and step).
+    pub fused_calls: u64,
+    /// Explicit dense fallbacks; always the sum of `fallbacks[].calls`.
+    pub fallback_calls: u64,
+    pub fallbacks: Vec<ReceiptCompressionFallback>,
+    /// Packed-to-dense transitions that rebuilt the full history as dense K/V. E3 requires zero.
+    pub full_cache_dequantizations: u64,
+    pub failed_dispatches: u64,
+}
+
+pub const COMPRESSED_PERSISTENT_KV: &str = "compressed";
+pub const DENSE_FALLBACK_PERSISTENT_KV: &str = "dense-fallback";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -1318,6 +1614,10 @@ pub struct Receipt {
     pub lifecycle: ReceiptLifecycle,
     pub cancellation: ReceiptCancellation,
     pub warmup: ReceiptWarmup,
+    /// Compressed rows only; absent (not serialized) on dense receipts so their bytes and seals are
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<ReceiptCompression>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1634,6 +1934,75 @@ pub fn validate_sealed_receipt(receipt: &Receipt) -> Result<(), String> {
     Ok(())
 }
 
+/// Compressed-row evidence rules (SC-20676): fused execution happened, every dense fallback is
+/// reasoned and counted, physical bytes are the sum of their measured components, and no dense
+/// full-cache reconstruction survived.
+fn validate_receipt_compression(
+    receipt: &Receipt,
+    compression: &ReceiptCompression,
+) -> Result<(), String> {
+    if compression.method.is_empty()
+        || !compression
+            .method
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        || compression.representation_identity.trim().is_empty()
+        || compression.representation_version == 0
+        || compression.bits == 0
+        || compression.quantization_group_size == 0
+    {
+        return Err("compressed representation identity is incomplete".into());
+    }
+    if compression.device_code_bytes == 0
+        || compression
+            .device_code_bytes
+            .checked_add(compression.device_metadata_bytes)
+            .and_then(|bytes| bytes.checked_add(compression.host_payload_bytes))
+            != Some(compression.physical_kv_bytes)
+    {
+        return Err("compressed physical KV bytes do not reconcile with measured storage".into());
+    }
+    if compression.fused_calls == 0 {
+        return Err("compressed row never executed the fused compressed-domain reader".into());
+    }
+    let mut calls = 0_u64;
+    for (index, fallback) in compression.fallbacks.iter().enumerate() {
+        if fallback.operation.trim().is_empty()
+            || fallback.reason.trim().is_empty()
+            || fallback.calls == 0
+            || compression.fallbacks[..index].iter().any(|prior| {
+                (prior.operation.as_str(), prior.reason.as_str())
+                    >= (fallback.operation.as_str(), fallback.reason.as_str())
+            })
+        {
+            return Err("compressed dense fallback is unreasoned, empty, or unordered".into());
+        }
+        calls = calls
+            .checked_add(fallback.calls)
+            .ok_or("compressed fallback count overflows u64")?;
+    }
+    if calls != compression.fallback_calls
+        || (compression.failed_dispatches != 0 && compression.fallback_calls == 0)
+        || (compression.fallback_calls != 0 && !receipt.lifecycle.dense_fallback)
+    {
+        return Err("compressed fallback calls are not fully reasoned".into());
+    }
+    match compression.persistent_kv_representation.as_str() {
+        COMPRESSED_PERSISTENT_KV
+            if receipt.memory.persistent_kv_bytes < receipt.memory.dense_theoretical_kv_bytes => {}
+        DENSE_FALLBACK_PERSISTENT_KV if compression.fallback_calls != 0 => {}
+        _ => {
+            return Err(
+                "compressed persistent KV representation disagrees with its evidence".into(),
+            )
+        }
+    }
+    if compression.full_cache_dequantizations != 0 {
+        return Err("compressed row reconstructed a dense full cache".into());
+    }
+    Ok(())
+}
+
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     let lowercase_hex = |v: &str, len: usize| {
         v.len() == len
@@ -1931,6 +2300,17 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         && u128::from(transient_high_water) * 10 >= u128::from(dense) * 9
     {
         return Err("full-cache transient high-water detected".into());
+    }
+    // An explicitly witnessed dense full-cache temporary is rejected regardless of its size
+    // (mirrors SceneWorks' detectFullCacheTemporary).
+    if receipt.mode == "compressed"
+        && receipt.memory.allocation_events.iter().any(|event| {
+            event.lifetime == "transient"
+                && [FULL_CACHE_MATERIALIZATION_KIND, DENSE_CACHE_TEMPORARY_KIND]
+                    .contains(&event.kind.as_str())
+        })
+    {
+        return Err("explicit full-cache temporary detected".into());
     }
     receipt.memory.admission.validate()?;
     let weights = receipt.memory.model_weights_bytes;
@@ -2374,6 +2754,15 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         return Err("postRunRelease is required".into());
     }
     if receipt.quality.statistics.variance_policy != "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum" || receipt.quality.statistics.confidence_interval != "95% bootstrap" || receipt.quality.statistics.outlier_policy != "report all samples; no silent deletion" || receipt.quality.statistics.max_coefficient_of_variation != 0.05 { return Err("frozen quality statistics mismatch".into()); }
+    match (receipt.mode.as_str(), &receipt.compression) {
+        ("compressed", Some(compression)) => validate_receipt_compression(receipt, compression)?,
+        ("dense", None) => {}
+        _ => {
+            return Err(
+                "compression evidence must be present exactly on compressed receipts".into(),
+            )
+        }
+    }
     Ok(())
 }
 
@@ -3016,11 +3405,19 @@ pub fn publish_complete_campaign(
     let mut seen = std::collections::BTreeSet::new();
     let mut global_identity = None;
     let mut family_identities = std::collections::BTreeMap::new();
+    let mut campaign_mode = None;
     for item in prepared {
         validate_artifact_bundle(&item.bundle)?;
         let receipt: Receipt = serde_json::from_slice(&item.bundle.receipt)
             .map_err(|e| format!("prepared receipt is not decodable: {e}"))?;
         receipt.memory.admission.validate_against(policy)?;
+        let mode = (
+            receipt.mode.clone(),
+            receipt.compression.as_ref().map(|c| c.method.clone()),
+        );
+        if campaign_mode.get_or_insert_with(|| mode.clone()) != &mode {
+            return Err("campaign mixes dense and compressed (or compressed-method) rows".into());
+        }
         let identity = campaign_global_identity(&receipt)?;
         if global_identity
             .as_ref()
@@ -3434,6 +3831,9 @@ pub fn select_sc20676_baseline_row(
         let coordinate = item.coordinate;
         let receipt: Receipt =
             serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+        if receipt.mode != "dense" {
+            return Err("SC-20676 baseline requires a dense SC-20671 campaign".into());
+        }
         if coordinate.family == family
             && coordinate.context_band == SC20676_BASELINE_CONTEXT_BAND
             && coordinate.request_mode == "single"
@@ -3518,6 +3918,9 @@ pub struct CampaignLaunch {
     pub destination: PathBuf,
     pub resume_dir: PathBuf,
     pub safety_policy: PathBuf,
+    /// `Some` launches every scheduled row in `compressed` mode with this KV method; `None` is the
+    /// dense baseline campaign.
+    pub compressed: Option<CompressedKvMethod>,
 }
 
 fn file_seal(path: &Path) -> Result<String, String> {
@@ -3552,7 +3955,7 @@ fn resume_identity(
             "bytes": inventories[index].bytes,
         })
     };
-    Ok(serde_json::json!({
+    let mut identity = serde_json::json!({
         "schemaVersion": 1,
         "kind": "sc-20671-resume-identity",
         "scheduleVersion": SC20671_SCHEDULE_VERSION,
@@ -3566,7 +3969,35 @@ fn resume_identity(
         "qwenCandidate": inventory_value(1),
         "llamaReference": inventory_value(2),
         "qwenReference": inventory_value(3),
-    }))
+    });
+    bind_resume_mode(&mut identity, launch.compressed);
+    Ok(identity)
+}
+
+/// A compressed campaign's resume identity names its mode and method, so dense and compressed
+/// rows (or two methods) can never resume into each other. Dense identities keep their exact
+/// historical bytes.
+fn bind_resume_mode(identity: &mut serde_json::Value, compressed: Option<CompressedKvMethod>) {
+    if let Some(method) = compressed {
+        identity["mode"] = "compressed".into();
+        identity["kvMethod"] = method.id().into();
+    }
+}
+
+/// The row mode a sealed resume identity launched: `None` for dense.
+fn resume_identity_mode(
+    identity: &serde_json::Value,
+) -> Result<Option<CompressedKvMethod>, String> {
+    match (
+        identity.get("mode").map(serde_json::Value::as_str),
+        identity.get("kvMethod").map(serde_json::Value::as_str),
+    ) {
+        (None, None) => Ok(None),
+        (Some(Some("compressed")), Some(Some(method))) => {
+            CompressedKvMethod::parse(method).map(Some)
+        }
+        _ => Err("resume identity has a malformed compressed mode binding".into()),
+    }
 }
 
 fn seal_json(value: &serde_json::Value) -> Result<(Vec<u8>, String), String> {
@@ -3727,6 +4158,19 @@ fn validate_receipt_launch_identity(
     } else {
         ("qwenCandidate", "qwenReference")
     };
+    let method = resume_identity_mode(identity)?;
+    if receipt.mode
+        != if method.is_some() {
+            "compressed"
+        } else {
+            "dense"
+        }
+        || receipt.compression.as_ref().map(|c| c.method.as_str()) != method.map(|m| m.id())
+    {
+        return Err(format!(
+            "resume row {slug} has a stale dense/compressed mode"
+        ));
+    }
     if p.inference_revision != field("inferenceRevision").unwrap_or("")
         || p.scene_works_revision != field("sceneWorksRevision").unwrap_or("")
         || p.model_file_sha256 != inventory(candidate).unwrap_or("")
@@ -3895,6 +4339,13 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
             .arg(&identity_sha256)
             .arg("--out")
             .arg(&child_dir);
+        if let Some(method) = launch.compressed {
+            command
+                .arg("--mode")
+                .arg("compressed")
+                .arg("--kv-method")
+                .arg(method.id());
+        }
         let logs = launch.resume_dir.join("logs");
         let log_prefix =
             unused_attempt_prefix(&logs, &slug).ok_or("no unused bounded worker log path")?;
@@ -3974,9 +4425,41 @@ fn required_flag(args: &[String], name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing {name}"))
 }
 
+/// `--mode dense|compressed` (default dense) and, for compressed, the required `--kv-method`.
+fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, String> {
+    let flag = |name: &str| {
+        args.iter()
+            .position(|arg| arg == name)
+            .map(|_| required_flag(args, name))
+            .transpose()
+    };
+    match (flag("--mode")?.as_deref(), flag("--kv-method")?) {
+        (None | Some("dense"), None) => Ok(None),
+        (Some("compressed"), Some(method)) => CompressedKvMethod::parse(&method).map(Some),
+        (Some("compressed"), None) => Err("--mode compressed requires --kv-method".into()),
+        (None | Some("dense"), Some(_)) => Err("--kv-method requires --mode compressed".into()),
+        (Some(mode), _) => Err(format!("--mode must be dense or compressed, not {mode:?}")),
+    }
+}
+
 /// CLI entrypoint used by the standalone `sc20671-kv-baseline` binary.  The child accepts no
 /// caller-authored evidence: identity, geometry, timing, quality, cache, and fixtures are bound
 /// from the loaded product session before receipt publication.
+///
+/// `--mode compressed --kv-method <method>` (parent, preflight, and worker) runs every scheduled
+/// row with its KV held in that method's compressed cache and fused decode attention, gated
+/// against a dense-KV reference arm on the same candidate weights (SC-20676). The GPU-window
+/// launch of the compressed campaign is one command from the inference checkout:
+///
+/// ```text
+/// eval "$(scripts/fetch-prebuilt-mlx.sh --build-type Release)" && export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH && \
+/// SCENEWORKS_ROOT=/abs/SceneWorks cargo run --locked --release -p mlx-llm --bin sc20671_kv_baseline -- \
+///   parent --mode compressed --kv-method group-affine \
+///   --llama-snapshot <llama-4bit> --qwen-snapshot <qwen-4bit> \
+///   --llama-fp32-reference-snapshot <llama-bf16> --qwen-fp32-reference-snapshot <qwen-bf16> \
+///   --prompt-file <prompt.txt> --safety-policy <policy.json> \
+///   --resume-dir /abs/sc20676-compressed-resume --out /abs/sc20676-compressed-campaign
+/// ```
 pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
     let Some(mode) = args.first().map(String::as_str) else {
         return Err("usage: sc20671-kv-baseline parent|worker [options]".into());
@@ -3999,6 +4482,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 destination: PathBuf::from(required_flag(args, "--out")?),
                 resume_dir: PathBuf::from(required_flag(args, "--resume-dir")?),
                 safety_policy: PathBuf::from(required_flag(args, "--safety-policy")?),
+                compressed: compressed_mode_flags(args)?,
             };
             if mode == "preflight" {
                 let value = preflight_complete_campaign(&launch)?;
@@ -4037,6 +4521,10 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                     .map(str::to_owned)
                     .ok_or_else(|| format!("resume identity lacks {key}"))
             };
+            let compressed = compressed_mode_flags(args)?;
+            if resume_identity_mode(&identity)? != compressed {
+                return Err("worker dense/compressed mode differs from resume identity".into());
+            }
             if identity_field("policySha256")? != policy.seal()?
                 || identity_field("executableSha256")?
                     != file_seal(&std::env::current_exe().map_err(|e| e.to_string())?)?
@@ -4112,8 +4600,13 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 &policy,
             )?;
             let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
-            let candidate_session = CampaignSession::load(&snapshot)
-                .map_err(|e| format!("load candidate campaign session: {e}"))?;
+            // Compressed rows: the measured arm holds KV in the method's compressed cache, and its
+            // quality denominator is the dense-KV run on the SAME candidate weights.
+            let candidate_session = match compressed {
+                Some(method) => CampaignSession::load_compressed(&snapshot, method),
+                None => CampaignSession::load(&snapshot),
+            }
+            .map_err(|e| format!("load candidate campaign session: {e}"))?;
             let candidate_baseline = candidate_session.load_start_sample.mlx_active_bytes;
             // Candidate lifecycle evidence is collected before the reference model exists in the
             // process. This keeps every global MLX phase sample attributable to the candidate.
@@ -4175,6 +4668,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 );
                 candidate_repeats.push(half);
             }
+            let compressed_parity = candidate_session
+                .compressed()
+                .map(CompressedKvArm::kernel_parity_errors)
+                .transpose()
+                .map_err(|e| format!("compressed kernel parity: {e}"))?;
             drop(candidate_session);
             quiesce_campaign_active_memory(candidate_baseline).map_err(|e| {
                 format!(
@@ -4183,7 +4681,12 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 )
             })?;
 
-            let reference_session = CampaignSession::load(&reference_snapshot)
+            let (reference_session_snapshot, reference_kind) = if compressed.is_some() {
+                (&snapshot, QualityReference::DenseKvSameWeights)
+            } else {
+                (&reference_snapshot, QualityReference::Bf16Characterization)
+            };
+            let reference_session = CampaignSession::load(reference_session_snapshot)
                 .map_err(|e| format!("load reference campaign session: {e}"))?;
             let reference_baseline = reference_session.load_start_sample.mlx_active_bytes;
             let mut reference_warmups = Vec::with_capacity(candidate_warmups.len());
@@ -4253,11 +4756,9 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 .zip(reference_warmups)
                 .enumerate()
                 .map(|(warmup_index, (candidate, reference))| {
-                    let suite = pair_product_fixture_halves(
-                        candidate,
-                        reference,
-                        QualityReference::Bf16Characterization,
-                    )?;
+                    let mut suite =
+                        pair_product_fixture_halves(candidate, reference, reference_kind)?;
+                    suite.kernel_parity_errors = compressed_parity.clone();
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product warmup {warmup_index} quality for {}: {e}",
@@ -4273,11 +4774,9 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 .zip(reference_repeats)
                 .enumerate()
                 .map(|(repeat, (candidate, reference))| {
-                    let suite = pair_product_fixture_halves(
-                        candidate,
-                        reference,
-                        QualityReference::Bf16Characterization,
-                    )?;
+                    let mut suite =
+                        pair_product_fixture_halves(candidate, reference, reference_kind)?;
+                    suite.kernel_parity_errors = compressed_parity.clone();
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product fixture repeat {repeat} quality for {}: {e}",
@@ -4313,6 +4812,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 warmup_cache_state_version,
                 &captured_source,
                 admission,
+                compressed.map(|method| (method, warmup_suites.as_slice())),
+                &reference_inventory,
             )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
@@ -4323,7 +4824,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())
         }
-        _ => Err("usage: sc20671-kv-baseline parent|worker [options]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [options]".into()),
     }
 }
 
@@ -5136,6 +5637,15 @@ pub trait Observer {
     /// caller-authored digest string.
     fn snapshot_inventory(&mut self, _inventory: &SnapshotInventory) {}
     fn geometry(&mut self, _geometry: ProductGeometry) {}
+    /// Immutable model-boundary evidence of one compressed (packed) decoder cache, forwarded once
+    /// after decode. Dense caches never call it.
+    fn packed_cache_evidence(&mut self, _evidence: &crate::primitives::PackedCacheEvidence) {}
+    /// A compressed-arm operation that ran on the explicit dense path, with its reason.
+    fn dense_fallback(&mut self, _operation: &str, _reason: &str) {}
+    /// A packed-to-dense transition rebuilt the whole cached history as dense K/V.
+    fn dense_reconstruction(&mut self, _bytes: u64) {}
+    /// Measured physical storage of a live compressed cache at a decoder boundary.
+    fn compressed_storage(&mut self, _storage: &crate::primitives::CompressedCacheStorage) {}
 }
 
 /// Device-backed product observer.  It deliberately has no setters for identity, phase samples,
@@ -5161,6 +5671,9 @@ pub struct ProductObserver {
     cache_live_tokens: u64,
     cache_capacity_tokens: u64,
     sampling_elapsed_ms: f64,
+    packed_evidence: Vec<crate::primitives::PackedCacheEvidence>,
+    dense_fallbacks: Vec<(String, String)>,
+    compressed_storage_peak: Option<crate::primitives::CompressedCacheStorage>,
 }
 
 impl ProductObserver {
@@ -5186,6 +5699,9 @@ impl ProductObserver {
             cache_live_tokens: 0,
             cache_capacity_tokens: 0,
             sampling_elapsed_ms: 0.0,
+            packed_evidence: Vec::new(),
+            dense_fallbacks: Vec::new(),
+            compressed_storage_peak: None,
         }
     }
 
@@ -5279,6 +5795,9 @@ impl ProductObserver {
             prefill_peak_window,
             cache_live_tokens: self.cache_live_tokens,
             cache_capacity_tokens: self.cache_capacity_tokens,
+            packed_evidence: self.packed_evidence,
+            dense_fallbacks: self.dense_fallbacks,
+            compressed_storage_peak: self.compressed_storage_peak,
         })
     }
 }
@@ -5304,6 +5823,12 @@ pub struct ProductObservations {
     pub prefill_peak_window: ReceiptPeakWindow,
     pub cache_live_tokens: u64,
     pub cache_capacity_tokens: u64,
+    /// Compressed-arm packed cache evidence, one entry per packed decoder cache (empty for dense).
+    pub packed_evidence: Vec<crate::primitives::PackedCacheEvidence>,
+    /// Compressed-arm operations that ran on the explicit dense path, with their reasons.
+    pub dense_fallbacks: Vec<(String, String)>,
+    /// Largest measured physical compressed storage (device + host) seen by this observer.
+    pub compressed_storage_peak: Option<crate::primitives::CompressedCacheStorage>,
 }
 
 impl Observer for ProductObserver {
@@ -5510,6 +6035,47 @@ impl Observer for ProductObserver {
     }
     fn geometry(&mut self, geometry: ProductGeometry) {
         self.geometry = Some(geometry);
+    }
+
+    fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+        self.packed_evidence.push(evidence.clone());
+    }
+
+    fn dense_fallback(&mut self, operation: &str, reason: &str) {
+        if operation.trim().is_empty() || reason.trim().is_empty() {
+            self.error = Some("compressed dense fallback lacks an operation or reason".into());
+            return;
+        }
+        self.dense_fallbacks.push((operation.into(), reason.into()));
+    }
+
+    fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+        let physical = |s: &crate::primitives::CompressedCacheStorage| {
+            s.device_bytes().saturating_add(s.host_payload_bytes)
+        };
+        if self
+            .compressed_storage_peak
+            .is_none_or(|peak| physical(storage) > physical(&peak))
+        {
+            self.compressed_storage_peak = Some(*storage);
+        }
+    }
+
+    fn dense_reconstruction(&mut self, bytes: u64) {
+        let Some(phase) = self.phase else {
+            self.error = Some("dense reconstruction observed before a product phase".into());
+            return;
+        };
+        // Deliberately unprefixed: this is the shared full-cache temporary witness kind that both
+        // receipt validators reject for compressed rows.
+        self.allocations.push(ReceiptAllocation {
+            kind: FULL_CACHE_MATERIALIZATION_KIND.into(),
+            role: "cache".into(),
+            lifetime: "transient".into(),
+            phase: phase.into(),
+            timestamp: timestamp_now(),
+            bytes: bytes.max(1),
+        });
     }
 }
 
@@ -5788,6 +6354,7 @@ pub fn run_dense_coordinate(
                 }
             },
             observer,
+            session.compressed(),
         )?;
         if !output_has_observed_generation(&output, saw_token) {
             return Err(core_llm::Error::InvalidRequest(
@@ -5863,10 +6430,20 @@ pub fn run_dense_lifecycle_request_on_session(
         if let Some(coordinate) = coordinate {
             if coordinate.request_mode == "supported-batch" {
                 provider.campaign_supported_batch(prefix_prompt, 2)?;
+                session.dense_fallback(
+                    observer,
+                    "supported-batch",
+                    COMPRESSED_BATCH_FALLBACK_REASON,
+                );
                 observer.operation("supported-batch");
             }
             if coordinate.prefill_mode == "chunked" {
                 provider.campaign_prefix_reuse(prefix_prompt)?;
+                session.dense_fallback(
+                    observer,
+                    "chunked-prefix-reuse",
+                    COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
+                );
                 observer.operation("chunked-prefix-reuse");
             }
         }
@@ -5878,6 +6455,7 @@ pub fn run_dense_lifecycle_request_on_session(
             &request,
             &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
             observer,
+            session.compressed(),
         )?;
         if !output_has_observed_generation(&output, saw_token) {
             return Err(core_llm::Error::InvalidRequest(
@@ -5892,7 +6470,7 @@ pub fn run_dense_lifecycle_request_on_session(
         // load.  The version is monotonically scoped to `CampaignSession`, not this PID.
         observer.cache_state(session.advance_cache_state());
         observer.phase("prompt-cache-reuse");
-        provider.campaign_cancel_after_first_token(observer)?;
+        provider.campaign_cancel_after_first_token(observer, session.compressed())?;
         output
     };
     provider.campaign_release_cache_state();
@@ -6148,7 +6726,13 @@ fn run_coordinate_operation_on_session(
     observer.snapshot_inventory(session.inventory());
     observer.geometry(provider.campaign_geometry());
     let compile_setup_ms = if operation == "chunked-prefix-reuse" {
-        provider.campaign_seed_prefix_reuse(prefix_prompt)?
+        let seeded = provider.campaign_seed_prefix_reuse(prefix_prompt)?;
+        session.dense_fallback(
+            &mut observer,
+            "chunked-prefix-seed",
+            COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
+        );
+        seeded
     } else {
         0.0
     };
@@ -6162,6 +6746,11 @@ fn run_coordinate_operation_on_session(
                 measure_product_dispatch(&mut observer, |observer| {
                     provider.campaign_supported_batch_observed(prefix_prompt, 2, observer)
                 })?;
+            session.dense_fallback(
+                &mut observer,
+                "supported-batch",
+                COMPRESSED_BATCH_FALLBACK_REASON,
+            );
             let mut bytes = Vec::new();
             let generated = outputs
                 .iter()
@@ -6185,6 +6774,11 @@ fn run_coordinate_operation_on_session(
                 measure_product_dispatch(&mut observer, |observer| {
                     provider.campaign_prefix_reuse_observed(prefix_prompt, observer)
                 })?;
+            session.dense_fallback(
+                &mut observer,
+                "chunked-prefix-reuse",
+                COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
+            );
             if hits == 0 {
                 return Err(core_llm::Error::InvalidRequest(
                     "observed prefix coordinate has no cache hit".into(),
@@ -6210,6 +6804,7 @@ fn run_coordinate_operation_on_session(
                         &request,
                         &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
                         observer,
+                        session.compressed(),
                     )
                 })?;
             if !output_has_observed_generation(&output, saw_token) {
@@ -6240,9 +6835,14 @@ fn run_coordinate_operation_on_session(
     // Prompt-cache reuse and deliberate cancellation are additional lifecycle facts.  They do not
     // replace the coordinate operation measured above.
     provider.campaign_prefix_reuse(prefix_prompt)?;
+    session.dense_fallback(
+        &mut observer,
+        "prompt-cache-reuse",
+        COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
+    );
     observer.cache_state(session.advance_cache_state());
     observer.phase("prompt-cache-reuse");
-    provider.campaign_cancel_after_first_token(&mut observer)?;
+    provider.campaign_cancel_after_first_token(&mut observer, session.compressed())?;
     provider.campaign_release_cache_state();
     mlx_rs::memory::clear_cache();
     observer.phase("post-run-release");
@@ -6377,6 +6977,7 @@ pub fn quality_from_product_fixtures(
     cache_reference: &ProductFixtureResult,
     expected_needle: &str,
     reference: QualityReference,
+    kernel_parity_errors: Option<&[f64]>,
 ) -> Result<QualityObservation, String> {
     if reference == QualityReference::DenseKvSameWeights
         && [
@@ -6419,7 +7020,12 @@ pub fn quality_from_product_fixtures(
         QualityReference::Bf16Characterization => outcomes.candidate_tool_valid,
         QualityReference::DenseKvSameWeights => outcomes.reference_tool_valid,
     };
-    let parity_errors = dense_kernel_fp32_parity_errors()?;
+    // A compressed arm supplies its own fused-reader parity; dense rows measure the dense kernel.
+    let parity_errors = match kernel_parity_errors {
+        Some(errors) if !errors.is_empty() => errors.to_vec(),
+        Some(_) => return Err("compressed kernel parity produced no errors to reduce".into()),
+        None => dense_kernel_fp32_parity_errors()?,
+    };
     Ok(QualityObservation {
         parity_errors,
         reference_perplexity: negative_log_likelihood(
@@ -6504,6 +7110,9 @@ pub struct ProductFixtureSuite {
     /// The fixture denominator: bf16 characterization for dense rows, the same-weights dense-KV
     /// run for compressed rows.
     pub reference: QualityReference,
+    /// Compressed rows: the fused reader's parity against its host-fp32 dequantize-then-attend
+    /// reference. `None` measures the dense kernel.
+    pub kernel_parity_errors: Option<Vec<f64>>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -6788,6 +7397,7 @@ fn pair_product_fixture_halves(
         context_target_tokens: candidate.context_target_tokens,
         context_payload_tokens: candidate.context_payload_tokens,
         reference: reference_kind,
+        kernel_parity_errors: None,
     })
 }
 
@@ -6804,6 +7414,7 @@ impl ProductFixtureSuite {
             &self.cache_reference,
             &self.needle,
             self.reference,
+            self.kernel_parity_errors.as_deref(),
         )
     }
 }
@@ -7301,6 +7912,192 @@ fn receipt_quality_over_repeats(
     Ok(quality)
 }
 
+/// Lifecycle capabilities a row actually exercised. Dense rows have no compressed lifecycle
+/// representation. Compressed rows run single-shot prefill, append, and cancellation on the
+/// compressed cache and exercise an explicit reasoned dense fallback; the prefix-cache paths
+/// (chunked prefill and prompt-cache reuse) are dense by construction and are recorded as such.
+pub fn receipt_lifecycle(compressed: bool) -> ReceiptLifecycle {
+    let mut fallback_reasons = std::collections::BTreeMap::new();
+    let unexercised = if compressed {
+        "not exercised by the SC-20671 compressed campaign arm"
+    } else {
+        "dense baseline route has no compressed lifecycle representation"
+    };
+    for capability in [
+        "trim",
+        "rollback",
+        "clear",
+        "clone",
+        "batchSplit",
+        "batchMerge",
+        "prefixCopyOnWrite",
+        "pageImport",
+        "pageExport",
+        "serialization",
+        "restore",
+    ] {
+        fallback_reasons.insert(format!("{capability}FallbackReason"), unexercised.into());
+    }
+    if compressed {
+        for capability in ["chunkedPrefill", "promptCacheReuse"] {
+            fallback_reasons.insert(
+                format!("{capability}FallbackReason"),
+                COMPRESSED_PREFIX_REUSE_FALLBACK_REASON.into(),
+            );
+        }
+    } else {
+        fallback_reasons.insert("denseFallbackFallbackReason".into(), unexercised.into());
+    }
+    ReceiptLifecycle {
+        append: true,
+        chunked_prefill: !compressed,
+        single_shot_prefill: true,
+        prompt_cache_reuse: !compressed,
+        trim: false,
+        rollback: false,
+        clear: false,
+        cancel: true,
+        clone: false,
+        batch_split: false,
+        batch_merge: false,
+        prefix_copy_on_write: false,
+        page_import: false,
+        page_export: false,
+        serialization: false,
+        restore: false,
+        dense_fallback: compressed,
+        post_run_release: true,
+        fallback_reasons,
+    }
+}
+
+/// Every candidate-side product observation of a compressed arm: each fixture's coordinate
+/// operation, its lifecycle/quality run, and any secondary coordinate operation.
+fn compressed_arm_observations<'a>(
+    suites: impl IntoIterator<Item = &'a ProductFixtureSuite>,
+) -> Vec<&'a ProductObservations> {
+    let mut observations = Vec::new();
+    for suite in suites {
+        for result in [
+            &suite.kernel_candidate,
+            &suite.tool_candidate,
+            &suite.needle_candidate,
+            &suite.cache_candidate,
+        ] {
+            observations.push(&result.observation);
+            observations.push(&result.quality_observation);
+            if let Some(secondary) = &result.secondary_coordinate_operation {
+                observations.push(&secondary.observation);
+            }
+        }
+    }
+    observations
+}
+
+/// Reduce a compressed arm's product observations to the receipt's compression block. Evidence is
+/// exported by the caches themselves; a cache that left the fused path without a recorded reason
+/// is refused here rather than published as a silent fallback. Dense reconstructions are counted,
+/// never hidden: the receipt validators reject any.
+pub fn compressed_receipt_block(
+    method: CompressedKvMethod,
+    primary: &ProductObservations,
+    observations: &[&ProductObservations],
+) -> Result<ReceiptCompression, String> {
+    let evidence = observations
+        .iter()
+        .flat_map(|observation| &observation.packed_evidence)
+        .collect::<Vec<_>>();
+    let first = evidence
+        .first()
+        .ok_or("compressed arm produced no compressed cache evidence")?;
+    let mut fallbacks = std::collections::BTreeMap::<(String, String), u64>::new();
+    let (mut fused_calls, mut full_cache_dequantizations, mut failed_dispatches) = (0_u64, 0, 0);
+    for item in &evidence {
+        if item.representation_identity != first.representation_identity
+            || item.representation_version != first.representation_version
+            || item.bits != first.bits
+            || item.quantization_group_size != first.quantization_group_size
+        {
+            return Err("compressed arm mixed representations".into());
+        }
+        if (item.dense_active
+            || item.failed_dispatches != 0
+            || item.full_cache_dequantizations != 0)
+            && item.fallback_reasons.is_empty()
+        {
+            return Err("compressed cache left the fused path without a recorded reason".into());
+        }
+        let count = |value: usize| u64::try_from(value).map_err(|_| "evidence count overflow");
+        fused_calls += count(item.accepted_direct_calls)?;
+        full_cache_dequantizations += count(item.full_cache_dequantizations)?;
+        failed_dispatches += item.failed_dispatches;
+        for (operation, reason) in &item.fallback_reasons {
+            *fallbacks
+                .entry((operation.clone(), reason.clone()))
+                .or_default() += 1;
+        }
+    }
+    for observation in observations {
+        for (operation, reason) in &observation.dense_fallbacks {
+            *fallbacks
+                .entry((operation.clone(), reason.clone()))
+                .or_default() += 1;
+        }
+    }
+    if fused_calls == 0 {
+        return Err("compressed arm never executed the fused compressed-domain reader".into());
+    }
+    let storage = observations
+        .iter()
+        .filter_map(|observation| observation.compressed_storage_peak)
+        .max_by_key(|storage| {
+            storage
+                .device_bytes()
+                .saturating_add(storage.host_payload_bytes)
+        })
+        .ok_or("compressed arm measured no live compressed storage")?;
+    let persistent_kv_representation = if !primary.packed_evidence.is_empty()
+        && primary.dense_fallbacks.is_empty()
+        && primary
+            .packed_evidence
+            .iter()
+            .all(|item| !item.dense_active && item.fallback_reasons.is_empty())
+    {
+        COMPRESSED_PERSISTENT_KV
+    } else {
+        DENSE_FALLBACK_PERSISTENT_KV
+    };
+    let fallbacks = fallbacks
+        .into_iter()
+        .map(|((operation, reason), calls)| ReceiptCompressionFallback {
+            operation,
+            reason,
+            calls,
+        })
+        .collect::<Vec<_>>();
+    Ok(ReceiptCompression {
+        method: method.id().into(),
+        representation_identity: first.representation_identity.clone(),
+        representation_version: first.representation_version.into(),
+        bits: first.bits.into(),
+        quantization_group_size: u64::try_from(first.quantization_group_size)
+            .map_err(|_| "quantization group size overflows u64")?,
+        device_code_bytes: storage.device_code_bytes,
+        device_metadata_bytes: storage.device_metadata_bytes,
+        host_payload_bytes: storage.host_payload_bytes,
+        physical_kv_bytes: storage
+            .device_bytes()
+            .checked_add(storage.host_payload_bytes)
+            .ok_or("physical compressed KV bytes overflow u64")?,
+        persistent_kv_representation: persistent_kv_representation.into(),
+        fused_calls,
+        fallback_calls: fallbacks.iter().map(|fallback| fallback.calls).sum(),
+        fallbacks,
+        full_cache_dequantizations,
+        failed_dispatches,
+    })
+}
+
 #[allow(clippy::too_many_arguments)] // Every argument is producer-owned sealed evidence.
 fn product_receipt(
     coordinate: &Coordinate,
@@ -7311,6 +8108,8 @@ fn product_receipt(
     warmup_cache_state_version: Option<u64>,
     captured_source: &(String, String),
     admission: ReceiptAdmission,
+    compressed: Option<(CompressedKvMethod, &[ProductFixtureSuite])>,
+    reference_model: &SnapshotInventory,
 ) -> Result<Receipt, String> {
     let suite = suites
         .first()
@@ -7364,8 +8163,14 @@ fn product_receipt(
             ));
         }
     }
-    let reference = &suite.kernel_reference.observation.snapshot;
+    // The fixture denominator is whatever the reference arm ran (bf16 for dense rows, the same
+    // candidate weights for compressed rows); provenance always names the pinned bf16 reference.
+    let denominator = &suite.kernel_reference.observation.snapshot;
     let model = &observation.snapshot;
+    if compressed.is_none() && denominator.sha256 != reference_model.sha256 {
+        return Err("dense receipt reference arm is not the pinned bf16 reference model".into());
+    }
+    let reference = reference_model;
     let candidate_contract = benchmark_model(coordinate.family, false)?;
     let reference_contract = benchmark_model(coordinate.family, true)?;
     let inference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7392,26 +8197,30 @@ fn product_receipt(
         suite.needle_candidate.output.text,
         suite.cache_candidate.output.text
     );
-    let mut fallback_reasons = std::collections::BTreeMap::new();
-    for capability in [
-        "trim",
-        "rollback",
-        "clear",
-        "clone",
-        "batchSplit",
-        "batchMerge",
-        "prefixCopyOnWrite",
-        "pageImport",
-        "pageExport",
-        "serialization",
-        "restore",
-        "denseFallback",
-    ] {
-        fallback_reasons.insert(
-            format!("{capability}FallbackReason"),
-            "dense baseline route has no compressed lifecycle representation".into(),
-        );
-    }
+    let lifecycle = receipt_lifecycle(compressed.is_some());
+    let compression = compressed
+        .map(|(method, warmups)| {
+            if suites.iter().chain(warmups).any(|suite| {
+                suite.reference != QualityReference::DenseKvSameWeights
+                    || suite.kernel_parity_errors.is_none()
+            }) {
+                return Err(
+                    "compressed receipt requires same-weights dense-KV fixtures and fused-reader parity"
+                        .to_string(),
+                );
+            }
+            compressed_receipt_block(
+                method,
+                observation,
+                &compressed_arm_observations(suites.iter().chain(warmups)),
+            )
+        })
+        .transpose()?;
+    let mode = if compression.is_some() {
+        "compressed"
+    } else {
+        "dense"
+    };
     let cache_bytes = observation
         .allocations
         .iter()
@@ -7463,19 +8272,19 @@ fn product_receipt(
                 independent_reference: fixture_independent_reference(
                     name,
                     suite.reference,
-                    &reference.sha256,
+                    &denominator.sha256,
                 ),
             },
         );
     }
     let template = Receipt {
-        schema_version: 4, harness_version: "sc-20671-kv-baseline-v4".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: "dense".into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
+        schema_version: 4, harness_version: "sc-20671-kv-baseline-v4".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: mode.into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
+        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 }, admission },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() } };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -7595,6 +8404,9 @@ pub(crate) mod tests {
                 },
                 cache_live_tokens: 32,
                 cache_capacity_tokens: 256,
+                packed_evidence: Vec::new(),
+                dense_fallbacks: Vec::new(),
+                compressed_storage_peak: None,
             };
             ProductFixtureResult {
                 observation: observation(),
@@ -8844,8 +9656,8 @@ pub(crate) mod tests {
         assert!(validate_fixture_evidence(&evidence[..3]).is_err());
     }
 
-    #[test]
-    fn artifact_bundle_rejects_tampering_and_partial_outputs() {
+    /// A complete, valid dense v4 receipt assembled by the real builder from minimal evidence.
+    fn builder_test_receipt() -> Receipt {
         let mut template = Receipt {
             schema_version: 4,
             harness_version: "sc-20671-kv-baseline-v4".into(),
@@ -9021,6 +9833,7 @@ pub(crate) mod tests {
                 session_id: String::new(),
                 cache_state_version: 0,
             },
+            compression: None,
         };
         for name in REQUIRED_FIXTURES {
             template.quality.fixture_evidence.insert(
@@ -9136,7 +9949,7 @@ pub(crate) mod tests {
             needle_discriminating: true,
             tool_discriminating: true,
         };
-        let mut receipt = ReceiptBuilder {
+        ReceiptBuilder {
             template,
             phases,
             allocations,
@@ -9145,7 +9958,377 @@ pub(crate) mod tests {
             quality,
         }
         .finish()
-        .expect("builder must produce a complete v4 receipt");
+        .expect("builder must produce a complete v4 receipt")
+    }
+
+    fn test_packed_evidence(fused: usize) -> crate::primitives::PackedCacheEvidence {
+        crate::primitives::PackedCacheEvidence {
+            representation_identity: "sc-20676-packed-group-affine-v1".into(),
+            representation_version: 2,
+            bits: 2,
+            quantization_group_size: 32,
+            accepted_direct_calls: fused,
+            kernel_warmed: true,
+            ..Default::default()
+        }
+    }
+
+    const TEST_STORAGE: crate::primitives::CompressedCacheStorage =
+        crate::primitives::CompressedCacheStorage {
+            device_code_bytes: 1,
+            device_metadata_bytes: 1,
+            host_payload_bytes: 3,
+            tokens: 1,
+            element_bytes: 2,
+        };
+
+    fn test_compressed_observation(
+        evidence: Vec<crate::primitives::PackedCacheEvidence>,
+        dense_fallbacks: &[(&str, &str)],
+        storage: Option<crate::primitives::CompressedCacheStorage>,
+    ) -> ProductObservations {
+        ProductObservations {
+            snapshot: SnapshotInventory {
+                root: PathBuf::new(),
+                files: Vec::new(),
+                bytes: 1,
+                sha256: "d".repeat(64),
+            },
+            geometry: ProductGeometry {
+                query_heads: 2,
+                kv_heads: 1,
+                head_dimension: 64,
+                layers: 1,
+                element_bytes: 2,
+            },
+            phases: Vec::new(),
+            phase_elapsed_ms: Vec::new(),
+            allocations: Vec::new(),
+            prefill_logits: Vec::new(),
+            token_probabilities: Vec::new(),
+            session_id: "e".repeat(64),
+            cache_state_version: 1,
+            operations: Vec::new(),
+            load_elapsed_ms: 1.0,
+            prefill_peak_window: ReceiptPeakWindow {
+                started_at: "2026-01-01T00:00:00Z".into(),
+                baseline_active_bytes: 1,
+                reset_peak_bytes: 0,
+            },
+            cache_live_tokens: 1,
+            cache_capacity_tokens: 256,
+            packed_evidence: evidence,
+            dense_fallbacks: dense_fallbacks
+                .iter()
+                .map(|(operation, reason)| ((*operation).into(), (*reason).into()))
+                .collect(),
+            compressed_storage_peak: storage,
+        }
+    }
+
+    /// The producer's block for a primary single-shot coordinate that stayed compressed plus a
+    /// lifecycle run whose prompt-cache reuse took the reasoned dense prefix path.
+    fn test_compression_block() -> ReceiptCompression {
+        let primary =
+            test_compressed_observation(vec![test_packed_evidence(4)], &[], Some(TEST_STORAGE));
+        let lifecycle = test_compressed_observation(
+            vec![test_packed_evidence(6)],
+            &[(
+                "prompt-cache-reuse",
+                COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
+            )],
+            None,
+        );
+        compressed_receipt_block(
+            CompressedKvMethod::GroupAffine,
+            &primary,
+            &[&primary, &lifecycle],
+        )
+        .unwrap()
+    }
+
+    /// Turn the builder's dense receipt into the same row measured in compressed mode: same-weights
+    /// fixtures, compressed lifecycle, a persistent KV below the dense geometry, and the block.
+    fn compress_test_receipt(receipt: &mut Receipt, compression: ReceiptCompression) {
+        receipt.mode = "compressed".into();
+        receipt.provenance.command = receipt
+            .provenance
+            .command_template
+            .replace("{mode}", "compressed");
+        for name in REQUIRED_FIXTURES {
+            receipt
+                .quality
+                .fixture_evidence
+                .get_mut(name)
+                .unwrap()
+                .independent_reference = fixture_independent_reference(
+                name,
+                QualityReference::DenseKvSameWeights,
+                &receipt.provenance.model_file_sha256,
+            );
+        }
+        receipt.lifecycle = receipt_lifecycle(true);
+        let compressed_kv = receipt.memory.persistent_kv_bytes / 2;
+        for event in &mut receipt.memory.allocation_events {
+            if event.role == "cache" && event.lifetime != "transient" {
+                event.bytes = compressed_kv;
+            }
+        }
+        receipt.memory.persistent_kv_bytes = compressed_kv;
+        receipt.memory.reconciliation.observed_persistent_kv_bytes = compressed_kv;
+        receipt.compression = Some(compression);
+        receipt.receipt_sha256 = receipt_semantic_seal(receipt).unwrap();
+    }
+
+    #[test]
+    fn compressed_row_round_trips_producer_evidence_through_the_validators() {
+        let block = test_compression_block();
+        assert_eq!(block.method, "group-affine");
+        assert_eq!(block.fused_calls, 10);
+        assert_eq!(block.fallback_calls, 1);
+        assert_eq!(
+            block.physical_kv_bytes, 5,
+            "device code + metadata + host staging"
+        );
+        assert_eq!(block.persistent_kv_representation, COMPRESSED_PERSISTENT_KV);
+        assert_eq!(block.full_cache_dequantizations, 0);
+
+        let dense = builder_test_receipt();
+        assert!(!String::from_utf8(dense.bytes().unwrap())
+            .unwrap()
+            .contains("compression"));
+        let mut compressed = builder_test_receipt();
+        compress_test_receipt(&mut compressed, block.clone());
+        validate_sealed_receipt(&compressed).expect("same-weights compressed row is accepted");
+        let parsed: Receipt = serde_json::from_slice(&compressed.bytes().unwrap()).unwrap();
+        validate_sealed_receipt(&parsed).expect("serialized compressed receipt still validates");
+        assert_eq!(parsed.compression, Some(block.clone()));
+
+        let rejects = |mutate: &dyn Fn(&mut Receipt), expected: &str| {
+            let mut receipt = compressed.clone();
+            mutate(&mut receipt);
+            receipt.receipt_sha256 = receipt_semantic_seal(&receipt).unwrap();
+            let error = validate_sealed_receipt(&receipt).unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        // Different weights: a bf16 (or any other model's) denominator is refused.
+        rejects(
+            &|r| {
+                for name in REQUIRED_FIXTURES {
+                    r.quality
+                        .fixture_evidence
+                        .get_mut(name)
+                        .unwrap()
+                        .independent_reference = fixture_independent_reference(
+                        name,
+                        QualityReference::Bf16Characterization,
+                        &r.provenance.reference_model_sha256,
+                    );
+                }
+            },
+            "contract v3 denominator",
+        );
+        // Silent fallback: unreasoned or uncounted dense execution, or no fused execution at all.
+        rejects(
+            &|r| r.compression.as_mut().unwrap().fallback_calls += 1,
+            "not fully reasoned",
+        );
+        rejects(
+            &|r| r.compression.as_mut().unwrap().fallbacks[0].reason = " ".into(),
+            "unreasoned",
+        );
+        rejects(
+            &|r| r.compression.as_mut().unwrap().fused_calls = 0,
+            "never executed the fused",
+        );
+        rejects(
+            &|r| {
+                let c = r.compression.as_mut().unwrap();
+                c.fallbacks.insert(
+                    0,
+                    ReceiptCompressionFallback {
+                        operation: "z".into(),
+                        reason: "r".into(),
+                        calls: 1,
+                    },
+                );
+                c.fallback_calls += 1;
+            },
+            "unordered",
+        );
+        rejects(
+            &|r| {
+                r.lifecycle.dense_fallback = false;
+                r.lifecycle
+                    .fallback_reasons
+                    .insert("denseFallbackFallbackReason".into(), "unsupported".into());
+            },
+            "not fully reasoned",
+        );
+        rejects(
+            &|r| {
+                let c = r.compression.as_mut().unwrap();
+                c.persistent_kv_representation = DENSE_FALLBACK_PERSISTENT_KV.into();
+                c.fallbacks.clear();
+                c.fallback_calls = 0;
+            },
+            "persistent KV representation",
+        );
+        // A persistent KV labelled compressed may not be the full dense geometry.
+        rejects(
+            &|r| {
+                let dense = r.memory.dense_theoretical_kv_bytes;
+                for event in &mut r.memory.allocation_events {
+                    if event.role == "cache" && event.lifetime != "transient" {
+                        event.bytes = dense;
+                    }
+                }
+                r.memory.persistent_kv_bytes = dense;
+                r.memory.reconciliation.observed_persistent_kv_bytes = dense;
+            },
+            "persistent KV representation",
+        );
+        // Dense reconstruction: counted by the cache, or witnessed by an explicit event.
+        rejects(
+            &|r| r.compression.as_mut().unwrap().full_cache_dequantizations = 1,
+            "reconstructed a dense full cache",
+        );
+        rejects(
+            &|r| {
+                r.memory.allocation_events.push(ReceiptAllocation {
+                    kind: FULL_CACHE_MATERIALIZATION_KIND.into(),
+                    role: "cache".into(),
+                    lifetime: "transient".into(),
+                    phase: "prefill-peak".into(),
+                    timestamp: "2026-01-01T00:00:02.300Z".into(),
+                    bytes: 1,
+                })
+            },
+            "explicit full-cache temporary",
+        );
+        // Measured storage must reconcile, and the block belongs exactly to compressed rows.
+        rejects(
+            &|r| r.compression.as_mut().unwrap().host_payload_bytes += 1,
+            "do not reconcile with measured storage",
+        );
+        rejects(&|r| r.compression = None, "present exactly on compressed");
+        let mut dense_with_block = builder_test_receipt();
+        dense_with_block.compression = Some(block);
+        assert!(validate_receipt_semantics(&dense_with_block)
+            .unwrap_err()
+            .contains("present exactly on compressed"));
+    }
+
+    #[test]
+    fn compressed_producer_refuses_silent_fallback_and_counts_reconstructions() {
+        let silent = crate::primitives::PackedCacheEvidence {
+            dense_active: true,
+            ..test_packed_evidence(3)
+        };
+        let primary = test_compressed_observation(vec![silent], &[], Some(TEST_STORAGE));
+        assert!(
+            compressed_receipt_block(CompressedKvMethod::GroupAffine, &primary, &[&primary])
+                .unwrap_err()
+                .contains("without a recorded reason")
+        );
+        let dense_only = test_compressed_observation(
+            vec![test_packed_evidence(0)],
+            &[("cache-selection", "refused")],
+            Some(TEST_STORAGE),
+        );
+        assert!(compressed_receipt_block(
+            CompressedKvMethod::GroupAffine,
+            &dense_only,
+            &[&dense_only]
+        )
+        .unwrap_err()
+        .contains("never executed the fused"));
+        let reconstructed = crate::primitives::PackedCacheEvidence {
+            dense_active: true,
+            full_cache_dequantizations: 1,
+            fallback_reasons: vec![(
+                "update".into(),
+                "decoder layer requires dense attention".into(),
+            )],
+            ..test_packed_evidence(3)
+        };
+        let primary = test_compressed_observation(vec![reconstructed], &[], Some(TEST_STORAGE));
+        let block =
+            compressed_receipt_block(CompressedKvMethod::GroupAffine, &primary, &[&primary])
+                .unwrap();
+        assert_eq!(block.full_cache_dequantizations, 1);
+        assert_eq!(block.fallback_calls, 1);
+        assert_eq!(
+            block.persistent_kv_representation, DENSE_FALLBACK_PERSISTENT_KV,
+            "a primary operation that left the fused path is not labelled compressed"
+        );
+        let mut receipt = builder_test_receipt();
+        compress_test_receipt(&mut receipt, block);
+        assert!(validate_sealed_receipt(&receipt)
+            .unwrap_err()
+            .contains("reconstructed a dense full cache"));
+    }
+
+    #[test]
+    fn compressed_mode_flags_and_resume_identity_bind_the_method() {
+        let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(compressed_mode_flags(&args(&["worker"])).unwrap(), None);
+        assert_eq!(
+            compressed_mode_flags(&args(&["worker", "--mode", "dense"])).unwrap(),
+            None
+        );
+        assert_eq!(
+            compressed_mode_flags(&args(&[
+                "parent",
+                "--mode",
+                "compressed",
+                "--kv-method",
+                "group-affine"
+            ]))
+            .unwrap(),
+            Some(CompressedKvMethod::GroupAffine)
+        );
+        for bad in [
+            &["--mode", "compressed"][..],
+            &["--kv-method", "group-affine"],
+            &["--mode", "compressed", "--kv-method", "rvq-unwired"],
+            &["--mode", "sparse"],
+        ] {
+            assert!(compressed_mode_flags(&args(bad)).is_err(), "{bad:?}");
+        }
+        let mut identity = serde_json::json!({ "kind": "sc-20671-resume-identity" });
+        let dense_bytes = canonical_json_bytes(&identity).unwrap();
+        bind_resume_mode(&mut identity, None);
+        assert_eq!(canonical_json_bytes(&identity).unwrap(), dense_bytes);
+        assert_eq!(resume_identity_mode(&identity).unwrap(), None);
+        bind_resume_mode(&mut identity, Some(CompressedKvMethod::GroupAffine));
+        assert_eq!(
+            resume_identity_mode(&identity).unwrap(),
+            Some(CompressedKvMethod::GroupAffine)
+        );
+        identity["kvMethod"] = serde_json::Value::Null;
+        assert!(resume_identity_mode(&identity).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_affine_fused_reader_parity_is_within_the_frozen_contract() {
+        let errors = CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap()
+            .kernel_parity_errors()
+            .unwrap();
+        assert_eq!(errors.len(), 4 * 128);
+        let max = errors.iter().copied().fold(0.0, f64::max);
+        assert!(
+            max <= COMPRESSED_PARITY_MAX_ERROR,
+            "fused reader parity {max}"
+        );
+    }
+
+    #[test]
+    fn artifact_bundle_rejects_tampering_and_partial_outputs() {
+        let mut receipt = builder_test_receipt();
         assert_eq!(receipt.provenance.model_file_bytes, 100);
         assert_eq!(receipt.memory.model_weights_bytes, 1);
         let mut padded = receipt.clone();
@@ -9263,6 +10446,10 @@ pub(crate) mod tests {
             .unwrap_err()
             .contains("contract v3 denominator"));
         same_weights(&mut compressed);
+        assert!(validate_receipt_semantics(&compressed)
+            .unwrap_err()
+            .contains("compression evidence must be present"));
+        compress_test_receipt(&mut compressed, test_compression_block());
         validate_receipt_semantics(&compressed).expect("same-weights compressed receipt");
         let mut compressed_miss = compressed.clone();
         compressed_miss.quality.needle_retrieval = 0.0;

@@ -81,6 +81,31 @@ pub struct PackedCacheEvidence {
     pub dense_active: bool,
     pub fallback_reasons: Vec<(String, String)>,
 }
+/// Measured physical storage of a live compressed KV representation, exported only to campaign
+/// observers (SC-20676 compressed rows). Device bytes are the sizes of the MLX arrays the cache
+/// actually retains and host bytes its allocated staging payload, never bit accounting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressedCacheStorage {
+    /// Retained device code arrays.
+    pub device_code_bytes: u64,
+    /// Retained device scale/zero (or codebook) arrays.
+    pub device_metadata_bytes: u64,
+    /// Allocated host-side staging payload.
+    pub host_payload_bytes: u64,
+    /// Live cached tokens.
+    pub tokens: u64,
+    /// Scalar width of the K/V tensors handed to the cache (the dense-equivalent element width).
+    pub element_bytes: u64,
+}
+
+impl CompressedCacheStorage {
+    /// MLX-resident compressed bytes: the cache's contribution to MLX active memory.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_code_bytes
+            .saturating_add(self.device_metadata_bytes)
+    }
+}
+
 /// Sequence positions a [`ContiguousKvCache`] buffer grows by at a time: the buffer is
 /// reallocated once per this many tokens and written in place in between.
 pub const KV_BLOCK_TOKENS: i32 = 256;
@@ -124,6 +149,17 @@ pub trait KvCache {
 
     /// Model-boundary evidence for sealed packed-cache receipts.
     fn packed_evidence(&self) -> Option<PackedCacheEvidence> {
+        None
+    }
+
+    /// Campaign-only measured storage of a live compressed representation. `None` for dense
+    /// caches, an empty compressed cache, or while an explicit dense fallback owns the history.
+    fn compressed_storage(&self) -> Result<Option<CompressedCacheStorage>> {
+        Ok(None)
+    }
+
+    /// Campaign-only: the explicit dense fallback cache owned by a compressed representation.
+    fn compressed_dense_fallback(&self) -> Option<&ContiguousKvCache> {
         None
     }
     /// Append `keys`/`values` for `layer` (each `[batch, n_kv_heads, step, head_dim]`) and return

@@ -53,6 +53,10 @@ enum CapturedCacheLifecycle {
     Allocation(&'static str, &'static str, &'static str, u64),
     Snapshot(u64, u64, u64, u64),
     Release(&'static str, &'static str, u64),
+    PackedEvidence(Box<crate::primitives::PackedCacheEvidence>),
+    DenseFallback(String, String),
+    DenseReconstruction(u64),
+    CompressedStorage(crate::primitives::CompressedCacheStorage),
 }
 
 #[derive(Default)]
@@ -72,6 +76,18 @@ impl CacheLifecycleCapture {
                 }
                 CapturedCacheLifecycle::Release(kind, role, bytes) => {
                     observer.release_event(kind, role, bytes);
+                }
+                CapturedCacheLifecycle::PackedEvidence(evidence) => {
+                    observer.packed_cache_evidence(&evidence);
+                }
+                CapturedCacheLifecycle::DenseFallback(operation, reason) => {
+                    observer.dense_fallback(&operation, &reason);
+                }
+                CapturedCacheLifecycle::DenseReconstruction(bytes) => {
+                    observer.dense_reconstruction(bytes);
+                }
+                CapturedCacheLifecycle::CompressedStorage(storage) => {
+                    observer.compressed_storage(&storage);
                 }
             }
         }
@@ -111,6 +127,65 @@ impl crate::campaign::Observer for CacheLifecycleCapture {
     fn release_event(&mut self, kind: &'static str, role: &'static str, bytes: u64) {
         self.events
             .push(CapturedCacheLifecycle::Release(kind, role, bytes));
+    }
+
+    fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+        self.events
+            .push(CapturedCacheLifecycle::PackedEvidence(Box::new(
+                evidence.clone(),
+            )));
+    }
+
+    fn dense_fallback(&mut self, operation: &str, reason: &str) {
+        self.events.push(CapturedCacheLifecycle::DenseFallback(
+            operation.into(),
+            reason.into(),
+        ));
+    }
+
+    fn dense_reconstruction(&mut self, bytes: u64) {
+        self.events
+            .push(CapturedCacheLifecycle::DenseReconstruction(bytes));
+    }
+
+    fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+        self.events
+            .push(CapturedCacheLifecycle::CompressedStorage(*storage));
+    }
+}
+
+/// Campaign-only compressed decoder (SC-20676 compressed rows): every cache it makes is the
+/// session's compressed representation bound to its retained fused reader. A selection the model
+/// refuses before mutation stays dense and is recorded as an explicit, reasoned fallback rather
+/// than silently replacing the fused path.
+struct PackedCampaignDecoder<'a> {
+    model: &'a CausalLm,
+    arm: &'a crate::campaign::CompressedKvArm,
+    selection_fallbacks: RefCell<Vec<String>>,
+}
+
+impl Decode for PackedCampaignDecoder<'_> {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        let selection = self.arm.select_cache(self.model);
+        let route = selection.route().clone();
+        let cache = selection.into_cache();
+        // A packed cache records its own fallback events; only a plain dense selection would
+        // otherwise leave no trace.
+        if let (crate::primitives::CacheRoute::DenseFallback { reason }, None) =
+            (route, cache.packed_evidence())
+        {
+            self.selection_fallbacks.borrow_mut().push(reason);
+        }
+        cache
+    }
+
+    fn step(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> crate::error::Result<Array> {
+        self.model.step(input_ids, cache, offset)
     }
 }
 
@@ -1045,6 +1120,7 @@ impl LlamaProvider {
     pub(crate) fn campaign_cancel_after_first_token(
         &self,
         observer: &mut dyn crate::campaign::Observer,
+        packed: Option<&crate::campaign::CompressedKvArm>,
     ) -> CoreResult<()> {
         let mut request = campaign_cancellation_probe_request();
         let cancel = crate::decode::CancelFlag::new();
@@ -1055,7 +1131,7 @@ impl LlamaProvider {
             }
         };
         let mut captured = CacheLifecycleCapture::default();
-        let output = self.generate_inner(&request, &mut sink, Some(&mut captured))?;
+        let output = self.generate_inner(&request, &mut sink, Some(&mut captured), packed)?;
         if output.finish_reason != Some(CoreFinish::Cancelled) {
             return Err(CoreError::Load(
                 "campaign cancellation did not finish as cancelled".into(),
@@ -2012,19 +2088,22 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
-        self.generate_inner(req, on_event, None)
+        self.generate_inner(req, on_event, None, None)
     }
 }
 
 impl LlamaProvider {
     /// Campaign-only entrypoint. The observer is never installed on ordinary production calls.
+    /// `packed` selects the compressed arm: the observed decode then runs on the packed
+    /// group-affine cache with the retained fused reader (SC-20676 compressed rows).
     pub(crate) fn generate_observed(
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
         observer: &mut dyn crate::campaign::Observer,
+        packed: Option<&crate::campaign::CompressedKvArm>,
     ) -> CoreResult<TextLlmOutput> {
-        self.generate_inner(req, on_event, Some(observer))
+        self.generate_inner(req, on_event, Some(observer), packed)
     }
 
     fn generate_inner(
@@ -2032,6 +2111,7 @@ impl LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
         observer: Option<&mut dyn crate::campaign::Observer>,
+        packed: Option<&crate::campaign::CompressedKvArm>,
     ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;
         if req.cancel.is_cancelled() {
@@ -2060,6 +2140,13 @@ impl LlamaProvider {
         let gemma4_mm_request = self.gemma4.is_some()
             && (!collect_images(&req.messages).is_empty()
                 || !collect_audio(&req.messages).is_empty());
+        // The compressed arm is wired only through the observed text decode; any other route would
+        // silently run dense under a compressed label.
+        if packed.is_some() && (observer.is_none() || multimodal || gemma4_mm_request) {
+            return Err(CoreError::Unsupported(
+                "compressed campaign decode supports only observed text generation".into(),
+            ));
+        }
         let substituted;
         let messages: &[Message] = if gemma4_mm_request {
             substituted = substitute_gemma4_placeholders(&req.messages)?;
@@ -2450,17 +2537,43 @@ impl LlamaProvider {
                                     "campaign observer cannot measure MTP decode".into(),
                                 ));
                             }
+                            let packed_decoder = match (packed, &self.model) {
+                                (None, _) => None,
+                                (Some(arm), Decoder::Causal(model)) => {
+                                    Some(PackedCampaignDecoder {
+                                        model,
+                                        arm,
+                                        selection_fallbacks: RefCell::new(Vec::new()),
+                                    })
+                                }
+                                (Some(_), Decoder::Qwen35(_)) => {
+                                    return Err(CoreError::Unsupported(
+                                        "compressed campaign decode requires the causal decoder"
+                                            .into(),
+                                    ))
+                                }
+                            };
+                            let decoder: &dyn Decode = match &packed_decoder {
+                                Some(packed) => packed,
+                                None => &self.model,
+                            };
                             let output = generate_with_observer(
-                                &self.model,
+                                decoder,
                                 &prompt_ids,
                                 &config,
                                 &req.cancel,
                                 &mut sink,
                                 json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
                                 should_stop_opt,
-                                Some(observer),
+                                Some(&mut *observer),
                             )
                             .map_err(to_core)?;
+                            for reason in packed_decoder
+                                .map(|packed| packed.selection_fallbacks.into_inner())
+                                .unwrap_or_default()
+                            {
+                                observer.dense_fallback("cache-selection", &reason);
+                            }
                             (output, None, None)
                         } else {
                             match (&self.model, mtp_draft_tokens) {
@@ -4013,5 +4126,143 @@ mod tests {
             "w within per-frame grid"
         );
         let _ = h;
+    }
+
+    /// Tiny synthetic Llama whose head dimension the packed Metal reader supports.
+    fn tiny_packed_capable_model() -> CausalLm {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let cfg = crate::config::ModelConfig {
+            hidden_size: 128,
+            intermediate_size: 64,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 64,
+            vocab_size: 32,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            tie_word_embeddings: false,
+            architecture: crate::config::Architecture::Llama,
+            max_position_embeddings: 0,
+            quantization: None,
+            moe: None,
+            attn_logit_softcap: None,
+            final_logit_softcap: None,
+            query_pre_attn_scalar: None,
+            partial_rotary_factor: 1.0,
+            mla: None,
+            yarn: None,
+            mrope_section: None,
+            gemma4: None,
+        };
+        let mut rng = SplitMix64::new(0x5c20676);
+        let mut randn = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+            Array::from_slice(&data, shape)
+        };
+        let (h, v, inter) = (cfg.hidden_size, cfg.vocab_size, cfg.intermediate_size);
+        let (qd, kvd) = (
+            cfg.num_heads * cfg.head_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+        );
+        let mut m = std::collections::HashMap::new();
+        m.insert("model.embed_tokens.weight".to_string(), randn(&[v, h]));
+        m.insert(
+            "model.norm.weight".into(),
+            Array::ones::<f32>(&[h]).unwrap(),
+        );
+        m.insert("lm_head.weight".into(), randn(&[v, h]));
+        for i in 0..cfg.num_layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            m.insert(
+                p("input_layernorm.weight"),
+                Array::ones::<f32>(&[h]).unwrap(),
+            );
+            m.insert(
+                p("post_attention_layernorm.weight"),
+                Array::ones::<f32>(&[h]).unwrap(),
+            );
+            m.insert(p("self_attn.q_proj.weight"), randn(&[qd, h]));
+            m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.o_proj.weight"), randn(&[h, qd]));
+            m.insert(p("mlp.gate_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.up_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.down_proj.weight"), randn(&[h, inter]));
+        }
+        CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap()
+    }
+
+    #[derive(Default)]
+    struct CompressedArmCapture {
+        snapshots: Vec<u64>,
+        releases: Vec<u64>,
+        reconstructions: usize,
+        evidence: Vec<crate::primitives::PackedCacheEvidence>,
+    }
+
+    impl crate::campaign::Observer for CompressedArmCapture {
+        fn phase(&mut self, _name: &'static str) {}
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+        fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, _element: u64) {
+            self.snapshots.push(bytes);
+        }
+        fn release_event(&mut self, _kind: &'static str, _role: &'static str, bytes: u64) {
+            self.releases.push(bytes);
+        }
+        fn dense_reconstruction(&mut self, _bytes: u64) {
+            self.reconstructions += 1;
+        }
+        fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+            self.evidence.push(evidence.clone());
+        }
+    }
+
+    /// The compressed campaign decoder runs the whole observed generation (prefill and decode) on
+    /// the packed cache through the fused reader: no fallback, no dense reconstruction, and the
+    /// persistent KV it reports is the packed storage it later releases.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_campaign_decoder_keeps_prefill_and_decode_on_the_fused_reader() {
+        let model = tiny_packed_capable_model();
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        let decoder = PackedCampaignDecoder {
+            model: &model,
+            arm: &arm,
+            selection_fallbacks: RefCell::new(Vec::new()),
+        };
+        let mut capture = CompressedArmCapture::default();
+        let config = GenerationConfig {
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let output = crate::decode::generate_with_observer(
+            &decoder,
+            &[1, 2, 3, 4, 5],
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+            None,
+            Some(&mut capture),
+        )
+        .unwrap();
+        assert_eq!(output.tokens.len(), 4);
+        assert!(decoder.selection_fallbacks.borrow().is_empty());
+        let [evidence] = capture.evidence.as_slice() else {
+            panic!("one compressed cache must export evidence once");
+        };
+        // Two layers: one fused prefill call plus three fused decode steps each.
+        assert_eq!(evidence.accepted_direct_calls, 2 * 4);
+        assert!(evidence.fallback_reasons.is_empty() && !evidence.dense_active);
+        assert_eq!(evidence.full_cache_dequantizations, 0);
+        assert_eq!(capture.reconstructions, 0);
+        assert!(!capture.snapshots.is_empty());
+        assert_eq!(capture.releases, vec![*capture.snapshots.last().unwrap()]);
     }
 }

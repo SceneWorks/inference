@@ -20,8 +20,8 @@ use mlx_rs::{Array, Dtype};
 use super::BufferRelease;
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
-use crate::primitives::kv_cache::ContiguousKvCache;
 use crate::primitives::kv_cache::KvCache;
+use crate::primitives::kv_cache::{ContiguousKvCache, KV_BLOCK_TOKENS};
 use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
 
 /// A decoder the streaming loop can drive: it makes its own cache and produces last-position logits.
@@ -243,7 +243,7 @@ pub(crate) fn generate_with_observer(
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
     let output = {
         let mut cache = decoder.make_cache();
-        let mut observed_cache_events = 0;
+        let mut observed_cache = ObservedCache::default();
         // Prefill the whole prompt at offset 0; logits are for the last prompt position.  The
         // observation is deliberately after dispatch so a sampler sees the actual prefill peak.
         let prompt = input_ids(prompt_ids);
@@ -258,7 +258,7 @@ pub(crate) fn generate_with_observer(
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("prefill-peak");
         }
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
         let output = decode_loop(
             decoder,
             cache.as_mut(),
@@ -275,17 +275,29 @@ pub(crate) fn generate_with_observer(
         if let Some(observer) = observer.as_deref_mut() {
             observer.phase("decode-steady");
         }
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
+        observe_packed_evidence(cache.as_ref(), &mut observer);
         if matches!(output.finish_reason, FinishReason::Cancelled) {
             if let Some(observer) = observer.as_deref_mut() {
                 observer.phase("cancellation-cleanup");
             }
         }
         cache.reset()?;
-        observe_cache_events(cache.as_mut(), &mut observed_cache_events, &mut observer)?;
+        observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
         output
     };
     Ok(output)
+}
+
+/// Campaign observation state for one decoder cache.
+#[derive(Default)]
+struct ObservedCache {
+    /// Dense cache events already forwarded.
+    dense_events: usize,
+    /// Physical packed bytes of the last forwarded packed snapshot, still owned by the cache.
+    packed_live_bytes: Option<u64>,
+    /// Full-cache dense reconstructions already forwarded as explicit materializations.
+    dequantizations: usize,
 }
 
 /// Export only cache-owned byte observations.  Unsupported cache implementations produce no
@@ -293,15 +305,76 @@ pub(crate) fn generate_with_observer(
 /// inventing an allocation total.
 fn observe_cache_events(
     cache: &mut dyn KvCache,
-    seen: &mut usize,
+    state: &mut ObservedCache,
     observer: &mut Option<&mut dyn crate::campaign::Observer>,
 ) -> Result<()> {
     let Some(observer) = observer.as_deref_mut() else {
         return Ok(());
     };
+    if let Some(evidence) = cache.packed_evidence() {
+        // Compressed-arm cache (SC-20676): the live compressed representation is the persistent
+        // KV. A transition that rebuilt the whole history as dense K/V is an explicit full-cache
+        // materialization, never a quiet change of the persistent total.
+        let storage = cache.compressed_storage()?;
+        if let Some(bytes) = state.packed_live_bytes.take() {
+            if storage.is_none() {
+                observer.release_event("cache_release", "cache", bytes);
+            } else {
+                state.packed_live_bytes = Some(bytes);
+            }
+        }
+        if let Some(dense) = cache.compressed_dense_fallback() {
+            observe_contiguous(dense, &mut state.dense_events, observer)?;
+        }
+        if evidence.full_cache_dequantizations > state.dequantizations {
+            let bytes = cache
+                .compressed_dense_fallback()
+                .map(ContiguousKvCache::retained_snapshot)
+                .transpose()?
+                .flatten()
+                .map(|(bytes, _, _, _)| bytes)
+                .ok_or_else(|| {
+                    Error::Msg(
+                        "compressed cache recorded a dense reconstruction without dense data"
+                            .into(),
+                    )
+                })?;
+            observer.dense_reconstruction(bytes);
+            state.dequantizations = evidence.full_cache_dequantizations;
+        }
+        if let Some(storage) = storage {
+            // Capacity is the dense-equivalent allocation for the live tokens, so the receipt's
+            // theoretical dense KV denominator describes the same geometry as a dense row.
+            let capacity = storage
+                .tokens
+                .div_ceil(KV_BLOCK_TOKENS as u64)
+                .saturating_mul(KV_BLOCK_TOKENS as u64);
+            observer.cache_snapshot(
+                storage.device_bytes(),
+                storage.tokens,
+                capacity,
+                storage.element_bytes,
+            );
+            observer.compressed_storage(&storage);
+            state.packed_live_bytes = Some(storage.device_bytes());
+        }
+        return Ok(());
+    }
     let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
         return Ok(());
     };
+    observe_contiguous(cache, &mut state.dense_events, observer)
+}
+
+fn observe_contiguous(
+    cache: &ContiguousKvCache,
+    seen: &mut usize,
+    observer: &mut dyn crate::campaign::Observer,
+) -> Result<()> {
+    if *seen > cache.events().len() {
+        // A packed cache replaced its dense fallback instance; its events start afresh.
+        *seen = 0;
+    }
     for event in cache.events().iter().skip(*seen) {
         if event.role == "cache" && event.lifetime == "persistent" {
             continue;
@@ -316,6 +389,17 @@ fn observe_cache_events(
         observer.cache_snapshot(bytes, tokens, capacity, element_bytes);
     }
     Ok(())
+}
+
+/// Forward a compressed cache's immutable model-boundary evidence exactly once per decoder cache,
+/// after decode and before reset, so fused/fallback counts are never double counted.
+fn observe_packed_evidence(
+    cache: &dyn KvCache,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) {
+    if let (Some(observer), Some(evidence)) = (observer.as_deref_mut(), cache.packed_evidence()) {
+        observer.packed_cache_evidence(&evidence);
+    }
 }
 
 /// Synchronized two-phase variant of [`generate_with`]. Tokenization and template rendering happen
@@ -709,7 +793,7 @@ mod tests {
         let mut cache = ContiguousKvCache::new(1);
         let key = Array::from_slice(&[1.0_f32, 2.0], &[1, 1, 1, 2]);
         cache.update(0, &key, &key).unwrap();
-        let mut seen = 0;
+        let mut seen = ObservedCache::default();
         let mut observer = DecodeObserver::default();
         let mut attached: Option<&mut dyn crate::campaign::Observer> = Some(&mut observer);
         observe_cache_events(&mut cache, &mut seen, &mut attached).unwrap();
@@ -718,6 +802,111 @@ mod tests {
             observer.cache_snapshots,
             vec![(4096, 1, 256, 4), (4096, 1, 256, 4)]
         );
+    }
+
+    #[derive(Default)]
+    struct CompressedCapture {
+        snapshots: Vec<(u64, u64, u64, u64)>,
+        releases: Vec<u64>,
+        reconstructions: Vec<u64>,
+        storages: Vec<crate::primitives::CompressedCacheStorage>,
+        evidence: Vec<crate::primitives::PackedCacheEvidence>,
+    }
+
+    impl crate::campaign::Observer for CompressedCapture {
+        fn phase(&mut self, _name: &'static str) {}
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+        fn cache_snapshot(&mut self, bytes: u64, tokens: u64, capacity: u64, element_bytes: u64) {
+            self.snapshots
+                .push((bytes, tokens, capacity, element_bytes));
+        }
+        fn release_event(&mut self, _kind: &'static str, _role: &'static str, bytes: u64) {
+            self.releases.push(bytes);
+        }
+        fn dense_reconstruction(&mut self, bytes: u64) {
+            self.reconstructions.push(bytes);
+        }
+        fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+            self.storages.push(*storage);
+        }
+        fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+            self.evidence.push(evidence.clone());
+        }
+    }
+
+    /// The compressed arm's persistent KV is the measured packed storage; an explicit dense
+    /// transition releases it and is witnessed as a full-cache materialization; reset releases
+    /// the dense fallback.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn compressed_cache_observation_reports_packed_storage_and_dense_reconstruction() {
+        use crate::primitives::{
+            select_decoder_cache_with_reader, CompiledKernelHandle, PackedAttentionMask,
+            PackedCacheRequest, PackedMetalKernel, PACKED_METAL_QUANT_GROUP_SIZE,
+        };
+        let kernel = PackedMetalKernel::new().unwrap();
+        let identity = crate::primitives::RetainedPackedKernel::cache_identity(&kernel).to_owned();
+        let handle = CompiledKernelHandle::new(std::sync::Arc::new(kernel));
+        let request = PackedCacheRequest {
+            enabled: true,
+            backend: "mlx-metal".into(),
+            identity,
+            layers: 1,
+            batch: 1,
+            kv_heads: 1,
+            head_dimension: 64,
+            group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+            query_length: 1,
+            has_mask: false,
+        };
+        let mut cache = select_decoder_cache_with_reader(request, handle).into_cache();
+        let values = (0..64).map(|i| (i % 7) as f32 * 0.01).collect::<Vec<_>>();
+        let kv = Array::from_slice(&values, &[1, 1, 1, 64])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        let q = Array::from_slice(&values, &[1, 1, 1, 64])
+            .as_dtype(Dtype::Float16)
+            .unwrap();
+        assert!(cache
+            .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, 0.125, false)
+            .unwrap()
+            .is_some());
+        let mut state = ObservedCache::default();
+        let mut capture = CompressedCapture::default();
+        let mut attached: Option<&mut dyn crate::campaign::Observer> = Some(&mut capture);
+        observe_cache_events(cache.as_mut(), &mut state, &mut attached).unwrap();
+        observe_packed_evidence(cache.as_ref(), &mut attached);
+        cache
+            .prepare_dense_fallback("campaign-test", "forced dense transition")
+            .unwrap();
+        observe_cache_events(cache.as_mut(), &mut state, &mut attached).unwrap();
+        cache.reset().unwrap();
+        observe_cache_events(cache.as_mut(), &mut state, &mut attached).unwrap();
+
+        let storage = capture.storages[0];
+        assert_eq!(capture.storages.len(), 1);
+        assert!(storage.device_code_bytes > 0 && storage.device_metadata_bytes > 0);
+        assert!(storage.host_payload_bytes > 0);
+        assert_eq!(
+            capture.snapshots[0],
+            (storage.device_bytes(), 1, 256, 2),
+            "packed persistent KV is the measured device storage at the dense-equivalent geometry"
+        );
+        assert!(
+            storage.device_bytes() < 2 * 64 * 2,
+            "below one dense f16 K/V token"
+        );
+        let dense_bytes = capture.snapshots[1].0;
+        assert_eq!(capture.reconstructions, vec![dense_bytes]);
+        assert_eq!(
+            capture.releases,
+            vec![storage.device_bytes(), dense_bytes],
+            "packed ownership is released at the transition, dense ownership at reset"
+        );
+        assert_eq!(capture.evidence.len(), 1);
+        assert_eq!(capture.evidence[0].accepted_direct_calls, 1);
+        assert_eq!(capture.evidence[0].full_cache_dequantizations, 0);
     }
 }
 

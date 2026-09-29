@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::primitives::kv_cache::{CacheRoute, ContiguousKvCache, KvCache, PackedCacheEvidence};
+use crate::primitives::kv_cache::{
+    CacheRoute, CompressedCacheStorage, ContiguousKvCache, KvCache, PackedCacheEvidence,
+};
 use half::f16;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
@@ -857,6 +859,76 @@ impl KvCache for DenseFallbackPackedDecoderCache {
 
     fn packed_evidence(&self) -> Option<PackedCacheEvidence> {
         Some(self.model_evidence())
+    }
+
+    /// Campaign-only physical ownership of the live packed representation (SC-20676 compressed
+    /// rows). Device bytes are the sizes of the MLX arrays actually retained by the cache and host
+    /// bytes are the allocated staging payload, so a receipt never substitutes bit accounting for
+    /// storage. `None` while the dense fallback owns the history or nothing is resident.
+    fn compressed_storage(&self) -> Result<Option<CompressedCacheStorage>> {
+        if self.dense_active || self.staged.logical_len() == 0 {
+            return Ok(None);
+        }
+        let array_bytes = |array: &Option<Array>| -> Result<u64> {
+            array.as_ref().map_or(Ok(0), |array| {
+                u64::try_from(array.size())
+                    .ok()
+                    .and_then(|elements| {
+                        elements.checked_mul(u64::try_from(array.item_size()).ok()?)
+                    })
+                    .ok_or_else(|| Error::Msg("packed device array bytes overflow u64".into()))
+            })
+        };
+        let (mut device_code_bytes, mut device_metadata_bytes) = (0_u64, 0_u64);
+        for device in self.staged.device_layers.iter().flatten() {
+            for codes in [&device.key_codes, &device.value_codes] {
+                device_code_bytes = device_code_bytes
+                    .checked_add(array_bytes(codes)?)
+                    .ok_or_else(|| Error::Msg("packed device code bytes overflow".into()))?;
+            }
+            for metadata in [
+                &device.key_scales,
+                &device.key_zeros,
+                &device.value_scales,
+                &device.value_zeros,
+            ] {
+                device_metadata_bytes = device_metadata_bytes
+                    .checked_add(array_bytes(metadata)?)
+                    .ok_or_else(|| {
+                    Error::Msg("packed device metadata bytes overflow".into())
+                })?;
+            }
+        }
+        let element_bytes = match self.packed_layer_dtypes.iter().flatten().next() {
+            Some((mlx_rs::Dtype::Float32, _)) => 4,
+            Some((mlx_rs::Dtype::Float16 | mlx_rs::Dtype::Bfloat16, _)) => 2,
+            Some((dtype, _)) => {
+                return Err(Error::Msg(format!(
+                    "packed cache retained unsupported K dtype {dtype:?}"
+                )))
+            }
+            None => {
+                return Err(Error::Msg(
+                    "packed cache has resident values without dtype evidence".into(),
+                ))
+            }
+        };
+        Ok(Some(CompressedCacheStorage {
+            device_code_bytes,
+            device_metadata_bytes,
+            host_payload_bytes: u64::try_from(self.staged.host_allocated_payload_bytes())
+                .map_err(|_| Error::Msg("packed host payload bytes overflow u64".into()))?,
+            tokens: u64::try_from(self.staged.logical_len())
+                .map_err(|_| Error::Msg("packed cache length overflows u64".into()))?,
+            element_bytes,
+        }))
+    }
+
+    /// The dense cache that owns history after an explicit transition (and records its own
+    /// allocation/release events). Campaign observation reads it whether or not it is active so a
+    /// reset's release is never missed.
+    fn compressed_dense_fallback(&self) -> Option<&ContiguousKvCache> {
+        Some(&self.dense)
     }
 
     fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
