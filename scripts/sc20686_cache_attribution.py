@@ -14,6 +14,7 @@ from pathlib import Path
 MANIFEST = Path(__file__).with_name("sc20686_coverage_manifest.json")
 SOURCE_MAP = Path(__file__).with_name("sc20686_source_map.json")
 FAMILIES = ("flux2-klein", "wan")
+PRODUCER = "sc20686-campaign-adapter-v5"
 THRESHOLDS = {
     "opportunity_bytes": 512 * 1024**2,
     "opportunity_peak_pct": 0.05,
@@ -27,7 +28,7 @@ GEOMETRY = (
     "heads", "head_dimension", "sq", "skv", "dtype", "mask", "rope",
 )
 REQUIRED = (
-    "producer", "family", "variant", "coordinate_name", "coordinate_id", "arm",
+    "producer", "backend", "family", "variant", "coordinate_name", "coordinate_id", "arm",
     "source_ref", "model_snapshot_revision", "residency_strategy",
     "route_manifest_sha256", "source_map_sha256",
     "model_snapshot_sha256", "model_snapshot_bytes", "input_file_sha256",
@@ -41,12 +42,22 @@ REQUIRED = (
 )
 PRODUCT_RESIDENCY = {
     "flux2_klein_9b_edit": "sequential",
+    "flux2_klein_9b_kv_edit": "sequential",
     "wan2_2_ti2v_5b": "sequential",
     "wan2_2_t2v_14b": "sequential",
     "wan2_2_i2v_14b": "sequential",
     "wan_vace": "resident",
     "wan2_2_vace_fun_14b": "sequential",
 }
+
+
+# Measurement lanes. The CUDA lane measures the Candle providers; the Metal lane measures the MLX
+# providers SceneWorks runs on a Mac (the Mac product path). One sealed campaign is one lane.
+LANES = ("candle-cuda", "mlx-metal")
+CACHE_KINDS = ("persistent", "recomputed")
+PHASE_WINDOWS = ("encode", "load", "prepare-cache", "denoise-step", "post-denoise", "decode")
+FLUX_IMAGE_ROUTES = ("flux2_klein_9b_edit", "flux2_klein_9b_kv_edit")
+DTYPE_BYTES = {"F16": 2, "BF16": 2, "F32": 4}
 
 
 def fail(message):
@@ -116,14 +127,86 @@ def active_allocator_measurement(event, label):
     return values
 
 
-def dense_reference_kv_bytes(geometry):
-    dtype_bytes = {"F16": 2, "BF16": 2, "F32": 4}.get(geometry["dtype"].upper())
+def dense_reference_kv_bytes(geometry, kv_batch=None):
+    dtype_bytes = DTYPE_BYTES.get(geometry["dtype"].upper())
     if dtype_bytes is None:
         fail("FLUX reference slice has unsupported live dtype")
+    batch = geometry["batch"] if kv_batch is None else kv_batch
     return (
-        2 * geometry["batch"] * geometry["heads"] * geometry["skv"]
+        2 * batch * geometry["heads"] * geometry["skv"]
         * geometry["head_dimension"] * dtype_bytes
     )
+
+
+def lane_variants(source_map, backend):
+    lanes = source_map.get("lanes")
+    if not isinstance(lanes, dict) or backend not in lanes:
+        fail(f"source map has no {backend} lane")
+    variants = lanes[backend].get("variants")
+    if not isinstance(variants, dict):
+        fail(f"source map {backend} lane is malformed")
+    return variants
+
+
+def lane_entry(source_map, backend, variant):
+    entry = lane_variants(source_map, backend).get(variant)
+    if not isinstance(entry, dict):
+        fail(f"{variant} is not a registered {backend} route")
+    return entry
+
+
+CFG_KV_BATCH_RULES = ("never", "guidance", "always")
+
+
+def expected_kv_batch(entry, geometry):
+    """The exact K/V batch a Metal-lane cache carries. MLX Wan stacks the CFG cond/uncond contexts
+    on one cache's batch axis: TI2V-5B only when guidance > 1 (`guidance`), the A14B experts always
+    (`always`). FLUX.2 runs its branches as separate B=1 forwards and VACE recomputes per branch
+    (`never`)."""
+    rule = entry.get("cfg_kv_batch")
+    if rule not in CFG_KV_BATCH_RULES:
+        fail("Metal lane route lacks its CFG K/V batch rule")
+    stacked = rule == "always" or (rule == "guidance" and float(geometry["guidance"]) > 1.0)
+    return geometry["batch"] * (2 if stacked else 1)
+
+
+def lane_coverage(coverage, backend):
+    """The frozen coverage of one lane: the shared families plus that lane's extensions."""
+    families = {
+        family: {variant: dict(spec) for variant, spec in variants.items()}
+        for family, variants in coverage["families"].items()
+    }
+    for family, variants in coverage.get("lane_extensions", {}).get(backend, {}).items():
+        for variant, spec in variants.items():
+            if variant in families.setdefault(family, {}):
+                fail(f"lane extension redefines a shared route: {backend}/{variant}")
+            families[family][variant] = spec
+    return families
+
+
+def validate_phase_windows(events, terminal_index, arm):
+    """Metal-lane per-phase attribution: every window carries a valid allocator window and Darwin
+    phys_footprint, precedes the terminal event, and the run covers denoise (+ decode if normal)."""
+    windows = [
+        (index, event) for index, event in enumerate(events)
+        if isinstance(event, dict) and event.get("phase") == "phase-window"
+    ]
+    names = [event.get("window") for _index, event in windows]
+    if not windows or any(name not in PHASE_WINDOWS for name in names):
+        fail("Metal phase-window attribution is missing or unnamed")
+    if "denoise-step" not in names or (arm == "normal" and "decode" not in names):
+        fail("Metal phase-window attribution does not cover denoise and decode")
+    for index, event in windows:
+        if index > terminal_index:
+            fail("Metal phase window closes after the terminal event")
+        active_allocator_measurement(event, "Metal phase window")
+        current = event.get("phys_footprint_bytes")
+        peak = event.get("phys_footprint_peak_bytes")
+        if (
+            not isinstance(current, int) or isinstance(current, bool) or current <= 0
+            or not isinstance(peak, int) or isinstance(peak, bool) or peak < current
+        ):
+            fail("Metal phase window lacks Darwin phys_footprint evidence")
 
 
 def read_checked_json(path, expected_schema):
@@ -138,8 +221,8 @@ def read_checked_json(path, expected_schema):
 
 
 def checked_contracts():
-    coverage, coverage_raw = read_checked_json(MANIFEST, "sc-20686-supported-coverage-v2")
-    source_map, source_map_raw = read_checked_json(SOURCE_MAP, "sc-20686-source-map-v2")
+    coverage, coverage_raw = read_checked_json(MANIFEST, "sc-20686-supported-coverage-v3")
+    source_map, source_map_raw = read_checked_json(SOURCE_MAP, "sc-20686-source-map-v3")
     if source_map.get("compatibility_target") != {
         "story": "SC-20675",
         "format": "packed-group-affine-v2",
@@ -149,52 +232,73 @@ def checked_contracts():
         "pending_key_tail": "dense f32",
     }:
         fail("source map compatibility target differs from the frozen SC-20675 format")
-    expected = {
-        variant: family_name
-        for family_name, family in coverage.get("families", {}).items()
-        for variant in family
-    }
-    if set(source_map.get("variants", {})) != set(expected):
-        fail("source map does not close over the frozen variant surface")
-    for variant, entry in source_map["variants"].items():
-        if (
-            entry.get("route") != variant
-            or entry.get("family") != expected[variant]
-            or entry.get("product_residency") != PRODUCT_RESIDENCY[variant]
-            or entry.get("self_attention_excluded") is not True
-        ):
-            fail(f"source map route is malformed: {variant}")
-        anchor_fields = ["activation", "creation", "reads", "release"]
-        if entry["family"] == "flux2-klein":
-            anchor_fields.append("reference_slice")
-        for field in anchor_fields:
-            anchors = entry.get(field)
-            if not isinstance(anchors, list) or not anchors:
-                fail(f"source map lacks {field} anchors: {variant}")
-            for anchor in anchors:
-                if (
-                    not isinstance(anchor, dict)
-                    or not isinstance(anchor.get("path"), str)
-                    or not isinstance(anchor.get("symbol"), str)
-                    or not isinstance(anchor.get("line"), int)
-                    or anchor["line"] < 1
-                ):
-                    fail(f"source map has an invalid exact anchor: {variant}/{field}")
-                source_path = SOURCE_MAP.parent.parent / anchor["path"]
-                try:
-                    source_lines = source_path.read_text(encoding="utf-8").splitlines()
-                except OSError as exc:
-                    fail(f"source map anchor path is unavailable: {variant}/{field}: {exc}")
-                line = anchor["line"]
-                symbol = anchor["symbol"].rsplit("::", 1)[-1]
-                if line > len(source_lines) or symbol.lower() not in source_lines[line - 1].lower():
-                    fail(f"source map exact anchor is stale: {variant}/{field}")
-        for field in (
-            "current_kernel", "cache_format", "paging", "offload", "recompute",
-            "compatibility",
-        ):
-            if not isinstance(entry.get(field), str) or not entry[field]:
-                fail(f"source map lacks {field}: {variant}")
+    if set(coverage.get("lane_extensions", {})) - set(LANES):
+        fail("coverage names an unknown measurement lane")
+    if set(source_map.get("lanes", {})) != set(LANES):
+        fail("source map must describe exactly the Candle/CUDA and MLX/Metal lanes")
+    for backend in LANES:
+        expected = {
+            variant: family_name
+            for family_name, family in lane_coverage(coverage, backend).items()
+            for variant in family
+        }
+        variants = lane_variants(source_map, backend)
+        if set(variants) != set(expected):
+            fail(f"source map does not close over the frozen {backend} variant surface")
+        for variant, entry in variants.items():
+            if (
+                entry.get("route") != variant
+                or entry.get("family") != expected[variant]
+                or entry.get("product_residency") != PRODUCT_RESIDENCY.get(variant)
+                or entry.get("self_attention_excluded") is not True
+                or entry.get("cache_kind") not in CACHE_KINDS
+                or not isinstance(entry.get("runtime_attribution"), bool)
+                or not isinstance(entry.get("entrypoint_stem"), str)
+                or not entry["entrypoint_stem"]
+            ):
+                fail(f"source map route is malformed: {backend}/{variant}")
+            operations = entry.get("operations")
+            if operations is not None and (
+                not isinstance(operations, dict)
+                or set(operations) != {"create", "read"}
+                or any(not isinstance(value, str) or not value for value in operations.values())
+            ):
+                fail(f"source map operations are malformed: {backend}/{variant}")
+            if entry["cache_kind"] == "recomputed" and operations is None:
+                fail(f"recomputed route lacks exact operations: {backend}/{variant}")
+            if (entry.get("cfg_kv_batch") in CFG_KV_BATCH_RULES) != (backend == "mlx-metal"):
+                fail(f"CFG K/V batch rule is Metal-lane only: {backend}/{variant}")
+            anchor_fields = ["activation", "creation", "reads", "release"]
+            if entry["family"] == "flux2-klein":
+                anchor_fields.append("reference_slice")
+            for field in anchor_fields:
+                anchors = entry.get(field)
+                if not isinstance(anchors, list) or not anchors:
+                    fail(f"source map lacks {field} anchors: {backend}/{variant}")
+                for anchor in anchors:
+                    if (
+                        not isinstance(anchor, dict)
+                        or not isinstance(anchor.get("path"), str)
+                        or not isinstance(anchor.get("symbol"), str)
+                        or not isinstance(anchor.get("line"), int)
+                        or anchor["line"] < 1
+                    ):
+                        fail(f"source map has an invalid exact anchor: {backend}/{variant}/{field}")
+                    source_path = SOURCE_MAP.parent.parent / anchor["path"]
+                    try:
+                        source_lines = source_path.read_text(encoding="utf-8").splitlines()
+                    except OSError as exc:
+                        fail(f"source map anchor path is unavailable: {backend}/{variant}/{field}: {exc}")
+                    line = anchor["line"]
+                    symbol = anchor["symbol"].rsplit("::", 1)[-1]
+                    if line > len(source_lines) or symbol.lower() not in source_lines[line - 1].lower():
+                        fail(f"source map exact anchor is stale: {backend}/{variant}/{field}")
+            for field in (
+                "current_kernel", "cache_format", "paging", "offload", "recompute",
+                "compatibility",
+            ):
+                if not isinstance(entry.get(field), str) or not entry[field]:
+                    fail(f"source map lacks {field}: {backend}/{variant}")
     return coverage, source_map, sha256(coverage_raw), sha256(source_map_raw)
 
 
@@ -280,16 +384,37 @@ def validate_lifecycle(row):
         fail("lifecycle summary differs from exact observer events")
 
 
-def validate(row, expected_source_map_hash):
+def validate_backend_identity(events, backend):
+    """Every observer event of a Metal-lane transcript declares `mlx-metal`; a CUDA-lane transcript
+    may not claim any other backend (the Candle observers predate the field)."""
+    for event in events:
+        if not isinstance(event, dict) or event.get("sample_kind") == "process":
+            continue
+        declared = event.get("backend")
+        if backend == "mlx-metal":
+            if declared != "mlx-metal":
+                fail("Metal-lane observer event lacks its mlx-metal backend identity")
+        elif declared not in (None, backend):
+            fail("CUDA-lane transcript claims a different measurement backend")
+
+
+def validate(row, expected_source_map_hash, source_map=None):
     if not isinstance(row, dict):
         fail("receipt row must be an object")
     missing = set(REQUIRED) - row.keys()
     if missing:
         fail(f"missing fields: {sorted(missing)}")
-    if row["producer"] != "sc20686-campaign-adapter-v4":
+    if row["producer"] != PRODUCER:
         fail("untrusted producer")
+    if row["backend"] not in LANES:
+        fail("invalid measurement backend")
     if row["family"] not in FAMILIES or not isinstance(row["variant"], str):
         fail("invalid family/variant")
+    if source_map is None:
+        source_map = checked_contracts()[1]
+    entry = lane_entry(source_map, row["backend"], row["variant"])
+    if entry["family"] != row["family"]:
+        fail("row family differs from its registered lane route")
     if not isinstance(row["coordinate_name"], str) or not row["coordinate_name"]:
         fail("invalid coordinate name")
     require_digest(row["coordinate_id"], "coordinate id", 16)
@@ -326,55 +451,82 @@ def validate(row, expected_source_map_hash):
         fail("arm/full-generation lifecycle mismatch")
     validate_geometry(row["geometry"])
     validate_lifecycle(row)
-    expected_candidate = packed_group32_kv_bytes(
-        row["geometry"]["batch"], row["geometry"]["heads"], row["geometry"]["skv"],
-        row["geometry"]["head_dimension"],
-    )
+    geometry = row["geometry"]
+    events = row["observer_events"]
+    validate_backend_identity(events, row["backend"])
+    if row["backend"] == "mlx-metal":
+        phases = [event.get("phase") for event in events]
+        terminal = "cancelled" if row["arm"] == "cancel" else "generation-end"
+        validate_phase_windows(events, phases.index(terminal), row["arm"])
+    kind = entry["cache_kind"]
+    operations = entry.get("operations")
     created = [
-        event for event in row["observer_events"]
+        event for event in events
         if isinstance(event, dict) and event.get("phase") == "cross-kv-created"
     ]
-    if row["family"] == "wan":
-        if not created or any(
-            event.get("candidate_persistent_bytes") != expected_candidate for event in created
-        ):
-            fail("Wan candidate bytes differ from exact SC-20675 group32 projection")
-    elif row["candidate_persistent_bytes"] != expected_candidate * row["geometry"]["layers"]:
-        fail("FLUX candidate bytes differ from exact per-layer SC-20675 group32 projection")
     reads = [
-        event for event in row["observer_events"]
+        event for event in events
         if isinstance(event, dict) and event.get("phase") == "cross-kv-read"
     ]
     releases = [
-        event for event in row["observer_events"]
+        event for event in events
         if isinstance(event, dict) and event.get("phase") in ("cross-kv-released", "released")
     ]
-    if not reads or not any(event.get("phase") == "released" for event in releases):
+    if not created or not reads or not any(event.get("phase") == "released" for event in releases):
         fail("allocator read/release evidence is incomplete")
     for event in releases:
         active_allocator_measurement(event, "release remnant")
-    if row["family"] == "wan":
+    if operations is not None and (
+        any(event.get("operation") != operations["create"] for event in created)
+        or any(event.get("operation") != operations["read"] for event in reads)
+    ):
+        fail("evidence is not anchored at the lane's exact K/V operations")
+    expected_candidate = packed_group32_kv_bytes(
+        geometry["batch"], geometry["heads"], geometry["skv"], geometry["head_dimension"],
+    )
+    if row["backend"] == "candle-cuda":
+        if any("kv_batch" in event for event in created):
+            fail("CUDA-lane events may not supply a Metal kv_batch")
+    else:
+        exact_batch = expected_kv_batch(entry, geometry)
+        if any(
+            not isinstance(event.get("kv_batch"), int) or isinstance(event.get("kv_batch"), bool)
+            or event["kv_batch"] != exact_batch
+            for event in created
+        ):
+            fail("Metal K/V batch differs from the route's exact CFG layout")
+    if kind == "persistent":
+        for event in created:
+            kv_batch = event.get("kv_batch", geometry["batch"])
+            if row["backend"] == "mlx-metal" and event.get("persistent_bytes") != dense_reference_kv_bytes(
+                geometry, kv_batch
+            ):
+                fail("Metal persistent cache bytes differ from its exact live [B,H,Skv,D] tensors")
+            if event.get("candidate_persistent_bytes") != packed_group32_kv_bytes(
+                kv_batch, geometry["heads"], geometry["skv"], geometry["head_dimension"],
+            ):
+                fail("persistent candidate bytes differ from exact SC-20675 group32 projection")
         for event in reads:
-            allocator = active_allocator_measurement(event, "Wan cache read")
+            allocator = active_allocator_measurement(event, "persistent cache read")
             if event.get("transient_bytes") != (
                 allocator["allocator_high_bytes"] - allocator["allocator_before_bytes"]
             ):
-                fail("Wan read transient differs from active allocator high-water")
+                fail("cache read transient differs from active allocator high-water")
     else:
-        exact_dense = dense_reference_kv_bytes(row["geometry"])
+        exact_dense = dense_reference_kv_bytes(geometry)
+        if row["candidate_persistent_bytes"] != expected_candidate * geometry["layers"]:
+            fail("recomputed candidate bytes differ from exact per-layer SC-20675 group32 projection")
         if (
-            any(event.get("operation") != "DoubleAttention::to_k/to_v(reference-slice)"
-                or event.get("transient_bytes") != exact_dense for event in created)
-            or any(
-                   event.get("operation")
-                   != "DoubleAttention::attention(joint-context-non-attributable)"
-                   or event.get("transient_bytes") != exact_dense for event in reads)
+            row["current_persistent_bytes"] != 0
+            or any(event.get("persistent_bytes", 0) != 0 for event in created)
+            or any(event.get("transient_bytes") != exact_dense for event in created)
+            or any(event.get("transient_bytes") != exact_dense for event in reads)
             or row["current_read_transient_bytes"] != exact_dense
             or row["candidate_read_transient_bytes"] != exact_dense
         ):
-            fail("FLUX reference K/V slice differs from exact live geometry/dtype")
+            fail("recomputed K/V slice differs from exact live geometry/dtype")
         for event in reads:
-            active_allocator_measurement(event, "FLUX attention read")
+            active_allocator_measurement(event, "recomputed K/V attention read")
     expected_coordinate_id = sha256(
         (json.dumps(row["geometry"], sort_keys=True, separators=(",", ":")) + "\n").encode()
     )[:16]
@@ -403,18 +555,18 @@ def validate(row, expected_source_map_hash):
         )
     ):
         fail("invalid runtime duration")
-    if row["family"] == "flux2-klein":
+    if not entry["runtime_attribution"]:
         if (
             row["reference_runtime_attribution_available"] is not False
             or row["cache_read_duration_ms"] != 0
             or row["joint_attention_context_duration_ms"] <= 0
         ):
-            fail("FLUX joint attention must remain non-attributable runtime context")
+            fail("joint attention must remain non-attributable runtime context")
     elif (
-        row["reference_runtime_attribution_available"]
-        and row["joint_attention_context_duration_ms"] != 0
+        row["reference_runtime_attribution_available"] is not True
+        or row["joint_attention_context_duration_ms"] != 0
     ):
-        fail("Wan attributable runtime cannot also claim joint context")
+        fail("attributable cross-attention runtime cannot also claim joint context")
     for sample in row["allocator_samples"] + row["process_samples"]:
         require_nonnegative(sample.get("peak_bytes"), "sample peak_bytes")
         if sample["peak_bytes"] <= 0:
@@ -446,10 +598,10 @@ def verify_seal_artifact(row, raw_data, sidecar_data, expected_name=None):
         fail("sidecar receipt mismatch")
 
 
-def expected_coordinates(coverage, family):
+def expected_coordinates(coverage, family, backend="candle-cuda"):
     return {
         (variant, coordinate): geometry
-        for variant, variant_spec in coverage["families"][family].items()
+        for variant, variant_spec in lane_coverage(coverage, backend).get(family, {}).items()
         for coordinate, geometry in variant_spec["coordinates"].items()
     }
 
@@ -544,7 +696,11 @@ def reduce(rows):
         fail("rows must be non-empty")
     coverage, source_map, coverage_hash, source_map_hash = checked_contracts()
     for row in rows:
-        validate(row, source_map_hash)
+        validate(row, source_map_hash, source_map)
+    backends = {row["backend"] for row in rows}
+    if len(backends) != 1:
+        fail("one sealed campaign measures exactly one lane; rows mix measurement backends")
+    backend = backends.pop()
     keys = [
         (row["family"], row["variant"], row["coordinate_name"], row["arm"])
         for row in rows
@@ -555,7 +711,7 @@ def reduce(rows):
     decisions = {}
     for family in FAMILIES:
         family_rows = [row for row in rows if row["family"] == family]
-        expected = expected_coordinates(coverage, family)
+        expected = expected_coordinates(coverage, family, backend)
         expected_keys = {
             (variant, coordinate, arm)
             for variant, coordinate in expected
@@ -590,7 +746,7 @@ def reduce(rows):
             if not geometry_matches_expected(normal["geometry"], expected_geometry):
                 fail(f"observed geometry violates frozen coordinate: {variant}/{coordinate}")
             for field in (
-                "source_ref", "model_snapshot_revision", "residency_strategy",
+                "backend", "source_ref", "model_snapshot_revision", "residency_strategy",
                 "route_manifest_sha256", "source_map_sha256",
                 "model_snapshot_sha256", "model_snapshot_bytes", "coordinate_id",
                 "input_file_sha256",
@@ -614,7 +770,8 @@ def reduce(rows):
             "self_attention_excluded": True,
         }
     return {
-        "schema": "sc-20686-cache-attribution-v5",
+        "schema": "sc-20686-cache-attribution-v6",
+        "backend": backend,
         "thresholds": THRESHOLDS,
         "coverage_manifest_sha256": coverage_hash,
         "source_map_sha256": source_map_hash,
@@ -658,7 +815,7 @@ def verify_media_manifest(row, manifest_raw, artifacts, bundle, evidence_names, 
         or not isinstance(manifest.get("files"), list)
     ):
         fail("campaign media manifest schema is invalid")
-    expected_output_name = "media.png" if row["variant"] == "flux2_klein_9b_edit" else "media"
+    expected_output_name = "media.png" if row["variant"] in FLUX_IMAGE_ROUTES else "media"
     if manifest["output_name"] != expected_output_name:
         fail("campaign media manifest output conflicts with its route")
     files = manifest["files"]
@@ -716,7 +873,7 @@ def verify_campaign_bundle(bundle):
     if (bundle / "campaign.json.sha256").read_bytes() != expected_sidecar:
         fail("campaign aggregate sidecar mismatch")
     campaign = json.loads(campaign_raw.decode("utf-8"))
-    if campaign.get("schema") != "sc-20686-campaign-bundle-v5":
+    if campaign.get("schema") != "sc-20686-campaign-bundle-v6":
         fail("invalid campaign bundle schema")
     artifacts = campaign.get("artifact_sha256")
     validate_hash_map(artifacts, "campaign artifact identity")
@@ -742,10 +899,15 @@ def verify_campaign_bundle(bundle):
         resolved = json.loads(resolved_raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         fail(f"campaign resolved inputs are malformed: {exc}")
-    if resolved.get("schema") != "sc-20686-resolved-inputs-v3" or not isinstance(
-        resolved.get("coordinates"), list
+    if (
+        resolved.get("schema") != "sc-20686-resolved-inputs-v4"
+        or not isinstance(resolved.get("coordinates"), list)
+        or resolved.get("backend") not in LANES
+        or resolved.get("mode", "decision") != "decision"
     ):
         fail("campaign resolved inputs schema is invalid")
+    if any(row.get("backend") != resolved["backend"] for row in sealed_rows):
+        fail("sealed rows differ from the resolved measurement backend")
     require_digest(resolved.get("inference_revision"), "resolved inference revision", 40)
     resolved_by_key = {}
     for entry in resolved["coordinates"]:
@@ -922,6 +1084,160 @@ def verify_campaign_bundle(bundle):
     if campaign.get("decision") != result:
         fail("campaign aggregate decision is not reproducible from sealed rows")
     return result
+
+
+def schedule_control_summary(events, variant, coordinate_name, expected_geometry, identity):
+    """Validate one Metal **schedule-control** transcript and summarize its product-schedule peaks.
+
+    The control arm opens no per-read evaluation windows, so its run and phase-window peaks follow
+    the product's own lazy schedule (the decision arms' per-read windows perturb that schedule). It
+    must still be the same real product route: identical runtime identity and native geometry,
+    cache creation/release, phase windows with Darwin footprint, and a normal completion."""
+    validate_backend_identity(events, "mlx-metal")
+    observer = [e for e in events if isinstance(e, dict) and e.get("sample_kind") != "process"]
+    process = [e for e in events if isinstance(e, dict) and e.get("sample_kind") == "process"]
+    phases = [event.get("phase") for event in observer]
+    if "cross-kv-read" in phases or "cancelled" in phases:
+        fail("schedule-control transcript contains read windows or a cancellation")
+    indices = {}
+    for phase in ("metadata", "generation-start", "generation-end", "metrics", "invalidated", "released"):
+        matches = [index for index, value in enumerate(phases) if value == phase]
+        if len(matches) != 1:
+            fail(f"schedule-control transcript requires exactly one {phase} event")
+        indices[phase] = matches[0]
+    creates = [index for index, value in enumerate(phases) if value == "cross-kv-created"]
+    if not creates or not (
+        indices["metadata"] < indices["generation-start"] < min(creates)
+        and max(creates) < indices["generation-end"] < indices["metrics"]
+        < indices["invalidated"] < indices["released"]
+    ):
+        fail("schedule-control lifecycle is out of product order")
+    metadata = observer[indices["metadata"]]
+    expected = {
+        "schedule_control": True, "variant": variant, "real_weights": True,
+        "full_generation": True, "cancellation_armed": False, "attention_kind": "cross",
+        **identity,
+    }
+    if any(metadata.get(key) != value for key, value in expected.items()):
+        fail("schedule-control metadata differs from its route identity")
+    geometry = metadata.get("geometry")
+    validate_geometry(geometry)
+    if not geometry_matches_expected(geometry, expected_geometry):
+        fail("schedule-control geometry violates its frozen coordinate")
+    validate_phase_windows(observer, indices["generation-end"], "normal")
+    active_allocator_measurement(observer[indices["released"]], "schedule-control remnant")
+    peaks = [e.get("peak_bytes") for e in observer if e.get("sample_kind") == "allocator"]
+    process_peaks = [e.get("peak_bytes") for e in process]
+    for value in peaks + process_peaks:
+        require_nonnegative(value, "schedule-control peak")
+    if not process_peaks or max(peaks) <= 0 or max(process_peaks) <= 0:
+        fail("schedule-control run lacks physical allocator/process peaks")
+    return {
+        "variant": variant,
+        "coordinate_name": coordinate_name,
+        "geometry": {key: geometry[key] for key in GEOMETRY},
+        "run_peak_bytes": max(peaks),
+        "process_peak_bytes": max(process_peaks),
+        "phase_windows": [
+            {
+                "window": event["window"],
+                "window_index": event["window_index"],
+                "high_bytes": event["allocator_high_bytes"] - event["allocator_before_bytes"],
+                "phys_footprint_peak_bytes": event["phys_footprint_peak_bytes"],
+            }
+            for event in observer if event.get("phase") == "phase-window"
+        ],
+    }
+
+
+def verify_schedule_control_bundle(bundle):
+    """Verify a sealed Metal schedule-control bundle and recompute every summary from its
+    transcripts. Coverage is the full Metal lane: no coordinate may be missing."""
+    campaign_raw = (bundle / "campaign.json").read_bytes()
+    if (bundle / "campaign.json.sha256").read_bytes() != f"{sha256(campaign_raw)}  campaign.json\n".encode():
+        fail("schedule-control aggregate sidecar mismatch")
+    campaign = json.loads(campaign_raw.decode("utf-8"))
+    if campaign.get("schema") != "sc-20686-schedule-control-v1" or campaign.get("backend") != "mlx-metal":
+        fail("invalid schedule-control bundle schema")
+    artifacts = campaign.get("artifact_sha256")
+    validate_hash_map(artifacts, "schedule-control artifact identity")
+    expected_files = {"campaign.json", "campaign.json.sha256"}
+    for name in artifacts:
+        expected_files.update((name, f"{name}.sha256"))
+    if {path.name for path in bundle.iterdir() if path.is_file()} != expected_files:
+        fail("schedule-control bundle file inventory is not exact")
+    payloads = {
+        name: verify_named_artifact(bundle, name, item_hash, load_payload=".media-" not in name)
+        for name, item_hash in artifacts.items()
+    }
+    resolved = json.loads(payloads["campaign-inputs.resolved.json"].decode("utf-8"))
+    if (
+        resolved.get("schema") != "sc-20686-resolved-inputs-v4"
+        or resolved.get("backend") != "mlx-metal"
+        or resolved.get("mode") != "schedule-control"
+    ):
+        fail("schedule-control resolved inputs are invalid")
+    coverage, _source_map, coverage_hash, source_map_hash = checked_contracts()
+    if artifacts.get("sc20686_coverage_manifest.json") != coverage_hash or artifacts.get(
+        "sc20686_source_map.json"
+    ) != source_map_hash:
+        fail("schedule-control bundle does not seal the checked-in contracts")
+    frozen = {
+        (variant, name): geometry
+        for family in FAMILIES
+        for (variant, name), geometry in expected_coordinates(coverage, family, "mlx-metal").items()
+    }
+    entries = resolved["coordinates"]
+    if {(entry.get("variant"), entry.get("name")) for entry in entries} != set(frozen) or len(
+        entries
+    ) != len(frozen):
+        fail("schedule-control coverage is not the complete Metal lane")
+    summaries = campaign.get("summaries")
+    if not isinstance(summaries, list) or len(summaries) != len(entries):
+        fail("schedule-control summary inventory is malformed")
+    media = set()
+    for index, (entry, summary) in enumerate(zip(entries, summaries)):
+        stem = f"run-{index:02d}-control"
+        transcript = payloads.get(f"{stem}.events.jsonl")
+        process_raw = payloads.get(f"{stem}.process.json")
+        manifest_raw = payloads.get(f"{stem}.media.json")
+        command_raw = payloads.get(f"{stem}.command.json")
+        if None in (transcript, process_raw, manifest_raw, command_raw):
+            fail(f"schedule-control run lacks its transcripts: {stem}")
+        if not transcript.endswith(b"\n") or b"\r" in transcript:
+            fail("schedule-control event transcript is malformed")
+        events = [json.loads(line) for line in transcript.decode("utf-8").splitlines()]
+        events += json.loads(process_raw.decode("utf-8"))["samples"]
+        argv = json.loads(command_raw.decode("utf-8"))["argv"]
+        if (
+            argv[:3] != [entry["entrypoint"], "--sc20686-campaign", "--sc20686-events"]
+            or "--sc20686-schedule-control" not in argv
+            or "--sc20686-cancel" in argv
+            or argv[argv.index("--variant") + 1] != entry["variant"]
+            or argv[argv.index("--snapshot") + 1] != entry["snapshot"]
+        ):
+            fail("schedule-control command conflicts with sealed resolved inputs")
+        recomputed = schedule_control_summary(
+            events, entry["variant"], entry["name"], frozen[(entry["variant"], entry["name"])],
+            {
+                "source_ref": resolved["inference_revision"],
+                "model_snapshot_revision": entry["model_snapshot_revision"],
+                "residency_strategy": entry["residency_strategy"],
+                "snapshot_sha256": entry["snapshot_sha256"],
+                "snapshot_bytes": entry["snapshot_bytes"],
+            },
+        )
+        if recomputed != summary:
+            fail("schedule-control summary is not reproducible from its transcript")
+        media_names = {name for name in artifacts if name.startswith(f"{stem}.media-")}
+        verify_media_manifest(
+            {"arm": "control", "variant": entry["variant"]}, manifest_raw, artifacts, bundle,
+            media_names, stem,
+        )
+        media |= media_names | {f"{stem}.media.json"}
+    if {name for name in artifacts if ".media" in name} != media:
+        fail("schedule-control bundle contains unbound media")
+    return campaign
 
 
 def atomic_write(path, payload):

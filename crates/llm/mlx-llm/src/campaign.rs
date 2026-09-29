@@ -7174,7 +7174,9 @@ fn dense_kernel_fp32_parity_errors() -> Result<Vec<f64>, String> {
     output
         .eval()
         .map_err(|error| format!("dense kernel parity evaluation: {error}"))?;
-    let actual = output.as_slice::<f32>();
+    // Stride-safe host read: a multi-row fused SDPA output is a transposed view (sc-20676).
+    let actual = crate::primitives::nn::to_f32_host(&output)
+        .map_err(|error| format!("dense kernel parity readback: {error}"))?;
     let groups = QUERY_HEADS / KV_HEADS;
     let mut expected = Vec::with_capacity(QUERY_HEADS * WIDTH);
     for query_head in 0..QUERY_HEADS {

@@ -1705,10 +1705,14 @@ fn live_rows(array: &Array, rows: usize) -> Result<Array> {
     rows_range(array, 0, rows)
 }
 
-/// A row-contiguous copy (`x · 1` is bit-exact), so a host readback of a strided view is valid.
+/// An owned, row-contiguous copy, so a host readback of a strided view is valid. `x · 1` (bit-exact)
+/// releases the source buffer but keeps a permuted-dense input's strides; [`contiguous`] then
+/// makes it row-major (a no-op share when it already is).
+///
+/// [`contiguous`]: crate::primitives::nn::contiguous
 fn materialized(array: &Array) -> Result<Array> {
     let one = Array::from_slice(&[1i32], &[1]).as_dtype(array.dtype())?;
-    Ok(multiply(array, &one)?)
+    crate::primitives::nn::contiguous(&multiply(array, &one)?)
 }
 
 /// Unpack four 2-bit codes per byte along the last axis: `[..., W]` Uint8 → `[..., 4W]` Float32.

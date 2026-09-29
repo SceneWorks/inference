@@ -25,6 +25,8 @@ autotests = false
 # pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
 # with mlx-gen's pin so the two still build ONE mlx-rs.
 mlx-rs = { workspace = true }
+# The mlx-c binding for ops mlx-rs does not wrap (`mlx_contiguous`, sc-20676), same pinned rev.
+mlx-sys = { workspace = true }
 # The backend-neutral contract this crate implements.
 core-llm = { workspace = true }
 # Error plumbing for the engine surface.

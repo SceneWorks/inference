@@ -1,7 +1,12 @@
 # SC-20686 persistent K/V campaign transport
 
+The campaign has two measurement lanes, selected by the safety policy's backend. The **Metal lane**
+(`darwin-mlx` → `mlx-metal`) measures the MLX providers SceneWorks runs on Apple Silicon — the Mac
+product path. The **CUDA lane** (`linux-cuda`/`windows-cuda` → `candle-cuda`) measures the Candle
+providers. One sealed bundle is exactly one lane; see [Metal lane](#metal-mlx-lane) below.
+
 The campaign adapter runs the one registered FLUX.2 Klein edit route and all five registered Wan
-routes. For every normal and cancellation arm it creates a private `events.jsonl` file, passes that
+routes on both lanes (plus the MLX-only FLUX.2 Klein kv-edit route on the Metal lane). For every normal and cancellation arm it creates a private `events.jsonl` file, passes that
 path to the product entrypoint with `--sc20686-events`, and seals the exact event transcript as a
 separate bundle artifact. Provider stdout and stderr are retained only as diagnostics: progress
 output, including carriage-return updates, is never parsed as campaign evidence.
@@ -28,9 +33,9 @@ identical completed arm. The repository revision is never inferred from a model 
 
 Both single and matrix launch modes require `--safety-policy` and an absolute
 external `--resume-dir`. The policy is strict schema version 1 with backend
-`linux-cuda` or `windows-cuda` matching the execution host; it sets positive deadline, poll, termination grace, host reserve, child
-footprint cap, stdout/stderr/event caps, selected CUDA GPU UUID, GPU-free reserve,
-and child GPU cap. Each validated normal/cancel arm is preserved in a sealed
+`darwin-mlx`, `linux-cuda` or `windows-cuda` matching the execution host; it sets positive deadline, poll, termination grace, host reserve, child
+footprint cap, stdout/stderr/event caps and, for the CUDA backends, the selected CUDA GPU UUID, GPU-free reserve,
+and child GPU cap. A resume directory is bound to the lane it was captured for. Each validated normal/cancel arm is preserved in a sealed
 unit with observer events, bounded logs, generated media or verified absence,
 process samples, supervisor exit and cleanup, and exact campaign identity. A
 later watchdog failure leaves the bundle incomplete; it cannot serve as the
@@ -78,6 +83,7 @@ SceneWorks-equivalent strategies are:
 | Product route | Strategy |
 | --- | --- |
 | `flux2_klein_9b_edit` | `sequential` |
+| `flux2_klein_9b_kv_edit` (Metal lane only) | `sequential` |
 | `wan2_2_ti2v_5b` | `sequential` |
 | `wan2_2_t2v_14b` | `sequential` |
 | `wan2_2_i2v_14b` | `sequential` |
@@ -98,8 +104,145 @@ Normal/cancellation pairs are inseparable decision evidence. The reducer indepen
 cancel arm's product-owned cancellation identity, exactly one `cancelled` terminal, then metrics,
 invalidation, and release in product order; each coordinate decision records that verification.
 
-FLUX.2 Klein edit is an evidence-based no-go for persistent-reference-K/V productization in this
-campaign. Its `DoubleAttention` path projects reference K/V for each denoise evaluation and joins
-it into dense attention; there is no persistent reference K/V boundary or packed reader to promote.
-The observer records that transient reference-slice work so a live campaign can establish the
-no-go without representing an ordinary attention allocation as a promotable cache.
+FLUX.2 Klein edit (`flux2_klein_9b_edit`) is an evidence-based no-go candidate for
+persistent-reference-K/V productization on both lanes. Its `DoubleAttention` path projects
+reference K/V for each denoise evaluation and joins it into dense attention;
+there is no persistent reference K/V boundary or packed reader to promote. The observers record that
+transient reference-slice work so a live campaign can establish the no-go without representing an
+ordinary attention allocation as a promotable cache. The Mac product's other Klein edit route, `flux2_klein_9b_kv_edit`, *does* own a
+persistent reference-K/V cache; it exists only on MLX and is measured by the Metal lane.
+
+## Metal (MLX) lane
+
+The Metal lane is the Mac product-path lane: it measures the MLX providers the SceneWorks worker
+loads on Apple Silicon, through the same provider loaders, with the frozen product residency applied
+to `LoadSpec::offload_policy` (`sequential` → `OffloadPolicy::Sequential` staged component/expert
+residency, `resident` → `OffloadPolicy::Resident`). The CUDA lane continues to measure Candle and is
+unchanged by it.
+
+### Coverage and route map
+
+The Metal lane runs the CUDA matrix unchanged — the same six routes at the same native coordinates
+(resolution, frames, reference count, prompt, guidance, steps) with the same normal/cancel arms — plus
+one lane extension recorded in `sc20686_coverage_manifest.json` (`lane_extensions.mlx-metal`):
+`flux2_klein_9b_kv_edit` at the two FLUX coordinates. Dropping any route blocks its family decision;
+nothing is narrowed to fit.
+
+| Route | MLX entrypoint | Cache kind on MLX | Residency |
+| --- | --- | --- | --- |
+| `flux2_klein_9b_edit` | `sc20686_flux2_edit` | recomputed reference slice | `sequential` |
+| `flux2_klein_9b_kv_edit` | `sc20686_flux2_edit` | persistent reference K/V (`Flux2KvCache`) | `sequential` |
+| `wan2_2_ti2v_5b` | `sc20686_wan` | persistent cross-K/V (`StepCache`) | `sequential` |
+| `wan2_2_t2v_14b` | `sc20686_wan` | persistent cross-K/V per expert | `sequential` |
+| `wan2_2_i2v_14b` | `sc20686_wan` | persistent cross-K/V per expert | `sequential` |
+| `wan_vace` | `sc20686_wan` | recomputed text K/V | `resident` |
+| `wan2_2_vace_fun_14b` | `sc20686_wan` | recomputed text K/V | `sequential` |
+
+Three source facts differ from the Candle lane and are recorded as cache kinds in the lane's source map
+(`sc20686_source_map.json`, `lanes.mlx-metal`), not smoothed over:
+
+* MLX Wan-VACE (`vace.rs`, `Attn::cross_attn`) projects the text K/V inside every main and VACE block
+  on every CFG forward of every step. There is no persistent cross-K/V cache on this route, so its
+  rows carry zero persistent bytes and the recomputed transient, like the FLUX edit route.
+* MLX Wan stacks the CFG cond/uncond contexts on the batch axis of one cache. The source map's
+  `cfg_kv_batch` rule fixes the exact batch: TI2V-5B is `2B` only when guidance > 1, the A14B
+  experts always stack (`2B`), and FLUX.2 kv-edit and VACE are `B`. Each cache's exact `nbytes` must
+  equal `2·kv_batch·H·Skv·D·dtype`; CUDA-lane events may not carry `kv_batch` at all.
+* MLX FLUX.2 kv-edit extracts one reference-K/V slot per double and single layer on the first
+  evaluation, with **one cache per CFG branch** (`Flux2KvCfgCaches`). The joint attention is unmasked,
+  so reference K/V are prompt-dependent from the first double layer; the route previously shared one
+  cache (the mflux fork's shape), so the negative extract overwrote the positive slots and every
+  positive cached step attended over negative-branch reference K/V — a pre-existing wrong-output
+  defect under guidance > 1, fixed with this lane and pinned by a CFG parity test (per-branch kv
+  equals the non-kv forward exactly on every cached step). The extract step also materializes every
+  slot together with its output, so a slot never keeps its layer's whole `[txt, target, ref]` K/V
+  alive. The Candle lane has no kv-edit route and is unaffected.
+
+### Observer and attribution method
+
+The observer is `mlx_gen::sc20686` (`crates/media/mlx-gen/src/sc20686.rs`). It is inert unless the
+entrypoint arms an output request on the rendering thread and the provider's `generate` enters
+`observe_generation`; with nothing armed the provider calls `generate_impl` directly and every hook
+returns before evaluating, allocating or resetting anything. It writes the same JSONL schema as the
+Candle observers plus `"backend": "mlx-metal"` on every event and a `kv_batch` on each creation.
+
+* **Persistent bytes** are the exact `nbytes` of the retained K/V arrays, registered when the product
+  creates a cache (`register_cross_kv_set` in Wan's `build_cache`; `Flux2KvCache::apply` extract) and
+  released when the product drops it (`StepCache`'s ownership guard; `Flux2KvCache`'s `Drop`, which
+  frees the arrays before sampling the post-release remnant).
+* **Transient peaks** come from MLX's `active`, `cache` and `peak` allocator counters. The observer
+  owns every `reset_peak_memory` during a campaign and folds the counter into three nested
+  high-waters before each reset: the run (`peak_bytes`, also folding every `active + cache`
+  reservation), the current phase window, and each read window. A read window evaluates its inputs,
+  resets the peak, runs the attention, evaluates the output, and records `high - before`. MLX is
+  lazy, so these evaluation boundaries are what make a read measurable; they exist only in campaign
+  mode and are a documented perturbation of the lazy schedule (hook tests prove the outputs stay
+  bit-identical).
+* **Per-phase attribution** is emitted as `phase-window` events (`encode`, `load`, `prepare-cache`,
+  `denoise-step` with its step index, `post-denoise`, `decode`) driven by the provider's own progress
+  stream and cache-build hooks. Each window carries its allocator before/after/high/reserved and the
+  process `phys_footprint`/`phys_footprint_peak` from `/usr/bin/footprint`. The supervisor adds its
+  own sampled `phys_footprint` of the owned process tree and admits each arm by `vm_stat` free memory
+  (runtime-guarded admission, no static peak bound).
+* **Reuse/invalidation** events are exact: every read names its cache id, a rebuild releases the old
+  id before the new creation, and the reducer's per-cache minimum reuse counts caches that were never
+  read. A cached FLUX read window opens on the query and the fresh K/V, so the splice of the stored
+  reference K/V is materialized inside it; a mid-denoise expert swap relabels its pending step window
+  as `load`, so every `(window, index)` is unique.
+
+**Campaign schedule vs product schedule.** Every number from the decision arms — the run and
+phase-window peaks that feed the reducer's `peak_bytes`, and the durations — is measured on the
+*campaign* schedule: the per-read evaluation windows cut the product's lazy graph at every cached
+cross-attention, which can move both peak memory and time. They are attribution numbers, not the
+product's own. The **schedule-control arm** (`--schedule-control`, Metal lane only) runs every
+coordinate once more with `--sc20686-schedule-control`: cache creation/release and phase windows are
+still recorded, but no read window evaluates or resets anything, so its run and phase peaks follow
+the product's schedule. It publishes a separate sealed `sc-20686-schedule-control-v1` bundle whose
+per-coordinate summaries (run peak, process peak, per-phase high-water and `phys_footprint_peak`) the
+reducer recomputes from the transcripts over the complete Metal coverage; it is never decision
+evidence and a decision bundle cannot be a control bundle.
+
+The adapter and reducer require, for Metal rows only, `mlx-metal` on every observer event, a
+`denoise-step` window (and `decode` for normal arms) before the terminal event with valid allocator
+ordering and positive footprint, and — for persistent routes — the exact `kv_batch` byte identity.
+A CUDA-lane transcript may not claim another backend. The v5 producer rows, v4 resolved inputs,
+v6 bundles and v6 reducer decisions carry the lane; one bundle may not mix lanes.
+
+### One-command Metal campaign
+
+Build the two MLX entrypoints once, then run the sealed matrix (14 coordinates × normal/cancel):
+
+```text
+eval "$(scripts/fetch-prebuilt-mlx.sh --build-type Release)" && export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH
+cargo build --locked --release -p mlx-gen-wan --example sc20686_wan \
+  -p mlx-gen-flux2 --example sc20686_flux2_edit
+export SC20686_MLX_BIN_DIR=$PWD/target/release/examples
+export SC20686_MLX_WAN_TI2V_5B_SNAPSHOT=… SC20686_MLX_WAN_T2V_14B_SNAPSHOT=… \
+  SC20686_MLX_WAN_I2V_14B_SNAPSHOT=… SC20686_MLX_WAN_VACE_SNAPSHOT=… \
+  SC20686_MLX_WAN_VACE_FUN_14B_SNAPSHOT=… SC20686_WAN_I2V_REFERENCE=… \
+  SC20686_VACE_CONTROL_17_DIR=… SC20686_VACE_MASK_17_DIR=… SC20686_VACE_CONTROL_33_DIR=… \
+  SC20686_VACE_MASK_33_DIR=… SC20686_VACE_REFERENCE=…
+python3 scripts/sc20686_campaign_adapter.py --campaign --matrix \
+  --inference-revision "$(git rev-parse HEAD)" \
+  --safety-policy /abs/sc20686-darwin-mlx-policy.json \
+  --resume-dir /abs/external/sc20686-mlx-resume \
+  --wan-manifest scripts/sc20686_mlx_wan_campaign_manifest.example.json \
+  --flux-entrypoint "$SC20686_MLX_BIN_DIR/sc20686_flux2_edit" \
+  --flux-snapshot <flux2-klein-9b tier root> --flux-kv-snapshot <flux2-klein-9b-kv tier root> \
+  --flux-reference /abs/ref.png --flux-reference2 /abs/ref2.png \
+  --matrix-output /abs/evidence/sc20686-mlx-campaign
+# Product-schedule control (same inputs, its own resume directory and output):
+python3 scripts/sc20686_campaign_adapter.py --campaign --matrix --schedule-control … \
+  --resume-dir /abs/external/sc20686-mlx-control-resume \
+  --matrix-output /abs/evidence/sc20686-mlx-schedule-control
+```
+
+The MLX entrypoints are strict: unknown flags (including the Candle harness's `--single-only`) and
+repeated flags are refused, and campaign mode requires every coordinate argument, so the Metal
+coordinates seal an explicit `--seed 42`.
+
+The policy is the strict `darwin-mlx` schema (`schemaVersion`, `backend`, `deadlineSeconds`,
+`pollMillis`, `termGraceMillis`, `hostFreeReserveBytes`, `childFootprintCapBytes`, `stdoutCapBytes`,
+`stderrCapBytes`, `eventCapBytes`); the caps must be chosen for the host that runs it, and every arm
+is refused before spawn unless free memory covers cap plus reserve. The run needs the Metal GPU for
+its duration. Each snapshot is an immutable tier root (`<revision>/q4` or a revision directory).

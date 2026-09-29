@@ -774,7 +774,6 @@ mod tests {
     use crate::models::CausalLm;
     use crate::primitives::kv_candidates::compare::load_captured_case;
     use crate::primitives::Weights;
-    use mlx_rs::Dtype;
 
     /// Tiny synthetic three-layer GQA Llama (head dim 64, 2 query heads over 1 KV head).
     fn tiny_model() -> CausalLm {
@@ -844,19 +843,22 @@ mod tests {
     }
 
     fn host(array: &Array) -> Vec<f32> {
-        array
-            .as_dtype(Dtype::Float32)
-            .unwrap()
-            .as_slice::<f32>()
-            .to_vec()
+        crate::primitives::nn::to_f32_host(array).unwrap()
     }
 
-    fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
-        assert_eq!(left.len(), right.len());
-        left.iter()
-            .zip(right)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max)
+    /// One bf16 ulp at magnitude `x` (8 significant bits): `2^(⌊log2 x⌋ − 7)`, or the smallest
+    /// normal's ulp for zero/subnormals.
+    fn bf16_ulp(x: f32) -> f32 {
+        let power = f32::from_bits(x.abs().to_bits() & 0x7f80_0000);
+        power.max(f32::MIN_POSITIVE) / 128.0
+    }
+
+    #[test]
+    fn bf16_ulp_is_the_bf16_spacing() {
+        assert_eq!(bf16_ulp(1.0), 1.0 / 128.0);
+        assert_eq!(bf16_ulp(4.406), 1.0 / 32.0);
+        assert_eq!(bf16_ulp(-0.75), 1.0 / 256.0);
+        assert_eq!(bf16_ulp(0.0), f32::MIN_POSITIVE / 128.0);
     }
 
     /// Independent reference: one full-prompt prefill through the same decoder, with the same
@@ -967,23 +969,36 @@ mod tests {
             assert_eq!(metadata["gqaGroup"], "2");
             assert_eq!(metadata["modelSnapshotSha256"], "c".repeat(64));
             assert_eq!(metadata["schema"], CAPTURE_SCHEMA);
-            // Prefill(8) + decode(1) reproduces a 9-token prefill's cache and last query row — to
-            // bf16 rounding: the 9-row prefill attends with MLX's fused full kernel and the split
-            // path with its vector kernel (sc-20676), so from layer 1 on they may differ by an ulp
-            // or two of the compute dtype. Tolerance: 2 bf16 ulps of the largest element.
+            // Prefill(8) + decode(1) reproduces a 9-token prefill's cache and last query row. Layer 0
+            // (no attention upstream) must match exactly. From layer 1 on the 9-row prefill attends
+            // with MLX's fused full kernel and the split path with its vector kernel (sc-20676): a
+            // one-ulp rounding difference in the attention output is summed through the next
+            // projection, so the error scales with the tensor's largest elements, not each
+            // element's own magnitude (measured: 1 ulp of the largest key, 8 ulps of a small one).
+            // Tolerance: 2 bf16 ulps of the tensor's largest magnitude.
             let (query, keys, values) = full_prefill_reference(&model, &tokens, file.layer);
-            let bf16_tolerance = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs())) / 64.0;
             for (name, got, want) in [
                 ("keys", &case.keys, &keys),
                 ("values", &case.values, &values),
                 ("query", &case.query, &query),
             ] {
-                let (diff, tolerance) = (max_abs_diff(got, want), bf16_tolerance(want));
-                assert!(
-                    diff <= tolerance,
-                    "layer {} {name}: max |Δ| {diff} > {tolerance}",
-                    file.layer
-                );
+                assert_eq!(got.len(), want.len());
+                let largest = got
+                    .iter()
+                    .chain(want.iter())
+                    .fold(0.0f32, |m, v| m.max(v.abs()));
+                let tolerance = if file.layer == 0 {
+                    0.0
+                } else {
+                    2.0 * bf16_ulp(largest)
+                };
+                for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (g - w).abs() <= tolerance,
+                        "layer {} {name}[{i}]: {g} vs {w} (tolerance {tolerance})",
+                        file.layer
+                    );
+                }
             }
         }
         // An unlisted capture file, or a tampered one, no longer verifies.

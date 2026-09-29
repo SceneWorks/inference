@@ -834,7 +834,14 @@ struct StepCache {
     sin: Array,
     /// Forward batch width: 2 when CFG is on (cond+uncond stacked), else 1.
     batch: usize,
+    /// SC-20686 Metal-lane ownership of `cross_kv` (`None` unless a campaign is armed). Declared
+    /// last so the K/V arrays are freed before the post-release allocator remnant is sampled.
+    _sc20686: Option<mlx_gen::sc20686::CacheSetGuard>,
 }
+
+/// SC-20686 operation names for the Wan cross-K/V cache lifecycle (Metal lane).
+pub(crate) const SC20686_CROSS_KV_CREATE: &str = "WanTransformer::prepare_cross_kv";
+pub(crate) const SC20686_CROSS_KV_RELEASE: &str = "StepCache::drop";
 
 /// Build the per-expert [`StepCache`] from the embedded contexts + the (constant) RoPE grid. When CFG
 /// is on (`ctx_uncond = Some`) the cond/uncond contexts are stacked on the batch axis so the cross-K/V
@@ -850,6 +857,7 @@ fn build_cache(
         Some(uncond) => (concatenate_axis(&[ctx_cond, uncond], 0)?, 2),
         None => (ctx_cond.clone(), 1),
     };
+    mlx_gen::sc20686::mark_phase("prepare-cache");
     let cross_kv = transformer.prepare_cross_kv(&context_batch)?;
     let (cos, sin) = transformer.prepare_rope(grid)?;
     let mut to_eval: Vec<&Array> = vec![&cos, &sin];
@@ -858,11 +866,20 @@ fn build_cache(
         to_eval.push(v);
     }
     mlx_rs::transforms::eval(to_eval)?;
+    // Inert (`None`, no work) unless an SC-20686 campaign is armed on this thread.
+    let sc20686 = mlx_gen::sc20686::register_cross_kv_set(
+        &cross_kv,
+        (grid.0 * grid.1 * grid.2) as u64,
+        SC20686_CROSS_KV_CREATE,
+        SC20686_CROSS_KV_RELEASE,
+    )?;
+    mlx_gen::sc20686::mark_denoise();
     Ok(StepCache {
         cross_kv,
         cos,
         sin,
         batch,
+        _sc20686: sc20686,
     })
 }
 
@@ -1464,6 +1481,8 @@ pub(crate) fn denoise_moe_curated_swapped(
                         "wan: curated sampler timestep increased across the MoE boundary".into(),
                     ));
                 }
+                // SC-20686 Metal lane: the swap (drop, evict, load) is its own phase window.
+                mlx_gen::sc20686::mark_phase("load");
                 drop(active.take());
                 mlx_rs::memory::clear_cache();
                 let (transformer, cond, uncond, guidance) = load(false)?;
@@ -1834,6 +1853,10 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
         &multiply(mask, noise)?,
     )?)
 }
+
+#[cfg(test)]
+#[path = "sc20686_hooks_tests.rs"]
+mod sc20686_hooks_tests;
 
 #[cfg(test)]
 mod tests {

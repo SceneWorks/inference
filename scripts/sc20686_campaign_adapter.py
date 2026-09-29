@@ -30,7 +30,7 @@ from scripts import media_campaign_supervisor as supervisor
 REDUCER = Path(__file__).with_name("sc20686_cache_attribution.py")
 COVERAGE = Path(__file__).with_name("sc20686_coverage_manifest.json")
 SOURCE_MAP = Path(__file__).with_name("sc20686_source_map.json")
-PRODUCER = "sc20686-campaign-adapter-v4"
+PRODUCER = "sc20686-campaign-adapter-v5"
 INFERENCE_ROOT = Path(__file__).resolve().parents[1]
 GEOMETRY = (
     "batch", "resolution", "reference_count", "frames", "prompt", "guidance", "layers",
@@ -40,7 +40,15 @@ WAN_ROUTES = (
     "wan2_2_ti2v_5b", "wan2_2_t2v_14b", "wan2_2_i2v_14b", "wan_vace",
     "wan2_2_vace_fun_14b",
 )
-FLUX_ROUTES = ("flux2_klein_9b_edit",)
+FLUX_ROUTES = ("flux2_klein_9b_edit", "flux2_klein_9b_kv_edit")
+# Measurement lanes: the CUDA lane measures the Candle providers; the Metal lane measures the MLX
+# providers the SceneWorks Mac product runs. The safety-policy backend selects exactly one lane.
+LANES = ("candle-cuda", "mlx-metal")
+LANE_BY_POLICY = {
+    "darwin-mlx": "mlx-metal",
+    "linux-cuda": "candle-cuda",
+    "windows-cuda": "candle-cuda",
+}
 WAN_ENTRYPOINT_STEMS = {
     "wan2_2_ti2v_5b": "wan-txt2video",
     "wan2_2_t2v_14b": "wan14b-txt2video",
@@ -61,6 +69,7 @@ PROTECTED_FLAGS = {
 }
 PRODUCT_RESIDENCY = {
     "flux2_klein_9b_edit": "sequential",
+    "flux2_klein_9b_kv_edit": "sequential",
     "wan2_2_ti2v_5b": "sequential",
     "wan2_2_t2v_14b": "sequential",
     "wan2_2_i2v_14b": "sequential",
@@ -315,21 +324,42 @@ def active_allocator_measurement(event, label):
     return values
 
 
-def dense_reference_kv_bytes(geometry):
+def dense_reference_kv_bytes(geometry, kv_batch=None):
     dtype_bytes = {"F16": 2, "BF16": 2, "F32": 4}.get(geometry["dtype"].upper())
     if dtype_bytes is None:
         raise ValueError("FLUX reference slice has unsupported live dtype")
+    batch = geometry["batch"] if kv_batch is None else kv_batch
     return (
-        2 * geometry["batch"] * geometry["heads"] * geometry["skv"]
+        2 * batch * geometry["heads"] * geometry["skv"]
         * geometry["head_dimension"] * dtype_bytes
     )
 
 
 def load_coverage():
     document = json.loads(COVERAGE.read_text(encoding="utf-8"))
-    if document.get("schema") != "sc-20686-supported-coverage-v2":
+    if document.get("schema") != "sc-20686-supported-coverage-v3":
         raise ValueError("checked-in coverage manifest is invalid")
     return document
+
+
+def load_source_map():
+    document = json.loads(SOURCE_MAP.read_text(encoding="utf-8"))
+    if document.get("schema") != "sc-20686-source-map-v3":
+        raise ValueError("checked-in source map is invalid")
+    return document
+
+
+def lane_coverage(backend):
+    """Frozen coordinates of one lane: the shared six routes plus that lane's extensions."""
+    if backend not in LANES:
+        raise ValueError(f"unknown measurement lane: {backend}")
+    return _load_reducer().lane_coverage(load_coverage(), backend)
+
+
+def lane_entry(backend, variant):
+    if backend not in LANES:
+        raise ValueError(f"unknown measurement lane: {backend}")
+    return _load_reducer().lane_entry(load_source_map(), backend, variant)
 
 
 def expand_argument(value):
@@ -379,7 +409,7 @@ def validate_coordinate_arguments(route, name, arguments, expected):
             raise ValueError(f"coordinate {field} differs from frozen coverage: {route}/{name}")
 
 
-def load_wan_manifest(path):
+def load_wan_manifest(path, backend="candle-cuda"):
     path = Path(path).resolve()
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -387,7 +417,7 @@ def load_wan_manifest(path):
         raise ValueError("Wan campaign manifest is not valid JSON") from exc
     if not isinstance(document, dict) or set(document) != set(WAN_ROUTES):
         raise ValueError("Wan campaign manifest must contain exactly the five registered routes")
-    coverage = load_coverage()["families"]["wan"]
+    coverage = lane_coverage(backend)["wan"]
     result = {}
     for route in WAN_ROUTES:
         entry = document[route]
@@ -404,7 +434,7 @@ def load_wan_manifest(path):
         snapshot = Path(expand_argument(entry["snapshot"])).expanduser().resolve()
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise ValueError(f"Wan manifest entrypoint is not executable: {route}")
-        if binary.stem != WAN_ENTRYPOINT_STEMS[route]:
+        if binary.stem != lane_entry(backend, route)["entrypoint_stem"]:
             raise ValueError(f"Wan manifest entrypoint does not match registered route: {route}")
         validate_snapshot_layout(snapshot, f"Wan manifest {route}")
         revision = model_snapshot_revision(snapshot)
@@ -429,6 +459,11 @@ def load_wan_manifest(path):
             validate_coordinate_arguments(
                 route, name, arguments, coverage[route]["coordinates"][name]
             )
+            if backend == "mlx-metal":
+                try:
+                    int(argument_value(arguments, "--seed"))
+                except ValueError as exc:
+                    raise ValueError(f"Metal coordinate must seal one integer --seed: {route}/{name}") from exc
             file_hashes, inventory = hash_file_arguments(arguments)
             identity = route_manifest_identity(
                 route, name, binary, snapshot, revision, residency_strategy,
@@ -442,58 +477,82 @@ def load_wan_manifest(path):
     return result
 
 
-def flux_coordinates(entrypoint, snapshot, reference, reference2):
+def flux_coordinates(
+    entrypoint, snapshot, reference, reference2, backend="candle-cuda", kv_snapshot=None,
+):
+    """Every FLUX.2 route of the lane, at the frozen coordinates. The Metal lane additionally
+    measures the MLX-only `flux2_klein_9b_kv_edit` route (its own snapshot), which owns the only
+    persistent reference-K/V cache; the Candle lane has no such route."""
     entrypoint = Path(entrypoint).resolve()
-    snapshot = Path(snapshot).resolve()
     reference = Path(reference).resolve()
     reference2 = Path(reference2).resolve()
     if not entrypoint.is_file() or not os.access(entrypoint, os.X_OK):
         raise ValueError("FLUX campaign entrypoint is not executable")
-    validate_snapshot_layout(snapshot, "FLUX campaign")
-    revision = model_snapshot_revision(snapshot)
-    residency_strategy = PRODUCT_RESIDENCY[FLUX_ROUTES[0]]
-    definitions = {
-        "edit-512-ref1-cfg1": (
-            "--reference", str(reference), "--single-only", "--width", "512",
-            "--height", "512", "--prompt", "SC-20686 edit one reference",
-            "--guidance", "1", "--steps", "4",
-        ),
-        "edit-768x512-ref2-cfg2": (
-            "--reference", str(reference), "--reference2", str(reference2),
-            "--single-only", "--width", "768", "--height", "512", "--prompt",
-            "SC-20686 edit two references", "--guidance", "2", "--steps", "4",
-        ),
-    }
+    coverage = lane_coverage(backend).get("flux2-klein", {})
+    routes = [route for route in FLUX_ROUTES if route in coverage]
+    if set(routes) != set(coverage):
+        raise ValueError("FLUX lane coverage names an unregistered route")
+    snapshots = {"flux2_klein_9b_edit": snapshot, "flux2_klein_9b_kv_edit": kv_snapshot}
+    if "flux2_klein_9b_kv_edit" not in routes and kv_snapshot is not None:
+        raise ValueError(f"{backend} has no flux2_klein_9b_kv_edit route; drop --flux-kv-snapshot")
     result = []
-    expected_coordinates = load_coverage()["families"]["flux2-klein"][FLUX_ROUTES[0]]["coordinates"]
-    if set(definitions) != set(expected_coordinates):
-        raise ValueError("FLUX coordinate definitions do not match frozen coverage")
-    for name, arguments in definitions.items():
-        width = int(argument_value(arguments, "--width"))
-        height = int(argument_value(arguments, "--height"))
-        prompt = argument_value(arguments, "--prompt")
-        expected = expected_coordinates[name]
-        actual = {
-            "batch": 1, "resolution": f"{width}x{height}", "frames": 1,
-            "reference_count": arguments.count("--reference") + arguments.count("--reference2"),
-            "prompt": digest(prompt.encode("utf-8")),
-            "guidance": float(argument_value(arguments, "--guidance")),
-        }
-        if any(
-            actual[field] != (float(value) if field == "guidance" else value)
-            for field, value in expected.items()
-        ):
-            raise ValueError(f"FLUX coordinate differs from frozen coverage: {name}")
-        file_hashes, inventory = hash_file_arguments(arguments)
-        result.append(CoordinateSpec(
-            "flux2-klein", FLUX_ROUTES[0], name, entrypoint, snapshot, revision,
-            residency_strategy, arguments,
-            route_manifest_identity(
-                FLUX_ROUTES[0], name, entrypoint, snapshot, revision,
-                residency_strategy, arguments, inventory,
+    for route in routes:
+        if snapshots[route] is None:
+            raise ValueError(f"{backend} FLUX coverage requires a {route} snapshot")
+        route_snapshot = Path(snapshots[route]).resolve()
+        if entrypoint.stem != lane_entry(backend, route)["entrypoint_stem"]:
+            raise ValueError(f"FLUX campaign entrypoint does not match registered route: {route}")
+        validate_snapshot_layout(route_snapshot, f"FLUX campaign {route}")
+        revision = model_snapshot_revision(route_snapshot)
+        residency_strategy = PRODUCT_RESIDENCY[route]
+        definitions = {
+            "edit-512-ref1-cfg1": (
+                "--reference", str(reference), "--single-only", "--width", "512",
+                "--height", "512", "--prompt", "SC-20686 edit one reference",
+                "--guidance", "1", "--steps", "4",
             ),
-            file_hashes, inventory,
-        ))
+            "edit-768x512-ref2-cfg2": (
+                "--reference", str(reference), "--reference2", str(reference2),
+                "--single-only", "--width", "768", "--height", "512", "--prompt",
+                "SC-20686 edit two references", "--guidance", "2", "--steps", "4",
+            ),
+        }
+        if backend == "mlx-metal":
+            # The strict MLX entrypoint refuses the Candle harness's --single-only and requires
+            # every coordinate argument, the seed included, so it is sealed with the route.
+            definitions = {
+                name: tuple(item for item in arguments if item != "--single-only") + ("--seed", "42")
+                for name, arguments in definitions.items()
+            }
+        expected_coordinates = coverage[route]["coordinates"]
+        if set(definitions) != set(expected_coordinates):
+            raise ValueError("FLUX coordinate definitions do not match frozen coverage")
+        for name, arguments in definitions.items():
+            width = int(argument_value(arguments, "--width"))
+            height = int(argument_value(arguments, "--height"))
+            prompt = argument_value(arguments, "--prompt")
+            expected = expected_coordinates[name]
+            actual = {
+                "batch": 1, "resolution": f"{width}x{height}", "frames": 1,
+                "reference_count": arguments.count("--reference") + arguments.count("--reference2"),
+                "prompt": digest(prompt.encode("utf-8")),
+                "guidance": float(argument_value(arguments, "--guidance")),
+            }
+            if any(
+                actual[field] != (float(value) if field == "guidance" else value)
+                for field, value in expected.items()
+            ):
+                raise ValueError(f"FLUX coordinate differs from frozen coverage: {name}")
+            file_hashes, inventory = hash_file_arguments(arguments)
+            result.append(CoordinateSpec(
+                "flux2-klein", route, name, entrypoint, route_snapshot, revision,
+                residency_strategy, arguments,
+                route_manifest_identity(
+                    route, name, entrypoint, route_snapshot, revision,
+                    residency_strategy, arguments, inventory,
+                ),
+                file_hashes, inventory,
+            ))
     return result
 
 
@@ -621,6 +680,8 @@ def run_entrypoint(
         ]
         if arm == "cancel":
             command.append("--sc20686-cancel")
+        elif arm == "control":
+            command.append("--sc20686-schedule-control")
         command.extend(("--out", str(media_output)))
         if safety_policy.deadline_seconds > timeout_seconds:
             raise supervisor.SupervisionError("invalid-timeout", "safety deadline exceeds requested run timeout")
@@ -748,6 +809,14 @@ def media_artifacts(run, stem, arm):
 def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     if args.fake:
         raise ValueError("fake evidence is test-only and cannot produce a receipt")
+    backend = getattr(args, "backend", "candle-cuda")
+    if backend not in LANES:
+        raise ValueError("campaign measurement backend is not a registered lane")
+    reducer = _load_reducer()
+    entry = lane_entry(backend, args.variant)
+    if entry["family"] != args.family:
+        raise ValueError("campaign family differs from the registered lane route")
+    kind = entry["cache_kind"]
     metadata_events = [event for event in events if event.get("phase") == "metadata"]
     metrics_events = [event for event in events if event.get("phase") == "metrics"]
     if len(metadata_events) != 1 or len(metrics_events) != 1:
@@ -767,6 +836,9 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         raise ValueError("entrypoint residency does not match the frozen product route")
     if metadata.get("variant") != args.variant:
         raise ValueError("producer variant does not match the exact product route")
+    if metadata.get("backend", "candle-cuda") != backend:
+        raise ValueError("entrypoint measurement backend differs from the campaign lane")
+    reducer.validate_backend_identity(events, backend)
     for field in ("route_manifest_sha256", "source_map_sha256"):
         if not re.fullmatch(r"[0-9a-f]{64}", str(config.get(field, ""))):
             raise ValueError(f"campaign {field} is missing")
@@ -829,6 +901,9 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         raise ValueError("entrypoint must identify a real product cross-attention route")
     if metadata.get("full_generation") is not (not args.cancel_campaign):
         raise ValueError("entrypoint full-generation claim conflicts with campaign arm")
+    if backend == "mlx-metal":
+        reducer.validate_phase_windows(events, indices[terminal], "cancel" if args.cancel_campaign else "normal")
+    operations = entry.get("operations")
     if args.cancel_campaign:
         if metadata.get("cancellation_armed") is not True or not metadata.get("cancellation_arm_id"):
             raise ValueError("deliberate cancellation lacks product-owned arm identity")
@@ -849,29 +924,42 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
     geometry = geometry_from(events)
     release_remnant = events[indices["released"]]
     active_allocator_measurement(release_remnant, "post-release remnant")
-    if args.family == "flux2-klein":
+    if entry["runtime_attribution"]:
         if (
-            runtime_attribution_available is not False
-            or metrics["cache_read_duration_ms"] != 0
-            or metrics["joint_attention_context_duration_ms"] <= 0
+            runtime_attribution_available is not True
+            or metrics["joint_attention_context_duration_ms"] != 0
         ):
-            raise ValueError("FLUX joint attention must remain non-attributable runtime context")
+            raise ValueError("attributable cross-attention runtime cannot also claim joint context")
+    elif (
+        runtime_attribution_available is not False
+        or metrics["cache_read_duration_ms"] != 0
+        or metrics["joint_attention_context_duration_ms"] <= 0
+    ):
+        raise ValueError("joint attention must remain non-attributable runtime context")
+    if operations is not None and (
+        any(event.get("operation") != operations["create"] for event in create_events)
+        or any(event.get("operation") != operations["read"] for event in read_events)
+    ):
+        raise ValueError("evidence is not anchored at the lane's exact K/V operations")
+    if backend == "candle-cuda":
+        if any("kv_batch" in event for event in create_events):
+            raise ValueError("CUDA-lane events may not supply a Metal kv_batch")
+    else:
+        exact_batch = reducer.expected_kv_batch(entry, geometry)
+        if any(
+            not isinstance(event.get("kv_batch"), int) or isinstance(event.get("kv_batch"), bool)
+            or event["kv_batch"] != exact_batch
+            for event in create_events
+        ):
+            raise ValueError("Metal K/V batch differs from the route's exact CFG layout")
+    if kind == "recomputed":
         if metrics["current_persistent_bytes"] != 0 or any(event.get("persistent_bytes") != 0 for event in create_events):
-            raise ValueError("FLUX edit must report its non-persistent route honestly")
+            raise ValueError("recomputed route must report its non-persistent K/V honestly")
         if (
             metrics["minimum_cache_reads"] != metrics["reused_requests"]
             or metrics["minimum_cache_reads"] > observed_reuse
         ):
-            raise ValueError("FLUX logical payload reuse differs from product-owned recomputations")
-        if any(
-            event.get("operation") != "DoubleAttention::to_k/to_v(reference-slice)"
-            for event in create_events
-        ) or any(
-            event.get("operation")
-            != "DoubleAttention::attention(joint-context-non-attributable)"
-            for event in read_events
-        ):
-            raise ValueError("FLUX evidence is not anchored at exact DoubleAttention K/V boundaries")
+            raise ValueError("logical payload reuse differs from product-owned recomputations")
         exact_dense = dense_reference_kv_bytes(geometry)
         if (
             any(event.get("transient_bytes") != exact_dense for event in create_events)
@@ -879,28 +967,26 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
             or metrics["current_read_transient_bytes"] != exact_dense
             or metrics["candidate_read_transient_bytes"] != exact_dense
         ):
-            raise ValueError("FLUX reference K/V slice bytes differ from exact live geometry/dtype")
+            raise ValueError("recomputed K/V slice bytes differ from exact live geometry/dtype")
         for event in read_events:
-            active_allocator_measurement(event, "FLUX attention read")
+            active_allocator_measurement(event, "recomputed K/V attention read")
     else:
-        if runtime_attribution_available and metrics["joint_attention_context_duration_ms"] != 0:
-            raise ValueError("Wan attributable runtime cannot also claim joint context")
         if metrics["reused_requests"] != observed_reuse:
             raise ValueError("reuse metric differs from product-owned read events")
         if metrics["current_persistent_bytes"] == 0:
-            raise ValueError("Wan persistent-cache route cannot claim zero persistence")
+            raise ValueError("persistent-cache route cannot claim zero persistence")
         created_ids = [event.get("cache_id") for event in create_events]
         if any(not isinstance(cache_id, int) or cache_id < 1 for cache_id in created_ids) or len(created_ids) != len(set(created_ids)):
-            raise ValueError("Wan cache creation identities are missing or duplicated")
+            raise ValueError("persistent cache creation identities are missing or duplicated")
         read_ids = [event.get("cache_id") for event in read_events]
         if any(cache_id not in set(created_ids) for cache_id in read_ids):
-            raise ValueError("Wan cache read does not identify its created cache")
+            raise ValueError("persistent cache read does not identify its created cache")
         release_events = [
             event for event in events if event.get("phase") == "cross-kv-released"
         ]
         released_ids = [event.get("cache_id") for event in release_events]
         if sorted(released_ids) != sorted(created_ids):
-            raise ValueError("Wan cache invalidation does not release every exact cache once")
+            raise ValueError("persistent cache invalidation does not release every exact cache once")
         for cache_id in created_ids:
             created_index = next(
                 index for index, event in enumerate(events)
@@ -918,10 +1004,10 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
                 created_index < released_index < indices["released"]
                 and all(created_index < read_index < released_index for read_index in cache_reads)
             ):
-                raise ValueError("Wan cache read/release ordering is not product-owned")
+                raise ValueError("persistent cache read/release ordering is not product-owned")
         per_cache_reads = {cache_id: read_ids.count(cache_id) for cache_id in created_ids}
         if metrics["minimum_cache_reads"] != min(per_cache_reads.values(), default=0):
-            raise ValueError("Wan minimum cache reuse is not the per-cache minimum")
+            raise ValueError("persistent minimum cache reuse is not the per-cache minimum")
         live_dense = live_candidate = peak_dense = peak_candidate = 0
         created_bytes = {}
         for event in events:
@@ -933,7 +1019,11 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
                     not isinstance(dense, int) or isinstance(dense, bool) or dense <= 0
                     or not isinstance(candidate, int) or isinstance(candidate, bool) or candidate <= 0
                 ):
-                    raise ValueError("Wan creation lacks exact dense/candidate retained bytes")
+                    raise ValueError("persistent creation lacks exact dense/candidate retained bytes")
+                if backend == "mlx-metal" and dense != dense_reference_kv_bytes(
+                    geometry, event["kv_batch"]
+                ):
+                    raise ValueError("Metal persistent cache bytes differ from its exact live tensors")
                 created_bytes[cache_id] = (dense, candidate)
                 live_dense += dense
                 live_candidate += candidate
@@ -945,24 +1035,24 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
                     event.get("persistent_bytes") != dense
                     or event.get("candidate_persistent_bytes") != candidate
                 ):
-                    raise ValueError("Wan release bytes differ from the exact created cache")
+                    raise ValueError("persistent release bytes differ from the exact created cache")
                 live_dense -= dense
                 live_candidate -= candidate
         if live_dense or live_candidate:
-            raise ValueError("Wan retained accounting does not close at release")
+            raise ValueError("persistent retained accounting does not close at release")
         if (
             metrics["current_persistent_bytes"] != peak_dense
             or metrics["candidate_persistent_bytes"] != peak_candidate
         ):
-            raise ValueError("Wan persistent metric differs from exact simultaneous residency")
+            raise ValueError("persistent metric differs from exact simultaneous residency")
         for event in read_events:
-            allocator = active_allocator_measurement(event, "Wan cache read")
+            allocator = active_allocator_measurement(event, "persistent cache read")
             if event.get("transient_bytes") != (
                 allocator["allocator_high_bytes"] - allocator["allocator_before_bytes"]
             ):
-                raise ValueError("Wan read transient differs from active allocator high-water")
+                raise ValueError("persistent read transient differs from active allocator high-water")
         for event in release_events:
-            active_allocator_measurement(event, "Wan cache release remnant")
+            active_allocator_measurement(event, "persistent cache release remnant")
     if args.family == "flux2-klein" and geometry["reference_count"] < 1:
         raise ValueError("FLUX edit campaign requires a live reference image")
     coordinate_id = digest(canonical(geometry))[:16]
@@ -980,6 +1070,7 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
         raise ValueError("producer must provide distinct physical allocator and process samples")
     return {
         "producer": PRODUCER,
+        "backend": backend,
         "family": args.family,
         "variant": args.variant,
         "coordinate_name": args.coordinate_name,
@@ -1022,7 +1113,12 @@ def _load_reducer():
 
 
 def render_markdown(keys, decision, source_map):
-    lines = ["# SC-20686 campaign", "", "## Frozen coordinates", ""]
+    backend = decision["backend"]
+    lines = [
+        "# SC-20686 campaign", "",
+        f"Measurement lane: `{backend}` ({source_map['lanes'][backend]['measures']})", "",
+        "## Frozen coordinates", "",
+    ]
     lines.extend(
         f"- {family}/{variant} `{coordinate}` arm=`{arm}`"
         for family, variant, coordinate, arm in keys
@@ -1036,10 +1132,11 @@ def render_markdown(keys, decision, source_map):
         f"- Metadata: {target['metadata']}",
         f"- Pending key tail: {target['pending_key_tail']}", "",
     ])
-    for variant, entry in source_map["variants"].items():
+    for variant, entry in source_map["lanes"][backend]["variants"].items():
         lines.extend([
             f"### `{variant}`", "",
-            f"- Product route: `{entry['route']}`", f"- Current kernel: {entry['current_kernel']}",
+            f"- Product route: `{entry['route']}`", f"- Cache kind: `{entry['cache_kind']}`",
+            f"- Current kernel: {entry['current_kernel']}",
             f"- Cache format: {entry['cache_format']}", f"- Paging: {entry['paging']}",
             f"- Offload: {entry['offload']}", f"- Recompute: {entry['recompute']}",
             f"- Compatibility: {entry['compatibility']}",
@@ -1184,7 +1281,12 @@ def _save_unit(root, stem, identity_sha, variant, arm, run):
 
 
 def publish_campaign(coordinates, runner, row_builder, destination, input_artifacts=None,
-                     *, resume_root=None, resume_identity_sha=None, preflight=None, stop_files=()):
+                     *, resume_root=None, resume_identity_sha=None, preflight=None, stop_files=(),
+                     schedule_control=False):
+    """Run every coordinate's arms and publish one sealed bundle. The decision campaign runs the
+    normal/cancel pair and seals reducer rows; `schedule_control` runs the Metal lane's single
+    control arm (no per-read evaluation windows) and seals product-schedule peak summaries."""
+    arms = ("control",) if schedule_control else ("normal", "cancel")
     rows = []
     run_artifacts = {}
     run_sources = {}
@@ -1196,7 +1298,7 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
         raise ValueError("campaign destination or staging path already exists")
     try:
         for index, coordinate in enumerate(coordinates):
-            for arm in ("normal", "cancel"):
+            for arm in arms:
                 if preflight is not None:
                     preflight(coordinate)
                 stem = f"run-{index:02d}-{arm}"
@@ -1208,8 +1310,8 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                         # Between arms only: a running entrypoint is never signalled.
                         supervisor.check_operator_stop(
                             stop_files, Path(resume_root) / "logs", kind="sc-20686-operator-stop",
-                            before=stem, index=index * 2 + ("normal", "cancel").index(arm),
-                            total=len(coordinates) * 2,
+                            before=stem, index=index * len(arms) + arms.index(arm),
+                            total=len(coordinates) * len(arms),
                         )
                     run = runner(coordinate, arm)
                     if preflight is not None:
@@ -1263,13 +1365,18 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                 rows.append(row)
                 run_artifacts.update(artifacts)
                 run_sources.update(media_sources)
+        reducer = _load_reducer()
+        if schedule_control:
+            return _publish_schedule_control(
+                coordinates, rows, run_artifacts, run_sources, input_artifacts, staging, final,
+                reducer,
+            )
         keys = [
             (row.get("family"), row.get("variant"), row.get("coordinate_name"), row.get("arm"))
             for row in rows
         ]
         if len(keys) != len(set(keys)) or len(rows) != len(coordinates) * 2:
             raise ValueError("campaign matrix has missing or duplicate coordinates")
-        reducer = _load_reducer()
         input_artifacts = dict(input_artifacts or {})
         if "campaign-inputs.resolved.json" not in input_artifacts:
             raise ValueError("campaign publication requires sealed resolved inputs")
@@ -1299,7 +1406,7 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                 raise ValueError("campaign media artifact is malformed")
             artifact_hashes[name] = file_identity(source)
         campaign = {
-            "schema": "sc-20686-campaign-bundle-v5",
+            "schema": "sc-20686-campaign-bundle-v6",
             "decision": decision,
             "artifact_sha256": artifact_hashes,
             "route_input_file_sha256": {
@@ -1340,6 +1447,47 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
             cleanup_campaign_run(run)
 
 
+def _publish_schedule_control(coordinates, summaries, run_artifacts, run_sources,
+                              input_artifacts, staging, final, reducer):
+    keys = [(summary["variant"], summary["coordinate_name"]) for summary in summaries]
+    if len(keys) != len(set(keys)) or len(summaries) != len(coordinates):
+        raise ValueError("schedule-control matrix has missing or duplicate coordinates")
+    artifact_payloads = dict(input_artifacts or {})
+    if "campaign-inputs.resolved.json" not in artifact_payloads:
+        raise ValueError("schedule-control publication requires sealed resolved inputs")
+    artifact_payloads.update(run_artifacts)
+    artifact_payloads["sc20686_coverage_manifest.json"] = COVERAGE.read_bytes()
+    artifact_payloads["sc20686_source_map.json"] = SOURCE_MAP.read_bytes()
+    staging.mkdir(parents=False)
+    artifact_hashes = {name: digest(payload) for name, payload in artifact_payloads.items()}
+    for name, source in run_sources.items():
+        artifact_hashes[name] = file_identity(source)
+    campaign = {
+        "schema": "sc-20686-schedule-control-v1",
+        "backend": "mlx-metal",
+        "artifact_sha256": artifact_hashes,
+        "summaries": summaries,
+    }
+    campaign_raw = (json.dumps(campaign, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    for name, payload in artifact_payloads.items():
+        if Path(name).name != name or not isinstance(payload, bytes):
+            raise ValueError("schedule-control artifact is malformed")
+        (staging / name).write_bytes(payload)
+        (staging / f"{name}.sha256").write_text(f"{artifact_hashes[name]}  {name}\n", encoding="utf-8")
+    for name, source in run_sources.items():
+        shutil.copyfile(source, staging / name)
+        if file_identity(staging / name) != artifact_hashes[name]:
+            raise ValueError(f"schedule-control media copy checksum mismatch: {name}")
+        (staging / f"{name}.sha256").write_text(f"{artifact_hashes[name]}  {name}\n", encoding="utf-8")
+    (staging / "campaign.json").write_bytes(campaign_raw)
+    (staging / "campaign.json.sha256").write_text(
+        f"{digest(campaign_raw)}  campaign.json\n", encoding="utf-8"
+    )
+    reducer.verify_schedule_control_bundle(staging)
+    os.replace(staging, final)
+    return campaign
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--campaign", action="store_true")
@@ -1354,6 +1502,12 @@ def main():
     parser.add_argument("--flux-snapshot", type=Path)
     parser.add_argument("--flux-reference", type=Path)
     parser.add_argument("--flux-reference2", type=Path)
+    parser.add_argument("--flux-kv-snapshot", type=Path)
+    parser.add_argument(
+        "--schedule-control", action="store_true",
+        help="Metal lane only: run each coordinate's schedule-control arm (phase windows, no "
+             "per-read evaluation windows) and seal product-schedule peaks instead of decisions",
+    )
     parser.add_argument("--matrix-output", type=Path)
     parser.add_argument("--entrypoint", type=Path)
     parser.add_argument("--inference-revision")
@@ -1372,8 +1526,11 @@ def main():
     stop_files = supervisor.operator_stop_files(args.stop_file, args.resume_dir)
     try:
         safety_policy = supervisor.load_policy(args.safety_policy)
-        if safety_policy.backend not in {"linux-cuda", "windows-cuda"}:
-            raise ValueError("SC-20686 Candle media campaigns require a Linux/Windows CUDA safety backend")
+        # darwin-mlx measures the MLX providers (the Mac product path); linux/windows-cuda measure
+        # the Candle providers. The supervisor refuses a policy whose backend is not this host's.
+        backend = LANE_BY_POLICY.get(safety_policy.backend)
+        if backend is None:
+            raise ValueError("SC-20686 media campaigns require a darwin-mlx, linux-cuda, or windows-cuda safety backend")
         if not args.resume_dir.is_absolute() or args.resume_dir.is_symlink():
             raise ValueError("resume directory must be an absolute, nonsymlink path")
         if args.run_timeout_seconds <= 0 or safety_policy.deadline_seconds > args.run_timeout_seconds:
@@ -1381,23 +1538,31 @@ def main():
         if args.resume_dir.exists():
             captured = json.loads((args.resume_dir / "resolved.json").read_bytes())
             inference_revision = require_revision(captured["inference_revision"], "captured inference revision")
+            if captured.get("backend") != backend:
+                raise ValueError("resume directory was captured for a different measurement lane")
             if args.inference_revision is not None and args.inference_revision != inference_revision:
                 raise ValueError("requested inference revision differs from captured resume provenance")
         else:
             inference_revision = verify_inference_revision(args.inference_revision)
         source_map_hash = digest(SOURCE_MAP.read_bytes())
+        if args.schedule_control and (backend != "mlx-metal" or not args.matrix):
+            raise ValueError("--schedule-control is a Metal-lane (darwin-mlx) matrix mode")
         if args.matrix:
             if not all((args.wan_manifest, args.flux_entrypoint, args.flux_snapshot, args.flux_reference, args.flux_reference2, args.matrix_output)):
                 parser.error("matrix mode requires the Wan manifest, FLUX executable/snapshot, two references, and output")
-            wan = load_wan_manifest(args.wan_manifest)
+            wan = load_wan_manifest(args.wan_manifest, backend)
             coordinates = [spec for route in WAN_ROUTES for spec in wan[route].values()]
-            coordinates.extend(flux_coordinates(args.flux_entrypoint, args.flux_snapshot, args.flux_reference, args.flux_reference2))
+            coordinates.extend(flux_coordinates(
+                args.flux_entrypoint, args.flux_snapshot, args.flux_reference,
+                args.flux_reference2, backend, args.flux_kv_snapshot,
+            ))
             snapshot_identities = {
                 str(snapshot): snapshot_identity(snapshot)
                 for snapshot in sorted({spec.snapshot for spec in coordinates})
             }
             resolved = {
-                "schema": "sc-20686-resolved-inputs-v3",
+                "schema": "sc-20686-resolved-inputs-v4",
+                "backend": backend,
                 "inference_revision": inference_revision,
                 "coordinates": [
                     {
@@ -1414,6 +1579,8 @@ def main():
                     for spec in coordinates
                 ],
             }
+            if args.schedule_control:
+                resolved["mode"] = "schedule-control"
             resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy, stop_files)
 
             def runner(spec, arm):
@@ -1431,9 +1598,22 @@ def main():
 
             def build_row(spec, arm, events, evidence_hashes):
                 snapshot_hash, snapshot_bytes = snapshot_identities[str(spec.snapshot)]
+                if arm == "control":
+                    return _load_reducer().schedule_control_summary(
+                        events, spec.variant, spec.name,
+                        lane_coverage(backend)[spec.family][spec.variant]["coordinates"][spec.name],
+                        {
+                            "source_ref": inference_revision,
+                            "model_snapshot_revision": spec.model_snapshot_revision,
+                            "residency_strategy": spec.residency_strategy,
+                            "snapshot_sha256": snapshot_hash,
+                            "snapshot_bytes": snapshot_bytes,
+                        },
+                    )
                 row_args = argparse.Namespace(
                     fake=False, family=spec.family, variant=spec.variant,
                     coordinate_name=spec.name, cancel_campaign=arm == "cancel",
+                    backend=backend,
                 )
                 return make_row(row_args, {
                     "route_manifest_sha256": spec.route_manifest_sha256,
@@ -1451,7 +1631,8 @@ def main():
                 "safety-policy.json": safety_policy.canonical_bytes,
                 "resume-identity.json": (args.resume_dir / "identity.json").read_bytes(),
             }, resume_root=args.resume_dir, resume_identity_sha=resume_identity_sha,
-                preflight=preflight, stop_files=stop_files)
+                preflight=preflight, stop_files=stop_files,
+                schedule_control=args.schedule_control)
             return 0
 
         if not all((args.family, args.snapshot, args.output, args.variant, args.coordinate_name, args.entrypoint)):
@@ -1464,6 +1645,11 @@ def main():
         file_hashes, inventory = hash_file_arguments(route_args)
         if args.variant not in PRODUCT_RESIDENCY:
             parser.error("single mode variant is not a frozen product route")
+        route_entry = lane_entry(backend, args.variant)
+        if route_entry["family"] != args.family:
+            raise ValueError("single mode family differs from the registered lane route")
+        if Path(args.entrypoint).stem != route_entry["entrypoint_stem"]:
+            raise ValueError("single mode entrypoint does not match the registered lane route")
         validate_snapshot_layout(args.snapshot, "single campaign")
         revision = model_snapshot_revision(args.snapshot)
         residency_strategy = PRODUCT_RESIDENCY[args.variant]
@@ -1495,6 +1681,7 @@ def main():
             row_args = argparse.Namespace(
                 fake=False, family=single_spec.family, variant=single_spec.variant,
                 coordinate_name=single_spec.name, cancel_campaign=arm == "cancel",
+                backend=backend,
             )
             return make_row(row_args, {
                 "route_manifest_sha256": single_spec.route_manifest_sha256,
@@ -1508,7 +1695,8 @@ def main():
 
         # A single invocation still captures both lifecycle arms into one atomic, sealed bundle.
         resolved = {
-            "schema": "sc-20686-resolved-inputs-v3",
+            "schema": "sc-20686-resolved-inputs-v4",
+            "backend": backend,
             "inference_revision": inference_revision,
             "coordinates": [{
                 "family": spec.family, "variant": spec.variant, "name": spec.name,
