@@ -151,8 +151,8 @@ fn unsupported(why: impl std::fmt::Display) -> gen_core::Error {
     ))
 }
 
-/// Refuse the FP8 mode for anything but the `bf16` tier computing in BF16 on CUDA (the device's
-/// compute capability is checked when the mode is prepared, [`prepare_fp8_ar`]).
+/// Refuse the FP8 mode for anything but the `bf16` tier computing in BF16 on CUDA sm_89+.
+/// Check the device before reading model weights, even though preparation checks it again.
 pub fn check_fp8_request(tier: Tier, dtype: DType, device: &Device) -> gen_core::Result<()> {
     if tier != Tier::Bf16 {
         return Err(unsupported(format!(
@@ -177,6 +177,8 @@ pub fn check_fp8_request(tier: Tier, dtype: DType, device: &Device) -> gen_core:
     if !cfg!(feature = "cuda") {
         return Err(unsupported("this build has no CUDA support"));
     }
+    #[cfg(feature = "cuda")]
+    cuda::check_hardware(device)?;
     Ok(())
 }
 
@@ -367,6 +369,18 @@ mod cuda {
 
     fn err(what: &'static str) -> impl Fn(candle_audio::candle_core::Error) -> gen_core::Error {
         move |e| gen_core::Error::Msg(format!("yue2 FP8 AR {what}: {e}"))
+    }
+
+    pub(super) fn check_hardware(device: &Device) -> gen_core::Result<()> {
+        let lt = CublasLt::new(device).map_err(err("cuBLASLt handle"))?;
+        let cap = lt.compute_cap().map_err(err("compute capability"))?;
+        if !candle_quant_kernels::compute_cap_meets_fp8_floor(cap) {
+            return Err(unsupported(format!(
+                "it needs CUDA compute capability >= {:?}, this device is {cap:?}",
+                candle_quant_kernels::FP8_COMPUTE_CAP_FLOOR
+            )));
+        }
+        Ok(())
     }
 
     pub(super) fn prepare(lm: &mut Yue2Lm) -> gen_core::Result<()> {
