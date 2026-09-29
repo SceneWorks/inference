@@ -151,6 +151,12 @@ impl PrefixCache {
         // `contains` guards the degenerate `capacity == 0` case, where the insert immediately evicts
         // its own entry (so we must not leave an orphan in `kv`).
         if self.index.contains(out.id) {
+            // `export` builds lazy copies: until they are evaluated each one still references the
+            // finished cache's whole padded block buffer, so the entry would pin every layer's
+            // full block capacity (not its live length) until whatever request next evaluates it
+            // frees it mid-prefill. Evaluate here so the entry owns only its live positions and the
+            // block buffers are released with the finished cache (sc-20671).
+            mlx_rs::transforms::eval(layers.iter().flat_map(|(k, v)| [k, v]))?;
             self.kv.insert(out.id, layers);
         }
         Ok(())
@@ -436,6 +442,119 @@ mod tests {
         assert_eq!(sliced[0].0.shape()[SEQ_AXIS as usize], 3);
         let cloned = slice_layers(&kv(4), 4).unwrap();
         assert_eq!(cloned[0].0.shape()[SEQ_AXIS as usize], 4);
+    }
+
+    /// Whether MLX has materialized `array`'s buffer (its lazy graph, if any, has been evaluated).
+    #[cfg(target_os = "macos")]
+    fn is_available(array: &Array) -> bool {
+        let mut available = false;
+        // SAFETY: `array` is a live MLX array handle and `available` outlives the call.
+        let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, array.as_ptr()) };
+        assert_eq!(status, 0, "mlx array status query failed");
+        available
+    }
+
+    /// Tiny synthetic Llama (4 KV heads × head dim 64, 2 layers) for the store-ownership test.
+    #[cfg(target_os = "macos")]
+    fn tiny_model() -> CausalLm {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        use crate::primitives::Weights;
+        let cfg = crate::config::ModelConfig {
+            hidden_size: 256,
+            intermediate_size: 128,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 64,
+            vocab_size: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            tie_word_embeddings: false,
+            architecture: crate::config::Architecture::Llama,
+            max_position_embeddings: 0,
+            quantization: None,
+            moe: None,
+            attn_logit_softcap: None,
+            final_logit_softcap: None,
+            query_pre_attn_scalar: None,
+            partial_rotary_factor: 1.0,
+            mla: None,
+            yarn: None,
+            mrope_section: None,
+            gemma4: None,
+        };
+        let mut rng = SplitMix64::new(0x5c20671);
+        let mut randn = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+            Array::from_slice(&data, shape)
+        };
+        let (h, v, inter) = (cfg.hidden_size, cfg.vocab_size, cfg.intermediate_size);
+        let (qd, kvd) = (
+            cfg.num_heads * cfg.head_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+        );
+        let ones = || Array::ones::<f32>(&[h]).unwrap();
+        let mut m = HashMap::new();
+        m.insert("model.embed_tokens.weight".to_string(), randn(&[v, h]));
+        m.insert("model.norm.weight".into(), ones());
+        m.insert("lm_head.weight".into(), randn(&[v, h]));
+        for i in 0..cfg.num_layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            m.insert(p("input_layernorm.weight"), ones());
+            m.insert(p("post_attention_layernorm.weight"), ones());
+            m.insert(p("self_attn.q_proj.weight"), randn(&[qd, h]));
+            m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.o_proj.weight"), randn(&[h, qd]));
+            m.insert(p("mlp.gate_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.up_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.down_proj.weight"), randn(&[h, inter]));
+        }
+        CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap()
+    }
+
+    /// sc-20671: a stored prefix entry is materialized at store time and owns only its live
+    /// positions. A lazy export keeps a reference to the finished cache's whole padded block
+    /// buffer, so a campaign's prefill-window baseline (sampled after seeding the store) counted
+    /// the full block capacity and the hit's first evaluation released it mid-prefill — the
+    /// phase-local floor then exceeded the measured active bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stored_prefix_entries_are_materialized_at_their_live_length() {
+        let model = tiny_model();
+        // 40 prompt tokens: well inside one 256-position block, and inside the vocabulary (MLX's
+        // embedding gather is not bounds-checked).
+        let prompt = (0..40).map(|i| i % 63 + 1).collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let mut store = PrefixCache::new(2);
+        generate_cached(
+            &model,
+            &prompt,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            &mut store,
+        )
+        .unwrap();
+        let [layers] = store.kv.values().collect::<Vec<_>>()[..] else {
+            panic!("one stored sequence");
+        };
+        assert_eq!(layers.len(), 2);
+        for (keys, values) in layers {
+            // A budget finish never feeds the last generated token, so the entry is the prompt.
+            assert_eq!(keys.shape()[SEQ_AXIS as usize], 40);
+            assert_eq!(values.shape()[SEQ_AXIS as usize], 40);
+            assert!(
+                is_available(keys) && is_available(values),
+                "a stored prefix entry must not be a lazy view of the finished cache's block buffer"
+            );
+        }
     }
 
     /// Defence in depth (sc-12455): if an index entry ever over-states its KV again (the pre-fix
