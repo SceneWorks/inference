@@ -66,6 +66,26 @@ lms_bin() {
   fi
 }
 
+# Returns 0 when LM Studio holds no loaded model, 1 otherwise; sets LMS_STATE for the log.
+# `lms ps` WAKES the LM Studio service when it is not running (it prints "Waking up LM Studio
+# service..." before the JSON -- the first probe on nax-macos-2 did exactly that), and a service
+# that is not running holds no model, so it is only asked when one of its processes exists.
+lms_idle() {
+  local lms out json n
+  lms="$(lms_bin)"
+  if [ -z "$lms" ]; then LMS_STATE="lms not installed"; return 0; fi
+  # A here-string, not a pipe: `grep -q` exiting early would SIGPIPE `ps`, and under pipefail
+  # that reads as "not running".
+  if ! grep -qiE 'lm studio|lmstudio|llmster' <<< "$(ps -axo comm=)"; then LMS_STATE="LM Studio not running"; return 0; fi
+  out="$("$lms" ps --json 2>&1)" || { LMS_STATE="lms ps --json failed: $out"; return 1; }
+  json="$(printf '%s\n' "$out" | sed -n '/^[[:space:]]*\[/,$p')"
+  n="$(printf '%s' "$json" | python3.12 -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null)" \
+    || { LMS_STATE="unparseable lms ps --json output: $out"; return 1; }
+  if [ "$n" = 0 ]; then LMS_STATE="running, no model loaded"; return 0; fi
+  LMS_STATE="$n model(s) loaded: $(printf '%s' "$json" | tr '\n' ' ' | cut -c1-200)"
+  return 1
+}
+
 # Processes that would share the GPU or the unified memory with a campaign row: the W1-PRECHECK.sh
 # set, minus its Runner.Listener/Runner.Worker check (on this box the runner IS the launcher, and
 # it runs one job at a time).
