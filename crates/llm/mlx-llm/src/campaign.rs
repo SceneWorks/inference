@@ -103,6 +103,11 @@ pub const REQUIRED_PHASES: [&str; 8] = [
     "cancellation-cleanup",
     "post-run-release",
 ];
+/// Receipt schema. v5 (sc-20671): per-repeat decode throughput is a dedicated fixed-length steady
+/// decode recorded beside each sample, and provenance records the host's power mode and thermal
+/// state at row start and end.
+pub const RECEIPT_SCHEMA_VERSION: u32 = 5;
+pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v5";
 /// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v3).
 pub const QUALITY_CONTRACT_HASH: &str =
     "58eaa007c35084c8acac2b35b5a2a1dff5af55832a7533557741d43a05944b49";
@@ -479,13 +484,20 @@ fn preflight_total_live_tokens(
         needle_fixture_prompt(prompt, &payload, needle),
         format!("{prompt}\n{payload}\nRepeat the stable baseline fact."),
     ];
-    let max_prefix = prompts
+    let prompt_tokens = prompts
         .iter()
         .map(|text| token_count(text))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let max_prefix = prompt_tokens
+        .iter()
+        .copied()
         .max()
         .ok_or("no fixture prompts")?;
+    // Each candidate repeat's steady decode holds the kernel fixture's raw context plus the fixed
+    // decode length in its own cache, alone (every fixture cache has been released).
+    let steady_decode = prompt_tokens[0]
+        .checked_add(STEADY_DECODE_TOKENS)
+        .ok_or("steady-decode live context overflows u64")?;
     let direct_request = max_prefix
         .checked_add(2)
         .ok_or("direct request token count overflows")?;
@@ -549,7 +561,7 @@ fn preflight_total_live_tokens(
     } else {
         max_request
     };
-    Ok((total, max_request))
+    Ok((total.max(steady_decode), max_request))
 }
 
 /// The dtype every campaign role's dense K/V is cached in: the causal loader's compute dtype. The
@@ -1021,8 +1033,12 @@ pub struct ReceiptProvenance {
     pub reference_model_id: String,
     pub reference_model_sha256: String,
     pub reference_model_bytes: u64,
+    /// The row's energy mode (one of [`POWER_MODES`]), equal at row start and row end.
     pub power_mode: String,
+    /// Always `nominal`: a throttled start or end refuses the row.
     pub thermal_state: String,
+    /// Power mode and thermal state observed at [`HOST_STATE_BOUNDARIES`], in order.
+    pub host_states: Vec<ReceiptHostState>,
     pub command_template: String,
     pub command: String,
     pub campaign_session_id: String,
@@ -1376,7 +1392,42 @@ pub struct ReceiptTimingSample {
     pub prefill_ms: f64,
     pub ttft_ms: f64,
     pub first_token_ms: f64,
+    /// `steady_decode_timed_tokens * 1000 / steady_decode_ms` of this repeat's dedicated
+    /// fixed-length steady decode ([`STEADY_DECODE_TOKENS`]).
     pub decode_tokens_per_second: f64,
+    pub steady_decode_prompt_tokens: u64,
+    pub steady_decode_generated_tokens: u64,
+    pub steady_decode_timed_tokens: u64,
+    pub steady_decode_ms: f64,
+    pub steady_decode_forced_stop_tokens: u64,
+}
+
+impl ReceiptTimingSample {
+    fn steady_decode(&self) -> SteadyDecodeMeasurement {
+        SteadyDecodeMeasurement {
+            prompt_tokens: self.steady_decode_prompt_tokens,
+            generated_tokens: self.steady_decode_generated_tokens,
+            timed_tokens: self.steady_decode_timed_tokens,
+            decode_ms: self.steady_decode_ms,
+            forced_stop_tokens: self.steady_decode_forced_stop_tokens,
+        }
+    }
+
+    /// The sample's throughput is exactly its recorded fixed-length steady decode, and that decode
+    /// fit the loaded native context.
+    fn validate_steady_decode(&self, context_window_tokens: u64) -> Result<(), String> {
+        let steady = self.steady_decode();
+        let derived = steady.tokens_per_second()?;
+        if (self.decode_tokens_per_second - derived).abs() > derived * 1e-9
+            || steady.prompt_tokens.saturating_add(steady.generated_tokens) > context_window_tokens
+        {
+            return Err(
+                "timing sample throughput does not derive from its fixed-length steady decode"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1629,6 +1680,55 @@ pub struct RawTiming {
     pub ttft_ms: f64,
     pub first_token_ms: f64,
     pub decode_tokens_per_second: f64,
+    pub steady_decode: SteadyDecodeMeasurement,
+}
+
+/// Fixed decode length of every SC-20671 steady-decode sample. Steady throughput is a dedicated
+/// measurement per repeat — the row's context prefilled into a fresh cache of the row's KV
+/// representation, then exactly this many greedy tokens decoded through any stop token — never
+/// the coordinate's own (EOS- or budget-terminated, footprint-sampled) generation. 256 is the
+/// longest fixed length every frozen context band admits: the fit-boundary fixture prompt is
+/// refused above `native context - 256`, so `prompt + 256` always fits the native window. The
+/// 255 timed tokens span roughly 1-2 s at short context on the pinned 1.7B-3B 4-bit candidates
+/// (about 130-250 tok/s) and several seconds at the longer bands.
+pub const STEADY_DECODE_TOKENS: u64 = 256;
+
+/// One steady-decode sample, measured by the product decoder at a synchronized per-token boundary
+/// (the crate-private `decode::forced_greedy_decode`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SteadyDecodeMeasurement {
+    /// Raw tokens of the row context prefilled before decoding.
+    pub prompt_tokens: u64,
+    /// Every decoded token, including the untimed first one; always [`STEADY_DECODE_TOKENS`].
+    pub generated_tokens: u64,
+    /// Tokens inside the timed window: every decoded token after the first.
+    pub timed_tokens: u64,
+    /// Milliseconds from the first token's GPU completion to the last token's.
+    pub decode_ms: f64,
+    /// Decoded stop tokens that were forced through instead of ending the sample.
+    pub forced_stop_tokens: u64,
+}
+
+impl SteadyDecodeMeasurement {
+    /// The frozen fixed-length shape and its derived throughput.
+    pub fn tokens_per_second(&self) -> Result<f64, String> {
+        if self.generated_tokens != STEADY_DECODE_TOKENS
+            || self.timed_tokens + 1 != self.generated_tokens
+            || self.prompt_tokens == 0
+            || self.forced_stop_tokens > self.generated_tokens
+            || !self.decode_ms.is_finite()
+            || self.decode_ms <= 0.0
+        {
+            return Err(format!(
+                "steady decode is not a {STEADY_DECODE_TOKENS}-token fixed-length sample in positive time: {self:?}"
+            ));
+        }
+        let throughput = self.timed_tokens as f64 * 1_000.0 / self.decode_ms;
+        if !throughput.is_finite() || throughput <= 0.0 {
+            return Err("invalid steady decode throughput".into());
+        }
+        Ok(throughput)
+    }
 }
 
 pub struct ProductTimingMeasurements {
@@ -1647,8 +1747,8 @@ pub struct ReceiptBuilder {
 
 impl ReceiptBuilder {
     pub fn finish(mut self) -> Result<Receipt, String> {
-        self.template.schema_version = 4;
-        self.template.harness_version = "sc-20671-kv-baseline-v4".into();
+        self.template.schema_version = RECEIPT_SCHEMA_VERSION;
+        self.template.harness_version = RECEIPT_HARNESS_VERSION.into();
         let digest = |v: &str| {
             v.len() == 64
                 && v.bytes()
@@ -1821,6 +1921,11 @@ impl ReceiptBuilder {
                     ttft_ms: t.ttft_ms,
                     first_token_ms: t.first_token_ms,
                     decode_tokens_per_second: t.decode_tokens_per_second,
+                    steady_decode_prompt_tokens: t.steady_decode.prompt_tokens,
+                    steady_decode_generated_tokens: t.steady_decode.generated_tokens,
+                    steady_decode_timed_tokens: t.steady_decode.timed_tokens,
+                    steady_decode_ms: t.steady_decode.decode_ms,
+                    steady_decode_forced_stop_tokens: t.steady_decode.forced_stop_tokens,
                 })
                 .collect(),
             summary,
@@ -2058,6 +2163,40 @@ fn validate_receipt_compression(
     Ok(())
 }
 
+/// The row's recorded power mode and thermal state: one observation per boundary, in order, each
+/// nominal and in the row's single power mode, bracketing every measured phase sample.
+fn validate_host_states(receipt: &Receipt) -> Result<(), String> {
+    let p = &receipt.provenance;
+    let invalid = |detail: &str| Err(format!("host power/thermal provenance {detail}"));
+    if !POWER_MODES.contains(&p.power_mode.as_str())
+        || p.thermal_state != "nominal"
+        || p.host_states.len() != HOST_STATE_BOUNDARIES.len()
+    {
+        return invalid("is incomplete or not nominal");
+    }
+    for (state, boundary) in p.host_states.iter().zip(HOST_STATE_BOUNDARIES) {
+        if state.boundary != boundary
+            || !valid_utc_timestamp(&state.captured_at)
+            || state.power_mode != p.power_mode
+            || state.thermal_state != "nominal"
+        {
+            return invalid("differs from the row's nominal power/thermal state");
+        }
+    }
+    let (Some(first), Some(last)) = (
+        receipt.memory.phase_samples.first(),
+        receipt.memory.phase_samples.last(),
+    ) else {
+        return invalid("has no phase samples to bracket");
+    };
+    if !utc_timestamp_before(&p.host_states[0].captured_at, &first.timestamp)
+        || !utc_timestamp_before(&last.timestamp, &p.host_states[1].captured_at)
+    {
+        return invalid("does not bracket the row's measured phases");
+    }
+    Ok(())
+}
+
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     let lowercase_hex = |v: &str, len: usize| {
         v.len() == len
@@ -2069,8 +2208,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             && v.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
-    if receipt.schema_version != 4
-        || receipt.harness_version != "sc-20671-kv-baseline-v4"
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION
+        || receipt.harness_version != RECEIPT_HARNESS_VERSION
         || receipt.status != "complete"
         || receipt.contract_hash != QUALITY_CONTRACT_HASH
     {
@@ -2122,6 +2261,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("provenance is incomplete".into());
     }
+    validate_host_states(receipt)?;
     let g = &receipt.geometry;
     if [
         g.batch,
@@ -2520,6 +2660,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             weights_loaded.mlx.cache_bytes,
             receipt.memory.release.mlx_cache_tolerance_bytes,
         ));
+    }
+    for sample in &receipt.timings.samples {
+        sample.validate_steady_decode(receipt.geometry.context_window_tokens)?;
     }
     if receipt.timings.samples.len() != 5
         || !receipt.timings.samples.iter().all(|s| {
@@ -4882,6 +5025,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 &policy,
             )?;
             let admission = supervised_admission(&policy, static_footprint_floor)?;
+            // Observed before any model loads: a throttled host refuses the row before it runs.
+            let row_start = capture_host_state("row-start")?;
             // Compressed rows: the measured arm holds KV in the method's compressed cache, and its
             // quality denominator is the dense-KV run on the SAME candidate weights.
             let candidate_session = match compressed {
@@ -4900,6 +5045,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                         &prompt,
                         &row.coordinate,
                         policy.max_request_tokens,
+                        true,
                     )
                     .map_err(|e| {
                         format!(
@@ -4930,6 +5076,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     &prompt,
                     &row.coordinate,
                     policy.max_request_tokens,
+                    true,
                 )
                 .map_err(|e| {
                     format!(
@@ -4978,6 +5125,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     &prompt,
                     &row.coordinate,
                     policy.max_request_tokens,
+                    false,
                 )
                 .map_err(|e| {
                     format!(
@@ -5005,6 +5153,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     &prompt,
                     &row.coordinate,
                     policy.max_request_tokens,
+                    false,
                 )
                 .map_err(|e| {
                     format!(
@@ -5077,8 +5226,18 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 .iter()
                 .map(|suite| &suite.kernel_candidate)
                 .collect::<Vec<_>>();
+            let steady_decodes = suites
+                .iter()
+                .map(|suite| {
+                    suite
+                        .steady_decode
+                        .as_ref()
+                        .ok_or("candidate repeat has no steady-decode measurement")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let timings = timing_samples_from_product_repeats(
                 &kernel_runs,
+                &steady_decodes,
                 &row.coordinate,
                 row.coordinate.process_temperature,
                 &warmup_runs,
@@ -5096,6 +5255,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 admission,
                 compressed.map(|method| (method, warmup_suites.as_slice())),
                 &reference_inventory,
+                row_start,
             )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
@@ -6052,6 +6212,13 @@ impl ProductObserver {
         self.sampling_elapsed_ms
     }
 
+    /// The observer's product clock: wall time since creation minus every synchronous memory
+    /// sample the observer itself took. Phase timings are deltas of this clock, so a `footprint -p`
+    /// subprocess at a phase boundary is never relabeled as prefill, first-token, or decode time.
+    fn product_elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1_000.0 - self.sampling_elapsed_ms
+    }
+
     pub fn finish(self) -> Result<ProductObservations, String> {
         if let Some(error) = self.error {
             return Err(error);
@@ -6191,7 +6358,10 @@ impl Observer for ProductObserver {
             return;
         }
         mlx_rs::memory::reset_peak_memory();
-        match sample_memory(self.pid) {
+        let sampling_started = std::time::Instant::now();
+        let sampled = sample_memory(self.pid);
+        self.sampling_elapsed_ms += sampling_started.elapsed().as_secs_f64() * 1_000.0;
+        match sampled {
             Ok(sample) if sample.mlx_active_bytes > 0 && sample.mlx_peak_bytes == 0 => {
                 self.prefill_peak_window = Some(ReceiptPeakWindow {
                     started_at: sample.captured_at,
@@ -6284,8 +6454,7 @@ impl Observer for ProductObserver {
                         peak_bytes: sample.mlx_peak_bytes,
                     },
                 });
-                self.phase_elapsed_ms
-                    .push(self.started.elapsed().as_secs_f64() * 1_000.0);
+                self.phase_elapsed_ms.push(self.product_elapsed_ms());
             }
             Err(error) => self.error = Some(format!("product memory sample at {name}: {error}")),
         }
@@ -7483,6 +7652,9 @@ pub struct ProductFixtureSuite {
     /// Compressed rows: the fused reader's parity against its host-fp32 dequantize-then-attend
     /// reference. `None` measures the dense kernel.
     pub kernel_parity_errors: Option<Vec<f64>>,
+    /// The candidate half's dedicated fixed-length steady decode (the reference arm is never
+    /// timed).
+    pub steady_decode: Option<SteadyDecodeMeasurement>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -7522,13 +7694,14 @@ pub fn run_product_fixture_suite(
 ) -> core_llm::Result<ProductFixtureSuite> {
     let candidate = CampaignSession::load(candidate_snapshot)?;
     let candidate_baseline = candidate.load_start_sample.mlx_active_bytes;
-    let candidate_half = run_product_fixture_half_on_session(&candidate, prompt, coordinate)?;
+    let candidate_half = run_product_fixture_half_on_session(&candidate, prompt, coordinate, true)?;
     drop(candidate);
     quiesce_campaign_active_memory(candidate_baseline)?;
 
     let reference = CampaignSession::load(reference_snapshot)?;
     let reference_baseline = reference.load_start_sample.mlx_active_bytes;
-    let reference_half = run_product_fixture_half_on_session(&reference, prompt, coordinate)?;
+    let reference_half =
+        run_product_fixture_half_on_session(&reference, prompt, coordinate, false)?;
     drop(reference);
     quiesce_campaign_active_memory(reference_baseline)?;
     pair_product_fixture_halves(
@@ -7550,6 +7723,7 @@ struct ProductFixtureHalf {
     context_payload_sha256: String,
     fixture_prompt_tokens: [u64; 4],
     fixture_prompt_sha256: [String; 4],
+    steady_decode: Option<SteadyDecodeMeasurement>,
 }
 
 /// A bounded, explicitly unaccepted worker-log record. It survives quality rejection but is never
@@ -7652,15 +7826,29 @@ fn run_product_fixture_half_on_session(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
+    measure_steady_decode: bool,
 ) -> core_llm::Result<ProductFixtureHalf> {
-    run_product_fixture_half_on_session_bounded(session, prompt, coordinate, u64::MAX)
+    run_product_fixture_half_on_session_bounded(
+        session,
+        prompt,
+        coordinate,
+        u64::MAX,
+        measure_steady_decode,
+    )
 }
 
+/// One fixture half: the four frozen fixtures, each with its coordinate operation, then — when
+/// `measure_steady_decode` (the timed candidate arm) — one fixed-length steady decode of the row
+/// context. The steady decode runs after every observer of the half has closed, on its own
+/// request-scoped cache that is released before the next half, so no coordinate's memory
+/// attribution sees it; its `prompt + STEADY_DECODE_TOKENS` live tokens are admitted up front by
+/// the preflight live-token bound.
 fn run_product_fixture_half_on_session_bounded(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
     max_request_tokens: u64,
+    measure_steady_decode: bool,
 ) -> core_llm::Result<ProductFixtureHalf> {
     session.validate_coordinate_family(coordinate)?;
     let context_window_tokens = session.provider.campaign_context_window()?;
@@ -7722,6 +7910,17 @@ fn run_product_fixture_half_on_session_bounded(
         fixture_request(cache_prompt.clone(), Vec::new()),
         coordinate,
     )?;
+    // Batch rows are timed as one sequence too: the compressed arm has no batch route, so a
+    // batched steady decode could not compare the two representations at the same boundary.
+    let steady_decode = measure_steady_decode
+        .then(|| {
+            session.provider.campaign_steady_decode(
+                &kernel_prompt,
+                STEADY_DECODE_TOKENS as usize,
+                session.compressed(),
+            )
+        })
+        .transpose()?;
     Ok(ProductFixtureHalf {
         kernel,
         tool,
@@ -7734,6 +7933,7 @@ fn run_product_fixture_half_on_session_bounded(
         context_payload_sha256: seal_bytes(band_payload.as_bytes()),
         fixture_prompt_tokens,
         fixture_prompt_sha256,
+        steady_decode,
     })
 }
 
@@ -7768,6 +7968,7 @@ fn pair_product_fixture_halves(
         context_payload_tokens: candidate.context_payload_tokens,
         reference: reference_kind,
         kernel_parity_errors: None,
+        steady_decode: candidate.steady_decode,
     })
 }
 
@@ -7790,15 +7991,18 @@ impl ProductFixtureSuite {
 }
 
 /// Derive one timing sample from product phase boundaries plus the wall-clock snapshot/provider
-/// load that created this session. Compile attribution is finalized across the cold dispatch or
-/// two real warmups by [`timing_samples_from_product_repeats`].
+/// load that created this session, and the repeat's dedicated fixed-length steady decode. Decode
+/// throughput is never a phase delta: the coordinate operation's own generation is EOS- or
+/// budget-terminated (a chunked coordinate decodes a single token), so its `first-token` →
+/// `decode-steady` interval is a few tokens or none at all. Compile attribution is finalized
+/// across the cold dispatch or two real warmups by [`timing_samples_from_product_repeats`].
 pub fn timing_from_product_observation(
     observation: &ProductObservations,
-    generated_tokens: usize,
+    steady_decode: &SteadyDecodeMeasurement,
     process_temperature: &str,
 ) -> Result<RawTiming, String> {
-    if observation.phase_elapsed_ms.len() != REQUIRED_PHASES.len() || generated_tokens == 0 {
-        return Err("timing requires eight product phases and generated tokens".into());
+    if observation.phase_elapsed_ms.len() != REQUIRED_PHASES.len() {
+        return Err("timing requires eight product phases".into());
     }
     let elapsed = &observation.phase_elapsed_ms;
     if elapsed.windows(2).any(|window| window[1] <= window[0]) {
@@ -7817,11 +8021,7 @@ pub fn timing_from_product_observation(
     let prefill_ms = positive_delta(2, 1)?;
     let ttft_ms = positive_delta(3, 2)?;
     let first_token_ms = positive_delta(3, 0)?;
-    let decode_ms = positive_delta(4, 3)?;
-    let throughput = generated_tokens as f64 * 1_000.0 / decode_ms;
-    if !throughput.is_finite() || throughput <= 0.0 {
-        return Err("invalid product decode throughput".into());
-    }
+    let throughput = steady_decode.tokens_per_second()?;
     if !matches!(process_temperature, "cold" | "warm") {
         return Err("unknown process temperature".into());
     }
@@ -7831,6 +8031,7 @@ pub fn timing_from_product_observation(
         ttft_ms,
         first_token_ms,
         decode_tokens_per_second: throughput,
+        steady_decode: *steady_decode,
     })
 }
 
@@ -8014,21 +8215,19 @@ fn warmup_probe_suite_sha256(
 /// observed-hit product calls, excluding allocator reset and footprint instrumentation.
 pub fn timing_samples_from_product_repeats(
     runs: &[&ProductFixtureResult],
+    steady_decodes: &[&SteadyDecodeMeasurement],
     coordinate: &Coordinate,
     process_temperature: &str,
     warmups: &[&ProductFixtureResult],
 ) -> Result<ProductTimingMeasurements, String> {
-    if runs.len() != 5 {
-        return Err("receipt requires exactly five product repeats".into());
+    if runs.len() != 5 || steady_decodes.len() != runs.len() {
+        return Err("receipt requires exactly five product repeats and steady decodes".into());
     }
     let samples = runs
         .iter()
-        .map(|run| {
-            timing_from_product_observation(
-                &run.observation,
-                run.coordinate_generated_tokens as usize,
-                process_temperature,
-            )
+        .zip(steady_decodes)
+        .map(|(run, steady)| {
+            timing_from_product_observation(&run.observation, steady, process_temperature)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let operation = runs[0].coordinate_operation.as_str();
@@ -8263,6 +8462,174 @@ pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
         return Ok("nominal".into());
     }
     Err("pmset thermal probe did not prove nominal thermal state".into())
+}
+
+/// Row boundaries at which the host's power mode and thermal state are observed, in order.
+pub const HOST_STATE_BOUNDARIES: [&str; 2] = ["row-start", "row-end"];
+/// Normalized macOS energy modes (`pmset` `powermode` 0/1/2, or the older `lowpowermode`).
+pub const POWER_MODES: [&str; 3] = ["automatic", "low-power", "high-power"];
+
+/// The host's power mode and thermal state at one row boundary. A row is refused (fails closed)
+/// unless both thermal probes read nominal at its start and at its end.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptHostState {
+    pub boundary: String,
+    pub captured_at: String,
+    pub power_mode: String,
+    pub thermal_state: String,
+}
+
+/// Normalize the active energy mode from `pmset -g` (its "Currently in use" settings): `powermode`
+/// 0/1/2 is Automatic/Low Power/High Power; hosts without it report `lowpowermode` (and, on some
+/// releases, `highpowermode`) 0/1. A missing, unknown, or contradictory setting is refused.
+pub fn normalize_pmset_power_mode(value: &str) -> Result<String, String> {
+    let mut in_use = false;
+    let mut settings = std::collections::BTreeMap::new();
+    for line in value.lines() {
+        let line = line.trim();
+        if line.eq_ignore_ascii_case("currently in use:") {
+            in_use = true;
+            continue;
+        }
+        if !in_use {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        if let (Some(key @ ("powermode" | "lowpowermode" | "highpowermode")), Some(setting)) =
+            (fields.next(), fields.next())
+        {
+            if settings.insert(key, setting).is_some() {
+                return Err(format!("pmset reports {key} twice"));
+            }
+        }
+    }
+    let flag = |key: &str| match settings.get(key).copied() {
+        None => Ok(None),
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        Some(other) => Err(format!("pmset reports unknown {key} {other}")),
+    };
+    let (low, high) = (flag("lowpowermode")?, flag("highpowermode")?);
+    let mode = match settings.get("powermode").copied() {
+        Some("0") => "automatic",
+        Some("1") => "low-power",
+        Some("2") => "high-power",
+        Some(other) => return Err(format!("pmset reports unknown powermode {other}")),
+        None => match (low, high) {
+            (Some(true), Some(true)) => {
+                return Err("pmset reports both low and high power mode".into())
+            }
+            (Some(true), _) => "low-power",
+            (_, Some(true)) => "high-power",
+            (Some(false), _) | (_, Some(false)) => "automatic",
+            (None, None) => {
+                return Err("pmset does not report the active power mode".into());
+            }
+        },
+    };
+    if (low == Some(true) && mode != "low-power") || (high == Some(true) && mode != "high-power") {
+        return Err("pmset power mode settings contradict each other".into());
+    }
+    Ok(mode.into())
+}
+
+/// `NSProcessInfo.thermalState` (0 nominal, 1 fair, 2 serious, 3 critical). Only nominal is
+/// accepted: every elevated state is thermal pressure under which decode timing throttles.
+pub fn normalize_process_thermal_state(state: i64) -> Result<String, String> {
+    match state {
+        0 => Ok("nominal".into()),
+        1..=3 => Err(format!(
+            "process thermal state is elevated ({}); the row fails closed on thermal throttling",
+            ["fair", "serious", "critical"][(state - 1) as usize]
+        )),
+        other => Err(format!("unknown process thermal state {other}")),
+    }
+}
+
+/// One boundary's host state from its raw probes: `pmset -g`, `pmset -g therm`, and
+/// `NSProcessInfo.thermalState`. Both thermal probes must prove nominal.
+pub fn host_state_from_probes(
+    boundary: &str,
+    captured_at: String,
+    pmset: &str,
+    pmset_thermal: &str,
+    process_thermal_state: i64,
+) -> Result<ReceiptHostState, String> {
+    if !HOST_STATE_BOUNDARIES.contains(&boundary) {
+        return Err(format!("unknown host-state boundary {boundary}"));
+    }
+    let power_mode = normalize_pmset_power_mode(pmset)?;
+    let pmset_thermal = normalize_pmset_thermal(pmset_thermal)?;
+    let process_thermal = normalize_process_thermal_state(process_thermal_state)?;
+    if pmset_thermal != process_thermal {
+        return Err("thermal probes disagree".into());
+    }
+    Ok(ReceiptHostState {
+        boundary: boundary.into(),
+        captured_at,
+        power_mode,
+        thermal_state: process_thermal,
+    })
+}
+
+/// Probe this host's power mode and thermal state at `boundary`, failing closed on throttling.
+pub fn capture_host_state(boundary: &str) -> Result<ReceiptHostState, String> {
+    let pmset = probed_command("pmset", &["-g"], "power mode")?;
+    let pmset_thermal = probed_command("pmset", &["-g", "therm"], "thermal state")?;
+    let process_thermal = process_thermal_state()?;
+    host_state_from_probes(
+        boundary,
+        timestamp_now(),
+        &pmset,
+        &pmset_thermal,
+        process_thermal,
+    )
+    .map_err(|e| format!("{boundary} host state: {e}"))
+}
+
+/// `[[NSProcessInfo processInfo] thermalState]` through the Objective-C runtime.
+#[cfg(target_os = "macos")]
+fn process_thermal_state() -> Result<i64, String> {
+    use std::ffi::{c_char, c_void};
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    #[link(name = "Foundation", kind = "framework")]
+    extern "C" {}
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    // SAFETY: the class and selector names are C string literals; `objc_msgSend` is called
+    // through the exact signatures of `+[NSProcessInfo processInfo]` (returns an object) and
+    // `-[NSProcessInfo thermalState]` (returns an `NSInteger`), as the arm64/x86_64 ABIs require.
+    unsafe {
+        let class = objc_getClass(c"NSProcessInfo".as_ptr());
+        if class.is_null() {
+            return Err("NSProcessInfo is unavailable".into());
+        }
+        let send_object = std::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "C" fn(Id, Sel) -> Id,
+        >(objc_msgSend);
+        let info = send_object(class, sel_registerName(c"processInfo".as_ptr()));
+        if info.is_null() {
+            return Err("NSProcessInfo returned no process info".into());
+        }
+        let send_integer = std::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "C" fn(Id, Sel) -> isize,
+        >(objc_msgSend);
+        Ok(send_integer(info, sel_registerName(c"thermalState".as_ptr())) as i64)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_thermal_state() -> Result<i64, String> {
+    Err("the process thermal state probe requires macOS".into())
 }
 
 /// The primary repeat supplies the receipt metrics; discrimination is the AND over every sealed
@@ -8517,6 +8884,7 @@ fn product_receipt(
     admission: ReceiptAdmission,
     compressed: Option<(CompressedKvMethod, &[ProductFixtureSuite])>,
     reference_model: &SnapshotInventory,
+    row_start: ReceiptHostState,
 ) -> Result<Receipt, String> {
     let suite = suites
         .first()
@@ -8593,9 +8961,16 @@ fn product_receipt(
     let inference_revision = captured_source.1.clone();
     let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
     let xcode = probed_command("xcodebuild", &["-version"], "xcode")?;
-    let power_mode = probed_command("pmset", &["-g", "custom"], "power mode")?;
-    let thermal_state = probed_command("pmset", &["-g", "therm"], "thermal state")?;
-    let normalized_thermal_state = normalize_pmset_thermal(&thermal_state)?;
+    let row_end = capture_host_state("row-end")?;
+    if row_end.power_mode != row_start.power_mode {
+        return Err(format!(
+            "host power mode changed during the row ({} -> {}); its timings span two modes",
+            row_start.power_mode, row_end.power_mode
+        ));
+    }
+    let power_mode = row_start.power_mode.clone();
+    let normalized_thermal_state = row_end.thermal_state.clone();
+    let host_states = vec![row_start, row_end];
     let mlx = locked_mlx_identity(include_bytes!("../../../../Cargo.lock"))?;
     let transcript = format!(
         "{}\n{}\n{}\n{}",
@@ -8685,8 +9060,8 @@ fn product_receipt(
         );
     }
     let template = Receipt {
-        schema_version: 4, harness_version: "sc-20671-kv-baseline-v4".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: mode.into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
+        schema_version: RECEIPT_SCHEMA_VERSION, harness_version: RECEIPT_HARNESS_VERSION.into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: mode.into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
+        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, host_states, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 }, admission },
@@ -8852,6 +9227,7 @@ pub(crate) mod tests {
                 context_payload_sha256: "d".repeat(64),
                 fixture_prompt_tokens: [32; 4],
                 fixture_prompt_sha256: std::array::from_fn(|_| "e".repeat(64)),
+                steady_decode: None,
             }
         };
         let coordinate = required_coordinates()[0].clone();
@@ -10125,11 +10501,22 @@ pub(crate) mod tests {
         assert!(validate_fixture_evidence(&evidence[..3]).is_err());
     }
 
-    /// A complete, valid dense v4 receipt assembled by the real builder from minimal evidence.
+    /// A fixed-length steady decode of a 32-token context whose 255 timed tokens took `decode_ms`.
+    fn test_steady_decode(decode_ms: f64) -> SteadyDecodeMeasurement {
+        SteadyDecodeMeasurement {
+            prompt_tokens: 32,
+            generated_tokens: STEADY_DECODE_TOKENS,
+            timed_tokens: STEADY_DECODE_TOKENS - 1,
+            decode_ms,
+            forced_stop_tokens: 3,
+        }
+    }
+
+    /// A complete, valid dense receipt assembled by the real builder from minimal evidence.
     fn builder_test_receipt() -> Receipt {
         let mut template = Receipt {
-            schema_version: 4,
-            harness_version: "sc-20671-kv-baseline-v4".into(),
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            harness_version: RECEIPT_HARNESS_VERSION.into(),
             run_id: "run".into(),
             captured_at: "2026-01-01T00:00:00Z".into(),
             mode: "dense".into(),
@@ -10158,8 +10545,22 @@ pub(crate) mod tests {
                 reference_model_id: "reference-model".into(),
                 reference_model_sha256: "9".repeat(64),
                 reference_model_bytes: 1,
-                power_mode: "nominal".into(),
+                power_mode: "automatic".into(),
                 thermal_state: "nominal".into(),
+                host_states: vec![
+                    ReceiptHostState {
+                        boundary: "row-start".into(),
+                        captured_at: "2025-12-31T23:59:59.000Z".into(),
+                        power_mode: "automatic".into(),
+                        thermal_state: "nominal".into(),
+                    },
+                    ReceiptHostState {
+                        boundary: "row-end".into(),
+                        captured_at: "2026-01-01T00:00:09.000Z".into(),
+                        power_mode: "automatic".into(),
+                        thermal_state: "nominal".into(),
+                    },
+                ],
                 command_template: "run --mode {mode}".into(),
                 command: "run --mode dense".into(),
                 campaign_session_id: "e".repeat(64),
@@ -10398,6 +10799,7 @@ pub(crate) mod tests {
                 ttft_ms: 1.0,
                 first_token_ms: 1.0,
                 decode_tokens_per_second: 1.0,
+                steady_decode: test_steady_decode(255_000.0),
             })
             .collect();
         let compile_attribution = ReceiptCompileAttribution {
@@ -11362,6 +11764,57 @@ pub(crate) mod tests {
         let mut timing_tampered = receipt.clone();
         timing_tampered.timings.decode_tokens_per_second += 1.0;
         assert!(validate_receipt_semantics(&timing_tampered).is_err());
+        // Each sample's throughput is exactly its recorded fixed-length steady decode.
+        let steady_error = |edit: &dyn Fn(&mut ReceiptTimingSample)| {
+            let mut tampered = receipt.clone();
+            edit(&mut tampered.timings.samples[2]);
+            validate_receipt_semantics(&tampered).unwrap_err()
+        };
+        for edit in [
+            &(|s: &mut ReceiptTimingSample| s.steady_decode_ms *= 2.0) as &dyn Fn(&mut _),
+            &|s: &mut ReceiptTimingSample| {
+                // A short EOS-terminated generation, internally consistent, is still refused.
+                s.steady_decode_generated_tokens = 24;
+                s.steady_decode_timed_tokens = 23;
+                s.decode_tokens_per_second = 23.0 * 1_000.0 / s.steady_decode_ms;
+            },
+            &|s: &mut ReceiptTimingSample| s.steady_decode_timed_tokens = STEADY_DECODE_TOKENS,
+            &|s: &mut ReceiptTimingSample| s.steady_decode_prompt_tokens = 4_000,
+            &|s: &mut ReceiptTimingSample| s.steady_decode_forced_stop_tokens = 257,
+        ] {
+            let error = steady_error(edit);
+            assert!(error.contains("steady decode"), "{error}");
+        }
+        // Power mode and thermal state are recorded at row start and end, nominal throughout.
+        let host_error = |edit: &dyn Fn(&mut ReceiptProvenance)| {
+            let mut tampered = receipt.clone();
+            edit(&mut tampered.provenance);
+            validate_receipt_semantics(&tampered).unwrap_err()
+        };
+        for edit in [
+            &(|p: &mut ReceiptProvenance| p.host_states[1].thermal_state = "fair".into())
+                as &dyn Fn(&mut _),
+            &|p: &mut ReceiptProvenance| p.host_states[1].power_mode = "low-power".into(),
+            &|p: &mut ReceiptProvenance| p.host_states.reverse(),
+            &|p: &mut ReceiptProvenance| {
+                p.host_states.pop();
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[0].captured_at = "2026-01-01T00:00:03.000Z".into()
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[1].captured_at = "2026-01-01T00:00:05.000Z".into()
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.power_mode = "nominal".into();
+                for state in &mut p.host_states {
+                    state.power_mode = "nominal".into();
+                }
+            },
+        ] {
+            let error = host_error(edit);
+            assert!(error.contains("host power/thermal"), "{error}");
+        }
         let mut unstable_timing = receipt.clone();
         unstable_timing
             .timings
@@ -12037,6 +12490,177 @@ pub(crate) mod tests {
                 "invalid thermal probe unexpectedly accepted: {invalid:?}"
             );
         }
+    }
+
+    const PMSET_NOMINAL_THERMAL: &str = "Note: No thermal warning level has been recorded\n\
+         Note: No performance warning level has been recorded\n\
+         Note: No CPU power status has been recorded\n";
+
+    fn pmset_in_use(settings: &str) -> String {
+        format!(
+            "System-wide power settings:\nCurrently in use:\n standby              1\n{settings} womp                 1\n"
+        )
+    }
+
+    /// The recorded power mode is the ACTIVE energy mode, not the per-source profile dump.
+    #[test]
+    fn power_mode_is_the_active_pmset_setting() {
+        for (settings, expected) in [
+            (" powermode            0\n", "automatic"),
+            (" powermode            1\n", "low-power"),
+            (" powermode            2\n", "high-power"),
+            (" lowpowermode         0\n", "automatic"),
+            (" lowpowermode         1\n", "low-power"),
+            (" highpowermode        1\n lowpowermode 0\n", "high-power"),
+        ] {
+            assert_eq!(
+                normalize_pmset_power_mode(&pmset_in_use(settings)).unwrap(),
+                expected,
+                "{settings:?}"
+            );
+        }
+        for invalid in [
+            pmset_in_use(""),
+            pmset_in_use(" powermode            3\n"),
+            pmset_in_use(" powermode            0\n lowpowermode 1\n"),
+            pmset_in_use(" lowpowermode 1\n highpowermode 1\n"),
+            pmset_in_use(" powermode 0\n powermode 2\n"),
+            // `pmset -g custom` lists every power source's profile, not the active mode.
+            "Battery Power:\n powermode            1\nAC Power:\n powermode            0\n".into(),
+        ] {
+            assert!(
+                normalize_pmset_power_mode(&invalid).is_err(),
+                "{invalid:?} was accepted"
+            );
+        }
+    }
+
+    /// SC-20671 fails closed on thermal throttling at either row boundary: an elevated
+    /// `NSProcessInfo.thermalState` or nonzero `pmset` thermal pressure refuses the host state.
+    #[test]
+    fn thermal_throttled_host_state_refuses_the_row() {
+        let pmset = pmset_in_use(" powermode            0\n");
+        let state = host_state_from_probes(
+            "row-start",
+            "2026-01-01T00:00:00Z".into(),
+            &pmset,
+            PMSET_NOMINAL_THERMAL,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            (state.power_mode.as_str(), state.thermal_state.as_str()),
+            ("automatic", "nominal")
+        );
+        for throttled in 1..=3 {
+            let error = host_state_from_probes(
+                "row-end",
+                "t".into(),
+                &pmset,
+                PMSET_NOMINAL_THERMAL,
+                throttled,
+            )
+            .unwrap_err();
+            assert!(error.contains("thermal throttling"), "{error}");
+        }
+        for (therm, process, boundary) in [
+            ("Thermal Pressure: 2\n", 0, "row-start"),
+            (PMSET_NOMINAL_THERMAL, 4, "row-start"),
+            (PMSET_NOMINAL_THERMAL, 0, "mid-row"),
+        ] {
+            assert!(
+                host_state_from_probes(boundary, "t".into(), &pmset, therm, process).is_err(),
+                "{therm:?}/{process}/{boundary} was accepted"
+            );
+        }
+    }
+
+    /// Decode throughput is the repeat's fixed-length steady decode, whatever the coordinate's
+    /// own phase deltas are; a short, EOS-terminated generation is not a steady-decode sample.
+    #[test]
+    fn decode_throughput_is_the_fixed_length_steady_decode_not_a_phase_delta() {
+        let observation = ProductObservations {
+            snapshot: SnapshotInventory {
+                root: PathBuf::new(),
+                files: Vec::new(),
+                bytes: 1,
+                sha256: "b".repeat(64),
+            },
+            geometry: ProductGeometry {
+                query_heads: 2,
+                kv_heads: 1,
+                head_dimension: 64,
+                layers: 1,
+                element_bytes: 2,
+            },
+            phases: Vec::new(),
+            // A chunked coordinate: `first-token` -> `decode-steady` is one token, 0.02 ms apart.
+            phase_elapsed_ms: vec![0.0, 1.0, 3.0, 4.0, 4.02, 6.0, 7.0, 8.0],
+            allocations: Vec::new(),
+            prefill_logits: Vec::new(),
+            token_probabilities: Vec::new(),
+            session_id: "session".into(),
+            cache_state_version: 1,
+            operations: Vec::new(),
+            load_elapsed_ms: 10.0,
+            prefill_peak_window: ReceiptPeakWindow {
+                started_at: "2026-01-01T00:00:00Z".into(),
+                baseline_active_bytes: 1,
+                reset_peak_bytes: 0,
+            },
+            cache_live_tokens: 32,
+            cache_capacity_tokens: 256,
+            packed_evidence: Vec::new(),
+            dense_fallbacks: Vec::new(),
+            coordinate_scope: None,
+        };
+        let timing =
+            timing_from_product_observation(&observation, &test_steady_decode(1_000.0), "cold")
+                .unwrap();
+        // 255 timed tokens in 1000 ms; the phase deltas still supply prefill/TTFT/first token.
+        let expected = RawTiming {
+            load_ms: 10.0,
+            prefill_ms: 2.0,
+            ttft_ms: 1.0,
+            first_token_ms: 4.0,
+            decode_tokens_per_second: 255.0,
+            steady_decode: test_steady_decode(1_000.0),
+        };
+        assert_eq!(timing, expected);
+        let eos_terminated = SteadyDecodeMeasurement {
+            generated_tokens: 24,
+            timed_tokens: 23,
+            ..test_steady_decode(100.0)
+        };
+        assert!(timing_from_product_observation(&observation, &eos_terminated, "cold").is_err());
+    }
+
+    /// A phase stamp is the observer's product clock: synchronous memory sampling (the
+    /// `footprint -p` subprocess) is subtracted, so it can never be charged to a phase delta.
+    #[test]
+    fn phase_clock_excludes_the_observers_own_memory_sampling() {
+        let pid = std::process::id();
+        let sample = |bytes| MemorySample {
+            captured_at: timestamp_now(),
+            pid,
+            current_bytes: bytes,
+            peak_bytes: bytes,
+            mlx_active_bytes: bytes,
+            mlx_cache_bytes: 0,
+            mlx_peak_bytes: bytes,
+        };
+        let mut observer = ProductObserver::new();
+        observer.load_boundary = Some((sample(1), sample(2)));
+        Observer::phase(&mut observer, "process-start");
+        // A sampling interval no test run can reach: charged to a phase, it would dominate.
+        observer.sampling_elapsed_ms += 1.0e12;
+        Observer::phase(&mut observer, "weights-loaded");
+        let [start, loaded] = observer.phase_elapsed_ms[..] else {
+            panic!("two phases were stamped");
+        };
+        // Clock-free in substance: the injected interval exceeds any wall time this test can see,
+        // so only a stamp that failed to subtract it could order these the other way.
+        assert!(loaded < start, "{start} -> {loaded}");
     }
 
     #[test]

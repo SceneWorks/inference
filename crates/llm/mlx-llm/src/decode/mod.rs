@@ -35,6 +35,7 @@ pub use stream::{
 };
 // The receipt producer is deliberately crate-private: ordinary callers must not install campaign
 // observers on a production decode.
+pub(crate) use stream::forced_greedy_decode;
 pub(crate) use stream::generate_with_observer;
 pub(crate) use stream::{generate_from_prefill_with_timings, generate_with_timings};
 

@@ -667,6 +667,93 @@ pub(crate) fn decode_loop(
     })
 }
 
+/// A fixed-length steady-decode measurement (SC-20671): `tokens` greedy tokens after a prefill,
+/// generated with every stop token ignored, and the synchronized duration of all but the first.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ForcedDecode {
+    /// Every generated id, including the first (which closes the prefill and is not timed).
+    pub(crate) tokens: Vec<i32>,
+    /// Tokens inside the timed window: every generated token after the first.
+    pub(crate) timed_tokens: u64,
+    /// Milliseconds from the first token's GPU completion to the last token's GPU completion.
+    pub(crate) decode_ms: f64,
+    /// Generated ids that are stop tokens and were decoded through instead of ending generation.
+    pub(crate) forced_stop_tokens: u64,
+}
+
+/// Prefill `prompt_ids` into `cache`, then greedily decode exactly `tokens` ids, feeding each back
+/// even when it is a stop token (`stop_tokens` are only counted, never obeyed), so every
+/// measurement covers the same number of decode steps whatever the model would emit.
+///
+/// Timing boundary: each token is stamped immediately after the product sampler returned its id,
+/// and that host readback cannot complete before the GPU has finished the step's logits — the same
+/// synchronized boundary for every cache representation. `boundary` is called with the sampled
+/// logits right before each stamp (a test seam that proves the array is materialized there). The
+/// timed window opens at the first token's stamp, so prefill and time-to-first-token are excluded.
+/// The loop body mirrors [`decode_loop`] (product sampler, KV feed, buffer-release cadence), minus
+/// stop handling, constraints, and the stream callback.
+pub(crate) fn forced_greedy_decode(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    prompt_ids: &[i32],
+    tokens: usize,
+    stop_tokens: &[i32],
+    boundary: &mut dyn FnMut(&Array),
+) -> Result<ForcedDecode> {
+    if prompt_ids.is_empty() || tokens < 2 {
+        return Err(Error::Msg(
+            "forced steady decode needs a prompt and at least two tokens".into(),
+        ));
+    }
+    let greedy = SamplingParams::default();
+    let mut rng = SplitMix64::new(0);
+    let mut history = prompt_ids.to_vec();
+    let mut release = BufferRelease::new();
+    let mut generated: Vec<i32> = Vec::with_capacity(tokens);
+    let mut logits = decoder.step(&input_ids(prompt_ids), cache, 0)?;
+    let mut opened: Option<Instant> = None;
+    let mut closed: Option<Instant> = None;
+    for step in 0..tokens {
+        if step > 0 {
+            let previous = generated[step - 1];
+            let offset = cache.offset();
+            logits = decoder.step(&input_ids(&[previous]), cache, offset)?;
+            release.advance(1);
+        }
+        let next = sample(&logits, &history, &greedy, &mut rng, None)?;
+        boundary(&logits);
+        let stamped = Instant::now();
+        if opened.is_none() {
+            opened = Some(stamped);
+        } else {
+            closed = Some(stamped);
+        }
+        generated.push(next);
+        history.push(next);
+    }
+    let (Some(opened), Some(closed)) = (opened, closed) else {
+        return Err(Error::Msg(
+            "forced steady decode closed no timed window".into(),
+        ));
+    };
+    let decode_ms = closed.duration_since(opened).as_secs_f64() * 1_000.0;
+    if generated.len() != tokens || !decode_ms.is_finite() || decode_ms <= 0.0 {
+        return Err(Error::Msg(
+            "forced steady decode did not produce its fixed length in positive time".into(),
+        ));
+    }
+    let forced_stop_tokens = generated
+        .iter()
+        .filter(|token| stop_tokens.contains(token))
+        .count() as u64;
+    Ok(ForcedDecode {
+        timed_tokens: (tokens - 1) as u64,
+        tokens: generated,
+        decode_ms,
+        forced_stop_tokens,
+    })
+}
+
 /// Product-owned selected-token probability.  This runs only while an evidence observer is
 /// attached, after the exact production logits have been produced and before sampling mutates the
 /// decode state.  The max-shifted reduction is deliberately finite/checked so malformed logits
@@ -898,6 +985,47 @@ mod tests {
                 ("decode-steady", 3, true),
             ]
         );
+    }
+
+    /// SC-20671 steady decode is a fixed-length measurement: a sampled stop token is decoded
+    /// through (and counted), never a reason to end early and shrink the timed window.
+    #[test]
+    fn forced_steady_decode_ignores_stop_tokens_and_produces_exactly_n() {
+        let mut cache = FixedDecoder.make_cache();
+        // FixedDecoder's greedy token is 1; declare it the stop token.
+        let measured =
+            forced_greedy_decode(&FixedDecoder, cache.as_mut(), &[7, 8], 6, &[1], &mut |_| {})
+                .unwrap();
+        assert_eq!(measured.tokens, vec![1; 6]);
+        assert_eq!(measured.timed_tokens, 5, "the first token is not timed");
+        assert_eq!(measured.forced_stop_tokens, 6);
+        assert!(
+            forced_greedy_decode(&FixedDecoder, cache.as_mut(), &[7], 1, &[], &mut |_| {}).is_err(),
+            "one token has no steady window"
+        );
+    }
+
+    /// Every steady-decode stamp is taken after the logits it closes over reached GPU completion,
+    /// so a lazy-only timer (stamping graph construction) cannot pass as decode throughput.
+    #[test]
+    fn forced_steady_decode_stamps_only_after_the_sampled_logits_complete() {
+        let produced = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let decoder = LazyDecoder {
+            produced: produced.clone(),
+        };
+        let mut cache = decoder.make_cache();
+        let mut boundaries = Vec::new();
+        let measured =
+            forced_greedy_decode(&decoder, cache.as_mut(), &[7], 4, &[], &mut |logits| {
+                let produced = produced.borrow();
+                boundaries.push((
+                    produced.len(),
+                    mlx_array_is_available(logits) && produced.iter().all(mlx_array_is_available),
+                ));
+            })
+            .unwrap();
+        assert_eq!(measured.tokens.len(), 4);
+        assert_eq!(boundaries, vec![(1, true), (2, true), (3, true), (4, true)]);
     }
 
     #[test]

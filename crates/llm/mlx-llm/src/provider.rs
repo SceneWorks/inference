@@ -185,6 +185,69 @@ impl Decode for PackedCampaignDecoder<'_> {
     }
 }
 
+/// [`LlamaProvider::campaign_steady_decode`] over an already-tokenized context. A compressed arm's
+/// measurement must run wholly on its fused compressed reader (selected cache, no fallback, no
+/// dense reconstruction): a timing that silently decoded dense would carry a compressed label.
+fn campaign_steady_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    tokens: usize,
+    stop_tokens: &[i32],
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
+    let packed = match (compressed, model) {
+        (None, _) => None,
+        (Some(arm), Decoder::Causal(causal)) => Some(PackedCampaignDecoder {
+            model: causal,
+            arm,
+            selection_fallbacks: RefCell::new(Vec::new()),
+        }),
+        (Some(_), Decoder::Qwen35(_)) => {
+            return Err(CoreError::Unsupported(
+                "compressed campaign steady decode requires the causal decoder".into(),
+            ))
+        }
+    };
+    let decoder: &dyn Decode = match &packed {
+        Some(packed) => packed,
+        None => model,
+    };
+    let mut cache = decoder.make_cache();
+    let measured = crate::decode::forced_greedy_decode(
+        decoder,
+        cache.as_mut(),
+        prompt_ids,
+        tokens,
+        stop_tokens,
+        &mut |_| {},
+    );
+    let evidence = cache.packed_evidence();
+    cache.reset().map_err(to_core)?;
+    let measured = measured.map_err(to_core)?;
+    if let Some(packed) = &packed {
+        let fused = packed.selection_fallbacks.borrow().is_empty()
+            && evidence.is_some_and(|evidence| {
+                evidence.accepted_direct_calls > 0
+                    && evidence.fallback_reasons.is_empty()
+                    && !evidence.dense_active
+                    && evidence.full_cache_dequantizations == 0
+                    && evidence.failed_dispatches == 0
+            });
+        if !fused {
+            return Err(CoreError::Load(
+                "compressed steady decode did not run wholly on the fused compressed reader".into(),
+            ));
+        }
+    }
+    Ok(crate::campaign::SteadyDecodeMeasurement {
+        prompt_tokens: prompt_ids.len() as u64,
+        generated_tokens: measured.tokens.len() as u64,
+        timed_tokens: measured.timed_tokens,
+        decode_ms: measured.decode_ms,
+        forced_stop_tokens: measured.forced_stop_tokens,
+    })
+}
+
 /// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
 /// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
 /// implement [`Decode`], so the generation loop is identical.
@@ -1156,6 +1219,36 @@ impl LlamaProvider {
         observer.phase("cancellation-cleanup");
         captured.replay(observer);
         Ok(())
+    }
+
+    /// SC-20671 steady-decode timing: prefill the raw `prompt` (the row's context) into a fresh
+    /// cache of the session's representation and greedily decode exactly `tokens` ids through any
+    /// stop token (see [`crate::decode::forced_greedy_decode`]). No observer is attached: this runs
+    /// outside every coordinate's memory attribution, and its request-scoped cache is reset and
+    /// MLX's buffer cache released before it returns.
+    pub(crate) fn campaign_steady_decode(
+        &self,
+        prompt: &str,
+        tokens: usize,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let budget = u32::try_from(tokens)
+            .map_err(|_| CoreError::InvalidRequest("steady-decode length overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured =
+            campaign_steady_decode_on(&self.model, &ids, tokens, &self.stop_tokens, compressed);
+        mlx_rs::memory::clear_cache();
+        measured
     }
 
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
@@ -4597,5 +4690,45 @@ mod tests {
         assert_eq!(capture.reconstructions, 0);
         assert!(!capture.snapshots.is_empty());
         assert_eq!(capture.releases, vec![*capture.snapshots.last().unwrap()]);
+    }
+
+    /// SC-20671 steady decode on a tiny model: both arms decode exactly the fixed length through
+    /// stop tokens (every vocabulary id is declared one), and a compressed arm whose reader is
+    /// refused fails closed instead of timing a dense decode under the compressed label.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn campaign_steady_decode_is_fixed_length_on_both_arms_and_refuses_a_dense_compressed_arm() {
+        let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let every_id = (0..32).collect::<Vec<i32>>();
+        let prompt = [1, 2, 3, 4, 5];
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        for compressed in [None, Some(&arm)] {
+            let measured =
+                campaign_steady_decode_on(&model, &prompt, 8, &every_id, compressed).unwrap();
+            assert_eq!(measured.prompt_tokens, 5);
+            assert_eq!(measured.generated_tokens, 8);
+            assert_eq!(measured.timed_tokens, 7);
+            assert_eq!(
+                measured.forced_stop_tokens, 8,
+                "every token was a forced stop"
+            );
+        }
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20671-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let error = campaign_steady_decode_on(&model, &prompt, 8, &every_id, Some(&refused))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fused compressed reader"), "{error}");
     }
 }
