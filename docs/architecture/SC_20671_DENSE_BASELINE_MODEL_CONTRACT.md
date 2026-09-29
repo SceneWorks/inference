@@ -23,3 +23,21 @@ identity.
 The benchmark is not runnable by merely materializing a directory. The coordinator must separately
 own the Metal/real-weight lane and run the exact product-loader campaign; this document is the
 pre-results provenance gate, not a substitute for a sealed measurement receipt.
+
+## Dense K/V element width
+
+Every role's dense K/V is the loader's BF16 compute dtype: 2 bytes per element. The pinned Llama
+4-bit candidate stores its quantized `scales`/`biases` as F16 (the Qwen candidate stores BF16).
+MLX affine `quantized_matmul` returns `promote_types(activations, scales)`, and BF16 with F16
+promotes to F32. Before the sc-20671 dtype fix, the loader kept stored scales in their stored
+dtype. The whole Llama candidate decoder, including the K/V it cached, therefore ran in F32
+(4 bytes). The harness encoded that promoted width as the expected one. The loader now holds
+stored scales and biases in the compute dtype at load. `DENSE_KV_COMPUTE_ELEMENT_BYTES` is the
+only accepted width. The product observer and receipt validation refuse any other observed width,
+naming the reason, instead of recording a widened dense baseline.
+
+Any Llama-candidate row, including short rows, captured before that fix came from the F32 path.
+Its memory denominator, timings, logits, and quality observations do not describe the shipped
+BF16 path, and they are not rewritten or relabelled. Re-take them on the fixed loader. The
+F16→BF16 scale cast is a real numeric change (BF16 keeps 8 mantissa bits against F16's 11), so
+quality has to be re-measured rather than assumed unchanged.

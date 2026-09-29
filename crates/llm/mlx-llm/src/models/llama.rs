@@ -330,6 +330,7 @@ impl CausalLm {
                 w.require(&format!("{embed_base}.biases"))?.clone(),
                 spec.group_size,
                 spec.bits,
+                COMPUTE_DTYPE,
             )?)
         } else {
             TokenEmbedding::Dense(req_bf16(embed_key)?)
@@ -353,7 +354,8 @@ impl CausalLm {
                     w.require(&head_scales_key)?.clone(),
                     w.require(&format!("{head_base}.biases"))?.clone(),
                     spec,
-                )
+                    COMPUTE_DTYPE,
+                )?
             } else {
                 Projection::Dense {
                     weight: req_bf16(head_key)?,
@@ -1911,14 +1913,15 @@ impl LayerPlan {
                          `quantization` block"
                     ))
                 })?;
-                Ok(Projection::Quantized(QuantizedLinear {
-                    weight: w.require(key)?.clone(),
-                    scales: w.require(&scales_key)?.clone(),
-                    biases: w.require(&format!("{base}.biases"))?.clone(),
-                    group_size: spec.group_size,
-                    bits: spec.bits,
+                Ok(Projection::Quantized(QuantizedLinear::from_stored(
+                    w.require(key)?.clone(),
+                    w.require(&scales_key)?.clone(),
+                    w.require(&format!("{base}.biases"))?.clone(),
+                    spec.group_size,
+                    spec.bits,
                     bias,
-                }))
+                    COMPUTE_DTYPE,
+                )?))
             } else {
                 Projection::load_with_bias(w.require(key)?.as_dtype(COMPUTE_DTYPE)?, bias, quant)
             }

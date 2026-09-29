@@ -263,3 +263,37 @@ fn expanded_provider_context_budget_fails_before_text_or_media_prefill() {
         assert_fixture_is_self_removing(dir);
     }
 }
+
+/// sc-20671: the fixture stores its Prism affine `scales`/`biases` as F16 (the published
+/// convention). They are held in the BF16 compute dtype at load, so the packed operators do not
+/// promote the activations — and the logits — to F32.
+#[test]
+fn f16_prism_affine_parameters_keep_the_decoder_in_compute_dtype() {
+    use mlx_llm::models::{Qwen35Config, Qwen35Model};
+    use mlx_llm::primitives::Weights;
+    use mlx_llm::prism::PrismMlxPack;
+
+    let dir = write_fixture();
+    let weights = Weights::from_dir(&*dir).unwrap();
+    assert_eq!(
+        weights
+            .require("language_model.model.layers.0.self_attn.k_proj.scales")
+            .unwrap()
+            .dtype(),
+        Dtype::Float16
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+    let pack = PrismMlxPack::from_dir(&dir, &config, &weights).unwrap();
+    let cfg = Qwen35Config::from_json(&config).unwrap();
+    let model = Qwen35Model::from_prism_weights(&weights, cfg, &pack).unwrap();
+    let logits = model
+        .forward(
+            &Array::from_slice(&[1i32, 2, 3], &[1, 3]),
+            &mut model.new_cache(),
+            0,
+        )
+        .unwrap();
+    assert_eq!(logits.shape(), &[1, 3, 4]);
+    assert_eq!(logits.dtype(), Dtype::Bfloat16);
+}
