@@ -1,0 +1,34 @@
+{
+  "version": 3,
+  "thresholds": {
+    "parityMaxError": 0.0001,
+    "perplexityDelta": 0.01,
+    "greedyTokenAgreement": 0.999,
+    "structuredToolAgreement": 1,
+    "needleRetrieval": 1,
+    "multiTurnPromptCache": 1
+  },
+  "gate": {
+    "denseRows": "raw characterization: candidate and bf16-reference fixture outcomes are recorded as observations and never reject a dense row",
+    "compressedReference": "dense-kv-same-weights",
+    "compressedRows": "every threshold compares the compressed-KV run with the dense-KV run on the same weights; the bf16 reference model is weight-quantization characterization only and never the gate denominator",
+    "kernelParity": "independent host-fp32 dequantize-then-attend reference",
+    "nonDiscriminatingNeedle": "when the same-weights dense-KV run misses the needle, the compressed needle check requires exact agreement with the dense output and the receipt records needleDiscriminating=false",
+    "nonDiscriminatingTool": "when the same-weights dense-KV run does not emit the valid structured tool call, compressed tool agreement is exact equality with that dense output and the receipt records toolDiscriminating=false",
+    "repeats": "discrimination flags are the AND over all sealed repeats; each repeat records its own flag, and compressed rows must pass every repeat"
+  },
+  "needleFixture": {
+    "statement": "The special magic identifier is {needle}.",
+    "question": "What is the special magic identifier mentioned in the text above? Reply with only the identifier.",
+    "match": "exact needle token"
+  },
+  "statistics": {
+    "repeats": 5,
+    "warmups": 2,
+    "confidenceInterval": "95% bootstrap",
+    "outlierPolicy": "report all samples; no silent deletion",
+    "variancePolicy": "all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum",
+    "maxCoefficientOfVariation": 0.05
+  },
+  "fixtures": ["kernel-fp32-reference", "structured-tool-call", "long-context-needle", "multi-turn-prompt-cache"]
+}

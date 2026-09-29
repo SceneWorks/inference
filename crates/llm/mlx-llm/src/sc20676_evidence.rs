@@ -2544,12 +2544,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
                     .arg("--resume-identity-sha256")
                     .arg(&identity_sha256);
                 let logs = worker_root.join("logs");
-                let log_prefix = (0_u64..)
-                    .map(|attempt| format!("{slug}.attempt-{attempt}"))
-                    .find(|prefix| {
-                        !logs.join(format!("{prefix}.stdout.log")).exists()
-                            && !logs.join(format!("{prefix}.stderr.log")).exists()
-                    })
+                let log_prefix = campaign::unused_attempt_prefix(&logs, &slug)
                     .ok_or("SC-20676 no unused bounded worker log path")?;
                 let request = RunRequest {
                     context_tokens: total_tokens,
@@ -2567,30 +2562,30 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
                     Ok(status) => status,
                     Err(failure) => {
                         let reason = format!("{:?}", failure.reason);
-                        campaign::write_unaccepted_row_record(
+                        return Err(campaign::unaccepted_row_error(
                             &unaccepted,
                             "sc-20676-unaccepted-arm",
                             &slug,
                             &admission,
                             (&reason, &failure.detail, failure.pid),
-                        )?;
-                        return Err(format!(
-                            "SC-20676 {slug} worker stopped ({reason}): {}; child {:?} reaped; stderr {}; not accepted ({}); valid arms remain in {}",
-                            failure.detail, failure.pid, request.stderr_path.display(), unaccepted.display(), worker_root.display(),
+                            format!(
+                                "SC-20676 {slug} worker stopped ({reason}): {}; child {:?} reaped; stderr {}; valid arms remain in {}",
+                                failure.detail, failure.pid, request.stderr_path.display(), worker_root.display(),
+                            ),
                         ));
                     }
                 };
                 if !status.success() {
-                    campaign::write_unaccepted_row_record(
+                    return Err(campaign::unaccepted_row_error(
                         &unaccepted,
                         "sc-20676-unaccepted-arm",
                         &slug,
                         &admission,
                         ("ChildExit", &status.to_string(), None),
-                    )?;
-                    return Err(format!(
-                        "SC-20676 {slug} worker failed with {status}; stderr {}; not accepted ({}); valid arms remain in {}",
-                        request.stderr_path.display(), unaccepted.display(), worker_root.display(),
+                        format!(
+                            "SC-20676 {slug} worker failed with {status}; stderr {}; valid arms remain in {}",
+                            request.stderr_path.display(), worker_root.display(),
+                        ),
                     ));
                 }
                 let bytes = fs::read(&arm_path).map_err(|e| e.to_string())?;
@@ -2629,6 +2624,9 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
                 eprintln!("SC-20676 accepted validated arm {slug}");
             }
             let (dense, packed) = take_validated_family_arms(arms)?;
+            // Resumed and fresh arms alike must have run under the captured policy's cap/reserve.
+            dense.admission.validate_against(&policy)?;
+            packed.admission.validate_against(&policy)?;
             let receipt = Sc20676Receipt {
                 schema_version: 0,
                 harness_version: String::new(),

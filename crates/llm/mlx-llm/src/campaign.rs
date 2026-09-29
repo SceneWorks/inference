@@ -105,7 +105,7 @@ pub const REQUIRED_PHASES: [&str; 8] = [
 ];
 /// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v3).
 pub const QUALITY_CONTRACT_HASH: &str =
-    "54909dcc0fe45afec01a95f84d10efcb06a810a67dad2eb070bbc99903584589";
+    "58eaa007c35084c8acac2b35b5a2a1dff5af55832a7533557741d43a05944b49";
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
 pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
@@ -778,6 +778,17 @@ pub struct ReceiptAdmission {
 }
 
 impl ReceiptAdmission {
+    /// The recorded cap and reserve must be the captured campaign policy's, not caller values.
+    pub fn validate_against(&self, policy: &CampaignSafetyPolicy) -> Result<(), String> {
+        self.validate()?;
+        if self.child_footprint_cap_bytes != policy.child_footprint_cap_bytes
+            || self.host_free_reserve_bytes != policy.host_free_reserve_bytes
+        {
+            return Err("row admission cap/reserve differs from the captured safety policy".into());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.mode != RUNTIME_GUARDED_ADMISSION
             || self.child_footprint_cap_bytes == 0
@@ -814,6 +825,37 @@ pub(crate) fn runtime_guarded_admission(
     };
     admission.validate()?;
     Ok(admission)
+}
+
+/// First attempt prefix whose stdout, stderr, and unaccepted record are all absent. The supervisor
+/// removes its logs when a spawn fails, so the record alone must also reserve a prefix.
+pub(crate) fn unused_attempt_prefix(logs: &Path, slug: &str) -> Option<String> {
+    (0_u64..)
+        .map(|attempt| format!("{slug}.attempt-{attempt}"))
+        .find(|prefix| {
+            ["stdout.log", "stderr.log", "unaccepted.json"]
+                .iter()
+                .all(|suffix| !logs.join(format!("{prefix}.{suffix}")).exists())
+        })
+}
+
+/// Record an unaccepted row and return the row's own failure. A record-write failure is appended
+/// to, never substituted for, the original refusal/abort/exit reason.
+pub(crate) fn unaccepted_row_error(
+    path: &Path,
+    kind: &str,
+    slug: &str,
+    admission: &ReceiptAdmission,
+    stop: (&str, &str, Option<u32>),
+    failure: String,
+) -> String {
+    match write_unaccepted_row_record(path, kind, slug, admission, stop) {
+        Ok(()) => format!("{failure}; not accepted ({})", path.display()),
+        Err(error) => format!(
+            "{failure}; not accepted, and its record {} could not be written: {error}",
+            path.display()
+        ),
+    }
 }
 
 /// Persist a refused (pre-spawn), aborted (post-spawn guard), or failed row as a sealed, explicitly
@@ -1202,6 +1244,10 @@ pub struct ReceiptQuality {
     /// measures only agreement with that dense output and cannot detect KV-induced retrieval loss.
     #[serde(rename = "needleDiscriminating")]
     pub needle_discriminating: bool,
+    /// False when the same-weights dense-KV run did not emit the valid structured tool call: tool
+    /// agreement then cannot detect KV-induced tool-call loss.
+    #[serde(rename = "toolDiscriminating")]
+    pub tool_discriminating: bool,
     #[serde(rename = "multiTurnPromptCache")]
     pub multi_turn_prompt_cache: f64,
     pub statistics: ReceiptQualityStatistics,
@@ -1483,6 +1529,7 @@ impl ReceiptBuilder {
         self.template.quality.structured_tool_agreement = metrics.structured_tool_agreement;
         self.template.quality.needle_retrieval = metrics.needle_retrieval;
         self.template.quality.needle_discriminating = self.quality.needle_discriminating;
+        self.template.quality.tool_discriminating = self.quality.tool_discriminating;
         self.template.quality.multi_turn_prompt_cache = metrics.multi_turn_prompt_cache;
         if self.template.memory.persistent_kv_bytes == 0
             || self.template.memory.model_weights_bytes == 0
@@ -2241,11 +2288,14 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             ));
         }
     }
+    // Discrimination is the AND over all repeats; a dense row that missed the needle in its
+    // primary repeat cannot claim every repeat recovered it.
     if receipt.mode == "dense"
-        && receipt.quality.needle_discriminating != (receipt.quality.needle_retrieval == 1.0)
+        && receipt.quality.needle_discriminating
+        && receipt.quality.needle_retrieval != 1.0
     {
         return Err(
-            "dense needle discrimination must equal the dense run's own needle recovery".into(),
+            "dense needle discrimination claims recovery the dense run did not show".into(),
         );
     }
     if !receipt.memory.release.verified || !receipt.cancellation.cleanup_verified {
@@ -2583,6 +2633,7 @@ pub fn validate_artifact_bundle_named(
         }
         validate_fixture_binding(&typed, name, &artifact.bytes, 0)?;
     }
+    let mut repeat_artifacts = Vec::with_capacity(5 * REQUIRED_FIXTURES.len());
     for repeat in 0..5 {
         for fixture in REQUIRED_FIXTURES {
             let artifact_name = fixture_artifact_name(fixture, repeat);
@@ -2592,8 +2643,10 @@ pub fn validate_artifact_bundle_named(
                 .find(|artifact| artifact.name == artifact_name)
                 .ok_or_else(|| format!("missing repeat-bound fixture {artifact_name}"))?;
             validate_fixture_binding(&typed, fixture, &artifact.bytes, repeat)?;
+            repeat_artifacts.push((fixture, artifact.bytes.as_slice()));
         }
     }
+    validate_repeat_discrimination(&typed, repeat_artifacts)?;
     let mut core = value.clone();
     core.as_object_mut()
         .ok_or("receipt is not an object")?
@@ -2607,6 +2660,92 @@ pub fn validate_artifact_bundle_named(
         return Err("human receipt is not bound to the sealed JSON receipt".into());
     }
     Ok(())
+}
+
+/// Every repeat's tool/needle outcomes must derive its own metric and flag, and the receipt's
+/// discrimination flags must be exactly the AND over all sealed repeats.
+fn validate_repeat_discrimination<'a>(
+    receipt: &Receipt,
+    artifacts: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<(), String> {
+    let (mut needle, mut tool) = (true, true);
+    for (fixture, bytes) in artifacts {
+        match (fixture, fixture_discrimination(receipt, fixture, bytes)?) {
+            ("long-context-needle", Some(flag)) => needle &= flag,
+            ("structured-tool-call", Some(flag)) => tool &= flag,
+            _ => {}
+        }
+    }
+    if receipt.quality.needle_discriminating != needle
+        || receipt.quality.tool_discriminating != tool
+    {
+        return Err("receipt discrimination is not the AND of its sealed repeats".into());
+    }
+    Ok(())
+}
+
+/// Re-derive a structured-tool or needle artifact's metric and discrimination flag from the raw
+/// outcomes it records, and return the per-repeat flag. Compressed rows must pass every repeat.
+fn fixture_discrimination(
+    receipt: &Receipt,
+    name: &str,
+    bytes: &[u8],
+) -> Result<Option<bool>, String> {
+    if !matches!(name, "structured-tool-call" | "long-context-needle") {
+        return Ok(None);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("fixture {name} JSON: {e}"))?;
+    let evidence = value
+        .get("evidence")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("fixture {name} lacks outcome evidence"))?;
+    let flag = |key: &str| {
+        evidence
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| format!("fixture {name} lacks boolean {key}"))
+    };
+    let count = |key: &str| {
+        evidence
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("fixture {name} lacks count {key}"))
+    };
+    let compressed = receipt.mode == "compressed";
+    let discriminating = flag("discriminating")?;
+    let outputs_match = flag("outputsMatch")?;
+    let (expected_discriminating, expected_match) = if name == "long-context-needle" {
+        let candidate = flag("candidateRecovered")?;
+        let reference = flag("referenceRecovered")?;
+        let same_weights_dense = if compressed { reference } else { candidate };
+        (
+            same_weights_dense,
+            if compressed && !same_weights_dense {
+                outputs_match
+            } else {
+                candidate
+            },
+        )
+    } else {
+        let candidate = flag("candidateValid")?;
+        let reference = flag("referenceValid")?;
+        (
+            if compressed { reference } else { candidate },
+            outputs_match,
+        )
+    };
+    let (matches, total) = (count("matches")?, count("total")?);
+    if total != 1
+        || discriminating != expected_discriminating
+        || matches != u64::from(expected_match)
+        || (compressed && matches != total)
+    {
+        return Err(format!(
+            "fixture {name} outcome evidence does not derive its metric and discrimination"
+        ));
+    }
+    Ok(Some(discriminating))
 }
 
 fn validate_fixture_binding(
@@ -2672,7 +2811,13 @@ fn validate_fixture_binding(
     ) -> Option<&'a str> {
         object.get(key).and_then(serde_json::Value::as_str)
     }
-    let reference_inventory = receipt.provenance.reference_model_sha256.as_str();
+    // Contract v3: a compressed row's denominator is bound (not merely labelled) to the dense-KV
+    // run on the candidate's own weights; a dense row's reference is the bf16 model.
+    let reference_inventory = if receipt.mode == "compressed" {
+        receipt.provenance.model_file_sha256.as_str()
+    } else {
+        receipt.provenance.reference_model_sha256.as_str()
+    };
     let reference_session = field(reference, "coordinateSessionId")
         .filter(|session| {
             session.len() == 64 && session.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -2875,6 +3020,7 @@ pub fn publish_complete_campaign(
         validate_artifact_bundle(&item.bundle)?;
         let receipt: Receipt = serde_json::from_slice(&item.bundle.receipt)
             .map_err(|e| format!("prepared receipt is not decodable: {e}"))?;
+        receipt.memory.admission.validate_against(policy)?;
         let identity = campaign_global_identity(&receipt)?;
         if global_identity
             .as_ref()
@@ -3750,13 +3896,8 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
             .arg("--out")
             .arg(&child_dir);
         let logs = launch.resume_dir.join("logs");
-        let log_prefix = (0_u64..)
-            .map(|attempt| format!("{slug}.attempt-{attempt}"))
-            .find(|prefix| {
-                !logs.join(format!("{prefix}.stdout.log")).exists()
-                    && !logs.join(format!("{prefix}.stderr.log")).exists()
-            })
-            .ok_or("no unused bounded worker log path")?;
+        let log_prefix =
+            unused_attempt_prefix(&logs, &slug).ok_or("no unused bounded worker log path")?;
         let request = RunRequest {
             context_tokens: total_tokens,
             request_tokens,
@@ -3773,30 +3914,30 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
             Ok(status) => status,
             Err(failure) => {
                 let reason = format!("{:?}", failure.reason);
-                write_unaccepted_row_record(
+                return Err(unaccepted_row_error(
                     &unaccepted,
                     "sc-20671-unaccepted-row",
                     &slug,
                     &admission,
                     (&reason, &failure.detail, failure.pid),
-                )?;
-                return Err(format!(
-                    "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; not accepted ({}); valid earlier rows remain in {}",
-                    failure.detail, failure.pid, unaccepted.display(), launch.resume_dir.display(),
+                    format!(
+                        "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
+                        failure.detail, failure.pid, launch.resume_dir.display(),
+                    ),
                 ));
             }
         };
         if !status.success() {
-            write_unaccepted_row_record(
+            return Err(unaccepted_row_error(
                 &unaccepted,
                 "sc-20671-unaccepted-row",
                 &slug,
                 &admission,
                 ("ChildExit", &status.to_string(), None),
-            )?;
-            return Err(format!(
-                "coordinate {slug} failed with {status}; stderr: {}; not accepted ({}); valid earlier rows remain in {}",
-                request.stderr_path.display(), unaccepted.display(), launch.resume_dir.display(),
+                format!(
+                    "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
+                    request.stderr_path.display(), launch.resume_dir.display(),
+                ),
             ));
         }
         // Child publication itself is atomic. Bind the row to this exact immutable launch before
@@ -4165,7 +4306,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
             let fixtures = sealed_product_fixture_artifacts(&suites, &row.coordinate)?;
             let receipt = product_receipt(
                 &row.coordinate,
-                &suites[0],
+                &suites,
                 timings,
                 &executable,
                 &fixtures,
@@ -4696,6 +4837,9 @@ pub struct QualityObservation {
     /// Whether the needle check can detect KV-induced retrieval loss: the same-weights dense-KV
     /// run recovered the exact needle.
     pub needle_discriminating: bool,
+    /// Whether tool agreement can detect KV-induced tool-call loss: the same-weights dense-KV run
+    /// emitted the valid structured call.
+    pub tool_discriminating: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4772,6 +4916,7 @@ fn product_fixture_artifact(
                 "candidateValid": quality.outcomes.candidate_tool_valid,
                 "referenceValid": quality.outcomes.reference_tool_valid,
                 "outputsMatch": quality.outcomes.tool_outputs_match,
+                "discriminating": quality.tool_discriminating,
             }),
             &suite.tool_candidate,
             &suite.tool_reference,
@@ -6268,6 +6413,12 @@ pub fn quality_from_product_fixtures(
         needle_outputs_match: needle_candidate.output.text == needle_reference.output.text,
     };
     let (needle_recovered, needle_discriminating) = needle_observation(&outcomes, reference);
+    // Tool agreement is exact tool-call equality with the reference. It discriminates only when
+    // the same-weights dense-KV run (a dense row's own candidate) emitted the valid call.
+    let tool_discriminating = match reference {
+        QualityReference::Bf16Characterization => outcomes.candidate_tool_valid,
+        QualityReference::DenseKvSameWeights => outcomes.reference_tool_valid,
+    };
     let parity_errors = dense_kernel_fp32_parity_errors()?;
     Ok(QualityObservation {
         parity_errors,
@@ -6287,6 +6438,7 @@ pub fn quality_from_product_fixtures(
         cache_total,
         outcomes,
         needle_discriminating,
+        tool_discriminating,
     })
 }
 
@@ -7132,10 +7284,27 @@ pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
     Err("pmset thermal probe did not prove nominal thermal state".into())
 }
 
+/// The primary repeat supplies the receipt metrics; discrimination is the AND over every sealed
+/// repeat, whose own values are recorded in each repeat's fixture artifact.
+fn receipt_quality_over_repeats(
+    suites: &[ProductFixtureSuite],
+) -> Result<QualityObservation, String> {
+    let (primary, repeats) = suites
+        .split_first()
+        .ok_or("product receipt requires its fixture repeats")?;
+    let mut quality = primary.quality()?;
+    for repeat in repeats {
+        let repeat = repeat.quality()?;
+        quality.needle_discriminating &= repeat.needle_discriminating;
+        quality.tool_discriminating &= repeat.tool_discriminating;
+    }
+    Ok(quality)
+}
+
 #[allow(clippy::too_many_arguments)] // Every argument is producer-owned sealed evidence.
 fn product_receipt(
     coordinate: &Coordinate,
-    suite: &ProductFixtureSuite,
+    suites: &[ProductFixtureSuite],
     timings: ProductTimingMeasurements,
     executable: &Path,
     fixtures: &[SealedFixtureArtifact],
@@ -7143,6 +7312,9 @@ fn product_receipt(
     captured_source: &(String, String),
     admission: ReceiptAdmission,
 ) -> Result<Receipt, String> {
+    let suite = suites
+        .first()
+        .ok_or("product receipt requires its fixture repeats")?;
     let ProductTimingMeasurements {
         samples: timing_samples,
         compile_attribution,
@@ -7156,7 +7328,7 @@ fn product_receipt(
     } else {
         String::new()
     };
-    let quality = suite.quality()?;
+    let quality = receipt_quality_over_repeats(suites)?;
     let observation = &suite.kernel_candidate.observation;
     let required_operations = [
         (
@@ -7303,7 +7475,7 @@ fn product_receipt(
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 }, admission },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() } };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() } };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -7597,6 +7769,36 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(divergent_miss.needle_matches, 0);
         assert!(!divergent_miss.needle_discriminating);
+        // Receipt discrimination is the AND over repeats, not the primary repeat alone.
+        let pair = |compressed: ProductFixtureHalf, dense: ProductFixtureHalf| {
+            pair_product_fixture_halves(compressed, dense, QualityReference::DenseKvSameWeights)
+                .unwrap()
+        };
+        let mut invalid_dense_tool = half("I cannot help with that.");
+        invalid_dense_tool.tool.output.tool_calls.clear();
+        let mut invalid_compressed_tool = half("I cannot help with that.");
+        invalid_compressed_tool.tool.output.tool_calls.clear();
+        let repeats = [
+            pair(
+                half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
+                half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
+            ),
+            pair(invalid_compressed_tool, invalid_dense_tool),
+        ];
+        assert!(repeats[0].quality().unwrap().needle_discriminating);
+        let anded = receipt_quality_over_repeats(&repeats).unwrap();
+        assert!(!anded.needle_discriminating);
+        assert!(!anded.tool_discriminating);
+        assert_eq!(
+            anded.needle_matches, 1,
+            "metrics still come from the primary repeat"
+        );
+        let shared_invalid = repeats[1].quality().unwrap();
+        assert_eq!(
+            shared_invalid.tool_matches, 1,
+            "identical invalid calls agree"
+        );
+        assert!(!shared_invalid.tool_discriminating, "but are flagged");
         let mut other_weights = half("SC20671-NUMERIC-NEEDLE-9b7a2e");
         other_weights
             .needle_result
@@ -7612,6 +7814,39 @@ pub(crate) mod tests {
         .quality()
         .unwrap_err()
         .contains("same weights"));
+    }
+
+    /// Byte-exact inference copy of SceneWorks `config/kv-baseline-quality-contract.json`: its
+    /// hash is the receipt contract identity, so producer wording and thresholds cannot drift.
+    #[test]
+    fn quality_contract_copy_pins_hash_wording_and_thresholds() {
+        let bytes = include_bytes!("../testdata/kv-baseline-quality-contract.json");
+        assert_eq!(seal_bytes(bytes), QUALITY_CONTRACT_HASH);
+        let contract: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(contract["version"], 3);
+        assert_eq!(
+            contract["gate"]["compressedReference"],
+            COMPRESSED_QUALITY_REFERENCE
+        );
+        assert_eq!(
+            contract["thresholds"]["parityMaxError"],
+            COMPRESSED_PARITY_MAX_ERROR
+        );
+        assert_eq!(
+            contract["thresholds"]["greedyTokenAgreement"],
+            COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN
+        );
+        assert_eq!(contract["thresholds"]["perplexityDelta"], 0.01);
+        let statement = contract["needleFixture"]["statement"].as_str().unwrap();
+        let question = contract["needleFixture"]["question"].as_str().unwrap();
+        assert_eq!(
+            statement,
+            format!("{NEEDLE_FIXTURE_STATEMENT_PREFIX}{{needle}}.")
+        );
+        assert_eq!(question, NEEDLE_FIXTURE_QUESTION);
+        let prompt = needle_fixture_prompt("base", "payload", "NEEDLE-1");
+        assert!(prompt.contains(&statement.replace("{needle}", "NEEDLE-1")));
+        assert!(prompt.ends_with(question));
     }
 
     #[test]
@@ -8215,6 +8450,41 @@ pub(crate) mod tests {
         let aborted = record("aborted", aborted);
         assert_eq!(aborted["outcome"], "aborted");
         assert_eq!(aborted["reason"], "ChildFootprint");
+        // A pre-spawn refusal leaves only its record (the supervisor removes the logs): the next
+        // attempt must not reuse that prefix, and a record-write failure is appended to, never
+        // substituted for, the row's own reason.
+        let logs = temporary.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        assert_eq!(
+            unused_attempt_prefix(&logs, "row").unwrap(),
+            "row.attempt-0"
+        );
+        fs::write(logs.join("row.attempt-0.unaccepted.json"), b"{}").unwrap();
+        assert_eq!(
+            unused_attempt_prefix(&logs, "row").unwrap(),
+            "row.attempt-1"
+        );
+        let stop = ("PreflightMemory", "host free 1 bytes", None);
+        let collided = unaccepted_row_error(
+            &logs.join("row.attempt-0.unaccepted.json"),
+            "sc-20671-unaccepted-row",
+            "row",
+            &admission,
+            stop,
+            "coordinate row stopped (PreflightMemory)".into(),
+        );
+        assert!(collided.starts_with("coordinate row stopped (PreflightMemory)"));
+        assert!(collided.contains("could not be written"), "{collided}");
+        let recorded = unaccepted_row_error(
+            &logs.join("row.attempt-1.unaccepted.json"),
+            "sc-20671-unaccepted-row",
+            "row",
+            &admission,
+            stop,
+            "coordinate row stopped (PreflightMemory)".into(),
+        );
+        assert!(recorded.contains("; not accepted ("), "{recorded}");
+        assert!(logs.join("row.attempt-1.unaccepted.json").exists());
         // Enough host RAM and a child under the cap: admitted and supervised to completion.
         assert!(campaign_supervisor::run_guarded(
             &mut Command::new("/usr/bin/true"),
@@ -8477,6 +8747,7 @@ pub(crate) mod tests {
             cache_total: 1,
             outcomes: FixtureOutcomes::default(),
             needle_discriminating: true,
+            tool_discriminating: true,
         };
         let metrics = compute_quality(&raw).unwrap();
         assert_eq!(metrics.parity_max_error, 0.0002);
@@ -8706,6 +8977,7 @@ pub(crate) mod tests {
                 structured_tool_agreement: 1.0,
                 needle_retrieval: 1.0,
                 needle_discriminating: true,
+                tool_discriminating: true,
                 multi_turn_prompt_cache: 1.0,
                 statistics: ReceiptQualityStatistics {
                     repeats: 5,
@@ -8862,6 +9134,7 @@ pub(crate) mod tests {
             cache_total: 1,
             outcomes: FixtureOutcomes::default(),
             needle_discriminating: true,
+            tool_discriminating: true,
         };
         let mut receipt = ReceiptBuilder {
             template,
@@ -9023,6 +9296,197 @@ pub(crate) mod tests {
             .static_footprint_floor_bytes =
             over_cap_estimate.memory.admission.child_footprint_cap_bytes + 1;
         assert!(validate_receipt_semantics(&over_cap_estimate).is_err());
+        // Artifacts: the compressed denominator is bound to the candidate's own inventory.
+        let binding = |receipt: &Receipt, reference_inventory: &str| {
+            let arm = |inventory: &str, session: &str| {
+                serde_json::json!({
+                    "coordinateInventorySha256": inventory,
+                    "qualityInventorySha256": inventory,
+                    "coordinateSessionId": session,
+                    "qualitySessionId": session,
+                    "operation": "single-shot-generation",
+                    "operationOutputSha256": "a".repeat(64),
+                    "operationEvidenceSha256": "a".repeat(64),
+                    "coordinateEvidenceSha256": "a".repeat(64),
+                    "qualityTranscriptSha256": "a".repeat(64),
+                    "secondaryOperation": null,
+                })
+            };
+            serde_json::to_vec(&serde_json::json!({ "binding": {
+                "coordinate": "llama-short-single-single-shot-cold",
+                "repeat": 1,
+                "candidate": arm(
+                    &receipt.provenance.model_file_sha256,
+                    &receipt.provenance.campaign_session_id,
+                ),
+                "reference": arm(reference_inventory, &"b".repeat(64)),
+            }}))
+            .unwrap()
+        };
+        let bf16 = receipt.provenance.reference_model_sha256.clone();
+        let own = receipt.provenance.model_file_sha256.clone();
+        let check = |receipt: &Receipt, inventory: &str| {
+            validate_fixture_binding(
+                receipt,
+                "long-context-needle",
+                &binding(receipt, inventory),
+                1,
+            )
+        };
+        check(&receipt, &bf16).expect("dense rows characterize against bf16");
+        assert!(check(&receipt, &own).is_err());
+        check(&compressed, &own).expect("compressed denominator is the same weights");
+        assert!(check(&compressed, &bf16)
+            .unwrap_err()
+            .contains("producer binding mismatch"));
+        // Receipt discrimination is the AND over all repeats, each re-derived from its outcomes.
+        let needle = |candidate: bool, reference: bool, outputs: bool, matches: u64, flag: bool| {
+            serde_json::to_vec(&serde_json::json!({ "evidence": {
+                "matches": matches, "total": 1, "candidateRecovered": candidate,
+                "referenceRecovered": reference, "outputsMatch": outputs, "discriminating": flag,
+            }}))
+            .unwrap()
+        };
+        let tool = |candidate: bool, reference: bool, outputs: bool, flag: bool| {
+            serde_json::to_vec(&serde_json::json!({ "evidence": {
+                "matches": u64::from(outputs), "total": 1, "candidateValid": candidate,
+                "referenceValid": reference, "outputsMatch": outputs, "discriminating": flag,
+            }}))
+            .unwrap()
+        };
+        let hit = needle(true, true, true, 1, true);
+        let shared_miss = needle(false, false, true, 1, false);
+        let valid_tool = tool(true, true, true, true);
+        let shared_invalid_tool = tool(false, false, true, false);
+        fn repeats<'a>(
+            needles: &[&'a Vec<u8>],
+            tools: &[&'a Vec<u8>],
+        ) -> Vec<(&'static str, &'a [u8])> {
+            needles
+                .iter()
+                .map(|bytes| ("long-context-needle", bytes.as_slice()))
+                .chain(
+                    tools
+                        .iter()
+                        .map(|bytes| ("structured-tool-call", bytes.as_slice())),
+                )
+                .collect()
+        }
+        let mut all_discriminating = compressed.clone();
+        all_discriminating.quality.needle_discriminating = true;
+        all_discriminating.quality.tool_discriminating = true;
+        validate_repeat_discrimination(
+            &all_discriminating,
+            repeats(&[&hit, &hit], &[&valid_tool, &valid_tool]),
+        )
+        .unwrap();
+        // One non-discriminating repeat makes the row non-discriminating; claiming otherwise fails.
+        for (needles, tools) in [
+            (
+                repeats(&[&hit, &shared_miss], &[&valid_tool, &valid_tool]),
+                "needle",
+            ),
+            (
+                repeats(&[&hit, &hit], &[&valid_tool, &shared_invalid_tool]),
+                "tool",
+            ),
+        ] {
+            assert!(
+                validate_repeat_discrimination(&all_discriminating, needles).is_err(),
+                "{tools} repeat disagreement hidden by the receipt flag"
+            );
+        }
+        assert!(validate_repeat_discrimination(
+            &all_discriminating,
+            repeats(&[&hit, &shared_miss], &[&valid_tool, &shared_invalid_tool]),
+        )
+        .is_err());
+        let mut anded = all_discriminating.clone();
+        anded.quality.needle_discriminating = false;
+        anded.quality.tool_discriminating = false;
+        validate_repeat_discrimination(
+            &anded,
+            repeats(&[&hit, &shared_miss], &[&valid_tool, &shared_invalid_tool]),
+        )
+        .unwrap();
+        // Per-artifact derivation: flag must follow the same-weights dense run, a non-discriminating
+        // compressed repeat must match the dense output, and compressed repeats must all pass.
+        for (fixture, forged, flag) in [
+            // Shared miss whose outputs differ from dense, counted as a match.
+            (
+                "long-context-needle",
+                needle(false, false, false, 1, false),
+                false,
+            ),
+            // Dense recovered, yet flagged non-discriminating.
+            (
+                "long-context-needle",
+                needle(true, true, true, 1, false),
+                false,
+            ),
+            // Discriminating compressed repeat that lost the needle.
+            (
+                "long-context-needle",
+                needle(false, true, false, 0, true),
+                true,
+            ),
+            // Dense tool call invalid, yet flagged discriminating.
+            ("structured-tool-call", tool(true, false, true, true), true),
+            // Compressed tool call diverged from dense.
+            ("structured-tool-call", tool(true, true, false, true), true),
+        ] {
+            // The receipt carries the artifact's own flag, so only the derivation can fail.
+            let mut claimed = compressed.clone();
+            claimed.quality.needle_discriminating = fixture != "long-context-needle" || flag;
+            claimed.quality.tool_discriminating = fixture != "structured-tool-call" || flag;
+            assert!(
+                validate_repeat_discrimination(&claimed, [(fixture, forged.as_slice())]).is_err(),
+                "{fixture} forgery accepted"
+            );
+        }
+        // Dense rows derive discrimination from their own run and are never gated on outcomes.
+        let mut dense_miss = receipt.clone();
+        dense_miss.quality.needle_discriminating = false;
+        dense_miss.quality.tool_discriminating = false;
+        validate_repeat_discrimination(
+            &dense_miss,
+            repeats(
+                &[&needle(false, true, false, 0, false)],
+                &[&tool(false, true, false, false)],
+            ),
+        )
+        .unwrap();
+        // Admission must carry the captured policy's cap and reserve.
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: receipt.memory.admission.host_free_reserve_bytes,
+            child_footprint_cap_bytes: receipt.memory.admission.child_footprint_cap_bytes,
+            max_context_tokens: 4096,
+            max_request_tokens: 4096,
+            stdout_cap_bytes: 4096,
+            stderr_cap_bytes: 4096,
+        };
+        receipt.memory.admission.validate_against(&policy).unwrap();
+        for other in [
+            CampaignSafetyPolicy {
+                child_footprint_cap_bytes: policy.child_footprint_cap_bytes + 1,
+                ..policy.clone()
+            },
+            CampaignSafetyPolicy {
+                host_free_reserve_bytes: policy.host_free_reserve_bytes + 1,
+                ..policy.clone()
+            },
+        ] {
+            assert!(receipt
+                .memory
+                .admission
+                .validate_against(&other)
+                .unwrap_err()
+                .contains("captured safety policy"));
+        }
         let mut lifecycle_tampered = receipt.clone();
         lifecycle_tampered.lifecycle.append = false;
         assert!(validate_receipt_semantics(&lifecycle_tampered).is_err());
