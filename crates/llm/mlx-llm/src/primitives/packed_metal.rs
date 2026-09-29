@@ -16,6 +16,15 @@
 //! per row (split-KV); their partial `(max, sum, acc)` are merged by a second one-SIMD-group pass.
 //! The causal/sliding bound is applied to the range before it is split, so masked tokens are never
 //! visited. The kernel never materializes dense historical K/V or an `S_q×S_kv` score tensor.
+//!
+//! On the qualified [`PackedMetalGpuFamily::Apple7OrNewer`] profile, multi-row steps (chunked
+//! prefill after the first chunk, speculative verify) use a tiled flash-attention kernel instead
+//! once `S_q` reaches [`packed_tiled_min_query_tokens`]: the per-row
+//! kernel re-decodes the whole compressed history for every query row. A tiled threadgroup owns 32
+//! query rows (query position × GQA head sharing one KV head) and streams the visible KV range in
+//! blocks; each packed K/V block is dequantized once into block-sized threadgroup tiles and reused by
+//! every row of the tile through `simdgroup_matrix` products, with the online softmax per row in
+//! registers. Long ranges may be split across threadgroups and merged by the same reduction pass.
 use crate::error::{Error, Result};
 use crate::primitives::packed_group_affine_kv::{
     packed_metal_head_dimension_supported, PACKED_CODES_PER_BYTE, PACKED_METAL_QUANT_GROUP_SIZE,
@@ -57,9 +66,11 @@ pub enum PackedMask {
     AdditiveUnsupported,
 }
 
-/// Explicit GPU-family tuning boundary. Unknown Apple GPUs run one SIMD group per threadgroup and
-/// rely on split-KV threadgroups for parallelism; qualified recent families use eight cooperating
-/// SIMD groups per threadgroup. No family outside this enum is silently assigned a geometry.
+/// Explicit GPU-family tuning boundary. Unknown Apple GPUs run only the per-row kernel with one SIMD
+/// group per threadgroup and rely on split-KV threadgroups for parallelism; qualified recent
+/// families use eight cooperating SIMD groups per threadgroup for the per-row kernel and select the
+/// tiled multi-row kernel (four SIMD groups, `simdgroup_matrix`) for multi-row steps. No family
+/// outside this enum is silently assigned a geometry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PackedMetalGpuFamily {
     #[default]
@@ -135,6 +146,69 @@ pub fn packed_kv_split_count(rows: usize, visible_tokens: usize, simd_groups: us
     let for_occupancy = TARGET_RESIDENT_SIMD_GROUPS.div_ceil(rows.saturating_mul(simd_groups));
     let for_amortization = blocks / MIN_BLOCKS_PER_SPLIT.max(2 * simd_groups);
     for_occupancy.min(for_amortization).clamp(1, MAX_KV_SPLITS)
+}
+
+/// SIMD groups per tiled threadgroup; each owns eight query rows (one 8×8 fragment row block).
+const TILED_SIMD_GROUPS: usize = 4;
+/// Query rows (position × GQA head) one tiled threadgroup serves.
+const TILED_ROWS: usize = TILED_SIMD_GROUPS * 8;
+/// KV tokens per tiled block: the fp32 K and V tiles together stay near 16 KiB of threadgroup
+/// memory (`2 · BK · (D + 4) · 4` bytes), i.e. 32/16/8 tokens for D = 64/128/256.
+const fn tiled_block_tokens(head_dimension: usize) -> usize {
+    2048 / head_dimension
+}
+/// Resident tiled threadgroups a split dispatch aims for (four SIMD groups each).
+const TILED_TARGET_THREADGROUPS: usize = 512;
+/// A tiled KV split owns at least this many visible tokens, so the extra partial write and the
+/// reduction stay amortized.
+const TILED_MIN_TOKENS_PER_SPLIT: usize = 2048;
+
+/// Query tokens from which [`PackedMetalKernel::dispatch`] selects the tiled multi-row kernel on the
+/// qualified family; fewer rows keep the per-row split-KV kernel. Chosen per head dimension from the
+/// SC-20676 synthetic crossover sweep (`tiled_threshold_crossover_sweep`, M5 Max, bf16, Hq = 24,
+/// Hkv = 8, per-row kernel on the Apple7OrNewer profile), median ms per-row / tiled at `S_q = 16`:
+///
+/// * D = 64: 1.24 / 1.26 over 4k, 2.28 / 0.97 over 32k → 16.
+/// * D = 128: 0.64 / 0.73 over 4k, 2.43 / 1.34 over 32k → 16.
+/// * D = 256 (8-token blocks, 64 fp32 fragments per lane): 0.67 / 1.63 over 4k and 4.08 / 3.49
+///   over 32k at 16, but 1.23 / 1.65 and 7.85 / 5.01 at 32 → 32.
+pub const fn packed_tiled_min_query_tokens(head_dimension: usize) -> usize {
+    if head_dimension >= 256 {
+        32
+    } else {
+        16
+    }
+}
+
+/// Static geometry of one packed kernel path, for evidence and comparison receipts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedKernelDescriptor {
+    pub kernel: &'static str,
+    pub threads: usize,
+    pub simd_groups: usize,
+    /// KV tokens one barrier-delimited step covers.
+    pub kv_block_tokens: usize,
+    /// Threadgroup barriers per KV block in the streaming loop (the per-row kernel has none; its
+    /// only barriers are in the once-per-threadgroup merge).
+    pub threadgroup_barriers_per_kv_block: usize,
+    pub softmax_state: &'static str,
+}
+
+/// KV splits for the tiled kernel: enough threadgroups for occupancy, never fewer than
+/// 2048 visible tokens per split, at most 128 splits.
+pub fn packed_tiled_split_count(threadgroups: usize, visible_tokens: usize) -> usize {
+    let for_occupancy = TILED_TARGET_THREADGROUPS.div_ceil(threadgroups.max(1));
+    let for_amortization = visible_tokens / TILED_MIN_TOKENS_PER_SPLIT;
+    for_occupancy.min(for_amortization).clamp(1, MAX_KV_SPLITS)
+}
+
+/// Kernel a dispatch selects (see [`PackedMetalKernel::planned_path`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackedKernelPath {
+    /// One threadgroup per (row of GQA heads, KV split); decode and short verify steps.
+    PerRow { splits: usize },
+    /// Tiled multi-row flash attention with block-shared dequantized K/V.
+    Tiled { splits: usize },
 }
 
 const HEADER: &str = r#"#include <metal_stdlib>
@@ -395,6 +469,237 @@ const REDUCE_BODY: &str = r#"
     }
 "#;
 
+/// Tiled multi-row core. A threadgroup of `WM` SIMD groups owns `8·WM` query rows of one KV head:
+/// row `m` is query position `m / gqa` and GQA head `m % gqa`, so every query head sharing the KV
+/// head reuses the same dequantized block. Per KV block of `BK` tokens the threadgroup dequantizes
+/// packed K and V once into fp32 tiles (tail tokens come from the dense residual inputs, tokens past
+/// the live extent are zero), then each SIMD group computes its 8×BK score fragment with
+/// `simdgroup_matrix` products, masks it per row, updates the online softmax in registers (the four
+/// lanes sharing a fragment row reduce with two shuffles), rescales its 8×D accumulator, and adds
+/// `P·V`. Blocks outside the tile's causal/sliding range are never visited, and blocks visible to
+/// every row of the tile skip the per-element mask. Scores are in the log2 domain like the per-row
+/// kernel, so split partials use the shared reduction pass.
+const TILED_HEADER: &str = r#"
+// Row and first column of this lane's two elements of an 8×8 simdgroup matrix: the Apple GPU
+// fragment layout MLX's steel GEMM and attention kernels are built on.
+inline ushort2 sc20676_frag(uint lane) {
+    const uint qid = lane / 4u;
+    return ushort2((qid & 4u) + ((lane / 2u) % 4u), (qid & 2u) * 2u + (lane % 2u) * 2u);
+}
+
+template <typename T>
+inline float4 sc20676_load4(const device T* src) {
+    return float4(float(src[0]), float(src[1]), float(src[2]), float(src[3]));
+}
+
+inline float4 sc20676_codes4(uint byte) {
+    return float4(float(byte & 3u), float((byte >> 2) & 3u), float((byte >> 4) & 3u),
+                  float((byte >> 6) & 3u));
+}
+
+template <int D, int BK, int WM, int MASK_MODE, int WINDOW, typename QT, typename KT, typename VT>
+inline void sc20676_tiled(
+    const device QT* q, const device uint8_t* k_codes, const device half* k_scale,
+    const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
+    const device half* v_scale, const device half* v_zero, const device VT* v_tail,
+    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, uint KG_CAP,
+    uint KT_CAP, uint V_CAP, uint VT_CAP, threadgroup float* k_tile, threadgroup float* v_tile,
+    uint tid, uint lane, uint sg, uint tile, uint kv_row, uint split, uint splits,
+    thread float* o, thread float& row_max, thread float& row_sum, thread uint& out_row,
+    thread bool& valid) {
+    constexpr uint G = 32;
+    constexpr uint KW = G * D / 4;
+    constexpr uint VW = D / 4;
+    constexpr uint VG = D / G;
+    constexpr uint LD = D + 4;
+    constexpr int DT = D / 8;
+    constexpr int KT8 = BK / 8;
+    constexpr uint BQ = 8 * WM;
+    constexpr uint QUADS = BK * D / 4;
+    const uint gqa = HQ / HKV;
+    const uint rows = SQ * gqa;
+    const uint b = kv_row / HKV;
+    const uint kvh = kv_row % HKV;
+    const ushort2 frag = sc20676_frag(lane);
+    const uint m = tile * BQ + sg * 8 + frag.x;
+    valid = m < rows;
+    const uint mc = min(m, rows - 1);
+    const uint qi = mc / gqa;
+    out_row = (b * HQ + kvh * gqa + mc % gqa) * SQ + qi;
+    const uint qoff = kv_len - SQ;
+    const uint hi = MASK_MODE == 0 ? kv_len : qoff + qi + 1;
+    const uint lo = (MASK_MODE == 2 && hi > uint(WINDOW)) ? hi - uint(WINDOW) : 0;
+    // Tile-wide bounds: the union of the rows' ranges is visited; the intersection needs no mask.
+    const uint first_qi = (tile * BQ) / gqa;
+    const uint last_qi = (min(tile * BQ + BQ, rows) - 1) / gqa;
+    const uint tile_hi = MASK_MODE == 0 ? kv_len : qoff + last_qi + 1;
+    const uint first_hi = MASK_MODE == 0 ? kv_len : qoff + first_qi + 1;
+    const uint tile_lo = (MASK_MODE == 2 && first_hi > uint(WINDOW)) ? first_hi - uint(WINDOW) : 0;
+    const uint full_hi = first_hi;
+    const uint full_lo = (MASK_MODE == 2 && tile_hi > uint(WINDOW)) ? tile_hi - uint(WINDOW) : 0;
+    const uint first_block = tile_lo / BK;
+    const uint end_block = (tile_hi + BK - 1) / BK;
+    const uint per_split = (end_block - first_block + splits - 1) / splits;
+    const uint block_begin = min(end_block, first_block + split * per_split);
+    const uint block_end = min(end_block, block_begin + per_split);
+
+    const float q_scale = rsqrt(float(D)) * M_LOG2E_F;
+    const device QT* q_row = q + out_row * D + frag.y;
+    simdgroup_float8x8 qm[DT];
+    simdgroup_float8x8 om[DT];
+#pragma clang loop unroll(full)
+    for (int d = 0; d < DT; ++d) {
+        qm[d].thread_elements()[0] = float(q_row[d * 8]) * q_scale;
+        qm[d].thread_elements()[1] = float(q_row[d * 8 + 1]) * q_scale;
+        om[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float run_max = -INFINITY;
+    float run_sum = 0.0f;
+
+    for (uint blk = block_begin; blk < block_end; ++blk) {
+        const uint t0 = blk * BK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < QUADS; idx += 32 * WM) {
+            const uint tt = idx / (D / 4);
+            const uint c0 = (idx % (D / 4)) * 4;
+            const uint t = t0 + tt;
+            float4 kv = float4(0.0f);
+            float4 vv = float4(0.0f);
+            if (t < kv_len) {
+                if (t < k_packed) {
+                    const uint grp = kv_row * KG_CAP + t / G;
+                    const float4 codes = sc20676_codes4(k_codes[grp * KW + ((t % G) * D + c0) / 4]);
+                    kv = sc20676_load4(k_zero + grp * D + c0)
+                        + sc20676_load4(k_scale + grp * D + c0) * codes;
+                } else {
+                    kv = sc20676_load4(k_tail + (kv_row * KT_CAP + (t - k_packed)) * D + c0);
+                }
+                if (t < v_packed) {
+                    const uint vrow = kv_row * V_CAP + t;
+                    const uint meta = vrow * VG + c0 / G;
+                    vv = float(v_zero[meta])
+                        + float(v_scale[meta]) * sc20676_codes4(v_codes[vrow * VW + c0 / 4]);
+                } else {
+                    vv = sc20676_load4(v_tail + (kv_row * VT_CAP + (t - v_packed)) * D + c0);
+                }
+            }
+            *(threadgroup float4*)(k_tile + tt * LD + c0) = kv;
+            *(threadgroup float4*)(v_tile + tt * LD + c0) = vv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 sm[KT8];
+#pragma clang loop unroll(full)
+        for (int j = 0; j < KT8; ++j) sm[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#pragma clang loop unroll(full)
+        for (int d = 0; d < DT; ++d) {
+#pragma clang loop unroll(full)
+            for (int j = 0; j < KT8; ++j) {
+                simdgroup_float8x8 kt;
+                simdgroup_load(kt, k_tile + j * 8 * LD + d * 8, LD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(sm[j], qm[d], kt, sm[j]);
+            }
+        }
+        const bool full = t0 >= full_lo && t0 + BK <= full_hi;
+        float block_max = -INFINITY;
+#pragma clang loop unroll(full)
+        for (int j = 0; j < KT8; ++j) {
+#pragma clang loop unroll(full)
+            for (int e = 0; e < 2; ++e) {
+                const uint t = t0 + j * 8 + frag.y + e;
+                float s = sm[j].thread_elements()[e];
+                if (!full && (t >= hi || t < lo)) s = -INFINITY;
+                sm[j].thread_elements()[e] = s;
+                block_max = max(block_max, s);
+            }
+        }
+        block_max = max(block_max, simd_shuffle_xor(block_max, 1));
+        block_max = max(block_max, simd_shuffle_xor(block_max, 8));
+        const float next_max = max(run_max, block_max);
+        const float factor = run_max == -INFINITY ? 0.0f : fast::exp2(run_max - next_max);
+        float block_sum = 0.0f;
+#pragma clang loop unroll(full)
+        for (int j = 0; j < KT8; ++j) {
+#pragma clang loop unroll(full)
+            for (int e = 0; e < 2; ++e) {
+                const float s = sm[j].thread_elements()[e];
+                const float p = s == -INFINITY ? 0.0f : fast::exp2(s - next_max);
+                sm[j].thread_elements()[e] = p;
+                block_sum += p;
+            }
+        }
+        block_sum += simd_shuffle_xor(block_sum, 1);
+        block_sum += simd_shuffle_xor(block_sum, 8);
+        run_sum = run_sum * factor + block_sum;
+        run_max = next_max;
+#pragma clang loop unroll(full)
+        for (int d = 0; d < DT; ++d) {
+            om[d].thread_elements()[0] *= factor;
+            om[d].thread_elements()[1] *= factor;
+        }
+#pragma clang loop unroll(full)
+        for (int j = 0; j < KT8; ++j) {
+#pragma clang loop unroll(full)
+            for (int d = 0; d < DT; ++d) {
+                simdgroup_float8x8 vm;
+                simdgroup_load(vm, v_tile + j * 8 * LD + d * 8, LD);
+                simdgroup_multiply_accumulate(om[d], sm[j], vm, om[d]);
+            }
+        }
+    }
+#pragma clang loop unroll(full)
+    for (int d = 0; d < DT; ++d) {
+        o[2 * d] = om[d].thread_elements()[0];
+        o[2 * d + 1] = om[d].thread_elements()[1];
+    }
+    row_max = run_max;
+    row_sum = run_sum;
+}
+"#;
+
+/// Per-call tiled body: grid `x` = query-row tiles, `y` = batch × KV head, `z` = KV splits.
+const TILED_BODY: &str = r#"
+    threadgroup float k_tile[BK * (D + 4)];
+    threadgroup float v_tile[BK * (D + 4)];
+    float o[D / 4];
+    float row_max;
+    float row_sum;
+    uint out_row;
+    bool valid;
+    const uint split = threadgroup_position_in_grid.z;
+    const uint splits = threadgroups_per_grid.z;
+    sc20676_tiled<D, BK, WM, MASK_MODE, WINDOW>(
+        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
+        uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]),
+        uint(k_codes_shape[2]), uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]),
+        k_tile, v_tile, thread_index_in_threadgroup, thread_index_in_simdgroup,
+        simdgroup_index_in_threadgroup, threadgroup_position_in_grid.x,
+        threadgroup_position_in_grid.y, split, splits, o, row_max, row_sum, out_row, valid);
+    if (!valid) return;
+    const uint col = sc20676_frag(thread_index_in_simdgroup).y;
+    for (uint d = 0; d < uint(D / 8); ++d) {
+        for (uint e = 0; e < 2u; ++e) {
+            SC20676_TILED_EPILOGUE
+        }
+    }
+"#;
+
+const TILED_SINGLE_EPILOGUE: &str = r#"
+            using OutputT = typename sc20676_device_element<decltype(out)>::type;
+            out[out_row * D + d * 8 + col + e] =
+                static_cast<OutputT>(row_sum > 0.0f ? o[2 * d + e] / row_sum : 0.0f);
+"#;
+
+// One lane per fragment row (column 0) writes the row's maximum and normalizer.
+const TILED_PARTIAL_EPILOGUE: &str = r#"
+            const uint slot = out_row * splits + split;
+            part_acc[slot * D + d * 8 + col + e] = o[2 * d + e];
+            if (col == 0 && e == 0 && d == 0) {
+                part_max[slot] = row_max;
+                part_sum[slot] = row_sum;
+            }
+"#;
+
 const ATTEND_INPUTS: [&str; 10] = [
     "q", "k_codes", "k_scale", "k_zero", "k_tail", "v_codes", "v_scale", "v_zero", "v_tail",
     "params",
@@ -439,6 +744,8 @@ pub struct PackedMetalKernel {
     single: MetalKernel,
     partial: MetalKernel,
     reduce: MetalKernel,
+    tiled_single: MetalKernel,
+    tiled_partial: MetalKernel,
     identity: String,
     gpu_family: PackedMetalGpuFamily,
 }
@@ -471,6 +778,10 @@ impl std::fmt::Debug for PackedMetalKernel {
 
 /// Live-extent and shape contract of one dispatch, validated before any kernel is encoded.
 struct ValidatedDispatch {
+    batch: usize,
+    kv_heads: usize,
+    query_heads: usize,
+    query_tokens: usize,
     /// Threadgroup rows: `B · (Hq / heads_per_row) · Sq`.
     rows: usize,
     /// Output rows: `B · Hq · Sq`.
@@ -572,6 +883,10 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
         _ => kv,
     };
     Ok(ValidatedDispatch {
+        batch,
+        kv_heads,
+        query_heads,
+        query_tokens,
         rows: batch * (query_heads / heads_per_row) * query_tokens,
         query_rows: batch * query_heads * query_tokens,
         heads_per_row,
@@ -599,14 +914,35 @@ impl PackedMetalKernel {
 
     /// Bind a cache identity to an explicit GPU-family tuning profile. Callers may select the
     /// qualified recent-family profile only after their device probe; unknown devices retain the
-    /// conservative one-SIMD-group geometry.
+    /// conservative one-SIMD-group per-row geometry for every step (never the tiled kernel).
     pub fn for_identity_and_family(
         identity: impl Into<String>,
         gpu_family: PackedMetalGpuFamily,
     ) -> Result<Self> {
         let single = ATTEND_BODY.replace("SC20676_EPILOGUE", SINGLE_EPILOGUE);
         let partial = ATTEND_BODY.replace("SC20676_EPILOGUE", PARTIAL_EPILOGUE);
+        let tiled_header = format!("{HEADER}{TILED_HEADER}");
+        let tiled_single = TILED_BODY.replace("SC20676_TILED_EPILOGUE", TILED_SINGLE_EPILOGUE);
+        let tiled_partial = TILED_BODY.replace("SC20676_TILED_EPILOGUE", TILED_PARTIAL_EPILOGUE);
         Ok(Self {
+            tiled_single: MetalKernel::with_options(
+                "sc20676_tiled",
+                &ATTEND_INPUTS,
+                &["out"],
+                &tiled_single,
+                &tiled_header,
+                true,
+                false,
+            )?,
+            tiled_partial: MetalKernel::with_options(
+                "sc20676_tiled_split",
+                &ATTEND_INPUTS,
+                &["part_acc", "part_max", "part_sum"],
+                &tiled_partial,
+                &tiled_header,
+                true,
+                false,
+            )?,
             single: MetalKernel::with_options(
                 "sc20676_attend",
                 &ATTEND_INPUTS,
@@ -654,15 +990,50 @@ impl PackedMetalKernel {
             })
     }
 
-    /// KV splits the heuristic selects for these arguments (1 = single pass).
+    /// KV splits of the kernel [`Self::planned_path`] selects (1 = single pass).
     pub fn planned_splits(&self, args: &PackedAttentionArgs<'_>) -> Result<usize> {
-        let validated = validate_dispatch(args)?;
-        let tuning = self.required_tuning(validated.head_dimension)?;
-        Ok(packed_kv_split_count(
-            validated.rows,
-            validated.visible_tokens,
-            tuning.simd_groups,
-        ))
+        Ok(match self.planned_path(args)? {
+            PackedKernelPath::PerRow { splits } | PackedKernelPath::Tiled { splits } => splits,
+        })
+    }
+
+    /// Whether a step of `query_tokens` rows at `head_dimension` runs the tiled kernel: only on the
+    /// qualified family, from [`packed_tiled_min_query_tokens`].
+    pub fn selects_tiled(&self, query_tokens: usize, head_dimension: usize) -> bool {
+        self.gpu_family == PackedMetalGpuFamily::Apple7OrNewer
+            && query_tokens >= packed_tiled_min_query_tokens(head_dimension)
+    }
+
+    /// Geometry of the kernel [`Self::dispatch`] runs for a step of `query_tokens` rows, or `None`
+    /// for an unsupported head dimension.
+    pub fn kernel_descriptor(
+        &self,
+        query_tokens: usize,
+        head_dimension: usize,
+    ) -> Option<PackedKernelDescriptor> {
+        let tuning = self.gpu_family.tuning(head_dimension)?;
+        Some(if self.selects_tiled(query_tokens, head_dimension) {
+            PackedKernelDescriptor {
+                kernel: "sc20676_tiled_multi_row_simdgroup_matrix",
+                threads: TILED_SIMD_GROUPS * SIMD_WIDTH,
+                simd_groups: TILED_SIMD_GROUPS,
+                kv_block_tokens: tiled_block_tokens(head_dimension),
+                threadgroup_barriers_per_kv_block: 2,
+                softmax_state: "registers per 8-row simdgroup_matrix fragment (two shuffles per \
+                                row reduction); K/V blocks dequantized once into threadgroup tiles; \
+                                split-KV partials merged by a reduce pass",
+            }
+        } else {
+            PackedKernelDescriptor {
+                kernel: "sc20676_split_kv_simdgroup",
+                threads: tuning.threads,
+                simd_groups: tuning.simd_groups,
+                kv_block_tokens: PACKED_METAL_QUANT_GROUP_SIZE,
+                threadgroup_barriers_per_kv_block: 0,
+                softmax_state: "registers per SIMD group (simd_sum), merged once through \
+                                threadgroup memory; split-KV partials merged by a reduce pass",
+            }
+        })
     }
 
     fn required_tuning(&self, head_dimension: usize) -> Result<PackedMetalTuning> {
@@ -673,8 +1044,158 @@ impl PackedMetalKernel {
         })
     }
 
+    /// Kernel and KV split count [`Self::dispatch`] selects (see [`Self::selects_tiled`]).
+    pub fn planned_path(&self, args: &PackedAttentionArgs<'_>) -> Result<PackedKernelPath> {
+        let validated = validate_dispatch(args)?;
+        if self.selects_tiled(validated.query_tokens, validated.head_dimension) {
+            return Ok(PackedKernelPath::Tiled {
+                splits: tiled_splits(&validated),
+            });
+        }
+        let tuning = self.required_tuning(validated.head_dimension)?;
+        Ok(PackedKernelPath::PerRow {
+            splits: packed_kv_split_count(
+                validated.rows,
+                validated.visible_tokens,
+                tuning.simd_groups,
+            ),
+        })
+    }
+
     pub fn dispatch(&self, args: &PackedAttentionArgs<'_>) -> Result<Array> {
-        self.dispatch_with_splits(args, None)
+        match self.planned_path(args)? {
+            PackedKernelPath::Tiled { .. } => self.dispatch_tiled(args, None),
+            PackedKernelPath::PerRow { .. } => self.dispatch_with_splits(args, None),
+        }
+    }
+
+    /// Run the tiled multi-row kernel regardless of `S_q`, with an explicit KV split count
+    /// (`None` = [`packed_tiled_split_count`]). Test, benchmark, and evidence seam; refused on the
+    /// conservative family, which never runs the tiled geometry.
+    pub fn dispatch_tiled(
+        &self,
+        args: &PackedAttentionArgs<'_>,
+        splits: Option<usize>,
+    ) -> Result<Array> {
+        if self.gpu_family != PackedMetalGpuFamily::Apple7OrNewer {
+            return Err(Error::Unsupported(
+                "SC-20676 tiled kernel requires the qualified Apple7OrNewer profile".into(),
+            ));
+        }
+        let validated = validate_dispatch(args)?;
+        let splits = splits
+            .unwrap_or_else(|| tiled_splits(&validated))
+            .clamp(1, MAX_KV_SPLITS);
+        let head_dimension = validated.head_dimension;
+        let params = dispatch_params(args)?;
+        let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
+            .div_ceil(TILED_ROWS);
+        let threads = TILED_SIMD_GROUPS * SIMD_WIDTH;
+        let grid_x = tiles
+            .checked_mul(threads)
+            .ok_or_else(|| Error::Unsupported("SC-20676 Metal grid dimension overflow".into()))
+            .and_then(|value| checked_msl_i32(value, "tiled grid width"))?;
+        let kv_rows = checked_msl_i32(validated.batch * validated.kv_heads, "KV rows")?;
+        let splits_i32 = checked_msl_i32(splits, "KV splits")?;
+        let threads = checked_msl_i32(threads, "thread-group width")?;
+        let head_i32 = checked_msl_i32(head_dimension, "head dimension")?;
+        let block = checked_msl_i32(tiled_block_tokens(head_dimension), "tiled block")?;
+        let wm = checked_msl_i32(TILED_SIMD_GROUPS, "tiled SIMD groups")?;
+        let kernel = if splits == 1 {
+            &self.tiled_single
+        } else {
+            &self.tiled_partial
+        };
+        let attend = kernel
+            .apply()
+            .input(args.query)
+            .input(args.key_codes)
+            .input(args.key_scales)
+            .input(args.key_zeros)
+            .input(args.key_tail)
+            .input(args.value_codes)
+            .input(args.value_scales)
+            .input(args.value_zeros)
+            .input(args.value_tail)
+            .input(&params)
+            .template_arg("D", head_i32)
+            .template_arg("BK", block)
+            .template_arg("WM", wm)
+            .template_arg("MASK_MODE", validated.mask_mode)
+            .template_arg("WINDOW", validated.window);
+        let query_shape = args.query.shape().to_vec();
+        if splits == 1 {
+            return attend
+                .output(OutputArg {
+                    shape: query_shape,
+                    dtype: args.query.dtype(),
+                })
+                .grid(grid_x, kv_rows, 1)
+                .thread_group(threads, 1, 1)
+                .run()?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Msg("SC-20676 tiled kernel returned no output".into()));
+        }
+        let query_rows = checked_msl_i32(validated.query_rows, "query rows")?;
+        let mut partials = attend
+            .output(OutputArg {
+                shape: vec![query_rows, splits_i32, head_i32],
+                dtype: Dtype::Float32,
+            })
+            .output(OutputArg {
+                shape: vec![query_rows, splits_i32],
+                dtype: Dtype::Float32,
+            })
+            .output(OutputArg {
+                shape: vec![query_rows, splits_i32],
+                dtype: Dtype::Float32,
+            })
+            .grid(grid_x, kv_rows, splits_i32)
+            .thread_group(threads, 1, 1)
+            .run()?
+            .into_iter();
+        let (Some(part_acc), Some(part_max), Some(part_sum)) =
+            (partials.next(), partials.next(), partials.next())
+        else {
+            return Err(Error::Msg(
+                "SC-20676 tiled split kernel returned too few outputs".into(),
+            ));
+        };
+        self.reduce_partials(
+            [&part_acc, &part_max, &part_sum],
+            args.query,
+            query_rows,
+            head_i32,
+        )
+    }
+
+    /// Second split-KV pass shared by both kernels: merge `[rows, splits]` partials into the
+    /// query-shaped, query-dtype output.
+    fn reduce_partials(
+        &self,
+        [part_acc, part_max, part_sum]: [&Array; 3],
+        query: &Array,
+        query_rows: i32,
+        head_dimension: i32,
+    ) -> Result<Array> {
+        let simd = checked_msl_i32(SIMD_WIDTH, "SIMD width")?;
+        self.reduce
+            .apply()
+            .input(part_acc)
+            .input(part_max)
+            .input(part_sum)
+            .output(OutputArg {
+                shape: query.shape().to_vec(),
+                dtype: query.dtype(),
+            })
+            .grid(simd, query_rows, 1)
+            .thread_group(simd, 1, 1)
+            .template_arg("D", head_dimension)
+            .run()?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Msg("SC-20676 reduce kernel returned no output".into()))
     }
 
     /// Dispatch with an explicit KV split count (`None` = the documented heuristic). Test and
@@ -692,14 +1213,7 @@ impl PackedMetalKernel {
             })
             .clamp(1, MAX_KV_SPLITS);
         let head_dimension = validated.head_dimension;
-        let params = Array::from_slice(
-            &[
-                checked_msl_i32(args.key_packed_tokens, "packed key tokens")?,
-                checked_msl_i32(args.value_packed_tokens, "packed value tokens")?,
-                checked_msl_i32(args.kv_tokens, "KV tokens")?,
-            ],
-            &[3],
-        );
+        let params = dispatch_params(args)?;
         let threads = checked_msl_i32(tuning.threads, "thread-group width")?;
         let rows = checked_msl_i32(validated.rows, "threadgroup rows")?;
         let query_rows = checked_msl_i32(validated.query_rows, "query rows")?;
@@ -772,24 +1286,35 @@ impl PackedMetalKernel {
                 "SC-20676 split kernel returned too few outputs".into(),
             ));
         };
-        let simd = checked_msl_i32(SIMD_WIDTH, "SIMD width")?;
-        self.reduce
-            .apply()
-            .input(&part_acc)
-            .input(&part_max)
-            .input(&part_sum)
-            .output(OutputArg {
-                shape: query_shape,
-                dtype: args.query.dtype(),
-            })
-            .grid(simd, query_rows, 1)
-            .thread_group(simd, 1, 1)
-            .template_arg("D", head_i32)
-            .run()?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Msg("SC-20676 reduce kernel returned no output".into()))
+        self.reduce_partials(
+            [&part_acc, &part_max, &part_sum],
+            args.query,
+            query_rows,
+            head_i32,
+        )
     }
+}
+
+/// Live extents `[key_packed, value_packed, kv]` as the kernels' `params` input.
+fn dispatch_params(args: &PackedAttentionArgs<'_>) -> Result<Array> {
+    Ok(Array::from_slice(
+        &[
+            checked_msl_i32(args.key_packed_tokens, "packed key tokens")?,
+            checked_msl_i32(args.value_packed_tokens, "packed value tokens")?,
+            checked_msl_i32(args.kv_tokens, "KV tokens")?,
+        ],
+        &[3],
+    ))
+}
+
+/// Tiled split count for a validated dispatch (threadgroups = row tiles × batch × KV heads).
+fn tiled_splits(validated: &ValidatedDispatch) -> usize {
+    let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
+        .div_ceil(TILED_ROWS);
+    packed_tiled_split_count(
+        tiles * validated.batch * validated.kv_heads,
+        validated.visible_tokens,
+    )
 }
 
 /// Quantize completed K token groups per channel exactly as the CPU reference
@@ -1100,5 +1625,236 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("sliding window exceeds i32"));
+    }
+
+    /// Synthetic packed buffers (random codes and metadata, no model weights) for `total` tokens
+    /// of one layer, all tokens quantized, plus one-group residual tails.
+    struct SyntheticPackedLayer {
+        key_codes: Array,
+        key_scales: Array,
+        key_zeros: Array,
+        key_tail: Array,
+        value_codes: Array,
+        value_scales: Array,
+        value_zeros: Array,
+        value_tail: Array,
+    }
+
+    const BENCH_QUERY_HEADS: i32 = 24;
+    const BENCH_KV_HEADS: i32 = 8;
+    const BENCH_DIM: i32 = 128;
+
+    fn synthetic_packed_layer(total: i32, d: i32) -> SyntheticPackedLayer {
+        use mlx_rs::random::{normal, randint};
+        let h = BENCH_KV_HEADS;
+        let groups = total / 32;
+        let codes = |shape: &[i32]| {
+            randint::<_, i32>(0, 256, shape, None)
+                .unwrap()
+                .as_dtype(Dtype::Uint8)
+                .unwrap()
+        };
+        let metadata = |shape: &[i32], scale: f32| {
+            normal::<f32>(shape, None, scale, None)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .as_dtype(Dtype::Float16)
+                .unwrap()
+        };
+        let tail = || {
+            normal::<f32>(&[1, h, 32, d], None, None, None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        let layer = SyntheticPackedLayer {
+            key_codes: codes(&[1, h, groups, 32 * d / 4]),
+            key_scales: metadata(&[1, h, groups, d], 0.3),
+            key_zeros: metadata(&[1, h, groups, d], 0.5),
+            key_tail: tail(),
+            value_codes: codes(&[1, h, total, d / 4]),
+            value_scales: metadata(&[1, h, total, d / 32], 0.3),
+            value_zeros: metadata(&[1, h, total, d / 32], 0.5),
+            value_tail: tail(),
+        };
+        for array in [
+            &layer.key_codes,
+            &layer.key_scales,
+            &layer.key_zeros,
+            &layer.key_tail,
+            &layer.value_codes,
+            &layer.value_scales,
+            &layer.value_zeros,
+            &layer.value_tail,
+        ] {
+            array.eval().unwrap();
+        }
+        layer
+    }
+
+    impl SyntheticPackedLayer {
+        fn args<'a>(&'a self, query: &'a Array, kv: usize) -> PackedAttentionArgs<'a> {
+            PackedAttentionArgs {
+                query,
+                key_codes: &self.key_codes,
+                key_scales: &self.key_scales,
+                key_zeros: &self.key_zeros,
+                key_tail: &self.key_tail,
+                value_codes: &self.value_codes,
+                value_scales: &self.value_scales,
+                value_zeros: &self.value_zeros,
+                value_tail: &self.value_tail,
+                key_packed_tokens: kv,
+                value_packed_tokens: kv,
+                kv_tokens: kv,
+                mask: PackedMask::Causal,
+            }
+        }
+    }
+
+    fn bench_query(rows: i32, d: i32) -> Array {
+        let query =
+            mlx_rs::random::normal::<f32>(&[1, BENCH_QUERY_HEADS, rows, d], None, None, None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+        query.eval().unwrap();
+        query
+    }
+
+    /// Wall milliseconds of one evaluated attention call.
+    fn timed(run: impl Fn() -> Array) -> f64 {
+        let started = std::time::Instant::now();
+        run().eval().unwrap();
+        started.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// SC-20676 threshold sweep (synthetic, one layer, bf16, Hq = 24, Hkv = 8, D = 64/128/256):
+    /// per-row kernel (both tuning families) vs tiled kernel for small `S_q` over 4k and 32k
+    /// histories. Median of five evaluated calls each after one warm call.
+    #[test]
+    #[ignore = "GPU micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn tiled_threshold_crossover_sweep() {
+        let conservative = PackedMetalKernel::new().unwrap();
+        let recent = PackedMetalKernel::for_identity_and_family(
+            "bench",
+            PackedMetalGpuFamily::Apple7OrNewer,
+        )
+        .unwrap();
+        let median = |run: &dyn Fn() -> Array| {
+            run().eval().unwrap();
+            let mut samples = (0..5).map(|_| timed(run)).collect::<Vec<_>>();
+            samples.sort_by(f64::total_cmp);
+            samples[2]
+        };
+        eprintln!("D\tkv\tS_q\tper-row conservative ms\tper-row apple7 ms\ttiled ms");
+        for d in [64, 128, 256] {
+            let layer = synthetic_packed_layer(32_768, d);
+            for kv in [4096usize, 32_768] {
+                for rows in [1, 2, 4, 8, 12, 16, 24, 32, 48, 64] {
+                    let query = bench_query(rows, d);
+                    let args = layer.args(&query, kv);
+                    let per_row_c =
+                        median(&|| conservative.dispatch_with_splits(&args, None).unwrap());
+                    let per_row_r = median(&|| recent.dispatch_with_splits(&args, None).unwrap());
+                    let tiled = median(&|| recent.dispatch_tiled(&args, None).unwrap());
+                    eprintln!("{d}\t{kv}\t{rows}\t{per_row_c:.3}\t{per_row_r:.3}\t{tiled:.3}");
+                }
+            }
+        }
+    }
+
+    fn chunked_prefill_benchmark(total: i32) {
+        use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
+        use mlx_rs::ops::indexing::TryIndexOp;
+        let kernel = PackedMetalKernel::for_identity_and_family(
+            "bench",
+            PackedMetalGpuFamily::Apple7OrNewer,
+        )
+        .unwrap();
+        let layer = synthetic_packed_layer(total, BENCH_DIM);
+        let dense = || {
+            let array = mlx_rs::random::normal::<f32>(
+                &[1, BENCH_KV_HEADS, total, BENCH_DIM],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+            array.eval().unwrap();
+            array
+        };
+        let (dense_keys, dense_values) = (dense(), dense());
+        let scale = (BENCH_DIM as f32).powf(-0.5);
+        eprintln!("total\tchunk\tpath\tchunks\tmean ms/chunk\tlast-chunk ms\ttotal ms");
+        for chunk in [512, 2048] {
+            let query = bench_query(chunk, BENCH_DIM);
+            let chunks = total / chunk;
+            // Warm every pipeline once on the first chunk's geometry.
+            let warm = layer.args(&query, chunk as usize);
+            kernel.dispatch_tiled(&warm, None).unwrap().eval().unwrap();
+            kernel
+                .dispatch_with_splits(&warm, None)
+                .unwrap()
+                .eval()
+                .unwrap();
+            let paths: [(&str, &dyn Fn(usize) -> Array); 3] = [
+                ("dense-sdpa", &|kv| {
+                    let end = kv as i32;
+                    let keys = dense_keys.try_index((.., .., 0..end, ..)).unwrap();
+                    let values = dense_values.try_index((.., .., 0..end, ..)).unwrap();
+                    scaled_dot_product_attention(
+                        &query,
+                        &keys,
+                        &values,
+                        scale,
+                        ScaledDotProductAttentionMask::Causal,
+                        None,
+                    )
+                    .unwrap()
+                }),
+                ("tiled-packed", &|kv| {
+                    kernel
+                        .dispatch_tiled(&layer.args(&query, kv), None)
+                        .unwrap()
+                }),
+                ("per-row-packed", &|kv| {
+                    kernel
+                        .dispatch_with_splits(&layer.args(&query, kv), None)
+                        .unwrap()
+                }),
+            ];
+            for (name, run) in paths {
+                run(chunk as usize).eval().unwrap();
+                let samples = (1..=chunks)
+                    .map(|index| timed(|| run((index * chunk) as usize)))
+                    .collect::<Vec<_>>();
+                let sum = samples.iter().sum::<f64>();
+                eprintln!(
+                    "{total}\t{chunk}\t{name}\t{chunks}\t{:.2}\t{:.2}\t{sum:.1}",
+                    sum / f64::from(chunks),
+                    samples.last().copied().unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    /// SC-20676 chunked-prefill micro-benchmark over an 8k history (see
+    /// [`chunked_prefill_benchmark`]): dense MLX SDPA on the full chunk vs the tiled and per-row
+    /// packed readers, synthetic bf16 tensors, one layer.
+    #[test]
+    #[ignore = "GPU micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn tiled_chunked_prefill_benchmark_8k() {
+        chunked_prefill_benchmark(8192);
+    }
+
+    /// The 32k-token variant of [`tiled_chunked_prefill_benchmark_8k`].
+    #[test]
+    #[ignore = "GPU micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn tiled_chunked_prefill_benchmark_32k() {
+        chunked_prefill_benchmark(32_768);
     }
 }

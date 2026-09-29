@@ -7,7 +7,7 @@
 //! path (7165).
 
 use mlx_rs::ops::{add, dequantize, quantize, quantized_matmul};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
 
@@ -32,13 +32,16 @@ pub struct QuantizedEmbedding {
 }
 
 impl QuantizedEmbedding {
-    /// Validate and retain already-quantized embedding parts from a snapshot.
+    /// Validate and retain already-quantized embedding parts from a snapshot, holding the affine
+    /// `scales`/`biases` in the model's `compute` dtype (sc-20671: a stored F16 scale must not
+    /// promote BF16 activations to F32).
     pub fn from_quantized(
         weight: Array,
         scales: Array,
         biases: Array,
         group_size: i32,
         bits: i32,
+        compute: Dtype,
     ) -> Result<Self> {
         let weight_shape = weight.shape();
         let scales_shape = scales.shape();
@@ -66,8 +69,8 @@ impl QuantizedEmbedding {
         }
         Ok(Self {
             weight,
-            scales,
-            biases,
+            scales: in_compute_dtype(scales, compute)?,
+            biases: in_compute_dtype(biases, compute)?,
             group_size,
             bits,
             hidden_size,
@@ -103,6 +106,23 @@ impl QuantizedEmbedding {
     }
 }
 
+/// Cast a stored affine quantization parameter to the model's compute dtype.
+///
+/// MLX's affine `quantized_matmul` produces `promote_types(x, scales)` (and `dequantize` the scale
+/// dtype), so a stored scale dtype that differs from the activations silently widens every
+/// downstream tensor: BF16
+/// activations against the F16 scales mlx-community checkpoints ship promote to **F32**, and the
+/// whole decoder — including the K/V handed to the cache — then runs 4-byte (sc-20671). Holding the
+/// parameters in the compute dtype at load keeps activations, and therefore the KV cache, in the
+/// compute dtype whatever dtype the snapshot stored them in.
+pub(crate) fn in_compute_dtype(parameter: Array, compute: Dtype) -> Result<Array> {
+    if parameter.dtype() == compute {
+        Ok(parameter)
+    } else {
+        Ok(parameter.as_dtype(compute)?)
+    }
+}
+
 /// A linear projection whose weight is stored group-wise quantized.
 ///
 /// Forward is `quantized_matmul(x, weight, scales, biases, transpose = true, ...)`, which computes
@@ -125,6 +145,29 @@ pub struct QuantizedLinear {
 }
 
 impl QuantizedLinear {
+    /// Retain already-quantized projection parts from a snapshot (the packed `weight` plus its
+    /// per-group `scales`/`biases`), holding the affine parameters — and the optional additive
+    /// `bias` — in the model's `compute` dtype (sc-20671: a stored F16 scale must not promote BF16
+    /// activations to F32). The packed weight is used as-is.
+    pub fn from_stored(
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+        bias: Option<Array>,
+        compute: Dtype,
+    ) -> Result<Self> {
+        Ok(Self {
+            weight,
+            scales: in_compute_dtype(scales, compute)?,
+            biases: in_compute_dtype(biases, compute)?,
+            group_size,
+            bits,
+            bias: bias.map(|b| in_compute_dtype(b, compute)).transpose()?,
+        })
+    }
+
     /// Quantize a dense `[out, in]` weight into a `QuantizedLinear`. `group_size` must divide the
     /// input dimension; `bits` is typically 4 or 8.
     pub fn quantize(
@@ -193,6 +236,7 @@ mod tests {
             linear.biases.clone(),
             linear.group_size,
             linear.bits,
+            Dtype::Float32,
         )
         .unwrap();
         let ids = input_ids(&[3, 1]);
