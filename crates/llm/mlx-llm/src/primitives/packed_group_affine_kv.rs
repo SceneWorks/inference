@@ -1818,6 +1818,20 @@ struct DeviceLayerMark {
     residuals: Option<Residuals>,
 }
 
+/// An evaluated, unpublished reader state for one layer (see
+/// [`PackedGroupAffineKvCache::staged_reader_arguments`]).
+pub(crate) struct StagedReaderLayer(DevicePackedLayer);
+
+impl StagedReaderLayer {
+    pub(crate) fn args<'a>(
+        &'a self,
+        query: &'a Array,
+        mask: crate::primitives::packed_metal::PackedMask,
+    ) -> PackedAttentionArgs<'a> {
+        self.0.args(query, mask)
+    }
+}
+
 impl DevicePackedLayer {
     fn empty(
         geometry: PackedGeometry,
@@ -2379,6 +2393,20 @@ impl PackedGroupAffineKvCache {
             .sum()
     }
 
+    /// Per-component logical bytes of one resident layer, read from the live host vectors:
+    /// `[key codes, key scale+zero, pending dense key tail, value codes, value scale+zero]`.
+    pub(crate) fn layer_component_bytes(&self, layer: usize) -> Option<[usize; 5]> {
+        let storage = self.layers.get(layer)?.as_ref()?;
+        let half = std::mem::size_of::<f16>();
+        Some([
+            storage.keys.codes.len(),
+            (storage.keys.scales.len() + storage.keys.zeros.len()) * half,
+            storage.keys.pending.len() * std::mem::size_of::<f32>(),
+            storage.values.codes.len(),
+            (storage.values.scales.len() + storage.values.zeros.len()) * half,
+        ])
+    }
+
     /// Actual allocated payload capacity for codes, metadata, and the pending key tail.
     pub fn host_allocated_payload_bytes(&self) -> usize {
         self.layers
@@ -2918,7 +2946,10 @@ impl PackedGroupAffineKvCache {
     /// Dense values numerically equal to what the packed reader consumes for `layer`, row-major
     /// `[batch·head, token, channel]`. Used only by an observable dense transition and by oracles;
     /// successful packed dispatches never call it.
-    fn evaluated_dense_layer(&self, layer: usize) -> Result<(usize, Vec<f32>, Vec<f32>)> {
+    pub(crate) fn evaluated_dense_layer(
+        &self,
+        layer: usize,
+    ) -> Result<(usize, Vec<f32>, Vec<f32>)> {
         if let Some(storage) = self.layers.get(layer).and_then(Option::as_ref) {
             let tokens = storage.keys.logical_tokens();
             let rows = self.rows();
@@ -2987,6 +3018,39 @@ impl PackedGroupAffineKvCache {
             .telemetry
             .peak_packed_transient_logical_bytes
             .max(transient);
+    }
+
+    /// The reader state `dispatch_packed` would dispatch `layer` against — a host-reference cache's
+    /// mirror with its deltas and bounded pending K group uploaded, or a device-resident layer
+    /// as is — evaluated but not published (no device state or telemetry changes). SC-20677 times
+    /// the retained reader on it separately from the per-dispatch mirror sync.
+    pub(crate) fn staged_reader_arguments(&self, layer: usize) -> Result<StagedReaderLayer> {
+        let previous = self.device_layers.get(layer).and_then(Option::as_ref);
+        let device = if self.layers.get(layer).and_then(Option::as_ref).is_some() {
+            let mut mirror = match previous {
+                Some(mirror) if !mirror.authoritative => mirror.clone(),
+                _ => self.empty_host_mirror()?,
+            };
+            self.sync_host_mirror(layer, &mut mirror)?;
+            mirror
+        } else {
+            previous
+                .cloned()
+                .ok_or_else(|| Error::Config("packed layer is not resident".into()))?
+        };
+        for array in [
+            &device.key_codes,
+            &device.key_scales,
+            &device.key_zeros,
+            &device.key_tail,
+            &device.value_codes,
+            &device.value_scales,
+            &device.value_zeros,
+            &device.value_tail,
+        ] {
+            array.eval()?;
+        }
+        Ok(StagedReaderLayer(device))
     }
 
     /// Internal source-test seam: upload the host reference into its device mirror and publish it,
