@@ -606,6 +606,7 @@ jobs:
       APP_STATE: ${{ github.workspace }}/../yue2-app-metal-state-${{ github.run_id }}-${{ github.run_attempt }}
       APP_OUT: ${{ github.workspace }}/../yue2-app-metal-out-${{ github.run_id }}-${{ github.run_attempt }}
       APP_EVIDENCE: ${{ github.workspace }}/../yue2-app-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+      APP_TOOLS: ${{ github.workspace }}/../yue2-app-metal-tools-${{ github.run_id }}-${{ github.run_attempt }}
       RUSTC_WRAPPER: ""
     steps:
       - name: Require nax-macos-2 before any checkout or build
@@ -633,13 +634,23 @@ jobs:
           ref: 99a60541a73706fb67b4e78f44458774423ffb8e
           path: engine
           persist-credentials: false
-      - name: Verify both immutable checkouts and host tools
+      - name: Verify both immutable checkouts and build tools
         run: |
           python3.12 -c 'import sys; sys.path.insert(0, "scripts/ci"); from yue2_app_metal import check_sources; from pathlib import Path; check_sources(Path("app"), Path("engine"))'
-          command -v ffmpeg
-          ffmpeg -version | head -1
           command -v rustc
           command -v cargo
+          command -v curl
+          command -v zstd
+      - name: Stage the app's hash-verified macOS ffmpeg binary
+        run: |
+          mkdir -p "$APP_TOOLS"
+          tools=$(cd "$APP_TOOLS" && pwd -P)
+          python3.12 app/apps/desktop/scripts/stage-ffmpeg.py "$tools/ffmpeg"
+          test -x "$tools/ffmpeg"
+          version=$("$tools/ffmpeg" -version)
+          [[ "$version" == "ffmpeg version "* ]] || { echo "::error::staged ffmpeg version probe failed"; exit 1; }
+          printf '%s\n' "$version" | sed -n '1p'
+          echo "YUE2_FFMPEG_BIN=$tools/ffmpeg" >> "$GITHUB_ENV"
       - name: Set up Node 22 for the acceptance and profile harnesses
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

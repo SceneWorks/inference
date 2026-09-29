@@ -111,6 +111,18 @@ def run_logged(command: list[str], *, cwd: Path, log: Path, env: dict[str, str] 
                               check=False).returncode
 
 
+def probe_ffmpeg(binary: str | None) -> tuple[str, str]:
+    if not binary:
+        raise ValueError("YUE2_FFMPEG_BIN must name the staged, verified app ffmpeg")
+    path = Path(binary)
+    if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError("staged ffmpeg is absent or not an absolute executable")
+    version = subprocess.check_output([str(path), "-version"], text=True).splitlines()[0]
+    if not version.startswith("ffmpeg version "):
+        raise ValueError("staged ffmpeg version probe failed")
+    return str(path), version
+
+
 def copy_receipts(out: Path, evidence: Path) -> None:
     for source in (out / "acceptance" / "evidence").rglob("*") if (out / "acceptance" / "evidence").exists() else ():
         if source.is_file() and source.suffix == ".json":
@@ -154,12 +166,7 @@ def main() -> int:
     ceiling = guard_ceiling(host_bytes)
     if ceiling <= 0:
         raise ValueError("host has no positive watchdog footprint ceiling")
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or not Path(ffmpeg).is_absolute():
-        raise ValueError("ffmpeg is absent or non-absolute")
-    version = subprocess.check_output([ffmpeg, "-version"], text=True).splitlines()[0]
-    if not version.startswith("ffmpeg version "):
-        raise ValueError("ffmpeg probe failed")
+    ffmpeg, version = probe_ffmpeg(os.environ.get("YUE2_FFMPEG_BIN"))
     if not args.api_bin.is_file():
         raise ValueError("release API binary is absent")
     state.mkdir(parents=True)

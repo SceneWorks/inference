@@ -27,6 +27,20 @@ def chain(events: list[dict]) -> str:
 
 
 class AppMetalProofTests(unittest.TestCase):
+    def test_staged_ffmpeg_is_explicit_and_probed_without_path_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            binary = Path(temp) / "ffmpeg"
+            binary.write_text("#!/bin/sh\nprintf 'ffmpeg version staged-test\\n'\n")
+            binary.chmod(0o755)
+            self.assertEqual(app.probe_ffmpeg(str(binary)), (str(binary), "ffmpeg version staged-test"))
+            with self.assertRaisesRegex(ValueError, "YUE2_FFMPEG_BIN"):
+                app.probe_ffmpeg(None)
+            with self.assertRaisesRegex(ValueError, "absolute executable"):
+                app.probe_ffmpeg("ffmpeg")
+            binary.write_text("#!/bin/sh\nprintf 'wrong tool\\n'\n")
+            with self.assertRaisesRegex(ValueError, "version probe"):
+                app.probe_ffmpeg(str(binary))
+
     def test_guard_ceiling_scales_with_host_and_caps_at_incident(self) -> None:
         self.assertEqual(app.guard_ceiling(137_438_953_472), 94_822_600_832)
         self.assertEqual(app.guard_ceiling(64 << 30), (62 << 30))
