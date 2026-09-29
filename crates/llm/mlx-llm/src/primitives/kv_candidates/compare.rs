@@ -218,7 +218,8 @@ impl CompressedKvCandidate for GroupAffineCandidate {
     fn kernel_profile(&self, request: &CandidateAttentionRequest) -> super::KernelProfile {
         let descriptor = self
             .kernel
-            .kernel_descriptor(request.query_len, self.geometry.head_dim);
+            // The comparison harness issues f32 queries (`measure_accepted`).
+            .kernel_descriptor(request.query_len, self.geometry.head_dim, Dtype::Float32);
         super::KernelProfile {
             kernel: descriptor.map_or("unsupported".into(), |d| d.kernel.into()),
             threads_per_threadgroup: descriptor.map_or(0, |d| d.threads),

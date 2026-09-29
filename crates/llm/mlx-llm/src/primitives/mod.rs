@@ -51,10 +51,10 @@ pub use packed_group_affine_kv::{
     RetainedPackedKernel, PACKED_CODES_PER_BYTE, PACKED_METAL_QUANT_GROUP_SIZE,
 };
 pub use packed_metal::{
-    packed_kv_split_count, packed_tiled_min_query_tokens, packed_tiled_split_count,
-    PackedAttentionArgs, PackedKernelDescriptor, PackedKernelPath, PackedMask,
-    PackedMetalGpuFamily, PackedMetalKernel, PackedMetalTuningProfile,
-    PACKED_METAL_DEFAULT_IDENTITY,
+    mlx_nax_available, packed_kv_split_count, packed_nax_head_dimension_supported,
+    packed_tiled_min_query_tokens, packed_tiled_split_count, PackedAttentionArgs,
+    PackedKernelDescriptor, PackedKernelPath, PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+    PackedMetalTuningProfile, PackedNaxSelection, PACKED_METAL_DEFAULT_IDENTITY,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};

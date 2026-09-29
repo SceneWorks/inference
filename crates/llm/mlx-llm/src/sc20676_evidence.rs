@@ -183,6 +183,9 @@ pub struct Sc20676KernelProfile {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sc20676MultiRowKernel {
     pub kernel: String,
+    /// Why the reader chose this multi-row kernel over the NAX tiled kernel (or chose NAX).
+    #[serde(default)]
+    pub selection: String,
     pub min_query_tokens: u64,
     pub threads: u64,
     pub simd_groups: u64,
@@ -1792,12 +1795,14 @@ pub fn run_sc20676_worker(
             .map_err(|_| "SC-20676 SIMD-group count does not fit u64")?,
         values_per_thread: u64::try_from(tuning.values_per_thread)
             .map_err(|_| "SC-20676 values-per-thread count does not fit u64")?,
-        // The longest step this run issues is the whole prompt; decode steps are one row.
+        // The longest step this run issues is the whole prompt; decode steps are one row. Queries
+        // carry the pinned model's BF16 activations (its loader input dtype).
         multi_row: kernel
-            .kernel_descriptor(ids.len(), head_dimension)
+            .kernel_descriptor(ids.len(), head_dimension, mlx_rs::Dtype::Bfloat16)
             .filter(|_| kernel.selects_tiled(ids.len(), head_dimension))
             .map(|descriptor| Sc20676MultiRowKernel {
                 kernel: descriptor.kernel.into(),
+                selection: descriptor.selection.into(),
                 min_query_tokens: crate::primitives::packed_tiled_min_query_tokens(head_dimension)
                     as u64,
                 threads: descriptor.threads as u64,
@@ -3497,6 +3502,7 @@ mod tests {
             .unwrap()
             .multi_row = Some(Sc20676MultiRowKernel {
             kernel: "sc20676_tiled_multi_row_simdgroup_matrix".into(),
+            selection: String::new(),
             min_query_tokens: 16,
             threads: 128,
             simd_groups: 4,

@@ -6468,26 +6468,291 @@ mod tests {
         eprintln!("tiled parity max abs error per case: {maxima:?}");
     }
 
-    /// `dispatch` runs exactly the kernel `planned_path` names: on the qualified family the tiled
+    /// The NAX tiled reader against the independent fp32 oracle at the tolerances the dense bf16/f16
+    /// SDPA path is held to (`assert_real_metal_dense_sdpa_case`): `S_q` 16/33/128/2048, K and V
+    /// residual tails (the pending K group) beside packed groups, causal rows offset to the end of
+    /// the KV range, GQA 1–3, sliding windows, `None` masks, the host-mirror layout
+    /// (`value_packed != key_packed`), D = 64/128, bf16 and f16 queries, and forced KV split counts
+    /// (partial + reduction), each agreeing with the single pass. D = 256 and f32 queries are
+    /// routed to the fp32 tiled kernel with the recorded reason. Skipped (with the reason) where
+    /// MLX reports no Neural Accelerator.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nax_tiled_reader_matches_independent_fp32_oracle_for_multi_row_steps() {
+        use crate::primitives::packed_attention::PackedAttentionShape;
+        use crate::primitives::packed_metal::{
+            mlx_nax_available, PackedKernelPath, PackedMask, PackedMetalGpuFamily,
+            PackedMetalKernel,
+        };
+        if !mlx_nax_available() {
+            eprintln!("skipped: mlx::core::metal::is_nax_available() is false on this host");
+            return;
+        }
+        let cases = [
+            (
+                Dtype::Bfloat16,
+                128,
+                2,
+                6,
+                333,
+                33,
+                PackedAttentionMask::Causal,
+            ),
+            (
+                Dtype::Float16,
+                64,
+                2,
+                4,
+                300,
+                16,
+                PackedAttentionMask::Causal,
+            ),
+            (
+                Dtype::Bfloat16,
+                64,
+                1,
+                3,
+                401,
+                128,
+                PackedAttentionMask::SlidingWindow(77),
+            ),
+            (
+                Dtype::Float16,
+                128,
+                2,
+                2,
+                530,
+                128,
+                PackedAttentionMask::None,
+            ),
+            (
+                Dtype::Bfloat16,
+                64,
+                1,
+                2,
+                2100,
+                2048,
+                PackedAttentionMask::Causal,
+            ),
+            (
+                Dtype::Float16,
+                128,
+                1,
+                3,
+                290,
+                33,
+                PackedAttentionMask::SlidingWindow(200),
+            ),
+            (
+                Dtype::Float16,
+                128,
+                1,
+                2,
+                2090,
+                2048,
+                PackedAttentionMask::SlidingWindow(700),
+            ),
+            // Host reference cache: V rows quantize per token, K keeps its incomplete group dense.
+            (
+                Dtype::Bfloat16,
+                128,
+                2,
+                4,
+                333,
+                33,
+                PackedAttentionMask::Causal,
+            ),
+        ];
+        const HOST_MIRROR_CASE: usize = 7;
+        let kernel =
+            PackedMetalKernel::for_identity_and_family("nax", PackedMetalGpuFamily::Apple7OrNewer)
+                .unwrap();
+        assert!(kernel.nax_available());
+        let mut maxima = Vec::new();
+        for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
+            cases.into_iter().enumerate()
+        {
+            let batch = if index % 2 == 0 && query_len < 2048 {
+                2
+            } else {
+                1
+            };
+            let shaped = |seed: u64| {
+                pseudo_random_outliers(batch, kv_heads, tokens, width, seed)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, value)| {
+                        let (channel, token) = (i % width, (i / width) % tokens);
+                        value.clamp(-4.0, 4.0) * (0.25 + (channel / 32) as f32 * 0.5)
+                            + (channel / 32) as f32 * 0.75
+                            - (token % 7) as f32 * 0.125
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let keys = shaped(411 + index as u64);
+            let values = shaped(507 + index as u64);
+            let queries = (0..batch * query_heads * query_len * width)
+                .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
+                .collect::<Vec<_>>();
+            let mut cache = device_cache(batch, kv_heads, width);
+            if index == HOST_MIRROR_CASE {
+                cache.append(0, &keys, &values, tokens).unwrap();
+            } else {
+                cache
+                    .append_device(
+                        0,
+                        &bhsd(&keys, batch, kv_heads, tokens, width)
+                            .as_dtype(dtype)
+                            .unwrap(),
+                        &bhsd(&values, batch, kv_heads, tokens, width)
+                            .as_dtype(dtype)
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            let query = bhsd(&queries, batch, query_heads, query_len, width)
+                .as_dtype(dtype)
+                .unwrap();
+            let reference = tiled_oracle(
+                &cache,
+                &host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap()),
+                PackedAttentionShape {
+                    batch,
+                    query_heads,
+                    kv_heads,
+                    query_len,
+                    kv_len: tokens,
+                    head_dim: width,
+                },
+                mask,
+            );
+            let packed_mask = match mask {
+                PackedAttentionMask::None => PackedMask::None,
+                PackedAttentionMask::Causal => PackedMask::Causal,
+                PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
+                PackedAttentionMask::Additive => unreachable!(),
+            };
+            let tolerance = match dtype {
+                Dtype::Float16 => 4e-2,
+                _ => 8e-2,
+            };
+            let staged = cache.staged_reader_arguments(0).unwrap();
+            let args = staged.args(&query, packed_mask);
+            assert!(
+                args.key_packed_tokens > 0 && args.key_packed_tokens < tokens,
+                "case {index} exercises packed K groups and the K residual"
+            );
+            assert_eq!(
+                args.value_packed_tokens == tokens,
+                index == HOST_MIRROR_CASE,
+                "only the host-mirror case packs every V row ahead of K"
+            );
+            assert!(
+                matches!(
+                    kernel.planned_path(&args).unwrap(),
+                    PackedKernelPath::NaxTiled { .. }
+                ),
+                "case {index} plans the NAX kernel"
+            );
+            let mut single: Option<Vec<f32>> = None;
+            let (mut case_abs, mut case_rel) = (0.0f32, 0.0f32);
+            for splits in [1, 2, 5] {
+                let output = host_readback::<f32>(
+                    &kernel
+                        .dispatch_nax(&args, Some(splits))
+                        .unwrap()
+                        .as_dtype(Dtype::Float32)
+                        .unwrap(),
+                );
+                assert_eq!(output.len(), reference.len());
+                for (i, (actual, expected)) in output.iter().zip(&reference).enumerate() {
+                    let error = (actual - expected).abs();
+                    case_abs = case_abs.max(error);
+                    case_rel = case_rel.max(error / expected.abs().max(1e-2));
+                    assert!(
+                        error <= tolerance,
+                        "case {index} splits {splits} element {i}: {actual} != {expected}"
+                    );
+                }
+                let single = single.get_or_insert_with(|| output.clone());
+                for (actual, expected) in output.iter().zip(single.iter()) {
+                    assert!((actual - expected).abs() <= tolerance / 4.0);
+                }
+            }
+            maxima.push((index, dtype, width, query_len, case_abs, case_rel));
+        }
+        eprintln!("NAX parity (case, dtype, D, S_q, max abs, max rel): {maxima:?}");
+
+        // D = 256 and f32 queries keep the fp32 tiled kernel, with the recorded reason.
+        for (width, dtype) in [(256, Dtype::Bfloat16), (128, Dtype::Float32)] {
+            let selection = kernel.nax_selection(width, dtype);
+            assert!(!selection.selected, "D {width} {dtype:?}");
+            let descriptor = kernel.kernel_descriptor(64, width, dtype).unwrap();
+            assert_eq!(
+                descriptor.kernel,
+                "sc20676_tiled_multi_row_simdgroup_matrix"
+            );
+            assert_eq!(descriptor.selection, selection.reason);
+            let mut cache = device_cache(1, 1, width);
+            let kv = bhsd(
+                &pseudo_random_outliers(1, 1, 80, width, 3)
+                    .into_iter()
+                    .map(|value| value.clamp(-3.0, 3.0))
+                    .collect::<Vec<_>>(),
+                1,
+                1,
+                80,
+                width,
+            )
+            .as_dtype(dtype)
+            .unwrap();
+            cache.append_device(0, &kv, &kv).unwrap();
+            let query = bhsd(&vec![0.1; 2 * 64 * width], 1, 2, 64, width)
+                .as_dtype(dtype)
+                .unwrap();
+            let staged = cache.staged_reader_arguments(0).unwrap();
+            let args = staged.args(&query, PackedMask::Causal);
+            assert!(matches!(
+                kernel.planned_path(&args).unwrap(),
+                PackedKernelPath::Tiled { .. }
+            ));
+            let refused = kernel.dispatch_nax(&args, None).unwrap_err().to_string();
+            assert!(refused.contains(selection.reason), "{refused}");
+        }
+    }
+
+    /// `dispatch` runs exactly the kernel `planned_path` names: on the qualified family a tiled
     /// kernel from the per-D threshold (16 for D = 64/128, 32 for D = 256) and the per-row kernel
-    /// below it; on the conservative family always the per-row kernel (and the tiled seam is
-    /// refused). The routed output is bit-identical to the named path's output.
+    /// below it — the NAX tiled kernel for bf16/f16 queries at D = 64/128 where MLX reports the
+    /// Neural Accelerator, the fp32 tiled kernel otherwise (f32 queries, D = 256, or no NAX); on the
+    /// conservative family always the per-row kernel (and both tiled seams are refused). The routed
+    /// output is bit-identical to the named path's output, and the descriptor names the same kernel
+    /// with the selection reason.
     #[cfg(target_os = "macos")]
     #[test]
     fn dispatch_runs_the_path_planned_path_names() {
         use crate::primitives::packed_metal::{
-            packed_tiled_min_query_tokens, PackedKernelPath, PackedMask, PackedMetalGpuFamily,
-            PackedMetalKernel,
+            mlx_nax_available, packed_tiled_min_query_tokens, PackedKernelPath, PackedMask,
+            PackedMetalGpuFamily, PackedMetalKernel,
         };
         assert_eq!(packed_tiled_min_query_tokens(64), 16);
         assert_eq!(packed_tiled_min_query_tokens(128), 16);
         assert_eq!(packed_tiled_min_query_tokens(256), 32);
+        let nax = mlx_nax_available();
         let conservative = PackedMetalKernel::for_identity("route").unwrap();
+        assert!(!conservative.nax_available());
         let recent = PackedMetalKernel::for_identity_and_family(
             "route",
             PackedMetalGpuFamily::Apple7OrNewer,
         )
         .unwrap();
+        assert_eq!(recent.nax_available(), nax);
+        let recent_without_nax = PackedMetalKernel::for_identity_and_family(
+            "route",
+            PackedMetalGpuFamily::Apple7OrNewer,
+        )
+        .unwrap()
+        .without_nax();
         for width in [128, 256] {
             let tokens = 96;
             let data = pseudo_random_outliers(1, 2, tokens, width, 9)
@@ -6499,7 +6764,10 @@ mod tests {
             cache.append_device(0, &kv, &kv).unwrap();
             let layer = cache.device_layers[0].as_ref().unwrap();
             let threshold = packed_tiled_min_query_tokens(width);
-            for query_len in [1, threshold - 1, threshold] {
+            for (query_len, dtype) in [1, threshold - 1, threshold]
+                .into_iter()
+                .flat_map(|len| [(len, Dtype::Float32), (len, Dtype::Bfloat16)])
+            {
                 let query = bhsd(
                     &(0..6 * query_len * width)
                         .map(|i| ((i * 7 + 1) % 23) as f32 * 0.04 - 0.4)
@@ -6508,34 +6776,69 @@ mod tests {
                     6,
                     query_len,
                     width,
-                );
+                )
+                .as_dtype(dtype)
+                .unwrap();
                 let args = layer.args(&query, PackedMask::Causal);
-                for (kernel, qualified) in [(&conservative, false), (&recent, true)] {
+                for (kernel, qualified, kernel_nax) in [
+                    (&conservative, false, false),
+                    (&recent, true, nax),
+                    (&recent_without_nax, true, false),
+                ] {
                     let path = kernel.planned_path(&args).unwrap();
-                    let tiled_expected = qualified && query_len >= threshold;
-                    assert_eq!(
-                        matches!(path, PackedKernelPath::Tiled { .. }),
-                        tiled_expected,
-                        "D {width} S_q {query_len} qualified {qualified}: {path:?}"
+                    let multi_row = qualified && query_len >= threshold;
+                    let nax_expected =
+                        multi_row && kernel_nax && width == 128 && dtype == Dtype::Bfloat16;
+                    let expected = match (multi_row, nax_expected) {
+                        (false, _) => "sc20676_split_kv_simdgroup",
+                        (true, false) => "sc20676_tiled_multi_row_simdgroup_matrix",
+                        (true, true) => "sc20676_nax_tiled_matmul2d",
+                    };
+                    let context = format!(
+                        "D {width} S_q {query_len} {dtype:?} qualified {qualified} nax {kernel_nax}"
                     );
-                    let (PackedKernelPath::Tiled { splits } | PackedKernelPath::PerRow { splits }) =
-                        path;
+                    assert_eq!(
+                        (
+                            matches!(path, PackedKernelPath::Tiled { .. }),
+                            matches!(path, PackedKernelPath::NaxTiled { .. })
+                        ),
+                        (multi_row && !nax_expected, nax_expected),
+                        "{context}: {path:?}"
+                    );
+                    let (PackedKernelPath::Tiled { splits }
+                    | PackedKernelPath::PerRow { splits }
+                    | PackedKernelPath::NaxTiled { splits }) = path;
                     assert_eq!(kernel.planned_splits(&args).unwrap(), splits);
-                    let descriptor = kernel.kernel_descriptor(query_len, width).unwrap();
-                    assert_eq!(
-                        descriptor.kernel == "sc20676_tiled_multi_row_simdgroup_matrix",
-                        tiled_expected
-                    );
-                    let routed = host_readback::<f32>(&kernel.dispatch(&args).unwrap());
-                    let named = host_readback::<f32>(&match path {
+                    let descriptor = kernel.kernel_descriptor(query_len, width, dtype).unwrap();
+                    assert_eq!(descriptor.kernel, expected, "{context}");
+                    if multi_row {
+                        assert_eq!(
+                            descriptor.selection,
+                            kernel.nax_selection(width, dtype).reason,
+                            "{context}"
+                        );
+                    }
+                    let readback = |array: Array| {
+                        host_readback::<f32>(&array.as_dtype(Dtype::Float32).unwrap())
+                    };
+                    let routed = readback(kernel.dispatch(&args).unwrap());
+                    let named = readback(match path {
                         PackedKernelPath::Tiled { splits } => {
                             kernel.dispatch_tiled(&args, Some(splits)).unwrap()
                         }
                         PackedKernelPath::PerRow { splits } => {
                             kernel.dispatch_with_splits(&args, Some(splits)).unwrap()
                         }
+                        PackedKernelPath::NaxTiled { splits } => {
+                            kernel.dispatch_nax(&args, Some(splits)).unwrap()
+                        }
                     });
-                    assert_eq!(routed, named, "D {width} S_q {query_len} {path:?}");
+                    assert_eq!(routed, named, "{context} {path:?}");
+                    assert_eq!(
+                        kernel.dispatch_nax(&args, None).is_ok(),
+                        kernel_nax && width == 128 && dtype == Dtype::Bfloat16,
+                        "{context}: the NAX seam follows nax_selection"
+                    );
                 }
                 assert!(conservative.dispatch_tiled(&args, None).is_err());
             }
@@ -6544,114 +6847,141 @@ mod tests {
 
     /// Chunked prefill through the decoder route: after the dense first chunk, each later
     /// multi-row chunk attends over the packed history plus its own fresh K/V through the tiled
-    /// reader, matches the fp32 oracle over the device representation, and never reconstructs the
-    /// cache densely.
+    /// reader — the NAX tiled kernel for bf16 activations where MLX reports the Neural Accelerator,
+    /// the fp32 tiled kernel for f32 — matches the fp32 oracle over the device representation, and
+    /// never reconstructs the cache densely.
     #[cfg(target_os = "macos")]
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn decoder_chunked_prefill_uses_the_tiled_reader_without_dense_reconstruction() {
         use crate::primitives::packed_attention::PackedAttentionShape;
         use crate::primitives::packed_metal::{
-            PackedKernelPath, PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+            mlx_nax_available, PackedKernelPath, PackedMask, PackedMetalGpuFamily,
+            PackedMetalKernel,
         };
         let (heads, query_heads, width) = (2, 6, 128);
-        let kernel = Arc::new(
-            PackedMetalKernel::for_identity_and_family(
-                "decoder-tiled",
-                PackedMetalGpuFamily::Apple7OrNewer,
+        for (dtype, tolerance) in [(Dtype::Float32, 1e-4), (Dtype::Bfloat16, 8e-2)] {
+            let kernel = Arc::new(
+                PackedMetalKernel::for_identity_and_family(
+                    "decoder-tiled",
+                    PackedMetalGpuFamily::Apple7OrNewer,
+                )
+                .unwrap(),
+            );
+            let reader = CompiledKernelHandle::new(kernel.clone());
+            let mut cache = select_decoder_cache_with_reader(
+                PackedCacheRequest {
+                    enabled: true,
+                    backend: "mlx-metal".into(),
+                    identity: "decoder-tiled".into(),
+                    layers: 1,
+                    batch: 1,
+                    kv_heads: heads,
+                    head_dimension: width,
+                    group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                    query_length: 40,
+                    has_mask: false,
+                },
+                reader,
             )
-            .unwrap(),
-        );
-        let reader = CompiledKernelHandle::new(kernel.clone());
-        let mut cache = select_decoder_cache_with_reader(
-            PackedCacheRequest {
-                enabled: true,
-                backend: "mlx-metal".into(),
-                identity: "decoder-tiled".into(),
-                layers: 1,
-                batch: 1,
-                kv_heads: heads,
-                head_dimension: width,
-                group_size: PACKED_METAL_QUANT_GROUP_SIZE,
-                query_length: 40,
-                has_mask: false,
-            },
-            reader,
-        )
-        .into_cache();
-        let scale = (width as f32).powf(-0.5);
-        let mut offset = 0;
-        for (chunk, rows) in [40usize, 33, 128].into_iter().enumerate() {
-            let fresh = |seed: u64| {
-                bhsd(
-                    &pseudo_random_outliers(1, heads, rows, width, seed)
-                        .into_iter()
-                        .map(|value| value.clamp(-3.0, 3.0))
+            .into_cache();
+            let scale = (width as f32).powf(-0.5);
+            let mut offset = 0;
+            for (chunk, rows) in [40usize, 33, 128].into_iter().enumerate() {
+                let fresh = |seed: u64| {
+                    bhsd(
+                        &pseudo_random_outliers(1, heads, rows, width, seed)
+                            .into_iter()
+                            .map(|value| value.clamp(-3.0, 3.0))
+                            .collect::<Vec<_>>(),
+                        1,
+                        heads,
+                        rows,
+                        width,
+                    )
+                    .as_dtype(dtype)
+                    .unwrap()
+                };
+                let (keys, values) = (fresh(50 + chunk as u64), fresh(60 + chunk as u64));
+                let query = bhsd(
+                    &(0..query_heads * rows * width)
+                        .map(|i| ((i * 13 + chunk) % 41) as f32 * 0.03 - 0.6)
                         .collect::<Vec<_>>(),
                     1,
-                    heads,
+                    query_heads,
                     rows,
                     width,
                 )
-            };
-            let (keys, values) = (fresh(50 + chunk as u64), fresh(60 + chunk as u64));
-            let query_values = (0..query_heads * rows * width)
-                .map(|i| ((i * 13 + chunk) % 41) as f32 * 0.03 - 0.6)
-                .collect::<Vec<_>>();
-            let query = bhsd(&query_values, 1, query_heads, rows, width);
-            let output = cache
-                .try_packed_attention(
-                    0,
-                    &query,
-                    &keys,
-                    &values,
+                .as_dtype(dtype)
+                .unwrap();
+                let query_values = host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap());
+                let output = cache
+                    .try_packed_attention(
+                        0,
+                        &query,
+                        &keys,
+                        &values,
+                        PackedAttentionMask::Causal,
+                        scale,
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap();
+                offset += rows;
+                if chunk == 0 {
+                    continue;
+                }
+                let packed = cache
+                    .as_any_mut()
+                    .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                    .unwrap();
+                let reference = tiled_oracle(
+                    &packed.staged,
+                    &query_values,
+                    PackedAttentionShape {
+                        batch: 1,
+                        query_heads,
+                        kv_heads: heads,
+                        query_len: rows,
+                        kv_len: offset,
+                        head_dim: width,
+                    },
                     PackedAttentionMask::Causal,
-                    scale,
-                    false,
-                )
-                .unwrap()
-                .unwrap();
-            offset += rows;
-            if chunk == 0 {
-                continue;
+                );
+                let output = host_readback::<f32>(&output.as_dtype(Dtype::Float32).unwrap());
+                for (actual, expected) in output.iter().zip(&reference) {
+                    assert!(
+                        (actual - expected).abs() <= tolerance,
+                        "{dtype:?}: {actual} != {expected}"
+                    );
+                }
+                // The step ran the planned multi-row kernel: its output is bit-identical to a
+                // direct dispatch of the kernel planned_path names over the same representation.
+                let staged = packed.staged.staged_reader_arguments(0).unwrap();
+                let args = staged.args(&query, PackedMask::Causal);
+                let direct = match kernel.planned_path(&args).unwrap() {
+                    PackedKernelPath::NaxTiled { splits }
+                        if dtype == Dtype::Bfloat16 && mlx_nax_available() =>
+                    {
+                        kernel.dispatch_nax(&args, Some(splits)).unwrap()
+                    }
+                    PackedKernelPath::Tiled { splits }
+                        if dtype == Dtype::Float32 || !mlx_nax_available() =>
+                    {
+                        kernel.dispatch_tiled(&args, Some(splits)).unwrap()
+                    }
+                    path => panic!("{dtype:?} chunk {chunk} of {rows} rows planned {path:?}"),
+                };
+                assert_eq!(
+                    output,
+                    host_readback::<f32>(&direct.as_dtype(Dtype::Float32).unwrap()),
+                    "{dtype:?} chunk {chunk} output is not the planned kernel's"
+                );
             }
-            let packed = cache
-                .as_any_mut()
-                .downcast_mut::<DenseFallbackPackedDecoderCache>()
-                .unwrap();
-            let reference = tiled_oracle(
-                &packed.staged,
-                &query_values,
-                PackedAttentionShape {
-                    batch: 1,
-                    query_heads,
-                    kv_heads: heads,
-                    query_len: rows,
-                    kv_len: offset,
-                    head_dim: width,
-                },
-                PackedAttentionMask::Causal,
-            );
-            let output = host_readback::<f32>(&output);
-            for (actual, expected) in output.iter().zip(&reference) {
-                assert!((actual - expected).abs() <= 1e-4, "{actual} != {expected}");
-            }
-            // The step ran the tiled kernel: its output is bit-identical to a direct tiled
-            // dispatch over the same committed representation, which planned_path names.
-            let staged = packed.staged.staged_reader_arguments(0).unwrap();
-            let args = staged.args(&query, PackedMask::Causal);
-            let PackedKernelPath::Tiled { splits } = kernel.planned_path(&args).unwrap() else {
-                panic!("chunk {chunk} of {rows} rows did not plan the tiled kernel");
-            };
-            let tiled = host_readback::<f32>(&kernel.dispatch_tiled(&args, Some(splits)).unwrap());
-            assert_eq!(
-                output, tiled,
-                "chunk {chunk} output is not the tiled kernel's"
-            );
+            let evidence = cache.packed_evidence().unwrap();
+            assert_eq!(evidence.accepted_direct_calls, 2);
+            assert_eq!(evidence.full_cache_dequantizations, 0);
+            assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
         }
-        let evidence = cache.packed_evidence().unwrap();
-        assert_eq!(evidence.accepted_direct_calls, 2);
-        assert_eq!(evidence.full_cache_dequantizations, 0);
-        assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
     }
 }

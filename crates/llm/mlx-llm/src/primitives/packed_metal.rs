@@ -25,6 +25,13 @@
 //! blocks; each packed K/V block is dequantized once into block-sized threadgroup tiles and reused by
 //! every row of the tile through `simdgroup_matrix` products, with the online softmax per row in
 //! registers. Long ranges may be split across threadgroups and merged by the same reduction pass.
+//!
+//! Where MLX itself runs its Neural-Accelerator kernels ([`mlx_nax_available`]), multi-row steps
+//! with bf16/f16 queries at D = 64/128 run the NAX tiled kernel instead: the same block-shared
+//! dequantization, but into 16-bit tiles, with `Q·Kᵀ` and `P·V` on the matrix unit through MLX's
+//! `steel_attention_nax` fragment products (`mpp::tensor_ops::matmul2d`). f32 queries and D = 256
+//! keep the fp32 tiled kernel; the choice and its reason are reported by
+//! [`PackedMetalKernel::nax_selection`] and [`PackedMetalKernel::kernel_descriptor`].
 use crate::error::{Error, Result};
 use crate::primitives::packed_group_affine_kv::{
     packed_metal_head_dimension_supported, PACKED_CODES_PER_BYTE, PACKED_METAL_QUANT_GROUP_SIZE,
@@ -172,6 +179,10 @@ const TILED_MIN_TOKENS_PER_SPLIT: usize = 2048;
 /// * D = 128: 0.64 / 0.73 over 4k, 2.43 / 1.34 over 32k → 16.
 /// * D = 256 (8-token blocks, 64 fp32 fragments per lane): 0.67 / 1.63 over 4k and 4.08 / 3.49
 ///   over 32k at 16, but 1.23 / 1.65 and 7.85 / 5.01 at 32 → 32.
+///
+/// The NAX tiled kernel (bf16/f16 at D = 64/128) is past its crossover at the same threshold
+/// (release build, median ms per-row / NAX at `S_q = 16`): D = 64 0.33 / 0.22 over 4k and
+/// 1.68 / 0.36 over 32k; D = 128 0.40 / 0.31 and 2.08 / 0.63.
 pub const fn packed_tiled_min_query_tokens(head_dimension: usize) -> usize {
     if head_dimension >= 256 {
         32
@@ -180,10 +191,72 @@ pub const fn packed_tiled_min_query_tokens(head_dimension: usize) -> usize {
     }
 }
 
+/// SIMD groups per NAX threadgroup; each owns sixteen query rows (one 16-row NAX fragment, as in
+/// MLX's `steel_attention_nax`). Eight rather than MLX's four: each dequantized block is shared by
+/// 128 rows instead of 64. SC-20676 synthetic chunked-prefill sweep (M5 Max, bf16, Hq = 24,
+/// Hkv = 8, D = 128, 2048-row chunks, all chunks evaluated together), NAX ms / dense SDPA ms:
+/// 4 groups 10.7 / 8.4 over 8k and 165.6 / 141.6 over 32k; 8 groups 9.9 / 8.3 and 160.5 / 150.0;
+/// 16 groups 11.5 / 8.4 and 176.4 / 157.7.
+const NAX_SIMD_GROUPS: usize = 8;
+/// Query rows (position × GQA head) one NAX threadgroup serves.
+const NAX_ROWS: usize = NAX_SIMD_GROUPS * 16;
+/// KV tokens per NAX block: one packed K token group, MLX's `bk = 32`. The bf16/f16 K and V tiles
+/// take `2 · 32 · (D + 8) · 2` bytes of threadgroup memory (9 KiB at D = 64, 17 KiB at D = 128).
+const NAX_BLOCK_TOKENS: usize = 32;
+
+/// Whether MLX's own Metal backend runs its Neural-Accelerator kernels in this process: the linked,
+/// pinned MLX's `mlx::core::metal::is_nax_available()`. It is false when MLX was built with
+/// `MLX_METAL_NO_NAX` (Metal < 4.0, SDK or deployment target below macOS 26.2), when the running
+/// OS is older than macOS 26.2, or when the GPU architecture generation — parsed from
+/// `MLX_METAL_GPU_ARCH` or `MTLDevice.architecture.name` — is below 17 (18 for phone GPUs). The
+/// packed reader calls the predicate instead of re-deriving it, so it can never disagree with
+/// MLX's dense `steel_attention_nax` selection (which additionally requires 16-bit inputs unless
+/// `MLX_ENABLE_TF32`; see [`PackedNaxSelection`]).
+#[cfg(target_os = "macos")]
+pub fn mlx_nax_available() -> bool {
+    // MLX keeps this predicate in its C++ Metal backend (no mlx-c binding); the static library is
+    // the exact pinned build every MLX dispatch in this process uses. `bool f()` has the same
+    // AArch64 calling convention in C and C++.
+    unsafe extern "C" {
+        #[link_name = "_ZN3mlx4core5metal16is_nax_availableEv"]
+        fn mlx_metal_is_nax_available() -> bool;
+    }
+    // SAFETY: a no-argument predicate; MLX caches its result in a function-local static.
+    unsafe { mlx_metal_is_nax_available() }
+}
+
+/// Non-macOS builds have no MLX Metal backend, hence no Neural Accelerator.
+#[cfg(not(target_os = "macos"))]
+pub fn mlx_nax_available() -> bool {
+    false
+}
+
+/// Head dimensions MLX instantiates `steel_attention_nax` for (`bd` 64 and 128).
+pub const fn packed_nax_head_dimension_supported(head_dimension: usize) -> bool {
+    matches!(head_dimension, 64 | 128)
+}
+
+/// The NAX decision for one multi-row step and why, recorded in [`PackedKernelDescriptor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedNaxSelection {
+    pub selected: bool,
+    pub reason: &'static str,
+}
+
+const NAX_SELECTED: &str = "mlx::core::metal::is_nax_available() and 16-bit queries at D 64/128";
+const NAX_CONSERVATIVE: &str = "conservative GPU family never runs the tiled kernels";
+const NAX_UNAVAILABLE: &str = "mlx::core::metal::is_nax_available() is false (MLX built without \
+     NAX, macOS < 26.2, or GPU generation < 17)";
+const NAX_F32_QUERY: &str = "f32 queries keep the fp32 tiled kernel: NAX products are 16-bit (MLX \
+     runs f32 on NAX only as TF32, which the f32 1e-4 contract excludes)";
+const NAX_HEAD_DIMENSION: &str = "MLX instantiates NAX attention for D 64/128 only";
+
 /// Static geometry of one packed kernel path, for evidence and comparison receipts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedKernelDescriptor {
     pub kernel: &'static str,
+    /// Why this kernel was selected over the NAX tiled kernel (or that NAX was selected).
+    pub selection: &'static str,
     pub threads: usize,
     pub simd_groups: usize,
     /// KV tokens one barrier-delimited step covers.
@@ -209,6 +282,8 @@ pub enum PackedKernelPath {
     PerRow { splits: usize },
     /// Tiled multi-row flash attention with block-shared dequantized K/V.
     Tiled { splits: usize },
+    /// The tiled mechanism with 16-bit K/V tiles and Neural-Accelerator matrix products.
+    NaxTiled { splits: usize },
 }
 
 const HEADER: &str = r#"#include <metal_stdlib>
@@ -700,6 +775,322 @@ const TILED_PARTIAL_EPILOGUE: &str = r#"
             }
 "#;
 
+/// Neural-Accelerator (NAX) tiled core: the tiled kernel's mechanism with MLX's
+/// `steel_attention_nax` matrix products (`mpp::tensor_ops::matmul2d`, 16×32×16 per SIMD group, the
+/// fragment layout of MLX's `BaseNAXFrag`). A threadgroup of `WM` SIMD groups owns `16·WM` query
+/// rows of one KV head (row `m` = query position `m / gqa`, GQA head `m % gqa`); each lane holds rows
+/// `fm` and `fm + 8` of its SIMD group's 16-row fragment and columns `fn..fn+3`. Per KV block of
+/// `BK` tokens the threadgroup dequantizes packed K and V once into `T` (bf16/f16, the query dtype)
+/// threadgroup tiles (tail tokens from the dense residual inputs, tokens past the live extent
+/// zero); every SIMD group then runs `S = Q·Kᵀ` and `O += P·V` on the accelerator with fp32
+/// accumulation, and keeps the online softmax (log2 domain, fp32) in registers. Blocks outside the
+/// tile's causal/sliding range are never visited, blocks visible to every row skip the
+/// per-element mask, and split partials use the shared reduction pass.
+///
+/// Every helper is force-inlined and every fixed-trip loop fully unrolled (MLX's `METAL_FUNC` and
+/// `STEEL_PRAGMA_UNROLL`): one dynamically indexed fragment array (e.g. the output accumulators in
+/// a rolled epilogue loop) moves it from registers to stack memory for the whole kernel, which made
+/// a verbatim port of MLX's dense NAX loop three times slower than MLX's own build of it.
+const NAX_HEADER: &str = r#"
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+// MLX BaseNAXFrag::get_coord: (column, row) of this lane's first element of a 16×16 fragment; the
+// lane holds rows `fm` and `fm + 8`, columns `fn..fn+3` of each.
+inline __attribute__((always_inline)) short2 sc20676_nax_coord(uint lane) {
+    const short qid = short(lane >> 2);
+    const short fm = (qid & 4) | short((lane >> 1) & 3u);
+    const short fn = ((qid & 2) | short(lane & 1u)) * 4;
+    return short2(fn, fm);
+}
+
+// C[16×32] += A[16×16] · B[16×32] on the matrix unit, B given as two 16×16 fragments (rows of `Bᵀ`
+// when `TB`), exactly MLX BaseNAXFrag::mma's first form.
+template <bool TB, typename AT, typename BT>
+inline __attribute__((always_inline)) void sc20676_nax_mma(thread vec<float, 8>& c0, thread vec<float, 8>& c1,
+                            thread const vec<AT, 8>& a, thread const vec<BT, 8>& b0,
+                            thread const vec<BT, 8>& b1) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16, 32, 16, false, TB, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    auto ct_a = op.template get_left_input_cooperative_tensor<AT, BT, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<AT, BT, float>();
+    auto ct_c = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), float>();
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 8; ++i) {
+        ct_a[i] = a[i];
+        ct_b[i] = b0[i];
+        ct_b[8 + i] = b1[i];
+        ct_c[i] = c0[i];
+        ct_c[8 + i] = c1[i];
+    }
+    op.run(ct_a, ct_b, ct_c);
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 8; ++i) {
+        c0[i] = ct_c[i];
+        c1[i] = ct_c[8 + i];
+    }
+}
+
+// Rows fm, fm+8 × columns fn..fn+3 of the 16×16 fragment at (`row0`, `col0`) of a threadgroup tile.
+template <typename T, int LD>
+inline __attribute__((always_inline)) vec<T, 8> sc20676_nax_tile_frag(const threadgroup T* tile, short2 coord, uint row0, uint col0) {
+    const threadgroup T* base = tile + (row0 + coord.y) * LD + col0 + coord.x;
+    const vec<T, 4> lo = *(const threadgroup vec<T, 4>*)(base);
+    const vec<T, 4> hi = *(const threadgroup vec<T, 4>*)(base + 8 * LD);
+    return vec<T, 8>(lo, hi);
+}
+
+template <int D, int BK, int WM, int MASK_MODE, int WINDOW, typename T, typename KT, typename VT>
+inline __attribute__((always_inline)) void sc20676_nax(
+    const device T* q, const device uint8_t* k_codes, const device half* k_scale,
+    const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
+    const device half* v_scale, const device half* v_zero, const device VT* v_tail,
+    uint k_packed, uint v_packed, uint kv_len, uint HQ, uint SQ, uint HKV, uint KG_CAP,
+    uint KT_CAP, uint V_CAP, uint VT_CAP, threadgroup T* k_tile, threadgroup T* v_tile,
+    uint tid, uint lane, uint sg, uint tile, uint kv_row, uint split, uint splits,
+    thread vec<float, 8>* o, thread float* row_max, thread float* row_sum,
+    thread uint* out_row, thread bool* valid) {
+    constexpr uint G = 32;
+    constexpr uint KW = G * D / 4;
+    constexpr uint VW = D / 4;
+    constexpr uint VG = D / G;
+    constexpr int LD = D + 8;
+    constexpr int DT = D / 16;
+    constexpr int KF = BK / 16;
+    constexpr uint BQ = 16 * WM;
+    // Dequantization ownership: thread `tid` fills channel quad `c_quad` of token rows
+    // `t_row, t_row + TSTEP, ...` of each block.
+    constexpr uint TSTEP = 32 * WM / (D / 4);
+    static_assert(BK == G, "a NAX block is one packed K token group");
+    static_assert((32 * WM) % (D / 4) == 0 && BK % TSTEP == 0, "dequantization ownership");
+    const uint c_quad = (tid % (D / 4)) * 4;
+    const uint t_row = tid / (D / 4);
+    const uint gqa = HQ / HKV;
+    const uint rows = SQ * gqa;
+    const uint b = kv_row / HKV;
+    const uint kvh = kv_row % HKV;
+    const short2 coord = sc20676_nax_coord(lane);
+    const uint qoff = kv_len - SQ;
+    uint hi[2];
+    uint lo[2];
+    const device T* q_row[2];
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; ++i) {
+        const uint m = tile * BQ + sg * 16 + coord.y + 8 * i;
+        valid[i] = m < rows;
+        const uint mc = min(m, rows - 1);
+        const uint qi = mc / gqa;
+        out_row[i] = (b * HQ + kvh * gqa + mc % gqa) * SQ + qi;
+        hi[i] = MASK_MODE == 0 ? kv_len : qoff + qi + 1;
+        lo[i] = (MASK_MODE == 2 && hi[i] > uint(WINDOW)) ? hi[i] - uint(WINDOW) : 0;
+        q_row[i] = q + out_row[i] * D + coord.x;
+    }
+    // Tile-wide bounds: the union of the rows' ranges is visited; the intersection needs no mask.
+    const uint first_qi = (tile * BQ) / gqa;
+    const uint last_qi = (min(tile * BQ + BQ, rows) - 1) / gqa;
+    const uint tile_hi = MASK_MODE == 0 ? kv_len : qoff + last_qi + 1;
+    const uint first_hi = MASK_MODE == 0 ? kv_len : qoff + first_qi + 1;
+    const uint tile_lo = (MASK_MODE == 2 && first_hi > uint(WINDOW)) ? first_hi - uint(WINDOW) : 0;
+    const uint full_hi = first_hi;
+    const uint full_lo = (MASK_MODE == 2 && tile_hi > uint(WINDOW)) ? tile_hi - uint(WINDOW) : 0;
+    const uint first_block = tile_lo / BK;
+    const uint end_block = (tile_hi + BK - 1) / BK;
+    const uint per_split = (end_block - first_block + splits - 1) / splits;
+    const uint block_begin = min(end_block, first_block + split * per_split);
+    const uint block_end = min(end_block, block_begin + per_split);
+
+    const float scale2 = rsqrt(float(D)) * M_LOG2E_F;
+#pragma clang loop unroll(full)
+    for (int d = 0; d < DT; ++d) o[d] = vec<float, 8>(0.0f);
+    float run_max[2] = {-INFINITY, -INFINITY};
+    float run_sum[2] = {0.0f, 0.0f};
+
+    for (uint blk = block_begin; blk < block_end; ++blk) {
+        const uint t0 = blk * BK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t0 + BK <= k_packed && t0 + BK <= v_packed) {
+            // Whole block packed (the prefill steady state): each thread owns one channel quad
+            // for the block, so the block's K scale/zero (one token group) load once per thread.
+            const uint grp = kv_row * KG_CAP + blk;
+            const float4 ks = sc20676_load4(k_scale + grp * D + c_quad);
+            const float4 kz = sc20676_load4(k_zero + grp * D + c_quad);
+            const device uint8_t* kc = k_codes + grp * KW + c_quad / 4;
+#pragma clang loop unroll(full)
+            for (uint r = 0; r < BK / TSTEP; ++r) {
+                const uint tt = t_row + r * TSTEP;
+                const float4 kv = kz + ks * sc20676_codes4(kc[tt * (D / 4)]);
+                *(threadgroup vec<T, 4>*)(k_tile + tt * LD + c_quad) = vec<T, 4>(kv);
+                const uint vrow = kv_row * V_CAP + t0 + tt;
+                const uint meta = vrow * VG + c_quad / G;
+                const float4 vv = float(v_zero[meta])
+                    + float(v_scale[meta]) * sc20676_codes4(v_codes[vrow * VW + c_quad / 4]);
+                *(threadgroup vec<T, 4>*)(v_tile + tt * LD + c_quad) = vec<T, 4>(vv);
+            }
+        } else {
+#pragma clang loop unroll(full)
+            for (uint r = 0; r < BK / TSTEP; ++r) {
+                const uint tt = t_row + r * TSTEP;
+                const uint t = t0 + tt;
+                float4 kv = float4(0.0f);
+                float4 vv = float4(0.0f);
+                if (t < kv_len) {
+                    if (t < k_packed) {
+                        const uint grp = kv_row * KG_CAP + t / G;
+                        const float4 codes =
+                            sc20676_codes4(k_codes[grp * KW + ((t % G) * D + c_quad) / 4]);
+                        kv = sc20676_load4(k_zero + grp * D + c_quad)
+                            + sc20676_load4(k_scale + grp * D + c_quad) * codes;
+                    } else {
+                        kv = sc20676_load4(k_tail + (kv_row * KT_CAP + (t - k_packed)) * D + c_quad);
+                    }
+                    if (t < v_packed) {
+                        const uint vrow = kv_row * V_CAP + t;
+                        const uint meta = vrow * VG + c_quad / G;
+                        vv = float(v_zero[meta])
+                            + float(v_scale[meta]) * sc20676_codes4(v_codes[vrow * VW + c_quad / 4]);
+                    } else {
+                        vv = sc20676_load4(v_tail + (kv_row * VT_CAP + (t - v_packed)) * D + c_quad);
+                    }
+                }
+                *(threadgroup vec<T, 4>*)(k_tile + tt * LD + c_quad) = vec<T, 4>(kv);
+                *(threadgroup vec<T, 4>*)(v_tile + tt * LD + c_quad) = vec<T, 4>(vv);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        vec<float, 8> s[KF];
+#pragma clang loop unroll(full)
+        for (int f = 0; f < KF; ++f) s[f] = vec<float, 8>(0.0f);
+#pragma clang loop unroll(full)
+        for (int f = 0; f < KF; f += 2) {
+#pragma clang loop unroll(full)
+            for (int d = 0; d < DT; ++d) {
+                // Query fragments are re-read per block (cache-resident), as MLX's NAX attention
+                // does, rather than held in registers across the KV loop.
+                const vec<T, 8> qd = vec<T, 8>(*(const device vec<T, 4>*)(q_row[0] + d * 16),
+                                               *(const device vec<T, 4>*)(q_row[1] + d * 16));
+                const vec<T, 8> k0 = sc20676_nax_tile_frag<T, LD>(k_tile, coord, f * 16, d * 16);
+                const vec<T, 8> k1 = sc20676_nax_tile_frag<T, LD>(k_tile, coord, f * 16 + 16, d * 16);
+                sc20676_nax_mma<true>(s[f], s[f + 1], qd, k0, k1);
+            }
+        }
+        const bool full = t0 >= full_lo && t0 + BK <= full_hi;
+        float block_max[2] = {-INFINITY, -INFINITY};
+#pragma clang loop unroll(full)
+        for (int f = 0; f < KF; ++f) {
+#pragma clang loop unroll(full)
+            for (short i = 0; i < 2; ++i) {
+#pragma clang loop unroll(full)
+                for (short j = 0; j < 4; ++j) {
+                    const uint t = t0 + f * 16 + coord.x + j;
+                    float v = s[f][4 * i + j] * scale2;
+                    if (!full && (t >= hi[i] || t < lo[i])) v = -INFINITY;
+                    s[f][4 * i + j] = v;
+                    block_max[i] = max(block_max[i], v);
+                }
+            }
+        }
+        float factor[2];
+#pragma clang loop unroll(full)
+        for (short i = 0; i < 2; ++i) {
+            block_max[i] = max(block_max[i], simd_shuffle_xor(block_max[i], 1));
+            block_max[i] = max(block_max[i], simd_shuffle_xor(block_max[i], 8));
+            const float next_max = max(run_max[i], block_max[i]);
+            factor[i] = run_max[i] == -INFINITY ? 0.0f : fast::exp2(run_max[i] - next_max);
+            float block_sum = 0.0f;
+#pragma clang loop unroll(full)
+            for (int f = 0; f < KF; ++f) {
+#pragma clang loop unroll(full)
+                for (short j = 0; j < 4; ++j) {
+                    const float v = s[f][4 * i + j];
+                    const float p = v == -INFINITY ? 0.0f : fast::exp2(v - next_max);
+                    s[f][4 * i + j] = p;
+                    block_sum += p;
+                }
+            }
+            block_sum += simd_shuffle_xor(block_sum, 1);
+            block_sum += simd_shuffle_xor(block_sum, 8);
+            run_sum[i] = run_sum[i] * factor[i] + block_sum;
+            run_max[i] = next_max;
+        }
+#pragma clang loop unroll(full)
+        for (int d = 0; d < DT; ++d) {
+#pragma clang loop unroll(full)
+            for (short j = 0; j < 4; ++j) {
+                o[d][j] *= factor[0];
+                o[d][4 + j] *= factor[1];
+            }
+        }
+#pragma clang loop unroll(full)
+        for (int d = 0; d < DT; d += 2) {
+#pragma clang loop unroll(full)
+            for (int f = 0; f < KF; ++f) {
+                const vec<T, 8> v0 = sc20676_nax_tile_frag<T, LD>(v_tile, coord, f * 16, d * 16);
+                const vec<T, 8> v1 = sc20676_nax_tile_frag<T, LD>(v_tile, coord, f * 16, d * 16 + 16);
+                sc20676_nax_mma<false>(o[d], o[d + 1], s[f], v0, v1);
+            }
+        }
+    }
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; ++i) {
+        row_max[i] = run_max[i];
+        row_sum[i] = run_sum[i];
+    }
+}
+"#;
+
+/// Per-call NAX body: grid `x` = query-row tiles, `y` = batch × KV head, `z` = KV splits.
+const NAX_BODY: &str = r#"
+    using T = metal::remove_cv_t<typename sc20676_device_element<decltype(q)>::type>;
+    threadgroup T k_tile[BK * (D + 8)];
+    threadgroup T v_tile[BK * (D + 8)];
+    vec<float, 8> o[D / 16];
+    float row_max[2];
+    float row_sum[2];
+    uint out_row[2];
+    bool valid[2];
+    const uint split = threadgroup_position_in_grid.z;
+    const uint splits = threadgroups_per_grid.z;
+    sc20676_nax<D, BK, WM, MASK_MODE, WINDOW>(
+        q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
+        uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]),
+        uint(k_codes_shape[2]), uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]),
+        k_tile, v_tile, thread_index_in_threadgroup, thread_index_in_simdgroup,
+        simdgroup_index_in_threadgroup, threadgroup_position_in_grid.x,
+        threadgroup_position_in_grid.y, split, splits, o, row_max, row_sum, out_row, valid);
+    const short col = sc20676_nax_coord(thread_index_in_simdgroup).x;
+#pragma clang loop unroll(full)
+    for (short i = 0; i < 2; ++i) {
+        if (!valid[i]) continue;
+#pragma clang loop unroll(full)
+        for (uint d = 0; d < uint(D / 16); ++d) {
+#pragma clang loop unroll(full)
+            for (short j = 0; j < 4; ++j) {
+                const uint c = d * 16 + col + j;
+                const float value = o[d][4 * i + j];
+                SC20676_NAX_EPILOGUE
+            }
+        }
+    }
+"#;
+
+const NAX_SINGLE_EPILOGUE: &str = r#"
+                using OutputT = typename sc20676_device_element<decltype(out)>::type;
+                out[out_row[i] * D + c] =
+                    static_cast<OutputT>(row_sum[i] > 0.0f ? value / row_sum[i] : 0.0f);
+"#;
+
+// The lane holding column 0 of a fragment row writes the row's maximum and normalizer.
+const NAX_PARTIAL_EPILOGUE: &str = r#"
+                const uint slot = out_row[i] * splits + split;
+                part_acc[slot * D + c] = value;
+                if (c == 0) {
+                    part_max[slot] = row_max[i];
+                    part_sum[slot] = row_sum[i];
+                }
+"#;
+
 const ATTEND_INPUTS: [&str; 10] = [
     "q", "k_codes", "k_scale", "k_zero", "k_tail", "v_codes", "v_scale", "v_zero", "v_tail",
     "params",
@@ -746,8 +1137,12 @@ pub struct PackedMetalKernel {
     reduce: MetalKernel,
     tiled_single: MetalKernel,
     tiled_partial: MetalKernel,
+    nax_single: MetalKernel,
+    nax_partial: MetalKernel,
     identity: String,
     gpu_family: PackedMetalGpuFamily,
+    /// [`mlx_nax_available`], probed once at construction on the qualified family only.
+    nax_available: bool,
 }
 
 impl crate::primitives::packed_group_affine_kv::RetainedPackedKernel for PackedMetalKernel {
@@ -772,6 +1167,7 @@ impl std::fmt::Debug for PackedMetalKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PackedMetalKernel")
             .field("gpu_family", &self.gpu_family)
+            .field("nax_available", &self.nax_available)
             .finish_non_exhaustive()
     }
 }
@@ -924,7 +1320,30 @@ impl PackedMetalKernel {
         let tiled_header = format!("{HEADER}{TILED_HEADER}");
         let tiled_single = TILED_BODY.replace("SC20676_TILED_EPILOGUE", TILED_SINGLE_EPILOGUE);
         let tiled_partial = TILED_BODY.replace("SC20676_TILED_EPILOGUE", TILED_PARTIAL_EPILOGUE);
+        let nax_header = format!("{tiled_header}{NAX_HEADER}");
+        let nax_single = NAX_BODY.replace("SC20676_NAX_EPILOGUE", NAX_SINGLE_EPILOGUE);
+        let nax_partial = NAX_BODY.replace("SC20676_NAX_EPILOGUE", NAX_PARTIAL_EPILOGUE);
         Ok(Self {
+            // Compiled on first run only, so a device without the Neural Accelerator (whose Metal
+            // compiler may lack MetalPerformancePrimitives) never builds these pipelines.
+            nax_single: MetalKernel::with_options(
+                "sc20676_nax",
+                &ATTEND_INPUTS,
+                &["out"],
+                &nax_single,
+                &nax_header,
+                true,
+                false,
+            )?,
+            nax_partial: MetalKernel::with_options(
+                "sc20676_nax_split",
+                &ATTEND_INPUTS,
+                &["part_acc", "part_max", "part_sum"],
+                &nax_partial,
+                &nax_header,
+                true,
+                false,
+            )?,
             tiled_single: MetalKernel::with_options(
                 "sc20676_tiled",
                 &ATTEND_INPUTS,
@@ -972,7 +1391,44 @@ impl PackedMetalKernel {
             )?,
             identity: identity.into(),
             gpu_family,
+            nax_available: gpu_family == PackedMetalGpuFamily::Apple7OrNewer && mlx_nax_available(),
         })
+    }
+
+    /// Test seam: behave as on a device where MLX reports no Neural Accelerator.
+    #[cfg(test)]
+    pub(crate) fn without_nax(mut self) -> Self {
+        self.nax_available = false;
+        self
+    }
+
+    /// Whether this reader may run the NAX tiled kernel at all ([`mlx_nax_available`] on the
+    /// qualified family).
+    pub fn nax_available(&self) -> bool {
+        self.nax_available
+    }
+
+    /// Whether a multi-row step with `query_dtype` queries at `head_dimension` runs the NAX tiled
+    /// kernel rather than the fp32 tiled kernel, and why.
+    pub fn nax_selection(&self, head_dimension: usize, query_dtype: Dtype) -> PackedNaxSelection {
+        let rejected = |reason| PackedNaxSelection {
+            selected: false,
+            reason,
+        };
+        if self.gpu_family != PackedMetalGpuFamily::Apple7OrNewer {
+            rejected(NAX_CONSERVATIVE)
+        } else if !self.nax_available {
+            rejected(NAX_UNAVAILABLE)
+        } else if !matches!(query_dtype, Dtype::Bfloat16 | Dtype::Float16) {
+            rejected(NAX_F32_QUERY)
+        } else if !packed_nax_head_dimension_supported(head_dimension) {
+            rejected(NAX_HEAD_DIMENSION)
+        } else {
+            PackedNaxSelection {
+                selected: true,
+                reason: NAX_SELECTED,
+            }
+        }
     }
 
     pub fn gpu_family(&self) -> PackedMetalGpuFamily {
@@ -993,7 +1449,9 @@ impl PackedMetalKernel {
     /// KV splits of the kernel [`Self::planned_path`] selects (1 = single pass).
     pub fn planned_splits(&self, args: &PackedAttentionArgs<'_>) -> Result<usize> {
         Ok(match self.planned_path(args)? {
-            PackedKernelPath::PerRow { splits } | PackedKernelPath::Tiled { splits } => splits,
+            PackedKernelPath::PerRow { splits }
+            | PackedKernelPath::Tiled { splits }
+            | PackedKernelPath::NaxTiled { splits } => splits,
         })
     }
 
@@ -1004,17 +1462,34 @@ impl PackedMetalKernel {
             && query_tokens >= packed_tiled_min_query_tokens(head_dimension)
     }
 
-    /// Geometry of the kernel [`Self::dispatch`] runs for a step of `query_tokens` rows, or `None`
-    /// for an unsupported head dimension.
+    /// Geometry of the kernel [`Self::dispatch`] runs for a step of `query_tokens` rows of
+    /// `query_dtype` queries, or `None` for an unsupported head dimension.
     pub fn kernel_descriptor(
         &self,
         query_tokens: usize,
         head_dimension: usize,
+        query_dtype: Dtype,
     ) -> Option<PackedKernelDescriptor> {
         let tuning = self.gpu_family.tuning(head_dimension)?;
-        Some(if self.selects_tiled(query_tokens, head_dimension) {
+        let nax = self.nax_selection(head_dimension, query_dtype);
+        let tiled = self.selects_tiled(query_tokens, head_dimension);
+        Some(if tiled && nax.selected {
+            PackedKernelDescriptor {
+                kernel: "sc20676_nax_tiled_matmul2d",
+                selection: nax.reason,
+                threads: NAX_SIMD_GROUPS * SIMD_WIDTH,
+                simd_groups: NAX_SIMD_GROUPS,
+                kv_block_tokens: NAX_BLOCK_TOKENS,
+                threadgroup_barriers_per_kv_block: 2,
+                softmax_state: "fp32 registers per 16-row NAX fragment (two shuffles per row \
+                                reduction); K/V blocks dequantized once into 16-bit threadgroup \
+                                tiles; S = Q·Kᵀ and O += P·V on mpp matmul2d; split-KV partials \
+                                merged by a reduce pass",
+            }
+        } else if tiled {
             PackedKernelDescriptor {
                 kernel: "sc20676_tiled_multi_row_simdgroup_matrix",
+                selection: nax.reason,
                 threads: TILED_SIMD_GROUPS * SIMD_WIDTH,
                 simd_groups: TILED_SIMD_GROUPS,
                 kv_block_tokens: tiled_block_tokens(head_dimension),
@@ -1026,6 +1501,8 @@ impl PackedMetalKernel {
         } else {
             PackedKernelDescriptor {
                 kernel: "sc20676_split_kv_simdgroup",
+                selection: "fewer query rows than packed_tiled_min_query_tokens, or the \
+                            conservative family",
                 threads: tuning.threads,
                 simd_groups: tuning.simd_groups,
                 kv_block_tokens: PACKED_METAL_QUANT_GROUP_SIZE,
@@ -1048,6 +1525,14 @@ impl PackedMetalKernel {
     pub fn planned_path(&self, args: &PackedAttentionArgs<'_>) -> Result<PackedKernelPath> {
         let validated = validate_dispatch(args)?;
         if self.selects_tiled(validated.query_tokens, validated.head_dimension) {
+            if self
+                .nax_selection(validated.head_dimension, args.query.dtype())
+                .selected
+            {
+                return Ok(PackedKernelPath::NaxTiled {
+                    splits: nax_splits(&validated),
+                });
+            }
             return Ok(PackedKernelPath::Tiled {
                 splits: tiled_splits(&validated),
             });
@@ -1064,9 +1549,42 @@ impl PackedMetalKernel {
 
     pub fn dispatch(&self, args: &PackedAttentionArgs<'_>) -> Result<Array> {
         match self.planned_path(args)? {
+            PackedKernelPath::NaxTiled { .. } => self.dispatch_nax(args, None),
             PackedKernelPath::Tiled { .. } => self.dispatch_tiled(args, None),
             PackedKernelPath::PerRow { .. } => self.dispatch_with_splits(args, None),
         }
+    }
+
+    /// Run the NAX tiled kernel regardless of `S_q`, with an explicit KV split count (`None` =
+    /// [`packed_tiled_split_count`] over 64-row tiles). Test, benchmark, and evidence seam; refused
+    /// wherever [`Self::nax_selection`] rejects NAX for the query dtype and head dimension.
+    pub fn dispatch_nax(
+        &self,
+        args: &PackedAttentionArgs<'_>,
+        splits: Option<usize>,
+    ) -> Result<Array> {
+        let validated = validate_dispatch(args)?;
+        let selection = self.nax_selection(validated.head_dimension, args.query.dtype());
+        if !selection.selected {
+            return Err(Error::Unsupported(format!(
+                "SC-20676 NAX tiled kernel refused: {}",
+                selection.reason
+            )));
+        }
+        let splits = splits
+            .unwrap_or_else(|| nax_splits(&validated))
+            .clamp(1, MAX_KV_SPLITS);
+        let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
+            .div_ceil(NAX_ROWS);
+        self.dispatch_tiles(
+            args,
+            &validated,
+            [&self.nax_single, &self.nax_partial],
+            tiles,
+            NAX_SIMD_GROUPS,
+            NAX_BLOCK_TOKENS,
+            splits,
+        )
     }
 
     /// Run the tiled multi-row kernel regardless of `S_q`, with an explicit KV split count
@@ -1086,11 +1604,35 @@ impl PackedMetalKernel {
         let splits = splits
             .unwrap_or_else(|| tiled_splits(&validated))
             .clamp(1, MAX_KV_SPLITS);
-        let head_dimension = validated.head_dimension;
-        let params = dispatch_params(args)?;
         let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
             .div_ceil(TILED_ROWS);
-        let threads = TILED_SIMD_GROUPS * SIMD_WIDTH;
+        self.dispatch_tiles(
+            args,
+            &validated,
+            [&self.tiled_single, &self.tiled_partial],
+            tiles,
+            TILED_SIMD_GROUPS,
+            tiled_block_tokens(validated.head_dimension),
+            splits,
+        )
+    }
+
+    /// Encode one tiled-family dispatch (fp32 tiled or NAX): grid `x` = row tiles, `y` = batch ×
+    /// KV head, `z` = KV splits, then the shared reduction when split.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_tiles(
+        &self,
+        args: &PackedAttentionArgs<'_>,
+        validated: &ValidatedDispatch,
+        [single, partial]: [&MetalKernel; 2],
+        tiles: usize,
+        simd_groups: usize,
+        block_tokens: usize,
+        splits: usize,
+    ) -> Result<Array> {
+        let head_dimension = validated.head_dimension;
+        let params = dispatch_params(args)?;
+        let threads = simd_groups * SIMD_WIDTH;
         let grid_x = tiles
             .checked_mul(threads)
             .ok_or_else(|| Error::Unsupported("SC-20676 Metal grid dimension overflow".into()))
@@ -1099,13 +1641,9 @@ impl PackedMetalKernel {
         let splits_i32 = checked_msl_i32(splits, "KV splits")?;
         let threads = checked_msl_i32(threads, "thread-group width")?;
         let head_i32 = checked_msl_i32(head_dimension, "head dimension")?;
-        let block = checked_msl_i32(tiled_block_tokens(head_dimension), "tiled block")?;
-        let wm = checked_msl_i32(TILED_SIMD_GROUPS, "tiled SIMD groups")?;
-        let kernel = if splits == 1 {
-            &self.tiled_single
-        } else {
-            &self.tiled_partial
-        };
+        let block = checked_msl_i32(block_tokens, "tiled block")?;
+        let wm = checked_msl_i32(simd_groups, "tiled SIMD groups")?;
+        let kernel = if splits == 1 { single } else { partial };
         let attend = kernel
             .apply()
             .input(args.query)
@@ -1309,8 +1847,17 @@ fn dispatch_params(args: &PackedAttentionArgs<'_>) -> Result<Array> {
 
 /// Tiled split count for a validated dispatch (threadgroups = row tiles × batch × KV heads).
 fn tiled_splits(validated: &ValidatedDispatch) -> usize {
+    tile_splits(validated, TILED_ROWS)
+}
+
+/// NAX split count: the tiled heuristic over 64-row tiles.
+fn nax_splits(validated: &ValidatedDispatch) -> usize {
+    tile_splits(validated, NAX_ROWS)
+}
+
+fn tile_splits(validated: &ValidatedDispatch, rows_per_tile: usize) -> usize {
     let tiles = (validated.query_tokens * (validated.query_heads / validated.kv_heads))
-        .div_ceil(TILED_ROWS);
+        .div_ceil(rows_per_tile);
     packed_tiled_split_count(
         tiles * validated.batch * validated.kv_heads,
         validated.visible_tokens,
@@ -1748,7 +2295,7 @@ mod tests {
             samples.sort_by(f64::total_cmp);
             samples[2]
         };
-        eprintln!("D\tkv\tS_q\tper-row conservative ms\tper-row apple7 ms\ttiled ms");
+        eprintln!("D\tkv\tS_q\tper-row conservative ms\tper-row apple7 ms\ttiled ms\tNAX tiled ms");
         for d in [64, 128, 256] {
             let layer = synthetic_packed_layer(32_768, d);
             for kv in [4096usize, 32_768] {
@@ -1759,7 +2306,17 @@ mod tests {
                         median(&|| conservative.dispatch_with_splits(&args, None).unwrap());
                     let per_row_r = median(&|| recent.dispatch_with_splits(&args, None).unwrap());
                     let tiled = median(&|| recent.dispatch_tiled(&args, None).unwrap());
-                    eprintln!("{d}\t{kv}\t{rows}\t{per_row_c:.3}\t{per_row_r:.3}\t{tiled:.3}");
+                    let nax = if packed_nax_head_dimension_supported(d as usize) {
+                        format!(
+                            "{:.3}",
+                            median(&|| recent.dispatch_nax(&args, None).unwrap())
+                        )
+                    } else {
+                        "-".into()
+                    };
+                    eprintln!(
+                        "{d}\t{kv}\t{rows}\t{per_row_c:.3}\t{per_row_r:.3}\t{tiled:.3}\t{nax}"
+                    );
                 }
             }
         }
@@ -1789,19 +2346,20 @@ mod tests {
         };
         let (dense_keys, dense_values) = (dense(), dense());
         let scale = (BENCH_DIM as f32).powf(-0.5);
-        eprintln!("total\tchunk\tpath\tchunks\tmean ms/chunk\tlast-chunk ms\ttotal ms");
+        eprintln!("total\tchunk\tpath\tchunks\tmean ms/chunk\tlast-chunk ms\ttotal ms\tbatched ms");
         for chunk in [512, 2048] {
             let query = bench_query(chunk, BENCH_DIM);
             let chunks = total / chunk;
             // Warm every pipeline once on the first chunk's geometry.
             let warm = layer.args(&query, chunk as usize);
             kernel.dispatch_tiled(&warm, None).unwrap().eval().unwrap();
+            kernel.dispatch_nax(&warm, None).unwrap().eval().unwrap();
             kernel
                 .dispatch_with_splits(&warm, None)
                 .unwrap()
                 .eval()
                 .unwrap();
-            let paths: [(&str, &dyn Fn(usize) -> Array); 3] = [
+            let paths: [(&str, &dyn Fn(usize) -> Array); 4] = [
                 ("dense-sdpa", &|kv| {
                     let end = kv as i32;
                     let keys = dense_keys.try_index((.., .., 0..end, ..)).unwrap();
@@ -1816,6 +2374,9 @@ mod tests {
                     )
                     .unwrap()
                 }),
+                ("nax-tiled-packed", &|kv| {
+                    kernel.dispatch_nax(&layer.args(&query, kv), None).unwrap()
+                }),
                 ("tiled-packed", &|kv| {
                     kernel
                         .dispatch_tiled(&layer.args(&query, kv), None)
@@ -1829,12 +2390,34 @@ mod tests {
             ];
             for (name, run) in paths {
                 run(chunk as usize).eval().unwrap();
+                // Per chunk, the fastest of three evaluated calls (a shared GPU adds noise).
                 let samples = (1..=chunks)
-                    .map(|index| timed(|| run((index * chunk) as usize)))
+                    .map(|index| {
+                        (0..3)
+                            .map(|_| timed(|| run((index * chunk) as usize)))
+                            .fold(f64::INFINITY, f64::min)
+                    })
                     .collect::<Vec<_>>();
                 let sum = samples.iter().sum::<f64>();
+                // Every chunk encoded lazily and evaluated together: GPU time without the
+                // per-call host round trip (fastest of three). The per-row path is left out: its
+                // chunks together would sit in one command buffer for seconds.
+                let batched = if name == "per-row-packed" {
+                    f64::NAN
+                } else {
+                    (0..3)
+                        .map(|_| {
+                            let started = std::time::Instant::now();
+                            let outputs = (1..=chunks)
+                                .map(|index| run((index * chunk) as usize))
+                                .collect::<Vec<_>>();
+                            mlx_rs::transforms::eval(&outputs).unwrap();
+                            started.elapsed().as_secs_f64() * 1000.0
+                        })
+                        .fold(f64::INFINITY, f64::min)
+                };
                 eprintln!(
-                    "{total}\t{chunk}\t{name}\t{chunks}\t{:.2}\t{:.2}\t{sum:.1}",
+                    "{total}\t{chunk}\t{name}\t{chunks}\t{:.2}\t{:.2}\t{sum:.1}\t{batched:.1}",
                     sum / f64::from(chunks),
                     samples.last().copied().unwrap_or_default()
                 );
