@@ -25,6 +25,11 @@ pre-spawn host free RAM covers cap plus reserve. The admission, with the unknown
 peak recorded as null plus reason, is sealed with every role. A pre-spawn refusal,
 watchdog abort or failed child is written as a sealed unaccepted log record and
 leaves the campaign incomplete; it is never an accepted role.
+
+Safe operator stop: ``touch <resume-dir>/STOP`` (or the ``--stop-file`` path). The launcher
+never signals a running product process; before starting the next role it writes a sealed
+``<resume-dir>/logs/operator-stop.attempt-<n>.json`` ("stopped-by-operator", ``beforeRow``) and
+exits with status 75. Remove the stop file and rerun the same command to resume at that role.
 """
 
 from __future__ import annotations
@@ -943,6 +948,7 @@ def _file_identity(path: Path, relative: str) -> dict[str, Any]:
 def _prepare_media_resume(
     root: Path, *, source: dict[str, Any], model: dict[str, Any],
     policy: supervisor.SafetyPolicy, argv: list[str], timeout: int,
+    stop_file: Path | None = None,
 ) -> dict[str, Any]:
     if not root.is_absolute() or root.is_symlink() or root.resolve() == ROOT.resolve() or ROOT.resolve() in root.resolve().parents:
         raise CampaignError("resume directory must be absolute, nonsymlink, and outside the repository")
@@ -977,7 +983,8 @@ def _prepare_media_resume(
     for entry in root.iterdir():
         if entry.is_symlink():
             raise CampaignError(f"symlinked resume artifact: {entry.name}")
-        if entry.name not in {"identity.json", "identity.json.sha256", "roles", "artifacts", "transcripts", "logs"}:
+        if entry.name not in {"identity.json", "identity.json.sha256", "roles", "artifacts", "transcripts", "logs"} \
+                and not supervisor.is_operator_stop_entry(root, supervisor.operator_stop_file(stop_file, root), entry.name):
             raise CampaignError(f"unexpected resume artifact: {entry.name}")
     return identity
 
@@ -1246,6 +1253,7 @@ def run_matrix(
     evidence_root: Path,
     safety_policy: supervisor.SafetyPolicy,
     resume_identity: dict[str, Any],
+    stop_file: Path | None = None,
 ) -> list[dict[str, Any]]:
     try:
         argv = shlex.split(command)
@@ -1258,7 +1266,8 @@ def run_matrix(
     rows: list[dict[str, Any]] = []
     used_run_ids: set[str] = set()
     used_pids: set[int] = set()
-    for mode, tier in CASES:
+    roles = ("paired", "dense-baseline")
+    for cell_index, (mode, tier) in enumerate(CASES):
         cell_name = f"{mode}-{tier}"
         artifact_dir = evidence_root / "artifacts" / cell_name
         transcript_dir = evidence_root / "transcripts"
@@ -1266,7 +1275,7 @@ def run_matrix(
         cell_started = time.monotonic_ns()
         observations: dict[str, Any] = {}
         transcripts: dict[str, dict[str, Any]] = {}
-        for role in ("paired", "dense-baseline"):
+        for role_index, role in enumerate(roles):
             role_name = f"{cell_name}.{role}"
             saved = _load_resumed_role(evidence_root, role_name, resume_identity)
             if saved is not None:
@@ -1295,6 +1304,11 @@ def run_matrix(
                 if saved["observationSha256"] != _canonical_sha256(observations[role]):
                     raise CampaignError(f"resume role {role_name} observation identity changed")
                 continue
+            # Between roles only: a running product process is never signalled.
+            supervisor.check_operator_stop(
+                stop_file, evidence_root / "logs", kind="sc-20684-operator-stop", before=role_name,
+                index=cell_index * len(roles) + role_index, total=len(CASES) * len(roles),
+            )
             run_id = str(uuid.uuid4())
             env = os.environ.copy()
             env.update({
@@ -1560,6 +1574,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=7200, help="per-cell command timeout in seconds")
     parser.add_argument("--safety-policy", type=Path, required=True, help="mandatory source-bound process safety policy")
     parser.add_argument("--resume-dir", type=Path, required=True, help="absolute external identity-bound role staging")
+    parser.add_argument("--stop-file", type=Path, help="operator stop file checked between roles (default: <resume-dir>/STOP); "
+                        f"its presence halts before the next role with exit status {supervisor.OPERATOR_STOP_EXIT_CODE}")
     args = parser.parse_args()
     try:
         if args.timeout <= 0:
@@ -1577,14 +1593,15 @@ def main() -> int:
             command = shlex.split(args.product_command)
         except ValueError as error:
             raise CampaignError(f"invalid product command: {error}") from error
+        stop_file = supervisor.operator_stop_file(args.stop_file, args.resume_dir)
         resume_identity = _prepare_media_resume(
             args.resume_dir, source=source, model=model, policy=safety_policy,
-            argv=command, timeout=args.timeout,
+            argv=command, timeout=args.timeout, stop_file=stop_file,
         )
         source = resume_identity["source"]
         rows = run_matrix(
             args.product_command, args.snapshot.resolve(), source, model, policy,
-            args.timeout, args.resume_dir, safety_policy, resume_identity,
+            args.timeout, args.resume_dir, safety_policy, resume_identity, stop_file,
         )
         if source_identity()["files"] != source["files"]:
             raise CampaignError("campaign behavior source changed after identity was frozen")
@@ -1594,6 +1611,13 @@ def main() -> int:
             output, source=source, model=model, rows=rows, evidence_root=args.resume_dir,
             policy=policy, safety_policy=safety_policy, resume_identity=resume_identity,
         )
+    except supervisor.OperatorStop as stop:
+        print(f"SC-20684 campaign {stop}", file=sys.stderr)
+        print(json.dumps({
+            "status": "stopped-by-operator", "beforeRow": stop.index,
+            "beforeRowSlug": stop.before, "record": str(stop.record),
+        }, sort_keys=True))
+        return supervisor.OPERATOR_STOP_EXIT_CODE
     except (CampaignError, supervisor.SupervisionError) as error:
         print(f"SC-20684 campaign refused: {error}", file=sys.stderr)
         return 1

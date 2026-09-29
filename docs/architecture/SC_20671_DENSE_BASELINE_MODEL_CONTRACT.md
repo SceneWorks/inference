@@ -23,3 +23,35 @@ identity.
 The benchmark is not runnable by merely materializing a directory. The coordinator must separately
 own the Metal/real-weight lane and run the exact product-loader campaign; this document is the
 pre-results provenance gate, not a substitute for a sealed measurement receipt.
+
+## Operator stop between rows
+
+A campaign parent (`sc20671_kv_baseline parent`, `sc20676_packed_evidence parent`, and the
+SC-20684 / SC-20686 media launchers) can be halted safely: create `<resume-dir>/STOP` (or the path
+given as `--stop-file <path>`). The parent never signals a running worker — killing an MLX render
+mid command buffer can wedge the GPU — so the row in flight finishes and is accepted normally.
+Before spawning the next row it writes a sealed, never-overwritten
+`<resume-dir>/logs/operator-stop.attempt-<n>.json` (`"status": "stopped-by-operator"`,
+`beforeRow`, `beforeRowSlug`, `rowsAccepted`) and exits with status **75** (sysexits
+`EX_TEMPFAIL`), distinct from success and from every refusal/failure status. The stop file is not
+part of the resume identity: remove it and rerun the identical command with the same resume
+directory, and the accepted rows resume while the campaign continues at the stopped row.
+
+## SC-20677 real K/V capture
+
+`sc20677_capture_kv` loads one campaign snapshot through the same `LlamaProvider` campaign load
+and causal decoder, prefills `N-1` tokens of the prompt (repeated/truncated to `--tokens N` with
+the snapshot's tokenizer), runs one real decode step, and writes per-layer `q` `[B,Hq,1,D]`
+(post-RoPE at position `N-1`) and dense-cache `k`/`v` `[B,Hkv,N,D]` safetensors with their scale,
+mask, geometry, dtype, snapshot/prompt digests, and inference revision, plus
+`capture-manifest.json` and `SHA256SUMS`. The worker runs under the campaign supervisor policy
+(child footprint cap, host reserve, deadline). One command captures and compares:
+
+```sh
+cargo run --locked --release -p mlx-llm --bin sc20677_capture_kv -- parent \
+  --snapshot <llama-4bit-snapshot> --prompt-file <prompt.txt> --tokens 8192 \
+  --layers 0,mid,last --safety-policy <policy.json> --out /abs/sc20677-kv-llama && \
+cargo run --locked --release -p mlx-llm --bin sc20677_kv_candidates -- \
+  $(for f in /abs/sc20677-kv-llama/*.safetensors; do printf -- '--kv %s ' "$f"; done) \
+  --out /abs/sc20677-comparison-llama.json
+```

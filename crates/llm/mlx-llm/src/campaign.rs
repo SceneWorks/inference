@@ -3832,6 +3832,144 @@ pub fn load_prepared_coordinate_receipt(
     Ok(PreparedCoordinateReceipt { coordinate, bundle })
 }
 
+/// Process exit status of a campaign parent halted by its operator stop file between rows. It is
+/// distinct from success and from every refusal/failure status: sysexits `EX_TEMPFAIL`, "try
+/// again later" — rerunning the same command against the same resume directory (with the stop
+/// file removed) resumes at the row that was not started.
+pub const OPERATOR_STOP_EXIT_CODE: u8 = 75;
+/// Default stop-file name inside a campaign resume directory (`--stop-file` overrides the path).
+pub const OPERATOR_STOP_FILE_NAME: &str = "STOP";
+
+/// A durable "stopped by operator before row N" status. Rows `0..before_row` are accepted (or
+/// resumed) in the resume directory; row `before_row` and later were never started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorStop {
+    pub before_row: usize,
+    pub row: String,
+    pub rows_total: usize,
+    /// The sealed status record written under the resume directory's `logs/`.
+    pub record: PathBuf,
+}
+
+/// How a campaign parent invocation ended without an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CampaignOutcome {
+    Completed,
+    StoppedByOperator(OperatorStop),
+}
+
+impl CampaignOutcome {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Completed => 0,
+            Self::StoppedByOperator(_) => OPERATOR_STOP_EXIT_CODE,
+        }
+    }
+}
+
+/// `--stop-file <path>`, else `<resume-dir>/STOP`. The stop file is operator control only: it is
+/// never part of a resume identity and never forwarded to a worker.
+pub(crate) fn operator_stop_file(args: &[String], resume_dir: &Path) -> Result<PathBuf, String> {
+    if args.iter().any(|arg| arg == "--stop-file") {
+        required_flag(args, "--stop-file").map(PathBuf::from)
+    } else {
+        Ok(resume_dir.join(OPERATOR_STOP_FILE_NAME))
+    }
+}
+
+/// Whether resume-directory entry `name` is the operator stop file rather than campaign state.
+pub(crate) fn is_operator_stop_entry(resume_dir: &Path, stop_file: &Path, name: &str) -> bool {
+    name == OPERATOR_STOP_FILE_NAME || resume_dir.join(name) == stop_file
+}
+
+/// Checked by a campaign parent only between rows, immediately before it would spawn row
+/// `before_row`'s worker; a running worker is never signalled (killing an MLX render mid command
+/// buffer can wedge the GPU). When the stop file exists this writes a sealed, never-overwritten
+/// `logs/operator-stop.attempt-<n>.json` status record and returns the stop.
+pub(crate) fn operator_stop_before_row(
+    stop_file: &Path,
+    logs: &Path,
+    kind: &str,
+    before_row: usize,
+    row: &str,
+    rows_total: usize,
+) -> Result<Option<OperatorStop>, String> {
+    if fs::symlink_metadata(stop_file).is_err() {
+        return Ok(None);
+    }
+    fs::create_dir_all(logs).map_err(|e| format!("create operator stop log directory: {e}"))?;
+    let record = (0_u64..)
+        .map(|attempt| logs.join(format!("operator-stop.attempt-{attempt}.json")))
+        .find(|path| fs::symlink_metadata(path).is_err())
+        .ok_or("no unused operator stop record path")?;
+    let value = serde_json::json!({
+        "schemaVersion": 1,
+        "kind": kind,
+        "status": "stopped-by-operator",
+        "beforeRow": before_row,
+        "beforeRowSlug": row,
+        "rowsTotal": rows_total,
+        "rowsAccepted": before_row,
+        "stopFile": stop_file.display().to_string(),
+        "recordedAt": timestamp_now(),
+        "resume": "remove the stop file and rerun the same command with the same resume directory",
+    });
+    let bytes = seal_json(&value)?.0;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&record)
+        .map_err(|e| format!("write operator stop record: {e}"))?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    eprintln!(
+        "stopped by operator before row {}/{rows_total} ({row}); stop file {}; status {}",
+        before_row + 1,
+        stop_file.display(),
+        record.display(),
+    );
+    Ok(Some(OperatorStop {
+        before_row,
+        row: row.into(),
+        rows_total,
+        record,
+    }))
+}
+
+/// One parent-loop step for a scheduled row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowStep {
+    /// Accept the row from the resume directory; `Ok(false)` means it must run.
+    Resume,
+    /// Spawn, supervise, and accept the row's worker.
+    Run,
+}
+
+/// The campaign parent's sequential row loop: resumed rows are accepted without a worker, and the
+/// operator stop file is consulted between rows, before each worker spawn.
+pub(crate) fn drive_rows(
+    slugs: &[String],
+    stop_file: &Path,
+    logs: &Path,
+    kind: &str,
+    mut row: impl FnMut(usize, RowStep) -> Result<bool, String>,
+) -> Result<Option<OperatorStop>, String> {
+    for (index, slug) in slugs.iter().enumerate() {
+        if row(index, RowStep::Resume)? {
+            eprintln!("coordinate {}/{} resumed: {slug}", index + 1, slugs.len());
+            continue;
+        }
+        if let Some(stop) =
+            operator_stop_before_row(stop_file, logs, kind, index, slug, slugs.len())?
+        {
+            return Ok(Some(stop));
+        }
+        row(index, RowStep::Run)?;
+        eprintln!("coordinate {}/{} accepted: {slug}", index + 1, slugs.len());
+    }
+    Ok(None)
+}
+
 /// Immutable parent inputs.  The only model-related choices are snapshot paths; model identity,
 /// geometry, memory, timing, and quality fields are collected by the child from the loaded product
 /// and are never accepted by this command-line boundary.
@@ -3845,13 +3983,15 @@ pub struct CampaignLaunch {
     pub prompt_file: PathBuf,
     pub destination: PathBuf,
     pub resume_dir: PathBuf,
+    /// Operator stop file checked between rows; never part of the resume identity.
+    pub stop_file: PathBuf,
     pub safety_policy: PathBuf,
     /// `Some` launches every scheduled row in `compressed` mode with this KV method; `None` is the
     /// dense baseline campaign.
     pub compressed: Option<CompressedKvMethod>,
 }
 
-fn file_seal(path: &Path) -> Result<String, String> {
+pub(crate) fn file_seal(path: &Path) -> Result<String, String> {
     let mut input = File::open(path).map_err(|e| e.to_string())?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
@@ -4146,8 +4286,10 @@ fn validate_resume_row(
 
 /// Run one row at a time under a mandatory bounded policy. Valid sealed rows stay in an
 /// identity-bound resume directory after a failure; the destination appears only after all eight
-/// scheduled rows have been accepted.
-pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
+/// scheduled rows have been accepted. Between rows — never during a worker — the parent honours
+/// the operator stop file: it records a durable stopped-before-row status and returns
+/// [`CampaignOutcome::StoppedByOperator`]; the same command later resumes at that row.
+pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutcome, String> {
     if launch.destination.exists() {
         return Err("campaign destination already exists".into());
     }
@@ -4188,162 +4330,179 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
     }
     let mut identity = resume_identity(launch, &policy_sha256, &inventories)?;
     let identity_sha256 = prepare_resume_root(&launch.resume_dir, &mut identity)?;
-    let allowed = schedule
+    let slugs = schedule
         .iter()
         .map(|row| coordinate_slug(&row.coordinate))
-        .collect::<std::collections::BTreeSet<_>>();
-    for entry in fs::read_dir(&launch.resume_dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
-            && !allowed.contains(&name)
-            && !allowed
-                .iter()
-                .any(|slug| name == format!("{slug}.binding.json"))
-        {
-            return Err(format!("unexpected or partial resume artifact: {name}"));
-        }
-    }
+        .collect::<Vec<_>>();
+    validate_resume_entries(&launch.resume_dir, &launch.stop_file, &slugs)?;
     let mut prepared = Vec::with_capacity(schedule.len());
-    for (index, row) in schedule.iter().enumerate() {
-        let slug = coordinate_slug(&row.coordinate);
-        let child_dir = launch.resume_dir.join(&slug);
-        let binding_path = row_binding_path(&launch.resume_dir, &slug);
-        if child_dir.exists() || binding_path.exists() {
-            if !child_dir.exists() || !binding_path.exists() {
-                return Err(format!(
-                    "partial resume row {slug} must be repaired explicitly"
+    let stopped = drive_rows(
+        &slugs,
+        &launch.stop_file,
+        &launch.resume_dir.join("logs"),
+        "sc-20671-operator-stop",
+        |index, step| {
+            let row = &schedule[index];
+            let slug = coordinate_slug(&row.coordinate);
+            let child_dir = launch.resume_dir.join(&slug);
+            let binding_path = row_binding_path(&launch.resume_dir, &slug);
+            if step == RowStep::Resume {
+                if !child_dir.exists() && !binding_path.exists() {
+                    return Ok(false);
+                }
+                if !child_dir.exists() || !binding_path.exists() {
+                    return Err(format!(
+                        "partial resume row {slug} must be repaired explicitly"
+                    ));
+                }
+                prepared.push(validate_resume_row(
+                    &launch.resume_dir,
+                    &row.coordinate,
+                    &identity,
+                    &identity_sha256,
+                )?);
+                return Ok(true);
+            }
+            let snapshot = if row.coordinate.family == "llama" {
+                &launch.llama_snapshot
+            } else {
+                &launch.qwen_snapshot
+            };
+            let reference_snapshot = if row.coordinate.family == "llama" {
+                &launch.llama_fp32_reference_snapshot
+            } else {
+                &launch.qwen_fp32_reference_snapshot
+            };
+            let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
+                &row.coordinate,
+                snapshot,
+                reference_snapshot,
+                &prompt,
+                &policy,
+            )?;
+            let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
+            let mut command = Command::new(&launch.executable);
+            command
+                .arg("worker")
+                .arg("--coordinate-index")
+                .arg(index.to_string())
+                .arg("--snapshot")
+                .arg(snapshot)
+                .arg("--prompt-file")
+                .arg(&launch.prompt_file)
+                .arg("--fp32-reference-snapshot")
+                .arg(reference_snapshot)
+                .arg("--safety-policy")
+                .arg(&launch.safety_policy)
+                .arg("--policy-sha256")
+                .arg(&policy_sha256)
+                .arg("--resume-identity")
+                .arg(launch.resume_dir.join("identity.json"))
+                .arg("--resume-identity-sha256")
+                .arg(&identity_sha256)
+                .arg("--out")
+                .arg(&child_dir);
+            if let Some(method) = launch.compressed {
+                command
+                    .arg("--mode")
+                    .arg("compressed")
+                    .arg("--kv-method")
+                    .arg(method.id());
+            }
+            let logs = launch.resume_dir.join("logs");
+            let log_prefix =
+                unused_attempt_prefix(&logs, &slug).ok_or("no unused bounded worker log path")?;
+            let request = RunRequest {
+                context_tokens: total_tokens,
+                request_tokens,
+                stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
+                stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
+            };
+            let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
+            let status = match campaign_supervisor::run_guarded(
+                &mut command,
+                &request,
+                &policy.supervisor(),
+                &mut SystemProbe,
+            ) {
+                Ok(status) => status,
+                Err(failure) => {
+                    let reason = format!("{:?}", failure.reason);
+                    return Err(unaccepted_row_error(
+                        &unaccepted,
+                        "sc-20671-unaccepted-row",
+                        &slug,
+                        &admission,
+                        (&reason, &failure.detail, failure.pid),
+                        format!(
+                            "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
+                            failure.detail, failure.pid, launch.resume_dir.display(),
+                        ),
+                    ));
+                }
+            };
+            if !status.success() {
+                return Err(unaccepted_row_error(
+                    &unaccepted,
+                    "sc-20671-unaccepted-row",
+                    &slug,
+                    &admission,
+                    ("ChildExit", &status.to_string(), None),
+                    format!(
+                        "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
+                        request.stderr_path.display(), launch.resume_dir.display(),
+                    ),
                 ));
             }
+            // Child publication itself is atomic. Bind the row to this exact immutable launch before
+            // permitting a future resume to accept it.
+            let item = load_prepared_coordinate_receipt(&child_dir, row.coordinate.clone())?;
+            let receipt: Receipt =
+                serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+            let binding = seal_json(&row_binding(
+                &identity_sha256,
+                &receipt,
+                &item.bundle.receipt,
+            ))?
+            .0;
+            fs::write(&binding_path, binding).map_err(|e| e.to_string())?;
             prepared.push(validate_resume_row(
                 &launch.resume_dir,
                 &row.coordinate,
                 &identity,
                 &identity_sha256,
             )?);
-            eprintln!(
-                "coordinate {}/{} resumed: {slug}",
-                index + 1,
-                schedule.len()
-            );
-            continue;
-        }
-        let snapshot = if row.coordinate.family == "llama" {
-            &launch.llama_snapshot
-        } else {
-            &launch.qwen_snapshot
-        };
-        let reference_snapshot = if row.coordinate.family == "llama" {
-            &launch.llama_fp32_reference_snapshot
-        } else {
-            &launch.qwen_fp32_reference_snapshot
-        };
-        let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
-            &row.coordinate,
-            snapshot,
-            reference_snapshot,
-            &prompt,
-            &policy,
-        )?;
-        let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
-        let mut command = Command::new(&launch.executable);
-        command
-            .arg("worker")
-            .arg("--coordinate-index")
-            .arg(index.to_string())
-            .arg("--snapshot")
-            .arg(snapshot)
-            .arg("--prompt-file")
-            .arg(&launch.prompt_file)
-            .arg("--fp32-reference-snapshot")
-            .arg(reference_snapshot)
-            .arg("--safety-policy")
-            .arg(&launch.safety_policy)
-            .arg("--policy-sha256")
-            .arg(&policy_sha256)
-            .arg("--resume-identity")
-            .arg(launch.resume_dir.join("identity.json"))
-            .arg("--resume-identity-sha256")
-            .arg(&identity_sha256)
-            .arg("--out")
-            .arg(&child_dir);
-        if let Some(method) = launch.compressed {
-            command
-                .arg("--mode")
-                .arg("compressed")
-                .arg("--kv-method")
-                .arg(method.id());
-        }
-        let logs = launch.resume_dir.join("logs");
-        let log_prefix =
-            unused_attempt_prefix(&logs, &slug).ok_or("no unused bounded worker log path")?;
-        let request = RunRequest {
-            context_tokens: total_tokens,
-            request_tokens,
-            stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
-            stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
-        };
-        let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
-        let status = match campaign_supervisor::run_guarded(
-            &mut command,
-            &request,
-            &policy.supervisor(),
-            &mut SystemProbe,
-        ) {
-            Ok(status) => status,
-            Err(failure) => {
-                let reason = format!("{:?}", failure.reason);
-                return Err(unaccepted_row_error(
-                    &unaccepted,
-                    "sc-20671-unaccepted-row",
-                    &slug,
-                    &admission,
-                    (&reason, &failure.detail, failure.pid),
-                    format!(
-                        "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
-                        failure.detail, failure.pid, launch.resume_dir.display(),
-                    ),
-                ));
-            }
-        };
-        if !status.success() {
-            return Err(unaccepted_row_error(
-                &unaccepted,
-                "sc-20671-unaccepted-row",
-                &slug,
-                &admission,
-                ("ChildExit", &status.to_string(), None),
-                format!(
-                    "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
-                    request.stderr_path.display(), launch.resume_dir.display(),
-                ),
-            ));
-        }
-        // Child publication itself is atomic. Bind the row to this exact immutable launch before
-        // permitting a future resume to accept it.
-        let item = load_prepared_coordinate_receipt(&child_dir, row.coordinate.clone())?;
-        let receipt: Receipt =
-            serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
-        let binding = seal_json(&row_binding(
-            &identity_sha256,
-            &receipt,
-            &item.bundle.receipt,
-        ))?
-        .0;
-        fs::write(&binding_path, binding).map_err(|e| e.to_string())?;
-        prepared.push(validate_resume_row(
-            &launch.resume_dir,
-            &row.coordinate,
-            &identity,
-            &identity_sha256,
-        )?);
-        eprintln!(
-            "coordinate {}/{} accepted: {slug}",
-            index + 1,
-            schedule.len()
-        );
+            Ok(true)
+        },
+    )?;
+    if let Some(stop) = stopped {
+        return Ok(CampaignOutcome::StoppedByOperator(stop));
     }
-    publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)
+    publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?;
+    Ok(CampaignOutcome::Completed)
+}
+
+/// Every resume-directory entry must be campaign state for this schedule or the operator stop file;
+/// the stop file is tolerated here and never enters the resume identity.
+fn validate_resume_entries(
+    resume_dir: &Path,
+    stop_file: &Path,
+    slugs: &[String],
+) -> Result<(), String> {
+    for entry in fs::read_dir(resume_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
+            && !is_operator_stop_entry(resume_dir, stop_file, &name)
+            && !slugs.contains(&name)
+            && !slugs
+                .iter()
+                .any(|slug| name == format!("{slug}.binding.json"))
+        {
+            return Err(format!("unexpected or partial resume artifact: {name}"));
+        }
+    }
+    Ok(())
 }
 
 fn required_flag(args: &[String], name: &str) -> Result<String, String> {
@@ -4388,12 +4547,20 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 ///   --prompt-file <prompt.txt> --safety-policy <policy.json> \
 ///   --resume-dir /abs/sc20676-compressed-resume --out /abs/sc20676-compressed-campaign
 /// ```
-pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
+///
+/// Safe operator stop: `touch /abs/sc20676-compressed-resume/STOP` (or the `--stop-file <path>`
+/// given to `parent`). The parent finishes the row whose worker is running — it never signals a
+/// worker — then, before spawning the next row, writes
+/// `<resume-dir>/logs/operator-stop.attempt-<n>.json` ("stopped-by-operator", `beforeRow`) and
+/// exits with status [`OPERATOR_STOP_EXIT_CODE`] (75). Remove the stop file and rerun the same
+/// command: accepted rows resume from the directory and the campaign continues at that row.
+pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
     let Some(mode) = args.first().map(String::as_str) else {
         return Err("usage: sc20671-kv-baseline parent|worker [options]".into());
     };
     match mode {
         "parent" | "preflight" => {
+            let resume_dir = PathBuf::from(required_flag(args, "--resume-dir")?);
             let launch = CampaignLaunch {
                 executable: std::env::current_exe().map_err(|e| e.to_string())?,
                 llama_snapshot: PathBuf::from(required_flag(args, "--llama-snapshot")?),
@@ -4408,7 +4575,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 )?),
                 prompt_file: PathBuf::from(required_flag(args, "--prompt-file")?),
                 destination: PathBuf::from(required_flag(args, "--out")?),
-                resume_dir: PathBuf::from(required_flag(args, "--resume-dir")?),
+                stop_file: operator_stop_file(args, &resume_dir)?,
+                resume_dir,
                 safety_policy: PathBuf::from(required_flag(args, "--safety-policy")?),
                 compressed: compressed_mode_flags(args)?,
             };
@@ -4419,7 +4587,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                     String::from_utf8(canonical_json_bytes(&value).map_err(|e| e.to_string())?)
                         .map_err(|e| e.to_string())?
                 );
-                Ok(())
+                Ok(CampaignOutcome::Completed)
             } else {
                 launch_complete_campaign(&launch)
             }
@@ -4750,9 +4918,10 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 "receipt.md",
                 &bundle,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [options]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--stop-file <path>] [options]".into()),
     }
 }
 
@@ -7709,7 +7878,7 @@ pub fn timing_samples_from_product_repeats(
     })
 }
 
-fn checked_git_revision(root: &Path) -> Result<String, String> {
+pub(crate) fn checked_git_revision(root: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -11531,5 +11700,174 @@ pub(crate) mod tests {
             identity.source,
             format!("git+{PMETAL_MLX_REPOSITORY}?rev={0}#{0}", identity.revision)
         );
+    }
+
+    /// A fake parent row set over a real resume directory: a row is "accepted" once its marker
+    /// exists, exactly as the production loop accepts a sealed row directory from resume.
+    struct FakeRows {
+        root: PathBuf,
+        ran: Vec<usize>,
+        /// Simulates the operator touching the stop file while this row's worker is running.
+        touch_stop_during: Option<usize>,
+        stop_file: PathBuf,
+    }
+
+    impl FakeRows {
+        fn new(root: &Path, stop_file: &Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                ran: Vec::new(),
+                touch_stop_during: None,
+                stop_file: stop_file.to_path_buf(),
+            }
+        }
+
+        fn drive(&mut self, slugs: &[String]) -> Result<Option<OperatorStop>, String> {
+            let (root, stop_file) = (self.root.clone(), self.stop_file.clone());
+            drive_rows(
+                slugs,
+                &stop_file,
+                &root.join("logs"),
+                "sc-20671-operator-stop",
+                |index, step| {
+                    let marker = root.join(&slugs[index]);
+                    match step {
+                        RowStep::Resume => Ok(marker.exists()),
+                        RowStep::Run => {
+                            if self.touch_stop_during == Some(index) {
+                                fs::write(&stop_file, b"").unwrap();
+                            }
+                            self.ran.push(index);
+                            fs::write(&marker, b"accepted").unwrap();
+                            Ok(true)
+                        }
+                    }
+                },
+            )
+        }
+    }
+
+    fn stop_slugs() -> Vec<String> {
+        ["row-a", "row-b", "row-c", "row-d"]
+            .iter()
+            .map(|slug| (*slug).to_string())
+            .collect()
+    }
+
+    fn stop_record(stop: &OperatorStop) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(&stop.record).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn operator_stop_before_row_zero_spawns_no_worker_and_records_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join(OPERATOR_STOP_FILE_NAME);
+        fs::write(&stop_file, b"").unwrap();
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        let stop = rows.drive(&stop_slugs()).unwrap().expect("operator stop");
+        assert!(rows.ran.is_empty(), "no worker may start after a stop");
+        assert_eq!(
+            (stop.before_row, stop.row.as_str(), stop.rows_total),
+            (0, "row-a", 4)
+        );
+        let record = stop_record(&stop);
+        assert_eq!(record["status"], "stopped-by-operator");
+        assert_eq!(record["kind"], "sc-20671-operator-stop");
+        assert_eq!(record["beforeRow"], 0);
+        assert_eq!(record["rowsAccepted"], 0);
+        assert!(stop.record.starts_with(dir.path().join("logs")));
+        assert_eq!(
+            CampaignOutcome::StoppedByOperator(stop).exit_code(),
+            OPERATOR_STOP_EXIT_CODE
+        );
+        assert_eq!(CampaignOutcome::Completed.exit_code(), 0);
+        assert_ne!(OPERATOR_STOP_EXIT_CODE, 0);
+        assert_ne!(OPERATOR_STOP_EXIT_CODE, 1);
+        assert_ne!(OPERATOR_STOP_EXIT_CODE, 2);
+    }
+
+    #[test]
+    fn operator_stop_between_rows_finishes_the_running_row_then_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join(OPERATOR_STOP_FILE_NAME);
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        rows.touch_stop_during = Some(1);
+        let stop = rows.drive(&stop_slugs()).unwrap().expect("operator stop");
+        // The row running when the operator asked is completed, never interrupted.
+        assert_eq!(rows.ran, vec![0, 1]);
+        assert!(dir.path().join("row-b").exists());
+        assert!(!dir.path().join("row-c").exists());
+        assert_eq!((stop.before_row, stop.row.as_str()), (2, "row-c"));
+        let record = stop_record(&stop);
+        assert_eq!(record["beforeRow"], 2);
+        assert_eq!(record["beforeRowSlug"], "row-c");
+        assert_eq!(record["rowsAccepted"], 2);
+    }
+
+    #[test]
+    fn resume_after_operator_stop_continues_at_the_stopped_row_and_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join("elsewhere-stop");
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        rows.touch_stop_during = Some(1);
+        let first = rows.drive(&stop_slugs()).unwrap().expect("operator stop");
+        // Still armed: a rerun stops again before the same row, with a second, distinct record.
+        let mut again = FakeRows::new(dir.path(), &stop_file);
+        let second = again.drive(&stop_slugs()).unwrap().expect("still stopped");
+        assert!(again.ran.is_empty());
+        assert_eq!(second.before_row, first.before_row);
+        assert_ne!(second.record, first.record);
+        assert!(first.record.exists());
+        fs::remove_file(&stop_file).unwrap();
+        let mut resumed = FakeRows::new(dir.path(), &stop_file);
+        assert_eq!(resumed.drive(&stop_slugs()).unwrap(), None);
+        assert_eq!(
+            resumed.ran,
+            vec![2, 3],
+            "accepted rows resume; the rest run once"
+        );
+        assert!(stop_slugs()
+            .iter()
+            .all(|slug| dir.path().join(slug).exists()));
+    }
+
+    #[test]
+    fn resume_directory_tolerates_the_stop_file_without_changing_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resume");
+        let slugs = stop_slugs();
+        let identity = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "fixture",
+            "inferenceRevision": "a".repeat(40),
+            "sceneWorksRevision": "b".repeat(40),
+        });
+        let sealed = prepare_resume_root(&root, &mut identity.clone()).unwrap();
+        fs::create_dir(root.join("logs")).unwrap();
+        fs::write(root.join(OPERATOR_STOP_FILE_NAME), b"").unwrap();
+        fs::write(root.join("custom.stop"), b"").unwrap();
+        validate_resume_entries(&root, &root.join("custom.stop"), &slugs).unwrap();
+        assert_eq!(
+            prepare_resume_root(&root, &mut identity.clone()).unwrap(),
+            sealed,
+            "stop-file presence must not change the resume identity"
+        );
+        fs::write(root.join("stray.json"), b"{}").unwrap();
+        assert!(validate_resume_entries(&root, &root.join("custom.stop"), &slugs).is_err());
+    }
+
+    #[test]
+    fn stop_file_flag_defaults_to_the_resume_directory() {
+        let resume = Path::new("/abs/resume");
+        assert_eq!(
+            operator_stop_file(&[], resume).unwrap(),
+            resume.join(OPERATOR_STOP_FILE_NAME)
+        );
+        let args = ["parent", "--stop-file", "/abs/halt"].map(String::from);
+        assert_eq!(
+            operator_stop_file(&args, resume).unwrap(),
+            PathBuf::from("/abs/halt")
+        );
+        assert!(operator_stop_file(&["--stop-file".to_string()], resume).is_err());
     }
 }

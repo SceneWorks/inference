@@ -759,6 +759,84 @@ class CampaignAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "corrupted"):
                 self.adapter._load_unit(resume, "run-00-normal", identity_sha, "wan_vace", "normal")
 
+    def test_operator_stop_halts_between_arms_and_resume_completes_the_loop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resume = root / "resume"
+            spec = SimpleNamespace(variant="wan_vace")
+            media = root / "media"
+            media.mkdir()
+            (media / "frame.png").write_bytes(b"real output bytes")
+            event = self.adapter.canonical({"phase": "metadata"})
+            policy = self.runner_safety()["safety_policy"]
+            identity_raw = self.adapter.canonical({"safetyPolicySha256": policy.sha256})
+            identity_sha = self.adapter.digest(identity_raw)
+            stop = resume / "STOP"
+            calls, touch_during = [], {"normal"}
+            sample = {"phase": "process-sample", "sample_kind": "process", "peak_bytes": 1}
+
+            def runner(_spec, arm):
+                calls.append(arm)
+                if arm in touch_during:
+                    stop.write_bytes(b"")  # the operator asks while this arm is running
+                output = media if arm == "normal" else root / f"absent-{arm}"
+                return self.adapter.CampaignRun(
+                    [{"phase": "metadata"}, sample], b"stdout", b"",
+                    ("producer", "--sc20686-events", str(root / "events"), "--out", str(output)),
+                    (sample,), event, output, None,
+                    {"pid": 100 + len(calls), "exitCode": 0, "ownedProcessGroupReaped": True,
+                     "admission": self.adapter.supervisor.runtime_guarded_admission(policy)},
+                )
+
+            def row_builder(_spec, arm, _events, _hashes):
+                return {"family": "wan", "variant": "wan_vace", "coordinate_name": "small", "arm": arm}
+
+            def publish():
+                return self.adapter.publish_campaign(
+                    [spec], runner, row_builder, root / "final",
+                    resume_root=resume, resume_identity_sha=identity_sha, stop_file=stop,
+                )
+
+            resume.mkdir()
+            (resume / "units").mkdir()
+            (resume / "identity.json").write_bytes(identity_raw)
+            stop.write_bytes(b"")
+            with self.assertRaises(self.adapter.supervisor.OperatorStop) as caught:
+                publish()
+            self.assertEqual(calls, [])
+            self.assertEqual((caught.exception.index, caught.exception.before), (0, "run-00-normal"))
+            self.assertEqual(json.loads(caught.exception.record.read_bytes())["status"], "stopped-by-operator")
+            stop.unlink()
+            with self.assertRaises(self.adapter.supervisor.OperatorStop) as caught:
+                publish()
+            # The running arm finished and was sealed; the next arm never started.
+            self.assertEqual(calls, ["normal"])
+            self.assertEqual((caught.exception.index, caught.exception.before), (1, "run-00-cancel"))
+            self.assertTrue((resume / "units" / "run-00-normal" / "record.json").is_file())
+            self.assertFalse((resume / "units" / "run-00-cancel").exists())
+            touch_during.clear()
+            stop.unlink()
+            # Resume: the sealed arm is reused, only the stopped arm runs, and the loop completes
+            # into publication (which this fixture deliberately refuses for lacking inputs).
+            with self.assertRaisesRegex(ValueError, "requires sealed resolved inputs"):
+                publish()
+            self.assertEqual(calls, ["normal", "cancel"])
+            self.assertTrue((resume / "units" / "run-00-cancel" / "record.json").is_file())
+
+    def test_resume_directory_tolerates_the_operator_stop_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resume = Path(directory) / "resume"
+            policy = self.runner_safety()["safety_policy"]
+            resolved = {"schema": "test"}
+            first = self.adapter._prepare_resume(resume, resolved, policy)
+            (resume / "STOP").write_bytes(b"")
+            (resume / "halt").write_bytes(b"")
+            (resume / "logs").mkdir()
+            self.assertEqual(self.adapter._prepare_resume(resume, resolved, policy, resume / "halt"), first)
+            (resume / "stray").write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "unexpected entries"):
+                self.adapter._prepare_resume(resume, resolved, policy, resume / "halt")
+
     def test_complete_bundle_is_reproducible_and_tampering_fails(self):
         coordinates = []
         for family, variants in self.coverage["families"].items():
