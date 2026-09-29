@@ -18,7 +18,7 @@ MODEL_BYTES = 7_261_441_640  # Pinned YuE2-3B safetensors manifest.
 # further checkpoint's worth for the release build and staging on a cold runner.
 DISK_HEADROOM_BYTES = 4 * MODEL_BYTES
 BUSY_NAME = re.compile(
-    r"(?:^|/)(?:cargo|rustc|candle_audio_yue2-[^ /]+|sceneworks-worker|candle-gen|mlx-gen)(?:$| )",
+    r"(?:^|/)(?:cargo|rustc|candle_audio_yue2-[^ /]+|sceneworks-worker|sceneworks-rust-api|candle-gen|mlx-gen)(?:$| )",
     re.IGNORECASE,
 )
 
@@ -87,7 +87,7 @@ def existing_parent(path: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", required=True, type=Path)
-    parser.add_argument("--label", choices=("initial", "before-metal"), default="initial")
+    parser.add_argument("--label", choices=("initial", "before-metal", "before-profile"), default="initial")
     args = parser.parse_args()
     runner = os.environ.get("RUNNER_NAME", "")
     total = int(output(["sysctl", "-n", "hw.memsize"]).strip())
