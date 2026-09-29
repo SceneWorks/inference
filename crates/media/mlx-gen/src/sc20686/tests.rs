@@ -106,16 +106,20 @@ impl Harness {
     }
 
     fn activate(&self, cancellation: bool) -> Scope {
+        self.activate_arm(if cancellation { "cancel" } else { "normal" })
+    }
+
+    fn activate_arm(&self, arm: &str) -> Scope {
         let request = request_output(
             self.root.path().join("unused.jsonl"),
             SOURCE_REF,
             "sequential",
         )
         .unwrap();
-        let request = if cancellation {
-            request.arm_cancellation()
-        } else {
-            request.arm()
+        let request = match arm {
+            "cancel" => request.arm_cancellation(),
+            "control" => request.arm_schedule_control(),
+            _ => request.arm(),
         };
         let scope = activate_with_instruments(
             &self.snapshot,
@@ -618,4 +622,91 @@ fn a_snapshot_without_an_immutable_revision_refuses_activation() {
     assert!(result.is_err());
     assert!(!active());
     assert!(events.borrow().is_empty());
+}
+
+#[test]
+fn a_mid_denoise_expert_swap_keeps_every_window_unique() {
+    let h = harness();
+    let scope = h.activate(false);
+    mark_phase("prepare-cache");
+    mark_denoise();
+    observe_progress(&Progress::Step {
+        current: 1,
+        total: 3,
+    });
+    // Sequential MoE swap before step 2: the curated path marks `load`, the native path emits
+    // `Progress::Loading`; either way the pending step-2 window becomes the swap, then the next
+    // expert's cache build and step 2 follow.
+    mark_phase("load");
+    observe_progress(&Progress::Loading(crate::LoadPhase::Renderer));
+    mark_phase("prepare-cache");
+    mark_denoise();
+    observe_progress(&Progress::Step {
+        current: 2,
+        total: 3,
+    });
+    observe_progress(&Progress::Step {
+        current: 3,
+        total: 3,
+    });
+    observe_progress(&Progress::Decoding);
+    observe_generation_end();
+    drop(scope);
+    let windows: Vec<(String, u64)> = h
+        .of("phase-window")
+        .iter()
+        .map(|w| {
+            (
+                w["window"].as_str().unwrap().to_owned(),
+                w["window_index"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let unique: std::collections::BTreeSet<_> = windows.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        windows.len(),
+        "duplicate phase windows: {windows:?}"
+    );
+    let steps: Vec<u64> = windows
+        .iter()
+        .filter(|(name, _)| name == "denoise-step")
+        .map(|(_, index)| *index)
+        .collect();
+    assert_eq!(steps, vec![1, 2, 3]);
+    assert!(windows.contains(&("load".to_owned(), 1)));
+}
+
+#[test]
+fn the_schedule_control_arm_opens_no_read_windows() {
+    let h = harness();
+    let scope = h.activate_arm("control");
+    let set = vec![kv(1, 4)];
+    let guard = register_cross_kv_set(&set, 8, "create", "release")
+        .unwrap()
+        .expect("caches are still attributed on the control arm");
+    let id = cross_kv_cache_id(&set[0]).unwrap();
+    let resets = h.script.resets.get();
+    assert!(
+        begin_read(Some(ReadTarget::Cache(id)), &[&set[0].0])
+            .unwrap()
+            .is_none(),
+        "the control arm must not evaluate or reset around reads"
+    );
+    assert_eq!(h.script.resets.get(), resets);
+    mark_denoise();
+    observe_progress(&Progress::Step {
+        current: 1,
+        total: 1,
+    });
+    observe_progress(&Progress::Decoding);
+    drop(guard);
+    observe_generation_end();
+    drop(scope);
+    assert!(h.of("cross-kv-read").is_empty());
+    assert_eq!(h.of("cross-kv-created").len(), 1);
+    assert!(!h.of("phase-window").is_empty());
+    let metadata = h.of("metadata").pop().unwrap();
+    assert_eq!(metadata["schedule_control"], true);
+    assert_eq!(metadata["full_generation"], true);
 }

@@ -32,7 +32,7 @@ use std::path::Path;
 use crate::caption_upsample;
 use crate::chunk::MemoryConfig;
 use crate::config::{Flux2Variant, SIZE_MULTIPLE};
-use crate::kv_cache::{CacheMode, Flux2KvCache};
+use crate::kv_cache::{CfgBranch, Flux2KvCache, Flux2KvCfgCaches};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
     prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule_with,
@@ -1426,61 +1426,51 @@ impl Flux2 {
                         }
                         None => noise,
                     };
-                    // Fresh cache per seed — the cached reference K/V depend on the step-0 target latents.
-                    let cache = kv_enabled.then(|| {
-                        Flux2KvCache::new(
+                    // Fresh caches per seed — the cached reference K/V depend on the step-0 target
+                    // latents — and one cache per CFG branch: the unmasked joint attention makes the
+                    // reference K/V prompt-dependent, so the negative pass must never overwrite the
+                    // positive slots (see `Flux2KvCfgCaches`).
+                    let mut kv_caches = kv_enabled.then(|| {
+                        Flux2KvCfgCaches::new(
                             self.config.num_double_layers,
                             self.config.num_single_layers,
+                            negative.is_some(),
+                            num_ref,
                         )
                     });
                     // The curated unified-framework solver owns the loop (epic 7114 P3). KV step role:
-                    // the first executed forward extracts the reference K/V (the full `[txt, target,
-                    // ref]` pass); later forwards run `[txt, target]` and splice the cached ref K/V back
-                    // in. "First executed forward" is tracked by `extracted` so a multi-eval solver still
-                    // extracts once; the single-eval Euler default is byte-identical to the prior loop.
+                    // the first executed forward extracts each branch's reference K/V (the full `[txt,
+                    // target, ref]` pass); later forwards run `[txt, target]` and splice that branch's
+                    // cached ref K/V back in. A multi-eval solver still extracts once.
                     // FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma convention).
-                    let mut extracted = false;
                     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
                         let ts = sigma * 1000.0;
-                        let (include_ref, cache_ref) = match &cache {
-                            Some(c) => {
-                                let mode = if extracted {
-                                    CacheMode::Cached
-                                } else {
-                                    CacheMode::Extract
+                        if let Some(caches) = kv_caches.as_mut() {
+                            return caches.velocity(guidance, |branch, include_ref, cache| {
+                                let (embeds, ids) = match (branch, &negative) {
+                                    (CfgBranch::Negative, Some((neg_embeds, neg_ids))) => {
+                                        (neg_embeds, neg_ids)
+                                    }
+                                    _ => (&prompt_embeds, &text_ids),
                                 };
-                                c.configure(mode, num_ref);
-                                extracted = true;
-                                (mode == CacheMode::Extract, Some(c))
-                            }
-                            None => (true, None),
-                        };
-                        let v = run(
-                            latents,
-                            &prompt_embeds,
-                            &text_ids,
-                            ts,
-                            include_ref,
-                            cache_ref,
-                        )?;
+                                run(latents, embeds, ids, ts, include_ref, Some(cache))
+                            });
+                        }
+                        let v = run(latents, &prompt_embeds, &text_ids, ts, true, None)?;
                         // sc-8273 spike: image-guidance CFG (non-kv edit only — the ref-dropped forward
                         // must run without a KV cache in play). Recompute this step with the reference
                         // tokens dropped, then extrapolate toward the with-reference prediction.
                         let v = match img_guidance {
-                            Some(s) if include_ref && cache_ref.is_none() => {
+                            Some(s) => {
                                 let v_img0 =
                                     run(latents, &prompt_embeds, &text_ids, ts, false, None)?;
                                 add(&v_img0, &multiply(&subtract(&v, &v_img0)?, scalar(s))?)?
                             }
-                            _ => v,
+                            None => v,
                         };
                         match &negative {
                             Some((neg_embeds, neg_ids)) => {
-                                // CFG with the cache mirrors the fork: the same cache feeds both forwards
-                                // (the negative extract overwrites the positive's slots). Distilled klein
-                                // runs guidance 1.0 → no negative pass, so this is the base path.
-                                let vn =
-                                    run(latents, neg_embeds, neg_ids, ts, include_ref, cache_ref)?;
+                                let vn = run(latents, neg_embeds, neg_ids, ts, true, None)?;
                                 // noise = neg + guidance·(pos − neg)
                                 Ok(add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?)
                             }

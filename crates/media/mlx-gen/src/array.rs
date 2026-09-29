@@ -131,6 +131,15 @@ fn flat_2d(shape: &[i32]) -> (i32, i32) {
     (a as i32, b as i32)
 }
 
+/// Whether `a` has been evaluated (its buffer is materialized, so it no longer keeps its lazy graph
+/// inputs alive). Used to prove retained caches hold only their own bytes.
+pub fn is_materialized(a: &Array) -> bool {
+    let mut available = false;
+    // SAFETY: `_mlx_array_is_available` writes one bool through a valid pointer for a live array.
+    unsafe { mlx_sys::_mlx_array_is_available(&mut available, a.as_ptr()) };
+    available
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

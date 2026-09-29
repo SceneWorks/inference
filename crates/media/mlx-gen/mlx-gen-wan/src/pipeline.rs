@@ -1481,6 +1481,8 @@ pub(crate) fn denoise_moe_curated_swapped(
                         "wan: curated sampler timestep increased across the MoE boundary".into(),
                     ));
                 }
+                // SC-20686 Metal lane: the swap (drop, evict, load) is its own phase window.
+                mlx_gen::sc20686::mark_phase("load");
                 drop(active.take());
                 mlx_rs::memory::clear_cache();
                 let (transformer, cond, uncond, guidance) = load(false)?;

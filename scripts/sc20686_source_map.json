@@ -344,14 +344,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
               "symbol": "sc20686_joint_read",
-              "line": 402
+              "line": 400
             }
           ],
           "release": [
             {
               "path": "crates/media/mlx-gen/src/sc20686.rs",
               "symbol": "Drop for Scope",
-              "line": 483
+              "line": 496
             }
           ],
           "current_kernel": "MLX fused SDPA (sdpa_budgeted_bhsd) over the joint [txt, target, ref] K/V; full joint duration is non-attributable context",
@@ -368,7 +368,8 @@
             "create": "DoubleAttention::to_k/to_v(reference-slice)",
             "read": "DoubleAttention::attention(joint-context-non-attributable)"
           },
-          "entrypoint_stem": "sc20686_flux2_edit"
+          "entrypoint_stem": "sc20686_flux2_edit",
+          "cfg_kv_batch": "never"
         },
         "flux2_klein_9b_kv_edit": {
           "family": "flux2-klein",
@@ -405,15 +406,15 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-flux2/src/kv_cache.rs",
               "symbol": "sc20686::release_owner",
-              "line": 179
+              "line": 287
             }
           ],
           "current_kernel": "MLX fused SDPA over fresh [txt, target] K/V concatenated with the cached reference K/V; full joint duration is non-attributable context",
-          "cache_format": "persistent dense reference K/V [B,H,Sref,D] per double- and single-stream layer (Flux2KvCache), extracted on the first evaluation",
+          "cache_format": "persistent dense reference K/V [B,H,Sref,D] per double- and single-stream layer, one Flux2KvCache per CFG branch (Flux2KvCfgCaches), extracted and materialized on the first evaluation",
           "paging": "none",
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential request-scoped staging; the reference cache lives for one seed",
-          "recompute": "extracted once per seed on the first evaluation and reused by every cached step; the CFG negative extract rebuilds every slot",
+          "recompute": "extracted once per seed and CFG branch on the first evaluation and reused by that branch's every cached step",
           "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection of each retained [B,H,Skv,D] cache; no packed reader is wired",
           "self_attention_excluded": true,
           "cache_kind": "persistent",
@@ -422,7 +423,8 @@
             "create": "Flux2KvCache::extract",
             "read": "Flux2KvCache::cached(joint-attention)"
           },
-          "entrypoint_stem": "sc20686_flux2_edit"
+          "entrypoint_stem": "sc20686_flux2_edit",
+          "cfg_kv_batch": "never"
         },
         "wan2_2_ti2v_5b": {
           "family": "wan",
@@ -469,7 +471,8 @@
           ],
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential component staging",
-          "recompute": "prepared once per generate and reused across denoise steps"
+          "recompute": "prepared once per generate and reused across denoise steps",
+          "cfg_kv_batch": "guidance"
         },
         "wan2_2_t2v_14b": {
           "family": "wan",
@@ -516,7 +519,8 @@
           ],
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap",
-          "recompute": "prepared once per expert and reused across that expert's denoise steps"
+          "recompute": "prepared once per expert and reused across that expert's denoise steps",
+          "cfg_kv_batch": "always"
         },
         "wan2_2_i2v_14b": {
           "family": "wan",
@@ -563,7 +567,8 @@
           ],
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap",
-          "recompute": "prepared once per expert and reused across that expert's denoise steps"
+          "recompute": "prepared once per expert and reused across that expert's denoise steps",
+          "cfg_kv_batch": "always"
         },
         "wan_vace": {
           "family": "wan",
@@ -585,7 +590,7 @@
             {
               "path": "crates/media/mlx-gen/src/sc20686.rs",
               "symbol": "Drop for Scope",
-              "line": 483
+              "line": 496
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention over the per-call projected text K/V",
@@ -601,6 +606,7 @@
           },
           "entrypoint_stem": "sc20686_wan",
           "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step",
+          "cfg_kv_batch": "never",
           "route": "wan_vace",
           "activation": [
             {
@@ -632,7 +638,7 @@
             {
               "path": "crates/media/mlx-gen/src/sc20686.rs",
               "symbol": "Drop for Scope",
-              "line": 483
+              "line": 496
             }
           ],
           "current_kernel": "MLX fused scaled_dot_product_attention over the per-call projected text K/V",
@@ -648,6 +654,7 @@
           },
           "entrypoint_stem": "sc20686_wan",
           "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step",
+          "cfg_kv_batch": "never",
           "route": "wan2_2_vace_fun_14b",
           "activation": [
             {

@@ -395,11 +395,13 @@ impl DoubleAttention {
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
         // KV-cache hook (post-RoPE, pre-SDPA): extract stores the trailing ref K/V; cached splices
         // it back so the `[txt, target]` queries attend over `[txt, target, ref]`.
+        // SC-20686: the read window opens on q + the FRESH K/V, so a cached step's splice of the
+        // stored reference K/V (the concatenation) is materialized inside the window.
+        let sc20686 = sc20686_joint_read(cache, Stream::Double, &q, &k, &v)?;
         let (k, v) = match cache {
             Some((c, idx)) => c.apply(Stream::Double, idx, k, v)?,
             None => (k, v),
         };
-        let sc20686 = sc20686_joint_read(cache, Stream::Double, &q, &k, &v)?;
         let o = attention(&q, &k, &v, self.head_dim, attention_plan)?;
         sc20686_finish_joint_read(sc20686, &o)?;
         let txt_seq = txt.shape()[1];
@@ -560,11 +562,13 @@ impl SingleBlock {
         let k = rms_norm(&to_bhsd(k)?, &self.norm_k, RMS_EPS)?;
         let v = to_bhsd(v)?;
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
+        // SC-20686: the read window opens on q + the FRESH K/V, so a cached step's splice of the
+        // stored reference K/V (the concatenation) is materialized inside the window.
+        let sc20686 = sc20686_joint_read(cache, Stream::Single, &q, &k, &v)?;
         let (k, v) = match cache {
             Some((c, idx)) => c.apply(Stream::Single, idx, k, v)?,
             None => (k, v),
         };
-        let sc20686 = sc20686_joint_read(cache, Stream::Single, &q, &k, &v)?;
         let attn = attention(&q, &k, &v, self.head_dim, attention_plan)?;
         sc20686_finish_joint_read(sc20686, &attn)?;
 
