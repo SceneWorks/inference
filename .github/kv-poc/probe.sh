@@ -58,7 +58,7 @@ row "chip" "$(code "$chip") ($(code "$model"))"
 row "hw.memsize" "$(( memsize / 1073741824 )) GiB ($memsize bytes)"
 row "macOS" "$(code "$macos ($build)")"
 row "NAX" "$nax"
-row "available RAM" "${free_gib} GiB (free + speculative + purgeable + file cache; precheck needs >= 84)"
+row "available RAM" "${free_gib} GiB (free + speculative + purgeable + file cache; W1 precheck needs >= 84, W2 >= its policy's cap + reserve)"
 row "inactive / purgeable / compressed" "${inactive_gib} / ${purgeable_gib} / ${compressed_gib} GiB"
 row "LM Studio" "$(code "$LMS_STATE")"
 row "GPU/build processes" "$(code "${busy:-none}")"
@@ -92,8 +92,27 @@ else
 fi
 if [ -d "$R" ]; then row "runs dir $R" "$(code "$(ls "$R" "$R/evidence" 2>/dev/null | tr '\n' ' ')")"; else row "runs dir" "none yet"; fi
 
+need_gib=84
+if [ "${KV_MODE:-}" = w2 ]; then
+  need_gib="$(policy_need_gib "$KV_DIR/policies/$W2_POLICY")" || need_gib=80
+  if [ -f "$F2/SHA256SUMS" ]; then
+    if (cd "$F2" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1); then row "W2 frozen dir" "sealed, verifies"; else row "W2 frozen dir" "sealed but DOES NOT verify"; fi
+  else
+    row "W2 frozen dir" "not built"
+  fi
+  for route in wan_vace wan_vace_fun; do
+    if problem="$(verify_w2_vace "$route")"; then row "W2 assembled $route" "verifies"; else row "W2 assembled $route" "$(code "$problem") (the w2-assets job assembles it)"; fi
+  done
+  row "W2 precheck RAM" "cap + reserve of $W2_POLICY = ${need_gib} GiB"
+  summary ""
+  summary "#### W2 pinned assets (\`models-w2.tsv\`) vs free disk (report only; the w2-assets job fails on a shortfall)"
+  summary '```'
+  summary "$(python3.12 "$KV_DIR/models.py" --report --hub "$KV_HF_HUB" --pins "$KV_DIR/models-w2.tsv" --reserve-gib "${KV_W2_DISK_RESERVE_GIB:-10}" 2>&1 | head -120)"
+  summary '```'
+fi
+
 go="GO"
-[ "$free_gib" -ge 84 ] || go="NO-GO (RAM)"
+[ "$free_gib" -ge "$need_gib" ] || go="NO-GO (RAM)"
 [ -z "$busy" ] || go="NO-GO (processes)"
 [ "$lms_ok" = 1 ] || go="NO-GO (LM Studio)"
 summary ""

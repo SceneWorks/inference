@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# One W1 campaign phase for kv-poc-campaign.yml:  phase.sh run <a1|a3|a2|b>  |  phase.sh collect <phase>
+# One campaign phase for kv-poc-campaign.yml:  phase.sh run <phase>  |  phase.sh collect <phase>
+#   W1 (LLM KV):  a1 | a3 | a2 | b
+#   W2 (media):   c  = SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV), sc20684_krea_realtime_campaign.py
+#                 d  = SC-20686 Metal matrix (18 coordinates x normal/cancel), sc20686_campaign_adapter.py
+#                 d-control = the same matrix's --schedule-control arm (one product-schedule arm each)
 #
-# `run` = precheck (fails, never kills) -> the exact W1-COMMANDS.sh command for the phase -> exit.
+# `run` = precheck (fails, never kills) -> the exact launch command for the phase -> exit.
 # Exit 0 = phase complete (or already complete); exit 0 with output stopped=true = the parent
 # honoured a stop request and exited 75 after its in-flight row; anything else = failure.
 #
 # SAFE STOP. A background watcher polls every 60 s for `refs/heads/kv-poc-stop/<run_id>` on the
 # inference remote, and also enforces this job's soft budget ($KV_SOFT_BUDGET_MIN). Either one
 # touches <resume-dir>/STOP, and the campaign parent exits 75 after the row it is running; it never
-# interrupts a row. B has no resume dir, so it checks the same request between its commands.
+# interrupts a row. B has no resume dir, so it checks the same request between its commands. The W2
+# parents also get `--stop-file <ctl>/stop-requested` (never part of a resume identity), so a request
+# lands even before their resume dir exists.
 # SIGINT/SIGTERM also touch STOP, but that is best effort only: a GitHub cancel (or a job timeout)
 # force-kills the process tree about 10 s later, mid-row, which can wedge the GPU. Cancel between
 # jobs only; to stop mid-job push the stop branch.
@@ -26,8 +32,13 @@ case "$phase" in
   a3) RESUME="$R/sc20676-resume"; OUT="$R/evidence/sc20676-packed" ;;
   a2) RESUME="$R/sc20671-compressed-resume"; OUT="$R/evidence/sc20671-compressed" ;;
   b) ;;
+  c) RESUME="$R/sc20684-resume"; OUT="$R/evidence/sc20684-krea" ;;
+  d) RESUME="$R/sc20686-mlx-resume"; OUT="$R/evidence/sc20686-mlx" ;;
+  d-control) RESUME="$R/sc20686-mlx-control-resume"; OUT="$R/evidence/sc20686-mlx-control" ;;
   *) echo "unknown phase $phase" >&2; exit 2 ;;
 esac
+W2=0
+case "$phase" in c|d|d-control) W2=1 ;; esac
 LOG_DIR="$R/logs"
 LOG="$LOG_DIR/$phase-run${GITHUB_RUN_ID:-local}-attempt${GITHUB_RUN_ATTEMPT:-1}.log"
 CTL="${RUNNER_TEMP:-/tmp}/kv-poc-ctl-$phase"
@@ -85,11 +96,16 @@ fi
 
 # 2. Precheck. Fails the job with the reason; never stops or kills anything.
 problems=""
+# W1: llm.json 68 GiB cap + 16 reserve. W2: the media policy's cap + reserve (media-64: 64 + 16).
+need=84
+if [ "$W2" = 1 ]; then
+  need="$(policy_need_gib "$F2/policies/$W2_POLICY" 2>/dev/null)" || { need=0; problems="$problems; $F2/policies/$W2_POLICY is unreadable"; }
+fi
 if measured="$(vm_stat | host_memory_from_vm_stat)" && [ -n "$measured" ]; then
   gib=$(( ${measured%% *} / 1073741824 ))
-  echo "available RAM (free + speculative + purgeable + file cache): ${gib} GiB (need >= 84 = 68 cap + 16 reserve)"
+  echo "available RAM (free + speculative + purgeable + file cache): ${gib} GiB (need >= ${need} = cap + reserve)"
   echo "  components (available-bytes page-size free speculative purgeable inactive file-backed anonymous throttled active file-cache pages): $measured"
-  [ "$gib" -ge 84 ] || problems="$problems; available RAM is ${gib} GiB (< 84)"
+  [ "$gib" -ge "$need" ] || problems="$problems; available RAM is ${gib} GiB (< ${need})"
 else
   problems="$problems; vm_stat host memory could not be measured"
 fi
@@ -98,10 +114,25 @@ echo "LM Studio: $LMS_STATE"
 busy="$(busy_processes)"
 [ -z "$busy" ] || problems="$problems; other MLX/cargo processes are running: $(printf '%s' "$busy" | tr '\n' ' ')"
 verify_tree "$INF" "$INFERENCE_URL" "$INFERENCE_SHA" || problems="$problems; inference tree is not clean at $INFERENCE_SHA"
-verify_tree "$SW" "$SCENEWORKS_URL" "$SCENEWORKS_SHA" || problems="$problems; SceneWorks tree is not clean at $SCENEWORKS_SHA"
-verify_frozen || problems="$problems; frozen dir does not verify"
-python3.12 "$KV_DIR/models.py" --check-only --hub "$KV_HF_HUB" --pins "$KV_DIR/models.tsv" \
-  || problems="$problems; pinned snapshots are missing or wrong"
+if [ "$W2" = 1 ]; then
+  # The W2 parents read the inference checkout (source identity, git HEAD), never SceneWorks.
+  verify_frozen "$F2" || problems="$problems; W2 frozen dir does not verify"
+  case "$F2" in *[[:space:]]*) problems="$problems; $F2 contains whitespace (the Krea launcher shlex-splits its product command)" ;; esac
+  python3.12 "$KV_DIR/models.py" --check-only --hub "$KV_HF_HUB" --pins "$KV_DIR/models-w2.tsv" \
+    || problems="$problems; W2 pinned snapshots are missing or wrong"
+  if [ "$phase" != c ]; then
+    for route in wan_vace wan_vace_fun; do
+      problem="$(verify_w2_vace "$route")" || problems="$problems; assembled $route: $problem"
+    done
+    python3.12 "$KV_DIR/fixtures.py" verify --out "$W2_FIXTURES" --pins "$KV_DIR/fixtures-w2.tsv" \
+      || problems="$problems; VACE fixtures do not verify"
+  fi
+else
+  verify_tree "$SW" "$SCENEWORKS_URL" "$SCENEWORKS_SHA" || problems="$problems; SceneWorks tree is not clean at $SCENEWORKS_SHA"
+  verify_frozen || problems="$problems; frozen dir does not verify"
+  python3.12 "$KV_DIR/models.py" --check-only --hub "$KV_HF_HUB" --pins "$KV_DIR/models.tsv" \
+    || problems="$problems; pinned snapshots are missing or wrong"
+fi
 if [ "$phase" = a3 ] && [ ! -d "$R/evidence/sc20671-dense" ]; then
   problems="$problems; A3 needs the completed A1 evidence $R/evidence/sc20671-dense"
 fi
@@ -112,8 +143,12 @@ if [ -n "$problems" ]; then
 fi
 echo "precheck: GO"
 
-export PMETAL_METALLIB_PATH="$F/mlx.metallib"
-export SCENEWORKS_ROOT="$SW"
+if [ "$W2" = 1 ]; then
+  export PMETAL_METALLIB_PATH="$F2/mlx.metallib"
+else
+  export PMETAL_METALLIB_PATH="$F/mlx.metallib"
+  export SCENEWORKS_ROOT="$SW"
+fi
 
 # 3. Stop plumbing.
 if [ -n "$RESUME" ] && [ -e "$RESUME/STOP" ]; then
@@ -160,6 +195,26 @@ run_cmd() {
   return "$rc"
 }
 
+# W2: the SC-20686 Wan manifest's variables (scripts/sc20686_mlx_wan_campaign_manifest.example.json)
+# and the matrix arguments shared by d and d-control (SC_20686_PERSISTENT_KV_CAMPAIGN.md).
+if [ "$W2" = 1 ]; then
+  export SC20686_MLX_BIN_DIR="$F2" \
+    SC20686_MLX_WAN_TI2V_5B_SNAPSHOT="$W2_TI2V" SC20686_MLX_WAN_T2V_14B_SNAPSHOT="$W2_T2V" \
+    SC20686_MLX_WAN_I2V_14B_SNAPSHOT="$W2_I2V" SC20686_MLX_WAN_VACE_SNAPSHOT="$W2_VACE" \
+    SC20686_MLX_WAN_VACE_FUN_14B_SNAPSHOT="$W2_VACE_FUN" \
+    SC20686_WAN_I2V_REFERENCE="$F2/inputs/dog.jpg" SC20686_VACE_REFERENCE="$F2/inputs/dog.jpg" \
+    SC20686_VACE_CONTROL_17_DIR="$W2_FIXTURES/512x512-17/control" SC20686_VACE_MASK_17_DIR="$W2_FIXTURES/512x512-17/mask" \
+    SC20686_VACE_CONTROL_33_DIR="$W2_FIXTURES/768x512-33/control" SC20686_VACE_MASK_33_DIR="$W2_FIXTURES/768x512-33/mask" \
+    SC20686_WAN_T2V_LIGHTNING_HIGH="$W2_LIGHTNING/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/high_noise_model.safetensors" \
+    SC20686_WAN_T2V_LIGHTNING_LOW="$W2_LIGHTNING/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/low_noise_model.safetensors" \
+    SC20686_WAN_I2V_LIGHTNING_HIGH="$W2_LIGHTNING/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors" \
+    SC20686_WAN_I2V_LIGHTNING_LOW="$W2_LIGHTNING/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors"
+fi
+D_ARGS=(--campaign --matrix --inference-revision "$INFERENCE_SHA" --safety-policy "$F2/policies/$W2_POLICY"
+  --stop-file "$CTL/stop-requested" --wan-manifest "$INF/scripts/sc20686_mlx_wan_campaign_manifest.example.json"
+  --flux-entrypoint "$F2/sc20686_flux2_edit" --flux-snapshot "$W2_FLUX" --flux-kv-snapshot "$W2_FLUX_KV"
+  --flux-reference "$F2/inputs/dog.jpg" --flux-reference2 "$F2/inputs/pulid-reference.png")
+
 LLM_ARGS_TEXT="--llama-snapshot $LQ --qwen-snapshot $QQ --llama-fp32-reference-snapshot $LB --qwen-fp32-reference-snapshot $QB --prompt-file $F/inputs/prompt.txt --safety-policy $F/policies/llm.json"
 # shellcheck disable=SC2206  # every element is a space-free absolute path or flag
 LLM_ARGS=($LLM_ARGS_TEXT)
@@ -201,6 +256,20 @@ case "$phase" in
       # shellcheck disable=SC2086  # deliberate word splitting of the space-free --kv list
       run_cmd "$F/sc20677_kv_candidates" $kv --out "$cmp" || { rc=$?; break; }
     done
+    ;;
+  c)
+    # The launcher shlex-splits --product-command: $F2 must stay free of spaces (it is under $HOME).
+    run_cmd python3.12 "$INF/scripts/sc20684_krea_realtime_campaign.py" --snapshot "$W2_KREA" --output "$OUT" \
+      --safety-policy "$F2/policies/$W2_POLICY" --resume-dir "$RESUME" --stop-file "$CTL/stop-requested" \
+      --product-command "$F2/krea-integration --exact --ignored --nocapture $W2_KREA_OBSERVER" || rc=$?
+    ;;
+  d)
+    run_cmd python3.12 "$INF/scripts/sc20686_campaign_adapter.py" "${D_ARGS[@]}" \
+      --resume-dir "$RESUME" --matrix-output "$OUT" || rc=$?
+    ;;
+  d-control)
+    run_cmd python3.12 "$INF/scripts/sc20686_campaign_adapter.py" "${D_ARGS[@]}" --schedule-control \
+      --resume-dir "$RESUME" --matrix-output "$OUT" || rc=$?
     ;;
 esac
 
