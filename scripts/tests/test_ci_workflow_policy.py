@@ -1588,10 +1588,14 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ):
             with self.subTest(workflow=path.name):
                 workflow = path.read_text(encoding="utf-8")
-                self.assertEqual(
-                    workflow.count("group: inference-real-weights-physical-host"),
-                    1,
-                )
+                if path == YUE_WORKFLOW:
+                    self.assertIn("'inference-real-weights-physical-host'", workflow)
+                    self.assertIn("'inference-yue2-metal-nax-macos-2'", workflow)
+                else:
+                    self.assertEqual(
+                        workflow.count("group: inference-real-weights-physical-host"),
+                        1,
+                    )
                 self.assertIn("cancel-in-progress: false", workflow)
 
     def test_yue_workflow_python_installs_are_binary_hash_locked(self) -> None:
@@ -1601,13 +1605,23 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             if re.search(r"\bpip\s+install\b", line) and not line.lstrip().startswith("#")
         ]
         locks = [re.search(r"\s-r\s+(\S+)", line).group(1) for line in installs]
-        # YuE-v1: the hub fetch and the reference-clip decode; YuE2 (sc-22995): the hub fetch.
-        self.assertEqual(locks, [WINDOWS_HUB_LOCK, WINDOWS_YUE_LOCK, WINDOWS_HUB_LOCK])
-        for line in installs:
+        # The first three are Windows CUDA; the fourth uses the reviewed macOS lock.
+        self.assertEqual(
+            locks,
+            [
+                WINDOWS_HUB_LOCK,
+                WINDOWS_YUE_LOCK,
+                WINDOWS_HUB_LOCK,
+                ".github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt",
+            ],
+        )
+        for line in installs[:3]:
             with self.subTest(install=line):
                 self.assertTrue(line.startswith(f"{WINDOWS_INTERPRETER} -m pip install "))
                 self.assertIn("--only-binary=:all: --require-hashes", line)
                 self.assertTrue(line.endswith("|| exit /b 1"))
+        self.assertTrue(installs[3].startswith("python3.12 -m pip install "))
+        self.assertIn("--only-binary=:all: --require-hashes", installs[3])
 
     def test_yue2_job_renders_through_the_registered_loader(self) -> None:
         # sc-23002: the YuE2 job renders through the registry on its production device and replays

@@ -1,4 +1,4 @@
-name: YuE real-weight validation (CUDA)
+name: YuE real-weight validation
 
 # sc-19387 (epic sc-19373): YuE-v1 lyrics2song through the PRODUCTION registered loader on CUDA.
 # Its own file because `real-weights.yml` sits within ~2 KB of GitHub's 500 KB workflow-size limit
@@ -50,11 +50,11 @@ on:
   workflow_dispatch:
     inputs:
       family:
-        description: "yue = YuE-v1 renders (sc-19387); yue2 = YuE2 precision tiers (sc-22995)"
+        description: "yue = YuE-v1 CUDA; yue2 = YuE2 CUDA; yue2-metal = YuE2 Metal quality"
         type: choice
         required: false
         default: yue
-        options: [yue, yue2]
+        options: [yue, yue2, yue2-metal]
       mode:
         description: "smoke = the three real-weight renders; memory = the device-memory measurement"
         type: choice
@@ -72,9 +72,9 @@ on:
 permissions:
   contents: read
 
-# Shared with every other real-weight workflow: one job on the physical CUDA host at a time.
+# The Metal quality job has its own physical host; leave the CUDA group unchanged.
 concurrency:
-  group: inference-real-weights-physical-host
+  group: ${{ inputs.family == 'yue2-metal' && 'inference-yue2-metal-nax-macos-2' || 'inference-real-weights-physical-host' }}
   cancel-in-progress: false
 
 env:
@@ -87,7 +87,7 @@ jobs:
   # the same shapes took ~3.7 h of render time), plus a one-time ~37 GB fetch of the other tiers.
   candle-audio-yue:
     name: Candle YuE lyrics2song real weights (CUDA)
-    if: inputs.family != 'yue2'
+    if: inputs.family == 'yue'
     runs-on: [self-hosted, windows, cuda, real-weights]
     timeout-minutes: ${{ inputs.mode == 'memory' && 600 || 180 }}
     env:
@@ -454,3 +454,109 @@ jobs:
           if defined YUE2_QUALITY_OUT if exist "%YUE2_QUALITY_OUT%" rmdir /s /q "%YUE2_QUALITY_OUT%"
           if defined YUE2_TIER_DIR if exist "%YUE2_TIER_DIR%" (echo ::error::could not remove %YUE2_TIER_DIR%& exit /b 1)
           exit /b 0
+
+  candle-audio-yue2-metal:
+    name: Candle YuE2 quality (Metal, nax-macos-2)
+    if: inputs.family == 'yue2-metal'
+    runs-on: [self-hosted, macOS, ARM64, rw-audio]
+    timeout-minutes: 240
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../yue2-metal-target-${{ github.run_id }}-${{ github.run_attempt }}
+      YUE2_QUALITY_OUT: ${{ github.workspace }}/../yue2-metal-quality-${{ github.run_id }}-${{ github.run_attempt }}
+      YUE2_TIER_DIR: ${{ github.workspace }}/../yue2-metal-tiers-${{ github.run_id }}-${{ github.run_attempt }}
+      YUE2_EVIDENCE: ${{ github.workspace }}/../yue2-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Require the designated physical host before checkout or provisioning
+        run: |
+          test "$RUNNER_NAME" = nax-macos-2 || { echo "::error::YuE2 Metal quality requires nax-macos-2, got $RUNNER_NAME"; exit 1; }
+      # Workflow controls come from the dispatched branch. The engine under test is always M2.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Refuse busy or undersized host
+        id: preflight
+        run: python3.12 scripts/ci/yue2_metal_preflight.py --evidence "$YUE2_EVIDENCE"
+      - name: Check out the immutable M2 engine
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: 99a60541a73706fb67b4e78f44458774423ffb8e
+          path: engine
+          persist-credentials: false
+      - name: Verify engine identity and prepare paths
+        run: |
+          test "$(git -C engine rev-parse HEAD)" = 99a60541a73706fb67b4e78f44458774423ffb8e
+          test -z "$(git -C engine status --porcelain)"
+          test -x "$(command -v python3.12)"
+          hub="${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub}"
+          mkdir -p "$hub" "$YUE2_QUALITY_OUT" "$YUE2_EVIDENCE"
+          {
+            echo "YUE2_HF_HUB=$hub"
+            echo "CANDLE_AUDIO_YUE2_3B_SNAPSHOT=$hub/models--m-a-p--YuE2-3B/snapshots/1a96eca688d6ae5d7f0feb88573fec89920fcd19"
+            echo "CANDLE_AUDIO_YUE2_VAE_SNAPSHOT=$hub/models--m-a-p--YuE2-Vae/snapshots/95535e72a97bc0f09b8ada125d26b4009428c0e8"
+            echo "CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT=$hub/models--m-a-p--YuE2-Vae-legacy/snapshots/b54118f0fc462f08999d1ec07e88817f4ee3f770"
+          } >> "$GITHUB_ENV"
+          printf 'workflow_sha=%s\nengine_sha=%s\nrunner=%s\n' "$GITHUB_SHA" "$(git -C engine rev-parse HEAD)" "$RUNNER_NAME" > "$YUE2_EVIDENCE/identity.txt"
+      - name: Install hash-locked macOS snapshot materializer
+        run: |
+          python3.12 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --target "$RUNNER_TEMP/yue2-metal-hub-tools" -r .github/requirements/real-weights-huggingface-hub-macos-arm64-py312.txt
+      - name: Materialize and verify pinned generation snapshots
+        env:
+          PYTHONPATH: ${{ runner.temp }}/yue2-metal-hub-tools
+        run: |
+          python3.12 scripts/release/ensure_model_snapshot.py --model yue2-3b --snapshot "$CANDLE_AUDIO_YUE2_3B_SNAPSHOT"
+          python3.12 scripts/release/ensure_model_snapshot.py --model yue2-vae --snapshot "$CANDLE_AUDIO_YUE2_VAE_SNAPSHOT"
+          python3.12 scripts/release/ensure_model_snapshot.py --model yue2-vae-legacy --snapshot "$CANDLE_AUDIO_YUE2_VAE_LEGACY_SNAPSHOT"
+      - name: Build exact-M2 release Metal quality binary without running it
+        working-directory: engine
+        run: |
+          cargo test --locked --release -p candle-audio-yue2 --features metal --lib --no-run > "$YUE2_EVIDENCE/build.log" 2>&1 || { cat "$YUE2_EVIDENCE/build.log"; exit 1; }
+      - name: Regenerate the exact-M2 CPU F32 reference
+        working-directory: engine
+        env:
+          YUE2_QUALITY_DEVICE: cpu
+          YUE2_QUALITY_REFERENCE_DEVICE: cpu
+          YUE2_QUALITY_CONFIGS: f32
+        run: |
+          cargo test --locked --release -p candle-audio-yue2 --features metal --lib quality::tier_quality_against_the_f32_reference -- --ignored --exact --nocapture --test-threads=1 > "$YUE2_EVIDENCE/reference.log" 2>&1 || { cat "$YUE2_EVIDENCE/reference.log"; exit 1; }
+          grep -F 'test result: ok. 1 passed' "$YUE2_EVIDENCE/reference.log"
+          grep -F 'YUE2_EVIDENCE_SUMMARY {"test":"quality::tier_quality_against_the_f32_reference","config":"f32"' "$YUE2_EVIDENCE/reference.log" > "$YUE2_EVIDENCE/reference-summary.txt"
+      - name: Validate reference identity and exact-M2 fixture shapes
+        run: |
+          python3.12 scripts/ci/yue2_quality_reference.py "$YUE2_QUALITY_OUT/reference-f32-cpu.safetensors" engine/crates/audio/candle-audio-yue2/tests/fixtures/ar_real_weights.json --identity "$YUE2_EVIDENCE/reference-identity.json"
+      - name: Recheck host contention before opening Metal
+        run: python3.12 scripts/ci/yue2_metal_preflight.py --evidence "$YUE2_EVIDENCE" --label before-metal
+      - name: Measure four Metal configurations in order, failing on the first error
+        working-directory: engine
+        env:
+          YUE2_QUALITY_DEVICE: metal
+          YUE2_QUALITY_REFERENCE_DEVICE: cpu
+          YUE2_QUALITY_CONFIGS: f32dev,bf16,q8,q4
+        run: |
+          cargo test --locked --release -p candle-audio-yue2 --features metal --lib quality::tier_quality_against_the_f32_reference -- --ignored --exact --nocapture --test-threads=1 > "$YUE2_EVIDENCE/metal-quality.log" 2>&1 || { cat "$YUE2_EVIDENCE/metal-quality.log"; exit 1; }
+          grep -F 'test result: ok. 1 passed' "$YUE2_EVIDENCE/metal-quality.log"
+          grep -F 'YUE2_EVIDENCE_SUMMARY {' "$YUE2_EVIDENCE/metal-quality.log" > "$YUE2_EVIDENCE/metal-quality-summary.txt"
+          for config in f32dev bf16 q8 q4; do
+            test -s "$YUE2_QUALITY_OUT/quality-$config-metal.json"
+          done
+          test "$(wc -l < "$YUE2_EVIDENCE/metal-quality-summary.txt" | tr -d ' ')" = 4
+      - name: Copy any completed quality metrics, including on failure
+        if: ${{ always() && steps.preflight.outcome == 'success' }}
+        run: |
+          for config in f32dev bf16 q8 q4; do
+            if test -s "$YUE2_QUALITY_OUT/quality-$config-metal.json"; then
+              cp "$YUE2_QUALITY_OUT/quality-$config-metal.json" "$YUE2_EVIDENCE/"
+            fi
+          done
+      # Artifact contains only logs/metrics/hashes; never upload the F32 tensor reference or tiers.
+      - name: Keep YuE2 Metal quality evidence
+        id: upload-metal-evidence
+        if: ${{ always() && steps.preflight.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-metal-quality-evidence
+          path: ${{ github.workspace }}/../yue2-metal-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove run-owned build, derived tiers, and tensor reference
+        if: ${{ always() && steps.upload-metal-evidence.outcome == 'success' }}
+        run: |
+          rm -rf -- "$CARGO_TARGET_DIR" "$YUE2_TIER_DIR" "$YUE2_QUALITY_OUT" "$RUNNER_TEMP/yue2-metal-hub-tools"
