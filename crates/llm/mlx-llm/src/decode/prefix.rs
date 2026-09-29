@@ -24,13 +24,14 @@ use core_llm::prefix::{PrefixId, PrefixIndex};
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::stream::{
-    decode_loop, default_seed, ConstraintMask, GenerationConfig, GenerationOutput, StreamEvent,
+    decode_loop, default_seed, observe_cache_events, observe_packed_evidence, ConstraintMask,
+    GenerationConfig, GenerationOutput, ObservedCache, StreamEvent,
 };
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
-use crate::primitives::input_ids;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache, SEQ_AXIS};
 use crate::primitives::sampler::SplitMix64;
+use crate::primitives::{input_ids, CacheRoute};
 
 /// Cumulative reuse accounting for a [`PrefixCache`] — the measurable payoff of story 7168.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,6 +186,7 @@ pub fn generate_cached(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -213,11 +215,17 @@ pub fn generate_cached_with(
         constraint,
         should_stop,
         None,
+        None,
     )
 }
 
 /// Campaign-only observer variant of [`generate_cached_with`].  The observer is attached to the
 /// cache-hit prefill and decode that actually execute, rather than to a later single-shot control.
+///
+/// With a `compressed` arm the request runs on that arm's compressed cache: a prefix hit is
+/// imported into it by quantize-on-append (never a reconstruction), and the compressed cache is
+/// not stored back into the dense prefix store. A declined import keeps the dense seed and is
+/// recorded on the observer as a reasoned `chunked-prefix-import` fallback.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_cached_with_observer(
     model: &CausalLm,
@@ -229,6 +237,7 @@ pub(crate) fn generate_cached_with_observer(
     constraint: Option<&mut dyn ConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
     mut observer: Option<&mut dyn crate::campaign::Observer>,
+    compressed: Option<&crate::campaign::CompressedKvArm>,
 ) -> Result<GenerationOutput> {
     if cancel.is_cancelled() {
         return Err(crate::error::Error::Canceled); // typed pre-inference cancel
@@ -242,24 +251,28 @@ pub(crate) fn generate_cached_with_observer(
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
 
     // Reuse the longest cached prefix (or start cold), then prefill only the uncached suffix.
-    let (mut cache, matched_len) = match prefix_cache.seed_for(prompt_ids)? {
-        Some((cache, len)) => (cache, len),
-        None => (model.new_cache(), 0),
+    let seed = prefix_cache.seed_for(prompt_ids)?;
+    let matched_len = seed.as_ref().map_or(0, |(_, len)| *len);
+    let mut cache: Box<dyn KvCache> = match (seed, compressed) {
+        (Some((seed, _)), Some(arm)) => import_compressed_prefix(model, arm, seed, &mut observer)?,
+        (None, Some(arm)) => compressed_cache(model, arm, &mut observer).0,
+        (Some((seed, _)), None) => Box::new(seed),
+        (None, None) => Box::new(model.new_cache()),
     };
-    let mut observed_cache_events = 0;
+    let mut observed_cache = ObservedCache::default();
     let suffix = input_ids(&prompt_ids[matched_len..]);
-    let logits = model.decode_logits(&suffix, &mut cache, matched_len as i32)?;
+    let logits = model.decode_logits(&suffix, cache.as_mut(), matched_len as i32)?;
     if let Some(observer) = observer.as_deref_mut() {
         let logits_f32 = logits.as_dtype(Dtype::Float32)?;
         let values = logits_f32.as_slice::<f32>().to_vec();
         observer.logits("prefill", &values);
         observer.phase("prefill-peak");
-        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
     }
+    observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
 
     let out = decode_loop(
         model,
-        &mut cache,
+        cache.as_mut(),
         logits,
         rng,
         prompt_ids.to_vec(),
@@ -273,7 +286,10 @@ pub(crate) fn generate_cached_with_observer(
 
     if let Some(observer) = observer.as_deref_mut() {
         observer.phase("decode-steady");
-        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
+    }
+    observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
+    observe_packed_evidence(cache.as_ref(), &mut observer);
+    if let Some(observer) = observer.as_deref_mut() {
         if matches!(out.finish_reason, crate::decode::FinishReason::Cancelled) {
             observer.phase("cancellation-cleanup");
         }
@@ -288,37 +304,76 @@ pub(crate) fn generate_cached_with_observer(
     let mut full = prompt_ids.to_vec();
     full.extend_from_slice(&out.tokens);
     full.truncate(cache.offset() as usize);
-    prefix_cache.store(full, &cache)?;
-    cache.reset()?;
-    if let Some(observer) = observer {
-        observe_cache_events(&mut cache, &mut observed_cache_events, observer)?;
+    // Only a dense contiguous cache is stored; a compressed cache never re-enters the dense store.
+    if let Some(dense) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() {
+        prefix_cache.store(full, dense)?;
     }
+    cache.reset()?;
+    observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
 
     Ok(out)
 }
 
-fn observe_cache_events(
-    cache: &mut dyn KvCache,
-    seen: &mut usize,
-    observer: &mut dyn crate::campaign::Observer,
-) -> Result<()> {
-    let Some(cache) = cache.as_any_mut().downcast_ref::<ContiguousKvCache>() else {
-        return Ok(());
-    };
-    for event in cache.events().iter().skip(*seen) {
-        if event.role == "cache" && event.lifetime == "persistent" {
-            continue;
-        } else if event.lifetime == "released" {
-            observer.release_event(event.operation, event.role, event.bytes);
-        } else {
-            observer.allocation_event(event.operation, event.role, event.lifetime, event.bytes);
+/// Operation name of a reasoned fallback on the compressed prefix-import path.
+pub(crate) const COMPRESSED_PREFIX_IMPORT_OPERATION: &str = "chunked-prefix-import";
+
+fn record_prefix_fallback(
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+    operation: &str,
+    reason: &str,
+) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.dense_fallback(operation, reason);
+    }
+}
+
+/// The arm's cache and whether its compressed route was selected. A selection the model refuses
+/// before any mutation is recorded, exactly as the campaign's compressed decoder records it.
+fn compressed_cache(
+    model: &CausalLm,
+    arm: &crate::campaign::CompressedKvArm,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) -> (Box<dyn KvCache>, bool) {
+    let selection = arm.select_cache(model);
+    let accepted = match selection.route() {
+        CacheRoute::DenseFallback { reason } => {
+            record_prefix_fallback(observer, "cache-selection", reason);
+            false
         }
+        CacheRoute::ExperimentalPacked => true,
+    };
+    (selection.into_cache(), accepted)
+}
+
+/// Import a prefix hit into the arm's compressed cache by quantize-on-append. Any refusal keeps the
+/// dense seed (the ordinary dense reuse path) and records why.
+fn import_compressed_prefix(
+    model: &CausalLm,
+    arm: &crate::campaign::CompressedKvArm,
+    seed: ContiguousKvCache,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) -> Result<Box<dyn KvCache>> {
+    let (mut cache, accepted) = compressed_cache(model, arm, observer);
+    if !accepted {
+        return Ok(Box::new(seed));
     }
-    *seen = cache.events().len();
-    if let Some((bytes, tokens, capacity, element_bytes)) = cache.retained_snapshot()? {
-        observer.cache_snapshot(bytes, tokens, capacity, element_bytes);
+    let Some(layers) = seed.export()? else {
+        record_prefix_fallback(
+            observer,
+            COMPRESSED_PREFIX_IMPORT_OPERATION,
+            "the reused prefix has no exportable dense K/V",
+        );
+        return Ok(Box::new(seed));
+    };
+    if !cache.import_prefix(&layers)? {
+        record_prefix_fallback(
+            observer,
+            COMPRESSED_PREFIX_IMPORT_OPERATION,
+            "the compressed cache declined the reused prefix (route not live, or geometry/dtype mismatch)",
+        );
+        return Ok(Box::new(seed));
     }
-    Ok(())
+    Ok(cache)
 }
 
 /// The sequence length (axis [`SEQ_AXIS`]) the stored per-layer KV actually holds — layer 0 speaks

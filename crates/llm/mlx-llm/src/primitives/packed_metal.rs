@@ -582,9 +582,12 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
     })
 }
 
+/// Cache identity of the default SC-20676 packed group-affine reader.
+pub const PACKED_METAL_DEFAULT_IDENTITY: &str = "sc-20676-packed-group-affine-v1";
+
 impl PackedMetalKernel {
     pub fn new() -> Result<Self> {
-        Self::for_identity("sc-20676-packed-group-affine-v1")
+        Self::for_identity(PACKED_METAL_DEFAULT_IDENTITY)
     }
 
     /// Construct the retained reader for one cache identity.  The identity is part of the

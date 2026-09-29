@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use core_llm::Tokenizer;
+use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
 
 use crate::campaign;
@@ -105,8 +106,12 @@ pub struct Sc20676TimingSample {
     pub ttft_ms: f64,
     pub first_token_ms: f64,
     pub steady_decode_tokens_per_second: f64,
+    /// Cold (JIT) packed dispatch, evaluated to completion inside the cache.
     pub packed_cold_dispatch_ms: f64,
-    pub packed_warm_dispatch_ms: f64,
+    /// Mean host-side encode time of one steady packed dispatch. A steady dispatch is lazy and
+    /// joins the per-token evaluation, so this excludes GPU execution; GPU time is inside the
+    /// token-boundary timings above (`ttftMs`, `steadyDecodeTokensPerSecond`).
+    pub packed_warm_host_dispatch_ms: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -589,10 +594,10 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
                     > f64::EPSILON * (sample.first_token_ms.abs() + 1.0)
                 || (arm.mode == "dense"
                     && (sample.packed_cold_dispatch_ms != 0.0
-                        || sample.packed_warm_dispatch_ms != 0.0))
+                        || sample.packed_warm_host_dispatch_ms != 0.0))
                 || (arm.mode == "packed"
                     && (sample.packed_cold_dispatch_ms != 0.0
-                        || !finite_positive(sample.packed_warm_dispatch_ms)))
+                        || !finite_positive(sample.packed_warm_host_dispatch_ms)))
         })
     {
         return Err("SC-20676 timing evidence is incomplete or unstable".into());
@@ -1295,6 +1300,17 @@ fn transient_peak_above_active(peak: &campaign::MemorySample) -> u64 {
     peak.mlx_peak_bytes.saturating_sub(peak.mlx_active_bytes)
 }
 
+/// Run a prefill and evaluate its logits inside the timed region, so `prefillMs` ends at GPU
+/// completion rather than at lazy graph construction (the same boundary for both arms).
+fn timed_prefill(
+    prefill: impl FnOnce() -> crate::error::Result<Array>,
+) -> std::result::Result<(Array, f64), String> {
+    let started = Instant::now();
+    let logits = prefill().map_err(|e| e.to_string())?;
+    logits.eval().map_err(|e| e.to_string())?;
+    Ok((logits, started.elapsed().as_secs_f64() * 1000.0))
+}
+
 /// Two warmups are deliberately discarded; all five stored samples are independent cache
 /// allocations and decode operations.  This prevents a single worker elapsed time from becoming
 /// the performance gate.
@@ -1304,11 +1320,8 @@ fn dense_timing_trial(
     config: &GenerationConfig,
 ) -> std::result::Result<Sc20676TimingSample, String> {
     let mut cache: Box<dyn KvCache> = Box::new(model.new_cache());
-    let prefill_started = Instant::now();
-    let logits = model
-        .decode_logits(&input_ids(ids), cache.as_mut(), 0)
-        .map_err(|e| e.to_string())?;
-    let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1000.0;
+    let (logits, prefill_ms) =
+        timed_prefill(|| model.decode_logits(&input_ids(ids), cache.as_mut(), 0))?;
     let decode_started = Instant::now();
     let mut first_token_ms = None;
     let output = generate_from_prefill(
@@ -1340,7 +1353,7 @@ fn dense_timing_trial(
         first_token_ms: prefill_ms + ttft_ms,
         steady_decode_tokens_per_second: (output.tokens.len() - 1) as f64 / (steady_ms / 1000.0),
         packed_cold_dispatch_ms: 0.0,
-        packed_warm_dispatch_ms: 0.0,
+        packed_warm_host_dispatch_ms: 0.0,
     })
 }
 
@@ -1354,11 +1367,8 @@ fn packed_timing_trial(
     if route != CacheRoute::ExperimentalPacked {
         return Err("timing trial did not select packed cache".into());
     }
-    let prefill_started = Instant::now();
-    let logits = model
-        .decode_logits(&input_ids(ids), cache.as_mut(), 0)
-        .map_err(|e| e.to_string())?;
-    let prefill_ms = prefill_started.elapsed().as_secs_f64() * 1000.0;
+    let (logits, prefill_ms) =
+        timed_prefill(|| model.decode_logits(&input_ids(ids), cache.as_mut(), 0))?;
     let decode_started = Instant::now();
     let mut first_token_ms = None;
     let output = generate_from_prefill(
@@ -1407,7 +1417,8 @@ fn packed_timing_trial(
         // The retained handle was warmed once by the primary measured arm. These five independent
         // cache trials are steady-only; the real cold/JIT observation remains in `arm.packed`.
         packed_cold_dispatch_ms: 0.0,
-        packed_warm_dispatch_ms: evidence.steady_elapsed_ms / evidence.steady_dispatches as f64,
+        packed_warm_host_dispatch_ms: evidence.steady_elapsed_ms
+            / evidence.steady_dispatches as f64,
     })
 }
 
@@ -2722,7 +2733,7 @@ mod tests {
                 first_token_ms: 2.0,
                 steady_decode_tokens_per_second: 10.0,
                 packed_cold_dispatch_ms: 0.0,
-                packed_warm_dispatch_ms: if packed { 1.0 } else { 0.0 }
+                packed_warm_host_dispatch_ms: if packed { 1.0 } else { 0.0 }
             };
             5
         ]
@@ -2929,6 +2940,16 @@ mod tests {
             packed: arm("packed"),
         }
     }
+    /// The prefill timer's region must end at GPU completion of the logits, not at the lazy graph.
+    #[test]
+    fn timed_prefill_ends_after_the_logits_are_evaluated() {
+        let (logits, _) = timed_prefill(|| {
+            Ok(Array::from_slice(&[1.0_f32, 2.0], &[1, 2]).multiply(Array::from_f32(3.0))?)
+        })
+        .unwrap();
+        assert!(crate::decode::stream::mlx_array_is_available(&logits));
+    }
+
     #[test]
     fn seal_nonce_pid_and_input_tampering_fail_closed() {
         let sealed = receipt().finish().unwrap();
@@ -3369,7 +3390,7 @@ mod tests {
         assert!(validate_sc20676_receipt(&bad).is_err());
 
         let mut bad = receipt();
-        bad.packed.timings[0].packed_warm_dispatch_ms = 0.0;
+        bad.packed.timings[0].packed_warm_host_dispatch_ms = 0.0;
         reseal_arm(&mut bad.packed);
         assert!(validate_sc20676_receipt(&bad).is_err());
     }

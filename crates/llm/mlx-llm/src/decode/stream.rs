@@ -291,7 +291,7 @@ pub(crate) fn generate_with_observer(
 
 /// Campaign observation state for one decoder cache.
 #[derive(Default)]
-struct ObservedCache {
+pub(super) struct ObservedCache {
     /// Dense cache events already forwarded.
     dense_events: usize,
     /// Physical packed bytes of the last forwarded packed snapshot, still owned by the cache.
@@ -303,7 +303,7 @@ struct ObservedCache {
 /// Export only cache-owned byte observations.  Unsupported cache implementations produce no
 /// synthetic events; the receipt producer must then record an explicit fallback rather than
 /// inventing an allocation total.
-fn observe_cache_events(
+pub(super) fn observe_cache_events(
     cache: &mut dyn KvCache,
     state: &mut ObservedCache,
     observer: &mut Option<&mut dyn crate::campaign::Observer>,
@@ -393,7 +393,7 @@ fn observe_contiguous(
 
 /// Forward a compressed cache's immutable model-boundary evidence exactly once per decoder cache,
 /// after decode and before reset, so fused/fallback counts are never double counted.
-fn observe_packed_evidence(
+pub(super) fn observe_packed_evidence(
     cache: &dyn KvCache,
     observer: &mut Option<&mut dyn crate::campaign::Observer>,
 ) {
@@ -707,6 +707,34 @@ pub(crate) fn default_seed() -> u64 {
 
 pub use super::cancel::CancelFlag;
 
+/// Test-only MLX evaluation probe: whether `array` is materialized (mlx-c's internal
+/// `_mlx_array_is_available`, linked through mlx-rs). A timer whose region ends while this is still
+/// false measured lazy graph construction, not GPU completion.
+#[cfg(test)]
+pub(crate) fn mlx_array_is_available(array: &Array) -> bool {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawMlxArray {
+        ctx: *mut std::ffi::c_void,
+    }
+    extern "C" {
+        fn _mlx_array_is_available(res: *mut bool, arr: RawMlxArray) -> std::ffi::c_int;
+    }
+    let handle = array.as_ptr();
+    assert_eq!(
+        std::mem::size_of_val(&handle),
+        std::mem::size_of::<RawMlxArray>()
+    );
+    // SAFETY: mlx-c's `mlx_array` is `struct { void* ctx; }`, mirrored by `RawMlxArray` (sizes
+    // asserted above); the call only reads the handle, which `array` keeps alive.
+    let raw: RawMlxArray = unsafe { std::mem::transmute_copy(&handle) };
+    let mut available = false;
+    // SAFETY: `available` is a valid out-pointer and `raw` a live array handle.
+    let status = unsafe { _mlx_array_is_available(&mut available, raw) };
+    assert_eq!(status, 0, "mlx-c availability probe failed");
+    available
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +813,90 @@ mod tests {
         assert_eq!(
             observer.phases,
             vec!["prefill-peak", "first-token", "decode-steady"]
+        );
+    }
+
+    /// Returns lazy logits (an unevaluated multiply) and keeps a handle to every array it returned,
+    /// so an observer can probe whether each had reached GPU completion at a phase timestamp.
+    struct LazyDecoder {
+        produced: std::rc::Rc<std::cell::RefCell<Vec<Array>>>,
+    }
+
+    impl Decode for LazyDecoder {
+        fn make_cache(&self) -> Box<dyn KvCache> {
+            Box::new(ContiguousKvCache::new(0))
+        }
+
+        fn step(
+            &self,
+            _input_ids: &Array,
+            _cache: &mut dyn KvCache,
+            _offset: i32,
+        ) -> Result<Array> {
+            let base = Array::from_slice(&[0.0_f32, 1.0, -1.0], &[1, 3]);
+            let logits = base.multiply(Array::from_f32(2.0))?;
+            assert!(
+                !mlx_array_is_available(&logits),
+                "the probe must see lazy logits"
+            );
+            self.produced.borrow_mut().push(logits.clone());
+            Ok(logits)
+        }
+    }
+
+    /// At each timing phase, whether every logits array produced so far was materialized.
+    struct BoundaryProbe {
+        produced: std::rc::Rc<std::cell::RefCell<Vec<Array>>>,
+        phases: Vec<(&'static str, usize, bool)>,
+    }
+
+    impl crate::campaign::Observer for BoundaryProbe {
+        fn phase(&mut self, name: &'static str) {
+            let produced = self.produced.borrow();
+            let complete = produced.iter().all(mlx_array_is_available);
+            self.phases.push((name, produced.len(), complete));
+        }
+
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+    }
+
+    /// SC-20671 timings are phase deltas (`prefill-peak`, `first-token`, `decode-steady`). Every
+    /// phase must be stamped only after the logits it closes over reached GPU completion — the
+    /// same boundary for the dense and compressed arms, which share this decode loop — so a lazy
+    /// cache or reader cannot turn a timing into host dispatch time.
+    #[test]
+    fn timing_phases_are_stamped_after_the_sampled_logits_complete() {
+        let produced = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let decoder = LazyDecoder {
+            produced: produced.clone(),
+        };
+        let mut probe = BoundaryProbe {
+            produced,
+            phases: Vec::new(),
+        };
+        let output = generate_with_observer(
+            &decoder,
+            &[7],
+            &GenerationConfig {
+                max_new_tokens: 3,
+                seed: Some(0),
+                ..Default::default()
+            },
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+            None,
+            Some(&mut probe),
+        )
+        .unwrap();
+        assert_eq!(output.tokens.len(), 3);
+        assert_eq!(
+            probe.phases,
+            vec![
+                ("prefill-peak", 1, true),
+                ("first-token", 1, true),
+                ("decode-steady", 3, true),
+            ]
         );
     }
 
@@ -887,15 +999,18 @@ mod tests {
         let storage = capture.storages[0];
         assert_eq!(capture.storages.len(), 1);
         assert!(storage.device_code_bytes > 0 && storage.device_metadata_bytes > 0);
-        assert!(storage.host_payload_bytes > 0);
+        assert_eq!(
+            storage.host_payload_bytes, 0,
+            "the decoder route's packed K/V is device-resident; no host copy exists"
+        );
         assert_eq!(
             capture.snapshots[0],
             (storage.device_bytes(), 1, 256, 2),
             "packed persistent KV is the measured device storage at the dense-equivalent geometry"
         );
         assert!(
-            storage.device_bytes() < 2 * 64 * 2,
-            "below one dense f16 K/V token"
+            storage.device_bytes() < 2 * 64 * 2 * 256,
+            "the block-preallocated packed store stays below one dense f16 K/V block"
         );
         let dense_bytes = capture.snapshots[1].0;
         assert_eq!(capture.reconstructions, vec![dense_bytes]);

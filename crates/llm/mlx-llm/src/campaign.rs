@@ -127,7 +127,7 @@ pub const FULL_CACHE_MATERIALIZATION_KIND: &str = "full_cache_materialization";
 pub const DENSE_CACHE_TEMPORARY_KIND: &str = "dense_cache_temporary";
 /// Compressed-arm operations the compressed representation has no route for. They run on the
 /// explicit dense path and every execution is recorded as a reasoned fallback in the receipt.
-pub const COMPRESSED_PREFIX_REUSE_FALLBACK_REASON: &str = "the provider prefix cache stores dense contiguous K/V; importing a reused prefix into the compressed representation is unsupported";
+pub const COMPRESSED_PREFIX_REUSE_FALLBACK_REASON: &str = "the provider prefix cache computes and stores shared prefixes as dense contiguous K/V; only a compressed cache-hit decode imports a reused prefix (quantize-on-append)";
 pub const COMPRESSED_BATCH_FALLBACK_REASON: &str = "batched prefill attends through additive padding masks, which the compressed fused reader cannot apply; the synchronous batch decoder keeps its dense cache";
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
@@ -1019,12 +1019,25 @@ impl CompressedKvMethod {
             })
     }
 
+    /// GPU-family tuning profile of this method's fused reader, recorded on every compressed
+    /// receipt. No device-family detector exists in this crate; none is needed because MLX's
+    /// Metal backend runs only on Apple silicon, whose oldest Mac GPU (M1) is Apple family 7, so
+    /// any device this arm can dispatch on qualifies for the recent-family profile.
+    pub fn kernel_gpu_family(self) -> crate::primitives::PackedMetalGpuFamily {
+        match self {
+            Self::GroupAffine => crate::primitives::PackedMetalGpuFamily::Apple7OrNewer,
+        }
+    }
+
     /// Build this method's retained fused reader once per campaign session.
     pub fn arm(self) -> Result<CompressedKvArm, String> {
         let reader = match self {
             Self::GroupAffine => {
-                let kernel =
-                    crate::primitives::PackedMetalKernel::new().map_err(|e| e.to_string())?;
+                let kernel = crate::primitives::PackedMetalKernel::for_identity_and_family(
+                    crate::primitives::PACKED_METAL_DEFAULT_IDENTITY,
+                    self.kernel_gpu_family(),
+                )
+                .map_err(|e| e.to_string())?;
                 // The single-threaded campaign worker owns this non-Send Metal object through the
                 // cache handle's `Arc`, exactly as the SC-20676 evidence worker does.
                 #[allow(clippy::arc_with_non_send_sync)]
@@ -1076,140 +1089,11 @@ impl CompressedKvArm {
     /// dequantize-then-attend reference over the exact stored codes.
     pub fn kernel_parity_errors(&self) -> Result<Vec<f64>, String> {
         match self.method {
-            CompressedKvMethod::GroupAffine => group_affine_kernel_fp32_parity_errors(&self.reader),
+            CompressedKvMethod::GroupAffine => {
+                crate::primitives::group_affine_kernel_fp32_parity_errors(&self.reader)
+            }
         }
     }
-}
-
-/// Fused packed-reader parity fixture: synthetic query/K/V large enough that attention is peaked
-/// and 2-bit quantization error is visible, stored in the packed group-affine cache, dispatched
-/// through the retained Metal reader, and compared with host-fp32 attention over the dequantized
-/// values the reader actually consumed.
-fn group_affine_kernel_fp32_parity_errors(
-    reader: &crate::primitives::CompiledKernelHandle,
-) -> Result<Vec<f64>, String> {
-    const QUERY_HEADS: usize = 4;
-    const KV_HEADS: usize = 2;
-    const TOKENS: usize = 32;
-    const WIDTH: usize = 128;
-    let query = (0..QUERY_HEADS * WIDTH)
-        .map(|index| (index as i32 % 17 - 8) as f32 * 0.05)
-        .collect::<Vec<_>>();
-    let keys = (0..KV_HEADS * TOKENS * WIDTH)
-        .map(|index| (index as i32 % 29 - 14) as f32 * 0.05)
-        .collect::<Vec<_>>();
-    let values = (0..KV_HEADS * TOKENS * WIDTH)
-        .map(|index| (index as i32 % 23 - 11) as f32 * 0.05)
-        .collect::<Vec<_>>();
-    let mut cache = crate::primitives::PackedGroupAffineKvCache::new(
-        reader.cache_identity(),
-        1,
-        1,
-        KV_HEADS,
-        WIDTH,
-        crate::primitives::PACKED_METAL_QUANT_GROUP_SIZE,
-    )
-    .map_err(|e| format!("packed kernel parity cache: {e}"))?;
-    cache
-        .append(0, &keys, &values, TOKENS)
-        .map_err(|e| format!("packed kernel parity append: {e}"))?;
-    cache
-        .bind_compiled_handle(reader.clone())
-        .map_err(|e| format!("packed kernel parity reader: {e}"))?;
-    // Host reference over the values the reader consumes: `read_row` dequantizes the exact codes.
-    let mut dequantized_keys = vec![0.0f32; KV_HEADS * TOKENS * WIDTH];
-    let mut dequantized_values = vec![0.0f32; KV_HEADS * TOKENS * WIDTH];
-    for head in 0..KV_HEADS {
-        for token in 0..TOKENS {
-            let (key, value) = cache
-                .read_row(0, token, head)
-                .map_err(|e| format!("packed kernel parity read: {e}"))?;
-            let base = (head * TOKENS + token) * WIDTH;
-            dequantized_keys[base..base + WIDTH].copy_from_slice(&key);
-            dequantized_values[base..base + WIDTH].copy_from_slice(&value);
-        }
-    }
-    let q = mlx_rs::Array::from_slice(&query, &[1, QUERY_HEADS as i32, 1, WIDTH as i32]);
-    let output = cache
-        .dispatch_packed(0, &q, crate::primitives::PackedMask::None)
-        .map_err(|e| format!("packed kernel parity dispatch: {e}"))?;
-    let output = output
-        .as_dtype(mlx_rs::Dtype::Float32)
-        .map_err(|e| format!("packed kernel parity dtype: {e}"))?;
-    output
-        .eval()
-        .map_err(|e| format!("packed kernel parity evaluation: {e}"))?;
-    if cache.direct_dispatches() != 1 || cache.full_cache_dequantizations() != 0 {
-        return Err("packed kernel parity did not run exactly one fused dispatch".into());
-    }
-    let expected = host_fp32_attention(
-        &query,
-        &dequantized_keys,
-        &dequantized_values,
-        QUERY_HEADS,
-        KV_HEADS,
-        TOKENS,
-        WIDTH,
-    );
-    let errors = output
-        .as_slice::<f32>()
-        .iter()
-        .zip(expected)
-        .map(|(actual, expected)| f64::from((*actual - expected).abs()))
-        .collect::<Vec<_>>();
-    if errors.len() != QUERY_HEADS * WIDTH {
-        return Err("packed kernel parity output has the wrong shape".into());
-    }
-    drop((output, q, cache));
-    mlx_rs::memory::clear_cache();
-    Ok(errors)
-}
-
-/// Independent host-fp32 single-query attention over `[kv_heads, tokens, width]` K/V.
-fn host_fp32_attention(
-    query: &[f32],
-    keys: &[f32],
-    values: &[f32],
-    query_heads: usize,
-    kv_heads: usize,
-    tokens: usize,
-    width: usize,
-) -> Vec<f32> {
-    let scale = 1.0 / (width as f32).sqrt();
-    let groups = query_heads / kv_heads;
-    let mut expected = Vec::with_capacity(query_heads * width);
-    for query_head in 0..query_heads {
-        let kv_base = (query_head / groups) * tokens * width;
-        let query_base = query_head * width;
-        let scores = (0..tokens)
-            .map(|token| {
-                (0..width)
-                    .map(|channel| {
-                        query[query_base + channel] * keys[kv_base + token * width + channel]
-                    })
-                    .sum::<f32>()
-                    * scale
-            })
-            .collect::<Vec<_>>();
-        let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let denominator = scores
-            .iter()
-            .map(|score| (*score - maximum).exp())
-            .sum::<f32>();
-        for channel in 0..width {
-            expected.push(
-                scores
-                    .iter()
-                    .enumerate()
-                    .map(|(token, score)| {
-                        ((*score - maximum).exp() / denominator)
-                            * values[kv_base + token * width + channel]
-                    })
-                    .sum::<f32>(),
-            );
-        }
-    }
-    expected
 }
 
 /// A campaign-only loaded product session. The provider and prefix cache remain resident across
@@ -1580,6 +1464,8 @@ pub struct ReceiptCompression {
     pub representation_version: u64,
     pub bits: u64,
     pub quantization_group_size: u64,
+    /// GPU-family tuning profile the fused reader was built with (`PackedMetalGpuFamily`).
+    pub kernel_gpu_family: String,
     /// Peak live compressed storage of the coordinate operation's own cache, measured from its
     /// retained device arrays and its allocated host payload (host codes/metadata copy plus the
     /// staged key tail): `physicalKvBytes` is exactly their sum and is the whole physical
@@ -1966,6 +1852,12 @@ fn validate_receipt_compression(
         || compression.representation_version == 0
         || compression.bits == 0
         || compression.quantization_group_size == 0
+        || ![
+            crate::primitives::PackedMetalGpuFamily::ConservativeUnknownApple,
+            crate::primitives::PackedMetalGpuFamily::Apple7OrNewer,
+        ]
+        .iter()
+        .any(|family| family.as_str() == compression.kernel_gpu_family)
     {
         return Err("compressed representation identity is incomplete".into());
     }
@@ -5710,11 +5602,15 @@ pub struct ProductObserver {
     packed_evidence: Vec<crate::primitives::PackedCacheEvidence>,
     dense_fallbacks: Vec<(String, String)>,
     compressed_storage_peak: Option<crate::primitives::CompressedCacheStorage>,
+    /// `(packed evidence, dense fallbacks)` recorded before the coordinate's measured dispatch
+    /// opened; set once by [`ProductObserver::begin_coordinate_operation`].
+    coordinate_start: Option<(usize, usize)>,
     coordinate_scope: Option<CoordinateCompressionScope>,
 }
 
-/// Compressed-arm evidence of one coordinate operation only (its setup and measured dispatch),
-/// closed by [`ProductObserver::end_coordinate_operation`] before the lifecycle probes
+/// Compressed-arm evidence of one coordinate operation's measured dispatch only (opened by
+/// [`ProductObserver::begin_coordinate_operation`] after its setup, or from observer creation when
+/// never opened), closed by [`ProductObserver::end_coordinate_operation`] before the lifecycle probes
 /// (prompt-cache reuse, cancellation) run on the same observer.
 #[derive(Clone, Debug, Default)]
 pub struct CoordinateCompressionScope {
@@ -5749,8 +5645,21 @@ impl ProductObserver {
             packed_evidence: Vec::new(),
             dense_fallbacks: Vec::new(),
             compressed_storage_peak: None,
+            coordinate_start: None,
             coordinate_scope: None,
         }
+    }
+
+    /// Open the coordinate operation's measured dispatch. Evidence recorded before it — setup
+    /// such as seeding the provider's dense prefix store — stays counted arm-wide but never
+    /// classifies the coordinate's representation or supplies its storage.
+    pub fn begin_coordinate_operation(&mut self) {
+        if self.coordinate_start.is_some() || self.coordinate_scope.is_some() {
+            self.error = Some("coordinate operation opened twice or after it closed".into());
+            return;
+        }
+        self.coordinate_start = Some((self.packed_evidence.len(), self.dense_fallbacks.len()));
+        self.compressed_storage_peak = None;
     }
 
     /// Close the coordinate operation: compressed evidence recorded so far describes the measured
@@ -5760,9 +5669,10 @@ impl ProductObserver {
             self.error = Some("duplicate coordinate-operation scope".into());
             return;
         }
+        let (evidence, fallbacks) = self.coordinate_start.unwrap_or((0, 0));
         self.coordinate_scope = Some(CoordinateCompressionScope {
-            packed_evidence: self.packed_evidence.clone(),
-            dense_fallbacks: self.dense_fallbacks.clone(),
+            packed_evidence: self.packed_evidence[evidence..].to_vec(),
+            dense_fallbacks: self.dense_fallbacks[fallbacks..].to_vec(),
             storage_peak: self.compressed_storage_peak,
         });
     }
@@ -6805,6 +6715,9 @@ fn run_coordinate_operation_on_session(
     } else {
         0.0
     };
+    // The dense prefix-store seed above is setup: counted, but it never classifies the
+    // coordinate's own (compressed or reasoned-dense) persistent KV.
+    observer.begin_coordinate_operation();
     observer.begin_prefill_memory_window();
     observer.phase("weights-loaded");
     observer.allocation("weights", "persistent", session.model_weights_bytes());
@@ -6839,15 +6752,16 @@ fn run_coordinate_operation_on_session(
                 dispatch_elapsed_ms,
             )
         } else if operation == "chunked-prefix-reuse" {
+            // A compressed arm imports the reused prefix into its compressed cache; a declined
+            // import is recorded by the prefix path as a reasoned fallback.
             let ((output, hits, prompt_tokens), dispatch_elapsed_ms) =
                 measure_product_dispatch(&mut observer, |observer| {
-                    provider.campaign_prefix_reuse_observed(prefix_prompt, observer)
+                    provider.campaign_prefix_reuse_observed(
+                        prefix_prompt,
+                        observer,
+                        session.compressed(),
+                    )
                 })?;
-            session.dense_fallback(
-                &mut observer,
-                "chunked-prefix-reuse",
-                COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
-            );
             if hits == 0 {
                 return Err(core_llm::Error::InvalidRequest(
                     "observed prefix coordinate has no cache hit".into(),
@@ -8008,9 +7922,10 @@ fn receipt_quality_over_repeats(
 }
 
 /// Lifecycle capabilities a row actually exercised. Dense rows have no compressed lifecycle
-/// representation. Compressed rows run single-shot prefill, append, and cancellation on the
-/// compressed cache and exercise an explicit reasoned dense fallback; the prefix-cache paths
-/// (chunked prefill and prompt-cache reuse) are dense by construction and are recorded as such.
+/// representation. Compressed rows run single-shot prefill, chunked (prefix-hit suffix) prefill
+/// over an imported prefix, append, and cancellation on the compressed cache and exercise an
+/// explicit reasoned dense fallback; prompt-cache reuse runs the provider's dense prefix store and
+/// is recorded as such.
 pub fn receipt_lifecycle(compressed: bool) -> ReceiptLifecycle {
     let mut fallback_reasons = std::collections::BTreeMap::new();
     let unexercised = if compressed {
@@ -8034,18 +7949,16 @@ pub fn receipt_lifecycle(compressed: bool) -> ReceiptLifecycle {
         fallback_reasons.insert(format!("{capability}FallbackReason"), unexercised.into());
     }
     if compressed {
-        for capability in ["chunkedPrefill", "promptCacheReuse"] {
-            fallback_reasons.insert(
-                format!("{capability}FallbackReason"),
-                COMPRESSED_PREFIX_REUSE_FALLBACK_REASON.into(),
-            );
-        }
+        fallback_reasons.insert(
+            "promptCacheReuseFallbackReason".into(),
+            COMPRESSED_PREFIX_REUSE_FALLBACK_REASON.into(),
+        );
     } else {
         fallback_reasons.insert("denseFallbackFallbackReason".into(), unexercised.into());
     }
     ReceiptLifecycle {
         append: true,
-        chunked_prefill: !compressed,
+        chunked_prefill: true,
         single_shot_prefill: true,
         prompt_cache_reuse: !compressed,
         trim: false,
@@ -8180,6 +8093,7 @@ pub fn compressed_receipt_block(
         bits: first.bits.into(),
         quantization_group_size: u64::try_from(first.quantization_group_size)
             .map_err(|_| "quantization group size overflows u64")?,
+        kernel_gpu_family: method.kernel_gpu_family().as_str().into(),
         device_code_bytes: storage.device_code_bytes,
         device_metadata_bytes: storage.device_metadata_bytes,
         host_payload_bytes: storage.host_payload_bytes,
@@ -10241,6 +10155,11 @@ pub(crate) mod tests {
             },
             "contract v3 denominator",
         );
+        // The fused reader's tuning profile must be a known GPU family.
+        rejects(
+            &|r| r.compression.as_mut().unwrap().kernel_gpu_family = "made-up-family".into(),
+            "identity is incomplete",
+        );
         // Silent fallback: unreasoned or uncounted dense execution, or no fused execution at all.
         rejects(
             &|r| r.compression.as_mut().unwrap().fallback_calls += 1,
@@ -10591,6 +10510,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// A chunked-prefix-reuse coordinate on a compressed arm: the dense prefix-store seed is setup
+    /// recorded before the measured dispatch opens, so an accepted prefix import (compressed
+    /// evidence, no fallback inside the dispatch) classifies the row `compressed`. A declined import,
+    /// recorded inside the dispatch, classifies it `dense-fallback`. Both keep the seed counted.
+    #[test]
+    fn chunked_prefix_seed_is_setup_and_an_accepted_import_classifies_compressed() {
+        let classify = |declined_import: bool| {
+            let mut observer = ProductObserver::new();
+            Observer::dense_fallback(
+                &mut observer,
+                "chunked-prefix-seed",
+                COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
+            );
+            observer.begin_coordinate_operation();
+            if declined_import {
+                Observer::dense_fallback(
+                    &mut observer,
+                    crate::decode::prefix::COMPRESSED_PREFIX_IMPORT_OPERATION,
+                    "the compressed cache declined the reused prefix",
+                );
+            } else {
+                Observer::compressed_storage(&mut observer, &TEST_STORAGE);
+                Observer::packed_cache_evidence(&mut observer, &test_packed_evidence(4));
+            }
+            observer.end_coordinate_operation();
+            let mut primary = test_compressed_observation(
+                observer.packed_evidence.clone(),
+                &[],
+                observer.compressed_storage_peak,
+            );
+            primary.dense_fallbacks = observer.dense_fallbacks.clone();
+            primary.coordinate_scope = observer.coordinate_scope.take();
+            let fixture = test_compressed_observation(vec![test_packed_evidence(2)], &[], None);
+            compressed_receipt_block(
+                CompressedKvMethod::GroupAffine,
+                &primary,
+                &[&primary, &fixture],
+            )
+            .unwrap()
+        };
+        let accepted = classify(false);
+        assert_eq!(
+            accepted.persistent_kv_representation,
+            COMPRESSED_PERSISTENT_KV
+        );
+        assert_eq!(accepted.physical_kv_bytes, 3);
+        assert!(accepted
+            .fallbacks
+            .iter()
+            .any(|fallback| fallback.operation == "chunked-prefix-seed"));
+        assert_eq!(accepted.kernel_gpu_family, "apple7-or-newer");
+        let mut receipt = builder_test_receipt();
+        compress_test_receipt(&mut receipt, accepted);
+        validate_sealed_receipt(&receipt).expect("an imported-prefix compressed row is valid");
+
+        let declined = classify(true);
+        assert_eq!(
+            declined.persistent_kv_representation,
+            DENSE_FALLBACK_PERSISTENT_KV
+        );
+        assert_eq!(declined.fallback_calls, 2);
+    }
+
     #[test]
     fn compressed_classification_reads_only_the_coordinate_scope() {
         // Out-of-scope lifecycle evidence (a fallback plus larger storage) never reclassifies a
@@ -10703,7 +10685,8 @@ pub(crate) mod tests {
             .unwrap()
             .kernel_parity_errors()
             .unwrap();
-        assert_eq!(errors.len(), 4 * 128);
+        // Decode (S_q = 1), causal prefill chunk (S_q = 5), and split-KV decode (S_q = 1) cases.
+        assert_eq!(errors.len(), 4 * 128 * (1 + 5 + 1));
         let max = errors.iter().copied().fold(0.0, f64::max);
         assert!(
             max <= COMPRESSED_PARITY_MAX_ERROR,

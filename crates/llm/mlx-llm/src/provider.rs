@@ -944,11 +944,13 @@ impl LlamaProvider {
 
     /// Execute only the cache-hit half of the real prefix-reuse path with campaign observation
     /// attached. The caller must seed before resetting the phase-local peak; this method proves a
-    /// new hit and emitted token before its output can be used as coordinate evidence.
+    /// new hit and emitted token before its output can be used as coordinate evidence. A
+    /// `compressed` arm imports the reused prefix into its compressed cache.
     pub(crate) fn campaign_prefix_reuse_observed(
         &self,
         prompt: &str,
         observer: &mut dyn crate::campaign::Observer,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
     ) -> CoreResult<(GenerationOutput, u64, u64)> {
         let ids = self
             .tokenizer
@@ -988,6 +990,7 @@ impl LlamaProvider {
             None,
             None,
             Some(observer),
+            compressed,
         )
         .map_err(to_core)?;
         let hits = cache.stats().hits;
@@ -4197,6 +4200,8 @@ mod tests {
         releases: Vec<u64>,
         reconstructions: usize,
         evidence: Vec<crate::primitives::PackedCacheEvidence>,
+        fallbacks: Vec<(String, String)>,
+        storage_tokens: Vec<u64>,
     }
 
     impl crate::campaign::Observer for CompressedArmCapture {
@@ -4214,6 +4219,113 @@ mod tests {
         fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
             self.evidence.push(evidence.clone());
         }
+        fn dense_fallback(&mut self, operation: &str, reason: &str) {
+            self.fallbacks.push((operation.into(), reason.into()));
+        }
+        fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+            self.storage_tokens.push(storage.tokens);
+        }
+    }
+
+    /// A compressed prefix hit imports the reused dense prefix into the arm's compressed cache by
+    /// quantize-on-append: the suffix prefill and decode run on the fused reader over the imported
+    /// history, nothing is reconstructed or recorded as a fallback, and the compressed cache never
+    /// re-enters the dense prefix store. A refused compressed selection keeps the dense seed and
+    /// records its reason instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_prefix_hit_imports_the_reused_prefix_into_the_compressed_cache() {
+        let model = tiny_packed_capable_model();
+        // Longer than one 32-token group, so the import packs a K group and keeps a residual.
+        let prompt = (1..=40).collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 2,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = CancelFlag::new();
+        let seeded_store = || {
+            let mut store = crate::decode::PrefixCache::new(2);
+            crate::decode::generate_cached(
+                &model,
+                &prompt,
+                &config,
+                &cancel,
+                &mut |_| {},
+                &mut store,
+            )
+            .unwrap();
+            assert_eq!(store.len(), 1);
+            store
+        };
+
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        let mut store = seeded_store();
+        let mut capture = CompressedArmCapture::default();
+        let output = crate::decode::prefix::generate_cached_with_observer(
+            &model,
+            &prompt,
+            &config,
+            &cancel,
+            &mut |_| {},
+            &mut store,
+            None,
+            None,
+            Some(&mut capture),
+            Some(&arm),
+        )
+        .unwrap();
+        assert_eq!(output.tokens.len(), 2);
+        assert_eq!(store.stats().hits, 1);
+        assert!(capture.fallbacks.is_empty(), "{:?}", capture.fallbacks);
+        let [evidence] = capture.evidence.as_slice() else {
+            panic!("the compressed cache must export evidence once");
+        };
+        assert!(evidence.accepted_direct_calls > 0);
+        assert!(evidence.fallback_reasons.is_empty() && !evidence.dense_active);
+        assert_eq!(evidence.full_cache_dequantizations, 0);
+        assert_eq!(capture.reconstructions, 0);
+        // 39 imported prefix tokens (a whole-prompt match recomputes the last) plus the suffix.
+        assert_eq!(capture.storage_tokens.first(), Some(&40));
+        assert_eq!(store.len(), 1, "the compressed cache is not stored back");
+
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20676-prefix-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let mut store = seeded_store();
+        let mut capture = CompressedArmCapture::default();
+        crate::decode::prefix::generate_cached_with_observer(
+            &model,
+            &prompt,
+            &config,
+            &cancel,
+            &mut |_| {},
+            &mut store,
+            None,
+            None,
+            Some(&mut capture),
+            Some(&refused),
+        )
+        .unwrap();
+        assert!(
+            matches!(capture.fallbacks.as_slice(), [(operation, _)] if operation == "cache-selection"),
+            "{:?}",
+            capture.fallbacks
+        );
+        assert!(
+            capture.evidence.is_empty(),
+            "the dense seed carries the request"
+        );
     }
 
     /// A packed cache whose retained reader fails to bind still records the selection's own
