@@ -24,15 +24,36 @@ The benchmark is not runnable by merely materializing a directory. The coordinat
 own the Metal/real-weight lane and run the exact product-loader campaign; this document is the
 pre-results provenance gate, not a substitute for a sealed measurement receipt.
 
+## Dense K/V element width
+
+Every role's dense K/V is the loader's BF16 compute dtype: 2 bytes per element. The pinned Llama
+4-bit candidate stores its quantized `scales`/`biases` as F16 (the Qwen candidate stores BF16).
+MLX affine `quantized_matmul` returns `promote_types(activations, scales)`, and BF16 with F16
+promotes to F32. Before the sc-20671 dtype fix, the loader kept stored scales in their stored
+dtype. The whole Llama candidate decoder, including the K/V it cached, therefore ran in F32
+(4 bytes). The harness encoded that promoted width as the expected one. The loader now holds
+stored scales and biases in the compute dtype at load. `DENSE_KV_COMPUTE_ELEMENT_BYTES` is the
+only accepted width. The product observer and receipt validation refuse any other observed width,
+naming the reason, instead of recording a widened dense baseline.
+
+Any Llama-candidate row, including short rows, captured before that fix came from the F32 path.
+Its memory denominator, timings, logits, and quality observations do not describe the shipped
+BF16 path, and they are not rewritten or relabelled. Re-take them on the fixed loader. The
+F16→BF16 scale cast is a real numeric change (BF16 keeps 8 mantissa bits against F16's 11), so
+quality has to be re-measured rather than assumed unchanged. The same applies to any SC-20677 Llama-candidate
+K/V capture taken before the fix. Its manifest records F32 K/V, so it is not the BF16 cache the
+candidates compress.
+
 ## Operator stop between rows
 
 A campaign parent (`sc20671_kv_baseline parent`, `sc20676_packed_evidence parent`, and the
-SC-20684 / SC-20686 media launchers) can be halted safely: create `<resume-dir>/STOP` (or the path
-given as `--stop-file <path>`). The parent never signals a running worker — killing an MLX render
+SC-20684 / SC-20686 media launchers) can be halted safely: create `<resume-dir>/STOP` (always
+honoured) or the path given as `--stop-file <path>` (honoured too); only a missing path counts as
+absent, any other stat failure is an error. The parent never signals a running worker — killing an MLX render
 mid command buffer can wedge the GPU — so the row in flight finishes and is accepted normally.
 Before spawning the next row it writes a sealed, never-overwritten
 `<resume-dir>/logs/operator-stop.attempt-<n>.json` (`"status": "stopped-by-operator"`,
-`beforeRow`, `beforeRowSlug`, `rowsAccepted`) and exits with status **75** (sysexits
+`beforeRow`, `beforeRowSlug`, `rowsAccepted`, `stopFiles`) with its `.sha256` seal and exits with status **75** (sysexits
 `EX_TEMPFAIL`), distinct from success and from every refusal/failure status. The stop file is not
 part of the resume identity: remove it and rerun the identical command with the same resume
 directory, and the accepted rows resume while the campaign continues at the stopped row.

@@ -77,6 +77,9 @@ mod prepare_snapshot;
 #[path = "prism.rs"]
 mod prism;
 
+#[path = "quantized_compute_dtype.rs"]
+mod quantized_compute_dtype;
+
 #[path = "qwen35.rs"]
 mod qwen35;
 

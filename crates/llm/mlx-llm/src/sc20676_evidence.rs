@@ -2445,7 +2445,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
     let current_provenance = worker_provenance()?;
     let destination = PathBuf::from(required_flag(args, "--out")?);
     let worker_root = PathBuf::from(required_flag(args, "--resume-dir")?);
-    let stop_file = campaign::operator_stop_file(args, &worker_root)?;
+    let stop_files = campaign::operator_stop_files(args, &worker_root)?;
     if !destination.is_absolute() || !worker_root.is_absolute() || destination == worker_root {
         return Err("SC-20676 destination and distinct resume directory must be absolute".into());
     }
@@ -2512,7 +2512,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             .to_string_lossy()
             .to_string();
         if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
-            && !campaign::is_operator_stop_entry(&worker_root, &stop_file, &name)
+            && !campaign::is_operator_stop_entry(&worker_root, &stop_files, &name)
             && !allowed.iter().any(|slug| {
                 name == format!("{slug}.json") || name == format!("{slug}.binding.json")
             })
@@ -2557,7 +2557,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                 }
                 // Between arms only: a running worker is never signalled.
                 if let Some(stop) = campaign::operator_stop_before_row(
-                    &stop_file,
+                    &stop_files,
                     &worker_root.join("logs"),
                     "sc-20676-operator-stop",
                     before_arm,
