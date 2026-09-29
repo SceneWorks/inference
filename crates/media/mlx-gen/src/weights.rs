@@ -92,7 +92,14 @@ impl Weights {
         Ok(())
     }
 
+    /// Every materialize path evaluates through here. The batch's pending safetensors reads are
+    /// evaluated first, on their own: MLX runs a `Load` on its CPU stream, and evaluating a derived
+    /// array (a GPU-stream cast/transpose/remap) over an unread `Load` makes the Metal command
+    /// buffer wait on the disk read — on a slow or external drive past the GPU watchdog
+    /// (`kIOGPUCommandBufferCallbackErrorTimeout`; sd3, ideogram and seedvr2 in the sc-24245
+    /// campaign). Reading the loads first means the GPU only ever sees resident inputs.
     fn materialize_batch(batch: &[(&str, &Array)]) -> Result<()> {
+        mlx_rs::transforms::eval_pending_loads(batch.iter().map(|(_, array)| *array))?;
         mlx_rs::transforms::eval(batch.iter().map(|(_, array)| *array))?;
         crate::coherence::verify_gpu_view(batch.iter().copied())
     }
@@ -615,5 +622,39 @@ mod tests {
             w.keys().filter(|key| key.starts_with("vae.block.")).count(),
             1
         );
+    }
+
+    fn is_available(a: &Array) -> bool {
+        let mut available = false;
+        let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, a.as_ptr()) };
+        assert_eq!(status, 0);
+        available
+    }
+
+    /// sc-24245: a derived (GPU-stream cast + transpose) array over a lazy safetensors `Load`,
+    /// stored under an accessed key, materializes to the right values with its source read.
+    #[test]
+    fn materialize_accessed_evaluates_a_derived_array_over_a_lazy_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.safetensors");
+        let source = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+        Array::save_safetensors(vec![("w", &source)], None, &path).unwrap();
+
+        let mut w = Weights::from_file(&path).unwrap();
+        let raw = w.require("w").unwrap().clone();
+        let derived = raw
+            .as_dtype(Dtype::Float16)
+            .unwrap()
+            .transpose_axes(&[1, 0])
+            .unwrap();
+        w.insert("w", derived);
+        assert!(!is_available(&raw));
+
+        w.materialize_accessed().unwrap();
+        let derived = w.require("w").unwrap();
+        assert!(is_available(&raw));
+        assert!(is_available(derived));
+        let expected = Array::from_slice(&[1.0f32, 4.0, 2.0, 5.0, 3.0, 6.0], &[3, 2]);
+        assert_eq!(derived.as_dtype(Dtype::Float32).unwrap(), expected);
     }
 }
