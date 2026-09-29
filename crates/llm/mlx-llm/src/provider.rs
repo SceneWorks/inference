@@ -4421,8 +4421,13 @@ mod tests {
     #[test]
     fn compressed_prefix_hit_imports_the_reused_prefix_into_the_compressed_cache() {
         let model = tiny_packed_capable_model();
-        // Longer than one 32-token group, so the import packs a K group and keeps a residual.
-        let prompt = (1..=40).collect::<Vec<i32>>();
+        // Longer than one 32-token group, so the import packs a K group and keeps a residual. The
+        // ids stay inside the 32-token vocabulary: MLX's embedding gather is not bounds-checked,
+        // so an out-of-vocabulary id reads whatever the allocator last left past the table and
+        // the logits then depend on which test ran before.
+        let prompt = (0..40).map(|i| i % 31 + 1).collect::<Vec<i32>>();
+        let vocab = model.config().vocab_size;
+        assert!(prompt.iter().all(|id| (0..vocab).contains(id)));
         let config = GenerationConfig {
             max_new_tokens: 2,
             seed: Some(0),
