@@ -18,10 +18,13 @@ Example (on the coordinator's held Metal lane, never ordinary CI):
     --product-command '/absolute/path/to/prebuilt/generate_smoke \
       --ignored --nocapture sc20684_packed_campaign_observer'
 
-The executable must be built and sealed before invoking this launcher. At the
-current source revision, no defensible whole-process peak bound is established;
-the supervisor therefore refuses each role before spawn, leaving the campaign
-incomplete rather than claiming a runnable or terminal result.
+The executable must be built and sealed before invoking this launcher. No static
+whole-process peak bound exists for these cells; each role is admitted by the
+supervisor's runtime guards (watchdog cap, host reserve, deadline, sampling) when
+pre-spawn host free RAM covers cap plus reserve. The admission, with the unknown
+peak recorded as null plus reason, is sealed with every role. A pre-spawn refusal,
+watchdog abort or failed child is written as a sealed unaccepted log record and
+leaves the campaign incomplete; it is never an accepted role.
 """
 
 from __future__ import annotations
@@ -996,6 +999,17 @@ def _role_file_bindings(root: Path, name: str, transcripts: dict[str, Any]) -> l
     return files
 
 
+def _supervision_record(result: supervisor.RunResult) -> dict[str, Any]:
+    return {
+        "pid": result.pid, "peakHostBytes": result.peak_host_bytes,
+        "peakGpuBytes": result.peak_gpu_bytes,
+        "hostFreeAtLaunch": result.host_free_at_launch,
+        "elapsedSeconds": result.elapsed_seconds,
+        "ownedProcessGroupReaped": True,
+        "admission": result.admission,
+    }
+
+
 def _save_resumed_role(root: Path, name: str, identity: dict[str, Any], record: dict[str, Any]) -> None:
     roles = root / "roles"
     roles.mkdir(exist_ok=True)
@@ -1037,6 +1051,10 @@ def _load_resumed_role(root: Path, name: str, identity: dict[str, Any]) -> dict[
     supervision = record.get("supervision")
     if not isinstance(supervision, dict) or type(supervision.get("pid")) is not int or supervision["pid"] <= 0 or supervision.get("ownedProcessGroupReaped") is not True:
         raise CampaignError(f"resume role {name} lacks an owned process identity")
+    try:
+        supervisor.validate_admission(supervision.get("admission"))
+    except supervisor.SupervisionError as error:
+        raise CampaignError(f"resume role {name} lacks its runtime-guarded admission") from error
     if record.get("files") != _role_file_bindings(root, name, record["transcripts"]):
         raise CampaignError(f"resume role {name} artifact bytes changed")
     for file in record["files"]:
@@ -1298,14 +1316,22 @@ def run_matrix(
             stderr_path = transcript_dir / f"{cell_name}.{role}.stderr.log"
             if stdout_path.exists() or stderr_path.exists():
                 raise CampaignError(f"partial {role_name} transcript exists without valid resume binding")
-            attempt = len(list((evidence_root / "logs").glob(f"{role_name}.*.stdout.log")))
             logs = evidence_root / "logs"
-            result = supervisor.run_guarded(
-                argv, cwd=ROOT, env=env, policy=safety_policy,
-                stdout_path=logs / f"{role_name}.{attempt}.stdout.log",
-                stderr_path=logs / f"{role_name}.{attempt}.stderr.log",
-                source_peak_host_bytes=None,  # No justified whole-process peak bound at this HEAD.
-            )
+            # A pre-spawn refusal leaves only an unaccepted record, so count every attempt index.
+            attempt = len({path.name[len(role_name) + 1:].split(".", 1)[0]
+                           for path in logs.glob(f"{role_name}.*")})
+            try:
+                result = supervisor.run_guarded(
+                    argv, cwd=ROOT, env=env, policy=safety_policy,
+                    stdout_path=logs / f"{role_name}.{attempt}.stdout.log",
+                    stderr_path=logs / f"{role_name}.{attempt}.stderr.log",
+                )
+            except supervisor.SupervisionError as error:
+                supervisor.write_unaccepted_record(
+                    logs / f"{role_name}.{attempt}.unaccepted.json",
+                    kind="sc-20684-unaccepted-role", coordinate=role_name, error=error,
+                )
+                raise
             if run_id in used_run_ids or result.pid in used_pids:
                 raise CampaignError(f"role {role_name} reuses a process identity")
             used_run_ids.add(run_id)
@@ -1340,13 +1366,7 @@ def run_matrix(
                 "runId": run_id, "exitCode": result.returncode,
                 "transcripts": transcripts[role],
                 "observationSha256": _canonical_sha256(observations[role]),
-                "supervision": {
-                    "pid": result.pid, "peakHostBytes": result.peak_host_bytes,
-                    "peakGpuBytes": result.peak_gpu_bytes,
-                    "hostFreeAtLaunch": result.host_free_at_launch,
-                    "elapsedSeconds": result.elapsed_seconds,
-                    "ownedProcessGroupReaped": True,
-                },
+                "supervision": _supervision_record(result),
             })
         candidate = observations["paired"]
         baseline = observations["dense-baseline"]

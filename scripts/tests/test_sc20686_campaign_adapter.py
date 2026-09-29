@@ -40,8 +40,56 @@ class CampaignAdapterTests(unittest.TestCase):
             "linux-cuda", deadline, 10, 20, 1024, 10**9, 10**6, 10**6, 10**7,
             "GPU-12345678-1234-1234-1234-123456789abc", 1024, 10**9, "test", b"{}\n",
         )
-        return {"safety_policy": policy, "source_peak_host_bytes": 1024,
-                "source_peak_gpu_bytes": 1024, "probe": Probe()}
+        return {"safety_policy": policy, "probe": Probe()}
+
+    def test_runner_admits_by_runtime_guards_and_seals_refusal_or_abort_as_unaccepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            executable = root / "producer"
+            executable.write_text(
+                "#!/usr/bin/env python3\nimport sys, time\n"
+                "open(sys.argv[sys.argv.index('--sc20686-events') + 1], 'w').write('{}\\n')\n"
+                "time.sleep(float(sys.argv[-3]))\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            safety = self.runner_safety()
+            policy = safety["safety_policy"]
+            run = self.adapter.run_entrypoint(
+                executable, snapshot, "route", "normal", "a" * 40, "sequential", ("0.05",),
+                timeout_seconds=5, failure_root=root / "failed", **safety,
+            )
+            admission = self.adapter.supervisor.validate_admission(run.supervision["admission"])
+            self.assertIsNone(admission["wholeProcessPeakBoundBytes"])
+            self.assertEqual(admission["childGpuCapBytes"], policy.child_gpu_cap_bytes)
+            self.adapter.cleanup_campaign_run(run)
+            self.assertFalse((root / "failed").exists())
+
+            probe = safety["probe"]
+            for outcome, name, override, expected in (
+                ("refused", "host_free",
+                 lambda: policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes - 1,
+                 "preflight-memory"),
+                ("aborted", "tree_footprint",
+                 lambda _owner: policy.child_footprint_cap_bytes + 1, "child-footprint"),
+            ):
+                setattr(probe, name, override)
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.adapter.run_entrypoint(
+                        executable, snapshot, "route", "normal", "a" * 40, "sequential",
+                        ("5",), timeout_seconds=5, failure_root=root / "failed", **safety,
+                    )
+                delattr(probe, name)
+            records = [json.loads(path.read_bytes())
+                       for path in (root / "failed").glob("incomplete-*/unaccepted.json")]
+            self.assertEqual(sorted(record["outcome"] for record in records), ["aborted", "refused"])
+            for record in records:
+                self.assertIs(record["accepted"], False)
+                self.assertEqual(record["coordinate"], "route/normal")
+                self.assertEqual(record["pid"] is None, record["outcome"] == "refused")
+                self.adapter.supervisor.validate_admission(record["admission"])
 
     def flux_events(self, *, variant="flux2_klein_9b_edit", cancel=False):
         geometry = {
@@ -621,7 +669,9 @@ class CampaignAdapterTests(unittest.TestCase):
                     b"stdout", b"", ("producer", "--sc20686-events", str(root / "events"), "--out", str(media)),
                     ({"phase": "process-sample", "sample_kind": "process", "peak_bytes": 1},),
                     event, media, None,
-                    {"pid": 123, "exitCode": 0, "ownedProcessGroupReaped": True},
+                    {"pid": 123, "exitCode": 0, "ownedProcessGroupReaped": True,
+                     "admission": self.adapter.supervisor.runtime_guarded_admission(
+                         self.runner_safety()["safety_policy"])},
                 )
 
             def row_builder(_spec, arm, _events, _hashes):
@@ -638,6 +688,30 @@ class CampaignAdapterTests(unittest.TestCase):
             self.assertEqual(calls, ["normal", "cancel", "cancel"])
             unit = resume / "units" / "run-00-normal"
             self.assertTrue((unit / "record.json").is_file())
+            self.assertEqual(self.adapter._load_unit(
+                resume, "run-00-normal", identity_sha, "wan_vace", "normal",
+            ).supervision["admission"]["mode"], "runtime-guarded")
+            # A unit sealed without its runtime-guarded admission is neither saved nor resumed.
+            supervision = json.loads((unit / "supervision.json").read_bytes())
+            del supervision["admission"]
+            (unit / "supervision.json").write_bytes(self.adapter.canonical(supervision))
+            record = self.adapter.canonical({
+                "schema": "sc-20686-resume-unit-v1", "identitySha256": identity_sha,
+                "stem": "run-00-normal", "files": self.adapter._unit_files(unit),
+            })
+            (unit / "record.json").write_bytes(record)
+            (unit / "record.json.sha256").write_text(
+                f"{self.adapter.digest(record)}  record.json\n", encoding="ascii")
+            with self.assertRaisesRegex(ValueError, "invalid-admission"):
+                self.adapter._load_unit(resume, "run-00-normal", identity_sha, "wan_vace", "normal")
+            unadmitted = self.adapter.CampaignRun(
+                [], b"", b"", ("producer", "--sc20686-events", "e", "--out", str(media)), (),
+                b"", media, None, supervision,
+            )
+            with self.assertRaisesRegex(ValueError, "invalid-admission"):
+                self.adapter._save_unit(resume, "run-09-normal", identity_sha, "wan_vace", "normal", unadmitted)
+            self.assertFalse((resume / "units" / "run-09-normal").exists())
+            self.assertFalse((resume / "units" / ".run-09-normal.partial").exists())
             (unit / "stdout").write_bytes(b"tampered")
             with self.assertRaisesRegex(ValueError, "corrupted"):
                 self.adapter._load_unit(resume, "run-00-normal", identity_sha, "wan_vace", "normal")

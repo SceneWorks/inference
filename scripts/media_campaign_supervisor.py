@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Small fail-closed process supervisor for the SC-20684/86 media campaigns.
 
-The caller supplies a source-justified peak bound. Sampling cannot establish that bound:
-the process can allocate beyond a policy cap between polls. This module never starts a child
-without it, a mandatory policy, and a fresh host/device admission probe.
+A row is admitted by its runtime guards, never by a static whole-process peak proof: the
+loader, lazy graphs, allocator/driver headroom and output coexistence make that peak
+unobtainable from source. This module never starts a child without a mandatory policy that
+configures every guard (deadline, sampling, termination grace, host reserve, child footprint
+watchdog cap, and for CUDA the device reserve/cap) and a fresh host/device probe covering
+cap plus reserve. The admission and the unknown peak (null plus reason) travel with every
+result; a pre-spawn refusal, watchdog abort or failed child is only ever an unaccepted record.
 """
 
 from __future__ import annotations
@@ -24,10 +28,23 @@ from typing import Callable
 from scripts import media_campaign_windows as windows
 
 
+RUNTIME_GUARDED_ADMISSION = "runtime-guarded"
+UNKNOWN_PEAK_REASON = (
+    "whole-process transient peak (loader, lazy graphs, allocator/driver headroom, output "
+    "coexistence) is not statically derivable; the row is admitted by the runtime watchdog "
+    "cap, free-memory reserve and deadline instead"
+)
+
+
 class SupervisionError(ValueError):
     def __init__(self, reason: str, detail: str):
         super().__init__(f"{reason}: {detail}")
         self.reason = reason
+        self.detail = detail
+        # Set by run_guarded: the admission the row ran under (None if the policy was
+        # unguarded) and the owned child PID (None when refused before spawn).
+        self.admission: dict[str, object] | None = None
+        self.pid: int | None = None
 
 
 def digest(raw: bytes) -> str:
@@ -323,6 +340,96 @@ def _stop_tree(child: subprocess.Popen[bytes], grace_seconds: float, known: set[
     raise SupervisionError("cleanup-failure", "owned process group still has live descendants")
 
 
+def _positive(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def runtime_guarded_admission(
+    policy: SafetyPolicy, *, static_floor_host_bytes: int | None = None,
+    static_floor_gpu_bytes: int | None = None,
+) -> dict[str, object]:
+    """Admit a row by its runtime guards rather than by a static whole-process peak proof.
+
+    Refuses before spawn unless every supervisor guard is configured, and when a caller has a
+    conservative static floor, unless that floor fits under the cap. The host/device free
+    probe against cap plus reserve happens in run_guarded immediately before spawn.
+    """
+    cuda = policy.backend in {"linux-cuda", "windows-cuda"}
+    guards = [policy.deadline_seconds, policy.poll_millis, policy.term_grace_millis,
+              policy.host_free_reserve_bytes, policy.child_footprint_cap_bytes,
+              policy.stdout_cap_bytes, policy.stderr_cap_bytes, policy.event_cap_bytes]
+    if cuda:
+        guards += [policy.gpu_free_reserve_bytes, policy.child_gpu_cap_bytes]
+    if (policy.backend not in {"darwin-mlx", "linux-cuda", "windows-cuda"}
+            or not all(_positive(value) for value in guards)
+            or policy.poll_millis >= policy.deadline_seconds * 1000
+            or policy.term_grace_millis >= policy.deadline_seconds * 1000
+            or (cuda and not policy.cuda_device_uuid)):
+        raise SupervisionError("unguarded-policy", "runtime guards are not all configured; refusing before spawn")
+    floors = ((static_floor_host_bytes, policy.child_footprint_cap_bytes, "host"),
+              (static_floor_gpu_bytes, policy.child_gpu_cap_bytes if cuda else None, "CUDA"))
+    for floor, cap, label in floors:
+        if floor is None:
+            continue
+        if type(floor) is not int or floor <= 0 or cap is None:
+            raise SupervisionError("invalid-admission", f"{label} static floor is malformed")
+        if floor > cap:
+            raise SupervisionError("preflight-memory", f"{label} static floor exceeds child cap")
+    return {
+        "mode": RUNTIME_GUARDED_ADMISSION,
+        "backend": policy.backend,
+        "policySha256": policy.sha256,
+        "deadlineSeconds": policy.deadline_seconds,
+        "pollMillis": policy.poll_millis,
+        "termGraceMillis": policy.term_grace_millis,
+        "hostFreeReserveBytes": policy.host_free_reserve_bytes,
+        "childFootprintCapBytes": policy.child_footprint_cap_bytes,
+        "cudaDeviceUuid": policy.cuda_device_uuid,
+        "gpuFreeReserveBytes": policy.gpu_free_reserve_bytes,
+        "childGpuCapBytes": policy.child_gpu_cap_bytes,
+        "staticFloorHostBytes": static_floor_host_bytes,
+        "staticFloorGpuBytes": static_floor_gpu_bytes,
+        "wholeProcessPeakBoundBytes": None,
+        "wholeProcessPeakUnknownReason": UNKNOWN_PEAK_REASON,
+    }
+
+
+def validate_admission(value: object) -> dict[str, object]:
+    """Reject a sealed record whose row was not admitted by configured runtime guards."""
+    if (not isinstance(value, dict) or value.get("mode") != RUNTIME_GUARDED_ADMISSION
+            or not _positive(value.get("childFootprintCapBytes"))
+            or not _positive(value.get("hostFreeReserveBytes"))
+            or not _positive(value.get("deadlineSeconds"))
+            or value.get("wholeProcessPeakBoundBytes") is not None
+            or not isinstance(value.get("wholeProcessPeakUnknownReason"), str)
+            or not value["wholeProcessPeakUnknownReason"]):
+        raise SupervisionError("invalid-admission", "record lacks a runtime-guarded admission")
+    floor = value.get("staticFloorHostBytes")
+    if floor is not None and (type(floor) is not int or not 0 < floor <= value["childFootprintCapBytes"]):
+        raise SupervisionError("invalid-admission", "recorded host static floor exceeds the cap")
+    return value
+
+
+def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: SupervisionError) -> Path:
+    """Persist a refused, aborted or failed row as a sealed, explicitly unaccepted record."""
+    if error.reason == "child-exit":
+        outcome = "failed"
+    else:
+        outcome = "refused" if error.pid is None else "aborted"
+    encoded = canonical({
+        "schemaVersion": 1, "kind": kind, "coordinate": coordinate, "accepted": False,
+        "outcome": outcome, "reason": error.reason, "detail": error.detail, "pid": error.pid,
+        "admission": error.admission,
+    })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    path.with_name(f"{path.name}.sha256").write_text(f"{digest(encoded)}  {path.name}\n", encoding="utf-8")
+    return path
+
+
 @dataclass(frozen=True)
 class RunResult:
     pid: int
@@ -333,28 +440,55 @@ class RunResult:
     gpu_free_at_launch: int | None
     elapsed_seconds: float
     samples: tuple[dict[str, object], ...]
+    admission: dict[str, object]
 
 
 def run_guarded(
     argv: list[str], *, cwd: Path, env: dict[str, str], policy: SafetyPolicy,
-    stdout_path: Path, stderr_path: Path, source_peak_host_bytes: int | None,
-    source_peak_gpu_bytes: int | None = None, event_path: Path | None = None,
+    stdout_path: Path, stderr_path: Path, static_floor_host_bytes: int | None = None,
+    static_floor_gpu_bytes: int | None = None, event_path: Path | None = None,
     probe: object | None = None, clock: Callable[[], float] = time.monotonic,
     on_spawn: Callable[[int, int | None], None] | None = None,
+) -> RunResult:
+    """Run one row under runtime-guarded admission.
+
+    Any SupervisionError carries the admission (None only for an unguarded policy) and the
+    owned child PID (None when refused before spawn) so callers can seal it as unaccepted.
+    """
+    admission = None
+    spawned: list[int] = []
+
+    def record_spawn(pid: int, pgid: int | None) -> None:
+        spawned.append(pid)
+        if on_spawn is not None:
+            on_spawn(pid, pgid)
+
+    try:
+        admission = runtime_guarded_admission(
+            policy, static_floor_host_bytes=static_floor_host_bytes,
+            static_floor_gpu_bytes=static_floor_gpu_bytes,
+        )
+        return _run_admitted(
+            argv, cwd=cwd, env=env, policy=policy, admission=admission,
+            stdout_path=stdout_path, stderr_path=stderr_path, event_path=event_path,
+            probe=probe, clock=clock, on_spawn=record_spawn,
+        )
+    except SupervisionError as error:
+        error.admission = admission
+        error.pid = spawned[0] if spawned else None
+        raise
+
+
+def _run_admitted(
+    argv: list[str], *, cwd: Path, env: dict[str, str], policy: SafetyPolicy,
+    admission: dict[str, object], stdout_path: Path, stderr_path: Path,
+    event_path: Path | None, probe: object | None, clock: Callable[[], float],
+    on_spawn: Callable[[int, int | None], None],
 ) -> RunResult:
     if not argv or not all(isinstance(item, str) and item for item in argv):
         raise SupervisionError("invalid-command", "argv is empty or malformed")
     if (policy.backend == "windows-cuda") != (os.name == "nt"):
         raise SupervisionError("unsupported-host", "safety backend differs from process host")
-    if type(source_peak_host_bytes) is not int or source_peak_host_bytes <= 0:
-        raise SupervisionError("unbounded-source", "no source-backed host peak bound; refusing before spawn")
-    if source_peak_host_bytes > policy.child_footprint_cap_bytes:
-        raise SupervisionError("preflight-memory", "source host peak exceeds child footprint cap")
-    if policy.backend in {"linux-cuda", "windows-cuda"} and (
-        type(source_peak_gpu_bytes) is not int or source_peak_gpu_bytes <= 0
-        or source_peak_gpu_bytes > policy.child_gpu_cap_bytes
-    ):
-        raise SupervisionError("unbounded-source", "CUDA peak is unbounded or exceeds device cap")
     if stdout_path == stderr_path or any(path.exists() for path in (stdout_path, stderr_path)):
         raise SupervisionError("invalid-log", "bounded log paths must be distinct and fresh")
     probe = probe if probe is not None else SystemProbe(policy)
@@ -433,12 +567,11 @@ def run_guarded(
                 raise SupervisionError("probe-failure", "CUDA child had no attributable GPU-memory sample")
             child.wait()
             return RunResult(child.pid, status, peak_host, peak_gpu if gpu_free is not None else None,
-                             host_free, gpu_free, clock() - started, tuple(samples))
+                             host_free, gpu_free, clock() - started, tuple(samples), admission)
 
         try:
-            if on_spawn is not None:
-                # Windows ownership is a Job, not a POSIX process group.
-                on_spawn(child.pid, None if job is not None else child.pid)
+            # Windows ownership is a Job, not a POSIX process group.
+            on_spawn(child.pid, None if job is not None else child.pid)
             while True:
                 if clock() - started >= policy.deadline_seconds:
                     raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")

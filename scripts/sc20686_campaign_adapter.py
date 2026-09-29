@@ -590,9 +590,11 @@ def parse_event_transcript(payload, variant, arm):
 
 def run_entrypoint(
     entrypoint, snapshot, variant, arm, inference_revision, residency_strategy,
-    extra_args=(), timeout_seconds=21600, *, safety_policy, source_peak_host_bytes=None,
-    source_peak_gpu_bytes=None, probe=None, failure_root=None,
+    extra_args=(), timeout_seconds=21600, *, safety_policy, static_floor_host_bytes=None,
+    static_floor_gpu_bytes=None, probe=None, failure_root=None,
 ):
+    # Admission is runtime-guarded (watchdog caps, free reserves, deadline); no static
+    # whole-process peak bound is required. Refusal, abort or failure is sealed unaccepted.
     # Provider stdout is free to contain progress bars (including carriage returns).  The adapter
     # owns this private file and accepts observer events only from it, never by filtering stdout.
     directory = Path(tempfile.mkdtemp(prefix="sc20686-events-"))
@@ -618,8 +620,8 @@ def run_entrypoint(
         result = supervisor.run_guarded(
             command, cwd=run_directory, env=os.environ.copy(), policy=safety_policy,
             stdout_path=run_directory / "stdout.log", stderr_path=run_directory / "stderr.log",
-            event_path=event_path, source_peak_host_bytes=source_peak_host_bytes,
-            source_peak_gpu_bytes=source_peak_gpu_bytes, probe=probe,
+            event_path=event_path, static_floor_host_bytes=static_floor_host_bytes,
+            static_floor_gpu_bytes=static_floor_gpu_bytes, probe=probe,
         )
         stdout = (run_directory / "stdout.log").read_bytes()
         stderr = (run_directory / "stderr.log").read_bytes()
@@ -644,10 +646,17 @@ def run_entrypoint(
                 "gpuFreeAtLaunch": result.gpu_free_at_launch,
                 "elapsedSeconds": result.elapsed_seconds,
                 "ownedProcessGroupReaped": True,
+                "admission": result.admission,
             },
         )
     except Exception as error:
-        if failure_root is not None and run_directory.is_dir() and any(run_directory.iterdir()):
+        unaccepted = isinstance(error, supervisor.SupervisionError)
+        if unaccepted and failure_root is not None:
+            supervisor.write_unaccepted_record(
+                directory / "unaccepted.json", kind="sc-20686-unaccepted-arm",
+                coordinate=f"{variant}/{arm}", error=error,
+            )
+        if failure_root is not None and (unaccepted or (run_directory.is_dir() and any(run_directory.iterdir()))):
             failure_root = Path(failure_root)
             failure_root.mkdir(exist_ok=True)
             retained = failure_root / f"incomplete-{uuid.uuid4()}"
@@ -1102,6 +1111,7 @@ def _load_unit(root, stem, identity_sha, variant, arm):
     supervision = json.loads((unit / "supervision.json").read_bytes())
     if supervision.get("exitCode") != 0 or supervision.get("ownedProcessGroupReaped") is not True or not isinstance(supervision.get("pid"), int) or supervision["pid"] <= 0:
         raise ValueError(f"{stem} resume supervision is not a clean, reaped exit")
+    supervisor.validate_admission(supervision.get("admission"))
     transcript = (unit / "events.jsonl").read_bytes()
     events = parse_event_transcript(transcript, variant, arm)
     events.extend(samples)
@@ -1119,6 +1129,7 @@ def _save_unit(root, stem, identity_sha, variant, arm, run):
         raise ValueError(f"{stem} resume unit already exists or was interrupted")
     if run.supervision is None or run.supervision.get("exitCode") != 0 or run.supervision.get("ownedProcessGroupReaped") is not True:
         raise ValueError(f"{stem} lacks successful supervisor and cleanup evidence")
+    supervisor.validate_admission(run.supervision.get("admission"))
     partial.mkdir()
     try:
         output = Path(run.media_output)

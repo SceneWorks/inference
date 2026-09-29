@@ -1,5 +1,6 @@
 """CPU-only fail-closed process supervision tests; no model or GPU is started."""
 
+import dataclasses
 import json
 import os
 import sys
@@ -40,15 +41,103 @@ class SupervisorTests(unittest.TestCase):
         policy_file.write_text(json.dumps(data), encoding="utf-8")
         self.policy = safety.load_policy(policy_file)
 
-    def run_child(self, script, *, probe=None, bound=1024, gpu_bound=None, policy=None,
+    def run_child(self, script, *, probe=None, floor=None, gpu_floor=None, policy=None,
                   event_path=None, on_spawn=None):
         return safety.run_guarded(
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy or self.policy, stdout_path=self.root / "stdout",
-            stderr_path=self.root / "stderr", source_peak_host_bytes=bound,
-            source_peak_gpu_bytes=gpu_bound, probe=probe or Probe(),
+            stderr_path=self.root / "stderr", static_floor_host_bytes=floor,
+            static_floor_gpu_bytes=gpu_floor, probe=probe or Probe(),
             event_path=event_path, on_spawn=on_spawn,
         )
+
+    def read_unaccepted(self, error):
+        path = safety.write_unaccepted_record(
+            self.root / "records" / f"{error.reason}.unaccepted.json",
+            kind="test-unaccepted-row", coordinate="cell", error=error,
+        )
+        raw = path.read_bytes()
+        self.assertEqual(raw, safety.canonical(json.loads(raw)))
+        self.assertEqual((path.parent / f"{path.name}.sha256").read_text(encoding="utf-8"),
+                         f"{safety.digest(raw)}  {path.name}\n")
+        return json.loads(raw)
+
+    def test_material_row_is_admitted_by_runtime_guards_without_a_peak_proof(self):
+        result = self.run_child("open('spawned','w').close()")
+        self.assertTrue((self.root / "spawned").exists())
+        admission = safety.validate_admission(result.admission)
+        self.assertEqual(admission["mode"], safety.RUNTIME_GUARDED_ADMISSION)
+        self.assertEqual(admission["childFootprintCapBytes"], self.policy.child_footprint_cap_bytes)
+        self.assertEqual(admission["hostFreeReserveBytes"], self.policy.host_free_reserve_bytes)
+        self.assertEqual(admission["policySha256"], self.policy.sha256)
+        self.assertIsNone(admission["staticFloorHostBytes"])
+        # The unknown transient peak is a recorded field (null plus reason), not a refusal.
+        self.assertIsNone(admission["wholeProcessPeakBoundBytes"])
+        self.assertEqual(admission["wholeProcessPeakUnknownReason"], safety.UNKNOWN_PEAK_REASON)
+        with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
+            safety.validate_admission({**admission, "mode": "static-peak-proof"})
+        with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
+            safety.validate_admission({**admission, "wholeProcessPeakUnknownReason": ""})
+
+    def test_row_without_runtime_guards_is_refused_before_spawn(self):
+        for field, value in (("host_free_reserve_bytes", 0), ("child_footprint_cap_bytes", 0),
+                             ("deadline_seconds", 0), ("poll_millis", 0),
+                             ("term_grace_millis", 0), ("poll_millis", 1000)):
+            with self.subTest(field=field, value=value):
+                policy = dataclasses.replace(self.policy, **{field: value})
+                with self.assertRaisesRegex(safety.SupervisionError, "unguarded-policy") as caught:
+                    self.run_child("open('spawned','w').close()", policy=policy)
+                self.assertFalse((self.root / "spawned").exists())
+                self.assertIsNone(caught.exception.pid)
+                self.assertIsNone(caught.exception.admission)
+        cuda = dataclasses.replace(self.policy, backend="linux-cuda",
+                                   cuda_device_uuid="GPU-12345678-1234-1234-1234-123456789abc",
+                                   gpu_free_reserve_bytes=1024, child_gpu_cap_bytes=10**6)
+        for field, value in (("gpu_free_reserve_bytes", None), ("child_gpu_cap_bytes", 0),
+                             ("cuda_device_uuid", None)):
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(safety.SupervisionError, "unguarded-policy"):
+                    self.run_child("open('spawned','w').close()",
+                                   policy=dataclasses.replace(cuda, **{field: value}))
+                self.assertFalse((self.root / "spawned").exists())
+        with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
+            safety.runtime_guarded_admission(cuda, static_floor_gpu_bytes=10**6 + 1)
+        self.assertEqual(safety.runtime_guarded_admission(cuda)["childGpuCapBytes"], 10**6)
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual((record["accepted"], record["outcome"]), (False, "refused"))
+
+    def test_insufficient_host_ram_is_a_sealed_unaccepted_refusal(self):
+        needed = self.policy.host_free_reserve_bytes + self.policy.child_footprint_cap_bytes
+        with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory") as caught:
+            self.run_child("open('spawned','w').close()", probe=Probe(free=needed - 1))
+        self.assertFalse((self.root / "spawned").exists())
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual((record["accepted"], record["outcome"], record["pid"]), (False, "refused", None))
+        self.assertEqual(record["admission"]["childFootprintCapBytes"], self.policy.child_footprint_cap_bytes)
+        with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
+            self.run_child("open('spawned','w').close()",
+                           floor=self.policy.child_footprint_cap_bytes + 1)
+        self.assertFalse((self.root / "spawned").exists())
+        # Free RAM exactly covering cap plus reserve, and a floor under the cap, are admitted.
+        result = self.run_child("open('spawned','w').close()", probe=Probe(free=needed), floor=1024)
+        self.assertEqual(result.admission["staticFloorHostBytes"], 1024)
+        self.assertTrue((self.root / "spawned").exists())
+
+    def test_watchdog_abort_and_child_failure_are_unaccepted_records(self):
+        with self.assertRaisesRegex(safety.SupervisionError, "child-footprint") as caught:
+            self.run_child("import time; time.sleep(5)", probe=Probe(footprint=10**7))
+        self.assertFalse(safety._group_pids(caught.exception.pid))
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual((record["accepted"], record["outcome"], record["pid"]),
+                         (False, "aborted", caught.exception.pid))
+        safety.validate_admission(record["admission"])
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+        with self.assertRaisesRegex(safety.SupervisionError, "child-exit") as caught:
+            self.run_child("import sys; sys.exit(7)")
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual((record["accepted"], record["outcome"]), (False, "failed"))
+        self.assertIsInstance(record["pid"], int)
 
     def test_policy_parsing_and_preflight_refuse_before_spawn(self):
         self.assertEqual(self.policy.sha256, safety.digest(self.policy.canonical_bytes))
@@ -57,9 +146,6 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(safety.linux_free_bytes("MemAvailable: 2048 kB\n"), 2048 * 1024)
         with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
             safety.darwin_footprint_bytes("phys_footprint: unavailable")
-        with self.assertRaisesRegex(safety.SupervisionError, "unbounded-source"):
-            self.run_child("open('spawned','w').close()", bound=None)
-        self.assertFalse((self.root / "spawned").exists())
         with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
             self.run_child("open('spawned','w').close()", probe=Probe(free=10))
         self.assertFalse((self.root / "spawned").exists())
@@ -173,7 +259,7 @@ class SupervisorTests(unittest.TestCase):
              patch.object(safety.subprocess, "Popen", return_value=FakeChild()):
             with self.assertRaisesRegex(OSError, "status persistence failed"):
                 self.run_child("unused", policy=policy, probe=CudaProbe(),
-                               gpu_bound=1024, on_spawn=fail_after_owned)
+                               gpu_floor=1024, on_spawn=fail_after_owned)
         self.assertEqual(observed, [(43210, None, True)])
         self.assertTrue(job.terminated)
         self.assertTrue(job.closed)
@@ -405,7 +491,7 @@ class WindowsSupervisorTests(unittest.TestCase):
         return safety.run_guarded(
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy, stdout_path=self.root / "stdout", stderr_path=self.root / "stderr",
-            source_peak_host_bytes=1024, source_peak_gpu_bytes=1024, probe=Probe(),
+            probe=Probe(),
             on_spawn=on_spawn,
         )
 

@@ -45,11 +45,21 @@ trusted System32 `nvidia-smi.exe` and the policy's exact GPU UUID. Unknown,
 `N/A`, missing, or un-attributable process GPU memory fails closed; a Windows
 run without a positive attributable GPU sample cannot publish success.
 
-At this source revision no defensible peak bound covers the route-specific
-loader, transient graphs, and output coexistence. The supervisor refuses an
-unbounded arm before model spawn even if the operator policy cap looks ample.
-Host and CUDA polling are necessary but cannot prevent an instantaneous spike.
-The fixed route geometry and normal/cancel schedule are never shortened to fit.
+No static bound covers the whole-process peak of the route-specific loader,
+transient graphs, and output coexistence, and none is required. Each arm is
+admitted by its runtime guards: the policy must configure every guard (deadline,
+sampling, termination grace, host reserve, child footprint cap, GPU UUID, GPU
+reserve and child GPU cap), and immediately before spawn host and selected-GPU
+free memory must cover cap plus reserve. The host and CUDA watchdogs then
+terminate the owned tree on a cap or reserve breach. Every sealed unit's
+`supervision.json` records that `admission` (`mode: runtime-guarded`, caps,
+reserves, optional static floors) with `wholeProcessPeakBoundBytes: null` and
+its `wholeProcessPeakUnknownReason`; a resumed unit without it is rejected. A
+pre-spawn refusal, watchdog abort, or failed child writes a sealed
+`unaccepted.json` (`accepted: false`, outcome `refused`/`aborted`/`failed`) into
+the retained `--resume-dir/failed/incomplete-*` diagnostics; it is never an
+accepted arm. The fixed route geometry and normal/cancel schedule are never
+shortened to fit.
 
 Model identity has two independent fields: `model_snapshot_revision` is the immutable Hugging Face
 revision, while `model_snapshot_sha256` hashes only the selected model/tier root. A selected root may

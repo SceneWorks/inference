@@ -73,11 +73,18 @@ The safety policy is mandatory and uses schema version 1 with backend `darwin-ml
 positive `deadlineSeconds`, `pollMillis`, `termGraceMillis`,
 `hostFreeReserveBytes`, `childFootprintCapBytes`, `stdoutCapBytes`,
 `stderrCapBytes`, and `eventCapBytes`. It rejects unknown fields and impossible caps.
-At this source revision there is **no justified whole-process transient peak bound**
-for the six Krea cells. The launcher therefore refuses each unresolved role before
-starting the model, retains already validated roles, and cannot publish a terminal
-Go or No-go receipt. Live polling cannot prevent an instantaneous memory spike; an
-operator-entered cap or historical RSS is not a source-backed peak bound.
+No static whole-process transient peak bound exists for the six Krea cells, and
+none is required: each role is **admitted by its runtime guards**. The policy must
+configure every guard (deadline, sampling, termination grace, host reserve, child
+footprint cap), and immediately before spawn host free RAM must cover cap plus
+reserve; the `phys_footprint` watchdog then terminates the owned process group on a
+cap or reserve breach. Each preserved role's `supervision.admission` records the
+cap, reserve and guards with `wholeProcessPeakBoundBytes: null` and a
+`wholeProcessPeakUnknownReason`; a resumed role without it is rejected. A pre-spawn
+refusal, watchdog abort, or failed child writes a sealed
+`logs/<cell>.<role>.<attempt>.unaccepted.json` (`accepted: false`) and leaves the
+campaign incomplete; it is never an accepted role. Native geometry and the Q8/Q4
+schedule are never shrunk to fit.
 The source ledger and bounded decode are prerequisites for guarded same-source
 phase calibration; they do not replace allocator/driver headroom evidence.
 

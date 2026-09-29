@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import importlib.util
 import copy
+import functools
 import hashlib
 import json
+import shlex
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).parents[1] / "sc20684_krea_realtime_campaign.py"
@@ -853,6 +857,13 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 "observationSha256": "a" * 64,
                 "supervision": {"pid": 123, "peakHostBytes": 1024, "hostFreeAtLaunch": 10**9, "ownedProcessGroupReaped": True},
             }
+            campaign._save_resumed_role(resume, "i2v-q8.dense-baseline", identity, record)
+            with self.assertRaisesRegex(campaign.CampaignError, "runtime-guarded admission"):
+                campaign._load_resumed_role(resume, "i2v-q8.dense-baseline", identity)
+            record["supervision"] = campaign._supervision_record(campaign.supervisor.RunResult(
+                123, 0, 1024, None, 10**9, None, 1.0, (),
+                campaign.supervisor.runtime_guarded_admission(policy),
+            ))
             campaign._save_resumed_role(resume, "t2v-q8.dense-baseline", identity, record)
             self.assertEqual(campaign._load_resumed_role(
                 resume, "t2v-q8.dense-baseline", identity,
@@ -866,6 +877,66 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                     resume, source=moved_ref, model=MODEL,
                     policy=policy, argv=[str(executable)], timeout=10,
                 )
+
+    def test_roles_are_admitted_by_runtime_guards_and_failures_are_unaccepted_records(self) -> None:
+        policy = campaign.supervisor.SafetyPolicy(
+            "darwin-mlx", 10, 20, 100, 1024, 10**9, 10**5, 10**5,
+            10**5, None, None, None, "f" * 64, b"{}\n",
+        )
+        original = campaign.supervisor.run_guarded
+
+        class Probe:
+            def __init__(self, free: int, footprint: int) -> None:
+                self.free, self.footprint = free, footprint
+
+            def host_free(self) -> int:
+                return self.free
+
+            def tree_footprint(self, _owner: object) -> int:
+                return self.footprint
+
+        def run(root: Path, probe: Probe, script: str) -> Exception:
+            command = shlex.join([sys.executable, "-c", script])
+            with patch.object(campaign.supervisor, "run_guarded", functools.partial(original, probe=probe)):
+                with self.assertRaises((campaign.CampaignError, campaign.supervisor.SupervisionError)) as caught:
+                    campaign.run_matrix(command, root, SOURCE, MODEL, campaign.decision_policy(),
+                                        10, root, policy, {"kind": "test"})
+            return caught.exception
+
+        def record(root: Path, attempt: int) -> dict:
+            return json.loads((root / "logs" / f"t2v-q8.paired.{attempt}.unaccepted.json").read_bytes())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "spawned"
+            spawn = f"open({str(marker)!r}, 'w').close()"
+            # Admitted without any static peak bound: the product process is spawned.
+            error = run(root / "admitted", Probe(10**12, 1024), spawn)
+            self.assertIsInstance(error, campaign.CampaignError)
+            self.assertTrue(marker.exists())
+            self.assertTrue((root / "admitted/logs/t2v-q8.paired.0.stdout.log").is_file())
+            self.assertFalse(list((root / "admitted/logs").glob("*.unaccepted.json")))
+            marker.unlink()
+
+            refused = root / "refused"
+            short = policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes - 1
+            for attempt in range(2):
+                error = run(refused, Probe(short, 1024), spawn)
+                self.assertEqual(error.reason, "preflight-memory")
+                sealed = record(refused, attempt)
+                self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["pid"]), (False, "refused", None))
+                self.assertEqual(sealed["coordinate"], "t2v-q8.paired")
+                campaign.supervisor.validate_admission(sealed["admission"])
+            self.assertFalse(marker.exists())
+            self.assertFalse((refused / "roles").exists())
+
+            aborted = root / "aborted"
+            error = run(aborted, Probe(10**12, policy.child_footprint_cap_bytes + 1), "import time; time.sleep(5)")
+            self.assertEqual(error.reason, "child-footprint")
+            sealed = record(aborted, 0)
+            self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["pid"]), (False, "aborted", error.pid))
+            self.assertIsNone(sealed["admission"]["wholeProcessPeakBoundBytes"])
+            self.assertFalse((aborted / "roles").exists())
 
     def validate_from(self, row: dict, mode: str = "t2v", tier: str = "q8") -> dict:
         return campaign._validate_observation(
