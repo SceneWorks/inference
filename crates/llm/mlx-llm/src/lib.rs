@@ -48,6 +48,7 @@ pub mod error;
 pub mod gguf;
 pub mod image;
 pub mod joycaption;
+pub mod kv_capture;
 mod load_memory;
 pub mod models;
 pub mod prepare;

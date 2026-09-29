@@ -508,6 +508,35 @@ class SupervisorTests(unittest.TestCase):
                 probe.gpu_free_and_tree_bytes(owner)
 
 
+class OperatorStopTests(unittest.TestCase):
+    def test_absent_stop_file_is_a_no_op_and_present_one_records_and_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stop = safety.operator_stop_file(None, root)
+            self.assertEqual(stop, root / "STOP")
+            self.assertEqual(safety.operator_stop_file(root / "halt", root), root / "halt")
+            safety.check_operator_stop(stop, root / "logs", kind="k", before="row-a", index=0, total=2)
+            self.assertFalse((root / "logs").exists())
+            stop.write_bytes(b"")
+            records = []
+            for _ in range(2):
+                with self.assertRaises(safety.OperatorStop) as caught:
+                    safety.check_operator_stop(stop, root / "logs", kind="k", before="row-b", index=1, total=2)
+                records.append(caught.exception.record)
+            self.assertEqual([path.name for path in records],
+                             ["operator-stop.attempt-0.json", "operator-stop.attempt-1.json"])
+            raw = records[0].read_bytes()
+            record = json.loads(raw)
+            self.assertEqual((record["status"], record["beforeRow"], record["beforeRowSlug"], record["rowsAccepted"]),
+                             ("stopped-by-operator", 1, "row-b", 1))
+            self.assertEqual(records[0].with_name(f"{records[0].name}.sha256").read_text(encoding="utf-8"),
+                             f"{safety.digest(raw)}  {records[0].name}\n")
+            self.assertNotIn(safety.OPERATOR_STOP_EXIT_CODE, (0, 1, 2))
+            self.assertTrue(safety.is_operator_stop_entry(root, root / "halt", "STOP"))
+            self.assertTrue(safety.is_operator_stop_entry(root, root / "halt", "halt"))
+            self.assertFalse(safety.is_operator_stop_entry(root, root / "halt", "stray"))
+
+
 @unittest.skipUnless(os.name == "nt", "real Job Object smoke requires Windows")
 class WindowsSupervisorTests(unittest.TestCase):
     """Real owned child/grandchild, real Windows memory APIs; no GPU/model use."""

@@ -2310,7 +2310,7 @@ fn read_bound_arm(
 
 /// Parent spawns a fresh dense and packed child for each family.  Workers write untrusted arm
 /// files; only this parent binds them to an already-sealed SC-20671 baseline and produces a seal.
-pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
+pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOutcome, String> {
     let mode = args
         .first()
         .map(String::as_str)
@@ -2398,7 +2398,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         fs::rename(staging, output).map_err(|e| e.to_string())?;
-        return Ok(());
+        return Ok(campaign::CampaignOutcome::Completed);
     }
     if mode != "parent" {
         return Err("usage: sc20676-packed-evidence parent|worker ...".into());
@@ -2412,6 +2412,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
     let current_provenance = worker_provenance()?;
     let destination = PathBuf::from(required_flag(args, "--out")?);
     let worker_root = PathBuf::from(required_flag(args, "--resume-dir")?);
+    let stop_file = campaign::operator_stop_file(args, &worker_root)?;
     if !destination.is_absolute() || !worker_root.is_absolute() || destination == worker_root {
         return Err("SC-20676 destination and distinct resume directory must be absolute".into());
     }
@@ -2478,6 +2479,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
             .to_string_lossy()
             .to_string();
         if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
+            && !campaign::is_operator_stop_entry(&worker_root, &stop_file, &name)
             && !allowed.iter().any(|slug| {
                 name == format!("{slug}.json") || name == format!("{slug}.binding.json")
             })
@@ -2487,15 +2489,18 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
             ));
         }
     }
-    let result = (|| -> std::result::Result<(), String> {
+    let result = (|| -> std::result::Result<campaign::CampaignOutcome, String> {
         let mut receipts = Vec::new();
         let mut worker_pids = std::collections::BTreeSet::new();
+        let mut arm_index = 0_usize;
         for input in &inputs {
             let family = input.family;
             let target_prompt_tokens = input.baseline.context_payload_tokens.to_string();
             let mut arms = Vec::new();
             for worker_mode in ["dense", "packed"] {
                 let slug = format!("{family}-{worker_mode}");
+                let before_arm = arm_index;
+                arm_index += 1;
                 let arm_path = worker_root.join(format!("{slug}.json"));
                 let binding_path = worker_root.join(format!("{slug}.binding.json"));
                 if arm_path.exists() || binding_path.exists() {
@@ -2516,6 +2521,17 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
                     )?);
                     eprintln!("SC-20676 resumed validated arm {slug}");
                     continue;
+                }
+                // Between arms only: a running worker is never signalled.
+                if let Some(stop) = campaign::operator_stop_before_row(
+                    &stop_file,
+                    &worker_root.join("logs"),
+                    "sc-20676-operator-stop",
+                    before_arm,
+                    &slug,
+                    allowed.len(),
+                )? {
+                    return Ok(campaign::CampaignOutcome::StoppedByOperator(stop));
                 }
                 let (total_tokens, request_tokens) = sc20676_admitted_tokens(
                     worker_mode,
@@ -2682,7 +2698,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         publish_complete_matrix(&staging, &destination, &nonce, &executable_sha256)?;
-        Ok(())
+        Ok(campaign::CampaignOutcome::Completed)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);

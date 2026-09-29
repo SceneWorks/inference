@@ -444,6 +444,57 @@ def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: Su
     return path
 
 
+# A campaign parent halted between rows by its operator stop file exits with this status
+# (sysexits EX_TEMPFAIL): distinct from success and every refusal; the same command resumes.
+OPERATOR_STOP_EXIT_CODE = 75
+OPERATOR_STOP_FILE_NAME = "STOP"
+
+
+class OperatorStop(Exception):
+    """The operator asked the parent to stop before starting row ``before``."""
+
+    def __init__(self, *, before: str, index: int, total: int, record: Path):
+        super().__init__(f"stopped by operator before row {index + 1}/{total} ({before}); status {record}")
+        self.before = before
+        self.index = index
+        self.total = total
+        self.record = record
+
+
+def operator_stop_file(stop_file: Path | None, resume_dir: Path) -> Path:
+    """``--stop-file`` or ``<resume-dir>/STOP``; never part of a resume identity."""
+    return Path(stop_file) if stop_file is not None else Path(resume_dir) / OPERATOR_STOP_FILE_NAME
+
+
+def is_operator_stop_entry(resume_dir: Path, stop_file: Path, name: str) -> bool:
+    return name == OPERATOR_STOP_FILE_NAME or Path(resume_dir) / name == Path(stop_file)
+
+
+def check_operator_stop(stop_file: Path | None, logs: Path, *, kind: str, before: str, index: int, total: int) -> None:
+    """Called by a parent between rows, just before spawning row ``index``; never signals a
+    running child. When the stop file exists, writes a sealed, never-overwritten
+    ``logs/operator-stop.attempt-<n>.json`` status record and raises :class:`OperatorStop`."""
+    if stop_file is None or not (Path(stop_file).exists() or Path(stop_file).is_symlink()):
+        return
+    logs.mkdir(parents=True, exist_ok=True)
+    attempt = 0
+    while (logs / f"operator-stop.attempt-{attempt}.json").exists():
+        attempt += 1
+    record = logs / f"operator-stop.attempt-{attempt}.json"
+    encoded = canonical({
+        "schemaVersion": 1, "kind": kind, "status": "stopped-by-operator",
+        "beforeRow": index, "beforeRowSlug": before, "rowsTotal": total, "rowsAccepted": index,
+        "stopFile": str(stop_file), "recordedAtUnixNs": time.time_ns(),
+        "resume": "remove the stop file and rerun the same command with the same resume directory",
+    })
+    with record.open("xb") as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    record.with_name(f"{record.name}.sha256").write_text(f"{digest(encoded)}  {record.name}\n", encoding="utf-8")
+    raise OperatorStop(before=before, index=index, total=total, record=record)
+
+
 @dataclass(frozen=True)
 class RunResult:
     pid: int
