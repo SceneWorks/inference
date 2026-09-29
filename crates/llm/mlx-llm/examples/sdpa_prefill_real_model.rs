@@ -1,3 +1,7 @@
+//! **Superseded (sc-20676):** the "numerically broken" fused prefill kernel was a strided-output
+//! readback artifact in the sc-7430 repro (`as_slice` ignores strides); the kernel is correct and
+//! `sdpa` now runs head dims 64/80/128 prefill through it in 2048-row blocks.
+//!
 //! sc-7430 real-model context demo: shows that generation stays FLUENT on prompts over 8 tokens
 //! even though the fused-SDPA prefill kernel (q_len > 8, multi-head, head_dim ∈ {64,128}) is
 //! numerically broken on the pinned pmetal fork — which is exactly why the bug went unnoticed and
