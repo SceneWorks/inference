@@ -1664,6 +1664,20 @@ impl PackedGroupAffineKvCache {
             .sum()
     }
 
+    /// Per-component logical bytes of one resident layer, read from the live host vectors:
+    /// `[key codes, key scale+zero, pending dense key tail, value codes, value scale+zero]`.
+    pub(crate) fn layer_component_bytes(&self, layer: usize) -> Option<[usize; 5]> {
+        let storage = self.layers.get(layer)?.as_ref()?;
+        let half = std::mem::size_of::<f16>();
+        Some([
+            storage.keys.codes.len(),
+            (storage.keys.scales.len() + storage.keys.zeros.len()) * half,
+            storage.keys.pending.len() * std::mem::size_of::<f32>(),
+            storage.values.codes.len(),
+            (storage.values.scales.len() + storage.values.zeros.len()) * half,
+        ])
+    }
+
     /// Actual allocated payload capacity for codes, metadata, and the pending key tail.
     pub fn host_allocated_payload_bytes(&self) -> usize {
         self.layers
@@ -2087,7 +2101,10 @@ impl PackedGroupAffineKvCache {
     /// Dense row-major values numerically equivalent to the buffers presented to the packed reader.
     /// This is used only for an observable dense transition; successful packed dispatches never call
     /// it. In particular, the incomplete K tail is reconstructed from its padded group quantization.
-    fn evaluated_dense_layer(&self, layer: usize) -> Result<(usize, Vec<f32>, Vec<f32>)> {
+    pub(crate) fn evaluated_dense_layer(
+        &self,
+        layer: usize,
+    ) -> Result<(usize, Vec<f32>, Vec<f32>)> {
         let storage = self
             .layers
             .get(layer)

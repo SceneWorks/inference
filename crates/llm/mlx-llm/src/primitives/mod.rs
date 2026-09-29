@@ -17,6 +17,7 @@ pub mod attention;
 pub mod coherence;
 pub mod gated_delta;
 pub mod kv_cache;
+pub mod kv_candidates;
 pub mod nn;
 pub mod packed_attention;
 pub mod packed_group_affine_kv;
