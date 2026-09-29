@@ -641,6 +641,21 @@ impl Qwen35Cache {
             .unwrap_or(0)
     }
 
+    /// The dtypes of each full-attention layer's cached keys and values, in layer order, skipping
+    /// a layer that has cached nothing yet. Inspection only: since sc-20671 they are the compute
+    /// dtype whatever dtype the snapshot stores its quantized scales in.
+    pub fn attention_kv_dtypes(&self) -> Result<Vec<(Dtype, Dtype)>> {
+        let mut dtypes = Vec::new();
+        for layer in &self.layers {
+            if let Qwen35LayerCache::Attn(slot) = layer {
+                if let Some((keys, values)) = slot.kv.peek(0)? {
+                    dtypes.push((keys.dtype(), values.dtype()));
+                }
+            }
+        }
+        Ok(dtypes)
+    }
+
     /// Drop all cached state.
     pub fn reset(&mut self) -> Result<()> {
         for l in &mut self.layers {
@@ -711,6 +726,12 @@ impl Qwen35Model {
     /// Whether the large projections were quantized on load.
     pub fn is_quantized(&self) -> bool {
         self.quantized
+    }
+
+    /// The decoder's compute dtype (bf16): its activations, logits, and full-attention K/V. The
+    /// linear-attention recurrence alone accumulates in f32.
+    pub const fn compute_dtype(&self) -> Dtype {
+        COMPUTE_DTYPE
     }
 
     /// Whether projections use the packed Prism Hadamard path.

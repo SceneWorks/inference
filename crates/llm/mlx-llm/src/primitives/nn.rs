@@ -10,6 +10,16 @@ use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
 
+/// Bytes per element of `dtype`.
+pub const fn dtype_bytes(dtype: Dtype) -> u64 {
+    match dtype {
+        Dtype::Bool | Dtype::Uint8 | Dtype::Int8 => 1,
+        Dtype::Uint16 | Dtype::Int16 | Dtype::Float16 | Dtype::Bfloat16 => 2,
+        Dtype::Uint32 | Dtype::Int32 | Dtype::Float32 => 4,
+        Dtype::Uint64 | Dtype::Int64 | Dtype::Float64 | Dtype::Complex64 => 8,
+    }
+}
+
 /// 2-D convolution over NHWC `x` with an mlx `[out, kH, kW, in]` weight (+ optional bias), square
 /// `stride`/`padding`, no dilation, groups = 1 — the patch-embedding conv the SigLIP vision tower
 /// uses (story 7157). HF stores the conv weight `[out, in, kH, kW]`; transpose to `[out, kH, kW, in]`

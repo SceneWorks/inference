@@ -152,9 +152,11 @@ fn assert_runs_in_compute_dtype(dir: &Fixture, label: &str) {
         assert_eq!(keys.dtype(), COMPUTE, "{label}: layer {layer} keys");
         assert_eq!(values.dtype(), COMPUTE, "{label}: layer {layer} values");
     }
+    // The campaign's pinned dense-KV expectation is the width this loader actually caches.
+    assert_eq!(COMPUTE, mlx_llm::campaign::DENSE_KV_COMPUTE_DTYPE);
     assert_eq!(
         cache.element_bytes().unwrap(),
-        Some(2),
+        Some(mlx_llm::campaign::DENSE_KV_COMPUTE_ELEMENT_BYTES),
         "{label}: dense KV element width"
     );
 }

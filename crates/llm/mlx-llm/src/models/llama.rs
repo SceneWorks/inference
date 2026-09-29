@@ -490,9 +490,12 @@ impl CausalLm {
         PagedKvCache::new(self.cfg.num_layers, block_size)
     }
 
+    /// The engine's cached-decode compute dtype (bf16): activations, logits and the K/V cache.
+    pub const COMPUTE_DTYPE: Dtype = COMPUTE_DTYPE;
+
     /// The engine's cached-decode compute dtype (bf16).
     pub const fn compute_dtype(&self) -> Dtype {
-        COMPUTE_DTYPE
+        Self::COMPUTE_DTYPE
     }
 
     /// Build per-row RoPE `(cos, sin)` tables for a `[rows, cols]` grid of absolute positions

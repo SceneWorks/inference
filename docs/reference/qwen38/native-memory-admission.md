@@ -51,8 +51,11 @@ native estimates against a JSON list of pinned paths and expected bounds without
 
 Request bounds include expanded visual tokens, eager attention scores/mask/softmax, full-length
 K/V storage, recurrent state, projection/MLP/logit buffers, MTP cache/rollback and draft-width
-buffers, RGB preprocessing, unmerged vision-patch attention and vision MLP workspaces. Four-byte
-workspace elements conservatively cover FP32 intermediates even with BF16 weights. Checked
+buffers, RGB preprocessing, unmerged vision-patch attention and vision MLP workspaces. Candle prices
+every workspace element at four bytes. Since sc-20671, MLX prices K/V, activations and logits at the
+decoder's compute width (BF16) and eager attention scores at F32. Prism/Bonsai stays at four bytes
+until its frozen allocator peaks are re-taken on the BF16 path; see
+`docs/architecture/SC_20671_DENSE_BASELINE_MODEL_CONTRACT.md`. Checked
 arithmetic rejects overflow. Visual geometry is computed before visual encoding. A low budget
 therefore rejects a request inside the architectural token window without invoking the decoder.
 
