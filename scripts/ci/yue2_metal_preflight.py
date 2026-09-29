@@ -18,7 +18,7 @@ MODEL_BYTES = 7_261_441_640  # Pinned YuE2-3B safetensors manifest.
 # further checkpoint's worth for the release build and staging on a cold runner.
 DISK_HEADROOM_BYTES = 4 * MODEL_BYTES
 BUSY_NAME = re.compile(
-    r"(?:^|/)(?:cargo|rustc|candle_audio_yue2-[^ /]+|sceneworks-worker|sceneworks-rust-api|candle-gen|mlx-gen)(?:$| )",
+    r"^(?:cargo|rustc|candle_audio_yue2-[^ /]+|sceneworks-worker|sceneworks-rust-api|candle-gen|mlx-gen)$",
     re.IGNORECASE,
 )
 
@@ -43,16 +43,20 @@ def competing_processes(ps: str, own_pid: int) -> list[str]:
     busy = []
     workers = []
     for line in ps.splitlines():
-        columns = line.strip().split(None, 2)
-        if len(columns) != 3 or not columns[0].isdigit():
+        columns = line.strip().split(None, 3)
+        if len(columns) != 4 or not columns[0].isdigit() or not columns[1].isdigit():
             continue
-        pid, comm, args = int(columns[0]), columns[1], columns[2]
+        pid, ppid, comm, args = int(columns[0]), int(columns[1]), columns[2], columns[3]
         if pid == own_pid:
             continue
-        if Path(comm).name == "Runner.Worker":
+        # macOS `ps comm` can truncate a path. `args` retains the executable, but
+        # later argv values are data: the controller's --api-bin path names the API
+        # binary without running it. Never mistake an ancestor's argument for work.
+        executable = Path(args.split(None, 1)[0]).name
+        if Path(comm).name == "Runner.Worker" or executable == "Runner.Worker":
             workers.append(pid)
-        if BUSY_NAME.search(comm) or BUSY_NAME.search(args):
-            busy.append(f"{pid}: {comm}")
+        if BUSY_NAME.fullmatch(Path(comm).name) or BUSY_NAME.fullmatch(executable):
+            busy.append(f"pid={pid} ppid={ppid} executable={executable} comm={comm}")
     if len(workers) > 1:
         busy.append(f"{len(workers)} Runner.Worker processes")
     return busy
@@ -100,7 +104,7 @@ def main() -> int:
         )
     )
     hub_disk = shutil.disk_usage(existing_parent(hub)).free
-    busy = competing_processes(output(["ps", "-axo", "pid=,comm=,args="]), os.getpid())
+    busy = competing_processes(output(["ps", "-axo", "pid=,ppid=,comm=,args="]), os.getpid())
     errors = assess(runner, total, available, min(disk, hub_disk), busy)
     record = {
         "runner": runner,

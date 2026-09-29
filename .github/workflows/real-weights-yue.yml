@@ -50,11 +50,11 @@ on:
   workflow_dispatch:
     inputs:
       family:
-        description: "yue = YuE-v1 CUDA; yue2 = YuE2 CUDA; yue2-metal = quality; yue2-app-metal = app proof"
+        description: "yue = YuE-v1 CUDA; yue2 = YuE2 CUDA; yue2-metal = quality; yue2-app-metal = app proof; resume = q4 profile only"
         type: choice
         required: false
         default: yue
-        options: [yue, yue2, yue2-metal, yue2-metal-evidence, yue2-app-metal]
+        options: [yue, yue2, yue2-metal, yue2-metal-evidence, yue2-app-metal, yue2-app-metal-profile-resume]
       mode:
         description: "smoke = the three real-weight renders; memory = the device-memory measurement"
         type: choice
@@ -74,7 +74,7 @@ permissions:
 
 # The Metal quality job has its own physical host; leave the CUDA group unchanged.
 concurrency:
-  group: ${{ (inputs.family == 'yue2-metal' || inputs.family == 'yue2-app-metal') && 'inference-yue2-metal-nax-macos-2' || 'inference-real-weights-physical-host' }}
+  group: ${{ (inputs.family == 'yue2-metal' || inputs.family == 'yue2-app-metal' || inputs.family == 'yue2-app-metal-profile-resume') && 'inference-yue2-metal-nax-macos-2' || 'inference-real-weights-physical-host' }}
   cancel-in-progress: false
 
 env:
@@ -703,5 +703,91 @@ jobs:
           PROOF_OUTCOME: ${{ steps.app-proof.outcome }}
         run: |
           test "$PROOF_OUTCOME" = success || { echo "::error::YuE2 app Metal proof failed; inspect retained host state and artifact"; exit 1; }
+          cat "$APP_EVIDENCE/verdict.json"
+          printf 'YuE2 Metal app state for listening: %s\n' "$APP_STATE" >> "$GITHUB_STEP_SUMMARY"
+
+  yue2-app-metal-profile-resume:
+    name: YuE2 q4-default profile resume only (Metal, nax-macos-2)
+    if: inputs.family == 'yue2-app-metal-profile-resume'
+    runs-on: [self-hosted, macOS, ARM64, rw-audio]
+    timeout-minutes: 180
+    env:
+      # Original run 36565987342-1 completed acceptance, but preflight prevented
+      # the profile from starting. Keep its app state, model cache and build target.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../yue2-app-metal-target-36565987342-1
+      APP_STATE: ${{ github.workspace }}/../yue2-app-metal-state-36565987342-1
+      APP_OUT: ${{ github.workspace }}/../yue2-app-metal-out-36565987342-1
+      APP_EVIDENCE: ${{ github.workspace }}/../yue2-app-metal-profile-resume-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Require nax-macos-2 before any checkout or build
+        run: |
+          test "$RUNNER_NAME" = nax-macos-2 || { echo "::error::YuE2 Metal profile resume requires nax-macos-2"; exit 1; }
+      # The dispatch checkout supplies only the controller and fixed-run verifier.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Canonicalize the new receipts directory
+        run: |
+          mkdir -p "$APP_EVIDENCE"
+          echo "APP_EVIDENCE=$(cd "$APP_EVIDENCE" && pwd -P)" >> "$GITHUB_ENV"
+      - name: Check physical resources and process ownership before resuming
+        id: resume-preflight
+        run: python3.12 scripts/ci/yue2_metal_preflight.py --evidence "$APP_EVIDENCE"
+      - name: Check out exact SceneWorks app revision
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: SceneWorks/SceneWorks
+          ref: 44dc4119fc64c48a38dbd4ca94a3a6c2cd05fbe3
+          path: app
+          persist-credentials: false
+      - name: Check out exact M2 inference source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: 99a60541a73706fb67b4e78f44458774423ffb8e
+          path: engine
+          persist-credentials: false
+      - name: Set up Node 22 for original evidence verification and profile
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - name: Fetch verified prebuilt release MLX for the exact app pin
+        working-directory: app
+        run: |
+          set +e
+          scripts/fetch-prebuilt-mlx.sh --build-type Release --github-env
+          rc=$?
+          set -e
+          if [ "$rc" = 1 ]; then
+            echo "::warning::No release prebuilt for the app's MLX pin; building MLX from source"
+            {
+              echo "PMETAL_MLX_PREBUILT_DIR="
+              echo "PMETAL_METALLIB_PATH="
+            } >> "$GITHUB_ENV"
+          elif [ "$rc" != 0 ]; then
+            exit "$rc"
+          fi
+      - name: Recheck host immediately before targeted Metal profile
+        run: python3.12 scripts/ci/yue2_metal_preflight.py --evidence "$APP_EVIDENCE" --label before-profile
+      - name: Verify original receipts and capture only the unstarted q4 profile
+        id: resume-proof
+        continue-on-error: true
+        run: |
+          python3.12 scripts/ci/yue2_app_metal_resume.py \
+            --app app --engine engine --state "$APP_STATE" --out "$APP_OUT" \
+            --target "$CARGO_TARGET_DIR" --evidence "$APP_EVIDENCE" \
+            --preflight "$APP_EVIDENCE/preflight-before-profile.json"
+      - name: Upload resumed profile receipts without audio or tensors
+        if: ${{ always() && steps.resume-preflight.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-metal-profile-resume-evidence-${{ github.run_id }}
+          path: ${{ env.APP_EVIDENCE }}
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enforce resumed profile verdict after upload
+        if: ${{ always() && steps.resume-preflight.outcome == 'success' }}
+        env:
+          PROOF_OUTCOME: ${{ steps.resume-proof.outcome }}
+        run: |
+          test "$PROOF_OUTCOME" = success || { echo "::error::YuE2 resumed q4 profile failed; inspect retained host state and artifact"; exit 1; }
           cat "$APP_EVIDENCE/verdict.json"
           printf 'YuE2 Metal app state for listening: %s\n' "$APP_STATE" >> "$GITHUB_STEP_SUMMARY"

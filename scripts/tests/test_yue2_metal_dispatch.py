@@ -32,10 +32,10 @@ class MetalPreflightTests(unittest.TestCase):
             "Pages speculative: 1000000.\n"
         )
         self.assertEqual(preflight.available_memory(vm), 49_152_000_000)
-        processes = """100 /bin/zsh zsh
-101 /usr/bin/cargo cargo test --release
-102 /opt/actions/Runner.Worker Runner.Worker
-103 /opt/actions/Runner.Worker Runner.Worker
+        processes = """100 1 /bin/zsh zsh
+101 100 /usr/bin/cargo cargo test --release
+102 1 /opt/actions/Runner.Worker Runner.Worker
+103 1 /opt/actions/Runner.Worker Runner.Worker
 """
         busy = preflight.competing_processes(processes, 100)
         self.assertEqual(len(busy), 2)
@@ -49,6 +49,23 @@ class MetalPreflightTests(unittest.TestCase):
     def test_incomplete_vm_stat_fails_closed(self) -> None:
         with self.assertRaises(ValueError):
             preflight.available_memory("Pages free: 123.\n")
+
+    def test_controller_argument_is_not_running_api_but_real_worker_is_busy(self) -> None:
+        controller = (
+            "79363 79100 /opt/homebrew/Ce /opt/homebrew/opt/python@3.12/bin/python3.12 "
+            "scripts/ci/yue2_app_metal.py --app app --engine engine "
+            "--api-bin /Users/MTrefry/actions-runner-nax/_work/inference/"
+            "yue2-app-metal-target-36565987342-1/release/sceneworks-rust-api"
+        )
+        self.assertEqual(preflight.competing_processes(controller, 99999), [])
+        running = controller + "\n81000 79363 /opt/homebrew/Ce /tmp/target/release/sceneworks-rust-api --port 8123\n"
+        self.assertEqual(
+            preflight.competing_processes(running, 99999),
+            ["pid=81000 ppid=79363 executable=sceneworks-rust-api comm=/opt/homebrew/Ce"],
+        )
+        self.assertEqual(
+            len(preflight.competing_processes("81001 79363 /tmp/sceneworks-worker /tmp/sceneworks-worker --job 1", 99999)), 1
+        )
 
 
 class ReferenceTests(unittest.TestCase):

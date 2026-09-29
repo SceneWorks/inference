@@ -5,15 +5,19 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("yue2_app_metal", ROOT / "scripts/ci/yue2_app_metal.py")
 app = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(app)
+sys.path.insert(0, str(ROOT / "scripts/ci"))
+import yue2_app_metal_resume as resume
 
 
 def chain(events: list[dict]) -> str:
@@ -27,6 +31,43 @@ def chain(events: list[dict]) -> str:
 
 
 class AppMetalProofTests(unittest.TestCase):
+    def test_resume_binds_original_run_and_refuses_started_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tag = resume.ORIGINAL_RUN
+            state = root / f"yue2-app-metal-state-{tag}"
+            out = root / f"yue2-app-metal-out-{tag}"
+            target = root / f"yue2-app-metal-target-{tag}"
+            (state / "app-data").mkdir(parents=True)
+            (state / "hf-home").mkdir()
+            (target / "release").mkdir(parents=True)
+            (target / "release" / "sceneworks-rust-api").write_text("binary")
+            evidence = out / "acceptance" / "evidence"
+            evidence.mkdir(parents=True)
+            summary = evidence / "summary.json"
+            summary.write_text("original summary")
+            chain = out / "watchdog-acceptance.jsonl"
+            chain.write_text("original chain")
+            (out / "identity.json").write_text(json.dumps({
+                "app_sha": app.APP_SHA, "engine_sha": app.ENGINE_SHA,
+                "runner": "nax-macos-2", "state": str(state), "out": str(out),
+            }))
+            preflight = root / "preflight.json"
+            preflight.write_text(json.dumps({"runner": "nax-macos-2", "admitted": True}))
+            with patch.object(resume, "SUMMARY_SHA256", resume.file_sha256(summary)), \
+                 patch.object(resume, "CHAIN_SHA256", resume.file_sha256(chain)):
+                self.assertEqual(resume.verify_original(state, out, target, preflight)["chain"], chain)
+                (out / "profile").mkdir()
+                with self.assertRaisesRegex(ValueError, "already started"):
+                    resume.verify_original(state, out, target, preflight)
+                (out / "profile").rmdir()
+                summary.write_text("different run")
+                with self.assertRaisesRegex(ValueError, "differs from published"):
+                    resume.verify_original(state, out, target, preflight)
+                summary.write_text("original summary")
+                with self.assertRaisesRegex(ValueError, "same original run"):
+                    resume.verify_original(state, out, root / "other-target", preflight)
+
     def test_staged_ffmpeg_is_explicit_and_probed_without_path_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             binary = Path(temp) / "ffmpeg"
