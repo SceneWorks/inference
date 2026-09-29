@@ -150,6 +150,48 @@
             }
           }
         }
+      },
+      "wan": {
+        "wan2_2_t2v_14b": {
+          "coordinates": {
+            "square-17f-lightning": {
+              "batch": 1,
+              "resolution": "512x512",
+              "frames": 17,
+              "reference_count": 0,
+              "prompt": "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5",
+              "guidance": "1"
+            },
+            "landscape-33f-lightning": {
+              "batch": 1,
+              "resolution": "768x512",
+              "frames": 33,
+              "reference_count": 0,
+              "prompt": "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713",
+              "guidance": "1"
+            }
+          }
+        },
+        "wan2_2_i2v_14b": {
+          "coordinates": {
+            "square-17f-ref1-lightning": {
+              "batch": 1,
+              "resolution": "512x512",
+              "frames": 17,
+              "reference_count": 1,
+              "prompt": "ff8b29180ce69f56369bd1222522f384564bc4154035ebb06c1efbdc30e36be5",
+              "guidance": "1"
+            },
+            "landscape-33f-ref1-lightning": {
+              "batch": 1,
+              "resolution": "768x512",
+              "frames": 33,
+              "reference_count": 1,
+              "prompt": "c19800ff5dc04d6cbd7d00d636218c569318b28a3df652255a531c4c3b3de713",
+              "guidance": "1"
+            }
+          }
+        }
       }
     }
   },

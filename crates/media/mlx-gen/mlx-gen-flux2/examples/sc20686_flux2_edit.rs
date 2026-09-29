@@ -239,11 +239,18 @@ mod tests {
     use super::*;
     use mlx_gen::gen_core::{Precision, WeightsSource};
 
-    /// The SceneWorks Mac worker's Klein edit load: the packed tier root, no load-time quant, and the
-    /// catalog model id as `resolved_route` (`image_jobs/flux2.rs::generate_flux2_edit_stream`).
+    /// The product's default Klein edit load (`product_load`, which the SceneWorks worker calls): the
+    /// packed q4 tier root, no load-time quant, and the catalog model as `resolved_route`.
     #[test]
     fn both_routes_load_with_the_product_settings() {
-        let snapshot = Path::new("/snapshots/rev/q8");
+        let root = tempfile::tempdir().expect("temp root");
+        let snapshot = root.path();
+        std::fs::create_dir_all(snapshot.join("transformer")).expect("transformer");
+        std::fs::write(
+            snapshot.join("transformer/config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .expect("config");
         for (route, catalog) in [
             ("flux2_klein_9b_edit", "flux2_klein_9b"),
             ("flux2_klein_9b_kv_edit", "flux2_klein_9b_kv"),

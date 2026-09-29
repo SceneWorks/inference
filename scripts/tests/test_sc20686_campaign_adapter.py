@@ -501,14 +501,53 @@ class CampaignAdapterTests(unittest.TestCase):
                 (assembled / name).write_bytes(name.encode("utf-8"))
             revision = "3" * 40
             (assembled / ".snapshot-revision").write_text(revision, encoding="utf-8")
-            self.adapter.validate_snapshot_layout(assembled, "Wan manifest wan_vace")
+            self.adapter.validate_snapshot_layout(
+                assembled, "Wan manifest wan_vace", "wan_vace", "mlx-metal"
+            )
+            # The assembled layout is scoped per route: VACE-Fun also needs its low-noise expert,
+            # and a non-VACE route never takes it.
+            with self.assertRaisesRegex(ValueError, "assembled wan2_2_vace_fun_14b"):
+                self.adapter.validate_snapshot_layout(
+                    assembled, "Wan manifest", "wan2_2_vace_fun_14b", "mlx-metal"
+                )
+            with self.assertRaisesRegex(ValueError, "exact component/tier root"):
+                self.adapter.validate_snapshot_layout(assembled, "Wan manifest", "wan2_2_t2v_14b")
             self.assertEqual(self.adapter.model_snapshot_revision(assembled), revision)
             identity = self.adapter.snapshot_identity(assembled)
             (source / "diffusion_pytorch_model.safetensors").write_bytes(b"vace-14b")
             self.assertNotEqual(self.adapter.snapshot_identity(assembled), identity)
+            # A dangling link or a link cycle is refused, never skipped.
+            (assembled / "dangling").symlink_to(root / "missing")
+            with self.assertRaisesRegex(ValueError, "broken link"):
+                self.adapter.snapshot_identity(assembled)
+            (assembled / "dangling").unlink()
+            (source / "loop").symlink_to(source, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "link cycle"):
+                self.adapter.snapshot_identity(assembled)
+            (source / "loop").unlink()
             (assembled / "tokenizer.json").unlink()
-            with self.assertRaisesRegex(ValueError, "assembled Wan-VACE"):
-                self.adapter.validate_snapshot_layout(assembled, "Wan manifest wan_vace")
+            with self.assertRaisesRegex(ValueError, "assembled wan_vace"):
+                self.adapter.validate_snapshot_layout(
+                    assembled, "Wan manifest wan_vace", "wan_vace", "mlx-metal"
+                )
+
+    def test_metal_tiered_routes_require_the_product_q4_tier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for route, relative in self.adapter.METAL_PACKED_TIER_CONFIG.items():
+                for bits, accepted in ((4, True), (8, False), (None, False)):
+                    tier = root / route / str(bits)
+                    (tier / relative).parent.mkdir(parents=True, exist_ok=True)
+                    (tier / "config.json").write_text("{}", encoding="utf-8")
+                    quantization = {} if bits is None else {"quantization": {"bits": bits}}
+                    (tier / relative).write_text(json.dumps(quantization), encoding="utf-8")
+                    if accepted:
+                        self.adapter.validate_snapshot_layout(tier, route, route, "mlx-metal")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "default q4 tier"):
+                            self.adapter.validate_snapshot_layout(tier, route, route, "mlx-metal")
+                    # The CUDA lane's Candle snapshots are not the Mac product's tiers.
+                    self.adapter.validate_snapshot_layout(tier, route, route, "candle-cuda")
 
     def test_manifest_rejects_non_product_residency(self):
         with tempfile.TemporaryDirectory() as directory:

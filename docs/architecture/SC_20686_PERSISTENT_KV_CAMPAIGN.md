@@ -124,8 +124,10 @@ unchanged by it.
 
 The Metal lane runs the CUDA matrix unchanged — the same six routes at the same native coordinates
 (resolution, frames, reference count, prompt, guidance, steps) with the same normal/cancel arms — plus
-one lane extension recorded in `sc20686_coverage_manifest.json` (`lane_extensions.mlx-metal`):
-`flux2_klein_9b_kv_edit` at the two FLUX coordinates. Dropping any route blocks its family decision;
+two lane extensions recorded in `sc20686_coverage_manifest.json` (`lane_extensions.mlx-metal`):
+`flux2_klein_9b_kv_edit` at the two FLUX coordinates, and the A14B product default (Lightning on) as
+a `-lightning` twin of each T2V/I2V coordinate at the forced guidance 1. A lane extension may add
+coordinates to a shared route but never redefine one. Dropping any route blocks its family decision;
 nothing is narrowed to fit.
 
 | Route | MLX entrypoint | Cache kind on MLX | Residency |
@@ -140,33 +142,38 @@ nothing is narrowed to fit.
 
 ### Product load
 
-Both MLX entrypoints build their `LoadSpec` through the product constructors
-(`mlx_gen_wan::product_load::product_load_spec`, `mlx_gen_flux2::product_load::product_load_spec`),
-which carry the SceneWorks Mac worker's default-request load decisions; the source map records them
-per route as `product_load`. Only residency comes from the sealed axis above.
+The per-route load decisions live in the provider crates (`mlx_gen_wan::product_load`,
+`mlx_gen_flux2::product_load`), which the SceneWorks worker calls for its own loads; both MLX
+entrypoints build their `LoadSpec` through the same modules' `product_load_spec`, and the source map
+records the decisions per route as `product_load` (and, on the A14B routes, `advanced_lightning`).
+Only residency comes from the sealed axis above.
 
 | Route | Snapshot (`SC20686_MLX_*` / `--flux-*-snapshot`) | Load quantization |
 | --- | --- | --- |
-| `flux2_klein_9b_edit`, `flux2_klein_9b_kv_edit` | the pre-packed Klein tier root (`resolved_route` `flux2_klein_9b` / `flux2_klein_9b_kv`) | none: the tier is packed |
-| `wan2_2_ti2v_5b`, `wan2_2_t2v_14b`, `wan2_2_i2v_14b` | the pre-packed quant-matrix tier root (`q4/` is the product default) | none: the tier's `config.json` is authoritative |
-| `wan_vace` | the worker-assembled `wan_vace` snapshot: the dense **Wan2.1-VACE-1.3B** transformer plus the base-Wan 14B UMT5, z16 VAE and tokenizer | none: dense bf16 |
-| `wan2_2_vace_fun_14b` | the worker-assembled dense VACE-Fun 14B high/low experts plus the same shared components | **Q4**, forced by the worker at load |
+| `flux2_klein_9b_edit`, `flux2_klein_9b_kv_edit` | the product's default `q4/` Klein tier root (`resolved_route` `flux2_klein_9b` / `flux2_klein_9b_kv`) | none: the tier is packed |
+| `wan2_2_ti2v_5b`, `wan2_2_t2v_14b`, `wan2_2_i2v_14b` | the product's default `q4/` quant-matrix tier root | none: the tier's `config.json` is authoritative |
+| `wan_vace` | the worker-assembled `wan_vace` snapshot: the dense **Wan2.1-VACE-1.3B** transformer plus the base-Wan 14B `q4/` tier's UMT5, z16 VAE and tokenizer | none: dense bf16 |
+| `wan2_2_vace_fun_14b` | the worker-assembled dense VACE-Fun 14B high/low experts plus the same shared components | **Q4**, forced by the product unless the user picks |
 
-The Mac product's `wan_vace` is the 1.3B transformer, not the Wan2.1-VACE-14B tree the Candle lane
-reads; the Wan entrypoint refuses a `wan_vace` snapshot of any other transformer size.
+The entrypoints and the adapter refuse any other tier (a packed tier whose `quantization.bits` is
+not 4), and a VACE snapshot that is not the worker's assembled layout for that route (VACE-Fun also
+needs `transformer_2/`). The Mac product's `wan_vace` is the 1.3B transformer, not the
+Wan2.1-VACE-14B tree the Candle lane reads; the Wan entrypoint refuses any other transformer size.
 
 The two VACE snapshots are assembled exactly as the worker assembles them
 (`mlx_gen_wan::convert::assemble_wan_vace_snapshot` / `assemble_wan_vace_fun_snapshot`, linked):
 `transformer/` (and `transformer_2/`) from `Wan-AI/Wan2.1-VACE-1.3B-diffusers`
 (`linoyts/Wan2.2-VACE-Fun-14B-diffusers`), and `t5_encoder.safetensors`, `vae.safetensors`,
-`tokenizer.json` from the dense `bf16/` tier of `SceneWorks/wan2.2-t2v-a14b-mlx` (the worker reads
-the repository root's legacy flat dense copies, which a tier-only install does not download). Each
-assembled root carries a `.snapshot-revision` holding the VACE repository revision.
+`tokenizer.json` from the first complete tier of the base-Wan 14B turnkey, `q4/` first (the tiers'
+shared components differ as blobs). Each assembled root carries a `.snapshot-revision` holding the
+VACE repository revision.
 
-The A14B coordinates (explicit steps and guidance > 1) are the product's Lightning-off request
-(`advanced.lightning: false`), which loads no adapter. The worker's default A14B request instead
-loads the Lightning high/low LoRA pair and runs 4 steps at guidance 1; that configuration is not in
-the frozen coordinate set.
+The A14B routes default to the Lightning distill (`advanced.lightning` unset means on): the
+per-architecture `lightx2v/Wan2.2-Lightning` high/low LoRA pair at strength 1.0, forced to 4 steps at
+guidance 1. Every Metal A14B coordinate states `--lightning on|off`: the shared coordinates are the
+Lightning-off request, and the `-lightning` coordinates are the product default, naming the pair with
+`--lora-high`/`--lora-low` (`SC20686_WAN_{T2V,I2V}_LIGHTNING_{HIGH,LOW}`), which the entrypoint
+refuses unless it is exactly the product's pair for that architecture.
 
 Three source facts differ from the Candle lane and are recorded as cache kinds in the lane's source map
 (`sc20686_source_map.json`, `lanes.mlx-metal`), not smoothed over:
@@ -240,7 +247,7 @@ v6 bundles and v6 reducer decisions carry the lane; one bundle may not mix lanes
 
 ### One-command Metal campaign
 
-Build the two MLX entrypoints once, then run the sealed matrix (14 coordinates × normal/cancel):
+Build the two MLX entrypoints once, then run the sealed matrix (18 coordinates × normal/cancel):
 
 ```text
 eval "$(scripts/fetch-prebuilt-mlx.sh --build-type Release)" && export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH
@@ -251,7 +258,8 @@ export SC20686_MLX_WAN_TI2V_5B_SNAPSHOT=… SC20686_MLX_WAN_T2V_14B_SNAPSHOT=…
   SC20686_MLX_WAN_I2V_14B_SNAPSHOT=… SC20686_MLX_WAN_VACE_SNAPSHOT=… \
   SC20686_MLX_WAN_VACE_FUN_14B_SNAPSHOT=… SC20686_WAN_I2V_REFERENCE=… \
   SC20686_VACE_CONTROL_17_DIR=… SC20686_VACE_MASK_17_DIR=… SC20686_VACE_CONTROL_33_DIR=… \
-  SC20686_VACE_MASK_33_DIR=… SC20686_VACE_REFERENCE=…
+  SC20686_VACE_MASK_33_DIR=… SC20686_VACE_REFERENCE=… SC20686_WAN_T2V_LIGHTNING_HIGH=… \
+  SC20686_WAN_T2V_LIGHTNING_LOW=… SC20686_WAN_I2V_LIGHTNING_HIGH=… SC20686_WAN_I2V_LIGHTNING_LOW=…
 python3 scripts/sc20686_campaign_adapter.py --campaign --matrix \
   --inference-revision "$(git rev-parse HEAD)" \
   --safety-policy /abs/sc20686-darwin-mlx-policy.json \

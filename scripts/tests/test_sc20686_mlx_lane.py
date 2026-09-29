@@ -189,10 +189,34 @@ class MetalLaneTests(unittest.TestCase):
 
     def test_metal_coverage_is_the_cuda_matrix_plus_the_mlx_only_kv_route(self):
         cuda = self.reducer.lane_coverage(self.coverage, "candle-cuda")
+        lightning = {}
         for family, variants in cuda.items():
             for variant, spec in variants.items():
                 # Identical native geometry: no Metal coordinate is narrowed or re-shaped.
-                self.assertEqual(self.mlx_coverage[family][variant], spec, variant)
+                metal = self.mlx_coverage[family][variant]["coordinates"]
+                for name, geometry in spec["coordinates"].items():
+                    self.assertEqual(metal[name], geometry, f"{variant}/{name}")
+                lightning[variant] = set(metal) - set(spec["coordinates"])
+        # The only added shared-route coordinates are the A14B product default (Lightning on): the
+        # Lightning-off twin of each CUDA coordinate at the forced guidance 1.
+        for variant in ("wan2_2_t2v_14b", "wan2_2_i2v_14b"):
+            cuda_coordinates = cuda["wan"][variant]["coordinates"]
+            self.assertEqual(
+                lightning.pop(variant), {f"{name}-lightning" for name in cuda_coordinates}
+            )
+            for name, geometry in cuda_coordinates.items():
+                self.assertEqual(
+                    self.mlx_coverage["wan"][variant]["coordinates"][f"{name}-lightning"],
+                    {**geometry, "guidance": "1"},
+                )
+        self.assertFalse(any(lightning.values()), lightning)
+        # A lane extension may add coordinates to a shared route but never redefine one.
+        redefining = json.loads(json.dumps(self.coverage))
+        redefining["lane_extensions"]["mlx-metal"]["wan"]["wan2_2_t2v_14b"]["coordinates"][
+            "square-17f"
+        ] = cuda["wan"]["wan2_2_t2v_14b"]["coordinates"]["square-17f"]
+        with self.assertRaisesRegex(ValueError, "redefines a shared route"):
+            self.reducer.lane_coverage(redefining, "mlx-metal")
         extra = {
             (family, variant)
             for family, variants in self.mlx_coverage.items()
@@ -248,9 +272,24 @@ class MetalLaneTests(unittest.TestCase):
             binary.chmod(0o755)
             snapshot = root / route / ("1" * 40) / "q4"
             snapshot.mkdir(parents=True, exist_ok=True)
-            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            # The product's default q4 tier (Metal refuses any other), plus the worker-assembled
+            # layout on the VACE routes.
+            (snapshot / "config.json").write_text(
+                json.dumps({"quantization": {"bits": 4, "group_size": 64}}), encoding="utf-8"
+            )
+            for relative in self.adapter.WAN_VACE_ASSEMBLED_FILES.get(route, ()):
+                (snapshot / relative).parent.mkdir(parents=True, exist_ok=True)
+                (snapshot / relative).write_text("{}", encoding="utf-8")
+            metal = stem_for(route) == "sc20686_wan"
+            coverage = self.mlx_coverage if metal else self.reducer.lane_coverage(
+                self.coverage, "candle-cuda"
+            )
+            lora = root / "lightning" / route
+            lora.mkdir(parents=True, exist_ok=True)
+            for half in ("high", "low"):
+                (lora / f"{half}.safetensors").write_bytes(half.encode())
             coordinates = {}
-            for name, expected in self.mlx_coverage["wan"][route]["coordinates"].items():
+            for name, expected in coverage["wan"][route]["coordinates"].items():
                 width, height = expected["resolution"].split("x")
                 values = [
                     "--width", width, "--height", height, "--frames", str(expected["frames"]),
@@ -266,6 +305,12 @@ class MetalLaneTests(unittest.TestCase):
                                    "--mask-dir", str(root / "mask")]
                     if expected["reference_count"]:
                         values[0:0] = ["--reference", str(reference)]
+                if metal and route in self.adapter.LIGHTNING_ROUTES:
+                    values[0:0] = (
+                        ["--lightning", "on", "--lora-high", str(lora / "high.safetensors"),
+                         "--lora-low", str(lora / "low.safetensors")]
+                        if name.endswith("-lightning") else ["--lightning", "off"]
+                    )
                 coordinates[name] = values
             entries[route] = {
                 "provider_id": route, "entrypoint": str(binary), "snapshot": str(snapshot),
@@ -306,6 +351,27 @@ class MetalLaneTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must seal one integer --seed"):
                 self.adapter.load_wan_manifest(manifest, "mlx-metal")
 
+    def test_metal_a14b_coordinates_state_the_product_lightning_toggle(self):
+        check = self.adapter.validate_metal_lightning
+        recipe = ("--guidance", "1", "--steps", "4")
+        pair = ("--lora-high", "/h", "--lora-low", "/l")
+        check("wan2_2_t2v_14b", "square-17f", ("--lightning", "off", "--guidance", "5"))
+        check("wan2_2_i2v_14b", "square-17f-ref1-lightning", ("--lightning", "on", *pair, *recipe))
+        check("wan2_2_ti2v_5b", "square-17f", ("--guidance", "5"))
+        for route, name, arguments, message in (
+            ("wan2_2_t2v_14b", "square-17f", ("--guidance", "5"), "must state --lightning"),
+            ("wan2_2_t2v_14b", "square-17f", ("--lightning", "on", *pair, *recipe), "differs"),
+            ("wan2_2_t2v_14b", "square-17f-lightning", ("--lightning", "off"), "differs"),
+            ("wan2_2_t2v_14b", "square-17f", ("--lightning", "off", *pair), "carries a LoRA"),
+            ("wan2_2_t2v_14b", "square-17f-lightning", ("--lightning", "on", *recipe),
+             "exactly one --lora-high"),
+            ("wan2_2_t2v_14b", "square-17f-lightning",
+             ("--lightning", "on", *pair, "--guidance", "5", "--steps", "4"), "4-step"),
+            ("wan_vace", "square-17f-control", ("--lightning", "off"), "only a product toggle"),
+        ):
+            with self.assertRaisesRegex(ValueError, message):
+                check(route, name, arguments)
+
     def _flux_inputs(self, root, stem):
         entrypoint = root / stem
         entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -315,6 +381,11 @@ class MetalLaneTests(unittest.TestCase):
             snapshot = root / name / revision / "q4"
             snapshot.mkdir(parents=True)
             (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            # The product's default q4 Klein tier: its packed transformer declares 4 bits.
+            (snapshot / "transformer").mkdir()
+            (snapshot / "transformer" / "config.json").write_text(
+                json.dumps({"quantization": {"bits": 4, "group_size": 64}}), encoding="utf-8"
+            )
             snapshots[name] = snapshot
         (root / "ref.png").write_bytes(b"ref")
         (root / "ref2.png").write_bytes(b"ref2")
@@ -427,7 +498,7 @@ class MetalLaneTests(unittest.TestCase):
             self.assertEqual(code, 0, stderr)
             self.assertEqual(captured["resolved"]["backend"], "mlx-metal")
             self.assertEqual(captured["resolved"]["schema"], "sc-20686-resolved-inputs-v4")
-            self.assertEqual(len(captured["coordinates"]), 14)
+            self.assertEqual(len(captured["coordinates"]), 18)
             self.assertEqual(
                 {spec.variant for spec in captured["coordinates"]},
                 set(self.source_map["lanes"]["mlx-metal"]["variants"]),
@@ -823,7 +894,7 @@ class MetalLaneTests(unittest.TestCase):
                 coordinates, runner, build, destination, inputs, schedule_control=True,
             )
             result = self.reducer.verify_schedule_control_bundle(destination)
-            self.assertEqual(len(result["summaries"]), 14)
+            self.assertEqual(len(result["summaries"]), 18)
             # A control bundle is not decision evidence, and vice versa.
             with self.assertRaises(ValueError):
                 self.reducer.verify_campaign_bundle(destination)
@@ -860,11 +931,20 @@ class MetalLaneTests(unittest.TestCase):
             self.assertEqual(arguments[index + 1], "42")
             return arguments[:index] + arguments[index + 2:]
 
+        def without_lightning_off(arguments):
+            if arguments[:2] == ["--lightning", "off"]:
+                return arguments[2:]
+            return arguments
+
         for route, entry in cuda.items():
-            self.assertEqual(
-                {name: without_seed(args) for name, args in mlx[route]["coordinates"].items()},
-                entry["coordinates"], route,
-            )
+            # Every CUDA coordinate runs unchanged on Metal (A14B: as the explicit Lightning-off
+            # request); the Metal-only `-lightning` coordinates add the A14B product default.
+            shared = {
+                name: without_lightning_off(without_seed(args))
+                for name, args in mlx[route]["coordinates"].items()
+                if not name.endswith("-lightning")
+            }
+            self.assertEqual(shared, entry["coordinates"], route)
             self.assertEqual(mlx[route]["residency_strategy"], entry["residency_strategy"], route)
             self.assertEqual(Path(mlx[route]["entrypoint"]).name, "sc20686_wan", route)
 
@@ -890,7 +970,7 @@ class MetalLaneTests(unittest.TestCase):
                 '"--sc20686-campaign"', '"--sc20686-events"', '"--sc20686-source-ref"',
                 '"--sc20686-residency"', '"--sc20686-cancel"', '.filter(|path| *path != "-")',
                 "dedicated --sc20686-events <file>", "campaign_cancelled()",
-                "::product_load::product_load_spec(", '"--sc20686-schedule-control"', "arm_schedule_control()",
+                "product_load::product_load_spec(", '"--sc20686-schedule-control"', "arm_schedule_control()",
                 "unsupported argument", "repeated argument", "requires an explicit",
             ):
                 self.assertIn(token, source, f"{relative}: {token}")

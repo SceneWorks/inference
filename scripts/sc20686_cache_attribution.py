@@ -178,9 +178,15 @@ def lane_coverage(coverage, backend):
     }
     for family, variants in coverage.get("lane_extensions", {}).get(backend, {}).items():
         for variant, spec in variants.items():
-            if variant in families.setdefault(family, {}):
+            shared = families.setdefault(family, {}).get(variant)
+            if shared is None:
+                families[family][variant] = spec
+                continue
+            # A lane may only ADD coordinates to a shared route (coverage only expands).
+            extra = spec.get("coordinates") if set(spec) == {"coordinates"} else None
+            if not isinstance(extra, dict) or not extra or set(extra) & set(shared["coordinates"]):
                 fail(f"lane extension redefines a shared route: {backend}/{variant}")
-            families[family][variant] = spec
+            shared["coordinates"] = {**shared["coordinates"], **extra}
     return families
 
 

@@ -15,8 +15,10 @@
     "snapshot": "$SC20686_MLX_WAN_T2V_14B_SNAPSHOT",
     "residency_strategy": "sequential",
     "coordinates": {
-      "square-17f": ["--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
-      "landscape-33f": ["--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"]
+      "square-17f": ["--lightning", "off", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
+      "landscape-33f": ["--lightning", "off", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"],
+      "square-17f-lightning": ["--lightning", "on", "--lora-high", "$SC20686_WAN_T2V_LIGHTNING_HIGH", "--lora-low", "$SC20686_WAN_T2V_LIGHTNING_LOW", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "1", "--steps", "4", "--seed", "42"],
+      "landscape-33f-lightning": ["--lightning", "on", "--lora-high", "$SC20686_WAN_T2V_LIGHTNING_HIGH", "--lora-low", "$SC20686_WAN_T2V_LIGHTNING_LOW", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "1", "--steps", "4", "--seed", "42"]
     }
   },
   "wan2_2_i2v_14b": {
@@ -25,8 +27,10 @@
     "snapshot": "$SC20686_MLX_WAN_I2V_14B_SNAPSHOT",
     "residency_strategy": "sequential",
     "coordinates": {
-      "square-17f-ref1": ["--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
-      "landscape-33f-ref1": ["--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"]
+      "square-17f-ref1": ["--lightning", "off", "--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
+      "landscape-33f-ref1": ["--lightning", "off", "--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"],
+      "square-17f-ref1-lightning": ["--lightning", "on", "--lora-high", "$SC20686_WAN_I2V_LIGHTNING_HIGH", "--lora-low", "$SC20686_WAN_I2V_LIGHTNING_LOW", "--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "1", "--steps", "4", "--seed", "42"],
+      "landscape-33f-ref1-lightning": ["--lightning", "on", "--lora-high", "$SC20686_WAN_I2V_LIGHTNING_HIGH", "--lora-low", "$SC20686_WAN_I2V_LIGHTNING_LOW", "--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "1", "--steps", "4", "--seed", "42"]
     }
   },
   "wan_vace": {

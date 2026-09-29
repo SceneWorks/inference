@@ -1,53 +1,155 @@
-//! The SceneWorks Mac worker's load decisions for the five MLX Wan routes, as one constructor.
+//! The SceneWorks Mac product's load decisions for the five MLX Wan routes.
 //!
-//! The worker builds every MLX Wan `LoadSpec` in `video_jobs/wan.rs::video_load_spec` from a
-//! `VideoGenInput` whose per-route fields are fixed by the route's handler. For a default request
-//! (no `advanced.mlxQuantize`, no user LoRA) those handler decisions are:
+//! This module is the single source of those decisions: the SceneWorks worker calls the decision
+//! functions below when it builds a Wan `LoadSpec`, and the SC-20686 campaign entrypoint builds its
+//! spec through [`product_load_spec`], so the two cannot drift.
 //!
-//! | Route | Weights the worker resolves | `LoadSpec::quantize` |
-//! | --- | --- | --- |
-//! | `wan2_2_ti2v_5b` / `wan2_2_t2v_14b` / `wan2_2_i2v_14b` | the pre-packed quant-matrix tier root (`q4/` first) | `None` — the packed tier's `config.json` is authoritative (`resolve_wan_tier_dir_and_quant`) |
-//! | `wan_vace` | `<data>/models/mlx/wan_vace`: the dense **Wan2.1-VACE-1.3B** transformer + the base-Wan 14B UMT5/z16-VAE/tokenizer | `None` — dense bf16 (`resolve_wan_quant`) |
-//! | `wan2_2_vace_fun_14b` | `<data>/models/mlx/wan_2_2_vace_fun`: both dense VACE-Fun 14B experts + the same shared components | `Some(Q4)` — forced (`resolve_wan_quant(request).or(Some(Quant::Q4))`) |
+//! | Route | Weights | Load quantization ([`load_quant`]) | Lightning |
+//! | --- | --- | --- | --- |
+//! | `wan2_2_ti2v_5b` | a pre-packed quant-matrix tier (`q4/` is the default) | none on a packed tier (its `config.json` is authoritative); the requested quant on a legacy flat root | none |
+//! | `wan2_2_t2v_14b` / `wan2_2_i2v_14b` | as above | as above | **on by default**: the per-architecture high/low LoRA pair, 4 steps at guidance 1 |
+//! | `wan_vace` | the assembled snapshot: the **Wan2.1-VACE-1.3B** transformer + a base-Wan tier's UMT5/VAE/tokenizer | the requested quant (none: dense bf16) | none |
+//! | `wan2_2_vace_fun_14b` | the assembled snapshot: both dense VACE-Fun 14B experts + the same shared components | the requested quant, **Q4 when none is requested** | none |
 //!
-//! Every route loads at `Precision::Bf16` with no adapters, text-encoder override, named
-//! components, or `resolved_route` (the video spec never sets one). Residency is not decided here:
-//! the worker's fit gate chooses it per host, so the caller passes the frozen campaign residency.
-//!
-//! [`product_load_spec`] is what a measurement entrypoint must call instead of assembling its own
-//! `LoadSpec`, so a campaign loads each route in the product's memory shape (without the forced Q4,
-//! a VACE-Fun load builds both 14B experts dense bf16 instead of the product's Q4).
+//! Every route loads at `Precision::Bf16`. Residency is not decided here (the worker's fit gate
+//! chooses it per host), so callers pass it in.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use mlx_gen::{Error, LoadSpec, OffloadPolicy, Precision, Quant, Result, WeightsSource};
+use mlx_gen::{
+    AdapterKind, AdapterSpec, Error, LoadSpec, MoeExpert, OffloadPolicy, Precision, Quant, Result,
+    WeightsSource,
+};
 
 use crate::config::{WanModelConfig, WanVaceConfig};
 use crate::model::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B};
 use crate::model_vace::{MODEL_ID_VACE, MODEL_ID_VACE_FUN};
 
-/// The load-time quantization the worker applies to `route` on a default request.
-pub fn product_load_quant(route: &str) -> Result<Option<Quant>> {
+/// The bit width of the product's default packed tier (`q4/`) for the tiered routes.
+pub const PRODUCT_TIER_BITS: u64 = 4;
+/// The Lightning distill recipe's step count.
+pub const LIGHTNING_STEPS: u32 = 4;
+/// The Lightning distill recipe's guidance (CFG off).
+pub const LIGHTNING_GUIDANCE: f32 = 1.0;
+/// The Hugging Face repository holding the Lightning LoRA pairs.
+pub const LIGHTNING_REPO: &str = "lightx2v/Wan2.2-Lightning";
+
+fn unknown(route: &str) -> Error {
+    Error::Msg(format!(
+        "no SceneWorks MLX Wan product load decision for route {route}"
+    ))
+}
+
+/// Whether `route` ships as a pre-packed quant-matrix tier (`q4/`, `q8/`, `bf16/`).
+pub fn uses_packed_tiers(route: &str) -> bool {
+    matches!(route, MODEL_ID | MODEL_ID_T2V_14B | MODEL_ID_I2V_14B)
+}
+
+/// The load-time quantization for `route` given the request's explicit pick (`requested`, from
+/// `advanced.mlxQuantize`) and whether `weights` is a pre-packed tier.
+pub fn load_quant(
+    route: &str,
+    requested: Option<Quant>,
+    packed_tier: bool,
+) -> Result<Option<Quant>> {
     match route {
-        MODEL_ID | MODEL_ID_T2V_14B | MODEL_ID_I2V_14B | MODEL_ID_VACE => Ok(None),
-        MODEL_ID_VACE_FUN => Ok(Some(Quant::Q4)),
-        other => Err(Error::Msg(format!(
-            "no SceneWorks MLX Wan product load decision for route {other}"
-        ))),
+        // A packed tier's config is authoritative; the pick chose WHICH tier, never a requant.
+        MODEL_ID | MODEL_ID_T2V_14B | MODEL_ID_I2V_14B if packed_tier => Ok(None),
+        MODEL_ID | MODEL_ID_T2V_14B | MODEL_ID_I2V_14B | MODEL_ID_VACE => Ok(requested),
+        // Both 14B experts at bf16 would risk OOM on a 128 GB Mac: Q4 unless the user picks.
+        MODEL_ID_VACE_FUN => Ok(requested.or(Some(Quant::Q4))),
+        other => Err(unknown(other)),
     }
 }
 
-/// The `LoadSpec` the worker hands the `route` loader for `weights`, with the caller's residency.
+/// Whether `route` runs the Lightning distill when the request leaves `advanced.lightning` unset.
+pub fn lightning_default(route: &str) -> bool {
+    lightning_subdir(route).is_some()
+}
+
+/// The per-architecture Lightning LoRA subdirectory of [`LIGHTNING_REPO`] (not cross-compatible).
+pub fn lightning_subdir(route: &str) -> Option<&'static str> {
+    match route {
+        MODEL_ID_T2V_14B => Some("Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1"),
+        MODEL_ID_I2V_14B => Some("Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1"),
+        _ => None,
+    }
+}
+
+/// The `(high, low)` Lightning LoRA files for `route` inside a [`LIGHTNING_REPO`] snapshot.
+pub fn lightning_lora_files(route: &str, snapshot: &Path) -> Result<(PathBuf, PathBuf)> {
+    let subdir = lightning_subdir(route).ok_or_else(|| {
+        Error::Msg(format!(
+            "{route}: no Lightning distill LoRA; only the A14B MoE models bake Lightning"
+        ))
+    })?;
+    let high = snapshot.join(subdir).join("high_noise_model.safetensors");
+    let low = snapshot.join(subdir).join("low_noise_model.safetensors");
+    for file in [&high, &low] {
+        if !file.is_file() {
+            return Err(Error::Msg(format!(
+                "{route}: Lightning LoRA file missing: {}",
+                file.display()
+            )));
+        }
+    }
+    Ok((high, low))
+}
+
+/// The Lightning pair as per-expert adapters at strength 1.0 (high → high-noise, low → low-noise).
+pub fn lightning_adapters(high: PathBuf, low: PathBuf) -> Vec<AdapterSpec> {
+    [(high, MoeExpert::High), (low, MoeExpert::Low)]
+        .into_iter()
+        .map(|(path, expert)| AdapterSpec {
+            path,
+            scale: 1.0,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: Some(expert),
+        })
+        .collect()
+}
+
+/// The `quantization.bits` a packed tier root declares in its `config.json` (`None` = dense).
+pub fn packed_tier_bits(root: &Path) -> Result<Option<u64>> {
+    let path = root.join("config.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| Error::Msg(format!("read {}: {error}", path.display())))?;
+    let config: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| Error::Msg(format!("parse {}: {error}", path.display())))?;
+    Ok(config
+        .get("quantization")
+        .and_then(|quantization| quantization.get("bits"))
+        .and_then(serde_json::Value::as_u64))
+}
+
+/// The `LoadSpec` of the product's DEFAULT request for `route` (no `advanced.mlxQuantize`, no user
+/// LoRA): what a measurement entrypoint must load instead of assembling its own spec.
 ///
-/// `wan_vace` additionally requires the product's transformer: the Mac worker assembles the
-/// Wan2.1-VACE-**1.3B** transformer, never the 14B one the Candle lane reads, so a snapshot of any
-/// other size is refused rather than measured as if it were the product.
+/// `lightning` is the request's Lightning toggle and `lightning_snapshot` the [`LIGHTNING_REPO`]
+/// snapshot it reads (required when on; Lightning is refused on routes that do not bake it). The
+/// default request's weights are also checked: a tiered route must be the `q4/` tier, and
+/// `wan_vace` must hold the Wan2.1-VACE-1.3B transformer the Mac product assembles (never the 14B
+/// tree the Candle lane reads).
 pub fn product_load_spec(
     route: &str,
     weights: &Path,
     offload_policy: OffloadPolicy,
+    lightning: bool,
+    lightning_snapshot: Option<&Path>,
 ) -> Result<LoadSpec> {
-    let quantize = product_load_quant(route)?;
+    let packed_tier = uses_packed_tiers(route);
+    let quantize = load_quant(route, None, packed_tier)?;
+    if packed_tier {
+        let bits = packed_tier_bits(weights)?;
+        if bits != Some(PRODUCT_TIER_BITS) {
+            return Err(Error::Msg(format!(
+                "{route}: the product's default tier is q{PRODUCT_TIER_BITS}; {} is packed at {}",
+                weights.display(),
+                bits.map_or_else(|| "dense bf16".to_owned(), |bits| format!("{bits} bits"))
+            )));
+        }
+    }
     if route == MODEL_ID_VACE {
         let base = WanVaceConfig::from_model_dir(weights)?.base;
         let product = WanModelConfig::wan21_t2v_1_3b();
@@ -63,10 +165,28 @@ pub fn product_load_spec(
             )));
         }
     }
+    let adapters = match (lightning, lightning_snapshot) {
+        (false, None) => Vec::new(),
+        (true, Some(snapshot)) => {
+            let (high, low) = lightning_lora_files(route, snapshot)?;
+            lightning_adapters(high, low)
+        }
+        (true, None) => {
+            return Err(Error::Msg(format!(
+                "{route}: Lightning is on but no {LIGHTNING_REPO} snapshot was given"
+            )))
+        }
+        (false, Some(_)) => {
+            return Err(Error::Msg(format!(
+                "{route}: a Lightning snapshot was given with Lightning off"
+            )))
+        }
+    };
     let mut spec = LoadSpec::new(WeightsSource::Dir(weights.to_path_buf()))
         .with_offload_policy(offload_policy);
     spec.quantize = quantize;
     spec.precision = Precision::Bf16;
+    spec.adapters = adapters;
     Ok(spec)
 }
 
@@ -74,20 +194,14 @@ pub fn product_load_spec(
 mod tests {
     use super::*;
 
-    const ROUTES: [&str; 5] = [
-        MODEL_ID,
-        MODEL_ID_T2V_14B,
-        MODEL_ID_I2V_14B,
-        MODEL_ID_VACE,
-        MODEL_ID_VACE_FUN,
-    ];
-
-    /// The worker's default-request load quant per route (SceneWorks `video_jobs/{wan,vace}.rs`).
-    fn worker_quant(route: &str) -> Option<Quant> {
-        match route {
-            "wan2_2_vace_fun_14b" => Some(Quant::Q4),
-            _ => None,
-        }
+    fn tier(bits: Option<u64>) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("temp root");
+        let config = match bits {
+            Some(bits) => serde_json::json!({"quantization": {"bits": bits, "group_size": 64}}),
+            None => serde_json::json!({}),
+        };
+        std::fs::write(root.path().join("config.json"), config.to_string()).expect("config");
+        root
     }
 
     fn vace_snapshot(heads: u64, layers: u64) -> tempfile::TempDir {
@@ -103,40 +217,179 @@ mod tests {
         root
     }
 
-    #[test]
-    fn every_route_loads_with_the_worker_decisions() {
-        let vace = vace_snapshot(12, 30);
-        for route in ROUTES {
-            for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-                let weights = if route == MODEL_ID_VACE {
-                    vace.path().to_path_buf()
-                } else {
-                    std::path::PathBuf::from("/snapshots/rev/q4")
-                };
-                let spec = product_load_spec(route, &weights, policy).expect(route);
-                assert!(matches!(&spec.weights, WeightsSource::Dir(dir) if *dir == weights));
-                assert_eq!(spec.quantize, worker_quant(route), "{route}");
-                assert_eq!(spec.precision, Precision::Bf16, "{route}");
-                assert_eq!(spec.offload_policy, policy, "{route}");
-                assert!(spec.adapters.is_empty(), "{route}");
-                assert!(spec.text_encoder.is_none(), "{route}");
-                assert!(spec.components.is_empty(), "{route}");
-                assert!(spec.resolved_route.is_none(), "{route}");
-                assert!(spec.control.is_none(), "{route}");
+    fn lightning_snapshot() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("temp root");
+        for route in [MODEL_ID_T2V_14B, MODEL_ID_I2V_14B] {
+            let dir = root.path().join(lightning_subdir(route).expect("A14B"));
+            std::fs::create_dir_all(&dir).expect("subdir");
+            for name in [
+                "high_noise_model.safetensors",
+                "low_noise_model.safetensors",
+            ] {
+                std::fs::write(dir.join(name), b"lora").expect("lora");
             }
+        }
+        root
+    }
+
+    #[test]
+    fn load_quant_matches_the_worker_decisions() {
+        for route in [MODEL_ID, MODEL_ID_T2V_14B, MODEL_ID_I2V_14B] {
+            assert_eq!(load_quant(route, Some(Quant::Q8), true).unwrap(), None);
+            assert_eq!(
+                load_quant(route, Some(Quant::Q8), false).unwrap(),
+                Some(Quant::Q8)
+            );
+            assert_eq!(load_quant(route, None, false).unwrap(), None);
+        }
+        assert_eq!(load_quant(MODEL_ID_VACE, None, false).unwrap(), None);
+        assert_eq!(
+            load_quant(MODEL_ID_VACE, Some(Quant::Q8), false).unwrap(),
+            Some(Quant::Q8)
+        );
+        assert_eq!(
+            load_quant(MODEL_ID_VACE_FUN, None, false).unwrap(),
+            Some(Quant::Q4)
+        );
+        assert_eq!(
+            load_quant(MODEL_ID_VACE_FUN, Some(Quant::Q8), false).unwrap(),
+            Some(Quant::Q8)
+        );
+        assert!(load_quant("wan_2_2", None, false).is_err());
+    }
+
+    #[test]
+    fn lightning_is_on_by_default_only_for_the_a14b_routes() {
+        assert!(lightning_default(MODEL_ID_T2V_14B));
+        assert!(lightning_default(MODEL_ID_I2V_14B));
+        for route in [MODEL_ID, MODEL_ID_VACE, MODEL_ID_VACE_FUN] {
+            assert!(!lightning_default(route), "{route}");
+        }
+        assert_eq!((LIGHTNING_STEPS, LIGHTNING_GUIDANCE), (4, 1.0));
+    }
+
+    #[test]
+    fn default_request_specs_match_the_product() {
+        let q4 = tier(Some(4));
+        let vace = vace_snapshot(12, 30);
+        let loras = lightning_snapshot();
+        for (route, weights, quant) in [
+            (MODEL_ID, q4.path(), None),
+            (MODEL_ID_T2V_14B, q4.path(), None),
+            (MODEL_ID_I2V_14B, q4.path(), None),
+            (MODEL_ID_VACE, vace.path(), None),
+            (
+                MODEL_ID_VACE_FUN,
+                Path::new("/assembled/vace_fun"),
+                Some(Quant::Q4),
+            ),
+        ] {
+            let lightning = lightning_default(route);
+            let snapshot = lightning.then_some(loras.path());
+            let spec = product_load_spec(
+                route,
+                weights,
+                OffloadPolicy::Sequential,
+                lightning,
+                snapshot,
+            )
+            .expect(route);
+            assert!(matches!(&spec.weights, WeightsSource::Dir(dir) if dir == weights));
+            assert_eq!(spec.quantize, quant, "{route}");
+            assert_eq!(spec.precision, Precision::Bf16, "{route}");
+            assert_eq!(spec.offload_policy, OffloadPolicy::Sequential, "{route}");
+            assert!(spec.text_encoder.is_none(), "{route}");
+            assert!(spec.components.is_empty(), "{route}");
+            assert!(spec.resolved_route.is_none(), "{route}");
+            if lightning {
+                let subdir = loras.path().join(lightning_subdir(route).unwrap());
+                let adapters: Vec<_> = spec
+                    .adapters
+                    .iter()
+                    .map(|a| (a.path.clone(), a.scale, a.moe_expert))
+                    .collect();
+                assert_eq!(
+                    adapters,
+                    vec![
+                        (
+                            subdir.join("high_noise_model.safetensors"),
+                            1.0,
+                            Some(MoeExpert::High)
+                        ),
+                        (
+                            subdir.join("low_noise_model.safetensors"),
+                            1.0,
+                            Some(MoeExpert::Low)
+                        ),
+                    ],
+                    "{route}"
+                );
+            } else {
+                assert!(spec.adapters.is_empty(), "{route}");
+            }
+        }
+        // The Lightning-off A14B request is also a product request: no adapter.
+        let off = product_load_spec(
+            MODEL_ID_T2V_14B,
+            q4.path(),
+            OffloadPolicy::Sequential,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(off.adapters.is_empty());
+    }
+
+    #[test]
+    fn lightning_is_refused_where_the_product_does_not_bake_it() {
+        let q4 = tier(Some(4));
+        let loras = lightning_snapshot();
+        let error = product_load_spec(
+            MODEL_ID,
+            q4.path(),
+            OffloadPolicy::Sequential,
+            true,
+            Some(loras.path()),
+        )
+        .expect_err("the 5B has no Lightning distill");
+        assert!(error.to_string().contains("only the A14B"), "{error}");
+        assert!(product_load_spec(
+            MODEL_ID_T2V_14B,
+            q4.path(),
+            OffloadPolicy::Sequential,
+            true,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_tiered_route_refuses_a_non_default_tier() {
+        for bits in [Some(8), None] {
+            let root = tier(bits);
+            let error = product_load_spec(
+                MODEL_ID_T2V_14B,
+                root.path(),
+                OffloadPolicy::Sequential,
+                false,
+                None,
+            )
+            .expect_err("only q4 is the product default");
+            assert!(error.to_string().contains("default tier is q4"), "{error}");
         }
     }
 
     #[test]
     fn wan_vace_refuses_a_transformer_the_product_does_not_assemble() {
         let fourteen_b = vace_snapshot(40, 40);
-        let error = product_load_spec(MODEL_ID_VACE, fourteen_b.path(), OffloadPolicy::Resident)
-            .expect_err("a 14B VACE transformer is not the Mac product's wan_vace");
+        let error = product_load_spec(
+            MODEL_ID_VACE,
+            fourteen_b.path(),
+            OffloadPolicy::Resident,
+            false,
+            None,
+        )
+        .expect_err("a 14B VACE transformer is not the Mac product's wan_vace");
         assert!(error.to_string().contains("Wan2.1-VACE-1.3B"), "{error}");
-    }
-
-    #[test]
-    fn an_unknown_route_has_no_product_decision() {
-        assert!(product_load_spec("wan_2_2", Path::new("/x"), OffloadPolicy::Resident).is_err());
     }
 }

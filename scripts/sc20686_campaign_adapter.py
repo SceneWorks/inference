@@ -125,13 +125,27 @@ def file_identity(path):
 def snapshot_identity(root):
     # Follow symlinked directories: the Mac worker assembles its Wan-VACE snapshots by linking the
     # transformer directories into place, and an identity that skipped them would omit the weights.
+    # Following links admits cycles and dangling links, so both are refused rather than skipped.
     root = Path(root).resolve()
-    files = sorted(
-        path
-        for directory, _, names in os.walk(root, followlinks=True)
-        for path in (Path(directory) / name for name in names)
-        if path.is_file() and ".git" not in path.relative_to(root).parts
-    )
+
+    def walk_error(error):
+        raise ValueError(f"snapshot inventory walk failed: {error}") from error
+
+    files = []
+    visited = set()
+    for directory, dirnames, names in os.walk(root, followlinks=True, onerror=walk_error):
+        status = os.stat(directory)
+        if (status.st_dev, status.st_ino) in visited:
+            raise ValueError(f"snapshot inventory revisits a directory (link cycle): {directory}")
+        visited.add((status.st_dev, status.st_ino))
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        for name in names:
+            path = Path(directory) / name
+            if not path.exists():
+                raise ValueError(f"snapshot inventory has a broken link: {path}")
+            if path.is_file():
+                files.append(path)
+    files.sort()
     if not files:
         raise ValueError("snapshot inventory is empty")
     aggregate = hashlib.sha256()
@@ -187,22 +201,57 @@ def verify_inference_revision(expected):
     return actual
 
 
-# The Mac worker's assembled Wan-VACE snapshot (`wan_vace_dir_is_complete`): a diffusers VACE
-# transformer beside the base-Wan UMT5, z16 VAE and tokenizer, with no root config or model index.
-WAN_VACE_ASSEMBLED_FILES = (
-    "transformer/config.json", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json",
-)
+# The Mac worker's assembled Wan-VACE snapshots (`wan_vace_dir_is_complete` /
+# `wan_vace_fun_dir_is_complete`): diffusers VACE transformer(s) beside a base-Wan tier's UMT5, VAE
+# and tokenizer, with no root config or model index. Only these routes may take that layout.
+WAN_VACE_ASSEMBLED_FILES = {
+    "wan_vace": (
+        "transformer/config.json", "t5_encoder.safetensors", "vae.safetensors", "tokenizer.json",
+    ),
+    "wan2_2_vace_fun_14b": (
+        "transformer/config.json", "transformer_2/config.json", "t5_encoder.safetensors",
+        "vae.safetensors", "tokenizer.json",
+    ),
+}
+# The Mac product's default packed tier (`q4/`) and where each Metal tiered route declares its bits.
+PRODUCT_TIER_BITS = 4
+METAL_PACKED_TIER_CONFIG = {
+    "wan2_2_ti2v_5b": "config.json",
+    "wan2_2_t2v_14b": "config.json",
+    "wan2_2_i2v_14b": "config.json",
+    "flux2_klein_9b_edit": "transformer/config.json",
+    "flux2_klein_9b_kv_edit": "transformer/config.json",
+}
 
 
-def validate_snapshot_layout(root, label):
-    """Accept an exact component/tier root, a real Diffusers pipeline root, or the Mac worker's
-    assembled Wan-VACE snapshot."""
+def packed_tier_bits(root, relative):
+    try:
+        config = json.loads((Path(root) / relative).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"packed tier config is unreadable: {relative}") from exc
+    quantization = config.get("quantization") if isinstance(config, dict) else None
+    return quantization.get("bits") if isinstance(quantization, dict) else None
+
+
+def validate_snapshot_layout(root, label, route=None, backend=None):
+    """Accept an exact component/tier root or a real Diffusers pipeline root. On the Metal lane a
+    tiered route must be the product's default q4 tier, and a VACE route must be the worker's
+    assembled snapshot for that route."""
     root = Path(root).resolve()
     if not root.is_dir():
         raise ValueError(f"{label} snapshot directory is missing")
+    if backend == "mlx-metal" and route in METAL_PACKED_TIER_CONFIG:
+        bits = packed_tier_bits(root, METAL_PACKED_TIER_CONFIG[route])
+        if bits != PRODUCT_TIER_BITS:
+            raise ValueError(
+                f"{label} snapshot is not the product's default q{PRODUCT_TIER_BITS} tier "
+                f"(packed bits: {bits})"
+            )
+    if backend == "mlx-metal" and route in WAN_VACE_ASSEMBLED_FILES:
+        if all((root / name).is_file() for name in WAN_VACE_ASSEMBLED_FILES[route]):
+            return
+        raise ValueError(f"{label} snapshot must be the worker's assembled {route} snapshot")
     if (root / "config.json").is_file():
-        return
-    if all((root / name).is_file() for name in WAN_VACE_ASSEMBLED_FILES):
         return
     component_configs = sorted(
         path for path in root.glob("*/config.json") if path.is_file()
@@ -210,9 +259,8 @@ def validate_snapshot_layout(root, label):
     if (root / "model_index.json").is_file() and component_configs:
         return
     raise ValueError(
-        f"{label} snapshot must be an exact component/tier root with config.json, a "
-        "Diffusers root with model_index.json plus component configs, or an assembled Wan-VACE "
-        "snapshot"
+        f"{label} snapshot must be an exact component/tier root with config.json or a "
+        "Diffusers root with model_index.json plus component configs"
     )
 
 
@@ -427,6 +475,34 @@ def validate_coordinate_arguments(route, name, arguments, expected):
             raise ValueError(f"coordinate {field} differs from frozen coverage: {route}/{name}")
 
 
+# The Mac product's A14B routes default to the Lightning distill (`advanced.lightning` unset => on):
+# every Metal A14B coordinate states its toggle, and the `-lightning` coordinates run the product
+# default with the per-architecture LoRA pair at the forced 4-step, guidance-1 recipe.
+LIGHTNING_ROUTES = ("wan2_2_t2v_14b", "wan2_2_i2v_14b")
+
+
+def validate_metal_lightning(route, name, arguments):
+    lightning_flags = ("--lightning", "--lora-high", "--lora-low")
+    if route not in LIGHTNING_ROUTES:
+        if any(flag in arguments for flag in lightning_flags):
+            raise ValueError(f"Lightning is only a product toggle on the A14B routes: {route}/{name}")
+        return
+    try:
+        toggle = argument_value(arguments, "--lightning")
+    except ValueError as exc:
+        raise ValueError(f"A14B coordinate must state --lightning on|off: {route}/{name}") from exc
+    if toggle not in ("on", "off") or (toggle == "on") != name.endswith("-lightning"):
+        raise ValueError(f"A14B coordinate Lightning toggle differs from its name: {route}/{name}")
+    if toggle == "off":
+        if "--lora-high" in arguments or "--lora-low" in arguments:
+            raise ValueError(f"Lightning-off coordinate carries a LoRA: {route}/{name}")
+        return
+    for flag in ("--lora-high", "--lora-low"):
+        argument_value(arguments, flag)
+    if float(argument_value(arguments, "--guidance")) != 1.0 or argument_value(arguments, "--steps") != "4":
+        raise ValueError(f"Lightning coordinate must run the 4-step guidance-1 recipe: {route}/{name}")
+
+
 def load_wan_manifest(path, backend="candle-cuda"):
     path = Path(path).resolve()
     try:
@@ -454,7 +530,7 @@ def load_wan_manifest(path, backend="candle-cuda"):
             raise ValueError(f"Wan manifest entrypoint is not executable: {route}")
         if binary.stem != lane_entry(backend, route)["entrypoint_stem"]:
             raise ValueError(f"Wan manifest entrypoint does not match registered route: {route}")
-        validate_snapshot_layout(snapshot, f"Wan manifest {route}")
+        validate_snapshot_layout(snapshot, f"Wan manifest {route}", route, backend)
         revision = model_snapshot_revision(snapshot)
         residency_strategy = entry["residency_strategy"]
         expected_coordinates = set(coverage[route]["coordinates"])
@@ -482,6 +558,7 @@ def load_wan_manifest(path, backend="candle-cuda"):
                     int(argument_value(arguments, "--seed"))
                 except ValueError as exc:
                     raise ValueError(f"Metal coordinate must seal one integer --seed: {route}/{name}") from exc
+                validate_metal_lightning(route, name, arguments)
             file_hashes, inventory = hash_file_arguments(arguments)
             identity = route_manifest_identity(
                 route, name, binary, snapshot, revision, residency_strategy,
@@ -520,7 +597,7 @@ def flux_coordinates(
         route_snapshot = Path(snapshots[route]).resolve()
         if entrypoint.stem != lane_entry(backend, route)["entrypoint_stem"]:
             raise ValueError(f"FLUX campaign entrypoint does not match registered route: {route}")
-        validate_snapshot_layout(route_snapshot, f"FLUX campaign {route}")
+        validate_snapshot_layout(route_snapshot, f"FLUX campaign {route}", route, backend)
         revision = model_snapshot_revision(route_snapshot)
         residency_strategy = PRODUCT_RESIDENCY[route]
         definitions = {
@@ -1668,7 +1745,7 @@ def main():
             raise ValueError("single mode family differs from the registered lane route")
         if Path(args.entrypoint).stem != route_entry["entrypoint_stem"]:
             raise ValueError("single mode entrypoint does not match the registered lane route")
-        validate_snapshot_layout(args.snapshot, "single campaign")
+        validate_snapshot_layout(args.snapshot, "single campaign", args.variant, backend)
         revision = model_snapshot_revision(args.snapshot)
         residency_strategy = PRODUCT_RESIDENCY[args.variant]
         spec = CoordinateSpec(

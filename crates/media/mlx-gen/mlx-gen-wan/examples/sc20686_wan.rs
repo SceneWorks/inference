@@ -17,7 +17,10 @@
 //! ```
 //!
 //! Route inputs: `--image <png>` (I2V-14B); `--control-dir <dir> --mask-dir <dir>
-//! [--reference <png>]` (VACE and VACE-Fun). The campaign adapter owns every `--sc20686-*` flag.
+//! [--reference <png>]` (VACE and VACE-Fun); `--lightning on|off` on the A14B routes (the product
+//! default is on; campaign mode must state it), with `--lora-high <file> --lora-low <file>` naming
+//! the product's per-architecture Lightning pair when on (which forces the 4-step, guidance-1
+//! recipe). The campaign adapter owns every `--sc20686-*` flag.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +28,7 @@ use mlx_gen::gen_core::{
     Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Progress,
     ReplacementMode,
 };
+use mlx_gen_wan::product_load;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -64,6 +68,9 @@ const VALUE_FLAGS: &[&str] = &[
     "--control-dir",
     "--mask-dir",
     "--reference",
+    "--lightning",
+    "--lora-high",
+    "--lora-low",
 ];
 const SWITCHES: &[&str] = &[
     "--sc20686-campaign",
@@ -161,13 +168,77 @@ fn product_policy(route: &str, residency: &str) -> Result<OffloadPolicy> {
     })
 }
 
-/// The route's `LoadSpec`: the worker's own load decisions (`product_load_spec`) at the frozen
+/// The route's Lightning pair: `--lightning on|off` on the routes that bake Lightning (an ordinary
+/// render may omit it and gets the product default, on), refused on every other route. On requires
+/// `--lora-high`/`--lora-low`; off forbids them.
+fn lightning_pair(route: &str, args: &Args) -> Result<Option<(PathBuf, PathBuf)>> {
+    let bakes = product_load::lightning_default(route);
+    let loras = args.get("--lora-high").is_some() || args.get("--lora-low").is_some();
+    if !bakes {
+        if args.get("--lightning").is_some() || loras {
+            return Err(format!("{route} has no Lightning toggle").into());
+        }
+        return Ok(None);
+    }
+    let on = match args.get("--lightning") {
+        Some("on") => true,
+        Some("off") => false,
+        Some(other) => return Err(format!("--lightning must be on or off, not {other}").into()),
+        None if args.has("--sc20686-campaign") => {
+            return Err("SC-20686 campaign requires an explicit --lightning on|off".into())
+        }
+        None => true,
+    };
+    if !on {
+        if loras {
+            return Err("--lora-high/--lora-low require --lightning on".into());
+        }
+        return Ok(None);
+    }
+    Ok(Some((
+        PathBuf::from(args.required("--lora-high")?),
+        PathBuf::from(args.required("--lora-low")?),
+    )))
+}
+
+/// The route's `LoadSpec`: the product's own load decisions (`product_load_spec`) at the frozen
 /// campaign residency. Never assembled here, so the campaign measures the product's memory shape.
-fn route_load_spec(route: &str, residency: &str, snapshot: &Path) -> Result<LoadSpec> {
+/// A Lightning pair must be exactly the files the product resolves in that Lightning snapshot.
+fn route_load_spec(
+    route: &str,
+    residency: &str,
+    snapshot: &Path,
+    lightning: Option<&(PathBuf, PathBuf)>,
+) -> Result<LoadSpec> {
     let policy = product_policy(route, residency)?;
-    Ok(mlx_gen_wan::product_load::product_load_spec(
-        route, snapshot, policy,
-    )?)
+    let lightning_snapshot = lightning
+        .map(|(high, _)| {
+            high.parent()
+                .and_then(Path::parent)
+                .ok_or("--lora-high is not inside a Lightning snapshot")
+        })
+        .transpose()?;
+    let spec = product_load::product_load_spec(
+        route,
+        snapshot,
+        policy,
+        lightning.is_some(),
+        lightning_snapshot,
+    )?;
+    if let Some((high, low)) = lightning {
+        let given = [high.canonicalize()?, low.canonicalize()?];
+        let product = spec
+            .adapters
+            .iter()
+            .map(|adapter| adapter.path.canonicalize())
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if product != given {
+            return Err(
+                format!("{route}: the LoRA pair is not the product's Lightning pair").into(),
+            );
+        }
+    }
+    Ok(spec)
 }
 
 fn load(route: &str, spec: &LoadSpec) -> Result<Box<dyn mlx_gen::Generator>> {
@@ -238,8 +309,9 @@ fn main() -> Result<()> {
             .map(|(_, residency)| (*residency).to_owned())
             .ok_or_else(|| format!("unsupported SC-20686 Wan route: {route}"))?
     };
-    // Refuse a non-product residency before arming the observer.
+    // Refuse a non-product residency or Lightning toggle before arming the observer.
     product_policy(&route, &residency)?;
+    let lightning = lightning_pair(&route, &args)?;
     let _campaign_request = if campaign {
         let events = args
             .get("--sc20686-events")
@@ -280,7 +352,18 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let spec = route_load_spec(&route, &residency, &snapshot)?;
+    if lightning.is_some()
+        && (request.steps != Some(product_load::LIGHTNING_STEPS)
+            || request.guidance != Some(product_load::LIGHTNING_GUIDANCE))
+    {
+        return Err(format!(
+            "the product's Lightning recipe is {} steps at guidance {}",
+            product_load::LIGHTNING_STEPS,
+            product_load::LIGHTNING_GUIDANCE
+        )
+        .into());
+    }
+    let spec = route_load_spec(&route, &residency, &snapshot, lightning.as_ref())?;
     let generator = load(&route, &spec)?;
     let mut on_progress = |progress: Progress| match progress {
         Progress::Step { current, total } => eprintln!("[sc20686-wan] step {current}/{total}"),
@@ -323,11 +406,11 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::gen_core::{Precision, Quant, WeightsSource};
+    use mlx_gen::gen_core::{MoeExpert, Precision, Quant, WeightsSource};
 
-    /// The SceneWorks Mac worker's default-request load quantization per route
-    /// (`video_jobs/wan.rs::resolve_wan_tier_dir_and_quant`, `video_jobs/vace.rs`).
-    const WORKER_QUANT: [(&str, Option<Quant>); 5] = [
+    /// The product's default-request load quantization per route (`product_load::load_quant`, which
+    /// the SceneWorks worker calls): none on the packed q4 tiers and `wan_vace`, Q4 on VACE-Fun.
+    const PRODUCT_QUANT: [(&str, Option<Quant>); 5] = [
         ("wan2_2_ti2v_5b", None),
         ("wan2_2_t2v_14b", None),
         ("wan2_2_i2v_14b", None),
@@ -335,41 +418,135 @@ mod tests {
         ("wan2_2_vace_fun_14b", Some(Quant::Q4)),
     ];
 
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, contents).expect("write");
+    }
+
+    fn args(raw: &[&str]) -> Args {
+        let raw: Vec<String> = std::iter::once("sc20686_wan")
+            .chain(raw.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        Args::parse(&raw).expect("arguments")
+    }
+
     #[test]
     fn every_route_loads_with_the_product_settings() {
+        let root = tempfile::tempdir().expect("temp root");
+        let q4 = root.path().join("rev/q4");
+        write(
+            &q4.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        );
         // The Mac product's `wan_vace` transformer is Wan2.1-VACE-1.3B (12 x 128 heads, 30 layers).
-        let vace = tempfile::tempdir().expect("temp root");
-        std::fs::create_dir_all(vace.path().join("transformer")).expect("transformer dir");
-        std::fs::write(
-            vace.path().join("transformer/config.json"),
+        let vace = root.path().join("wan_vace");
+        write(
+            &vace.join("transformer/config.json"),
             r#"{"num_attention_heads": 12, "attention_head_dim": 128, "num_layers": 30}"#,
-        )
-        .expect("config");
-        assert_eq!(ROUTES.len(), WORKER_QUANT.len());
+        );
+        let loras = root.path().join("lightning");
+        for route in ["wan2_2_t2v_14b", "wan2_2_i2v_14b"] {
+            let subdir = loras.join(product_load::lightning_subdir(route).expect("A14B"));
+            write(&subdir.join("high_noise_model.safetensors"), "high");
+            write(&subdir.join("low_noise_model.safetensors"), "low");
+        }
+        assert_eq!(ROUTES.len(), PRODUCT_QUANT.len());
         for (route, residency) in ROUTES {
-            let snapshot = if route == "wan_vace" {
-                vace.path().to_path_buf()
-            } else {
-                PathBuf::from("/snapshots/rev/q4")
+            let snapshot = match route {
+                "wan_vace" => vace.clone(),
+                "wan2_2_vace_fun_14b" => root.path().join("vace_fun"),
+                _ => q4.clone(),
             };
-            let spec = route_load_spec(route, residency, &snapshot).expect(route);
-            let quant = WORKER_QUANT
+            let quant = PRODUCT_QUANT
                 .iter()
                 .find(|(id, _)| *id == route)
                 .map(|(_, quant)| *quant)
                 .expect(route);
-            assert_eq!(spec.quantize, quant, "{route}");
-            assert_eq!(spec.precision, Precision::Bf16, "{route}");
             let policy = match residency {
                 "sequential" => OffloadPolicy::Sequential,
                 _ => OffloadPolicy::Resident,
             };
-            assert_eq!(spec.offload_policy, policy, "{route}");
-            assert!(matches!(&spec.weights, WeightsSource::Dir(dir) if *dir == snapshot));
-            assert!(spec.adapters.is_empty(), "{route}");
-            assert!(spec.text_encoder.is_none(), "{route}");
-            assert!(spec.components.is_empty(), "{route}");
-            assert!(spec.resolved_route.is_none(), "{route}");
+            let pair = product_load::lightning_subdir(route).map(|subdir| {
+                (
+                    loras.join(subdir).join("high_noise_model.safetensors"),
+                    loras.join(subdir).join("low_noise_model.safetensors"),
+                )
+            });
+            // Lightning off everywhere, then the product default (on) where the route bakes it.
+            for lightning in [None, pair.as_ref()] {
+                let spec = route_load_spec(route, residency, &snapshot, lightning).expect(route);
+                assert_eq!(spec.quantize, quant, "{route}");
+                assert_eq!(spec.precision, Precision::Bf16, "{route}");
+                assert_eq!(spec.offload_policy, policy, "{route}");
+                assert!(matches!(&spec.weights, WeightsSource::Dir(dir) if *dir == snapshot));
+                assert!(spec.text_encoder.is_none(), "{route}");
+                assert!(spec.components.is_empty(), "{route}");
+                assert!(spec.resolved_route.is_none(), "{route}");
+                let adapters: Vec<_> = spec
+                    .adapters
+                    .iter()
+                    .map(|a| (a.path.clone(), a.scale, a.moe_expert))
+                    .collect();
+                let expected = lightning
+                    .map(|(high, low)| {
+                        vec![
+                            (high.clone(), 1.0, Some(MoeExpert::High)),
+                            (low.clone(), 1.0, Some(MoeExpert::Low)),
+                        ]
+                    })
+                    .unwrap_or_default();
+                assert_eq!(adapters, expected, "{route}");
+            }
         }
+        // A pair from the other architecture is not the product's Lightning pair.
+        let (i2v_high, i2v_low) = (
+            loras
+                .join(product_load::lightning_subdir("wan2_2_i2v_14b").unwrap())
+                .join("high_noise_model.safetensors"),
+            loras
+                .join(product_load::lightning_subdir("wan2_2_i2v_14b").unwrap())
+                .join("low_noise_model.safetensors"),
+        );
+        assert!(route_load_spec(
+            "wan2_2_t2v_14b",
+            "sequential",
+            &q4,
+            Some(&(i2v_high, i2v_low))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_lightning_toggle_follows_the_product() {
+        // Product default: on for the A14B routes; campaign mode must state it.
+        assert!(lightning_pair("wan2_2_t2v_14b", &args(&[])).is_err());
+        assert!(lightning_pair(
+            "wan2_2_t2v_14b",
+            &args(&["--sc20686-campaign", "--lightning", "off"])
+        )
+        .unwrap()
+        .is_none());
+        // Even with the pair present, campaign mode never falls back to the default.
+        assert!(lightning_pair(
+            "wan2_2_t2v_14b",
+            &args(&[
+                "--sc20686-campaign",
+                "--lora-high",
+                "/h",
+                "--lora-low",
+                "/l"
+            ])
+        )
+        .is_err());
+        let on = lightning_pair(
+            "wan2_2_i2v_14b",
+            &args(&["--lightning", "on", "--lora-high", "/h", "--lora-low", "/l"]),
+        )
+        .unwrap();
+        assert_eq!(on, Some((PathBuf::from("/h"), PathBuf::from("/l"))));
+        // Routes without Lightning refuse the toggle.
+        assert!(lightning_pair("wan_vace", &args(&[])).unwrap().is_none());
+        assert!(lightning_pair("wan_vace", &args(&["--lightning", "off"])).is_err());
     }
 }
