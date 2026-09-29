@@ -444,6 +444,80 @@ def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: Su
     return path
 
 
+# A campaign parent halted between rows by its operator stop file exits with this status
+# (sysexits EX_TEMPFAIL): distinct from success and every refusal; the same command resumes.
+OPERATOR_STOP_EXIT_CODE = 75
+OPERATOR_STOP_FILE_NAME = "STOP"
+
+
+class OperatorStop(Exception):
+    """The operator asked the parent to stop before starting row ``before``."""
+
+    def __init__(self, *, before: str, index: int, total: int, record: Path):
+        super().__init__(f"stopped by operator before row {index + 1}/{total} ({before}); status {record}")
+        self.before = before
+        self.index = index
+        self.total = total
+        self.record = record
+
+
+def operator_stop_files(stop_file: Path | None, resume_dir: Path) -> tuple[Path, ...]:
+    """Always ``<resume-dir>/STOP``, plus ``--stop-file`` when given; either present stops the
+    campaign. Stop files are never part of a resume identity."""
+    default = Path(resume_dir) / OPERATOR_STOP_FILE_NAME
+    if stop_file is None or Path(stop_file) == default:
+        return (default,)
+    return (default, Path(stop_file))
+
+
+def is_operator_stop_entry(resume_dir: Path, stop_files: tuple[Path, ...], name: str) -> bool:
+    return name == OPERATOR_STOP_FILE_NAME or Path(resume_dir) / name in tuple(Path(path) for path in stop_files)
+
+
+def _stop_present(path: Path) -> bool:
+    """Anything at the path (even a dangling symlink) is present; only a missing path is absent,
+    every other stat failure propagates."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _write_new_durable(path: Path, data: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def check_operator_stop(stop_files: tuple[Path, ...] | None, logs: Path, *, kind: str, before: str, index: int, total: int) -> None:
+    """Called by a parent between rows, just before spawning row ``index``; never signals a
+    running child. When any stop file exists, writes a sealed, never-overwritten
+    ``logs/operator-stop.attempt-<n>.json`` status record (plus ``.sha256``) and raises
+    :class:`OperatorStop`."""
+    present = [str(path) for path in (stop_files or ()) if _stop_present(Path(path))]
+    if not present:
+        return
+    logs.mkdir(parents=True, exist_ok=True)
+    encoded = canonical({
+        "schemaVersion": 1, "kind": kind, "status": "stopped-by-operator",
+        "beforeRow": index, "beforeRowSlug": before, "rowsTotal": total, "rowsAccepted": index,
+        "stopFiles": present, "recordedAtUnixNs": time.time_ns(),
+        "resume": "remove the stop file and rerun the same command with the same resume directory",
+    })
+    attempt = 0
+    while True:
+        record = logs / f"operator-stop.attempt-{attempt}.json"
+        try:
+            _write_new_durable(record, encoded)
+            break
+        except FileExistsError:
+            attempt += 1
+    _write_new_durable(record.with_name(f"{record.name}.sha256"), f"{digest(encoded)}  {record.name}\n".encode("utf-8"))
+    raise OperatorStop(before=before, index=index, total=total, record=record)
+
+
 @dataclass(frozen=True)
 class RunResult:
     pid: int

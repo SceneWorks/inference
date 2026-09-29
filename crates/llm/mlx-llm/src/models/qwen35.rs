@@ -641,6 +641,21 @@ impl Qwen35Cache {
             .unwrap_or(0)
     }
 
+    /// The dtypes of each full-attention layer's cached keys and values, in layer order, skipping
+    /// a layer that has cached nothing yet. Inspection only: since sc-20671 they are the compute
+    /// dtype whatever dtype the snapshot stores its quantized scales in.
+    pub fn attention_kv_dtypes(&self) -> Result<Vec<(Dtype, Dtype)>> {
+        let mut dtypes = Vec::new();
+        for layer in &self.layers {
+            if let Qwen35LayerCache::Attn(slot) = layer {
+                if let Some((keys, values)) = slot.kv.peek(0)? {
+                    dtypes.push((keys.dtype(), values.dtype()));
+                }
+            }
+        }
+        Ok(dtypes)
+    }
+
     /// Drop all cached state.
     pub fn reset(&mut self) -> Result<()> {
         for l in &mut self.layers {
@@ -711,6 +726,12 @@ impl Qwen35Model {
     /// Whether the large projections were quantized on load.
     pub fn is_quantized(&self) -> bool {
         self.quantized
+    }
+
+    /// The decoder's compute dtype (bf16): its activations, logits, and full-attention K/V. The
+    /// linear-attention recurrence alone accumulates in f32.
+    pub const fn compute_dtype(&self) -> Dtype {
+        COMPUTE_DTYPE
     }
 
     /// Whether projections use the packed Prism Hadamard path.
@@ -1237,7 +1258,7 @@ impl Qwen35Model {
         let saw_stored = Cell::new(false);
         let proj_q = |key: String| -> Result<Projection> {
             if let Some(pack) = prism {
-                return Ok(Projection::Prism(pack.linear(w, &key)?));
+                return Ok(Projection::Prism(pack.linear(w, &key, COMPUTE_DTYPE)?));
             }
             let base = key.strip_suffix(".weight").unwrap_or(&key);
             let scales_key = format!("{base}.scales");
@@ -1306,7 +1327,7 @@ impl Qwen35Model {
                     )));
                 }
                 saw_stored.set(true);
-                Ok(Projection::from_quantized(weight, scales, biases, spec))
+                Projection::from_quantized(weight, scales, biases, spec, COMPUTE_DTYPE)
             } else {
                 Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
             }
@@ -1337,7 +1358,7 @@ impl Qwen35Model {
             }
             Projection::load(embed_weight.expect("dense embedding"), None)?
         } else if let Some(pack) = prism {
-            Projection::Prism(pack.linear(w, "language_model.lm_head.weight")?)
+            Projection::Prism(pack.linear(w, "language_model.lm_head.weight", COMPUTE_DTYPE)?)
         } else {
             Projection::load(req("lm_head.weight".to_string())?, None)?
         };
@@ -3504,5 +3525,75 @@ mod tests {
             .as_slice::<f32>()
             .iter()
             .all(|x| x.is_finite()));
+    }
+
+    /// sc-20671: stored quantized projections whose `scales`/`biases` are F16 (the mlx-community
+    /// convention) must not promote the BF16 activations to F32 — the hidden states and the full-
+    /// attention K/V stay in the compute dtype. The BF16-scale twin is the unchanged control.
+    #[test]
+    fn stored_quantized_scales_keep_activations_and_kv_in_compute_dtype() {
+        use crate::primitives::quant::QuantizedLinear;
+        let mut value = cfg_json();
+        // qwen3_5 stores 64-wide groups: widen every stored projection's input to a multiple.
+        let text = &mut value["text_config"];
+        text["hidden_size"] = json!(64);
+        text["intermediate_size"] = json!(128);
+        text["head_dim"] = json!(16);
+        text["linear_value_head_dim"] = json!(16);
+        value["quantization"] = json!({"group_size": 64, "bits": 4});
+        let cfg = Qwen35Config::from_json(&value).unwrap();
+        let dense = synthetic_weights(&cfg);
+        const STORED: [&str; 10] = [
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ];
+        for scale_dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let mut map = HashMap::new();
+            for key in dense.keys() {
+                let array = dense.require(key).unwrap().as_dtype(scale_dtype).unwrap();
+                let base = key.strip_suffix(".weight").unwrap_or(key);
+                if key.starts_with("model.language_model.layers.")
+                    && STORED.iter().any(|p| base.ends_with(p))
+                {
+                    let q = QuantizedLinear::quantize(&array, 64, 4, None).unwrap();
+                    assert_eq!(q.scales.dtype(), scale_dtype);
+                    map.insert(format!("{base}.weight"), q.weight);
+                    map.insert(format!("{base}.scales"), q.scales);
+                    map.insert(format!("{base}.biases"), q.biases);
+                } else {
+                    map.insert(key.to_string(), array);
+                }
+            }
+            let model = Qwen35Model::from_weights(
+                &Weights::from_map(map),
+                "model.language_model",
+                cfg.clone(),
+            )
+            .unwrap();
+            assert!(model.is_quantized());
+            let mut cache = model.new_cache();
+            let hidden = model
+                .hidden(&Array::from_slice(&[1i32, 2, 3], &[1, 3]), &mut cache, 0)
+                .unwrap();
+            assert_eq!(hidden.dtype(), COMPUTE_DTYPE, "{scale_dtype:?} hidden");
+            let mut attention_layers = 0;
+            for layer in &cache.layers {
+                if let Qwen35LayerCache::Attn(slot) = layer {
+                    let (k, v) = slot.kv.peek(0).unwrap().unwrap();
+                    assert_eq!(k.dtype(), COMPUTE_DTYPE, "{scale_dtype:?} keys");
+                    assert_eq!(v.dtype(), COMPUTE_DTYPE, "{scale_dtype:?} values");
+                    attention_layers += 1;
+                }
+            }
+            assert_eq!(attention_layers, 1);
+        }
     }
 }

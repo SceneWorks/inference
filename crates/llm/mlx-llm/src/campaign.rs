@@ -552,13 +552,23 @@ fn preflight_total_live_tokens(
     Ok((total, max_request))
 }
 
-/// Infer the widest dense K/V scalar produced by this pinned loader route without loading MLX
-/// arrays. The embed is cast to BF16, but affine quantized projections promote BF16 activations
-/// with their stored scale dtype. An F16 or F32 scale anywhere in the decoder can make a later
-/// hidden state F32, even when that later layer's own K/V scales are BF16. Dense projections cast
-/// their stored weights to BF16; a prior F32 activation still produces F32. Use the widest width
-/// across the entire stack rather than assuming the config's `torch_dtype` is the cache dtype.
-/// Both parent preflight and worker validate the exact pinned snapshot inventory before this call.
+/// The dtype every campaign role's dense K/V is cached in: the causal loader's compute dtype. The
+/// loader holds stored quantized scales/biases in the compute dtype (sc-20671), so a stored F16/F32
+/// scale no longer promotes the activations — and the cache — to F32.
+pub const DENSE_KV_COMPUTE_DTYPE: mlx_rs::Dtype = crate::models::CausalLm::COMPUTE_DTYPE;
+
+/// Scalar width of [`DENSE_KV_COMPUTE_DTYPE`]. [`ProductObserver`] and
+/// [`validate_receipt_semantics`] refuse any other observed width rather than record a silently
+/// widened dense baseline.
+pub const DENSE_KV_COMPUTE_ELEMENT_BYTES: u64 =
+    crate::primitives::dtype_bytes(DENSE_KV_COMPUTE_DTYPE);
+
+/// Validate the pinned decoder projection inventory without loading MLX arrays and return the
+/// dense K/V scalar width it produces. Every supported stored scale dtype (BF16/F16/F32) is cast to
+/// the BF16 compute dtype at load, and dense projections are cast to BF16 too, so the width is the
+/// compute dtype's whatever the snapshot stores — never the widest stored scale (the pre-sc-20671
+/// F32-promoted path). Both parent preflight and worker validate the exact pinned snapshot
+/// inventory before this call.
 fn pinned_dense_kv_element_bytes(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
@@ -600,7 +610,6 @@ fn pinned_dense_kv_element_bytes(
             }
         }
     }
-    let mut width = 2_u64; // The loader casts the embedding output to BF16.
     for layer in 0..layers {
         for projection in [
             "self_attn.q_proj",
@@ -623,11 +632,9 @@ fn pinned_dense_kv_element_bytes(
                     if !spec.quantized || weight != "U32" || scales != biases {
                         return Err(format!("unsupported pinned quantized projection {stem}"));
                     }
-                    match scales.as_str() {
-                        "BF16" => {}
-                        // MLX 0.32 affine quantized_matmul promotes BF16+F16 to F32.
-                        "F16" | "F32" => width = 4,
-                        _ => return Err(format!("unsupported pinned scale dtype for {stem}")),
+                    // Held in the BF16 compute dtype at load whatever the stored width.
+                    if !matches!(scales.as_str(), "BF16" | "F16" | "F32") {
+                        return Err(format!("unsupported pinned scale dtype for {stem}"));
                     }
                 }
                 None => {
@@ -640,7 +647,24 @@ fn pinned_dense_kv_element_bytes(
             }
         }
     }
-    Ok(width)
+    Ok(DENSE_KV_COMPUTE_ELEMENT_BYTES)
+}
+
+/// The fail-closed reason for an observed dense K/V width that is not the compute dtype's.
+fn dense_kv_width_refusal(observed: u64) -> String {
+    let observed_dtype = match observed {
+        1 => "an 8-bit",
+        2 => "a 16-bit float",
+        4 => "Float32",
+        8 => "Float64",
+        _ => "an unknown",
+    };
+    format!(
+        "dense KV observed as {observed_dtype} dtype ({observed} bytes/element), expected the \
+         {DENSE_KV_COMPUTE_DTYPE:?} compute dtype ({DENSE_KV_COMPUTE_ELEMENT_BYTES} \
+         bytes/element); the loader promoted the cache (sc-20671), so this row is refused rather \
+         than recorded as a widened dense baseline"
+    )
 }
 
 /// A deliberately conservative planning floor, not a proven process peak. The two-times
@@ -2014,6 +2038,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     .any(|v| v == 0)
     {
         return Err("geometry contains zero".into());
+    }
+    if g.element_bytes != DENSE_KV_COMPUTE_ELEMENT_BYTES {
+        return Err(dense_kv_width_refusal(g.element_bytes));
     }
     if !["llama", "qwen"].contains(&receipt.matrix.family.as_str())
         || !CONTEXT_BANDS.contains(&receipt.matrix.context_band.as_str())
@@ -3832,6 +3859,195 @@ pub fn load_prepared_coordinate_receipt(
     Ok(PreparedCoordinateReceipt { coordinate, bundle })
 }
 
+/// Process exit status of a campaign parent halted by its operator stop file between rows. It is
+/// distinct from success and from every refusal/failure status: sysexits `EX_TEMPFAIL`, "try
+/// again later" — rerunning the same command against the same resume directory (with the stop
+/// file removed) resumes at the row that was not started.
+pub const OPERATOR_STOP_EXIT_CODE: u8 = 75;
+/// Default stop-file name inside a campaign resume directory (`--stop-file` overrides the path).
+pub const OPERATOR_STOP_FILE_NAME: &str = "STOP";
+
+/// A durable "stopped by operator before row N" status. Rows `0..before_row` are accepted (or
+/// resumed) in the resume directory; row `before_row` and later were never started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorStop {
+    pub before_row: usize,
+    pub row: String,
+    pub rows_total: usize,
+    /// The sealed status record written under the resume directory's `logs/`.
+    pub record: PathBuf,
+}
+
+/// How a campaign parent invocation ended without an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CampaignOutcome {
+    Completed,
+    StoppedByOperator(OperatorStop),
+}
+
+impl CampaignOutcome {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Completed => 0,
+            Self::StoppedByOperator(_) => OPERATOR_STOP_EXIT_CODE,
+        }
+    }
+}
+
+/// The operator stop files a parent honours: always `<resume-dir>/STOP`, plus `--stop-file <path>`
+/// when given (either present stops the campaign). Stop files are operator control only: never
+/// part of a resume identity and never forwarded to a worker.
+pub(crate) fn operator_stop_files(
+    args: &[String],
+    resume_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = vec![resume_dir.join(OPERATOR_STOP_FILE_NAME)];
+    if args.iter().any(|arg| arg == "--stop-file") {
+        let custom = PathBuf::from(required_flag(args, "--stop-file")?);
+        if !files.contains(&custom) {
+            files.push(custom);
+        }
+    }
+    Ok(files)
+}
+
+/// Whether resume-directory entry `name` is an operator stop file rather than campaign state.
+pub(crate) fn is_operator_stop_entry(
+    resume_dir: &Path,
+    stop_files: &[PathBuf],
+    name: &str,
+) -> bool {
+    name == OPERATOR_STOP_FILE_NAME || stop_files.contains(&resume_dir.join(name))
+}
+
+/// A stop file is present when anything (even a dangling symlink) exists at its path. Only
+/// `NotFound` means absent; any other stat failure is an error, never a silent "keep going".
+fn operator_stop_present(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "stat operator stop file {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Create `path` exclusively and write `bytes` durably (fsync).
+fn write_new_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()
+}
+
+/// Checked by a campaign parent only between rows, immediately before it would spawn row
+/// `before_row`'s worker; a running worker is never signalled (killing an MLX render mid command
+/// buffer can wedge the GPU). When any stop file exists this writes a sealed, never-overwritten
+/// `logs/operator-stop.attempt-<n>.json` status record plus its `.sha256` sidecar and returns the
+/// stop.
+pub(crate) fn operator_stop_before_row(
+    stop_files: &[PathBuf],
+    logs: &Path,
+    kind: &str,
+    before_row: usize,
+    row: &str,
+    rows_total: usize,
+) -> Result<Option<OperatorStop>, String> {
+    let mut present = Vec::new();
+    for path in stop_files {
+        if operator_stop_present(path)? {
+            present.push(path.display().to_string());
+        }
+    }
+    if present.is_empty() {
+        return Ok(None);
+    }
+    fs::create_dir_all(logs).map_err(|e| format!("create operator stop log directory: {e}"))?;
+    let value = serde_json::json!({
+        "schemaVersion": 1,
+        "kind": kind,
+        "status": "stopped-by-operator",
+        "beforeRow": before_row,
+        "beforeRowSlug": row,
+        "rowsTotal": rows_total,
+        "rowsAccepted": before_row,
+        "stopFiles": present,
+        "recordedAt": timestamp_now(),
+        "resume": "remove the stop file and rerun the same command with the same resume directory",
+    });
+    let (bytes, sha256) = seal_json(&value)?;
+    let mut attempt = 0_u64;
+    let record = loop {
+        let name = format!("operator-stop.attempt-{attempt}.json");
+        let path = logs.join(&name);
+        match write_new_durable(&path, &bytes) {
+            Ok(()) => {
+                write_new_durable(
+                    &logs.join(format!("{name}.sha256")),
+                    format!("{sha256}  {name}\n").as_bytes(),
+                )
+                .map_err(|e| format!("write operator stop record seal: {e}"))?;
+                break path;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt
+                    .checked_add(1)
+                    .ok_or("no unused operator stop record path")?;
+            }
+            Err(error) => return Err(format!("write operator stop record: {error}")),
+        }
+    };
+    eprintln!(
+        "stopped by operator before row {}/{rows_total} ({row}); stop file(s) {}; status {}",
+        before_row + 1,
+        present.join(", "),
+        record.display(),
+    );
+    Ok(Some(OperatorStop {
+        before_row,
+        row: row.into(),
+        rows_total,
+        record,
+    }))
+}
+
+/// One parent-loop step for a scheduled row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowStep {
+    /// Accept the row from the resume directory; `Ok(false)` means it must run.
+    Resume,
+    /// Spawn, supervise, and accept the row's worker.
+    Run,
+}
+
+/// The campaign parent's sequential row loop: resumed rows are accepted without a worker, and the
+/// operator stop file is consulted between rows, before each worker spawn.
+pub(crate) fn drive_rows(
+    slugs: &[String],
+    stop_files: &[PathBuf],
+    logs: &Path,
+    kind: &str,
+    mut row: impl FnMut(usize, RowStep) -> Result<bool, String>,
+) -> Result<Option<OperatorStop>, String> {
+    for (index, slug) in slugs.iter().enumerate() {
+        if row(index, RowStep::Resume)? {
+            eprintln!("coordinate {}/{} resumed: {slug}", index + 1, slugs.len());
+            continue;
+        }
+        if let Some(stop) =
+            operator_stop_before_row(stop_files, logs, kind, index, slug, slugs.len())?
+        {
+            return Ok(Some(stop));
+        }
+        row(index, RowStep::Run)?;
+        eprintln!("coordinate {}/{} accepted: {slug}", index + 1, slugs.len());
+    }
+    Ok(None)
+}
+
 /// Immutable parent inputs.  The only model-related choices are snapshot paths; model identity,
 /// geometry, memory, timing, and quality fields are collected by the child from the loaded product
 /// and are never accepted by this command-line boundary.
@@ -3845,13 +4061,15 @@ pub struct CampaignLaunch {
     pub prompt_file: PathBuf,
     pub destination: PathBuf,
     pub resume_dir: PathBuf,
+    /// Operator stop files checked between rows; never part of the resume identity.
+    pub stop_files: Vec<PathBuf>,
     pub safety_policy: PathBuf,
     /// `Some` launches every scheduled row in `compressed` mode with this KV method; `None` is the
     /// dense baseline campaign.
     pub compressed: Option<CompressedKvMethod>,
 }
 
-fn file_seal(path: &Path) -> Result<String, String> {
+pub(crate) fn file_seal(path: &Path) -> Result<String, String> {
     let mut input = File::open(path).map_err(|e| e.to_string())?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
@@ -4146,8 +4364,10 @@ fn validate_resume_row(
 
 /// Run one row at a time under a mandatory bounded policy. Valid sealed rows stay in an
 /// identity-bound resume directory after a failure; the destination appears only after all eight
-/// scheduled rows have been accepted.
-pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
+/// scheduled rows have been accepted. Between rows — never during a worker — the parent honours
+/// the operator stop file: it records a durable stopped-before-row status and returns
+/// [`CampaignOutcome::StoppedByOperator`]; the same command later resumes at that row.
+pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutcome, String> {
     if launch.destination.exists() {
         return Err("campaign destination already exists".into());
     }
@@ -4188,162 +4408,179 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
     }
     let mut identity = resume_identity(launch, &policy_sha256, &inventories)?;
     let identity_sha256 = prepare_resume_root(&launch.resume_dir, &mut identity)?;
-    let allowed = schedule
+    let slugs = schedule
         .iter()
         .map(|row| coordinate_slug(&row.coordinate))
-        .collect::<std::collections::BTreeSet<_>>();
-    for entry in fs::read_dir(&launch.resume_dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
-            && !allowed.contains(&name)
-            && !allowed
-                .iter()
-                .any(|slug| name == format!("{slug}.binding.json"))
-        {
-            return Err(format!("unexpected or partial resume artifact: {name}"));
-        }
-    }
+        .collect::<Vec<_>>();
+    validate_resume_entries(&launch.resume_dir, &launch.stop_files, &slugs)?;
     let mut prepared = Vec::with_capacity(schedule.len());
-    for (index, row) in schedule.iter().enumerate() {
-        let slug = coordinate_slug(&row.coordinate);
-        let child_dir = launch.resume_dir.join(&slug);
-        let binding_path = row_binding_path(&launch.resume_dir, &slug);
-        if child_dir.exists() || binding_path.exists() {
-            if !child_dir.exists() || !binding_path.exists() {
-                return Err(format!(
-                    "partial resume row {slug} must be repaired explicitly"
+    let stopped = drive_rows(
+        &slugs,
+        &launch.stop_files,
+        &launch.resume_dir.join("logs"),
+        "sc-20671-operator-stop",
+        |index, step| {
+            let row = &schedule[index];
+            let slug = coordinate_slug(&row.coordinate);
+            let child_dir = launch.resume_dir.join(&slug);
+            let binding_path = row_binding_path(&launch.resume_dir, &slug);
+            if step == RowStep::Resume {
+                if !child_dir.exists() && !binding_path.exists() {
+                    return Ok(false);
+                }
+                if !child_dir.exists() || !binding_path.exists() {
+                    return Err(format!(
+                        "partial resume row {slug} must be repaired explicitly"
+                    ));
+                }
+                prepared.push(validate_resume_row(
+                    &launch.resume_dir,
+                    &row.coordinate,
+                    &identity,
+                    &identity_sha256,
+                )?);
+                return Ok(true);
+            }
+            let snapshot = if row.coordinate.family == "llama" {
+                &launch.llama_snapshot
+            } else {
+                &launch.qwen_snapshot
+            };
+            let reference_snapshot = if row.coordinate.family == "llama" {
+                &launch.llama_fp32_reference_snapshot
+            } else {
+                &launch.qwen_fp32_reference_snapshot
+            };
+            let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
+                &row.coordinate,
+                snapshot,
+                reference_snapshot,
+                &prompt,
+                &policy,
+            )?;
+            let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
+            let mut command = Command::new(&launch.executable);
+            command
+                .arg("worker")
+                .arg("--coordinate-index")
+                .arg(index.to_string())
+                .arg("--snapshot")
+                .arg(snapshot)
+                .arg("--prompt-file")
+                .arg(&launch.prompt_file)
+                .arg("--fp32-reference-snapshot")
+                .arg(reference_snapshot)
+                .arg("--safety-policy")
+                .arg(&launch.safety_policy)
+                .arg("--policy-sha256")
+                .arg(&policy_sha256)
+                .arg("--resume-identity")
+                .arg(launch.resume_dir.join("identity.json"))
+                .arg("--resume-identity-sha256")
+                .arg(&identity_sha256)
+                .arg("--out")
+                .arg(&child_dir);
+            if let Some(method) = launch.compressed {
+                command
+                    .arg("--mode")
+                    .arg("compressed")
+                    .arg("--kv-method")
+                    .arg(method.id());
+            }
+            let logs = launch.resume_dir.join("logs");
+            let log_prefix =
+                unused_attempt_prefix(&logs, &slug).ok_or("no unused bounded worker log path")?;
+            let request = RunRequest {
+                context_tokens: total_tokens,
+                request_tokens,
+                stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
+                stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
+            };
+            let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
+            let status = match campaign_supervisor::run_guarded(
+                &mut command,
+                &request,
+                &policy.supervisor(),
+                &mut SystemProbe,
+            ) {
+                Ok(status) => status,
+                Err(failure) => {
+                    let reason = format!("{:?}", failure.reason);
+                    return Err(unaccepted_row_error(
+                        &unaccepted,
+                        "sc-20671-unaccepted-row",
+                        &slug,
+                        &admission,
+                        (&reason, &failure.detail, failure.pid),
+                        format!(
+                            "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
+                            failure.detail, failure.pid, launch.resume_dir.display(),
+                        ),
+                    ));
+                }
+            };
+            if !status.success() {
+                return Err(unaccepted_row_error(
+                    &unaccepted,
+                    "sc-20671-unaccepted-row",
+                    &slug,
+                    &admission,
+                    ("ChildExit", &status.to_string(), None),
+                    format!(
+                        "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
+                        request.stderr_path.display(), launch.resume_dir.display(),
+                    ),
                 ));
             }
+            // Child publication itself is atomic. Bind the row to this exact immutable launch before
+            // permitting a future resume to accept it.
+            let item = load_prepared_coordinate_receipt(&child_dir, row.coordinate.clone())?;
+            let receipt: Receipt =
+                serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+            let binding = seal_json(&row_binding(
+                &identity_sha256,
+                &receipt,
+                &item.bundle.receipt,
+            ))?
+            .0;
+            fs::write(&binding_path, binding).map_err(|e| e.to_string())?;
             prepared.push(validate_resume_row(
                 &launch.resume_dir,
                 &row.coordinate,
                 &identity,
                 &identity_sha256,
             )?);
-            eprintln!(
-                "coordinate {}/{} resumed: {slug}",
-                index + 1,
-                schedule.len()
-            );
-            continue;
-        }
-        let snapshot = if row.coordinate.family == "llama" {
-            &launch.llama_snapshot
-        } else {
-            &launch.qwen_snapshot
-        };
-        let reference_snapshot = if row.coordinate.family == "llama" {
-            &launch.llama_fp32_reference_snapshot
-        } else {
-            &launch.qwen_fp32_reference_snapshot
-        };
-        let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
-            &row.coordinate,
-            snapshot,
-            reference_snapshot,
-            &prompt,
-            &policy,
-        )?;
-        let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
-        let mut command = Command::new(&launch.executable);
-        command
-            .arg("worker")
-            .arg("--coordinate-index")
-            .arg(index.to_string())
-            .arg("--snapshot")
-            .arg(snapshot)
-            .arg("--prompt-file")
-            .arg(&launch.prompt_file)
-            .arg("--fp32-reference-snapshot")
-            .arg(reference_snapshot)
-            .arg("--safety-policy")
-            .arg(&launch.safety_policy)
-            .arg("--policy-sha256")
-            .arg(&policy_sha256)
-            .arg("--resume-identity")
-            .arg(launch.resume_dir.join("identity.json"))
-            .arg("--resume-identity-sha256")
-            .arg(&identity_sha256)
-            .arg("--out")
-            .arg(&child_dir);
-        if let Some(method) = launch.compressed {
-            command
-                .arg("--mode")
-                .arg("compressed")
-                .arg("--kv-method")
-                .arg(method.id());
-        }
-        let logs = launch.resume_dir.join("logs");
-        let log_prefix =
-            unused_attempt_prefix(&logs, &slug).ok_or("no unused bounded worker log path")?;
-        let request = RunRequest {
-            context_tokens: total_tokens,
-            request_tokens,
-            stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
-            stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
-        };
-        let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
-        let status = match campaign_supervisor::run_guarded(
-            &mut command,
-            &request,
-            &policy.supervisor(),
-            &mut SystemProbe,
-        ) {
-            Ok(status) => status,
-            Err(failure) => {
-                let reason = format!("{:?}", failure.reason);
-                return Err(unaccepted_row_error(
-                    &unaccepted,
-                    "sc-20671-unaccepted-row",
-                    &slug,
-                    &admission,
-                    (&reason, &failure.detail, failure.pid),
-                    format!(
-                        "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
-                        failure.detail, failure.pid, launch.resume_dir.display(),
-                    ),
-                ));
-            }
-        };
-        if !status.success() {
-            return Err(unaccepted_row_error(
-                &unaccepted,
-                "sc-20671-unaccepted-row",
-                &slug,
-                &admission,
-                ("ChildExit", &status.to_string(), None),
-                format!(
-                    "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
-                    request.stderr_path.display(), launch.resume_dir.display(),
-                ),
-            ));
-        }
-        // Child publication itself is atomic. Bind the row to this exact immutable launch before
-        // permitting a future resume to accept it.
-        let item = load_prepared_coordinate_receipt(&child_dir, row.coordinate.clone())?;
-        let receipt: Receipt =
-            serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
-        let binding = seal_json(&row_binding(
-            &identity_sha256,
-            &receipt,
-            &item.bundle.receipt,
-        ))?
-        .0;
-        fs::write(&binding_path, binding).map_err(|e| e.to_string())?;
-        prepared.push(validate_resume_row(
-            &launch.resume_dir,
-            &row.coordinate,
-            &identity,
-            &identity_sha256,
-        )?);
-        eprintln!(
-            "coordinate {}/{} accepted: {slug}",
-            index + 1,
-            schedule.len()
-        );
+            Ok(true)
+        },
+    )?;
+    if let Some(stop) = stopped {
+        return Ok(CampaignOutcome::StoppedByOperator(stop));
     }
-    publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)
+    publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?;
+    Ok(CampaignOutcome::Completed)
+}
+
+/// Every resume-directory entry must be campaign state for this schedule or the operator stop file;
+/// the stop file is tolerated here and never enters the resume identity.
+fn validate_resume_entries(
+    resume_dir: &Path,
+    stop_files: &[PathBuf],
+    slugs: &[String],
+) -> Result<(), String> {
+    for entry in fs::read_dir(resume_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
+            && !is_operator_stop_entry(resume_dir, stop_files, &name)
+            && !slugs.contains(&name)
+            && !slugs
+                .iter()
+                .any(|slug| name == format!("{slug}.binding.json"))
+        {
+            return Err(format!("unexpected or partial resume artifact: {name}"));
+        }
+    }
+    Ok(())
 }
 
 fn required_flag(args: &[String], name: &str) -> Result<String, String> {
@@ -4388,12 +4625,20 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 ///   --prompt-file <prompt.txt> --safety-policy <policy.json> \
 ///   --resume-dir /abs/sc20676-compressed-resume --out /abs/sc20676-compressed-campaign
 /// ```
-pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
+///
+/// Safe operator stop: `touch /abs/sc20676-compressed-resume/STOP` (always honoured) or the
+/// `--stop-file <path>` given to `parent` (honoured as well). The parent finishes the row whose
+/// worker is running — it never signals a worker — then, before spawning the next row, writes
+/// `<resume-dir>/logs/operator-stop.attempt-<n>.json` ("stopped-by-operator", `beforeRow`) with its
+/// `.sha256` seal and exits with status [`OPERATOR_STOP_EXIT_CODE`] (75). Remove the stop file(s)
+/// and rerun the same command: accepted rows resume and the campaign continues at that row.
+pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
     let Some(mode) = args.first().map(String::as_str) else {
         return Err("usage: sc20671-kv-baseline parent|worker [options]".into());
     };
     match mode {
         "parent" | "preflight" => {
+            let resume_dir = PathBuf::from(required_flag(args, "--resume-dir")?);
             let launch = CampaignLaunch {
                 executable: std::env::current_exe().map_err(|e| e.to_string())?,
                 llama_snapshot: PathBuf::from(required_flag(args, "--llama-snapshot")?),
@@ -4408,7 +4653,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 )?),
                 prompt_file: PathBuf::from(required_flag(args, "--prompt-file")?),
                 destination: PathBuf::from(required_flag(args, "--out")?),
-                resume_dir: PathBuf::from(required_flag(args, "--resume-dir")?),
+                stop_files: operator_stop_files(args, &resume_dir)?,
+                resume_dir,
                 safety_policy: PathBuf::from(required_flag(args, "--safety-policy")?),
                 compressed: compressed_mode_flags(args)?,
             };
@@ -4419,7 +4665,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                     String::from_utf8(canonical_json_bytes(&value).map_err(|e| e.to_string())?)
                         .map_err(|e| e.to_string())?
                 );
-                Ok(())
+                Ok(CampaignOutcome::Completed)
             } else {
                 launch_complete_campaign(&launch)
             }
@@ -4750,9 +4996,10 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 "receipt.md",
                 &bundle,
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [options]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--stop-file <path>] [options]".into()),
     }
 }
 
@@ -5869,6 +6116,10 @@ impl Observer for ProductObserver {
             geometry.element_bytes = element_bytes;
         } else if geometry.element_bytes != element_bytes {
             self.error = Some("product cache element width changed within one coordinate".into());
+            return;
+        }
+        if element_bytes != DENSE_KV_COMPUTE_ELEMENT_BYTES {
+            self.error = Some(dense_kv_width_refusal(element_bytes));
             return;
         }
         self.cache_live_tokens = self.cache_live_tokens.max(tokens);
@@ -7709,7 +7960,7 @@ pub fn timing_samples_from_product_repeats(
     })
 }
 
-fn checked_git_revision(root: &Path) -> Result<String, String> {
+pub(crate) fn checked_git_revision(root: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -8384,7 +8635,7 @@ pub(crate) mod tests {
                     kv_heads: 8,
                     head_dimension: 8,
                     layers: 28,
-                    element_bytes: 4,
+                    element_bytes: 2,
                 },
                 phases: vec![
                     ReceiptPhase {
@@ -8499,7 +8750,7 @@ pub(crate) mod tests {
         assert_eq!(needle["output"]["text"]["prefix"], "wrong\nanswer");
         assert_eq!(
             needle["coordinateObservation"]["geometry"]["elementBytes"],
-            4
+            2
         );
         assert_eq!(needle["coordinateObservation"]["geometry"]["capacity"], 256);
         assert_eq!(
@@ -9034,8 +9285,8 @@ pub(crate) mod tests {
             },
         );
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 256, 4);
-        assert_eq!(observer.geometry.unwrap().element_bytes, 4);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 256, 2);
+        assert_eq!(observer.geometry.unwrap().element_bytes, 2);
         assert_eq!(observer.cache_live_tokens, 2);
         assert_eq!(observer.cache_capacity_tokens, 256);
         assert!(observer.error.is_none());
@@ -9045,7 +9296,7 @@ pub(crate) mod tests {
     fn product_observer_rejects_capacity_below_live_length() {
         let mut observer = ProductObserver::new();
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 1, 4);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 1, 2);
         assert_eq!(
             observer.error.as_deref(),
             Some("product cache snapshot must have positive bytes, valid live/capacity tokens, and element width")
@@ -9066,11 +9317,56 @@ pub(crate) mod tests {
             },
         );
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 2, 4);
-        Observer::cache_snapshot(&mut observer, 8192, 4, 4, 2);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 2, 2);
+        Observer::cache_snapshot(&mut observer, 8192, 4, 4, 4);
         assert_eq!(
             observer.error.as_deref(),
             Some("product cache element width changed within one coordinate")
+        );
+    }
+
+    /// sc-20671: an F32-promoted dense cache (the pre-fix F16-scale Llama path) fails the row closed
+    /// with a reason, at the live observer and again at receipt acceptance.
+    #[test]
+    fn a_kv_width_other_than_the_compute_dtype_is_refused() {
+        let mut observer = ProductObserver::new();
+        Observer::geometry(
+            &mut observer,
+            ProductGeometry {
+                query_heads: 8,
+                kv_heads: 2,
+                head_dimension: 64,
+                layers: 4,
+                element_bytes: 0,
+            },
+        );
+        observer.phase = Some("prefill-peak");
+        Observer::cache_snapshot(&mut observer, 8192, 2, 256, 4);
+        assert_eq!(
+            observer.error.as_deref(),
+            Some(dense_kv_width_refusal(4).as_str())
+        );
+        let reason = observer.finish().err().unwrap();
+        assert!(reason.contains("sc-20671"), "{reason}");
+        assert!(
+            reason.contains("observed as Float32 dtype (4 bytes/element)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("expected the Bfloat16 compute dtype (2 bytes/element)"),
+            "{reason}"
+        );
+
+        let receipt = builder_test_receipt();
+        assert_eq!(
+            receipt.geometry.element_bytes,
+            DENSE_KV_COMPUTE_ELEMENT_BYTES
+        );
+        let mut widened = receipt.clone();
+        widened.geometry.element_bytes = 4;
+        assert_eq!(
+            validate_receipt_semantics(&widened).unwrap_err(),
+            dense_kv_width_refusal(4)
         );
     }
 
@@ -9411,73 +9707,48 @@ pub(crate) mod tests {
         assert!(budget > 12_000_000_000); // BF16 reference dominates the sequential roles.
     }
 
+    /// sc-20671: the pinned dense KV width is the BF16 compute dtype's for every role, whatever
+    /// dtype the snapshot stores its quantized scales in — an F16-scale candidate no longer plans
+    /// (or records) the F32-promoted 4-byte cache. Unsupported scale dtypes still refuse.
     #[test]
-    fn pinned_projection_scales_set_role_kv_width_and_refuse_old_two_byte_cap() {
+    fn pinned_kv_width_is_the_compute_dtype_whatever_the_stored_scale_dtype() {
         let temporary = tempfile::tempdir().unwrap();
-        let llama_candidate = temporary.path().join("llama-candidate");
         let llama_reference = temporary.path().join("llama-reference");
-        let qwen_candidate = temporary.path().join("qwen-candidate");
         let qwen_reference = temporary.path().join("qwen-reference");
-        write_stub_dtype_snapshot(&llama_candidate, &LLAMA_CANDIDATE, "F16");
         write_stub_dtype_snapshot(&llama_reference, &LLAMA_REFERENCE, "BF16");
-        write_stub_dtype_snapshot(&qwen_candidate, &QWEN_CANDIDATE, "BF16");
         write_stub_dtype_snapshot(&qwen_reference, &QWEN_REFERENCE, "BF16");
-        for (spec, path, expected) in [
-            (&LLAMA_CANDIDATE, &llama_candidate, 4),
-            (&LLAMA_REFERENCE, &llama_reference, 2),
-            (&QWEN_CANDIDATE, &qwen_candidate, 2),
-            (&QWEN_REFERENCE, &qwen_reference, 2),
-        ] {
+        let mut candidates = Vec::new();
+        for (spec, name) in [(&LLAMA_CANDIDATE, "llama"), (&QWEN_CANDIDATE, "qwen")] {
+            for scale in ["BF16", "F16", "F32"] {
+                let path = temporary.path().join(format!("{name}-candidate-{scale}"));
+                write_stub_dtype_snapshot(&path, spec, scale);
+                candidates.push((spec, path));
+            }
+        }
+        for (spec, path) in candidates.iter().map(|(spec, path)| (*spec, path)).chain([
+            (&LLAMA_REFERENCE, &llama_reference),
+            (&QWEN_REFERENCE, &qwen_reference),
+        ]) {
             assert_eq!(
                 pinned_dense_kv_element_bytes(spec, path, 28).unwrap(),
-                expected
+                DENSE_KV_COMPUTE_ELEMENT_BYTES,
+                "{} {}",
+                spec.repository,
+                path.display()
             );
         }
-        let old_row_budget =
-            static_role_footprint_budget(&LLAMA_REFERENCE, &llama_reference, 262_144, 131_072)
-                .unwrap();
-        let new_candidate =
-            static_role_footprint_budget(&LLAMA_CANDIDATE, &llama_candidate, 262_144, 131_072)
-                .unwrap();
-        let cap = 50_u64 << 30;
-        // With the old 2-byte candidate estimate the larger reference set the row floor.
-        assert!(old_row_budget < cap && new_candidate > cap);
-        let mut policy = CampaignSafetyPolicy {
-            schema_version: 1,
-            row_deadline_seconds: 10,
-            poll_millis: 100,
-            term_grace_millis: 500,
-            host_free_reserve_bytes: 1,
-            child_footprint_cap_bytes: cap,
-            max_context_tokens: u64::MAX,
-            max_request_tokens: u64::MAX,
-            stdout_cap_bytes: 100,
-            stderr_cap_bytes: 100,
-        };
-        let row = &required_coordinates()[0];
-        assert!(static_row_footprint_budget(
-            row,
-            &llama_candidate,
-            &llama_reference,
-            262_144,
-            131_072,
-            &policy,
-        )
-        .unwrap_err()
-        .contains("refuses before spawn"));
-        policy.child_footprint_cap_bytes = new_candidate;
-        assert_eq!(
-            static_row_footprint_budget(
-                row,
-                &llama_candidate,
-                &llama_reference,
+        // The static floor therefore no longer depends on the stored scale dtype.
+        let budget = |scale: &str| {
+            static_role_footprint_budget(
+                &LLAMA_CANDIDATE,
+                &temporary.path().join(format!("llama-candidate-{scale}")),
                 262_144,
                 131_072,
-                &policy,
             )
-            .unwrap(),
-            new_candidate
-        );
+            .unwrap()
+        };
+        assert_eq!(budget("F16"), budget("BF16"));
+        assert_eq!(budget("F32"), budget("BF16"));
         let unsupported = temporary.path().join("unsupported-scales");
         write_stub_dtype_snapshot(&unsupported, &LLAMA_CANDIDATE, "F64");
         assert!(
@@ -11531,5 +11802,233 @@ pub(crate) mod tests {
             identity.source,
             format!("git+{PMETAL_MLX_REPOSITORY}?rev={0}#{0}", identity.revision)
         );
+    }
+
+    /// A fake parent row set over a real resume directory: a row is "accepted" once its marker
+    /// exists, exactly as the production loop accepts a sealed row directory from resume.
+    struct FakeRows {
+        root: PathBuf,
+        ran: Vec<usize>,
+        /// Simulates the operator touching the stop file while this row's worker is running.
+        touch_stop_during: Option<usize>,
+        stop_file: PathBuf,
+    }
+
+    impl FakeRows {
+        fn new(root: &Path, stop_file: &Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                ran: Vec::new(),
+                touch_stop_during: None,
+                stop_file: stop_file.to_path_buf(),
+            }
+        }
+
+        fn drive(&mut self, slugs: &[String]) -> Result<Option<OperatorStop>, String> {
+            let (root, stop_file) = (self.root.clone(), self.stop_file.clone());
+            drive_rows(
+                slugs,
+                &operator_stop_files(
+                    &["--stop-file".to_string(), stop_file.display().to_string()],
+                    &root,
+                )
+                .unwrap(),
+                &root.join("logs"),
+                "sc-20671-operator-stop",
+                |index, step| {
+                    let marker = root.join(&slugs[index]);
+                    match step {
+                        RowStep::Resume => Ok(marker.exists()),
+                        RowStep::Run => {
+                            if self.touch_stop_during == Some(index) {
+                                fs::write(&stop_file, b"").unwrap();
+                            }
+                            self.ran.push(index);
+                            fs::write(&marker, b"accepted").unwrap();
+                            Ok(true)
+                        }
+                    }
+                },
+            )
+        }
+    }
+
+    fn stop_slugs() -> Vec<String> {
+        ["row-a", "row-b", "row-c", "row-d"]
+            .iter()
+            .map(|slug| (*slug).to_string())
+            .collect()
+    }
+
+    fn stop_record(stop: &OperatorStop) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(&stop.record).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn operator_stop_before_row_zero_spawns_no_worker_and_records_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join(OPERATOR_STOP_FILE_NAME);
+        fs::write(&stop_file, b"").unwrap();
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        let stop = rows.drive(&stop_slugs()).unwrap().expect("operator stop");
+        assert!(rows.ran.is_empty(), "no worker may start after a stop");
+        assert_eq!(
+            (stop.before_row, stop.row.as_str(), stop.rows_total),
+            (0, "row-a", 4)
+        );
+        let record = stop_record(&stop);
+        assert_eq!(record["status"], "stopped-by-operator");
+        assert_eq!(record["kind"], "sc-20671-operator-stop");
+        assert_eq!(record["beforeRow"], 0);
+        assert_eq!(record["rowsAccepted"], 0);
+        assert!(stop.record.starts_with(dir.path().join("logs")));
+        // The record is sealed by its own sidecar.
+        let raw = fs::read(&stop.record).unwrap();
+        let name = stop
+            .record
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("logs").join(format!("{name}.sha256"))).unwrap(),
+            format!("{}  {name}\n", seal_bytes(&raw))
+        );
+        assert_eq!(
+            CampaignOutcome::StoppedByOperator(stop).exit_code(),
+            OPERATOR_STOP_EXIT_CODE
+        );
+        assert_eq!(CampaignOutcome::Completed.exit_code(), 0);
+        assert_ne!(OPERATOR_STOP_EXIT_CODE, 0);
+        assert_ne!(OPERATOR_STOP_EXIT_CODE, 1);
+        assert_ne!(OPERATOR_STOP_EXIT_CODE, 2);
+    }
+
+    #[test]
+    fn operator_stop_between_rows_finishes_the_running_row_then_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join(OPERATOR_STOP_FILE_NAME);
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        rows.touch_stop_during = Some(1);
+        let stop = rows.drive(&stop_slugs()).unwrap().expect("operator stop");
+        // The row running when the operator asked is completed, never interrupted.
+        assert_eq!(rows.ran, vec![0, 1]);
+        assert!(dir.path().join("row-b").exists());
+        assert!(!dir.path().join("row-c").exists());
+        assert_eq!((stop.before_row, stop.row.as_str()), (2, "row-c"));
+        let record = stop_record(&stop);
+        assert_eq!(record["beforeRow"], 2);
+        assert_eq!(record["beforeRowSlug"], "row-c");
+        assert_eq!(record["rowsAccepted"], 2);
+    }
+
+    #[test]
+    fn resume_after_operator_stop_continues_at_the_stopped_row_and_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join("elsewhere-stop");
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        rows.touch_stop_during = Some(1);
+        let first = rows.drive(&stop_slugs()).unwrap().expect("operator stop");
+        // Still armed: a rerun stops again before the same row, with a second, distinct record.
+        let mut again = FakeRows::new(dir.path(), &stop_file);
+        let second = again.drive(&stop_slugs()).unwrap().expect("still stopped");
+        assert!(again.ran.is_empty());
+        assert_eq!(second.before_row, first.before_row);
+        assert_ne!(second.record, first.record);
+        assert!(first.record.exists());
+        fs::remove_file(&stop_file).unwrap();
+        let mut resumed = FakeRows::new(dir.path(), &stop_file);
+        assert_eq!(resumed.drive(&stop_slugs()).unwrap(), None);
+        assert_eq!(
+            resumed.ran,
+            vec![2, 3],
+            "accepted rows resume; the rest run once"
+        );
+        assert!(stop_slugs()
+            .iter()
+            .all(|slug| dir.path().join(slug).exists()));
+    }
+
+    #[test]
+    fn resume_directory_tolerates_the_stop_file_without_changing_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("resume");
+        let slugs = stop_slugs();
+        let identity = serde_json::json!({
+            "schemaVersion": 1,
+            "kind": "fixture",
+            "inferenceRevision": "a".repeat(40),
+            "sceneWorksRevision": "b".repeat(40),
+        });
+        let sealed = prepare_resume_root(&root, &mut identity.clone()).unwrap();
+        fs::create_dir(root.join("logs")).unwrap();
+        fs::write(root.join(OPERATOR_STOP_FILE_NAME), b"").unwrap();
+        fs::write(root.join("custom.stop"), b"").unwrap();
+        let stops = vec![root.join(OPERATOR_STOP_FILE_NAME), root.join("custom.stop")];
+        validate_resume_entries(&root, &stops, &slugs).unwrap();
+        assert_eq!(
+            prepare_resume_root(&root, &mut identity.clone()).unwrap(),
+            sealed,
+            "stop-file presence must not change the resume identity"
+        );
+        fs::write(root.join("stray.json"), b"{}").unwrap();
+        assert!(validate_resume_entries(&root, &stops, &slugs).is_err());
+    }
+
+    #[test]
+    fn stop_file_flag_adds_to_the_resume_directory_stop() {
+        let resume = Path::new("/abs/resume");
+        assert_eq!(
+            operator_stop_files(&[], resume).unwrap(),
+            vec![resume.join(OPERATOR_STOP_FILE_NAME)]
+        );
+        let args = ["parent", "--stop-file", "/abs/halt"].map(String::from);
+        assert_eq!(
+            operator_stop_files(&args, resume).unwrap(),
+            vec![
+                resume.join(OPERATOR_STOP_FILE_NAME),
+                PathBuf::from("/abs/halt")
+            ]
+        );
+        assert!(operator_stop_files(&["--stop-file".to_string()], resume).is_err());
+    }
+
+    #[test]
+    fn both_stop_paths_stop_and_stat_errors_are_not_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("elsewhere").join("halt");
+        let files = operator_stop_files(
+            &["--stop-file".to_string(), custom.display().to_string()],
+            dir.path(),
+        )
+        .unwrap();
+        let logs = dir.path().join("logs");
+        assert_eq!(
+            operator_stop_before_row(&files, &logs, "k", 0, "row-a", 2).unwrap(),
+            None
+        );
+        // <resume-dir>/STOP still stops a parent given --stop-file.
+        fs::write(dir.path().join(OPERATOR_STOP_FILE_NAME), b"").unwrap();
+        let stop = operator_stop_before_row(&files, &logs, "k", 1, "row-b", 2)
+            .unwrap()
+            .expect("default stop honoured");
+        assert_eq!(
+            stop_record(&stop)["stopFiles"][0],
+            files[0].display().to_string()
+        );
+        fs::remove_file(dir.path().join(OPERATOR_STOP_FILE_NAME)).unwrap();
+        // ...and so does the custom path alone.
+        fs::create_dir(dir.path().join("elsewhere")).unwrap();
+        fs::write(&custom, b"").unwrap();
+        let stop = operator_stop_before_row(&files, &logs, "k", 1, "row-b", 2)
+            .unwrap()
+            .expect("custom stop honoured");
+        assert_eq!(
+            stop_record(&stop)["stopFiles"][0],
+            custom.display().to_string()
+        );
+        // A stat failure other than NotFound (here ENOTDIR) is an error, not "no stop".
+        let blocked = vec![custom.join("STOP")];
+        assert!(operator_stop_before_row(&blocked, &logs, "k", 0, "row-a", 2).is_err());
     }
 }

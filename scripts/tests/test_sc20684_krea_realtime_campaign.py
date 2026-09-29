@@ -10,6 +10,7 @@ import json
 import shlex
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -849,7 +850,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             stdout.write_bytes(b"validated observation")
             stderr.write_bytes(b"")
             record = {
-                "runId": "run-1", "exitCode": 0,
+                "runId": "run-1", "exitCode": 0, "launcherElapsedNs": 5,
                 "transcripts": {
                     "stdout": campaign._file_identity(stdout, f"transcripts/{stdout.name}"),
                     "stderr": campaign._file_identity(stderr, f"transcripts/{stderr.name}"),
@@ -869,6 +870,10 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             campaign._save_resumed_role(resume, "v2v-q8.dense-baseline", identity, foreign)
             with self.assertRaisesRegex(campaign.CampaignError, "runtime-guarded admission"):
                 campaign._load_resumed_role(resume, "v2v-q8.dense-baseline", identity)
+            untimed = {key: value for key, value in record.items() if key != "launcherElapsedNs"}
+            campaign._save_resumed_role(resume, "t2v-q4.dense-baseline", identity, untimed)
+            with self.assertRaisesRegex(campaign.CampaignError, "launcher elapsed"):
+                campaign._load_resumed_role(resume, "t2v-q4.dense-baseline", identity)
             campaign._save_resumed_role(resume, "t2v-q8.dense-baseline", identity, record)
             self.assertEqual(campaign._load_resumed_role(
                 resume, "t2v-q8.dense-baseline", identity,
@@ -882,6 +887,111 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                     resume, source=moved_ref, model=MODEL,
                     policy=policy, argv=[str(executable)], timeout=10,
                 )
+
+    def test_operator_stop_halts_between_roles_and_resume_completes(self) -> None:
+        supervisor = campaign.supervisor
+        policy = supervisor.SafetyPolicy(
+            "darwin-mlx", 10, 20, 100, 1024, 10**9, 10**5, 10**5,
+            10**5, None, None, None, "f" * 64, b"{}\n",
+        )
+        identity = {"kind": "test", "policySha256": policy.sha256}
+        timing = {"requestFirstFrameAvailableMs": 1.0, "meanOutputFps": 1.0, "steadyDenoiseEquivalentFps": 1.0}
+        paired = {"memory": {"candidateTerminal": {"physFootprintPeakBytes": 1},
+                             "mlx": {"sampledFootprintPeakBytes": 1}}, "timing": timing}
+        baseline = {"memory": {"generationTerminal": {"physFootprintPeakBytes": 2},
+                               "mlx": {"sampledFootprintPeakBytes": 2}}, "timing": timing}
+        spawned: list[str] = []
+        touch: list[str] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stop = root / "STOP"
+
+            def fake_run_guarded(_argv, *, env, stdout_path, stderr_path, **_kwargs):
+                name = f"{env['KREA_SC20684_REQUEST_MODE']}-{env['KREA_SC20684_CACHE_TIER']}.{env['KREA_SC20684_MEASUREMENT_ROLE']}"
+                spawned.append(name)
+                if name in touch:
+                    stop.write_bytes(b"")  # the operator asks while this role is running
+                if name == "t2v-q8.paired":
+                    time.sleep(0.02)
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_path.write_bytes(b"observation\n")
+                stderr_path.write_bytes(b"")
+                if env["KREA_SC20684_MEASUREMENT_ROLE"] == "paired":
+                    artifacts = Path(env["KREA_SC20684_ARTIFACT_DIR"])
+                    artifacts.mkdir(parents=True, exist_ok=True)
+                    (artifacts / "frame.bin").write_bytes(name.encode())
+                return supervisor.RunResult(1000 + len(spawned), 0, 1024, None, 10**9, None, 1.0, (),
+                                            supervisor.runtime_guarded_admission(policy))
+
+            def run() -> list[dict]:
+                return campaign.run_matrix(
+                    "/prebuilt/observer", root, SOURCE, MODEL, campaign.decision_policy(),
+                    10, root, policy, identity, campaign.supervisor.operator_stop_files(None, root),
+                )
+
+            with patch.object(supervisor, "run_guarded", fake_run_guarded), \
+                    patch.object(campaign, "_read_observation", lambda *_args, **_kwargs: {}), \
+                    patch.object(campaign, "_validate_observation", lambda *_args, **_kwargs: paired), \
+                    patch.object(campaign, "_validate_baseline_observation", lambda *_args, **_kwargs: baseline), \
+                    patch.object(campaign, "_validate_artifact_directory", lambda *_args: None), \
+                    patch.object(campaign, "arm_decision", lambda *_args: {}):
+                stop.write_bytes(b"")
+                with self.assertRaises(supervisor.OperatorStop) as caught:
+                    run()
+                self.assertEqual(spawned, [])
+                self.assertEqual((caught.exception.index, caught.exception.before), (0, "t2v-q8.paired"))
+                record = json.loads(caught.exception.record.read_bytes())
+                self.assertEqual((record["status"], record["rowsTotal"]), ("stopped-by-operator", 12))
+                stop.unlink()
+                touch.append("t2v-q8.paired")
+                with self.assertRaises(supervisor.OperatorStop) as caught:
+                    run()
+                # The running role finished and was sealed; the next role never started.
+                self.assertEqual(spawned, ["t2v-q8.paired"])
+                self.assertEqual((caught.exception.index, caught.exception.before), (1, "t2v-q8.dense-baseline"))
+                self.assertTrue((root / "roles" / "t2v-q8.paired.json").is_file())
+                touch.clear()
+                stop.unlink()
+                rows = run()
+                self.assertEqual(len(rows), len(campaign.CASES))
+                # The stopped cell reports both roles' launcher time: the paired role's from its
+                # durable resume record, the baseline's from this invocation.
+                saved = json.loads((root / "roles" / "t2v-q8.paired.json").read_bytes())
+                first = rows[0]
+                self.assertEqual(first["resumedRoles"], ["paired"])
+                self.assertEqual(first["roleLauncherElapsedNs"]["paired"], saved["launcherElapsedNs"])
+                self.assertGreater(first["roleLauncherElapsedNs"]["dense-baseline"], 0)
+                self.assertEqual(first["launcherElapsedNs"], sum(first["roleLauncherElapsedNs"].values()))
+                self.assertGreaterEqual(saved["launcherElapsedNs"], 20_000_000)
+                self.assertEqual(rows[1]["resumedRoles"], [])
+                self.assertEqual(len(spawned), 2 * len(campaign.CASES))
+                self.assertEqual(spawned.count("t2v-q8.paired"), 1, "accepted role resumes, never reruns")
+
+    def test_resume_directory_tolerates_the_operator_stop_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "observer"
+            executable.write_bytes(b"prebuilt observer")
+            policy = campaign.supervisor.SafetyPolicy(
+                "darwin-mlx", 10, 100, 100, 1, 10**9, 10**5, 10**5,
+                10**5, None, None, None, "f" * 64, b"{}\n",
+            )
+            resume = root / "resume"
+
+            def prepare(stop_file: Path | None = None) -> dict:
+                return campaign._prepare_media_resume(
+                    resume, source=json.loads(json.dumps(SOURCE)), model=MODEL,
+                    policy=policy, argv=[str(executable)], timeout=10,
+                    stop_files=campaign.supervisor.operator_stop_files(stop_file, resume),
+                )
+
+            first = prepare()
+            (resume / "STOP").write_bytes(b"")
+            (resume / "halt").write_bytes(b"")
+            self.assertEqual(prepare(resume / "halt"), first)
+            with self.assertRaisesRegex(campaign.CampaignError, "unexpected resume artifact: halt"):
+                prepare()
 
     def test_roles_are_admitted_by_runtime_guards_and_failures_are_unaccepted_records(self) -> None:
         policy = campaign.supervisor.SafetyPolicy(

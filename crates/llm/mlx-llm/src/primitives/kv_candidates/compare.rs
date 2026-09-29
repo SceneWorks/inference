@@ -6,14 +6,18 @@
 //! input K/V, implementation parity against an independent fp32 dequantize-then-attend oracle,
 //! allocator-measured transient memory, timing, and the matched-budget / matched-quality picks.
 //!
-//! Real captured K/V is a one-command step once a capture exists (safetensors with `q`
+//! Real captured K/V comes from [`crate::kv_capture`] (`sc20677_capture_kv`: safetensors with `q`
 //! `[B,Hq,S_q,D]`, `k`/`v` `[B,Hkv,S,D]`; optional string metadata `scale`, `mask`, `model`,
-//! `layer` is recorded):
+//! `layer` is recorded). One command captures a snapshot's layers under the campaign supervisor
+//! and compares them:
 //!
 //! ```text
-//! cargo run --release -p mlx-llm --bin sc20677_kv_candidates -- \
-//!     --kv /path/llama-layer12.safetensors --kv /path/qwen-layer20.safetensors \
-//!     --warm-iterations 20 --out /path/sc20677-comparison.json
+//! cargo run --locked --release -p mlx-llm --bin sc20677_capture_kv -- parent \
+//!     --snapshot <llama-4bit-snapshot> --prompt-file <prompt.txt> --tokens 8192 \
+//!     --layers 0,mid,last --safety-policy <policy.json> --out /abs/sc20677-kv-llama && \
+//! cargo run --locked --release -p mlx-llm --bin sc20677_kv_candidates -- \
+//!     $(for f in /abs/sc20677-kv-llama/*.safetensors; do printf -- '--kv %s ' "$f"; done) \
+//!     --warm-iterations 20 --out /abs/sc20677-comparison-llama.json
 //! ```
 
 use std::collections::BTreeMap;
@@ -209,18 +213,23 @@ impl CompressedKvCandidate for GroupAffineCandidate {
         })())
     }
 
-    fn kernel_profile(&self) -> super::KernelProfile {
-        let tuning = self.kernel.tuning_profile(self.geometry.head_dim);
+    /// The kernel the retained reader selects for this request's query length (per-row decode
+    /// kernel or tiled multi-row kernel), as `PackedMetalKernel::kernel_descriptor` reports it.
+    fn kernel_profile(&self, request: &CandidateAttentionRequest) -> super::KernelProfile {
+        let descriptor = self
+            .kernel
+            .kernel_descriptor(request.query_len, self.geometry.head_dim);
         super::KernelProfile {
-            kernel: "sc20676_split_kv_simdgroup".into(),
-            threads_per_threadgroup: tuning.map_or(0, |t| t.threads),
-            simd_groups: tuning.map_or(0, |t| t.simd_groups),
-            gpu_family: tuning.map_or("unsupported".into(), |t| t.gpu_family.into()),
-            // Barriers occur only in the once-per-threadgroup SIMD-group merge, never per token.
-            threadgroup_barriers_per_kv_token: 0,
-            softmax_state: "registers per SIMD group (simd_sum), merged once through threadgroup \
-                            memory; split-KV partials merged by a reduce pass"
-                .into(),
+            kernel: descriptor.map_or("unsupported".into(), |d| d.kernel.into()),
+            threads_per_threadgroup: descriptor.map_or(0, |d| d.threads),
+            simd_groups: descriptor.map_or(0, |d| d.simd_groups),
+            gpu_family: descriptor.map_or("unsupported".into(), |_| {
+                self.kernel.gpu_family().as_str().into()
+            }),
+            kv_block_tokens: descriptor.map_or(0, |d| d.kv_block_tokens),
+            threadgroup_barriers_per_kv_block: descriptor
+                .map_or(0, |d| d.threadgroup_barriers_per_kv_block),
+            softmax_state: descriptor.map_or("unsupported".into(), |d| d.softmax_state.into()),
             extra_mlx_ops_per_attend: 0,
             // The host-reference cache syncs its device mirror inside `dispatch_packed`: appended
             // deltas plus a re-upload of the bounded (< one group) pending K tail.
@@ -645,7 +654,7 @@ fn measure_accepted(
             dense_fp16_kv_bytes(request) as f64 / representation.representation_bytes as f64,
         ),
         representation: Some(representation),
-        kernel: Some(candidate.kernel_profile()),
+        kernel: Some(candidate.kernel_profile(request)),
         timing: Some(Timing {
             encode_ms,
             device_sync_ms: (candidate.family() != "group-affine").then_some(sync_ms),
@@ -1365,7 +1374,8 @@ mod tests {
             let kernel = result.kernel.as_ref().unwrap();
             let group_affine = result.family == "group-affine";
             assert_eq!(kernel.host_staging_inside_attend, group_affine);
-            assert_eq!(kernel.threadgroup_barriers_per_kv_token, 0);
+            // Conservative-family reader: the per-row kernel, whose barriers are only in the merge.
+            assert_eq!(kernel.threadgroup_barriers_per_kv_block, 0);
             assert_eq!(
                 kernel.extra_mlx_ops_per_attend,
                 if group_affine { 0 } else { 6 }
@@ -1522,5 +1532,67 @@ mod tests {
             load_captured_case(&path, Some(PackedAttentionMask::Causal), Some(0.5)).unwrap();
         assert_eq!(overridden.request.mask, PackedAttentionMask::Causal);
         assert_eq!(overridden.request.scale, 0.5);
+    }
+
+    /// The group-affine receipt describes the kernel the reader actually selects for the
+    /// request: the conservative reader stays per-row for any `S_q`, the qualified reader reports
+    /// the tiled geometry from its per-D threshold and the per-row geometry below it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn group_affine_kernel_profile_follows_the_selected_path() {
+        use crate::primitives::packed_metal::PackedMetalGpuFamily;
+        let request = |query_len| {
+            synthetic_case(
+                SyntheticShape {
+                    batch: 1,
+                    query_heads: 4,
+                    kv_heads: 2,
+                    query_len,
+                    kv_len: 64,
+                    head_dim: 128,
+                },
+                3,
+                PackedAttentionMask::Causal,
+                None,
+            )
+            .request
+        };
+        let mut candidate = GroupAffineCandidate::new(1, 2, 128).unwrap();
+        let conservative = candidate.kernel_profile(&request(64));
+        assert_eq!(conservative.kernel, "sc20676_split_kv_simdgroup");
+        assert_eq!(
+            (
+                conservative.threads_per_threadgroup,
+                conservative.simd_groups
+            ),
+            (32, 1)
+        );
+        assert_eq!(conservative.gpu_family, "conservative-unknown-apple");
+        candidate.kernel = Arc::new(
+            PackedMetalKernel::for_identity_and_family(
+                GROUP_AFFINE_IDENTITY,
+                PackedMetalGpuFamily::Apple7OrNewer,
+            )
+            .unwrap(),
+        );
+        let decode = candidate.kernel_profile(&request(15));
+        assert_eq!(decode.kernel, "sc20676_split_kv_simdgroup");
+        assert_eq!(
+            (decode.threads_per_threadgroup, decode.simd_groups),
+            (256, 8)
+        );
+        assert_eq!(decode.threadgroup_barriers_per_kv_block, 0);
+        let tiled = candidate.kernel_profile(&request(16));
+        assert_eq!(tiled.kernel, "sc20676_tiled_multi_row_simdgroup_matrix");
+        assert_eq!((tiled.threads_per_threadgroup, tiled.simd_groups), (128, 4));
+        assert_eq!(
+            (
+                tiled.kv_block_tokens,
+                tiled.threadgroup_barriers_per_kv_block
+            ),
+            (16, 2)
+        );
+        assert_eq!(tiled.gpu_family, "apple7-or-newer");
     }
 }
