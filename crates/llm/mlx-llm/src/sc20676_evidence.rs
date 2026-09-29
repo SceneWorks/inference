@@ -168,9 +168,26 @@ pub struct Sc20676KernelProfile {
     pub gpu_family: String,
     pub qualification: String,
     pub head_dimension: u64,
+    /// Per-row (decode) kernel geometry.
     pub threads: u64,
     pub simd_groups: u64,
     pub values_per_thread: u64,
+    /// The tiled multi-row kernel's geometry when the reader selects it for a step this run can
+    /// issue (`PackedMetalKernel::kernel_descriptor`); absent when every step runs per-row, as on
+    /// the conservative profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_row: Option<Sc20676MultiRowKernel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Sc20676MultiRowKernel {
+    pub kernel: String,
+    pub min_query_tokens: u64,
+    pub threads: u64,
+    pub simd_groups: u64,
+    pub kv_block_tokens: u64,
+    pub threadgroup_barriers_per_kv_block: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -635,6 +652,8 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         || profile.threads != 32
         || profile.simd_groups != 1
         || profile.values_per_thread != expected_values_per_thread
+        // The conservative profile never selects the tiled multi-row kernel.
+        || profile.multi_row.is_some()
     {
         return Err("SC-20676 packed kernel profile is not bound to the measured device".into());
     }
@@ -1773,6 +1792,20 @@ pub fn run_sc20676_worker(
             .map_err(|_| "SC-20676 SIMD-group count does not fit u64")?,
         values_per_thread: u64::try_from(tuning.values_per_thread)
             .map_err(|_| "SC-20676 values-per-thread count does not fit u64")?,
+        // The longest step this run issues is the whole prompt; decode steps are one row.
+        multi_row: kernel
+            .kernel_descriptor(ids.len(), head_dimension)
+            .filter(|_| kernel.selects_tiled(ids.len(), head_dimension))
+            .map(|descriptor| Sc20676MultiRowKernel {
+                kernel: descriptor.kernel.into(),
+                min_query_tokens: crate::primitives::packed_tiled_min_query_tokens(head_dimension)
+                    as u64,
+                threads: descriptor.threads as u64,
+                simd_groups: descriptor.simd_groups as u64,
+                kv_block_tokens: descriptor.kv_block_tokens as u64,
+                threadgroup_barriers_per_kv_block: descriptor.threadgroup_barriers_per_kv_block
+                    as u64,
+            }),
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let retained = CompiledKernelHandle::new(Arc::new(kernel));
@@ -2880,6 +2913,7 @@ mod tests {
                 threads: 32,
                 simd_groups: 1,
                 values_per_thread: 2,
+                multi_row: None,
             }),
             packed: packed.then(packed_evidence),
             warm_packed: packed.then_some(PackedCacheEvidence {
@@ -3454,6 +3488,23 @@ mod tests {
             .gpu_family = "apple7-or-newer".into();
         reseal_arm(&mut wrong_family.packed);
         assert!(validate_sc20676_receipt_core(&wrong_family).is_err());
+
+        let mut claimed_tiled = valid.clone();
+        claimed_tiled
+            .packed
+            .kernel_profile
+            .as_mut()
+            .unwrap()
+            .multi_row = Some(Sc20676MultiRowKernel {
+            kernel: "sc20676_tiled_multi_row_simdgroup_matrix".into(),
+            min_query_tokens: 16,
+            threads: 128,
+            simd_groups: 4,
+            kv_block_tokens: 32,
+            threadgroup_barriers_per_kv_block: 2,
+        });
+        reseal_arm(&mut claimed_tiled.packed);
+        assert!(validate_sc20676_receipt_core(&claimed_tiled).is_err());
 
         let mut wrong_geometry = valid;
         wrong_geometry

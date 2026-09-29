@@ -231,7 +231,10 @@ pub struct KernelProfile {
     pub threads_per_threadgroup: usize,
     pub simd_groups: usize,
     pub gpu_family: String,
-    pub threadgroup_barriers_per_kv_token: usize,
+    /// KV tokens per barrier-delimited streaming step.
+    pub kv_block_tokens: usize,
+    /// Threadgroup barriers per KV block in the streaming loop.
+    pub threadgroup_barriers_per_kv_block: usize,
     /// Where the online-softmax running max/normalizer live.
     pub softmax_state: String,
     /// MLX ops dispatched around the kernel on every attend (query/output rotation and casts).
@@ -249,7 +252,8 @@ pub(crate) fn rotated_kernel_profile(kernel: &str) -> KernelProfile {
         threads_per_threadgroup: 32,
         simd_groups: 1,
         gpu_family: "any-apple (fixed one-SIMD-group geometry)".into(),
-        threadgroup_barriers_per_kv_token: 0,
+        kv_block_tokens: 1,
+        threadgroup_barriers_per_kv_block: 0,
         softmax_state: "registers (simd_sum)".into(),
         extra_mlx_ops_per_attend: 6,
         host_staging_inside_attend: false,
@@ -280,7 +284,9 @@ pub trait CompressedKvCandidate {
     ) -> Option<Result<Array>> {
         None
     }
-    fn kernel_profile(&self) -> KernelProfile;
+    /// Geometry of the kernel `attend` dispatches for `request` (a reader may select different
+    /// kernels for decode and multi-row steps).
+    fn kernel_profile(&self, request: &CandidateAttentionRequest) -> KernelProfile;
     /// Oracle-only full reconstruction `[B,Hkv,S,D]` in the original domain. Counted.
     fn dequantize_dense_for_oracle(&mut self) -> Result<(Vec<f32>, Vec<f32>)>;
     /// The query the representation's score estimator effectively uses (identity unless the

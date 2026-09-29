@@ -17,8 +17,9 @@
 //! The causal/sliding bound is applied to the range before it is split, so masked tokens are never
 //! visited. The kernel never materializes dense historical K/V or an `S_q×S_kv` score tensor.
 //!
-//! Multi-row steps (chunked prefill after the first chunk, speculative verify) use a tiled
-//! flash-attention kernel instead once `S_q` reaches [`PACKED_TILED_MIN_QUERY_TOKENS`]: the per-row
+//! On the qualified [`PackedMetalGpuFamily::Apple7OrNewer`] profile, multi-row steps (chunked
+//! prefill after the first chunk, speculative verify) use a tiled flash-attention kernel instead
+//! once `S_q` reaches [`packed_tiled_min_query_tokens`]: the per-row
 //! kernel re-decodes the whole compressed history for every query row. A tiled threadgroup owns 32
 //! query rows (query position × GQA head sharing one KV head) and streams the visible KV range in
 //! blocks; each packed K/V block is dequantized once into block-sized threadgroup tiles and reused by
@@ -65,9 +66,11 @@ pub enum PackedMask {
     AdditiveUnsupported,
 }
 
-/// Explicit GPU-family tuning boundary. Unknown Apple GPUs run one SIMD group per threadgroup and
-/// rely on split-KV threadgroups for parallelism; qualified recent families use eight cooperating
-/// SIMD groups per threadgroup. No family outside this enum is silently assigned a geometry.
+/// Explicit GPU-family tuning boundary. Unknown Apple GPUs run only the per-row kernel with one SIMD
+/// group per threadgroup and rely on split-KV threadgroups for parallelism; qualified recent
+/// families use eight cooperating SIMD groups per threadgroup for the per-row kernel and select the
+/// tiled multi-row kernel (four SIMD groups, `simdgroup_matrix`) for multi-row steps. No family
+/// outside this enum is silently assigned a geometry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PackedMetalGpuFamily {
     #[default]
@@ -160,13 +163,36 @@ const TILED_TARGET_THREADGROUPS: usize = 512;
 /// reduction stay amortized.
 const TILED_MIN_TOKENS_PER_SPLIT: usize = 2048;
 
-/// Query tokens from which [`PackedMetalKernel::dispatch`] selects the tiled multi-row kernel; fewer
-/// rows keep the per-row split-KV kernel. Chosen from the SC-20676 synthetic crossover sweep
-/// (`tiled_threshold_crossover_sweep`, M5 Max, bf16, Hq = 24, Hkv = 8, D = 128): over a 32k history
-/// the tiled kernel wins from 8 rows (1.2 vs 2.1 ms) and by 1.7x at 16; over a 4k history the
-/// per-row kernel wins below ~24 rows but by at most 0.3 ms at 16. 16 bounds the short-history loss
-/// while taking most of the long-history gain.
-pub const PACKED_TILED_MIN_QUERY_TOKENS: usize = 16;
+/// Query tokens from which [`PackedMetalKernel::dispatch`] selects the tiled multi-row kernel on the
+/// qualified family; fewer rows keep the per-row split-KV kernel. Chosen per head dimension from the
+/// SC-20676 synthetic crossover sweep (`tiled_threshold_crossover_sweep`, M5 Max, bf16, Hq = 24,
+/// Hkv = 8, per-row kernel on the Apple7OrNewer profile), median ms per-row / tiled at `S_q = 16`:
+///
+/// * D = 64: 1.24 / 1.26 over 4k, 2.28 / 0.97 over 32k → 16.
+/// * D = 128: 0.64 / 0.73 over 4k, 2.43 / 1.34 over 32k → 16.
+/// * D = 256 (8-token blocks, 64 fp32 fragments per lane): 0.67 / 1.63 over 4k and 4.08 / 3.49
+///   over 32k at 16, but 1.23 / 1.65 and 7.85 / 5.01 at 32 → 32.
+pub const fn packed_tiled_min_query_tokens(head_dimension: usize) -> usize {
+    if head_dimension >= 256 {
+        32
+    } else {
+        16
+    }
+}
+
+/// Static geometry of one packed kernel path, for evidence and comparison receipts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedKernelDescriptor {
+    pub kernel: &'static str,
+    pub threads: usize,
+    pub simd_groups: usize,
+    /// KV tokens one barrier-delimited step covers.
+    pub kv_block_tokens: usize,
+    /// Threadgroup barriers per KV block in the streaming loop (the per-row kernel has none; its
+    /// only barriers are in the once-per-threadgroup merge).
+    pub threadgroup_barriers_per_kv_block: usize,
+    pub softmax_state: &'static str,
+}
 
 /// KV splits for the tiled kernel: enough threadgroups for occupancy, never fewer than
 /// 2048 visible tokens per split, at most 128 splits.
@@ -888,7 +914,7 @@ impl PackedMetalKernel {
 
     /// Bind a cache identity to an explicit GPU-family tuning profile. Callers may select the
     /// qualified recent-family profile only after their device probe; unknown devices retain the
-    /// conservative one-SIMD-group geometry.
+    /// conservative one-SIMD-group per-row geometry for every step (never the tiled kernel).
     pub fn for_identity_and_family(
         identity: impl Into<String>,
         gpu_family: PackedMetalGpuFamily,
@@ -964,15 +990,50 @@ impl PackedMetalKernel {
             })
     }
 
-    /// KV splits the heuristic selects for these arguments (1 = single pass).
+    /// KV splits of the kernel [`Self::planned_path`] selects (1 = single pass).
     pub fn planned_splits(&self, args: &PackedAttentionArgs<'_>) -> Result<usize> {
-        let validated = validate_dispatch(args)?;
-        let tuning = self.required_tuning(validated.head_dimension)?;
-        Ok(packed_kv_split_count(
-            validated.rows,
-            validated.visible_tokens,
-            tuning.simd_groups,
-        ))
+        Ok(match self.planned_path(args)? {
+            PackedKernelPath::PerRow { splits } | PackedKernelPath::Tiled { splits } => splits,
+        })
+    }
+
+    /// Whether a step of `query_tokens` rows at `head_dimension` runs the tiled kernel: only on the
+    /// qualified family, from [`packed_tiled_min_query_tokens`].
+    pub fn selects_tiled(&self, query_tokens: usize, head_dimension: usize) -> bool {
+        self.gpu_family == PackedMetalGpuFamily::Apple7OrNewer
+            && query_tokens >= packed_tiled_min_query_tokens(head_dimension)
+    }
+
+    /// Geometry of the kernel [`Self::dispatch`] runs for a step of `query_tokens` rows, or `None`
+    /// for an unsupported head dimension.
+    pub fn kernel_descriptor(
+        &self,
+        query_tokens: usize,
+        head_dimension: usize,
+    ) -> Option<PackedKernelDescriptor> {
+        let tuning = self.gpu_family.tuning(head_dimension)?;
+        Some(if self.selects_tiled(query_tokens, head_dimension) {
+            PackedKernelDescriptor {
+                kernel: "sc20676_tiled_multi_row_simdgroup_matrix",
+                threads: TILED_SIMD_GROUPS * SIMD_WIDTH,
+                simd_groups: TILED_SIMD_GROUPS,
+                kv_block_tokens: tiled_block_tokens(head_dimension),
+                threadgroup_barriers_per_kv_block: 2,
+                softmax_state: "registers per 8-row simdgroup_matrix fragment (two shuffles per \
+                                row reduction); K/V blocks dequantized once into threadgroup tiles; \
+                                split-KV partials merged by a reduce pass",
+            }
+        } else {
+            PackedKernelDescriptor {
+                kernel: "sc20676_split_kv_simdgroup",
+                threads: tuning.threads,
+                simd_groups: tuning.simd_groups,
+                kv_block_tokens: PACKED_METAL_QUANT_GROUP_SIZE,
+                threadgroup_barriers_per_kv_block: 0,
+                softmax_state: "registers per SIMD group (simd_sum), merged once through \
+                                threadgroup memory; split-KV partials merged by a reduce pass",
+            }
+        })
     }
 
     fn required_tuning(&self, head_dimension: usize) -> Result<PackedMetalTuning> {
@@ -983,11 +1044,10 @@ impl PackedMetalKernel {
         })
     }
 
-    /// Kernel and KV split count [`Self::dispatch`] selects: the tiled multi-row kernel from
-    /// [`PACKED_TILED_MIN_QUERY_TOKENS`] query tokens, the per-row kernel below that.
+    /// Kernel and KV split count [`Self::dispatch`] selects (see [`Self::selects_tiled`]).
     pub fn planned_path(&self, args: &PackedAttentionArgs<'_>) -> Result<PackedKernelPath> {
         let validated = validate_dispatch(args)?;
-        if validated.query_tokens >= PACKED_TILED_MIN_QUERY_TOKENS {
+        if self.selects_tiled(validated.query_tokens, validated.head_dimension) {
             return Ok(PackedKernelPath::Tiled {
                 splits: tiled_splits(&validated),
             });
@@ -1010,12 +1070,18 @@ impl PackedMetalKernel {
     }
 
     /// Run the tiled multi-row kernel regardless of `S_q`, with an explicit KV split count
-    /// (`None` = [`packed_tiled_split_count`]). Test, benchmark, and evidence seam.
+    /// (`None` = [`packed_tiled_split_count`]). Test, benchmark, and evidence seam; refused on the
+    /// conservative family, which never runs the tiled geometry.
     pub fn dispatch_tiled(
         &self,
         args: &PackedAttentionArgs<'_>,
         splits: Option<usize>,
     ) -> Result<Array> {
+        if self.gpu_family != PackedMetalGpuFamily::Apple7OrNewer {
+            return Err(Error::Unsupported(
+                "SC-20676 tiled kernel requires the qualified Apple7OrNewer profile".into(),
+            ));
+        }
         let validated = validate_dispatch(args)?;
         let splits = splits
             .unwrap_or_else(|| tiled_splits(&validated))
@@ -1578,9 +1644,9 @@ mod tests {
     const BENCH_KV_HEADS: i32 = 8;
     const BENCH_DIM: i32 = 128;
 
-    fn synthetic_packed_layer(total: i32) -> SyntheticPackedLayer {
+    fn synthetic_packed_layer(total: i32, d: i32) -> SyntheticPackedLayer {
         use mlx_rs::random::{normal, randint};
-        let (h, d) = (BENCH_KV_HEADS, BENCH_DIM);
+        let h = BENCH_KV_HEADS;
         let groups = total / 32;
         let codes = |shape: &[i32]| {
             randint::<_, i32>(0, 256, shape, None)
@@ -1647,16 +1713,12 @@ mod tests {
         }
     }
 
-    fn bench_query(rows: i32) -> Array {
-        let query = mlx_rs::random::normal::<f32>(
-            &[1, BENCH_QUERY_HEADS, rows, BENCH_DIM],
-            None,
-            None,
-            None,
-        )
-        .unwrap()
-        .as_dtype(Dtype::Bfloat16)
-        .unwrap();
+    fn bench_query(rows: i32, d: i32) -> Array {
+        let query =
+            mlx_rs::random::normal::<f32>(&[1, BENCH_QUERY_HEADS, rows, d], None, None, None)
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
         query.eval().unwrap();
         query
     }
@@ -1668,9 +1730,9 @@ mod tests {
         started.elapsed().as_secs_f64() * 1000.0
     }
 
-    /// SC-20676 threshold sweep (synthetic, one layer, bf16, Hq = 24, Hkv = 8, D = 128): per-row
-    /// kernel (both tuning families) vs tiled kernel for small `S_q` over 4k and 32k histories.
-    /// Median of five evaluated calls each after one warm call.
+    /// SC-20676 threshold sweep (synthetic, one layer, bf16, Hq = 24, Hkv = 8, D = 64/128/256):
+    /// per-row kernel (both tuning families) vs tiled kernel for small `S_q` over 4k and 32k
+    /// histories. Median of five evaluated calls each after one warm call.
     #[test]
     #[ignore = "GPU micro-benchmark; run explicitly with --ignored --nocapture"]
     fn tiled_threshold_crossover_sweep() {
@@ -1680,22 +1742,25 @@ mod tests {
             PackedMetalGpuFamily::Apple7OrNewer,
         )
         .unwrap();
-        let layer = synthetic_packed_layer(32_768);
         let median = |run: &dyn Fn() -> Array| {
             run().eval().unwrap();
             let mut samples = (0..5).map(|_| timed(run)).collect::<Vec<_>>();
             samples.sort_by(f64::total_cmp);
             samples[2]
         };
-        eprintln!("kv\tS_q\tper-row conservative ms\tper-row apple7 ms\ttiled ms");
-        for kv in [4096usize, 32_768] {
-            for rows in [1, 2, 4, 8, 12, 16, 24, 32, 64] {
-                let query = bench_query(rows);
-                let args = layer.args(&query, kv);
-                let per_row_c = median(&|| conservative.dispatch_with_splits(&args, None).unwrap());
-                let per_row_r = median(&|| recent.dispatch_with_splits(&args, None).unwrap());
-                let tiled = median(&|| recent.dispatch_tiled(&args, None).unwrap());
-                eprintln!("{kv}\t{rows}\t{per_row_c:.3}\t{per_row_r:.3}\t{tiled:.3}");
+        eprintln!("D\tkv\tS_q\tper-row conservative ms\tper-row apple7 ms\ttiled ms");
+        for d in [64, 128, 256] {
+            let layer = synthetic_packed_layer(32_768, d);
+            for kv in [4096usize, 32_768] {
+                for rows in [1, 2, 4, 8, 12, 16, 24, 32, 48, 64] {
+                    let query = bench_query(rows, d);
+                    let args = layer.args(&query, kv);
+                    let per_row_c =
+                        median(&|| conservative.dispatch_with_splits(&args, None).unwrap());
+                    let per_row_r = median(&|| recent.dispatch_with_splits(&args, None).unwrap());
+                    let tiled = median(&|| recent.dispatch_tiled(&args, None).unwrap());
+                    eprintln!("{d}\t{kv}\t{rows}\t{per_row_c:.3}\t{per_row_r:.3}\t{tiled:.3}");
+                }
             }
         }
     }
@@ -1708,7 +1773,7 @@ mod tests {
             PackedMetalGpuFamily::Apple7OrNewer,
         )
         .unwrap();
-        let layer = synthetic_packed_layer(total);
+        let layer = synthetic_packed_layer(total, BENCH_DIM);
         let dense = || {
             let array = mlx_rs::random::normal::<f32>(
                 &[1, BENCH_KV_HEADS, total, BENCH_DIM],
@@ -1726,7 +1791,7 @@ mod tests {
         let scale = (BENCH_DIM as f32).powf(-0.5);
         eprintln!("total\tchunk\tpath\tchunks\tmean ms/chunk\tlast-chunk ms\ttotal ms");
         for chunk in [512, 2048] {
-            let query = bench_query(chunk);
+            let query = bench_query(chunk, BENCH_DIM);
             let chunks = total / chunk;
             // Warm every pipeline once on the first chunk's geometry.
             let warm = layer.args(&query, chunk as usize);

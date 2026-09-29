@@ -6259,13 +6259,17 @@ mod tests {
     /// The tiled multi-row reader against the independent fp32 oracle at the existing tolerances:
     /// `S_q` 9/33/128/257 (partial last tiles, several tiles, rows spanning GQA heads), K and V
     /// residual tails beside packed groups, causal rows offset to the end of the KV range, GQA 1–3,
-    /// a sliding window narrower than the chunk, head dimensions 64/128/256, all query dtypes, and
+    /// a sliding window narrower than the chunk (also at D = 256), the host-mirror layout whose V rows
+    /// are fully packed while K keeps a residual tail (`value_packed != key_packed`), head
+    /// dimensions 64/128/256, all query dtypes, and
     /// forced KV split counts (the partial + reduction path), each agreeing with the single pass.
     #[cfg(target_os = "macos")]
     #[test]
     fn tiled_reader_matches_independent_fp32_oracle_for_multi_row_steps() {
         use crate::primitives::packed_attention::PackedAttentionShape;
-        use crate::primitives::packed_metal::{PackedMask, PackedMetalKernel};
+        use crate::primitives::packed_metal::{
+            PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+        };
         let cases = [
             (
                 Dtype::Float32,
@@ -6331,8 +6335,32 @@ mod tests {
                 128,
                 PackedAttentionMask::SlidingWindow(200),
             ),
+            (
+                Dtype::Float32,
+                256,
+                1,
+                2,
+                300,
+                33,
+                PackedAttentionMask::SlidingWindow(90),
+            ),
+            // Host reference cache: V rows quantize per token, K keeps its incomplete group dense.
+            (
+                Dtype::Float32,
+                128,
+                2,
+                4,
+                333,
+                33,
+                PackedAttentionMask::Causal,
+            ),
         ];
-        let kernel = PackedMetalKernel::for_identity("tiled").unwrap();
+        const HOST_MIRROR_CASE: usize = 9;
+        let kernel = PackedMetalKernel::for_identity_and_family(
+            "tiled",
+            PackedMetalGpuFamily::Apple7OrNewer,
+        )
+        .unwrap();
         let mut maxima = Vec::new();
         for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
             cases.into_iter().enumerate()
@@ -6358,17 +6386,21 @@ mod tests {
                 .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
                 .collect::<Vec<_>>();
             let mut cache = device_cache(batch, kv_heads, width);
-            cache
-                .append_device(
-                    0,
-                    &bhsd(&keys, batch, kv_heads, tokens, width)
-                        .as_dtype(dtype)
-                        .unwrap(),
-                    &bhsd(&values, batch, kv_heads, tokens, width)
-                        .as_dtype(dtype)
-                        .unwrap(),
-                )
-                .unwrap();
+            if index == HOST_MIRROR_CASE {
+                cache.append(0, &keys, &values, tokens).unwrap();
+            } else {
+                cache
+                    .append_device(
+                        0,
+                        &bhsd(&keys, batch, kv_heads, tokens, width)
+                            .as_dtype(dtype)
+                            .unwrap(),
+                        &bhsd(&values, batch, kv_heads, tokens, width)
+                            .as_dtype(dtype)
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
             let query = bhsd(&queries, batch, query_heads, query_len, width)
                 .as_dtype(dtype)
                 .unwrap();
@@ -6396,12 +6428,17 @@ mod tests {
                 Dtype::Float16 => 4e-2,
                 _ => 8e-2,
             };
-            let layer = cache.device_layers[0].as_ref().unwrap();
+            let staged = cache.staged_reader_arguments(0).unwrap();
+            let args = staged.args(&query, packed_mask);
             assert!(
-                layer.key_tail_rows > 0 && layer.key_packed_tokens > 0,
+                args.key_packed_tokens > 0 && args.key_packed_tokens < tokens,
                 "case {index} exercises packed K groups and the K residual"
             );
-            let args = layer.args(&query, packed_mask);
+            assert_eq!(
+                args.value_packed_tokens == tokens,
+                index == HOST_MIRROR_CASE,
+                "only the host-mirror case packs every V row ahead of K"
+            );
             let mut single: Option<Vec<f32>> = None;
             let mut case_max = 0.0f32;
             for splits in [1, 2, 5] {
@@ -6431,51 +6468,76 @@ mod tests {
         eprintln!("tiled parity max abs error per case: {maxima:?}");
     }
 
-    /// `dispatch` routes multi-row steps to the tiled kernel and decode rows to the per-row
-    /// kernel; both agree with each other on the same arguments.
+    /// `dispatch` runs exactly the kernel `planned_path` names: on the qualified family the tiled
+    /// kernel from the per-D threshold (16 for D = 64/128, 32 for D = 256) and the per-row kernel
+    /// below it; on the conservative family always the per-row kernel (and the tiled seam is
+    /// refused). The routed output is bit-identical to the named path's output.
     #[cfg(target_os = "macos")]
     #[test]
-    fn dispatch_routes_multi_row_steps_to_the_tiled_kernel() {
+    fn dispatch_runs_the_path_planned_path_names() {
         use crate::primitives::packed_metal::{
-            PackedKernelPath, PackedMask, PackedMetalKernel, PACKED_TILED_MIN_QUERY_TOKENS,
+            packed_tiled_min_query_tokens, PackedKernelPath, PackedMask, PackedMetalGpuFamily,
+            PackedMetalKernel,
         };
-        let (width, tokens) = (128, 96);
-        let data = pseudo_random_outliers(1, 2, tokens, width, 9)
-            .into_iter()
-            .map(|value| value.clamp(-3.0, 3.0))
-            .collect::<Vec<_>>();
-        let mut cache = device_cache(1, 2, width);
-        let kv = bhsd(&data, 1, 2, tokens, width);
-        cache.append_device(0, &kv, &kv).unwrap();
-        let kernel = PackedMetalKernel::for_identity("route").unwrap();
-        let layer = cache.device_layers[0].as_ref().unwrap();
-        for query_len in [
-            1,
-            PACKED_TILED_MIN_QUERY_TOKENS - 1,
-            PACKED_TILED_MIN_QUERY_TOKENS,
-        ] {
-            let query = bhsd(
-                &(0..6 * query_len * width)
-                    .map(|i| ((i * 7 + 1) % 23) as f32 * 0.04 - 0.4)
-                    .collect::<Vec<_>>(),
-                1,
-                6,
-                query_len,
-                width,
-            );
-            let args = layer.args(&query, PackedMask::Causal);
-            let path = kernel.planned_path(&args).unwrap();
-            assert_eq!(
-                matches!(path, PackedKernelPath::Tiled { .. }),
-                query_len >= PACKED_TILED_MIN_QUERY_TOKENS,
-                "S_q {query_len}: {path:?}"
-            );
-            let routed = host_readback::<f32>(&kernel.dispatch(&args).unwrap());
-            let per_row = host_readback::<f32>(&kernel.dispatch_with_splits(&args, None).unwrap());
-            let tiled = host_readback::<f32>(&kernel.dispatch_tiled(&args, None).unwrap());
-            for ((routed, per_row), tiled) in routed.iter().zip(&per_row).zip(&tiled) {
-                assert!((per_row - tiled).abs() <= 1e-4, "{per_row} != {tiled}");
-                assert!(*routed == *per_row || *routed == *tiled);
+        assert_eq!(packed_tiled_min_query_tokens(64), 16);
+        assert_eq!(packed_tiled_min_query_tokens(128), 16);
+        assert_eq!(packed_tiled_min_query_tokens(256), 32);
+        let conservative = PackedMetalKernel::for_identity("route").unwrap();
+        let recent = PackedMetalKernel::for_identity_and_family(
+            "route",
+            PackedMetalGpuFamily::Apple7OrNewer,
+        )
+        .unwrap();
+        for width in [128, 256] {
+            let tokens = 96;
+            let data = pseudo_random_outliers(1, 2, tokens, width, 9)
+                .into_iter()
+                .map(|value| value.clamp(-3.0, 3.0))
+                .collect::<Vec<_>>();
+            let mut cache = device_cache(1, 2, width);
+            let kv = bhsd(&data, 1, 2, tokens, width);
+            cache.append_device(0, &kv, &kv).unwrap();
+            let layer = cache.device_layers[0].as_ref().unwrap();
+            let threshold = packed_tiled_min_query_tokens(width);
+            for query_len in [1, threshold - 1, threshold] {
+                let query = bhsd(
+                    &(0..6 * query_len * width)
+                        .map(|i| ((i * 7 + 1) % 23) as f32 * 0.04 - 0.4)
+                        .collect::<Vec<_>>(),
+                    1,
+                    6,
+                    query_len,
+                    width,
+                );
+                let args = layer.args(&query, PackedMask::Causal);
+                for (kernel, qualified) in [(&conservative, false), (&recent, true)] {
+                    let path = kernel.planned_path(&args).unwrap();
+                    let tiled_expected = qualified && query_len >= threshold;
+                    assert_eq!(
+                        matches!(path, PackedKernelPath::Tiled { .. }),
+                        tiled_expected,
+                        "D {width} S_q {query_len} qualified {qualified}: {path:?}"
+                    );
+                    let (PackedKernelPath::Tiled { splits } | PackedKernelPath::PerRow { splits }) =
+                        path;
+                    assert_eq!(kernel.planned_splits(&args).unwrap(), splits);
+                    let descriptor = kernel.kernel_descriptor(query_len, width).unwrap();
+                    assert_eq!(
+                        descriptor.kernel == "sc20676_tiled_multi_row_simdgroup_matrix",
+                        tiled_expected
+                    );
+                    let routed = host_readback::<f32>(&kernel.dispatch(&args).unwrap());
+                    let named = host_readback::<f32>(&match path {
+                        PackedKernelPath::Tiled { splits } => {
+                            kernel.dispatch_tiled(&args, Some(splits)).unwrap()
+                        }
+                        PackedKernelPath::PerRow { splits } => {
+                            kernel.dispatch_with_splits(&args, Some(splits)).unwrap()
+                        }
+                    });
+                    assert_eq!(routed, named, "D {width} S_q {query_len} {path:?}");
+                }
+                assert!(conservative.dispatch_tiled(&args, None).is_err());
             }
         }
     }
@@ -6489,11 +6551,18 @@ mod tests {
     #[allow(clippy::arc_with_non_send_sync)]
     fn decoder_chunked_prefill_uses_the_tiled_reader_without_dense_reconstruction() {
         use crate::primitives::packed_attention::PackedAttentionShape;
-        use crate::primitives::packed_metal::PackedMetalKernel;
+        use crate::primitives::packed_metal::{
+            PackedKernelPath, PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+        };
         let (heads, query_heads, width) = (2, 6, 128);
-        let reader = CompiledKernelHandle::new(Arc::new(
-            PackedMetalKernel::for_identity("decoder-tiled").unwrap(),
-        ));
+        let kernel = Arc::new(
+            PackedMetalKernel::for_identity_and_family(
+                "decoder-tiled",
+                PackedMetalGpuFamily::Apple7OrNewer,
+            )
+            .unwrap(),
+        );
+        let reader = CompiledKernelHandle::new(kernel.clone());
         let mut cache = select_decoder_cache_with_reader(
             PackedCacheRequest {
                 enabled: true,
@@ -6563,9 +6632,22 @@ mod tests {
                 },
                 PackedAttentionMask::Causal,
             );
-            for (actual, expected) in host_readback::<f32>(&output).iter().zip(&reference) {
+            let output = host_readback::<f32>(&output);
+            for (actual, expected) in output.iter().zip(&reference) {
                 assert!((actual - expected).abs() <= 1e-4, "{actual} != {expected}");
             }
+            // The step ran the tiled kernel: its output is bit-identical to a direct tiled
+            // dispatch over the same committed representation, which planned_path names.
+            let staged = packed.staged.staged_reader_arguments(0).unwrap();
+            let args = staged.args(&query, PackedMask::Causal);
+            let PackedKernelPath::Tiled { splits } = kernel.planned_path(&args).unwrap() else {
+                panic!("chunk {chunk} of {rows} rows did not plan the tiled kernel");
+            };
+            let tiled = host_readback::<f32>(&kernel.dispatch_tiled(&args, Some(splits)).unwrap());
+            assert_eq!(
+                output, tiled,
+                "chunk {chunk} output is not the tiled kernel's"
+            );
         }
         let evidence = cache.packed_evidence().unwrap();
         assert_eq!(evidence.accepted_direct_calls, 2);
