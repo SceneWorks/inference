@@ -218,9 +218,11 @@ def validate_host_memory(value: object) -> dict[str, object]:
 
 # Reads of one PID's footprint per watchdog tick: one read plus three immediate retries.
 FOOTPRINT_READS_PER_TICK = 4
-# Consecutive ticks whose footprint sample failed before the row stops as probe-failure.
-# The host-reserve watchdog keeps running on the failed ticks.
+# Consecutive ticks whose footprint (or host) sample failed before the row stops as
+# probe-failure. The other watchdog keeps running on the failed ticks.
 FOOTPRINT_FAILED_TICK_LIMIT = 5
+# Host reads per preflight or watchdog tick: one read plus three immediate retries.
+HOST_READS_PER_TICK = 4
 _RUSAGE_INFO_V4 = 4
 
 
@@ -262,6 +264,20 @@ def proc_pid_rusage_footprint(pid: int) -> tuple[int, int]:
         code = ctypes.get_errno()
         raise OSError(code, os.strerror(code))  # ESRCH constructs ProcessLookupError
     return info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint
+
+
+def read_host(probe: object) -> tuple[int, dict[str, object] | None]:
+    """One host measurement, retried immediately; probe-failure once every read failed."""
+    last = SupervisionError("probe-failure", "no host read attempted")
+    for _ in range(HOST_READS_PER_TICK):
+        try:
+            return probe.host_admission()
+        except SupervisionError as error:
+            if error.reason != "probe-failure":
+                raise
+            last = error
+    raise SupervisionError(
+        "probe-failure", f"host probe failed {HOST_READS_PER_TICK} reads; last error {last.detail}")
 
 
 def darwin_phys_footprint(pid: int, *, read: Callable[[int], tuple[int, int]] = proc_pid_rusage_footprint) -> int | None:
@@ -726,7 +742,10 @@ def _run_admitted(
     # and the live reserve watchdog below uses the same measure, so page cache alone never
     # aborts an admitted row. The components are recorded in the admission itself, so refused,
     # aborted and accepted rows all carry the decision's inputs.
-    host_free, host_memory = probe.host_admission()
+    try:
+        host_free, host_memory = read_host(probe)
+    except SupervisionError as error:
+        raise SupervisionError(error.reason, f"preflight {error.detail}") from error
     if policy.backend == "darwin-mlx":
         admission["hostMemoryComponents"] = host_memory
     if host_free < policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes:
@@ -768,6 +787,7 @@ def _run_admitted(
         peak_gpu = 0
         samples: list[dict[str, object]] = []
         failed_footprint_ticks = 0
+        failed_host_ticks = 0
         def check_artifact_caps() -> None:
             if stdout_path.stat().st_size > policy.stdout_cap_bytes or stderr_path.stat().st_size > policy.stderr_cap_bytes:
                 raise SupervisionError("log-cap", "child exceeded a bounded transcript file")
@@ -820,8 +840,22 @@ def _run_admitted(
                 finished = finished_result(status, pids, owned)
                 if finished is not None:
                     return finished
-                available, live_host = probe.host_admission()
-                if available < policy.host_free_reserve_bytes:
+                try:
+                    available, live_host = read_host(probe)
+                except SupervisionError as error:
+                    if error.reason != "probe-failure":
+                        raise
+                    # The child footprint watchdog keeps running on a failed host tick.
+                    failed_host_ticks += 1
+                    if failed_host_ticks >= FOOTPRINT_FAILED_TICK_LIMIT:
+                        raise SupervisionError(
+                            "probe-failure",
+                            f"live host probe failed on {failed_host_ticks} consecutive ticks; "
+                            f"last error {error.detail}") from error
+                    available, live_host = None, None
+                else:
+                    failed_host_ticks = 0
+                if available is not None and available < policy.host_free_reserve_bytes:
                     metric = live_host["metric"] if live_host is not None else "host-free"
                     error = SupervisionError(
                         "host-memory",

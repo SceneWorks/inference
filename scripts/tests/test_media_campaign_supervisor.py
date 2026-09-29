@@ -429,6 +429,64 @@ class SupervisorTests(unittest.TestCase):
         return stop, (f"import os, time\nwhile not os.path.exists({str(stop)!r}):\n"
                       "    time.sleep(.01)\n")
 
+    class HostScriptProbe(Probe):
+        """host_admission answers from a script: an exception instance raises, else passes."""
+        def __init__(self, script, after=None):
+            super().__init__()
+            self.script = list(script)
+            self.after = after
+            self.host_reads = 0
+        def host_admission(self):
+            self.host_reads += 1
+            if self.script:
+                step = self.script.pop(0)
+            else:
+                step = self.after() if self.after else None
+            if isinstance(step, BaseException):
+                raise step
+            return super().host_admission()
+
+    @staticmethod
+    def vm_stat_fault():
+        return safety.SupervisionError("probe-failure", "/usr/bin/vm_stat: exit status 1")
+
+    def test_host_preflight_retries_then_refuses_with_the_error(self):
+        probe = self.HostScriptProbe([self.vm_stat_fault()] * 3)
+        self.assertEqual(self.run_child("pass", probe=probe).returncode, 0)
+        self.assertGreaterEqual(probe.host_reads, 4)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        probe = self.HostScriptProbe([], after=self.vm_stat_fault)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child("open('spawned','w').close()", probe=probe)
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("preflight host probe failed 4 reads; last error /usr/bin/vm_stat: exit status 1",
+                      caught.exception.detail)
+        self.assertEqual(probe.host_reads, 4)
+        self.assertFalse((self.root / "spawned").exists())
+
+    def test_transient_host_failures_never_stop_a_row(self):
+        stop, script = self.stop_when_present_script()
+        fault = self.vm_stat_fault()
+        # Admission, four failed ticks, a good tick, four failed ticks: never five in a row.
+        probe = self.HostScriptProbe([None] + [fault] * 16 + [None] + [fault] * 16,
+                                     after=lambda: stop.touch())
+        result = self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(probe.host_reads, 34)
+
+    def test_sustained_host_failure_stops_with_detail_and_count(self):
+        _stop, script = self.stop_when_present_script()
+        probe = self.HostScriptProbe([None], after=self.vm_stat_fault)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("live host probe failed on 5 consecutive ticks; last error host probe "
+                      "failed 4 reads; last error /usr/bin/vm_stat: exit status 1",
+                      caught.exception.detail)
+        self.assertEqual(probe.host_reads, 1 + 5 * safety.HOST_READS_PER_TICK)
+
     def test_footprint_read_retries_within_a_tick_and_a_gone_pid_is_none(self):
         def reads(outcomes):
             calls = []

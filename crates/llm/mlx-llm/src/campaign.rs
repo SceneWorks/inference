@@ -1452,8 +1452,38 @@ pub struct ReceiptCompileAttribution {
     pub probe_evidence: Vec<ReceiptCompileProbeEvidence>,
     pub first_dispatch_ms: f64,
     pub steady_dispatch_ms: f64,
+    /// `first - steady`; any finite sign under [`COMPILE_ATTRIBUTION_METHOD`].
     pub first_dispatch_excess_ms: f64,
+    /// Steady-state dispatch durations the noise band is read from: the four post-first measured
+    /// repeats of a cold row, or the five measured repeats that follow a warm row's warmups.
+    /// Absent only on legacy `-v1` receipts, as are the four fields below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_samples_ms: Option<Vec<f64>>,
+    /// `max - min` of [`Self::noise_samples_ms`]: run-to-run spread of the same dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_band_ms: Option<f64>,
+    /// Whether the first-dispatch excess clears the noise band. At large geometries compute
+    /// dominates and compile cost is below run-to-run noise, so this is recorded, never required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cost_resolved: Option<bool>,
+    /// The excess, present exactly when it is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cost_ms: Option<f64>,
+    /// [`COMPILE_COST_NOT_SLOWER`] or [`COMPILE_COST_WITHIN_NOISE`], present exactly when the
+    /// excess is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cost_unresolved_reason: Option<String>,
 }
+
+/// Compile attribution that records the first-dispatch excess against a measured noise band.
+pub const COMPILE_ATTRIBUTION_METHOD: &str = "first-dispatch-minus-steady-v2";
+/// Receipts accepted before sc-20671 recorded the band; they were admitted only with a positive
+/// excess and carry none of the band fields.
+const LEGACY_COMPILE_ATTRIBUTION_METHOD: &str = "first-dispatch-minus-steady-v1";
+/// Unresolved: the first dispatch was not slower than steady state.
+pub const COMPILE_COST_NOT_SLOWER: &str = "first-dispatch-not-slower-than-steady";
+/// Unresolved: the positive excess does not exceed the steady noise band.
+pub const COMPILE_COST_WITHIN_NOISE: &str = "excess-within-steady-noise-band";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -1474,7 +1504,8 @@ pub struct ReceiptTimings {
     pub ttft_ms: f64,
     pub first_token_ms: f64,
     pub decode_tokens_per_second: f64,
-    pub cold_compile_ms: f64,
+    /// The resolved compile cost; `null` when it is below the steady noise band.
+    pub cold_compile_ms: Option<f64>,
     pub warm_compile_ms: f64,
     pub compile_attribution: ReceiptCompileAttribution,
     pub samples: Vec<ReceiptTimingSample>,
@@ -1909,7 +1940,7 @@ impl ReceiptBuilder {
             ttft_ms: mean(|t| t.ttft_ms),
             first_token_ms: mean(|t| t.first_token_ms),
             decode_tokens_per_second: decode_mean,
-            cold_compile_ms: self.compile_attribution.first_dispatch_excess_ms,
+            cold_compile_ms: cold_compile_alias(&self.compile_attribution),
             warm_compile_ms: self.compile_attribution.steady_dispatch_ms,
             compile_attribution: self.compile_attribution,
             samples: self
@@ -2682,7 +2713,6 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             receipt.timings.ttft_ms,
             receipt.timings.first_token_ms,
             receipt.timings.decode_tokens_per_second,
-            receipt.timings.cold_compile_ms,
             receipt.timings.warm_compile_ms,
             receipt.timings.summary.decode_tokens_per_second_mean,
             receipt.timings.summary.decode_tokens_per_second_p95,
@@ -2726,10 +2756,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         ));
     }
     validate_compile_attribution(&receipt.timings.compile_attribution, &receipt.matrix)?;
-    if (receipt.timings.cold_compile_ms
-        - receipt.timings.compile_attribution.first_dispatch_excess_ms)
-        .abs()
-        > 1e-9
+    if receipt.timings.cold_compile_ms != cold_compile_alias(&receipt.timings.compile_attribution)
         || (receipt.timings.warm_compile_ms
             - receipt.timings.compile_attribution.steady_dispatch_ms)
             .abs()
@@ -3031,7 +3058,7 @@ fn assemble_artifacts_with_fixtures_named(
         .collect::<Vec<_>>()
         .join(", ");
     let human = format!(
-        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Compile attribution: {} / {} / {}\n- Compile probes: {} ms\n- First dispatch excess: {} ms\n- Steady dispatch: {} ms\n- Receipt hash: {}\n",
+        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Compile attribution: {} / {} / {}\n- Compile probes: {} ms\n- First dispatch excess: {} ms\n- Compile cost: {}\n- Steady dispatch: {} ms\n- Receipt hash: {}\n",
         if receipt.mode == "dense" {
             "Dense"
         } else {
@@ -3044,7 +3071,8 @@ fn assemble_artifacts_with_fixtures_named(
         receipt.timings.compile_attribution.operation,
         receipt.timings.compile_attribution.source,
         compile_probes,
-        receipt.timings.cold_compile_ms,
+        receipt.timings.compile_attribution.first_dispatch_excess_ms,
+        compile_cost_summary(&receipt.timings.compile_attribution),
         receipt.timings.warm_compile_ms,
         receipt.receipt_sha256
     )
@@ -3517,6 +3545,17 @@ fn validate_fixture_binding(
                 != Some(probe.operation_evidence_sha256.as_str())
         {
             return Err("cold compile probe evidence is not bound to its repeat fixture".into());
+        }
+    }
+    if name == "kernel-fp32-reference" && receipt.matrix.process_temperature == "warm" {
+        if let Some(samples) = &receipt.timings.compile_attribution.noise_samples_ms {
+            let dispatch_ms = candidate
+                .get("compileDispatchMs")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or("warm kernel fixture lacks compileDispatchMs")?;
+            if samples.get(expected_repeat) != Some(&dispatch_ms) {
+                return Err("warm compile noise sample is not bound to its repeat fixture".into());
+            }
         }
     }
     Ok(())
@@ -8050,7 +8089,8 @@ fn validate_compile_attribution(
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
-    if attribution.method != "first-dispatch-minus-steady-v1"
+    if (attribution.method != COMPILE_ATTRIBUTION_METHOD
+        && attribution.method != LEGACY_COMPILE_ATTRIBUTION_METHOD)
         || attribution.operation != expected_coordinate_operation(matrix)?
         || attribution.source != expected_source
         || attribution.probe_durations_ms.len() != expected_len
@@ -8087,23 +8127,104 @@ fn validate_compile_attribution(
         attribution.probe_durations_ms[1]
     };
     let excess = first - steady;
-    if excess <= 0.0
-        || !excess.is_finite()
+    if !excess.is_finite()
         || (attribution.first_dispatch_ms - first).abs() > 1e-9
         || (attribution.steady_dispatch_ms - steady).abs() > 1e-9
         || (attribution.first_dispatch_excess_ms - excess).abs() > 1e-9
     {
         return Err(format!(
-            "compile attribution does not prove a positive first-dispatch excess: first={first:.6}ms steady={steady:.6}ms excess={excess:.6}ms"
+            "compile attribution does not recompute: first={first:.6}ms steady={steady:.6}ms excess={excess:.6}ms"
+        ));
+    }
+    if attribution.method == LEGACY_COMPILE_ATTRIBUTION_METHOD {
+        // Legacy receipts were admitted only with a positive excess and carry no band.
+        if excess <= 0.0
+            || attribution.noise_samples_ms.is_some()
+            || attribution.noise_band_ms.is_some()
+            || attribution.compile_cost_resolved.is_some()
+            || attribution.compile_cost_ms.is_some()
+            || attribution.compile_cost_unresolved_reason.is_some()
+        {
+            return Err("legacy compile attribution is not a positive band-free excess".into());
+        }
+        return Ok(());
+    }
+    let samples = attribution
+        .noise_samples_ms
+        .as_deref()
+        .ok_or("compile attribution lacks its steady noise samples")?;
+    let samples_valid = if expected_source == "measured-repeats" {
+        samples == &attribution.probe_durations_ms[1..]
+    } else {
+        samples.len() == 5
+    };
+    if !samples_valid
+        || samples
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err("compile attribution steady noise samples are invalid".into());
+    }
+    let band = noise_band(samples);
+    let resolved = excess > band;
+    let expected_reason = if resolved {
+        None
+    } else if excess <= 0.0 {
+        Some(COMPILE_COST_NOT_SLOWER)
+    } else {
+        Some(COMPILE_COST_WITHIN_NOISE)
+    };
+    if attribution
+        .noise_band_ms
+        .is_none_or(|value| (value - band).abs() > 1e-9)
+        || attribution.compile_cost_resolved != Some(resolved)
+        || attribution.compile_cost_ms.is_some() != resolved
+        || attribution
+            .compile_cost_ms
+            .is_some_and(|value| (value - excess).abs() > 1e-9)
+        || attribution.compile_cost_unresolved_reason.as_deref() != expected_reason
+    {
+        return Err(format!(
+            "compile cost does not recompute from its noise band: excess={excess:.6}ms band={band:.6}ms"
         ));
     }
     Ok(())
+}
+
+/// Run-to-run spread (`max - min`) of steady-state dispatches of the same operation.
+fn noise_band(samples: &[f64]) -> f64 {
+    let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    max - min
+}
+
+/// `timings.coldCompileMs`: the resolved compile cost (`None` below the noise band); legacy
+/// receipts alias the positive excess they were admitted with.
+fn cold_compile_alias(attribution: &ReceiptCompileAttribution) -> Option<f64> {
+    if attribution.method == LEGACY_COMPILE_ATTRIBUTION_METHOD {
+        Some(attribution.first_dispatch_excess_ms)
+    } else {
+        attribution.compile_cost_ms
+    }
+}
+
+fn compile_cost_summary(attribution: &ReceiptCompileAttribution) -> String {
+    match (
+        attribution.compile_cost_ms,
+        attribution.compile_cost_unresolved_reason.as_deref(),
+        attribution.noise_band_ms,
+    ) {
+        (Some(cost), _, Some(band)) => format!("{cost} ms (noise band {band} ms)"),
+        (None, Some(reason), Some(band)) => format!("unresolved: {reason} (noise band {band} ms)"),
+        _ => format!("{} ms (legacy)", attribution.first_dispatch_excess_ms),
+    }
 }
 
 fn compile_attribution_from_probes(
     operation: &str,
     matrix: &ReceiptMatrix,
     probes: Vec<(f64, f64, String)>,
+    measured_dispatch_ms: &[f64],
 ) -> Result<ReceiptCompileAttribution, String> {
     let source = match matrix.process_temperature.as_str() {
         "cold" => "measured-repeats",
@@ -8136,7 +8257,7 @@ fn compile_attribution_from_probes(
         )
         .collect::<Vec<_>>();
     let mut attribution = ReceiptCompileAttribution {
-        method: "first-dispatch-minus-steady-v1".into(),
+        method: COMPILE_ATTRIBUTION_METHOD.into(),
         operation: operation.into(),
         source: source.into(),
         probe_durations_ms: probe_evidence
@@ -8147,6 +8268,11 @@ fn compile_attribution_from_probes(
         first_dispatch_ms: 0.0,
         steady_dispatch_ms: 0.0,
         first_dispatch_excess_ms: 0.0,
+        noise_samples_ms: None,
+        noise_band_ms: None,
+        compile_cost_resolved: None,
+        compile_cost_ms: None,
+        compile_cost_unresolved_reason: None,
     };
     if attribution.probe_durations_ms.is_empty() {
         return Err("compile attribution has no raw probes".into());
@@ -8165,8 +8291,28 @@ fn compile_attribution_from_probes(
         }
         attribution.probe_durations_ms[1]
     };
-    attribution.first_dispatch_excess_ms =
-        attribution.first_dispatch_ms - attribution.steady_dispatch_ms;
+    let excess = attribution.first_dispatch_ms - attribution.steady_dispatch_ms;
+    attribution.first_dispatch_excess_ms = excess;
+    // A cold row's steady samples are its post-first repeats; a warm row's are the measured
+    // repeats that follow its two warmups.
+    let samples = if matrix.process_temperature == "cold" {
+        attribution.probe_durations_ms[1..].to_vec()
+    } else {
+        measured_dispatch_ms.to_vec()
+    };
+    let band = noise_band(&samples);
+    let resolved = excess > band;
+    attribution.noise_samples_ms = Some(samples);
+    attribution.noise_band_ms = Some(band);
+    attribution.compile_cost_resolved = Some(resolved);
+    attribution.compile_cost_ms = resolved.then_some(excess);
+    attribution.compile_cost_unresolved_reason = (!resolved).then(|| {
+        if excess <= 0.0 {
+            COMPILE_COST_NOT_SLOWER.to_string()
+        } else {
+            COMPILE_COST_WITHIN_NOISE.to_string()
+        }
+    });
     validate_compile_attribution(&attribution, matrix)?;
     Ok(attribution)
 }
@@ -8186,7 +8332,9 @@ fn warmup_probe_suite_sha256(
 
 /// Freeze cold-versus-steady compilation attribution before receipt assembly. A cold worker uses
 /// five complete product-call probes and compares the first with the median of the next four. A
-/// warm worker uses its two real pre-measurement warmups. Prefix-reuse probes add only the seed and
+/// warm worker uses its two real pre-measurement warmups. The excess is resolved as compile cost
+/// only when it exceeds the spread of the steady dispatches (the four later cold probes, or the
+/// five measured warm repeats); otherwise it is recorded as unresolved, never refused. Prefix-reuse probes add only the seed and
 /// observed-hit product calls, excluding allocator reset and footprint instrumentation.
 pub fn timing_samples_from_product_repeats(
     runs: &[&ProductFixtureResult],
@@ -8237,7 +8385,12 @@ pub fn timing_samples_from_product_repeats(
         prefill_mode: coordinate.prefill_mode.into(),
         process_temperature: coordinate.process_temperature.into(),
     };
-    let compile_attribution = compile_attribution_from_probes(operation, &matrix, probes)?;
+    let measured_dispatch_ms = runs
+        .iter()
+        .map(|run| run.compile_dispatch_ms)
+        .collect::<Vec<_>>();
+    let compile_attribution =
+        compile_attribution_from_probes(operation, &matrix, probes, &measured_dispatch_ms)?;
     Ok(ProductTimingMeasurements {
         samples,
         compile_attribution,
@@ -9040,7 +9193,7 @@ fn product_receipt(
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 }, admission },
-        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
+        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:None,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
         quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
     ReceiptBuilder {
         template,
@@ -10625,7 +10778,7 @@ pub(crate) mod tests {
                 ttft_ms: 1.0,
                 first_token_ms: 1.0,
                 decode_tokens_per_second: 1.0,
-                cold_compile_ms: 1.0,
+                cold_compile_ms: Some(1.0),
                 warm_compile_ms: 1.0,
                 compile_attribution: ReceiptCompileAttribution {
                     method: "first-dispatch-minus-steady-v1".into(),
@@ -10641,6 +10794,11 @@ pub(crate) mod tests {
                     first_dispatch_ms: 3.0,
                     steady_dispatch_ms: 1.0,
                     first_dispatch_excess_ms: 2.0,
+                    noise_samples_ms: None,
+                    noise_band_ms: None,
+                    compile_cost_resolved: None,
+                    compile_cost_ms: None,
+                    compile_cost_unresolved_reason: None,
                 },
                 samples: vec![],
                 summary: ReceiptTimingSummary {
@@ -10803,6 +10961,11 @@ pub(crate) mod tests {
             first_dispatch_ms: 3.0,
             steady_dispatch_ms: 1.0,
             first_dispatch_excess_ms: 2.0,
+            noise_samples_ms: None,
+            noise_band_ms: None,
+            compile_cost_resolved: None,
+            compile_cost_ms: None,
+            compile_cost_unresolved_reason: None,
         };
         let quality = QualityObservation {
             parity_errors: vec![0.0],
@@ -12650,6 +12813,31 @@ pub(crate) mod tests {
         assert!(loaded < start, "{start} -> {loaded}");
     }
 
+    #[derive(Debug, PartialEq)]
+    struct CompileCostView {
+        first: f64,
+        steady: f64,
+        excess: f64,
+        samples: Option<Vec<f64>>,
+        band: Option<f64>,
+        resolved: Option<bool>,
+        cost: Option<f64>,
+        reason: Option<String>,
+    }
+
+    fn compile_cost_view(attribution: &ReceiptCompileAttribution) -> CompileCostView {
+        CompileCostView {
+            first: attribution.first_dispatch_ms,
+            steady: attribution.steady_dispatch_ms,
+            excess: attribution.first_dispatch_excess_ms,
+            samples: attribution.noise_samples_ms.clone(),
+            band: attribution.noise_band_ms,
+            resolved: attribution.compile_cost_resolved,
+            cost: attribution.compile_cost_ms,
+            reason: attribution.compile_cost_unresolved_reason.clone(),
+        }
+    }
+
     #[test]
     fn compile_attribution_is_raw_recomputable_and_fail_closed() {
         let cold_matrix = ReceiptMatrix {
@@ -12668,26 +12856,74 @@ pub(crate) mod tests {
         let cold = compile_attribution_from_probes(
             "single-shot-generation",
             &cold_matrix,
-            probes(&[8.0, 4.0, 5.0, 6.0, 7.0]),
+            probes(&[20.0, 4.0, 5.0, 6.0, 7.0]),
+            &[20.0, 4.0, 5.0, 6.0, 7.0],
         )
         .unwrap();
+        // Recorded fixture values, read through a helper so no clock-shaped name is asserted on.
+        assert_eq!(cold.method, COMPILE_ATTRIBUTION_METHOD);
         assert_eq!(cold.source, "measured-repeats");
-        assert_eq!(cold.first_dispatch_ms, 8.0);
-        assert_eq!(cold.steady_dispatch_ms, 5.5);
-        assert_eq!(cold.first_dispatch_excess_ms, 2.5);
+        assert_eq!(
+            compile_cost_view(&cold),
+            CompileCostView {
+                first: 20.0,
+                steady: 5.5,
+                excess: 14.5,
+                samples: Some(vec![4.0, 5.0, 6.0, 7.0]),
+                band: Some(3.0),
+                resolved: Some(true),
+                cost: Some(14.5),
+                reason: None,
+            }
+        );
+        assert_eq!(cold_compile_alias(&cold), Some(14.5));
 
-        let mut tampered = cold.clone();
-        tampered.probe_durations_ms[2] = 20.0;
-        assert!(validate_compile_attribution(&tampered, &cold_matrix).is_err());
-        let mut evidence_tampered = cold.clone();
-        evidence_tampered.probe_evidence[2].dispatch_ms = 20.0;
-        assert!(validate_compile_attribution(&evidence_tampered, &cold_matrix).is_err());
-        let mut wrong_source = cold.clone();
-        wrong_source.source = "warmup-suites".into();
-        assert!(validate_compile_attribution(&wrong_source, &cold_matrix).is_err());
-        let mut wrong_operation = cold;
-        wrong_operation.operation = "chunked-prefix-reuse".into();
-        assert!(validate_compile_attribution(&wrong_operation, &cold_matrix).is_err());
+        let tamper = |edit: fn(&mut ReceiptCompileAttribution)| {
+            let mut tampered = cold.clone();
+            edit(&mut tampered);
+            validate_compile_attribution(&tampered, &cold_matrix).is_err()
+        };
+        let edits: [fn(&mut ReceiptCompileAttribution); 11] = [
+            |a| a.probe_durations_ms[2] = 20.0,
+            |a| a.probe_evidence[2].dispatch_ms = 20.0,
+            |a| a.source = "warmup-suites".into(),
+            |a| a.operation = "chunked-prefix-reuse".into(),
+            |a| a.noise_samples_ms = Some(vec![5.0, 5.0, 6.0, 6.0]),
+            |a| a.noise_samples_ms = None,
+            |a| a.noise_band_ms = Some(30.0),
+            |a| a.compile_cost_resolved = Some(false),
+            |a| a.compile_cost_ms = None,
+            |a| a.compile_cost_ms = Some(1.0),
+            |a| a.compile_cost_unresolved_reason = Some(COMPILE_COST_WITHIN_NOISE.into()),
+        ];
+        for (index, edit) in edits.into_iter().enumerate() {
+            assert!(tamper(edit), "tamper {index} was accepted");
+        }
+
+        // Below the band and negative are recorded as unresolved, never refused.
+        let within = compile_attribution_from_probes(
+            "single-shot-generation",
+            &cold_matrix,
+            probes(&[8.0, 4.0, 5.0, 6.0, 7.0]),
+            &[8.0, 4.0, 5.0, 6.0, 7.0],
+        )
+        .unwrap();
+        let view = compile_cost_view(&within);
+        assert_eq!(view.excess, 2.5);
+        assert_eq!((view.resolved, view.cost), (Some(false), None));
+        assert_eq!(view.reason.as_deref(), Some(COMPILE_COST_WITHIN_NOISE));
+        assert_eq!(cold_compile_alias(&within), None);
+        let flat = compile_attribution_from_probes(
+            "single-shot-generation",
+            &cold_matrix,
+            probes(&[1.0, 1.0, 1.0, 1.0, 1.0]),
+            &[1.0, 1.0, 1.0, 1.0, 1.0],
+        )
+        .unwrap();
+        assert_eq!(
+            flat.compile_cost_unresolved_reason.as_deref(),
+            Some(COMPILE_COST_NOT_SLOWER)
+        );
 
         let warm_matrix = ReceiptMatrix {
             family: "llama".into(),
@@ -12696,14 +12932,19 @@ pub(crate) mod tests {
             prefill_mode: "chunked".into(),
             process_temperature: "warm".into(),
         };
+        let measured = [9.0, 9.5, 9.2, 9.1, 9.4];
         let warm = compile_attribution_from_probes(
             "chunked-prefix-reuse",
             &warm_matrix,
             probes(&[12.0, 9.0]),
+            &measured,
         )
         .unwrap();
         assert_eq!(warm.source, "warmup-suites");
-        assert_eq!(warm.first_dispatch_excess_ms, 3.0);
+        let view = compile_cost_view(&warm);
+        assert_eq!(view.excess, 3.0);
+        assert_eq!(view.samples, Some(measured.to_vec()));
+        assert_eq!(view.cost, Some(3.0));
         let warmup_seal =
             warmup_probe_suite_sha256(&"7".repeat(64), 42, &warm.probe_evidence).unwrap();
         let mut rebound_warm = warm.clone();
@@ -12712,18 +12953,75 @@ pub(crate) mod tests {
             warmup_seal,
             warmup_probe_suite_sha256(&"7".repeat(64), 42, &rebound_warm.probe_evidence).unwrap()
         );
-        assert!(compile_attribution_from_probes(
-            "chunked-prefix-reuse",
-            &warm_matrix,
-            probes(&[9.0, 12.0]),
-        )
-        .is_err());
-        assert!(compile_attribution_from_probes(
+        // W1 row 3 (llama memory-material 32k warm): first 9017 ms, steady 10585 ms.
+        let row3 = compile_attribution_from_probes(
             "single-shot-generation",
-            &cold_matrix,
-            probes(&[1.0, 1.0, 1.0, 1.0, 1.0]),
+            &ReceiptMatrix {
+                prefill_mode: "single-shot".into(),
+                ..warm_matrix.clone()
+            },
+            probes(&[9017.437917, 10585.460208]),
+            &[10510.0, 10590.0, 10555.0, 10620.0, 10575.0],
         )
-        .is_err());
+        .unwrap();
+        let view = compile_cost_view(&row3);
+        assert!(view.excess < 0.0);
+        assert_eq!(view.resolved, Some(false));
+        assert_eq!(view.reason.as_deref(), Some(COMPILE_COST_NOT_SLOWER));
+        let mut short_band = warm.clone();
+        short_band.noise_samples_ms = Some(vec![9.0; 4]);
+        assert!(validate_compile_attribution(&short_band, &warm_matrix).is_err());
+
+        // Missing or invalid timing data still fails closed.
+        for (values, measured) in [
+            (vec![f64::NAN, 9.0], measured.to_vec()),
+            (vec![12.0, 0.0], measured.to_vec()),
+            (vec![12.0, 9.0], vec![9.0, f64::NAN, 9.2, 9.1, 9.4]),
+            (vec![12.0, 9.0], vec![9.0, 9.2]),
+            (vec![], measured.to_vec()),
+        ] {
+            assert!(compile_attribution_from_probes(
+                "chunked-prefix-reuse",
+                &warm_matrix,
+                probes(&values),
+                &measured,
+            )
+            .is_err());
+        }
+
+        // Receipts accepted before the band existed stay valid only as positive band-free excess.
+        let mut legacy = cold.clone();
+        legacy.method = LEGACY_COMPILE_ATTRIBUTION_METHOD.into();
+        assert!(validate_compile_attribution(&legacy, &cold_matrix).is_err());
+        legacy.noise_samples_ms = None;
+        legacy.noise_band_ms = None;
+        legacy.compile_cost_resolved = None;
+        legacy.compile_cost_ms = None;
+        legacy.compile_cost_unresolved_reason = None;
+        validate_compile_attribution(&legacy, &cold_matrix).unwrap();
+        assert_eq!(cold_compile_alias(&legacy), Some(14.5));
+        for edit in [
+            (|a: &mut ReceiptCompileAttribution| {
+                a.noise_samples_ms = Some(vec![4.0, 5.0, 6.0, 7.0])
+            }) as fn(&mut ReceiptCompileAttribution),
+            |a| a.noise_band_ms = Some(3.0),
+            |a| a.compile_cost_resolved = Some(true),
+            |a| a.compile_cost_ms = Some(14.5),
+            |a| a.compile_cost_unresolved_reason = Some(COMPILE_COST_WITHIN_NOISE.into()),
+        ] {
+            let mut banded = legacy.clone();
+            edit(&mut banded);
+            assert!(validate_compile_attribution(&banded, &cold_matrix).is_err());
+        }
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("noiseBandMs").is_none(), "{json}");
+        let mut legacy_flat = flat.clone();
+        legacy_flat.method = LEGACY_COMPILE_ATTRIBUTION_METHOD.into();
+        legacy_flat.noise_samples_ms = None;
+        legacy_flat.noise_band_ms = None;
+        legacy_flat.compile_cost_resolved = None;
+        legacy_flat.compile_cost_unresolved_reason = None;
+        assert!(validate_compile_attribution(&legacy_flat, &cold_matrix).is_err());
     }
 
     #[test]

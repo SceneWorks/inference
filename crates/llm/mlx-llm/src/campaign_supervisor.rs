@@ -232,9 +232,22 @@ pub trait MemoryProbe {
 
 /// Reads per watchdog tick: one read plus three immediate retries of a failed read.
 const CHILD_FOOTPRINT_READS_PER_TICK: u32 = 4;
-/// Consecutive ticks whose every read failed before the row stops with
-/// [`StopReason::ProbeFailure`]. The host-reserve watchdog keeps running on the failed ticks.
-const CHILD_FOOTPRINT_FAILED_TICK_LIMIT: u32 = 5;
+/// Host reads per preflight or watchdog tick: one read plus three immediate retries.
+const HOST_MEMORY_READS_PER_TICK: u32 = 4;
+/// Consecutive ticks whose every read of one probe (host or child footprint) failed before the row
+/// stops with [`StopReason::ProbeFailure`]. The other watchdog keeps running on the failed ticks.
+const PROBE_FAILED_TICK_LIMIT: u32 = 5;
+
+/// One host measurement, retried immediately; the last error once every read failed.
+fn read_host_memory<P: MemoryProbe>(probe: &mut P, deadline: Instant) -> io::Result<HostMemory> {
+    let mut read = 1;
+    loop {
+        match probe.host_memory(deadline) {
+            Err(_) if read < HOST_MEMORY_READS_PER_TICK => read += 1,
+            result => return result,
+        }
+    }
+}
 
 /// One watchdog tick's child footprint: the first successful read, or the last error once a
 /// process-gone read or every retry has failed.
@@ -445,10 +458,13 @@ pub fn run_guarded<P: MemoryProbe>(
 ) -> Result<ExitStatus, Failure> {
     validate(policy, request)?;
     let preflight_deadline = Instant::now() + policy.deadline;
-    let host = probe.host_memory(preflight_deadline).map_err(|error| {
+    let host = read_host_memory(probe, preflight_deadline).map_err(|error| {
         Failure::new(
             StopReason::ProbeFailure,
-            format!("host preflight probe: {error}"),
+            format!(
+                "host preflight probe failed {HOST_MEMORY_READS_PER_TICK} reads; last error {}",
+                describe_probe_error(&error)
+            ),
             None,
         )
     })?;
@@ -566,6 +582,7 @@ fn run_admitted<P: MemoryProbe>(
     };
     let deadline = preflight_deadline;
     let mut failed_footprint_ticks = 0_u32;
+    let mut failed_host_ticks = 0_u32;
     let result = loop {
         if exceeded.load(Ordering::Acquire) {
             break Err(Failure::new(
@@ -599,27 +616,37 @@ fn run_admitted<P: MemoryProbe>(
                 Some(pid),
             ));
         }
-        let sample = match probe.host_memory(deadline) {
-            Ok(host) => host,
-            Err(error) => {
-                break Err(Failure::new(
-                    StopReason::ProbeFailure,
-                    format!("live host probe: {error}"),
-                    Some(pid),
-                ));
+        match read_host_memory(probe, deadline) {
+            Ok(sample) => {
+                failed_host_ticks = 0;
+                if sample.available_bytes < policy.host_free_reserve_bytes {
+                    let mut failure = Failure::new(
+                        StopReason::HostMemory,
+                        format!(
+                            "host available {} bytes ({}) fell below reserve {} bytes",
+                            sample.available_bytes, sample.metric, policy.host_free_reserve_bytes
+                        ),
+                        Some(pid),
+                    );
+                    failure.watchdog_host_memory = Some(Box::new(sample));
+                    break Err(failure);
+                }
             }
-        };
-        if sample.available_bytes < policy.host_free_reserve_bytes {
-            let mut failure = Failure::new(
-                StopReason::HostMemory,
-                format!(
-                    "host available {} bytes ({}) fell below reserve {} bytes",
-                    sample.available_bytes, sample.metric, policy.host_free_reserve_bytes
-                ),
-                Some(pid),
-            );
-            failure.watchdog_host_memory = Some(Box::new(sample));
-            break Err(failure);
+            // The child footprint watchdog keeps running on a failed host tick.
+            Err(error) => {
+                failed_host_ticks += 1;
+                if failed_host_ticks >= PROBE_FAILED_TICK_LIMIT {
+                    break Err(Failure::new(
+                        StopReason::ProbeFailure,
+                        format!(
+                            "live host probe failed on {failed_host_ticks} consecutive ticks \
+                             ({HOST_MEMORY_READS_PER_TICK} reads each); last error {}",
+                            describe_probe_error(&error)
+                        ),
+                        Some(pid),
+                    ));
+                }
+            }
         }
         match read_child_footprint(probe, pid, deadline) {
             Ok(footprint) => {
@@ -641,7 +668,7 @@ fn run_admitted<P: MemoryProbe>(
                 // classifies the exit. Any other error stops the row only once it is sustained.
                 if error.kind() != io::ErrorKind::NotFound {
                     failed_footprint_ticks += 1;
-                    if failed_footprint_ticks >= CHILD_FOOTPRINT_FAILED_TICK_LIMIT {
+                    if failed_footprint_ticks >= PROBE_FAILED_TICK_LIMIT {
                         break Err(Failure::new(
                             StopReason::ProbeFailure,
                             format!(
@@ -816,7 +843,7 @@ fn bounded_system_output(command: &str, args: &[&str], deadline: Instant) -> io:
     let bytes = fs::read(&path);
     let _ = fs::remove_file(&path);
     if !status.success() {
-        return Err(io::Error::other("memory probe command failed"));
+        return Err(io::Error::other(format!("{command} exited with {status}")));
     }
     let bytes = bytes?;
     if bytes.len() > 64 * 1024 {
@@ -858,6 +885,9 @@ mod tests {
         /// Answers every footprint read once `footprint` is drained.
         footprint_after: Box<dyn FnMut() -> io::Result<u64>>,
         footprint_reads: usize,
+        /// Answers every host read once `host` is drained.
+        host_after: Box<dyn FnMut() -> io::Result<HostMemory>>,
+        host_reads: usize,
     }
 
     /// A one-byte-page measurement whose free pages are the whole available measure.
@@ -883,13 +913,16 @@ mod tests {
                 footprint: VecDeque::new(),
                 footprint_after: Box::new(|| Ok(1)),
                 footprint_reads: 0,
+                host_after: Box::new(|| Ok(free_only(1000))),
+                host_reads: 0,
             }
         }
     }
 
     impl MemoryProbe for FakeProbe {
         fn host_memory(&mut self, _: Instant) -> io::Result<HostMemory> {
-            self.host.pop_front().unwrap_or_else(|| Ok(free_only(1000)))
+            self.host_reads += 1;
+            self.host.pop_front().unwrap_or_else(|| (self.host_after)())
         }
         fn child_footprint_bytes(&mut self, _: u32, _: Instant) -> io::Result<u64> {
             self.footprint_reads += 1;
@@ -1242,24 +1275,107 @@ mod tests {
 
     #[test]
     fn live_host_decline_and_probe_failure_stop_and_reap() {
-        for (samples, expected) in [
-            (vec![Ok(1000), Ok(50)], StopReason::HostMemory),
-            (
-                vec![Ok(1000), Err(io::Error::other("probe failed"))],
-                StopReason::ProbeFailure,
-            ),
+        let request = new_request();
+        let failure = run_guarded(
+            Command::new("/bin/sleep").arg("2"),
+            &request,
+            &policy(),
+            &mut FakeProbe::new([Ok(1000), Ok(50)]),
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, StopReason::HostMemory);
+        assert!(gone(failure.pid.unwrap()));
+
+        let request = new_request();
+        let mut probe = FakeProbe::new([Ok(1000)]);
+        probe.host_after = Box::new(|| Err(io::Error::from_raw_os_error(35)));
+        let failure = run_guarded(
+            &mut until_exists(&stop_path(&request)),
+            &request,
+            &patient_policy(),
+            &mut probe,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.reason,
+            StopReason::ProbeFailure,
+            "{}",
+            failure.detail
+        );
+        for part in [
+            "live host probe failed on 5 consecutive ticks (4 reads each)",
+            "errno 35: ",
         ] {
-            let request = new_request();
-            let failure = run_guarded(
-                Command::new("/bin/sleep").arg("2"),
-                &request,
-                &policy(),
-                &mut FakeProbe::new(samples),
-            )
-            .unwrap_err();
-            assert_eq!(failure.reason, expected);
-            assert!(gone(failure.pid.unwrap()));
+            assert!(failure.detail.contains(part), "{}", failure.detail);
         }
+        assert_eq!(probe.host_reads, 1 + 20);
+        assert!(gone(failure.pid.unwrap()));
+    }
+
+    #[test]
+    fn host_preflight_retries_then_refuses_with_the_error() {
+        let request = new_request();
+        let mut probe = FakeProbe::new([
+            Err(io::Error::from_raw_os_error(35)),
+            Err(io::Error::from_raw_os_error(35)),
+            Err(io::Error::from_raw_os_error(35)),
+            Ok(1000),
+        ]);
+        run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request,
+            &policy(),
+            &mut probe,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}: {}", failure.reason, failure.detail));
+
+        let request = new_request();
+        let mut probe = FakeProbe::new([]);
+        probe.host_after = Box::new(|| Err(io::Error::from_raw_os_error(35)));
+        let failure = run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request,
+            &policy(),
+            &mut probe,
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, StopReason::ProbeFailure);
+        assert!(
+            failure
+                .detail
+                .contains("host preflight probe failed 4 reads; last error errno 35: "),
+            "{}",
+            failure.detail
+        );
+        assert_eq!(probe.host_reads, 4);
+        assert!(failure.pid.is_none() && !request.stdout_path.exists());
+    }
+
+    #[test]
+    fn transient_host_failures_never_stop_a_row() {
+        // Four fully failed ticks, one good read, four more failed ticks: never five in a row.
+        let request = new_request();
+        let stop = stop_path(&request);
+        let eagain = || Err(io::Error::from_raw_os_error(35));
+        let mut host = vec![Ok(free_only(1000))];
+        host.extend((0..16).map(|_| eagain()));
+        host.push(Ok(free_only(1000)));
+        host.extend((0..16).map(|_| eagain()));
+        let mut probe = FakeProbe::hosts(host);
+        let flag = stop.clone();
+        probe.host_after = Box::new(move || {
+            fs::write(&flag, b"")?;
+            Ok(free_only(1000))
+        });
+        let status = run_guarded(
+            &mut until_exists(&stop),
+            &request,
+            &patient_policy(),
+            &mut probe,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}: {}", failure.reason, failure.detail));
+        assert!(status.success());
+        assert!(probe.host_reads > 34);
     }
 
     #[test]
@@ -1407,7 +1523,7 @@ mod tests {
         let mut reads = 0;
         probe.footprint_after = Box::new(move || {
             reads += 1;
-            if reads == 3 * CHILD_FOOTPRINT_FAILED_TICK_LIMIT {
+            if reads == 3 * PROBE_FAILED_TICK_LIMIT {
                 fs::write(&flag, b"")?;
             }
             pid_gone()
@@ -1420,7 +1536,7 @@ mod tests {
         )
         .unwrap_or_else(|failure| panic!("{:?}: {}", failure.reason, failure.detail));
         assert!(status.success());
-        assert!(probe.footprint_reads >= 3 * CHILD_FOOTPRINT_FAILED_TICK_LIMIT as usize);
+        assert!(probe.footprint_reads >= 3 * PROBE_FAILED_TICK_LIMIT as usize);
     }
 
     #[test]
