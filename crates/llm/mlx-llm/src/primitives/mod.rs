@@ -43,14 +43,15 @@ pub use nn::{
     soft_cap,
 };
 pub use packed_group_affine_kv::{
-    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
-    DecoderCacheSelection, DenseFallbackEvent, DenseFallbackPackedDecoderCache,
-    OpaqueCompiledKernel, PackedCacheRequest, PackedDispatchTelemetry, PackedGroupAffineKvCache,
-    RepresentationMetadata, RetainedPackedKernel, PACKED_CODES_PER_BYTE,
-    PACKED_METAL_QUANT_GROUP_SIZE,
+    group_affine_kernel_fp32_parity_errors, select_decoder_cache, select_decoder_cache_with_reader,
+    CompiledKernelHandle, DecoderCacheSelection, DenseFallbackEvent,
+    DenseFallbackPackedDecoderCache, OpaqueCompiledKernel, PackedCacheRequest,
+    PackedDispatchTelemetry, PackedGroupAffineKvCache, RepresentationMetadata,
+    RetainedPackedKernel, PACKED_CODES_PER_BYTE, PACKED_METAL_QUANT_GROUP_SIZE,
 };
 pub use packed_metal::{
-    PackedMask, PackedMetalGpuFamily, PackedMetalKernel, PackedMetalTuningProfile,
+    packed_kv_split_count, PackedAttentionArgs, PackedMask, PackedMetalGpuFamily,
+    PackedMetalKernel, PackedMetalTuningProfile,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};
