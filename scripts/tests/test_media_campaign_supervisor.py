@@ -512,16 +512,16 @@ class OperatorStopTests(unittest.TestCase):
     def test_absent_stop_file_is_a_no_op_and_present_one_records_and_raises(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            stop = safety.operator_stop_file(None, root)
-            self.assertEqual(stop, root / "STOP")
-            self.assertEqual(safety.operator_stop_file(root / "halt", root), root / "halt")
-            safety.check_operator_stop(stop, root / "logs", kind="k", before="row-a", index=0, total=2)
+            stops = safety.operator_stop_files(None, root)
+            self.assertEqual(stops, (root / "STOP",))
+            self.assertEqual(safety.operator_stop_files(root / "halt", root), (root / "STOP", root / "halt"))
+            safety.check_operator_stop(stops, root / "logs", kind="k", before="row-a", index=0, total=2)
             self.assertFalse((root / "logs").exists())
-            stop.write_bytes(b"")
+            (root / "STOP").write_bytes(b"")
             records = []
             for _ in range(2):
                 with self.assertRaises(safety.OperatorStop) as caught:
-                    safety.check_operator_stop(stop, root / "logs", kind="k", before="row-b", index=1, total=2)
+                    safety.check_operator_stop(stops, root / "logs", kind="k", before="row-b", index=1, total=2)
                 records.append(caught.exception.record)
             self.assertEqual([path.name for path in records],
                              ["operator-stop.attempt-0.json", "operator-stop.attempt-1.json"])
@@ -532,9 +532,31 @@ class OperatorStopTests(unittest.TestCase):
             self.assertEqual(records[0].with_name(f"{records[0].name}.sha256").read_text(encoding="utf-8"),
                              f"{safety.digest(raw)}  {records[0].name}\n")
             self.assertNotIn(safety.OPERATOR_STOP_EXIT_CODE, (0, 1, 2))
-            self.assertTrue(safety.is_operator_stop_entry(root, root / "halt", "STOP"))
-            self.assertTrue(safety.is_operator_stop_entry(root, root / "halt", "halt"))
-            self.assertFalse(safety.is_operator_stop_entry(root, root / "halt", "stray"))
+            custom = safety.operator_stop_files(root / "halt", root)
+            self.assertTrue(safety.is_operator_stop_entry(root, custom, "STOP"))
+            self.assertTrue(safety.is_operator_stop_entry(root, custom, "halt"))
+            self.assertFalse(safety.is_operator_stop_entry(root, custom, "stray"))
+
+    def test_both_stop_paths_stop_and_stat_errors_are_not_absence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "elsewhere").mkdir()
+            stops = safety.operator_stop_files(root / "elsewhere" / "halt", root)
+            logs = root / "logs"
+            safety.check_operator_stop(stops, logs, kind="k", before="row-a", index=0, total=2)
+            (root / "STOP").write_bytes(b"")  # the default path still stops a --stop-file parent
+            with self.assertRaises(safety.OperatorStop) as caught:
+                safety.check_operator_stop(stops, logs, kind="k", before="row-a", index=0, total=2)
+            self.assertEqual(json.loads(caught.exception.record.read_bytes())["stopFiles"], [str(root / "STOP")])
+            (root / "STOP").unlink()
+            (root / "elsewhere" / "halt").write_bytes(b"")  # and so does the custom path alone
+            with self.assertRaises(safety.OperatorStop) as caught:
+                safety.check_operator_stop(stops, logs, kind="k", before="row-a", index=0, total=2)
+            self.assertEqual(json.loads(caught.exception.record.read_bytes())["stopFiles"],
+                             [str(root / "elsewhere" / "halt")])
+            blocked = (root / "elsewhere" / "halt" / "STOP",)  # ENOTDIR, not "absent"
+            with self.assertRaises(OSError):
+                safety.check_operator_stop(blocked, logs, kind="k", before="row-a", index=0, total=2)
 
 
 @unittest.skipUnless(os.name == "nt", "real Job Object smoke requires Windows")

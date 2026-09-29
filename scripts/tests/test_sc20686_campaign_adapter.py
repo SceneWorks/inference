@@ -794,7 +794,8 @@ class CampaignAdapterTests(unittest.TestCase):
             def publish():
                 return self.adapter.publish_campaign(
                     [spec], runner, row_builder, root / "final",
-                    resume_root=resume, resume_identity_sha=identity_sha, stop_file=stop,
+                    resume_root=resume, resume_identity_sha=identity_sha,
+                    stop_files=self.adapter.supervisor.operator_stop_files(None, resume),
                 )
 
             resume.mkdir()
@@ -832,10 +833,11 @@ class CampaignAdapterTests(unittest.TestCase):
             (resume / "STOP").write_bytes(b"")
             (resume / "halt").write_bytes(b"")
             (resume / "logs").mkdir()
-            self.assertEqual(self.adapter._prepare_resume(resume, resolved, policy, resume / "halt"), first)
+            stops = self.adapter.supervisor.operator_stop_files(resume / "halt", resume)
+            self.assertEqual(self.adapter._prepare_resume(resume, resolved, policy, stops), first)
             (resume / "stray").write_bytes(b"")
             with self.assertRaisesRegex(ValueError, "unexpected entries"):
-                self.adapter._prepare_resume(resume, resolved, policy, resume / "halt")
+                self.adapter._prepare_resume(resume, resolved, policy, stops)
 
     def test_complete_bundle_is_reproducible_and_tampering_fails(self):
         coordinates = []

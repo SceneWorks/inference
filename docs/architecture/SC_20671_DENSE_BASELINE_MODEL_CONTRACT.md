@@ -27,12 +27,13 @@ pre-results provenance gate, not a substitute for a sealed measurement receipt.
 ## Operator stop between rows
 
 A campaign parent (`sc20671_kv_baseline parent`, `sc20676_packed_evidence parent`, and the
-SC-20684 / SC-20686 media launchers) can be halted safely: create `<resume-dir>/STOP` (or the path
-given as `--stop-file <path>`). The parent never signals a running worker — killing an MLX render
+SC-20684 / SC-20686 media launchers) can be halted safely: create `<resume-dir>/STOP` (always
+honoured) or the path given as `--stop-file <path>` (honoured too); only a missing path counts as
+absent, any other stat failure is an error. The parent never signals a running worker — killing an MLX render
 mid command buffer can wedge the GPU — so the row in flight finishes and is accepted normally.
 Before spawning the next row it writes a sealed, never-overwritten
 `<resume-dir>/logs/operator-stop.attempt-<n>.json` (`"status": "stopped-by-operator"`,
-`beforeRow`, `beforeRowSlug`, `rowsAccepted`) and exits with status **75** (sysexits
+`beforeRow`, `beforeRowSlug`, `rowsAccepted`, `stopFiles`) with its `.sha256` seal and exits with status **75** (sysexits
 `EX_TEMPFAIL`), distinct from success and from every refusal/failure status. The stop file is not
 part of the resume identity: remove it and rerun the identical command with the same resume
 directory, and the accepted rows resume while the campaign continues at the stopped row.

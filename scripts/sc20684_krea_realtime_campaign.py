@@ -26,10 +26,10 @@ peak recorded as null plus reason, is sealed with every role. A pre-spawn refusa
 watchdog abort or failed child is written as a sealed unaccepted log record and
 leaves the campaign incomplete; it is never an accepted role.
 
-Safe operator stop: ``touch <resume-dir>/STOP`` (or the ``--stop-file`` path). The launcher
+Safe operator stop: ``touch <resume-dir>/STOP`` (always honoured) or the ``--stop-file`` path. The launcher
 never signals a running product process; before starting the next role it writes a sealed
-``<resume-dir>/logs/operator-stop.attempt-<n>.json`` ("stopped-by-operator", ``beforeRow``) and
-exits with status 75. Remove the stop file and rerun the same command to resume at that role.
+``<resume-dir>/logs/operator-stop.attempt-<n>.json`` ("stopped-by-operator", ``beforeRow``, with a
+``.sha256`` seal) and exits with status 75. Remove the stop file and rerun the same command to resume at that role.
 """
 
 from __future__ import annotations
@@ -948,7 +948,7 @@ def _file_identity(path: Path, relative: str) -> dict[str, Any]:
 def _prepare_media_resume(
     root: Path, *, source: dict[str, Any], model: dict[str, Any],
     policy: supervisor.SafetyPolicy, argv: list[str], timeout: int,
-    stop_file: Path | None = None,
+    stop_files: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     if not root.is_absolute() or root.is_symlink() or root.resolve() == ROOT.resolve() or ROOT.resolve() in root.resolve().parents:
         raise CampaignError("resume directory must be absolute, nonsymlink, and outside the repository")
@@ -984,7 +984,7 @@ def _prepare_media_resume(
         if entry.is_symlink():
             raise CampaignError(f"symlinked resume artifact: {entry.name}")
         if entry.name not in {"identity.json", "identity.json.sha256", "roles", "artifacts", "transcripts", "logs"} \
-                and not supervisor.is_operator_stop_entry(root, supervisor.operator_stop_file(stop_file, root), entry.name):
+                and not supervisor.is_operator_stop_entry(root, stop_files, entry.name):
             raise CampaignError(f"unexpected resume artifact: {entry.name}")
     return identity
 
@@ -1055,6 +1055,9 @@ def _load_resumed_role(root: Path, name: str, identity: dict[str, Any]) -> dict[
         raise CampaignError(f"resume role {name} is stale or noncanonical")
     if record.get("exitCode") != 0 or not isinstance(record.get("runId"), str):
         raise CampaignError(f"resume role {name} did not exit successfully")
+    elapsed = record.get("launcherElapsedNs")
+    if type(elapsed) is not int or elapsed <= 0:
+        raise CampaignError(f"resume role {name} lacks its launcher elapsed time")
     supervision = record.get("supervision")
     if not isinstance(supervision, dict) or type(supervision.get("pid")) is not int or supervision["pid"] <= 0 or supervision.get("ownedProcessGroupReaped") is not True:
         raise CampaignError(f"resume role {name} lacks an owned process identity")
@@ -1253,7 +1256,7 @@ def run_matrix(
     evidence_root: Path,
     safety_policy: supervisor.SafetyPolicy,
     resume_identity: dict[str, Any],
-    stop_file: Path | None = None,
+    stop_files: tuple[Path, ...] = (),
 ) -> list[dict[str, Any]]:
     try:
         argv = shlex.split(command)
@@ -1272,7 +1275,10 @@ def run_matrix(
         artifact_dir = evidence_root / "artifacts" / cell_name
         transcript_dir = evidence_root / "transcripts"
         transcript_dir.mkdir(parents=True, exist_ok=True)
-        cell_started = time.monotonic_ns()
+        # Launcher time is measured per role and made durable in the role's resume record, so a
+        # cell resumed between its roles still reports both roles' time.
+        role_elapsed_ns: dict[str, int] = {}
+        resumed_roles: list[str] = []
         observations: dict[str, Any] = {}
         transcripts: dict[str, dict[str, Any]] = {}
         for role_index, role in enumerate(roles):
@@ -1303,12 +1309,15 @@ def run_matrix(
                     )
                 if saved["observationSha256"] != _canonical_sha256(observations[role]):
                     raise CampaignError(f"resume role {role_name} observation identity changed")
+                role_elapsed_ns[role] = saved["launcherElapsedNs"]
+                resumed_roles.append(role)
                 continue
             # Between roles only: a running product process is never signalled.
             supervisor.check_operator_stop(
-                stop_file, evidence_root / "logs", kind="sc-20684-operator-stop", before=role_name,
+                stop_files, evidence_root / "logs", kind="sc-20684-operator-stop", before=role_name,
                 index=cell_index * len(roles) + role_index, total=len(CASES) * len(roles),
             )
+            role_started = time.monotonic_ns()
             run_id = str(uuid.uuid4())
             env = os.environ.copy()
             env.update({
@@ -1386,8 +1395,10 @@ def run_matrix(
                     unaccepted, kind="sc-20684-unaccepted-role", coordinate=role_name, error=failure,
                 )
                 raise
+            role_elapsed_ns[role] = time.monotonic_ns() - role_started
             _save_resumed_role(evidence_root, role_name, resume_identity, {
                 "runId": run_id, "exitCode": result.returncode,
+                "launcherElapsedNs": role_elapsed_ns[role],
                 "transcripts": transcripts[role],
                 "observationSha256": _canonical_sha256(observations[role]),
                 "supervision": _supervision_record(result),
@@ -1401,7 +1412,9 @@ def run_matrix(
         row = {
             "mode": mode,
             "cacheTier": tier,
-            "launcherElapsedNs": time.monotonic_ns() - cell_started,
+            "launcherElapsedNs": sum(role_elapsed_ns[role] for role in roles),
+            "roleLauncherElapsedNs": {role: role_elapsed_ns[role] for role in roles},
+            "resumedRoles": resumed_roles,
             "artifactDirectory": f"artifacts/{cell_name}",
             "transcripts": transcripts,
             "processExitCodes": {
@@ -1574,7 +1587,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=7200, help="per-cell command timeout in seconds")
     parser.add_argument("--safety-policy", type=Path, required=True, help="mandatory source-bound process safety policy")
     parser.add_argument("--resume-dir", type=Path, required=True, help="absolute external identity-bound role staging")
-    parser.add_argument("--stop-file", type=Path, help="operator stop file checked between roles (default: <resume-dir>/STOP); "
+    parser.add_argument("--stop-file", type=Path, help="extra operator stop file checked between roles (<resume-dir>/STOP is always checked); "
                         f"its presence halts before the next role with exit status {supervisor.OPERATOR_STOP_EXIT_CODE}")
     args = parser.parse_args()
     try:
@@ -1593,15 +1606,15 @@ def main() -> int:
             command = shlex.split(args.product_command)
         except ValueError as error:
             raise CampaignError(f"invalid product command: {error}") from error
-        stop_file = supervisor.operator_stop_file(args.stop_file, args.resume_dir)
+        stop_files = supervisor.operator_stop_files(args.stop_file, args.resume_dir)
         resume_identity = _prepare_media_resume(
             args.resume_dir, source=source, model=model, policy=safety_policy,
-            argv=command, timeout=args.timeout, stop_file=stop_file,
+            argv=command, timeout=args.timeout, stop_files=stop_files,
         )
         source = resume_identity["source"]
         rows = run_matrix(
             args.product_command, args.snapshot.resolve(), source, model, policy,
-            args.timeout, args.resume_dir, safety_policy, resume_identity, stop_file,
+            args.timeout, args.resume_dir, safety_policy, resume_identity, stop_files,
         )
         if source_identity()["files"] != source["files"]:
             raise CampaignError("campaign behavior source changed after identity was frozen")

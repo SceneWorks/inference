@@ -3867,41 +3867,78 @@ impl CampaignOutcome {
     }
 }
 
-/// `--stop-file <path>`, else `<resume-dir>/STOP`. The stop file is operator control only: it is
-/// never part of a resume identity and never forwarded to a worker.
-pub(crate) fn operator_stop_file(args: &[String], resume_dir: &Path) -> Result<PathBuf, String> {
+/// The operator stop files a parent honours: always `<resume-dir>/STOP`, plus `--stop-file <path>`
+/// when given (either present stops the campaign). Stop files are operator control only: never
+/// part of a resume identity and never forwarded to a worker.
+pub(crate) fn operator_stop_files(
+    args: &[String],
+    resume_dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = vec![resume_dir.join(OPERATOR_STOP_FILE_NAME)];
     if args.iter().any(|arg| arg == "--stop-file") {
-        required_flag(args, "--stop-file").map(PathBuf::from)
-    } else {
-        Ok(resume_dir.join(OPERATOR_STOP_FILE_NAME))
+        let custom = PathBuf::from(required_flag(args, "--stop-file")?);
+        if !files.contains(&custom) {
+            files.push(custom);
+        }
+    }
+    Ok(files)
+}
+
+/// Whether resume-directory entry `name` is an operator stop file rather than campaign state.
+pub(crate) fn is_operator_stop_entry(
+    resume_dir: &Path,
+    stop_files: &[PathBuf],
+    name: &str,
+) -> bool {
+    name == OPERATOR_STOP_FILE_NAME || stop_files.contains(&resume_dir.join(name))
+}
+
+/// A stop file is present when anything (even a dangling symlink) exists at its path. Only
+/// `NotFound` means absent; any other stat failure is an error, never a silent "keep going".
+fn operator_stop_present(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "stat operator stop file {}: {error}",
+            path.display()
+        )),
     }
 }
 
-/// Whether resume-directory entry `name` is the operator stop file rather than campaign state.
-pub(crate) fn is_operator_stop_entry(resume_dir: &Path, stop_file: &Path, name: &str) -> bool {
-    name == OPERATOR_STOP_FILE_NAME || resume_dir.join(name) == stop_file
+/// Create `path` exclusively and write `bytes` durably (fsync).
+fn write_new_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()
 }
 
 /// Checked by a campaign parent only between rows, immediately before it would spawn row
 /// `before_row`'s worker; a running worker is never signalled (killing an MLX render mid command
-/// buffer can wedge the GPU). When the stop file exists this writes a sealed, never-overwritten
-/// `logs/operator-stop.attempt-<n>.json` status record and returns the stop.
+/// buffer can wedge the GPU). When any stop file exists this writes a sealed, never-overwritten
+/// `logs/operator-stop.attempt-<n>.json` status record plus its `.sha256` sidecar and returns the
+/// stop.
 pub(crate) fn operator_stop_before_row(
-    stop_file: &Path,
+    stop_files: &[PathBuf],
     logs: &Path,
     kind: &str,
     before_row: usize,
     row: &str,
     rows_total: usize,
 ) -> Result<Option<OperatorStop>, String> {
-    if fs::symlink_metadata(stop_file).is_err() {
+    let mut present = Vec::new();
+    for path in stop_files {
+        if operator_stop_present(path)? {
+            present.push(path.display().to_string());
+        }
+    }
+    if present.is_empty() {
         return Ok(None);
     }
     fs::create_dir_all(logs).map_err(|e| format!("create operator stop log directory: {e}"))?;
-    let record = (0_u64..)
-        .map(|attempt| logs.join(format!("operator-stop.attempt-{attempt}.json")))
-        .find(|path| fs::symlink_metadata(path).is_err())
-        .ok_or("no unused operator stop record path")?;
     let value = serde_json::json!({
         "schemaVersion": 1,
         "kind": kind,
@@ -3910,22 +3947,36 @@ pub(crate) fn operator_stop_before_row(
         "beforeRowSlug": row,
         "rowsTotal": rows_total,
         "rowsAccepted": before_row,
-        "stopFile": stop_file.display().to_string(),
+        "stopFiles": present,
         "recordedAt": timestamp_now(),
         "resume": "remove the stop file and rerun the same command with the same resume directory",
     });
-    let bytes = seal_json(&value)?.0;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&record)
-        .map_err(|e| format!("write operator stop record: {e}"))?;
-    std::io::Write::write_all(&mut file, &bytes).map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
+    let (bytes, sha256) = seal_json(&value)?;
+    let mut attempt = 0_u64;
+    let record = loop {
+        let name = format!("operator-stop.attempt-{attempt}.json");
+        let path = logs.join(&name);
+        match write_new_durable(&path, &bytes) {
+            Ok(()) => {
+                write_new_durable(
+                    &logs.join(format!("{name}.sha256")),
+                    format!("{sha256}  {name}\n").as_bytes(),
+                )
+                .map_err(|e| format!("write operator stop record seal: {e}"))?;
+                break path;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt
+                    .checked_add(1)
+                    .ok_or("no unused operator stop record path")?;
+            }
+            Err(error) => return Err(format!("write operator stop record: {error}")),
+        }
+    };
     eprintln!(
-        "stopped by operator before row {}/{rows_total} ({row}); stop file {}; status {}",
+        "stopped by operator before row {}/{rows_total} ({row}); stop file(s) {}; status {}",
         before_row + 1,
-        stop_file.display(),
+        present.join(", "),
         record.display(),
     );
     Ok(Some(OperatorStop {
@@ -3949,7 +4000,7 @@ pub(crate) enum RowStep {
 /// operator stop file is consulted between rows, before each worker spawn.
 pub(crate) fn drive_rows(
     slugs: &[String],
-    stop_file: &Path,
+    stop_files: &[PathBuf],
     logs: &Path,
     kind: &str,
     mut row: impl FnMut(usize, RowStep) -> Result<bool, String>,
@@ -3960,7 +4011,7 @@ pub(crate) fn drive_rows(
             continue;
         }
         if let Some(stop) =
-            operator_stop_before_row(stop_file, logs, kind, index, slug, slugs.len())?
+            operator_stop_before_row(stop_files, logs, kind, index, slug, slugs.len())?
         {
             return Ok(Some(stop));
         }
@@ -3983,8 +4034,8 @@ pub struct CampaignLaunch {
     pub prompt_file: PathBuf,
     pub destination: PathBuf,
     pub resume_dir: PathBuf,
-    /// Operator stop file checked between rows; never part of the resume identity.
-    pub stop_file: PathBuf,
+    /// Operator stop files checked between rows; never part of the resume identity.
+    pub stop_files: Vec<PathBuf>,
     pub safety_policy: PathBuf,
     /// `Some` launches every scheduled row in `compressed` mode with this KV method; `None` is the
     /// dense baseline campaign.
@@ -4334,11 +4385,11 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
         .iter()
         .map(|row| coordinate_slug(&row.coordinate))
         .collect::<Vec<_>>();
-    validate_resume_entries(&launch.resume_dir, &launch.stop_file, &slugs)?;
+    validate_resume_entries(&launch.resume_dir, &launch.stop_files, &slugs)?;
     let mut prepared = Vec::with_capacity(schedule.len());
     let stopped = drive_rows(
         &slugs,
-        &launch.stop_file,
+        &launch.stop_files,
         &launch.resume_dir.join("logs"),
         "sc-20671-operator-stop",
         |index, step| {
@@ -4486,14 +4537,14 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
 /// the stop file is tolerated here and never enters the resume identity.
 fn validate_resume_entries(
     resume_dir: &Path,
-    stop_file: &Path,
+    stop_files: &[PathBuf],
     slugs: &[String],
 ) -> Result<(), String> {
     for entry in fs::read_dir(resume_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().to_string();
         if !["identity.json", "identity.json.sha256", "logs"].contains(&name.as_str())
-            && !is_operator_stop_entry(resume_dir, stop_file, &name)
+            && !is_operator_stop_entry(resume_dir, stop_files, &name)
             && !slugs.contains(&name)
             && !slugs
                 .iter()
@@ -4548,12 +4599,12 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 ///   --resume-dir /abs/sc20676-compressed-resume --out /abs/sc20676-compressed-campaign
 /// ```
 ///
-/// Safe operator stop: `touch /abs/sc20676-compressed-resume/STOP` (or the `--stop-file <path>`
-/// given to `parent`). The parent finishes the row whose worker is running — it never signals a
-/// worker — then, before spawning the next row, writes
-/// `<resume-dir>/logs/operator-stop.attempt-<n>.json` ("stopped-by-operator", `beforeRow`) and
-/// exits with status [`OPERATOR_STOP_EXIT_CODE`] (75). Remove the stop file and rerun the same
-/// command: accepted rows resume from the directory and the campaign continues at that row.
+/// Safe operator stop: `touch /abs/sc20676-compressed-resume/STOP` (always honoured) or the
+/// `--stop-file <path>` given to `parent` (honoured as well). The parent finishes the row whose
+/// worker is running — it never signals a worker — then, before spawning the next row, writes
+/// `<resume-dir>/logs/operator-stop.attempt-<n>.json` ("stopped-by-operator", `beforeRow`) with its
+/// `.sha256` seal and exits with status [`OPERATOR_STOP_EXIT_CODE`] (75). Remove the stop file(s)
+/// and rerun the same command: accepted rows resume and the campaign continues at that row.
 pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
     let Some(mode) = args.first().map(String::as_str) else {
         return Err("usage: sc20671-kv-baseline parent|worker [options]".into());
@@ -4575,7 +4626,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 )?),
                 prompt_file: PathBuf::from(required_flag(args, "--prompt-file")?),
                 destination: PathBuf::from(required_flag(args, "--out")?),
-                stop_file: operator_stop_file(args, &resume_dir)?,
+                stop_files: operator_stop_files(args, &resume_dir)?,
                 resume_dir,
                 safety_policy: PathBuf::from(required_flag(args, "--safety-policy")?),
                 compressed: compressed_mode_flags(args)?,
@@ -11726,7 +11777,11 @@ pub(crate) mod tests {
             let (root, stop_file) = (self.root.clone(), self.stop_file.clone());
             drive_rows(
                 slugs,
-                &stop_file,
+                &operator_stop_files(
+                    &["--stop-file".to_string(), stop_file.display().to_string()],
+                    &root,
+                )
+                .unwrap(),
                 &root.join("logs"),
                 "sc-20671-operator-stop",
                 |index, step| {
@@ -11776,6 +11831,18 @@ pub(crate) mod tests {
         assert_eq!(record["beforeRow"], 0);
         assert_eq!(record["rowsAccepted"], 0);
         assert!(stop.record.starts_with(dir.path().join("logs")));
+        // The record is sealed by its own sidecar.
+        let raw = fs::read(&stop.record).unwrap();
+        let name = stop
+            .record
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("logs").join(format!("{name}.sha256"))).unwrap(),
+            format!("{}  {name}\n", seal_bytes(&raw))
+        );
         assert_eq!(
             CampaignOutcome::StoppedByOperator(stop).exit_code(),
             OPERATOR_STOP_EXIT_CODE
@@ -11846,28 +11913,71 @@ pub(crate) mod tests {
         fs::create_dir(root.join("logs")).unwrap();
         fs::write(root.join(OPERATOR_STOP_FILE_NAME), b"").unwrap();
         fs::write(root.join("custom.stop"), b"").unwrap();
-        validate_resume_entries(&root, &root.join("custom.stop"), &slugs).unwrap();
+        let stops = vec![root.join(OPERATOR_STOP_FILE_NAME), root.join("custom.stop")];
+        validate_resume_entries(&root, &stops, &slugs).unwrap();
         assert_eq!(
             prepare_resume_root(&root, &mut identity.clone()).unwrap(),
             sealed,
             "stop-file presence must not change the resume identity"
         );
         fs::write(root.join("stray.json"), b"{}").unwrap();
-        assert!(validate_resume_entries(&root, &root.join("custom.stop"), &slugs).is_err());
+        assert!(validate_resume_entries(&root, &stops, &slugs).is_err());
     }
 
     #[test]
-    fn stop_file_flag_defaults_to_the_resume_directory() {
+    fn stop_file_flag_adds_to_the_resume_directory_stop() {
         let resume = Path::new("/abs/resume");
         assert_eq!(
-            operator_stop_file(&[], resume).unwrap(),
-            resume.join(OPERATOR_STOP_FILE_NAME)
+            operator_stop_files(&[], resume).unwrap(),
+            vec![resume.join(OPERATOR_STOP_FILE_NAME)]
         );
         let args = ["parent", "--stop-file", "/abs/halt"].map(String::from);
         assert_eq!(
-            operator_stop_file(&args, resume).unwrap(),
-            PathBuf::from("/abs/halt")
+            operator_stop_files(&args, resume).unwrap(),
+            vec![
+                resume.join(OPERATOR_STOP_FILE_NAME),
+                PathBuf::from("/abs/halt")
+            ]
         );
-        assert!(operator_stop_file(&["--stop-file".to_string()], resume).is_err());
+        assert!(operator_stop_files(&["--stop-file".to_string()], resume).is_err());
+    }
+
+    #[test]
+    fn both_stop_paths_stop_and_stat_errors_are_not_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("elsewhere").join("halt");
+        let files = operator_stop_files(
+            &["--stop-file".to_string(), custom.display().to_string()],
+            dir.path(),
+        )
+        .unwrap();
+        let logs = dir.path().join("logs");
+        assert_eq!(
+            operator_stop_before_row(&files, &logs, "k", 0, "row-a", 2).unwrap(),
+            None
+        );
+        // <resume-dir>/STOP still stops a parent given --stop-file.
+        fs::write(dir.path().join(OPERATOR_STOP_FILE_NAME), b"").unwrap();
+        let stop = operator_stop_before_row(&files, &logs, "k", 1, "row-b", 2)
+            .unwrap()
+            .expect("default stop honoured");
+        assert_eq!(
+            stop_record(&stop)["stopFiles"][0],
+            files[0].display().to_string()
+        );
+        fs::remove_file(dir.path().join(OPERATOR_STOP_FILE_NAME)).unwrap();
+        // ...and so does the custom path alone.
+        fs::create_dir(dir.path().join("elsewhere")).unwrap();
+        fs::write(&custom, b"").unwrap();
+        let stop = operator_stop_before_row(&files, &logs, "k", 1, "row-b", 2)
+            .unwrap()
+            .expect("custom stop honoured");
+        assert_eq!(
+            stop_record(&stop)["stopFiles"][0],
+            custom.display().to_string()
+        );
+        // A stat failure other than NotFound (here ENOTDIR) is an error, not "no stop".
+        let blocked = vec![custom.join("STOP")];
+        assert!(operator_stop_before_row(&blocked, &logs, "k", 0, "row-a", 2).is_err());
     }
 }
