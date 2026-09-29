@@ -103,11 +103,24 @@ pub const REQUIRED_PHASES: [&str; 8] = [
     "cancellation-cleanup",
     "post-run-release",
 ];
+/// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v3).
 pub const QUALITY_CONTRACT_HASH: &str =
-    "03c44b0f12caf79c1560e29fcfe536e2d7fd57153add4f3958697057b10116d2";
+    "54909dcc0fe45afec01a95f84d10efcb06a810a67dad2eb070bbc99903584589";
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
 pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
+/// Quality contract v3: the only denominator of a compressed receipt's quality gate is the
+/// dense-KV run on the same weights. The bf16 model remains weight-quantization characterization.
+pub const COMPRESSED_QUALITY_REFERENCE: &str = "dense-kv-same-weights";
+/// Quality contract v3 needle wording (RULER/NIAH style). The v2 credential-like "passphrase"
+/// wording made the dense Q4 Llama baseline answer with a safety refusal. The needle token itself
+/// is still matched exactly.
+pub const NEEDLE_FIXTURE_STATEMENT_PREFIX: &str = "The special magic identifier is ";
+pub const NEEDLE_FIXTURE_QUESTION: &str =
+    "What is the special magic identifier mentioned in the text above? Reply with only the identifier.";
+/// Every campaign row is admitted by its runtime guards (supervised worker, footprint watchdog cap,
+/// host reserve, deadline, sampling), never by a static whole-process peak proof.
+pub const RUNTIME_GUARDED_ADMISSION: &str = "runtime-guarded";
 
 pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit-boundary"];
 pub const MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS: u64 = 1_000;
@@ -625,8 +638,10 @@ fn pinned_dense_kv_element_bytes(
 /// A deliberately conservative planning floor, not a proven process peak. The two-times
 /// checkpoint load reservation matches this model type's load admission; the pinned projection
 /// metadata supplies role-specific dense KV width. The actual lazy graph may retain more,
-/// especially at long context, so this floor alone does not admit material or fit rows.
-fn static_role_footprint_budget(
+/// especially at long context, so the floor is only a pre-spawn refusal (a row whose floor already
+/// exceeds the child cap cannot fit) and the estimate recorded in the receipt. Admission itself is
+/// runtime-guarded: see [`runtime_guarded_admission`].
+pub(crate) fn static_role_footprint_budget(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
     total_live_tokens: u64,
@@ -719,12 +734,6 @@ fn static_row_requirements(
     prompt: &str,
     policy: &CampaignSafetyPolicy,
 ) -> Result<(u64, u64, u64), String> {
-    if ["memory-material", "fit-boundary"].contains(&coordinate.context_band) {
-        return Err(format!(
-            "{} incomplete: no validated source-backed transient prefill peak bound for this required long-context geometry; token and polling limits alone cannot admit it",
-            coordinate_slug(coordinate)
-        ));
-    }
     let candidate = benchmark_model(coordinate.family, false)?;
     let reference = benchmark_model(coordinate.family, true)?;
     let candidate_tokens =
@@ -754,6 +763,94 @@ fn static_row_requirements(
         policy,
     )?;
     Ok((total, max_request, known_footprint_budget))
+}
+
+/// The runtime admission a row ran under. It is recorded in every receipt so the stated child cap
+/// and the static planning estimate travel with the evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptAdmission {
+    pub mode: String,
+    pub child_footprint_cap_bytes: u64,
+    pub host_free_reserve_bytes: u64,
+    pub static_footprint_floor_bytes: u64,
+}
+
+impl ReceiptAdmission {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode != RUNTIME_GUARDED_ADMISSION
+            || self.child_footprint_cap_bytes == 0
+            || self.host_free_reserve_bytes == 0
+            || self
+                .host_free_reserve_bytes
+                .checked_add(self.child_footprint_cap_bytes)
+                .is_none()
+            || self.static_footprint_floor_bytes == 0
+            || self.static_footprint_floor_bytes > self.child_footprint_cap_bytes
+        {
+            return Err("row admission is not a runtime-guarded cap with its estimate".into());
+        }
+        Ok(())
+    }
+}
+
+/// Admit a row by its runtime guards rather than by a static whole-process MLX peak proof, which is
+/// unobtainable for lazy long-context graphs. The row is admitted only when the mandatory policy
+/// configures every supervisor guard (deadline, sampling, termination grace, host RAM reserve,
+/// child `phys_footprint` watchdog cap) and the conservative static floor still fits under the
+/// cap. The supervisor then refuses before spawn unless host free RAM covers cap plus reserve, and
+/// terminates the child if the watchdog trips; neither outcome is ever an accepted row.
+pub(crate) fn runtime_guarded_admission(
+    policy: &CampaignSafetyPolicy,
+    static_footprint_floor_bytes: u64,
+) -> Result<ReceiptAdmission, String> {
+    policy.validate()?;
+    let admission = ReceiptAdmission {
+        mode: RUNTIME_GUARDED_ADMISSION.into(),
+        child_footprint_cap_bytes: policy.child_footprint_cap_bytes,
+        host_free_reserve_bytes: policy.host_free_reserve_bytes,
+        static_footprint_floor_bytes,
+    };
+    admission.validate()?;
+    Ok(admission)
+}
+
+/// Persist a refused (pre-spawn), aborted (post-spawn guard), or failed row as a sealed, explicitly
+/// unaccepted log record. It never becomes a receipt and the resume validator never reads it.
+pub(crate) fn write_unaccepted_row_record(
+    path: &Path,
+    kind: &str,
+    slug: &str,
+    admission: &ReceiptAdmission,
+    stop: (&str, &str, Option<u32>),
+) -> Result<(), String> {
+    let (reason, detail, pid) = stop;
+    let record = serde_json::json!({
+        "schemaVersion": 1,
+        "kind": kind,
+        "coordinate": slug,
+        "accepted": false,
+        "outcome": match (reason, pid) {
+            ("ChildExit", _) => "failed",
+            (_, None) => "refused",
+            (_, Some(_)) => "aborted",
+        },
+        "reason": reason,
+        "detail": detail,
+        "pid": pid,
+        "admission": admission,
+    });
+    let bytes = seal_json(&record)?.0;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("write unaccepted row record: {e}"))?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(|e| e.to_string())
 }
 
 fn valid_locked_mlx_fields(version: &str, source: &str, revision: &str) -> bool {
@@ -1003,6 +1100,7 @@ pub struct ReceiptMemory {
     pub allocation_events: Vec<ReceiptAllocation>,
     pub reconciliation: ReceiptReconciliation,
     pub release: ReceiptRelease,
+    pub admission: ReceiptAdmission,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1100,6 +1198,10 @@ pub struct ReceiptQuality {
     pub structured_tool_agreement: f64,
     #[serde(rename = "needleRetrieval")]
     pub needle_retrieval: f64,
+    /// False when the same-weights dense-KV run itself missed the needle: the needle check then
+    /// measures only agreement with that dense output and cannot detect KV-induced retrieval loss.
+    #[serde(rename = "needleDiscriminating")]
+    pub needle_discriminating: bool,
     #[serde(rename = "multiTurnPromptCache")]
     pub multi_turn_prompt_cache: f64,
     pub statistics: ReceiptQualityStatistics,
@@ -1380,6 +1482,7 @@ impl ReceiptBuilder {
         self.template.quality.greedy_token_agreement = metrics.greedy_token_agreement;
         self.template.quality.structured_tool_agreement = metrics.structured_tool_agreement;
         self.template.quality.needle_retrieval = metrics.needle_retrieval;
+        self.template.quality.needle_discriminating = self.quality.needle_discriminating;
         self.template.quality.multi_turn_prompt_cache = metrics.multi_turn_prompt_cache;
         if self.template.memory.persistent_kv_bytes == 0
             || self.template.memory.model_weights_bytes == 0
@@ -1782,6 +1885,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("full-cache transient high-water detected".into());
     }
+    receipt.memory.admission.validate()?;
     let weights = receipt.memory.model_weights_bytes;
     let kv = receipt.memory.persistent_kv_bytes;
     let sample_for = |phase: &str| {
@@ -2118,6 +2222,31 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         })
     {
         return Err("quality threshold or fixture evidence failed".into());
+    }
+    // Contract v3: a compressed receipt's quality denominator is the dense-KV run on the same
+    // weights, never the bf16 model; dense fixtures are bf16 characterization and must not claim
+    // to be a same-weights gate reference.
+    for name in REQUIRED_FIXTURES {
+        let same_weights = fixture_independent_reference(
+            name,
+            QualityReference::DenseKvSameWeights,
+            &receipt.provenance.model_file_sha256,
+        );
+        if (receipt.mode == "compressed")
+            != (receipt.quality.fixture_evidence[name].independent_reference == same_weights)
+        {
+            return Err(format!(
+                "{name} quality reference is not the contract v3 denominator for a {} receipt",
+                receipt.mode
+            ));
+        }
+    }
+    if receipt.mode == "dense"
+        && receipt.quality.needle_discriminating != (receipt.quality.needle_retrieval == 1.0)
+    {
+        return Err(
+            "dense needle discrimination must equal the dense run's own needle recovery".into(),
+        );
     }
     if !receipt.memory.release.verified || !receipt.cancellation.cleanup_verified {
         return Err("release/cancellation evidence failed".into());
@@ -3364,11 +3493,19 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
             (&launch.qwen_snapshot, &launch.qwen_fp32_reference_snapshot)
         };
         let coordinate = coordinate_slug(&row.coordinate);
-        match static_row_requirements(&row.coordinate, candidate, reference, &prompt, &policy) {
-            Ok((total, request, footprint)) => row_admission.push(serde_json::json!({
+        match static_row_requirements(&row.coordinate, candidate, reference, &prompt, &policy)
+            .and_then(|(total, request, footprint)| {
+                Ok((
+                    total,
+                    request,
+                    runtime_guarded_admission(&policy, footprint)?,
+                ))
+            }) {
+            Ok((total, request, admission)) => row_admission.push(serde_json::json!({
                 "coordinate": coordinate, "staticPreflightPassed": true,
                 "totalLiveTokenBound": total, "requestTokenBound": request,
-                "knownFootprintBudgetBytes": footprint,
+                "knownFootprintBudgetBytes": admission.static_footprint_floor_bytes,
+                "admission": admission,
             })),
             Err(reason) => row_admission.push(serde_json::json!({
                 "coordinate": coordinate, "staticPreflightPassed": false, "reason": reason,
@@ -3583,13 +3720,14 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
         } else {
             &launch.qwen_fp32_reference_snapshot
         };
-        let (total_tokens, request_tokens, _) = static_row_requirements(
+        let (total_tokens, request_tokens, static_footprint_floor) = static_row_requirements(
             &row.coordinate,
             snapshot,
             reference_snapshot,
             &prompt,
             &policy,
         )?;
+        let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
         let mut command = Command::new(&launch.executable);
         command
             .arg("worker")
@@ -3625,16 +3763,40 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<(), String> {
             stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
             stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
         };
-        let status = campaign_supervisor::run_guarded(
-            &mut command, &request, &policy.supervisor(), &mut SystemProbe,
-        ).map_err(|failure| format!(
-            "coordinate {slug} stopped ({:?}): {}; child {:?} reaped; valid earlier rows remain in {}",
-            failure.reason, failure.detail, failure.pid, launch.resume_dir.display(),
-        ))?;
+        let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
+        let status = match campaign_supervisor::run_guarded(
+            &mut command,
+            &request,
+            &policy.supervisor(),
+            &mut SystemProbe,
+        ) {
+            Ok(status) => status,
+            Err(failure) => {
+                let reason = format!("{:?}", failure.reason);
+                write_unaccepted_row_record(
+                    &unaccepted,
+                    "sc-20671-unaccepted-row",
+                    &slug,
+                    &admission,
+                    (&reason, &failure.detail, failure.pid),
+                )?;
+                return Err(format!(
+                    "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; not accepted ({}); valid earlier rows remain in {}",
+                    failure.detail, failure.pid, unaccepted.display(), launch.resume_dir.display(),
+                ));
+            }
+        };
         if !status.success() {
+            write_unaccepted_row_record(
+                &unaccepted,
+                "sc-20671-unaccepted-row",
+                &slug,
+                &admission,
+                ("ChildExit", &status.to_string(), None),
+            )?;
             return Err(format!(
-                "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
-                request.stderr_path.display(), launch.resume_dir.display(),
+                "coordinate {slug} failed with {status}; stderr: {}; not accepted ({}); valid earlier rows remain in {}",
+                request.stderr_path.display(), unaccepted.display(), launch.resume_dir.display(),
             ));
         }
         // Child publication itself is atomic. Bind the row to this exact immutable launch before
@@ -3801,13 +3963,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                     ));
                 }
             }
-            static_row_requirements(
+            let (_, _, static_footprint_floor) = static_row_requirements(
                 &row.coordinate,
                 &snapshot,
                 &reference_snapshot,
                 &prompt,
                 &policy,
             )?;
+            let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
             let candidate_session = CampaignSession::load(&snapshot)
                 .map_err(|e| format!("load candidate campaign session: {e}"))?;
             let candidate_baseline = candidate_session.load_start_sample.mlx_active_bytes;
@@ -3949,7 +4112,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 .zip(reference_warmups)
                 .enumerate()
                 .map(|(warmup_index, (candidate, reference))| {
-                    let suite = pair_product_fixture_halves(candidate, reference)?;
+                    let suite = pair_product_fixture_halves(
+                        candidate,
+                        reference,
+                        QualityReference::Bf16Characterization,
+                    )?;
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product warmup {warmup_index} quality for {}: {e}",
@@ -3965,7 +4132,11 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 .zip(reference_repeats)
                 .enumerate()
                 .map(|(repeat, (candidate, reference))| {
-                    let suite = pair_product_fixture_halves(candidate, reference)?;
+                    let suite = pair_product_fixture_halves(
+                        candidate,
+                        reference,
+                        QualityReference::Bf16Characterization,
+                    )?;
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product fixture repeat {repeat} quality for {}: {e}",
@@ -4000,6 +4171,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<(), String> {
                 &fixtures,
                 warmup_cache_state_version,
                 &captured_source,
+                admission,
             )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
@@ -4485,6 +4657,28 @@ pub struct FixtureEvidence {
     pub passed: bool,
 }
 
+/// Which run is the denominator of a fixture comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityReference {
+    /// Dense rows: raw characterization of weight quantization against the bf16 model. Recorded,
+    /// never gated.
+    Bf16Characterization,
+    /// Compressed rows: the dense-KV run on the same weights, so every gated metric isolates the
+    /// effect of KV compression.
+    DenseKvSameWeights,
+}
+
+/// Raw per-fixture behaviour of both arms, recorded as observations in the sealed artifacts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixtureOutcomes {
+    pub candidate_tool_valid: bool,
+    pub reference_tool_valid: bool,
+    pub tool_outputs_match: bool,
+    pub candidate_needle_recovered: bool,
+    pub reference_needle_recovered: bool,
+    pub needle_outputs_match: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct QualityObservation {
     pub parity_errors: Vec<f64>,
@@ -4498,6 +4692,10 @@ pub struct QualityObservation {
     pub needle_total: u64,
     pub cache_matches: u64,
     pub cache_total: u64,
+    pub outcomes: FixtureOutcomes,
+    /// Whether the needle check can detect KV-induced retrieval loss: the same-weights dense-KV
+    /// run recovered the exact needle.
+    pub needle_discriminating: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4568,12 +4766,25 @@ fn product_fixture_artifact(
             &suite.kernel_reference,
         ),
         "structured-tool-call" => (
-            serde_json::json!({ "matches": quality.tool_matches, "total": quality.tool_total }),
+            serde_json::json!({
+                "matches": quality.tool_matches,
+                "total": quality.tool_total,
+                "candidateValid": quality.outcomes.candidate_tool_valid,
+                "referenceValid": quality.outcomes.reference_tool_valid,
+                "outputsMatch": quality.outcomes.tool_outputs_match,
+            }),
             &suite.tool_candidate,
             &suite.tool_reference,
         ),
         "long-context-needle" => (
-            serde_json::json!({ "matches": quality.needle_matches, "total": quality.needle_total }),
+            serde_json::json!({
+                "matches": quality.needle_matches,
+                "total": quality.needle_total,
+                "candidateRecovered": quality.outcomes.candidate_needle_recovered,
+                "referenceRecovered": quality.outcomes.reference_needle_recovered,
+                "outputsMatch": quality.outcomes.needle_outputs_match,
+                "discriminating": quality.needle_discriminating,
+            }),
             &suite.needle_candidate,
             &suite.needle_reference,
         ),
@@ -4587,7 +4798,7 @@ fn product_fixture_artifact(
     let metrics = compute_quality(&quality)?;
     let value = serde_json::json!({
         "fixture": name,
-        "independentReference": fixture_independent_reference(name, &reference.quality_observation.snapshot.sha256),
+        "independentReference": fixture_independent_reference(name, suite.reference, &reference.quality_observation.snapshot.sha256),
         "binding": {
             "coordinate": coordinate_slug(coordinate),
             "repeat": repeat,
@@ -4657,11 +4868,22 @@ fn product_fixture_artifact(
     Ok(sealed_json(&value))
 }
 
-fn fixture_independent_reference(name: &str, reference_inventory: &str) -> String {
+fn fixture_independent_reference(
+    name: &str,
+    reference: QualityReference,
+    reference_inventory: &str,
+) -> String {
+    let model = match reference {
+        QualityReference::Bf16Characterization => format!("bf16-model:{reference_inventory}"),
+        QualityReference::DenseKvSameWeights => {
+            format!("{COMPRESSED_QUALITY_REFERENCE}:{reference_inventory}")
+        }
+    };
+    // Kernel parity keeps its independent host-fp32 dequantize-then-attend reference either way.
     if name == "kernel-fp32-reference" {
-        format!("host-fp32-dense-attention-v1;bf16-model:{reference_inventory}")
+        format!("host-fp32-dense-attention-v1;{model}")
     } else {
-        format!("bf16-model:{reference_inventory}")
+        model
     }
 }
 
@@ -5994,9 +6216,10 @@ fn dense_kernel_fp32_parity_errors() -> Result<Vec<f64>, String> {
 }
 
 /// Convert four actual candidate/reference fixture pairs into the raw quality input consumed by
-/// [`ReceiptBuilder`].  This helper intentionally rejects a fixture that did not execute its own
-/// required behavior (tool parsing, needle recovery, or prefix result equality), rather than
-/// converting a missing capability into a green ratio.
+/// [`ReceiptBuilder`]. Tool validity, needle recovery, and output agreement are recorded for both
+/// arms as observations; nothing here rejects a row on model behaviour. Dense rows are raw
+/// characterization against the bf16 model, and compressed rows are gated by the receipt
+/// validator against the dense-KV run on the same weights (quality contract v3).
 #[allow(clippy::too_many_arguments)]
 pub fn quality_from_product_fixtures(
     kernel_candidate: &ProductFixtureResult,
@@ -6008,7 +6231,26 @@ pub fn quality_from_product_fixtures(
     cache_candidate: &ProductFixtureResult,
     cache_reference: &ProductFixtureResult,
     expected_needle: &str,
+    reference: QualityReference,
 ) -> Result<QualityObservation, String> {
+    if reference == QualityReference::DenseKvSameWeights
+        && [
+            (kernel_candidate, kernel_reference),
+            (tool_candidate, tool_reference),
+            (needle_candidate, needle_reference),
+            (cache_candidate, cache_reference),
+        ]
+        .iter()
+        .any(|(candidate, reference)| {
+            candidate.quality_observation.snapshot.sha256
+                != reference.quality_observation.snapshot.sha256
+        })
+    {
+        return Err(
+            "compressed quality must be measured against the dense-KV run on the same weights"
+                .into(),
+        );
+    }
     let (greedy_matches, greedy_total) = token_agreement(
         &kernel_candidate.quality_observation.token_probabilities,
         &kernel_reference.quality_observation.token_probabilities,
@@ -6017,21 +6259,15 @@ pub fn quality_from_product_fixtures(
         &cache_candidate.quality_observation.token_probabilities,
         &cache_reference.quality_observation.token_probabilities,
     );
-    let candidate_tool_ok = structured_fixture_tool_valid(&tool_candidate.output);
-    let reference_tool_ok = structured_fixture_tool_valid(&tool_reference.output);
-    let tool_outputs_match = tool_candidate.output.tool_calls == tool_reference.output.tool_calls;
-    if !candidate_tool_ok || !reference_tool_ok || !tool_outputs_match {
-        return Err(format!(
-            "structured-tool fixture failed: candidate={candidate_tool_ok}, reference={reference_tool_ok}, outputsMatch={tool_outputs_match}"
-        ));
-    }
-    let candidate_needle_ok = needle_candidate.output.text.contains(expected_needle);
-    let reference_needle_ok = needle_reference.output.text.contains(expected_needle);
-    if !candidate_needle_ok || !reference_needle_ok {
-        return Err(format!(
-            "long-context needle fixture did not recover the product-owned needle: candidate={candidate_needle_ok}, reference={reference_needle_ok}"
-        ));
-    }
+    let outcomes = FixtureOutcomes {
+        candidate_tool_valid: structured_fixture_tool_valid(&tool_candidate.output),
+        reference_tool_valid: structured_fixture_tool_valid(&tool_reference.output),
+        tool_outputs_match: tool_candidate.output.tool_calls == tool_reference.output.tool_calls,
+        candidate_needle_recovered: needle_candidate.output.text.contains(expected_needle),
+        reference_needle_recovered: needle_reference.output.text.contains(expected_needle),
+        needle_outputs_match: needle_candidate.output.text == needle_reference.output.text,
+    };
+    let (needle_recovered, needle_discriminating) = needle_observation(&outcomes, reference);
     let parity_errors = dense_kernel_fp32_parity_errors()?;
     Ok(QualityObservation {
         parity_errors,
@@ -6043,13 +6279,35 @@ pub fn quality_from_product_fixtures(
         )?,
         greedy_matches,
         greedy_total,
-        tool_matches: 1,
+        tool_matches: u64::from(outcomes.tool_outputs_match),
         tool_total: 1,
-        needle_matches: 1,
+        needle_matches: u64::from(needle_recovered),
         needle_total: 1,
         cache_matches,
         cache_total,
+        outcomes,
+        needle_discriminating,
     })
+}
+
+/// Needle outcome and whether it can discriminate KV-induced retrieval loss.
+///
+/// A dense row's dense-KV run on its own weights is the candidate itself, so its observation is
+/// the candidate's exact recovery. A compressed row is compared with the same-weights dense-KV run:
+/// when that run recovered the needle the compressed run must recover it too; when it did not, the
+/// only measurable property is exact agreement with the dense output, and the row is flagged
+/// non-discriminating instead of silently counting a shared miss as retrieval.
+fn needle_observation(outcomes: &FixtureOutcomes, reference: QualityReference) -> (bool, bool) {
+    match reference {
+        QualityReference::Bf16Characterization => (
+            outcomes.candidate_needle_recovered,
+            outcomes.candidate_needle_recovered,
+        ),
+        QualityReference::DenseKvSameWeights if outcomes.reference_needle_recovered => {
+            (outcomes.candidate_needle_recovered, true)
+        }
+        QualityReference::DenseKvSameWeights => (outcomes.needle_outputs_match, false),
+    }
 }
 
 fn structured_fixture_tool_valid(output: &TextLlmOutput) -> bool {
@@ -6091,6 +6349,9 @@ pub struct ProductFixtureSuite {
     pub context_window_tokens: u64,
     pub context_target_tokens: u64,
     pub context_payload_tokens: u64,
+    /// The fixture denominator: bf16 characterization for dense rows, the same-weights dense-KV
+    /// run for compressed rows.
+    pub reference: QualityReference,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -6117,9 +6378,8 @@ fn fixture_request(prompt: String, tools: Vec<ToolSpec>) -> TextLlmRequest {
 
 fn needle_fixture_prompt(prompt: &str, band_payload: &str, needle: &str) -> String {
     format!(
-        "{prompt}\nRemember this harmless passphrase exactly: {needle}\n\
-         BEGIN LONG CONTEXT\n{band_payload}\nEND LONG CONTEXT\n\
-         What harmless passphrase were you instructed to remember? Reply with only the passphrase."
+        "{prompt}\n{NEEDLE_FIXTURE_STATEMENT_PREFIX}{needle}.\n\
+         BEGIN LONG CONTEXT\n{band_payload}\nEND LONG CONTEXT\n{NEEDLE_FIXTURE_QUESTION}"
     )
 }
 
@@ -6140,7 +6400,11 @@ pub fn run_product_fixture_suite(
     let reference_half = run_product_fixture_half_on_session(&reference, prompt, coordinate)?;
     drop(reference);
     quiesce_campaign_active_memory(reference_baseline)?;
-    pair_product_fixture_halves(candidate_half, reference_half)
+    pair_product_fixture_halves(
+        candidate_half,
+        reference_half,
+        QualityReference::Bf16Characterization,
+    )
 }
 
 struct ProductFixtureHalf {
@@ -6345,6 +6609,7 @@ fn run_product_fixture_half_on_session_bounded(
 fn pair_product_fixture_halves(
     candidate: ProductFixtureHalf,
     reference: ProductFixtureHalf,
+    reference_kind: QualityReference,
 ) -> core_llm::Result<ProductFixtureSuite> {
     if candidate.needle != reference.needle
         || candidate.context_window_tokens != reference.context_window_tokens
@@ -6370,6 +6635,7 @@ fn pair_product_fixture_halves(
         context_window_tokens: candidate.context_window_tokens,
         context_target_tokens: candidate.context_target_tokens,
         context_payload_tokens: candidate.context_payload_tokens,
+        reference: reference_kind,
     })
 }
 
@@ -6385,6 +6651,7 @@ impl ProductFixtureSuite {
             &self.cache_candidate,
             &self.cache_reference,
             &self.needle,
+            self.reference,
         )
     }
 }
@@ -6865,6 +7132,7 @@ pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
     Err("pmset thermal probe did not prove nominal thermal state".into())
 }
 
+#[allow(clippy::too_many_arguments)] // Every argument is producer-owned sealed evidence.
 fn product_receipt(
     coordinate: &Coordinate,
     suite: &ProductFixtureSuite,
@@ -6873,6 +7141,7 @@ fn product_receipt(
     fixtures: &[SealedFixtureArtifact],
     warmup_cache_state_version: Option<u64>,
     captured_source: &(String, String),
+    admission: ReceiptAdmission,
 ) -> Result<Receipt, String> {
     let ProductTimingMeasurements {
         samples: timing_samples,
@@ -7019,7 +7288,11 @@ fn product_receipt(
                 artifact_name,
                 artifact_sha256: hash,
                 artifact_sidecar_sha256: seal_bytes(artifact.sidecar.as_bytes()),
-                independent_reference: fixture_independent_reference(name, &reference.sha256),
+                independent_reference: fixture_independent_reference(
+                    name,
+                    suite.reference,
+                    &reference.sha256,
+                ),
             },
         );
     }
@@ -7028,9 +7301,9 @@ fn product_receipt(
         provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: "sc20671-kv-baseline --mode dense".into(), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
-        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 } },
+        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 }, admission },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() } };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle: ReceiptLifecycle { append:true,chunked_prefill:true,single_shot_prefill:true,prompt_cache_reuse:true,trim:false,rollback:false,clear:false,cancel:true,clone:false,batch_split:false,batch_merge:false,prefix_copy_on_write:false,page_import:false,page_export:false,serialization:false,restore:false,dense_fallback:false,post_run_release:true,fallback_reasons }, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() } };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -7065,7 +7338,7 @@ pub fn verify_coordinate_product_controls(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
@@ -7091,18 +7364,18 @@ mod tests {
     }
 
     #[test]
-    fn needle_prompt_places_one_passphrase_before_the_long_context() {
+    fn needle_prompt_places_one_neutral_needle_before_the_long_context() {
         let prompt = needle_fixture_prompt("baseline", "DISTRACTOR", "SC20671-NEEDLE");
         assert_eq!(prompt.matches("SC20671-NEEDLE").count(), 1);
         assert!(prompt.find("SC20671-NEEDLE").unwrap() < prompt.find("DISTRACTOR").unwrap());
         assert!(prompt.contains("BEGIN LONG CONTEXT\nDISTRACTOR\nEND LONG CONTEXT"));
         assert!(prompt.ends_with(
-            "What harmless passphrase were you instructed to remember? Reply with only the passphrase."
+            "What is the special magic identifier mentioned in the text above? Reply with only the identifier."
         ));
     }
 
     #[test]
-    fn failed_needle_quality_retains_role_diagnostics_without_acceptance() {
+    fn needle_miss_is_a_recorded_observation_with_role_diagnostics() {
         let result = |text: &str| {
             let observation = || ProductObservations {
                 snapshot: SnapshotInventory {
@@ -7138,7 +7411,7 @@ mod tests {
                 phase_elapsed_ms: Vec::new(),
                 allocations: Vec::new(),
                 prefill_logits: Vec::new(),
-                token_probabilities: Vec::new(),
+                token_probabilities: vec![(7, 0.5), (9, 0.25)],
                 session_id: "session".into(),
                 cache_state_version: 1,
                 operations: Vec::new(),
@@ -7250,16 +7523,142 @@ mod tests {
                 ["truncated"],
             true
         );
-        let suite = pair_product_fixture_halves(candidate, reference).unwrap();
-        let error = suite.quality().unwrap_err();
-        assert!(error.contains("candidate=false, reference=true"));
-        let reversed =
-            pair_product_fixture_halves(half("SC20671-NUMERIC-NEEDLE-9b7a2e"), half("wrong"))
-                .unwrap();
-        assert!(reversed
-            .quality()
-            .unwrap_err()
-            .contains("candidate=true, reference=false"));
+        // Dense rows are raw characterization: a Q4 miss (or refusal) against a recovering bf16
+        // reference is recorded, never a rejected row.
+        let dense = pair_product_fixture_halves(
+            candidate,
+            reference,
+            QualityReference::Bf16Characterization,
+        )
+        .unwrap()
+        .quality()
+        .unwrap();
+        assert_eq!((dense.needle_matches, dense.needle_total), (0, 1));
+        assert!(!dense.outcomes.candidate_needle_recovered);
+        assert!(dense.outcomes.reference_needle_recovered);
+        assert!(!dense.needle_discriminating);
+        assert_eq!(dense.tool_matches, 1);
+        let reversed = pair_product_fixture_halves(
+            half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
+            half("wrong"),
+            QualityReference::Bf16Characterization,
+        )
+        .unwrap()
+        .quality()
+        .unwrap();
+        assert_eq!(reversed.needle_matches, 1);
+        assert!(reversed.needle_discriminating);
+        assert!(!reversed.outcomes.reference_needle_recovered);
+        let mut invalid_tool = half("SC20671-NUMERIC-NEEDLE-9b7a2e");
+        invalid_tool.tool.output.tool_calls.clear();
+        let characterized = pair_product_fixture_halves(
+            invalid_tool,
+            half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
+            QualityReference::Bf16Characterization,
+        )
+        .unwrap()
+        .quality()
+        .unwrap();
+        assert_eq!(characterized.tool_matches, 0);
+        assert!(!characterized.outcomes.candidate_tool_valid);
+        assert!(characterized.outcomes.reference_tool_valid);
+
+        // Compressed rows: the same-weights dense-KV run is the denominator.
+        let compressed = pair_product_fixture_halves(
+            half("wrong"),
+            half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
+            QualityReference::DenseKvSameWeights,
+        )
+        .unwrap()
+        .quality()
+        .unwrap();
+        assert_eq!(compressed.needle_matches, 0);
+        assert!(compressed.needle_discriminating);
+        let shared_miss = pair_product_fixture_halves(
+            half("I cannot help with that."),
+            half("I cannot help with that."),
+            QualityReference::DenseKvSameWeights,
+        )
+        .unwrap()
+        .quality()
+        .unwrap();
+        assert_eq!(shared_miss.needle_matches, 1, "agreement with dense output");
+        assert!(
+            !shared_miss.needle_discriminating,
+            "a shared miss must be flagged, not silently counted as retrieval"
+        );
+        let divergent_miss = pair_product_fixture_halves(
+            half("something else"),
+            half("I cannot help with that."),
+            QualityReference::DenseKvSameWeights,
+        )
+        .unwrap()
+        .quality()
+        .unwrap();
+        assert_eq!(divergent_miss.needle_matches, 0);
+        assert!(!divergent_miss.needle_discriminating);
+        let mut other_weights = half("SC20671-NUMERIC-NEEDLE-9b7a2e");
+        other_weights
+            .needle_result
+            .quality_observation
+            .snapshot
+            .sha256 = "f".repeat(64);
+        assert!(pair_product_fixture_halves(
+            half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
+            other_weights,
+            QualityReference::DenseKvSameWeights,
+        )
+        .unwrap()
+        .quality()
+        .unwrap_err()
+        .contains("same weights"));
+    }
+
+    #[test]
+    fn needle_observation_gates_compressed_rows_only_against_same_weights_dense() {
+        let outcomes = |candidate, reference, outputs_match| FixtureOutcomes {
+            candidate_needle_recovered: candidate,
+            reference_needle_recovered: reference,
+            needle_outputs_match: outputs_match,
+            ..FixtureOutcomes::default()
+        };
+        use QualityReference::{Bf16Characterization as Dense, DenseKvSameWeights as Compressed};
+        assert_eq!(
+            needle_observation(&outcomes(false, true, false), Dense),
+            (false, false)
+        );
+        assert_eq!(
+            needle_observation(&outcomes(true, false, false), Dense),
+            (true, true)
+        );
+        assert_eq!(
+            needle_observation(&outcomes(true, true, true), Compressed),
+            (true, true)
+        );
+        assert_eq!(
+            needle_observation(&outcomes(false, true, false), Compressed),
+            (false, true)
+        );
+        assert_eq!(
+            needle_observation(&outcomes(false, false, true), Compressed),
+            (true, false)
+        );
+        assert_eq!(
+            needle_observation(&outcomes(false, false, false), Compressed),
+            (false, false)
+        );
+        assert_eq!(
+            fixture_independent_reference("long-context-needle", Compressed, "abc"),
+            "dense-kv-same-weights:abc"
+        );
+        assert_eq!(
+            fixture_independent_reference("kernel-fp32-reference", Compressed, "abc"),
+            "host-fp32-dense-attention-v1;dense-kv-same-weights:abc"
+        );
+        let prompt = needle_fixture_prompt("base", "payload", "NEEDLE-1");
+        assert!(prompt.contains("The special magic identifier is NEEDLE-1."));
+        assert!(prompt.ends_with(NEEDLE_FIXTURE_QUESTION));
+        assert!(!prompt.to_ascii_lowercase().contains("passphrase"));
     }
 
     #[test]
@@ -7674,14 +8073,14 @@ mod tests {
     }
 
     #[test]
-    fn long_context_requires_a_source_backed_prefill_bound_before_model_load() {
+    fn material_and_fit_rows_are_admitted_by_runtime_guards_not_a_static_peak_proof() {
         let policy = CampaignSafetyPolicy {
             schema_version: 1,
             row_deadline_seconds: 10,
             poll_millis: 100,
             term_grace_millis: 500,
-            host_free_reserve_bytes: 1,
-            child_footprint_cap_bytes: 2,
+            host_free_reserve_bytes: 1_024,
+            child_footprint_cap_bytes: 2_048,
             max_context_tokens: u64::MAX,
             max_request_tokens: u64::MAX,
             stdout_cap_bytes: 100,
@@ -7690,6 +8089,7 @@ mod tests {
         for coordinate in required_coordinates().into_iter().filter(|coordinate| {
             ["memory-material", "fit-boundary"].contains(&coordinate.context_band)
         }) {
+            // No band refusal: the row reaches the same snapshot-backed preflight as short rows.
             let error = static_row_requirements(
                 &coordinate,
                 Path::new("/nonexistent-candidate"),
@@ -7698,11 +8098,142 @@ mod tests {
                 &policy,
             )
             .unwrap_err();
-            assert!(error.contains("source-backed transient prefill peak bound"));
+            assert!(
+                error.contains("load pinned tokenizer for safety preflight"),
+                "{error}"
+            );
         }
+
+        // Admitted with every runtime guard configured; the stated cap and estimate are recorded.
+        let admission = runtime_guarded_admission(&policy, 1_000).unwrap();
+        assert_eq!(
+            admission,
+            ReceiptAdmission {
+                mode: RUNTIME_GUARDED_ADMISSION.into(),
+                child_footprint_cap_bytes: 2_048,
+                host_free_reserve_bytes: 1_024,
+                static_footprint_floor_bytes: 1_000,
+            }
+        );
+        // Refused without guards, or when the conservative floor already exceeds the cap.
+        for unguarded in [
+            CampaignSafetyPolicy {
+                child_footprint_cap_bytes: 0,
+                ..policy.clone()
+            },
+            CampaignSafetyPolicy {
+                host_free_reserve_bytes: 0,
+                ..policy.clone()
+            },
+            CampaignSafetyPolicy {
+                row_deadline_seconds: 0,
+                ..policy.clone()
+            },
+            CampaignSafetyPolicy {
+                poll_millis: 0,
+                ..policy.clone()
+            },
+        ] {
+            assert!(runtime_guarded_admission(&unguarded, 1_000).is_err());
+        }
+        assert!(runtime_guarded_admission(&policy, 2_049).is_err());
+
+        struct Host {
+            free: u64,
+            child: u64,
+        }
+        impl campaign_supervisor::MemoryProbe for Host {
+            fn host_free_bytes(&mut self, _: std::time::Instant) -> std::io::Result<u64> {
+                Ok(self.free)
+            }
+            fn child_footprint_bytes(
+                &mut self,
+                _: u32,
+                _: std::time::Instant,
+            ) -> std::io::Result<u64> {
+                Ok(self.child)
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let request = |name: &str| RunRequest {
+            context_tokens: 10,
+            request_tokens: 10,
+            stdout_path: temporary.path().join(format!("{name}.stdout.log")),
+            stderr_path: temporary.path().join(format!("{name}.stderr.log")),
+        };
+        let record = |name: &str, failure: campaign_supervisor::Failure| {
+            let path = temporary.path().join(format!("{name}.unaccepted.json"));
+            write_unaccepted_row_record(
+                &path,
+                "sc-20671-unaccepted-row",
+                name,
+                &admission,
+                (
+                    &format!("{:?}", failure.reason),
+                    &failure.detail,
+                    failure.pid,
+                ),
+            )
+            .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap()
+        };
+        // Insufficient host RAM for cap plus reserve: refused before spawn, recorded unaccepted.
+        let refused = campaign_supervisor::run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request("refused"),
+            &policy.supervisor(),
+            &mut Host {
+                free: 2_048 + 1_024 - 1,
+                child: 1,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused.reason,
+            campaign_supervisor::StopReason::PreflightMemory
+        );
+        let refused = record("refused", refused);
+        assert_eq!(refused["accepted"], false);
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(refused["admission"]["childFootprintCapBytes"], 2_048);
+        assert_eq!(refused["admission"]["staticFootprintFloorBytes"], 1_000);
+        // A watchdog trip after spawn is an aborted row, never an accepted one.
+        let aborted = campaign_supervisor::run_guarded(
+            Command::new("/bin/sleep").arg("5"),
+            &request("aborted"),
+            &policy.supervisor(),
+            &mut Host {
+                free: 2_048 + 1_024,
+                child: 2_049,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            aborted.reason,
+            campaign_supervisor::StopReason::ChildFootprint
+        );
+        let aborted = record("aborted", aborted);
+        assert_eq!(aborted["outcome"], "aborted");
+        assert_eq!(aborted["reason"], "ChildFootprint");
+        // Enough host RAM and a child under the cap: admitted and supervised to completion.
+        assert!(campaign_supervisor::run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request("admitted"),
+            &policy.supervisor(),
+            &mut Host {
+                free: 2_048 + 1_024,
+                child: 1,
+            },
+        )
+        .unwrap()
+        .success());
     }
 
-    fn write_stub_dtype_snapshot(root: &Path, spec: &BenchmarkModelSpec, scale_dtype: &str) {
+    pub(crate) fn write_stub_dtype_snapshot(
+        root: &Path,
+        spec: &BenchmarkModelSpec,
+        scale_dtype: &str,
+    ) {
         fs::create_dir_all(root).unwrap();
         fs::write(
             root.join("config.json"),
@@ -7944,6 +8475,8 @@ mod tests {
             needle_total: 1,
             cache_matches: 1,
             cache_total: 1,
+            outcomes: FixtureOutcomes::default(),
+            needle_discriminating: true,
         };
         let metrics = compute_quality(&raw).unwrap();
         assert_eq!(metrics.parity_max_error, 0.0002);
@@ -8126,6 +8659,12 @@ mod tests {
                     mlx_active_tolerance_bytes: 0,
                     mlx_cache_tolerance_bytes: 0,
                 },
+                admission: ReceiptAdmission {
+                    mode: RUNTIME_GUARDED_ADMISSION.into(),
+                    child_footprint_cap_bytes: 1 << 30,
+                    host_free_reserve_bytes: 1 << 30,
+                    static_footprint_floor_bytes: 1 << 20,
+                },
             },
             timings: ReceiptTimings {
                 load_ms: 1.0,
@@ -8166,6 +8705,7 @@ mod tests {
                 greedy_token_agreement: 1.0,
                 structured_tool_agreement: 1.0,
                 needle_retrieval: 1.0,
+                needle_discriminating: true,
                 multi_turn_prompt_cache: 1.0,
                 statistics: ReceiptQualityStatistics {
                     repeats: 5,
@@ -8320,6 +8860,8 @@ mod tests {
             needle_total: 1,
             cache_matches: 1,
             cache_total: 1,
+            outcomes: FixtureOutcomes::default(),
+            needle_discriminating: true,
         };
         let mut receipt = ReceiptBuilder {
             template,
@@ -8425,6 +8967,62 @@ mod tests {
         assert!(validate_receipt_semantics(&quality_tampered)
             .unwrap_err()
             .contains("parityMaxError=0.1"));
+        // Contract v3: compressed quality is gated only against the same-weights dense-KV run.
+        let same_weights = |receipt: &mut Receipt| {
+            for name in REQUIRED_FIXTURES {
+                let reference = fixture_independent_reference(
+                    name,
+                    QualityReference::DenseKvSameWeights,
+                    &receipt.provenance.model_file_sha256,
+                );
+                receipt
+                    .quality
+                    .fixture_evidence
+                    .get_mut(name)
+                    .unwrap()
+                    .independent_reference = reference;
+            }
+        };
+        let mut compressed = receipt.clone();
+        compressed.mode = "compressed".into();
+        compressed.provenance.command = "run --mode compressed".into();
+        assert!(validate_receipt_semantics(&compressed)
+            .unwrap_err()
+            .contains("contract v3 denominator"));
+        same_weights(&mut compressed);
+        validate_receipt_semantics(&compressed).expect("same-weights compressed receipt");
+        let mut compressed_miss = compressed.clone();
+        compressed_miss.quality.needle_retrieval = 0.0;
+        assert!(validate_receipt_semantics(&compressed_miss).is_err());
+        let mut dense_claiming_gate = receipt.clone();
+        same_weights(&mut dense_claiming_gate);
+        assert!(validate_receipt_semantics(&dense_claiming_gate)
+            .unwrap_err()
+            .contains("contract v3 denominator"));
+        // Dense rows record a needle miss as characterization, never a rejection, but may not
+        // hide it behind a discriminating flag.
+        let mut recorded_miss = receipt.clone();
+        recorded_miss.quality.needle_retrieval = 0.0;
+        recorded_miss.quality.needle_discriminating = false;
+        recorded_miss.quality.structured_tool_agreement = 0.0;
+        validate_receipt_semantics(&recorded_miss).expect("dense quality is never gated");
+        let mut hidden_miss = recorded_miss.clone();
+        hidden_miss.quality.needle_discriminating = true;
+        assert!(validate_receipt_semantics(&hidden_miss)
+            .unwrap_err()
+            .contains("needle discrimination"));
+        let mut unguarded = receipt.clone();
+        unguarded.memory.admission.child_footprint_cap_bytes = 0;
+        assert!(validate_receipt_semantics(&unguarded)
+            .unwrap_err()
+            .contains("runtime-guarded"));
+        let mut over_cap_estimate = receipt.clone();
+        over_cap_estimate
+            .memory
+            .admission
+            .static_footprint_floor_bytes =
+            over_cap_estimate.memory.admission.child_footprint_cap_bytes + 1;
+        assert!(validate_receipt_semantics(&over_cap_estimate).is_err());
         let mut lifecycle_tampered = receipt.clone();
         lifecycle_tampered.lifecycle.append = false;
         assert!(validate_receipt_semantics(&lifecycle_tampered).is_err());

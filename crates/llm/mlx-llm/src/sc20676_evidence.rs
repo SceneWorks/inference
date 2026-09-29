@@ -30,8 +30,8 @@ use crate::primitives::{
 };
 use crate::{Error, ModelConfig, Result};
 
-pub const SC20676_SCHEMA_VERSION: u32 = 2;
-pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v2";
+pub const SC20676_SCHEMA_VERSION: u32 = 3;
+pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v3";
 /// The SC-20671 frozen contract is the policy identity; SC-20676 only narrows it with the
 /// compressed-domain parity requirements below and never introduces a tunable caller threshold.
 pub const SC20676_CONTRACT_HASH: &str = campaign::QUALITY_CONTRACT_HASH;
@@ -173,7 +173,11 @@ pub struct Sc20676KernelProfile {
 pub struct Sc20676Quality {
     pub max_logit_abs_error: f64,
     pub greedy_token_agreement: f64,
+    /// Packed needle outcome relative to the same-weights dense run (quality contract v3).
     pub needle_retrieval: bool,
+    /// False when the dense run itself missed the needle; the packed check then measures only
+    /// exact agreement with the dense output and cannot detect KV-induced retrieval loss.
+    pub needle_discriminating: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -246,6 +250,8 @@ pub struct Sc20676Arm {
     pub quality: Option<Sc20676Quality>,
     pub fallback: Option<Sc20676Fallback>,
     pub cancellation: Option<Sc20676Cancellation>,
+    /// Runtime guards the worker ran under, with the stated cap and static estimate.
+    pub admission: campaign::ReceiptAdmission,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -555,7 +561,6 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         || arm.output.token_len == 0
         || !is_digest(&arm.output.tokens_sha256)
         || arm.output.needle_expected != SC20676_NEEDLE
-        || arm.output.needle_output != arm.output.needle_expected
         || !arm.provenance.source_tree_clean
         || arm.provenance.scene_works_repository != campaign::SCENEWORKS_REPOSITORY
         || arm.provenance.inference_repository != campaign::INFERENCE_REPOSITORY
@@ -571,6 +576,7 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
     {
         return Err("SC-20676 worker arm identity/input/output provenance is incomplete".into());
     }
+    arm.admission.validate()?;
     let summary = timing_summary(&arm.timings)?;
     if !finite_positive(summary.mean_tokens_per_second)
         || summary.coefficient_of_variation > 0.05
@@ -827,10 +833,16 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         .quality
         .as_ref()
         .ok_or("missing SC-20676 quality evidence")?;
+    let (needle_retrieval, needle_discriminating) = sc20676_needle_observation(
+        &receipt.dense.output.needle_output,
+        &receipt.packed.output.needle_output,
+    );
     if !quality.max_logit_abs_error.is_finite()
         || quality.max_logit_abs_error > receipt.thresholds.max_logit_abs_error
         || !(0.0..=1.0).contains(&quality.greedy_token_agreement)
         || quality.greedy_token_agreement < receipt.thresholds.min_greedy_token_agreement
+        || quality.needle_retrieval != needle_retrieval
+        || quality.needle_discriminating != needle_discriminating
         || !quality.needle_retrieval
     {
         return Err("SC-20676 packed quality is outside declared bounds".into());
@@ -1152,9 +1164,13 @@ fn context_ids(tokenizer: &Tokenizer, cfg: &ModelConfig, target_tokens: u64) -> 
         ));
     }
     let needle = SC20676_NEEDLE;
-    let suffix = "What passphrase was requested? Reply with only the passphrase.";
+    let suffix = campaign::NEEDLE_FIXTURE_QUESTION;
+    let question = suffix.split_inclusive('?').next().unwrap_or(suffix);
     let mut ids = tokenizer
-        .encode(&format!("Remember {needle}. "), false)
+        .encode(
+            &format!("{}{needle}. ", campaign::NEEDLE_FIXTURE_STATEMENT_PREFIX),
+            false,
+        )
         .map_err(|e| Error::Msg(e.to_string()))?;
     let suffix_ids = tokenizer
         .encode(suffix, false)
@@ -1183,7 +1199,7 @@ fn context_ids(tokenizer: &Tokenizer, cfg: &ModelConfig, target_tokens: u64) -> 
     let decoded = tokenizer
         .decode(&ids, true)
         .map_err(|e| Error::Msg(e.to_string()))?;
-    if !decoded.contains(needle) || !decoded.contains("What passphrase was requested?") {
+    if !decoded.contains(needle) || !decoded.contains(question) {
         return Err(Error::Config(
             "SC-20676 exact token construction lost the needle/question contract".into(),
         ));
@@ -1445,13 +1461,35 @@ fn sc20676_admitted_tokens(
     Ok((total, request))
 }
 
-fn require_validated_prefill_peak_bound(
+/// Admit one arm by its runtime guards (supervised worker, footprint watchdog cap, host reserve,
+/// deadline, sampling) instead of an unobtainable static whole-process peak proof. The pinned
+/// candidate's conservative load-plus-KV floor is recorded as the arm's estimate and still refuses
+/// before spawn when it alone exceeds the child cap.
+fn sc20676_runtime_admission(
     family: &str,
-    mode: &str,
-) -> std::result::Result<(), String> {
-    Err(format!(
-        "SC-20676 {family}-{mode} incomplete: no validated source-backed transient prefill peak bound for the required material-context geometry; token and polling limits alone cannot admit it"
-    ))
+    snapshot: &Path,
+    total_tokens: u64,
+    request_tokens: u64,
+    policy: &campaign::CampaignSafetyPolicy,
+) -> std::result::Result<campaign::ReceiptAdmission, String> {
+    let floor = campaign::static_role_footprint_budget(
+        campaign::benchmark_model(family, false)?,
+        snapshot,
+        total_tokens,
+        request_tokens,
+    )?;
+    campaign::runtime_guarded_admission(policy, floor)
+}
+
+/// Packed needle outcome relative to the same-weights dense output: exact recovery when the dense
+/// run recovered the needle, otherwise exact agreement with the dense output, flagged as
+/// non-discriminating so a shared miss is never counted as retrieval.
+fn sc20676_needle_observation(dense_output: &str, packed_output: &str) -> (bool, bool) {
+    if dense_output == SC20676_NEEDLE {
+        (packed_output == SC20676_NEEDLE, true)
+    } else {
+        (packed_output == dense_output, false)
+    }
 }
 
 /// Execute one fresh worker.  This is intentionally the only live model entry point; parent mode
@@ -1479,8 +1517,10 @@ pub fn run_sc20676_worker(
     let provenance = captured_provenance.clone();
     let before = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
     let cfg = ModelConfig::from_dir(snapshot).map_err(|e| e.to_string())?;
-    sc20676_admitted_tokens(mode, target_prompt_tokens, policy)?;
-    require_validated_prefill_peak_bound(family, mode)?;
+    let (total_tokens, request_tokens) =
+        sc20676_admitted_tokens(mode, target_prompt_tokens, policy)?;
+    let admission =
+        sc20676_runtime_admission(family, snapshot, total_tokens, request_tokens, policy)?;
     let native = u64::try_from(cfg.max_position_embeddings)
         .map_err(|_| "SC-20676 model native context is invalid")?;
     if target_prompt_tokens
@@ -1658,6 +1698,7 @@ pub fn run_sc20676_worker(
             quality: None,
             fallback: None,
             cancellation: None,
+            admission,
         });
     }
     if mode != "packed" {
@@ -1771,10 +1812,21 @@ pub fn run_sc20676_worker(
         .map_err(|e| e.to_string())?
         .trim()
         .to_owned();
+    let dense_needle_output = tokenizer
+        .decode(
+            &dense_tokens.iter().map(|v| *v as u32).collect::<Vec<_>>(),
+            true,
+        )
+        .map_err(|e| e.to_string())?
+        .trim()
+        .to_owned();
+    let (needle_retrieval, needle_discriminating) =
+        sc20676_needle_observation(&dense_needle_output, &needle_output);
     let quality = Sc20676Quality {
         max_logit_abs_error: max_abs(&dense_logits.0, &packed_logits)?,
         greedy_token_agreement: agreement(&dense_tokens, &out.tokens),
-        needle_retrieval: needle_output == SC20676_NEEDLE,
+        needle_retrieval,
+        needle_discriminating,
     };
     let output = output_binding(
         &packed_logits,
@@ -1963,6 +2015,7 @@ pub fn run_sc20676_worker(
             release_verified: after_reset == 0 && physical_release_verified,
             packed_before_reset: cancel_evidence,
         }),
+        admission,
     })
 }
 
@@ -2458,7 +2511,13 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
                     input.baseline.context_payload_tokens,
                     &policy,
                 )?;
-                require_validated_prefill_peak_bound(family, worker_mode)?;
+                let admission = sc20676_runtime_admission(
+                    family,
+                    &input.snapshot,
+                    total_tokens,
+                    request_tokens,
+                    &policy,
+                )?;
                 let mut command = Command::new(&executable);
                 command
                     .arg("worker")
@@ -2498,16 +2557,40 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<(), String> {
                     stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
                     stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
                 };
-                let status = campaign_supervisor::run_guarded(
-                    &mut command, &request, &policy.supervisor(), &mut SystemProbe,
-                ).map_err(|failure| format!(
-                    "SC-20676 {slug} worker stopped ({:?}): {}; child {:?} reaped; stderr {}; valid arms remain in {}",
-                    failure.reason, failure.detail, failure.pid, request.stderr_path.display(), worker_root.display(),
-                ))?;
+                let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
+                let status = match campaign_supervisor::run_guarded(
+                    &mut command,
+                    &request,
+                    &policy.supervisor(),
+                    &mut SystemProbe,
+                ) {
+                    Ok(status) => status,
+                    Err(failure) => {
+                        let reason = format!("{:?}", failure.reason);
+                        campaign::write_unaccepted_row_record(
+                            &unaccepted,
+                            "sc-20676-unaccepted-arm",
+                            &slug,
+                            &admission,
+                            (&reason, &failure.detail, failure.pid),
+                        )?;
+                        return Err(format!(
+                            "SC-20676 {slug} worker stopped ({reason}): {}; child {:?} reaped; stderr {}; not accepted ({}); valid arms remain in {}",
+                            failure.detail, failure.pid, request.stderr_path.display(), unaccepted.display(), worker_root.display(),
+                        ));
+                    }
+                };
                 if !status.success() {
+                    campaign::write_unaccepted_row_record(
+                        &unaccepted,
+                        "sc-20676-unaccepted-arm",
+                        &slug,
+                        &admission,
+                        ("ChildExit", &status.to_string(), None),
+                    )?;
                     return Err(format!(
-                        "SC-20676 {slug} worker failed with {status}; stderr {}; valid arms remain in {}",
-                        request.stderr_path.display(), worker_root.display(),
+                        "SC-20676 {slug} worker failed with {status}; stderr {}; not accepted ({}); valid arms remain in {}",
+                        request.stderr_path.display(), unaccepted.display(), worker_root.display(),
                     ));
                 }
                 let bytes = fs::read(&arm_path).map_err(|e| e.to_string())?;
@@ -2786,6 +2869,7 @@ mod tests {
                 max_logit_abs_error: 0.0,
                 greedy_token_agreement: 1.0,
                 needle_retrieval: true,
+                needle_discriminating: true,
             }),
             fallback: packed.then_some(Sc20676Fallback {
                 route: "dense-fallback".into(),
@@ -2802,6 +2886,12 @@ mod tests {
                 release_verified: true,
                 packed_before_reset: packed_evidence(),
             }),
+            admission: campaign::ReceiptAdmission {
+                mode: campaign::RUNTIME_GUARDED_ADMISSION.into(),
+                child_footprint_cap_bytes: 1 << 30,
+                host_free_reserve_bytes: 1 << 30,
+                static_footprint_floor_bytes: 1 << 20,
+            },
         };
         arm.arm_sha256 = arm_semantic_seal(&arm).unwrap();
         arm
@@ -3051,10 +3141,83 @@ mod tests {
             (2080, 1040)
         );
         assert!(sc20676_admitted_tokens("packed", u64::MAX, &policy).is_err());
-        for mode in ["dense", "packed"] {
-            let refusal = require_validated_prefill_peak_bound("llama", mode).unwrap_err();
-            assert!(refusal.contains("source-backed transient prefill peak bound"));
+        // No unconditional long-context refusal: the arm reaches the pinned snapshot's load-plus-KV
+        // floor, and admission is otherwise the runtime guards.
+        let error = sc20676_runtime_admission(
+            "llama",
+            Path::new("/nonexistent-snapshot"),
+            2080,
+            1040,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(!error.contains("prefill peak bound"), "{error}");
+        let temporary = tempfile::tempdir().unwrap();
+        let snapshot = temporary.path().join("llama");
+        campaign::tests::write_stub_dtype_snapshot(
+            &snapshot,
+            campaign::benchmark_model("llama", false).unwrap(),
+            "F16",
+        );
+        policy.child_footprint_cap_bytes = 64 << 30;
+        let admission = sc20676_runtime_admission("llama", &snapshot, 2080, 1040, &policy).unwrap();
+        assert_eq!(admission.mode, campaign::RUNTIME_GUARDED_ADMISSION);
+        assert_eq!(admission.child_footprint_cap_bytes, 64 << 30);
+        assert!(admission.static_footprint_floor_bytes > 0);
+        policy.child_footprint_cap_bytes = admission.static_footprint_floor_bytes - 1;
+        assert!(sc20676_runtime_admission("llama", &snapshot, 2080, 1040, &policy).is_err());
+        policy.child_footprint_cap_bytes = 64 << 30;
+        policy.host_free_reserve_bytes = 0;
+        assert!(sc20676_runtime_admission("llama", &snapshot, 2080, 1040, &policy).is_err());
+    }
+
+    #[test]
+    fn packed_needle_is_gated_against_the_same_weights_dense_output() {
+        assert_eq!(
+            sc20676_needle_observation(SC20676_NEEDLE, SC20676_NEEDLE),
+            (true, true)
+        );
+        assert_eq!(
+            sc20676_needle_observation(SC20676_NEEDLE, "x"),
+            (false, true)
+        );
+        assert_eq!(
+            sc20676_needle_observation("I cannot help.", "I cannot help."),
+            (true, false)
+        );
+        assert_eq!(
+            sc20676_needle_observation("I cannot help.", "other"),
+            (false, false)
+        );
+        // A dense arm that missed the needle is valid evidence, and the packed arm's identical
+        // output is accepted only when flagged non-discriminating.
+        let mut shared_miss = receipt();
+        for arm in [&mut shared_miss.dense, &mut shared_miss.packed] {
+            arm.output.needle_output = "I cannot help.".into();
         }
+        let quality = shared_miss.packed.quality.as_mut().unwrap();
+        quality.needle_discriminating = false;
+        reseal_arm(&mut shared_miss.dense);
+        reseal_arm(&mut shared_miss.packed);
+        validate_arm(&shared_miss.dense).unwrap();
+        let flagged = shared_miss.clone().finish().unwrap();
+        assert!(
+            !flagged
+                .packed
+                .quality
+                .as_ref()
+                .unwrap()
+                .needle_discriminating
+        );
+        let mut hidden = shared_miss;
+        hidden
+            .packed
+            .quality
+            .as_mut()
+            .unwrap()
+            .needle_discriminating = true;
+        reseal_arm(&mut hidden.packed);
+        assert!(hidden.finish().is_err());
     }
 
     #[test]
