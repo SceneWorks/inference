@@ -8,6 +8,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
 use crate::primitives::prism::{PrismEmbedding, PrismLinear};
+use crate::primitives::quant::in_compute_dtype;
 use crate::primitives::Weights;
 
 #[derive(Clone, Debug)]
@@ -296,17 +297,24 @@ impl PrismMlxPack {
         })
     }
 
-    pub(crate) fn linear(&self, weights: &Weights, weight_key: &str) -> Result<PrismLinear> {
+    pub(crate) fn linear(
+        &self,
+        weights: &Weights,
+        weight_key: &str,
+        compute: Dtype,
+    ) -> Result<PrismLinear> {
         let module = self.module(weight_key, false)?;
         let (weight, scales, biases, signs) = parts(weights, weight_key)?;
         validate_affine_parts(weight_key, &scales, &biases)?;
         let width = affine_width(weight_key, &scales)?;
         self.validate_sign_tensor(weight_key, width, &signs)?;
+        // Validated in the stored dtype; held in the compute dtype so the affine matmul does not
+        // promote the activations (sc-20671).
         PrismLinear::new(
             weight_key,
             weight,
-            scales,
-            biases,
+            in_compute_dtype(scales, compute)?,
+            in_compute_dtype(biases, compute)?,
             signs,
             module.block as i32,
         )
@@ -318,6 +326,8 @@ impl PrismMlxPack {
         validate_affine_parts(weight_key, &scales, &biases)?;
         let width = affine_width(weight_key, &scales)?;
         self.validate_sign_tensor(weight_key, width, &signs)?;
+        // Kept in the stored dtype: the embedding feeds no matmul (Prism refuses a tied head) and
+        // the decoder casts its rows to the compute dtype, so there is nothing to promote.
         PrismEmbedding::new(
             weight_key,
             weight,

@@ -552,13 +552,19 @@ fn preflight_total_live_tokens(
     Ok((total, max_request))
 }
 
-/// Infer the widest dense K/V scalar produced by this pinned loader route without loading MLX
-/// arrays. The embed is cast to BF16, but affine quantized projections promote BF16 activations
-/// with their stored scale dtype. An F16 or F32 scale anywhere in the decoder can make a later
-/// hidden state F32, even when that later layer's own K/V scales are BF16. Dense projections cast
-/// their stored weights to BF16; a prior F32 activation still produces F32. Use the widest width
-/// across the entire stack rather than assuming the config's `torch_dtype` is the cache dtype.
-/// Both parent preflight and worker validate the exact pinned snapshot inventory before this call.
+/// Scalar width of the dense K/V every campaign role must hand its cache: the loader's BF16
+/// compute dtype. The loader holds stored quantized scales/biases in the compute dtype
+/// (sc-20671), so a stored F16/F32 scale no longer promotes the activations — and the cache — to
+/// F32. [`ProductObserver`] and [`validate_receipt_semantics`] refuse any other observed width
+/// rather than record a silently widened dense baseline.
+pub const DENSE_KV_COMPUTE_ELEMENT_BYTES: u64 = 2;
+
+/// Validate the pinned decoder projection inventory without loading MLX arrays and return the
+/// dense K/V scalar width it produces. Every supported stored scale dtype (BF16/F16/F32) is cast to
+/// the BF16 compute dtype at load, and dense projections are cast to BF16 too, so the width is the
+/// compute dtype's whatever the snapshot stores — never the widest stored scale (the pre-sc-20671
+/// F32-promoted path). Both parent preflight and worker validate the exact pinned snapshot
+/// inventory before this call.
 fn pinned_dense_kv_element_bytes(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
@@ -600,7 +606,6 @@ fn pinned_dense_kv_element_bytes(
             }
         }
     }
-    let mut width = 2_u64; // The loader casts the embedding output to BF16.
     for layer in 0..layers {
         for projection in [
             "self_attn.q_proj",
@@ -623,11 +628,9 @@ fn pinned_dense_kv_element_bytes(
                     if !spec.quantized || weight != "U32" || scales != biases {
                         return Err(format!("unsupported pinned quantized projection {stem}"));
                     }
-                    match scales.as_str() {
-                        "BF16" => {}
-                        // MLX 0.32 affine quantized_matmul promotes BF16+F16 to F32.
-                        "F16" | "F32" => width = 4,
-                        _ => return Err(format!("unsupported pinned scale dtype for {stem}")),
+                    // Held in the BF16 compute dtype at load whatever the stored width.
+                    if !matches!(scales.as_str(), "BF16" | "F16" | "F32") {
+                        return Err(format!("unsupported pinned scale dtype for {stem}"));
                     }
                 }
                 None => {
@@ -640,7 +643,16 @@ fn pinned_dense_kv_element_bytes(
             }
         }
     }
-    Ok(width)
+    Ok(DENSE_KV_COMPUTE_ELEMENT_BYTES)
+}
+
+/// The fail-closed reason for an observed dense K/V width that is not the compute dtype's.
+fn dense_kv_width_refusal(observed: u64) -> String {
+    format!(
+        "dense KV element width {observed} bytes is not the BF16 compute dtype width \
+         {DENSE_KV_COMPUTE_ELEMENT_BYTES}; the loader promoted the cache (sc-20671), so this row \
+         is refused rather than recorded as a widened dense baseline"
+    )
 }
 
 /// A deliberately conservative planning floor, not a proven process peak. The two-times
@@ -2014,6 +2026,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     .any(|v| v == 0)
     {
         return Err("geometry contains zero".into());
+    }
+    if g.element_bytes != DENSE_KV_COMPUTE_ELEMENT_BYTES {
+        return Err(dense_kv_width_refusal(g.element_bytes));
     }
     if !["llama", "qwen"].contains(&receipt.matrix.family.as_str())
         || !CONTEXT_BANDS.contains(&receipt.matrix.context_band.as_str())
@@ -6091,6 +6106,10 @@ impl Observer for ProductObserver {
             self.error = Some("product cache element width changed within one coordinate".into());
             return;
         }
+        if element_bytes != DENSE_KV_COMPUTE_ELEMENT_BYTES {
+            self.error = Some(dense_kv_width_refusal(element_bytes));
+            return;
+        }
         self.cache_live_tokens = self.cache_live_tokens.max(tokens);
         self.cache_capacity_tokens = self.cache_capacity_tokens.max(capacity);
         self.allocation("cache", "persistent", bytes);
@@ -8604,7 +8623,7 @@ pub(crate) mod tests {
                     kv_heads: 8,
                     head_dimension: 8,
                     layers: 28,
-                    element_bytes: 4,
+                    element_bytes: 2,
                 },
                 phases: vec![
                     ReceiptPhase {
@@ -8719,7 +8738,7 @@ pub(crate) mod tests {
         assert_eq!(needle["output"]["text"]["prefix"], "wrong\nanswer");
         assert_eq!(
             needle["coordinateObservation"]["geometry"]["elementBytes"],
-            4
+            2
         );
         assert_eq!(needle["coordinateObservation"]["geometry"]["capacity"], 256);
         assert_eq!(
@@ -9254,8 +9273,8 @@ pub(crate) mod tests {
             },
         );
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 256, 4);
-        assert_eq!(observer.geometry.unwrap().element_bytes, 4);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 256, 2);
+        assert_eq!(observer.geometry.unwrap().element_bytes, 2);
         assert_eq!(observer.cache_live_tokens, 2);
         assert_eq!(observer.cache_capacity_tokens, 256);
         assert!(observer.error.is_none());
@@ -9265,7 +9284,7 @@ pub(crate) mod tests {
     fn product_observer_rejects_capacity_below_live_length() {
         let mut observer = ProductObserver::new();
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 1, 4);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 1, 2);
         assert_eq!(
             observer.error.as_deref(),
             Some("product cache snapshot must have positive bytes, valid live/capacity tokens, and element width")
@@ -9286,11 +9305,47 @@ pub(crate) mod tests {
             },
         );
         observer.phase = Some("prefill-peak");
-        Observer::cache_snapshot(&mut observer, 4096, 2, 2, 4);
-        Observer::cache_snapshot(&mut observer, 8192, 4, 4, 2);
+        Observer::cache_snapshot(&mut observer, 4096, 2, 2, 2);
+        Observer::cache_snapshot(&mut observer, 8192, 4, 4, 4);
         assert_eq!(
             observer.error.as_deref(),
             Some("product cache element width changed within one coordinate")
+        );
+    }
+
+    /// sc-20671: an F32-promoted dense cache (the pre-fix F16-scale Llama path) fails the row closed
+    /// with a reason, at the live observer and again at receipt acceptance.
+    #[test]
+    fn a_kv_width_other_than_the_compute_dtype_is_refused() {
+        let mut observer = ProductObserver::new();
+        Observer::geometry(
+            &mut observer,
+            ProductGeometry {
+                query_heads: 8,
+                kv_heads: 2,
+                head_dimension: 64,
+                layers: 4,
+                element_bytes: 0,
+            },
+        );
+        observer.phase = Some("prefill-peak");
+        Observer::cache_snapshot(&mut observer, 8192, 2, 256, 4);
+        assert_eq!(
+            observer.error.as_deref(),
+            Some(dense_kv_width_refusal(4).as_str())
+        );
+        assert!(observer.finish().err().unwrap().contains("sc-20671"));
+
+        let receipt = builder_test_receipt();
+        assert_eq!(
+            receipt.geometry.element_bytes,
+            DENSE_KV_COMPUTE_ELEMENT_BYTES
+        );
+        let mut widened = receipt.clone();
+        widened.geometry.element_bytes = 4;
+        assert_eq!(
+            validate_receipt_semantics(&widened).unwrap_err(),
+            dense_kv_width_refusal(4)
         );
     }
 
@@ -9631,73 +9686,48 @@ pub(crate) mod tests {
         assert!(budget > 12_000_000_000); // BF16 reference dominates the sequential roles.
     }
 
+    /// sc-20671: the pinned dense KV width is the BF16 compute dtype's for every role, whatever
+    /// dtype the snapshot stores its quantized scales in — an F16-scale candidate no longer plans
+    /// (or records) the F32-promoted 4-byte cache. Unsupported scale dtypes still refuse.
     #[test]
-    fn pinned_projection_scales_set_role_kv_width_and_refuse_old_two_byte_cap() {
+    fn pinned_kv_width_is_the_compute_dtype_whatever_the_stored_scale_dtype() {
         let temporary = tempfile::tempdir().unwrap();
-        let llama_candidate = temporary.path().join("llama-candidate");
         let llama_reference = temporary.path().join("llama-reference");
-        let qwen_candidate = temporary.path().join("qwen-candidate");
         let qwen_reference = temporary.path().join("qwen-reference");
-        write_stub_dtype_snapshot(&llama_candidate, &LLAMA_CANDIDATE, "F16");
         write_stub_dtype_snapshot(&llama_reference, &LLAMA_REFERENCE, "BF16");
-        write_stub_dtype_snapshot(&qwen_candidate, &QWEN_CANDIDATE, "BF16");
         write_stub_dtype_snapshot(&qwen_reference, &QWEN_REFERENCE, "BF16");
-        for (spec, path, expected) in [
-            (&LLAMA_CANDIDATE, &llama_candidate, 4),
-            (&LLAMA_REFERENCE, &llama_reference, 2),
-            (&QWEN_CANDIDATE, &qwen_candidate, 2),
-            (&QWEN_REFERENCE, &qwen_reference, 2),
-        ] {
+        let mut candidates = Vec::new();
+        for (spec, name) in [(&LLAMA_CANDIDATE, "llama"), (&QWEN_CANDIDATE, "qwen")] {
+            for scale in ["BF16", "F16", "F32"] {
+                let path = temporary.path().join(format!("{name}-candidate-{scale}"));
+                write_stub_dtype_snapshot(&path, spec, scale);
+                candidates.push((spec, path));
+            }
+        }
+        for (spec, path) in candidates.iter().map(|(spec, path)| (*spec, path)).chain([
+            (&LLAMA_REFERENCE, &llama_reference),
+            (&QWEN_REFERENCE, &qwen_reference),
+        ]) {
             assert_eq!(
                 pinned_dense_kv_element_bytes(spec, path, 28).unwrap(),
-                expected
+                DENSE_KV_COMPUTE_ELEMENT_BYTES,
+                "{} {}",
+                spec.repository,
+                path.display()
             );
         }
-        let old_row_budget =
-            static_role_footprint_budget(&LLAMA_REFERENCE, &llama_reference, 262_144, 131_072)
-                .unwrap();
-        let new_candidate =
-            static_role_footprint_budget(&LLAMA_CANDIDATE, &llama_candidate, 262_144, 131_072)
-                .unwrap();
-        let cap = 50_u64 << 30;
-        // With the old 2-byte candidate estimate the larger reference set the row floor.
-        assert!(old_row_budget < cap && new_candidate > cap);
-        let mut policy = CampaignSafetyPolicy {
-            schema_version: 1,
-            row_deadline_seconds: 10,
-            poll_millis: 100,
-            term_grace_millis: 500,
-            host_free_reserve_bytes: 1,
-            child_footprint_cap_bytes: cap,
-            max_context_tokens: u64::MAX,
-            max_request_tokens: u64::MAX,
-            stdout_cap_bytes: 100,
-            stderr_cap_bytes: 100,
-        };
-        let row = &required_coordinates()[0];
-        assert!(static_row_footprint_budget(
-            row,
-            &llama_candidate,
-            &llama_reference,
-            262_144,
-            131_072,
-            &policy,
-        )
-        .unwrap_err()
-        .contains("refuses before spawn"));
-        policy.child_footprint_cap_bytes = new_candidate;
-        assert_eq!(
-            static_row_footprint_budget(
-                row,
-                &llama_candidate,
-                &llama_reference,
+        // The static floor therefore no longer depends on the stored scale dtype.
+        let budget = |scale: &str| {
+            static_role_footprint_budget(
+                &LLAMA_CANDIDATE,
+                &temporary.path().join(format!("llama-candidate-{scale}")),
                 262_144,
                 131_072,
-                &policy,
             )
-            .unwrap(),
-            new_candidate
-        );
+            .unwrap()
+        };
+        assert_eq!(budget("F16"), budget("BF16"));
+        assert_eq!(budget("F32"), budget("BF16"));
         let unsupported = temporary.path().join("unsupported-scales");
         write_stub_dtype_snapshot(&unsupported, &LLAMA_CANDIDATE, "F64");
         assert!(
