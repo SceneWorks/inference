@@ -1,5 +1,5 @@
 {
-  "mode": "probe",
+  "mode": "w1",
   "inference_ref": "cf9937540bf9a4ec42ad44acb07865358b906553",
   "sceneworks_ref": "278f4b3af4d252aa58ac5905e08a3ddebaf7568f",
   "runner_label": "rw-krea",
