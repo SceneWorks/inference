@@ -90,10 +90,11 @@ class DarwinHostMemoryTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue(any(mutant(case) != case["reclaimableFilePages"] for case in valid))
 
-    def test_watchdog_measure_is_still_free_plus_speculative(self):
+    def test_free_plus_speculative_is_below_the_available_measure(self):
         case = next(case for case in CASES if case["name"] == "heavy-file-cache")
         self.assertEqual(safety.darwin_free_bytes(case["vmStat"]),
                          (case["expect"]["freePages"] + case["expect"]["speculativePages"]) * 16384)
+        self.assertLess(safety.darwin_free_bytes(case["vmStat"]), case["expect"]["availableBytes"])
 
     def test_recorded_components_must_recompute(self):
         expect = next(case for case in CASES if case["name"] == "heavy-anonymous-inactive")["expect"]

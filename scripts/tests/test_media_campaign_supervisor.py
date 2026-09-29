@@ -366,6 +366,31 @@ class SupervisorTests(unittest.TestCase):
             self.run_child(script)
         self.assertNotIn(int((self.root / "escaped-pid").read_text(encoding="ascii")), safety._process_table())
 
+    def test_live_reserve_counts_reclaimable_file_cache(self):
+        class FileCacheProbe(Probe):
+            """Free plus speculative is under the 100-byte reserve on every sample; inactive
+            clean file cache keeps the available measure above reserve plus cap until told."""
+            def __init__(self, cache_pages):
+                super().__init__()
+                self.cache_pages = list(cache_pages)
+            def host_free(self):
+                return 0
+            def host_admission(self):
+                pages = self.cache_pages.pop(0) if len(self.cache_pages) > 1 else self.cache_pages[0]
+                host = safety.darwin_host_memory(4096, {
+                    "freePages": 0, "speculativePages": 0, "purgeablePages": 0,
+                    "inactivePages": pages, "fileBackedPages": pages})
+                return host["availableBytes"], host
+        result = self.run_child("import time; time.sleep(.1)", probe=FileCacheProbe([1000]))
+        self.assertEqual(result.returncode, 0)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+        with self.assertRaisesRegex(safety.SupervisionError,
+                                    r"host-memory: host available 0 bytes \(darwin-vm-stat-available-v1\)") as caught:
+            self.run_child("import time; time.sleep(5)", probe=FileCacheProbe([1000, 0]))
+        self.assertIsNotNone(caught.exception.pid)
+        self.assertEqual(caught.exception.admission["hostMemoryComponents"]["inactivePages"], 1000)
+
     def test_live_reserve_and_footprint_abort(self):
         class DecliningProbe(Probe):
             def host_free(self):

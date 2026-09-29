@@ -165,8 +165,8 @@ def _darwin_pages(output: str) -> tuple[int, dict[str, int]]:
 
 
 def darwin_free_bytes(output: str) -> int:
-    """Free plus speculative pages: the runtime watchdog's measure (admission uses
-    darwin_available)."""
+    """Free plus speculative pages (SystemProbe.host_free on macOS). Admission and the live
+    host-reserve watchdog both use darwin_available via host_admission."""
     first = output.splitlines()[0] if output else ""
     match = re.search(r"page size of (\d+) bytes", first)
     if not match or int(match.group(1)) < 4096 or int(match.group(1)) & (int(match.group(1)) - 1):
@@ -667,9 +667,10 @@ def _run_admitted(
         raise SupervisionError("invalid-log", "bounded log paths must be distinct and fresh")
     probe = probe if probe is not None else SystemProbe(policy)
     started = clock()
-    # On macOS the admission measure counts reclaimable clean file cache (darwin_host_memory);
-    # the live watchdog below keeps free plus speculative. The components are recorded in the
-    # admission itself, so refused, aborted and accepted rows all carry the decision's inputs.
+    # On macOS the admission measure counts reclaimable clean file cache (darwin_host_memory),
+    # and the live reserve watchdog below uses the same measure, so page cache alone never
+    # aborts an admitted row. The components are recorded in the admission itself, so refused,
+    # aborted and accepted rows all carry the decision's inputs.
     host_free, host_memory = probe.host_admission()
     if policy.backend == "darwin-mlx":
         admission["hostMemoryComponents"] = host_memory
@@ -763,9 +764,13 @@ def _run_admitted(
                 finished = finished_result(status, pids, owned)
                 if finished is not None:
                     return finished
-                free = probe.host_free()
-                if free < policy.host_free_reserve_bytes:
-                    raise SupervisionError("host-memory", "host free fell below reserve")
+                available, live_host = probe.host_admission()
+                if available < policy.host_free_reserve_bytes:
+                    metric = live_host["metric"] if live_host is not None else "host-free"
+                    raise SupervisionError(
+                        "host-memory",
+                        f"host available {available} bytes ({metric}) fell below reserve "
+                        f"{policy.host_free_reserve_bytes} bytes")
                 if pids:
                     try:
                         footprint = probe.tree_footprint(owner)

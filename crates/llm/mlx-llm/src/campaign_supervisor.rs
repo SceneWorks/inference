@@ -85,13 +85,6 @@ impl HostMemory {
         })
     }
 
-    /// Free plus speculative bytes: the live watchdog's measure, unchanged by the admission metric.
-    pub fn free_and_speculative_bytes(&self) -> u64 {
-        self.free_pages
-            .saturating_add(self.speculative_pages)
-            .saturating_mul(self.page_size_bytes)
-    }
-
     /// A recorded measurement must name this metric, carry a real page size, and recompute
     /// exactly from its own components.
     pub fn validate(&self) -> Result<(), String> {
@@ -201,8 +194,8 @@ impl Failure {
 /// The host probe is separate from MLX allocation counters: a parent process must not report its
 /// own MLX counters as though they belonged to the worker PID.
 pub trait MemoryProbe {
-    /// One host measurement: admission reads `available_bytes`, the live watchdog reads
-    /// `free_and_speculative_bytes`.
+    /// One host measurement. Pre-spawn admission and the live host-reserve watchdog both read
+    /// [`HostMemory::available_bytes`], so page cache alone never aborts an admitted row.
     fn host_memory(&mut self, deadline: Instant) -> io::Result<HostMemory>;
     fn child_footprint_bytes(&mut self, pid: u32, deadline: Instant) -> io::Result<u64>;
 }
@@ -489,8 +482,8 @@ fn run_admitted<P: MemoryProbe>(
                 Some(pid),
             ));
         }
-        let free = match probe.host_memory(deadline) {
-            Ok(host) => host.free_and_speculative_bytes(),
+        let available = match probe.host_memory(deadline) {
+            Ok(host) => host.available_bytes,
             Err(error) => {
                 break Err(Failure::new(
                     StopReason::ProbeFailure,
@@ -499,10 +492,13 @@ fn run_admitted<P: MemoryProbe>(
                 ));
             }
         };
-        if free < policy.host_free_reserve_bytes {
+        if available < policy.host_free_reserve_bytes {
             break Err(Failure::new(
                 StopReason::HostMemory,
-                format!("host free {free} bytes fell below reserve"),
+                format!(
+                    "host available {available} bytes ({DARWIN_AVAILABLE_METRIC}) fell below reserve {} bytes",
+                    policy.host_free_reserve_bytes
+                ),
                 Some(pid),
             ));
         }
@@ -575,9 +571,10 @@ fn run_admitted<P: MemoryProbe>(
     Ok(status)
 }
 
-/// Production probe. Pre-spawn admission uses [`HostMemory::available_bytes`] (free, speculative,
-/// purgeable, and inactive clean file cache); the live reserve watchdog still uses only free and
-/// speculative pages. Compressed and anonymous inactive pages are never counted.
+/// Production probe. Pre-spawn admission and the live reserve watchdog both use
+/// [`HostMemory::available_bytes`] (free, speculative, purgeable, and inactive clean file cache);
+/// compressed and anonymous inactive pages are never counted. The child cap stays
+/// `phys_footprint`.
 pub struct SystemProbe;
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -945,19 +942,41 @@ mod tests {
     }
 
     #[test]
-    fn admission_counts_file_cache_but_the_watchdog_keeps_free_plus_speculative() {
-        // 10 free + 290 inactive file-backed pages: available 300 covers cap 200 + reserve 100,
-        // while free plus speculative (10) is under the reserve, so the live watchdog trips.
+    fn admission_and_watchdog_count_reclaimable_file_cache() {
+        // 10 free + 290 inactive file-backed pages: available 300 covers cap 200 + reserve 100
+        // and stays above the reserve on every live sample, although free plus speculative (10)
+        // is under it throughout. Page cache alone must not abort the row.
         let cached = HostMemory::from_pages(1, 10, 0, 0, 290, 290).unwrap();
+        let request = new_request();
+        let status = run_guarded(
+            Command::new("/bin/sleep").arg("0.1"),
+            &request,
+            &policy(),
+            &mut FakeProbe::hosts((0..1000).map(|_| Ok(cached.clone()))),
+        )
+        .unwrap();
+        assert!(status.success());
+        // A live sample whose available measure is under the reserve aborts, naming the metric.
+        let short = HostMemory::from_pages(1, 10, 0, 0, 89, 89).unwrap();
         let request = new_request();
         let failure = run_guarded(
             Command::new("/bin/sleep").arg("2"),
             &request,
             &policy(),
-            &mut FakeProbe::hosts([Ok(cached.clone()), Ok(cached.clone())]),
+            &mut FakeProbe::hosts([Ok(cached.clone()), Ok(short)]),
         )
         .unwrap_err();
         assert_eq!(failure.reason, StopReason::HostMemory, "{}", failure.detail);
+        assert!(
+            failure.detail.contains("host available 99 bytes"),
+            "{}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains(DARWIN_AVAILABLE_METRIC),
+            "{}",
+            failure.detail
+        );
         assert_eq!(failure.host_memory.as_deref(), Some(&cached));
         assert!(gone(failure.pid.unwrap()));
         // The same 290 inactive pages as anonymous memory (file-backed only 5) are not credited.
@@ -1017,12 +1036,9 @@ mod tests {
         child.wait().unwrap();
         // These are probe *contents*, not latency assertions; NonZero makes the check explicit
         // without asking the clock-assertion ratchet to infer that distinction from `deadline`.
-        // validate() recomputes available from the parsed components, so it is never below free
-        // plus speculative.
         let host = host.unwrap();
         host.validate().unwrap();
-        std::num::NonZeroU64::new(host.free_and_speculative_bytes())
-            .expect("host probe returned zero");
+        std::num::NonZeroU64::new(host.available_bytes).expect("host probe returned zero");
         std::num::NonZeroU64::new(owned_child_bytes.unwrap()).expect("child probe returned zero");
     }
 
