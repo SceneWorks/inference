@@ -88,14 +88,8 @@ problems=""
 gib="$(free_spec_gib)"
 echo "free+speculative RAM: ${gib} GiB (need >= 84 = 68 cap + 16 reserve)"
 [ "$gib" -ge 84 ] || problems="$problems; free+speculative RAM is ${gib} GiB (< 84)"
-lms="$(lms_bin)"
-if [ -n "$lms" ]; then
-  lms_out="$("$lms" ps --json 2>&1 || true)"
-  echo "lms ps --json: $lms_out"
-  [ "$(printf '%s' "$lms_out" | tr -d '[:space:]')" = "[]" ] || problems="$problems; LM Studio has a loaded model (or lms failed): $lms_out"
-else
-  echo "lms: not installed"
-fi
+lms_idle || problems="$problems; LM Studio is not idle: $LMS_STATE"
+echo "LM Studio: $LMS_STATE"
 busy="$(busy_processes)"
 [ -z "$busy" ] || problems="$problems; other MLX/cargo processes are running: $(printf '%s' "$busy" | tr '\n' ' ')"
 verify_tree "$INF" "$INFERENCE_URL" "$INFERENCE_SHA" || problems="$problems; inference tree is not clean at $INFERENCE_SHA"

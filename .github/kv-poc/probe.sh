@@ -32,8 +32,7 @@ else
   nax="likely UNAVAILABLE (HEURISTIC: chip gen '${chip_gen:-?}', macOS ${macos}; needs >= M5 and >= 26.2)"
 fi
 
-lms="$(lms_bin)"
-if [ -n "$lms" ]; then lms_out="$("$lms" ps --json 2>&1 || true)"; else lms_out="(lms not installed)"; fi
+lms_ok=1; lms_idle || lms_ok=0
 busy="$(busy_processes)"
 listeners="$(runner_listeners)"
 listener_count="$(printf '%s' "$listeners" | grep -c . || true)"
@@ -61,7 +60,7 @@ row "macOS" "$(code "$macos ($build)")"
 row "NAX" "$nax"
 row "free+speculative RAM" "${free_gib} GiB (precheck needs >= 84)"
 row "inactive / purgeable / compressed" "${inactive_gib} / ${purgeable_gib} / ${compressed_gib} GiB"
-row "lms ps --json" "$(code "$lms_out")"
+row "LM Studio" "$(code "$LMS_STATE")"
 row "GPU/build processes" "$(code "${busy:-none}")"
 row "Runner.Listener processes" "${listener_count} $(code "${listeners:-none}")"
 row "python3.12" "$(code "$py312")"
@@ -96,7 +95,7 @@ if [ -d "$R" ]; then row "runs dir $R" "$(code "$(ls "$R" "$R/evidence" 2>/dev/n
 go="GO"
 [ "$free_gib" -ge 84 ] || go="NO-GO (RAM)"
 [ -z "$busy" ] || go="NO-GO (processes)"
-if [ -n "$lms" ] && [ "$(printf '%s' "$lms_out" | tr -d '[:space:]')" != "[]" ]; then go="NO-GO (LM Studio)"; fi
+[ "$lms_ok" = 1 ] || go="NO-GO (LM Studio)"
 summary ""
 summary "Precheck as of now: **$go** (report only; each campaign job re-checks before launching)."
 summary ""
