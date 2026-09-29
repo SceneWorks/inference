@@ -1046,6 +1046,15 @@ pub struct CompressedKvArm {
 }
 
 impl CompressedKvArm {
+    /// Test-only arm bound to an arbitrary retained reader (e.g. one the cache refuses to bind).
+    #[cfg(test)]
+    pub(crate) fn with_reader(
+        method: CompressedKvMethod,
+        reader: crate::primitives::CompiledKernelHandle,
+    ) -> Self {
+        Self { method, reader }
+    }
+
     pub fn method(&self) -> CompressedKvMethod {
         self.method
     }
@@ -1571,14 +1580,21 @@ pub struct ReceiptCompression {
     pub representation_version: u64,
     pub bits: u64,
     pub quantization_group_size: u64,
-    /// Peak live compressed storage, measured from the retained device arrays and allocated host
-    /// staging payload of one cache: `physicalKvBytes` is exactly their sum.
+    /// Peak live compressed storage of the coordinate operation's own cache, measured from its
+    /// retained device arrays and its allocated host payload (host codes/metadata copy plus the
+    /// staged key tail): `physicalKvBytes` is exactly their sum and is the whole physical
+    /// representation a reduction claim is computed from. `memory.persistentKvBytes` is the MLX
+    /// device share only and equals `deviceCodeBytes + deviceMetadataBytes`. All zero when the
+    /// coordinate operation ran on an explicit dense fallback.
     pub device_code_bytes: u64,
     pub device_metadata_bytes: u64,
     pub host_payload_bytes: u64,
     pub physical_kv_bytes: u64,
-    /// Whether `memory.persistentKvBytes` (the coordinate operation) measured the compressed
-    /// representation or an explicit dense fallback of that operation.
+    /// Live tokens of that measured storage; equals `geometry.kvLength` (zero on a dense fallback).
+    pub storage_tokens: u64,
+    /// Whether the coordinate operation (and only it: warmups, fixtures, prompt-cache reuse and
+    /// cancellation are excluded) ran on the compressed representation or an explicit dense
+    /// fallback. Only `compressed` rows are eligible for a persistent-KV reduction claim.
     pub persistent_kv_representation: String,
     /// Fused compressed-domain attention calls accepted by the cache (per layer and step).
     pub fused_calls: u64,
@@ -1953,12 +1969,11 @@ fn validate_receipt_compression(
     {
         return Err("compressed representation identity is incomplete".into());
     }
-    if compression.device_code_bytes == 0
-        || compression
-            .device_code_bytes
-            .checked_add(compression.device_metadata_bytes)
-            .and_then(|bytes| bytes.checked_add(compression.host_payload_bytes))
-            != Some(compression.physical_kv_bytes)
+    let device_bytes = compression
+        .device_code_bytes
+        .checked_add(compression.device_metadata_bytes);
+    if device_bytes.and_then(|bytes| bytes.checked_add(compression.host_payload_bytes))
+        != Some(compression.physical_kv_bytes)
     {
         return Err("compressed physical KV bytes do not reconcile with measured storage".into());
     }
@@ -1988,9 +2003,30 @@ fn validate_receipt_compression(
         return Err("compressed fallback calls are not fully reasoned".into());
     }
     match compression.persistent_kv_representation.as_str() {
-        COMPRESSED_PERSISTENT_KV
-            if receipt.memory.persistent_kv_bytes < receipt.memory.dense_theoretical_kv_bytes => {}
-        DENSE_FALLBACK_PERSISTENT_KV if compression.fallback_calls != 0 => {}
+        // The coordinate's own compressed storage: the MLX-resident persistent KV is exactly its
+        // device arrays, it describes the receipt's KV length, and the whole physical
+        // representation (device + host copy + staged tail) is below the dense geometry.
+        COMPRESSED_PERSISTENT_KV => {
+            if compression.device_code_bytes == 0
+                || device_bytes != Some(receipt.memory.persistent_kv_bytes)
+                || compression.storage_tokens != receipt.geometry.kv_length
+            {
+                return Err(
+                    "compressed persistent KV does not reconcile with the coordinate's measured storage"
+                        .into(),
+                );
+            }
+            if compression.physical_kv_bytes >= receipt.memory.dense_theoretical_kv_bytes {
+                return Err(
+                    "compressed persistent KV representation disagrees with its evidence".into(),
+                );
+            }
+        }
+        // A dense coordinate claims no compressed storage, so it can never yield a reduction.
+        DENSE_FALLBACK_PERSISTENT_KV
+            if compression.fallback_calls != 0
+                && compression.physical_kv_bytes == 0
+                && compression.storage_tokens == 0 => {}
         _ => {
             return Err(
                 "compressed persistent KV representation disagrees with its evidence".into(),
@@ -5674,6 +5710,17 @@ pub struct ProductObserver {
     packed_evidence: Vec<crate::primitives::PackedCacheEvidence>,
     dense_fallbacks: Vec<(String, String)>,
     compressed_storage_peak: Option<crate::primitives::CompressedCacheStorage>,
+    coordinate_scope: Option<CoordinateCompressionScope>,
+}
+
+/// Compressed-arm evidence of one coordinate operation only (its setup and measured dispatch),
+/// closed by [`ProductObserver::end_coordinate_operation`] before the lifecycle probes
+/// (prompt-cache reuse, cancellation) run on the same observer.
+#[derive(Clone, Debug, Default)]
+pub struct CoordinateCompressionScope {
+    pub packed_evidence: Vec<crate::primitives::PackedCacheEvidence>,
+    pub dense_fallbacks: Vec<(String, String)>,
+    pub storage_peak: Option<crate::primitives::CompressedCacheStorage>,
 }
 
 impl ProductObserver {
@@ -5702,7 +5749,22 @@ impl ProductObserver {
             packed_evidence: Vec::new(),
             dense_fallbacks: Vec::new(),
             compressed_storage_peak: None,
+            coordinate_scope: None,
         }
+    }
+
+    /// Close the coordinate operation: compressed evidence recorded so far describes the measured
+    /// operation, and anything recorded afterwards is lifecycle evidence of the same observer.
+    pub fn end_coordinate_operation(&mut self) {
+        if self.coordinate_scope.is_some() {
+            self.error = Some("duplicate coordinate-operation scope".into());
+            return;
+        }
+        self.coordinate_scope = Some(CoordinateCompressionScope {
+            packed_evidence: self.packed_evidence.clone(),
+            dense_fallbacks: self.dense_fallbacks.clone(),
+            storage_peak: self.compressed_storage_peak,
+        });
     }
 
     pub fn bind_session(&mut self, session_id: impl Into<String>) {
@@ -5797,7 +5859,7 @@ impl ProductObserver {
             cache_capacity_tokens: self.cache_capacity_tokens,
             packed_evidence: self.packed_evidence,
             dense_fallbacks: self.dense_fallbacks,
-            compressed_storage_peak: self.compressed_storage_peak,
+            coordinate_scope: self.coordinate_scope,
         })
     }
 }
@@ -5827,8 +5889,9 @@ pub struct ProductObservations {
     pub packed_evidence: Vec<crate::primitives::PackedCacheEvidence>,
     /// Compressed-arm operations that ran on the explicit dense path, with their reasons.
     pub dense_fallbacks: Vec<(String, String)>,
-    /// Largest measured physical compressed storage (device + host) seen by this observer.
-    pub compressed_storage_peak: Option<crate::primitives::CompressedCacheStorage>,
+    /// The coordinate operation's own compressed evidence; `None` for observers that never ran a
+    /// coordinate operation (fixture quality/lifecycle runs).
+    pub coordinate_scope: Option<CoordinateCompressionScope>,
 }
 
 impl Observer for ProductObserver {
@@ -6049,13 +6112,19 @@ impl Observer for ProductObserver {
         self.dense_fallbacks.push((operation.into(), reason.into()));
     }
 
+    /// Keep the storage at the persistent-KV peak: the largest device share (which is what
+    /// `cache_snapshot` reports as persistent KV), then the largest whole physical footprint, so
+    /// the receipt's physical bytes describe the same instant as `memory.persistentKvBytes`.
     fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
-        let physical = |s: &crate::primitives::CompressedCacheStorage| {
-            s.device_bytes().saturating_add(s.host_payload_bytes)
+        let key = |s: &crate::primitives::CompressedCacheStorage| {
+            (
+                s.device_bytes(),
+                s.device_bytes().saturating_add(s.host_payload_bytes),
+            )
         };
         if self
             .compressed_storage_peak
-            .is_none_or(|peak| physical(storage) > physical(&peak))
+            .is_none_or(|peak| key(storage) > key(&peak))
         {
             self.compressed_storage_peak = Some(*storage);
         }
@@ -6832,20 +6901,17 @@ fn run_coordinate_operation_on_session(
             "coordinate produced no positive compile-attribution dispatch duration".into(),
         ));
     }
-    // Prompt-cache reuse and deliberate cancellation are additional lifecycle facts.  They do not
-    // replace the coordinate operation measured above.
-    provider.campaign_prefix_reuse(prefix_prompt)?;
-    session.dense_fallback(
+    finish_coordinate_lifecycle(
         &mut observer,
-        "prompt-cache-reuse",
-        COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
-    );
-    observer.cache_state(session.advance_cache_state());
-    observer.phase("prompt-cache-reuse");
-    provider.campaign_cancel_after_first_token(&mut observer, session.compressed())?;
-    provider.campaign_release_cache_state();
-    mlx_rs::memory::clear_cache();
-    observer.phase("post-run-release");
+        session.compressed().is_some(),
+        || provider.campaign_prefix_reuse(prefix_prompt).map(drop),
+        || session.advance_cache_state(),
+        |observer| provider.campaign_cancel_after_first_token(observer, session.compressed()),
+        || {
+            provider.campaign_release_cache_state();
+            mlx_rs::memory::clear_cache();
+        },
+    )?;
     let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
     Ok(CoordinateOperationEvidence {
         observation,
@@ -6856,6 +6922,35 @@ fn run_coordinate_operation_on_session(
         compile_setup_ms,
         compile_dispatch_ms,
     })
+}
+
+/// Prompt-cache reuse and deliberate cancellation are additional lifecycle facts of every
+/// coordinate observer. They do not replace the coordinate operation measured before them: the
+/// coordinate scope is closed first, so their (reasoned dense or compressed) evidence can never
+/// classify the measured representation.
+fn finish_coordinate_lifecycle(
+    observer: &mut ProductObserver,
+    compressed: bool,
+    prefix_reuse: impl FnOnce() -> core_llm::Result<()>,
+    advance_cache_state: impl FnOnce() -> u64,
+    cancel_after_first_token: impl FnOnce(&mut ProductObserver) -> core_llm::Result<()>,
+    release_cache_state: impl FnOnce(),
+) -> core_llm::Result<()> {
+    observer.end_coordinate_operation();
+    prefix_reuse()?;
+    if compressed {
+        Observer::dense_fallback(
+            observer,
+            "prompt-cache-reuse",
+            COMPRESSED_PREFIX_REUSE_FALLBACK_REASON,
+        );
+    }
+    observer.cache_state(advance_cache_state());
+    observer.phase("prompt-cache-reuse");
+    cancel_after_first_token(observer)?;
+    release_cache_state();
+    observer.phase("post-run-release");
+    Ok(())
 }
 
 fn negative_log_likelihood(probabilities: &[(i32, f64)]) -> Result<f64, String> {
@@ -7997,7 +8092,8 @@ fn compressed_arm_observations<'a>(
 /// Reduce a compressed arm's product observations to the receipt's compression block. Evidence is
 /// exported by the caches themselves; a cache that left the fused path without a recorded reason
 /// is refused here rather than published as a silent fallback. Dense reconstructions are counted,
-/// never hidden: the receipt validators reject any.
+/// never hidden: the receipt validators reject any. Counts cover every observation; the
+/// representation and physical bytes come from the primary's coordinate scope only.
 pub fn compressed_receipt_block(
     method: CompressedKvMethod,
     primary: &ProductObservations,
@@ -8047,25 +8143,27 @@ pub fn compressed_receipt_block(
     if fused_calls == 0 {
         return Err("compressed arm never executed the fused compressed-domain reader".into());
     }
-    let storage = observations
-        .iter()
-        .filter_map(|observation| observation.compressed_storage_peak)
-        .max_by_key(|storage| {
-            storage
-                .device_bytes()
-                .saturating_add(storage.host_payload_bytes)
-        })
-        .ok_or("compressed arm measured no live compressed storage")?;
-    let persistent_kv_representation = if !primary.packed_evidence.is_empty()
-        && primary.dense_fallbacks.is_empty()
-        && primary
-            .packed_evidence
-            .iter()
-            .all(|item| !item.dense_active && item.fallback_reasons.is_empty())
-    {
-        COMPRESSED_PERSISTENT_KV
-    } else {
-        DENSE_FALLBACK_PERSISTENT_KV
+    // Representation and physical bytes describe the coordinate operation alone: warmups,
+    // fixtures, and the primary's own lifecycle probes (prompt-cache reuse, cancellation) are
+    // counted above but never classify it.
+    let scope = primary
+        .coordinate_scope
+        .as_ref()
+        .ok_or("compressed primary observation has no coordinate-operation scope")?;
+    let coordinate_storage = scope.storage_peak.filter(|_| {
+        !scope.packed_evidence.is_empty()
+            && scope.dense_fallbacks.is_empty()
+            && scope
+                .packed_evidence
+                .iter()
+                .all(|item| !item.dense_active && item.fallback_reasons.is_empty())
+    });
+    let (persistent_kv_representation, storage) = match coordinate_storage {
+        Some(storage) => (COMPRESSED_PERSISTENT_KV, storage),
+        None => (
+            DENSE_FALLBACK_PERSISTENT_KV,
+            crate::primitives::CompressedCacheStorage::default(),
+        ),
     };
     let fallbacks = fallbacks
         .into_iter()
@@ -8086,9 +8184,11 @@ pub fn compressed_receipt_block(
         device_metadata_bytes: storage.device_metadata_bytes,
         host_payload_bytes: storage.host_payload_bytes,
         physical_kv_bytes: storage
-            .device_bytes()
-            .checked_add(storage.host_payload_bytes)
+            .device_code_bytes
+            .checked_add(storage.device_metadata_bytes)
+            .and_then(|bytes| bytes.checked_add(storage.host_payload_bytes))
             .ok_or("physical compressed KV bytes overflow u64")?,
+        storage_tokens: storage.tokens,
         persistent_kv_representation: persistent_kv_representation.into(),
         fused_calls,
         fallback_calls: fallbacks.iter().map(|fallback| fallback.calls).sum(),
@@ -8406,7 +8506,7 @@ pub(crate) mod tests {
                 cache_capacity_tokens: 256,
                 packed_evidence: Vec::new(),
                 dense_fallbacks: Vec::new(),
-                compressed_storage_peak: None,
+                coordinate_scope: None,
             };
             ProductFixtureResult {
                 observation: observation(),
@@ -9977,16 +10077,22 @@ pub(crate) mod tests {
         crate::primitives::CompressedCacheStorage {
             device_code_bytes: 1,
             device_metadata_bytes: 1,
-            host_payload_bytes: 3,
+            host_payload_bytes: 1,
             tokens: 1,
             element_bytes: 2,
         };
 
+    /// An observation whose coordinate scope holds exactly `evidence`, `dense_fallbacks`, and
+    /// `storage` (lifecycle evidence is appended by callers outside the scope).
     fn test_compressed_observation(
         evidence: Vec<crate::primitives::PackedCacheEvidence>,
         dense_fallbacks: &[(&str, &str)],
         storage: Option<crate::primitives::CompressedCacheStorage>,
     ) -> ProductObservations {
+        let dense_fallbacks = dense_fallbacks
+            .iter()
+            .map(|(operation, reason)| ((*operation).into(), (*reason).into()))
+            .collect::<Vec<(String, String)>>();
         ProductObservations {
             snapshot: SnapshotInventory {
                 root: PathBuf::new(),
@@ -10017,20 +10123,26 @@ pub(crate) mod tests {
             },
             cache_live_tokens: 1,
             cache_capacity_tokens: 256,
-            packed_evidence: evidence,
-            dense_fallbacks: dense_fallbacks
-                .iter()
-                .map(|(operation, reason)| ((*operation).into(), (*reason).into()))
-                .collect(),
-            compressed_storage_peak: storage,
+            packed_evidence: evidence.clone(),
+            dense_fallbacks: dense_fallbacks.clone(),
+            coordinate_scope: Some(CoordinateCompressionScope {
+                packed_evidence: evidence,
+                dense_fallbacks,
+                storage_peak: storage,
+            }),
         }
     }
 
-    /// The producer's block for a primary single-shot coordinate that stayed compressed plus a
-    /// lifecycle run whose prompt-cache reuse took the reasoned dense prefix path.
+    /// The producer's block for a primary single-shot coordinate that stayed compressed (its own
+    /// lifecycle prompt-cache reuse took the reasoned dense prefix path after the coordinate scope
+    /// closed, exactly as `finish_coordinate_lifecycle` records it) plus a fixture lifecycle run.
     fn test_compression_block() -> ReceiptCompression {
-        let primary =
+        let mut primary =
             test_compressed_observation(vec![test_packed_evidence(4)], &[], Some(TEST_STORAGE));
+        primary.dense_fallbacks.push((
+            "prompt-cache-reuse".into(),
+            COMPRESSED_PREFIX_REUSE_FALLBACK_REASON.into(),
+        ));
         let lifecycle = test_compressed_observation(
             vec![test_packed_evidence(6)],
             &[(
@@ -10085,11 +10197,12 @@ pub(crate) mod tests {
         let block = test_compression_block();
         assert_eq!(block.method, "group-affine");
         assert_eq!(block.fused_calls, 10);
-        assert_eq!(block.fallback_calls, 1);
+        assert_eq!(block.fallback_calls, 2);
         assert_eq!(
-            block.physical_kv_bytes, 5,
+            block.physical_kv_bytes, 3,
             "device code + metadata + host staging"
         );
+        assert_eq!(block.storage_tokens, 1);
         assert_eq!(block.persistent_kv_representation, COMPRESSED_PERSISTENT_KV);
         assert_eq!(block.full_cache_dequantizations, 0);
 
@@ -10174,7 +10287,18 @@ pub(crate) mod tests {
             },
             "persistent KV representation",
         );
-        // A persistent KV labelled compressed may not be the full dense geometry.
+        // A representation labelled compressed may not reach the dense geometry once its host
+        // copy and staged tail are counted.
+        rejects(
+            &|r| {
+                let c = r.compression.as_mut().unwrap();
+                c.host_payload_bytes += 1;
+                c.physical_kv_bytes += 1;
+            },
+            "persistent KV representation",
+        );
+        // The persistent KV is exactly the coordinate storage's device share, at the receipt's
+        // KV length.
         rejects(
             &|r| {
                 let dense = r.memory.dense_theoretical_kv_bytes;
@@ -10185,6 +10309,43 @@ pub(crate) mod tests {
                 }
                 r.memory.persistent_kv_bytes = dense;
                 r.memory.reconciliation.observed_persistent_kv_bytes = dense;
+            },
+            "coordinate's measured storage",
+        );
+        rejects(
+            &|r| r.compression.as_mut().unwrap().storage_tokens += 1,
+            "coordinate's measured storage",
+        );
+        rejects(
+            &|r| {
+                let c = r.compression.as_mut().unwrap();
+                c.device_code_bytes += 1;
+                c.host_payload_bytes -= 1;
+            },
+            "coordinate's measured storage",
+        );
+        // A dense coordinate claims no compressed storage (so it can never yield a reduction).
+        rejects(
+            &|r| {
+                r.compression.as_mut().unwrap().persistent_kv_representation =
+                    DENSE_FALLBACK_PERSISTENT_KV.into()
+            },
+            "persistent KV representation",
+        );
+        rejects(
+            &|r| {
+                let c = r.compression.as_mut().unwrap();
+                c.persistent_kv_representation = DENSE_FALLBACK_PERSISTENT_KV.into();
+                c.storage_tokens = 0;
+            },
+            "persistent KV representation",
+        );
+        rejects(
+            &|r| {
+                let c = r.compression.as_mut().unwrap();
+                c.persistent_kv_representation = DENSE_FALLBACK_PERSISTENT_KV.into();
+                (c.device_code_bytes, c.device_metadata_bytes) = (0, 0);
+                (c.host_payload_bytes, c.physical_kv_bytes) = (0, 0);
             },
             "persistent KV representation",
         );
@@ -10267,6 +10428,230 @@ pub(crate) mod tests {
         assert!(validate_sealed_receipt(&receipt)
             .unwrap_err()
             .contains("reconstructed a dense full cache"));
+    }
+
+    /// Drive a real `ProductObserver` through the producer's coordinate sequence: the events the
+    /// decode stream emits for a compressed single-shot dispatch, then the shared
+    /// `finish_coordinate_lifecycle` tail (prompt-cache reuse dense fallback, cancellation run
+    /// replay, release). Only the coordinate operation may classify the representation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn producer_lifecycle_does_not_classify_the_compressed_coordinate() {
+        let coordinate = crate::primitives::CompressedCacheStorage {
+            device_code_bytes: 64,
+            device_metadata_bytes: 32,
+            host_payload_bytes: 16,
+            tokens: 9,
+            element_bytes: 2,
+        };
+        // The cancellation probe's cache: smaller device share, larger host staging, and a
+        // reasoned fallback of its own. None of it describes the coordinate.
+        let cancellation = crate::primitives::CompressedCacheStorage {
+            device_code_bytes: 32,
+            device_metadata_bytes: 16,
+            host_payload_bytes: 4096,
+            tokens: 3,
+            element_bytes: 2,
+        };
+        let pid = std::process::id();
+        let sample = |current_bytes| MemorySample {
+            captured_at: timestamp_now(),
+            pid,
+            current_bytes,
+            peak_bytes: current_bytes,
+            mlx_active_bytes: current_bytes,
+            mlx_cache_bytes: 0,
+            mlx_peak_bytes: current_bytes,
+        };
+        let mut observer = ProductObserver::new();
+        observer.bind_session("e".repeat(64));
+        observer.load_elapsed_ms = Some(1.0);
+        observer.load_boundary = Some((sample(1), sample(2)));
+        Observer::phase(&mut observer, "process-start");
+        Observer::snapshot_inventory(
+            &mut observer,
+            &SnapshotInventory {
+                root: PathBuf::new(),
+                files: Vec::new(),
+                bytes: 1,
+                sha256: "d".repeat(64),
+            },
+        );
+        Observer::geometry(
+            &mut observer,
+            ProductGeometry {
+                query_heads: 2,
+                kv_heads: 1,
+                head_dimension: 64,
+                layers: 1,
+                element_bytes: 0,
+            },
+        );
+        observer.prefill_peak_window = Some(ReceiptPeakWindow {
+            started_at: timestamp_now(),
+            baseline_active_bytes: 1,
+            reset_peak_bytes: 0,
+        });
+        Observer::phase(&mut observer, "weights-loaded");
+        // Measured dispatch, as `observe_cache_events` reports a compressed cache.
+        Observer::phase(&mut observer, "prefill-peak");
+        Observer::logits(&mut observer, "prefill", &[0.25, 0.75]);
+        let report = |observer: &mut ProductObserver,
+                      storage: &crate::primitives::CompressedCacheStorage| {
+            Observer::cache_snapshot(
+                observer,
+                storage.device_bytes(),
+                storage.tokens,
+                256,
+                storage.element_bytes,
+            );
+            Observer::compressed_storage(observer, storage);
+        };
+        report(&mut observer, &coordinate);
+        Observer::phase(&mut observer, "first-token");
+        Observer::token_probability(&mut observer, "decode", 1, 0.5);
+        Observer::phase(&mut observer, "decode-steady");
+        report(&mut observer, &coordinate);
+        Observer::packed_cache_evidence(&mut observer, &test_packed_evidence(4));
+        Observer::release_event(
+            &mut observer,
+            "cache_release",
+            "cache",
+            coordinate.device_bytes(),
+        );
+        observer.operation("single-shot-generation");
+        finish_coordinate_lifecycle(
+            &mut observer,
+            true,
+            || Ok(()),
+            || 1,
+            |observer| {
+                Observer::phase(observer, "cancellation-cleanup");
+                report(observer, &cancellation);
+                Observer::packed_cache_evidence(
+                    observer,
+                    &crate::primitives::PackedCacheEvidence {
+                        dense_active: true,
+                        fallback_reasons: vec![("update".into(), "cancelled".into())],
+                        ..test_packed_evidence(1)
+                    },
+                );
+                Observer::release_event(
+                    observer,
+                    "cache_release",
+                    "cache",
+                    cancellation.device_bytes(),
+                );
+                Ok(())
+            },
+            || {},
+        )
+        .unwrap();
+        let primary = observer.finish().expect("producer sequence finalizes");
+        let block =
+            compressed_receipt_block(CompressedKvMethod::GroupAffine, &primary, &[&primary])
+                .unwrap();
+        assert_eq!(block.persistent_kv_representation, COMPRESSED_PERSISTENT_KV);
+        assert_eq!(block.physical_kv_bytes, 64 + 32 + 16);
+        assert_eq!(
+            (block.device_code_bytes, block.device_metadata_bytes),
+            (64, 32)
+        );
+        assert_eq!(block.storage_tokens, primary.cache_live_tokens);
+        // The lifecycle facts are still counted arm-wide.
+        assert_eq!(block.fused_calls, 5);
+        assert_eq!(block.fallback_calls, 2);
+        assert!(block
+            .fallbacks
+            .iter()
+            .any(|fallback| fallback.operation == "prompt-cache-reuse"));
+    }
+
+    #[test]
+    fn coordinate_storage_is_taken_at_the_persistent_kv_peak() {
+        // A host copy released after upload must not pin the physical bytes to an earlier,
+        // smaller device share than the persistent KV the receipt reports.
+        let mut observer = ProductObserver::new();
+        let staged = crate::primitives::CompressedCacheStorage {
+            host_payload_bytes: 100,
+            ..TEST_STORAGE
+        };
+        let uploaded = crate::primitives::CompressedCacheStorage {
+            device_code_bytes: 20,
+            host_payload_bytes: 0,
+            tokens: 2,
+            ..TEST_STORAGE
+        };
+        Observer::compressed_storage(&mut observer, &staged);
+        Observer::compressed_storage(&mut observer, &uploaded);
+        observer.end_coordinate_operation();
+        assert_eq!(
+            observer.coordinate_scope.unwrap().storage_peak,
+            Some(uploaded)
+        );
+    }
+
+    #[test]
+    fn compressed_classification_reads_only_the_coordinate_scope() {
+        // Out-of-scope lifecycle evidence (a fallback plus larger storage) never reclassifies a
+        // compressed coordinate or supplies its bytes.
+        let mut primary =
+            test_compressed_observation(vec![test_packed_evidence(4)], &[], Some(TEST_STORAGE));
+        primary.dense_fallbacks.push((
+            "prompt-cache-reuse".into(),
+            COMPRESSED_PREFIX_REUSE_FALLBACK_REASON.into(),
+        ));
+        let warmup = test_compressed_observation(
+            vec![test_packed_evidence(2)],
+            &[],
+            Some(crate::primitives::CompressedCacheStorage {
+                host_payload_bytes: 1 << 20,
+                tokens: 99,
+                ..TEST_STORAGE
+            }),
+        );
+        let block = compressed_receipt_block(
+            CompressedKvMethod::GroupAffine,
+            &primary,
+            &[&primary, &warmup],
+        )
+        .unwrap();
+        assert_eq!(block.persistent_kv_representation, COMPRESSED_PERSISTENT_KV);
+        assert_eq!((block.physical_kv_bytes, block.storage_tokens), (3, 1));
+
+        // A coordinate that itself ran dense (batch / prefix reuse) claims no compressed storage,
+        // even though the arm's fixtures stayed compressed.
+        let batch = test_compressed_observation(
+            Vec::new(),
+            &[("supported-batch", COMPRESSED_BATCH_FALLBACK_REASON)],
+            None,
+        );
+        let block =
+            compressed_receipt_block(CompressedKvMethod::GroupAffine, &batch, &[&batch, &warmup])
+                .unwrap();
+        assert_eq!(
+            block.persistent_kv_representation,
+            DENSE_FALLBACK_PERSISTENT_KV
+        );
+        assert_eq!(
+            (
+                block.physical_kv_bytes,
+                block.device_code_bytes,
+                block.storage_tokens
+            ),
+            (0, 0, 0)
+        );
+        let mut receipt = builder_test_receipt();
+        compress_test_receipt(&mut receipt, block);
+        validate_sealed_receipt(&receipt).expect("a reasoned dense coordinate is a valid row");
+
+        // A primary that never closed its coordinate scope cannot be classified.
+        primary.coordinate_scope = None;
+        assert!(
+            compressed_receipt_block(CompressedKvMethod::GroupAffine, &primary, &[&primary])
+                .unwrap_err()
+                .contains("no coordinate-operation scope")
+        );
     }
 
     #[test]

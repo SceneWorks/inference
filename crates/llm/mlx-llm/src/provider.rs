@@ -167,16 +167,12 @@ struct PackedCampaignDecoder<'a> {
 impl Decode for PackedCampaignDecoder<'_> {
     fn make_cache(&self) -> Box<dyn KvCache> {
         let selection = self.arm.select_cache(self.model);
-        let route = selection.route().clone();
-        let cache = selection.into_cache();
-        // A packed cache records its own fallback events; only a plain dense selection would
-        // otherwise leave no trace.
-        if let (crate::primitives::CacheRoute::DenseFallback { reason }, None) =
-            (route, cache.packed_evidence())
-        {
-            self.selection_fallbacks.borrow_mut().push(reason);
+        // Every refused selection keeps its own reason, including a packed cache whose reader
+        // binding failed: that cache's later update fallback would otherwise hide why.
+        if let crate::primitives::CacheRoute::DenseFallback { reason } = selection.route() {
+            self.selection_fallbacks.borrow_mut().push(reason.clone());
         }
-        cache
+        selection.into_cache()
     }
 
     fn step(
@@ -4218,6 +4214,41 @@ mod tests {
         fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
             self.evidence.push(evidence.clone());
         }
+    }
+
+    /// A packed cache whose retained reader fails to bind still records the selection's own
+    /// reason rather than only the later generic dense-attention fallback.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_campaign_decoder_records_a_refused_reader_binding() {
+        let model = tiny_packed_capable_model();
+        let reader = crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+            crate::primitives::OpaqueCompiledKernel::new(
+                "sc20676rx-refused",
+                "cpu",
+                0,
+                std::sync::Arc::new(()),
+            ),
+        ));
+        let arm = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            reader,
+        );
+        let decoder = PackedCampaignDecoder {
+            model: &model,
+            arm: &arm,
+            selection_fallbacks: RefCell::new(Vec::new()),
+        };
+        let cache = decoder.make_cache();
+        assert!(
+            cache.packed_evidence().is_some(),
+            "a refused binding still yields the packed cache"
+        );
+        let fallbacks = decoder.selection_fallbacks.into_inner();
+        assert!(
+            matches!(fallbacks.as_slice(), [reason] if reason.contains("packed reader rejected before mutation")),
+            "{fallbacks:?}"
+        );
     }
 
     /// The compressed campaign decoder runs the whole observed generation (prefill and decode) on
