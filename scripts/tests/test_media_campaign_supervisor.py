@@ -26,7 +26,8 @@ class Probe:
         free = self.host_free()
         return free, safety.darwin_host_memory(4096, {
             "freePages": free // 4096, "speculativePages": 0, "purgeablePages": 0,
-            "inactivePages": 0, "fileBackedPages": 0})
+            "inactivePages": 0, "fileBackedPages": 0,
+            "anonymousPages": 0, "throttledPages": 0})
 
     def tree_footprint(self, _pgid):
         return self.footprint
@@ -210,7 +211,8 @@ class SupervisorTests(unittest.TestCase):
 
     def test_policy_parsing_and_preflight_refuse_before_spawn(self):
         self.assertEqual(self.policy.sha256, safety.digest(self.policy.canonical_bytes))
-        self.assertEqual(safety.darwin_free_bytes("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 2.\nPages speculative: 3.\n"), 5 * 16384)
+        with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
+            safety.darwin_available("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 2.\nPages speculative: 3.\n")
         self.assertEqual(safety.darwin_footprint_bytes("    phys_footprint: 32768 B\n"), 32768)
         self.assertEqual(safety.linux_free_bytes("MemAvailable: 2048 kB\n"), 2048 * 1024)
         with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
@@ -379,17 +381,23 @@ class SupervisorTests(unittest.TestCase):
                 pages = self.cache_pages.pop(0) if len(self.cache_pages) > 1 else self.cache_pages[0]
                 host = safety.darwin_host_memory(4096, {
                     "freePages": 0, "speculativePages": 0, "purgeablePages": 0,
-                    "inactivePages": pages, "fileBackedPages": pages})
+                    "inactivePages": pages, "fileBackedPages": pages, "anonymousPages": 0,
+                    "throttledPages": 0})
                 return host["availableBytes"], host
         result = self.run_child("import time; time.sleep(.1)", probe=FileCacheProbe([1000]))
         self.assertEqual(result.returncode, 0)
         (self.root / "stdout").unlink()
         (self.root / "stderr").unlink()
         with self.assertRaisesRegex(safety.SupervisionError,
-                                    r"host-memory: host available 0 bytes \(darwin-vm-stat-available-v1\)") as caught:
+                                    r"host-memory: host available 0 bytes \(darwin-vm-stat-available-v2\)") as caught:
             self.run_child("import time; time.sleep(5)", probe=FileCacheProbe([1000, 0]))
         self.assertIsNotNone(caught.exception.pid)
         self.assertEqual(caught.exception.admission["hostMemoryComponents"]["inactivePages"], 1000)
+        # The abort record carries the tripping sample itself, next to the admission's.
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual((record["outcome"], record["reason"]), ("aborted", "host-memory"))
+        self.assertEqual(record["watchdogHostMemory"]["inactivePages"], 0)
+        self.assertEqual(record["watchdogHostMemory"]["metric"], "darwin-vm-stat-available-v2")
 
     def test_live_reserve_and_footprint_abort(self):
         class DecliningProbe(Probe):

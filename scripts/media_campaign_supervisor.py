@@ -49,6 +49,8 @@ class SupervisionError(ValueError):
         # unguarded) and the owned child PID (None when refused before spawn).
         self.admission: dict[str, object] | None = None
         self.pid: int | None = None
+        # The live macOS sample that tripped the host-reserve watchdog, when one did.
+        self.watchdog_host_memory: dict[str, object] | None = None
 
 
 def digest(raw: bytes) -> str:
@@ -134,11 +136,12 @@ def _bounded_output(argv: list[str], *, timeout: float = 2.0) -> str:
         raise SupervisionError("probe-failure", f"{argv[0]} output is not ASCII") from error
 
 
-DARWIN_AVAILABLE_METRIC = "darwin-vm-stat-available-v1"
+DARWIN_AVAILABLE_METRIC = "darwin-vm-stat-available-v2"
 _DARWIN_COUNTERS = {
     "Pages free": "freePages", "Pages speculative": "speculativePages",
     "Pages purgeable": "purgeablePages", "Pages inactive": "inactivePages",
-    "File-backed pages": "fileBackedPages",
+    "File-backed pages": "fileBackedPages", "Anonymous pages": "anonymousPages",
+    "Pages throttled": "throttledPages",
 }
 
 
@@ -164,43 +167,28 @@ def _darwin_pages(output: str) -> tuple[int, dict[str, int]]:
     return page_size, pages
 
 
-def darwin_free_bytes(output: str) -> int:
-    """Free plus speculative pages (SystemProbe.host_free on macOS). Admission and the live
-    host-reserve watchdog both use darwin_available via host_admission."""
-    first = output.splitlines()[0] if output else ""
-    match = re.search(r"page size of (\d+) bytes", first)
-    if not match or int(match.group(1)) < 4096 or int(match.group(1)) & (int(match.group(1)) - 1):
-        raise SupervisionError("probe-failure", "vm_stat page size is invalid")
-    page_size = int(match.group(1))
-    pages = {}
-    for line in output.splitlines()[1:]:
-        match = re.fullmatch(r"(Pages free|Pages speculative):\s*(\d+)\.", line.strip())
-        if match:
-            if match.group(1) in pages:
-                raise SupervisionError("probe-failure", "duplicate vm_stat counter")
-            pages[match.group(1)] = int(match.group(2))
-    if set(pages) != {"Pages free", "Pages speculative"}:
-        raise SupervisionError("probe-failure", "vm_stat lacks free or speculative pages")
-    return (pages["Pages free"] + pages["Pages speculative"]) * page_size
-
-
 def darwin_host_memory(page_size: int, pages: dict[str, int]) -> dict[str, object]:
-    """The macOS admission metric, with every component it was computed from.
+    """The macOS admission and host-reserve watchdog measure, with every component.
 
-    availableBytes = (free + speculative + purgeable + reclaimable file cache) * page size, where
-    the file cache credit is min(inactive - purgeable, file-backed - speculative), each floored
-    at zero. vm_stat's counters partition as: free and speculative are disjoint lists (vm_stat
-    prints kernel free_count minus speculative); File-backed + Anonymous = active + inactive +
-    speculative + throttled, so speculative read-ahead is inside File-backed and is removed before
-    the credit; purgeable (volatile) pages are anonymous and may sit on the inactive list, so they
-    are removed from inactive. The min is an upper bound on inactive-and-file-backed pages -- the
-    clean cache the pageout daemon frees without the compressor or swap -- so file-backed pages
-    on the active list (mapped, in use) are never credited beyond the inactive list's size.
-    Mirrors the Rust `campaign_supervisor::HostMemory` and `.github/kv-poc/common.sh`; all three
-    are pinned by crates/llm/mlx-llm/testdata/darwin-host-memory-cases.json.
+    availableBytes = (free + speculative + purgeable + R) * page size, required below 2^63, where
+    R = min(inactive - purgeable, file-backed - speculative, inactive + throttled - anonymous),
+    each floored at zero. vm_stat prints free (kernel free_count minus speculative) and
+    speculative as disjoint lists, and File-backed + Anonymous = active + inactive + speculative
+    + throttled. Throttled pages are anonymous (the throttled queue holds internal pages with no
+    pager to take them), so at most anonymous - throttled anonymous pages can sit on the inactive
+    list and at least inactive + throttled - anonymous inactive pages are file-backed: the third
+    bound makes R a provable lower bound on inactive file-backed pages, which the pageout daemon
+    frees (clean) or writes back (dirty) without the compressor or swap. Purgeable pages are
+    anonymous, so they never overlap R; speculative read-ahead is a separate list inside
+    File-backed. vm_stat is one host_statistics64 call whose counters are read without a global
+    lock, so the identity can skew by in-flight transitions; the parsers do not enforce it (the
+    shared fixture asserts it on real snapshots). Mirrors the Rust `campaign_supervisor::HostMemory`
+    and `.github/kv-poc/common.sh`; all three are pinned by
+    crates/llm/mlx-llm/testdata/darwin-host-memory-cases.json.
     """
     reclaimable = min(max(0, pages["inactivePages"] - pages["purgeablePages"]),
-                      max(0, pages["fileBackedPages"] - pages["speculativePages"]))
+                      max(0, pages["fileBackedPages"] - pages["speculativePages"]),
+                      max(0, pages["inactivePages"] + pages["throttledPages"] - pages["anonymousPages"]))
     available = (pages["freePages"] + pages["speculativePages"] + pages["purgeablePages"]
                  + reclaimable) * page_size
     if available >= 2**63:
@@ -303,8 +291,7 @@ class SystemProbe:
         return self.host_free(), None
 
     def host_free(self) -> int:
-        if self.policy.backend == "darwin-mlx":
-            return darwin_free_bytes(_bounded_output(["/usr/bin/vm_stat"]))
+        """Linux/Windows host free memory; macOS measures through host_admission."""
         if self.policy.backend == "windows-cuda":
             try:
                 return windows.host_free_bytes()
@@ -520,6 +507,8 @@ def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: Su
         "schemaVersion": 1, "kind": kind, "coordinate": coordinate, "accepted": False,
         "outcome": outcome, "reason": error.reason, "detail": error.detail, "pid": error.pid,
         "admission": error.admission,
+        **({"watchdogHostMemory": error.watchdog_host_memory}
+           if error.watchdog_host_memory is not None else {}),
     })
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
@@ -767,10 +756,12 @@ def _run_admitted(
                 available, live_host = probe.host_admission()
                 if available < policy.host_free_reserve_bytes:
                     metric = live_host["metric"] if live_host is not None else "host-free"
-                    raise SupervisionError(
+                    error = SupervisionError(
                         "host-memory",
                         f"host available {available} bytes ({metric}) fell below reserve "
                         f"{policy.host_free_reserve_bytes} bytes")
+                    error.watchdog_host_memory = live_host
+                    raise error
                 if pids:
                     try:
                         footprint = probe.tree_footprint(owner)

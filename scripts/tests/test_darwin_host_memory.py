@@ -20,23 +20,34 @@ from scripts import media_campaign_supervisor as safety
 ROOT = Path(__file__).resolve().parents[2]
 CASES = json.loads((ROOT / "crates/llm/mlx-llm/testdata/darwin-host-memory-cases.json").read_text(encoding="utf-8"))["cases"]
 COMMON = ROOT / ".github/kv-poc/common.sh"
-COUNTERS = ("freePages", "speculativePages", "purgeablePages", "inactivePages", "fileBackedPages")
+COUNTERS = ("freePages", "speculativePages", "purgeablePages", "inactivePages", "fileBackedPages",
+            "anonymousPages", "throttledPages")
 
 
 def reclaimable(pages: dict[str, int]) -> int:
     return min(max(0, pages["inactivePages"] - pages["purgeablePages"]),
-               max(0, pages["fileBackedPages"] - pages["speculativePages"]))
+               max(0, pages["fileBackedPages"] - pages["speculativePages"]),
+               max(0, pages["inactivePages"] + pages["throttledPages"] - pages["anonymousPages"]))
 
 
 # Plausible wrong definitions. Each must disagree with the fixture on at least one case.
 MUTANTS = {
+    "drop the anonymous bound (v1)": lambda p: min(max(0, p["inactivePages"] - p["purgeablePages"]),
+                                                   max(0, p["fileBackedPages"] - p["speculativePages"])),
     "drop the min (credit all file-backed)": lambda p: max(0, p["fileBackedPages"] - p["speculativePages"]),
     "count all inactive": lambda p: p["inactivePages"],
     "drop file-backed (inactive minus purgeable)": lambda p: max(0, p["inactivePages"] - p["purgeablePages"]),
-    "speculative counted twice": lambda p: min(max(0, p["inactivePages"] - p["purgeablePages"]), p["fileBackedPages"]),
-    "purgeable counted twice": lambda p: min(p["inactivePages"], max(0, p["fileBackedPages"] - p["speculativePages"])),
+    "purgeable counted twice": lambda p: min(p["inactivePages"], max(0, p["fileBackedPages"] - p["speculativePages"]),
+                                             max(0, p["inactivePages"] + p["throttledPages"] - p["anonymousPages"])),
+    "throttled ignored": lambda p: min(max(0, p["inactivePages"] - p["purgeablePages"]),
+                                       max(0, p["fileBackedPages"] - p["speculativePages"]),
+                                       max(0, p["inactivePages"] - p["anonymousPages"])),
     "no file cache (free + speculative + purgeable)": lambda p: 0,
 }
+
+
+def page_counter(text: str, key: str) -> int:
+    return int(next(line for line in text.splitlines() if line.startswith(key + ":")).split(":")[1].strip(" ."))
 
 
 def shell_measure(text: str) -> subprocess.CompletedProcess:
@@ -90,17 +101,29 @@ class DarwinHostMemoryTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue(any(mutant(case) != case["reclaimableFilePages"] for case in valid))
 
-    def test_free_plus_speculative_is_below_the_available_measure(self):
-        case = next(case for case in CASES if case["name"] == "heavy-file-cache")
-        self.assertEqual(safety.darwin_free_bytes(case["vmStat"]),
-                         (case["expect"]["freePages"] + case["expect"]["speculativePages"]) * 16384)
-        self.assertLess(safety.darwin_free_bytes(case["vmStat"]), case["expect"]["availableBytes"])
+    def test_every_case_obeys_the_vm_stat_page_identity(self):
+        # File-backed + Anonymous = active + inactive + speculative + throttled: the identity the
+        # anonymous bound rests on. It holds exactly on both real snapshots from this host.
+        for case in CASES:
+            if case["expect"] is None:
+                continue
+            with self.subTest(case["name"]):
+                text = case["vmStat"]
+                self.assertEqual(
+                    page_counter(text, "File-backed pages") + page_counter(text, "Anonymous pages"),
+                    sum(page_counter(text, key) for key in
+                        ("Pages active", "Pages inactive", "Pages speculative", "Pages throttled")))
+
+    def test_inactive_anonymous_with_active_file_cache_is_not_credited(self):
+        case = next(case for case in CASES if case["name"] == "inactive-anonymous-active-file")["expect"]
+        self.assertEqual(case["reclaimableFilePages"], 0)
+        self.assertEqual(MUTANTS["drop the anonymous bound (v1)"](case), 40000)
 
     def test_recorded_components_must_recompute(self):
         expect = next(case for case in CASES if case["name"] == "heavy-anonymous-inactive")["expect"]
         for field, value in (("availableBytes", expect["availableBytes"] + 16384),
                              ("reclaimableFilePages", expect["inactivePages"]),
-                             ("metric", "free-plus-speculative"), ("pageSizeBytes", 1000)):
+                             ("metric", "darwin-vm-stat-available-v1"), ("pageSizeBytes", 1000)):
             with self.subTest(field):
                 with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
                     safety.validate_host_memory({**expect, field: value})
@@ -136,7 +159,8 @@ class DarwinHostMemoryTests(unittest.TestCase):
         host = safety.validate_host_memory(safety.darwin_available(text))
         shell = [int(value) for value in shell_measure(text).stdout.split()]
         self.assertEqual(shell[0], host["availableBytes"])
-        self.assertGreaterEqual(host["availableBytes"], safety.darwin_free_bytes(text))
+        self.assertGreaterEqual(host["availableBytes"],
+                                (host["freePages"] + host["speculativePages"]) * host["pageSizeBytes"])
 
 
 if __name__ == "__main__":

@@ -2711,7 +2711,12 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                             "sc-20676-unaccepted-arm",
                             &slug,
                             &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
-                            (&reason, &failure.detail, failure.pid),
+                            (
+                &reason,
+                &failure.detail,
+                failure.pid,
+                failure.watchdog_host_memory.as_deref(),
+            ),
                             format!(
                                 "SC-20676 {slug} worker stopped ({reason}): {}; child {:?} reaped; stderr {}; valid arms remain in {}",
                                 failure.detail, failure.pid, request.stderr_path.display(), worker_root.display(),
@@ -2725,7 +2730,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                         "sc-20676-unaccepted-arm",
                         &slug,
                         &admission,
-                        ("ChildExit", &status.to_string(), None),
+                        ("ChildExit", &status.to_string(), None, None),
                         format!(
                             "SC-20676 {slug} worker failed with {status}; stderr {}; valid arms remain in {}",
                             request.stderr_path.display(), worker_root.display(),
@@ -3046,7 +3051,16 @@ mod tests {
                 host_free_reserve_bytes: 1 << 30,
                 static_footprint_floor_bytes: 1 << 20,
                 host_memory_components: campaign_supervisor::HostMemory::from_pages(
-                    16_384, 200_000, 4_000, 100, 90_000, 60_000,
+                    16_384,
+                    campaign_supervisor::VmStatPages {
+                        free: 200_000,
+                        speculative: 4_000,
+                        purgeable: 100,
+                        inactive: 90_000,
+                        file_backed: 60_000,
+                        anonymous: 40_000,
+                        throttled: 0,
+                    },
                 ),
             },
         };

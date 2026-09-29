@@ -651,7 +651,12 @@ fn parent(args: &[String]) -> Result<(), String> {
             "sc-20677-unaccepted-capture",
             "capture",
             &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
-            (&reason, &failure.detail, failure.pid),
+            (
+                &reason,
+                &failure.detail,
+                failure.pid,
+                failure.watchdog_host_memory.as_deref(),
+            ),
             format!(
                 "capture worker stopped ({reason}): {}; child {:?} reaped; partial output {}",
                 failure.detail,
@@ -666,7 +671,7 @@ fn parent(args: &[String]) -> Result<(), String> {
             "sc-20677-unaccepted-capture",
             "capture",
             &admission,
-            ("ChildExit", &status.to_string(), None),
+            ("ChildExit", &status.to_string(), None, None),
             format!(
                 "capture worker failed with {status}; stderr {}; partial output {}",
                 request.stderr_path.display(),

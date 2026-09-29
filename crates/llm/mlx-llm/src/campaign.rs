@@ -915,6 +915,15 @@ pub(crate) fn unused_attempt_prefix(logs: &Path, slug: &str) -> Option<String> {
         })
 }
 
+/// Why a row stopped: reason, detail, the owned child PID (after spawn), and the live host sample
+/// that tripped the host-reserve watchdog, when one did.
+pub(crate) type UnacceptedStop<'a> = (
+    &'a str,
+    &'a str,
+    Option<u32>,
+    Option<&'a campaign_supervisor::HostMemory>,
+);
+
 /// Record an unaccepted row and return the row's own failure. A record-write failure is appended
 /// to, never substituted for, the original refusal/abort/exit reason.
 pub(crate) fn unaccepted_row_error(
@@ -922,7 +931,7 @@ pub(crate) fn unaccepted_row_error(
     kind: &str,
     slug: &str,
     admission: &ReceiptAdmission,
-    stop: (&str, &str, Option<u32>),
+    stop: UnacceptedStop<'_>,
     failure: String,
 ) -> String {
     match write_unaccepted_row_record(path, kind, slug, admission, stop) {
@@ -941,10 +950,10 @@ pub(crate) fn write_unaccepted_row_record(
     kind: &str,
     slug: &str,
     admission: &ReceiptAdmission,
-    stop: (&str, &str, Option<u32>),
+    stop: UnacceptedStop<'_>,
 ) -> Result<(), String> {
-    let (reason, detail, pid) = stop;
-    let record = serde_json::json!({
+    let (reason, detail, pid, watchdog_host_memory) = stop;
+    let mut record = serde_json::json!({
         "schemaVersion": 1,
         "kind": kind,
         "coordinate": slug,
@@ -959,6 +968,9 @@ pub(crate) fn write_unaccepted_row_record(
         "pid": pid,
         "admission": admission,
     });
+    if let Some(sample) = watchdog_host_memory {
+        record["watchdogHostMemory"] = serde_json::to_value(sample).map_err(|e| e.to_string())?;
+    }
     let bytes = seal_json(&record)?.0;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -4602,7 +4614,12 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                         "sc-20671-unaccepted-row",
                         &slug,
                         &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
-                        (&reason, &failure.detail, failure.pid),
+                        (
+                &reason,
+                &failure.detail,
+                failure.pid,
+                failure.watchdog_host_memory.as_deref(),
+            ),
                         format!(
                             "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
                             failure.detail, failure.pid, launch.resume_dir.display(),
@@ -4616,7 +4633,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                     "sc-20671-unaccepted-row",
                     &slug,
                     &admission,
-                    ("ChildExit", &status.to_string(), None),
+                    ("ChildExit", &status.to_string(), None, None),
                     format!(
                         "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
                         request.stderr_path.display(), launch.resume_dir.display(),
@@ -9630,7 +9647,14 @@ pub(crate) mod tests {
                 &mut self,
                 _: std::time::Instant,
             ) -> std::io::Result<campaign_supervisor::HostMemory> {
-                Ok(campaign_supervisor::HostMemory::from_pages(1, self.free, 0, 0, 0, 0).unwrap())
+                Ok(campaign_supervisor::HostMemory::from_pages(
+                    1,
+                    campaign_supervisor::VmStatPages {
+                        free: self.free,
+                        ..Default::default()
+                    },
+                )
+                .unwrap())
             }
             fn child_footprint_bytes(
                 &mut self,
@@ -9658,6 +9682,7 @@ pub(crate) mod tests {
                     &format!("{:?}", failure.reason),
                     &failure.detail,
                     failure.pid,
+                    failure.watchdog_host_memory.as_deref(),
                 ),
             )
             .unwrap();
@@ -9720,7 +9745,7 @@ pub(crate) mod tests {
             unused_attempt_prefix(&logs, "row").unwrap(),
             "row.attempt-1"
         );
-        let stop = ("PreflightMemory", "host free 1 bytes", None);
+        let stop = ("PreflightMemory", "host free 1 bytes", None, None);
         let collided = unaccepted_row_error(
             &logs.join("row.attempt-0.unaccepted.json"),
             "sc-20671-unaccepted-row",
@@ -9740,6 +9765,31 @@ pub(crate) mod tests {
             "coordinate row stopped (PreflightMemory)".into(),
         );
         assert!(recorded.contains("; not accepted ("), "{recorded}");
+        // A host-reserve watchdog abort records the live sample that tripped it.
+        let sample = campaign_supervisor::HostMemory::from_pages(
+            16_384,
+            campaign_supervisor::VmStatPages {
+                free: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tripped = logs.join("row.attempt-2.unaccepted.json");
+        write_unaccepted_row_record(
+            &tripped,
+            "sc-20671-unaccepted-row",
+            "row",
+            &admission,
+            ("HostMemory", "host available", Some(9), Some(&sample)),
+        )
+        .unwrap();
+        let tripped: serde_json::Value =
+            serde_json::from_slice(&fs::read(tripped).unwrap()).unwrap();
+        assert_eq!(tripped["outcome"], "aborted");
+        assert_eq!(
+            tripped["watchdogHostMemory"],
+            serde_json::to_value(&sample).unwrap()
+        );
         assert!(logs.join("row.attempt-1.unaccepted.json").exists());
         // Enough host RAM and a child under the cap: admitted and supervised to completion.
         assert!(campaign_supervisor::run_guarded(
@@ -10167,7 +10217,16 @@ pub(crate) mod tests {
                     host_free_reserve_bytes: 1 << 30,
                     static_footprint_floor_bytes: 1 << 20,
                     host_memory_components: campaign_supervisor::HostMemory::from_pages(
-                        16_384, 200_000, 4_000, 100, 90_000, 60_000,
+                        16_384,
+                        campaign_supervisor::VmStatPages {
+                            free: 200_000,
+                            speculative: 4_000,
+                            purgeable: 100,
+                            inactive: 90_000,
+                            file_backed: 60_000,
+                            anonymous: 40_000,
+                            throttled: 0,
+                        },
                     ),
                 },
             },
@@ -11396,7 +11455,13 @@ pub(crate) mod tests {
             .contains("recompute"));
         let mut short_host = receipt.clone();
         short_host.memory.admission.host_memory_components =
-            campaign_supervisor::HostMemory::from_pages(16_384, 100_000, 0, 0, 0, 0);
+            campaign_supervisor::HostMemory::from_pages(
+                16_384,
+                campaign_supervisor::VmStatPages {
+                    free: 100_000,
+                    ..Default::default()
+                },
+            );
         assert!(validate_receipt_semantics(&short_host)
             .unwrap_err()
             .contains("below reserve plus child cap"));

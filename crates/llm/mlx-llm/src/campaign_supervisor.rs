@@ -17,25 +17,46 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// Identity of the macOS admission measure recorded with every measurement.
-pub const DARWIN_AVAILABLE_METRIC: &str = "darwin-vm-stat-available-v1";
+/// Identity of the macOS admission and host-reserve watchdog measure recorded with every sample.
+pub const DARWIN_AVAILABLE_METRIC: &str = "darwin-vm-stat-available-v2";
 /// The supervisor hands the worker the host measurement it was admitted on, so the worker's own
 /// receipt records the decision's inputs.
 pub const HOST_MEMORY_ADMISSION_ENV: &str = "SCENEWORKS_CAMPAIGN_HOST_MEMORY_ADMISSION";
+/// Every implementation (Rust, Python, the kv-poc shell precheck) refuses a measure at or above
+/// 2^63 bytes, so all three fail closed on the same input.
+const AVAILABLE_BYTES_LIMIT: u64 = 1 << 63;
 
-/// One vm_stat host-memory measurement and every component of the admission measure.
+/// The raw vm_stat page counters the measure is computed from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmStatPages {
+    pub free: u64,
+    pub speculative: u64,
+    pub purgeable: u64,
+    pub inactive: u64,
+    pub file_backed: u64,
+    pub anonymous: u64,
+    pub throttled: u64,
+}
+
+/// One vm_stat host-memory measurement and every component of the available measure, used by the
+/// pre-spawn admission and the live host-reserve watchdog alike.
 ///
-/// `available_bytes = (free + speculative + purgeable + reclaimable_file) * page_size`, where
-/// `reclaimable_file = min(max(0, inactive - purgeable), max(0, file_backed - speculative))`.
-/// vm_stat's counters partition as follows: free and speculative are disjoint lists (vm_stat prints
-/// the kernel's free_count minus speculative); `File-backed + Anonymous = active + inactive +
-/// speculative + throttled`, so speculative read-ahead sits inside File-backed and is removed
-/// before the credit; purgeable (volatile) pages are anonymous and can sit on the inactive list,
-/// so they are removed from inactive. The min is therefore an upper bound on inactive, clean
-/// file-backed pages -- the cache the pageout daemon frees without the compressor or swap -- and
-/// file-backed pages on the active list (mapped, in use) are never credited beyond the inactive
-/// list's size. Free plus speculative alone counts none of it, which made every admission after a
-/// large file read (model hashing) pessimistic by the size of the read.
+/// `available_bytes = (free + speculative + purgeable + R) * page_size` (below 2^63), where
+/// `R = min(inactive - purgeable, file_backed - speculative, inactive + throttled - anonymous)`,
+/// each floored at zero. vm_stat prints free (the kernel's free_count minus speculative) and
+/// speculative as disjoint lists, and `File-backed + Anonymous = active + inactive + speculative +
+/// throttled`. Throttled pages are anonymous (the throttled queue holds internal pages with no
+/// pager to take them), so at most `anonymous - throttled` anonymous pages can sit on the inactive
+/// list and at least `inactive + throttled - anonymous` inactive pages are file-backed. The third
+/// bound therefore makes `R` a provable lower bound on inactive file-backed pages, which the
+/// pageout daemon frees (clean) or writes back (dirty) without the compressor or swap; the first
+/// two bounds keep it within the non-purgeable inactive list and the non-speculative file-backed
+/// pages. Purgeable pages are anonymous, so they never overlap `R`. Anonymous inactive pages are
+/// credited only as far as purgeable pages cover them; active file-backed pages are not credited.
+///
+/// vm_stat is one `host_statistics64` call whose counters are read without a global lock, so the
+/// identity can skew by pages in flight between lists; the parser does not enforce it (the shared
+/// fixture asserts it on real snapshots, where it held exactly).
 ///
 /// Mirrors `scripts/media_campaign_supervisor.py` `darwin_host_memory` and
 /// `.github/kv-poc/common.sh` `host_memory_from_vm_stat`; all three are pinned by
@@ -50,39 +71,58 @@ pub struct HostMemory {
     pub purgeable_pages: u64,
     pub inactive_pages: u64,
     pub file_backed_pages: u64,
+    pub anonymous_pages: u64,
+    pub throttled_pages: u64,
     pub reclaimable_file_pages: u64,
     pub available_bytes: u64,
 }
 
 impl HostMemory {
-    /// Derive the admission measure from raw vm_stat page counts; `None` on overflow.
-    pub fn from_pages(
-        page_size_bytes: u64,
-        free_pages: u64,
-        speculative_pages: u64,
-        purgeable_pages: u64,
-        inactive_pages: u64,
-        file_backed_pages: u64,
-    ) -> Option<Self> {
-        let reclaimable_file_pages = inactive_pages
-            .saturating_sub(purgeable_pages)
-            .min(file_backed_pages.saturating_sub(speculative_pages));
-        let available_bytes = free_pages
-            .checked_add(speculative_pages)?
-            .checked_add(purgeable_pages)?
+    /// Derive the measure from raw vm_stat page counts; `None` at or above 2^63 bytes.
+    pub fn from_pages(page_size_bytes: u64, pages: VmStatPages) -> Option<Self> {
+        let reclaimable_file_pages = pages
+            .inactive
+            .saturating_sub(pages.purgeable)
+            .min(pages.file_backed.saturating_sub(pages.speculative))
+            .min(
+                pages
+                    .inactive
+                    .saturating_add(pages.throttled)
+                    .saturating_sub(pages.anonymous),
+            );
+        let available_bytes = pages
+            .free
+            .checked_add(pages.speculative)?
+            .checked_add(pages.purgeable)?
             .checked_add(reclaimable_file_pages)?
-            .checked_mul(page_size_bytes)?;
+            .checked_mul(page_size_bytes)
+            .filter(|bytes| *bytes < AVAILABLE_BYTES_LIMIT)?;
         Some(Self {
             metric: DARWIN_AVAILABLE_METRIC.into(),
             page_size_bytes,
-            free_pages,
-            speculative_pages,
-            purgeable_pages,
-            inactive_pages,
-            file_backed_pages,
+            free_pages: pages.free,
+            speculative_pages: pages.speculative,
+            purgeable_pages: pages.purgeable,
+            inactive_pages: pages.inactive,
+            file_backed_pages: pages.file_backed,
+            anonymous_pages: pages.anonymous,
+            throttled_pages: pages.throttled,
             reclaimable_file_pages,
             available_bytes,
         })
+    }
+
+    /// The raw counters this measurement was derived from.
+    pub fn pages(&self) -> VmStatPages {
+        VmStatPages {
+            free: self.free_pages,
+            speculative: self.speculative_pages,
+            purgeable: self.purgeable_pages,
+            inactive: self.inactive_pages,
+            file_backed: self.file_backed_pages,
+            anonymous: self.anonymous_pages,
+            throttled: self.throttled_pages,
+        }
     }
 
     /// A recorded measurement must name this metric, carry a real page size, and recompute
@@ -91,16 +131,7 @@ impl HostMemory {
         if self.metric != DARWIN_AVAILABLE_METRIC
             || self.page_size_bytes < 4096
             || !self.page_size_bytes.is_power_of_two()
-            || Self::from_pages(
-                self.page_size_bytes,
-                self.free_pages,
-                self.speculative_pages,
-                self.purgeable_pages,
-                self.inactive_pages,
-                self.file_backed_pages,
-            )
-            .as_ref()
-                != Some(self)
+            || Self::from_pages(self.page_size_bytes, self.pages()).as_ref() != Some(self)
         {
             return Err("host memory components do not recompute the admission measure".into());
         }
@@ -178,6 +209,8 @@ pub struct Failure {
     pub pid: Option<u32>,
     /// The pre-spawn host measurement, present whenever the probe succeeded (refusals included).
     pub host_memory: Option<Box<HostMemory>>,
+    /// The live sample that tripped the host-reserve watchdog ([`StopReason::HostMemory`]).
+    pub watchdog_host_memory: Option<Box<HostMemory>>,
 }
 
 impl Failure {
@@ -187,6 +220,7 @@ impl Failure {
             detail: detail.into(),
             pid,
             host_memory: None,
+            watchdog_host_memory: None,
         }
     }
 }
@@ -482,8 +516,8 @@ fn run_admitted<P: MemoryProbe>(
                 Some(pid),
             ));
         }
-        let available = match probe.host_memory(deadline) {
-            Ok(host) => host.available_bytes,
+        let sample = match probe.host_memory(deadline) {
+            Ok(host) => host,
             Err(error) => {
                 break Err(Failure::new(
                     StopReason::ProbeFailure,
@@ -492,15 +526,17 @@ fn run_admitted<P: MemoryProbe>(
                 ));
             }
         };
-        if available < policy.host_free_reserve_bytes {
-            break Err(Failure::new(
+        if sample.available_bytes < policy.host_free_reserve_bytes {
+            let mut failure = Failure::new(
                 StopReason::HostMemory,
                 format!(
-                    "host available {available} bytes ({DARWIN_AVAILABLE_METRIC}) fell below reserve {} bytes",
-                    policy.host_free_reserve_bytes
+                    "host available {} bytes ({}) fell below reserve {} bytes",
+                    sample.available_bytes, sample.metric, policy.host_free_reserve_bytes
                 ),
                 Some(pid),
-            ));
+            );
+            failure.watchdog_host_memory = Some(Box::new(sample));
+            break Err(failure);
         }
         let footprint = match probe.child_footprint_bytes(pid, deadline) {
             Ok(bytes) => bytes,
@@ -606,13 +642,17 @@ fn parse_vm_stat(text: &str) -> io::Result<HostMemory> {
     };
     HostMemory::from_pages(
         page_size,
-        pages("Pages free")?,
-        pages("Pages speculative")?,
-        pages("Pages purgeable")?,
-        pages("Pages inactive")?,
-        pages("File-backed pages")?,
+        VmStatPages {
+            free: pages("Pages free")?,
+            speculative: pages("Pages speculative")?,
+            purgeable: pages("Pages purgeable")?,
+            inactive: pages("Pages inactive")?,
+            file_backed: pages("File-backed pages")?,
+            anonymous: pages("Anonymous pages")?,
+            throttled: pages("Pages throttled")?,
+        },
     )
-    .ok_or_else(|| io::Error::other("vm_stat available-byte count overflows"))
+    .ok_or_else(|| io::Error::other("vm_stat available bytes reach 2^63"))
 }
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -769,7 +809,14 @@ mod tests {
 
     /// A one-byte-page measurement whose free pages are the whole available measure.
     fn free_only(bytes: u64) -> HostMemory {
-        HostMemory::from_pages(1, bytes, 0, 0, 0, 0).unwrap()
+        HostMemory::from_pages(
+            1,
+            VmStatPages {
+                free: bytes,
+                ..VmStatPages::default()
+            },
+        )
+        .unwrap()
     }
 
     impl FakeProbe {
@@ -862,6 +909,25 @@ mod tests {
         for (name, text, expect) in cases {
             match expect {
                 Some(expect) => {
+                    // File-backed + Anonymous = active + inactive + speculative + throttled: the
+                    // identity the anonymous bound rests on (exact on the real snapshots).
+                    let counter = |key: &str| -> u64 {
+                        text.lines()
+                            .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
+                            .unwrap()
+                            .trim()
+                            .trim_end_matches('.')
+                            .parse()
+                            .unwrap()
+                    };
+                    assert_eq!(
+                        counter("File-backed pages") + counter("Anonymous pages"),
+                        counter("Pages active")
+                            + counter("Pages inactive")
+                            + counter("Pages speculative")
+                            + counter("Pages throttled"),
+                        "{name}"
+                    );
                     let host = parse_vm_stat(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
                     assert_eq!(host, expect, "{name}");
                     host.validate().unwrap();
@@ -879,7 +945,15 @@ mod tests {
     #[test]
     fn fixture_discriminates_every_plausible_wrong_definition() {
         type Credit = fn(&HostMemory) -> u64;
-        let mutants: [(&str, Credit); 6] = [
+        let anonymous_bound = |h: &HostMemory| {
+            (h.inactive_pages + h.throttled_pages).saturating_sub(h.anonymous_pages)
+        };
+        let mutants: [(&str, Credit); 7] = [
+            ("drop the anonymous bound (v1)", |h| {
+                h.inactive_pages
+                    .saturating_sub(h.purgeable_pages)
+                    .min(h.file_backed_pages.saturating_sub(h.speculative_pages))
+            }),
             ("drop the min", |h| {
                 h.file_backed_pages.saturating_sub(h.speculative_pages)
             }),
@@ -887,14 +961,16 @@ mod tests {
             ("drop file-backed", |h| {
                 h.inactive_pages.saturating_sub(h.purgeable_pages)
             }),
-            ("speculative counted twice", |h| {
-                h.inactive_pages
-                    .saturating_sub(h.purgeable_pages)
-                    .min(h.file_backed_pages)
-            }),
             ("purgeable counted twice", |h| {
                 h.inactive_pages
                     .min(h.file_backed_pages.saturating_sub(h.speculative_pages))
+                    .min((h.inactive_pages + h.throttled_pages).saturating_sub(h.anonymous_pages))
+            }),
+            ("throttled ignored", |h| {
+                h.inactive_pages
+                    .saturating_sub(h.purgeable_pages)
+                    .min(h.file_backed_pages.saturating_sub(h.speculative_pages))
+                    .min(h.inactive_pages.saturating_sub(h.anonymous_pages))
             }),
             ("no file cache", |_| 0),
         ];
@@ -902,6 +978,9 @@ mod tests {
             .into_iter()
             .filter_map(|(.., expect)| expect)
             .collect();
+        for h in &valid {
+            assert!(h.reclaimable_file_pages <= anonymous_bound(h));
+        }
         for (name, mutant) in mutants {
             assert!(
                 valid.iter().any(|h| mutant(h) != h.reclaimable_file_pages),
@@ -946,7 +1025,19 @@ mod tests {
         // 10 free + 290 inactive file-backed pages: available 300 covers cap 200 + reserve 100
         // and stays above the reserve on every live sample, although free plus speculative (10)
         // is under it throughout. Page cache alone must not abort the row.
-        let cached = HostMemory::from_pages(1, 10, 0, 0, 290, 290).unwrap();
+        let file_cache = |pages| {
+            HostMemory::from_pages(
+                1,
+                VmStatPages {
+                    free: 10,
+                    inactive: pages,
+                    file_backed: pages,
+                    ..VmStatPages::default()
+                },
+            )
+            .unwrap()
+        };
+        let cached = file_cache(290);
         let request = new_request();
         let status = run_guarded(
             Command::new("/bin/sleep").arg("0.1"),
@@ -957,13 +1048,13 @@ mod tests {
         .unwrap();
         assert!(status.success());
         // A live sample whose available measure is under the reserve aborts, naming the metric.
-        let short = HostMemory::from_pages(1, 10, 0, 0, 89, 89).unwrap();
+        let short = file_cache(89);
         let request = new_request();
         let failure = run_guarded(
             Command::new("/bin/sleep").arg("2"),
             &request,
             &policy(),
-            &mut FakeProbe::hosts([Ok(cached.clone()), Ok(short)]),
+            &mut FakeProbe::hosts([Ok(cached.clone()), Ok(short.clone())]),
         )
         .unwrap_err();
         assert_eq!(failure.reason, StopReason::HostMemory, "{}", failure.detail);
@@ -978,9 +1069,20 @@ mod tests {
             failure.detail
         );
         assert_eq!(failure.host_memory.as_deref(), Some(&cached));
+        assert_eq!(failure.watchdog_host_memory.as_deref(), Some(&short));
         assert!(gone(failure.pid.unwrap()));
-        // The same 290 inactive pages as anonymous memory (file-backed only 5) are not credited.
-        let anonymous = HostMemory::from_pages(1, 10, 0, 0, 290, 5).unwrap();
+        // The same 290 inactive pages as anonymous memory are not credited.
+        let anonymous = HostMemory::from_pages(
+            1,
+            VmStatPages {
+                free: 10,
+                inactive: 290,
+                file_backed: 5,
+                anonymous: 290,
+                ..VmStatPages::default()
+            },
+        )
+        .unwrap();
         let request = new_request();
         let failure = run_guarded(
             Command::new("/bin/sleep").arg("2"),
@@ -990,14 +1092,21 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.reason, StopReason::PreflightMemory);
-        assert!(failure.detail.contains("host available 15 bytes"));
+        assert!(failure.detail.contains("host available 10 bytes"));
         assert_eq!(failure.host_memory.as_deref(), Some(&anonymous));
         assert!(failure.pid.is_none() && !request.stdout_path.exists());
     }
 
     #[test]
     fn worker_receives_the_measurement_it_was_admitted_on() {
-        let host = HostMemory::from_pages(4096, 1, 0, 0, 0, 0).unwrap();
+        let host = HostMemory::from_pages(
+            4096,
+            VmStatPages {
+                free: 1,
+                ..VmStatPages::default()
+            },
+        )
+        .unwrap();
         let request = new_request();
         let expected = serde_json::to_string(&host).unwrap();
         run_guarded(
