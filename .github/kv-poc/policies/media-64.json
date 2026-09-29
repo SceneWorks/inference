@@ -1,0 +1,1 @@
+{"schemaVersion":1,"backend":"darwin-mlx","deadlineSeconds":3600,"pollMillis":250,"termGraceMillis":5000,"hostFreeReserveBytes":17179869184,"childFootprintCapBytes":68719476736,"stdoutCapBytes":67108864,"stderrCapBytes":67108864,"eventCapBytes":67108864}

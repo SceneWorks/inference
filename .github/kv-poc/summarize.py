@@ -55,9 +55,11 @@ def report(phase: str, root: Path, dirs: list[Path]) -> None:
         present.append(base)
         for path in ([base] if base.is_file() else sorted(base.rglob("*.json"))):
             name = path.name
-            if name == "receipt.json":
+            # receipt.json: W1 rows and the SC-20684 bundle; campaign.json: the SC-20686 bundle.
+            # Unaccepted: `<row>.unaccepted.json` (W1, SC-20684) or `failed/*/unaccepted.json` (SC-20686).
+            if name in ("receipt.json", "campaign.json"):
                 receipts.append(path)
-            elif name.endswith(".unaccepted.json"):
+            elif name.endswith(".unaccepted.json") or name == "unaccepted.json":
                 unaccepted.append((path, load(path)))
             elif "operator-stop" in name:
                 stops.append((path, load(path)))
@@ -76,7 +78,7 @@ def report(phase: str, root: Path, dirs: list[Path]) -> None:
         for path, record in unaccepted:
             detail = str(record.get("detail", ""))[:160].replace("|", "/").replace("\n", " ")
             print(f"| `{record.get('coordinate', '?')}` | {record.get('outcome', '?')} | "
-                  f"{record.get('reason', '?')}: {detail} | `{path.name}` |")
+                  f"{record.get('reason', '?')}: {detail} | `{path.relative_to(root)}` |")
     for path, record in stops:
         print(f"\nOperator stop: before row {record.get('beforeRow', '?')} of {record.get('rowsTotal', '?')} "
               f"(`{record.get('beforeRowSlug', '?')}`), `{path.name}`")
