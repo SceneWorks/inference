@@ -6,14 +6,18 @@
 //! input K/V, implementation parity against an independent fp32 dequantize-then-attend oracle,
 //! allocator-measured transient memory, timing, and the matched-budget / matched-quality picks.
 //!
-//! Real captured K/V is a one-command step once a capture exists (safetensors with `q`
+//! Real captured K/V comes from [`crate::kv_capture`] (`sc20677_capture_kv`: safetensors with `q`
 //! `[B,Hq,S_q,D]`, `k`/`v` `[B,Hkv,S,D]`; optional string metadata `scale`, `mask`, `model`,
-//! `layer` is recorded):
+//! `layer` is recorded). One command captures a snapshot's layers under the campaign supervisor
+//! and compares them:
 //!
 //! ```text
-//! cargo run --release -p mlx-llm --bin sc20677_kv_candidates -- \
-//!     --kv /path/llama-layer12.safetensors --kv /path/qwen-layer20.safetensors \
-//!     --warm-iterations 20 --out /path/sc20677-comparison.json
+//! cargo run --locked --release -p mlx-llm --bin sc20677_capture_kv -- parent \
+//!     --snapshot <llama-4bit-snapshot> --prompt-file <prompt.txt> --tokens 8192 \
+//!     --layers 0,mid,last --safety-policy <policy.json> --out /abs/sc20677-kv-llama && \
+//! cargo run --locked --release -p mlx-llm --bin sc20677_kv_candidates -- \
+//!     $(for f in /abs/sc20677-kv-llama/*.safetensors; do printf -- '--kv %s ' "$f"; done) \
+//!     --warm-iterations 20 --out /abs/sc20677-comparison-llama.json
 //! ```
 
 use std::collections::BTreeMap;

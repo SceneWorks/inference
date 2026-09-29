@@ -822,6 +822,18 @@ impl LlamaProvider {
 
     /// Loaded decoder geometry for the receipt producer.  This is crate-private so a campaign
     /// cannot substitute JSON-provided head/layer values for the actual provider configuration.
+    /// SC-20677 K/V capture: the loaded causal decoder the campaign decodes through, and the
+    /// snapshot's own tokenizer. Only campaign families (Llama/Qwen3) are accepted.
+    pub(crate) fn campaign_causal_decoder(&self) -> CoreResult<(&CausalLm, &Tokenizer)> {
+        self.campaign_family()?;
+        match &self.model {
+            Decoder::Causal(model) => Ok((model, &self.tokenizer)),
+            Decoder::Qwen35(_) => Err(CoreError::Unsupported(
+                "SC-20677 K/V capture requires the causal campaign decoder".into(),
+            )),
+        }
+    }
+
     pub(crate) fn campaign_geometry(&self) -> crate::campaign::ProductGeometry {
         let (query_heads, kv_heads, head_dimension, layers) = match &self.model {
             Decoder::Causal(model) => {
