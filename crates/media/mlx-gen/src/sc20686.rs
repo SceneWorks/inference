@@ -482,7 +482,7 @@ fn model_snapshot_revision(root: &Path) -> io::Result<String> {
     ))
 }
 
-/// Components injected by tests; production uses the Metal allocator, `/usr/bin/footprint` and a
+/// Components injected by tests; production uses the Metal allocator, `proc_pid_rusage` and a
 /// JSONL file.
 pub struct Instruments {
     pub sink: Box<dyn EventSink>,
