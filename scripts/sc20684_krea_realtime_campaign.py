@@ -1052,7 +1052,7 @@ def _load_resumed_role(root: Path, name: str, identity: dict[str, Any]) -> dict[
     if not isinstance(supervision, dict) or type(supervision.get("pid")) is not int or supervision["pid"] <= 0 or supervision.get("ownedProcessGroupReaped") is not True:
         raise CampaignError(f"resume role {name} lacks an owned process identity")
     try:
-        supervisor.validate_admission(supervision.get("admission"))
+        supervisor.validate_admission(supervision.get("admission"), policy_sha256=identity.get("policySha256"))
     except supervisor.SupervisionError as error:
         raise CampaignError(f"resume role {name} lacks its runtime-guarded admission") from error
     if record.get("files") != _role_file_bindings(root, name, record["transcripts"]):
@@ -1317,9 +1317,11 @@ def run_matrix(
             if stdout_path.exists() or stderr_path.exists():
                 raise CampaignError(f"partial {role_name} transcript exists without valid resume binding")
             logs = evidence_root / "logs"
-            # A pre-spawn refusal leaves only an unaccepted record, so count every attempt index.
-            attempt = len({path.name[len(role_name) + 1:].split(".", 1)[0]
-                           for path in logs.glob(f"{role_name}.*")})
+            # A pre-spawn refusal leaves only an unaccepted record, so every attempt index counts.
+            indices = [int(index) for path in logs.glob(f"{role_name}.*")
+                       if (index := path.name[len(role_name) + 1:].split(".", 1)[0]).isdecimal()]
+            attempt = max(indices) + 1 if indices else 0
+            unaccepted = logs / f"{role_name}.{attempt}.unaccepted.json"
             try:
                 result = supervisor.run_guarded(
                     argv, cwd=ROOT, env=env, policy=safety_policy,
@@ -1328,40 +1330,48 @@ def run_matrix(
                 )
             except supervisor.SupervisionError as error:
                 supervisor.write_unaccepted_record(
-                    logs / f"{role_name}.{attempt}.unaccepted.json",
-                    kind="sc-20684-unaccepted-role", coordinate=role_name, error=error,
+                    unaccepted, kind="sc-20684-unaccepted-role", coordinate=role_name, error=error,
                 )
                 raise
-            if run_id in used_run_ids or result.pid in used_pids:
-                raise CampaignError(f"role {role_name} reuses a process identity")
-            used_run_ids.add(run_id)
-            used_pids.add(result.pid)
-            shutil.copyfile(logs / f"{role_name}.{attempt}.stdout.log", stdout_path)
-            shutil.copyfile(logs / f"{role_name}.{attempt}.stderr.log", stderr_path)
-            transcripts[role] = {
-                "stdout": _file_identity(stdout_path, f"transcripts/{stdout_path.name}"),
-                "stderr": _file_identity(stderr_path, f"transcripts/{stderr_path.name}"),
-            }
-            observations[f"{role}-process-exit-code"] = result.returncode
-            stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
-            if role == "paired":
-                observations[role] = _validate_observation(
-                    _read_observation(stdout),
-                    expected_mode=mode,
-                    expected_tier=tier,
-                    run_id=run_id,
-                    expected_source=source,
-                    expected_snapshot=model,
+            try:
+                if run_id in used_run_ids or result.pid in used_pids:
+                    raise CampaignError(f"role {role_name} reuses a process identity")
+                used_run_ids.add(run_id)
+                used_pids.add(result.pid)
+                shutil.copyfile(logs / f"{role_name}.{attempt}.stdout.log", stdout_path)
+                shutil.copyfile(logs / f"{role_name}.{attempt}.stderr.log", stderr_path)
+                transcripts[role] = {
+                    "stdout": _file_identity(stdout_path, f"transcripts/{stdout_path.name}"),
+                    "stderr": _file_identity(stderr_path, f"transcripts/{stderr_path.name}"),
+                }
+                observations[f"{role}-process-exit-code"] = result.returncode
+                stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+                if role == "paired":
+                    observations[role] = _validate_observation(
+                        _read_observation(stdout),
+                        expected_mode=mode,
+                        expected_tier=tier,
+                        run_id=run_id,
+                        expected_source=source,
+                        expected_snapshot=model,
+                    )
+                    _validate_artifact_directory(observations[role], artifact_dir)
+                else:
+                    observations[role] = _validate_baseline_observation(
+                        _read_observation(stdout, BASELINE_PREFIX),
+                        expected_mode=mode,
+                        expected_tier=tier,
+                        run_id=run_id,
+                        candidate=observations["paired"],
+                    )
+            except CampaignError as error:
+                # The child exited cleanly but left invalid evidence: a failed, unaccepted role.
+                failure = supervisor.SupervisionError("invalid-evidence", str(error))
+                failure.pid, failure.admission = result.pid, result.admission
+                supervisor.write_unaccepted_record(
+                    unaccepted, kind="sc-20684-unaccepted-role", coordinate=role_name, error=failure,
                 )
-                _validate_artifact_directory(observations[role], artifact_dir)
-            else:
-                observations[role] = _validate_baseline_observation(
-                    _read_observation(stdout, BASELINE_PREFIX),
-                    expected_mode=mode,
-                    expected_tier=tier,
-                    run_id=run_id,
-                    candidate=observations["paired"],
-                )
+                raise
             _save_resumed_role(evidence_root, role_name, resume_identity, {
                 "runId": run_id, "exitCode": result.returncode,
                 "transcripts": transcripts[role],

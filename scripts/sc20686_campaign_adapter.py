@@ -598,6 +598,7 @@ def run_entrypoint(
     # Provider stdout is free to contain progress bars (including carriage returns).  The adapter
     # owns this private file and accepts observer events only from it, never by filtering stdout.
     directory = Path(tempfile.mkdtemp(prefix="sc20686-events-"))
+    result = None
     try:
         run_directory = directory / "sealed-run"
         run_directory.mkdir()
@@ -616,7 +617,7 @@ def run_entrypoint(
             command.append("--sc20686-cancel")
         command.extend(("--out", str(media_output)))
         if safety_policy.deadline_seconds > timeout_seconds:
-            raise ValueError("safety deadline exceeds requested run timeout")
+            raise supervisor.SupervisionError("invalid-timeout", "safety deadline exceeds requested run timeout")
         result = supervisor.run_guarded(
             command, cwd=run_directory, env=os.environ.copy(), policy=safety_policy,
             stdout_path=run_directory / "stdout.log", stderr_path=run_directory / "stderr.log",
@@ -650,11 +651,16 @@ def run_entrypoint(
             },
         )
     except Exception as error:
-        unaccepted = isinstance(error, supervisor.SupervisionError)
+        failure = error if isinstance(error, supervisor.SupervisionError) else None
+        if failure is None and result is not None:
+            # The child exited cleanly but left invalid evidence: a failed, unaccepted arm.
+            failure = supervisor.SupervisionError("invalid-evidence", str(error))
+            failure.pid, failure.admission = result.pid, result.admission
+        unaccepted = failure is not None
         if unaccepted and failure_root is not None:
             supervisor.write_unaccepted_record(
                 directory / "unaccepted.json", kind="sc-20686-unaccepted-arm",
-                coordinate=f"{variant}/{arm}", error=error,
+                coordinate=f"{variant}/{arm}", error=failure,
             )
         if failure_root is not None and (unaccepted or (run_directory.is_dir() and any(run_directory.iterdir()))):
             failure_root = Path(failure_root)
@@ -1090,6 +1096,13 @@ def _unit_files(root):
     return files
 
 
+def _resume_policy_sha(root, identity_sha):
+    raw = (Path(root) / "identity.json").read_bytes()
+    if digest(raw) != identity_sha:
+        raise ValueError("resume identity does not match its sealed digest")
+    return json.loads(raw)["safetyPolicySha256"]
+
+
 def _load_unit(root, stem, identity_sha, variant, arm):
     unit = root / "units" / stem
     if not unit.exists():
@@ -1111,7 +1124,7 @@ def _load_unit(root, stem, identity_sha, variant, arm):
     supervision = json.loads((unit / "supervision.json").read_bytes())
     if supervision.get("exitCode") != 0 or supervision.get("ownedProcessGroupReaped") is not True or not isinstance(supervision.get("pid"), int) or supervision["pid"] <= 0:
         raise ValueError(f"{stem} resume supervision is not a clean, reaped exit")
-    supervisor.validate_admission(supervision.get("admission"))
+    supervisor.validate_admission(supervision.get("admission"), policy_sha256=_resume_policy_sha(root, identity_sha))
     transcript = (unit / "events.jsonl").read_bytes()
     events = parse_event_transcript(transcript, variant, arm)
     events.extend(samples)
@@ -1129,7 +1142,7 @@ def _save_unit(root, stem, identity_sha, variant, arm, run):
         raise ValueError(f"{stem} resume unit already exists or was interrupted")
     if run.supervision is None or run.supervision.get("exitCode") != 0 or run.supervision.get("ownedProcessGroupReaped") is not True:
         raise ValueError(f"{stem} lacks successful supervisor and cleanup evidence")
-    supervisor.validate_admission(run.supervision.get("admission"))
+    supervisor.validate_admission(run.supervision.get("admission"), policy_sha256=_resume_policy_sha(root, identity_sha))
     partial.mkdir()
     try:
         output = Path(run.media_output)

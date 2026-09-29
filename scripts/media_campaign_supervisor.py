@@ -36,6 +36,10 @@ UNKNOWN_PEAK_REASON = (
 )
 
 
+# The child could not start, exited unsuccessfully, or exited leaving invalid evidence.
+FAILED_REASONS = frozenset({"child-exit", "spawn-failure", "invalid-evidence"})
+
+
 class SupervisionError(ValueError):
     def __init__(self, reason: str, detail: str):
         super().__init__(f"{reason}: {detail}")
@@ -394,9 +398,11 @@ def runtime_guarded_admission(
     }
 
 
-def validate_admission(value: object) -> dict[str, object]:
-    """Reject a sealed record whose row was not admitted by configured runtime guards."""
+def validate_admission(value: object, *, policy_sha256: str) -> dict[str, object]:
+    """Reject a sealed record whose row was not admitted by the resume policy's runtime guards."""
     if (not isinstance(value, dict) or value.get("mode") != RUNTIME_GUARDED_ADMISSION
+            or value.get("policySha256") != policy_sha256
+            or value.get("backend") not in {"darwin-mlx", "linux-cuda", "windows-cuda"}
             or not _positive(value.get("childFootprintCapBytes"))
             or not _positive(value.get("hostFreeReserveBytes"))
             or not _positive(value.get("deadlineSeconds"))
@@ -404,15 +410,23 @@ def validate_admission(value: object) -> dict[str, object]:
             or not isinstance(value.get("wholeProcessPeakUnknownReason"), str)
             or not value["wholeProcessPeakUnknownReason"]):
         raise SupervisionError("invalid-admission", "record lacks a runtime-guarded admission")
-    floor = value.get("staticFloorHostBytes")
-    if floor is not None and (type(floor) is not int or not 0 < floor <= value["childFootprintCapBytes"]):
-        raise SupervisionError("invalid-admission", "recorded host static floor exceeds the cap")
+    if value["backend"] in {"linux-cuda", "windows-cuda"} and (
+            not isinstance(value.get("cudaDeviceUuid"), str) or not value["cudaDeviceUuid"]
+            or not _positive(value.get("gpuFreeReserveBytes"))
+            or not _positive(value.get("childGpuCapBytes"))):
+        raise SupervisionError("invalid-admission", "CUDA admission lacks its device guards")
+    for key, cap in (("staticFloorHostBytes", "childFootprintCapBytes"),
+                     ("staticFloorGpuBytes", "childGpuCapBytes")):
+        floor = value.get(key)
+        if floor is not None and (type(floor) is not int or not _positive(value.get(cap))
+                                  or not 0 < floor <= value[cap]):
+            raise SupervisionError("invalid-admission", f"recorded {key} exceeds its cap")
     return value
 
 
 def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: SupervisionError) -> Path:
     """Persist a refused, aborted or failed row as a sealed, explicitly unaccepted record."""
-    if error.reason == "child-exit":
+    if error.reason in FAILED_REASONS:
         outcome = "failed"
     else:
         outcome = "refused" if error.pid is None else "aborted"
@@ -522,8 +536,11 @@ def _run_admitted(
                     job.close()
                 raise SupervisionError("spawn-failure", str(error)) from error
         else:
-            child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
-                                     start_new_session=True)
+            try:
+                child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr,
+                                         start_new_session=True)
+            except OSError as error:
+                raise SupervisionError("spawn-failure", str(error)) from error
         owner = job if job is not None else child.pid
         known = {child.pid}
         peak_host = 0

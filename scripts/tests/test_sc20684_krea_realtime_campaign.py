@@ -864,6 +864,11 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 123, 0, 1024, None, 10**9, None, 1.0, (),
                 campaign.supervisor.runtime_guarded_admission(policy),
             ))
+            foreign = copy.deepcopy(record)
+            foreign["supervision"]["admission"]["policySha256"] = "0" * 64
+            campaign._save_resumed_role(resume, "v2v-q8.dense-baseline", identity, foreign)
+            with self.assertRaisesRegex(campaign.CampaignError, "runtime-guarded admission"):
+                campaign._load_resumed_role(resume, "v2v-q8.dense-baseline", identity)
             campaign._save_resumed_role(resume, "t2v-q8.dense-baseline", identity, record)
             self.assertEqual(campaign._load_resumed_role(
                 resume, "t2v-q8.dense-baseline", identity,
@@ -895,8 +900,8 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             def tree_footprint(self, _owner: object) -> int:
                 return self.footprint
 
-        def run(root: Path, probe: Probe, script: str) -> Exception:
-            command = shlex.join([sys.executable, "-c", script])
+        def run(root: Path, probe: Probe, script: str, argv: list[str] | None = None) -> Exception:
+            command = shlex.join(argv or [sys.executable, "-c", script])
             with patch.object(campaign.supervisor, "run_guarded", functools.partial(original, probe=probe)):
                 with self.assertRaises((campaign.CampaignError, campaign.supervisor.SupervisionError)) as caught:
                     campaign.run_matrix(command, root, SOURCE, MODEL, campaign.decision_policy(),
@@ -915,8 +920,20 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             self.assertIsInstance(error, campaign.CampaignError)
             self.assertTrue(marker.exists())
             self.assertTrue((root / "admitted/logs/t2v-q8.paired.0.stdout.log").is_file())
-            self.assertFalse(list((root / "admitted/logs").glob("*.unaccepted.json")))
+            # It exited cleanly without an observation: a failed, unaccepted role, never a receipt.
+            sealed = record(root / "admitted", 0)
+            self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["reason"]),
+                             (False, "failed", "invalid-evidence"))
+            self.assertIsInstance(sealed["pid"], int)
+            campaign.supervisor.validate_admission(sealed["admission"], policy_sha256=policy.sha256)
+            self.assertFalse((root / "admitted/roles").exists())
             marker.unlink()
+
+            missing = root / "missing"
+            error = run(missing, Probe(10**12, 1024), "", argv=[str(root / "missing-observer")])
+            self.assertEqual(error.reason, "spawn-failure")
+            sealed = record(missing, 0)
+            self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["pid"]), (False, "failed", None))
 
             refused = root / "refused"
             short = policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes - 1
@@ -926,7 +943,12 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 sealed = record(refused, attempt)
                 self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["pid"]), (False, "refused", None))
                 self.assertEqual(sealed["coordinate"], "t2v-q8.paired")
-                campaign.supervisor.validate_admission(sealed["admission"])
+                campaign.supervisor.validate_admission(sealed["admission"], policy_sha256=policy.sha256)
+            # A gap in attempt indices must not reuse an index: the next attempt is max + 1.
+            for path in (refused / "logs").glob("t2v-q8.paired.0.*"):
+                path.unlink()
+            self.assertEqual(run(refused, Probe(short, 1024), spawn).reason, "preflight-memory")
+            self.assertEqual(record(refused, 2)["outcome"], "refused")
             self.assertFalse(marker.exists())
             self.assertFalse((refused / "roles").exists())
 

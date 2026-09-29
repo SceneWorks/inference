@@ -61,7 +61,8 @@ class CampaignAdapterTests(unittest.TestCase):
                 executable, snapshot, "route", "normal", "a" * 40, "sequential", ("0.05",),
                 timeout_seconds=5, failure_root=root / "failed", **safety,
             )
-            admission = self.adapter.supervisor.validate_admission(run.supervision["admission"])
+            admission = self.adapter.supervisor.validate_admission(
+                run.supervision["admission"], policy_sha256=policy.sha256)
             self.assertIsNone(admission["wholeProcessPeakBoundBytes"])
             self.assertEqual(admission["childGpuCapBytes"], policy.child_gpu_cap_bytes)
             self.adapter.cleanup_campaign_run(run)
@@ -72,6 +73,9 @@ class CampaignAdapterTests(unittest.TestCase):
                 ("refused", "host_free",
                  lambda: policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes - 1,
                  "preflight-memory"),
+                ("refused", "gpu_free",
+                 lambda: policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes - 1,
+                 "CUDA free is below reserve plus child cap"),
                 ("aborted", "tree_footprint",
                  lambda _owner: policy.child_footprint_cap_bytes + 1, "child-footprint"),
             ):
@@ -84,12 +88,42 @@ class CampaignAdapterTests(unittest.TestCase):
                 delattr(probe, name)
             records = [json.loads(path.read_bytes())
                        for path in (root / "failed").glob("incomplete-*/unaccepted.json")]
-            self.assertEqual(sorted(record["outcome"] for record in records), ["aborted", "refused"])
+            self.assertEqual(sorted(record["outcome"] for record in records),
+                             ["aborted", "refused", "refused"])
+            self.assertEqual(sorted(record["reason"] for record in records),
+                             ["child-footprint", "preflight-memory", "preflight-memory"])
             for record in records:
                 self.assertIs(record["accepted"], False)
                 self.assertEqual(record["coordinate"], "route/normal")
                 self.assertEqual(record["pid"] is None, record["outcome"] == "refused")
-                self.adapter.supervisor.validate_admission(record["admission"])
+                self.adapter.supervisor.validate_admission(record["admission"], policy_sha256=policy.sha256)
+
+    def test_runner_seals_spawn_timeout_and_evidence_failures_as_unaccepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            malformed = root / "malformed"
+            malformed.write_text("#!/usr/bin/env python3\nprint('no observer events')\n", encoding="utf-8")
+            malformed.chmod(0o755)
+            for label, entrypoint, timeout, expected in (
+                ("spawn", root / "missing-entrypoint", 5, "spawn-failure"),
+                ("timeout", malformed, 0.5, "invalid-timeout"),
+                ("evidence", malformed, 5, "missing or malformed observer transcript"),
+            ):
+                failed = root / f"failed-{label}"
+                with self.assertRaisesRegex(ValueError, expected):
+                    self.adapter.run_entrypoint(
+                        entrypoint, snapshot, "route", "normal", "a" * 40, "sequential",
+                        timeout_seconds=timeout, failure_root=failed, **self.runner_safety(),
+                    )
+                [path] = failed.glob("incomplete-*/unaccepted.json")
+                record = json.loads(path.read_bytes())
+                self.assertIs(record["accepted"], False)
+                outcome = {"spawn": "failed", "timeout": "refused", "evidence": "failed"}[label]
+                self.assertEqual(record["outcome"], outcome)
+                self.assertEqual(record["pid"] is None, label != "evidence")
+                self.assertEqual(record["admission"] is None, label == "timeout")
 
     def flux_events(self, *, variant="flux2_klein_9b_edit", cancel=False):
         geometry = {
@@ -658,7 +692,9 @@ class CampaignAdapterTests(unittest.TestCase):
             (media / "frame.png").write_bytes(b"real output bytes")
             event = self.adapter.canonical({"phase": "metadata"})
             calls = []
-            identity_sha = "f" * 64
+            policy = self.runner_safety()["safety_policy"]
+            identity_raw = self.adapter.canonical({"safetyPolicySha256": policy.sha256})
+            identity_sha = self.adapter.digest(identity_raw)
 
             def runner(_spec, arm):
                 calls.append(arm)
@@ -679,6 +715,7 @@ class CampaignAdapterTests(unittest.TestCase):
 
             resume.mkdir()
             (resume / "units").mkdir()
+            (resume / "identity.json").write_bytes(identity_raw)
             for _ in range(2):
                 with self.assertRaisesRegex(ValueError, "interrupted"):
                     self.adapter.publish_campaign(
@@ -710,6 +747,12 @@ class CampaignAdapterTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "invalid-admission"):
                 self.adapter._save_unit(resume, "run-09-normal", identity_sha, "wan_vace", "normal", unadmitted)
+            self.assertFalse((resume / "units" / "run-09-normal").exists())
+            foreign = dict(supervision, admission={
+                **self.adapter.supervisor.runtime_guarded_admission(policy), "policySha256": "0" * 64})
+            with self.assertRaisesRegex(ValueError, "invalid-admission"):
+                self.adapter._save_unit(resume, "run-09-normal", identity_sha, "wan_vace", "normal",
+                                        unadmitted.__class__(**{**unadmitted.__dict__, "supervision": foreign}))
             self.assertFalse((resume / "units" / "run-09-normal").exists())
             self.assertFalse((resume / "units" / ".run-09-normal.partial").exists())
             (unit / "stdout").write_bytes(b"tampered")
