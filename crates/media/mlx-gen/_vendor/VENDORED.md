@@ -56,7 +56,10 @@ The harness does not edit the vendored source to run off CUDA. It rebinds
 (`dump_mage_flow_golden.py::_load_model`) — the reference already supports that value in both
 `_attn_backend.set_attn_backend` and `text_encoder._resolve_hf_attn_impl`. The text encoder's
 `create_causal_mask` call was updated for Transformers 5.10.4; the small CPU oracles verify its
-arithmetic against the original committed fixtures.
+arithmetic against the original committed fixtures. Its packed-text boundaries travel as
+`text_cu_seqlens` rather than `cu_seqlens` (sc-24380): Transformers 5.10 forwards `**kwargs` into
+the Qwen3-VL vision tower, whose `get_vision_cu_seqlens` pops a bare `cu_seqlens` as precomputed
+patch boundaries, which crashed the image-conditioned edit encode.
 
 ### SHA-256 of the current vendored files
 
@@ -76,7 +79,7 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  mage_flow/mode
 4b198343b8929f48a0a14d388502c81f54be17b222f6831303d2da6a91f33a62  mage_flow/models/modules/mage_layers.py
 eed7846d02bee28ebf7a1fb45db7d9f621dd66e702e761848d67bed426c1c4a7  mage_flow/models/modules/mage_text.py
 6b9ac21199e249337f89b9527a8eeec05a8c9164b9631c7c15c3a7590c13ac5a  mage_flow/models/modules/mage_vae.py
-ae09ccf8b9f7c435f3200c1e19efbdd4dff287ca94854bad2564fe301f58b3b8  mage_flow/models/modules/text_encoder.py
+02ed541fd06c782e31b4479768ffde6269ba2314ae79e03643121454c437e608  mage_flow/models/modules/text_encoder.py
 122a32788cd294b5e8e0d38ac231d48213e3a6860756aff2162d1559e9f2ffe1  mage_flow/models/utils.py
 b9fc57018570372dd3404a733e19b918a359188dd9f5ef7817c6b30969fc13db  mage_flow/pipeline.py
 6385399ad9a3fa373bede12915f67e3c345346cf9c3cd1ea1370d94278fa781d  mage_flow/pyproject.toml
