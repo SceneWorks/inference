@@ -69,15 +69,16 @@
 # fails that eval instead of returning corrupted arrays as Ok. It changes only error recording and
 # host-wait ordering in metal/device.cpp, metal/event.cpp and array.cpp; no kernel or numeric path
 # moved, so no parity re-baseline is implied.
-# SHA 2abeba79 = 105a72fd + mlx-rs#32 eval_pending_loads (sc-24245): a new mlx-c entry point that
-# evaluates only a lazy graph's unscheduled safetensors `Load` leaves on the CPU stream; no
-# kernel/numeric path moved.
-mlx-rs ={ package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "2abeba79bc1cdd5ea9c5e061c98986102bb13ae7" }
+# SHA 48ff5e78 = 105a72fd + mlx-rs#32 eval_pending_loads (sc-24245): a new mlx-c entry point that
+# evaluates only a lazy graph's unscheduled safetensors `Load` leaves on the CPU stream; + mlx-rs#33
+# cpu-stream-wait-error: a GPU command-buffer error seen by a CPU-stream wait is carried to the
+# host as Err (it used to throw on the scheduler thread and abort). No kernel/numeric path moved.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "48ff5e78a49e0a513f1976b0b1af70f9a5305f00" }
 # The mlx-sys C-binding layer (pmetal-mlx-sys), same git rev as mlx-rs's path dep so cargo unifies on
 # ONE build (two distinct sources would yield two `mlx_sys` crates → link/symbol drift). Added as a
 # direct core dep so core can query MLX device properties not surfaced through mlx-rs (sc-8135: the
 # Metal per-single-buffer cap `maxBufferLength`, via the `device_info` C API).
-mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "2abeba79bc1cdd5ea9c5e061c98986102bb13ae7" }
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "48ff5e78a49e0a513f1976b0b1af70f9a5305f00" }
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.
