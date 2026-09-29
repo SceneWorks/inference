@@ -89,7 +89,7 @@ class AttributionTests(unittest.TestCase):
             release_event,
         ))
         row = {
-            "producer": "sc20686-campaign-adapter-v4", "family": family,
+            "producer": self.reducer.PRODUCER, "backend": "candle-cuda", "family": family,
             "variant": variant, "coordinate_name": coordinate,
             "coordinate_id": coordinate_id, "arm": arm, "source_ref": "d" * 40,
             "model_snapshot_revision": "a" * 40,
@@ -112,7 +112,8 @@ class AttributionTests(unittest.TestCase):
             "raw_receipt_sidecar_sha256": "f" * 64,
             "real_weights": True, "full_generation": arm == "normal",
             "attention_kind": "cross",
-            "current_persistent_bytes": 1,
+            # A recomputed (FLUX edit) route retains nothing; the reducer enforces zero.
+            "current_persistent_bytes": 0 if family == "flux2-klein" else 1,
             "current_read_transient_bytes": exact_dense if family == "flux2-klein" else 1,
             "candidate_persistent_bytes": (
                 exact_candidate * geometry["layers"] if family == "flux2-klein"
@@ -399,7 +400,7 @@ class AttributionTests(unittest.TestCase):
             self.reducer.reduce(rows)
         result = self.reducer.reduce(self.complete_rows())
         self.assertEqual(
-            set(result["source_map"]["variants"]),
+            set(result["source_map"]["lanes"]["candle-cuda"]["variants"]),
             {
                 variant
                 for family in self.coverage["families"].values()
@@ -496,7 +497,7 @@ class AttributionTests(unittest.TestCase):
 
     def test_flux_source_map_anchors_live_double_attention_kv(self):
         source_map = json.loads(self.reducer.SOURCE_MAP.read_text(encoding="utf-8"))
-        entry = source_map["variants"]["flux2_klein_9b_edit"]
+        entry = source_map["lanes"]["candle-cuda"]["variants"]["flux2_klein_9b_edit"]
         self.assertEqual(
             {anchor["symbol"] for anchor in entry["creation"]},
             {"to_k.forward", "to_v.forward", "add_k.forward", "add_v.forward"},

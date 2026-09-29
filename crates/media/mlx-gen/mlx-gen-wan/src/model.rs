@@ -503,7 +503,16 @@ impl Generator for Wan {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1463,7 +1472,16 @@ impl Generator for Wan14b {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(request, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &request.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(request),
+            on_progress,
+            |on_progress| self.generate_impl(request, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {

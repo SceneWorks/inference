@@ -55,7 +55,11 @@ pub struct Flux2KvCache {
     mode: Cell<Option<CacheMode>>,
     /// Count of trailing reference tokens to cache (the static slice). `0` disables caching.
     num_ref_tokens: Cell<i32>,
+    /// Process-unique SC-20686 owner id (a counter, not an address: the cache may move).
+    sc20686_owner: usize,
 }
+
+static SC20686_NEXT_OWNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 impl Flux2KvCache {
     /// One slot per double-stream and per single-stream block.
@@ -65,6 +69,7 @@ impl Flux2KvCache {
             single: RefCell::new(vec![None; num_single_layers]),
             mode: Cell::new(None),
             num_ref_tokens: Cell::new(0),
+            sc20686_owner: SC20686_NEXT_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -97,6 +102,17 @@ impl Flux2KvCache {
             Some(CacheMode::Extract) if num_ref > 0 => {
                 let ref_k = trailing(&key, num_ref)?;
                 let ref_v = trailing(&value, num_ref)?;
+                if mlx_gen::sc20686::active() {
+                    // SC-20686 Metal lane: the stored slice is a persistent cache; re-extracting an
+                    // occupied slot (the CFG negative pass) is recorded as a rebuild.
+                    mlx_gen::sc20686::register_cache(
+                        self.sc20686_key(stream, layer_idx),
+                        &ref_k,
+                        &ref_v,
+                        SC20686_EXTRACT,
+                        SC20686_REBUILD,
+                    )?;
+                }
                 self.slots(stream).borrow_mut()[layer_idx] = Some((ref_k, ref_v));
                 Ok((key, value))
             }
@@ -123,10 +139,45 @@ impl Flux2KvCache {
         }
     }
 
+    fn sc20686_key(&self, stream: Stream, layer_idx: usize) -> mlx_gen::sc20686::CacheKey {
+        mlx_gen::sc20686::CacheKey {
+            owner: self.sc20686_owner,
+            stream: match stream {
+                Stream::Double => 1,
+                Stream::Single => 2,
+            },
+            slot: layer_idx,
+        }
+    }
+
+    /// The SC-20686 cache id this layer reads on a [`CacheMode::Cached`] step (campaign mode only).
+    pub fn sc20686_cached_read(&self, stream: Stream, layer_idx: usize) -> Option<u64> {
+        if self.mode.get() != Some(CacheMode::Cached) || self.num_ref_tokens.get() <= 0 {
+            return None;
+        }
+        mlx_gen::sc20686::cache_id(self.sc20686_key(stream, layer_idx))
+    }
+
     /// All per-layer slots are populated (both stacks) — i.e. the extract pass has run.
     pub fn is_populated(&self) -> bool {
         self.double.borrow().iter().all(Option::is_some)
             && self.single.borrow().iter().all(Option::is_some)
+    }
+}
+
+/// SC-20686 operation names for the persistent reference-K/V cache lifecycle (Metal lane).
+const SC20686_EXTRACT: &str = "Flux2KvCache::extract";
+const SC20686_REBUILD: &str = "Flux2KvCache::extract(rebuild)";
+const SC20686_DROP: &str = "Flux2KvCache::drop";
+
+impl Drop for Flux2KvCache {
+    fn drop(&mut self) {
+        if mlx_gen::sc20686::active() {
+            // Free the cached arrays first so the post-release remnant is sampled after them.
+            self.double.borrow_mut().clear();
+            self.single.borrow_mut().clear();
+            mlx_gen::sc20686::release_owner(self.sc20686_owner, &[1, 2], SC20686_DROP);
+        }
     }
 }
 
