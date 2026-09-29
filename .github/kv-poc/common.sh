@@ -1,5 +1,5 @@
 # shellcheck shell=bash disable=SC2034  # every variable here is consumed by the sourcing script
-# Shared paths and helpers for .github/workflows/kv-poc-campaign.yml (epic 20669, W1).
+# Shared paths and helpers for .github/workflows/kv-poc-campaign.yml (epic 20669, W1 + W2).
 #
 # Sourced by every macOS job. The runners' /bin/bash is 3.2: no mapfile, no associative arrays,
 # no ${x,,}, and an EMPTY array expanded under `set -u` is an error -- keep it that way.
@@ -12,10 +12,14 @@
 #
 #   $KV_ROOT/<inference_sha>/inference    stable inference clone (the bins' CARGO_MANIFEST_DIR)
 #   $KV_ROOT/<inference_sha>/SceneWorks   SCENEWORKS_ROOT
-#   $KV_ROOT/<inference_sha>/frozen       bins + mlx.metallib + policies + prompt, SHA256SUMS, a-w
+#   $KV_ROOT/<inference_sha>/frozen       W1 bins + mlx.metallib + policies + prompt, SHA256SUMS, a-w
+#   $KV_ROOT/<inference_sha>/frozen-w2    W2 bins (sc20686_wan, sc20686_flux2_edit, krea-integration)
+#                                         + mlx.metallib + media policy + reference images, sealed alike
 #   $KV_ROOT/<inference_sha>-runs         resume dirs + evidence (a re-dispatch resumes here)
 #   $KV_ROOT/cargo-target                 persistent CARGO_TARGET_DIR
 #   $KV_ROOT/tools                        hash-locked huggingface_hub install
+#   $KV_ROOT/w2-inputs                    W2 assembled VACE snapshots (per-file links into the hub
+#                                         cache) + the generated VACE control/mask fixtures
 
 : "${INFERENCE_SHA:?INFERENCE_SHA is required}"
 : "${SCENEWORKS_SHA:?SCENEWORKS_SHA is required}"
@@ -31,12 +35,39 @@ KV_TOOLS="$KV_ROOT/tools"
 INFERENCE_URL="https://github.com/SceneWorks/inference"
 SCENEWORKS_URL="https://github.com/SceneWorks/SceneWorks"
 BINS="sc20671_kv_baseline sc20676_packed_evidence sc20677_capture_kv sc20677_kv_candidates"
+F2="$KV_ROOT/$INFERENCE_SHA/frozen-w2"
+W2_INPUTS="$KV_ROOT/w2-inputs"
+W2_BINS="sc20686_wan sc20686_flux2_edit krea-integration"
 
 # The four pinned snapshots the W1 commands name (hub-cache layout on both Macs).
 LQ="$KV_HF_HUB/models--mlx-community--Llama-3.2-3B-Instruct-4bit/snapshots/7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
 LB="$KV_HF_HUB/models--mlx-community--Llama-3.2-3B-Instruct-bf16/snapshots/6d88ba43024fef71b10e52e101c7cd4598322601"
 QQ="$KV_HF_HUB/models--mlx-community--Qwen3-1.7B-4bit/snapshots/3b1b1768f8f8cf8351c712464f906e86c2b8269e"
 QB="$KV_HF_HUB/models--mlx-community--Qwen3-1.7B-bf16/snapshots/9cd6692855d3e06772228e9a962b2606359b2d24"
+
+# The W2 (media) snapshots, pinned file-by-file in models-w2.tsv. The q4 tier roots are passed as
+# is; the two VACE routes take the worker-assembled layout under $W2_INPUTS (build.sh w2-inputs).
+hub_snapshot() { printf '%s/models--%s/snapshots/%s' "$KV_HF_HUB" "$(printf '%s' "$1" | sed 's|/|--|g')" "$2"; }
+W2_KREA="$(hub_snapshot SceneWorks/krea-realtime-14b-mlx e68e9a3d98187fdf6936838ffcf6df5aa48d6626)/q4"
+W2_FLUX="$(hub_snapshot SceneWorks/flux2-klein-9b-mlx 1902693279fcfb828919370dfac2b8922d99499a)/q4"
+W2_FLUX_KV="$(hub_snapshot SceneWorks/flux2-klein-9b-kv-mlx bbf22de8d654789de3b177632d2e283cc4f77729)/q4"
+W2_TI2V="$(hub_snapshot SceneWorks/wan2.2-ti2v-5b-mlx bb1b055249614cf9d7cf4373fbdbc184b77dee88)/q4"
+W2_T2V="$(hub_snapshot SceneWorks/wan2.2-t2v-a14b-mlx 991eb255c544bbb2e1f1e07da4355c2f0a5337b7)/q4"
+W2_I2V="$(hub_snapshot SceneWorks/wan2.2-i2v-a14b-mlx c6c786170031eccc3a1fac0f98f1ad4ff988271e)/q4"
+W2_LIGHTNING="$(hub_snapshot lightx2v/Wan2.2-Lightning 18bccf8884ec0a078eed79785eb4ef13ea16ce1e)"
+W2_VACE_REVISION=ec4d2cb062b548996b179d493fdd05340de702a1
+W2_VACE_SRC="$(hub_snapshot Wan-AI/Wan2.1-VACE-1.3B-diffusers "$W2_VACE_REVISION")"
+W2_VACE_FUN_REVISION=1abfb95801b7bd8f952083ebf80b93448ddb0ce4
+W2_VACE_FUN_SRC="$(hub_snapshot linoyts/Wan2.2-VACE-Fun-14B-diffusers "$W2_VACE_FUN_REVISION")"
+W2_VACE="$W2_INPUTS/assembled/wan_vace"
+W2_VACE_FUN="$W2_INPUTS/assembled/wan_vace_fun"
+W2_FIXTURES="$W2_INPUTS/fixtures/sc20686"
+W2_POLICY=media-64.json
+W2_KREA_OBSERVER="generate_smoke::sc20684_packed_campaign_observer"
+# The two reference images the SC-20686 coordinates read (FLUX --reference/--reference2, Wan I2V
+# --image, VACE --reference), copied from the frozen inference tree into $F2/inputs: path:sha256.
+W2_REFERENCES="crates/media/mlx-gen/_vendor/mage_flow/assets/dog.jpg:164d8dfe707fb854e288ad2eea65c2db87e90af11f689c85502860eeaf3f4794
+docs/migration/evidence/sc-16956/pulid-reference.png:3995f2e856346748588e76a5557516d0218f44f5663701c5a50139d50c86a7be"
 
 KV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -158,8 +189,54 @@ verify_tree() {
   [ -z "$(git -C "$dir" status --porcelain)" ] || { echo "::error title=dirty tree::$dir has local changes"; git -C "$dir" status --short | head -20; return 1; }
 }
 
-verify_frozen() {
-  [ -f "$F/SHA256SUMS" ] || { echo "::error title=frozen dir not sealed::$F/SHA256SUMS is missing (run the build job)"; return 1; }
-  (cd "$F" && shasum -a 256 -c SHA256SUMS >/dev/null) \
-    || { echo "::error title=frozen dir mismatch::$F does not match its SHA256SUMS"; return 1; }
+verify_frozen() { # [dir] (default: the W1 frozen dir)
+  local dir="${1:-$F}"
+  [ -f "$dir/SHA256SUMS" ] || { echo "::error title=frozen dir not sealed::$dir/SHA256SUMS is missing (run the build job)"; return 1; }
+  (cd "$dir" && shasum -a 256 -c SHA256SUMS >/dev/null) \
+    || { echo "::error title=frozen dir mismatch::$dir does not match its SHA256SUMS"; return 1; }
 }
+
+# Cap + reserve of a darwin-mlx media safety policy, in whole GiB (the parents admit each arm only
+# when available RAM covers both).
+policy_need_gib() {
+  python3.12 -c 'import json, sys; p = json.load(open(sys.argv[1])); print(-(-(p["childFootprintCapBytes"] + p["hostFreeReserveBytes"]) // 1073741824))' "$1"
+}
+
+# The worker-assembled VACE snapshot layout (mlx_gen_wan::convert::assemble_wan_vace[_fun]_snapshot,
+# sceneworks-worker video_jobs/vace.rs): each transformer dir of the VACE repo plus the base-Wan
+# T2V-A14B q4 tier's UMT5, z16 VAE and tokenizer, as REAL directories of per-file symlinks into the
+# hub cache (the adapter's identity walk would also follow directory links, but per-file links keep
+# the tree exactly the pinned file set), plus a .snapshot-revision holding the VACE revision.
+# Prints "<relative path> <link target>" for every entry of <route> (wan_vace | wan_vace_fun).
+w2_vace_layout() {
+  local route="$1" repo src rev
+  case "$route" in
+    wan_vace) repo=Wan-AI/Wan2.1-VACE-1.3B-diffusers; src="$W2_VACE_SRC"; rev="$W2_VACE_REVISION" ;;
+    wan_vace_fun) repo=linoyts/Wan2.2-VACE-Fun-14B-diffusers; src="$W2_VACE_FUN_SRC"; rev="$W2_VACE_FUN_REVISION" ;;
+    *) return 2 ;;
+  esac
+  awk -F '\t' -v repo="$repo" -v rev="$rev" '$1 == repo && $2 == rev && $3 ~ /^transformer(_2)?\// { print $3 }' \
+    "$KV_DIR/models-w2.tsv" | while read -r rel; do printf '%s %s\n' "$rel" "$src/$rel"; done
+  for name in t5_encoder.safetensors vae.safetensors tokenizer.json; do printf '%s %s\n' "$name" "$W2_T2V/$name"; done
+}
+
+# Verify an assembled VACE snapshot: exactly the layout's links, each resolving to its hub file,
+# and the .snapshot-revision marker. Prints the problems; returns 1 when there are any.
+verify_w2_vace() {
+  local route="$1" dir rev rel target expected=0 found
+  case "$route" in
+    wan_vace) dir="$W2_VACE"; rev="$W2_VACE_REVISION" ;;
+    wan_vace_fun) dir="$W2_VACE_FUN"; rev="$W2_VACE_FUN_REVISION" ;;
+    *) return 2 ;;
+  esac
+  [ -d "$dir" ] || { echo "$dir is missing"; return 1; }
+  [ "$(cat "$dir/.snapshot-revision" 2>/dev/null)" = "$rev" ] || { echo "$dir/.snapshot-revision is not $rev"; return 1; }
+  while read -r rel target; do
+    expected=$((expected + 1))
+    [ -L "$dir/$rel" ] && [ -f "$dir/$rel" ] && [ "$(realpath "$dir/$rel")" = "$(realpath "$target")" ] \
+      || { echo "$dir/$rel does not link to $target"; return 1; }
+  done < <(w2_vace_layout "$route")
+  found="$(find "$dir" ! -type d ! -path "$dir/.snapshot-revision" | wc -l | tr -d ' ')"
+  [ "$found" = "$expected" ] || { echo "$dir holds $found entries, the layout has $expected links"; return 1; }
+}
+

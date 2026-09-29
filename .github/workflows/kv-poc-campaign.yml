@@ -1,24 +1,38 @@
-name: KV PoC W1 campaign (epic 20669)
+name: KV PoC campaigns (epic 20669, W1 + W2)
 
-# Runs epic 20669's GPU window W1 (the LLM KV campaign: A1 dense sc20671 -> A3 packed sc20676 ->
-# A2 compressed sc20671 -> B sc20677 capture + compare) on the SECOND Mac (`rw-krea` =
-# nax-macos-2) instead of the dev Mac, with the exact commands of the dev-Mac prep's
-# W1-COMMANDS.sh. Measurement, not a gate: no pull_request / schedule trigger, and nothing here can
+# Runs epic 20669's GPU windows on a selected Mac (`rw-krea` = nax-macos-2, the second Mac; `nax` =
+# the dev Mac). Measurement, not a gate: no pull_request / schedule trigger, and nothing here can
 # become a required check.
+#   W1 (mode=w1), the LLM KV campaign, with the exact commands of the dev-Mac prep's W1-COMMANDS.sh:
+#     A1 dense sc20671 -> A3 packed sc20676 -> A2 compressed sc20671 -> B sc20677 capture + compare.
+#   W2 (mode=w2), the media campaigns (docs/architecture/SC_20684_*.md, SC_20686_*.md):
+#     C  SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV) -> D SC-20686 Metal matrix (18
+#     coordinates incl. the A14B Lightning default, normal + cancel arms) -> D-control (the same
+#     matrix's --schedule-control arm). Policy .github/kv-poc/policies/media-64.json (64 GiB child
+#     cap + 16 GiB host reserve, 3600 s arm deadline). Its jobs: w2-assets (disk check FIRST, then
+#     only the missing pinned files of .github/kv-poc/models-w2.tsv, sha256-verified; the assembled
+#     VACE snapshots; the VACE fixtures of fixtures-w2.tsv) -> w2-build (sc20686_wan +
+#     sc20686_flux2_edit examples and the Krea `integration` test binary, release, sealed in
+#     $KV_ROOT/<sha>/frozen-w2) -> c -> d -> d-control. `phases: none` = assets + build only.
 #
 # TRIGGERS
 #   * push to `kv-poc-run/**`: parameters come from `.github/kv-poc-run.json` on the pushed commit
 #     ({mode, inference_ref, sceneworks_ref, runner_label, phases}). This is how the campaign runs
 #     before this file reaches `main` (a workflow_dispatch workflow must exist on the default
-#     branch to be dispatched). Start W1 by flipping "mode" to "w1" in that file and pushing.
+#     branch to be dispatched). Start W1 by flipping "mode" to "w1" in that file and pushing; start
+#     W2 with "mode": "w2" and an inference_ref that carries the W2 sources (SC-20686 product_load /
+#     VACE-Fun Q4, >= a3cde51d5), on a new kv-poc-run/w2-* branch.
 #   * workflow_dispatch (once this file is on `main`):
 #       gh workflow run kv-poc-campaign.yml -R SceneWorks/inference --ref main -f mode=w1
 #     Defaults are the frozen W1 revisions; `phases` selects a subset (run order is fixed).
-#   `mode=probe` (the default) runs only the host probe. `mode=w1` runs probe -> build -> phases.
+#   `mode=probe` (the default) runs only the host probe. `mode=w1` runs probe -> build -> phases;
+#   `mode=w2` runs probe (plus the W2 disk/asset report) -> w2-assets -> w2-build -> phases.
+#   Empty `phases` = every phase of the mode.
 #
 # WHERE STATE LIVES (.github/kv-poc/common.sh): $HOME/kv-poc on the runner, outside the workspace:
 # stable inference + SceneWorks clones at the frozen SHAs (the bins check both HEADs at run time),
-# the sealed frozen dir (reused, never rebuilt, once it verifies), and $HOME/kv-poc/<sha>-runs
+# the sealed frozen dirs (frozen/ for W1, frozen-w2/ for W2; reused, never rebuilt, once they
+# verify), $HOME/kv-poc/w2-inputs (assembled VACE snapshots + fixtures), and $HOME/kv-poc/<sha>-runs
 # (resume dirs + evidence). A re-dispatch with the same parameters therefore RESUMES: accepted
 # rows are kept, finished phases (their --out exists) are skipped.
 #
@@ -35,12 +49,13 @@ name: KV PoC W1 campaign (epic 20669)
 # The SIGINT/SIGTERM trap only touches STOP, best effort. Cancel between jobs, or push the stop
 # branch and wait.
 #
-# TIMEOUTS. Each campaign job has a SOFT budget (KV_SOFT_BUDGET_MIN: a1/a2 330, a3 60, b 60 min):
-# when it is spent the watcher requests a safe stop, exactly like the stop branch, and a
-# re-dispatch resumes. The HARD `timeout-minutes` is that budget PLUS the policy's own row
-# deadline (llm.json rowDeadlineSeconds 18000 = 300 min; capture.json 1800 = 30 min) plus 20 min,
-# so a timeout can only land after a row has already overrun its own deadline -- never mid-row on
-# a healthy row.
+# TIMEOUTS. Each campaign job has a SOFT budget (KV_SOFT_BUDGET_MIN: a1/a2 330, a3 60, b 60 min;
+# c 240, d 360, d-control 240 min): when it is spent the watcher requests a safe stop, exactly like
+# the stop branch, and a re-dispatch resumes. The HARD `timeout-minutes` is that budget PLUS the
+# policy's own row deadline (llm.json rowDeadlineSeconds 18000 = 300 min; capture.json 1800 = 30 min;
+# media-64.json deadlineSeconds 3600 = 60 min) plus 20 min (W1) or 30 min (W2: the SC-20686 adapter
+# re-hashes the arm's snapshot, up to ~81 GB for VACE-Fun, after every arm), so a timeout can only
+# land after a row has already overrun its own deadline -- never mid-row on a healthy row.
 
 on:
   push:
@@ -48,9 +63,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "probe = host probe only; w1 = probe, build, then the selected phases"
+        description: "probe = host probe only; w1 = LLM window (probe, build, phases); w2 = media window (probe, w2-assets, w2-build, phases)"
         type: choice
-        options: [probe, w1]
+        options: [probe, w1, w2]
         default: probe
       inference_ref:
         description: "Frozen inference commit (full 40-hex SHA)"
@@ -66,9 +81,9 @@ on:
         options: [rw-krea, nax]
         default: rw-krea
       phases:
-        description: "Comma-separated subset of a1,a3,a2,b (always run in that order)"
+        description: "Empty = all of the mode's phases. w1: subset of a1,a3,a2,b; w2: subset of c,d,d-control, or none (assets + build only). Run order is fixed."
         type: string
-        default: "a1,a3,a2,b"
+        default: ""
 
 permissions:
   contents: read
@@ -121,6 +136,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_MODE: ${{ needs.config.outputs.mode }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -295,5 +311,154 @@ jobs:
         with:
           name: kv-poc-b-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kv-poc-artifact/b/
+          if-no-files-found: warn
+          retention-days: 30
+
+  w2-assets:
+    name: W2 model assets, VACE snapshots and fixtures
+    needs: [config, probe]
+    if: ${{ needs.config.outputs.mode == 'w2' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    # Downloading every W2 file on an empty host is ~204 GiB; the sha256 pass reads all of it.
+    timeout-minutes: 360
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Put inference and SceneWorks at the frozen SHAs
+        run: bash .github/kv-poc/build.sh trees
+      - name: Check disk, fetch only missing pinned W2 files, verify sha256
+        run: bash .github/kv-poc/build.sh w2-models
+      - name: Assemble the VACE snapshots and materialize the VACE fixtures
+        run: bash .github/kv-poc/build.sh w2-inputs
+
+  w2-build:
+    name: Build and seal the frozen W2 campaign binaries
+    needs: [config, w2-assets]
+    if: ${{ needs.config.outputs.mode == 'w2' && needs.w2-assets.result == 'success' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 180
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build, freeze and seal the W2 campaign binaries
+        run: bash .github/kv-poc/build.sh w2-binaries
+
+  c:
+    name: "C Krea Realtime six-cell (sc20684)"
+    needs: [config, w2-build]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',c,')
+      && needs.w2-build.result == 'success' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 330
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "240"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run C
+        id: run
+        run: bash .github/kv-poc/phase.sh run c
+      - name: Collect C evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect c
+      - name: Upload C evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-c-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/c/
+          if-no-files-found: warn
+          retention-days: 30
+
+  d:
+    name: "D SC-20686 Metal matrix (sc20686)"
+    needs: [config, w2-build, c]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d,')
+      && needs.w2-build.result == 'success'
+      && (needs.c.result == 'success' || needs.c.result == 'skipped') && needs.c.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 450
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "360"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run D
+        id: run
+        run: bash .github/kv-poc/phase.sh run d
+      - name: Collect D evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect d
+      - name: Upload D evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-d-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/d/
+          if-no-files-found: warn
+          retention-days: 30
+
+  d-control:
+    name: "D-control SC-20686 schedule-control arm"
+    needs: [config, w2-build, c, d]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d-control,')
+      && needs.w2-build.result == 'success'
+      && (needs.c.result == 'success' || needs.c.result == 'skipped') && needs.c.outputs.stopped != 'true'
+      && (needs.d.result == 'success' || needs.d.result == 'skipped') && needs.d.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 330
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "240"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run D-control
+        id: run
+        run: bash .github/kv-poc/phase.sh run d-control
+      - name: Collect D-control evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect d-control
+      - name: Upload D-control evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-d-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/d-control/
           if-no-files-found: warn
           retention-days: 30
