@@ -134,10 +134,6 @@ impl WanBlockStream {
             )));
         }
         let mut block = Block::load(view, index, &self.cfg)?;
-        // Read this block's bytes on the CPU stream now, before its forward is encoded (and before
-        // `quantize`); left lazy, the window's `eval` makes Metal command buffers wait on the disk
-        // read — past the GPU watchdog on a cold page cache (sc-24245).
-        view.materialize_accessed()?;
         // LOAD-BEARING (sc-15750): the view keeps its own refcounted handle to every tensor the
         // constructor cloned. Draining exactly the accessed keys is what makes the window's drop a
         // real release rather than a no-op that still produces correct images.
