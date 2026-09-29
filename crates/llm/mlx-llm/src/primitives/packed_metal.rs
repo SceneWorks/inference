@@ -200,6 +200,13 @@ pub const fn packed_tiled_min_query_tokens(head_dimension: usize) -> usize {
 const NAX_SIMD_GROUPS: usize = 8;
 /// Query rows (position × GQA head) one NAX threadgroup serves.
 const NAX_ROWS: usize = NAX_SIMD_GROUPS * 16;
+/// Resident NAX threadgroups a split dispatch aims for (eight SIMD groups each). Measured rather
+/// than scaled from the four-SIMD-group tiled target: SC-20676 split-target sweep (M5 Max, bf16,
+/// Hq = 24, Hkv = 8, D = 128, median of 7), NAX ms at targets 128 / 256 / 512 / 1024 threadgroups:
+/// `S_q` 128 over 32k 1.65 / 1.72 / 1.55 / 1.57, `S_q` 512 over 8k 1.57 / 1.54 / 1.50 / 1.49, and
+/// within noise elsewhere (`S_q` 16–512 over 8k/32k, where the 2048-token amortization floor
+/// binds) → 512, the tiled kernel's value.
+const NAX_TARGET_THREADGROUPS: usize = 512;
 /// KV tokens per NAX block: one packed K token group, MLX's `bk = 32`. The bf16/f16 K and V tiles
 /// take `2 · 32 · (D + 8) · 2` bytes of threadgroup memory (9 KiB at D = 64, 17 KiB at D = 128).
 const NAX_BLOCK_TOKENS: usize = 32;
@@ -212,8 +219,32 @@ const NAX_BLOCK_TOKENS: usize = 32;
 /// packed reader calls the predicate instead of re-deriving it, so it can never disagree with
 /// MLX's dense `steel_attention_nax` selection (which additionally requires 16-bit inputs unless
 /// `MLX_ENABLE_TF32`; see [`PackedNaxSelection`]).
+///
+/// The predicate is C++ and reaches `metal::device()`, which throws when no Metal device can be
+/// created; an exception crossing into Rust would abort. The GPU device is therefore materialized
+/// first through an exception-guarded mlx-c evaluation on the GPU stream, whose failure is
+/// returned as an error with MLX's reason; once the device exists the predicate cannot throw.
+pub fn mlx_nax_available() -> Result<bool> {
+    nax_available_after(|| {
+        let probe = Array::from_slice(&[0.0f32], &[1]).abs_device(mlx_rs::Stream::gpu())?;
+        probe.eval()?;
+        Ok(())
+    })
+}
+
+/// [`mlx_nax_available`] behind an injectable device probe (the error path is testable without a
+/// broken GPU).
+fn nax_available_after(probe: impl FnOnce() -> Result<()>) -> Result<bool> {
+    probe().map_err(|error| {
+        Error::Unsupported(format!(
+            "SC-20676 NAX detection could not create MLX's Metal device: {error}"
+        ))
+    })?;
+    Ok(mlx_nax_predicate())
+}
+
 #[cfg(target_os = "macos")]
-pub fn mlx_nax_available() -> bool {
+fn mlx_nax_predicate() -> bool {
     // MLX keeps this predicate in its C++ Metal backend (no mlx-c binding); the static library is
     // the exact pinned build every MLX dispatch in this process uses. `bool f()` has the same
     // AArch64 calling convention in C and C++.
@@ -221,13 +252,14 @@ pub fn mlx_nax_available() -> bool {
         #[link_name = "_ZN3mlx4core5metal16is_nax_availableEv"]
         fn mlx_metal_is_nax_available() -> bool;
     }
-    // SAFETY: a no-argument predicate; MLX caches its result in a function-local static.
+    // SAFETY: a no-argument predicate over the already-created device (see `mlx_nax_available`),
+    // whose result MLX caches in a function-local static.
     unsafe { mlx_metal_is_nax_available() }
 }
 
 /// Non-macOS builds have no MLX Metal backend, hence no Neural Accelerator.
 #[cfg(not(target_os = "macos"))]
-pub fn mlx_nax_available() -> bool {
+fn mlx_nax_predicate() -> bool {
     false
 }
 
@@ -240,8 +272,31 @@ pub const fn packed_nax_head_dimension_supported(head_dimension: usize) -> bool 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedNaxSelection {
     pub selected: bool,
+    /// Stable selection token (one of the `PACKED_SELECTION_*` constants).
+    pub selection: &'static str,
+    /// Human-readable reason for the token.
     pub reason: &'static str,
 }
+
+/// Per-row split-KV kernel (decode and short multi-row steps).
+pub const PACKED_PER_ROW_KERNEL: &str = "sc20676_split_kv_simdgroup";
+/// fp32 tiled multi-row kernel.
+pub const PACKED_TILED_KERNEL: &str = "sc20676_tiled_multi_row_simdgroup_matrix";
+/// NAX tiled multi-row kernel.
+pub const PACKED_NAX_KERNEL: &str = "sc20676_nax_tiled_matmul2d";
+
+/// Multi-row step on a NAX device with 16-bit queries at D 64/128: the NAX kernel.
+pub const PACKED_SELECTION_NAX: &str = "nax-selected";
+/// Multi-row step where MLX reports no Neural Accelerator: the fp32 tiled kernel.
+pub const PACKED_SELECTION_NAX_UNAVAILABLE: &str = "nax-unavailable";
+/// Multi-row step with f32 queries: the fp32 tiled kernel.
+pub const PACKED_SELECTION_F32_QUERY: &str = "f32-query";
+/// Multi-row step at a head dimension MLX has no NAX attention for: the fp32 tiled kernel.
+pub const PACKED_SELECTION_HEAD_DIMENSION: &str = "nax-head-dimension";
+/// Step below [`packed_tiled_min_query_tokens`] on the qualified family: the per-row kernel.
+pub const PACKED_SELECTION_BELOW_MULTI_ROW: &str = "below-multi-row-threshold";
+/// Any step on the conservative family: the per-row kernel.
+pub const PACKED_SELECTION_CONSERVATIVE: &str = "conservative-family";
 
 const NAX_SELECTED: &str = "mlx::core::metal::is_nax_available() and 16-bit queries at D 64/128";
 const NAX_CONSERVATIVE: &str = "conservative GPU family never runs the tiled kernels";
@@ -250,13 +305,64 @@ const NAX_UNAVAILABLE: &str = "mlx::core::metal::is_nax_available() is false (ML
 const NAX_F32_QUERY: &str = "f32 queries keep the fp32 tiled kernel: NAX products are 16-bit (MLX \
      runs f32 on NAX only as TF32, which the f32 1e-4 contract excludes)";
 const NAX_HEAD_DIMENSION: &str = "MLX instantiates NAX attention for D 64/128 only";
+const PER_ROW_BELOW_THRESHOLD: &str = "fewer query rows than packed_tiled_min_query_tokens";
+
+/// Receipt name of a query dtype the packed reader accepts.
+pub fn packed_query_dtype_name(dtype: Dtype) -> Option<&'static str> {
+    match dtype {
+        Dtype::Float32 => Some("float32"),
+        Dtype::Float16 => Some("float16"),
+        Dtype::Bfloat16 => Some("bfloat16"),
+        _ => None,
+    }
+}
+
+/// Whether a recorded `(kernel, selection, query dtype)` triple is one the reader of `gpu_family`
+/// (a [`PackedMetalGpuFamily::as_str`] value) can dispatch: the NAX kernel exactly with the NAX
+/// selection and 16-bit queries, the fp32 tiled kernel only with a NAX rejection its dtype allows,
+/// and the per-row kernel only below the multi-row threshold or on the conservative family (which
+/// never records anything else). Receipt validators apply this to every recorded path.
+pub fn packed_kernel_path_valid(
+    gpu_family: &str,
+    kernel: &str,
+    selection: &str,
+    query_dtype: &str,
+) -> bool {
+    let sixteen_bit = matches!(query_dtype, "float16" | "bfloat16");
+    let known_dtype = sixteen_bit || query_dtype == "float32";
+    let conservative = gpu_family == PackedMetalGpuFamily::ConservativeUnknownApple.as_str();
+    let qualified = gpu_family == PackedMetalGpuFamily::Apple7OrNewer.as_str();
+    known_dtype
+        && match (kernel, selection) {
+            (PACKED_NAX_KERNEL, PACKED_SELECTION_NAX) => qualified && sixteen_bit,
+            (PACKED_TILED_KERNEL, PACKED_SELECTION_NAX_UNAVAILABLE) => qualified,
+            (PACKED_TILED_KERNEL, PACKED_SELECTION_F32_QUERY) => {
+                qualified && query_dtype == "float32"
+            }
+            (PACKED_TILED_KERNEL, PACKED_SELECTION_HEAD_DIMENSION) => qualified && sixteen_bit,
+            (PACKED_PER_ROW_KERNEL, PACKED_SELECTION_BELOW_MULTI_ROW) => qualified,
+            (PACKED_PER_ROW_KERNEL, PACKED_SELECTION_CONSERVATIVE) => conservative,
+            _ => false,
+        }
+}
+
+/// The kernel one accepted dispatch ran and why, recorded by the packed cache per call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedKernelSelection {
+    pub kernel: &'static str,
+    pub selection: &'static str,
+    pub reason: &'static str,
+    pub query_dtype: &'static str,
+}
 
 /// Static geometry of one packed kernel path, for evidence and comparison receipts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedKernelDescriptor {
     pub kernel: &'static str,
-    /// Why this kernel was selected over the NAX tiled kernel (or that NAX was selected).
+    /// Selection token (a `PACKED_SELECTION_*` constant): why this kernel ran.
     pub selection: &'static str,
+    /// Human-readable reason for the selection.
+    pub selection_reason: &'static str,
     pub threads: usize,
     pub simd_groups: usize,
     /// KV tokens one barrier-delimited step covers.
@@ -270,7 +376,17 @@ pub struct PackedKernelDescriptor {
 /// KV splits for the tiled kernel: enough threadgroups for occupancy, never fewer than
 /// 2048 visible tokens per split, at most 128 splits.
 pub fn packed_tiled_split_count(threadgroups: usize, visible_tokens: usize) -> usize {
-    let for_occupancy = TILED_TARGET_THREADGROUPS.div_ceil(threadgroups.max(1));
+    split_count(TILED_TARGET_THREADGROUPS, threadgroups, visible_tokens)
+}
+
+/// KV splits for the NAX kernel: the tiled rule with its own occupancy target of 512 eight-SIMD-group
+/// threadgroups (measured; see `NAX_TARGET_THREADGROUPS`).
+pub fn packed_nax_split_count(threadgroups: usize, visible_tokens: usize) -> usize {
+    split_count(NAX_TARGET_THREADGROUPS, threadgroups, visible_tokens)
+}
+
+fn split_count(target: usize, threadgroups: usize, visible_tokens: usize) -> usize {
+    let for_occupancy = target.div_ceil(threadgroups.max(1));
     let for_amortization = visible_tokens / TILED_MIN_TOKENS_PER_SPLIT;
     for_occupancy.min(for_amortization).clamp(1, MAX_KV_SPLITS)
 }
@@ -1161,6 +1277,10 @@ impl crate::primitives::packed_group_affine_kv::RetainedPackedKernel for PackedM
     fn dispatch(&self, args: &PackedAttentionArgs<'_>) -> Result<Array> {
         PackedMetalKernel::dispatch(self, args)
     }
+
+    fn kernel_selection(&self, args: &PackedAttentionArgs<'_>) -> Option<PackedKernelSelection> {
+        PackedMetalKernel::kernel_selection(self, args).ok()
+    }
 }
 
 impl std::fmt::Debug for PackedMetalKernel {
@@ -1391,7 +1511,8 @@ impl PackedMetalKernel {
             )?,
             identity: identity.into(),
             gpu_family,
-            nax_available: gpu_family == PackedMetalGpuFamily::Apple7OrNewer && mlx_nax_available(),
+            nax_available: gpu_family == PackedMetalGpuFamily::Apple7OrNewer
+                && mlx_nax_available()?,
         })
     }
 
@@ -1411,21 +1532,23 @@ impl PackedMetalKernel {
     /// Whether a multi-row step with `query_dtype` queries at `head_dimension` runs the NAX tiled
     /// kernel rather than the fp32 tiled kernel, and why.
     pub fn nax_selection(&self, head_dimension: usize, query_dtype: Dtype) -> PackedNaxSelection {
-        let rejected = |reason| PackedNaxSelection {
+        let rejected = |selection, reason| PackedNaxSelection {
             selected: false,
+            selection,
             reason,
         };
         if self.gpu_family != PackedMetalGpuFamily::Apple7OrNewer {
-            rejected(NAX_CONSERVATIVE)
+            rejected(PACKED_SELECTION_CONSERVATIVE, NAX_CONSERVATIVE)
         } else if !self.nax_available {
-            rejected(NAX_UNAVAILABLE)
+            rejected(PACKED_SELECTION_NAX_UNAVAILABLE, NAX_UNAVAILABLE)
         } else if !matches!(query_dtype, Dtype::Bfloat16 | Dtype::Float16) {
-            rejected(NAX_F32_QUERY)
+            rejected(PACKED_SELECTION_F32_QUERY, NAX_F32_QUERY)
         } else if !packed_nax_head_dimension_supported(head_dimension) {
-            rejected(NAX_HEAD_DIMENSION)
+            rejected(PACKED_SELECTION_HEAD_DIMENSION, NAX_HEAD_DIMENSION)
         } else {
             PackedNaxSelection {
                 selected: true,
+                selection: PACKED_SELECTION_NAX,
                 reason: NAX_SELECTED,
             }
         }
@@ -1475,8 +1598,9 @@ impl PackedMetalKernel {
         let tiled = self.selects_tiled(query_tokens, head_dimension);
         Some(if tiled && nax.selected {
             PackedKernelDescriptor {
-                kernel: "sc20676_nax_tiled_matmul2d",
-                selection: nax.reason,
+                kernel: PACKED_NAX_KERNEL,
+                selection: nax.selection,
+                selection_reason: nax.reason,
                 threads: NAX_SIMD_GROUPS * SIMD_WIDTH,
                 simd_groups: NAX_SIMD_GROUPS,
                 kv_block_tokens: NAX_BLOCK_TOKENS,
@@ -1488,8 +1612,9 @@ impl PackedMetalKernel {
             }
         } else if tiled {
             PackedKernelDescriptor {
-                kernel: "sc20676_tiled_multi_row_simdgroup_matrix",
-                selection: nax.reason,
+                kernel: PACKED_TILED_KERNEL,
+                selection: nax.selection,
+                selection_reason: nax.reason,
                 threads: TILED_SIMD_GROUPS * SIMD_WIDTH,
                 simd_groups: TILED_SIMD_GROUPS,
                 kv_block_tokens: tiled_block_tokens(head_dimension),
@@ -1500,9 +1625,17 @@ impl PackedMetalKernel {
             }
         } else {
             PackedKernelDescriptor {
-                kernel: "sc20676_split_kv_simdgroup",
-                selection: "fewer query rows than packed_tiled_min_query_tokens, or the \
-                            conservative family",
+                kernel: PACKED_PER_ROW_KERNEL,
+                selection: if self.gpu_family == PackedMetalGpuFamily::Apple7OrNewer {
+                    PACKED_SELECTION_BELOW_MULTI_ROW
+                } else {
+                    PACKED_SELECTION_CONSERVATIVE
+                },
+                selection_reason: if self.gpu_family == PackedMetalGpuFamily::Apple7OrNewer {
+                    PER_ROW_BELOW_THRESHOLD
+                } else {
+                    NAX_CONSERVATIVE
+                },
                 threads: tuning.threads,
                 simd_groups: tuning.simd_groups,
                 kv_block_tokens: PACKED_METAL_QUANT_GROUP_SIZE,
@@ -1510,6 +1643,27 @@ impl PackedMetalKernel {
                 softmax_state: "registers per SIMD group (simd_sum), merged once through \
                                 threadgroup memory; split-KV partials merged by a reduce pass",
             }
+        })
+    }
+
+    /// The kernel [`Self::dispatch`] runs for `args` and why, from [`Self::kernel_descriptor`] at
+    /// the dispatched query's real row count, head dimension, and dtype.
+    pub fn kernel_selection(
+        &self,
+        args: &PackedAttentionArgs<'_>,
+    ) -> Result<PackedKernelSelection> {
+        let validated = validate_dispatch(args)?;
+        let dtype = args.query.dtype();
+        let query_dtype = packed_query_dtype_name(dtype)
+            .ok_or_else(|| Error::Unsupported("SC-20676 query dtype".into()))?;
+        let descriptor = self
+            .kernel_descriptor(validated.query_tokens, validated.head_dimension, dtype)
+            .ok_or_else(|| Error::Unsupported("SC-20676 head dimension".into()))?;
+        Ok(PackedKernelSelection {
+            kernel: descriptor.kernel,
+            selection: descriptor.selection,
+            reason: descriptor.selection_reason,
+            query_dtype,
         })
     }
 
@@ -1556,7 +1710,7 @@ impl PackedMetalKernel {
     }
 
     /// Run the NAX tiled kernel regardless of `S_q`, with an explicit KV split count (`None` =
-    /// [`packed_tiled_split_count`] over 64-row tiles). Test, benchmark, and evidence seam; refused
+    /// [`packed_nax_split_count`] over 128-row tiles). Test, benchmark, and evidence seam; refused
     /// wherever [`Self::nax_selection`] rejects NAX for the query dtype and head dimension.
     pub fn dispatch_nax(
         &self,
@@ -1850,9 +2004,14 @@ fn tiled_splits(validated: &ValidatedDispatch) -> usize {
     tile_splits(validated, TILED_ROWS)
 }
 
-/// NAX split count: the tiled heuristic over 64-row tiles.
+/// NAX split count: [`packed_nax_split_count`] over 128-row tiles.
 fn nax_splits(validated: &ValidatedDispatch) -> usize {
-    tile_splits(validated, NAX_ROWS)
+    let tiles =
+        (validated.query_tokens * (validated.query_heads / validated.kv_heads)).div_ceil(NAX_ROWS);
+    packed_nax_split_count(
+        tiles * validated.batch * validated.kv_heads,
+        validated.visible_tokens,
+    )
 }
 
 fn tile_splits(validated: &ValidatedDispatch, rows_per_tile: usize) -> usize {
@@ -2097,6 +2256,136 @@ mod tests {
             .unwrap()
     }
 
+    /// A failed Metal-device probe is an error carrying MLX's reason, and the C++ predicate is
+    /// never reached (it could throw across the FFI boundary); a working probe reaches it.
+    #[test]
+    fn nax_detection_returns_the_device_probe_error_instead_of_calling_the_predicate() {
+        let error =
+            nax_available_after(|| Err(Error::Msg("no Metal device in this sandbox".into())))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("could not create MLX's Metal device")
+                && error.contains("no Metal device in this sandbox"),
+            "{error}"
+        );
+        assert_eq!(nax_available_after(|| Ok(())).unwrap(), mlx_nax_predicate());
+        assert_eq!(mlx_nax_available().unwrap(), mlx_nax_predicate());
+    }
+
+    /// Receipt validators accept exactly the paths the reader can record: the NAX kernel iff the
+    /// NAX selection (16-bit queries, qualified family), the fp32 tiled kernel only with a NAX
+    /// rejection its dtype allows, per-row below the threshold or on the conservative family.
+    #[test]
+    fn kernel_path_validity_pairs_every_kernel_with_its_selections() {
+        let (q, c) = (
+            PackedMetalGpuFamily::Apple7OrNewer.as_str(),
+            PackedMetalGpuFamily::ConservativeUnknownApple.as_str(),
+        );
+        let valid = [
+            (q, PACKED_NAX_KERNEL, PACKED_SELECTION_NAX, "bfloat16"),
+            (q, PACKED_NAX_KERNEL, PACKED_SELECTION_NAX, "float16"),
+            (
+                q,
+                PACKED_TILED_KERNEL,
+                PACKED_SELECTION_NAX_UNAVAILABLE,
+                "bfloat16",
+            ),
+            (
+                q,
+                PACKED_TILED_KERNEL,
+                PACKED_SELECTION_NAX_UNAVAILABLE,
+                "float32",
+            ),
+            (
+                q,
+                PACKED_TILED_KERNEL,
+                PACKED_SELECTION_F32_QUERY,
+                "float32",
+            ),
+            (
+                q,
+                PACKED_TILED_KERNEL,
+                PACKED_SELECTION_HEAD_DIMENSION,
+                "float16",
+            ),
+            (
+                q,
+                PACKED_PER_ROW_KERNEL,
+                PACKED_SELECTION_BELOW_MULTI_ROW,
+                "bfloat16",
+            ),
+            (
+                c,
+                PACKED_PER_ROW_KERNEL,
+                PACKED_SELECTION_CONSERVATIVE,
+                "float32",
+            ),
+        ];
+        let invalid = [
+            (q, PACKED_NAX_KERNEL, PACKED_SELECTION_NAX, "float32"),
+            (
+                q,
+                PACKED_NAX_KERNEL,
+                PACKED_SELECTION_NAX_UNAVAILABLE,
+                "bfloat16",
+            ),
+            (q, PACKED_TILED_KERNEL, PACKED_SELECTION_NAX, "bfloat16"),
+            (q, PACKED_PER_ROW_KERNEL, PACKED_SELECTION_NAX, "bfloat16"),
+            (
+                q,
+                PACKED_TILED_KERNEL,
+                PACKED_SELECTION_F32_QUERY,
+                "bfloat16",
+            ),
+            (
+                q,
+                PACKED_TILED_KERNEL,
+                PACKED_SELECTION_HEAD_DIMENSION,
+                "float32",
+            ),
+            (
+                q,
+                PACKED_PER_ROW_KERNEL,
+                PACKED_SELECTION_CONSERVATIVE,
+                "float32",
+            ),
+            (c, PACKED_NAX_KERNEL, PACKED_SELECTION_NAX, "bfloat16"),
+            (
+                c,
+                PACKED_TILED_KERNEL,
+                PACKED_SELECTION_NAX_UNAVAILABLE,
+                "float32",
+            ),
+            (
+                c,
+                PACKED_PER_ROW_KERNEL,
+                PACKED_SELECTION_BELOW_MULTI_ROW,
+                "float32",
+            ),
+            (q, PACKED_NAX_KERNEL, PACKED_SELECTION_NAX, "int8"),
+            (q, "made-up-kernel", PACKED_SELECTION_NAX, "bfloat16"),
+            (
+                "made-up-family",
+                PACKED_NAX_KERNEL,
+                PACKED_SELECTION_NAX,
+                "bfloat16",
+            ),
+        ];
+        for (family, kernel, selection, dtype) in valid {
+            assert!(
+                packed_kernel_path_valid(family, kernel, selection, dtype),
+                "{kernel} {selection} {dtype}"
+            );
+        }
+        for (family, kernel, selection, dtype) in invalid {
+            assert!(
+                !packed_kernel_path_valid(family, kernel, selection, dtype),
+                "{family} {kernel} {selection} {dtype}"
+            );
+        }
+    }
+
     #[test]
     fn gpu_family_tuning_is_conservative_and_geometry_explicit() {
         for dimension in [64, 128, 256] {
@@ -2306,7 +2595,10 @@ mod tests {
                         median(&|| conservative.dispatch_with_splits(&args, None).unwrap());
                     let per_row_r = median(&|| recent.dispatch_with_splits(&args, None).unwrap());
                     let tiled = median(&|| recent.dispatch_tiled(&args, None).unwrap());
-                    let nax = if packed_nax_head_dimension_supported(d as usize) {
+                    // The NAX column only where MLX reports the Neural Accelerator.
+                    let nax = if recent.nax_available()
+                        && packed_nax_head_dimension_supported(d as usize)
+                    {
                         format!(
                             "{:.3}",
                             median(&|| recent.dispatch_nax(&args, None).unwrap())
@@ -2353,7 +2645,9 @@ mod tests {
             // Warm every pipeline once on the first chunk's geometry.
             let warm = layer.args(&query, chunk as usize);
             kernel.dispatch_tiled(&warm, None).unwrap().eval().unwrap();
-            kernel.dispatch_nax(&warm, None).unwrap().eval().unwrap();
+            if kernel.nax_available() {
+                kernel.dispatch_nax(&warm, None).unwrap().eval().unwrap();
+            }
             kernel
                 .dispatch_with_splits(&warm, None)
                 .unwrap()
@@ -2389,6 +2683,11 @@ mod tests {
                 }),
             ];
             for (name, run) in paths {
+                // The NAX path only where MLX reports the Neural Accelerator.
+                if name == "nax-tiled-packed" && !kernel.nax_available() {
+                    eprintln!("{total}\t{chunk}\t{name}\tskipped: no Neural Accelerator");
+                    continue;
+                }
                 run(chunk as usize).eval().unwrap();
                 // Per chunk, the fastest of three evaluated calls (a shared GPU adds noise).
                 let samples = (1..=chunks)

@@ -1475,6 +1475,22 @@ pub struct ReceiptCompressionFallback {
     pub calls: u64,
 }
 
+/// One fused-reader kernel path of a compressed arm and the accepted calls that ran it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptCompressionKernelPath {
+    /// Kernel name (per-row split-KV, fp32 tiled, or NAX tiled).
+    pub kernel: String,
+    /// Selection token: why that kernel ran (`nax-selected`, `nax-unavailable`, `f32-query`, ...).
+    pub selection: String,
+    /// Human-readable reason for the selection.
+    pub reason: String,
+    /// Query dtype the reader was dispatched with (`float32`, `float16`, `bfloat16`).
+    pub query_dtype: String,
+    pub calls: u64,
+}
+
 /// Compressed-row evidence (SC-20676). Present exactly on `compressed` receipts; counts cover
 /// every compressed-arm dispatch of the row (warmups and all five repeats).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1490,6 +1506,10 @@ pub struct ReceiptCompression {
     pub quantization_group_size: u64,
     /// GPU-family tuning profile the fused reader was built with (`PackedMetalGpuFamily`).
     pub kernel_gpu_family: String,
+    /// Every kernel path the fused reader actually ran, from its dispatch-time descriptor at the
+    /// real query shape and dtype, sorted by (kernel, selection, query dtype); the calls sum to
+    /// `fused_calls`, so a NAX and a non-NAX run can never produce the same receipt.
+    pub kernel_paths: Vec<ReceiptCompressionKernelPath>,
     /// Peak live compressed storage of the coordinate operation's own cache, measured from its
     /// retained device arrays and its allocated host payload (host codes/metadata copy plus the
     /// staged key tail): `physicalKvBytes` is exactly their sum and is the whole physical
@@ -1895,6 +1915,33 @@ fn validate_receipt_compression(
     }
     if compression.fused_calls == 0 {
         return Err("compressed row never executed the fused compressed-domain reader".into());
+    }
+    let mut path_calls = 0_u64;
+    for (index, path) in compression.kernel_paths.iter().enumerate() {
+        // The NAX kernel appears exactly with the NAX selection (and 16-bit queries), and every
+        // other kernel only with a selection its GPU family and query dtype allow.
+        if !crate::primitives::packed_kernel_path_valid(
+            &compression.kernel_gpu_family,
+            &path.kernel,
+            &path.selection,
+            &path.query_dtype,
+        ) || path.reason.trim().is_empty()
+            || path.calls == 0
+            || compression.kernel_paths[..index].iter().any(|prior| {
+                (&prior.kernel, &prior.selection, &prior.query_dtype)
+                    >= (&path.kernel, &path.selection, &path.query_dtype)
+            })
+        {
+            return Err(
+                "compressed kernel path disagrees with its selection or is unordered".into(),
+            );
+        }
+        path_calls = path_calls
+            .checked_add(path.calls)
+            .ok_or("compressed kernel path count overflows u64")?;
+    }
+    if path_calls != compression.fused_calls {
+        return Err("compressed fused calls are not all attributed to a kernel path".into());
     }
     let mut calls = 0_u64;
     for (index, fallback) in compression.fallbacks.iter().enumerate() {
@@ -8273,6 +8320,8 @@ pub fn compressed_receipt_block(
         .first()
         .ok_or("compressed arm produced no compressed cache evidence")?;
     let mut fallbacks = std::collections::BTreeMap::<(String, String), u64>::new();
+    let mut kernel_paths =
+        std::collections::BTreeMap::<(String, String, String), (String, u64)>::new();
     let (mut fused_calls, mut full_cache_dequantizations, mut failed_dispatches) = (0_u64, 0, 0);
     for item in &evidence {
         if item.representation_identity != first.representation_identity
@@ -8290,6 +8339,24 @@ pub fn compressed_receipt_block(
             return Err("compressed cache left the fused path without a recorded reason".into());
         }
         let count = |value: usize| u64::try_from(value).map_err(|_| "evidence count overflow");
+        if item.kernel_paths.iter().map(|path| path.calls).sum::<u64>()
+            != count(item.accepted_direct_calls)?
+        {
+            return Err("compressed cache fused calls are not attributed to kernel paths".into());
+        }
+        for path in &item.kernel_paths {
+            let entry = kernel_paths
+                .entry((
+                    path.kernel.clone(),
+                    path.selection.clone(),
+                    path.query_dtype.clone(),
+                ))
+                .or_insert_with(|| (path.reason.clone(), 0));
+            if entry.0 != path.reason {
+                return Err("compressed kernel path reported two reasons".into());
+            }
+            entry.1 += path.calls;
+        }
         fused_calls += count(item.accepted_direct_calls)?;
         full_cache_dequantizations += count(item.full_cache_dequantizations)?;
         failed_dispatches += item.failed_dispatches;
@@ -8347,6 +8414,18 @@ pub fn compressed_receipt_block(
         quantization_group_size: u64::try_from(first.quantization_group_size)
             .map_err(|_| "quantization group size overflows u64")?,
         kernel_gpu_family: method.kernel_gpu_family().as_str().into(),
+        kernel_paths: kernel_paths
+            .into_iter()
+            .map(|((kernel, selection, query_dtype), (reason, calls))| {
+                ReceiptCompressionKernelPath {
+                    kernel,
+                    selection,
+                    reason,
+                    query_dtype,
+                    calls,
+                }
+            })
+            .collect(),
         device_code_bytes: storage.device_code_bytes,
         device_metadata_bytes: storage.device_metadata_bytes,
         host_payload_bytes: storage.host_payload_bytes,
@@ -10255,8 +10334,42 @@ pub(crate) mod tests {
             bits: 2,
             quantization_group_size: 32,
             accepted_direct_calls: fused,
+            // A prefill chunk on the NAX kernel and decode steps on the per-row kernel.
+            kernel_paths: test_kernel_paths(fused),
             kernel_warmed: true,
             ..Default::default()
+        }
+    }
+
+    fn test_kernel_paths(fused: usize) -> Vec<crate::primitives::PackedKernelPathEvidence> {
+        let path = |kernel: &str, selection: &str, calls: usize| {
+            crate::primitives::PackedKernelPathEvidence {
+                kernel: kernel.into(),
+                selection: selection.into(),
+                reason: "test".into(),
+                query_dtype: "bfloat16".into(),
+                calls: calls as u64,
+            }
+        };
+        match fused {
+            0 => Vec::new(),
+            1 => vec![path(
+                crate::primitives::PACKED_PER_ROW_KERNEL,
+                crate::primitives::PACKED_SELECTION_BELOW_MULTI_ROW,
+                1,
+            )],
+            _ => vec![
+                path(
+                    crate::primitives::PACKED_NAX_KERNEL,
+                    crate::primitives::PACKED_SELECTION_NAX,
+                    1,
+                ),
+                path(
+                    crate::primitives::PACKED_PER_ROW_KERNEL,
+                    crate::primitives::PACKED_SELECTION_BELOW_MULTI_ROW,
+                    fused - 1,
+                ),
+            ],
         }
     }
 
@@ -10433,6 +10546,80 @@ pub(crate) mod tests {
             &|r| r.compression.as_mut().unwrap().kernel_gpu_family = "made-up-family".into(),
             "identity is incomplete",
         );
+        // The receipt names the kernel paths the reader actually ran: the NAX kernel exactly with
+        // the NAX selection, and every fused call attributed.
+        assert_eq!(
+            block
+                .kernel_paths
+                .iter()
+                .map(|path| (path.kernel.as_str(), path.selection.as_str(), path.calls))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    crate::primitives::PACKED_NAX_KERNEL,
+                    crate::primitives::PACKED_SELECTION_NAX,
+                    2
+                ),
+                (
+                    crate::primitives::PACKED_PER_ROW_KERNEL,
+                    crate::primitives::PACKED_SELECTION_BELOW_MULTI_ROW,
+                    8
+                ),
+            ]
+        );
+        let path_rejected = "disagrees with its selection or is unordered";
+        rejects(
+            &|r| {
+                r.compression.as_mut().unwrap().kernel_paths[0].selection =
+                    crate::primitives::PACKED_SELECTION_NAX_UNAVAILABLE.into()
+            },
+            path_rejected,
+        );
+        rejects(
+            &|r| {
+                r.compression.as_mut().unwrap().kernel_paths[0].kernel =
+                    crate::primitives::PACKED_TILED_KERNEL.into()
+            },
+            path_rejected,
+        );
+        rejects(
+            &|r| {
+                r.compression.as_mut().unwrap().kernel_paths[1].selection =
+                    crate::primitives::PACKED_SELECTION_NAX.into()
+            },
+            path_rejected,
+        );
+        rejects(
+            &|r| r.compression.as_mut().unwrap().kernel_paths[0].query_dtype = "float32".into(),
+            path_rejected,
+        );
+        rejects(
+            &|r| r.compression.as_mut().unwrap().kernel_paths[0].reason = " ".into(),
+            path_rejected,
+        );
+        rejects(
+            &|r| r.compression.as_mut().unwrap().kernel_paths.swap(0, 1),
+            path_rejected,
+        );
+        rejects(
+            &|r| {
+                r.compression.as_mut().unwrap().kernel_gpu_family =
+                    crate::primitives::PackedMetalGpuFamily::ConservativeUnknownApple
+                        .as_str()
+                        .into()
+            },
+            path_rejected,
+        );
+        rejects(
+            &|r| r.compression.as_mut().unwrap().kernel_paths[1].calls -= 1,
+            "not all attributed to a kernel path",
+        );
+        rejects(
+            &|r| {
+                r.compression.as_mut().unwrap().kernel_paths.clear();
+            },
+            "not all attributed to a kernel path",
+        );
         // Silent fallback: unreasoned or uncounted dense execution, or no fused execution at all.
         rejects(
             &|r| r.compression.as_mut().unwrap().fallback_calls += 1,
@@ -10583,6 +10770,16 @@ pub(crate) mod tests {
             compressed_receipt_block(CompressedKvMethod::GroupAffine, &primary, &[&primary])
                 .unwrap_err()
                 .contains("without a recorded reason")
+        );
+        let unattributed = crate::primitives::PackedCacheEvidence {
+            kernel_paths: test_kernel_paths(2),
+            ..test_packed_evidence(3)
+        };
+        let primary = test_compressed_observation(vec![unattributed], &[], Some(TEST_STORAGE));
+        assert!(
+            compressed_receipt_block(CompressedKvMethod::GroupAffine, &primary, &[&primary])
+                .unwrap_err()
+                .contains("not attributed to kernel paths")
         );
         let dense_only = test_compressed_observation(
             vec![test_packed_evidence(0)],
