@@ -1,0 +1,105 @@
+# shellcheck shell=bash disable=SC2034  # every variable here is consumed by the sourcing script
+# Shared paths and helpers for .github/workflows/kv-poc-campaign.yml (epic 20669, W1).
+#
+# Sourced by every macOS job. The runners' /bin/bash is 3.2: no mapfile, no associative arrays,
+# no ${x,,}, and an EMPTY array expanded under `set -u` is an error -- keep it that way.
+#
+# Everything the campaign keeps lives under $KV_ROOT (default $HOME/kv-poc), OUTSIDE the Actions
+# workspace, because actions/checkout wipes the workspace between jobs and the campaign binaries
+# bind their inference tree at COMPILE time (CARGO_MANIFEST_DIR) and read `git rev-parse HEAD` of
+# it, and of $SCENEWORKS_ROOT, at RUN time. Both trees must therefore sit at fixed paths, at the
+# exact frozen SHAs, clean, for as long as any phase of the campaign can still run or resume.
+#
+#   $KV_ROOT/<inference_sha>/inference    stable inference clone (the bins' CARGO_MANIFEST_DIR)
+#   $KV_ROOT/<inference_sha>/SceneWorks   SCENEWORKS_ROOT
+#   $KV_ROOT/<inference_sha>/frozen       bins + mlx.metallib + policies + prompt, SHA256SUMS, a-w
+#   $KV_ROOT/<inference_sha>-runs         resume dirs + evidence (a re-dispatch resumes here)
+#   $KV_ROOT/cargo-target                 persistent CARGO_TARGET_DIR
+#   $KV_ROOT/tools                        hash-locked huggingface_hub install
+
+: "${INFERENCE_SHA:?INFERENCE_SHA is required}"
+: "${SCENEWORKS_SHA:?SCENEWORKS_SHA is required}"
+
+KV_ROOT="${KV_POC_ROOT:-$HOME/kv-poc}"
+KV_HF_HUB="${KV_POC_HF_HUB:-/Volumes/Models/huggingface/hub}"
+INF="$KV_ROOT/$INFERENCE_SHA/inference"
+SW="$KV_ROOT/$INFERENCE_SHA/SceneWorks"
+F="$KV_ROOT/$INFERENCE_SHA/frozen"
+R="$KV_ROOT/$INFERENCE_SHA-runs"
+KV_TARGET="$KV_ROOT/cargo-target"
+KV_TOOLS="$KV_ROOT/tools"
+INFERENCE_URL="https://github.com/SceneWorks/inference"
+SCENEWORKS_URL="https://github.com/SceneWorks/SceneWorks"
+BINS="sc20671_kv_baseline sc20676_packed_evidence sc20677_capture_kv sc20677_kv_candidates"
+
+# The four pinned snapshots the W1 commands name (hub-cache layout on both Macs).
+LQ="$KV_HF_HUB/models--mlx-community--Llama-3.2-3B-Instruct-4bit/snapshots/7f0dc925e0d0afb0322d96f9255cfddf2ba5636e"
+LB="$KV_HF_HUB/models--mlx-community--Llama-3.2-3B-Instruct-bf16/snapshots/6d88ba43024fef71b10e52e101c7cd4598322601"
+QQ="$KV_HF_HUB/models--mlx-community--Qwen3-1.7B-4bit/snapshots/3b1b1768f8f8cf8351c712464f906e86c2b8269e"
+QB="$KV_HF_HUB/models--mlx-community--Qwen3-1.7B-bf16/snapshots/9cd6692855d3e06772228e9a962b2606359b2d24"
+
+KV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+summary() { if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; fi; }
+output() { if [ -n "${GITHUB_OUTPUT:-}" ]; then printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; fi; }
+
+stop_ref() { printf 'refs/heads/kv-poc-stop/%s' "$GITHUB_RUN_ID"; }
+stop_command() {
+  printf 'gh api -X POST repos/%s/git/refs -f ref=%s -f sha=%s' \
+    "${GITHUB_REPOSITORY:-SceneWorks/inference}" "$(stop_ref)" "$INFERENCE_SHA"
+}
+stop_branch_present() {
+  git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY:-SceneWorks/inference}" "$(stop_ref)" >/dev/null 2>&1
+}
+
+# free + speculative pages, in whole GiB (the W1-PRECHECK measure).
+free_spec_gib() {
+  local page free spec
+  page=$(sysctl -n hw.pagesize)
+  read -r free spec < <(vm_stat | awk '/Pages free/ {gsub("\\.","",$3); f=$3} /Pages speculative/ {gsub("\\.","",$3); s=$3} END {print f+0, s+0}')
+  echo $(( (free + spec) * page / 1073741824 ))
+}
+
+lms_bin() {
+  if command -v lms >/dev/null 2>&1; then command -v lms
+  elif [ -x "$HOME/.lmstudio/bin/lms" ]; then echo "$HOME/.lmstudio/bin/lms"
+  fi
+}
+
+# Processes that would share the GPU or the unified memory with a campaign row: the W1-PRECHECK.sh
+# set, minus its Runner.Listener/Runner.Worker check (on this box the runner IS the launcher, and
+# it runs one job at a time).
+#
+# NOT `pgrep -f`: on macOS it matches against, and `-l` prints, the process ENVIRONMENT as well as
+# argv. Every process whose PATH holds ~/.cargo/bin then matches `cargo` (this job's own shell
+# included, so the check could never pass), and the output leaks other processes' env -- tokens
+# included -- into the job log. `ps -o comm` / `-o args` read the executable and argv only.
+busy_processes() {
+  ps -axo pid=,comm= | awk '{ pid = $1; sub(/^ *[0-9]+ +/, ""); sub(/.*\//, "");
+    if ($0 ~ /^(cargo|rustc|sc2067.*|sc2068.*|krea-integration.*)$/) print pid " " $0 }'
+  # A Python interpreter (argv[0]) with MLX anywhere in its argv, e.g. `python -m mlx_lm ...`. Keyed
+  # on argv[0] so a shell whose command line merely mentions python and mlx is not a match. Prints
+  # the pid and interpreter only; argv can carry things that do not belong in a job log.
+  ps -axww -o pid=,args= | awk '{ n = split($2, a, "/"); if (a[n] ~ /^[Pp]ython/ && $0 ~ /mlx/) print $1 " " a[n] " (argv mentions mlx)" }'
+}
+
+runner_listeners() {
+  ps -axo pid=,comm= | awk '/[R]unner\.Listener$/ { print }'
+}
+
+# Verify one stable clone is exactly <sha>, clean, with the origin the campaign bins demand.
+verify_tree() {
+  local dir="$1" url="$2" sha="$3" head
+  [ -d "$dir/.git" ] || { echo "::error title=missing tree::$dir is not a git checkout (run the build job)"; return 1; }
+  [ "$(git -C "$dir" config --get remote.origin.url)" = "$url" ] \
+    || { echo "::error title=wrong origin::$dir origin is not $url"; return 1; }
+  head="$(git -C "$dir" rev-parse HEAD)"
+  [ "$head" = "$sha" ] || { echo "::error title=wrong revision::$dir HEAD is $head, expected $sha"; return 1; }
+  [ -z "$(git -C "$dir" status --porcelain)" ] || { echo "::error title=dirty tree::$dir has local changes"; git -C "$dir" status --short | head -20; return 1; }
+}
+
+verify_frozen() {
+  [ -f "$F/SHA256SUMS" ] || { echo "::error title=frozen dir not sealed::$F/SHA256SUMS is missing (run the build job)"; return 1; }
+  (cd "$F" && shasum -a 256 -c SHA256SUMS >/dev/null) \
+    || { echo "::error title=frozen dir mismatch::$F does not match its SHA256SUMS"; return 1; }
+}
