@@ -967,23 +967,24 @@ mod tests {
             assert_eq!(metadata["gqaGroup"], "2");
             assert_eq!(metadata["modelSnapshotSha256"], "c".repeat(64));
             assert_eq!(metadata["schema"], CAPTURE_SCHEMA);
-            // Prefill(8) + decode(1) reproduces a 9-token prefill's cache and last query row.
+            // Prefill(8) + decode(1) reproduces a 9-token prefill's cache and last query row — to
+            // bf16 rounding: the 9-row prefill attends with MLX's fused full kernel and the split
+            // path with its vector kernel (sc-20676), so from layer 1 on they may differ by an ulp
+            // or two of the compute dtype. Tolerance: 2 bf16 ulps of the largest element.
             let (query, keys, values) = full_prefill_reference(&model, &tokens, file.layer);
-            assert!(
-                max_abs_diff(&case.keys, &keys) < 1e-3,
-                "layer {} keys",
-                file.layer
-            );
-            assert!(
-                max_abs_diff(&case.values, &values) < 1e-3,
-                "layer {} values",
-                file.layer
-            );
-            assert!(
-                max_abs_diff(&case.query, &query) < 1e-3,
-                "layer {} query",
-                file.layer
-            );
+            let bf16_tolerance = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs())) / 64.0;
+            for (name, got, want) in [
+                ("keys", &case.keys, &keys),
+                ("values", &case.values, &values),
+                ("query", &case.query, &query),
+            ] {
+                let (diff, tolerance) = (max_abs_diff(got, want), bf16_tolerance(want));
+                assert!(
+                    diff <= tolerance,
+                    "layer {} {name}: max |Δ| {diff} > {tolerance}",
+                    file.layer
+                );
+            }
         }
         // An unlisted capture file, or a tampered one, no longer verifies.
         fs::copy(
