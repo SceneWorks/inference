@@ -88,7 +88,8 @@ pub struct PackedCacheEvidence {
 pub struct CompressedCacheStorage {
     /// Retained device code arrays.
     pub device_code_bytes: u64,
-    /// Retained device scale/zero (or codebook) arrays.
+    /// Retained device scale/zero (or codebook) arrays, plus any bounded dense residual of
+    /// not-yet-quantized recent tokens the representation keeps on the device.
     pub device_metadata_bytes: u64,
     /// Allocated host-side staging payload.
     pub host_payload_bytes: u64,
@@ -139,6 +140,14 @@ pub trait KvCache {
         _retained_for_sharing: bool,
     ) -> Result<Option<Array>> {
         Ok(None)
+    }
+
+    /// Import a reused dense prefix — one `(keys, values)` pair per layer, each
+    /// `[batch, n_kv_heads, seq, head_dim]` — into an empty cache's own representation. Returns
+    /// `Ok(true)` when the cache now holds the prefix; the default declines (`Ok(false)`, nothing
+    /// mutated), and the caller keeps its dense seed.
+    fn import_prefix(&mut self, _layers: &[(Array, Array)]) -> Result<bool> {
+        Ok(false)
     }
 
     /// Force an explicitly-reasoned dense transition before the caller performs its ordinary
