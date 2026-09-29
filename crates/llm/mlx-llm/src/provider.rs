@@ -41,10 +41,10 @@ use crate::primitives::attention::SDPA_MAX_FUSED_QLEN;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{input_ids, Weights};
+use crate::primitives::{dtype_bytes, input_ids, Weights};
 use crate::prism::PrismMlxPack;
 use mlx_rs::ops::concatenate_axis;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "mlx-llama";
@@ -251,12 +251,17 @@ impl Decoder {
                     )
                 }
             };
+        let (compute, prism) = match self {
+            Decoder::Causal(m) => (m.compute_dtype(), false),
+            Decoder::Qwen35(m) => (m.compute_dtype(), m.is_prism()),
+        };
         LlmMemoryGeometry {
             query_heads: query_heads.max(0) as u64,
             kv_heads: kv_heads.max(0) as u64,
             head_dim: head_dim.max(0) as u64,
             layers: layers as u64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(compute, prism),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: hidden as u64,
             intermediate_size: intermediate as u64,
             vocab_size: vocab as u64,
@@ -3028,6 +3033,26 @@ fn estimate_qwen35_workspace_extra_bytes(
     ])
 }
 
+/// Scalar width of the attention scores, additive mask and softmax weights priced by the request
+/// estimate: `sdpa_eager` upcasts all three to F32 for a BF16 decoder.
+const EAGER_SCORE_ELEMENT_BYTES: u64 = dtype_bytes(Dtype::Float32);
+
+/// Scalar width the request estimate prices K/V, decoder activations and logits at.
+///
+/// Since sc-20671 every decoder runs these in its compute dtype, whatever dtype the snapshot
+/// stores its quantized scales in. The Prism/Bonsai path is held at the F32 width: its F16 scales
+/// promoted the whole decoder to F32 before sc-20671, and its frozen allocator peaks (the
+/// `qwen35_prism_estimate_covers_frozen_allocator_peaks…` floors) were measured on that path. At
+/// the compute width the 27-token floor is no longer covered, so the width stays until those
+/// peaks are re-taken on the BF16 path at epic end (SC-20671 dense-baseline contract doc).
+fn priced_compute_element_bytes(compute: Dtype, prism: bool) -> u64 {
+    if prism {
+        dtype_bytes(Dtype::Float32)
+    } else {
+        dtype_bytes(compute)
+    }
+}
+
 /// Select the estimate matching the complete decoder execution graph. Generic fused attention uses
 /// the shared tiled estimate. Dense Qwen3.5 adds its F32 recurrence, packed-Hadamard, allocator, and
 /// lazy-evaluator lifetimes; eager/otherwise-unbounded implementations retain the quadratic model.
@@ -3401,7 +3426,8 @@ mod tests {
             kv_heads: 4,
             head_dim: 128,
             layers: 64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, false),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -3429,7 +3455,8 @@ mod tests {
             kv_heads: 2,
             head_dim: 64,
             layers: 4,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, false),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 256,
             intermediate_size: 512,
             vocab_size: 1024,
@@ -3471,7 +3498,8 @@ mod tests {
             kv_heads: 4,
             head_dim: 256,
             layers: 64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, true),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -3495,10 +3523,33 @@ mod tests {
         assert!(arithmetic >= 773_229_760, "estimate: {arithmetic}");
         assert!(context_64 >= 4_091_010_468, "estimate: {context_64}");
         assert!(context_512 >= 22_885_373_536, "estimate: {context_512}");
-        assert_eq!(arithmetic, 788_726_144);
-        assert_eq!(context_64, 7_974_200_704);
-        assert_eq!(context_512, 32_756_098_432);
-        assert_eq!(context_2048, 117_722_604_928);
+        // The Prism hold (see `priced_compute_element_bytes`) exceeds the compute-width estimate
+        // by exactly the K/V, activation and last-row logit terms at the width difference; every
+        // other term is width-independent.
+        let compute_width = LlmMemoryGeometry {
+            element_bytes: dtype_bytes(Dtype::Bfloat16),
+            ..geometry
+        };
+        let delta = geometry.element_bytes - compute_width.element_bytes;
+        for (prompt, estimate) in [
+            (27_u64, arithmetic),
+            (1_187, context_64),
+            (9_251, context_512),
+            (36_899, context_2048),
+        ] {
+            let g = geometry;
+            let kv = (prompt + 128) * g.layers * g.kv_heads * g.head_dim * delta * 2;
+            let activations = prompt * (g.intermediate_size * 3 + g.hidden_size * 8) * delta
+                + g.vocab_size * delta;
+            let at_compute_width =
+                estimate_mlx_request_bytes(prompt as usize, 128, compute_width, 0, 0, contract)
+                    .unwrap();
+            assert_eq!(
+                estimate - at_compute_width,
+                kv + activations,
+                "prompt {prompt}"
+            );
+        }
         assert!(arithmetic < context_64 && context_64 < context_512 && context_512 < context_2048);
         assert!(
             core_llm::admit_request_memory(context_2048, 47_922_610_176).is_err(),
@@ -3514,7 +3565,8 @@ mod tests {
             kv_heads: 4,
             head_dim: 256,
             layers: 64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, true),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -3528,8 +3580,22 @@ mod tests {
         // 256-step floor. A normal 128-token prompt remains admitted on an 8-GB machine.
         let scalar = estimate_mlx_request_bytes(1, 1, geometry, 0, 0, contract).unwrap();
         let ordinary = estimate_mlx_request_bytes(128, 128, geometry, 0, 0, contract).unwrap();
-        assert_eq!(scalar, 231_142_880);
-        assert_eq!(ordinary, 2_695_981_056);
+        for (prompt, new_tokens, estimate) in [(1, 1, scalar), (128, 128, ordinary)] {
+            assert_eq!(
+                estimate,
+                core_llm::estimate_chunked_request_bytes(
+                    prompt,
+                    new_tokens,
+                    geometry,
+                    0,
+                    0,
+                    SDPA_MAX_FUSED_QLEN as usize,
+                )
+                .unwrap()
+                    + estimate_qwen35_workspace_extra_bytes(prompt, &config, true).unwrap(),
+                "prompt {prompt}"
+            );
+        }
         assert!(scalar < ordinary);
         assert!(core_llm::admit_request_memory(ordinary, 8_000_000_000).is_ok());
         assert!(
@@ -4204,6 +4270,34 @@ mod tests {
             m.insert(p("mlp.down_proj.weight"), randn(&[h, inter]));
         }
         CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap()
+    }
+
+    /// sc-20671: admission prices K/V, activations and logits at the width the decoder actually
+    /// caches (its compute dtype), and only the eager score term at F32. The Prism/Bonsai path is
+    /// held at F32 until its frozen allocator peaks are re-taken.
+    #[test]
+    fn memory_geometry_prices_kv_at_the_cached_width() {
+        let decoder = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let geometry = decoder.memory_geometry();
+        let Decoder::Causal(model) = &decoder else {
+            unreachable!()
+        };
+        let mut cache = model.new_cache();
+        model
+            .decode_logits(&input_ids(&[1, 2, 3]), &mut cache, 0)
+            .unwrap();
+        assert_eq!(cache.element_bytes().unwrap(), Some(geometry.element_bytes));
+        assert_eq!(geometry.element_bytes, dtype_bytes(model.compute_dtype()));
+        assert_eq!(
+            geometry.score_element_bytes,
+            dtype_bytes(Dtype::Float32),
+            "sdpa_eager scores stay F32"
+        );
+        assert_eq!(
+            priced_compute_element_bytes(Dtype::Bfloat16, true),
+            dtype_bytes(Dtype::Float32),
+            "Prism admission holds the pre-fix width until its peaks are re-taken"
+        );
     }
 
     #[derive(Default)]

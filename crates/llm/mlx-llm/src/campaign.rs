@@ -552,12 +552,16 @@ fn preflight_total_live_tokens(
     Ok((total, max_request))
 }
 
-/// Scalar width of the dense K/V every campaign role must hand its cache: the loader's BF16
-/// compute dtype. The loader holds stored quantized scales/biases in the compute dtype
-/// (sc-20671), so a stored F16/F32 scale no longer promotes the activations — and the cache — to
-/// F32. [`ProductObserver`] and [`validate_receipt_semantics`] refuse any other observed width
-/// rather than record a silently widened dense baseline.
-pub const DENSE_KV_COMPUTE_ELEMENT_BYTES: u64 = 2;
+/// The dtype every campaign role's dense K/V is cached in: the causal loader's compute dtype. The
+/// loader holds stored quantized scales/biases in the compute dtype (sc-20671), so a stored F16/F32
+/// scale no longer promotes the activations — and the cache — to F32.
+pub const DENSE_KV_COMPUTE_DTYPE: mlx_rs::Dtype = crate::models::CausalLm::COMPUTE_DTYPE;
+
+/// Scalar width of [`DENSE_KV_COMPUTE_DTYPE`]. [`ProductObserver`] and
+/// [`validate_receipt_semantics`] refuse any other observed width rather than record a silently
+/// widened dense baseline.
+pub const DENSE_KV_COMPUTE_ELEMENT_BYTES: u64 =
+    crate::primitives::dtype_bytes(DENSE_KV_COMPUTE_DTYPE);
 
 /// Validate the pinned decoder projection inventory without loading MLX arrays and return the
 /// dense K/V scalar width it produces. Every supported stored scale dtype (BF16/F16/F32) is cast to
@@ -648,10 +652,18 @@ fn pinned_dense_kv_element_bytes(
 
 /// The fail-closed reason for an observed dense K/V width that is not the compute dtype's.
 fn dense_kv_width_refusal(observed: u64) -> String {
+    let observed_dtype = match observed {
+        1 => "an 8-bit",
+        2 => "a 16-bit float",
+        4 => "Float32",
+        8 => "Float64",
+        _ => "an unknown",
+    };
     format!(
-        "dense KV element width {observed} bytes is not the BF16 compute dtype width \
-         {DENSE_KV_COMPUTE_ELEMENT_BYTES}; the loader promoted the cache (sc-20671), so this row \
-         is refused rather than recorded as a widened dense baseline"
+        "dense KV observed as {observed_dtype} dtype ({observed} bytes/element), expected the \
+         {DENSE_KV_COMPUTE_DTYPE:?} compute dtype ({DENSE_KV_COMPUTE_ELEMENT_BYTES} \
+         bytes/element); the loader promoted the cache (sc-20671), so this row is refused rather \
+         than recorded as a widened dense baseline"
     )
 }
 
@@ -9334,7 +9346,16 @@ pub(crate) mod tests {
             observer.error.as_deref(),
             Some(dense_kv_width_refusal(4).as_str())
         );
-        assert!(observer.finish().err().unwrap().contains("sc-20671"));
+        let reason = observer.finish().err().unwrap();
+        assert!(reason.contains("sc-20671"), "{reason}");
+        assert!(
+            reason.contains("observed as Float32 dtype (4 bytes/element)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("expected the Bfloat16 compute dtype (2 bytes/element)"),
+            "{reason}"
+        );
 
         let receipt = builder_test_receipt();
         assert_eq!(

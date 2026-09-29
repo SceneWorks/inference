@@ -287,13 +287,15 @@ fn f16_prism_affine_parameters_keep_the_decoder_in_compute_dtype() {
     let pack = PrismMlxPack::from_dir(&dir, &config, &weights).unwrap();
     let cfg = Qwen35Config::from_json(&config).unwrap();
     let model = Qwen35Model::from_prism_weights(&weights, cfg, &pack).unwrap();
+    let mut cache = model.new_cache();
     let logits = model
-        .forward(
-            &Array::from_slice(&[1i32, 2, 3], &[1, 3]),
-            &mut model.new_cache(),
-            0,
-        )
+        .forward(&Array::from_slice(&[1i32, 2, 3], &[1, 3]), &mut cache, 0)
         .unwrap();
     assert_eq!(logits.shape(), &[1, 3, 4]);
     assert_eq!(logits.dtype(), Dtype::Bfloat16);
+    // The fixture's single layer is full attention: its K/V are cached in the compute dtype.
+    assert_eq!(
+        cache.attention_kv_dtypes().unwrap(),
+        vec![(Dtype::Bfloat16, Dtype::Bfloat16)]
+    );
 }

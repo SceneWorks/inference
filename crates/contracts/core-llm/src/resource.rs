@@ -12,7 +12,13 @@ pub struct LlmMemoryGeometry {
     pub kv_heads: u64,
     pub head_dim: u64,
     pub layers: u64,
+    /// Scalar width of the K/V cache, decoder activations, and logits: the decoder's compute
+    /// dtype (2 for a BF16 decoder, 4 for an F32 one).
     pub element_bytes: u64,
+    /// Scalar width of the attention scores, additive mask, and softmax weights the attention
+    /// workspace term prices. A backend whose score path upcasts (MLX's eager SDPA computes scores
+    /// in F32 for a BF16 decoder) declares that width here rather than widening every other term.
+    pub score_element_bytes: u64,
     pub hidden_size: u64,
     pub intermediate_size: u64,
     pub vocab_size: u64,
@@ -33,7 +39,7 @@ pub fn estimate_request_bytes(
     let attention = prompt
         .checked_mul(prompt)?
         .checked_mul(geometry.query_heads)?
-        .checked_mul(geometry.element_bytes)?
+        .checked_mul(geometry.score_element_bytes)?
         .checked_mul(3)?;
     // K and V caches for every layer through the requested terminal position.
     let kv = total
@@ -133,7 +139,7 @@ pub fn estimate_chunked_request_bytes_with_recurrent_copies(
     let attention = prompt
         .checked_mul(attention_rows)?
         .checked_mul(geometry.query_heads)?
-        .checked_mul(geometry.element_bytes)?
+        .checked_mul(geometry.score_element_bytes)?
         .checked_mul(3)?;
     let kv = total
         .checked_mul(geometry.layers)?
@@ -345,6 +351,7 @@ mod tests {
             head_dim: 128,
             layers: 40,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 5120,
             intermediate_size: 17408,
             vocab_size: 248320,
@@ -368,6 +375,7 @@ mod tests {
             head_dim: 128,
             layers: 64,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -382,6 +390,49 @@ mod tests {
         assert!(estimate_chunked_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3, 8).is_none());
     }
 
+    /// sc-20671: the compute width prices K/V, activations, logits and MTP state; only the
+    /// attention-score term takes the score width. A BF16 decoder with F32 eager scores must not
+    /// be charged a 4-byte K/V cache, and must still be charged 4-byte scores.
+    #[test]
+    fn compute_and_score_widths_price_separate_terms() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 8,
+            kv_heads: 2,
+            head_dim: 64,
+            layers: 4,
+            element_bytes: 2,
+            score_element_bytes: 4,
+            hidden_size: 256,
+            intermediate_size: 512,
+            vocab_size: 1024,
+            recurrent_bytes: 4096,
+        };
+        let (prompt, new, rows, mtp) = (300_u64, 20_u64, 8_u64, 3_u64);
+        let g = geometry;
+        let kv = (prompt + new) * g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let mtp_bytes = kv * 2 + mtp * (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let mlp = g.intermediate_size * 3 + g.hidden_size * 8;
+        let eager = prompt * prompt * g.query_heads * g.score_element_bytes * 3
+            + kv
+            + mtp_bytes
+            + prompt * (mlp + g.vocab_size) * g.element_bytes
+            + g.recurrent_bytes * 3;
+        assert_eq!(
+            estimate_request_bytes(300, 20, geometry, 0, 3).unwrap(),
+            eager
+        );
+        let chunked = prompt * rows * g.query_heads * g.score_element_bytes * 3
+            + kv
+            + mtp_bytes
+            + prompt * mlp * g.element_bytes
+            + g.vocab_size * g.element_bytes
+            + g.recurrent_bytes * 3;
+        assert_eq!(
+            estimate_chunked_request_bytes(300, 20, geometry, 0, 3, 8).unwrap(),
+            chunked
+        );
+    }
+
     #[test]
     fn recurrent_copies_scale_only_the_recurrent_term() {
         let recurrent = 7_000_003u64;
@@ -391,6 +442,7 @@ mod tests {
             head_dim: 128,
             layers: 64,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
