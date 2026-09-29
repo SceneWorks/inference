@@ -224,12 +224,12 @@ def _validate_reference_metadata(
         raise InvalidOracle(f"{name} metadata population/values are stale")
 
 
-def _validate_manifest_header(
+def _manifest_header_problems(
     document: dict,
     revision: str,
     edit_revision: str,
     expected_names: set[str],
-) -> None:
+) -> list[str]:
     expected_keys = {
         "schema",
         "reference",
@@ -241,43 +241,78 @@ def _validate_manifest_header(
         "referenceEnvironment",
         "files",
     }
-    seconds = document.get("generationSeconds")
-    records = document.get("files")
-    if (
-        set(document) != expected_keys
-        or type(document.get("schema")) is not int
-        or document.get("schema") != 1
-        or type(document.get("reference")) is not str
-        or document.get("reference") != "microsoft/Mage frozen vendored reference"
-        or type(document.get("snapshotRevision")) is not str
-        or document.get("snapshotRevision") != revision
-        or type(document.get("editSnapshotRevision")) is not str
-        or document.get("editSnapshotRevision") != edit_revision
-        or type(document.get("device")) is not str
-        or document.get("device") != "cpu"
-        or type(document.get("vaeGeometries")) is not list
-        or document.get("vaeGeometries") != list(GEOMETRIES)
-        or type(document.get("referenceEnvironment")) is not dict
-        or document.get("referenceEnvironment") != REFERENCE_PACKAGES
-        or type(seconds) is not float
-        or not math.isfinite(float(seconds))
-        or float(seconds) < 0.0
-        or not isinstance(records, list)
-        or any(
-            not isinstance(record, dict)
-            or set(record) != {"name", "bytes", "sha256"}
-            or type(record.get("name")) is not str
-            or type(record.get("bytes")) is not int
-            or record["bytes"] <= 0
-            or type(record.get("sha256")) is not str
-            or re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", "")) is None
-            for record in records
+    exact = {
+        "schema": (int, 1),
+        "reference": (str, "microsoft/Mage frozen vendored reference"),
+        "snapshotRevision": (str, revision),
+        "editSnapshotRevision": (str, edit_revision),
+        "device": (str, "cpu"),
+        "vaeGeometries": (list, list(GEOMETRIES)),
+    }
+    problems = []
+    if set(document) != expected_keys:
+        problems.append(
+            f"keys missing {sorted(expected_keys - set(document))} "
+            f"unexpected {sorted(set(document) - expected_keys)}"
         )
-        or {record.get("name") for record in records if isinstance(record, dict)}
-        != expected_names
-        or len(records) != len(expected_names)
+    for key, (kind, expected) in exact.items():
+        value = document.get(key)
+        if type(value) is not kind or value != expected:
+            problems.append(f"{key}: manifest {value!r} != expected {expected!r}")
+    environment = document.get("referenceEnvironment")
+    if type(environment) is not dict:
+        problems.append(f"referenceEnvironment: manifest {environment!r} is not an object")
+    elif environment != REFERENCE_PACKAGES:
+        for package in sorted(set(environment) | set(REFERENCE_PACKAGES)):
+            if (
+                package not in environment
+                or package not in REFERENCE_PACKAGES
+                or environment[package] != REFERENCE_PACKAGES[package]
+            ):
+                problems.append(
+                    f"referenceEnvironment.{package}: manifest {environment.get(package)!r} "
+                    f"!= pinned {REFERENCE_PACKAGES.get(package)!r}"
+                )
+    seconds = document.get("generationSeconds")
+    if type(seconds) is not float or not math.isfinite(seconds) or seconds < 0.0:
+        problems.append(f"generationSeconds: {seconds!r} is not a finite non-negative float")
+    records = document.get("files")
+    if not isinstance(records, list):
+        problems.append("files: not a list")
+        return problems
+    if any(
+        not isinstance(record, dict)
+        or set(record) != {"name", "bytes", "sha256"}
+        or type(record.get("name")) is not str
+        or type(record.get("bytes")) is not int
+        or record["bytes"] <= 0
+        or type(record.get("sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", "")) is None
+        for record in records
     ):
-        raise InvalidOracle("Mage oracle manifest header/population is incomplete or stale")
+        problems.append("files: a record is malformed")
+        return problems
+    names = {record["name"] for record in records}
+    if names != expected_names or len(records) != len(expected_names):
+        problems.append(
+            f"files: population {sorted(map(str, names))} ({len(records)} records) "
+            f"!= expected {sorted(expected_names)}"
+        )
+    return problems
+
+
+def _validate_manifest_header(
+    document: dict,
+    revision: str,
+    edit_revision: str,
+    expected_names: set[str],
+) -> None:
+    problems = _manifest_header_problems(document, revision, edit_revision, expected_names)
+    if problems:
+        raise InvalidOracle(
+            "Mage oracle manifest header/population is incomplete or stale: "
+            + "; ".join(problems)
+        )
 
 
 def _validate_manifest_file_record(
