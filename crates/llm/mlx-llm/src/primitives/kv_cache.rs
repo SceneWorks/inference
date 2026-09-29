@@ -57,6 +57,10 @@ pub struct PackedCacheEvidence {
     pub bits: u8,
     pub quantization_group_size: usize,
     pub accepted_direct_calls: usize,
+    /// Accepted calls per kernel path actually dispatched, sorted by (kernel, selection, query
+    /// dtype); on a reader that reports its selection these sum to `accepted_direct_calls`.
+    #[serde(default)]
+    pub kernel_paths: Vec<PackedKernelPathEvidence>,
     pub full_cache_dequantizations: usize,
     pub dispatch_attempts: u64,
     pub failed_dispatches: u64,
@@ -81,6 +85,46 @@ pub struct PackedCacheEvidence {
     pub dense_active: bool,
     pub fallback_reasons: Vec<(String, String)>,
 }
+/// One kernel path of the packed reader and the accepted calls that ran it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct PackedKernelPathEvidence {
+    /// Kernel name (a `PACKED_*_KERNEL` constant).
+    pub kernel: String,
+    /// Selection token (a `PACKED_SELECTION_*` constant).
+    pub selection: String,
+    /// Human-readable reason for the selection.
+    pub reason: String,
+    /// Dispatched query dtype (`float32`, `float16`, `bfloat16`).
+    pub query_dtype: String,
+    pub calls: u64,
+}
+
+impl PackedKernelPathEvidence {
+    /// Evidence rows for a cache's recorded paths, sorted by (kernel, selection, query dtype).
+    pub fn sorted(
+        paths: &[(crate::primitives::packed_metal::PackedKernelSelection, u64)],
+    ) -> Vec<Self> {
+        let mut rows = paths
+            .iter()
+            .map(|(path, calls)| Self {
+                kernel: path.kernel.into(),
+                selection: path.selection.into(),
+                reason: path.reason.into(),
+                query_dtype: path.query_dtype.into(),
+                calls: *calls,
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            (&a.kernel, &a.selection, &a.query_dtype).cmp(&(
+                &b.kernel,
+                &b.selection,
+                &b.query_dtype,
+            ))
+        });
+        rows
+    }
+}
+
 /// Measured physical storage of a live compressed KV representation, exported only to campaign
 /// observers (SC-20676 compressed rows). Device bytes are the sizes of the MLX arrays the cache
 /// actually retains and host bytes its allocated staging payload, never bit accounting.

@@ -183,9 +183,15 @@ pub struct Sc20676KernelProfile {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sc20676MultiRowKernel {
     pub kernel: String,
-    /// Why the reader chose this multi-row kernel over the NAX tiled kernel (or chose NAX).
+    /// Selection token of the dispatched multi-row path (`nax-selected`, `nax-unavailable`, ...).
     #[serde(default)]
     pub selection: String,
+    /// Human-readable reason for the selection.
+    #[serde(default)]
+    pub selection_reason: String,
+    /// Query dtype the multi-row step was dispatched with.
+    #[serde(default)]
+    pub query_dtype: String,
     pub min_query_tokens: u64,
     pub threads: u64,
     pub simd_groups: u64,
@@ -647,6 +653,48 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         .kernel_profile
         .as_ref()
         .ok_or("packed arm lacks device-bound kernel profile evidence")?;
+    // A multi-row path's kernel must be the one its selection names (the NAX kernel exactly with
+    // the NAX selection), and every recorded dispatch path must be one this family can run.
+    if let Some(multi_row) = &profile.multi_row {
+        if multi_row.kernel == crate::primitives::PACKED_PER_ROW_KERNEL
+            || multi_row.selection_reason.trim().is_empty()
+            || !crate::primitives::packed_kernel_path_valid(
+                &profile.gpu_family,
+                &multi_row.kernel,
+                &multi_row.selection,
+                &multi_row.query_dtype,
+            )
+        {
+            return Err("SC-20676 multi-row kernel disagrees with its selection".into());
+        }
+    }
+    for evidence in [arm.packed.as_ref(), arm.warm_packed.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let attributed = evidence.kernel_paths.iter().all(|path| {
+            path.calls != 0
+                && !path.reason.trim().is_empty()
+                && crate::primitives::packed_kernel_path_valid(
+                    &profile.gpu_family,
+                    &path.kernel,
+                    &path.selection,
+                    &path.query_dtype,
+                )
+        });
+        if !attributed
+            || evidence
+                .kernel_paths
+                .iter()
+                .map(|path| path.calls)
+                .sum::<u64>()
+                != evidence.accepted_direct_calls as u64
+        {
+            return Err(
+                "SC-20676 packed dispatches are not attributed to valid kernel paths".into(),
+            );
+        }
+    }
     let expected_values_per_thread = profile.head_dimension.checked_div(32).unwrap_or(0);
     if profile.metal_device != arm.provenance.metal_device
         || profile.gpu_family != "conservative-unknown-apple"
@@ -1783,7 +1831,7 @@ pub fn run_sc20676_worker(
     let tuning = kernel
         .tuning_profile(head_dimension)
         .ok_or("SC-20676 packed kernel has no tuning profile for the model head dimension")?;
-    let kernel_profile = Sc20676KernelProfile {
+    let mut kernel_profile = Sc20676KernelProfile {
         metal_device: provenance.metal_device.clone(),
         gpu_family: tuning.gpu_family.into(),
         qualification: "conservative-default".into(),
@@ -1795,25 +1843,13 @@ pub fn run_sc20676_worker(
             .map_err(|_| "SC-20676 SIMD-group count does not fit u64")?,
         values_per_thread: u64::try_from(tuning.values_per_thread)
             .map_err(|_| "SC-20676 values-per-thread count does not fit u64")?,
-        // The longest step this run issues is the whole prompt; decode steps are one row. Queries
-        // carry the pinned model's BF16 activations (its loader input dtype).
-        multi_row: kernel
-            .kernel_descriptor(ids.len(), head_dimension, mlx_rs::Dtype::Bfloat16)
-            .filter(|_| kernel.selects_tiled(ids.len(), head_dimension))
-            .map(|descriptor| Sc20676MultiRowKernel {
-                kernel: descriptor.kernel.into(),
-                selection: descriptor.selection.into(),
-                min_query_tokens: crate::primitives::packed_tiled_min_query_tokens(head_dimension)
-                    as u64,
-                threads: descriptor.threads as u64,
-                simd_groups: descriptor.simd_groups as u64,
-                kv_block_tokens: descriptor.kv_block_tokens as u64,
-                threadgroup_barriers_per_kv_block: descriptor.threadgroup_barriers_per_kv_block
-                    as u64,
-            }),
+        // Filled from the prefill's recorded dispatch (below): the path actually taken at the
+        // dispatched query dtype, never a planned one.
+        multi_row: None,
     };
     #[allow(clippy::arc_with_non_send_sync)]
-    let retained = CompiledKernelHandle::new(Arc::new(kernel));
+    let kernel = Arc::new(kernel);
+    let retained = CompiledKernelHandle::new(kernel.clone());
     let (route, mut cache) = packed_cache(&model, retained.clone(), ids.len(), false);
     if route != CacheRoute::ExperimentalPacked {
         return Err(format!("packed selection refused real request: {route:?}"));
@@ -1824,6 +1860,44 @@ pub fn run_sc20676_worker(
     let packed_prefill = model
         .packed_cache_evidence(cache.as_ref())
         .ok_or("packed cache did not expose model evidence")?;
+    // The prompt is the longest step this run issues; its recorded multi-row path (if any) names
+    // the kernel, selection, and real dispatched query dtype.
+    kernel_profile.multi_row = packed_prefill
+        .kernel_paths
+        .iter()
+        .find(|path| path.kernel != crate::primitives::PACKED_PER_ROW_KERNEL)
+        .map(|path| {
+            let dtype = [
+                mlx_rs::Dtype::Float32,
+                mlx_rs::Dtype::Float16,
+                mlx_rs::Dtype::Bfloat16,
+            ]
+            .into_iter()
+            .find(|dtype| {
+                crate::primitives::packed_query_dtype_name(*dtype) == Some(&path.query_dtype)
+            })
+            .ok_or("SC-20676 multi-row path recorded an unknown query dtype")?;
+            let descriptor = kernel
+                .kernel_descriptor(ids.len(), head_dimension, dtype)
+                .ok_or("SC-20676 multi-row path has no kernel descriptor")?;
+            if descriptor.kernel != path.kernel || descriptor.selection != path.selection {
+                return Err("SC-20676 recorded multi-row path disagrees with its descriptor");
+            }
+            Ok(Sc20676MultiRowKernel {
+                kernel: path.kernel.clone(),
+                selection: path.selection.clone(),
+                selection_reason: path.reason.clone(),
+                query_dtype: path.query_dtype.clone(),
+                min_query_tokens: crate::primitives::packed_tiled_min_query_tokens(head_dimension)
+                    as u64,
+                threads: descriptor.threads as u64,
+                simd_groups: descriptor.simd_groups as u64,
+                kv_block_tokens: descriptor.kv_block_tokens as u64,
+                threadgroup_barriers_per_kv_block: descriptor.threadgroup_barriers_per_kv_block
+                    as u64,
+            })
+        })
+        .transpose()?;
     let packed_logits = to_f32_host(&first_logits).map_err(|e| e.to_string())?;
     let packed_logit_shape = first_logits.shape().to_vec();
     let packed_logit_dtype = format!("{:?}", first_logits.dtype());
@@ -2836,6 +2910,15 @@ mod tests {
             release_verified: true,
         }
     }
+    fn conservative_paths(calls: u64) -> Vec<crate::primitives::PackedKernelPathEvidence> {
+        vec![crate::primitives::PackedKernelPathEvidence {
+            kernel: crate::primitives::PACKED_PER_ROW_KERNEL.into(),
+            selection: crate::primitives::PACKED_SELECTION_CONSERVATIVE.into(),
+            reason: "conservative GPU family never runs the tiled kernels".into(),
+            query_dtype: "bfloat16".into(),
+            calls,
+        }]
+    }
     fn packed_evidence() -> PackedCacheEvidence {
         PackedCacheEvidence {
             representation_identity: "sc-20676-packed-group-affine-v1".into(),
@@ -2843,6 +2926,7 @@ mod tests {
             bits: 2,
             quantization_group_size: 32,
             accepted_direct_calls: 2,
+            kernel_paths: conservative_paths(2),
             compile_jit_attempts: 1,
             kernel_warmed: true,
             cold_dispatches: 1,
@@ -2923,6 +3007,7 @@ mod tests {
             packed: packed.then(packed_evidence),
             warm_packed: packed.then_some(PackedCacheEvidence {
                 accepted_direct_calls: 2,
+                kernel_paths: conservative_paths(2),
                 kernel_warmed: true,
                 steady_dispatches: 1,
                 steady_elapsed_ms: 1.0,
@@ -3502,7 +3587,9 @@ mod tests {
             .unwrap()
             .multi_row = Some(Sc20676MultiRowKernel {
             kernel: "sc20676_tiled_multi_row_simdgroup_matrix".into(),
-            selection: String::new(),
+            selection: "nax-unavailable".into(),
+            selection_reason: "test".into(),
+            query_dtype: "float32".into(),
             min_query_tokens: 16,
             threads: 128,
             simd_groups: 4,
@@ -3510,7 +3597,48 @@ mod tests {
             threadgroup_barriers_per_kv_block: 2,
         });
         reseal_arm(&mut claimed_tiled.packed);
-        assert!(validate_sc20676_receipt_core(&claimed_tiled).is_err());
+        // A tiled kernel is not a path the conservative family can run.
+        assert!(validate_sc20676_receipt_core(&claimed_tiled)
+            .unwrap_err()
+            .contains("multi-row kernel disagrees with its selection"));
+        // The NAX kernel appears only with the NAX selection.
+        let mut nax_without_selection = claimed_tiled.clone();
+        let multi_row = nax_without_selection
+            .packed
+            .kernel_profile
+            .as_mut()
+            .unwrap()
+            .multi_row
+            .as_mut()
+            .unwrap();
+        multi_row.kernel = crate::primitives::PACKED_NAX_KERNEL.into();
+        multi_row.query_dtype = "bfloat16".into();
+        reseal_arm(&mut nax_without_selection.packed);
+        assert!(validate_sc20676_receipt_core(&nax_without_selection)
+            .unwrap_err()
+            .contains("multi-row kernel disagrees with its selection"));
+        // Every accepted dispatch is attributed to a path this family can run.
+        let paths_rejected = "not attributed to valid kernel paths";
+        let mut nax_dispatch = valid.clone();
+        let path = &mut nax_dispatch.packed.packed.as_mut().unwrap().kernel_paths[0];
+        path.kernel = crate::primitives::PACKED_NAX_KERNEL.into();
+        path.selection = crate::primitives::PACKED_SELECTION_NAX.into();
+        reseal_arm(&mut nax_dispatch.packed);
+        assert!(validate_sc20676_receipt_core(&nax_dispatch)
+            .unwrap_err()
+            .contains(paths_rejected));
+        let mut unattributed = valid.clone();
+        unattributed
+            .packed
+            .warm_packed
+            .as_mut()
+            .unwrap()
+            .kernel_paths[0]
+            .calls = 1;
+        reseal_arm(&mut unattributed.packed);
+        assert!(validate_sc20676_receipt_core(&unattributed)
+            .unwrap_err()
+            .contains(paths_rejected));
 
         let mut wrong_geometry = valid;
         wrong_geometry

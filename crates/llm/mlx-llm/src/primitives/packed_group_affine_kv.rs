@@ -25,7 +25,9 @@ use crate::primitives::kv_cache::{
     CacheRoute, CompressedCacheStorage, ContiguousKvCache, KvCache, PackedAttentionMask,
     PackedCacheEvidence, KV_BLOCK_TOKENS,
 };
-use crate::primitives::packed_metal::{quantize_group_affine_flush, PackedAttentionArgs};
+use crate::primitives::packed_metal::{
+    quantize_group_affine_flush, PackedAttentionArgs, PackedKernelSelection,
+};
 use half::f16;
 use mlx_rs::ops::indexing::{TryIndexMutOp, TryIndexOp};
 use mlx_rs::ops::{add, concatenate_axis, floor_divide, multiply, remainder, zeros_dtype};
@@ -188,6 +190,12 @@ pub trait RetainedPackedKernel: fmt::Debug {
     /// them.  The storage accounting includes this value and never calls it payload bytes.
     fn retained_host_bytes_estimate(&self) -> usize;
     fn dispatch(&self, args: &PackedAttentionArgs<'_>) -> Result<Array>;
+    /// The kernel [`Self::dispatch`] runs for `args` and why, recorded per accepted call so
+    /// receipts name the path actually taken. Readers that cannot report one return `None`, and a
+    /// receipt whose fused calls are not all attributed is refused.
+    fn kernel_selection(&self, _args: &PackedAttentionArgs<'_>) -> Option<PackedKernelSelection> {
+        None
+    }
 }
 
 /// Lifetime-owned, type-erased compiled-kernel slot.  `Arc` keeps the real backend object alive
@@ -350,9 +358,10 @@ impl DecoderCacheSelection {
 }
 
 /// Accepted-dispatch counters restored by a whole-step rollback.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct AcceptedDispatchSnapshot {
     direct_dispatches: usize,
+    kernel_paths: Vec<(PackedKernelSelection, u64)>,
     cold_dispatches: u64,
     steady_dispatches: u64,
     cold_elapsed_ms: f64,
@@ -423,6 +432,9 @@ impl DenseFallbackPackedDecoderCache {
             bits: representation.bits,
             quantization_group_size: representation.group_size,
             accepted_direct_calls: self.staged.direct_dispatches(),
+            kernel_paths: crate::primitives::kv_cache::PackedKernelPathEvidence::sorted(
+                self.staged.kernel_paths(),
+            ),
             full_cache_dequantizations: self.staged.full_cache_dequantizations(),
             dispatch_attempts: telemetry.dispatch_attempts,
             failed_dispatches: telemetry.failed_dispatches,
@@ -2148,6 +2160,8 @@ pub struct PackedGroupAffineKvCache {
     /// dense reconstruction performed by a caller.
     direct_dispatches: usize,
     full_cache_dequantizations: usize,
+    /// Accepted calls per reported kernel path (transactional with `direct_dispatches`).
+    kernel_paths: Vec<(PackedKernelSelection, u64)>,
     telemetry: PackedDispatchTelemetry,
 }
 
@@ -2180,6 +2194,7 @@ impl PackedGroupAffineKvCache {
             handle: None,
             direct_dispatches: 0,
             full_cache_dequantizations: 0,
+            kernel_paths: Vec::new(),
             telemetry: PackedDispatchTelemetry::default(),
         })
     }
@@ -3178,15 +3193,14 @@ impl PackedGroupAffineKvCache {
         if !was_warmed {
             self.telemetry.compile_jit_attempts += 1;
         }
-        let result = handle
-            .inner
-            .dispatch(&device.args(query, mask))
-            .and_then(|output| {
-                if evaluate || !was_warmed {
-                    output.eval()?;
-                }
-                Ok(output)
-            });
+        let args = device.args(query, mask);
+        let selection = handle.inner.kernel_selection(&args);
+        let result = handle.inner.dispatch(&args).and_then(|output| {
+            if evaluate || !was_warmed {
+                output.eval()?;
+            }
+            Ok(output)
+        });
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.telemetry.attempted_elapsed_ms += elapsed_ms;
         let output = match result {
@@ -3215,6 +3229,16 @@ impl PackedGroupAffineKvCache {
             "accepted fused packed dispatch must not reconstruct the full cache"
         );
         self.direct_dispatches += 1;
+        if let Some(selection) = selection {
+            match self
+                .kernel_paths
+                .iter_mut()
+                .find(|(recorded, _)| *recorded == selection)
+            {
+                Some((_, calls)) => *calls += 1,
+                None => self.kernel_paths.push((selection, 1)),
+            }
+        }
         self.telemetry.accepted_uploaded_packed_bytes = self
             .telemetry
             .accepted_uploaded_packed_bytes
@@ -3232,6 +3256,10 @@ impl PackedGroupAffineKvCache {
     pub fn direct_dispatches(&self) -> usize {
         self.direct_dispatches
     }
+    /// Accepted calls per kernel path the reader reported, in first-use order.
+    pub fn kernel_paths(&self) -> &[(PackedKernelSelection, u64)] {
+        &self.kernel_paths
+    }
     pub fn full_cache_dequantizations(&self) -> usize {
         self.full_cache_dequantizations
     }
@@ -3244,6 +3272,7 @@ impl PackedGroupAffineKvCache {
     fn accepted_dispatch_snapshot(&self) -> AcceptedDispatchSnapshot {
         AcceptedDispatchSnapshot {
             direct_dispatches: self.direct_dispatches,
+            kernel_paths: self.kernel_paths.clone(),
             cold_dispatches: self.telemetry.cold_dispatches,
             steady_dispatches: self.telemetry.steady_dispatches,
             cold_elapsed_ms: self.telemetry.cold_elapsed_ms,
@@ -3253,6 +3282,7 @@ impl PackedGroupAffineKvCache {
     }
     fn restore_accepted_dispatch(&mut self, snapshot: AcceptedDispatchSnapshot) {
         self.direct_dispatches = snapshot.direct_dispatches;
+        self.kernel_paths = snapshot.kernel_paths;
         self.telemetry.cold_dispatches = snapshot.cold_dispatches;
         self.telemetry.steady_dispatches = snapshot.steady_dispatches;
         self.telemetry.cold_elapsed_ms = snapshot.cold_elapsed_ms;
@@ -3601,6 +3631,17 @@ mod tests {
                 return Err(Error::Msg("injected packed dispatch fault".into()));
             }
             Ok(args.query.clone())
+        }
+        fn kernel_selection(
+            &self,
+            _args: &PackedAttentionArgs<'_>,
+        ) -> Option<PackedKernelSelection> {
+            Some(PackedKernelSelection {
+                kernel: crate::primitives::PACKED_PER_ROW_KERNEL,
+                selection: crate::primitives::PACKED_SELECTION_BELOW_MULTI_ROW,
+                reason: "test reader",
+                query_dtype: "float32",
+            })
         }
     }
 
@@ -4285,6 +4326,9 @@ mod tests {
         let prior_devices = packed.staged.device_layers.clone();
         let prior_accepted = packed.staged.accepted_dispatch_snapshot();
         let prior_physical = packed.staged.dispatch_telemetry();
+        // Kernel paths are accepted-call evidence: one per layer so far, restored with the step.
+        assert_eq!(prior_accepted.kernel_paths.len(), 1);
+        assert_eq!(prior_accepted.kernel_paths[0].1, 2);
 
         assert!(packed
             .try_packed_attention(
@@ -6477,21 +6521,23 @@ mod tests {
     /// residual tails (the pending K group) beside packed groups, causal rows offset to the end of
     /// the KV range, GQA 1–3, sliding windows, `None` masks, the host-mirror layout
     /// (`value_packed != key_packed`), D = 64/128, bf16 and f16 queries, and forced KV split counts
-    /// (partial + reduction), each agreeing with the single pass. D = 256 and f32 queries are
-    /// routed to the fp32 tiled kernel with the recorded reason. Skipped (with the reason) where
-    /// MLX reports no Neural Accelerator.
+    /// (partial + reduction), each agreeing with the single pass. Each case also matches the fp32
+    /// tiled kernel over the same inputs at 2e-2 (relative above 1), a bound a one-token mask or
+    /// offset error in short rows exceeds. D = 256 and f32 queries are routed to the fp32 tiled
+    /// kernel with the recorded reason. Requires a Neural-Accelerator Mac (ignored elsewhere).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "requires a Neural-Accelerator Mac (mlx::core::metal::is_nax_available()); run with --ignored"]
     fn nax_tiled_reader_matches_independent_fp32_oracle_for_multi_row_steps() {
         use crate::primitives::packed_attention::PackedAttentionShape;
         use crate::primitives::packed_metal::{
             mlx_nax_available, PackedKernelPath, PackedMask, PackedMetalGpuFamily,
             PackedMetalKernel,
         };
-        if !mlx_nax_available() {
-            eprintln!("skipped: mlx::core::metal::is_nax_available() is false on this host");
-            return;
-        }
+        assert!(
+            mlx_nax_available().unwrap(),
+            "mlx::core::metal::is_nax_available() is false on this host"
+        );
         let cases = [
             (
                 Dtype::Bfloat16,
@@ -6683,9 +6729,29 @@ mod tests {
                     assert!((actual - expected).abs() <= tolerance / 4.0);
                 }
             }
-            maxima.push((index, dtype, width, query_len, case_abs, case_rel));
+            // Same inputs through the fp32 tiled kernel: both read the identical representation, so
+            // they differ only by 16-bit tile rounding and output rounding.
+            let tiled = host_readback::<f32>(
+                &kernel
+                    .dispatch_tiled(&args, None)
+                    .unwrap()
+                    .as_dtype(Dtype::Float32)
+                    .unwrap(),
+            );
+            let mut case_tiled = 0.0f32;
+            for (i, (nax, tiled)) in single.as_ref().unwrap().iter().zip(&tiled).enumerate() {
+                let error = (nax - tiled).abs() / tiled.abs().max(1.0);
+                case_tiled = case_tiled.max(error);
+                assert!(
+                    error <= 2e-2,
+                    "case {index} element {i}: NAX {nax} != tiled {tiled}"
+                );
+            }
+            maxima.push((
+                index, dtype, width, query_len, case_abs, case_rel, case_tiled,
+            ));
         }
-        eprintln!("NAX parity (case, dtype, D, S_q, max abs, max rel): {maxima:?}");
+        eprintln!("NAX parity (case, dtype, D, S_q, max abs, max rel, max vs tiled): {maxima:?}");
 
         // D = 256 and f32 queries keep the fp32 tiled kernel, with the recorded reason.
         for (width, dtype) in [(256, Dtype::Bfloat16), (128, Dtype::Float32)] {
@@ -6696,7 +6762,8 @@ mod tests {
                 descriptor.kernel,
                 "sc20676_tiled_multi_row_simdgroup_matrix"
             );
-            assert_eq!(descriptor.selection, selection.reason);
+            assert_eq!(descriptor.selection, selection.selection);
+            assert_eq!(descriptor.selection_reason, selection.reason);
             let mut cache = device_cache(1, 1, width);
             let kv = bhsd(
                 &pseudo_random_outliers(1, 1, 80, width, 3)
@@ -6742,7 +6809,7 @@ mod tests {
         assert_eq!(packed_tiled_min_query_tokens(64), 16);
         assert_eq!(packed_tiled_min_query_tokens(128), 16);
         assert_eq!(packed_tiled_min_query_tokens(256), 32);
-        let nax = mlx_nax_available();
+        let nax = mlx_nax_available().unwrap();
         let conservative = PackedMetalKernel::for_identity("route").unwrap();
         assert!(!conservative.nax_available());
         let recent = PackedMetalKernel::for_identity_and_family(
@@ -6816,12 +6883,34 @@ mod tests {
                     let descriptor = kernel.kernel_descriptor(query_len, width, dtype).unwrap();
                     assert_eq!(descriptor.kernel, expected, "{context}");
                     if multi_row {
+                        let nax_selection = kernel.nax_selection(width, dtype);
+                        assert_eq!(descriptor.selection, nax_selection.selection, "{context}");
                         assert_eq!(
-                            descriptor.selection,
-                            kernel.nax_selection(width, dtype).reason,
+                            descriptor.selection_reason, nax_selection.reason,
                             "{context}"
                         );
                     }
+                    // The dispatch-time selection the cache records is this descriptor's.
+                    let recorded = kernel.kernel_selection(&args).unwrap();
+                    assert_eq!(
+                        (recorded.kernel, recorded.selection, recorded.reason),
+                        (
+                            descriptor.kernel,
+                            descriptor.selection,
+                            descriptor.selection_reason
+                        ),
+                        "{context}"
+                    );
+                    assert_eq!(
+                        Some(recorded.query_dtype),
+                        crate::primitives::packed_query_dtype_name(dtype)
+                    );
+                    assert!(crate::primitives::packed_kernel_path_valid(
+                        kernel.gpu_family().as_str(),
+                        recorded.kernel,
+                        recorded.selection,
+                        recorded.query_dtype
+                    ));
                     let readback = |array: Array| {
                         host_readback::<f32>(&array.as_dtype(Dtype::Float32).unwrap())
                     };
@@ -6864,6 +6953,7 @@ mod tests {
             PackedMetalKernel,
         };
         let (heads, query_heads, width) = (2, 6, 128);
+        let nax = mlx_nax_available().unwrap();
         for (dtype, tolerance) in [(Dtype::Float32, 1e-4), (Dtype::Bfloat16, 8e-2)] {
             let kernel = Arc::new(
                 PackedMetalKernel::for_identity_and_family(
@@ -6964,14 +7054,10 @@ mod tests {
                 let staged = packed.staged.staged_reader_arguments(0).unwrap();
                 let args = staged.args(&query, PackedMask::Causal);
                 let direct = match kernel.planned_path(&args).unwrap() {
-                    PackedKernelPath::NaxTiled { splits }
-                        if dtype == Dtype::Bfloat16 && mlx_nax_available() =>
-                    {
+                    PackedKernelPath::NaxTiled { splits } if dtype == Dtype::Bfloat16 && nax => {
                         kernel.dispatch_nax(&args, Some(splits)).unwrap()
                     }
-                    PackedKernelPath::Tiled { splits }
-                        if dtype == Dtype::Float32 || !mlx_nax_available() =>
-                    {
+                    PackedKernelPath::Tiled { splits } if dtype == Dtype::Float32 || !nax => {
                         kernel.dispatch_tiled(&args, Some(splits)).unwrap()
                     }
                     path => panic!("{dtype:?} chunk {chunk} of {rows} rows planned {path:?}"),
@@ -6984,6 +7070,42 @@ mod tests {
             }
             let evidence = cache.packed_evidence().unwrap();
             assert_eq!(evidence.accepted_direct_calls, 2);
+            // Both packed chunks are recorded under the path they actually ran.
+            let (kernel, selection, query_dtype) = match (dtype, nax) {
+                (Dtype::Bfloat16, true) => (
+                    crate::primitives::PACKED_NAX_KERNEL,
+                    crate::primitives::PACKED_SELECTION_NAX,
+                    "bfloat16",
+                ),
+                (Dtype::Bfloat16, false) => (
+                    crate::primitives::PACKED_TILED_KERNEL,
+                    crate::primitives::PACKED_SELECTION_NAX_UNAVAILABLE,
+                    "bfloat16",
+                ),
+                _ => (
+                    crate::primitives::PACKED_TILED_KERNEL,
+                    if nax {
+                        crate::primitives::PACKED_SELECTION_F32_QUERY
+                    } else {
+                        crate::primitives::PACKED_SELECTION_NAX_UNAVAILABLE
+                    },
+                    "float32",
+                ),
+            };
+            assert_eq!(
+                evidence
+                    .kernel_paths
+                    .iter()
+                    .map(|path| (
+                        path.kernel.as_str(),
+                        path.selection.as_str(),
+                        path.query_dtype.as_str(),
+                        path.calls
+                    ))
+                    .collect::<Vec<_>>(),
+                vec![(kernel, selection, query_dtype, 2)],
+                "{dtype:?}"
+            );
             assert_eq!(evidence.full_cache_dequantizations, 0);
             assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
         }
