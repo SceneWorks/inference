@@ -14,7 +14,7 @@ macos="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
 build="$(sw_vers -buildVersion 2>/dev/null || echo unknown)"
 model="$(sysctl -n hw.model 2>/dev/null || echo unknown)"
 page="$(sysctl -n hw.pagesize)"
-free_gib="$(free_spec_gib)"
+free_gib="$(available_gib)" || free_gib=0
 vm="$(vm_stat)"
 pages() { printf '%s\n' "$vm" | awk -v k="$1" 'index($0, k) == 1 {gsub("\\.","",$NF); print $NF+0}'; }
 inactive_gib=$(( $(pages "Pages inactive") * page / 1073741824 ))
@@ -58,7 +58,7 @@ row "chip" "$(code "$chip") ($(code "$model"))"
 row "hw.memsize" "$(( memsize / 1073741824 )) GiB ($memsize bytes)"
 row "macOS" "$(code "$macos ($build)")"
 row "NAX" "$nax"
-row "free+speculative RAM" "${free_gib} GiB (precheck needs >= 84)"
+row "available RAM" "${free_gib} GiB (free + speculative + purgeable + reclaimable file cache; precheck needs >= 84)"
 row "inactive / purgeable / compressed" "${inactive_gib} / ${purgeable_gib} / ${compressed_gib} GiB"
 row "LM Studio" "$(code "$LMS_STATE")"
 row "GPU/build processes" "$(code "${busy:-none}")"

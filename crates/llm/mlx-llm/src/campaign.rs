@@ -807,12 +807,17 @@ pub struct ReceiptAdmission {
     pub child_footprint_cap_bytes: u64,
     pub host_free_reserve_bytes: u64,
     pub static_footprint_floor_bytes: u64,
+    /// Every vm_stat component of the pre-spawn host measurement the row was admitted (or
+    /// refused) on. Absent only from a parent-side static admission computed before any
+    /// measurement; a receipt requires it (see [`Self::validate_admitted`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_components: Option<campaign_supervisor::HostMemory>,
 }
 
 impl ReceiptAdmission {
     /// The recorded cap and reserve must be the captured campaign policy's, not caller values.
     pub fn validate_against(&self, policy: &CampaignSafetyPolicy) -> Result<(), String> {
-        self.validate()?;
+        self.validate_admitted()?;
         if self.child_footprint_cap_bytes != policy.child_footprint_cap_bytes
             || self.host_free_reserve_bytes != policy.host_free_reserve_bytes
         {
@@ -834,7 +839,28 @@ impl ReceiptAdmission {
         {
             return Err("row admission is not a runtime-guarded cap with its estimate".into());
         }
+        if let Some(host) = &self.host_memory_components {
+            host.validate()?;
+        }
         Ok(())
+    }
+
+    /// A receipt's admission: the row ran, so its recorded host measurement must exist,
+    /// recompute, and cover cap plus reserve.
+    pub fn validate_admitted(&self) -> Result<(), String> {
+        self.validate()?;
+        self.host_memory_components
+            .as_ref()
+            .ok_or("row admission lacks its host memory components")?
+            .validate_admits(self.host_free_reserve_bytes, self.child_footprint_cap_bytes)
+    }
+
+    /// The same admission with the supervisor's pre-spawn measurement (for unaccepted records).
+    pub fn with_host_memory(&self, host: Option<campaign_supervisor::HostMemory>) -> Self {
+        Self {
+            host_memory_components: host,
+            ..self.clone()
+        }
     }
 }
 
@@ -842,8 +868,9 @@ impl ReceiptAdmission {
 /// unobtainable for lazy long-context graphs. The row is admitted only when the mandatory policy
 /// configures every supervisor guard (deadline, sampling, termination grace, host RAM reserve,
 /// child `phys_footprint` watchdog cap) and the conservative static floor still fits under the
-/// cap. The supervisor then refuses before spawn unless host free RAM covers cap plus reserve, and
-/// terminates the child if the watchdog trips; neither outcome is ever an accepted row.
+/// cap. The supervisor then refuses before spawn unless host available RAM
+/// ([`campaign_supervisor::HostMemory`]) covers cap plus reserve, and terminates the child if the
+/// watchdog trips; neither outcome is ever an accepted row.
 pub(crate) fn runtime_guarded_admission(
     policy: &CampaignSafetyPolicy,
     static_footprint_floor_bytes: u64,
@@ -854,8 +881,25 @@ pub(crate) fn runtime_guarded_admission(
         child_footprint_cap_bytes: policy.child_footprint_cap_bytes,
         host_free_reserve_bytes: policy.host_free_reserve_bytes,
         static_footprint_floor_bytes,
+        host_memory_components: None,
     };
     admission.validate()?;
+    Ok(admission)
+}
+
+/// Worker side: the runtime-guarded admission plus the host measurement its supervisor admitted
+/// it on (handed over in [`campaign_supervisor::HOST_MEMORY_ADMISSION_ENV`]), so the worker's own
+/// receipt records every component of the decision.
+pub(crate) fn supervised_admission(
+    policy: &CampaignSafetyPolicy,
+    static_footprint_floor_bytes: u64,
+) -> Result<ReceiptAdmission, String> {
+    let admission = runtime_guarded_admission(policy, static_footprint_floor_bytes)?
+        .with_host_memory(Some(campaign_supervisor::admitted_host_memory(
+            policy.host_free_reserve_bytes,
+            policy.child_footprint_cap_bytes,
+        )?));
+    admission.validate_admitted()?;
     Ok(admission)
 }
 
@@ -2314,7 +2358,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("explicit full-cache temporary detected".into());
     }
-    receipt.memory.admission.validate()?;
+    receipt.memory.admission.validate_admitted()?;
     let weights = receipt.memory.model_weights_bytes;
     let kv = receipt.memory.persistent_kv_bytes;
     let sample_for = |phase: &str| {
@@ -4557,7 +4601,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                         &unaccepted,
                         "sc-20671-unaccepted-row",
                         &slug,
-                        &admission,
+                        &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
                         (&reason, &failure.detail, failure.pid),
                         format!(
                             "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
@@ -4820,7 +4864,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 &prompt,
                 &policy,
             )?;
-            let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
+            let admission = supervised_admission(&policy, static_footprint_floor)?;
             // Compressed rows: the measured arm holds KV in the method's compressed cache, and its
             // quality denominator is the dense-KV run on the SAME candidate weights.
             let candidate_session = match compressed {
@@ -9551,6 +9595,7 @@ pub(crate) mod tests {
                 child_footprint_cap_bytes: 2_048,
                 host_free_reserve_bytes: 1_024,
                 static_footprint_floor_bytes: 1_000,
+                host_memory_components: None,
             }
         );
         // Refused without guards, or when the conservative floor already exceeds the cap.
@@ -9581,8 +9626,11 @@ pub(crate) mod tests {
             child: u64,
         }
         impl campaign_supervisor::MemoryProbe for Host {
-            fn host_free_bytes(&mut self, _: std::time::Instant) -> std::io::Result<u64> {
-                Ok(self.free)
+            fn host_memory(
+                &mut self,
+                _: std::time::Instant,
+            ) -> std::io::Result<campaign_supervisor::HostMemory> {
+                Ok(campaign_supervisor::HostMemory::from_pages(1, self.free, 0, 0, 0, 0).unwrap())
             }
             fn child_footprint_bytes(
                 &mut self,
@@ -9605,7 +9653,7 @@ pub(crate) mod tests {
                 &path,
                 "sc-20671-unaccepted-row",
                 name,
-                &admission,
+                &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
                 (
                     &format!("{:?}", failure.reason),
                     &failure.detail,
@@ -9635,6 +9683,11 @@ pub(crate) mod tests {
         assert_eq!(refused["outcome"], "refused");
         assert_eq!(refused["admission"]["childFootprintCapBytes"], 2_048);
         assert_eq!(refused["admission"]["staticFootprintFloorBytes"], 1_000);
+        // The refusal records the measurement it was refused on.
+        assert_eq!(
+            refused["admission"]["hostMemoryComponents"]["availableBytes"],
+            2_048 + 1_024 - 1
+        );
         // A watchdog trip after spawn is an aborted row, never an accepted one.
         let aborted = campaign_supervisor::run_guarded(
             Command::new("/bin/sleep").arg("5"),
@@ -10113,6 +10166,9 @@ pub(crate) mod tests {
                     child_footprint_cap_bytes: 1 << 30,
                     host_free_reserve_bytes: 1 << 30,
                     static_footprint_floor_bytes: 1 << 20,
+                    host_memory_components: campaign_supervisor::HostMemory::from_pages(
+                        16_384, 200_000, 4_000, 100, 90_000, 60_000,
+                    ),
                 },
             },
             timings: ReceiptTimings {
@@ -11321,6 +11377,29 @@ pub(crate) mod tests {
             .static_footprint_floor_bytes =
             over_cap_estimate.memory.admission.child_footprint_cap_bytes + 1;
         assert!(validate_receipt_semantics(&over_cap_estimate).is_err());
+        // A receipt must carry a host measurement that recomputes and covers cap plus reserve.
+        let mut unmeasured = receipt.clone();
+        unmeasured.memory.admission.host_memory_components = None;
+        assert!(validate_receipt_semantics(&unmeasured)
+            .unwrap_err()
+            .contains("host memory components"));
+        let mut tampered_host = receipt.clone();
+        tampered_host
+            .memory
+            .admission
+            .host_memory_components
+            .as_mut()
+            .unwrap()
+            .reclaimable_file_pages = 90_000;
+        assert!(validate_receipt_semantics(&tampered_host)
+            .unwrap_err()
+            .contains("recompute"));
+        let mut short_host = receipt.clone();
+        short_host.memory.admission.host_memory_components =
+            campaign_supervisor::HostMemory::from_pages(16_384, 100_000, 0, 0, 0, 0);
+        assert!(validate_receipt_semantics(&short_host)
+            .unwrap_err()
+            .contains("below reserve plus child cap"));
         // Artifacts: the compressed denominator is bound to the candidate's own inventory.
         let binding = |receipt: &Receipt, reference_inventory: &str| {
             let arm = |inventory: &str, session: &str| {

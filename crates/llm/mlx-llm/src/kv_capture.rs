@@ -650,7 +650,7 @@ fn parent(args: &[String]) -> Result<(), String> {
             &unaccepted,
             "sc-20677-unaccepted-capture",
             "capture",
-            &admission,
+            &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
             (&reason, &failure.detail, failure.pid),
             format!(
                 "capture worker stopped ({reason}): {}; child {:?} reaped; partial output {}",
@@ -698,6 +698,11 @@ fn worker(args: &[String]) -> Result<(), String> {
     if policy.seal()? != flag(args, "--policy-sha256")? {
         return Err("worker safety policy seal differs from the parent's".into());
     }
+    // The supervisor's pre-spawn host measurement travels with the sealed capture metadata.
+    let admitted_host = campaign_supervisor::admitted_host_memory(
+        policy.host_free_reserve_bytes,
+        policy.child_footprint_cap_bytes,
+    )?;
     let snapshot = PathBuf::from(flag(args, "--snapshot")?);
     let out = PathBuf::from(flag(args, "--out")?);
     let prompt_path = PathBuf::from(flag(args, "--prompt-file")?);
@@ -756,6 +761,10 @@ fn worker(args: &[String]) -> Result<(), String> {
         ("tokens".to_string(), tokens.to_string()),
         ("tokenization".to_string(), TOKENIZATION.to_string()),
         ("inferenceRevision".to_string(), inference_revision),
+        (
+            "hostMemoryAdmission".to_string(),
+            serde_json::to_string(&admitted_host).map_err(|e| e.to_string())?,
+        ),
     ]);
     let capture = capture_decode_step(model, &ids, &layers)?;
     let files = write_capture(capture, &out, &base)?;

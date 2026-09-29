@@ -134,7 +134,39 @@ def _bounded_output(argv: list[str], *, timeout: float = 2.0) -> str:
         raise SupervisionError("probe-failure", f"{argv[0]} output is not ASCII") from error
 
 
+DARWIN_AVAILABLE_METRIC = "darwin-vm-stat-available-v1"
+_DARWIN_COUNTERS = {
+    "Pages free": "freePages", "Pages speculative": "speculativePages",
+    "Pages purgeable": "purgeablePages", "Pages inactive": "inactivePages",
+    "File-backed pages": "fileBackedPages",
+}
+
+
+def _darwin_pages(output: str) -> tuple[int, dict[str, int]]:
+    first = output.splitlines()[0] if output else ""
+    match = re.search(r"page size of (\d+) bytes", first)
+    if not match or int(match.group(1)) < 4096 or int(match.group(1)) & (int(match.group(1)) - 1):
+        raise SupervisionError("probe-failure", "vm_stat page size is invalid")
+    page_size = int(match.group(1))
+    pages = {}
+    for line in output.splitlines()[1:]:
+        key = line.strip().split(":", 1)[0]
+        if key not in _DARWIN_COUNTERS:
+            continue
+        match = re.fullmatch(r"[^:]+:\s*(\d+)\.", line.strip())
+        if not match:
+            raise SupervisionError("probe-failure", f"vm_stat {key} is malformed")
+        if _DARWIN_COUNTERS[key] in pages:
+            raise SupervisionError("probe-failure", "duplicate vm_stat counter")
+        pages[_DARWIN_COUNTERS[key]] = int(match.group(1))
+    if set(pages) != set(_DARWIN_COUNTERS.values()):
+        raise SupervisionError("probe-failure", "vm_stat lacks a host-memory counter")
+    return page_size, pages
+
+
 def darwin_free_bytes(output: str) -> int:
+    """Free plus speculative pages: the runtime watchdog's measure (admission uses
+    darwin_available)."""
     first = output.splitlines()[0] if output else ""
     match = re.search(r"page size of (\d+) bytes", first)
     if not match or int(match.group(1)) < 4096 or int(match.group(1)) & (int(match.group(1)) - 1):
@@ -150,6 +182,49 @@ def darwin_free_bytes(output: str) -> int:
     if set(pages) != {"Pages free", "Pages speculative"}:
         raise SupervisionError("probe-failure", "vm_stat lacks free or speculative pages")
     return (pages["Pages free"] + pages["Pages speculative"]) * page_size
+
+
+def darwin_host_memory(page_size: int, pages: dict[str, int]) -> dict[str, object]:
+    """The macOS admission metric, with every component it was computed from.
+
+    availableBytes = (free + speculative + purgeable + reclaimable file cache) * page size, where
+    the file cache credit is min(inactive - purgeable, file-backed - speculative), each floored
+    at zero. vm_stat's counters partition as: free and speculative are disjoint lists (vm_stat
+    prints kernel free_count minus speculative); File-backed + Anonymous = active + inactive +
+    speculative + throttled, so speculative read-ahead is inside File-backed and is removed before
+    the credit; purgeable (volatile) pages are anonymous and may sit on the inactive list, so they
+    are removed from inactive. The min is an upper bound on inactive-and-file-backed pages -- the
+    clean cache the pageout daemon frees without the compressor or swap -- so file-backed pages
+    on the active list (mapped, in use) are never credited beyond the inactive list's size.
+    Mirrors the Rust `campaign_supervisor::HostMemory` and `.github/kv-poc/common.sh`; all three
+    are pinned by crates/llm/mlx-llm/testdata/darwin-host-memory-cases.json.
+    """
+    reclaimable = min(max(0, pages["inactivePages"] - pages["purgeablePages"]),
+                      max(0, pages["fileBackedPages"] - pages["speculativePages"]))
+    available = (pages["freePages"] + pages["speculativePages"] + pages["purgeablePages"]
+                 + reclaimable) * page_size
+    if available >= 2**63:
+        raise SupervisionError("probe-failure", "vm_stat available bytes overflow")
+    return {"metric": DARWIN_AVAILABLE_METRIC, "pageSizeBytes": page_size, **pages,
+            "reclaimableFilePages": reclaimable, "availableBytes": available}
+
+
+def darwin_available(output: str) -> dict[str, object]:
+    return darwin_host_memory(*_darwin_pages(output))
+
+
+def validate_host_memory(value: object) -> dict[str, object]:
+    """A recorded darwin measurement must name the metric and recompute exactly from its
+    components. Sufficiency is not re-judged: a refused row records its short measurement too."""
+    keys = {"metric", "pageSizeBytes", *_DARWIN_COUNTERS.values(), "reclaimableFilePages", "availableBytes"}
+    if (not isinstance(value, dict) or set(value) != keys or value["metric"] != DARWIN_AVAILABLE_METRIC
+            or any(type(value[key]) is not int or value[key] < 0 for key in keys - {"metric"})
+            or value["pageSizeBytes"] < 4096 or value["pageSizeBytes"] & (value["pageSizeBytes"] - 1)):
+        raise SupervisionError("invalid-admission", "host memory components are malformed")
+    pages = {key: value[key] for key in _DARWIN_COUNTERS.values()}
+    if darwin_host_memory(value["pageSizeBytes"], pages) != value:
+        raise SupervisionError("invalid-admission", "host memory components do not recompute")
+    return value
 
 
 def darwin_footprint_bytes(output: str) -> int:
@@ -219,6 +294,13 @@ class SystemProbe:
             self._smi = windows.trusted_nvidia_smi() if actual == "windows-cuda" else "nvidia-smi"
         except windows.WindowsJobError as error:
             raise SupervisionError("probe-failure", str(error)) from error
+
+    def host_admission(self) -> tuple[int, dict[str, object] | None]:
+        """Pre-spawn host measure and, on macOS, the components it was computed from."""
+        if self.policy.backend == "darwin-mlx":
+            host = darwin_available(_bounded_output(["/usr/bin/vm_stat"]))
+            return int(host["availableBytes"]), host
+        return self.host_free(), None
 
     def host_free(self) -> int:
         if self.policy.backend == "darwin-mlx":
@@ -415,6 +497,10 @@ def validate_admission(value: object, *, policy_sha256: str) -> dict[str, object
             or not _positive(value.get("gpuFreeReserveBytes"))
             or not _positive(value.get("childGpuCapBytes"))):
         raise SupervisionError("invalid-admission", "CUDA admission lacks its device guards")
+    if value["backend"] == "darwin-mlx":
+        validate_host_memory(value.get("hostMemoryComponents"))
+    elif "hostMemoryComponents" in value:
+        raise SupervisionError("invalid-admission", "only a macOS admission records vm_stat components")
     for key, cap in (("staticFloorHostBytes", "childFootprintCapBytes"),
                      ("staticFloorGpuBytes", "childGpuCapBytes")):
         floor = value.get(key)
@@ -581,9 +667,14 @@ def _run_admitted(
         raise SupervisionError("invalid-log", "bounded log paths must be distinct and fresh")
     probe = probe if probe is not None else SystemProbe(policy)
     started = clock()
-    host_free = probe.host_free()
+    # On macOS the admission measure counts reclaimable clean file cache (darwin_host_memory);
+    # the live watchdog below keeps free plus speculative. The components are recorded in the
+    # admission itself, so refused, aborted and accepted rows all carry the decision's inputs.
+    host_free, host_memory = probe.host_admission()
+    if policy.backend == "darwin-mlx":
+        admission["hostMemoryComponents"] = host_memory
     if host_free < policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes:
-        raise SupervisionError("preflight-memory", "host free is below reserve plus child cap")
+        raise SupervisionError("preflight-memory", "host available is below reserve plus child cap")
     gpu_free = None
     if policy.backend in {"linux-cuda", "windows-cuda"}:
         gpu_free = probe.gpu_free()

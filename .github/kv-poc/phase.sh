@@ -85,9 +85,14 @@ fi
 
 # 2. Precheck. Fails the job with the reason; never stops or kills anything.
 problems=""
-gib="$(free_spec_gib)"
-echo "free+speculative RAM: ${gib} GiB (need >= 84 = 68 cap + 16 reserve)"
-[ "$gib" -ge 84 ] || problems="$problems; free+speculative RAM is ${gib} GiB (< 84)"
+if measured="$(vm_stat | host_memory_from_vm_stat)" && [ -n "$measured" ]; then
+  gib=$(( ${measured%% *} / 1073741824 ))
+  echo "available RAM (free + speculative + purgeable + reclaimable file cache): ${gib} GiB (need >= 84 = 68 cap + 16 reserve)"
+  echo "  components (available-bytes page-size free speculative purgeable inactive file-backed reclaimable-file pages): $measured"
+  [ "$gib" -ge 84 ] || problems="$problems; available RAM is ${gib} GiB (< 84)"
+else
+  problems="$problems; vm_stat host memory could not be measured"
+fi
 lms_idle || problems="$problems; LM Studio is not idle: $LMS_STATE"
 echo "LM Studio: $LMS_STATE"
 busy="$(busy_processes)"

@@ -30,6 +30,8 @@ class CampaignAdapterTests(unittest.TestCase):
         class Probe:
             def host_free(self):
                 return 10**12
+            def host_admission(self):
+                return self.host_free(), None
             def tree_footprint(self, _pgid):
                 return 1024
             def gpu_free(self):

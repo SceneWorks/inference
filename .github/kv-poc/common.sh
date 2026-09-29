@@ -52,12 +52,50 @@ stop_branch_present() {
   git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY:-SceneWorks/inference}" "$(stop_ref)" >/dev/null 2>&1
 }
 
-# free + speculative pages, in whole GiB (the W1-PRECHECK measure).
-free_spec_gib() {
-  local page free spec
-  page=$(sysctl -n hw.pagesize)
-  read -r free spec < <(vm_stat | awk '/Pages free/ {gsub("\\.","",$3); f=$3} /Pages speculative/ {gsub("\\.","",$3); s=$3} END {print f+0, s+0}')
-  echo $(( (free + spec) * page / 1073741824 ))
+# The macOS host-memory ADMISSION measure, identical to the campaign parents' pre-spawn check
+# (crates/llm/mlx-llm campaign_supervisor::HostMemory, scripts/media_campaign_supervisor.py
+# darwin_host_memory; all three are pinned by crates/llm/mlx-llm/testdata/
+# darwin-host-memory-cases.json):
+#   available = (free + speculative + purgeable + reclaimable file cache) * page size
+#   reclaimable file cache = min(max(0, inactive - purgeable), max(0, file-backed - speculative))
+# i.e. clean file cache the kernel frees without the compressor or swap is available; free +
+# speculative alone made every precheck after a large file read (model hashing) pessimistic.
+# Reads vm_stat on stdin; prints "available page free speculative purgeable inactive file-backed
+# reclaimable" (bytes, then page size, then pages) or prints nothing and fails when the banner
+# or any counter is missing, duplicated or malformed.
+host_memory_from_vm_stat() {
+  awk '
+    NR == 1 {
+      if (match($0, /page size of [0-9]+ bytes/)) page = substr($0, RSTART + 13, RLENGTH - 19) + 0
+      next
+    }
+    {
+      line = $0; sub(/^[ \t]+/, "", line); key = line; sub(/:.*/, "", key)
+      if (key != "Pages free" && key != "Pages speculative" && key != "Pages purgeable" \
+          && key != "Pages inactive" && key != "File-backed pages") next
+      val = line; sub(/^[^:]*:[ \t]*/, "", val); sub(/[ \t]+$/, "", val)
+      if (val !~ /^[0-9]+\.$/ || (key in v)) bad = 1
+      sub(/\.$/, "", val); v[key] = val + 0; n++
+    }
+    END {
+      p = page; while (p > 1 && p % 2 == 0) p /= 2
+      if (bad || n != 5 || page < 4096 || p != 1) exit 1
+      i = v["Pages inactive"] - v["Pages purgeable"]; if (i < 0) i = 0
+      f = v["File-backed pages"] - v["Pages speculative"]; if (f < 0) f = 0
+      r = (i < f) ? i : f
+      printf "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n", \
+        (v["Pages free"] + v["Pages speculative"] + v["Pages purgeable"] + r) * page, page, \
+        v["Pages free"], v["Pages speculative"], v["Pages purgeable"], v["Pages inactive"], \
+        v["File-backed pages"], r
+    }'
+}
+
+# Admission-available host RAM in whole GiB (floored, so ">= 84" matches the parents' byte
+# comparison against 84 GiB exactly); fails when vm_stat cannot be measured.
+available_gib() {
+  local measured
+  measured="$(vm_stat | host_memory_from_vm_stat)" && [ -n "$measured" ] || return 1
+  echo $(( ${measured%% *} / 1073741824 ))
 }
 
 lms_bin() {

@@ -607,7 +607,7 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
     {
         return Err("SC-20676 worker arm identity/input/output provenance is incomplete".into());
     }
-    arm.admission.validate()?;
+    arm.admission.validate_admitted()?;
     let summary = timing_summary(&arm.timings)?;
     if !finite_positive(summary.mean_tokens_per_second)
         || summary.coefficient_of_variation > 0.05
@@ -1601,7 +1601,12 @@ pub fn run_sc20676_worker(
     let (total_tokens, request_tokens) =
         sc20676_admitted_tokens(mode, target_prompt_tokens, policy)?;
     let admission =
-        sc20676_runtime_admission(family, snapshot, total_tokens, request_tokens, policy)?;
+        sc20676_runtime_admission(family, snapshot, total_tokens, request_tokens, policy)?
+            .with_host_memory(Some(campaign_supervisor::admitted_host_memory(
+                policy.host_free_reserve_bytes,
+                policy.child_footprint_cap_bytes,
+            )?));
+    admission.validate_admitted()?;
     let native = u64::try_from(cfg.max_position_embeddings)
         .map_err(|_| "SC-20676 model native context is invalid")?;
     if target_prompt_tokens
@@ -2705,7 +2710,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                             &unaccepted,
                             "sc-20676-unaccepted-arm",
                             &slug,
-                            &admission,
+                            &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
                             (&reason, &failure.detail, failure.pid),
                             format!(
                                 "SC-20676 {slug} worker stopped ({reason}): {}; child {:?} reaped; stderr {}; valid arms remain in {}",
@@ -3040,6 +3045,9 @@ mod tests {
                 child_footprint_cap_bytes: 1 << 30,
                 host_free_reserve_bytes: 1 << 30,
                 static_footprint_floor_bytes: 1 << 20,
+                host_memory_components: campaign_supervisor::HostMemory::from_pages(
+                    16_384, 200_000, 4_000, 100, 90_000, 60_000,
+                ),
             },
         };
         arm.arm_sha256 = arm_semantic_seal(&arm).unwrap();

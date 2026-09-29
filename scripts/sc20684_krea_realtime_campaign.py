@@ -25,7 +25,7 @@ the ``Executable`` path that command prints. The executable must be built and se
 invoking this launcher. No static
 whole-process peak bound exists for these cells; each role is admitted by the
 supervisor's runtime guards (watchdog cap, host reserve, deadline, sampling) when
-pre-spawn host free RAM covers cap plus reserve. The admission, with the unknown
+pre-spawn host available RAM covers cap plus reserve. The admission, with the unknown
 peak recorded as null plus reason, is sealed with every role. A pre-spawn refusal,
 watchdog abort or failed child is written as a sealed unaccepted log record and
 leaves the campaign incomplete; it is never an accepted role.

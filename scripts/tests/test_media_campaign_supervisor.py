@@ -22,6 +22,12 @@ class Probe:
     def host_free(self):
         return self.free
 
+    def host_admission(self):
+        free = self.host_free()
+        return free, safety.darwin_host_memory(4096, {
+            "freePages": free // 4096, "speculativePages": 0, "purgeablePages": 0,
+            "inactivePages": 0, "fileBackedPages": 0})
+
     def tree_footprint(self, _pgid):
         return self.footprint
 
@@ -593,6 +599,8 @@ class WindowsSupervisorTests(unittest.TestCase):
         class Probe:
             def host_free(self):
                 return 10**12
+            def host_admission(self):
+                return self.host_free(), None
             def gpu_free(self):
                 return 10**12
             def tree_footprint(self, owner):
