@@ -498,7 +498,7 @@ impl CompressedKvCandidate for RabitqKvCandidate {
             .as_dtype(query.dtype())?)
     }
 
-    fn kernel_profile(&self) -> super::KernelProfile {
+    fn kernel_profile(&self, _request: &super::CandidateAttentionRequest) -> super::KernelProfile {
         super::rotated_kernel_profile("sc20677_rabitq_online")
     }
 

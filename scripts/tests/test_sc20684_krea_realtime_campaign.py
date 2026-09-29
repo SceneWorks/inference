@@ -10,6 +10,7 @@ import json
 import shlex
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -849,7 +850,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             stdout.write_bytes(b"validated observation")
             stderr.write_bytes(b"")
             record = {
-                "runId": "run-1", "exitCode": 0,
+                "runId": "run-1", "exitCode": 0, "launcherElapsedNs": 5,
                 "transcripts": {
                     "stdout": campaign._file_identity(stdout, f"transcripts/{stdout.name}"),
                     "stderr": campaign._file_identity(stderr, f"transcripts/{stderr.name}"),
@@ -869,6 +870,10 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             campaign._save_resumed_role(resume, "v2v-q8.dense-baseline", identity, foreign)
             with self.assertRaisesRegex(campaign.CampaignError, "runtime-guarded admission"):
                 campaign._load_resumed_role(resume, "v2v-q8.dense-baseline", identity)
+            untimed = {key: value for key, value in record.items() if key != "launcherElapsedNs"}
+            campaign._save_resumed_role(resume, "t2v-q4.dense-baseline", identity, untimed)
+            with self.assertRaisesRegex(campaign.CampaignError, "launcher elapsed"):
+                campaign._load_resumed_role(resume, "t2v-q4.dense-baseline", identity)
             campaign._save_resumed_role(resume, "t2v-q8.dense-baseline", identity, record)
             self.assertEqual(campaign._load_resumed_role(
                 resume, "t2v-q8.dense-baseline", identity,
@@ -907,6 +912,8 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 spawned.append(name)
                 if name in touch:
                     stop.write_bytes(b"")  # the operator asks while this role is running
+                if name == "t2v-q8.paired":
+                    time.sleep(0.02)
                 stdout_path.parent.mkdir(parents=True, exist_ok=True)
                 stdout_path.write_bytes(b"observation\n")
                 stderr_path.write_bytes(b"")
@@ -920,7 +927,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             def run() -> list[dict]:
                 return campaign.run_matrix(
                     "/prebuilt/observer", root, SOURCE, MODEL, campaign.decision_policy(),
-                    10, root, policy, identity, stop,
+                    10, root, policy, identity, campaign.supervisor.operator_stop_files(None, root),
                 )
 
             with patch.object(supervisor, "run_guarded", fake_run_guarded), \
@@ -948,6 +955,16 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 stop.unlink()
                 rows = run()
                 self.assertEqual(len(rows), len(campaign.CASES))
+                # The stopped cell reports both roles' launcher time: the paired role's from its
+                # durable resume record, the baseline's from this invocation.
+                saved = json.loads((root / "roles" / "t2v-q8.paired.json").read_bytes())
+                first = rows[0]
+                self.assertEqual(first["resumedRoles"], ["paired"])
+                self.assertEqual(first["roleLauncherElapsedNs"]["paired"], saved["launcherElapsedNs"])
+                self.assertGreater(first["roleLauncherElapsedNs"]["dense-baseline"], 0)
+                self.assertEqual(first["launcherElapsedNs"], sum(first["roleLauncherElapsedNs"].values()))
+                self.assertGreaterEqual(saved["launcherElapsedNs"], 20_000_000)
+                self.assertEqual(rows[1]["resumedRoles"], [])
                 self.assertEqual(len(spawned), 2 * len(campaign.CASES))
                 self.assertEqual(spawned.count("t2v-q8.paired"), 1, "accepted role resumes, never reruns")
 
@@ -965,7 +982,8 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             def prepare(stop_file: Path | None = None) -> dict:
                 return campaign._prepare_media_resume(
                     resume, source=json.loads(json.dumps(SOURCE)), model=MODEL,
-                    policy=policy, argv=[str(executable)], timeout=10, stop_file=stop_file,
+                    policy=policy, argv=[str(executable)], timeout=10,
+                    stop_files=campaign.supervisor.operator_stop_files(stop_file, resume),
                 )
 
             first = prepare()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Product-entrypoint campaign producer for sealed SC-20686 evidence bundles.
 
-Safe operator stop: ``touch <resume-dir>/STOP`` (or the ``--stop-file`` path). The adapter never
+Safe operator stop: ``touch <resume-dir>/STOP`` (always honoured) or the ``--stop-file`` path. The adapter never
 signals a running entrypoint; before starting the next arm it writes a sealed
 ``<resume-dir>/logs/operator-stop.attempt-<n>.json`` ("stopped-by-operator", ``beforeRow``) and
 exits with status 75. Remove the stop file and rerun the same command to resume at that arm.
@@ -1054,7 +1054,7 @@ def render_markdown(keys, decision, source_map):
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def _prepare_resume(root, resolved, policy, stop_file=None):
+def _prepare_resume(root, resolved, policy, stop_files=()):
     root = Path(root)
     if not root.is_absolute() or root.is_symlink():
         raise ValueError("resume directory must be an absolute, nonsymlink path")
@@ -1079,7 +1079,7 @@ def _prepare_resume(root, resolved, policy, stop_file=None):
             raise ValueError("resume resolved inputs changed")
         unexpected = {
             item.name for item in root.iterdir()
-            if not supervisor.is_operator_stop_entry(root, supervisor.operator_stop_file(stop_file, root), item.name)
+            if not supervisor.is_operator_stop_entry(root, stop_files, item.name)
         } - {"identity.json", "identity.json.sha256", "resolved.json", "resolved.json.sha256", "units", "failed", "logs"}
         if unexpected:
             raise ValueError(f"resume directory has unexpected entries: {sorted(unexpected)}")
@@ -1184,7 +1184,7 @@ def _save_unit(root, stem, identity_sha, variant, arm, run):
 
 
 def publish_campaign(coordinates, runner, row_builder, destination, input_artifacts=None,
-                     *, resume_root=None, resume_identity_sha=None, preflight=None, stop_file=None):
+                     *, resume_root=None, resume_identity_sha=None, preflight=None, stop_files=()):
     rows = []
     run_artifacts = {}
     run_sources = {}
@@ -1207,7 +1207,7 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                     if resume_root is not None:
                         # Between arms only: a running entrypoint is never signalled.
                         supervisor.check_operator_stop(
-                            stop_file, Path(resume_root) / "logs", kind="sc-20686-operator-stop",
+                            stop_files, Path(resume_root) / "logs", kind="sc-20686-operator-stop",
                             before=stem, index=index * 2 + ("normal", "cancel").index(arm),
                             total=len(coordinates) * 2,
                         )
@@ -1362,14 +1362,14 @@ def main():
     parser.add_argument("--run-timeout-seconds", type=float, default=21600)
     parser.add_argument("--safety-policy", type=Path, required=True)
     parser.add_argument("--resume-dir", type=Path, required=True)
-    parser.add_argument("--stop-file", type=Path, help="operator stop file checked between arms (default: <resume-dir>/STOP); "
+    parser.add_argument("--stop-file", type=Path, help="extra operator stop file checked between arms (<resume-dir>/STOP is always checked); "
                         f"its presence halts before the next arm with exit status {supervisor.OPERATOR_STOP_EXIT_CODE}")
     args = parser.parse_args()
     if not args.campaign:
         parser.error("SC-20686 adapter requires explicit --campaign")
     if args.fake:
         parser.error("synthetic evidence cannot enter the campaign adapter")
-    stop_file = supervisor.operator_stop_file(args.stop_file, args.resume_dir)
+    stop_files = supervisor.operator_stop_files(args.stop_file, args.resume_dir)
     try:
         safety_policy = supervisor.load_policy(args.safety_policy)
         if safety_policy.backend not in {"linux-cuda", "windows-cuda"}:
@@ -1414,7 +1414,7 @@ def main():
                     for spec in coordinates
                 ],
             }
-            resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy, stop_file)
+            resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy, stop_files)
 
             def runner(spec, arm):
                 run = run_entrypoint(
@@ -1451,7 +1451,7 @@ def main():
                 "safety-policy.json": safety_policy.canonical_bytes,
                 "resume-identity.json": (args.resume_dir / "identity.json").read_bytes(),
             }, resume_root=args.resume_dir, resume_identity_sha=resume_identity_sha,
-                preflight=preflight, stop_file=stop_file)
+                preflight=preflight, stop_files=stop_files)
             return 0
 
         if not all((args.family, args.snapshot, args.output, args.variant, args.coordinate_name, args.entrypoint)):
@@ -1523,7 +1523,7 @@ def main():
                 "input_files": list(spec.input_file_inventory),
             }],
         }
-        resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy, stop_file)
+        resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy, stop_files)
         publish_campaign([spec], runner, build_row, args.output, {
             "campaign-inputs.resolved.json": (
                 json.dumps(resolved, indent=2, sort_keys=True) + "\n"
@@ -1531,7 +1531,7 @@ def main():
             "safety-policy.json": safety_policy.canonical_bytes,
             "resume-identity.json": (args.resume_dir / "identity.json").read_bytes(),
         }, resume_root=args.resume_dir, resume_identity_sha=resume_identity_sha,
-            preflight=preflight, stop_file=stop_file)
+            preflight=preflight, stop_files=stop_files)
         return 0
     except supervisor.OperatorStop as stop:
         print(f"SC-20686 adapter {stop}", file=sys.stderr)
