@@ -32,6 +32,7 @@ pub mod model_control;
 pub mod pipeline;
 pub mod pos_embed;
 pub mod preview;
+pub mod product_load;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;

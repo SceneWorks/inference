@@ -487,6 +487,29 @@ class CampaignAdapterTests(unittest.TestCase):
             (q4 / "weights.safetensors").write_bytes(b"selected")
             self.assertNotEqual(self.adapter.snapshot_identity(q4), identity)
 
+    def test_worker_assembled_vace_snapshot_is_accepted_and_hashes_linked_weights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "hf" / "transformer"
+            source.mkdir(parents=True)
+            (source / "config.json").write_text("{}", encoding="utf-8")
+            (source / "diffusion_pytorch_model.safetensors").write_bytes(b"vace-1.3b")
+            assembled = root / "wan_vace"
+            assembled.mkdir()
+            (assembled / "transformer").symlink_to(source, target_is_directory=True)
+            for name in ("t5_encoder.safetensors", "vae.safetensors", "tokenizer.json"):
+                (assembled / name).write_bytes(name.encode("utf-8"))
+            revision = "3" * 40
+            (assembled / ".snapshot-revision").write_text(revision, encoding="utf-8")
+            self.adapter.validate_snapshot_layout(assembled, "Wan manifest wan_vace")
+            self.assertEqual(self.adapter.model_snapshot_revision(assembled), revision)
+            identity = self.adapter.snapshot_identity(assembled)
+            (source / "diffusion_pytorch_model.safetensors").write_bytes(b"vace-14b")
+            self.assertNotEqual(self.adapter.snapshot_identity(assembled), identity)
+            (assembled / "tokenizer.json").unlink()
+            with self.assertRaisesRegex(ValueError, "assembled Wan-VACE"):
+                self.adapter.validate_snapshot_layout(assembled, "Wan manifest wan_vace")
+
     def test_manifest_rejects_non_product_residency(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

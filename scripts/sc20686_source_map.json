@@ -359,6 +359,7 @@
           "paging": "none",
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential request-scoped staging (Phase A text encoder, then the render bundle)",
+          "product_load": "mlx_gen_flux2::product_load::product_load_spec: the worker's pre-packed Klein tier root, LoadSpec::quantize None (the tier is packed; its dense bf16 text encoder is never re-quantized), resolved_route flux2_klein_9b",
           "recompute": "reference K/V is projected in every double- and single-stream layer on every denoise evaluation; the double-stream slice is observed, matching the Candle lane boundary",
           "compatibility": "the recomputed [B,H,Skv,D] slice projects exactly to SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail bytes per layer; no persistent boundary or packed reader exists",
           "self_attention_excluded": true,
@@ -414,6 +415,7 @@
           "paging": "none",
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential request-scoped staging; the reference cache lives for one seed",
+          "product_load": "mlx_gen_flux2::product_load::product_load_spec: the worker's pre-packed Klein tier root, LoadSpec::quantize None (the tier is packed; its dense bf16 text encoder is never re-quantized), resolved_route flux2_klein_9b_kv",
           "recompute": "extracted once per seed and CFG branch on the first evaluation and reused by that branch's every cached step",
           "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection of each retained [B,H,Skv,D] cache; no packed reader is wired",
           "self_attention_excluded": true,
@@ -471,6 +473,7 @@
           ],
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential component staging",
+          "product_load": "mlx_gen_wan::product_load::product_load_spec: the worker's pre-packed quant-matrix tier root (q4/ first), LoadSpec::quantize None (the packed tier config is authoritative)",
           "recompute": "prepared once per generate and reused across denoise steps",
           "cfg_kv_batch": "guidance"
         },
@@ -519,6 +522,7 @@
           ],
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap",
+          "product_load": "mlx_gen_wan::product_load::product_load_spec: the worker's pre-packed quant-matrix tier root (q4/ first), LoadSpec::quantize None (the packed tier config is authoritative)",
           "recompute": "prepared once per expert and reused across that expert's denoise steps",
           "cfg_kv_batch": "always"
         },
@@ -567,6 +571,7 @@
           ],
           "product_residency": "sequential",
           "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap",
+          "product_load": "mlx_gen_wan::product_load::product_load_spec: the worker's pre-packed quant-matrix tier root (q4/ first), LoadSpec::quantize None (the packed tier config is authoritative)",
           "recompute": "prepared once per expert and reused across that expert's denoise steps",
           "cfg_kv_batch": "always"
         },
@@ -616,7 +621,8 @@
             }
           ],
           "product_residency": "resident",
-          "offload": "resident model lifecycle"
+          "offload": "resident model lifecycle",
+          "product_load": "mlx_gen_wan::product_load::product_load_spec: the worker-assembled wan_vace snapshot, i.e. the dense Wan2.1-VACE-1.3B-diffusers transformer (dim 1536, 30 layers; any other size is refused) plus the base-Wan 14B UMT5/z16-VAE/tokenizer, LoadSpec::quantize None (dense bf16). The Candle lane's wan_vace is the Wan2.1-VACE-14B tree instead"
         },
         "wan2_2_vace_fun_14b": {
           "family": "wan",
@@ -664,7 +670,8 @@
             }
           ],
           "product_residency": "sequential",
-          "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap"
+          "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap",
+          "product_load": "mlx_gen_wan::product_load::product_load_spec: the worker-assembled dense VACE-Fun 14B high/low experts plus the base-Wan 14B UMT5/z16-VAE/tokenizer, LoadSpec::quantize Some(Q4) (the worker forces Q4 on both experts at load)"
         }
       }
     }

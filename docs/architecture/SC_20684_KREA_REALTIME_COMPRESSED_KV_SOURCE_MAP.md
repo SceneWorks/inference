@@ -58,10 +58,12 @@ python3 scripts/sc20684_krea_realtime_campaign.py \
   --output /Users/michael/.codex/worktrees/epic20669/evidence/sc20684/campaign-$(date +%Y%m%dT%H%M%S) \
   --safety-policy /absolute/path/sc20684-safety-policy.json \
   --resume-dir /absolute/external/path/sc20684-resume \
-  --product-command '/absolute/path/to/prebuilt/generate_smoke --ignored --nocapture sc20684_packed_campaign_observer'
+  --product-command '/absolute/path/to/target/release/deps/integration-<hash> --exact --ignored --nocapture generate_smoke::sc20684_packed_campaign_observer'
 ```
 
-The product command must be an already-built observer binary: the launcher seals its
+The product command must be an already-built observer binary: the crate's single `integration`
+test binary (`cargo test --locked --release -p mlx-gen-krea-realtime --test integration --no-run`
+prints its `Executable` path; there is no `generate_smoke` binary). The launcher seals its
 exact executable bytes and argv before the first role. The resume directory preserves
 validated paired and dense-baseline roles independently, including transcript hashes,
 product artifacts, supervisor exit/footprint evidence, and the captured source identity.

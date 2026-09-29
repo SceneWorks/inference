@@ -219,6 +219,11 @@ class MetalLaneTests(unittest.TestCase):
             for variant, entry in self.source_map["lanes"]["mlx-metal"]["variants"].items()
         }
         self.assertEqual(actual, expected)
+        # The Mac product's load choices, as the Metal entrypoints' product constructors make them.
+        metal = self.source_map["lanes"]["mlx-metal"]["variants"]
+        self.assertIn("Wan2.1-VACE-1.3B", metal["wan_vace"]["product_load"])
+        self.assertIn("quantize None", metal["wan_vace"]["product_load"])
+        self.assertIn("quantize Some(Q4)", metal["wan2_2_vace_fun_14b"]["product_load"])
         # The CUDA lane is untouched: same Candle entrypoints, same frozen kinds.
         cuda = self.source_map["lanes"]["candle-cuda"]["variants"]
         for route, stem in self.adapter.WAN_ENTRYPOINT_STEMS.items():
@@ -885,7 +890,7 @@ class MetalLaneTests(unittest.TestCase):
                 '"--sc20686-campaign"', '"--sc20686-events"', '"--sc20686-source-ref"',
                 '"--sc20686-residency"', '"--sc20686-cancel"', '.filter(|path| *path != "-")',
                 "dedicated --sc20686-events <file>", "campaign_cancelled()",
-                "with_offload_policy(", '"--sc20686-schedule-control"', "arm_schedule_control()",
+                "::product_load::product_load_spec(", '"--sc20686-schedule-control"', "arm_schedule_control()",
                 "unsupported argument", "repeated argument", "requires an explicit",
             ):
                 self.assertIn(token, source, f"{relative}: {token}")
