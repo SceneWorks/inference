@@ -1,7 +1,8 @@
 //! Bounded, fail-closed child execution for the SC-20671 and SC-20676 campaigns.
 //!
-//! This module deliberately uses only the standard library and serde so its process-control tests
-//! can run without linking MLX or starting a model. Callers must supply a frozen policy for every run;
+//! This module deliberately uses only the standard library, serde and (on macOS, for
+//! `proc_pid_rusage`) libc so its process-control tests can run without linking MLX or starting a
+//! model. Callers must supply a frozen policy for every run;
 //! this module does not choose a host reserve or silently shorten a context band.
 
 use std::fs::{self, File, OpenOptions};
@@ -223,7 +224,96 @@ pub trait MemoryProbe {
     /// One host measurement. Pre-spawn admission and the live host-reserve watchdog both read
     /// [`HostMemory::available_bytes`], so page cache alone never aborts an admitted row.
     fn host_memory(&mut self, deadline: Instant) -> io::Result<HostMemory>;
+    /// One read of the child's `phys_footprint`. [`io::ErrorKind::NotFound`] means the PID no
+    /// longer exists (`ESRCH`: the child is exiting); the supervisor lets its exit handling
+    /// classify that instead of reporting a probe failure.
     fn child_footprint_bytes(&mut self, pid: u32, deadline: Instant) -> io::Result<u64>;
+}
+
+/// Reads per watchdog tick: one read plus three immediate retries of a failed read.
+const CHILD_FOOTPRINT_READS_PER_TICK: u32 = 4;
+/// Consecutive ticks whose every read failed before the row stops with
+/// [`StopReason::ProbeFailure`]. The host-reserve watchdog keeps running on the failed ticks.
+const CHILD_FOOTPRINT_FAILED_TICK_LIMIT: u32 = 5;
+
+/// One watchdog tick's child footprint: the first successful read, or the last error once a
+/// process-gone read or every retry has failed.
+fn read_child_footprint<P: MemoryProbe>(
+    probe: &mut P,
+    pid: u32,
+    deadline: Instant,
+) -> io::Result<u64> {
+    let mut read = 1;
+    loop {
+        match probe.child_footprint_bytes(pid, deadline) {
+            Err(error)
+                if error.kind() != io::ErrorKind::NotFound
+                    && read < CHILD_FOOTPRINT_READS_PER_TICK =>
+            {
+                read += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// An abort detail that keeps the OS errno and its message.
+fn describe_probe_error(error: &io::Error) -> String {
+    match error.raw_os_error() {
+        Some(errno) => format!("errno {errno}: {error}"),
+        None => format!("no errno: {error}"),
+    }
+}
+
+/// A process's Darwin `phys_footprint` ledger, the metric `/usr/bin/footprint` prints as
+/// `phys_footprint` / `phys_footprint_peak`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysFootprint {
+    pub current_bytes: u64,
+    pub lifetime_peak_bytes: u64,
+}
+
+/// Read `pid`'s `phys_footprint` with one `proc_pid_rusage(RUSAGE_INFO_V4)` syscall rather than a
+/// `/usr/bin/footprint` subprocess. A PID that no longer exists (`ESRCH`) is
+/// [`io::ErrorKind::NotFound`]; every other failure keeps its raw OS errno.
+#[cfg(target_os = "macos")]
+pub fn phys_footprint(pid: u32) -> io::Result<PhysFootprint> {
+    let os_pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds pid_t"))?;
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: the RUSAGE_INFO_V4 flavor writes at most one `rusage_info_v4` into the buffer, which
+    // is exactly that size and zero-initialized.
+    let status = unsafe {
+        libc::proc_pid_rusage(
+            os_pid,
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if status != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("process {pid} not found (ESRCH)"),
+            ));
+        }
+        return Err(error);
+    }
+    // SAFETY: the successful call initialized the buffer (and it was zeroed before).
+    let info = unsafe { info.assume_init() };
+    Ok(PhysFootprint {
+        current_bytes: info.ri_phys_footprint,
+        lifetime_peak_bytes: info.ri_lifetime_max_phys_footprint,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn phys_footprint(_pid: u32) -> io::Result<PhysFootprint> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "phys_footprint requires macOS",
+    ))
 }
 
 fn validate(policy: &SafetyPolicy, request: &RunRequest) -> Result<(), Failure> {
@@ -475,6 +565,7 @@ fn run_admitted<P: MemoryProbe>(
         }
     };
     let deadline = preflight_deadline;
+    let mut failed_footprint_ticks = 0_u32;
     let result = loop {
         if exceeded.load(Ordering::Acquire) {
             break Err(Failure::new(
@@ -530,27 +621,40 @@ fn run_admitted<P: MemoryProbe>(
             failure.watchdog_host_memory = Some(Box::new(sample));
             break Err(failure);
         }
-        let footprint = match probe.child_footprint_bytes(pid, deadline) {
-            Ok(bytes) => bytes,
+        match read_child_footprint(probe, pid, deadline) {
+            Ok(footprint) => {
+                failed_footprint_ticks = 0;
+                if footprint > policy.child_footprint_cap_bytes {
+                    break Err(Failure::new(
+                        StopReason::ChildFootprint,
+                        format!("child footprint {footprint} bytes exceeded cap"),
+                        Some(pid),
+                    ));
+                }
+            }
             Err(error) => {
-                // A fast child can exit between try_wait and the PID probe. Preserve that exit;
-                // every other probe failure stops the row.
+                // A child can exit between try_wait and the PID probe. Preserve that exit.
                 if let Ok(Some(status)) = child.try_wait() {
                     break Ok(status);
                 }
-                break Err(Failure::new(
-                    StopReason::ProbeFailure,
-                    format!("child footprint probe: {error}"),
-                    Some(pid),
-                ));
+                // ESRCH: the child is exiting but not yet reapable; the next tick's try_wait
+                // classifies the exit. Any other error stops the row only once it is sustained.
+                if error.kind() != io::ErrorKind::NotFound {
+                    failed_footprint_ticks += 1;
+                    if failed_footprint_ticks >= CHILD_FOOTPRINT_FAILED_TICK_LIMIT {
+                        break Err(Failure::new(
+                            StopReason::ProbeFailure,
+                            format!(
+                                "child footprint probe failed on {failed_footprint_ticks} \
+                                 consecutive ticks ({CHILD_FOOTPRINT_READS_PER_TICK} reads each); \
+                                 last error {}",
+                                describe_probe_error(&error)
+                            ),
+                            Some(pid),
+                        ));
+                    }
+                }
             }
-        };
-        if footprint > policy.child_footprint_cap_bytes {
-            break Err(Failure::new(
-                StopReason::ChildFootprint,
-                format!("child footprint {footprint} bytes exceeded cap"),
-                Some(pid),
-            ));
         }
         thread::sleep(
             policy
@@ -648,40 +752,6 @@ fn parse_vm_stat(text: &str) -> io::Result<HostMemory> {
     .ok_or_else(|| io::Error::other("vm_stat available bytes reach 2^63"))
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn parse_footprint(text: &str) -> io::Result<u64> {
-    let mut matching = text
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("phys_footprint:"));
-    let value = matching
-        .next()
-        .ok_or_else(|| io::Error::other("footprint has no phys_footprint"))?;
-    if matching.next().is_some() {
-        return Err(io::Error::other("footprint duplicates phys_footprint"));
-    }
-    let mut parts = value.split_whitespace();
-    let number = parts
-        .next()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .ok_or_else(|| io::Error::other("footprint has invalid size"))?;
-    let multiplier = match parts.next().unwrap_or("B").to_ascii_uppercase().as_str() {
-        "B" => 1.0,
-        "K" | "KB" => 1024.0,
-        "M" | "MB" => 1024.0 * 1024.0,
-        "G" | "GB" => 1024.0 * 1024.0 * 1024.0,
-        _ => return Err(io::Error::other("footprint has unknown size unit")),
-    };
-    if parts.next().is_some() {
-        return Err(io::Error::other("footprint has trailing size fields"));
-    }
-    let bytes = (number * multiplier).ceil();
-    if !bytes.is_finite() || bytes > u64::MAX as f64 {
-        return Err(io::Error::other("footprint size overflows"));
-    }
-    Ok(bytes as u64)
-}
-
 #[cfg(target_os = "macos")]
 fn bounded_system_output(command: &str, args: &[&str], deadline: Instant) -> io::Result<String> {
     // A stalled OS sampler must not consume the whole model-row deadline. Two seconds bounds each
@@ -770,22 +840,9 @@ impl MemoryProbe for SystemProbe {
         }
     }
 
-    fn child_footprint_bytes(&mut self, pid: u32, deadline: Instant) -> io::Result<u64> {
-        #[cfg(target_os = "macos")]
-        {
-            parse_footprint(&bounded_system_output(
-                "/usr/bin/footprint",
-                &["--pid", &pid.to_string(), "--noCategories", "--wired"],
-                deadline,
-            )?)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = (pid, deadline);
-            Err(io::Error::other(
-                "campaign child footprint probe requires macOS",
-            ))
-        }
+    fn child_footprint_bytes(&mut self, pid: u32, _deadline: Instant) -> io::Result<u64> {
+        // One non-blocking syscall per read; no sampler process can stall past the deadline.
+        phys_footprint(pid).map(|footprint| footprint.current_bytes)
     }
 }
 
@@ -798,6 +855,9 @@ mod tests {
     struct FakeProbe {
         host: VecDeque<io::Result<HostMemory>>,
         footprint: VecDeque<io::Result<u64>>,
+        /// Answers every footprint read once `footprint` is drained.
+        footprint_after: Box<dyn FnMut() -> io::Result<u64>>,
+        footprint_reads: usize,
     }
 
     /// A one-byte-page measurement whose free pages are the whole available measure.
@@ -821,6 +881,8 @@ mod tests {
             Self {
                 host: host.into_iter().collect(),
                 footprint: VecDeque::new(),
+                footprint_after: Box::new(|| Ok(1)),
+                footprint_reads: 0,
             }
         }
     }
@@ -830,7 +892,10 @@ mod tests {
             self.host.pop_front().unwrap_or_else(|| Ok(free_only(1000)))
         }
         fn child_footprint_bytes(&mut self, _: u32, _: Instant) -> io::Result<u64> {
-            self.footprint.pop_front().unwrap_or(Ok(1))
+            self.footprint_reads += 1;
+            self.footprint
+                .pop_front()
+                .unwrap_or_else(|| (self.footprint_after)())
         }
     }
 
@@ -1107,15 +1172,6 @@ mod tests {
         assert!(decoded.validate_admits(4000, 97).is_err());
     }
 
-    #[test]
-    fn footprint_parser_is_conservative_and_fails_closed() {
-        assert_eq!(
-            parse_footprint("phys_footprint: 1.5 MB\n").unwrap(),
-            1_572_864
-        );
-        assert!(parse_footprint("phys_footprint: unknown GB\n").is_err());
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn system_probe_reads_owned_child_and_host() {
@@ -1258,5 +1314,188 @@ mod tests {
         .unwrap_err();
         assert_eq!(failure.reason, StopReason::ChildExit, "{}", failure.detail);
         assert!(gone(failure.pid.unwrap()));
+    }
+
+    /// A deadline no test below reaches: each is bounded by probe reads, never the clock.
+    fn patient_policy() -> SafetyPolicy {
+        SafetyPolicy {
+            deadline: Duration::from_secs(30),
+            ..policy()
+        }
+    }
+
+    fn eperm() -> io::Result<u64> {
+        Err(io::Error::from_raw_os_error(1))
+    }
+
+    fn pid_gone() -> io::Result<u64> {
+        Err(io::Error::new(io::ErrorKind::NotFound, "ESRCH"))
+    }
+
+    fn read_tick(probe: &mut FakeProbe) -> io::Result<u64> {
+        read_child_footprint(probe, 1, Instant::now())
+    }
+
+    /// A child that runs until `stop` exists, so a test decides when it exits.
+    fn until_exists(stop: &Path) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "while [ ! -e \"$0\" ]; do sleep 0.01; done",
+            stop.to_str().unwrap(),
+        ]);
+        command
+    }
+
+    fn stop_path(request: &RunRequest) -> PathBuf {
+        request.stdout_path.with_file_name("stop")
+    }
+
+    #[test]
+    fn a_tick_retries_a_failed_read_but_not_a_gone_pid() {
+        let mut probe = FakeProbe::new([]);
+        probe.footprint.extend([eperm(), eperm(), eperm(), Ok(7)]);
+        assert_eq!(read_tick(&mut probe).unwrap(), 7);
+        assert_eq!(probe.footprint_reads, 4);
+
+        let mut probe = FakeProbe::new([]);
+        probe.footprint_after = Box::new(eperm);
+        assert_eq!(read_tick(&mut probe).unwrap_err().raw_os_error(), Some(1));
+        assert_eq!(probe.footprint_reads, 4);
+
+        let mut probe = FakeProbe::new([]);
+        probe.footprint_after = Box::new(pid_gone);
+        assert_eq!(
+            read_tick(&mut probe).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(probe.footprint_reads, 1);
+    }
+
+    #[test]
+    fn transient_footprint_failures_never_stop_a_row() {
+        // Four fully failed ticks, one good read, four more failed ticks: never five in a row.
+        let request = new_request();
+        let stop = stop_path(&request);
+        let mut probe = FakeProbe::new([Ok(1000)]);
+        probe.footprint.extend((0..16).map(|_| eperm()));
+        probe.footprint.push_back(Ok(1));
+        probe.footprint.extend((0..16).map(|_| eperm()));
+        let flag = stop.clone();
+        probe.footprint_after = Box::new(move || {
+            fs::write(&flag, b"")?;
+            Ok(1)
+        });
+        let status = run_guarded(
+            &mut until_exists(&stop),
+            &request,
+            &patient_policy(),
+            &mut probe,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}: {}", failure.reason, failure.detail));
+        assert!(status.success());
+        assert!(probe.footprint_reads > 33);
+    }
+
+    #[test]
+    fn a_gone_pid_is_left_to_exit_handling() {
+        // ESRCH on every read: the child is exiting, so the row ends with the child's own exit.
+        let request = new_request();
+        let stop = stop_path(&request);
+        let mut probe = FakeProbe::new([Ok(1000)]);
+        let flag = stop.clone();
+        let mut reads = 0;
+        probe.footprint_after = Box::new(move || {
+            reads += 1;
+            if reads == 3 * CHILD_FOOTPRINT_FAILED_TICK_LIMIT {
+                fs::write(&flag, b"")?;
+            }
+            pid_gone()
+        });
+        let status = run_guarded(
+            &mut until_exists(&stop),
+            &request,
+            &patient_policy(),
+            &mut probe,
+        )
+        .unwrap_or_else(|failure| panic!("{:?}: {}", failure.reason, failure.detail));
+        assert!(status.success());
+        assert!(probe.footprint_reads >= 3 * CHILD_FOOTPRINT_FAILED_TICK_LIMIT as usize);
+    }
+
+    #[test]
+    fn sustained_footprint_failure_stops_the_row_with_errno_and_count() {
+        let request = new_request();
+        let mut probe = FakeProbe::new([Ok(1000)]);
+        probe.footprint_after = Box::new(eperm);
+        let failure = run_guarded(
+            &mut until_exists(&stop_path(&request)),
+            &request,
+            &patient_policy(),
+            &mut probe,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.reason,
+            StopReason::ProbeFailure,
+            "{}",
+            failure.detail
+        );
+        for part in [
+            "failed on 5 consecutive ticks (4 reads each)",
+            "errno 1: ",
+            "Operation not permitted",
+        ] {
+            assert!(failure.detail.contains(part), "{}", failure.detail);
+        }
+        assert_eq!(probe.footprint_reads, 20);
+        assert!(gone(failure.pid.unwrap()));
+    }
+
+    /// The syscall reads the same ledger `/usr/bin/footprint` prints, for a child holding 64 MiB.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn phys_footprint_reads_a_child_allocation_and_a_reaped_pid_is_gone() {
+        const BLOCK: u64 = 64 << 20;
+        // dd reads one 64 MiB block from /dev/zero, then blocks writing it into an undrained pipe.
+        let mut dd = Command::new("/bin/dd")
+            .args(["if=/dev/zero", "bs=64m", "count=1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut first = [0_u8; 1];
+        // The block is fully read (resident) before its first byte can reach the pipe.
+        dd.stdout.as_mut().unwrap().read_exact(&mut first).unwrap();
+        let pid = dd.id();
+        let before = phys_footprint(pid).unwrap();
+        let tool = Command::new("/usr/bin/footprint")
+            .args(["-p", &pid.to_string(), "-f", "bytes"])
+            .output()
+            .unwrap();
+        let after = phys_footprint(pid).unwrap();
+        drop(dd.stdout.take());
+        let _ = dd.kill();
+        dd.wait().unwrap();
+        assert!(
+            (BLOCK..4 * BLOCK).contains(&before.current_bytes),
+            "{before:?}"
+        );
+        assert!(before.lifetime_peak_bytes >= before.current_bytes);
+        assert_eq!(before, after, "dd is blocked, so its footprint is stable");
+        let text = String::from_utf8(tool.stdout).unwrap();
+        let field = |name: &str| -> u64 {
+            text.lines()
+                .find_map(|line| line.trim().strip_prefix(name))
+                .and_then(|value| value.trim().strip_suffix(" B"))
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("footprint output lacks {name}: {text}"))
+        };
+        assert_eq!(field("phys_footprint:"), before.current_bytes);
+        assert_eq!(field("phys_footprint_peak:"), before.lifetime_peak_bytes);
+        assert_eq!(
+            phys_footprint(pid).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 }

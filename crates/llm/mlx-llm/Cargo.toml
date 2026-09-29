@@ -40,6 +40,10 @@ sha2 = { workspace = true }
 half = "2"
 memmap2 = "0.9"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# `proc_pid_rusage` reads a PID's phys_footprint without spawning /usr/bin/footprint (sc-20671).
+libc = { workspace = true }
+
 [dev-dependencies]
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct
 # tokenizers dep needed.)

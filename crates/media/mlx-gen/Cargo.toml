@@ -153,6 +153,11 @@ sha2 = { workspace = true }
 safetensors-fp8 = { package = "safetensors", version = "0.4" }
 memmap2 = "0.9"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# SC-20686 observer: `proc_pid_rusage` reads the process phys_footprint without spawning
+# /usr/bin/footprint (sc-20671).
+libc = { workspace = true }
+
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on
 # `Drop` — including out of a panicking test, which is the only path the old

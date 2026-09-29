@@ -12,6 +12,7 @@ result; a pre-spawn refusal, watchdog abort or failed child is only ever an unac
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import math
@@ -215,18 +216,76 @@ def validate_host_memory(value: object) -> dict[str, object]:
     return value
 
 
-def darwin_footprint_bytes(output: str) -> int:
-    matches = re.findall(r"^\s*phys_footprint:\s*(\d+(?:\.\d+)?)\s*(B|K|KB|M|MB|G|GB)\s*$",
-                         output, re.MULTILINE)
-    if len(matches) != 1:
-        raise SupervisionError("probe-failure", "footprint has no unique phys_footprint")
-    value, unit = matches[0]
-    scale = {"B": 1, "K": 1024, "KB": 1024, "M": 1024**2,
-             "MB": 1024**2, "G": 1024**3, "GB": 1024**3}[unit]
-    result = math.ceil(float(value) * scale)
-    if result < 0 or result >= 2**63:
-        raise SupervisionError("probe-failure", "footprint value is invalid")
-    return result
+# Reads of one PID's footprint per watchdog tick: one read plus three immediate retries.
+FOOTPRINT_READS_PER_TICK = 4
+# Consecutive ticks whose footprint sample failed before the row stops as probe-failure.
+# The host-reserve watchdog keeps running on the failed ticks.
+FOOTPRINT_FAILED_TICK_LIMIT = 5
+_RUSAGE_INFO_V4 = 4
+
+
+class _RusageInfoV4(ctypes.Structure):
+    """<sys/resource.h> struct rusage_info_v4."""
+
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [(name, ctypes.c_uint64) for name in (
+        "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups", "ri_interrupt_wkups",
+        "ri_pageins", "ri_wired_size", "ri_resident_size", "ri_phys_footprint",
+        "ri_proc_start_abstime", "ri_proc_exit_abstime", "ri_child_user_time",
+        "ri_child_system_time", "ri_child_pkg_idle_wkups", "ri_child_interrupt_wkups",
+        "ri_child_pageins", "ri_child_elapsed_abstime", "ri_diskio_bytesread",
+        "ri_diskio_byteswritten", "ri_cpu_time_qos_default", "ri_cpu_time_qos_maintenance",
+        "ri_cpu_time_qos_background", "ri_cpu_time_qos_utility", "ri_cpu_time_qos_legacy",
+        "ri_cpu_time_qos_user_initiated", "ri_cpu_time_qos_user_interactive",
+        "ri_billed_system_time", "ri_serviced_system_time", "ri_logical_writes",
+        "ri_lifetime_max_phys_footprint", "ri_instructions", "ri_cycles", "ri_billed_energy",
+        "ri_serviced_energy", "ri_interval_max_phys_footprint", "ri_runnable_time")]
+
+
+_libproc = None
+
+
+def proc_pid_rusage_footprint(pid: int) -> tuple[int, int]:
+    """(phys_footprint, lifetime peak) from one proc_pid_rusage(RUSAGE_INFO_V4) syscall.
+
+    The same kernel ledger /usr/bin/footprint prints as phys_footprint / phys_footprint_peak,
+    read without spawning a sampler process. ESRCH (the PID is gone) raises
+    ProcessLookupError; every other failure raises OSError carrying its errno.
+    """
+    global _libproc
+    if _libproc is None:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_pid_rusage.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+        library.proc_pid_rusage.restype = ctypes.c_int
+        _libproc = library
+    info = _RusageInfoV4()
+    if _libproc.proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(info)) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))  # ESRCH constructs ProcessLookupError
+    return info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint
+
+
+def darwin_phys_footprint(pid: int, *, read: Callable[[int], tuple[int, int]] = proc_pid_rusage_footprint) -> int | None:
+    """One tick's phys_footprint for pid, or None when the PID is gone (ESRCH).
+
+    A failed read is retried immediately, FOOTPRINT_READS_PER_TICK reads in all; the
+    probe-failure detail keeps the last errno and its message.
+    """
+    last = OSError("no read attempted")
+    for _ in range(FOOTPRINT_READS_PER_TICK):
+        try:
+            footprint = read(pid)[0]
+        except ProcessLookupError:
+            return None
+        except OSError as error:
+            last = error
+            continue
+        if footprint < 0 or footprint >= 2**63:
+            raise SupervisionError("probe-failure", f"process {pid} footprint {footprint} is invalid")
+        return footprint
+    raise SupervisionError(
+        "probe-failure",
+        f"proc_pid_rusage({pid}) failed {FOOTPRINT_READS_PER_TICK} reads: "
+        f"errno {last.errno}: {last.strerror}")
 
 
 def linux_free_bytes(output: str) -> int:
@@ -311,7 +370,8 @@ class SystemProbe:
             raise SupervisionError("probe-failure", f"cgroup memory budget unavailable: {error}") from error
         return free
 
-    def tree_footprint(self, owner: int | windows.WindowsJob) -> int:
+    def tree_footprint(self, owner: int | windows.WindowsJob) -> int | None:
+        """The owned tree's footprint, or None when every owned process vanished mid-sample."""
         if self.policy.backend == "windows-cuda":
             try:
                 return owner.footprint_bytes()
@@ -320,11 +380,16 @@ class SystemProbe:
         pgid = owner
         pids = _group_pids(pgid)
         if not pids:
-            raise SupervisionError("probe-failure", "owned process group disappeared during footprint sample")
+            return None
         total = 0
+        sampled = False
         for pid in pids:
             if self.policy.backend == "darwin-mlx":
-                total += darwin_footprint_bytes(_bounded_output(["/usr/bin/footprint", "-p", str(pid), "-f", "bytes"]))
+                footprint = darwin_phys_footprint(pid)
+                if footprint is None:
+                    continue  # exited after the process-table snapshot
+                total += footprint
+                sampled = True
             else:
                 try:
                     output = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
@@ -334,7 +399,8 @@ class SystemProbe:
                 if not match:
                     raise SupervisionError("probe-failure", f"process {pid} RSS malformed")
                 total += int(match.group(1)) * 1024
-        return total
+                sampled = True
+        return total if sampled else None
 
     def gpu_free_and_tree_bytes(self, owner: int | windows.WindowsJob) -> tuple[int, int]:
         free = self.gpu_free()
@@ -701,6 +767,7 @@ def _run_admitted(
         peak_host = 0
         peak_gpu = 0
         samples: list[dict[str, object]] = []
+        failed_footprint_ticks = 0
         def check_artifact_caps() -> None:
             if stdout_path.stat().st_size > policy.stdout_cap_bytes or stderr_path.stat().st_size > policy.stderr_cap_bytes:
                 raise SupervisionError("log-cap", "child exceeded a bounded transcript file")
@@ -765,22 +832,36 @@ def _run_admitted(
                 if pids:
                     try:
                         footprint = probe.tree_footprint(owner)
-                    except SupervisionError:
+                    except SupervisionError as error:
                         # A short-lived child may exit after the ownership
-                        # snapshot and before the footprint subprocess runs.
-                        # A live root, owned descendant, or uncertain ownership
-                        # retains the original fail-closed probe error.
+                        # snapshot and before its footprint is read.
                         finished = finished_result(child.poll(), *owned_processes())
                         if finished is not None:
                             return finished
-                        raise
-                    peak_host = max(peak_host, footprint)
-                    samples.append({"phase": "process-sample", "sample_kind": "process",
-                                    "peak_bytes": footprint, "at_ns": time.time_ns()})
-                    if len(samples) * 160 > policy.event_cap_bytes:
-                        raise SupervisionError("event-cap", "process sample spool exceeded cap")
-                    if footprint > policy.child_footprint_cap_bytes:
-                        raise SupervisionError("child-footprint", "owned tree exceeded child cap")
+                        if error.reason != "probe-failure":
+                            raise
+                        # A live root, owned descendant, or uncertain ownership
+                        # stops the row only once the failure is sustained.
+                        failed_footprint_ticks += 1
+                        if failed_footprint_ticks >= FOOTPRINT_FAILED_TICK_LIMIT:
+                            raise SupervisionError(
+                                "probe-failure",
+                                f"child footprint probe failed on {failed_footprint_ticks} "
+                                f"consecutive ticks; last error {error.detail}") from error
+                        footprint = None
+                    else:
+                        # None: every owned process was gone (ESRCH); the next
+                        # tick's poll and ownership snapshot classify the exit.
+                        if footprint is not None:
+                            failed_footprint_ticks = 0
+                    if footprint is not None:
+                        peak_host = max(peak_host, footprint)
+                        samples.append({"phase": "process-sample", "sample_kind": "process",
+                                        "peak_bytes": footprint, "at_ns": time.time_ns()})
+                        if len(samples) * 160 > policy.event_cap_bytes:
+                            raise SupervisionError("event-cap", "process sample spool exceeded cap")
+                        if footprint > policy.child_footprint_cap_bytes:
+                            raise SupervisionError("child-footprint", "owned tree exceeded child cap")
                     if policy.backend in {"linux-cuda", "windows-cuda"}:
                         device_free, device_used = probe.gpu_free_and_tree_bytes(owner)
                         peak_gpu = max(peak_gpu, device_used)

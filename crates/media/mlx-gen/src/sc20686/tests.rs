@@ -579,22 +579,20 @@ fn request_and_footprint_inputs_fail_closed() {
     assert!(request_output("-", SOURCE_REF, "sequential").is_err());
     assert!(request_output("e.jsonl", "HEAD", "sequential").is_err());
     assert!(request_output("e.jsonl", SOURCE_REF, "offloaded").is_err());
-    let text =
-        "Auxiliary data:\n    phys_footprint: 2228560 B\n    phys_footprint_peak: 2277712 B\n";
-    assert_eq!(parse_footprint(text), Some((2_228_560, 2_277_712)));
     assert_eq!(
-        parse_footprint("phys_footprint: 2160 KB\nphys_footprint_peak: 2224 KB\n"),
-        None
+        footprint_pair(2_228_560, 2_277_712),
+        Some((2_228_560, 2_277_712))
     );
-    assert_eq!(parse_footprint("phys_footprint: 10 B\n"), None);
-    assert_eq!(
-        parse_footprint("phys_footprint: 10 B\nphys_footprint: 11 B\nphys_footprint_peak: 12 B\n"),
-        None
-    );
-    assert_eq!(
-        parse_footprint("phys_footprint: 20 B\nphys_footprint_peak: 10 B\n"),
-        None
-    );
+    assert_eq!(footprint_pair(10, 10), Some((10, 10)));
+    assert_eq!(footprint_pair(0, 10), None);
+    assert_eq!(footprint_pair(20, 10), None);
+    #[cfg(target_os = "macos")]
+    {
+        let (current, peak) = DarwinFootprint
+            .sample()
+            .expect("own proc_pid_rusage footprint");
+        assert!(current > 0 && peak >= current);
+    }
 }
 
 #[test]

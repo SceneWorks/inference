@@ -2288,6 +2288,7 @@ dependencies = [
 name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "memmap2",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
@@ -2829,6 +2830,7 @@ dependencies = [
  "core-llm",
  "core-llm-testkit",
  "half",
+ "libc",
  "memmap2",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",

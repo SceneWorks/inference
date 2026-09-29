@@ -1833,7 +1833,7 @@ impl ReceiptBuilder {
         for (phase, expected) in self.phases.iter().zip(REQUIRED_PHASES) {
             if phase.phase != expected
                 || phase.pid == 0
-                || phase.source != "footprint -p"
+                || !valid_phys_footprint_source(&phase.source)
                 || phase.mlx.source != "mlx_rs::memory"
             {
                 return Err("invalid phase evidence".into());
@@ -2317,7 +2317,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             .zip(REQUIRED_PHASES)
             .any(|(p, expected)| {
                 p.phase != expected
-                    || p.source != "footprint -p"
+                    || !valid_phys_footprint_source(&p.source)
                     || p.mlx.source != "mlx_rs::memory"
                     || p.phys_footprint_peak_bytes < p.phys_footprint_bytes
                     || !valid_utc_timestamp(&p.timestamp)
@@ -6213,8 +6213,8 @@ impl ProductObserver {
     }
 
     /// The observer's product clock: wall time since creation minus every synchronous memory
-    /// sample the observer itself took. Phase timings are deltas of this clock, so a `footprint -p`
-    /// subprocess at a phase boundary is never relabeled as prefill, first-token, or decode time.
+    /// sample the observer itself took. Phase timings are deltas of this clock, so a memory sample
+    /// at a phase boundary is never relabeled as prefill, first-token, or decode time.
     fn product_elapsed_ms(&self) -> f64 {
         self.started.elapsed().as_secs_f64() * 1_000.0 - self.sampling_elapsed_ms
     }
@@ -6443,7 +6443,7 @@ impl Observer for ProductObserver {
                 self.phases.push(ReceiptPhase {
                     phase: name.into(),
                     pid: sample.pid,
-                    source: "footprint -p".into(),
+                    source: PHYS_FOOTPRINT_SOURCE.into(),
                     timestamp: sample.captured_at,
                     phys_footprint_bytes: sample.current_bytes,
                     phys_footprint_peak_bytes: sample.peak_bytes,
@@ -6710,7 +6710,7 @@ impl<S: CampaignSampler> PhaseRecorder<S> {
         self.samples.push(ReceiptPhase {
             phase: phase.into(),
             pid: sample.pid,
-            source: "footprint -p".into(),
+            source: PHYS_FOOTPRINT_SOURCE.into(),
             timestamp: sample.captured_at,
             phys_footprint_bytes: sample.current_bytes,
             phys_footprint_peak_bytes: sample.peak_bytes,
@@ -6762,50 +6762,25 @@ where
     recorder.finish()
 }
 
-/// Parse Darwin footprint fields while accepting the units emitted by different macOS releases.
-pub fn parse_footprint_value(value: &str) -> Option<u64> {
-    let mut parts = value.split_whitespace();
-    let number: f64 = parts.next()?.parse().ok()?;
-    let unit = parts.next().unwrap_or("B").to_ascii_uppercase();
-    let multiplier = match unit.as_str() {
-        "B" => 1.0,
-        "KB" => 1024.0,
-        "MB" => 1024.0 * 1024.0,
-        "GB" => 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
-    if !number.is_finite() || number < 0.0 {
-        return None;
-    }
-    let bytes = (number * multiplier).round();
-    if !bytes.is_finite() || !(0.0..=(u64::MAX as f64)).contains(&bytes) {
-        return None;
-    }
-    Some(bytes as u64)
+/// Provenance recorded on every phase sample: one `proc_pid_rusage(RUSAGE_INFO_V4)` read of the
+/// Darwin `phys_footprint` ledger (`ri_phys_footprint`, `ri_lifetime_max_phys_footprint`).
+pub const PHYS_FOOTPRINT_SOURCE: &str = "proc_pid_rusage";
+/// Receipts written before sc-20671 moved sampling off the `/usr/bin/footprint` subprocess. The
+/// tool prints the same ledger, so those receipts stay valid.
+const LEGACY_PHYS_FOOTPRINT_SOURCE: &str = "footprint -p";
+
+fn valid_phys_footprint_source(source: &str) -> bool {
+    source == PHYS_FOOTPRINT_SOURCE || source == LEGACY_PHYS_FOOTPRINT_SOURCE
 }
 
 #[cfg(target_os = "macos")]
 pub fn sample_memory(pid: u32) -> std::io::Result<MemorySample> {
-    use std::process::Command;
-    let output = Command::new("/usr/bin/footprint")
-        .args(["--pid", &pid.to_string(), "--noCategories", "--wired"])
-        .output()?;
-    if !output.status.success() {
-        return Err(std::io::Error::other("footprint failed"));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let field = |name: &str| {
-        text.lines()
-            .find_map(|line| line.trim().strip_prefix(name))
-            .and_then(parse_footprint_value)
-    };
+    let footprint = crate::campaign_supervisor::phys_footprint(pid)?;
     Ok(MemorySample {
         captured_at: timestamp_now(),
         pid,
-        current_bytes: field("phys_footprint:")
-            .ok_or_else(|| std::io::Error::other("missing phys_footprint"))?,
-        peak_bytes: field("phys_footprint_peak:")
-            .ok_or_else(|| std::io::Error::other("missing phys_footprint_peak"))?,
+        current_bytes: footprint.current_bytes,
+        peak_bytes: footprint.lifetime_peak_bytes,
         mlx_active_bytes: mlx_rs::memory::get_active_memory() as u64,
         mlx_cache_bytes: mlx_rs::memory::get_cache_memory() as u64,
         mlx_peak_bytes: mlx_rs::memory::get_peak_memory() as u64,
@@ -7188,7 +7163,7 @@ pub fn run_product_fixture_on_session(
 
 /// Time one product dispatch while removing only the synchronous memory-sampling work performed
 /// by the campaign observer. The provider remains responsible for invoking the observer at its
-/// real phase boundaries; this wrapper prevents `/usr/bin/footprint` latency from being relabeled
+/// real phase boundaries; this wrapper prevents memory-sampling latency from being relabeled
 /// as model compilation or execution time.
 fn measure_product_dispatch<T>(
     observer: &mut ProductObserver,
@@ -9158,7 +9133,7 @@ pub(crate) mod tests {
                     ReceiptPhase {
                         phase: "prefill-peak".into(),
                         pid: 42,
-                        source: "footprint -p".into(),
+                        source: PHYS_FOOTPRINT_SOURCE.into(),
                         timestamp: "2026-01-01T00:00:00Z".into(),
                         phys_footprint_bytes: 123,
                         phys_footprint_peak_bytes: 456,
@@ -9682,11 +9657,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn footprint_units_are_deterministic() {
-        assert_eq!(parse_footprint_value("1664 KB"), Some(1_703_936));
-        assert_eq!(parse_footprint_value("2 MB"), Some(2 * 1024 * 1024));
-        assert!(parse_footprint_value("nan B").is_none());
-        assert!(parse_footprint_value("4 TB").is_none());
+    fn phase_samples_name_the_syscall_and_legacy_footprint_receipts_stay_valid() {
+        assert_eq!(PHYS_FOOTPRINT_SOURCE, "proc_pid_rusage");
+        assert!(valid_phys_footprint_source(PHYS_FOOTPRINT_SOURCE));
+        assert!(valid_phys_footprint_source("footprint -p"));
+        for other in ["", "footprint", "mlx_rs::memory", "proc_pid_rusage "] {
+            assert!(!valid_phys_footprint_source(other), "{other:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn worker_samples_its_own_footprint_without_a_subprocess() {
+        let pid = std::process::id();
+        let sample = sample_memory(pid).unwrap();
+        assert_eq!(sample.pid, pid);
+        std::num::NonZeroU64::new(sample.current_bytes).expect("own phys_footprint is zero");
+        assert!(sample.peak_bytes >= sample.current_bytes);
     }
 
     #[test]
@@ -10738,7 +10725,7 @@ pub(crate) mod tests {
             .map(|(index, phase)| ReceiptPhase {
                 phase: (*phase).into(),
                 pid: 7,
-                source: "footprint -p".into(),
+                source: PHYS_FOOTPRINT_SOURCE.into(),
                 timestamp: format!("2026-01-01T00:00:0{index}.000Z"),
                 phys_footprint_bytes: 100,
                 phys_footprint_peak_bytes: 100,
@@ -12636,7 +12623,7 @@ pub(crate) mod tests {
     }
 
     /// A phase stamp is the observer's product clock: synchronous memory sampling (the
-    /// `footprint -p` subprocess) is subtracted, so it can never be charged to a phase delta.
+    /// `proc_pid_rusage` read) is subtracted, so it can never be charged to a phase delta.
     #[test]
     fn phase_clock_excludes_the_observers_own_memory_sampling() {
         let pid = std::process::id();
