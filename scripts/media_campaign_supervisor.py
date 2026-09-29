@@ -136,12 +136,12 @@ def _bounded_output(argv: list[str], *, timeout: float = 2.0) -> str:
         raise SupervisionError("probe-failure", f"{argv[0]} output is not ASCII") from error
 
 
-DARWIN_AVAILABLE_METRIC = "darwin-vm-stat-available-v2"
+DARWIN_AVAILABLE_METRIC = "darwin-vm-stat-available-v3"
 _DARWIN_COUNTERS = {
     "Pages free": "freePages", "Pages speculative": "speculativePages",
     "Pages purgeable": "purgeablePages", "Pages inactive": "inactivePages",
     "File-backed pages": "fileBackedPages", "Anonymous pages": "anonymousPages",
-    "Pages throttled": "throttledPages",
+    "Pages throttled": "throttledPages", "Pages active": "activePages",
 }
 
 
@@ -171,24 +171,24 @@ def darwin_host_memory(page_size: int, pages: dict[str, int]) -> dict[str, objec
     """The macOS admission and host-reserve watchdog measure, with every component.
 
     availableBytes = (free + speculative + purgeable + R) * page size, required below 2^63, where
-    R = min(inactive - purgeable, file-backed - speculative, inactive + throttled - anonymous),
-    each floored at zero. vm_stat prints free (kernel free_count minus speculative) and
-    speculative as disjoint lists, and File-backed + Anonymous = active + inactive + speculative
-    + throttled. Throttled pages are anonymous (the throttled queue holds internal pages with no
-    pager to take them), so at most anonymous - throttled anonymous pages can sit on the inactive
-    list and at least inactive + throttled - anonymous inactive pages are file-backed: the third
-    bound makes R a provable lower bound on inactive file-backed pages, which the pageout daemon
-    frees (clean) or writes back (dirty) without the compressor or swap. Purgeable pages are
-    anonymous, so they never overlap R; speculative read-ahead is a separate list inside
-    File-backed. vm_stat is one host_statistics64 call whose counters are read without a global
-    lock, so the identity can skew by in-flight transitions; the parsers do not enforce it (the
-    shared fixture asserts it on real snapshots). Mirrors the Rust `campaign_supervisor::HostMemory`
-    and `.github/kv-poc/common.sh`; all three are pinned by
-    crates/llm/mlx-llm/testdata/darwin-host-memory-cases.json.
+    R = max(0, file-backed - speculative): Activity Monitor's "Cached Files" model. Every
+    file-backed page is page cache the kernel can drop (clean) or write back (dirty) without the
+    compressor or swap; anonymous pages are never credited. vm_stat prints free (kernel
+    free_count minus speculative) and speculative as disjoint lists, and File-backed + Anonymous =
+    active + inactive + speculative + throttled, so speculative read-ahead sits inside
+    File-backed and is removed from R; purgeable pages are anonymous, so they never overlap R.
+    Inactive, anonymous, throttled and active pages are parsed (fail closed) and recorded for
+    audit only.
+
+    Known limitation (Activity Monitor semantics): file-backed pages that another process has
+    actively mapped -- executables, mmapped model weights of another app -- count as available
+    although evicting them makes that process fault them back in. The campaign child's own
+    mapped weights are bounded by its phys_footprint cap, not by this measure.
+
+    Mirrors the Rust `campaign_supervisor::HostMemory` and `.github/kv-poc/common.sh`; all three
+    are pinned by crates/llm/mlx-llm/testdata/darwin-host-memory-cases.json.
     """
-    reclaimable = min(max(0, pages["inactivePages"] - pages["purgeablePages"]),
-                      max(0, pages["fileBackedPages"] - pages["speculativePages"]),
-                      max(0, pages["inactivePages"] + pages["throttledPages"] - pages["anonymousPages"]))
+    reclaimable = max(0, pages["fileBackedPages"] - pages["speculativePages"])
     available = (pages["freePages"] + pages["speculativePages"] + pages["purgeablePages"]
                  + reclaimable) * page_size
     if available >= 2**63:

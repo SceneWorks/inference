@@ -54,7 +54,7 @@ def measured_admission(supervisor, policy) -> dict:
     admission["hostMemoryComponents"] = supervisor.darwin_host_memory(16384, {
         "freePages": 10**9 // 16384, "speculativePages": 0, "purgeablePages": 0,
         "inactivePages": 0, "fileBackedPages": 0,
-            "anonymousPages": 0, "throttledPages": 0})
+            "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
     return admission
 
 
@@ -1021,7 +1021,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 return self.free, campaign.supervisor.darwin_host_memory(4096, {
                     "freePages": self.free // 4096, "speculativePages": 0, "purgeablePages": 0,
                     "inactivePages": 0, "fileBackedPages": 0,
-            "anonymousPages": 0, "throttledPages": 0})
+            "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
 
             def tree_footprint(self, _owner: object) -> int:
                 return self.footprint

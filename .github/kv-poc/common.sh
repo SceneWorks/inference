@@ -57,13 +57,14 @@ stop_branch_present() {
 # darwin_host_memory; all three are pinned by crates/llm/mlx-llm/testdata/
 # darwin-host-memory-cases.json):
 #   available = (free + speculative + purgeable + R) * page size   (must stay below 2^63)
-#   R = min(inactive - purgeable, file-backed - speculative, inactive + throttled - anonymous),
-#       each floored at zero: a provable lower bound on inactive file-backed pages, because
-#       File-backed + Anonymous = active + inactive + speculative + throttled and throttled
-#       pages are anonymous (darwin-vm-stat-available-v2).
+#   R = max(0, file-backed - speculative)   (darwin-vm-stat-available-v3)
+# Activity Monitor's "Cached Files" model: all file-backed page cache counts, anonymous pages
+# never do. Known limitation: file pages another process has mapped count as available; the
+# campaign child's own mapped weights are bounded by its phys_footprint cap.
 # Reads vm_stat on stdin; prints "available page free speculative purgeable inactive file-backed
-# anonymous throttled R" (bytes, then page size, then pages) or prints nothing and fails when the
-# banner or any counter is missing, duplicated or malformed, or available reaches 2^63.
+# anonymous throttled active R" (bytes, then page size, then pages; inactive, anonymous,
+# throttled and active are audit-only) or prints nothing and fails when the banner or any counter
+# is missing, duplicated or malformed, or available reaches 2^63.
 host_memory_from_vm_stat() {
   awk '
     NR == 1 {
@@ -74,23 +75,20 @@ host_memory_from_vm_stat() {
       line = $0; sub(/^[ \t]+/, "", line); key = line; sub(/:.*/, "", key)
       if (key != "Pages free" && key != "Pages speculative" && key != "Pages purgeable" \
           && key != "Pages inactive" && key != "File-backed pages" \
-          && key != "Anonymous pages" && key != "Pages throttled") next
+          && key != "Anonymous pages" && key != "Pages throttled" && key != "Pages active") next
       val = line; sub(/^[^:]*:[ \t]*/, "", val); sub(/[ \t]+$/, "", val)
       if (val !~ /^[0-9]+\.$/ || (key in v)) bad = 1
       sub(/\.$/, "", val); v[key] = val + 0; n++
     }
     END {
       p = page; while (p > 1 && p % 2 == 0) p /= 2
-      if (bad || n != 7 || page < 4096 || p != 1) exit 1
-      i = v["Pages inactive"] - v["Pages purgeable"]; if (i < 0) i = 0
-      f = v["File-backed pages"] - v["Pages speculative"]; if (f < 0) f = 0
-      a = v["Pages inactive"] + v["Pages throttled"] - v["Anonymous pages"]; if (a < 0) a = 0
-      r = (i < f) ? i : f; r = (a < r) ? a : r
+      if (bad || n != 8 || page < 4096 || p != 1) exit 1
+      r = v["File-backed pages"] - v["Pages speculative"]; if (r < 0) r = 0
       avail = (v["Pages free"] + v["Pages speculative"] + v["Pages purgeable"] + r) * page
       if (avail >= 9223372036854775808) exit 1
-      printf "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n", avail, page, \
+      printf "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n", avail, page, \
         v["Pages free"], v["Pages speculative"], v["Pages purgeable"], v["Pages inactive"], \
-        v["File-backed pages"], v["Anonymous pages"], v["Pages throttled"], r
+        v["File-backed pages"], v["Anonymous pages"], v["Pages throttled"], v["Pages active"], r
     }'
 }
 

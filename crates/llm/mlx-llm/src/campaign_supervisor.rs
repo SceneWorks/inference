@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 /// Identity of the macOS admission and host-reserve watchdog measure recorded with every sample.
-pub const DARWIN_AVAILABLE_METRIC: &str = "darwin-vm-stat-available-v2";
+pub const DARWIN_AVAILABLE_METRIC: &str = "darwin-vm-stat-available-v3";
 /// The supervisor hands the worker the host measurement it was admitted on, so the worker's own
 /// receipt records the decision's inputs.
 pub const HOST_MEMORY_ADMISSION_ENV: &str = "SCENEWORKS_CAMPAIGN_HOST_MEMORY_ADMISSION";
@@ -36,27 +36,25 @@ pub struct VmStatPages {
     pub file_backed: u64,
     pub anonymous: u64,
     pub throttled: u64,
+    pub active: u64,
 }
 
 /// One vm_stat host-memory measurement and every component of the available measure, used by the
 /// pre-spawn admission and the live host-reserve watchdog alike.
 ///
 /// `available_bytes = (free + speculative + purgeable + R) * page_size` (below 2^63), where
-/// `R = min(inactive - purgeable, file_backed - speculative, inactive + throttled - anonymous)`,
-/// each floored at zero. vm_stat prints free (the kernel's free_count minus speculative) and
-/// speculative as disjoint lists, and `File-backed + Anonymous = active + inactive + speculative +
-/// throttled`. Throttled pages are anonymous (the throttled queue holds internal pages with no
-/// pager to take them), so at most `anonymous - throttled` anonymous pages can sit on the inactive
-/// list and at least `inactive + throttled - anonymous` inactive pages are file-backed. The third
-/// bound therefore makes `R` a provable lower bound on inactive file-backed pages, which the
-/// pageout daemon frees (clean) or writes back (dirty) without the compressor or swap; the first
-/// two bounds keep it within the non-purgeable inactive list and the non-speculative file-backed
-/// pages. Purgeable pages are anonymous, so they never overlap `R`. Anonymous inactive pages are
-/// credited only as far as purgeable pages cover them; active file-backed pages are not credited.
+/// `R = max(0, file_backed - speculative)`: Activity Monitor's "Cached Files" model. Every
+/// file-backed page is page cache the kernel can drop (clean) or write back (dirty) without the
+/// compressor or swap; anonymous pages are never credited. vm_stat prints free (the kernel's
+/// free_count minus speculative) and speculative as disjoint lists, and `File-backed + Anonymous =
+/// active + inactive + speculative + throttled`, so speculative read-ahead sits inside File-backed
+/// and is removed from `R`; purgeable pages are anonymous, so they never overlap `R`. Inactive,
+/// anonymous, throttled and active pages are parsed (fail closed) and recorded for audit only.
 ///
-/// vm_stat is one `host_statistics64` call whose counters are read without a global lock, so the
-/// identity can skew by pages in flight between lists; the parser does not enforce it (the shared
-/// fixture asserts it on real snapshots, where it held exactly).
+/// Known limitation (Activity Monitor semantics): file-backed pages that another process has
+/// actively mapped -- executables, another app's mmapped model weights -- count as available
+/// although evicting them makes that process fault them back in. The campaign child's own mapped
+/// weights are bounded by its `phys_footprint` cap, not by this measure.
 ///
 /// Mirrors `scripts/media_campaign_supervisor.py` `darwin_host_memory` and
 /// `.github/kv-poc/common.sh` `host_memory_from_vm_stat`; all three are pinned by
@@ -73,6 +71,7 @@ pub struct HostMemory {
     pub file_backed_pages: u64,
     pub anonymous_pages: u64,
     pub throttled_pages: u64,
+    pub active_pages: u64,
     pub reclaimable_file_pages: u64,
     pub available_bytes: u64,
 }
@@ -80,16 +79,7 @@ pub struct HostMemory {
 impl HostMemory {
     /// Derive the measure from raw vm_stat page counts; `None` at or above 2^63 bytes.
     pub fn from_pages(page_size_bytes: u64, pages: VmStatPages) -> Option<Self> {
-        let reclaimable_file_pages = pages
-            .inactive
-            .saturating_sub(pages.purgeable)
-            .min(pages.file_backed.saturating_sub(pages.speculative))
-            .min(
-                pages
-                    .inactive
-                    .saturating_add(pages.throttled)
-                    .saturating_sub(pages.anonymous),
-            );
+        let reclaimable_file_pages = pages.file_backed.saturating_sub(pages.speculative);
         let available_bytes = pages
             .free
             .checked_add(pages.speculative)?
@@ -107,6 +97,7 @@ impl HostMemory {
             file_backed_pages: pages.file_backed,
             anonymous_pages: pages.anonymous,
             throttled_pages: pages.throttled,
+            active_pages: pages.active,
             reclaimable_file_pages,
             available_bytes,
         })
@@ -122,6 +113,7 @@ impl HostMemory {
             file_backed: self.file_backed_pages,
             anonymous: self.anonymous_pages,
             throttled: self.throttled_pages,
+            active: self.active_pages,
         }
     }
 
@@ -650,6 +642,7 @@ fn parse_vm_stat(text: &str) -> io::Result<HostMemory> {
             file_backed: pages("File-backed pages")?,
             anonymous: pages("Anonymous pages")?,
             throttled: pages("Pages throttled")?,
+            active: pages("Pages active")?,
         },
     )
     .ok_or_else(|| io::Error::other("vm_stat available bytes reach 2^63"))
@@ -945,42 +938,31 @@ mod tests {
     #[test]
     fn fixture_discriminates_every_plausible_wrong_definition() {
         type Credit = fn(&HostMemory) -> u64;
-        let anonymous_bound = |h: &HostMemory| {
-            (h.inactive_pages + h.throttled_pages).saturating_sub(h.anonymous_pages)
-        };
-        let mutants: [(&str, Credit); 7] = [
-            ("drop the anonymous bound (v1)", |h| {
+        let mutants: [(&str, Credit); 6] = [
+            ("count anonymous instead of file-backed", |h| {
+                h.anonymous_pages
+            }),
+            ("count inactive instead of file-backed", |h| {
+                h.inactive_pages
+            }),
+            ("min with inactive (v1)", |h| {
                 h.inactive_pages
                     .saturating_sub(h.purgeable_pages)
                     .min(h.file_backed_pages.saturating_sub(h.speculative_pages))
             }),
-            ("drop the min", |h| {
-                h.file_backed_pages.saturating_sub(h.speculative_pages)
-            }),
-            ("count all inactive", |h| h.inactive_pages),
-            ("drop file-backed", |h| {
-                h.inactive_pages.saturating_sub(h.purgeable_pages)
-            }),
-            ("purgeable counted twice", |h| {
+            ("anonymous bound (v2)", |h| {
                 h.inactive_pages
+                    .saturating_sub(h.purgeable_pages)
                     .min(h.file_backed_pages.saturating_sub(h.speculative_pages))
                     .min((h.inactive_pages + h.throttled_pages).saturating_sub(h.anonymous_pages))
             }),
-            ("throttled ignored", |h| {
-                h.inactive_pages
-                    .saturating_sub(h.purgeable_pages)
-                    .min(h.file_backed_pages.saturating_sub(h.speculative_pages))
-                    .min(h.inactive_pages.saturating_sub(h.anonymous_pages))
-            }),
+            ("speculative counted twice", |h| h.file_backed_pages),
             ("no file cache", |_| 0),
         ];
         let valid: Vec<HostMemory> = host_memory_cases()
             .into_iter()
             .filter_map(|(.., expect)| expect)
             .collect();
-        for h in &valid {
-            assert!(h.reclaimable_file_pages <= anonymous_bound(h));
-        }
         for (name, mutant) in mutants {
             assert!(
                 valid.iter().any(|h| mutant(h) != h.reclaimable_file_pages),
@@ -1092,7 +1074,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(failure.reason, StopReason::PreflightMemory);
-        assert!(failure.detail.contains("host available 10 bytes"));
+        // Only its 5 file-backed pages are credited, never the 290 anonymous inactive pages.
+        assert!(failure.detail.contains("host available 15 bytes"));
         assert_eq!(failure.host_memory.as_deref(), Some(&anonymous));
         assert!(failure.pid.is_none() && !request.stdout_path.exists());
     }

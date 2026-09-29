@@ -87,8 +87,8 @@ fi
 problems=""
 if measured="$(vm_stat | host_memory_from_vm_stat)" && [ -n "$measured" ]; then
   gib=$(( ${measured%% *} / 1073741824 ))
-  echo "available RAM (free + speculative + purgeable + reclaimable file cache): ${gib} GiB (need >= 84 = 68 cap + 16 reserve)"
-  echo "  components (available-bytes page-size free speculative purgeable inactive file-backed anonymous throttled reclaimable-file pages): $measured"
+  echo "available RAM (free + speculative + purgeable + file cache): ${gib} GiB (need >= 84 = 68 cap + 16 reserve)"
+  echo "  components (available-bytes page-size free speculative purgeable inactive file-backed anonymous throttled active file-cache pages): $measured"
   [ "$gib" -ge 84 ] || problems="$problems; available RAM is ${gib} GiB (< 84)"
 else
   problems="$problems; vm_stat host memory could not be measured"

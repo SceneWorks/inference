@@ -1,14 +1,14 @@
 {
-  "schema": "sceneworks-darwin-host-memory-cases-v2",
-  "definition": "availableBytes = (freePages + speculativePages + purgeablePages + reclaimableFilePages) * pageSizeBytes < 2^63; reclaimableFilePages = min(max(0, inactivePages - purgeablePages), max(0, fileBackedPages - speculativePages), max(0, inactivePages + throttledPages - anonymousPages))",
+  "schema": "sceneworks-darwin-host-memory-cases-v3",
+  "definition": "availableBytes = (freePages + speculativePages + purgeablePages + reclaimableFilePages) * pageSizeBytes < 2^63; reclaimableFilePages = max(0, fileBackedPages - speculativePages) (Activity Monitor Cached Files); anonymous, inactive, throttled and active pages are recorded for audit only",
   "identity": "File-backed pages + Anonymous pages = Pages active + Pages inactive + Pages speculative + Pages throttled (every valid case)",
   "cases": [
     {
       "name": "host-2026-09-29-idle",
-      "why": "real vm_stat, 128 GiB M-series host at rest: anonymous pages outnumber the inactive list, so no file cache is provably inactive",
+      "why": "real vm_stat, 128 GiB M-series host at rest",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  5180105.\nPages active:                                1131478.\nPages inactive:                               807701.\nPages speculative:                            401326.\nPages throttled:                                   0.\nPages wired down:                             353386.\nPages purgeable:                               34413.\n\"Translation faults\":                     2994921092.\nPages copy-on-write:                       167601412.\nPages zero filled:                        2354537730.\nPages reactivated:                           3861903.\nPages purged:                                4016113.\nFile-backed pages:                           1323096.\nAnonymous pages:                             1017409.\nPages stored in compressor:                   835065.\nPages occupied by compressor:                 423528.\nDecompressions:                               594178.\nCompressions:                                9276548.\nPageins:                                   468791399.\nPageouts:                                      39106.\nSwapins:                                         100.\nSwapouts:                                       1884.\nPages tagged:                                 181043.\nPages tagged resident:                        159506.\nPages tagged compressed:                       21537.\nPages tag-storage:                            262144.\nPages tag-storage holding tags:                 6132.\nPages tag-storage free:                         9902.\nPages tag-storage non-tag pageable:           245980.\nPages tag-storage non-tag wired:                 130.\nBytes of compressed tags:                    3101504.\nTagged compressions:                           38616.\nTagged decompressions:                         16001.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 5180105,
         "speculativePages": 401326,
@@ -17,16 +17,17 @@
         "fileBackedPages": 1323096,
         "anonymousPages": 1017409,
         "throttledPages": 0,
-        "reclaimableFilePages": 0,
-        "availableBytes": 92009988096
+        "activePages": 1131478,
+        "reclaimableFilePages": 921770,
+        "availableBytes": 107112267776
       }
     },
     {
       "name": "host-2026-09-29-after-10gb-file-read",
-      "why": "same host right after `cat`-ing 10.2 GB of safetensors: free fell 625768 pages, inactive and file-backed each rose ~623.8k; inactive + throttled - anonymous proves 411802 inactive file-backed pages",
+      "why": "same host right after `cat`-ing 10.2 GB of safetensors: free fell 625768 pages, inactive and file-backed each rose ~623.8k; every non-speculative file-backed page is credited",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                  4554337.\nPages active:                                1133705.\nPages inactive:                              1431455.\nPages speculative:                            401440.\nPages throttled:                                   0.\nPages wired down:                             353123.\nPages purgeable:                               37980.\n\"Translation faults\":                     2995023674.\nPages copy-on-write:                       167602104.\nPages zero filled:                        2354735946.\nPages reactivated:                           3862077.\nPages purged:                                4016305.\nFile-backed pages:                           1946947.\nAnonymous pages:                             1019653.\nPages stored in compressor:                   835058.\nPages occupied by compressor:                 423527.\nDecompressions:                               594185.\nCompressions:                                9276548.\nPageins:                                   469415179.\nPageouts:                                      39106.\nSwapins:                                         100.\nSwapouts:                                       1884.\nPages tagged:                                 180881.\nPages tagged resident:                        159344.\nPages tagged compressed:                       21537.\nPages tag-storage:                            262144.\nPages tag-storage holding tags:                 6132.\nPages tag-storage free:                         9885.\nPages tag-storage non-tag pageable:           245996.\nPages tag-storage non-tag wired:                 131.\nBytes of compressed tags:                    3101504.\nTagged compressions:                           38616.\nTagged decompressions:                         16001.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 4554337,
         "speculativePages": 401440,
@@ -35,16 +36,17 @@
         "fileBackedPages": 1946947,
         "anonymousPages": 1019653,
         "throttledPages": 0,
-        "reclaimableFilePages": 411802,
-        "availableBytes": 88564678656
+        "activePages": 1133705,
+        "reclaimableFilePages": 1545507,
+        "availableBytes": 107139301376
       }
     },
     {
       "name": "heavy-file-cache",
-      "why": "inactive list is clean file cache: all but the anonymous remainder is credited",
+      "why": "inactive list is clean file cache: every non-speculative file-backed page is credited",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages active:                                  7000.\nPages inactive:                               60000.\nPages speculative:                              500.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                            65500.\nAnonymous pages:                               2000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 1000,
         "speculativePages": 500,
@@ -53,16 +55,17 @@
         "fileBackedPages": 65500,
         "anonymousPages": 2000,
         "throttledPages": 0,
-        "reclaimableFilePages": 58000,
-        "availableBytes": 974848000
+        "activePages": 7000,
+        "reclaimableFilePages": 65000,
+        "availableBytes": 1089536000
       }
     },
     {
       "name": "heavy-anonymous-inactive",
-      "why": "inactive list is anonymous (needs the compressor): nothing is credited",
+      "why": "inactive list is anonymous (needs the compressor): only the small file cache is credited, never the anonymous pages",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages active:                                  2000.\nPages inactive:                               60000.\nPages speculative:                              500.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                             2500.\nAnonymous pages:                              60000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 1000,
         "speculativePages": 500,
@@ -71,16 +74,17 @@
         "fileBackedPages": 2500,
         "anonymousPages": 60000,
         "throttledPages": 0,
-        "reclaimableFilePages": 0,
-        "availableBytes": 24576000
+        "activePages": 2000,
+        "reclaimableFilePages": 2000,
+        "availableBytes": 57344000
       }
     },
     {
       "name": "inactive-anonymous-active-file",
-      "why": "inactive list is anonymous while the file cache is active: min(inactive, file-backed) would credit 40000 compressor-only pages; the anonymous bound credits none",
+      "why": "inactive list is anonymous while the file cache is active: exactly file-backed - speculative (40000) is credited, never the 40000 anonymous inactive pages",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages active:                                 40000.\nPages inactive:                               40000.\nPages speculative:                              500.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                            40500.\nAnonymous pages:                              40000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 1000,
         "speculativePages": 500,
@@ -89,16 +93,17 @@
         "fileBackedPages": 40500,
         "anonymousPages": 40000,
         "throttledPages": 0,
-        "reclaimableFilePages": 0,
-        "availableBytes": 24576000
+        "activePages": 40000,
+        "reclaimableFilePages": 40000,
+        "availableBytes": 679936000
       }
     },
     {
       "name": "active-mapped-file",
-      "why": "file-backed pages mostly active (mapped, in use): only provably inactive file pages are credited",
+      "why": "file-backed pages mostly active (mapped): Activity Monitor Cached Files semantics credit them all",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages active:                                 48000.\nPages inactive:                                3000.\nPages speculative:                              500.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                            50500.\nAnonymous pages:                               1000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 1000,
         "speculativePages": 500,
@@ -107,16 +112,17 @@
         "fileBackedPages": 50500,
         "anonymousPages": 1000,
         "throttledPages": 0,
-        "reclaimableFilePages": 2000,
-        "availableBytes": 57344000
+        "activePages": 48000,
+        "reclaimableFilePages": 50000,
+        "availableBytes": 843776000
       }
     },
     {
       "name": "purgeable-on-throttled-inactive",
-      "why": "purgeable (anonymous) pages are counted once; throttled anonymous pages widen the anonymous bound",
+      "why": "purgeable (anonymous) pages are credited once; throttled anonymous pages are not credited",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages active:                                  5000.\nPages inactive:                                5000.\nPages speculative:                                0.\nPages throttled:                               2000.\nPages wired down:                             1000.\nPages purgeable:                               2000.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                             9000.\nAnonymous pages:                               3000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 1000,
         "speculativePages": 0,
@@ -125,8 +131,9 @@
         "fileBackedPages": 9000,
         "anonymousPages": 3000,
         "throttledPages": 2000,
-        "reclaimableFilePages": 3000,
-        "availableBytes": 98304000
+        "activePages": 5000,
+        "reclaimableFilePages": 9000,
+        "availableBytes": 196608000
       }
     },
     {
@@ -134,7 +141,7 @@
       "why": "speculative read-ahead is file-backed and counted once",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages active:                                  1000.\nPages inactive:                               10000.\nPages speculative:                             4000.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                            14000.\nAnonymous pages:                               1000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 1000,
         "speculativePages": 4000,
@@ -143,24 +150,26 @@
         "fileBackedPages": 14000,
         "anonymousPages": 1000,
         "throttledPages": 0,
-        "reclaimableFilePages": 9000,
-        "availableBytes": 229376000
+        "activePages": 1000,
+        "reclaimableFilePages": 10000,
+        "availableBytes": 245760000
       }
     },
     {
       "name": "saturating-components",
-      "why": "negative differences floor at zero",
-      "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                      10.\nPages active:                                    90.\nPages inactive:                                  20.\nPages speculative:                              100.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                 50.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                              150.\nAnonymous pages:                                 60.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
+      "why": "speculative above file-backed floors the file-cache credit at zero",
+      "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                      10.\nPages active:                                   120.\nPages inactive:                                  20.\nPages speculative:                              100.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                 50.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                               40.\nAnonymous pages:                                200.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 16384,
         "freePages": 10,
         "speculativePages": 100,
         "purgeablePages": 50,
         "inactivePages": 20,
-        "fileBackedPages": 150,
-        "anonymousPages": 60,
+        "fileBackedPages": 40,
+        "anonymousPages": 200,
         "throttledPages": 0,
+        "activePages": 120,
         "reclaimableFilePages": 0,
         "availableBytes": 2621440
       }
@@ -170,7 +179,7 @@
       "why": "the page size comes from the vm_stat banner",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free:                                       7.\nPages active:                                     0.\nPages inactive:                                   0.\nPages speculative:                                3.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                                3.\nAnonymous pages:                                  0.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": {
-        "metric": "darwin-vm-stat-available-v2",
+        "metric": "darwin-vm-stat-available-v3",
         "pageSizeBytes": 4096,
         "freePages": 7,
         "speculativePages": 3,
@@ -179,6 +188,7 @@
         "fileBackedPages": 3,
         "anonymousPages": 0,
         "throttledPages": 0,
+        "activePages": 0,
         "reclaimableFilePages": 0,
         "availableBytes": 40960
       }
@@ -223,6 +233,12 @@
       "name": "missing-pages-throttled",
       "why": "`Pages throttled` absent: fail closed",
       "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages active:                                  7000.\nPages inactive:                               60000.\nPages speculative:                              500.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                            65500.\nAnonymous pages:                               2000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
+      "expect": null
+    },
+    {
+      "name": "missing-pages-active",
+      "why": "`Pages active` absent: fail closed",
+      "vmStat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    1000.\nPages inactive:                               60000.\nPages speculative:                              500.\nPages throttled:                                  0.\nPages wired down:                             1000.\nPages purgeable:                                  0.\n\"Translation faults\":                          12345.\nPages purged:                                   77.\nFile-backed pages:                            65500.\nAnonymous pages:                               2000.\nPages tag-storage free:                          9.\nPages occupied by compressor:                    5.\n",
       "expect": null
     },
     {

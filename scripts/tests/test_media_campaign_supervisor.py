@@ -27,7 +27,7 @@ class Probe:
         return free, safety.darwin_host_memory(4096, {
             "freePages": free // 4096, "speculativePages": 0, "purgeablePages": 0,
             "inactivePages": 0, "fileBackedPages": 0,
-            "anonymousPages": 0, "throttledPages": 0})
+            "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
 
     def tree_footprint(self, _pgid):
         return self.footprint
@@ -382,14 +382,14 @@ class SupervisorTests(unittest.TestCase):
                 host = safety.darwin_host_memory(4096, {
                     "freePages": 0, "speculativePages": 0, "purgeablePages": 0,
                     "inactivePages": pages, "fileBackedPages": pages, "anonymousPages": 0,
-                    "throttledPages": 0})
+                    "throttledPages": 0, "activePages": 0})
                 return host["availableBytes"], host
         result = self.run_child("import time; time.sleep(.1)", probe=FileCacheProbe([1000]))
         self.assertEqual(result.returncode, 0)
         (self.root / "stdout").unlink()
         (self.root / "stderr").unlink()
         with self.assertRaisesRegex(safety.SupervisionError,
-                                    r"host-memory: host available 0 bytes \(darwin-vm-stat-available-v2\)") as caught:
+                                    r"host-memory: host available 0 bytes \(darwin-vm-stat-available-v3\)") as caught:
             self.run_child("import time; time.sleep(5)", probe=FileCacheProbe([1000, 0]))
         self.assertIsNotNone(caught.exception.pid)
         self.assertEqual(caught.exception.admission["hostMemoryComponents"]["inactivePages"], 1000)
@@ -397,7 +397,7 @@ class SupervisorTests(unittest.TestCase):
         record = self.read_unaccepted(caught.exception)
         self.assertEqual((record["outcome"], record["reason"]), ("aborted", "host-memory"))
         self.assertEqual(record["watchdogHostMemory"]["inactivePages"], 0)
-        self.assertEqual(record["watchdogHostMemory"]["metric"], "darwin-vm-stat-available-v2")
+        self.assertEqual(record["watchdogHostMemory"]["metric"], "darwin-vm-stat-available-v3")
 
     def test_live_reserve_and_footprint_abort(self):
         class DecliningProbe(Probe):

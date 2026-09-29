@@ -10226,6 +10226,7 @@ pub(crate) mod tests {
                             file_backed: 60_000,
                             anonymous: 40_000,
                             throttled: 0,
+                            active: 0,
                         },
                     ),
                 },
