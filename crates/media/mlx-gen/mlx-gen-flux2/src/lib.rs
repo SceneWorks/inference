@@ -53,7 +53,7 @@ pub use convert::{
     build_target_state_dict, convert_and_assemble, quantize_flux2_dit, quantize_flux2_text_encoder,
     quantize_flux2_text_encoder_dir, quantize_flux2_transformer,
 };
-pub use kv_cache::{CacheMode, Flux2KvCache, Stream};
+pub use kv_cache::{CacheMode, CfgBranch, Flux2KvCache, Flux2KvCfgCaches, Stream};
 pub use loader::{
     load_control_transformer_dev, load_multimodal_projector_dev, load_text_encoder,
     load_text_encoder_dev, load_tokenizer, load_tokenizer_dev, load_transformer,

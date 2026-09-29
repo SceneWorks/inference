@@ -272,3 +272,73 @@ fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
         "2·B·H·Skv·D·f32 for the recomputed text K/V"
     );
 }
+
+#[test]
+fn a_sequential_expert_swap_is_its_own_load_window_and_windows_stay_unique() {
+    let cfg = tiny_cfg();
+    let weights = mlx_gen::weights::Weights::from_file(format!(
+        "{}/tests/fixtures/s5_low.safetensors",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let raw = weights.require("ctx_cond").unwrap().clone();
+    let latent = weights.require("init_noise").unwrap().clone();
+    let (root, snapshot) = snapshot();
+    let (scope, events) = activate(root.path(), &snapshot, "wan2_2_t2v_14b");
+    let loads = std::cell::Cell::new(0);
+    // Both "experts" are the tiny 2-block fixture; the swap mechanics are what is under test.
+    let load = |_high: bool| -> Result<(WanTransformer, Array, Option<Array>, f32)> {
+        loads.set(loads.get() + 1);
+        let transformer = WanTransformer::from_weights(&weights, &cfg)?;
+        let cond = transformer.embed_text(&raw)?;
+        let uncond = transformer.embed_text(&multiply(&raw, scalar(0.5))?)?;
+        Ok((transformer, cond, Some(uncond), 5.0))
+    };
+    denoise_moe_curated_swapped(
+        500.0,
+        "euler",
+        1000,
+        4,
+        1.0,
+        &latent,
+        None,
+        7,
+        &CancelFlag::new(),
+        &mut |progress| obs::observe_progress(&progress),
+        load,
+    )
+    .unwrap();
+    obs::observe_generation_end();
+    drop(scope);
+    assert_eq!(
+        loads.get(),
+        2,
+        "the schedule must cross the expert boundary"
+    );
+    let windows: Vec<(String, u64)> = of(&events.borrow(), "phase-window")
+        .iter()
+        .map(|w| {
+            (
+                w["window"].as_str().unwrap().to_owned(),
+                w["window_index"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let unique: std::collections::BTreeSet<_> = windows.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        windows.len(),
+        "duplicate windows: {windows:?}"
+    );
+    assert_eq!(
+        windows.iter().filter(|(name, _)| name == "load").count(),
+        1,
+        "the mid-denoise swap is one load window: {windows:?}"
+    );
+    let steps: Vec<u64> = windows
+        .iter()
+        .filter(|(name, _)| name == "denoise-step")
+        .map(|(_, index)| *index)
+        .collect();
+    assert_eq!(steps, vec![1, 2, 3, 4], "{windows:?}");
+}

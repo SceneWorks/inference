@@ -252,6 +252,8 @@ class MetalLaneTests(unittest.TestCase):
                     "--prompt", PROMPTS[expected["prompt"]], "--guidance", expected["guidance"],
                     "--steps", "4",
                 ]
+                if stem_for(route) == "sc20686_wan":
+                    values += ["--seed", "42"]
                 if route == "wan2_2_i2v_14b":
                     values[0:0] = ["--image", str(image)]
                 if route in ("wan_vace", "wan2_2_vace_fun_14b"):
@@ -288,6 +290,16 @@ class MetalLaneTests(unittest.TestCase):
             self.adapter.load_wan_manifest(manifest, "candle-cuda")
             with self.assertRaisesRegex(ValueError, "does not match registered route"):
                 self.adapter.load_wan_manifest(manifest, "mlx-metal")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._wan_manifest(root, lambda _route: "sc20686_wan")
+            entries = json.loads(manifest.read_text(encoding="utf-8"))
+            for coordinates in entries["wan_vace"]["coordinates"].values():
+                index = coordinates.index("--seed")
+                del coordinates[index:index + 2]
+            manifest.write_text(json.dumps(entries), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must seal one integer --seed"):
+                self.adapter.load_wan_manifest(manifest, "mlx-metal")
 
     def _flux_inputs(self, root, stem):
         entrypoint = root / stem
@@ -317,6 +329,9 @@ class MetalLaneTests(unittest.TestCase):
                     for name in ("edit-512-ref1-cfg1", "edit-768x512-ref2-cfg2")
                 ),
             )
+            for spec in specs:
+                self.assertNotIn("--single-only", spec.args)
+                self.assertEqual(self.adapter.argument_value(spec.args, "--seed"), "42")
             kv = [spec for spec in specs if spec.variant == "flux2_klein_9b_kv_edit"]
             self.assertTrue(all(spec.model_snapshot_revision == "3" * 40 for spec in kv))
             with self.assertRaisesRegex(ValueError, "requires a flux2_klein_9b_kv_edit snapshot"):
@@ -329,6 +344,7 @@ class MetalLaneTests(unittest.TestCase):
             entrypoint, snapshots, ref, ref2 = self._flux_inputs(Path(directory), "flux2-edit")
             cuda = self.adapter.flux_coordinates(entrypoint, snapshots["edit"], ref, ref2)
             self.assertEqual({spec.variant for spec in cuda}, {"flux2_klein_9b_edit"})
+            self.assertTrue(all("--single-only" in spec.args and "--seed" not in spec.args for spec in cuda))
             with self.assertRaisesRegex(ValueError, "does not match registered route"):
                 self.adapter.flux_coordinates(
                     entrypoint, snapshots["edit"], ref, ref2, "mlx-metal", snapshots["kv"],
@@ -418,6 +434,13 @@ class MetalLaneTests(unittest.TestCase):
             ])
             self.assertEqual(code, 1)
             self.assertIn("different measurement lane", stderr)
+            code, stderr = self._run_main([
+                *common, "--schedule-control",
+                "--safety-policy", str(self._policy(root, "linux-cuda")),
+                "--resume-dir", str(root / "resume-cuda-control"),
+            ])
+            self.assertEqual(code, 1)
+            self.assertIn("Metal-lane (darwin-mlx) matrix mode", stderr)
 
     # --- transcript validation -----------------------------------------------------------------
 
@@ -484,14 +507,29 @@ class MetalLaneTests(unittest.TestCase):
         window["allocator_high_bytes"] = window["allocator_before_bytes"] - 1
         self.assert_refused("wan2_2_t2v_14b", events, "ordering")
 
-    def test_persistent_bytes_bind_the_exact_live_cfg_batch(self):
-        for kv_batch in (3, 1):
-            events = self.mlx_events("wan2_2_t2v_14b")
+    def test_kv_batch_is_the_routes_exact_cfg_layout(self):
+        def with_batch(variant, kv_batch, guidance=None):
+            events = self.mlx_events(variant)
             for event in events:
                 if event["phase"] == "cross-kv-created":
                     event["kv_batch"] = kv_batch
-            # 3 is not a CFG batch; 1 disagrees with the retained CFG-stacked bytes.
-            self.assert_refused("wan2_2_t2v_14b", events, "exact live tensors")
+                if event["phase"] == "metadata" and guidance is not None:
+                    event["geometry"]["guidance"] = guidance
+            return events
+
+        # A14B always stacks cond+uncond (2B); TI2V-5B only when guidance > 1.
+        self.assert_refused("wan2_2_t2v_14b", with_batch("wan2_2_t2v_14b", 1), "exact CFG layout")
+        self.assert_refused("wan2_2_t2v_14b", with_batch("wan2_2_t2v_14b", 3), "exact CFG layout")
+        self.assert_refused("wan2_2_ti2v_5b", with_batch("wan2_2_ti2v_5b", 2, "1"), "exact CFG layout")
+        # FLUX.2 kv-edit runs each branch at B and VACE recomputes per branch.
+        self.assert_refused(
+            "flux2_klein_9b_kv_edit", with_batch("flux2_klein_9b_kv_edit", 2), "exact CFG layout",
+        )
+        self.assert_refused("wan_vace", with_batch("wan_vace", 2), "exact CFG layout")
+        # With the right batch but bytes of another batch, the retained-bytes identity refuses.
+        events = self.mlx_events("wan2_2_t2v_14b")
+        next(e for e in events if e["phase"] == "cross-kv-created")["persistent_bytes"] //= 2
+        self.assert_refused("wan2_2_t2v_14b", events, "exact live tensors|exact simultaneous")
 
     def test_recomputed_and_persistent_semantics_cannot_be_swapped(self):
         events = self.mlx_events("wan_vace")
@@ -551,6 +589,12 @@ class MetalLaneTests(unittest.TestCase):
         mixed[0]["backend"] = "candle-cuda"
         for event in mixed[0]["observer_events"]:
             event.pop("backend", None)
+        # A CUDA-lane event may not carry a Metal kv_batch (it would shift the candidate check).
+        with self.assertRaisesRegex(ValueError, "may not supply a Metal kv_batch"):
+            self.reducer.validate(mixed[0], self.source_map_hash, self.source_map)
+        for event in mixed[0]["observer_events"]:
+            if event.pop("kv_batch", None) is not None:
+                event["candidate_persistent_bytes"] = self.reducer.packed_group32_kv_bytes(1, 2, 128, 64)
         self.reducer.validate(mixed[0], self.source_map_hash, self.source_map)
         with self.assertRaisesRegex(ValueError, "mix measurement backends"):
             self.reducer.reduce(mixed)
@@ -660,6 +704,141 @@ class MetalLaneTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "resolved measurement backend"):
                 self.reducer.verify_campaign_bundle(destination)
 
+    # --- schedule-control arm ------------------------------------------------------------------
+
+    def control_events(self, variant, coordinate):
+        events = [
+            event for event in self.mlx_events(variant, False, coordinate)
+            if event["phase"] != "cross-kv-read"
+        ]
+        next(event for event in events if event["phase"] == "metadata")["schedule_control"] = True
+        return events
+
+    def control_identity(self):
+        return {
+            "source_ref": "a" * 40, "model_snapshot_revision": "b" * 40,
+            "residency_strategy": None, "snapshot_sha256": "b" * 64, "snapshot_bytes": 1,
+        }
+
+    def test_schedule_control_summary_requires_the_real_route_without_reads(self):
+        name, geometry = self.geometry("wan2_2_t2v_14b")
+        expected = self.mlx_coverage["wan"]["wan2_2_t2v_14b"]["coordinates"][name]
+        identity = {**self.control_identity(), "residency_strategy": "sequential"}
+        summary = self.reducer.schedule_control_summary(
+            self.control_events("wan2_2_t2v_14b", name), "wan2_2_t2v_14b", name, expected, identity,
+        )
+        self.assertEqual(summary["run_peak_bytes"], 10 * GIB)
+        self.assertEqual(summary["process_peak_bytes"], 12 * GIB)
+        self.assertEqual(
+            [w["window"] for w in summary["phase_windows"]],
+            ["encode", "prepare-cache", "denoise-step", "decode"],
+        )
+        with_read = self.mlx_events("wan2_2_t2v_14b", False, name)
+        next(e for e in with_read if e["phase"] == "metadata")["schedule_control"] = True
+        with self.assertRaisesRegex(ValueError, "read windows"):
+            self.reducer.schedule_control_summary(with_read, "wan2_2_t2v_14b", name, expected, identity)
+        unflagged = self.control_events("wan2_2_t2v_14b", name)
+        del next(e for e in unflagged if e["phase"] == "metadata")["schedule_control"]
+        with self.assertRaisesRegex(ValueError, "route identity"):
+            self.reducer.schedule_control_summary(unflagged, "wan2_2_t2v_14b", name, expected, identity)
+        wrong = {**identity, "snapshot_sha256": "c" * 64}
+        with self.assertRaisesRegex(ValueError, "route identity"):
+            self.reducer.schedule_control_summary(
+                self.control_events("wan2_2_t2v_14b", name), "wan2_2_t2v_14b", name, expected, wrong,
+            )
+
+    def test_schedule_control_bundle_is_complete_reproducible_and_tamper_evident(self):
+        coordinates = [
+            argparse.Namespace(family=family, variant=variant, name=name)
+            for family, variants in self.mlx_coverage.items()
+            for variant, spec in variants.items()
+            for name in sorted(spec["coordinates"])
+        ]
+        resolved = {
+            "schema": "sc-20686-resolved-inputs-v4", "backend": "mlx-metal",
+            "mode": "schedule-control", "inference_revision": "a" * 40,
+            "coordinates": [
+                {
+                    "family": c.family, "variant": c.variant, "name": c.name,
+                    "entrypoint": "product-entrypoint", "entrypoint_sha256": "d" * 64,
+                    "snapshot": "/snapshot", "snapshot_sha256": "b" * 64, "snapshot_bytes": 1,
+                    "model_snapshot_revision": "b" * 40,
+                    "residency_strategy": self.adapter.PRODUCT_RESIDENCY[c.variant],
+                    "args": [], "route_manifest_sha256": "e" * 64, "input_files": [],
+                }
+                for c in coordinates
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            media_root = Path(directory) / "media"
+            media_root.mkdir()
+
+            def runner(coordinate, arm):
+                self.assertEqual(arm, "control")
+                events = self.control_events(coordinate.variant, coordinate.name)
+                observed = [e for e in events if e.get("sample_kind") != "process"]
+                process = [e for e in events if e.get("sample_kind") == "process"]
+                run_directory = (
+                    Path(tempfile.mkdtemp(dir=media_root)) / "sealed-run"
+                )
+                run_directory.mkdir(parents=True)
+                output = run_directory / ("media.png" if coordinate.family == "flux2-klein" else "media")
+                if coordinate.family == "flux2-klein":
+                    output.write_bytes(b"png")
+                else:
+                    output.mkdir()
+                    (output / "frame_0000.png").write_bytes(b"frame")
+                argv = [
+                    "product-entrypoint", "--sc20686-campaign", "--sc20686-events",
+                    str(run_directory / "events.jsonl"), "--snapshot", "/snapshot",
+                    "--variant", coordinate.variant, "--sc20686-schedule-control",
+                    "--out", str(output),
+                ]
+                transcript = b"".join(self.adapter.canonical(event) for event in observed)
+                return self.adapter.CampaignRun(
+                    [*observed, *process], transcript, b"", tuple(argv), tuple(process),
+                    transcript, output,
+                )
+
+            def build(coordinate, _arm, events, _hashes):
+                return self.reducer.schedule_control_summary(
+                    events, coordinate.variant, coordinate.name,
+                    self.mlx_coverage[coordinate.family][coordinate.variant]["coordinates"][coordinate.name],
+                    {**self.control_identity(),
+                     "residency_strategy": self.adapter.PRODUCT_RESIDENCY[coordinate.variant]},
+                )
+
+            destination = Path(directory) / "control"
+            inputs = {
+                "campaign-inputs.resolved.json": (
+                    json.dumps(resolved, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8"),
+            }
+            self.adapter.publish_campaign(
+                coordinates, runner, build, destination, inputs, schedule_control=True,
+            )
+            result = self.reducer.verify_schedule_control_bundle(destination)
+            self.assertEqual(len(result["summaries"]), 14)
+            # A control bundle is not decision evidence, and vice versa.
+            with self.assertRaises(ValueError):
+                self.reducer.verify_campaign_bundle(destination)
+            campaign_path = destination / "campaign.json"
+            campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+            campaign["summaries"][0]["run_peak_bytes"] -= 1
+            raw = (json.dumps(campaign, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            campaign_path.write_bytes(raw)
+            (destination / "campaign.json.sha256").write_text(
+                f"{self.adapter.digest(raw)}  campaign.json\n", encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "not reproducible"):
+                self.reducer.verify_schedule_control_bundle(destination)
+            # Dropping a coordinate is refused before anything runs.
+            with self.assertRaisesRegex(ValueError, "missing or duplicate"):
+                self.adapter.publish_campaign(
+                    coordinates, runner, lambda *_: {"variant": "x", "coordinate_name": "y"},
+                    Path(directory) / "control-2", inputs, schedule_control=True,
+                )
+
     # --- source contracts ----------------------------------------------------------------------
 
     def test_mlx_example_manifest_keeps_the_cuda_coordinates(self):
@@ -671,8 +850,16 @@ class MetalLaneTests(unittest.TestCase):
             (scripts / "sc20686_wan_campaign_manifest.example.json").read_text(encoding="utf-8")
         )
         self.assertEqual(set(mlx), set(cuda))
+        def without_seed(arguments):
+            index = arguments.index("--seed")
+            self.assertEqual(arguments[index + 1], "42")
+            return arguments[:index] + arguments[index + 2:]
+
         for route, entry in cuda.items():
-            self.assertEqual(mlx[route]["coordinates"], entry["coordinates"], route)
+            self.assertEqual(
+                {name: without_seed(args) for name, args in mlx[route]["coordinates"].items()},
+                entry["coordinates"], route,
+            )
             self.assertEqual(mlx[route]["residency_strategy"], entry["residency_strategy"], route)
             self.assertEqual(Path(mlx[route]["entrypoint"]).name, "sc20686_wan", route)
 
@@ -696,9 +883,10 @@ class MetalLaneTests(unittest.TestCase):
             source = (mlx / relative).read_text(encoding="utf-8")
             for token in (
                 '"--sc20686-campaign"', '"--sc20686-events"', '"--sc20686-source-ref"',
-                '"--sc20686-residency"', '"--sc20686-cancel"', '.filter(|path| path != "-")',
+                '"--sc20686-residency"', '"--sc20686-cancel"', '.filter(|path| *path != "-")',
                 "dedicated --sc20686-events <file>", "campaign_cancelled()",
-                "with_offload_policy(",
+                "with_offload_policy(", '"--sc20686-schedule-control"', "arm_schedule_control()",
+                "unsupported argument", "repeated argument", "requires an explicit",
             ):
                 self.assertIn(token, source, f"{relative}: {token}")
         wan = (mlx / "mlx-gen-wan/examples/sc20686_wan.rs").read_text(encoding="utf-8")

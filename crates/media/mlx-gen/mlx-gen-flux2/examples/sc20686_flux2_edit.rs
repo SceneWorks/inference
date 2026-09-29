@@ -16,8 +16,8 @@
 //!    --sc20686-residency sequential [--sc20686-cancel]]
 //! ```
 //!
-//! `--single-only` is accepted for argument parity with the Candle `flux2-edit` coordinate
-//! definitions; this entrypoint always performs exactly one generation.
+//! Arguments are strict: unknown (including the Candle harness's `--single-only`) or repeated flags
+//! are refused, and campaign mode requires every coordinate argument (`--seed` included).
 
 use std::path::{Path, PathBuf};
 
@@ -32,35 +32,84 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Frozen SceneWorks-equivalent residency for both FLUX.2 edit routes.
 const PRODUCT_RESIDENCY: &str = "sequential";
 
-fn arg(args: &[String], key: &str) -> Option<String> {
-    let mut values = args
-        .iter()
-        .enumerate()
-        .filter(|(_, value)| *value == key)
-        .filter_map(|(index, _)| args.get(index + 1).cloned());
-    let first = values.next();
-    if values.next().is_some() {
-        return None;
+/// Strict command line: every flag is known, appears at most once, and value flags carry a value.
+/// Unknown or repeated flags are refused (an ambiguous campaign input is never resolved by picking
+/// one), and campaign mode requires every coordinate argument explicitly.
+struct Args {
+    values: std::collections::BTreeMap<String, String>,
+    switches: std::collections::BTreeSet<String>,
+}
+
+const VALUE_FLAGS: &[&str] = &[
+    "--variant",
+    "--sc20686-events",
+    "--sc20686-source-ref",
+    "--sc20686-residency",
+    "--snapshot",
+    "--out",
+    "--prompt",
+    "--width",
+    "--height",
+    "--seed",
+    "--steps",
+    "--guidance",
+    "--reference",
+    "--reference2",
+];
+const SWITCHES: &[&str] = &[
+    "--sc20686-campaign",
+    "--sc20686-cancel",
+    "--sc20686-schedule-control",
+];
+
+impl Args {
+    fn parse(raw: &[String]) -> Result<Self> {
+        let mut values = std::collections::BTreeMap::new();
+        let mut switches = std::collections::BTreeSet::new();
+        let mut items = raw.iter().skip(1);
+        while let Some(flag) = items.next() {
+            let fresh = if SWITCHES.contains(&flag.as_str()) {
+                switches.insert(flag.clone())
+            } else if VALUE_FLAGS.contains(&flag.as_str()) {
+                let value = items
+                    .next()
+                    .ok_or_else(|| format!("{flag} requires a value"))?;
+                values.insert(flag.clone(), value.clone()).is_none()
+            } else {
+                return Err(format!("unsupported argument: {flag}").into());
+            };
+            if !fresh {
+                return Err(format!("repeated argument: {flag}").into());
+            }
+        }
+        Ok(Self { values, switches })
     }
-    first
-}
 
-fn required(args: &[String], key: &str) -> Result<String> {
-    arg(args, key).ok_or_else(|| format!("missing or repeated {key}").into())
-}
+    fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
+    }
 
-fn parsed<T: std::str::FromStr>(args: &[String], key: &str) -> Result<T> {
-    required(args, key)?
-        .parse()
-        .map_err(|_| format!("{key} is malformed").into())
-}
+    fn has(&self, key: &str) -> bool {
+        self.switches.contains(key)
+    }
 
-/// A coordinate argument with a single-mode default. Absent → `default`; repeated → error (an
-/// ambiguous campaign input is refused, never resolved by picking one).
-fn parsed_or<T: std::str::FromStr>(args: &[String], key: &str, default: T) -> Result<T> {
-    match args.iter().filter(|value| *value == key).count() {
-        0 => Ok(default),
-        _ => parsed(args, key),
+    fn required(&self, key: &str) -> Result<String> {
+        self.get(key)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("missing {key}").into())
+    }
+
+    /// A coordinate argument: required in campaign mode, `default` for an ordinary render.
+    fn coordinate<T: std::str::FromStr>(&self, key: &str, default: T) -> Result<T> {
+        match self.get(key) {
+            Some(value) => value
+                .parse()
+                .map_err(|_| format!("{key} is malformed").into()),
+            None if self.has("--sc20686-campaign") => {
+                Err(format!("SC-20686 campaign requires an explicit {key}").into())
+            }
+            None => Ok(default),
+        }
     }
 }
 
@@ -75,29 +124,39 @@ fn load_image(path: &Path) -> Result<Image> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let route = required(&args, "--variant")?;
-    let campaign = args.iter().any(|value| value == "--sc20686-campaign");
-    let cancel_arm = args.iter().any(|value| value == "--sc20686-cancel");
+    let args = Args::parse(&std::env::args().collect::<Vec<_>>())?;
+    let route = args.required("--variant")?;
+    let campaign = args.has("--sc20686-campaign");
+    let cancel_arm = args.has("--sc20686-cancel");
+    let control_arm = args.has("--sc20686-schedule-control");
+    if !campaign && (cancel_arm || control_arm) {
+        return Err(
+            "--sc20686-cancel/--sc20686-schedule-control require --sc20686-campaign".into(),
+        );
+    }
+    if cancel_arm && control_arm {
+        return Err("the cancellation and schedule-control arms are exclusive".into());
+    }
     if campaign {
-        let residency = required(&args, "--sc20686-residency")?;
+        let residency = args.required("--sc20686-residency")?;
         if residency != PRODUCT_RESIDENCY {
             return Err(format!("{route} campaign residency must be {PRODUCT_RESIDENCY}").into());
         }
-    } else if cancel_arm {
-        return Err("--sc20686-cancel requires --sc20686-campaign".into());
     }
     let _campaign_request = if campaign {
-        let events = arg(&args, "--sc20686-events")
-            .filter(|path| path != "-")
+        let events = args
+            .get("--sc20686-events")
+            .filter(|path| *path != "-")
             .ok_or("SC-20686 campaign requires a dedicated --sc20686-events <file>")?;
         let request = mlx_gen::sc20686::request_output(
             events,
-            required(&args, "--sc20686-source-ref")?,
+            args.required("--sc20686-source-ref")?,
             PRODUCT_RESIDENCY,
         )?;
         Some(if cancel_arm {
             request.arm_cancellation()
+        } else if control_arm {
+            request.arm_schedule_control()
         } else {
             request.arm()
         })
@@ -105,9 +164,9 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut references = vec![load_image(Path::new(&required(&args, "--reference")?))?];
-    if let Some(second) = arg(&args, "--reference2") {
-        references.push(load_image(Path::new(&second))?);
+    let mut references = vec![load_image(Path::new(&args.required("--reference")?))?];
+    if let Some(second) = args.get("--reference2") {
+        references.push(load_image(Path::new(second))?);
     }
     let conditioning = if references.len() == 1 {
         vec![Conditioning::Reference {
@@ -118,28 +177,27 @@ fn main() -> Result<()> {
         vec![Conditioning::MultiReference { images: references }]
     };
     let request = GenerationRequest {
-        prompt: parsed_or(&args, "--prompt", "SC-20686 edit one reference".to_owned())?,
-        width: parsed_or(&args, "--width", 512)?,
-        height: parsed_or(&args, "--height", 512)?,
+        prompt: args.coordinate("--prompt", "SC-20686 edit one reference".to_owned())?,
+        width: args.coordinate("--width", 512)?,
+        height: args.coordinate("--height", 512)?,
         count: 1,
-        seed: Some(parsed_or(&args, "--seed", 42)?),
-        steps: Some(parsed_or(&args, "--steps", 4)?),
-        guidance: Some(parsed_or(&args, "--guidance", 1.0)?),
+        seed: Some(args.coordinate("--seed", 42)?),
+        steps: Some(args.coordinate("--steps", 4)?),
+        guidance: Some(args.coordinate("--guidance", 1.0)?),
         conditioning,
         ..Default::default()
     };
 
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(required(
-        &args,
-        "--snapshot",
-    )?)))
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(
+        args.required("--snapshot")?,
+    )))
     .with_offload_policy(OffloadPolicy::Sequential);
     let generator = match route.as_str() {
         "flux2_klein_9b_edit" => mlx_gen_flux2::load_klein_9b_edit(&spec)?,
         "flux2_klein_9b_kv_edit" => mlx_gen_flux2::load_klein_9b_kv_edit(&spec)?,
         other => return Err(format!("unsupported SC-20686 FLUX.2 route: {other}").into()),
     };
-    let out = PathBuf::from(required(&args, "--out")?);
+    let out = PathBuf::from(args.required("--out")?);
     let mut on_progress = |progress: Progress| match progress {
         Progress::Step { current, total } => eprintln!("[sc20686-flux2] step {current}/{total}"),
         Progress::Decoding => eprintln!("[sc20686-flux2] decoding"),

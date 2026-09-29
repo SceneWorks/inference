@@ -253,6 +253,7 @@ struct State {
     context: Context,
     cancel: CancelFlag,
     cancellation_armed: bool,
+    schedule_control: bool,
     started: Instant,
     metadata_emitted: bool,
     start_emitted: bool,
@@ -292,6 +293,7 @@ struct Pending {
     source_ref: String,
     residency_strategy: String,
     cancellation: bool,
+    schedule_control: bool,
 }
 
 /// True only while an armed campaign is observing this thread's generation. Product hooks test this
@@ -319,6 +321,7 @@ pub struct CampaignRequest {
     source_ref: String,
     residency_strategy: String,
     cancellation: bool,
+    schedule_control: bool,
 }
 
 pub fn request_output(
@@ -352,6 +355,7 @@ pub fn request_output(
         source_ref,
         residency_strategy,
         cancellation: false,
+        schedule_control: false,
     })
 }
 
@@ -363,6 +367,7 @@ impl CampaignRequest {
                 source_ref: self.source_ref.clone(),
                 residency_strategy: self.residency_strategy.clone(),
                 cancellation: self.cancellation,
+                schedule_control: self.schedule_control,
             })
         });
         self
@@ -371,6 +376,14 @@ impl CampaignRequest {
     /// Arm the deliberate cancellation arm: the product is cancelled after its first live read.
     pub fn arm_cancellation(mut self) -> Self {
         self.cancellation = true;
+        self.arm()
+    }
+
+    /// Arm the **schedule-control** arm: phase windows, cache creation/release and footprint only,
+    /// with no per-read evaluation windows, so run and phase peaks follow the product's own lazy
+    /// schedule. Read attribution comes from the normal arm; this arm is its schedule control.
+    pub fn arm_schedule_control(mut self) -> Self {
+        self.schedule_control = true;
         self.arm()
     }
 }
@@ -543,6 +556,7 @@ fn activate_pending(
         context,
         cancel: cancel.clone(),
         cancellation_armed: pending.cancellation,
+        schedule_control: pending.schedule_control,
         started: Instant::now(),
         metadata_emitted: false,
         start_emitted: false,
@@ -703,16 +717,32 @@ pub fn observe_progress(progress: &Progress) {
             }
         }
         Progress::Decoding => open_phase(state, "decode", state.last_step),
-        Progress::Loading(_) => open_phase(state, "load", state.last_step),
+        Progress::Loading(_) => enter_phase(state, "load"),
     });
 }
 
-/// Mark the start of a product phase (`prepare-cache` before a cache build).
+/// Mark the start of a product phase (`prepare-cache` before a cache build, `load` before a
+/// mid-denoise component load).
 pub fn mark_phase(name: &'static str) {
-    with_state(|state| {
-        let index = state.last_step;
-        open_phase(state, name, index)
-    });
+    with_state(|state| enter_phase(state, name));
+}
+
+/// Enter `name`. A mid-denoise load or cache build (the MoE expert swap) interrupts a
+/// `denoise-step` window that has not run its step yet: that window is relabelled rather than closed,
+/// so the swap work is attributed to `name`; re-entering the open window is a no-op. Every
+/// `(window, index)` therefore stays unique.
+fn enter_phase(state: &mut State, name: &'static str) {
+    let index = state.last_step;
+    match state.phase.as_mut() {
+        Some(window) if window.name == "denoise-step" && window.index > state.last_step => {
+            window.name = name;
+            window.index = index;
+        }
+        // A load announced twice (an explicit mark and the provider's `Progress::Loading`) is one
+        // window.
+        Some(window) if window.name == name && window.index == index => {}
+        _ => open_phase(state, name, index),
+    }
 }
 
 /// Mark that the next evaluated work is the next denoise step.
@@ -887,6 +917,7 @@ fn emit(state: &mut State, phase: &'static str, operation: &str, fields: EventFi
         }
         value["real_weights"] = json!(context.real_weights);
         value["full_generation"] = json!(!state.cancellation_armed);
+        value["schedule_control"] = json!(state.schedule_control);
         value["attention_kind"] = json!("cross");
     }
     state.sink.emit(value);
@@ -1343,7 +1374,12 @@ pub fn begin_read(target: Option<ReadTarget>, inputs: &[&Array]) -> Result<Optio
     let Some(target) = target else {
         return Ok(None);
     };
-    if !active() {
+    let reads_observed = STATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|state| !state.schedule_control)
+    });
+    if !reads_observed {
         return Ok(None);
     }
     mlx_rs::transforms::eval(inputs.iter().copied())?;

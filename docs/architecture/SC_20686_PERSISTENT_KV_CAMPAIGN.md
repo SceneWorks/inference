@@ -144,11 +144,19 @@ Three source facts differ from the Candle lane and are recorded as cache kinds i
 * MLX Wan-VACE (`vace.rs`, `Attn::cross_attn`) projects the text K/V inside every main and VACE block
   on every CFG forward of every step. There is no persistent cross-K/V cache on this route, so its
   rows carry zero persistent bytes and the recomputed transient, like the FLUX edit route.
-* MLX Wan stacks the CFG cond/uncond contexts on the batch axis of one cache, so each cache's
-  `kv_batch` is 2 under CFG; its exact `nbytes` must equal `2·kv_batch·H·Skv·D·dtype`.
+* MLX Wan stacks the CFG cond/uncond contexts on the batch axis of one cache. The source map's
+  `cfg_kv_batch` rule fixes the exact batch: TI2V-5B is `2B` only when guidance > 1, the A14B
+  experts always stack (`2B`), and FLUX.2 kv-edit and VACE are `B`. Each cache's exact `nbytes` must
+  equal `2·kv_batch·H·Skv·D·dtype`; CUDA-lane events may not carry `kv_batch` at all.
 * MLX FLUX.2 kv-edit extracts one reference-K/V slot per double and single layer on the first
-  evaluation. With CFG the negative pass re-extracts every slot: the transcript records that as a
-  rebuild (release, then create), so the positive slots' zero reads are counted honestly.
+  evaluation, with **one cache per CFG branch** (`Flux2KvCfgCaches`). The joint attention is unmasked,
+  so reference K/V are prompt-dependent from the first double layer; the route previously shared one
+  cache (the mflux fork's shape), so the negative extract overwrote the positive slots and every
+  positive cached step attended over negative-branch reference K/V — a pre-existing wrong-output
+  defect under guidance > 1, fixed with this lane and pinned by a CFG parity test (per-branch kv
+  equals the non-kv forward exactly on every cached step). The extract step also materializes every
+  slot together with its output, so a slot never keeps its layer's whole `[txt, target, ref]` K/V
+  alive. The Candle lane has no kv-edit route and is unaffected.
 
 ### Observer and attribution method
 
@@ -178,7 +186,21 @@ Candle observers plus `"backend": "mlx-metal"` on every event and a `kv_batch` o
   (runtime-guarded admission, no static peak bound).
 * **Reuse/invalidation** events are exact: every read names its cache id, a rebuild releases the old
   id before the new creation, and the reducer's per-cache minimum reuse counts caches that were never
-  read.
+  read. A cached FLUX read window opens on the query and the fresh K/V, so the splice of the stored
+  reference K/V is materialized inside it; a mid-denoise expert swap relabels its pending step window
+  as `load`, so every `(window, index)` is unique.
+
+**Campaign schedule vs product schedule.** Every number from the decision arms — the run and
+phase-window peaks that feed the reducer's `peak_bytes`, and the durations — is measured on the
+*campaign* schedule: the per-read evaluation windows cut the product's lazy graph at every cached
+cross-attention, which can move both peak memory and time. They are attribution numbers, not the
+product's own. The **schedule-control arm** (`--schedule-control`, Metal lane only) runs every
+coordinate once more with `--sc20686-schedule-control`: cache creation/release and phase windows are
+still recorded, but no read window evaluates or resets anything, so its run and phase peaks follow
+the product's schedule. It publishes a separate sealed `sc-20686-schedule-control-v1` bundle whose
+per-coordinate summaries (run peak, process peak, per-phase high-water and `phys_footprint_peak`) the
+reducer recomputes from the transcripts over the complete Metal coverage; it is never decision
+evidence and a decision bundle cannot be a control bundle.
 
 The adapter and reducer require, for Metal rows only, `mlx-metal` on every observer event, a
 `denoise-step` window (and `decode` for normal arms) before the terminal event with valid allocator
@@ -209,7 +231,15 @@ python3 scripts/sc20686_campaign_adapter.py --campaign --matrix \
   --flux-snapshot <flux2-klein-9b tier root> --flux-kv-snapshot <flux2-klein-9b-kv tier root> \
   --flux-reference /abs/ref.png --flux-reference2 /abs/ref2.png \
   --matrix-output /abs/evidence/sc20686-mlx-campaign
+# Product-schedule control (same inputs, its own resume directory and output):
+python3 scripts/sc20686_campaign_adapter.py --campaign --matrix --schedule-control … \
+  --resume-dir /abs/external/sc20686-mlx-control-resume \
+  --matrix-output /abs/evidence/sc20686-mlx-schedule-control
 ```
+
+The MLX entrypoints are strict: unknown flags (including the Candle harness's `--single-only`) and
+repeated flags are refused, and campaign mode requires every coordinate argument, so the Metal
+coordinates seal an explicit `--seed 42`.
 
 The policy is the strict `darwin-mlx` schema (`schemaVersion`, `backend`, `deadlineSeconds`,
 `pollMillis`, `termGraceMillis`, `hostFreeReserveBytes`, `childFootprintCapBytes`, `stdoutCapBytes`,

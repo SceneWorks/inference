@@ -5,8 +5,8 @@
     "snapshot": "$SC20686_MLX_WAN_TI2V_5B_SNAPSHOT",
     "residency_strategy": "sequential",
     "coordinates": {
-      "square-17f": ["--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4"],
-      "landscape-33f": ["--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4"]
+      "square-17f": ["--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
+      "landscape-33f": ["--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"]
     }
   },
   "wan2_2_t2v_14b": {
@@ -15,8 +15,8 @@
     "snapshot": "$SC20686_MLX_WAN_T2V_14B_SNAPSHOT",
     "residency_strategy": "sequential",
     "coordinates": {
-      "square-17f": ["--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4"],
-      "landscape-33f": ["--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4"]
+      "square-17f": ["--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
+      "landscape-33f": ["--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"]
     }
   },
   "wan2_2_i2v_14b": {
@@ -25,8 +25,8 @@
     "snapshot": "$SC20686_MLX_WAN_I2V_14B_SNAPSHOT",
     "residency_strategy": "sequential",
     "coordinates": {
-      "square-17f-ref1": ["--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4"],
-      "landscape-33f-ref1": ["--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4"]
+      "square-17f-ref1": ["--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
+      "landscape-33f-ref1": ["--image", "$SC20686_WAN_I2V_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"]
     }
   },
   "wan_vace": {
@@ -35,8 +35,8 @@
     "snapshot": "$SC20686_MLX_WAN_VACE_SNAPSHOT",
     "residency_strategy": "resident",
     "coordinates": {
-      "square-17f-control": ["--control-dir", "$SC20686_VACE_CONTROL_17_DIR", "--mask-dir", "$SC20686_VACE_MASK_17_DIR", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4"],
-      "landscape-33f-reference": ["--control-dir", "$SC20686_VACE_CONTROL_33_DIR", "--mask-dir", "$SC20686_VACE_MASK_33_DIR", "--reference", "$SC20686_VACE_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4"]
+      "square-17f-control": ["--control-dir", "$SC20686_VACE_CONTROL_17_DIR", "--mask-dir", "$SC20686_VACE_MASK_17_DIR", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
+      "landscape-33f-reference": ["--control-dir", "$SC20686_VACE_CONTROL_33_DIR", "--mask-dir", "$SC20686_VACE_MASK_33_DIR", "--reference", "$SC20686_VACE_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"]
     }
   },
   "wan2_2_vace_fun_14b": {
@@ -45,8 +45,8 @@
     "snapshot": "$SC20686_MLX_WAN_VACE_FUN_14B_SNAPSHOT",
     "residency_strategy": "sequential",
     "coordinates": {
-      "square-17f-control": ["--control-dir", "$SC20686_VACE_CONTROL_17_DIR", "--mask-dir", "$SC20686_VACE_MASK_17_DIR", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4"],
-      "landscape-33f-reference": ["--control-dir", "$SC20686_VACE_CONTROL_33_DIR", "--mask-dir", "$SC20686_VACE_MASK_33_DIR", "--reference", "$SC20686_VACE_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4"]
+      "square-17f-control": ["--control-dir", "$SC20686_VACE_CONTROL_17_DIR", "--mask-dir", "$SC20686_VACE_MASK_17_DIR", "--width", "512", "--height", "512", "--frames", "17", "--prompt", "SC-20686 representative still-motion study", "--guidance", "5", "--steps", "4", "--seed", "42"],
+      "landscape-33f-reference": ["--control-dir", "$SC20686_VACE_CONTROL_33_DIR", "--mask-dir", "$SC20686_VACE_MASK_33_DIR", "--reference", "$SC20686_VACE_REFERENCE", "--width", "768", "--height", "512", "--frames", "33", "--prompt", "SC-20686 representative long-motion study", "--guidance", "4", "--steps", "4", "--seed", "42"]
     }
   }
 }
