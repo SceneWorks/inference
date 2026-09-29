@@ -250,3 +250,194 @@ fn cached_without_populated_cache_errors() {
         .to_string();
     assert!(err.contains("slot is empty"), "got: {err}");
 }
+
+// -------------------------------------------------------------------------------------------------
+// SC-20686 Metal lane: the observer hooks at the reference-K/V boundaries are inert when no
+// campaign is armed and leave the forward bit-identical when one is.
+// -------------------------------------------------------------------------------------------------
+
+mod sc20686 {
+    use super::*;
+    use mlx_gen::sc20686 as obs;
+    use serde_json::Value;
+
+    const SOURCE_REF: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    fn activate() -> (
+        tempfile::TempDir,
+        obs::Scope,
+        std::rc::Rc<std::cell::RefCell<Vec<Value>>>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = root.path().join("0123456789abcdef0123456789abcdef01234567");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("config.json"), b"{}").unwrap();
+        let request = obs::request_output(root.path().join("e.jsonl"), SOURCE_REF, "sequential")
+            .unwrap()
+            .arm();
+        let (instruments, events) = obs::capture_instruments();
+        let scope = obs::activate_with_instruments(
+            &snapshot,
+            &mlx_gen::CancelFlag::new(),
+            "flux2_klein_9b_kv_edit",
+            obs::RequestFacts {
+                batch: 1,
+                frames: 1,
+                width: 16,
+                height: 16,
+                prompt_sha256: "a".repeat(64),
+                guidance: "1".into(),
+                reference_count: 1,
+            },
+            instruments,
+        )
+        .unwrap()
+        .expect("armed");
+        drop(request);
+        (root, scope, events)
+    }
+
+    fn of(events: &[Value], phase: &str) -> Vec<Value> {
+        events
+            .iter()
+            .filter(|event| event["phase"] == phase)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn kv_cache_lifecycle_is_observed_without_changing_the_forward() {
+        let f = Fixture::load();
+        let off_cache = Flux2KvCache::new(1, 1);
+        assert_eq!(
+            off_cache.sc20686_cached_read(mlx_gen_flux2::Stream::Double, 0),
+            None
+        );
+        off_cache.configure(CacheMode::Extract, f.ref_seq());
+        let extract_off = f.forward_full(Some(&off_cache));
+        off_cache.configure(CacheMode::Cached, f.ref_seq());
+        let cached_off = f.forward_cached(&off_cache);
+        drop(off_cache);
+
+        let (_root, scope, events) = activate();
+        obs::bind_geometry(
+            obs::KvGeometry {
+                layers: 2,
+                heads: 2,
+                head_dimension: 8,
+                sq: f.target.shape()[1] as u64,
+                skv: f.ref_seq() as u64,
+            },
+            None,
+            "joint-unmasked",
+            "flux2-4-axis",
+        );
+        let cache = Flux2KvCache::new(1, 1);
+        cache.configure(CacheMode::Extract, f.ref_seq());
+        let extract_on = f.forward_full(Some(&cache));
+        // The CFG negative pass re-extracts every slot: a rebuild, not a second live cache.
+        let _ = f.forward_full(Some(&cache));
+        cache.configure(CacheMode::Cached, f.ref_seq());
+        let cached_on = f.forward_cached(&cache);
+        assert!(
+            exact_eq(&extract_off, &extract_on),
+            "extract changed under the observer"
+        );
+        assert!(
+            exact_eq(&cached_off, &cached_on),
+            "cached forward changed under the observer"
+        );
+        drop(cache);
+        obs::observe_generation_end();
+        drop(scope);
+
+        let events = events.borrow();
+        let created = of(&events, "cross-kv-created");
+        assert_eq!(created.len(), 4, "two slots extracted twice");
+        let slice_bytes = 2 * (2 * f.ref_seq() * 8 * 4) as u64; // K+V [1,2,ref,8] f32
+        assert!(created.iter().all(|e| e["persistent_bytes"] == slice_bytes
+            && e["kv_batch"] == 1
+            && e["operation"] == "Flux2KvCache::extract"));
+        let released = of(&events, "cross-kv-released");
+        let operations: Vec<_> = released.iter().map(|e| e["operation"].clone()).collect();
+        assert_eq!(
+            operations,
+            vec![
+                "Flux2KvCache::extract(rebuild)",
+                "Flux2KvCache::extract(rebuild)",
+                "Flux2KvCache::drop",
+                "Flux2KvCache::drop"
+            ]
+        );
+        let reads = of(&events, "cross-kv-read");
+        assert_eq!(reads.len(), 2, "one cached read per slot");
+        let live_ids = [
+            created[2]["cache_id"].clone(),
+            created[3]["cache_id"].clone(),
+        ];
+        assert!(reads.iter().all(|read| live_ids.contains(&read["cache_id"])
+            && read["operation"] == "Flux2KvCache::cached(joint-attention)"));
+        let metrics = of(&events, "metrics").pop().unwrap();
+        assert_eq!(metrics["current_persistent_bytes"], 2 * slice_bytes);
+        assert_eq!(
+            metrics["minimum_cache_reads"], 0,
+            "the rebuilt slots were never read"
+        );
+        assert_eq!(metrics["reference_runtime_attribution_available"], false);
+    }
+
+    #[test]
+    fn edit_reference_slice_is_recomputed_on_double_stream_forwards_only() {
+        let f = Fixture::load();
+        let off = f.forward_full(None);
+        let (_root, scope, events) = activate();
+        obs::bind_geometry(
+            obs::KvGeometry {
+                layers: 1,
+                heads: 2,
+                head_dimension: 8,
+                sq: f.target.shape()[1] as u64,
+                skv: f.ref_seq() as u64,
+            },
+            None,
+            "joint-unmasked",
+            "flux2-4-axis",
+        );
+        let on = {
+            let _reference = obs::reference_forward(true);
+            f.forward_full(None)
+        };
+        // A forward that does not carry the reference tokens records nothing.
+        let _ = f.forward_full(None);
+        obs::observe_generation_end();
+        drop(scope);
+        assert!(
+            exact_eq(&off, &on),
+            "the reference-slice window changed the forward"
+        );
+        let events = events.borrow();
+        let created = of(&events, "cross-kv-created");
+        assert_eq!(
+            created.len(),
+            1,
+            "one double-stream layer, one reference forward"
+        );
+        let dense = 2 * (2 * f.ref_seq() * 8 * 4) as u64;
+        assert_eq!(created[0]["persistent_bytes"], 0);
+        assert_eq!(created[0]["transient_bytes"], dense);
+        assert_eq!(
+            created[0]["operation"],
+            "DoubleAttention::to_k/to_v(reference-slice)"
+        );
+        let reads = of(&events, "cross-kv-read");
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0]["transient_bytes"], dense);
+        assert_eq!(
+            reads[0]["operation"],
+            "DoubleAttention::attention(joint-context-non-attributable)"
+        );
+        let metrics = of(&events, "metrics").pop().unwrap();
+        assert_eq!(metrics["current_persistent_bytes"], 0);
+        assert_eq!(metrics["reused_requests"], 1);
+    }
+}

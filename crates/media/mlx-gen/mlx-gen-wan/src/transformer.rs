@@ -689,6 +689,9 @@ fn sdpa_maybe_checkpoint(
         .ok_or_else(|| Error::Msg("wan: checkpoint SDPA produced no output".into()))
 }
 
+/// SC-20686 operation name of one Wan cross-attention read over its cached text K/V (Metal lane).
+pub(crate) const SC20686_CROSS_KV_READ: &str = "CrossAttention::forward(cached-text-kv)";
+
 #[derive(Clone)]
 struct CrossAttention {
     q: AdaptableLinear,
@@ -809,6 +812,12 @@ impl CrossAttention {
         let q = rms_norm(&self.q.forward(&bf16(x)?)?, &self.norm_q, self.eps)?
             .reshape(&[b, s, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
+        // SC-20686 Metal lane: a read window only for a registered campaign cache (`None` — no
+        // evaluation, no allocation — for every ordinary render and every non-campaign caller).
+        let sc20686 = mlx_gen::sc20686::begin_read(
+            mlx_gen::sc20686::cross_kv_cache_id(kv).map(mlx_gen::sc20686::ReadTarget::Cache),
+            &[&q, &kv.0, &kv.1],
+        )?;
         let out = sdpa_maybe_checkpoint(
             &q,
             &kv.0,
@@ -817,6 +826,7 @@ impl CrossAttention {
             self.ckpt_sdpa,
             self.attn_budget,
         )?;
+        mlx_gen::sc20686::finish_read(sc20686, &out, SC20686_CROSS_KV_READ, true)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }

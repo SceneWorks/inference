@@ -1,5 +1,5 @@
 {
-  "schema": "sc-20686-source-map-v2",
+  "schema": "sc-20686-source-map-v3",
   "compatibility_target": {
     "story": "SC-20675",
     "format": "packed-group-affine-v2",
@@ -8,112 +8,658 @@
     "metadata": "f16 scale and zero per completed group",
     "pending_key_tail": "dense f32"
   },
-  "variants": {
-    "flux2_klein_9b_edit": {
-      "family": "flux2-klein",
-      "route": "flux2_klein_9b_edit",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs", "symbol": "sc20686_observer::activate_requested", "line": 524}],
-      "creation": [
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "to_k.forward", "line": 365},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "to_v.forward", "line": 366},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "add_k.forward", "line": 376},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "add_v.forward", "line": 381}
-      ],
-      "reference_slice": [
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "record_flux_kv_created", "line": 367},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 620},
-        {"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "narrow", "line": 621}
-      ],
-      "reads": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs", "symbol": "attention", "line": 393}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs", "symbol": "drop", "line": 959}],
-      "current_kernel": "DoubleAttention dense joint attention over exact to_k/to_v/add_k/add_v projections; full joint duration is non-attributable context",
-      "cache_format": "no persistent cross-KV cache",
-      "paging": "none",
-      "product_residency": "sequential",
-      "offload": "provider memory-strategy staging; no reference-KV paging",
-      "recompute": "reference image K/V is projected in each DoubleAttention layer on every denoise evaluation",
-      "compatibility": "reference slice [B,H,Skv,D] projects exactly to SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail bytes; no packed reader is wired",
-      "self_attention_excluded": true
+  "lanes": {
+    "candle-cuda": {
+      "measures": "Candle providers on a Linux/Windows CUDA host",
+      "variants": {
+        "flux2_klein_9b_edit": {
+          "family": "flux2-klein",
+          "route": "flux2_klein_9b_edit",
+          "activation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/edit_provider.rs",
+              "symbol": "sc20686_observer::activate_requested",
+              "line": 524
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
+              "symbol": "to_k.forward",
+              "line": 365
+            },
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
+              "symbol": "to_v.forward",
+              "line": 366
+            },
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
+              "symbol": "add_k.forward",
+              "line": 376
+            },
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
+              "symbol": "add_v.forward",
+              "line": 381
+            }
+          ],
+          "reference_slice": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
+              "symbol": "record_flux_kv_created",
+              "line": 367
+            },
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
+              "symbol": "narrow",
+              "line": 620
+            },
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
+              "symbol": "narrow",
+              "line": 621
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/transformer.rs",
+              "symbol": "attention",
+              "line": 393
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-flux2/src/sc20686_observer.rs",
+              "symbol": "drop",
+              "line": 959
+            }
+          ],
+          "current_kernel": "DoubleAttention dense joint attention over exact to_k/to_v/add_k/add_v projections; full joint duration is non-attributable context",
+          "cache_format": "no persistent cross-KV cache",
+          "paging": "none",
+          "product_residency": "sequential",
+          "offload": "provider memory-strategy staging; no reference-KV paging",
+          "recompute": "reference image K/V is projected in each DoubleAttention layer on every denoise evaluation",
+          "compatibility": "reference slice [B,H,Skv,D] projects exactly to SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail bytes; no packed reader is wired",
+          "self_attention_excluded": true,
+          "cache_kind": "recomputed",
+          "runtime_attribution": false,
+          "entrypoint_stem": "flux2-edit",
+          "operations": {
+            "create": "DoubleAttention::to_k/to_v(reference-slice)",
+            "read": "DoubleAttention::attention(joint-context-non-attributable)"
+          }
+        },
+        "wan2_2_ti2v_5b": {
+          "family": "wan",
+          "route": "wan2_2_ti2v_5b",
+          "activation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/lib.rs",
+              "symbol": "sc20686_observer::activate_requested",
+              "line": 1147
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "register_cache",
+              "line": 347
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "record_cache_read",
+              "line": 413
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "drop",
+              "line": 176
+            }
+          ],
+          "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+          "paging": "none",
+          "product_residency": "sequential",
+          "offload": "product-selected sequential component staging",
+          "recompute": "prepared once per conditioning branch and reused across denoise steps",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "entrypoint_stem": "wan-txt2video"
+        },
+        "wan2_2_t2v_14b": {
+          "family": "wan",
+          "route": "wan2_2_t2v_14b",
+          "activation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
+              "symbol": "sc20686_observer::activate_requested",
+              "line": 1171
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "register_cache",
+              "line": 347
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "record_cache_read",
+              "line": 413
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "drop",
+              "line": 176
+            }
+          ],
+          "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+          "paging": "none",
+          "product_residency": "sequential",
+          "offload": "product-selected sequential high/low expert staging",
+          "recompute": "prepared once per expert and conditioning branch",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "entrypoint_stem": "wan14b-txt2video"
+        },
+        "wan2_2_i2v_14b": {
+          "family": "wan",
+          "route": "wan2_2_i2v_14b",
+          "activation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs",
+              "symbol": "sc20686_observer::activate_requested",
+              "line": 1171
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "register_cache",
+              "line": 347
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "record_cache_read",
+              "line": 413
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "drop",
+              "line": 176
+            }
+          ],
+          "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+          "paging": "none",
+          "product_residency": "sequential",
+          "offload": "product-selected sequential high/low expert staging",
+          "recompute": "prepared once per expert and conditioning branch",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "entrypoint_stem": "wan14b-img2video"
+        },
+        "wan_vace": {
+          "family": "wan",
+          "route": "wan_vace",
+          "activation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/model_vace.rs",
+              "symbol": "sc20686_observer::activate_requested",
+              "line": 471
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "register_cache",
+              "line": 347
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "record_cache_read",
+              "line": 413
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "drop",
+              "line": 176
+            }
+          ],
+          "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+          "paging": "none",
+          "product_residency": "resident",
+          "offload": "product-selected resident model lifecycle",
+          "recompute": "prepared once per conditioning branch",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "entrypoint_stem": "vace_smoke"
+        },
+        "wan2_2_vace_fun_14b": {
+          "family": "wan",
+          "route": "wan2_2_vace_fun_14b",
+          "activation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs",
+              "symbol": "sc20686_observer::activate_requested",
+              "line": 576
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "register_cache",
+              "line": 347
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "record_cache_read",
+              "line": 413
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs",
+              "symbol": "drop",
+              "line": 176
+            }
+          ],
+          "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
+          "paging": "none",
+          "product_residency": "sequential",
+          "offload": "product-selected sequential high/low expert staging",
+          "recompute": "prepared once per expert and conditioning branch",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "entrypoint_stem": "vace_smoke"
+        }
+      }
     },
-    "wan2_2_ti2v_5b": {
-      "family": "wan",
-      "route": "wan2_2_ti2v_5b",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/lib.rs", "symbol": "sc20686_observer::activate_requested", "line": 1147}],
-      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "register_cache", "line": 347}],
-      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "record_cache_read", "line": 413}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "drop", "line": 176}],
-      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
-      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
-      "paging": "none",
-      "product_residency": "sequential",
-      "offload": "product-selected sequential component staging",
-      "recompute": "prepared once per conditioning branch and reused across denoise steps",
-      "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
-      "self_attention_excluded": true
-    },
-    "wan2_2_t2v_14b": {
-      "family": "wan",
-      "route": "wan2_2_t2v_14b",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs", "symbol": "sc20686_observer::activate_requested", "line": 1171}],
-      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "register_cache", "line": 347}],
-      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "record_cache_read", "line": 413}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "drop", "line": 176}],
-      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
-      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
-      "paging": "none",
-      "product_residency": "sequential",
-      "offload": "product-selected sequential high/low expert staging",
-      "recompute": "prepared once per expert and conditioning branch",
-      "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
-      "self_attention_excluded": true
-    },
-    "wan2_2_i2v_14b": {
-      "family": "wan",
-      "route": "wan2_2_i2v_14b",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/wan14b.rs", "symbol": "sc20686_observer::activate_requested", "line": 1171}],
-      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "register_cache", "line": 347}],
-      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "record_cache_read", "line": 413}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "drop", "line": 176}],
-      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
-      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
-      "paging": "none",
-      "product_residency": "sequential",
-      "offload": "product-selected sequential high/low expert staging",
-      "recompute": "prepared once per expert and conditioning branch",
-      "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
-      "self_attention_excluded": true
-    },
-    "wan_vace": {
-      "family": "wan",
-      "route": "wan_vace",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace.rs", "symbol": "sc20686_observer::activate_requested", "line": 471}],
-      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "register_cache", "line": 347}],
-      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "record_cache_read", "line": 413}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "drop", "line": 176}],
-      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
-      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
-      "paging": "none",
-      "product_residency": "resident",
-      "offload": "product-selected resident model lifecycle",
-      "recompute": "prepared once per conditioning branch",
-      "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
-      "self_attention_excluded": true
-    },
-    "wan2_2_vace_fun_14b": {
-      "family": "wan",
-      "route": "wan2_2_vace_fun_14b",
-      "activation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/model_vace_fun.rs", "symbol": "sc20686_observer::activate_requested", "line": 576}],
-      "creation": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "register_cache", "line": 347}],
-      "reads": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "record_cache_read", "line": 413}],
-      "release": [{"path": "crates/media/candle-gen/candle-gen-wan/src/transformer.rs", "symbol": "drop", "line": 176}],
-      "current_kernel": "sdpa_budgeted_bhsd dense cross-attention",
-      "cache_format": "request-scoped dense K/V heads [B,H,Skv,D]",
-      "paging": "none",
-      "product_residency": "sequential",
-      "offload": "product-selected sequential high/low expert staging",
-      "recompute": "prepared once per expert and conditioning branch",
-      "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection",
-      "self_attention_excluded": true
+    "mlx-metal": {
+      "measures": "MLX providers on Apple Silicon (the Mac product path)",
+      "variants": {
+        "flux2_klein_9b_edit": {
+          "family": "flux2-klein",
+          "route": "flux2_klein_9b_edit",
+          "activation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
+              "symbol": "sc20686::observe_generation",
+              "line": 990
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
+              "symbol": "sc20686::record_recomputed_kv",
+              "line": 169
+            }
+          ],
+          "reference_slice": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
+              "symbol": "sc20686::bound_skv",
+              "line": 172
+            },
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
+              "symbol": "sc20686::reference_forward",
+              "line": 1309
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/transformer.rs",
+              "symbol": "sc20686_joint_read",
+              "line": 402
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/mlx-gen/src/sc20686.rs",
+              "symbol": "Drop for Scope",
+              "line": 483
+            }
+          ],
+          "current_kernel": "MLX fused SDPA (sdpa_budgeted_bhsd) over the joint [txt, target, ref] K/V; full joint duration is non-attributable context",
+          "cache_format": "no persistent reference-K/V cache",
+          "paging": "none",
+          "product_residency": "sequential",
+          "offload": "LoadSpec OffloadPolicy::Sequential request-scoped staging (Phase A text encoder, then the render bundle)",
+          "recompute": "reference K/V is projected in every double- and single-stream layer on every denoise evaluation; the double-stream slice is observed, matching the Candle lane boundary",
+          "compatibility": "the recomputed [B,H,Skv,D] slice projects exactly to SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail bytes per layer; no persistent boundary or packed reader exists",
+          "self_attention_excluded": true,
+          "cache_kind": "recomputed",
+          "runtime_attribution": false,
+          "operations": {
+            "create": "DoubleAttention::to_k/to_v(reference-slice)",
+            "read": "DoubleAttention::attention(joint-context-non-attributable)"
+          },
+          "entrypoint_stem": "sc20686_flux2_edit"
+        },
+        "flux2_klein_9b_kv_edit": {
+          "family": "flux2-klein",
+          "route": "flux2_klein_9b_kv_edit",
+          "activation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/model.rs",
+              "symbol": "sc20686::observe_generation",
+              "line": 990
+            }
+          ],
+          "creation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/kv_cache.rs",
+              "symbol": "sc20686::register_cache",
+              "line": 108
+            }
+          ],
+          "reference_slice": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/kv_cache.rs",
+              "symbol": "trailing",
+              "line": 103
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/kv_cache.rs",
+              "symbol": "sc20686_cached_read",
+              "line": 154
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-flux2/src/kv_cache.rs",
+              "symbol": "sc20686::release_owner",
+              "line": 179
+            }
+          ],
+          "current_kernel": "MLX fused SDPA over fresh [txt, target] K/V concatenated with the cached reference K/V; full joint duration is non-attributable context",
+          "cache_format": "persistent dense reference K/V [B,H,Sref,D] per double- and single-stream layer (Flux2KvCache), extracted on the first evaluation",
+          "paging": "none",
+          "product_residency": "sequential",
+          "offload": "LoadSpec OffloadPolicy::Sequential request-scoped staging; the reference cache lives for one seed",
+          "recompute": "extracted once per seed on the first evaluation and reused by every cached step; the CFG negative extract rebuilds every slot",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection of each retained [B,H,Skv,D] cache; no packed reader is wired",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": false,
+          "operations": {
+            "create": "Flux2KvCache::extract",
+            "read": "Flux2KvCache::cached(joint-attention)"
+          },
+          "entrypoint_stem": "sc20686_flux2_edit"
+        },
+        "wan2_2_ti2v_5b": {
+          "family": "wan",
+          "creation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "symbol": "sc20686::register_cross_kv_set",
+              "line": 870
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
+              "symbol": "sc20686::cross_kv_cache_id",
+              "line": 818
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "symbol": "CacheSetGuard",
+              "line": 839
+            }
+          ],
+          "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D] per block, CFG cond+uncond stacked on B (one StepCache per expert)",
+          "paging": "none",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection of each retained [B,H,Skv,D] cache; no packed reader is wired",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "operations": {
+            "create": "WanTransformer::prepare_cross_kv",
+            "read": "CrossAttention::forward(cached-text-kv)"
+          },
+          "entrypoint_stem": "sc20686_wan",
+          "route": "wan2_2_ti2v_5b",
+          "activation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
+              "symbol": "sc20686::observe_generation",
+              "line": 507
+            }
+          ],
+          "product_residency": "sequential",
+          "offload": "LoadSpec OffloadPolicy::Sequential component staging",
+          "recompute": "prepared once per generate and reused across denoise steps"
+        },
+        "wan2_2_t2v_14b": {
+          "family": "wan",
+          "creation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "symbol": "sc20686::register_cross_kv_set",
+              "line": 870
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
+              "symbol": "sc20686::cross_kv_cache_id",
+              "line": 818
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "symbol": "CacheSetGuard",
+              "line": 839
+            }
+          ],
+          "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D] per block, CFG cond+uncond stacked on B (one StepCache per expert)",
+          "paging": "none",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection of each retained [B,H,Skv,D] cache; no packed reader is wired",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "operations": {
+            "create": "WanTransformer::prepare_cross_kv",
+            "read": "CrossAttention::forward(cached-text-kv)"
+          },
+          "entrypoint_stem": "sc20686_wan",
+          "route": "wan2_2_t2v_14b",
+          "activation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
+              "symbol": "sc20686::observe_generation",
+              "line": 1476
+            }
+          ],
+          "product_residency": "sequential",
+          "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap",
+          "recompute": "prepared once per expert and reused across that expert's denoise steps"
+        },
+        "wan2_2_i2v_14b": {
+          "family": "wan",
+          "creation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "symbol": "sc20686::register_cross_kv_set",
+              "line": 870
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
+              "symbol": "sc20686::cross_kv_cache_id",
+              "line": 818
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/pipeline.rs",
+              "symbol": "CacheSetGuard",
+              "line": 839
+            }
+          ],
+          "current_kernel": "MLX fused scaled_dot_product_attention (budgeted chunked SDPA under the attention rung) over the cached text K/V",
+          "cache_format": "request-scoped dense K/V heads [B,H,Skv,D] per block, CFG cond+uncond stacked on B (one StepCache per expert)",
+          "paging": "none",
+          "compatibility": "exact SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail projection of each retained [B,H,Skv,D] cache; no packed reader is wired",
+          "self_attention_excluded": true,
+          "cache_kind": "persistent",
+          "runtime_attribution": true,
+          "operations": {
+            "create": "WanTransformer::prepare_cross_kv",
+            "read": "CrossAttention::forward(cached-text-kv)"
+          },
+          "entrypoint_stem": "sc20686_wan",
+          "route": "wan2_2_i2v_14b",
+          "activation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model.rs",
+              "symbol": "sc20686::observe_generation",
+              "line": 1476
+            }
+          ],
+          "product_residency": "sequential",
+          "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap",
+          "recompute": "prepared once per expert and reused across that expert's denoise steps"
+        },
+        "wan_vace": {
+          "family": "wan",
+          "creation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
+              "symbol": "sc20686::record_recomputed_kv",
+              "line": 179
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
+              "symbol": "sc20686::begin_read",
+              "line": 185
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/mlx-gen/src/sc20686.rs",
+              "symbol": "Drop for Scope",
+              "line": 483
+            }
+          ],
+          "current_kernel": "MLX fused scaled_dot_product_attention over the per-call projected text K/V",
+          "cache_format": "no persistent cross-KV cache: MLX Wan-VACE projects the text K/V inside every main and VACE block on every CFG forward",
+          "paging": "none",
+          "compatibility": "the recomputed [B,H,Skv,D] slice projects exactly to SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail bytes per layer; no persistent boundary or packed reader exists",
+          "self_attention_excluded": true,
+          "cache_kind": "recomputed",
+          "runtime_attribution": true,
+          "operations": {
+            "create": "WanVace::attn2(recomputed-text-kv)",
+            "read": "WanVace::attn2(sdpa)"
+          },
+          "entrypoint_stem": "sc20686_wan",
+          "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step",
+          "route": "wan_vace",
+          "activation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
+              "symbol": "sc20686::observe_generation",
+              "line": 456
+            }
+          ],
+          "product_residency": "resident",
+          "offload": "resident model lifecycle"
+        },
+        "wan2_2_vace_fun_14b": {
+          "family": "wan",
+          "creation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
+              "symbol": "sc20686::record_recomputed_kv",
+              "line": 179
+            }
+          ],
+          "reads": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
+              "symbol": "sc20686::begin_read",
+              "line": 185
+            }
+          ],
+          "release": [
+            {
+              "path": "crates/media/mlx-gen/src/sc20686.rs",
+              "symbol": "Drop for Scope",
+              "line": 483
+            }
+          ],
+          "current_kernel": "MLX fused scaled_dot_product_attention over the per-call projected text K/V",
+          "cache_format": "no persistent cross-KV cache: MLX Wan-VACE projects the text K/V inside every main and VACE block on every CFG forward",
+          "paging": "none",
+          "compatibility": "the recomputed [B,H,Skv,D] slice projects exactly to SC-20675 2-bit/group32 f16 scale-zero plus dense pending-key-tail bytes per layer; no persistent boundary or packed reader exists",
+          "self_attention_excluded": true,
+          "cache_kind": "recomputed",
+          "runtime_attribution": true,
+          "operations": {
+            "create": "WanVace::attn2(recomputed-text-kv)",
+            "read": "WanVace::attn2(sdpa)"
+          },
+          "entrypoint_stem": "sc20686_wan",
+          "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step",
+          "route": "wan2_2_vace_fun_14b",
+          "activation": [
+            {
+              "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
+              "symbol": "sc20686::observe_generation",
+              "line": 856
+            }
+          ],
+          "product_residency": "sequential",
+          "offload": "LoadSpec OffloadPolicy::Sequential high/low expert swap"
+        }
+      }
     }
   }
 }

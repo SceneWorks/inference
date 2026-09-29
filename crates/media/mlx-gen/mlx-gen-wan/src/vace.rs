@@ -87,6 +87,10 @@ fn load_patch_embedding(w: &Weights, prefix: &str) -> Result<AdaptableLinear> {
     Ok(AdaptableLinear::dense(weight, Some(bias)))
 }
 
+/// SC-20686 operation names for MLX Wan-VACE's recomputed text cross-attention K/V (Metal lane).
+pub(crate) const SC20686_VACE_TEXT_KV_CREATE: &str = "WanVace::attn2(recomputed-text-kv)";
+pub(crate) const SC20686_VACE_TEXT_KV_READ: &str = "WanVace::attn2(sdpa)";
+
 /// A Wan attention module (`attn1` self-attn or `attn2` cross-attn): `to_q/to_k/to_v/to_out.0` +
 /// qk-RMSNorm `norm_q/norm_k`. Matmuls run in `compute_dtype`; the residual the caller maintains is
 /// f32.
@@ -168,7 +172,25 @@ impl Attn {
             .forward(&ctx)?
             .reshape(&[b, -1, n, d])?
             .transpose_axes(&[0, 2, 1, 3])?;
+        // SC-20686 Metal lane: MLX Wan-VACE recomputes this text K/V on every call (every block,
+        // every CFG branch, every denoise step) — there is no persistent cross-K/V cache to promote.
+        // Campaign mode records that recomputed transient; ordinary renders skip this entirely.
+        let sc20686 = if mlx_gen::sc20686::active() {
+            let dense = mlx_gen::sc20686::record_recomputed_kv(
+                &k,
+                &v,
+                k.shape()[2] as u64,
+                SC20686_VACE_TEXT_KV_CREATE,
+            )?;
+            mlx_gen::sc20686::begin_read(
+                dense.map(mlx_gen::sc20686::ReadTarget::Recomputed),
+                &[&q, &k, &v],
+            )?
+        } else {
+            None
+        };
         let out = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        mlx_gen::sc20686::finish_read(sc20686, &out, SC20686_VACE_TEXT_KV_READ, true)?;
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
@@ -507,6 +529,29 @@ impl WanVaceTransformer {
         let cache = self.build_vace_cache(latent, control)?;
         let context_emb = self.text_embed(context)?;
         self.forward_vace_cached(latent, t, &cache, &context_emb, scales)
+    }
+
+    /// SC-20686 Metal lane: bind the live recomputed-text-K/V geometry (every main + VACE block
+    /// projects the full context per forward) and open the first denoise-step window. No-op unless a
+    /// campaign is armed.
+    fn sc20686_bind(&self, cache: &VaceStepCache, context_emb: &Array) {
+        if !mlx_gen::sc20686::active() {
+            return;
+        }
+        let head = &self.blocks[0].cross_attn;
+        mlx_gen::sc20686::bind_geometry(
+            mlx_gen::sc20686::KvGeometry {
+                layers: (self.blocks.len() + self.vace_blocks.len()) as u32,
+                heads: head.num_heads as u32,
+                head_dimension: head.head_dim as u32,
+                sq: cache.l as u64,
+                skv: context_emb.shape()[1] as u64,
+            },
+            Some(self.compute_dtype),
+            "none",
+            "none",
+        );
+        mlx_gen::sc20686::mark_denoise();
     }
 
     /// Build the step-invariant [`VaceStepCache`] for a fixed latent shape + control latent. The grid
@@ -896,6 +941,7 @@ pub fn denoise_vace(
     // Hoist the step-invariant work out of the loop (F-023): the RoPE table + patch-embedded control
     // latent (shared by every step AND both CFG branches) and the projected text contexts (constant
     // per branch). The old loop rebuilt all of these inside each of the 2 forwards per step.
+    mlx_gen::sc20686::mark_phase("prepare-cache");
     let cache = transformer.build_vace_cache(init_noise, control)?;
     let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
     let ctx_uncond_emb = ctx_uncond.map(|u| transformer.text_embed(u)).transpose()?;
@@ -905,6 +951,7 @@ pub fn denoise_vace(
         &cache.control_emb,
         &ctx_cond_emb,
     ])?;
+    transformer.sc20686_bind(&cache, &ctx_cond_emb);
 
     // F-073 (documented divergence from the base loop): CFG here runs cond/uncond as two
     // sequential B=1 forwards, while `crate::pipeline::denoise` batches them into one B=2 forward
@@ -1026,6 +1073,7 @@ pub(crate) fn denoise_vace_range(
     cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<()> {
+    mlx_gen::sc20686::mark_phase("prepare-cache");
     let cache = transformer.build_vace_cache(latents, control)?;
     let ctx_cond_emb = transformer.text_embed(ctx_cond)?;
     let ctx_uncond_emb = ctx_uncond.map(|u| transformer.text_embed(u)).transpose()?;
@@ -1035,6 +1083,7 @@ pub(crate) fn denoise_vace_range(
         &cache.control_emb,
         &ctx_cond_emb,
     ])?;
+    transformer.sc20686_bind(&cache, &ctx_cond_emb);
 
     for i in range {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).

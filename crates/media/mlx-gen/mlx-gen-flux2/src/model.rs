@@ -983,7 +983,19 @@ impl Generator for Flux2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        let snapshot_root = match &self.loaded_spec.weights {
+            WeightsSource::Dir(root) | WeightsSource::File(root) => root.as_path(),
+        };
+        mlx_gen::sc20686::observe_generation(
+            snapshot_root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1294,6 +1306,9 @@ impl Flux2 {
                            cache: Option<&Flux2KvCache>|
                  -> Result<Array> {
                     let target_seq = latents.shape()[1];
+                    let _sc20686 = mlx_gen::sc20686::reference_forward(
+                        include_ref && cache.is_none() && reference.is_some(),
+                    );
                     let (hidden, img_ids) = match (&reference, include_ref) {
                         (Some((ref_lat, ref_ids)), true) => (
                             concatenate_axis(&[latents, ref_lat], 1)?,
@@ -1331,6 +1346,28 @@ impl Flux2 {
                     .as_ref()
                     .map(|(r, _)| r.shape()[1] as usize)
                     .unwrap_or(0);
+                // SC-20686 Metal lane (no-op unless a campaign is armed): the kv edit caches the
+                // reference K/V of every double AND single layer; the non-kv edit's recomputed
+                // reference slice is observed at the double-stream boundary the Candle lane uses.
+                if reference.is_some() && mlx_gen::sc20686::active() {
+                    mlx_gen::sc20686::bind_geometry(
+                        mlx_gen::sc20686::KvGeometry {
+                            layers: if kv_enabled {
+                                (self.config.num_double_layers + self.config.num_single_layers)
+                                    as u32
+                            } else {
+                                self.config.num_double_layers as u32
+                            },
+                            heads: self.config.num_heads as u32,
+                            head_dimension: self.config.head_dim as u32,
+                            sq: (lat_h * lat_w) as u64,
+                            skv: num_ref as u64,
+                        },
+                        None,
+                        "joint-unmasked",
+                        "flux2-4-axis",
+                    );
+                }
 
                 // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
                 // SwiGLU, gated residual, RoPE rotation) through `mx.compile`. Under MLX 0.32 bf16 is
@@ -1453,6 +1490,7 @@ impl Flux2 {
                     // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
                     // `run_flow_sampler`. img2img slices the schedule from `start_step`.
                     let denoise_sigmas = &sched.sigmas[start_step..keep];
+                    mlx_gen::sc20686::mark_denoise();
                     let previews = mlx_gen::preview::PreviewCounter::new(denoise_sigmas);
                     let final_latents = run_flow_sampler_with_latent_hook(
                         sampler_name,

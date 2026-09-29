@@ -869,7 +869,8 @@ class CampaignAdapterTests(unittest.TestCase):
                 "route_manifest_sha256": route_hash, "input_files": [],
             })
         resolved = {
-            "schema": "sc-20686-resolved-inputs-v3",
+            "schema": "sc-20686-resolved-inputs-v4",
+            "backend": "candle-cuda",
             "inference_revision": "a" * 40,
             "coordinates": resolved_coordinates,
         }
@@ -994,7 +995,8 @@ class CampaignAdapterTests(unittest.TestCase):
             )
             exact_dense = self.reducer.dense_reference_kv_bytes(geometry)
             return {
-                "producer": self.adapter.PRODUCER, "family": coordinate.family,
+                "producer": self.adapter.PRODUCER, "backend": "candle-cuda",
+                "family": coordinate.family,
                 "variant": coordinate.variant, "coordinate_name": coordinate.name,
                 "coordinate_id": self.adapter.digest(self.adapter.canonical(geometry))[:16],
                 "arm": arm, "source_ref": "a" * 40,
@@ -1024,7 +1026,8 @@ class CampaignAdapterTests(unittest.TestCase):
                 "observer_events": events,
                 "raw_receipt_sha256": "", "raw_receipt_sidecar_sha256": "",
                 "real_weights": True, "full_generation": arm == "normal",
-                "attention_kind": "cross", "current_persistent_bytes": 1,
+                "attention_kind": "cross",
+                "current_persistent_bytes": 0 if coordinate.family == "flux2-klein" else 1,
                 "current_read_transient_bytes": (
                     exact_dense if coordinate.family == "flux2-klein" else 1
                 ), "candidate_persistent_bytes": (
