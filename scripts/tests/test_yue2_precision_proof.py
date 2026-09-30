@@ -41,6 +41,24 @@ class PrecisionControlTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "CUDA census unavailable"):
                 CONTROL.cuda_census()
 
+    def test_metal_census_refuses_foreign_workers_by_executable_only(self):
+        rows = "\n".join((
+            "101 /tmp/precision_real_weights-deadbeef",
+            "102 /tmp/sequential_residency_real_weights-deadbeef",
+            "103 /tmp/mlx-gen-qwen-image",
+            "104 /tmp/memory-mlx-adapter",
+            "105 /tmp/sceneworks-worker",
+            "106 /opt/actions-runner/bin/Runner.Worker",
+            "107 /bin/zsh",
+            "108 /Applications/Safari.app/Contents/MacOS/Safari",
+        )) + "\n"
+        result = type("Result", (), {"returncode": 0, "stdout": rows, "stderr": ""})()
+        with patch.object(CONTROL.subprocess, "run", return_value=result) as run:
+            raw, busy = CONTROL.metal_census()
+        self.assertEqual(raw, rows)
+        self.assertEqual([int(line.split()[0]) for line in busy], [101, 102, 103, 104, 105])
+        self.assertEqual(run.call_args.args[0], ["/bin/ps", "-axo", "pid=,comm="])
+
     def test_one_exact_ignored_test_must_execute(self):
         good = "test explicit_stage_precision_real_weights ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out\n"
         self.assertTrue(CONTROL.one_test_executed(good))
@@ -122,6 +140,11 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("if: inputs.stage == 'metal'", source)
         self.assertIn("group: inference-real-weights-physical-host", source)
         self.assertIn('CUDA_VISIBLE_DEVICES: "0"', source)
+        self.assertEqual(source.count("path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav"), 2)
+        self.assertEqual(source.count("if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}"), 2)
+        self.assertNotIn("path: ${{ env.YUE2_PRECISION_WORK_DIR }}\n", source)
+        self.assertIn("yue2-precision-listening-cuda-cc-by-nc-internal-", source)
+        self.assertIn("yue2-precision-listening-metal-cc-by-nc-internal-", source)
         self.assertIn("test \"$RUNNER_NAME\" = nax-macos-2", source)
         self.assertIn("--test precision_real_weights", source)
         self.assertNotIn("tier_quality_against_the_f32_reference", source)

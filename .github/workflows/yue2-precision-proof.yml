@@ -165,6 +165,15 @@ jobs:
           path: ${{ runner.temp }}/yue2-precision-proof
           if-no-files-found: warn
           retention-days: 30
+      # Internal CC BY-NC 4.0 listening only. Upload generated WAVs, never weights or caches.
+      - name: Upload CUDA listening WAVs only
+        if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-precision-listening-cuda-cc-by-nc-internal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav
+          if-no-files-found: warn
+          retention-days: 30
 
   metal:
     if: inputs.stage == 'metal'
@@ -235,5 +244,14 @@ jobs:
         with:
           name: yue2-precision-metal-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/yue2-precision-proof
+          if-no-files-found: warn
+          retention-days: 30
+      # Internal CC BY-NC 4.0 listening only. Upload generated WAVs, never weights or caches.
+      - name: Upload Metal listening WAVs only
+        if: ${{ always() && env.YUE2_PRECISION_WORK_DIR != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-precision-listening-metal-cc-by-nc-internal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.YUE2_PRECISION_WORK_DIR }}/**/*.wav
           if-no-files-found: warn
           retention-days: 30

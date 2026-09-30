@@ -132,6 +132,21 @@ def cuda_census() -> tuple[str, list[str]]:
             query_compute_apps_rows(fallback.stdout))
 
 
+def metal_worker_executable(name: str) -> bool:
+    # Inspect only the executable, never argv: the GitHub controller may quote
+    # a worker name in its own command line without running that worker.
+    return bool(
+        re.fullmatch(r"[a-z0-9_]*real_weights-[0-9a-f]+", name)
+        or re.fullmatch(r"real_weight_tiling(?:-[0-9a-f]+)?", name)
+        or name.startswith(("mlx-gen-", "mlx_gen_", "candle-gen-", "candle_gen_"))
+        or name in {
+            "sceneworks-worker", "sceneworks-rust-api", "sceneworks-api",
+            "memory-mlx-adapter", "memory-candle-adapter", "candle_audio_yue2",
+            "candle-audio-yue2",
+        }
+    )
+
+
 def metal_census() -> tuple[str, list[str]]:
     result = subprocess.run(["/bin/ps", "-axo", "pid=,comm="], capture_output=True, text=True, timeout=20)
     require(result.returncode == 0, f"ps executable census failed: {result.stderr.strip()}")
@@ -142,9 +157,7 @@ def metal_census() -> tuple[str, list[str]]:
         if len(fields) != 2 or not fields[0].isdigit():
             continue
         name = Path(fields[1]).name
-        if re.fullmatch(r"precision_real_weights-[0-9a-f]+", name) or name in {
-            "sceneworks-rust-api", "candle_audio_yue2", "candle-audio-yue2"
-        }:
+        if metal_worker_executable(name):
             busy.append(line)
     return result.stdout, busy
 
