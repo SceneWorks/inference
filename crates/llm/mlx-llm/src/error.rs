@@ -57,6 +57,15 @@ pub enum Error {
         attempts: u32,
     },
 
+    /// A constraint mask allowed no token of a logits row (story sc-24434): there is nothing the
+    /// sampler may draw. Typed so a caller can tell a dead-ended constraint from a backend fault;
+    /// the sampler never falls back to a forbidden id.
+    #[error("the constraint mask allows no token of the {vocab}-entry logits row")]
+    NoAllowedToken {
+        /// The logits row's width.
+        vocab: usize,
+    },
+
     /// Anything else, with a human-readable message.
     #[error("{0}")]
     Msg(String),
