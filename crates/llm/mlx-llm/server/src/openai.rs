@@ -6,7 +6,8 @@
 //! ([`crate::main`]) wires them to a TCP socket + a loaded `core_llm::TextLlm` provider.
 
 use mlx_llm::core_llm::{
-    Constraint, Content, Message, MtpMode, Role, Sampling, Speculative, TextLlmRequest,
+    Constraint, Content, DecodeReport, Message, MtpMode, Role, Sampling, Speculative,
+    TextLlmRequest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -214,12 +215,39 @@ pub fn content_chunk(id: &str, model: &str, created: u64, delta: &str) -> String
     chunk(id, model, created, json!({ "content": delta }), Value::Null)
 }
 
-/// The terminal SSE chunk: an empty delta plus the finish reason.
-pub fn final_chunk(id: &str, model: &str, created: u64, finish: &str) -> String {
-    chunk(id, model, created, json!({}), json!(finish))
+/// The terminal SSE chunk: an empty delta plus the finish reason, and the request's decode
+/// report as [`x_decode`] (sc-24438).
+pub fn final_chunk(
+    id: &str,
+    model: &str,
+    created: u64,
+    finish: &str,
+    decode: Option<&DecodeReport>,
+) -> String {
+    let mut v = chunk_value(id, model, created, json!({}), json!(finish));
+    if let Some(report) = decode {
+        v["x_decode"] = x_decode(report);
+    }
+    v.to_string()
+}
+
+/// The decode report an OpenAI client can see (sc-24438, epic sc-24432 E2): which proposer ran,
+/// its depth, and every fallback — a clamped depth, an unavailable proposer — by name, so no
+/// downgrade is silent over HTTP. Carried as the `x_decode` extension member of the non-streaming
+/// body and of the final SSE chunk before `[DONE]`.
+pub fn x_decode(report: &DecodeReport) -> Value {
+    json!({
+        "proposer": report.proposer.label(),
+        "draft_tokens": report.draft_tokens,
+        "fallbacks": report.fallbacks,
+    })
 }
 
 fn chunk(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value) -> String {
+    chunk_value(id, model, created, delta, finish_reason).to_string()
+}
+
+fn chunk_value(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value) -> Value {
     json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -227,20 +255,32 @@ fn chunk(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value
         "model": model,
         "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
     })
-    .to_string()
 }
 
-/// A non-streaming `chat.completion` response body.
+/// The token counts a completion reports.
+pub struct CompletionUsage {
+    /// Prompt tokens.
+    pub prompt_tokens: u32,
+    /// Generated tokens.
+    pub completion_tokens: u32,
+}
+
+/// A non-streaming `chat.completion` response body, with the request's decode report as
+/// [`x_decode`] (sc-24438).
 pub fn completion(
     id: &str,
     model: &str,
     created: u64,
     text: &str,
     finish: &str,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    usage: CompletionUsage,
+    decode: Option<&DecodeReport>,
 ) -> String {
-    json!({
+    let CompletionUsage {
+        prompt_tokens,
+        completion_tokens,
+    } = usage;
+    let mut v = json!({
         "id": id,
         "object": "chat.completion",
         "created": created,
@@ -255,8 +295,11 @@ pub fn completion(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
-    })
-    .to_string()
+    });
+    if let Some(report) = decode {
+        v["x_decode"] = x_decode(report);
+    }
+    v.to_string()
 }
 
 /// The `GET /v1/models` body listing the single hosted model.
@@ -420,15 +463,23 @@ mod tests {
             serde_json::from_str::<Value>(&content_chunk("id1", "m", 100, "hello")).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "hello");
 
-        let fin = serde_json::from_str::<Value>(&final_chunk("id1", "m", 100, "length")).unwrap();
+        let fin =
+            serde_json::from_str::<Value>(&final_chunk("id1", "m", 100, "length", None)).unwrap();
         assert_eq!(fin["choices"][0]["finish_reason"], "length");
         assert_eq!(fin["choices"][0]["delta"], json!({}));
+        assert!(fin.get("x_decode").is_none(), "no report, no member");
     }
 
     #[test]
     fn completion_body_carries_usage_and_message() {
-        let v = serde_json::from_str::<Value>(&completion("id", "m", 1, "hi there", "stop", 3, 2))
-            .unwrap();
+        let usage = CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+        };
+        let v = serde_json::from_str::<Value>(&completion(
+            "id", "m", 1, "hi there", "stop", usage, None,
+        ))
+        .unwrap();
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["content"], "hi there");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");

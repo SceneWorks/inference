@@ -853,7 +853,13 @@ impl LlamaProvider {
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         Self {
-            descriptor: provider_descriptor(),
+            descriptor: {
+                let mut d = provider_descriptor();
+                d.capabilities.speculative = vec![prompt_lookup_capabilities(
+                    speculative_max_depth(causal_attention_geometries(model.config())),
+                )];
+                d
+            },
             model: Decoder::Causal(model),
             tokenizer,
             template: Box::new(Llama3Template),
@@ -1387,11 +1393,7 @@ impl TextLlm for LlamaProvider {
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
         self.descriptor
             .capabilities
-            .validate_request_with_skipped_mtp(
-                &self.descriptor.id,
-                req,
-                self.skipped_mtp().is_some(),
-            )
+            .validate_request(&self.descriptor.id, req)
     }
 
     fn generate(
@@ -1497,11 +1499,8 @@ impl TextLlm for LlamaProvider {
         // provider advertises, then the proposer this request's shape can run on the engine
         // (sc-24434). Anything less than the request asked for is named in the report's
         // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure.
-        let resolution = core_llm::resolve_speculative_with_skipped_mtp(
-            req.speculative_mode(),
-            &self.descriptor.capabilities,
-            self.skipped_mtp(),
-        );
+        let resolution =
+            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities);
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
         let required = self
@@ -1990,34 +1989,69 @@ impl TextLlm for LlamaProvider {
     }
 }
 
-/// The deepest speculative proposal any proposer runs on MLX (sc-24438, epic sc-24432 E4): drafts
-/// per verify step, so the verify forward carries at most `1 + 7 = 8` query rows.
+/// The ceiling on any speculative proposal MLX runs (sc-24438, epic sc-24432 E4): drafts per
+/// verify step, so the verify forward carries at most `1 + 7 = 8` query rows. A loaded model
+/// advertises its own, possibly lower, depth — [`speculative_max_depth`] over its attention
+/// geometry — and the weightless [`provider_descriptor`] advertises this ceiling.
 ///
-/// Why 7: the attention primitive's `MLX_SDPA_VECTOR_MAX_QLEN` is 8 — the widest query MLX
-/// 0.32's single-pass **vector** SDPA kernel takes. That is its decode kernel, the one every plain
-/// `q_len = 1` step runs. A verify of up to 8 rows stays on it: one fused call per attention
-/// layer, no score matrix, the same kernel as the plain step it must agree with token for token.
-/// Past 8 rows the same verify moves to the fused **full** kernel (head dims 64/80/128), whose
-/// query blocks are sized for prefill, or — for head dims only the vector kernel serves, like the
-/// Qwen35 hybrid's 256 — to a second vector-kernel tile per layer: the per-step verify cost stops
-/// being flat in the depth exactly where speculation needs it flat. (A GQA group wider than 4
-/// narrows the vector kernel to `32 / gqa` rows; a verify between that and 8 rows is split into
-/// vector-kernel tiles — still the decode kernel, still no score matrix — so the bound stays the
-/// kernel's `q_len` limit.) sc-24442 removed the old 8-row cap on *fused* SDPA; this is the width
-/// the decode kernel serves, not that cap.
+/// Why 8 rows: the attention primitive's `MLX_SDPA_VECTOR_MAX_QLEN` is the widest query MLX
+/// 0.32's single-pass **vector** SDPA kernel takes — its decode kernel, the one every plain
+/// `q_len = 1` step runs. A verify it serves in one call costs one fused call per attention layer,
+/// no score matrix, the same kernel as the plain step it must agree with token for token. Past it
+/// the verify moves to the fused **full** kernel (head dims 64/80/128), whose query blocks are
+/// sized for prefill, or — for head dims only the vector kernel serves, like the Qwen35 hybrid's
+/// 256 — to a second vector-kernel tile per layer: the per-step verify cost stops being flat in
+/// the depth exactly where speculation needs it flat. sc-24442 removed the old 8-row cap on
+/// *fused* SDPA; this is the width the decode kernel serves, not that cap.
 pub const SPECULATIVE_MAX_DEPTH: u32 =
     crate::primitives::attention::MLX_SDPA_VECTOR_MAX_QLEN as u32 - 1;
 
-/// The deepest prompt-lookup proposal the provider runs: [`SPECULATIVE_MAX_DEPTH`]. Every extra
-/// depth also adds a KV overshoot position and — on the Qwen35 hybrid — a larger step-start
-/// snapshot to restore on rejection; a copied span past it gains little over the next verify
-/// step starting a fresh lookup.
-pub const PROMPT_LOOKUP_MAX_DEPTH: u32 = SPECULATIVE_MAX_DEPTH;
+/// The deepest speculative proposal (prompt lookup and MTP alike) a model whose attention layers
+/// have these `(q_heads, kv_heads, qk_head_dim, v_head_dim)` geometries runs on MLX (sc-24438,
+/// E4): one less than the narrowest `vector_verify_rows` among them, so a max-depth verify is one
+/// decode-kernel call in **every** attention layer.
+///
+/// MLX's vector kernel serves `q_len × gqa <= 32`, so a GQA group wider than 4 narrows it:
+/// Qwen3.8-27B (24q/4kv/hd 256, gqa 6) verifies 5 rows in one call → depth 4; Qwen3.5/3.6-35B-A3B
+/// (16q/2kv/hd 256, gqa 8) 4 rows → depth 3; a gqa-4 Llama 8 rows → depth 7
+/// ([`SPECULATIVE_MAX_DEPTH`]). A geometry the vector kernel does not serve is bounded at 8 rows.
+/// Never below 1: a gqa-32 group (one vector row) still speculates one draft, in two calls.
+pub fn speculative_max_depth(geometries: impl IntoIterator<Item = (i32, i32, i32, i32)>) -> u32 {
+    geometries
+        .into_iter()
+        .map(|(hq, hkv, qd, vd)| crate::primitives::attention::vector_verify_rows(hq, hkv, qd, vd))
+        .min()
+        .map_or(SPECULATIVE_MAX_DEPTH, |rows| (rows - 1).max(1) as u32)
+}
 
-/// The deepest MTP proposal a Qwen3.8 head runs: [`SPECULATIVE_MAX_DEPTH`] (each MTP draft also
-/// costs one sequential predictor forward, so the verify width is the binding bound, not the
-/// head). Advertised on both the legacy `mtp` field and the per-proposer list (sc-24438).
-pub const MTP_MAX_DEPTH: u32 = SPECULATIVE_MAX_DEPTH;
+/// Every attention geometry `(q_heads, kv_heads, qk_head_dim, v_head_dim)` a causal decoder's
+/// layers hand `sdpa`: per layer type (Gemma 4's sliding and full layers differ), MLA's
+/// head-expanded `qk_nope + qk_rope` / `v_head_dim` keys.
+fn causal_attention_geometries(cfg: &ModelConfig) -> Vec<(i32, i32, i32, i32)> {
+    if let Some(mla) = &cfg.mla {
+        return vec![(
+            cfg.num_heads,
+            cfg.num_heads,
+            mla.q_head_dim(),
+            mla.v_head_dim,
+        )];
+    }
+    let mut geometries: Vec<_> = (0..cfg.num_layers.max(1))
+        .map(|i| {
+            let a = cfg.layer_attention(i);
+            (cfg.num_heads, a.num_kv_heads, a.head_dim, a.head_dim)
+        })
+        .collect();
+    geometries.sort_unstable();
+    geometries.dedup();
+    geometries
+}
+
+/// The attention geometry of the Qwen35 hybrid's full-attention layers — the only layers that run
+/// `sdpa` (the Gated DeltaNet layers are recurrent) — which its MTP predictor layer shares.
+fn qwen35_attention_geometry(cfg: &Qwen35Config) -> (i32, i32, i32, i32) {
+    (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.head_dim)
+}
 
 /// The MTP depth [`Speculative::Auto`](core_llm::Speculative::Auto) runs on a Qwen3.8 head (the
 /// upstream recommendation).
@@ -2028,12 +2062,13 @@ pub const MTP_RECOMMENDED_DEPTH: u32 = 3;
 /// single-token decode, so the depth only prices a match.
 pub const PROMPT_LOOKUP_RECOMMENDED_DEPTH: u32 = 4;
 
-/// The prompt-lookup advertisement every `mlx-llama` decoder carries.
-fn prompt_lookup_capabilities() -> ProposerCapabilities {
+/// The prompt-lookup advertisement every `mlx-llama` decoder carries, at the model's
+/// [`speculative_max_depth`] (the recommendation clamped under it).
+fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
     ProposerCapabilities {
         proposer: SpeculativeProposer::PromptLookup,
-        max_depth: PROMPT_LOOKUP_MAX_DEPTH,
-        recommended_depth: PROMPT_LOOKUP_RECOMMENDED_DEPTH,
+        max_depth,
+        recommended_depth: PROMPT_LOOKUP_RECOMMENDED_DEPTH.min(max_depth),
     }
 }
 
@@ -2068,14 +2103,6 @@ impl SpeculativeRoute {
 }
 
 impl LlamaProvider {
-    /// Why the checkpoint's MTP head was loaded past instead of run (sc-24438), if it was.
-    fn skipped_mtp(&self) -> Option<&'static str> {
-        match &self.model {
-            Decoder::Qwen35(m) => m.skipped_mtp(),
-            Decoder::Causal(_) => None,
-        }
-    }
-
     /// The request's admission price under its speculative route (sc-24434). A step-start
     /// snapshot (the Qwen35 hybrid, MTP or prompt lookup) is priced as the MTP route always was —
     /// a second KV/recurrent copy plus the verify rows — because the verify forward's in-place
@@ -2206,7 +2233,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // Every decoder this provider loads runs the speculative engine (sc-24434), so prompt
             // lookup needs nothing from the checkpoint. A Qwen3.8 MTP head is advertised on the
             // legacy `mtp` field by the load path.
-            speculative: vec![prompt_lookup_capabilities()],
+            speculative: vec![prompt_lookup_capabilities(SPECULATIVE_MAX_DEPTH)],
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![ConstraintKind::Json],
         },
@@ -2219,6 +2246,9 @@ fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
     d.family = cfg.architecture.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
+    d.capabilities.speculative = vec![prompt_lookup_capabilities(speculative_max_depth(
+        causal_attention_geometries(cfg),
+    ))];
     d
 }
 
@@ -2228,12 +2258,13 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     let mut d = provider_descriptor();
     d.family = Architecture::Qwen35.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
-    // A configured head the loader runs is advertised with its backend-true depth on both the
-    // legacy and the per-proposer field (sc-24438); a head the loader skips (a sparse-MoE
-    // predictor, `mtp_skip_reason`) is not advertised, and requests for it fall back by name.
-    if cfg.mtp_num_hidden_layers > 0 && cfg.mtp_skip_reason().is_none() {
+    // Both proposers at the full-attention layers' backend-true depth (sc-24438); a configured
+    // head — dense or sparse-MoE predictor layer — on both the legacy and the per-proposer field.
+    let max_depth = speculative_max_depth([qwen35_attention_geometry(cfg)]);
+    d.capabilities.speculative = vec![prompt_lookup_capabilities(max_depth)];
+    if cfg.mtp_num_hidden_layers > 0 {
         d.capabilities
-            .advertise_mtp(MTP_MAX_DEPTH, MTP_RECOMMENDED_DEPTH);
+            .advertise_mtp(max_depth, MTP_RECOMMENDED_DEPTH);
     }
     d
 }
@@ -3798,21 +3829,22 @@ mod tests {
         );
     }
 
-    /// Both decoder families advertise prompt lookup (the engine runs it on either); the
-    /// Qwen3.8 head keeps its MTP advertisement — the same finite depth on the legacy field and
-    /// the per-proposer list (sc-24438) — and a depth past the bound is admitted (it is clamped at
-    /// generate, by name).
+    /// Both decoder families advertise prompt lookup (the engine runs it on either) at their
+    /// geometry's depth; the Qwen3.8 head keeps its MTP advertisement — the same finite depth on
+    /// the legacy field and the per-proposer list (sc-24438) — and a depth past the bound is
+    /// admitted (it is clamped at generate, by name).
     #[test]
     fn every_decoder_advertises_prompt_lookup() {
         use core_llm::Speculative;
         for provider in [causal_provider(), qwen35_mtp_provider()] {
             let caps = &provider.descriptor().capabilities;
             let lookup = caps.proposer(SpeculativeProposer::PromptLookup).unwrap();
-            assert_eq!(lookup.max_depth, PROMPT_LOOKUP_MAX_DEPTH);
+            // The fixtures' head dims (4, 8) are not vector-kernel dims: the 8-row bound.
+            assert_eq!(lookup.max_depth, SPECULATIVE_MAX_DEPTH);
             assert_eq!(lookup.recommended_depth, PROMPT_LOOKUP_RECOMMENDED_DEPTH);
             let too_deep = spec_request(Speculative::proposer(
                 SpeculativeProposer::PromptLookup,
-                PROMPT_LOOKUP_MAX_DEPTH + 1,
+                lookup.max_depth + 1,
             ));
             provider.validate(&too_deep).unwrap();
         }
@@ -3821,7 +3853,7 @@ mod tests {
         let mtp = caps.proposer(SpeculativeProposer::Mtp).unwrap();
         assert_eq!(
             (mtp.max_depth, mtp.recommended_depth),
-            (MTP_MAX_DEPTH, MTP_RECOMMENDED_DEPTH)
+            (SPECULATIVE_MAX_DEPTH, MTP_RECOMMENDED_DEPTH)
         );
         assert_eq!(
             caps.mtp,
@@ -3839,20 +3871,132 @@ mod tests {
             .is_none());
     }
 
-    /// sc-24438 AC1: the advertised max depth is finite and backend-true — the widest verify
-    /// MLX's decode SDPA kernel takes in one call (8 rows = 1 + 7 drafts) — and a request above it
-    /// runs at it, with the clamp named in `DecodeReport::fallbacks`, emitting exactly `off`'s
-    /// stream: prompt lookup on both decoders, and MTP (the new option and the legacy field) on
-    /// the Qwen3.8 head.
+    /// sc-24438 AC1 (E4): a loaded model's advertised depth is its attention geometry's — one less
+    /// than the rows MLX's decode kernel verifies in one call — for both proposers and on the
+    /// legacy MTP field: the shipped Qwen3.8-27B config (24q/4kv/hd 256) → 4, a 35B-A3B-shaped
+    /// MoE config (16q/2kv/hd 256) → 3, a gqa-4 hd-128 Llama → 7, a gqa-8 one → 3, Gemma 4 the
+    /// narrower of its sliding / full layers, DeepSeek MLA (192/128, head-expanded keys) → 7.
+    #[test]
+    fn the_advertised_depth_is_the_attention_geometrys() {
+        let depths = |caps: &TextLlmCapabilities| {
+            let lookup = caps.proposer(SpeculativeProposer::PromptLookup).unwrap();
+            assert!(lookup.recommended_depth <= lookup.max_depth);
+            let mtp = caps.proposer(SpeculativeProposer::Mtp).map(|m| {
+                assert_eq!(
+                    caps.mtp,
+                    Some(core_llm::MtpCapabilities {
+                        max_draft_tokens: m.max_depth,
+                        recommended_draft_tokens: m.recommended_depth,
+                    })
+                );
+                m.max_depth
+            });
+            (lookup.max_depth, mtp)
+        };
+        let qwen38: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        let dense = Qwen35Config::from_json(&qwen38).unwrap();
+        assert_eq!(
+            (dense.num_heads, dense.num_kv_heads, dense.head_dim),
+            (24, 4, 256)
+        );
+        assert_eq!(
+            depths(&descriptor_for_qwen35(&dense).capabilities),
+            (4, Some(4))
+        );
+        let mut a3b = qwen38.clone();
+        let text = a3b["text_config"].as_object_mut().unwrap();
+        text.insert("num_attention_heads".into(), json!(16));
+        text.insert("num_key_value_heads".into(), json!(2));
+        text.insert("model_type".into(), json!("qwen3_5_moe_text"));
+        text.insert("num_experts".into(), json!(256));
+        text.insert("num_experts_per_tok".into(), json!(8));
+        text.insert("moe_intermediate_size".into(), json!(512));
+        text.insert("shared_expert_intermediate_size".into(), json!(512));
+        let a3b = Qwen35Config::from_json(&a3b).unwrap();
+        assert!(a3b.moe.is_some());
+        assert_eq!(
+            depths(&descriptor_for_qwen35(&a3b).capabilities),
+            (3, Some(3))
+        );
+
+        let llama = |heads: i32, kv: i32, extra: serde_json::Value| {
+            let mut v = json!({
+                "model_type": "llama", "architectures": ["LlamaForCausalLM"],
+                "hidden_size": heads * 128, "intermediate_size": 256, "num_hidden_layers": 2,
+                "num_attention_heads": heads, "num_key_value_heads": kv,
+                "vocab_size": 32, "rms_norm_eps": 1e-5, "max_position_embeddings": 64
+            });
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            depths(&descriptor_for(&ModelConfig::from_json(&v).unwrap()).capabilities)
+        };
+        assert_eq!(llama(32, 8, json!({})), (7, None));
+        assert_eq!(llama(64, 8, json!({})), (3, None));
+        assert_eq!(
+            llama(
+                16,
+                16,
+                json!({"model_type": "deepseek_v2", "architectures": ["DeepseekV2ForCausalLM"],
+                       "kv_lora_rank": 64, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64,
+                       "v_head_dim": 128})
+            ),
+            (7, None)
+        );
+
+        // Gemma 4: sliding hd 256 over 2 KV heads (gqa 8 → 4 rows) beats the full layers' hd 512.
+        let gemma4 = |kv: i32| {
+            let cfg = ModelConfig {
+                num_heads: 16,
+                gemma4: Some(Box::new(crate::config::Gemma4Config {
+                    layer_types: vec![
+                        crate::config::LayerAttentionType::Sliding,
+                        crate::config::LayerAttentionType::Full,
+                    ],
+                    sliding: crate::config::LayerAttention {
+                        head_dim: 256,
+                        num_kv_heads: kv,
+                        rope_type: crate::config::RopeType::Default,
+                        rope_theta: 1e4,
+                        partial_rotary_factor: 1.0,
+                        rope_factor: 1.0,
+                        sliding_window: Some(512),
+                        k_eq_v: false,
+                    },
+                    full: crate::config::LayerAttention {
+                        head_dim: 512,
+                        num_kv_heads: 1,
+                        rope_type: crate::config::RopeType::Default,
+                        rope_theta: 1e6,
+                        partial_rotary_factor: 1.0,
+                        rope_factor: 1.0,
+                        sliding_window: None,
+                        k_eq_v: true,
+                    },
+                    bidirectional: None,
+                    num_kv_shared_layers: 0,
+                    use_double_wide_mlp: false,
+                })),
+                num_layers: 2,
+                ..crate::decode::engine::tests::tiny_llama(8).config().clone()
+            };
+            depths(&descriptor_for(&cfg).capabilities)
+        };
+        assert_eq!(gemma4(2), (3, None));
+        assert_eq!(gemma4(8), (7, None));
+    }
+
+    /// sc-24438 AC1: the advertised max depth is finite and backend-true (on these fixtures'
+    /// head dims, the 8-row bound) and a request above it runs at it, with the clamp named in
+    /// `DecodeReport::fallbacks`, emitting exactly `off`'s stream: prompt lookup on both
+    /// decoders, and MTP (the new option and the legacy field) on the Qwen3.8 head.
     #[test]
     fn a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp() {
         use core_llm::{MtpMode, Speculative};
-        assert_eq!(SPECULATIVE_MAX_DEPTH, 7);
-        assert_eq!(
-            SPECULATIVE_MAX_DEPTH + 1,
-            crate::primitives::attention::MLX_SDPA_VECTOR_MAX_QLEN as u32,
-            "a max-depth verify is one decode-kernel call"
-        );
         let clamp = |proposer: &str, asked: u32, max: u32| {
             vec![format!(
                 "speculative: `{proposer}` depth {asked} clamped to {max} (advertised 1..={max})"
@@ -3867,109 +4011,112 @@ mod tests {
             assert_eq!(ids, off_ids, "{label}: the clamped run is greedy-exact");
             report.fallbacks
         };
+        let max = |provider: &LlamaProvider, proposer| {
+            provider
+                .descriptor()
+                .capabilities
+                .proposer(proposer)
+                .unwrap()
+                .max_depth
+        };
 
-        let asked = PROMPT_LOOKUP_MAX_DEPTH + 5;
         for (label, provider) in [
             ("causal", causal_provider()),
             ("qwen35", qwen35_mtp_provider()),
         ] {
+            let max = max(&provider, SpeculativeProposer::PromptLookup);
+            let asked = max + 5;
             let req = spec_request(Speculative::proposer(
                 SpeculativeProposer::PromptLookup,
                 asked,
             ));
-            let fallbacks = check(
-                &provider,
-                req,
-                ProposerKind::PromptLookup,
-                PROMPT_LOOKUP_MAX_DEPTH,
-                label,
-            );
-            assert_eq!(
-                fallbacks,
-                clamp("prompt_lookup", asked, PROMPT_LOOKUP_MAX_DEPTH),
-                "{label}"
-            );
+            let fallbacks = check(&provider, req, ProposerKind::PromptLookup, max, label);
+            assert_eq!(fallbacks, clamp("prompt_lookup", asked, max), "{label}");
         }
 
         let hybrid = qwen35_mtp_provider();
+        let mtp_max = max(&hybrid, SpeculativeProposer::Mtp);
         let new = spec_request(Speculative::proposer(SpeculativeProposer::Mtp, 40));
-        let fallbacks = check(&hybrid, new, ProposerKind::Mtp, MTP_MAX_DEPTH, "mtp");
-        assert_eq!(fallbacks, clamp("mtp", 40, MTP_MAX_DEPTH));
+        let fallbacks = check(&hybrid, new, ProposerKind::Mtp, mtp_max, "mtp");
+        assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
         let mut legacy = spec_request(Speculative::Off);
         legacy.speculative = None;
         legacy.mtp = MtpMode::Enabled { draft_tokens: 40 };
-        let fallbacks = check(&hybrid, legacy, ProposerKind::Mtp, MTP_MAX_DEPTH, "legacy");
-        assert_eq!(fallbacks, clamp("mtp", 40, MTP_MAX_DEPTH));
+        let fallbacks = check(&hybrid, legacy, ProposerKind::Mtp, mtp_max, "legacy");
+        assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
     }
 
-    /// sc-24438 AC2 (E2): a sparse-MoE Qwen35 snapshot carrying an MTP head loads through the
-    /// production load path, advertises no MTP (the head is skipped, not run), and a request for
-    /// MTP — the new option or the legacy field — decodes plainly with the skipped head named;
-    /// `auto` runs prompt lookup and names the skipped head too. Every run emits `off`'s stream.
+    /// sc-24438 AC2: a sparse-MoE Qwen35 snapshot carrying an MTP head — its predictor layer a
+    /// sparse-MoE block, as the 35B-A3B ships it, in the fused (Qwen3.6) and the per-expert
+    /// (Qwen3.5) expert layout — loads through the production load path, advertises MTP on both
+    /// fields, and **runs** it: `{mtp, 3}`, the legacy `enabled 3` and `auto` each report the MTP
+    /// proposer with drafts proposed, and emit exactly `off`'s stream.
     #[test]
-    fn a_moe_snapshot_with_an_mtp_head_loads_and_decodes_plain_by_name() {
-        use crate::models::qwen35::tests::{cfg_json_moe_mtp, synthetic_moe_mtp_tensors};
+    fn a_moe_snapshot_with_an_mtp_head_runs_mtp() {
+        use crate::models::qwen35::tests::{cfg_json_moe_mtp, seeded_moe_mtp_tensors};
         use core_llm::{MtpMode, Speculative};
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = cfg_json_moe_mtp();
-        config["model_type"] = json!("qwen3_5_moe");
-        config.as_object_mut().unwrap().remove("vision_config");
-        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
-        let entries: Vec<String> = (0..50).map(|i| format!("\"t{i}\": {i}")).collect();
-        std::fs::write(
-            dir.path().join("tokenizer.json"),
-            format!(
-                r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+        for fused in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = cfg_json_moe_mtp();
+            config["model_type"] = json!("qwen3_5_moe");
+            config.as_object_mut().unwrap().remove("vision_config");
+            std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+            let entries: Vec<String> = (0..50).map(|i| format!("\"t{i}\": {i}")).collect();
+            std::fs::write(
+                dir.path().join("tokenizer.json"),
+                format!(
+                    r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
                     "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
                     "decoder": null,
                     "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
-                entries.join(", ")
-            ),
-        )
-        .unwrap();
-        let cfg = Qwen35Config::from_json(&config).unwrap();
-        let tensors = synthetic_moe_mtp_tensors(&cfg);
-        assert!(tensors.contains_key("mtp.layers.0.mlp.experts.gate_up_proj"));
-        let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
-        Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
+                    entries.join(", ")
+                ),
+            )
+            .unwrap();
+            let cfg = Qwen35Config::from_json(&config).unwrap();
+            let tensors = seeded_moe_mtp_tensors(&cfg, fused);
+            let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
 
-        let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
-            .expect("a MoE checkpoint with an MTP head loads");
-        let caps = &provider.descriptor().capabilities;
-        assert!(caps.mtp.is_none());
-        assert!(caps.proposer(SpeculativeProposer::Mtp).is_none());
-        assert!(caps.proposer(SpeculativeProposer::PromptLookup).is_some());
+            let label = if fused { "fused" } else { "per-expert" };
+            let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string()))
+                .expect("a MoE checkpoint with an MTP head loads");
+            let caps = &provider.descriptor().capabilities;
+            let mtp = caps.proposer(SpeculativeProposer::Mtp).expect(label);
+            assert_eq!(
+                caps.mtp,
+                Some(core_llm::MtpCapabilities {
+                    max_draft_tokens: mtp.max_depth,
+                    recommended_draft_tokens: mtp.recommended_depth,
+                }),
+                "{label}"
+            );
 
-        let (_, off_ids) = run(&provider, &spec_request(Speculative::Off));
-        let skipped = "speculative: `mtp` is not run on this checkpoint (its MTP predictor layer \
-                       is a sparse-MoE block, which the MLX MTP proposer does not run); decoded \
-                       without a proposer"
-            .to_string();
-        let mut legacy = spec_request(Speculative::Off);
-        legacy.speculative = None;
-        legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
-        for (label, req) in [
-            (
-                "explicit",
-                spec_request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
-            ),
-            ("legacy", legacy),
-        ] {
-            provider.validate(&req).unwrap();
-            let (out, ids) = run(&provider, &req);
-            let report = out.decode.unwrap();
-            assert_eq!(report.proposer, ProposerKind::None, "{label}");
-            assert_eq!(report.fallbacks, vec![skipped.clone()], "{label}");
-            assert_eq!(ids, off_ids, "{label}");
+            let (_, off_ids) = run(&provider, &spec_request(Speculative::Off));
+            let mut legacy = spec_request(Speculative::Off);
+            legacy.speculative = None;
+            legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
+            for (case, req) in [
+                (
+                    "explicit",
+                    spec_request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
+                ),
+                ("legacy", legacy),
+                ("auto", spec_request(Speculative::Auto)),
+            ] {
+                provider.validate(&req).unwrap();
+                let (out, ids) = run(&provider, &req);
+                let report = out.decode.unwrap();
+                assert_eq!(report.proposer, ProposerKind::Mtp, "{label} {case}");
+                assert_eq!(report.draft_tokens, Some(3), "{label} {case}");
+                assert!(
+                    report.proposed_tokens > 0,
+                    "{label} {case}: the head drafted"
+                );
+                assert!(report.fallbacks.is_empty(), "{label} {case}");
+                assert_eq!(ids, off_ids, "{label} {case}: greedy-exact");
+            }
         }
-
-        let (out, ids) = run(&provider, &spec_request(Speculative::Auto));
-        let report = out.decode.unwrap();
-        assert_eq!(report.proposer, ProposerKind::PromptLookup);
-        assert_eq!(report.draft_tokens, Some(PROMPT_LOOKUP_RECOMMENDED_DEPTH));
-        assert_eq!(report.fallbacks.len(), 1);
-        assert!(report.fallbacks[0].contains("auto skipped this checkpoint's `mtp` head"));
-        assert_eq!(ids, off_ids);
     }
 
     /// Admission prices what each route holds: prompt lookup on a softmax decoder pays only its
@@ -4025,12 +4172,7 @@ mod tests {
             speculative: Speculative::Auto,
             expect_proposer,
         };
-        let depths = [
-            1,
-            3,
-            PROMPT_LOOKUP_RECOMMENDED_DEPTH,
-            PROMPT_LOOKUP_MAX_DEPTH,
-        ];
+        let depths = [1, 3, PROMPT_LOOKUP_RECOMMENDED_DEPTH, SPECULATIVE_MAX_DEPTH];
         for (label, provider, cases) in [
             (
                 "causal",

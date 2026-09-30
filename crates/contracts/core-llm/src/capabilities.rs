@@ -161,21 +161,6 @@ impl TextLlmCapabilities {
     /// [`TextLlm::validate`](crate::TextLlm::validate). Rejects (rather than silently ignoring)
     /// anything outside the declared surface.
     pub fn validate_request(&self, id: &str, req: &TextLlmRequest) -> Result<()> {
-        self.validate_request_with_skipped_mtp(id, req, false)
-    }
-
-    /// [`validate_request`](Self::validate_request) for a loaded model whose checkpoint carries an
-    /// MTP head the backend loaded past without running (`mtp_skipped`, sc-24438 — e.g. a
-    /// sparse-MoE predictor layer). An explicit `mtp` request is then admitted rather than refused
-    /// as unsupported: it decodes without a proposer, the skipped head named in its report
-    /// ([`resolve_speculative_with_skipped_mtp`](crate::resolve_speculative_with_skipped_mtp),
-    /// epic sc-24432 E2). Everything else is validated exactly as `validate_request` does.
-    pub fn validate_request_with_skipped_mtp(
-        &self,
-        id: &str,
-        req: &TextLlmRequest,
-        mtp_skipped: bool,
-    ) -> Result<()> {
         let reject = |msg: String| Err(Error::InvalidRequest(format!("[{id}] {msg}")));
 
         if req.messages.is_empty() {
@@ -256,14 +241,12 @@ impl TextLlmCapabilities {
                     .into(),
             );
         }
-        // An explicit proposer must be advertised (or be a checkpoint MTP head the backend
-        // skipped, which falls back by name) and ask for at least one draft. A depth above the
-        // advertised maximum is not refused: `resolve_speculative` clamps it and names the clamp
-        // in the report (sc-24438). `auto` and `off` never refuse (auto resolves to what the model
-        // offers, or runs plain with the reason named).
+        // An explicit proposer must be advertised and ask for at least one draft. A depth above
+        // the advertised maximum is not refused: `resolve_speculative` clamps it and names the
+        // clamp in the report (sc-24438). `auto` and `off` never refuse (auto resolves to what the
+        // model offers, or runs plain with the reason named).
         if let crate::Speculative::Proposer { proposer, depth } = req.speculative_mode() {
-            let skipped_head = mtp_skipped && proposer == crate::SpeculativeProposer::Mtp;
-            if self.proposer(proposer).is_none() && !skipped_head {
+            if self.proposer(proposer).is_none() {
                 return Err(Error::Unsupported(format!(
                     "[{id}] provider does not support speculative decoding with the \
                      `{proposer}` proposer"
@@ -441,38 +424,6 @@ mod tests {
                 recommended_draft_tokens: 2
             })
         );
-    }
-
-    /// sc-24438 (E2): a checkpoint MTP head the backend skipped admits an explicit `mtp` request
-    /// (it falls back by name at generate) instead of refusing it as unsupported; nothing else
-    /// about validation changes.
-    #[test]
-    fn a_skipped_mtp_head_admits_an_explicit_mtp_request() {
-        use crate::{Speculative, SpeculativeProposer};
-        let caps = TextLlmCapabilities::default();
-        let mut req = request();
-        req.speculative = Some(Speculative::proposer(SpeculativeProposer::Mtp, 3));
-        assert!(matches!(
-            caps.validate_request("test", &req),
-            Err(Error::Unsupported(_))
-        ));
-        caps.validate_request_with_skipped_mtp("test", &req, true)
-            .unwrap();
-        req.speculative = None;
-        req.mtp = MtpMode::Enabled { draft_tokens: 3 };
-        caps.validate_request_with_skipped_mtp("test", &req, true)
-            .unwrap();
-        req.mtp = MtpMode::Enabled { draft_tokens: 0 };
-        assert!(matches!(
-            caps.validate_request_with_skipped_mtp("test", &req, true),
-            Err(Error::InvalidRequest(_))
-        ));
-        req.mtp = MtpMode::Off;
-        req.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2));
-        assert!(matches!(
-            caps.validate_request_with_skipped_mtp("test", &req, true),
-            Err(Error::Unsupported(_))
-        ));
     }
 
     /// sc-24433: an explicit proposer is checked against the per-proposer advertisement (legacy

@@ -379,8 +379,11 @@ fn handle_chat(
                     created,
                     &out.text,
                     finish,
-                    out.usage.prompt_tokens,
-                    out.usage.generated_tokens,
+                    openai::CompletionUsage {
+                        prompt_tokens: out.usage.prompt_tokens,
+                        completion_tokens: out.usage.generated_tokens,
+                    },
+                    out.decode.as_ref(),
                 );
                 write_json(stream, 200, &body)
             }
@@ -442,7 +445,10 @@ fn stream_chat(
                 .finish_reason
                 .map(openai::finish_reason_str)
                 .unwrap_or("stop");
-            let _ = sse(stream, &openai::final_chunk(id, model, created, finish));
+            let _ = sse(
+                stream,
+                &openai::final_chunk(id, model, created, finish, out.decode.as_ref()),
+            );
         }
         Err(CoreError::Canceled) => return Ok(()),
         Err(e) => {
@@ -782,8 +788,10 @@ mod tests {
         );
     }
 
-    /// A provider advertising prompt lookup only, validating through the contract and recording
-    /// the speculative option of every request it generates for.
+    /// A provider advertising prompt lookup only, validating through the contract, recording the
+    /// speculative option of every request it generates for, and reporting what the contract's
+    /// resolver made of it — the proposer, its depth and any fallback (a clamp) — the way a
+    /// backend's `DecodeReport` does.
     struct SpeculativeRecorder {
         descriptor: core_llm::TextLlmDescriptor,
         seen: std::sync::Arc<std::sync::Mutex<Vec<core_llm::Speculative>>>,
@@ -804,9 +812,19 @@ mod tests {
             _: &mut dyn FnMut(StreamEvent),
         ) -> core_llm::Result<core_llm::TextLlmOutput> {
             self.seen.lock().unwrap().push(req.speculative_mode());
+            let resolution = core_llm::resolve_speculative(
+                req.speculative_mode(),
+                &self.descriptor.capabilities,
+            );
             Ok(core_llm::TextLlmOutput {
                 text: "ok".into(),
                 finish_reason: Some(core_llm::FinishReason::Stop),
+                decode: Some(core_llm::DecodeReport {
+                    proposer: resolution.plan.proposer(),
+                    draft_tokens: resolution.plan.depth(),
+                    fallbacks: resolution.fallback.into_iter().collect(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             })
         }
@@ -829,7 +847,9 @@ mod tests {
 
     /// sc-24438 AC3, end to end over the socket: the new `speculative` option and the legacy
     /// `mtp` shape reach the provider as sent; an unknown value, both fields at once, or a
-    /// proposer the model does not advertise is a 400 and never reaches generation.
+    /// proposer the model does not advertise is a 400 and never reaches generation. The decode
+    /// report reaches the client as `x_decode` — a too-deep request's clamp named — in the
+    /// non-streaming body and in the final SSE chunk before `[DONE]` (E2: never silent).
     #[test]
     fn the_speculative_field_reaches_the_provider_and_unknown_values_are_400() {
         use core_llm::{ProposerCapabilities, Speculative, SpeculativeProposer};
@@ -887,6 +907,37 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "no refused request generated"
         );
+
+        let clamp = "speculative: `prompt_lookup` depth 40 clamped to 7 (advertised 1..=7)";
+        let too_deep = r#","speculative":{"proposer":"prompt_lookup","depth":40}"#;
+        let json_after_headers = |resp: &str| -> serde_json::Value {
+            serde_json::from_str(resp.split_once("\r\n\r\n").unwrap().1).unwrap()
+        };
+        let body_resp = post_chat(addr, &body(too_deep));
+        assert!(body_resp.starts_with("HTTP/1.1 200"), "{body_resp:?}");
+        let v = json_after_headers(&body_resp);
+        assert_eq!(
+            v["x_decode"],
+            serde_json::json!({
+                "proposer": "prompt_lookup",
+                "draft_tokens": 7,
+                "fallbacks": [clamp],
+            })
+        );
+        let stream_resp = post_chat(addr, &body(&format!(r#"{too_deep},"stream":true"#)));
+        assert!(stream_resp.starts_with("HTTP/1.1 200"), "{stream_resp:?}");
+        let events: Vec<&str> = stream_resp
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .collect();
+        assert_eq!(events.last(), Some(&"[DONE]"), "{stream_resp:?}");
+        let last: serde_json::Value = serde_json::from_str(events[events.len() - 2]).unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            last["x_decode"], v["x_decode"],
+            "the stream names the clamp too"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     #[test]

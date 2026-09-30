@@ -1235,14 +1235,6 @@ impl LlamaProvider {
     /// the request is a Qwen3-VL generic-causal multimodal one — which falls back to it, named,
     /// even with a proposer resolved, because its prefill has no step-seam form.
     /// `qwen_vl_multimodal` is whether the request carries Qwen-VL visuals.
-    /// Why the checkpoint's MTP head was loaded past instead of run (sc-24438), if it was.
-    fn skipped_mtp(&self) -> Option<&'static str> {
-        match &self.model {
-            Decoder::Qwen35(m) => m.config().mtp_skip_reason(),
-            Decoder::Causal(_) => None,
-        }
-    }
-
     fn decode_route(
         &self,
         plan: SpeculativePlan,
@@ -1519,11 +1511,7 @@ impl LlamaProvider {
             };
             let configured_layers = m.config().mtp_num_hidden_layers;
             let has_mtp_tensors = weights.keys().any(|key| key.starts_with("mtp."));
-            let mtp = if m.config().mtp_skip_reason().is_some() {
-                // A head this runtime does not run (a sparse-MoE predictor, sc-24438): its
-                // `mtp.*` tensors stay unread, the target decodes, and requests name the skip.
-                None
-            } else if configured_layers > 0 {
+            let mtp = if configured_layers > 0 {
                 Some(
                     Qwen35Mtp::from_weights_format(&weights, &m, format.as_ref())
                         .map_err(to_core)?,
@@ -2660,8 +2648,13 @@ fn snapshot_quantized_copy_bytes<'a>(
                 }
                 consumed.insert(key.as_str());
                 // The stacked MoE experts are quantized one expert slice at a time: a
-                // `[mi, hidden]` gate and up from `gate_up_proj`, a `[hidden, mi]` down.
-                let stacked = key.rsplit_once(".mlp.experts.").map(|(_, name)| name);
+                // `[mi, hidden]` gate and up from `gate_up_proj`, a `[hidden, mi]` down. A
+                // per-expert snapshot's `experts.{e}.*_proj.weight` (sc-24438) is an ordinary
+                // 2-D projection.
+                let stacked = key
+                    .rsplit_once(".mlp.experts.")
+                    .map(|(_, name)| name)
+                    .filter(|name| matches!(*name, "gate_up_proj" | "down_proj"));
                 // A prepared tier's stored GGML blocks (sc-19375) are rebuilt slice by slice
                 // exactly as stored, at the blocks each slice holds.
                 if let Some((dtype, rows, cols)) = crate::primitives::quant::ggml_block_storage(
@@ -3242,11 +3235,7 @@ impl TextLlm for LlamaProvider {
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
         self.descriptor
             .capabilities
-            .validate_request_with_skipped_mtp(
-                &self.descriptor.id,
-                req,
-                self.skipped_mtp().is_some(),
-            )
+            .validate_request(&self.descriptor.id, req)
     }
 
     fn load_report(&self) -> Option<core_llm::LoadReport> {
@@ -3364,11 +3353,8 @@ impl TextLlm for LlamaProvider {
         // The backend-neutral speculative resolution (core-llm, sc-24433): `auto` runs MTP where
         // the checkpoint has a head, else prompt lookup; anything the plan cannot deliver is
         // named in the report's `fallbacks` (epic sc-24432 E2), never a silent downgrade.
-        let resolution = core_llm::resolve_speculative_with_skipped_mtp(
-            req.speculative_mode(),
-            &self.descriptor.capabilities,
-            self.skipped_mtp(),
-        );
+        let resolution =
+            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities);
         // Which loop decodes this request (sc-24140): decided once, so admission prices the
         // cache and graphs that loop will actually hold.
         let (route, route_fallback) =
@@ -4216,15 +4202,23 @@ fn validate_context_window(
 /// The deepest speculative proposal any proposer runs on Candle (sc-24438, epic sc-24432 E4):
 /// drafts per verify step, so the verify forward carries at most `1 + 7 = 8` token rows.
 ///
-/// Why 7: [`NVFP4_GEMV_MAX_ROWS`](candle_quant_kernels::NVFP4_GEMV_MAX_ROWS) is 8 — the most
-/// token rows the fused NVFP4 decode GEMV (sc-24136) serves, the W4A16 kernel every plain decode
-/// step of an NVFP4 checkpoint runs. A verify of up to 8 rows stays on it: one launch per
-/// projection, a cost flat in the row count, and the plain step's numerics (unquantized bf16
-/// activations). A 9-row verify is refused by the GEMV and runs the cuBLASLt W4A4 GEMM instead —
-/// pad to 16 rows, quantize the activation with a host sync — so it is both slower per step and
-/// numerically a different product from the plain step greedy speculation must reproduce. The
-/// bound is the backend's, applied to every proposer and weight format so a depth means the same
-/// thing on every Candle checkpoint.
+/// Why 7: two decode kernels serve at most 8 token rows per launch, and a verify of up to 8 rows
+/// stays on them — one launch per projection, a cost flat in the row count, and the plain step's
+/// numerics:
+///
+/// * [`NVFP4_GEMV_MAX_ROWS`](candle_quant_kernels::NVFP4_GEMV_MAX_ROWS) (8) — the fused NVFP4
+///   decode GEMV (sc-24136), the W4A16 kernel every plain decode step of an NVFP4 checkpoint runs
+///   on unquantized bf16 activations. A 9-row verify is refused by the GEMV and runs the cuBLASLt
+///   W4A4 GEMM instead — pad to 16 rows, quantize the activation with a host sync — so it is both
+///   slower per step and numerically a different product from the plain step greedy speculation
+///   must reproduce.
+/// * GGML's **MMVQ** — the quantized mat-vec kernel a Q4/Q8 (GGML-block) checkpoint's decode step
+///   runs, which candle's CUDA backend dispatches for batches of 1–8 rows only
+///   (`candle-core/src/quantized/cuda.rs`, `QCudaStorage::fwd`); a 9-row verify moves to the MMQ
+///   tile kernel (or the dequantize + GEMM fallback), the same cliff.
+///
+/// A bf16 checkpoint's cuBLAS GEMM has no such cliff; it is capped at the same depth by policy, so
+/// a depth means the same thing on every Candle checkpoint, every proposer and weight format.
 pub const SPECULATIVE_MAX_DEPTH: u32 = candle_quant_kernels::NVFP4_GEMV_MAX_ROWS as u32 - 1;
 
 /// The deepest prompt-lookup proposal the provider runs: [`SPECULATIVE_MAX_DEPTH`]. The bound is
@@ -6327,13 +6321,14 @@ mod tests {
     /// The synthetic qwen3_5 decoder (every projection 32 or 64 wide, so Q8_0 can quantize it)
     /// written as a snapshot: with the MTP head, or with the MoE bank instead.
     fn q8_capable_qwen35_snapshot(moe: bool) -> tempfile::TempDir {
-        qwen35_snapshot(moe, !moe)
+        qwen35_snapshot(moe, !moe, true)
     }
 
     /// [`q8_capable_qwen35_snapshot`] with the MoE bank and the MTP head chosen independently.
-    /// A MoE snapshot's MTP predictor layer carries a sparse-MoE FFN (stacked experts, router,
-    /// shared expert) instead of the dense MLP — as the 35B-A3B checkpoint ships it (sc-24438).
-    fn qwen35_snapshot(moe: bool, mtp: bool) -> tempfile::TempDir {
+    /// A MoE snapshot's MTP predictor layer carries a sparse-MoE FFN (router, experts, shared
+    /// expert) instead of the dense MLP — as the 35B-A3B checkpoint ships it (sc-24438) — with every
+    /// MoE tensor seeded non-zero random, the experts fused (Qwen3.6) or per expert (Qwen3.5).
+    fn qwen35_snapshot(moe: bool, mtp: bool, fused: bool) -> tempfile::TempDir {
         let mut json = crate::models::qwen35::tests::synthetic_cfg_json();
         let text = json["text_config"].as_object_mut().unwrap();
         text.insert("linear_value_head_dim".into(), serde_json::json!(8));
@@ -6352,39 +6347,15 @@ mod tests {
             serde_json::json!(u32::from(mtp)),
         );
         let cfg = crate::models::Qwen35Config::from_json(&json).unwrap();
-        let weights = crate::models::qwen35::tests::synthetic_snapshot_weights(&cfg);
-        let mut tensors: HashMap<String, Tensor> = weights
-            .keys()
-            .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
-            .collect();
-        if let (true, Some(bank)) = (mtp, cfg.moe.as_ref()) {
-            let lp = |s: &str| format!("mtp.layers.0.{s}");
-            for dense in ["gate_proj", "up_proj", "down_proj"] {
-                assert!(tensors
-                    .remove(&lp(&format!("mlp.{dense}.weight")))
-                    .is_some());
-            }
-            let h = cfg.hidden_size as usize;
-            let (e, mi) = (
-                bank.num_experts as usize,
-                bank.moe_intermediate_size as usize,
-            );
-            let si = bank.shared_expert_intermediate_size as usize;
-            let z = |dims: &[usize]| {
-                Tensor::zeros(dims, candle_core::DType::F32, &candle_core::Device::Cpu).unwrap()
-            };
-            for (key, dims) in [
-                ("mlp.experts.gate_up_proj", vec![e, 2 * mi, h]),
-                ("mlp.experts.down_proj", vec![e, h, mi]),
-                ("mlp.gate.weight", vec![e, h]),
-                ("mlp.shared_expert.gate_proj.weight", vec![si, h]),
-                ("mlp.shared_expert.up_proj.weight", vec![si, h]),
-                ("mlp.shared_expert.down_proj.weight", vec![h, si]),
-                ("mlp.shared_expert_gate.weight", vec![1, h]),
-            ] {
-                tensors.insert(lp(key), z(&dims));
-            }
-        }
+        let tensors: HashMap<String, Tensor> = if moe && mtp {
+            crate::models::qwen35::tests::seeded_moe_mtp_tensors(&cfg, fused)
+        } else {
+            let weights = crate::models::qwen35::tests::synthetic_snapshot_weights(&cfg);
+            weights
+                .keys()
+                .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
+                .collect()
+        };
         let mut config = serde_json::json!({
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "model_type": "qwen3_5",
@@ -6637,22 +6608,35 @@ mod tests {
 
     /// sc-19375: a qwen3_5 tier stores every projection its loader quantizes — the Gated
     /// DeltaNet `in_proj_qkv` / `in_proj_z` / `out_proj`, attention, MLP, the MTP head and the
-    /// stacked MoE experts — as GGML blocks, and its loader reads them from the stored-block
-    /// `quantization` block; the per-head `in_proj_a` / `in_proj_b`, the router, the embeddings
-    /// and the head stay as read. A qwen3_5 tier prepared before then (dense-rounded weights
-    /// under a bare block) still loads dense, exactly as it did.
+    /// MoE experts (stacked, or per expert — sc-24438) — as GGML blocks, and its loader reads them
+    /// from the stored-block `quantization` block; the per-head `in_proj_a` / `in_proj_b`, the
+    /// router, the embeddings and the head stay as read. A qwen3_5 tier prepared before then
+    /// (dense-rounded weights under a bare block) still loads dense, exactly as it did. The MoE
+    /// snapshots with an MTP head (its predictor layer a sparse-MoE block, sc-24438) prepare and
+    /// price that head too, in both expert layouts.
     #[test]
     fn a_qwen35_tier_stores_its_projections_and_experts_as_blocks() {
         use core_llm::Quantize;
-        for moe in [false, true] {
-            let src = q8_capable_qwen35_snapshot(moe);
+        for (moe, mtp, fused) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+            (true, true, false),
+        ] {
+            let src = qwen35_snapshot(moe, mtp, fused);
             let headers = super::snapshot_tensor_headers(src.path()).unwrap();
             let expected = |key: &str| crate::models::qwen35::quantizes_tensor(key);
             // The tricky keys really are in the fixture, on the right side of the rule.
             let has = |suffix: &str| headers.keys().any(|k| k.ends_with(suffix) && expected(k));
             assert!(has("linear_attn.in_proj_qkv.weight") && has("linear_attn.in_proj_z.weight"));
-            assert_eq!(has("mlp.experts.gate_up_proj"), moe);
-            assert_eq!(has("mtp.fc.weight"), !moe);
+            assert_eq!(has("mlp.experts.gate_up_proj"), moe && fused);
+            assert_eq!(has("mlp.experts.0.gate_proj.weight"), moe && !fused);
+            assert_eq!(
+                has("mtp.layers.0.mlp.shared_expert.up_proj.weight"),
+                moe && mtp
+            );
+            assert_eq!(has("mtp.fc.weight"), mtp);
+            let moe = format!("{moe} mtp={mtp} fused={fused}");
             assert!(headers
                 .keys()
                 .any(|k| k.ends_with("in_proj_a.weight") && !expected(k)));
@@ -7862,11 +7846,6 @@ mod tests {
     fn a_too_deep_request_runs_at_the_advertised_max_and_names_the_clamp() {
         use core_llm::{MtpMode, Sampling, Speculative, SpeculativeProposer, TextLlm};
         assert_eq!(super::SPECULATIVE_MAX_DEPTH, 7);
-        assert_eq!(
-            super::SPECULATIVE_MAX_DEPTH as usize + 1,
-            candle_quant_kernels::NVFP4_GEMV_MAX_ROWS,
-            "a max-depth verify is one GEMV launch"
-        );
         let prompt = &fixture_prompts()[0];
         let request = |spec| core_llm_testkit::bench_request(prompt, spec, &Sampling::greedy(), 16);
         let clamp = |proposer: &str, asked: u32, max: u32| {
@@ -7949,57 +7928,16 @@ mod tests {
         assert_eq!(fallbacks, clamp("mtp", 40, super::MTP_MAX_DEPTH));
     }
 
-    /// sc-24438 (E2): a qwen3_5 MoE snapshot carrying an MTP head — whose predictor layer is a
-    /// sparse-MoE block — loads (before, `Qwen35Mtp` refused it and the whole load failed),
-    /// advertises no MTP, prices and builds no head, and a request for MTP (the new option or the
-    /// legacy field) decodes plainly with the skipped head named; `auto` runs prompt lookup and
-    /// names it too. Every run emits `off`'s stream.
+    /// sc-24438 AC2: a qwen3_5 MoE snapshot carrying an MTP head — its predictor layer a
+    /// sparse-MoE block, as the 35B-A3B ships it, in the fused (Qwen3.6) and the per-expert
+    /// (Qwen3.5) expert layout — loads (before, `Qwen35Mtp` refused it and the whole load failed),
+    /// advertises MTP on both fields, and **runs** it: `{mtp, 3}`, the legacy `enabled 3` and
+    /// `auto` each report the MTP proposer with drafts proposed, and emit exactly `off`'s stream.
+    /// Under Q8 the head is priced: the estimate equals the copy the load builds, head included,
+    /// and exceeds the headless MoE snapshot's.
     #[test]
-    fn a_moe_snapshot_with_an_mtp_head_loads_and_decodes_plain_by_name() {
+    fn a_moe_snapshot_with_an_mtp_head_runs_mtp() {
         use core_llm::{MtpMode, Quantize, Sampling, Speculative, SpeculativeProposer, TextLlm};
-        let dir = qwen35_snapshot(true, true);
-        let provider = super::LlamaProvider::load(&core_llm::LoadSpec::dense(
-            dir.path().display().to_string(),
-        ))
-        .expect("a MoE checkpoint with an MTP head loads");
-        let caps = &provider.descriptor().capabilities;
-        assert!(caps.mtp.is_none());
-        assert!(caps.proposer(SpeculativeProposer::Mtp).is_none());
-        assert!(provider.mtp.is_none());
-
-        let prompt = &fixture_prompts()[0];
-        let request = |spec| core_llm_testkit::bench_request(prompt, spec, &Sampling::greedy(), 12);
-        let (off, _) = token_events(&provider, &request(Speculative::Off));
-        let skipped = "speculative: `mtp` is not run on this checkpoint (its MTP predictor layer \
-                       is a sparse-MoE block, which the Candle MTP proposer does not run); \
-                       decoded without a proposer"
-            .to_string();
-        let mut legacy = request(Speculative::Off);
-        legacy.speculative = None;
-        legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
-        for (label, req) in [
-            (
-                "explicit",
-                request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
-            ),
-            ("legacy", legacy),
-        ] {
-            provider.validate(&req).expect(label);
-            let (events, out) = token_events(&provider, &req);
-            let report = out.decode.unwrap();
-            assert_eq!(report.proposer, ProposerKind::None, "{label}");
-            assert_eq!(report.fallbacks, vec![skipped.clone()], "{label}");
-            assert_eq!(events, off, "{label}");
-        }
-        let (events, out) = token_events(&provider, &request(Speculative::Auto));
-        let report = out.decode.unwrap();
-        assert_eq!(report.proposer, ProposerKind::PromptLookup);
-        assert_eq!(report.fallbacks.len(), 1, "{:?}", report.fallbacks);
-        assert!(report.fallbacks[0].contains("auto skipped this checkpoint's `mtp` head"));
-        assert_eq!(events, off);
-
-        // The skipped head is neither priced nor built: under Q8 the estimate matches the MoE
-        // snapshot without a head, and the load's built copy.
         let estimate = |dir: &tempfile::TempDir| {
             super::LlamaProvider::load_memory_estimate(
                 &spec_at(dir.path(), Some(Quantize::Q8)),
@@ -8009,12 +7947,66 @@ mod tests {
             .quantized_copy_bytes
         };
         let headless = q8_capable_qwen35_snapshot(true);
-        assert_eq!(estimate(&dir), estimate(&headless));
-        let census = loaded_census(&spec_at(dir.path(), Some(Quantize::Q8)));
-        assert_eq!(
-            estimate(&dir),
-            ggml_copy_built(&census, candle_core::quantized::GgmlDType::Q8_0)
-        );
+        for fused in [true, false] {
+            let label = if fused { "fused" } else { "per-expert" };
+            let dir = qwen35_snapshot(true, true, fused);
+            let provider = super::LlamaProvider::load(&core_llm::LoadSpec::dense(
+                dir.path().display().to_string(),
+            ))
+            .expect("a MoE checkpoint with an MTP head loads");
+            assert!(provider.mtp.is_some(), "{label}");
+            let caps = &provider.descriptor().capabilities;
+            let mtp = caps.proposer(SpeculativeProposer::Mtp).expect(label);
+            assert_eq!(
+                caps.mtp,
+                Some(core_llm::MtpCapabilities {
+                    max_draft_tokens: mtp.max_depth,
+                    recommended_draft_tokens: mtp.recommended_depth,
+                }),
+                "{label}"
+            );
+
+            let prompt = &fixture_prompts()[0];
+            let request =
+                |spec| core_llm_testkit::bench_request(prompt, spec, &Sampling::greedy(), 12);
+            let (off, _) = token_events(&provider, &request(Speculative::Off));
+            let mut legacy = request(Speculative::Off);
+            legacy.speculative = None;
+            legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
+            for (case, req) in [
+                (
+                    "explicit",
+                    request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
+                ),
+                ("legacy", legacy),
+                ("auto", request(Speculative::Auto)),
+            ] {
+                provider.validate(&req).expect(case);
+                let (events, out) = token_events(&provider, &req);
+                let report = out.decode.unwrap();
+                assert_eq!(report.proposer, ProposerKind::Mtp, "{label} {case}");
+                assert_eq!(report.draft_tokens, Some(3), "{label} {case}");
+                assert!(
+                    report.proposed_tokens > 0,
+                    "{label} {case}: the head drafted"
+                );
+                assert!(report.fallbacks.is_empty(), "{label} {case}");
+                assert_eq!(events, off, "{label} {case}: greedy-exact");
+            }
+
+            // The head is priced and built: under Q8 the estimate is the load's built copy
+            // (the MTP head's attention, MoE experts, shared expert and `fc` included).
+            let census = loaded_census(&spec_at(dir.path(), Some(Quantize::Q8)));
+            assert_eq!(
+                estimate(&dir),
+                ggml_copy_built(&census, candle_core::quantized::GgmlDType::Q8_0),
+                "{label}"
+            );
+            assert!(
+                estimate(&dir) > estimate(&headless),
+                "{label}: the head is priced"
+            );
+        }
     }
 
     /// sc-24433 (scope e): on the qwen3_5 hybrid a multimodal request runs prompt lookup over the
