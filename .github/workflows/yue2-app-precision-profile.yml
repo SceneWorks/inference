@@ -44,6 +44,7 @@ jobs:
       CARGO_NET_OFFLINE: "true"
     steps:
       - name: Confirm exact dispatch and fresh run-owned path before provisioning
+        id: run-root
         shell: powershell
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
@@ -136,7 +137,7 @@ jobs:
           set "NVCC_CCBIN=%VCToolsInstallDir%bin\Hostx64\x64"
           "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_app_precision_profile.py run-captures --app . --engine ..\engine --data "%APP_RUN_ROOT%\app-data" --output "%APP_RUN_ROOT%\profile" --evidence "%APP_EVIDENCE%" --cases "%APP_RUN_ROOT%\cases" --backend cuda
       - name: Upload CUDA JSON/log/raw-sampler receipts only
-        if: always()
+        if: always() && steps.run-root.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: yue2-app-precision-cuda-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -144,6 +145,16 @@ jobs:
             ${{ env.APP_EVIDENCE }}
             ${{ env.APP_RUN_ROOT }}/install/evidence/*.json
             ${{ env.APP_RUN_ROOT }}/install/evidence/*.md
+          if-no-files-found: warn
+          retention-days: 30
+      # Internal listening review only (YuE2 weights/output: CC BY-NC 4.0).
+      # Keep WAVs separate from the metrics artifact and on the original host.
+      - name: Upload generated CUDA WAVs for internal listening
+        if: always() && steps.run-root.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-precision-cuda-listening-internal-cc-by-nc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.APP_RUN_ROOT }}/profile/**/run/audio.wav
           if-no-files-found: warn
           retention-days: 30
       - name: Enforce CUDA verdict after upload
@@ -165,6 +176,7 @@ jobs:
       CARGO_TARGET_DIR: /Volumes/Models/yue2-app-precision-profile/${{ github.run_id }}-${{ github.run_attempt }}/target
     steps:
       - name: Assert designated runner, exact dispatch, and fresh path before provisioning
+        id: run-root
         shell: bash
         env:
           EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
@@ -267,7 +279,7 @@ jobs:
             --app . --engine ../engine --data "$APP_RUN_ROOT/app-data" --output "$APP_RUN_ROOT/profile" \
             --evidence "$APP_EVIDENCE" --cases "$APP_RUN_ROOT/cases" --backend metal
       - name: Upload Metal JSON/log/raw-sampler receipts only
-        if: always()
+        if: always() && steps.run-root.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: yue2-app-precision-metal-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -275,6 +287,16 @@ jobs:
             ${{ env.APP_EVIDENCE }}
             ${{ env.APP_RUN_ROOT }}/install/evidence/*.json
             ${{ env.APP_RUN_ROOT }}/install/evidence/*.md
+          if-no-files-found: warn
+          retention-days: 30
+      # Internal listening review only (YuE2 weights/output: CC BY-NC 4.0).
+      # Keep WAVs separate from the metrics artifact and on the original host.
+      - name: Upload generated Metal WAVs for internal listening
+        if: always() && steps.run-root.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-app-precision-metal-listening-internal-cc-by-nc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.APP_RUN_ROOT }}/profile/**/run/audio.wav
           if-no-files-found: warn
           retention-days: 30
       - name: Enforce Metal verdict after upload

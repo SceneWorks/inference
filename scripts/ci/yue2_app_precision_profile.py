@@ -80,6 +80,14 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def sha256_stream(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def git(root: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
 
@@ -189,12 +197,30 @@ def verify_record(record_path: Path, backend: str, name: str) -> dict:
             "record_sha256": sha256(record_path)}
 
 
+def verify_audio(profile_dir: Path, backend: str, name: str) -> dict:
+    require(profile_dir.is_absolute(), "profile root must be an absolute run-owned path")
+    require(name in NAMES and backend in ("cuda", "metal"), "unknown audio case/backend")
+    root = profile_dir.resolve(strict=True)
+    candidate = profile_dir / case_id(backend, name).replace(":", "__") / "run" / "audio.wav"
+    audio = candidate.resolve(strict=True)
+    require(audio.is_relative_to(root) and audio.is_file(), "audio escaped the run-owned profile root")
+    size = audio.stat().st_size
+    require(size > 44, "completed case has empty or truncated audio")
+    with audio.open("rb") as source:
+        header = source.read(12)
+    require(header[:4] == b"RIFF" and header[8:12] == b"WAVE", "completed case has no WAV header")
+    return {"case_id": case_id(backend, name), "path": str(audio), "size_bytes": size,
+            "sha256": sha256_stream(audio)}
+
+
 def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
     require(not (evidence / "profile").exists(), "profile receipts were already collected")
     rows = []
     for name in NAMES:
         source = profile_dir / case_id(backend, name).replace(":", "__")
-        rows.append(verify_record(source / "record.json", backend, name))
+        row = verify_record(source / "record.json", backend, name)
+        row["listening_audio"] = verify_audio(profile_dir, backend, name)
+        rows.append(row)
         target = evidence / "profile" / name
         target.mkdir(parents=True)
         for filename in RECEIPT_FILES:
@@ -206,7 +232,11 @@ def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
             for file in boundary.glob("*.json"):
                 (target / "boundary").mkdir(exist_ok=True)
                 shutil.copy2(file, target / "boundary" / file.name)
-    verdict = {"backend": backend, "cases": rows, "status": "completed"}
+    verdict = {"backend": backend, "cases": rows, "status": "completed",
+               "listening_audio": [row["listening_audio"] for row in rows]}
+    (evidence / "audio-inventory.json").write_text(
+        json.dumps({"backend": backend, "status": "completed", "cases": verdict["listening_audio"]}, indent=2) + "\n"
+    )
     (evidence / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict
 
@@ -243,6 +273,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
             [row.get("name") for row in manifest.get("cases", [])] == list(NAMES),
             "run-owned case manifest/backend mismatch")
     shutil.copy2(cases / "manifest.json", evidence / "cases-manifest.json")
+    completed_audio = []
     try:
         for row in manifest["cases"]:
             name = row["name"]
@@ -270,6 +301,10 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
                                         cwd=app, env=environment, stdout=log,
                                         stderr=subprocess.STDOUT, check=False).returncode
             require(status == 0, f"{name} off-plan closure/currency check exited {status}")
+            completed_audio.append(verify_audio(output, backend, name))
+            (evidence / "audio-inventory.json").write_text(
+                json.dumps({"backend": backend, "status": "partial", "cases": completed_audio}, indent=2) + "\n"
+            )
         return collect(output, evidence, backend)
     finally:
         copy_partial(output, evidence, backend)

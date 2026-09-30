@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -97,6 +98,63 @@ class PrecisionControlTests(unittest.TestCase):
             record = json.loads((evidence / "preflight-before-test.json").read_text())
             self.assertFalse(record["admitted"])
             self.assertEqual(record["competing_processes"], ["123 C worker"])
+
+    def test_listening_wav_inventory_is_run_owned_and_stream_hashed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile"
+            run = profile / control.case_id("metal", "strict-bf16-standard").replace(":", "__") / "run"
+            run.mkdir(parents=True)
+            audio = run / "audio.wav"
+            wav = b"RIFF" + (48).to_bytes(4, "little") + b"WAVE" + b"\0" * 48
+            audio.write_bytes(wav)
+            row = control.verify_audio(profile, "metal", "strict-bf16-standard")
+            self.assertEqual(row["path"], str(audio.resolve()))
+            self.assertEqual(row["size_bytes"], len(wav))
+            self.assertEqual(row["sha256"], hashlib.sha256(wav).hexdigest())
+            audio.write_bytes(b"not-a-wave" + b"\0" * 50)
+            with self.assertRaisesRegex(ValueError, "WAV header"):
+                control.verify_audio(profile, "metal", "strict-bf16-standard")
+            audio.unlink()
+            outside = root / "outside.wav"
+            outside.write_bytes(wav)
+            audio.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "escaped"):
+                control.verify_audio(profile, "metal", "strict-bf16-standard")
+
+    def test_collected_verdict_inventories_all_audio_without_copying_wavs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile"
+            evidence = root / "evidence"
+            wav = b"RIFF" + (48).to_bytes(4, "little") + b"WAVE" + b"\0" * 48
+            for name, (_, case_name, decoder, policy, model_dtype, vae_dtype) in control.CASES.items():
+                run = profile / control.case_id("cuda", name).replace(":", "__") / "run"
+                run.mkdir(parents=True)
+                (run / "audio.wav").write_bytes(wav)
+                body = {
+                    "caseId": control.case_id("cuda", name), "backend": "cuda",
+                    "identity": {"decoder": {"repo": "m-a-p/YuE2-Vae" +
+                                              ("-legacy" if decoder == "legacy" else "")}},
+                    "request": {"name": case_name, "computePolicy": policy},
+                    "admission": {"outcome": "admitted"},
+                    "outcome": {"status": "completed", "engineComputePolicy": policy,
+                                "engineModelDtype": model_dtype, "engineVaeDtype": vae_dtype},
+                    "measured": {"peakBytes": 1024, "stages": {
+                        stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
+                }
+                (run.parent / "record.json").write_text(json.dumps(body))
+            verdict = control.collect(profile, evidence, "cuda")
+            self.assertEqual(len(verdict["listening_audio"]), 7)
+            self.assertEqual(len(json.loads((evidence / "audio-inventory.json").read_text())["cases"]), 7)
+            self.assertEqual(list(evidence.rglob("*.wav")), [])
+
+    def test_wav_artifacts_use_only_fresh_run_owned_profile_glob(self):
+        workflow = (MODULE_PATH.parents[2] / ".github/workflows/yue2-app-precision-profile.yml").read_text()
+        self.assertEqual(workflow.count("path: ${{ env.APP_RUN_ROOT }}/profile/**/run/audio.wav"), 2)
+        self.assertEqual(workflow.count("if: always() && steps.run-root.outcome == 'success'"), 4)
+        self.assertEqual(workflow.count("id: run-root"), 2)
+        self.assertNotIn("${{ env.APP_EVIDENCE }}/**/audio.wav", workflow)
 
 
 if __name__ == "__main__":
