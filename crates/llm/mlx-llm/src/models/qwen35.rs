@@ -1545,11 +1545,12 @@ fn companion_geometry_mismatches(head: &Qwen35Config, target: &Qwen35Config) -> 
         head.rotary_dim().into(),
         target.rotary_dim().into(),
     );
-    int(
-        "mtp_num_hidden_layers",
-        head.mtp_num_hidden_layers as i64,
-        1,
-    );
+    if head.mtp_num_hidden_layers != 1 {
+        out.push(format!(
+            "mtp_num_hidden_layers {} (this runtime runs exactly one predictor layer)",
+            head.mtp_num_hidden_layers
+        ));
+    }
     if head.rms_norm_eps != target.rms_norm_eps {
         out.push(format!(
             "rms_norm_eps {} != target {}",
