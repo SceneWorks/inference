@@ -990,6 +990,13 @@ impl DeltaNetCache {
         });
     }
 
+    /// Drop the checkpoint window, open or closed, keeping only the live state: the cache can
+    /// then return to no earlier position. What a cross-turn prefix-cache entry holds (sc-24437)
+    /// — its state exists only at its own position, and it is charged exactly the live state.
+    pub fn discard_checkpoints(&mut self) {
+        self.window = None;
+    }
+
     /// Stop recording: later forwards run the final-state-only recurrence and drop the window.
     /// Its positions stay restorable until then.
     pub fn close_checkpoints(&mut self) {

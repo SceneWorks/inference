@@ -181,6 +181,579 @@ fn common_prefix_len(a: &[i32], b: &[i32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+// ---------------------------------------------------------------------------------------------
+// The byte-budgeted cross-turn store (epic sc-24432, story sc-24437).
+// ---------------------------------------------------------------------------------------------
+
+/// The prefix-cache budget a load reserves when [`LoadSpec::prefix_cache_bytes`] is unset: 1 GiB,
+/// clamped to what the load's own admission leaves ([`prefix_cache_budget`]).
+///
+/// **Default ON** (epic sc-24432 E5: a speed-up ships on unless a measured regression justifies
+/// off). The epic's terminal campaign (story sc-24446) measures TTFT and parity with the cache on
+/// against `prefix_cache_bytes: Some(0)` and confirms this value or flips it to `0`; this constant
+/// is the one place that decision lands. The budget is admission-honest either way: a load
+/// reports what it settled ([`LoadReport::prefix_cache_bytes`]) and a backend's load estimate
+/// names what it asks for, beside — never inside — what the load requires.
+///
+/// [`LoadSpec::prefix_cache_bytes`]: crate::LoadSpec::prefix_cache_bytes
+/// [`LoadReport::prefix_cache_bytes`]: crate::LoadReport::prefix_cache_bytes
+pub const DEFAULT_PREFIX_CACHE_BYTES: u64 = 1 << 30;
+
+/// The prefix-cache budget a load asks for before admission clamps it: the requested budget, or
+/// [`DEFAULT_PREFIX_CACHE_BYTES`] when unset. A load estimate reports it beside the bytes the load
+/// requires; [`prefix_cache_budget`] settles it against the load's headroom.
+pub fn requested_prefix_cache_bytes(requested: Option<u64>) -> u64 {
+    requested.unwrap_or(DEFAULT_PREFIX_CACHE_BYTES)
+}
+
+/// The prefix-cache byte budget a load settles (E7): the requested budget (`None`:
+/// [`DEFAULT_PREFIX_CACHE_BYTES`]) clamped to the headroom the load's admission leaves —
+/// `available - load_required`, the same two figures the load was admitted on. So the cache can
+/// never push the load past its admission budget, and a load that fits without the cache never
+/// fails because of it; a tight host simply gets a smaller (or zero) cache.
+pub fn prefix_cache_budget(requested: Option<u64>, load_required: u64, available: u64) -> u64 {
+    requested_prefix_cache_bytes(requested).min(available.saturating_sub(load_required))
+}
+
+/// How a stored entry may be reused by a later prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefixReuse {
+    /// Any leading run of the stored tokens: a softmax KV cache is sliced by offset, so a prompt
+    /// sharing only part of the entry still reuses that part.
+    AnyPrefix,
+    /// Only the whole stored sequence: a recurrent (DeltaNet) state exists only at the boundary it
+    /// was snapshotted at, so the prompt must extend the entry's tokens exactly.
+    WholeEntry,
+}
+
+/// Cumulative accounting of a [`PrefixStore`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixStats {
+    /// [`PrefixStore::lookup`] calls.
+    pub lookups: usize,
+    /// Lookups that reused a stored prefix.
+    pub hits: usize,
+    /// Prompt positions whose state came from the store across every hit (prefill skipped).
+    pub reused_prefix_tokens: usize,
+    /// Prompt positions left to prefill across every lookup (the whole prompt on a miss, the
+    /// suffix past the reused span on a hit).
+    pub computed_prefill_tokens: usize,
+    /// Entries stored.
+    pub inserted: usize,
+    /// Entries dropped least-recently-used first — to fit an insert under the budget, or to free
+    /// room for a request ([`PrefixStore::reclaim_for`]).
+    pub evicted: usize,
+    /// Entries refused because they alone exceed the budget.
+    pub rejected: usize,
+}
+
+/// One store entry.
+#[derive(Debug)]
+struct StoredPrefix<S> {
+    tokens: Vec<i32>,
+    reuse: PrefixReuse,
+    bytes: u64,
+    state: S,
+}
+
+/// A hit: the stored state and how many leading prompt positions it covers.
+#[derive(Debug)]
+pub struct PrefixHit<'a, S> {
+    /// The stored state (an immutable snapshot the backend restores from, never writes).
+    pub state: &'a S,
+    /// Leading prompt tokens the state covers — always `< prompt.len()`, so the suffix prefill has
+    /// at least one token.
+    pub reused: usize,
+    /// How the entry is reused ([`PrefixReuse::AnyPrefix`] entries are sliced to `reused`).
+    pub reuse: PrefixReuse,
+}
+
+/// What [`PrefixStore::admit`] settled for a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixAdmission {
+    /// The availability to admit the request against (what was free plus what was evicted).
+    pub available: u64,
+    /// Whether the request may take (and the cache keep) its snapshot; when `true` the request is
+    /// admitted with the snapshot's bytes on top of its own.
+    pub snapshot: bool,
+}
+
+/// What [`PrefixStore::insert`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixInsert {
+    /// Whether the entry is now held.
+    pub stored: bool,
+    /// Entries dropped to make room (or replaced / superseded by this one).
+    pub evicted: usize,
+}
+
+/// The cross-turn prefix cache's policy (story sc-24437): per-entry backend state `S` (KV tensors,
+/// or a hybrid decoder's KV plus recurrent state) under a **byte** budget with least-recently-used
+/// eviction, and longest-usable-prefix lookup that respects each entry's [`PrefixReuse`].
+///
+/// The store is tensor-free: each backend owns one per loaded provider, keyed by the tokens the
+/// entry's state was computed from, and reports each entry's resident bytes. The invariant the
+/// backend's admission leans on (E7): [`resident_bytes`](Self::resident_bytes) never exceeds
+/// [`budget_bytes`](Self::budget_bytes), and a request that needs room evicts entries first
+/// ([`reclaim_for`](Self::reclaim_for)).
+#[derive(Debug)]
+pub struct PrefixStore<S> {
+    budget_bytes: u64,
+    resident_bytes: u64,
+    /// Least-recently-used at the front.
+    entries: VecDeque<StoredPrefix<S>>,
+    stats: PrefixStats,
+}
+
+impl<S> PrefixStore<S> {
+    /// An empty store holding at most `budget_bytes` of entry state (`0` stores nothing).
+    pub fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes,
+            resident_bytes: 0,
+            entries: VecDeque::new(),
+            stats: PrefixStats::default(),
+        }
+    }
+
+    /// The byte budget.
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes
+    }
+
+    /// Bytes the held entries report, always `<= budget_bytes`.
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    /// Entries held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is held.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Cumulative accounting since construction.
+    pub fn stats(&self) -> PrefixStats {
+        self.stats
+    }
+
+    /// The held entries' token sequences, least-recently-used first (diagnostics and tests).
+    pub fn keys(&self) -> Vec<&[i32]> {
+        self.entries.iter().map(|e| e.tokens.as_slice()).collect()
+    }
+
+    /// The entry reusing the most leading tokens of `prompt`, or `None` (a miss). `held` says,
+    /// per entry, how many positions its state really holds — `None` when this request cannot use
+    /// it at all — and the reuse never exceeds it (defence in depth against a key that over-states
+    /// its state, sc-12455). An [`AnyPrefix`](PrefixReuse::AnyPrefix) entry reuses its shared
+    /// leading run, a [`WholeEntry`](PrefixReuse::WholeEntry) one only its whole sequence (and
+    /// only when its state holds exactly that); either way the reuse stops short of the whole
+    /// prompt so a forward always has a query. Ties go to the most-recently-used entry, and a hit
+    /// becomes most-recently-used. Updates [`PrefixStats`] with the reuse actually granted.
+    pub fn lookup(
+        &mut self,
+        prompt: &[i32],
+        held: impl Fn(&S) -> Option<usize>,
+    ) -> Option<PrefixHit<'_, S>> {
+        self.stats.lookups += 1;
+        let limit = prompt.len().saturating_sub(1);
+        let mut best: Option<(usize, usize)> = None; // (deque index, reused)
+        for (i, e) in self.entries.iter().enumerate().rev() {
+            let Some(held) = held(&e.state) else {
+                continue;
+            };
+            let shared = common_prefix_len(&e.tokens, prompt);
+            let reused = match e.reuse {
+                PrefixReuse::AnyPrefix => shared.min(limit).min(held),
+                PrefixReuse::WholeEntry
+                    if shared == e.tokens.len() && shared <= limit && held == shared =>
+                {
+                    shared
+                }
+                PrefixReuse::WholeEntry => 0,
+            };
+            if reused > 0 && best.is_none_or(|(_, b)| reused > b) {
+                best = Some((i, reused));
+            }
+        }
+        let Some((idx, reused)) = best else {
+            self.stats.computed_prefill_tokens += prompt.len();
+            return None;
+        };
+        let entry = self.entries.remove(idx).expect("index in range");
+        self.entries.push_back(entry);
+        self.stats.hits += 1;
+        self.stats.reused_prefix_tokens += reused;
+        self.stats.computed_prefill_tokens += prompt.len() - reused;
+        let entry = self.entries.back().expect("just pushed");
+        Some(PrefixHit {
+            state: &entry.state,
+            reused,
+            reuse: entry.reuse,
+        })
+    }
+
+    /// Hold `state` for the prefix `tokens` (its `bytes` as the backend measured them). An entry
+    /// larger than the whole budget is refused without evicting anything. An entry with the same
+    /// tokens is replaced, and an [`AnyPrefix`](PrefixReuse::AnyPrefix) entry supersedes every
+    /// `AnyPrefix` entry whose tokens it extends (it reuses everything they could). Then
+    /// least-recently-used entries are evicted until the new one fits.
+    pub fn insert(
+        &mut self,
+        tokens: Vec<i32>,
+        reuse: PrefixReuse,
+        bytes: u64,
+        state: S,
+    ) -> PrefixInsert {
+        if tokens.is_empty() || bytes > self.budget_bytes {
+            self.stats.rejected += 1;
+            return PrefixInsert::default();
+        }
+        let mut evicted = 0;
+        let mut i = 0;
+        while i < self.entries.len() {
+            let e = &self.entries[i];
+            let superseded = e.tokens == tokens
+                || (reuse == PrefixReuse::AnyPrefix
+                    && e.reuse == PrefixReuse::AnyPrefix
+                    && tokens.starts_with(&e.tokens));
+            if superseded {
+                let gone = self.entries.remove(i).expect("index in range");
+                self.resident_bytes -= gone.bytes;
+                evicted += 1;
+            } else {
+                i += 1;
+            }
+        }
+        while self.resident_bytes + bytes > self.budget_bytes {
+            let gone = self
+                .entries
+                .pop_front()
+                .expect("resident bytes > 0 means an entry is held");
+            self.resident_bytes -= gone.bytes;
+            evicted += 1;
+        }
+        self.resident_bytes += bytes;
+        self.entries.push_back(StoredPrefix {
+            tokens,
+            reuse,
+            bytes,
+            state,
+        });
+        self.stats.inserted += 1;
+        self.stats.evicted += evicted;
+        PrefixInsert {
+            stored: true,
+            evicted,
+        }
+    }
+
+    /// Make room for a request that needs `required` bytes when `available` are free (E7): when
+    /// the shortfall can be covered by evicting held entries, evict least-recently-used entries
+    /// until it is, and return the availability the request is then admitted against (`available`
+    /// plus what was freed). Otherwise — no shortfall, or one the whole store could not cover —
+    /// evict nothing and return `available`, so the caller's admission refuses exactly as it
+    /// would without the cache.
+    pub fn reclaim_for(&mut self, required: u64, available: u64) -> u64 {
+        let shortfall = required.saturating_sub(available);
+        if shortfall == 0 || shortfall > self.resident_bytes {
+            return available;
+        }
+        available.saturating_add(self.evict_at_least(shortfall))
+    }
+
+    /// Request admission with the cache in the picture (E7). The request needs `required` bytes,
+    /// `available` are free, and running it would take a snapshot of up to `snapshot_bytes` for
+    /// the cache to keep (a copy made during the request, which the request's own estimate does
+    /// not cover). Least-recently-used entries are evicted until the request **and** the snapshot
+    /// fit in memory and the snapshot fits in the budget beside what stays resident; then the
+    /// request is admitted against the returned availability with `required + snapshot_bytes`.
+    /// When that cannot be reached the request runs without keeping a snapshot
+    /// ([`PrefixAdmission::snapshot`] is `false`) and is admitted as [`reclaim_for`](Self::reclaim_for)
+    /// admits it — so caching never makes a request fail, and never takes memory admission did
+    /// not grant.
+    pub fn admit(&mut self, required: u64, snapshot_bytes: u64, available: u64) -> PrefixAdmission {
+        if snapshot_bytes <= self.budget_bytes {
+            let over_budget =
+                (self.resident_bytes + snapshot_bytes).saturating_sub(self.budget_bytes);
+            let short = required
+                .saturating_add(snapshot_bytes)
+                .saturating_sub(available);
+            let need = over_budget.max(short);
+            if need <= self.resident_bytes {
+                let freed = self.evict_at_least(need);
+                return PrefixAdmission {
+                    available: available.saturating_add(freed),
+                    snapshot: true,
+                };
+            }
+        }
+        PrefixAdmission {
+            available: self.reclaim_for(required, available),
+            snapshot: false,
+        }
+    }
+
+    /// Evict least-recently-used entries until at least `bytes` are freed (the caller has checked
+    /// that the resident bytes cover it); returns what was freed.
+    fn evict_at_least(&mut self, bytes: u64) -> u64 {
+        let mut freed = 0u64;
+        while freed < bytes {
+            let gone = self
+                .entries
+                .pop_front()
+                .expect("the caller checked the resident bytes cover it");
+            self.resident_bytes -= gone.bytes;
+            freed += gone.bytes;
+            self.stats.evicted += 1;
+        }
+        freed
+    }
+
+    /// Drop every entry.
+    pub fn clear(&mut self) {
+        self.stats.evicted += self.entries.len();
+        self.entries.clear();
+        self.resident_bytes = 0;
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[test]
+    fn a_whole_entry_is_reused_only_when_the_prompt_extends_it() {
+        let mut store = PrefixStore::new(1_000);
+        store.insert(vec![1, 2, 3], PrefixReuse::WholeEntry, 10, "b3");
+        assert!(
+            store.lookup(&[1, 2, 9, 9], |_| Some(3)).is_none(),
+            "partial"
+        );
+        assert!(store.lookup(&[1, 2, 3], |_| Some(3)).is_none(), "no suffix");
+        assert!(
+            store.lookup(&[1, 2, 3, 4], |_| Some(2)).is_none(),
+            "a state that does not hold exactly the key"
+        );
+        let hit = store.lookup(&[1, 2, 3, 4], |_| Some(3)).unwrap();
+        assert_eq!((hit.reused, *hit.state), (3, "b3"));
+    }
+
+    #[test]
+    fn an_any_prefix_entry_is_sliced_and_leaves_one_token_to_prefill() {
+        let mut store = PrefixStore::new(1_000);
+        store.insert(vec![1, 2, 3, 4, 5], PrefixReuse::AnyPrefix, 10, ());
+        assert_eq!(
+            store
+                .lookup(&[1, 2, 7], |_| Some(usize::MAX))
+                .unwrap()
+                .reused,
+            2
+        );
+        assert_eq!(
+            store
+                .lookup(&[1, 2, 3], |_| Some(usize::MAX))
+                .unwrap()
+                .reused,
+            2
+        );
+        assert_eq!(
+            store
+                .lookup(&[1, 2, 3, 4, 5, 6], |_| Some(usize::MAX))
+                .unwrap()
+                .reused,
+            5
+        );
+        assert!(store.lookup(&[9], |_| Some(usize::MAX)).is_none());
+        // A state holding fewer positions than its key clamps the reuse, and the stats say so.
+        assert_eq!(
+            store
+                .lookup(&[1, 2, 3, 4, 5, 6], |_| Some(4))
+                .unwrap()
+                .reused,
+            4
+        );
+        let s = store.stats();
+        assert_eq!((s.lookups, s.hits, s.reused_prefix_tokens), (5, 4, 13));
+        assert_eq!(s.computed_prefill_tokens, 1 + 1 + 1 + 1 + 2);
+    }
+
+    #[test]
+    fn ineligible_entries_are_skipped() {
+        let mut store = PrefixStore::new(1_000);
+        store.insert(vec![1, 2, 3], PrefixReuse::WholeEntry, 10, (false, 3));
+        store.insert(vec![1, 2], PrefixReuse::WholeEntry, 10, (true, 2));
+        let hit = store
+            .lookup(&[1, 2, 3, 4], |&(mtp, len)| mtp.then_some(len))
+            .unwrap();
+        assert_eq!(
+            hit.reused, 2,
+            "the longer entry lacks what the request needs"
+        );
+    }
+
+    /// AC3: past the budget the least-recently-used entry goes, and resident bytes never exceed
+    /// the budget.
+    #[test]
+    fn the_least_recently_used_entry_is_evicted_and_bytes_stay_in_budget() {
+        let mut store = PrefixStore::new(100);
+        store.insert(vec![1], PrefixReuse::WholeEntry, 40, 'a');
+        store.insert(vec![2], PrefixReuse::WholeEntry, 40, 'b');
+        // Touch `a`, so `b` is now least recently used.
+        assert!(store.lookup(&[1, 0], |_| Some(1)).is_some());
+        let out = store.insert(vec![3], PrefixReuse::WholeEntry, 40, 'c');
+        assert_eq!(
+            out,
+            PrefixInsert {
+                stored: true,
+                evicted: 1
+            }
+        );
+        assert_eq!(store.keys(), vec![&[1][..], &[3][..]]);
+        assert_eq!(store.resident_bytes(), 80);
+        assert!(store.resident_bytes() <= store.budget_bytes());
+        // An entry needing everything evicts everything else; one past the budget is refused.
+        store.insert(vec![4], PrefixReuse::WholeEntry, 100, 'd');
+        assert_eq!((store.len(), store.resident_bytes()), (1, 100));
+        let refused = store.insert(vec![5], PrefixReuse::WholeEntry, 101, 'e');
+        assert!(!refused.stored);
+        assert_eq!((store.len(), store.resident_bytes()), (1, 100));
+        assert_eq!(store.stats().rejected, 1);
+    }
+
+    #[test]
+    fn a_longer_any_prefix_entry_supersedes_the_one_it_extends() {
+        let mut store = PrefixStore::new(1_000);
+        store.insert(vec![1, 2], PrefixReuse::AnyPrefix, 10, ());
+        store.insert(vec![7, 8], PrefixReuse::AnyPrefix, 10, ());
+        let out = store.insert(vec![1, 2, 3], PrefixReuse::AnyPrefix, 15, ());
+        assert_eq!(out.evicted, 1);
+        assert_eq!(store.keys(), vec![&[7, 8][..], &[1, 2, 3][..]]);
+        assert_eq!(store.resident_bytes(), 25);
+        // A re-insert of the same tokens replaces (no duplicate).
+        store.insert(vec![7, 8], PrefixReuse::AnyPrefix, 12, ());
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.resident_bytes(), 27);
+    }
+
+    /// E7: a request short of memory evicts exactly enough, one that the whole store could not
+    /// cover evicts nothing, and the boundary (`required == available + resident`) is admitted.
+    #[test]
+    fn a_request_reclaims_room_up_to_the_boundary() {
+        let fill = || {
+            let mut store = PrefixStore::new(1_000);
+            store.insert(vec![1], PrefixReuse::WholeEntry, 300, ());
+            store.insert(vec![2], PrefixReuse::WholeEntry, 300, ());
+            store
+        };
+        let mut store = fill();
+        assert_eq!(store.reclaim_for(500, 500), 500, "no shortfall");
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.reclaim_for(700, 500), 800, "one entry covers 200");
+        assert_eq!(
+            (store.keys(), store.resident_bytes()),
+            (vec![&[2][..]], 300)
+        );
+
+        let mut store = fill();
+        assert_eq!(store.reclaim_for(1_100, 500), 1_100, "exactly the boundary");
+        assert!(store.is_empty());
+        assert!(crate::admit_request_memory(1_100, 1_100).is_ok());
+
+        let mut store = fill();
+        assert_eq!(store.reclaim_for(1_101, 500), 500, "past the boundary");
+        assert_eq!(store.len(), 2, "a refused request keeps the cache");
+        assert!(crate::admit_request_memory(1_101, 500).is_err());
+    }
+
+    /// E7: a request keeps its snapshot only when both fit — evicting exactly enough for memory
+    /// and budget — and otherwise runs without it, admitted as without the cache.
+    #[test]
+    fn a_request_snapshot_is_admitted_only_when_memory_and_budget_hold_it() {
+        let fill = || {
+            let mut store = PrefixStore::new(1_000);
+            store.insert(vec![1], PrefixReuse::WholeEntry, 400, ());
+            store.insert(vec![2], PrefixReuse::WholeEntry, 400, ());
+            store
+        };
+        // Budget room: 800 held + 300 would exceed 1 000, so one entry goes.
+        let mut store = fill();
+        let a = store.admit(100, 300, 10_000);
+        assert_eq!(
+            a,
+            PrefixAdmission {
+                available: 10_400,
+                snapshot: true
+            }
+        );
+        assert_eq!(store.keys(), vec![&[2][..]]);
+        // Memory room at the exact boundary: 500 + 300 with nothing free needs all 800 held.
+        let mut store = fill();
+        let a = store.admit(500, 300, 0);
+        assert_eq!(
+            a,
+            PrefixAdmission {
+                available: 800,
+                snapshot: true
+            }
+        );
+        assert!(crate::admit_request_memory(500 + 300, a.available).is_ok());
+        assert!(store.is_empty());
+        // One byte past what eviction can free: no snapshot, the request alone is reclaimed for.
+        let mut store = fill();
+        let a = store.admit(501, 300, 0);
+        assert_eq!(
+            a,
+            PrefixAdmission {
+                available: 800,
+                snapshot: false
+            }
+        );
+        assert!(crate::admit_request_memory(501, a.available).is_ok());
+        // A snapshot past the whole budget is never taken.
+        let mut store = fill();
+        let a = store.admit(10, 1_001, 10_000);
+        assert_eq!(
+            a,
+            PrefixAdmission {
+                available: 10_000,
+                snapshot: false
+            }
+        );
+        assert_eq!(store.len(), 2);
+    }
+
+    /// E7: the budget a load reserves is what its admission leaves, never more.
+    #[test]
+    fn the_load_budget_is_clamped_to_the_admission_headroom() {
+        assert_eq!(
+            prefix_cache_budget(None, 10, 1 << 40),
+            DEFAULT_PREFIX_CACHE_BYTES
+        );
+        assert_eq!(prefix_cache_budget(Some(500), 100, 1_000), 500);
+        assert_eq!(
+            prefix_cache_budget(Some(500), 600, 1_000),
+            400,
+            "the boundary"
+        );
+        assert_eq!(prefix_cache_budget(Some(500), 1_000, 1_000), 0);
+        assert_eq!(prefix_cache_budget(Some(0), 0, 1_000), 0, "disabled");
+        assert_eq!(
+            requested_prefix_cache_bytes(None),
+            DEFAULT_PREFIX_CACHE_BYTES
+        );
+        assert_eq!(requested_prefix_cache_bytes(Some(7)), 7);
+        let (required, available) = (600u64, 1_000u64);
+        let budget = prefix_cache_budget(Some(u64::MAX), required, available);
+        assert!(crate::admit_request_memory(required + budget, available).is_ok());
+        assert!(crate::admit_request_memory(required + budget + 1, available).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

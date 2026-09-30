@@ -309,6 +309,7 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
     // Every component is projected to the dtype retained by its concrete constructor. Packed
     // `.weight` tensors are automatically kept at their stored width by `asset_facts`, even when
     // the surrounding dense component is promoted to f32.
+    let enhancer_bytes = optional_projected_bytes(&enhancer_path, ResidentProjection::Bfloat16)?;
     let conditioning_bytes = checked_sum(
         "conditioning",
         [
@@ -351,7 +352,17 @@ fn production_asset_declaration(spec: &LoadSpec) -> gen_core::Result<AssetDeclar
             // The provider resolves this staged Gemma-4 snapshot at load and enhancement runs it
             // while the ordinary packed text encoder is still in the conditioning scope. Charge
             // it whenever present, matching the established LTX-2.3 enhancer accounting rule.
-            optional_projected_bytes(&enhancer_path, ResidentProjection::Bfloat16)?,
+            enhancer_bytes,
+            // sc-24437: the enhancer's cross-request prefix cache holds up to its byte budget for
+            // as long as the load, so a staged enhancer charges that budget with its weights —
+            // never an unpriced second cache beside admission. The contract has no per-phase
+            // residency for base components (see `MemoryAssetFacts`), so it is charged once,
+            // here, and every fit decision on `base_bytes` sees it.
+            if enhancer_bytes > 0 {
+                crate::model::LTX25_ENHANCER_PREFIX_CACHE_BYTES
+            } else {
+                0
+            },
         ],
     )?;
     let transformer_bytes = checked_sum(
@@ -1161,8 +1172,10 @@ mod tests {
         std::fs::create_dir_all(root.join("enhancer")).unwrap();
         write_one_tensor(&root.join("enhancer/model.safetensors"));
         let enhanced_contract = memory_strategy_contract(&spec).unwrap();
-        assert_eq!(enhanced_contract.asset_facts.conditioning_bytes, 18);
-        assert_eq!(enhanced_contract.asset_facts.base_bytes, 42);
+        // The staged enhancer's weights plus its prefix cache's budget (sc-24437).
+        let cache = crate::model::LTX25_ENHANCER_PREFIX_CACHE_BYTES;
+        assert_eq!(enhanced_contract.asset_facts.conditioning_bytes, 18 + cache);
+        assert_eq!(enhanced_contract.asset_facts.base_bytes, 42 + cache);
 
         write_one_tensor(&root.join("adapter.safetensors"));
         let adapter_bytes = std::fs::metadata(root.join("adapter.safetensors"))
@@ -1175,7 +1188,7 @@ mod tests {
             AdapterKind::Lora,
         ));
         let adapted_contract = memory_strategy_contract(&adapted).unwrap();
-        assert_eq!(adapted_contract.asset_facts.base_bytes, 42);
+        assert_eq!(adapted_contract.asset_facts.base_bytes, 42 + cache);
         assert_eq!(adapted_contract.asset_facts.overlay_bytes, adapter_bytes);
         let MemoryFormulaKind::ComponentPhaseEnvelope {
             resident_components,

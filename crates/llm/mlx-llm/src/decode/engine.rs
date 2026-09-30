@@ -1187,10 +1187,15 @@ fn report<T: SpeculativeTarget + ?Sized>(
         nvfp4_projections: none(),
         fused_primitives: none(),
         target_forwards: stats.forwards as u64,
+        // The engine prefills the prompt (or counts a caller's prefill) as one forward; a caller
+        // whose prefill took more adds them (sc-24437).
+        prefill_forwards: 1,
         proposed_tokens: stats.proposed as u64,
         accepted_tokens: stats.accepted as u64,
         verify_steps: stats.verify_steps as u64,
         replay_forwards: stats.replays as u64,
+        prefix_hit_tokens: 0,
+        prefix_cache: none(),
         fallbacks: Vec::new(),
     }
 }
@@ -1573,9 +1578,10 @@ pub(crate) mod tests {
             1 + r.verify_steps + r.accepted_tokens,
             "{label}: tokens = first + one per verify step + accepted drafts: {r:?}"
         );
+        assert_eq!(r.prefill_forwards, 1, "{label}: one prefill forward: {r:?}");
         assert_eq!(
             r.target_forwards,
-            1 + r.verify_steps + r.replay_forwards,
+            r.prefill_forwards + r.verify_steps + r.replay_forwards,
             "{label}: forwards = prefill + verify steps + replays: {r:?}"
         );
     }

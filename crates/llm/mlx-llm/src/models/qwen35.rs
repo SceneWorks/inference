@@ -215,6 +215,48 @@ impl Qwen35Config {
         [base + (rem > 0) as usize, base + (rem > 1) as usize, base]
     }
 
+    /// An upper bound on the bytes a prefix-cache snapshot of the whole cache at `positions`
+    /// holds (story sc-24437), at 4 bytes an element: every full-attention layer's KV for
+    /// `positions` rounded up to the KV block, every linear layer's conv tail and recurrent state,
+    /// and — with `mtp` — the predictor's KV plus one hidden row. `None` on overflow.
+    pub fn prefix_snapshot_bytes(&self, positions: usize, mtp: bool) -> Option<u64> {
+        let block = crate::primitives::kv_cache::KV_BLOCK_TOKENS as u64;
+        let positions = (positions as u64).div_ceil(block).checked_mul(block)?;
+        let linear = (0..self.num_layers).filter(|&i| self.is_linear(i)).count() as u64;
+        let attention = self.num_layers as u64 - linear;
+        let kv_position = (self.num_kv_heads as u64)
+            .checked_mul(self.head_dim as u64)?
+            .checked_mul(2 * 4)?;
+        let conv_dim = (2 * self.linear_num_key_heads as u64)
+            .checked_mul(self.linear_key_head_dim as u64)?
+            .checked_add(
+                (self.linear_num_value_heads as u64)
+                    .checked_mul(self.linear_value_head_dim as u64)?,
+            )?;
+        let recurrent = (self.linear_conv_kernel_dim as u64)
+            .saturating_sub(1)
+            .checked_mul(conv_dim)?
+            .checked_add(
+                (self.linear_num_value_heads as u64)
+                    .checked_mul(self.linear_value_head_dim as u64)?
+                    .checked_mul(self.linear_key_head_dim as u64)?,
+            )?
+            .checked_mul(4)?;
+        let head = if mtp {
+            (self.mtp_num_hidden_layers as u64)
+                .checked_mul(kv_position)?
+                .checked_mul(positions)?
+                .checked_add((self.hidden_size as u64).checked_mul(4)?)?
+        } else {
+            0
+        };
+        attention
+            .checked_mul(kv_position)?
+            .checked_mul(positions)?
+            .checked_add(linear.checked_mul(recurrent)?)?
+            .checked_add(head)
+    }
+
     /// Whether layer `i` (0-indexed) is a linear (Gated DeltaNet) layer; otherwise full attention.
     pub fn is_linear(&self, i: usize) -> bool {
         !(i + 1).is_multiple_of(self.full_attention_interval)
@@ -621,6 +663,21 @@ impl Qwen35Cache {
         }
     }
 
+    /// Bytes the cache's arrays hold: every attention layer's KV block buffers plus every linear
+    /// layer's resident recurrent bytes ([`DeltaNetCache::resident_bytes`]: the live conv tail
+    /// and recurrent state, plus any checkpoint window still open) — what the prefix cache charges
+    /// an entry holding this cache (story sc-24437). A stored entry's window is closed, so it is
+    /// charged exactly its live state.
+    pub fn bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                Qwen35LayerCache::Attn(a) => a.kv.bytes(),
+                Qwen35LayerCache::Delta(c) => c.resident_bytes() as u64,
+            })
+            .sum()
+    }
+
     /// Open a checkpoint window at the current position in every DeltaNet layer: the state here
     /// and after every token of each forward until the window closes stays restorable, so
     /// [`truncate`](Self::truncate) can return to any of those positions without a forward. The
@@ -669,6 +726,17 @@ impl Qwen35Cache {
                 Qwen35LayerCache::Attn(_) => None,
             })
             .collect()
+    }
+
+    /// Drop every DeltaNet layer's checkpoint window, open or closed
+    /// ([`DeltaNetCache::discard_checkpoints`]): the cache holds only its live state at
+    /// [`offset`](Self::offset) — what a cross-turn prefix-cache entry keeps (sc-24437).
+    pub fn discard_checkpoints(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.discard_checkpoints();
+            }
+        }
     }
 
     /// Close the checkpoint window: later forwards stop recording (and drop it).
@@ -808,6 +876,13 @@ impl TokenEmbedding {
 pub struct MtpCache {
     layers: Vec<AttnKv>,
     steps: usize,
+}
+
+impl MtpCache {
+    /// Bytes the predictor's KV block buffers hold (story sc-24437).
+    pub fn bytes(&self) -> u64 {
+        self.layers.iter().map(|a| a.kv.bytes()).sum()
+    }
 }
 
 /// Qwen3.8's optional speculative predictor. Embeddings and the LM head are shared with the target
