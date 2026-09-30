@@ -1985,9 +1985,9 @@ impl TextLlm for LlamaProvider {
 
 /// The deepest prompt-lookup proposal the provider runs (sc-24434, matching Candle's bound):
 /// drafts per verify step, so the verify forward carries at most `1 + 8` positions. Every extra
-/// depth adds a verify row, a KV overshoot position and — on the Qwen35 hybrid — a larger
-/// step-start snapshot to restore on rejection; a copied span past 8 tokens gains little over the
-/// next verify step starting a fresh lookup.
+/// depth adds a verify row, a KV overshoot position and — on the Qwen35 hybrid — another
+/// checkpoint-ring slot per linear layer (sc-24435); a copied span past 8 tokens gains little over
+/// the next verify step starting a fresh lookup.
 pub const PROMPT_LOOKUP_MAX_DEPTH: u32 = 8;
 
 /// The prompt-lookup depth [`Speculative::Auto`](core_llm::Speculative::Auto) runs on a model
@@ -2035,12 +2035,13 @@ impl SpeculativeRoute {
 }
 
 impl LlamaProvider {
-    /// The request's admission price under its speculative route (sc-24434). A step-start
-    /// snapshot (the Qwen35 hybrid, MTP or prompt lookup) is priced as the MTP route always was —
-    /// a second KV/recurrent copy plus the verify rows — because the verify forward's in-place
-    /// writes copy the buffers the snapshot still holds. Prompt lookup on a softmax decoder rolls
-    /// back by truncation, so it pays only its verify overshoot: `width` more KV positions and
-    /// `width` more hidden + logit rows.
+    /// The request's admission price under its speculative route. Prompt lookup rolls back
+    /// without a forward or a copy on both decoders — a softmax decoder by truncation, the Qwen35
+    /// hybrid through its DeltaNet checkpoint ring (sc-24435) — so it pays its verify overshoot
+    /// (`width` more KV positions and `width` more hidden + logit rows) and, on the hybrid, the
+    /// ring ([`Qwen35Model::checkpoint_ring_bytes`]). MTP keeps the predictor-cache pricing
+    /// (`width` in the estimate) plus the ring; the ring replaced the step-start snapshot, so the
+    /// hybrid's recurrent state is charged once, never as clone + replay copies.
     fn speculative_request_bytes(
         &self,
         route: SpeculativeRoute,
@@ -2048,10 +2049,14 @@ impl LlamaProvider {
         max_new_tokens: u32,
         vision_workspace: u64,
     ) -> Option<u64> {
-        let geometry = self.model.memory_geometry();
-        let truncating = matches!(self.model, Decoder::Causal(_));
+        let mut geometry = self.model.memory_geometry();
+        if let (Decoder::Qwen35(m), width @ 1..) = (&self.model, route.width()) {
+            geometry.recurrent_bytes = geometry
+                .recurrent_bytes
+                .checked_add(m.checkpoint_ring_bytes(width)?)?;
+        }
         let (priced_width, overshoot) = match route {
-            SpeculativeRoute::PromptLookup { width } if truncating => {
+            SpeculativeRoute::PromptLookup { width } => {
                 let width = u64::try_from(width).ok()?;
                 let kv_position = geometry
                     .layers
@@ -2467,13 +2472,16 @@ fn estimate_mlx_request_bytes(
             SDPA_SCORE_TILE_QLEN as usize,
         ),
         MlxWorkspaceContract::Qwen35 { config, prism } => {
-            let base = core_llm::estimate_chunked_request_bytes(
+            // The recurrent term once: the hybrid rolls back through its checkpoint ring, whose
+            // bytes the caller folds into `geometry.recurrent_bytes`, and is never cloned.
+            let base = core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
                 prompt_tokens,
                 max_new_tokens,
                 geometry,
                 vision_workspace_bytes,
                 mtp_width,
                 SDPA_SCORE_TILE_QLEN as usize,
+                1,
             )?;
             base.checked_add(estimate_qwen35_workspace_extra_bytes(
                 prompt_tokens,
@@ -3604,6 +3612,12 @@ mod tests {
                 4,
             ),
             (
+                "qwen35 prompt lookup",
+                qwen35_mtp_provider(),
+                SpeculativeProposer::PromptLookup,
+                4,
+            ),
+            (
                 "qwen35 mtp",
                 qwen35_mtp_provider(),
                 SpeculativeProposer::Mtp,
@@ -3675,6 +3689,15 @@ mod tests {
                 proposer == SpeculativeProposer::Mtp,
                 "{label}"
             );
+            if matches!(provider.model, Decoder::Qwen35(_)) {
+                // AC3 (sc-24435): the hybrid rejected drafts and recovered every rejection
+                // through its checkpoint ring — no replay forward.
+                assert!(
+                    report.accepted_tokens < report.proposed_tokens,
+                    "{label}: a draft was rejected: {report:?}"
+                );
+                assert_eq!(report.replay_forwards, 0, "{label}: {report:?}");
+            }
         }
     }
 
@@ -3785,8 +3808,10 @@ mod tests {
     }
 
     /// Admission prices what each route holds: prompt lookup on a softmax decoder pays only its
-    /// verify overshoot (it rolls back by truncation), while any speculation on the hybrid pays
-    /// the step-start snapshot exactly as MTP always did.
+    /// verify overshoot (it rolls back by truncation). On the hybrid every speculative route pays
+    /// the DeltaNet checkpoint ring its rollback holds (E7, sc-24435) — prompt lookup the ring plus
+    /// the overshoot, MTP the ring plus its predictor cache and verify rows — and the recurrent
+    /// state once: no step-start snapshot, no clone/replay copies.
     #[test]
     fn speculative_admission_prices_the_rollback_the_route_holds() {
         let causal = causal_provider();
@@ -3804,9 +3829,29 @@ mod tests {
         );
 
         let hybrid = qwen35_mtp_provider();
-        let snapshot = price(&hybrid, SpeculativeRoute::PromptLookup { width: 3 });
-        assert_eq!(snapshot, price(&hybrid, SpeculativeRoute::Mtp { width: 3 }));
-        assert!(snapshot > price(&hybrid, SpeculativeRoute::Plain));
+        let Decoder::Qwen35(model) = &hybrid.model else {
+            unreachable!("the hybrid fixture")
+        };
+        let off = price(&hybrid, SpeculativeRoute::Plain);
+        let g = hybrid.model.memory_geometry();
+        let kv_position = g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let rows = (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let kv = (64 + 32) * kv_position;
+        for width in [1usize, 3, 8] {
+            let ring = model.checkpoint_ring_bytes(width).unwrap();
+            let w = width as u64;
+            assert!(ring > 0);
+            assert_eq!(
+                price(&hybrid, SpeculativeRoute::PromptLookup { width }),
+                off + ring + w * (kv_position + rows),
+                "lookup {width}: the ring plus the overshoot"
+            );
+            assert_eq!(
+                price(&hybrid, SpeculativeRoute::Mtp { width }),
+                off + ring + 2 * kv + w * rows,
+                "mtp {width}: the ring plus the predictor cache and verify rows"
+            );
+        }
     }
 
     /// E1/E8: the backend-neutral greedy parity suite (core-llm-testkit) — the one Candle runs —
