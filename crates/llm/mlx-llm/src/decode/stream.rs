@@ -21,7 +21,7 @@ use super::BufferRelease;
 use crate::error::{Error, Result};
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::KvCache;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::{draw_token, SamplingParams, SplitMix64};
 
 /// A decoder the streaming loop can drive: it makes its own cache and produces last-position logits.
 pub trait Decode {
@@ -343,8 +343,9 @@ pub(crate) fn decode_loop(
     let mut release = BufferRelease::new();
 
     for step in 0..config.max_new_tokens {
-        // Pulling logits to host for sampling forces a graph eval each step, so this check is
-        // genuinely effective despite MLX's lazy evaluation.
+        // Reading each drawn token back forces a graph eval each step, so this check is genuinely
+        // effective despite MLX's lazy evaluation. (This loop is the unpipelined reference; the
+        // engine's token-at-a-time loop pipelines — `decode::engine`.)
         if cancel.is_cancelled() {
             finish = FinishReason::Cancelled;
             break;
@@ -354,7 +355,7 @@ pub(crate) fn decode_loop(
         // so the constraint is free to be advanced again below.
         let next = {
             let mask = constraint.as_mut().map(|c| c.allowed());
-            sample(&logits, &history, &config.sampling, &mut rng, mask)?
+            draw_token(&logits, &history, &config.sampling, &mut rng, mask)?
         };
 
         if config.stop_tokens.contains(&next) {

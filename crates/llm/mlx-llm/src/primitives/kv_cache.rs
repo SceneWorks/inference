@@ -357,28 +357,19 @@ impl KvCache for ContiguousKvCache {
 #[cfg(test)]
 pub(crate) mod testing {
     use mlx_rs::ops::add;
-    use mlx_rs::{Array, Device, Dtype};
+    use mlx_rs::{Array, Dtype};
 
-    /// Pin every op in a test to the CPU stream, restoring the previous default device on drop.
-    /// The default device is process-global and every `#[test]` in this crate shares one binary,
-    /// so a one-way switch would leak into whichever test runs next. The cache is pure
-    /// bookkeeping over a handful of floats and must not depend on (or dispatch to) the GPU.
-    pub(crate) struct CpuStream {
-        previous: Device,
-    }
-
-    impl CpuStream {
-        pub(crate) fn enter() -> Self {
-            let previous = Device::try_default().expect("a default device");
-            Device::set_default(&Device::cpu());
-            Self { previous }
-        }
-    }
-
-    impl Drop for CpuStream {
-        fn drop(&mut self) {
-            Device::set_default(&self.previous);
-        }
+    /// Run `f` with every op it issues on this thread pinned to the CPU stream (a task-local
+    /// default stream, restored when `f` returns). The cache is pure bookkeeping over a handful of
+    /// floats and must not depend on (or dispatch to) the GPU.
+    ///
+    /// Never switch the default device: it is **process-global** in MLX and every
+    /// `#[test]` in this crate shares one binary, so flipping it races every test running in
+    /// parallel (overlapping scopes restored out of order leave the CPU the default for whoever
+    /// runs next — the sc-24439 greedy-parity flake), and a global CPU default under another
+    /// thread's task-local GPU stream has livelocked MLX's stream threads.
+    pub(crate) fn on_cpu<R>(f: impl FnOnce() -> R) -> R {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), f)
     }
 
     /// Host copy in logical (row-major) order. The cache hands out strided views over its
@@ -444,7 +435,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{host, tok, ConcatReference, CpuStream};
+    use super::testing::{host, on_cpu, tok, ConcatReference};
     use super::*;
     use mlx_rs::memory;
 
@@ -457,275 +448,289 @@ mod tests {
 
     #[test]
     fn first_update_stores_and_returns_input() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::new(2);
-        assert_eq!(cache.offset(), 0);
-        assert_eq!(cache.batch_size(), 0);
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::new(2);
+            assert_eq!(cache.offset(), 0);
+            assert_eq!(cache.batch_size(), 0);
 
-        let k = arange4(1, 2, 3, 4);
-        let v = arange4(1, 2, 3, 4);
-        let (ka, va) = cache.update(0, &k, &v).unwrap();
-        assert_eq!(ka.shape(), &[1, 2, 3, 4]);
-        assert_eq!(va.shape(), &[1, 2, 3, 4]);
-        assert_eq!(host(&ka), host(&k));
-        assert_eq!(cache.offset(), 3);
-        assert_eq!(cache.num_layers(), 2);
+            let k = arange4(1, 2, 3, 4);
+            let v = arange4(1, 2, 3, 4);
+            let (ka, va) = cache.update(0, &k, &v).unwrap();
+            assert_eq!(ka.shape(), &[1, 2, 3, 4]);
+            assert_eq!(va.shape(), &[1, 2, 3, 4]);
+            assert_eq!(host(&ka), host(&k));
+            assert_eq!(cache.offset(), 3);
+            assert_eq!(cache.num_layers(), 2);
+        })
     }
 
     #[test]
     fn second_update_concatenates_on_seq_axis() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::new(1);
-        let k0 = arange4(1, 2, 3, 4);
-        cache.update(0, &k0, &k0).unwrap();
-        let k1 = arange4(1, 2, 1, 4); // one new token
-        let (ka, _) = cache.update(0, &k1, &k1).unwrap();
-        assert_eq!(ka.shape(), &[1, 2, 4, 4]); // 3 + 1 along seq
-        assert_eq!(cache.offset(), 4);
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::new(1);
+            let k0 = arange4(1, 2, 3, 4);
+            cache.update(0, &k0, &k0).unwrap();
+            let k1 = arange4(1, 2, 1, 4); // one new token
+            let (ka, _) = cache.update(0, &k1, &k1).unwrap();
+            assert_eq!(ka.shape(), &[1, 2, 4, 4]); // 3 + 1 along seq
+            assert_eq!(cache.offset(), 4);
+        })
     }
 
     #[test]
     fn supports_batch_greater_than_one() {
-        let _cpu = CpuStream::enter();
-        // The headline acceptance for story 7155: the cache is batch-capable.
-        let mut cache = ContiguousKvCache::new(1);
-        let k0 = arange4(4, 8, 5, 16); // batch = 4
-        cache.update(0, &k0, &k0).unwrap();
-        let k1 = arange4(4, 8, 2, 16);
-        let (ka, va) = cache.update(0, &k1, &k1).unwrap();
-        assert_eq!(ka.shape(), &[4, 8, 7, 16]);
-        assert_eq!(va.shape(), &[4, 8, 7, 16]);
-        assert_eq!(cache.batch_size(), 4);
-        assert_eq!(cache.offset(), 7);
+        on_cpu(|| {
+            // The headline acceptance for story 7155: the cache is batch-capable.
+            let mut cache = ContiguousKvCache::new(1);
+            let k0 = arange4(4, 8, 5, 16); // batch = 4
+            cache.update(0, &k0, &k0).unwrap();
+            let k1 = arange4(4, 8, 2, 16);
+            let (ka, va) = cache.update(0, &k1, &k1).unwrap();
+            assert_eq!(ka.shape(), &[4, 8, 7, 16]);
+            assert_eq!(va.shape(), &[4, 8, 7, 16]);
+            assert_eq!(cache.batch_size(), 4);
+            assert_eq!(cache.offset(), 7);
+        })
     }
 
     #[test]
     fn concatenated_values_are_in_order() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::new(1);
-        // [1,1,2,2] = [[0,1],[2,3]]
-        let a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]);
-        // [1,1,1,2] = [[10,11]]
-        let b = Array::from_slice(&[10.0f32, 11.0], &[1, 1, 1, 2]);
-        cache.update(0, &a, &a).unwrap();
-        let (ka, _) = cache.update(0, &b, &b).unwrap();
-        assert_eq!(host(&ka), vec![0.0, 1.0, 2.0, 3.0, 10.0, 11.0]);
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::new(1);
+            // [1,1,2,2] = [[0,1],[2,3]]
+            let a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0], &[1, 1, 2, 2]);
+            // [1,1,1,2] = [[10,11]]
+            let b = Array::from_slice(&[10.0f32, 11.0], &[1, 1, 1, 2]);
+            cache.update(0, &a, &a).unwrap();
+            let (ka, _) = cache.update(0, &b, &b).unwrap();
+            assert_eq!(host(&ka), vec![0.0, 1.0, 2.0, 3.0, 10.0, 11.0]);
+        })
     }
 
     #[test]
     fn block_cache_matches_concat_reference_across_block_boundaries() {
-        let _cpu = CpuStream::enter();
-        // 300 single-token updates on top of a 3-token prefill with block 256: crosses the
-        // 256 -> 512 growth once. Every returned K/V must equal the concat reference's, and the
-        // underlying buffer must change size only at the boundary.
-        let block = 256;
-        let mut cache = ContiguousKvCache::with_block_tokens(1, block);
-        let mut reference = ConcatReference::new();
+        on_cpu(|| {
+            // 300 single-token updates on top of a 3-token prefill with block 256: crosses the
+            // 256 -> 512 growth once. Every returned K/V must equal the concat reference's, and the
+            // underlying buffer must change size only at the boundary.
+            let block = 256;
+            let mut cache = ContiguousKvCache::with_block_tokens(1, block);
+            let mut reference = ConcatReference::new();
 
-        let prefill_k = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
-        let prefill_v = Array::from_slice(
-            &[100.0f32, 100.5, 101.0, 101.5, 102.0, 102.5],
-            &[1, 1, 3, 2],
-        );
-        let (ck, cv) = cache.update(0, &prefill_k, &prefill_v).unwrap();
-        let (rk, rv) = reference.update(&prefill_k, &prefill_v);
-        assert_eq!(host(&ck), host(&rk));
-        assert_eq!(host(&cv), host(&rv));
-        assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), block);
+            let prefill_k = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
+            let prefill_v = Array::from_slice(
+                &[100.0f32, 100.5, 101.0, 101.5, 102.0, 102.5],
+                &[1, 1, 3, 2],
+            );
+            let (ck, cv) = cache.update(0, &prefill_k, &prefill_v).unwrap();
+            let (rk, rv) = reference.update(&prefill_k, &prefill_v);
+            assert_eq!(host(&ck), host(&rk));
+            assert_eq!(host(&cv), host(&rv));
+            assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), block);
 
-        let mut capacity_changes = Vec::new();
-        let mut last_capacity = block;
-        for i in 0..300 {
-            let k = tok(3.0 + i as f32);
-            let v = tok(103.0 + i as f32);
-            let (ck, cv) = cache.update(0, &k, &v).unwrap();
-            let (rk, rv) = reference.update(&k, &v);
-            assert_eq!(ck.shape(), rk.shape(), "update {i}: key shape");
-            assert_eq!(host(&ck), host(&rk), "update {i}: keys");
-            assert_eq!(host(&cv), host(&rv), "update {i}: values");
-            assert_eq!(cache.offset(), 4 + i);
+            let mut capacity_changes = Vec::new();
+            let mut last_capacity = block;
+            for i in 0..300 {
+                let k = tok(3.0 + i as f32);
+                let v = tok(103.0 + i as f32);
+                let (ck, cv) = cache.update(0, &k, &v).unwrap();
+                let (rk, rv) = reference.update(&k, &v);
+                assert_eq!(ck.shape(), rk.shape(), "update {i}: key shape");
+                assert_eq!(host(&ck), host(&rk), "update {i}: keys");
+                assert_eq!(host(&cv), host(&rv), "update {i}: values");
+                assert_eq!(cache.offset(), 4 + i);
 
-            let capacity = cache.layers[0].as_ref().unwrap().capacity();
-            if capacity != last_capacity {
-                capacity_changes.push((cache.offset(), capacity));
-                last_capacity = capacity;
+                let capacity = cache.layers[0].as_ref().unwrap().capacity();
+                if capacity != last_capacity {
+                    capacity_changes.push((cache.offset(), capacity));
+                    last_capacity = capacity;
+                }
             }
-        }
-        // The buffer grew exactly once, when position 257 needed a second block.
-        assert_eq!(capacity_changes, vec![(257, 2 * block)]);
-        assert_eq!(cache.offset(), 303);
+            // The buffer grew exactly once, when position 257 needed a second block.
+            assert_eq!(capacity_changes, vec![(257, 2 * block)]);
+            assert_eq!(cache.offset(), 303);
+        })
     }
 
     #[test]
     fn multi_token_update_that_overflows_a_block_grows_by_whole_blocks() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::with_block_tokens(1, 4);
-        let a = arange4(1, 1, 3, 2); // fills 3 of a 4-block
-        cache.update(0, &a, &a).unwrap();
-        assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 4);
-        let b = arange4(1, 1, 6, 2); // needs 6 more: two whole blocks appended
-        let (k, _) = cache.update(0, &b, &b).unwrap();
-        assert_eq!(k.shape(), &[1, 1, 9, 2]);
-        assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 3 + 8);
-        let expected: Vec<f32> = host(&a).into_iter().chain(host(&b)).collect();
-        assert_eq!(host(&k), expected);
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::with_block_tokens(1, 4);
+            let a = arange4(1, 1, 3, 2); // fills 3 of a 4-block
+            cache.update(0, &a, &a).unwrap();
+            assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 4);
+            let b = arange4(1, 1, 6, 2); // needs 6 more: two whole blocks appended
+            let (k, _) = cache.update(0, &b, &b).unwrap();
+            assert_eq!(k.shape(), &[1, 1, 9, 2]);
+            assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 3 + 8);
+            let expected: Vec<f32> = host(&a).into_iter().chain(host(&b)).collect();
+            assert_eq!(host(&k), expected);
+        })
     }
 
     #[test]
     fn returned_view_never_exposes_padding() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::with_block_tokens(2, 8);
-        let a = arange4(1, 2, 3, 4);
-        for layer in 0..2 {
-            let (k, v) = cache.update(layer, &a, &a).unwrap();
-            assert_eq!(k.shape(), &[1, 2, 3, 4]);
-            assert_eq!(v.shape(), &[1, 2, 3, 4]);
-            let (pk, pv) = cache.peek(layer).unwrap().unwrap();
-            assert_eq!(pk.shape(), &[1, 2, 3, 4]);
-            assert_eq!(host(&pv), host(&a));
-        }
-        let exported = cache.export().unwrap().unwrap();
-        assert_eq!(exported.len(), 2);
-        assert!(exported
-            .iter()
-            .all(|(k, v)| k.shape() == [1, 2, 3, 4] && v.shape() == [1, 2, 3, 4]));
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::with_block_tokens(2, 8);
+            let a = arange4(1, 2, 3, 4);
+            for layer in 0..2 {
+                let (k, v) = cache.update(layer, &a, &a).unwrap();
+                assert_eq!(k.shape(), &[1, 2, 3, 4]);
+                assert_eq!(v.shape(), &[1, 2, 3, 4]);
+                let (pk, pv) = cache.peek(layer).unwrap().unwrap();
+                assert_eq!(pk.shape(), &[1, 2, 3, 4]);
+                assert_eq!(host(&pv), host(&a));
+            }
+            let exported = cache.export().unwrap().unwrap();
+            assert_eq!(exported.len(), 2);
+            assert!(exported
+                .iter()
+                .all(|(k, v)| k.shape() == [1, 2, 3, 4] && v.shape() == [1, 2, 3, 4]));
+        })
     }
 
     #[test]
     fn seeded_cache_reports_length_and_grows_on_update() {
-        let _cpu = CpuStream::enter();
-        // A seeded layer is exact-length (no padding); the first update grows it by a block and
-        // the result equals prefix + suffix in order.
-        let prefix = arange4(1, 1, 5, 2);
-        let mut cache = ContiguousKvCache::seeded(vec![(prefix.clone(), prefix.clone())]);
-        assert_eq!(cache.offset(), 5);
-        assert_eq!(cache.batch_size(), 1);
-        let suffix = tok(99.0);
-        let (k, _) = cache.update(0, &suffix, &suffix).unwrap();
-        assert_eq!(k.shape(), &[1, 1, 6, 2]);
-        let expected: Vec<f32> = host(&prefix).into_iter().chain(host(&suffix)).collect();
-        assert_eq!(host(&k), expected);
-        assert_eq!(cache.offset(), 6);
+        on_cpu(|| {
+            // A seeded layer is exact-length (no padding); the first update grows it by a block and
+            // the result equals prefix + suffix in order.
+            let prefix = arange4(1, 1, 5, 2);
+            let mut cache = ContiguousKvCache::seeded(vec![(prefix.clone(), prefix.clone())]);
+            assert_eq!(cache.offset(), 5);
+            assert_eq!(cache.batch_size(), 1);
+            let suffix = tok(99.0);
+            let (k, _) = cache.update(0, &suffix, &suffix).unwrap();
+            assert_eq!(k.shape(), &[1, 1, 6, 2]);
+            let expected: Vec<f32> = host(&prefix).into_iter().chain(host(&suffix)).collect();
+            assert_eq!(host(&k), expected);
+            assert_eq!(cache.offset(), 6);
+        })
     }
 
     #[test]
     fn retain_sequences_compacts_batch_rows() {
-        let _cpu = CpuStream::enter();
-        // Batch of 3 rows; drop the middle one, keep [0, 2] in order.
-        let mut cache = ContiguousKvCache::new(1);
-        // Distinct per-row values so we can verify the right rows survive: row r filled with r.
-        let row = |r: f32| vec![r; 2]; // [1, hkv=2, s=1, hd=1] flattened (hd=1) => 2 values/row
-        let mut data = Vec::new();
-        for r in 0..3 {
-            data.extend(row(r as f32));
-        }
-        let k = Array::from_slice(&data, &[3, 2, 1, 1]);
-        cache.update(0, &k, &k).unwrap();
-        assert_eq!(cache.batch_size(), 3);
+        on_cpu(|| {
+            // Batch of 3 rows; drop the middle one, keep [0, 2] in order.
+            let mut cache = ContiguousKvCache::new(1);
+            // Distinct per-row values so we can verify the right rows survive: row r filled with r.
+            let row = |r: f32| vec![r; 2]; // [1, hkv=2, s=1, hd=1] flattened (hd=1) => 2 values/row
+            let mut data = Vec::new();
+            for r in 0..3 {
+                data.extend(row(r as f32));
+            }
+            let k = Array::from_slice(&data, &[3, 2, 1, 1]);
+            cache.update(0, &k, &k).unwrap();
+            assert_eq!(cache.batch_size(), 3);
 
-        cache.retain_sequences(&[0, 2]).unwrap();
-        assert_eq!(cache.batch_size(), 2);
-        assert_eq!(cache.offset(), 1);
-        let (ka, _) = cache.peek(0).unwrap().unwrap();
-        // Kept rows 0 and 2 (each 2 heads * 1 * 1 = 2 values): all 0.0 then all 2.0.
-        assert_eq!(host(&ka), vec![0.0, 0.0, 2.0, 2.0]);
+            cache.retain_sequences(&[0, 2]).unwrap();
+            assert_eq!(cache.batch_size(), 2);
+            assert_eq!(cache.offset(), 1);
+            let (ka, _) = cache.peek(0).unwrap().unwrap();
+            // Kept rows 0 and 2 (each 2 heads * 1 * 1 = 2 values): all 0.0 then all 2.0.
+            assert_eq!(host(&ka), vec![0.0, 0.0, 2.0, 2.0]);
+        })
     }
 
     #[test]
     fn retain_sequences_on_empty_cache_is_noop() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::new(2);
-        cache.retain_sequences(&[0]).unwrap();
-        assert_eq!(cache.batch_size(), 0);
-        assert!(cache.peek(0).unwrap().is_none());
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::new(2);
+            cache.retain_sequences(&[0]).unwrap();
+            assert_eq!(cache.batch_size(), 0);
+            assert!(cache.peek(0).unwrap().is_none());
+        })
     }
 
     #[test]
     fn truncate_slices_sequence_axis() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::new(1);
-        // [1,1,5,1] = values 0..4 along the seq axis.
-        let a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0], &[1, 1, 5, 1]);
-        cache.update(0, &a, &a).unwrap();
-        assert_eq!(cache.offset(), 5);
-        cache.truncate(3).unwrap();
-        assert_eq!(cache.offset(), 3);
-        let (k, _) = cache.peek(0).unwrap().unwrap();
-        assert_eq!(host(&k), vec![0.0, 1.0, 2.0]);
-        cache.truncate(10).unwrap(); // no-op past the end
-        assert_eq!(cache.offset(), 3);
-        assert!(cache.truncate(-1).is_err());
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::new(1);
+            // [1,1,5,1] = values 0..4 along the seq axis.
+            let a = Array::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0], &[1, 1, 5, 1]);
+            cache.update(0, &a, &a).unwrap();
+            assert_eq!(cache.offset(), 5);
+            cache.truncate(3).unwrap();
+            assert_eq!(cache.offset(), 3);
+            let (k, _) = cache.peek(0).unwrap().unwrap();
+            assert_eq!(host(&k), vec![0.0, 1.0, 2.0]);
+            cache.truncate(10).unwrap(); // no-op past the end
+            assert_eq!(cache.offset(), 3);
+            assert!(cache.truncate(-1).is_err());
+        })
     }
 
     #[test]
     fn truncate_then_update_overwrites_the_rolled_back_positions() {
-        let _cpu = CpuStream::enter();
-        // Speculative rollback: after truncating, the next update lands at the truncated offset and
-        // the result matches a concat reference that never saw the rejected tail — in place, with
-        // no buffer growth, and across a block boundary too.
-        let block = 4;
-        let mut cache = ContiguousKvCache::with_block_tokens(1, block);
-        let mut reference = ConcatReference::new();
-        let prompt = arange4(1, 1, 3, 2);
-        cache.update(0, &prompt, &prompt).unwrap();
-        reference.update(&prompt, &prompt);
+        on_cpu(|| {
+            // Speculative rollback: after truncating, the next update lands at the truncated offset and
+            // the result matches a concat reference that never saw the rejected tail — in place, with
+            // no buffer growth, and across a block boundary too.
+            let block = 4;
+            let mut cache = ContiguousKvCache::with_block_tokens(1, block);
+            let mut reference = ConcatReference::new();
+            let prompt = arange4(1, 1, 3, 2);
+            cache.update(0, &prompt, &prompt).unwrap();
+            reference.update(&prompt, &prompt);
 
-        // Verify pass: 3 draft tokens (positions 3..6) — crosses the 4-block boundary.
-        let drafts = Array::from_slice(&[7.0f32, 7.5, 8.0, 8.5, 9.0, 9.5], &[1, 1, 3, 2]);
-        cache.update(0, &drafts, &drafts).unwrap();
-        assert_eq!(cache.offset(), 6);
-        let capacity_after_drafts = cache.layers[0].as_ref().unwrap().capacity();
-        assert_eq!(capacity_after_drafts, 3 + 4);
+            // Verify pass: 3 draft tokens (positions 3..6) — crosses the 4-block boundary.
+            let drafts = Array::from_slice(&[7.0f32, 7.5, 8.0, 8.5, 9.0, 9.5], &[1, 1, 3, 2]);
+            cache.update(0, &drafts, &drafts).unwrap();
+            assert_eq!(cache.offset(), 6);
+            let capacity_after_drafts = cache.layers[0].as_ref().unwrap().capacity();
+            assert_eq!(capacity_after_drafts, 3 + 4);
 
-        // Reject the last two drafts: keep the prompt + the first draft.
-        cache.truncate(4).unwrap();
-        assert_eq!(cache.offset(), 4);
-        let accepted = drafts.try_index((.., .., 0..1, ..)).unwrap();
-        reference.update(&accepted, &accepted);
-        let (k, _) = cache.peek(0).unwrap().unwrap();
-        assert_eq!(host(&k), host(reference.k.as_ref().unwrap()));
+            // Reject the last two drafts: keep the prompt + the first draft.
+            cache.truncate(4).unwrap();
+            assert_eq!(cache.offset(), 4);
+            let accepted = drafts.try_index((.., .., 0..1, ..)).unwrap();
+            reference.update(&accepted, &accepted);
+            let (k, _) = cache.peek(0).unwrap().unwrap();
+            assert_eq!(host(&k), host(reference.k.as_ref().unwrap()));
 
-        // Next step overwrites the rejected positions in place.
-        let next = tok(42.0);
-        let (ck, cv) = cache.update(0, &next, &next).unwrap();
-        let (rk, rv) = reference.update(&next, &next);
-        assert_eq!(host(&ck), host(&rk));
-        assert_eq!(host(&cv), host(&rv));
-        assert_eq!(cache.offset(), 5);
-        assert_eq!(
-            cache.layers[0].as_ref().unwrap().capacity(),
-            capacity_after_drafts,
-            "rollback + refill must not reallocate"
-        );
+            // Next step overwrites the rejected positions in place.
+            let next = tok(42.0);
+            let (ck, cv) = cache.update(0, &next, &next).unwrap();
+            let (rk, rv) = reference.update(&next, &next);
+            assert_eq!(host(&ck), host(&rk));
+            assert_eq!(host(&cv), host(&rv));
+            assert_eq!(cache.offset(), 5);
+            assert_eq!(
+                cache.layers[0].as_ref().unwrap().capacity(),
+                capacity_after_drafts,
+                "rollback + refill must not reallocate"
+            );
+        })
     }
 
     #[test]
     fn truncate_below_a_block_then_grow_keeps_only_live_positions() {
-        let _cpu = CpuStream::enter();
-        // Growth after a rollback trims the padding first, so the new buffer is live + one block.
-        let block = 4;
-        let mut cache = ContiguousKvCache::with_block_tokens(1, block);
-        let a = arange4(1, 1, 7, 2); // capacity 8
-        cache.update(0, &a, &a).unwrap();
-        cache.truncate(2).unwrap();
-        let big = arange4(1, 1, 7, 2); // 2 + 7 > 8: grow
-        let (k, _) = cache.update(0, &big, &big).unwrap();
-        assert_eq!(k.shape(), &[1, 1, 9, 2]);
-        assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 2 + 8);
-        let a_head = a.try_index((.., .., 0..2, ..)).unwrap();
-        let expected: Vec<f32> = host(&a_head).into_iter().chain(host(&big)).collect();
-        assert_eq!(host(&k), expected);
+        on_cpu(|| {
+            // Growth after a rollback trims the padding first, so the new buffer is live + one block.
+            let block = 4;
+            let mut cache = ContiguousKvCache::with_block_tokens(1, block);
+            let a = arange4(1, 1, 7, 2); // capacity 8
+            cache.update(0, &a, &a).unwrap();
+            cache.truncate(2).unwrap();
+            let big = arange4(1, 1, 7, 2); // 2 + 7 > 8: grow
+            let (k, _) = cache.update(0, &big, &big).unwrap();
+            assert_eq!(k.shape(), &[1, 1, 9, 2]);
+            assert_eq!(cache.layers[0].as_ref().unwrap().capacity(), 2 + 8);
+            let a_head = a.try_index((.., .., 0..2, ..)).unwrap();
+            let expected: Vec<f32> = host(&a_head).into_iter().chain(host(&big)).collect();
+            assert_eq!(host(&k), expected);
+        })
     }
 
     #[test]
     fn reset_clears_state() {
-        let _cpu = CpuStream::enter();
-        let mut cache = ContiguousKvCache::new(2);
-        let k = arange4(1, 2, 3, 4);
-        cache.update(0, &k, &k).unwrap();
-        cache.reset();
-        assert_eq!(cache.offset(), 0);
-        assert!(cache.peek(0).unwrap().is_none());
+        on_cpu(|| {
+            let mut cache = ContiguousKvCache::new(2);
+            let k = arange4(1, 2, 3, 4);
+            cache.update(0, &k, &k).unwrap();
+            cache.reset();
+            assert_eq!(cache.offset(), 0);
+            assert!(cache.peek(0).unwrap().is_none());
+        })
     }
 
     /// Shapes for the memory tests: big enough that one block buffer dwarfs the few-KB noise of
@@ -744,104 +749,106 @@ mod tests {
 
     #[test]
     fn single_token_updates_keep_memory_bounded_to_the_live_block_buffers() {
-        let _cpu = CpuStream::enter();
-        // The memory claim behind this cache: 300 single-token updates allocate nothing beyond the
-        // live K/V buffers (plus the old + new pair while a block is grown). If the in-place write
-        // ever stopped donating — a retained view, an extra clone held across the update — every
-        // step would leave a whole block buffer behind and this grows by hundreds of buffers.
-        let steps = 300;
-        let mut cache = ContiguousKvCache::with_block_tokens(1, MEM_BLOCK);
+        on_cpu(|| {
+            // The memory claim behind this cache: 300 single-token updates allocate nothing beyond the
+            // live K/V buffers (plus the old + new pair while a block is grown). If the in-place write
+            // ever stopped donating — a retained view, an extra clone held across the update — every
+            // step would leave a whole block buffer behind and this grows by hundreds of buffers.
+            let steps = 300;
+            let mut cache = ContiguousKvCache::with_block_tokens(1, MEM_BLOCK);
 
-        // Baseline after the inputs exist, so only the cache's own allocations count. Tests run
-        // one at a time (`RUST_TEST_THREADS = 1` is forced by `.cargo/config.toml`), so the
-        // process-global counters are ours for the duration.
-        let inputs: Vec<(Array, Array)> = (0..steps)
-            .map(|i| (mem_tok(i as f32), mem_tok(1000.0 + i as f32)))
-            .collect();
-        for (k, v) in &inputs {
-            mlx_rs::transforms::eval([k, v]).unwrap();
-        }
-        memory::reset_peak_memory();
-        let active_base = memory::get_active_memory();
-        let cache_base = memory::get_cache_memory();
+            // Baseline after the inputs exist, so only the cache's own allocations count. Tests run
+            // one at a time (`RUST_TEST_THREADS = 1` is forced by `.cargo/config.toml`), so the
+            // process-global counters are ours for the duration.
+            let inputs: Vec<(Array, Array)> = (0..steps)
+                .map(|i| (mem_tok(i as f32), mem_tok(1000.0 + i as f32)))
+                .collect();
+            for (k, v) in &inputs {
+                mlx_rs::transforms::eval([k, v]).unwrap();
+            }
+            memory::reset_peak_memory();
+            let active_base = memory::get_active_memory();
+            let cache_base = memory::get_cache_memory();
 
-        for (k, v) in &inputs {
-            let (ck, cv) = cache.update(0, k, v).unwrap();
-            // Force the step's graph so the accounting reflects real buffers, then drop the
-            // views before the next update exactly as the attention does.
-            mlx_rs::transforms::eval([&ck, &cv]).unwrap();
-        }
+            for (k, v) in &inputs {
+                let (ck, cv) = cache.update(0, k, v).unwrap();
+                // Force the step's graph so the accounting reflects real buffers, then drop the
+                // views before the next update exactly as the attention does.
+                mlx_rs::transforms::eval([&ck, &cv]).unwrap();
+            }
 
-        let capacity = cache.layers[0].as_ref().unwrap().capacity() as usize;
-        assert_eq!(capacity, cache.blocks_for(steps) as usize);
-        // K + V at the final capacity; growth briefly holds the previous (smaller) pair alongside
-        // the new one and the zero block being appended, so "two buffers' worth" is the ceiling.
-        let live_pair = 2 * capacity * MEM_BYTES_PER_POS;
-        let block_pair = 2 * MEM_BLOCK as usize * MEM_BYTES_PER_POS;
-        let slack = 256 * 1024; // page rounding + per-step 1-position inputs
-        let bound = 2 * live_pair + block_pair + slack;
+            let capacity = cache.layers[0].as_ref().unwrap().capacity() as usize;
+            assert_eq!(capacity, cache.blocks_for(steps) as usize);
+            // K + V at the final capacity; growth briefly holds the previous (smaller) pair alongside
+            // the new one and the zero block being appended, so "two buffers' worth" is the ceiling.
+            let live_pair = 2 * capacity * MEM_BYTES_PER_POS;
+            let block_pair = 2 * MEM_BLOCK as usize * MEM_BYTES_PER_POS;
+            let slack = 256 * 1024; // page rounding + per-step 1-position inputs
+            let bound = 2 * live_pair + block_pair + slack;
 
-        let active_growth = memory::get_active_memory().saturating_sub(active_base);
-        let peak_growth = memory::get_peak_memory().saturating_sub(active_base);
-        let cache_growth = memory::get_cache_memory().saturating_sub(cache_base);
-        assert!(
-            active_growth <= live_pair + slack,
-            "active grew {active_growth} B; live K/V is {live_pair} B"
-        );
-        assert!(
-            peak_growth <= bound,
-            "peak grew {peak_growth} B over {steps} updates; bound {bound} B (a lost donation \
-             copies a block buffer per step)"
-        );
-        // The freed-buffer set is what blew up in production: every concat'd buffer was a new
-        // size, so none was ever reused and one retired per STEP. With blocks one retires per
-        // GROWTH (each a different size, so still not reused — that residue is what
-        // `decode::BufferRelease` clears): the sum of the pre-growth K/V pairs, versus ~300
-        // retired pairs (~180 MB here) if the cache silently went back to a per-step reallocation.
-        let growths = capacity / MEM_BLOCK as usize;
-        let retired: usize = (1..growths)
-            .map(|g| 2 * g * MEM_BLOCK as usize * MEM_BYTES_PER_POS)
-            .sum();
-        assert!(
-            cache_growth <= retired + block_pair + slack,
-            "freed-buffer cache grew {cache_growth} B; retired pre-growth buffers total {retired} B"
-        );
+            let active_growth = memory::get_active_memory().saturating_sub(active_base);
+            let peak_growth = memory::get_peak_memory().saturating_sub(active_base);
+            let cache_growth = memory::get_cache_memory().saturating_sub(cache_base);
+            assert!(
+                active_growth <= live_pair + slack,
+                "active grew {active_growth} B; live K/V is {live_pair} B"
+            );
+            assert!(
+                peak_growth <= bound,
+                "peak grew {peak_growth} B over {steps} updates; bound {bound} B (a lost donation \
+                 copies a block buffer per step)"
+            );
+            // The freed-buffer set is what blew up in production: every concat'd buffer was a new
+            // size, so none was ever reused and one retired per STEP. With blocks one retires per
+            // GROWTH (each a different size, so still not reused — that residue is what
+            // `decode::BufferRelease` clears): the sum of the pre-growth K/V pairs, versus ~300
+            // retired pairs (~180 MB here) if the cache silently went back to a per-step reallocation.
+            let growths = capacity / MEM_BLOCK as usize;
+            let retired: usize = (1..growths)
+                .map(|g| 2 * g * MEM_BLOCK as usize * MEM_BYTES_PER_POS)
+                .sum();
+            assert!(
+                cache_growth <= retired + block_pair + slack,
+                "freed-buffer cache grew {cache_growth} B; retired pre-growth buffers total {retired} B"
+            );
+        })
     }
 
     #[test]
     fn export_copies_do_not_pin_the_block_buffer() {
-        let _cpu = CpuStream::enter();
-        // A stored prefix must not keep this cache's padded buffer alive: after `export`, the
-        // next in-place update still donates (no fresh block-sized allocation) and the exported
-        // tensors are unaffected by it.
-        let mut cache = ContiguousKvCache::with_block_tokens(1, MEM_BLOCK);
-        let inputs: Vec<(Array, Array)> = (0..6)
-            .map(|i| (mem_tok(i as f32), mem_tok(50.0 + i as f32)))
-            .collect();
-        for (k, v) in &inputs[..5] {
+        on_cpu(|| {
+            // A stored prefix must not keep this cache's padded buffer alive: after `export`, the
+            // next in-place update still donates (no fresh block-sized allocation) and the exported
+            // tensors are unaffected by it.
+            let mut cache = ContiguousKvCache::with_block_tokens(1, MEM_BLOCK);
+            let inputs: Vec<(Array, Array)> = (0..6)
+                .map(|i| (mem_tok(i as f32), mem_tok(50.0 + i as f32)))
+                .collect();
+            for (k, v) in &inputs[..5] {
+                let (ck, cv) = cache.update(0, k, v).unwrap();
+                mlx_rs::transforms::eval([&ck, &cv]).unwrap();
+            }
+            let exported = cache.export().unwrap().unwrap();
+            let (ek, ev) = &exported[0];
+            mlx_rs::transforms::eval([ek, ev]).unwrap();
+            assert_eq!(ek.shape(), &[1, MEM_HEADS, 5, MEM_HEAD_DIM]);
+            let before_k = host(ek);
+            let before_v = host(ev);
+
+            let active_base = memory::get_active_memory();
+            let (k, v) = &inputs[5];
             let (ck, cv) = cache.update(0, k, v).unwrap();
             mlx_rs::transforms::eval([&ck, &cv]).unwrap();
-        }
-        let exported = cache.export().unwrap().unwrap();
-        let (ek, ev) = &exported[0];
-        mlx_rs::transforms::eval([ek, ev]).unwrap();
-        assert_eq!(ek.shape(), &[1, MEM_HEADS, 5, MEM_HEAD_DIM]);
-        let before_k = host(ek);
-        let before_v = host(ev);
-
-        let active_base = memory::get_active_memory();
-        let (k, v) = &inputs[5];
-        let (ck, cv) = cache.update(0, k, v).unwrap();
-        mlx_rs::transforms::eval([&ck, &cv]).unwrap();
-        let growth = memory::get_active_memory().saturating_sub(active_base);
-        let block_pair = 2 * MEM_BLOCK as usize * MEM_BYTES_PER_POS;
-        assert!(
-            growth < block_pair / 2,
-            "update after export allocated {growth} B (a pinned buffer costs a whole block pair, \
-             {block_pair} B): the export is pinning the buffer"
-        );
-        assert_eq!(host(ek), before_k);
-        assert_eq!(host(ev), before_v);
-        assert_eq!(cache.offset(), 6);
+            let growth = memory::get_active_memory().saturating_sub(active_base);
+            let block_pair = 2 * MEM_BLOCK as usize * MEM_BYTES_PER_POS;
+            assert!(
+                growth < block_pair / 2,
+                "update after export allocated {growth} B (a pinned buffer costs a whole block pair, \
+                 {block_pair} B): the export is pinning the buffer"
+            );
+            assert_eq!(host(ek), before_k);
+            assert_eq!(host(ev), before_v);
+            assert_eq!(cache.offset(), 6);
+        })
     }
 }

@@ -360,10 +360,16 @@ pub(crate) mod route_override {
             }
             logits
         };
+        // Both halves run on the same explicit (task-local) GPU stream, so nothing ambient — a
+        // process-global default device another test switched, an enclosing stream scope — can put
+        // them on different devices and read the device difference as routing drift.
+        let stream = mlx_rs::Stream::gpu();
+        let on_stream =
+            |f: &dyn Fn() -> Vec<Vec<f32>>| mlx_rs::with_new_default_stream(stream.clone(), f);
         take_differing_calls();
-        let old_logits = with_pre_sc24442_routing(|| run(None));
+        let old_logits = on_stream(&|| with_pre_sc24442_routing(|| run(None)));
         let old_tokens: Vec<i32> = old_logits.iter().map(|l| argmax(l)).collect();
-        let new_logits = run(Some(&old_tokens));
+        let new_logits = on_stream(&|| run(Some(&old_tokens)));
         let mut seen = GreedyComparison {
             differing_calls: take_differing_calls(),
             ..Default::default()

@@ -34,7 +34,7 @@ use mlx_rs::Array;
 use core_llm::{PrefixReuse, PrefixStore};
 
 use crate::decode::cancel::CancelFlag;
-use crate::decode::engine::{LogitsScope, SpeculativeTarget};
+use crate::decode::engine::{LogitsScope, SpeculativeRun, SpeculativeTarget};
 use crate::decode::proposers::MtpBoundary;
 use crate::decode::stream::{
     decode_loop, default_seed, ConstraintMask, GenerationConfig, GenerationOutput, StreamEvent,
@@ -101,6 +101,10 @@ pub trait PrefixSnapshot: Clone + Sized {
     fn into_entry(self, mtp: Option<MtpBoundary>) -> PrefixEntry;
     /// Positions held.
     fn positions(&self) -> usize;
+    /// This cache cut back to its first `len` positions — the committed length a finished run
+    /// reports ([`SpeculativeRun::committed_cache_len`]). Only an [`PrefixReuse::AnyPrefix`] cache
+    /// can be cut; a recurrent state holding any other length is an error.
+    fn committed(self, len: usize) -> Result<Self>;
 }
 
 impl PrefixSnapshot for ContiguousKvCache {
@@ -125,6 +129,13 @@ impl PrefixSnapshot for ContiguousKvCache {
 
     fn positions(&self) -> usize {
         self.offset().max(0) as usize
+    }
+
+    fn committed(mut self, len: usize) -> Result<Self> {
+        if self.positions() > len {
+            self.truncate(len as i32)?;
+        }
+        Ok(self)
     }
 }
 
@@ -155,6 +166,17 @@ impl PrefixSnapshot for Qwen35Cache {
 
     fn positions(&self) -> usize {
         self.offset().max(0) as usize
+    }
+
+    fn committed(self, len: usize) -> Result<Self> {
+        if self.positions() == len {
+            Ok(self)
+        } else {
+            Err(Error::Msg(format!(
+                "prefix cache: a recurrent state cannot be cut from {} to {len} positions",
+                self.offset()
+            )))
+        }
     }
 }
 
@@ -288,6 +310,26 @@ impl PrefixCache {
                 }
             }
         }
+    }
+
+    /// [`store`](Self::store) the cache a finished engine `run` left, cut to the run's committed
+    /// length first: a pipelined run that ended with a discarded look-ahead (sc-24439) holds a row
+    /// past it, which an entry must never carry. A [`PrefixReuse::WholeEntry`] cache keeps only
+    /// the prefill's boundary snapshot, so the run's cache is not cut.
+    pub fn store_run<C: PrefixSnapshot>(
+        &mut self,
+        prompt: &[i32],
+        run: &SpeculativeRun,
+        cache: C,
+        boundary: Option<Boundary<C>>,
+        mtp: Option<MtpBoundary>,
+    ) -> Result<()> {
+        let cache = match C::REUSE {
+            PrefixReuse::AnyPrefix => cache.committed(run.committed_cache_len.max(0) as usize)?,
+            PrefixReuse::WholeEntry => cache,
+        };
+        self.store(prompt, &run.output.tokens, cache, boundary, mtp);
+        Ok(())
     }
 
     fn insert(&mut self, tokens: Vec<i32>, entry: PrefixEntry) {
@@ -738,7 +780,7 @@ mod engine_tests {
             EngineOptions::default(),
         )
         .unwrap();
-        pc.store(prompt, &run.output.tokens, cache, boundary, None);
+        pc.store_run(prompt, &run, cache, boundary, None).unwrap();
         (run, reused)
     }
 
@@ -778,6 +820,80 @@ mod engine_tests {
     /// AC2: the hybrid restores the recurrent state snapshotted at the boundary, prefills only
     /// past it, and matches a cold run. A third turn restores the same entry after the second
     /// turn's decode continued from it — the entry is an immutable snapshot.
+    /// A pipelined run that ends with a discarded look-ahead (sc-24439) stores exactly what the
+    /// unpipelined run stores — the committed length, never the look-ahead row — whether it ends
+    /// on a stop token (the look-ahead fed the unemitted stop token) or on the caller's stop
+    /// predicate (it fed the last emitted token).
+    #[test]
+    fn a_pipelined_run_stores_only_its_committed_length() {
+        use crate::decode::engine::Pipelining;
+        let model = causal();
+        let prompt = vec![3, 9, 4, 11, 3, 9, 4, 11, 5];
+        let free = cold(&model, &mut NoProposer, &prompt, 12);
+        let mut stopping = greedy(12);
+        stopping.stop_tokens = vec![free[6]];
+        let emitted = Cell::new(0usize);
+        let after_four = || emitted.get() >= 4;
+        type End<'a> = (&'a str, &'a GenerationConfig, Option<&'a dyn Fn() -> bool>);
+        let ends: [End<'_>; 2] = [
+            ("stop token", &stopping, None),
+            ("stop predicate", &greedy(12), Some(&after_four)),
+        ];
+        for (end, config, should_stop) in ends {
+            let mut stored = Vec::new();
+            for pipelining in [Pipelining::Off, Pipelining::Auto] {
+                emitted.set(0);
+                let mut pc = PrefixCache::with_budget(1 << 30);
+                let PrefixPrefill {
+                    mut cache, logits, ..
+                } = prefill_with_prefix(&model, &mut pc, &prompt, None, false, &CancelFlag::new())
+                    .unwrap();
+                let run = generate_speculative(
+                    &model,
+                    &mut NoProposer,
+                    SpeculativePrompt::Prefilled {
+                        cache: &mut cache,
+                        logits,
+                        hidden: None,
+                        history: &prompt,
+                        position_delta: 0,
+                    },
+                    config,
+                    0,
+                    &CancelFlag::new(),
+                    &mut |e| {
+                        if matches!(e, StreamEvent::Token { .. }) {
+                            emitted.set(emitted.get() + 1);
+                        }
+                    },
+                    EngineOptions {
+                        should_stop,
+                        pipelining,
+                        ..EngineOptions::default()
+                    },
+                )
+                .unwrap();
+                let discarded = run.stats.discarded;
+                pc.store_run(&prompt, &run, cache, None, None).unwrap();
+                // The positions the stored state holds (a key never reveals a row past itself).
+                let held = Cell::new(0usize);
+                pc.store.lookup(&[], |entry| {
+                    held.set(entry.positions());
+                    None
+                });
+                stored.push((pc.keys(), held.get(), discarded));
+            }
+            let (off, on) = (&stored[0], &stored[1]);
+            assert_eq!(
+                (off.2, on.2),
+                (0, 1),
+                "{end}: only the pipelined run discards"
+            );
+            assert_eq!(on.0, off.0, "{end}: stored key");
+            assert_eq!(on.1, off.1, "{end}: stored positions");
+        }
+    }
+
     #[test]
     fn a_qwen35_second_turn_restores_the_recurrent_state_at_the_boundary() {
         let model = qwen35(false);

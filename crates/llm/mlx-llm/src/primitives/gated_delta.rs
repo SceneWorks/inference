@@ -1682,26 +1682,36 @@ mod tests {
         });
     }
 
-    /// The route follows the stream ops are issued on: a task-local GPU stream runs the kernel on
-    /// that stream even when the process default device is the CPU (another test may have set it —
-    /// the default device is process-global).
+    /// The route follows the innermost task-local stream ops are issued on: a GPU scope nested in a
+    /// CPU scope runs the kernel on that GPU stream, and once it returns the enclosing CPU scope
+    /// takes the ops route again (`dispatch_routes_by_device_and_length_and_keeps_dtypes` covers a
+    /// CPU scope under the GPU default). Both scopes are task-local — never the process-global
+    /// default device: switching that races every parallel test in this binary (the sc-24439
+    /// greedy-parity flake), and a global CPU default under a task-local GPU stream has
+    /// livelocked MLX's stream threads, so that combination is not tested at all.
     #[test]
-    fn kernel_runs_on_the_task_local_gpu_stream_under_a_cpu_default_device() {
-        let _cpu_default = crate::primitives::kv_cache::testing::CpuStream::enter();
-        mlx_rs::with_new_default_stream(Stream::gpu(), || {
-            let x = inputs([1, 4, 2, 4, 32, 16], Dtype::Float32, 21);
-            let ((y, s), routes) = recording_routes(|| {
+    fn kernel_runs_on_the_task_local_gpu_stream_inside_a_cpu_scope() {
+        crate::primitives::kv_cache::testing::on_cpu(|| {
+            mlx_rs::with_new_default_stream(Stream::gpu(), || {
+                let x = inputs([1, 4, 2, 4, 32, 16], Dtype::Float32, 21);
+                let ((y, s), routes) = recording_routes(|| {
+                    gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap()
+                });
+                assert_eq!(routes, [Route::Kernel]);
+                let (y_ref, s_ref) = reference(&x, true);
+                let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+                assert!(ey.0 < 1e-5 && es.0 < 1e-5, "y {ey:?} state {es:?}");
+                // The public kernel entry point dispatches on the same task-local stream.
+                let (y, s) =
+                    gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+                let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+                assert!(ey.0 < 1e-5 && es.0 < 1e-5, "kernel y {ey:?} state {es:?}");
+            });
+            let x = inputs([1, 4, 2, 4, 32, 16], Dtype::Float32, 22);
+            let (_, routes) = recording_routes(|| {
                 gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap()
             });
-            assert_eq!(routes, [Route::Kernel]);
-            let (y_ref, s_ref) = reference(&x, true);
-            let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
-            assert!(ey.0 < 1e-5 && es.0 < 1e-5, "y {ey:?} state {es:?}");
-            // The public kernel entry point dispatches on the same task-local stream.
-            let (y, s) =
-                gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
-            let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
-            assert!(ey.0 < 1e-5 && es.0 < 1e-5, "kernel y {ey:?} state {es:?}");
+            assert_eq!(routes, [Route::Ops], "the enclosing CPU scope is restored");
         });
     }
 
