@@ -44,11 +44,33 @@ pub const DECODE_ATTENTION_SRC: KernelSource = KernelSource {
 pub const DECODE_ATTN_CHUNK: usize = 256;
 
 /// Threads per block of both passes (`DECODE_ATTN_THREADS` in the source).
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 const DECODE_ATTN_THREADS: u32 = 128;
 
 /// Widest key or value head the kernel serves (its per-block query row lives in shared memory).
 pub const DECODE_ATTN_MAX_HEAD_DIM: usize = 1024;
+
+/// Most query heads one partial block serves (`DECODE_ATTN_MAX_GROUP_TILE` in the source): the
+/// query heads sharing a KV head are split into tiles of at most this many, and each tile reads
+/// the KV head's chunk once.
+pub const DECODE_ATTN_MAX_GROUP_TILE: usize = 16;
+
+/// The shared memory a partial block may take without opting in to more (48 KiB, every device).
+const DECODE_ATTN_SHARED_LIMIT: usize = 48 * 1024;
+
+/// How many of the `groups` query heads sharing one KV head a partial block serves at key width
+/// `key_dim`: as many as fit [`DECODE_ATTN_MAX_GROUP_TILE`] and the block's shared memory — each
+/// head holds its query row and its chunk's scores there (`(tile·(dk + chunk) + threads)` f32).
+/// The result never depends on it (every head's reductions run in one fixed order, see
+/// `decode_attention.cu`); only how often a K/V chunk is read does. At least `1`.
+pub fn group_tile(groups: usize, key_dim: usize) -> usize {
+    let shared =
+        |tile: usize| (tile * (key_dim + DECODE_ATTN_CHUNK) + DECODE_ATTN_THREADS as usize) * 4;
+    let mut tile = groups.clamp(1, DECODE_ATTN_MAX_GROUP_TILE);
+    while tile > 1 && shared(tile) > DECODE_ATTN_SHARED_LIMIT {
+        tile -= 1;
+    }
+    tile
+}
 
 /// The attention policy of one call: the score scale, Gemma-2's optional score soft-cap
 /// (`c·tanh(s/c)`, applied after scaling) and an optional sliding window (a query sees at most
@@ -516,12 +538,21 @@ mod cuda_impl {
             .unwrap_or(0);
         let stream = dev.cuda_stream();
         let partial = function(&dev, &format!("decode_attn_partial_{suffix}"))?;
-        let shared = (plan.key_dim + DECODE_ATTN_CHUNK + DECODE_ATTN_THREADS as usize) * 4;
+        // One block per (chunk, KV head × tile of the query heads sharing it, batch·query).
+        let groups = plan.heads / plan.kv_heads;
+        let tile = group_tile(groups, plan.key_dim);
+        let tiles = groups.div_ceil(tile);
+        let shared = (tile * (plan.key_dim + DECODE_ATTN_CHUNK) + DECODE_ATTN_THREADS as usize) * 4;
         let cfg = LaunchConfig {
-            grid_dim: (plan.chunks as u32, plan.heads as u32, bm as u32),
+            grid_dim: (
+                plan.chunks as u32,
+                (plan.kv_heads * tiles) as u32,
+                bm as u32,
+            ),
             block_dim: (DECODE_ATTN_THREADS, 1, 1),
             shared_mem_bytes: shared as u32,
         };
+        let tile = tile as i32;
         let mut b = stream.launch_builder(&partial);
         b.arg(&q_slice)
             .arg(&k_slice)
@@ -537,7 +568,8 @@ mod cuda_impl {
             .arg(&scale)
             .arg(&softcap)
             .arg(&window)
-            .arg(&chunks);
+            .arg(&chunks)
+            .arg(&tile);
         // SAFETY: argument list matches `decode_attn_partial_*` in `decode_attention.cu`.
         unsafe { b.launch(cfg) }.map_err(drv)?;
         let combine = function(&dev, &format!("decode_attn_combine_{suffix}"))?;
@@ -936,6 +968,32 @@ mod tests {
         .is_err());
     }
 
+    /// The partial pass's head tile: the whole group up to 16 heads, fewer where the query rows
+    /// and scores would overflow 48 KiB of shared memory, never zero.
+    #[test]
+    fn group_tile_takes_the_whole_group_within_the_shared_memory() {
+        assert_eq!(group_tile(1, 128), 1);
+        assert_eq!(group_tile(4, 128), 4);
+        assert_eq!(group_tile(8, 128), 8);
+        assert_eq!(group_tile(16, 128), 16);
+        assert_eq!(group_tile(24, 128), 16, "tiled past the register bound");
+        assert_eq!(
+            group_tile(16, 512),
+            15,
+            "15 × (512 + 256) + 128 f32 fit 48 KiB"
+        );
+        assert_eq!(
+            group_tile(16, 1024),
+            9,
+            "9 × (1024 + 256) + 128 f32 fit 48 KiB"
+        );
+        assert_eq!(group_tile(0, 1024), 1);
+        for (groups, dk) in [(16, 1024), (16, 512), (8, 256)] {
+            let tile = group_tile(groups, dk);
+            assert!((tile * (dk + DECODE_ATTN_CHUNK) + 128) * 4 <= 48 * 1024);
+        }
+    }
+
     #[test]
     fn workspace_bytes_cover_every_chunk() {
         assert_eq!(
@@ -1073,6 +1131,44 @@ mod cuda_tests {
                         window: None,
                     },
                 ),
+                // GQA groups 1, 4 and 8 on one geometry (sc-24441: a partial block serves the
+                // query heads sharing a KV head).
+                (
+                    8,
+                    8,
+                    3,
+                    128,
+                    128,
+                    DecodeAttnSpec {
+                        scale: 0.088,
+                        softcap: None,
+                        window: None,
+                    },
+                ),
+                (
+                    8,
+                    2,
+                    3,
+                    128,
+                    128,
+                    DecodeAttnSpec {
+                        scale: 0.088,
+                        softcap: None,
+                        window: None,
+                    },
+                ),
+                (
+                    8,
+                    1,
+                    3,
+                    128,
+                    128,
+                    DecodeAttnSpec {
+                        scale: 0.088,
+                        softcap: None,
+                        window: None,
+                    },
+                ),
             ] {
                 let q = ramp(&[1, h, m, dk], 3, &dev, dtype);
                 let k = ramp(&[1, hkv, cap, dk], 5, &dev, dtype);
@@ -1097,6 +1193,53 @@ mod cuda_tests {
                             "{dtype:?} h={h} m={m} at={at} [{i}] {g} vs {w}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// sc-24441: a partial block serving a tile of the query heads that share a KV head runs
+    /// every head's reductions in the order a one-head block does, so a grouped launch is
+    /// bit-identical to launching each query head alone against its KV head — groups 1, 4, 8,
+    /// and 16 at the widest head (two tiles of 9 + 7), with a soft-cap and a sliding window.
+    #[test]
+    fn grouped_heads_are_bit_identical_to_one_head_per_launch() {
+        let Some(dev) = device() else { return };
+        let cap = 2 * DECODE_ATTN_CHUNK + 9;
+        for dtype in [DType::F32, DType::BF16] {
+            for (h, hkv, m, dk, dv, spec) in [
+                (4usize, 4usize, 2usize, 64usize, 64usize, None),
+                (8, 2, 3, 128, 128, Some(30.0)),
+                (8, 1, 1, 128, 96, None),
+                (16, 1, 2, 1024, 64, None),
+            ] {
+                let spec = DecodeAttnSpec {
+                    scale: 0.07,
+                    softcap: spec,
+                    window: Some(300),
+                };
+                let q = ramp(&[1, h, m, dk], 11, &dev, dtype);
+                let k = ramp(&[1, hkv, cap, dk], 13, &dev, dtype);
+                let v = ramp(&[1, hkv, cap, dv], 17, &dev, dtype);
+                for at in [0usize, DECODE_ATTN_CHUNK + 3, cap - m] {
+                    let s = Tensor::new(&[at as u32], &dev).unwrap();
+                    let grouped = host(&decode_attention(&q, &k, &v, &s, spec).unwrap());
+                    let groups = h / hkv;
+                    let mut alone = Vec::with_capacity(grouped.len());
+                    for head in 0..h {
+                        let one =
+                            |t: &Tensor, i: usize| t.narrow(1, i, 1).unwrap().contiguous().unwrap();
+                        let out = decode_attention(
+                            &one(&q, head),
+                            &one(&k, head / groups),
+                            &one(&v, head / groups),
+                            &s,
+                            spec,
+                        )
+                        .unwrap();
+                        alone.extend(host(&out));
+                    }
+                    assert_eq!(grouped, alone, "{dtype:?} h={h} hkv={hkv} at={at}");
                 }
             }
         }

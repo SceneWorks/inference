@@ -442,6 +442,29 @@ impl DecodeCache for StepKvCache {
         }
     }
 
+    /// The cache's own address folded with every static layer's K/V buffer addresses and the
+    /// staged [`DevicePositions`] buffers — everything a captured step reads or writes — so a
+    /// fresh cache moved into this one's place (a restored prefix) never replays a graph recorded
+    /// against the old buffers (sc-24441). Stable across steps and rollbacks: the static buffers
+    /// are written in place.
+    fn graph_identity(&self) -> usize {
+        use crate::primitives::decode_cache::fold_graph_identity;
+        let mut id = self as *const Self as usize;
+        if let Backing::Static(layers) = &self.backing {
+            id = fold_graph_identity(
+                id,
+                layers
+                    .iter()
+                    .flatten()
+                    .filter_map(|l| l.storage_addresses(0).ok()),
+            );
+        }
+        if let Some(Ok(positions)) = self.positions.as_ref().map(DevicePositions::addresses) {
+            id = fold_graph_identity(id, [positions]);
+        }
+        id
+    }
+
     /// Stage the next step's start and RoPE positions (length + delta) on the device.
     fn stage_positions(&mut self) -> Result<()> {
         match &self.positions {
@@ -665,6 +688,33 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(StepKvCache::growing(&l).with_device_positions().is_err());
+    }
+
+    /// sc-24441: the graph identity follows the buffers a captured step touches — stable across
+    /// steps and rollbacks, but a fresh static cache moved into the same place (fresh K/V) or
+    /// fresh position buffers read as a different identity, so the runner never replays a graph
+    /// into freed buffers.
+    #[test]
+    fn graph_identity_follows_the_kv_and_position_buffers() {
+        let l = layout();
+        let mut cache = StepKvCache::preallocated(&l, 16).unwrap();
+        feed(&mut cache, 3, 0.0);
+        let identity = cache.graph_identity();
+        feed(&mut cache, 1, 1.0);
+        cache.rollback_to(2).unwrap();
+        assert_eq!(identity, cache.graph_identity(), "stable");
+        // A fresh cache in the same place: only its static K/V buffers differ.
+        cache = StepKvCache::preallocated(&l, 16).unwrap();
+        assert_ne!(identity, cache.graph_identity(), "fresh K/V buffers");
+
+        let mut cache = StepKvCache::preallocated(&l, 16)
+            .unwrap()
+            .with_device_positions()
+            .unwrap();
+        let identity = cache.graph_identity();
+        // The same K/V buffers with fresh position buffers.
+        cache.positions = Some(DevicePositions::new(&Device::Cpu).unwrap());
+        assert_ne!(identity, cache.graph_identity(), "fresh position buffers");
     }
 
     /// The paged backing sits behind the same seam: exact rollback, memory as reserved slots.

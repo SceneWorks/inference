@@ -17,12 +17,16 @@
 //
 // COST CONTRACT. The partial kernel's grid covers the capacity, but a block whose chunk holds no
 // visible key (past the query's position, or before its sliding window) returns before touching
-// memory; the combine reads only the chunks that hold visible keys. Work follows the fill.
+// memory; the combine reads only the chunks that hold visible keys. Work follows the fill. A
+// partial block serves a tile of the query heads that share one KV head, so each K/V chunk is
+// read once per tile (once in all when the group fits a tile), not once per query head.
 
 typedef unsigned short bf16_t;
 
 #define DECODE_ATTN_CHUNK 256
 #define DECODE_ATTN_THREADS 128
+// Most query heads one partial block serves (its per-head accumulators live in registers).
+#define DECODE_ATTN_MAX_GROUP_TILE 16
 
 __device__ __forceinline__ float bf16_to_f32(bf16_t h) {
     return __uint_as_float(((unsigned int)h) << 16);
@@ -82,25 +86,39 @@ __device__ __forceinline__ float block_tree(float* red, float v, bool is_max) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Phase 1: one block per (chunk, query head, batch·query). Writes the chunk's partial softmax
-// state to `ws[(bm, h, c)] = [max, sum, acc[0..dv)]` (f32). Chunks with no visible key return
+// Phase 1: one block per (chunk, KV head x group tile, batch·query). A block serves `tile` query
+// heads that share one KV head (grouped-query attention: `groups = heads / kv_heads` query heads
+// per KV head, split into ceil(groups / tile) tiles), so each K/V row of the chunk is read from
+// memory once per tile rather than once per query head. Writes each head's partial softmax state
+// to `ws[(bm, h, c)] = [max, sum, acc[0..dv)]` (f32). Chunks with no visible key return
 // immediately and are never read by the combine.
 //
+// Every per-head reduction runs in exactly the order a one-head block would run it — the dot
+// product's lane-strided fma chain and xor-shuffle tree, the max / sum trees, the ascending-key
+// value fma chain — so the result is independent of the tile: bit-identical to a launch with one
+// query head per block.
+//
 // q:   [B, H, M, dk]        k: [B, Hkv, cap, dk]      v: [B, Hkv, cap, dv]   (all contiguous)
-// Dynamic shared memory: (dk + DECODE_ATTN_CHUNK + DECODE_ATTN_THREADS) floats.
+// Dynamic shared memory: (tile·dk + tile·DECODE_ATTN_CHUNK + DECODE_ATTN_THREADS) floats.
 // ---------------------------------------------------------------------------------------------
 template <typename T>
 __device__ void decode_attn_partial(const T* q, const T* k, const T* v,
                                     const unsigned int* start, float* ws, int heads,
                                     int kv_heads, int queries, int cap, int dk, int dv,
-                                    float scale, float softcap, int window, int n_chunks) {
+                                    float scale, float softcap, int window, int n_chunks,
+                                    int tile) {
     extern __shared__ float smem[];
-    float* q_s = smem;
-    float* s_s = smem + dk;
-    float* red = s_s + DECODE_ATTN_CHUNK;
+    float* q_s = smem;                            // [tile][dk]
+    float* s_s = smem + tile * dk;                // [tile][DECODE_ATTN_CHUNK]
+    float* red = s_s + tile * DECODE_ATTN_CHUNK;  // [DECODE_ATTN_THREADS]
 
+    const int groups = heads / kv_heads;
+    const int n_tiles = (groups + tile - 1) / tile;
     const int c = blockIdx.x;
-    const int h = blockIdx.y;
+    const int kvh = blockIdx.y / n_tiles;
+    const int g0 = (blockIdx.y % n_tiles) * tile;
+    const int gn = groups - g0 < tile ? groups - g0 : tile;  // query heads this block serves
+    const int h0 = kvh * groups + g0;       // the first of them
     const int bm = blockIdx.z;
     const int b = bm / queries;
     const int i = bm % queries;
@@ -114,10 +132,10 @@ __device__ void decode_attn_partial(const T* q, const T* k, const T* v,
     const int ks = k0 > lo ? k0 : lo;
     if (ks >= k1) return;  // no visible key in this chunk: never read by the combine
 
-    const int groups = heads / kv_heads;
-    const int kvh = h / groups;
-    const T* qrow = q + (((size_t)b * heads + h) * queries + i) * (size_t)dk;
-    for (int d = tid; d < dk; d += DECODE_ATTN_THREADS) q_s[d] = load_val(qrow, d);
+    for (int g = 0; g < gn; ++g) {
+        const T* qrow = q + (((size_t)b * heads + h0 + g) * queries + i) * (size_t)dk;
+        for (int d = tid; d < dk; d += DECODE_ATTN_THREADS) q_s[g * dk + d] = load_val(qrow, d);
+    }
     __syncthreads();
 
     const T* kbase = k + ((size_t)b * kv_heads + kvh) * (size_t)cap * dk;
@@ -127,42 +145,74 @@ __device__ void decode_attn_partial(const T* q, const T* k, const T* v,
     const int n_warps = DECODE_ATTN_THREADS / 32;
     for (int j = ks + warp; j < k1; j += n_warps) {
         const T* kr = kbase + (size_t)j * dk;
-        float acc = 0.0f;
-        for (int d = lane; d < dk; d += 32) acc = fmaf(q_s[d], load_val(kr, d), acc);
-        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
-        if (lane == 0) {
-            float s = acc * scale;
-            if (softcap > 0.0f) s = softcap * tanhf(s / softcap);
-            s_s[j - k0] = s;
+        float acc[DECODE_ATTN_MAX_GROUP_TILE];
+#pragma unroll
+        for (int g = 0; g < DECODE_ATTN_MAX_GROUP_TILE; ++g) acc[g] = 0.0f;
+        for (int d = lane; d < dk; d += 32) {
+            const float kd = load_val(kr, d);  // one read of the key serves every head
+#pragma unroll
+            for (int g = 0; g < DECODE_ATTN_MAX_GROUP_TILE; ++g) {
+                if (g < gn) acc[g] = fmaf(q_s[g * dk + d], kd, acc[g]);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < DECODE_ATTN_MAX_GROUP_TILE; ++g) {
+            if (g < gn) {  // `gn` is uniform across the block, so every lane shuffles
+                float a = acc[g];
+                for (int off = 16; off > 0; off >>= 1) a += __shfl_xor_sync(0xffffffffu, a, off);
+                if (lane == 0) {
+                    float s = a * scale;
+                    if (softcap > 0.0f) s = softcap * tanhf(s / softcap);
+                    s_s[g * DECODE_ATTN_CHUNK + (j - k0)] = s;
+                }
+            }
         }
     }
     __syncthreads();
 
-    // Max over the chunk's visible scores (two slots per thread, then the fixed tree).
     const int a0 = ks - k0;
     const int a1 = k1 - k0;
-    float m = neg_inf();
-    for (int t = a0 + tid; t < a1; t += DECODE_ATTN_THREADS) m = fmaxf(m, s_s[t]);
-    m = block_tree(red, m, true);
+    for (int g = 0; g < gn; ++g) {
+        float* sg = s_s + g * DECODE_ATTN_CHUNK;
+        // Max over the chunk's visible scores (strided per thread, then the fixed tree).
+        float m = neg_inf();
+        for (int t = a0 + tid; t < a1; t += DECODE_ATTN_THREADS) m = fmaxf(m, sg[t]);
+        m = block_tree(red, m, true);
 
-    // p_j = exp(s_j - m), written back in place; the chunk sum through the fixed tree.
-    float sum = 0.0f;
-    for (int t = a0 + tid; t < a1; t += DECODE_ATTN_THREADS) {
-        float p = expf(s_s[t] - m);
-        s_s[t] = p;
-        sum = __fadd_rn(sum, p);
+        // p_j = exp(s_j - m), written back in place; the chunk sum through the fixed tree.
+        float sum = 0.0f;
+        for (int t = a0 + tid; t < a1; t += DECODE_ATTN_THREADS) {
+            float p = expf(sg[t] - m);
+            sg[t] = p;
+            sum = __fadd_rn(sum, p);
+        }
+        sum = block_tree(red, sum, false);
+        if (tid == 0) {
+            float* w = ws + (((size_t)bm * heads + h0 + g) * n_chunks + c) * (size_t)(2 + dv);
+            w[0] = m;
+            w[1] = sum;
+        }
     }
-    sum = block_tree(red, sum, false);
+    __syncthreads();
 
-    float* w = ws + (((size_t)bm * heads + h) * n_chunks + c) * (size_t)(2 + dv);
     for (int d = tid; d < dv; d += DECODE_ATTN_THREADS) {
-        float a = 0.0f;
-        for (int j = ks; j < k1; ++j) a = fmaf(s_s[j - k0], load_val(vbase + (size_t)j * dv, d), a);
-        w[2 + d] = a;
-    }
-    if (tid == 0) {
-        w[0] = m;
-        w[1] = sum;
+        float a[DECODE_ATTN_MAX_GROUP_TILE];
+#pragma unroll
+        for (int g = 0; g < DECODE_ATTN_MAX_GROUP_TILE; ++g) a[g] = 0.0f;
+        for (int j = ks; j < k1; ++j) {
+            const float vd = load_val(vbase + (size_t)j * dv, d);  // one read serves every head
+#pragma unroll
+            for (int g = 0; g < DECODE_ATTN_MAX_GROUP_TILE; ++g) {
+                if (g < gn) a[g] = fmaf(s_s[g * DECODE_ATTN_CHUNK + (j - k0)], vd, a[g]);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < DECODE_ATTN_MAX_GROUP_TILE; ++g) {
+            if (g < gn) {
+                ws[(((size_t)bm * heads + h0 + g) * n_chunks + c) * (size_t)(2 + dv) + 2 + d] =
+                    a[g];
+            }
+        }
     }
 }
 
@@ -210,9 +260,9 @@ __device__ void decode_attn_combine(const float* ws, const unsigned int* start, 
     extern "C" __global__ void decode_attn_partial_##SUFFIX(                                     \
         const T* q, const T* k, const T* v, const unsigned int* start, float* ws, int heads,     \
         int kv_heads, int queries, int cap, int dk, int dv, float scale, float softcap,          \
-        int window, int n_chunks) {                                                              \
+        int window, int n_chunks, int tile) {                                                    \
         decode_attn_partial<T>(q, k, v, start, ws, heads, kv_heads, queries, cap, dk, dv, scale, \
-                               softcap, window, n_chunks);                                        \
+                               softcap, window, n_chunks, tile);                                  \
     }                                                                                            \
     extern "C" __global__ void decode_attn_combine_##SUFFIX(                                     \
         const float* ws, const unsigned int* start, T* out, int heads, int queries, int cap,     \

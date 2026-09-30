@@ -36,6 +36,58 @@ use candle_core::{DType, Device, Tensor};
 use crate::decode::graph::capturing;
 use crate::error::{Error, Result};
 use crate::primitives::rope::Rope;
+use crate::primitives::switch::{ProcessSwitch, SwitchGuard};
+
+/// Environment variable that sets whether decoders stage device positions: `1` / `on` / `true`
+/// / `yes` turns the path on for **every** device (the CPU runs the same logic through the
+/// reference kernel), anything else turns it off; unset leaves [`DEVICE_POSITIONS_DEFAULT`].
+pub const DEVICE_POSITIONS_ENV: &str = "CANDLE_LLM_DEVICE_POSITIONS";
+
+/// Whether a decoder built on a **CUDA** device stages device positions when nothing asks
+/// otherwise — the one place the default is set, read by both static-cache decoders' constructors
+/// ([`CausalLm`](crate::models::CausalLm), [`Qwen35Model`](crate::models::Qwen35Model); E8).
+/// On: the device-positions step is what makes a CUDA graph capturable, and it moves the eager
+/// CUDA cached decode / verify step onto the length-aware [`candle_quant_kernels::decode_attention()`]
+/// too, so graphs on and off are one arithmetic (E5). A CPU or Metal decoder keeps the host path
+/// unless a caller asks for the device path ([`DEVICE_POSITIONS_ENV`],
+/// [`set_device_positions_default`], or the model's own `set_device_positions`). Provisional: the
+/// epic's terminal campaign (sc-24446) measures the eager CUDA decode on both attentions and
+/// confirms this default or flips it.
+pub const DEVICE_POSITIONS_DEFAULT: bool = true;
+
+fn env_value_enables(v: &str) -> bool {
+    matches!(v, "1" | "on" | "true" | "yes")
+}
+
+/// The process device-positions switch, on the crate's one switch implementation.
+static SWITCH: ProcessSwitch = ProcessSwitch::new(
+    DEVICE_POSITIONS_ENV,
+    DEVICE_POSITIONS_DEFAULT,
+    env_value_enables,
+);
+
+/// Whether a decoder built now on `device` stages device positions: what was asked for
+/// explicitly — [`set_device_positions_default`], else [`DEVICE_POSITIONS_ENV`] — on any device;
+/// else [`DEVICE_POSITIONS_DEFAULT`] on a CUDA device and off elsewhere. The model still serves
+/// the path only where it can (`device_positions_support`).
+pub fn device_positions_default(device: &Device) -> bool {
+    SWITCH
+        .explicit()
+        .unwrap_or(DEVICE_POSITIONS_DEFAULT && device.is_cuda())
+}
+
+/// Override the device-positions default for the process: `Some(true)` / `Some(false)` force it
+/// on every device, `None` returns to the environment's setting (else the CUDA default).
+pub fn set_device_positions_default(enabled: Option<bool>) {
+    SWITCH.set(enabled);
+}
+
+/// Test seam: take the switch's lock, apply `enabled` (as [`set_device_positions_default`]) and
+/// hand back a guard that restores the previous policy when dropped.
+#[doc(hidden)]
+pub fn device_positions_policy_guard(enabled: Option<bool>) -> SwitchGuard {
+    SWITCH.guard(enabled)
+}
 
 /// The longest step the device-positions path serves: the graph runner's largest captured step
 /// ([`GraphRunner::MAX_CAPTURED_TOKENS`](crate::decode::GraphRunner::MAX_CAPTURED_TOKENS)). A
@@ -126,6 +178,16 @@ impl DevicePositions {
         )?;
         self.staged.set(Some(key));
         Ok(())
+    }
+
+    /// The storage addresses of the `(index, rope)` buffers
+    /// ([`storage_address`](crate::primitives::storage_address)): a captured graph reads them, so
+    /// a cache's [`graph_identity`](crate::primitives::DecodeCache::graph_identity) folds them in.
+    pub fn addresses(&self) -> Result<(usize, usize)> {
+        Ok((
+            crate::primitives::storage_address(&self.index)?,
+            crate::primitives::storage_address(&self.rope)?,
+        ))
     }
 
     /// The step start (`[1]` `u32`): the KV write row and the first query's position.
@@ -239,6 +301,45 @@ mod tests {
                         assert_eq!(host(&cos), host(&hc), "cos len={len} n={n}");
                         assert_eq!(host(&sin), host(&hs), "sin len={len} n={n}");
                     }
+                }
+            }
+        }
+    }
+
+    /// sc-24441 (E8): both static-cache decoders take their device-positions setting from the
+    /// one process default — asked for explicitly it applies on any device (the CPU here), and
+    /// unset it is on only for a CUDA device. The environment is read once per process, so each
+    /// explicit setting runs in a child process of its own.
+    #[test]
+    fn both_decoders_take_the_process_device_positions_default() {
+        const CHILD: &str = "CANDLE_LLM_DEVICE_POSITIONS_TEST_CHILD";
+        let settings = || {
+            let (weights, cfg) = crate::models::llama::tests::tiny_qwen3(32, true, &Device::Cpu);
+            let causal = crate::models::CausalLm::from_weights(&weights, "", cfg).unwrap();
+            let (_, hybrid) = crate::models::qwen35::tests::text_model();
+            (causal.device_positions(), hybrid.device_positions())
+        };
+        match std::env::var(CHILD).ok().as_deref() {
+            Some(expected) => {
+                let on = expected == "on";
+                assert_eq!(device_positions_default(&Device::Cpu), on);
+                assert_eq!(settings(), (on, on), "both constructors take the default");
+            }
+            None => {
+                let name = std::thread::current().name().unwrap().to_owned();
+                for (value, expected) in [("1", "on"), ("0", "off")] {
+                    let status = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", &name, "--nocapture"])
+                        .env(CHILD, expected)
+                        .env(DEVICE_POSITIONS_ENV, value)
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "{DEVICE_POSITIONS_ENV}={value}");
+                }
+                if std::env::var_os(DEVICE_POSITIONS_ENV).is_none() {
+                    let _guard = device_positions_policy_guard(None);
+                    assert!(!device_positions_default(&Device::Cpu), "unset: CUDA only");
+                    assert_eq!(settings(), (false, false));
                 }
             }
         }

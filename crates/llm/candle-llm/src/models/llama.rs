@@ -288,8 +288,10 @@ pub struct CausalLm {
     device_rope: DeviceRope,
     device_rope_full: Option<DeviceRope>,
     /// Whether a static step cache stages its positions on the device (sc-24441; see
-    /// [`CausalLm::set_device_positions`]). On by default on CUDA, where it is what makes the step
-    /// capturable as a CUDA graph; off on the CPU, where the host path serves.
+    /// [`CausalLm::set_device_positions`]). Built from the process default
+    /// ([`device_positions_default`](crate::primitives::device_positions_default)): on CUDA, where
+    /// it is what makes the step capturable as a CUDA graph; off on the CPU, where the host path
+    /// serves.
     device_positions: bool,
 }
 
@@ -744,7 +746,7 @@ impl CausalLm {
             .as_ref()
             .map(|r| DeviceRope::new(r, &device))
             .transpose()?;
-        let device_positions = device.is_cuda();
+        let device_positions = crate::primitives::device_positions_default(&device);
         Ok(Self {
             embed_tokens,
             layers,
@@ -918,7 +920,8 @@ impl CausalLm {
     /// RoPE tables built from device positions, the K/V written at a device-held index and
     /// attention through the length-aware [`candle_quant_kernels::decode_attention()`] — the path
     /// a CUDA graph can replay, and the one the eager static path runs too, so graphs on and off
-    /// are the same arithmetic. On by default on CUDA; on the CPU it is off by default (the host
+    /// are the same arithmetic. The process default ([`crate::primitives::DEVICE_POSITIONS_DEFAULT`])
+    /// turns it on on CUDA; on the CPU it is off by default (the host
     /// path serves) and can be switched on to exercise the same logic. Applies to caches built
     /// afterwards, and only when the model supports it ([`CausalLm::device_positions_support`]).
     pub fn set_device_positions(&mut self, on: bool) {
@@ -1002,7 +1005,7 @@ impl CausalLm {
     /// pre-migration arithmetic for a labelled comparison. The static cache attends un-expanded
     /// regardless.
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
-        self.attn_formulation = formulation;
+        self.attn_formulation = formulation.selector();
     }
 
     /// The selected formulation (what the reference paths request).
@@ -1025,11 +1028,26 @@ impl CausalLm {
     /// no sliding window (Gemma 4) and not MLA; a layer that cannot keeps the `repeat_kv` + `sdpa`
     /// arithmetic, and one such layer makes the request's label [`AttnFormulation::Expanded`].
     pub fn effective_attn_formulation(&self, requested: AttnFormulation) -> AttnFormulation {
-        match requested {
+        match requested.selector() {
             AttnFormulation::Gqa if self.layers.iter().all(|l| l.attn.gqa_expressible()) => {
                 AttnFormulation::Gqa
             }
             _ => AttnFormulation::Expanded,
+        }
+    }
+
+    /// What a request asking for `requested` reports (sc-24441):
+    /// [`AttnFormulation::DecodeAttention`] when its cached decode / verify steps attend with the
+    /// length-aware decode attention — the model's device positions are active and the request
+    /// attends un-expanded, the condition `run_decoder_stack_collecting` takes that attention on
+    /// (its prompt prefill still attends [`AttnFormulation::Gqa`]); else
+    /// [`effective_attn_formulation`](Self::effective_attn_formulation). The reference loop's
+    /// report reads this with the model's selector.
+    pub fn decode_attention_formulation(&self, requested: AttnFormulation) -> AttnFormulation {
+        if requested.selector() == AttnFormulation::Gqa && self.device_positions_active() {
+            AttnFormulation::DecodeAttention
+        } else {
+            self.effective_attn_formulation(requested)
         }
     }
 
@@ -1609,7 +1627,7 @@ impl CausalLm {
         // empty cache (a prompt prefill, a text encoder) keeps the reference attention.
         let decode_start = (!indexed
             && cache.offset() > 0
-            && formulation == AttnFormulation::Gqa
+            && formulation.selector() == AttnFormulation::Gqa
             && !additive_gqa
             && matches!(mask, AttnMask::Causal)
             && input_embeds.dim(1)? <= MAX_DEVICE_STEP_TOKENS
@@ -1826,10 +1844,17 @@ impl StepModel for CausalLm {
         }
     }
 
-    /// Un-expanded on a static cache where every layer can express it; otherwise the selector's
-    /// effective formulation (see [`CausalLm::effective_attn_formulation`]).
+    /// [`AttnFormulation::DecodeAttention`] when the request's cached steps attend with the
+    /// length-aware decode attention (sc-24441) — a cache that stages device positions, or an
+    /// un-expanded cache of a model whose device positions are active
+    /// ([`CausalLm::decode_attention_formulation`]); otherwise un-expanded on a static cache where
+    /// every layer can express it, else the selector's effective formulation (see
+    /// [`CausalLm::effective_attn_formulation`]).
     fn attn_formulation(&self, cache: &StepKvCache) -> AttnFormulation {
-        self.effective_attn_formulation(self.cache_formulation(cache))
+        if cache.device_positions().is_some() {
+            return AttnFormulation::DecodeAttention;
+        }
+        self.decode_attention_formulation(self.cache_formulation(cache))
     }
 
     /// Replayable as a CUDA graph (stories sc-24134, sc-24441) when every per-step position is
@@ -2534,7 +2559,7 @@ impl LlamaAttention {
         // otherwise the `repeat_kv` expansion through `sdpa`, the pre-migration arithmetic. An
         // additive mask joins the un-expanded path only on the opt-in `decode_logits_masked_gqa`
         // (a sliding layer's additive mask is `AdditiveSliding` here, so it never matches).
-        let out = match (state.formulation, mask) {
+        let out = match (state.formulation.selector(), mask) {
             (AttnFormulation::Gqa, AttnMask::Causal) if self.softcap.is_none() => {
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)?
             }
@@ -2878,6 +2903,45 @@ fn join(prefix: &str, suffix: &str) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// sc-24441: a request's record names the attention its cached steps ran — the length-aware
+    /// decode attention whenever the model's device positions are active (the static cache that
+    /// stages them, and an un-expanded growing cache alike), `gqa` / `expanded` otherwise.
+    #[test]
+    fn records_report_the_decode_attention_when_device_positions_run_it() {
+        use crate::decode::{generate_step, CancelFlag, GenerationConfig};
+        let (weights, cfg) = tiny_qwen3(64, true, &Device::Cpu);
+        let mut model = CausalLm::from_weights(&weights, "", cfg).unwrap();
+        let config = GenerationConfig {
+            max_new_tokens: 6,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let attention = |model: &CausalLm| {
+            let (_, record) = generate_step(
+                model,
+                &[1, 7, 3, 42, 9],
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            record.report(false).attention
+        };
+        assert!(!model.device_positions(), "off on the CPU by default");
+        assert_eq!(attention(&model), "gqa");
+        model.set_device_positions(true);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_step_kv_cache(KvCacheKind::Growing);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_attn_formulation(AttnFormulation::Expanded);
+        assert_eq!(
+            attention(&model),
+            "expanded",
+            "the expanded selector keeps sdpa"
+        );
+    }
 
     /// A tiny `Qwen3ForCausalLM` (the Qwen3-8B block shape: explicit head_dim, per-head q/k
     /// RMSNorm, GQA) with `vocab` rows, deterministic weights on `device` (sc-24140).

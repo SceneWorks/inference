@@ -37,8 +37,9 @@ pub use engine::{
     SpeculativeRun,
 };
 pub use graph::{
-    cuda_graphs_enabled, cuda_graphs_scope, graph_tally, graph_workspace_admission_bytes,
-    set_cuda_graphs, CudaGraphsScope, GraphRunner, GraphTally, GraphWorkspace, CUDA_GRAPHS_ENV,
+    cuda_graphs_enabled, cuda_graphs_scope, graph_param_cache_load_bytes, graph_tally,
+    graph_workspace_admission_bytes, set_cuda_graphs, CudaGraphsScope, GraphRunner, GraphTally,
+    GraphWorkspace, CUDA_GRAPHS_ENV, PARAM_CACHE_ADMISSION_BYTES,
 };
 pub use prefix::{generate_cached, PrefixCache, PrefixStats};
 pub use proposers::{DraftModelProposer, MtpProposer, NgramProposer};

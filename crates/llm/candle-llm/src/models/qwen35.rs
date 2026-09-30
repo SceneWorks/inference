@@ -539,13 +539,19 @@ impl Qwen35Attention {
         let out = match (cache, formulation) {
             // A short cached step of a model with device positions (sc-24441): the static
             // path's length-aware attention, over the growing concat — one arithmetic still.
-            (KvSlot::Growing(growing, Some(start)), AttnFormulation::Gqa) => {
+            (
+                KvSlot::Growing(growing, Some(start)),
+                AttnFormulation::Gqa | AttnFormulation::DecodeAttention,
+            ) => {
                 let (k_all, v_all) = growing.update(&k, &v)?;
                 decode(&q, &k_all, &v_all, start)?
             }
             // Reference path: growing concat, then the same grouped-query attention the static
             // path runs (the S4 decision: one attention arithmetic for both slots).
-            (KvSlot::Growing(growing, _), AttnFormulation::Gqa) => {
+            (
+                KvSlot::Growing(growing, _),
+                AttnFormulation::Gqa | AttnFormulation::DecodeAttention,
+            ) => {
                 let (k_all, v_all) = growing.update(&k, &v)?;
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
             }
@@ -1252,16 +1258,24 @@ impl DecodeCache for Qwen35Cache {
         Ok(())
     }
 
-    /// The cache's own address folded with every checkpoint ring's buffer addresses: a ring
-    /// reallocated by [`set_max_checkpoints`](Qwen35Cache::set_max_checkpoints) (a deeper
-    /// retention mid-request) moves the buffers a captured graph writes, so the identity changes
-    /// and the runner drops its graphs instead of replaying into freed memory (sc-24441).
+    /// The cache's own address folded with every buffer a captured step reads or writes: each
+    /// checkpoint ring, each static attention layer's K/V buffers and the staged
+    /// [`DevicePositions`]. A ring reallocated by
+    /// [`set_max_checkpoints`](Qwen35Cache::set_max_checkpoints) (a deeper retention mid-request)
+    /// or a fresh cache moved into this one's place (a restored prefix) holds different buffers,
+    /// so the identity changes and the runner drops its graphs instead of replaying into freed
+    /// memory (sc-24441).
     fn graph_identity(&self) -> usize {
+        use crate::primitives::decode_cache::fold_graph_identity;
         let mut id = self as *const Self as usize;
         if let Ok(rings) = self.recurrent_ring_addresses() {
-            for (conv, ssm) in rings {
-                id = id.rotate_left(7) ^ conv ^ ssm.rotate_left(13);
-            }
+            id = fold_graph_identity(id, rings);
+        }
+        if let Ok(kv) = self.static_kv_addresses() {
+            id = fold_graph_identity(id, kv);
+        }
+        if let Some(Ok(positions)) = self.positions.as_ref().map(DevicePositions::addresses) {
+            id = fold_graph_identity(id, [positions]);
         }
         id
     }
@@ -1336,7 +1350,9 @@ pub struct Qwen35Model {
     /// tables on the device-positions path (sc-24441).
     device_rope: DeviceRope,
     /// Whether a static cache stages its positions on the device (sc-24441; see
-    /// [`Qwen35Model::set_device_positions`]): on by default on CUDA, off on the CPU.
+    /// [`Qwen35Model::set_device_positions`]): built from the process default
+    /// ([`device_positions_default`](crate::primitives::device_positions_default)) — on CUDA, off
+    /// on the CPU.
     device_positions: bool,
 }
 
@@ -1669,7 +1685,7 @@ impl Qwen35Mtp {
     /// Select how the predictor layers attend (see [`Qwen35Model::set_attn_formulation`]); the
     /// head copies the target's selection when it is built.
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
-        self.attn_formulation = formulation;
+        self.attn_formulation = formulation.selector();
     }
 
     /// How the predictor layers attend.
@@ -2111,7 +2127,7 @@ impl Qwen35Model {
     /// target's formulation when it is built ([`Qwen35Mtp::set_attn_formulation`] changes it
     /// afterwards).
     pub fn set_attn_formulation(&mut self, formulation: AttnFormulation) {
-        self.attn_formulation = formulation;
+        self.attn_formulation = formulation.selector();
     }
 
     /// How the growing `AttnKv` slots attend.
@@ -2123,7 +2139,8 @@ impl Qwen35Model {
     /// from device positions, the full-attention K/V written at a device-held index and attended
     /// by the length-aware [`candle_quant_kernels::decode_attention()`], the DeltaNet checkpoint
     /// ring indexed on the device — the path a CUDA graph can replay, and the one the eager static
-    /// path runs too, so graphs on and off are the same arithmetic. On by default on CUDA; off by
+    /// path runs too, so graphs on and off are the same arithmetic. The process default
+    /// ([`crate::primitives::DEVICE_POSITIONS_DEFAULT`]) turns it on on CUDA; off by
     /// default on the CPU (the host path serves), where it can be switched on to exercise the same
     /// logic. Applies to caches built afterwards, and only when the model supports it
     /// ([`Qwen35Model::device_positions_support`]).
@@ -2151,6 +2168,20 @@ impl Qwen35Model {
             return Err("decode_attention_unavailable");
         }
         Ok(())
+    }
+
+    /// What a request asking for `requested` reports (sc-24441):
+    /// [`AttnFormulation::DecodeAttention`] when its cached decode / verify steps attend with the
+    /// length-aware decode attention — the model's device positions are active and `requested`
+    /// is un-expanded, the condition the model's `decode_start` takes it on under (the prompt
+    /// prefill still attends [`AttnFormulation::Gqa`]); else `requested`. The reference loop's
+    /// report reads this with the model's selector.
+    pub fn decode_attention_formulation(&self, requested: AttnFormulation) -> AttnFormulation {
+        if requested.selector() == AttnFormulation::Gqa && self.device_positions_active() {
+            AttnFormulation::DecodeAttention
+        } else {
+            requested
+        }
     }
 
     /// Whether a static cache built now stages device positions (the setting, and the model
@@ -2767,7 +2798,7 @@ impl Qwen35Model {
 
         let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
         let device_rope = DeviceRope::new(&rope, &device)?;
-        let device_positions = device.is_cuda();
+        let device_positions = crate::primitives::device_positions_default(&device);
         Ok(Self {
             embed_tokens,
             layers,
@@ -2868,12 +2899,18 @@ impl StepModel for Qwen35Model {
         Ok(cache)
     }
 
-    /// The static cache always attends un-expanded ([`AttnFormulation::Gqa`]); a growing cache
-    /// runs the model's selector.
+    /// [`AttnFormulation::DecodeAttention`] when the request's cached steps attend with the
+    /// length-aware decode attention (sc-24441): a cache that stages device positions, or — the
+    /// condition the model's `decode_start` takes it on under — a model whose device
+    /// positions are active with the un-expanded selector. Otherwise the static cache attends
+    /// un-expanded ([`AttnFormulation::Gqa`]) and a growing cache runs the model's selector.
     fn attn_formulation(&self, cache: &Qwen35Cache) -> AttnFormulation {
+        if cache.device_positions().is_some() {
+            return AttnFormulation::DecodeAttention;
+        }
         match cache.kv_kind() {
-            KvCacheKind::Static => AttnFormulation::Gqa,
-            KvCacheKind::Growing => self.attn_formulation,
+            KvCacheKind::Static => self.decode_attention_formulation(AttnFormulation::Gqa),
+            KvCacheKind::Growing => self.decode_attention_formulation(self.attn_formulation),
         }
     }
 
@@ -5191,6 +5228,79 @@ pub(crate) mod tests {
         cache.reset();
         assert_eq!(cache.len(), 0);
         assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
+    }
+
+    /// sc-24441: a request's record names the attention its cached steps ran — the length-aware
+    /// decode attention whenever the model's device positions are active (the static cache that
+    /// stages them, and an un-expanded growing cache alike), `gqa` / `expanded` otherwise.
+    #[test]
+    fn records_report_the_decode_attention_when_device_positions_run_it() {
+        use crate::decode::{generate_step, CancelFlag, GenerationConfig};
+        let (_cfg, mut model) = text_model();
+        let config = GenerationConfig {
+            max_new_tokens: 6,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let attention = |model: &Qwen35Model| {
+            let (_, record) = generate_step(
+                model,
+                &[1, 7, 3, 42, 9],
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            record.report(false).attention
+        };
+        assert!(!model.device_positions(), "off on the CPU by default");
+        assert_eq!(attention(&model), "gqa");
+        model.set_device_positions(true);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_step_kv_cache(KvCacheKind::Growing);
+        assert_eq!(attention(&model), "decode_attention");
+        model.set_attn_formulation(AttnFormulation::Expanded);
+        assert_eq!(
+            attention(&model),
+            "expanded",
+            "the expanded selector keeps sdpa"
+        );
+    }
+
+    /// sc-24441: a cache's graph identity follows the device buffers a captured step touches,
+    /// not only its host address — stable across steps, but a fresh cache moved into the same
+    /// place (fresh static K/V; fresh device positions) reads as a different identity, so the
+    /// runner never replays a graph into freed buffers. The attention-only decoder has no
+    /// checkpoint ring, so the K/V and position buffers are all that can move the identity.
+    #[test]
+    fn graph_identity_follows_the_kv_and_position_buffers() {
+        let (_cfg, mut model) = text_model_attention_only_on(&Device::Cpu);
+        let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert!(cache.device_positions().is_none());
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        let identity = DecodeCache::graph_identity(&cache);
+        model
+            .forward_step(&mut cache, StepRequest::last(&[5]))
+            .unwrap();
+        assert_eq!(identity, DecodeCache::graph_identity(&cache), "stable");
+        // A fresh cache in the same place: only its static K/V buffers differ.
+        cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        let fresh = DecodeCache::graph_identity(&cache);
+        assert_ne!(identity, fresh, "fresh K/V buffers");
+
+        model.set_device_positions(true);
+        let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        let identity = DecodeCache::graph_identity(&cache);
+        // The same K/V buffers with fresh position buffers.
+        cache.positions = Some(DevicePositions::new(&Device::Cpu).unwrap());
+        assert_ne!(
+            identity,
+            DecodeCache::graph_identity(&cache),
+            "fresh position buffers"
+        );
     }
 
     /// sc-24134 after sc-24131 and sc-24441: the CUDA-graph declarations. A linear layer that

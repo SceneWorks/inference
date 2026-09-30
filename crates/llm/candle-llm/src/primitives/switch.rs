@@ -38,7 +38,8 @@ pub struct ProcessSwitch {
     unset: bool,
     parse: fn(&str) -> bool,
     policy: AtomicU8,
-    from_env: OnceLock<bool>,
+    /// The environment's setting, read once: `None` when the variable is unset.
+    from_env: OnceLock<Option<bool>>,
     lock: ThreadLock,
 }
 
@@ -72,10 +73,28 @@ impl ProcessSwitch {
 
     /// The environment's setting, read once per process.
     fn env_enabled(&self) -> bool {
-        *self.from_env.get_or_init(|| match std::env::var(self.env) {
-            Ok(v) => (self.parse)(&v.trim().to_ascii_lowercase()),
-            Err(_) => self.unset,
+        self.env_setting().unwrap_or(self.unset)
+    }
+
+    /// The variable's parsed value, read once per process; `None` when it is unset.
+    fn env_setting(&self) -> Option<bool> {
+        *self.from_env.get_or_init(|| {
+            std::env::var(self.env)
+                .ok()
+                .map(|v| (self.parse)(&v.trim().to_ascii_lowercase()))
         })
+    }
+
+    /// What was **asked for** explicitly: the runtime override if one is set, else the
+    /// environment variable's value if it is set, else `None` (the switch is at its default). A
+    /// switch whose default depends on more than a bool (the device-positions default is "on
+    /// CUDA") reads this, and applies its own default on `None`.
+    pub fn explicit(&self) -> Option<bool> {
+        match self.policy.load(Ordering::Relaxed) {
+            POLICY_ON => Some(true),
+            POLICY_OFF => Some(false),
+            _ => self.env_setting(),
+        }
     }
 
     /// Override the switch for the process: `Some(true)` / `Some(false)` force it, `None` returns
@@ -316,6 +335,29 @@ mod tests {
         );
         std::env::remove_var(READ_ONCE.env());
         assert!(READ_ONCE.enabled());
+    }
+
+    /// sc-24441: `explicit` is what was asked for — the override, else a set variable — and
+    /// `None` at the default, whatever the default is.
+    #[test]
+    fn explicit_is_the_override_else_a_set_variable_else_none() {
+        static EXPLICIT_SET: ProcessSwitch =
+            ProcessSwitch::new("CANDLE_LLM_TEST_SWITCH_EXPLICIT_SET", true, on_words);
+        let guard = DEFAULT_ON.guard(None);
+        assert!(DEFAULT_ON.enabled());
+        assert_eq!(DEFAULT_ON.explicit(), None, "unset: at its default");
+        DEFAULT_ON.set(Some(true));
+        assert_eq!(DEFAULT_ON.explicit(), Some(true));
+        DEFAULT_ON.set(Some(false));
+        assert_eq!(DEFAULT_ON.explicit(), Some(false));
+        drop(guard);
+        let _set = EXPLICIT_SET.guard(None);
+        std::env::set_var(EXPLICIT_SET.env(), "0");
+        assert_eq!(EXPLICIT_SET.explicit(), Some(false), "a set variable");
+        assert!(!EXPLICIT_SET.enabled());
+        EXPLICIT_SET.set(Some(true));
+        assert_eq!(EXPLICIT_SET.explicit(), Some(true), "the override wins");
+        std::env::remove_var(EXPLICIT_SET.env());
     }
 
     /// sc-24140 feature-end review: the lock is re-entrant on the thread that holds it — a

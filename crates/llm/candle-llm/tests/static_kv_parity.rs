@@ -111,7 +111,13 @@ fn ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv() {
     );
     assert_eq!(record.path, DecodePath::StepModel);
     assert_eq!(record.kv_cache, KvCacheKind::Static);
-    assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
+    // Device positions (the CUDA default) put the cached steps on the decode attention.
+    let attention = if model.device_positions_active() {
+        AttnFormulation::DecodeAttention
+    } else {
+        AttnFormulation::Gqa
+    };
+    assert_eq!(record.attn_formulation, attention);
     assert_eq!(record.generated_tokens, FIXTURE_TOKENS as u64);
     assert_eq!(record.target_forwards, FIXTURE_TOKENS as u64);
     assert_eq!(
@@ -133,7 +139,7 @@ fn ac1_static_kv_greedy_fixture_is_token_identical_to_attn_kv() {
     )
     .unwrap();
     assert_eq!(record.kv_cache, KvCacheKind::Growing);
-    assert_eq!(record.attn_formulation, AttnFormulation::Gqa);
+    assert_eq!(record.attn_formulation, attention);
     assert_eq!(
         growing.tokens,
         reference.tokens,
@@ -436,10 +442,16 @@ fn provider_off_path_is_token_identical_to_the_reference_loop() {
         (out, events, record, secs)
     };
 
+    // Device positions (the CUDA default) put both loops' cached steps on the decode attention.
+    let attention = if candle_llm::primitives::device_positions_default(&select_device().unwrap()) {
+        AttnFormulation::DecodeAttention
+    } else {
+        AttnFormulation::Gqa
+    };
     let (engine, engine_events, engine_record, engine_secs) = run(&provider);
     assert_eq!(engine_record.path, DecodePath::StepModel, "the engine ran");
     assert_eq!(engine_record.kv_cache, KvCacheKind::Static);
-    assert_eq!(engine_record.attn_formulation, AttnFormulation::Gqa);
+    assert_eq!(engine_record.attn_formulation, attention);
     assert_eq!(engine_record.proposer, core_llm::ProposerKind::None);
 
     provider
@@ -448,7 +460,7 @@ fn provider_off_path_is_token_identical_to_the_reference_loop() {
     let (reference, reference_events, reference_record, reference_secs) = run(&provider);
     assert_eq!(reference_record.path, DecodePath::Reference);
     assert_eq!(reference_record.kv_cache, KvCacheKind::Growing);
-    assert_eq!(reference_record.attn_formulation, AttnFormulation::Gqa);
+    assert_eq!(reference_record.attn_formulation, attention);
 
     let ids = |events: &[Event]| events.iter().map(|e| e.0 as i32).collect::<Vec<i32>>();
     let divergence = first_divergence(&ids(&reference_events), &ids(&engine_events));

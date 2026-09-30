@@ -130,7 +130,8 @@ pub struct DecodeReport {
     pub sampler: String,
     /// The KV cache implementation (`growing`, `static`).
     pub kv_cache: String,
-    /// How attention was computed (`gqa`, `expanded`).
+    /// How attention was computed (`gqa`, `expanded`; `decode_attention` when a Candle request's
+    /// cached steps ran the length-aware decode attention, sc-24441).
     pub attention: String,
     /// The CUDA-graph runner's part.
     pub cuda_graphs: CudaGraphsReport,

@@ -113,6 +113,13 @@ pub enum AttnFormulation {
     /// a labelled comparison row against the sealed pre-epic baseline (it reproduces that
     /// baseline's bits); it materializes the expansion every step, so it is never the fast path.
     Expanded,
+    /// The length-aware [`candle_quant_kernels::decode_attention()`] over the cache (sc-24441):
+    /// what a request's cached decode / verify steps ran when its decoder stages device positions
+    /// (the CUDA default, [`DEVICE_POSITIONS_DEFAULT`](crate::primitives::DEVICE_POSITIONS_DEFAULT)).
+    /// Its prompt prefill still attends [`AttnFormulation::Gqa`]. A **report** label: as a
+    /// selector it is [`AttnFormulation::Gqa`] ([`AttnFormulation::selector`]) — which cached
+    /// steps run the decode attention is the device-positions setting's call, not the selector's.
+    DecodeAttention,
 }
 
 impl AttnFormulation {
@@ -121,6 +128,17 @@ impl AttnFormulation {
         match self {
             AttnFormulation::Gqa => "gqa",
             AttnFormulation::Expanded => "expanded",
+            AttnFormulation::DecodeAttention => "decode_attention",
+        }
+    }
+
+    /// The arithmetic selector this names: [`AttnFormulation::DecodeAttention`] (a report label)
+    /// selects [`AttnFormulation::Gqa`]; the others select themselves. Every model's
+    /// `set_attn_formulation` stores this, so a selector field never holds the report label.
+    pub fn selector(self) -> AttnFormulation {
+        match self {
+            AttnFormulation::DecodeAttention => AttnFormulation::Gqa,
+            other => other,
         }
     }
 }

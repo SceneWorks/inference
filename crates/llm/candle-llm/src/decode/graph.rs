@@ -450,9 +450,9 @@ impl GraphWorkspace {
 /// step's attention is the length-aware decode attention, whose partial-softmax workspace is sized
 /// to the cache capacity — `(head_dim + 2)` f32 per query head and key chunk
 /// ([`candle_quant_kernels::decode_attention_workspace_bytes`]) — so that is priced per token-row
-/// too; and each captured shape may add parameter vectors to the vendored candle's per-device
-/// parameter cache, which lives for the process: that is priced as a fixed
-/// [`PARAM_CACHE_ADMISSION_BYTES`] per shape. The speculative engine can present
+/// too. (The vendored candle's parameter cache the captures fill is **not** a request's: it
+/// outlives every request and the model itself, so a load prices it once —
+/// [`graph_param_cache_load_bytes`].) The speculative engine can present
 /// `max_step_tokens` token counts (`1 ..= K + 1`: the verify and every replay length) in two logits
 /// scopes each, so every one is priced. `None` on overflow (the caller fails closed).
 pub fn graph_workspace_admission_bytes(
@@ -492,22 +492,36 @@ pub fn graph_workspace_admission_bytes(
     // Σ_{M=1}^{N} M = N (N + 1) / 2 token-rows, in two scopes.
     let n = u64::from(max_step_tokens);
     let rows = n.checked_mul(n.checked_add(1)?)? / 2;
-    let shapes = n.checked_mul(2)?;
-    per_token
-        .checked_mul(rows)?
-        .checked_mul(2)?
-        .checked_add(shapes.checked_mul(PARAM_CACHE_ADMISSION_BYTES)?)
+    per_token.checked_mul(rows)?.checked_mul(2)
 }
 
-/// What admission charges per captured step shape for the vendored candle's CUDA parameter cache
-/// (sc-24441, E7): the `[dims, strides]` vectors of every distinct layout a shape's step uses are
-/// uploaded once, under the runner's guard, into small device buffers that live for the process.
-/// A decoder step has a few hundred distinct layouts at most (they repeat across layers — the
-/// cache is keyed by value), each a few dozen bytes in a stream-ordered-pool allocation; 1 MiB per
-/// shape covers ~2000 such entries at a 512-byte allocation granularity. The small-upload content
-/// cache the same guard enables (positions, token ids: at most 4 KiB each, a handful per warm-up)
-/// fits in the same allowance.
+/// What a load charges per step shape its graph runner may capture for the vendored candle's
+/// CUDA parameter cache (sc-24441, E7): the `[dims, strides]` vectors of every distinct layout a
+/// shape's step uses are uploaded once, under the runner's guard, into small device buffers. A
+/// decoder step has a few hundred distinct layouts at most (they repeat across layers — the cache
+/// is keyed by value), each a few dozen bytes in a stream-ordered-pool allocation; 1 MiB per shape
+/// covers ~2000 such entries at a 512-byte allocation granularity, which also absorbs the layout
+/// variants of different verify depths. The small-upload content cache the same guard enables
+/// (positions, token ids: at most 4 KiB each, a handful per warm-up) fits in the same allowance.
+///
+/// **Resident for the process.** The cache is a process-global map keyed by the candle device
+/// (`CUDA_PARAM_CACHE` in the vendored `cuda_backend/mod.rs`) with no eviction and no public way
+/// to clear it: every entry holds its device buffer — and through it the load's CUDA stream — past
+/// the model's unload, and each load opens a new device, so a later load of the same model does
+/// not reuse the earlier one's entries. It is therefore priced **per load**
+/// ([`graph_param_cache_load_bytes`]), never per request; what earlier loads left behind is
+/// already in use when a later load or request reads the device's free memory. See the vendored
+/// crate's `VENDORED.md`.
 pub const PARAM_CACHE_ADMISSION_BYTES: u64 = 1 << 20;
+
+/// Device bytes a load whose decoder the graph runner wraps leaves resident in the vendored
+/// candle's parameter cache (sc-24441, E7): [`PARAM_CACHE_ADMISSION_BYTES`] for every step shape
+/// the runner can capture — each token count up to
+/// [`MAX_DEVICE_STEP_TOKENS`](crate::primitives::MAX_DEVICE_STEP_TOKENS) (the runner's
+/// [`GraphRunner::MAX_CAPTURED_TOKENS`]) in both logits scopes.
+pub fn graph_param_cache_load_bytes() -> u64 {
+    crate::primitives::MAX_DEVICE_STEP_TOKENS as u64 * 2 * PARAM_CACHE_ADMISSION_BYTES
+}
 
 /// What a captured graph is made of — the node census the runner takes before instantiating it,
 /// and the record behind the POC findings (a real decoder step's census is in the evidence).
@@ -1841,6 +1855,14 @@ mod tests {
         );
     }
 
+    /// sc-24441 (E7): a load under the graph runner prices the parameter cache its captures
+    /// leave resident — 1 MiB for each of the 16 token counts in both logits scopes.
+    #[test]
+    fn a_load_prices_the_parameter_cache_its_captures_leave_resident() {
+        assert_eq!(PARAM_CACHE_ADMISSION_BYTES, 1 << 20);
+        assert_eq!(graph_param_cache_load_bytes(), 32 << 20);
+    }
+
     #[test]
     fn graph_admission_prices_every_step_shape_of_a_request() {
         let geometry = core_llm::LlmMemoryGeometry {
@@ -1860,16 +1882,21 @@ mod tests {
             4 * 100u64.div_ceil(candle_quant_kernels::DECODE_ATTN_CHUNK as u64) * (8 + 2) * 4;
         let per_token =
             (3 * 64 + 8 * 32 + 50) * 4 + 4 * 100 * 4 * 3 + decode_attention + 4 + (50 + 32) * 4;
-        // A decode-only request (one 1-token shape, two scopes), plus the parameter-cache
-        // allowance per shape.
+        assert_eq!(
+            decode_attention, 160,
+            "the decode attention's workspace, literally"
+        );
+        assert_eq!(per_token, 7_284, "one token-row, literally");
+        // A decode-only request (one 1-token shape, two scopes). The parameter cache is a load's,
+        // not a request's (`graph_param_cache_load_bytes`).
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 1),
-            Some(2 * per_token + 2 * PARAM_CACHE_ADMISSION_BYTES)
+            Some(2 * 7_284)
         );
-        // K = 3: token counts 1..=4 → 10 token-rows and 4 shapes per scope.
+        // K = 3: token counts 1..=4 → 10 token-rows per scope.
         assert_eq!(
             graph_workspace_admission_bytes(&geometry, 100, 4),
-            Some(2 * 10 * per_token + 8 * PARAM_CACHE_ADMISSION_BYTES)
+            Some(2 * 10 * 7_284)
         );
         assert_eq!(graph_workspace_admission_bytes(&geometry, 100, 0), Some(0));
         let huge = core_llm::LlmMemoryGeometry {

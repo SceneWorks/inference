@@ -80,6 +80,30 @@ existing candle-llm / candle-gen / candle-audio CUDA suites run unchanged agains
 `candle-llm`'s `cuda_graphs` suite checks the layout-bearing ops bit for bit with and without the
 guard.
 
+## The parameter cache lives for the process
+
+`f53ed3bf`'s cache (`CUDA_PARAM_CACHE`, `src/cuda_backend/mod.rs`) is a process-global
+`HashMap<(DeviceId, Vec<usize>), Arc<CudaSlice<usize>>>` with **no eviction and no public way to
+clear it** — neither cherry-pick exposes one, and this vendor adds none (it stays byte-for-byte
+upstream). Consequences a consumer must know:
+
+* Every entry keeps its small device buffer — and, through the `CudaSlice`, the CUDA stream it
+  was allocated on — alive until the process exits, including after the model whose captures
+  created it is unloaded.
+* `DeviceId` is per `CudaDevice` instance, and `candle-llm` opens a new device at every load, so a
+  reload of the same model adds its own entries rather than reusing the earlier load's.
+* Entries are added only under the graph runner's guard (warm-up and capture), keyed by the value
+  of a layout's `[dims, strides]`: a decoder step has a few hundred distinct layouts at most.
+
+`candle-llm` therefore prices it **per load**, not per request: a CUDA load the graph runner wraps
+admits `graph_param_cache_load_bytes()` (`PARAM_CACHE_ADMISSION_BYTES` = 1 MiB for each of the
+16 capturable step token counts in both logits scopes = 32 MiB) on top of its device bound
+(`LoadMemoryEstimate::graph_param_cache_bytes`), and what earlier loads left behind is already in
+use when a later load or request reads the device's free memory. A process that loads and unloads
+graph-captured models many times accumulates up to that allowance per load; restarting the
+worker process is what reclaims it. Upstream eviction (or a clear API) would let the provider free
+a load's entries at unload — revisit when the candle pin is next bumped.
+
 ## Consumers
 
 **A `[patch]` only takes effect in the top-level workspace.** Any consumer that builds these
