@@ -1198,7 +1198,7 @@ impl Yue2Engine {
             &wav_f32_bytes(audio.samples(), SAMPLE_RATE, AUDIO_CHANNELS as u16),
         )?;
         let keys = self.identity_keys();
-        let decode_identity = identity_of(&json!([
+        let mut decode_keys = json!([
             IDENTITY_SCHEMA,
             "decode",
             latents.identity().sha256,
@@ -1207,7 +1207,14 @@ impl Yue2Engine {
             keys.runtime,
             // Not the tiling: it changes no sample (a memory control; the decoder metadata in
             // result.json records it).
-        ]));
+        ]);
+        if keys.vae_dtype != candle_audio::candle_core::DType::F32 {
+            decode_keys
+                .as_array_mut()
+                .expect("decode keys are an array")
+                .push(json!("bfloat16"));
+        }
+        let decode_identity = identity_of(&decode_keys);
         stage_ids.insert("decode".into(), stage_entry(&decode_identity, false));
 
         let request = plan.request();
@@ -1497,7 +1504,21 @@ impl Yue2Engine {
             },
         );
         let mut config = source_config.as_object().cloned().unwrap_or_default();
+        // This is a NEW decode under the currently selected VAE policy. The historical source
+        // configuration remains byte-for-byte in source_generation.json below; config.json names
+        // the loaded target policy and model dtype, even when the input latents came from Legacy.
         for key in [
+            "compute_policy",
+            "effective_stage_dtypes",
+            "fp32_numerical_internals",
+        ] {
+            config.remove(key);
+            if let Some(value) = current.get(key) {
+                config.insert(key.into(), value.clone());
+            }
+        }
+        for key in [
+            "model_dtype",
             "vae_dtype",
             "vae_decode",
             "vae_core_frames",

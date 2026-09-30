@@ -469,6 +469,33 @@ fn forward_all(layers: &[Layer], x: &Tensor) -> candle_core::Result<Tensor> {
     Ok(x)
 }
 
+/// Normalize the published FP32 weight-norm pairs first, then materialize every resident
+/// decoder/encoder parameter in the selected stage dtype. The source checkpoint is never mutated.
+fn cast_layers(layers: Vec<Layer>, dtype: DType) -> Result<Vec<Layer>> {
+    layers
+        .into_iter()
+        .map(|layer| {
+            Ok(match layer {
+                Layer::Snake(s) => Layer::Snake(SnakeBeta {
+                    alpha: s.alpha.to_dtype(dtype)?,
+                    inv_beta: s.inv_beta.to_dtype(dtype)?,
+                }),
+                Layer::Conv(c) => Layer::Conv(Conv {
+                    weight: c.weight.to_dtype(dtype)?,
+                    bias: c.bias.map(|b| b.to_dtype(dtype)).transpose()?,
+                    ..c
+                }),
+                Layer::ConvT(c) => Layer::ConvT(ConvT {
+                    weight: c.weight.to_dtype(dtype)?,
+                    bias: c.bias.to_dtype(dtype)?,
+                    ..c
+                }),
+                Layer::Residual(inner) => Layer::Residual(cast_layers(inner, dtype)?),
+            })
+        })
+        .collect()
+}
+
 /// Upstream `_output_length`.
 fn output_length(layers: &[Layer], mut n: i64) -> i64 {
     for layer in layers {
@@ -761,7 +788,7 @@ impl Posterior {
             )));
         }
         Ok(noise
-            .to_dtype(DType::F32)?
+            .to_dtype(self.mean.dtype())?
             .to_device(self.mean.device())?
             .mul(&self.stdev)?
             .add(&self.mean)?)
@@ -782,7 +809,7 @@ fn softplus(x: &Tensor) -> candle_core::Result<Tensor> {
     x.gt(SOFTPLUS_THRESHOLD)?.where_cond(x, &smooth)
 }
 
-/// A loaded YuE2 VAE (standard or legacy), FP32 on one device.
+/// A loaded YuE2 VAE (standard or legacy) in its selected stage dtype.
 #[derive(Clone, Debug)]
 pub struct Yue2Vae {
     config: VaeConfig,
@@ -790,6 +817,7 @@ pub struct Yue2Vae {
     decoder: Vec<Layer>,
     encoder: Option<Vec<Layer>>,
     device: Device,
+    dtype: DType,
 }
 
 impl Yue2Vae {
@@ -798,6 +826,17 @@ impl Yue2Vae {
     /// `config.json` and weights paths are read. The config's `release_variant` must agree with
     /// the component (a standard snapshot cannot load as legacy or vice versa).
     pub fn load(verified: &VerifiedComponent, parts: VaeParts, device: &Device) -> Result<Self> {
+        Self::load_with_dtype(verified, parts, device, DType::F32)
+    }
+
+    /// Load a verified decoder in the selected stage dtype. The published source stays FP32;
+    /// weight normalization and Snake parameter preparation run in FP32 before resident casting.
+    pub fn load_with_dtype(
+        verified: &VerifiedComponent,
+        parts: VaeParts,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let component = verified.component();
         let expected = match component.id {
             ComponentId::VaeStandard => VaeVariant::Standard,
@@ -838,12 +877,11 @@ impl Yue2Vae {
             config_sha256: pinned("config.json")?,
             weights_sha256: pinned(weights.path)?,
         };
-        Self::load_files(config_path, weights_path, identity, parts, device)
+        Self::load_files_with_dtype(config_path, weights_path, identity, parts, device, dtype)
     }
 
-    /// Load from a config + weights file pair under an explicit identity. Crate-internal: the
-    /// public entry point is [`Self::load`], which only accepts verified snapshot paths. Used by the
-    /// synthetic-weight tests (whose identity is the hashes of their fixture files).
+    /// Synthetic-weight tests provide an identity made from their fixture files' hashes.
+    #[cfg(test)]
     pub(crate) fn load_files(
         config_path: &Path,
         weights_path: &Path,
@@ -851,6 +889,29 @@ impl Yue2Vae {
         parts: VaeParts,
         device: &Device,
     ) -> Result<Self> {
+        Self::load_files_with_dtype(
+            config_path,
+            weights_path,
+            identity,
+            parts,
+            device,
+            DType::F32,
+        )
+    }
+
+    pub(crate) fn load_files_with_dtype(
+        config_path: &Path,
+        weights_path: &Path,
+        identity: DecoderIdentity,
+        parts: VaeParts,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        if !matches!(dtype, DType::F32 | DType::BF16) {
+            return Err(VaeError::Input(format!(
+                "YuE2 VAE stage dtype {dtype:?} is unsupported on {device:?}"
+            )));
+        }
         let text = fs::read_to_string(config_path)
             .map_err(|e| VaeError::Config(format!("reading {}: {e}", config_path.display())))?;
         let config = VaeConfig::parse(&text)?;
@@ -886,13 +947,13 @@ impl Yue2Vae {
             })
         };
         let mut dw = load_prefix("decoder.")?;
-        let decoder = build_decoder(&config.decoder, &mut dw)?;
+        let decoder = cast_layers(build_decoder(&config.decoder, &mut dw)?, dtype)?;
         dw.finish("decoder.")?;
         let encoder = match parts {
             VaeParts::DecoderOnly => None,
             VaeParts::Full => {
                 let mut ew = load_prefix("encoder.")?;
-                let enc = build_encoder(&config.encoder, &mut ew)?;
+                let enc = cast_layers(build_encoder(&config.encoder, &mut ew)?, dtype)?;
                 ew.finish("encoder.")?;
                 Some(enc)
             }
@@ -915,6 +976,7 @@ impl Yue2Vae {
             decoder,
             encoder,
             device: device.clone(),
+            dtype,
         })
     }
 
@@ -936,6 +998,11 @@ impl Yue2Vae {
     /// The device the weights live on.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The resident decoder/encoder weights and stage activations' dtype.
+    pub fn dtype(&self) -> DType {
+        self.dtype
     }
 
     /// Whether the encoder was loaded ([`VaeParts::Full`]).
@@ -969,10 +1036,11 @@ impl Yue2Vae {
                 self.config.latent_dim
             )));
         }
-        if z.dtype() != DType::F32 {
+        if z.dtype() != self.dtype {
             return Err(VaeError::Input(format!(
-                "latents are {:?}; the VAE decodes FP32 only",
-                z.dtype()
+                "latents are {:?}; the VAE decodes {:?}",
+                z.dtype(),
+                self.dtype
             )));
         }
         let finite = z
@@ -1078,11 +1146,15 @@ impl Yue2Vae {
         {
             return Err(VaeError::Input("Audio contains non-finite values".into()));
         }
-        let pre = forward_all(encoder, &audio.to_device(&self.device)?)?;
+        let pre = forward_all(
+            encoder,
+            &audio.to_device(&self.device)?.to_dtype(self.dtype)?,
+        )?;
         let half = self.config.latent_dim;
         let mean = pre.narrow(1, 0, half)?;
         let scale = pre.narrow(1, half, half)?;
-        let stdev = (softplus(&scale)? + STDEV_FLOOR)?;
+        let stdev =
+            (softplus(&scale.to_dtype(DType::F32)?)? + STDEV_FLOOR)?.to_dtype(self.dtype)?;
         Ok(Posterior { mean, scale, stdev })
     }
 
@@ -1141,6 +1213,10 @@ pub(crate) mod tests {
     /// The synthetic-weight tiny VAE of `variant`, loaded through the same loader as production
     /// with an identity made of its fixture files' hashes.
     pub(crate) fn tiny(variant: VaeVariant, parts: VaeParts) -> Yue2Vae {
+        tiny_with_dtype(variant, parts, DType::F32)
+    }
+
+    pub(crate) fn tiny_with_dtype(variant: VaeVariant, parts: VaeParts, dtype: DType) -> Yue2Vae {
         let dir = fixture_dir().join("vae_tiny").join(variant_name(variant));
         let identity = DecoderIdentity {
             component_key: format!("tiny_{}", variant_name(variant)),
@@ -1150,12 +1226,13 @@ pub(crate) mod tests {
             config_sha256: sha256_file(&dir.join("config.json")).unwrap(),
             weights_sha256: sha256_file(&dir.join("model.safetensors")).unwrap(),
         };
-        Yue2Vae::load_files(
+        Yue2Vae::load_files_with_dtype(
             &dir.join("config.json"),
             &dir.join("model.safetensors"),
             identity,
             parts,
             &Device::Cpu,
+            dtype,
         )
         .unwrap()
     }
@@ -1176,6 +1253,23 @@ pub(crate) mod tests {
 
     fn latent_bct() -> Tensor {
         reference()["latent"].t().unwrap().unsqueeze(0).unwrap()
+    }
+
+    #[test]
+    fn explicit_bf16_materializes_both_vaes_on_cpu() {
+        for variant in [VaeVariant::Standard, VaeVariant::Legacy] {
+            let vae = tiny_with_dtype(variant, VaeParts::Full, DType::BF16);
+            assert_eq!(vae.dtype(), DType::BF16);
+            assert!(vae.has_encoder());
+            match &vae.decoder[0] {
+                Layer::Conv(conv) => assert_eq!(conv.weight.dtype(), DType::BF16),
+                other => panic!("unexpected decoder head: {other:?}"),
+            }
+            match &vae.encoder.as_ref().unwrap()[0] {
+                Layer::Conv(conv) => assert_eq!(conv.weight.dtype(), DType::BF16),
+                other => panic!("unexpected encoder head: {other:?}"),
+            }
+        }
     }
 
     /// FP32 agreement bound between the native and PyTorch CPU decoders on the tiny models.

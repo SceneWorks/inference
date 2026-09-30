@@ -14,7 +14,8 @@
 //! | `components["vae"]` | `Dir`: the `m-a-p/YuE2-Vae` snapshot (the standard decoder) |
 //! | `components["vae_legacy"]` | `Dir`: the `m-a-p/YuE2-Vae-legacy` snapshot (the legacy decoder) |
 //! | | a plain snapshot stages **at least one** of the two decoders ([`DECODER_COMPONENTS`]); every request's decoder is checked before any compute |
-//! | `precision` | `Fp32` ⇒ F32; the default ⇒ BF16 on an accelerator, F32 on the CPU (no BF16 matmul) |
+//! | `yue2_compute_policy` | `Legacy` keeps historical load behavior; `Auto` uses BF16 MoT/F32 VAE on an accelerator; explicit `Bf16` or `Fp32` applies to both MoT and VAE stages. CPU BF16 refuses before weights (no CPU BF16 matmul). |
+//! | `precision` | The shared `Fp32` override remains for legacy loads; a conflicting explicit YuE2 policy is refused. |
 //! | `quantize` | `None` loads the staged tier (the original is `bf16`); `Q8` / `Q4` assert that tier — the `weights` directory must be that derived tier snapshot, anything else is refused. Exactly [`SUPPORTED_QUANTS`] (advertised as `supported_quants`, the audio lane's convention: the unquantized `bf16` load is `None`) is accepted; `Nvfp4` is refused ([`crate::precision`]) |
 //! | `yue2_ar_mode` | `Native` (default) runs the loaded tier; `ExperimentalFp8` uses E4M3 for the AR projections of the original BF16 tier on CUDA sm_89+, retaining exact BF16 originals for the acoustic stage. This is separate from `quantize`. |
 //! | `offload_policy` | `Sequential` ⇒ the AR-only weights move to host memory while the acoustic stage runs (upstream `offload_ar`) for every request that does not choose otherwise; `Resident` ⇒ they stay |
@@ -87,7 +88,7 @@ use candle_audio::gen_core::{
     GenerationOutput, GenerationReport, GenerationRequest, GenerationWarning, Generator, LoadShape,
     LoadSpec, MemoryStrategy, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant,
     SongCover, SongCoverMode, SongCoverVoice, SongDecoder, SongPlanning, TokenSampling,
-    WeightsSource, Yue2ArMode,
+    WeightsSource, Yue2ArMode, Yue2ComputePolicy,
 };
 use serde_json::{json, Value};
 
@@ -1008,13 +1009,51 @@ fn resolve_spec(
     Ok((dirs, GenerationConfig::default(), tier))
 }
 
-fn device_and_dtype(spec: &LoadSpec) -> gen_core::Result<(Device, DType)> {
+fn device_and_dtypes(spec: &LoadSpec) -> gen_core::Result<(Device, DType, DType)> {
     let device = candle_audio::default_device().map_err(gen_core::Error::from)?;
-    let dtype = match (spec.precision, &device) {
-        (Precision::Fp32, _) | (_, Device::Cpu) => DType::F32,
-        (Precision::Bf16, _) => DType::BF16,
+    let dtypes = stage_dtypes(spec, &device)?;
+    Ok((device, dtypes.0, dtypes.1))
+}
+
+fn stage_dtypes(spec: &LoadSpec, device: &Device) -> gen_core::Result<(DType, DType)> {
+    let native = if device.is_cpu() {
+        DType::F32
+    } else {
+        DType::BF16
     };
-    Ok((device, dtype))
+    let dtypes = match spec.yue2_compute_policy {
+        Yue2ComputePolicy::Legacy => {
+            let model = if spec.precision == Precision::Fp32 {
+                DType::F32
+            } else {
+                native
+            };
+            (model, DType::F32)
+        }
+        Yue2ComputePolicy::Auto => {
+            if spec.precision == Precision::Fp32 {
+                return Err(gen_core::Error::Unsupported(
+                    "yue2: Auto conflicts with the shared FP32 precision override".into(),
+                ));
+            }
+            (native, DType::F32)
+        }
+        Yue2ComputePolicy::Bf16 => {
+            if device.is_cpu() {
+                return Err(gen_core::Error::Unsupported(
+                    "yue2: explicit BF16 requires an accelerator; Candle CPU has no BF16 MoT matmul".into(),
+                ));
+            }
+            if spec.precision == Precision::Fp32 {
+                return Err(gen_core::Error::Unsupported(
+                    "yue2: explicit BF16 conflicts with the shared FP32 precision override".into(),
+                ));
+            }
+            (DType::BF16, DType::BF16)
+        }
+        Yue2ComputePolicy::Fp32 => (DType::F32, DType::F32),
+    };
+    Ok(dtypes)
 }
 
 #[cfg(test)]
@@ -1033,10 +1072,18 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 /// [`load`], returning the concrete generator (and so its [`Yue2Engine`]).
 pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<Yue2Generator> {
     let (dirs, generation, tier) = resolve_spec(spec)?;
-    let (device, dtype) = device_and_dtype(spec)?;
+    let (device, dtype, vae_dtype) = device_and_dtypes(spec)?;
     let ar = match spec.yue2_ar_mode {
         Yue2ArMode::Native => ArPrecision::Native,
         Yue2ArMode::ExperimentalFp8 => {
+            if !matches!(
+                spec.yue2_compute_policy,
+                Yue2ComputePolicy::Auto | Yue2ComputePolicy::Legacy
+            ) {
+                return Err(gen_core::Error::Unsupported(
+                    "yue2: experimental FP8 AR mixes stage precision; select Auto (legacy loads remain supported)".into(),
+                ));
+            }
             let weights = dirs.snapshot_dir(&ComponentId::Lm.component().repo)?;
             if crate::tier::is_tier_snapshot(&weights) {
                 return Err(gen_core::Error::Unsupported(
@@ -1058,11 +1105,20 @@ pub fn load_generator(spec: &LoadSpec) -> gen_core::Result<Yue2Generator> {
         return Ok(Yue2Generator {
             descriptor: descriptor(),
             engine: Yue2Engine::synthetic_at(precision, options, weights)?
+                .with_stage_compute(spec.yue2_compute_policy, vae_dtype)
                 .with_checked_decoders(dirs),
         });
     }
-    let engine =
-        Yue2Engine::load_with_precision(&dirs, dtype, &device, precision, generation, options)?;
+    let engine = Yue2Engine::load_with_stage_compute(
+        &dirs,
+        dtype,
+        vae_dtype,
+        spec.yue2_compute_policy,
+        &device,
+        precision,
+        generation,
+        options,
+    )?;
     Ok(Yue2Generator {
         descriptor: descriptor(),
         engine,

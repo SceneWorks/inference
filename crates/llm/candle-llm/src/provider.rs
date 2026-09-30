@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
+use core_llm::DraftReport;
 use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, GenerationTimings, ImageRef, IncrementalDetok,
@@ -27,10 +28,10 @@ use serde_json::Value;
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
     cuda_graphs_enabled, generate_from_prefill_with_stop, generate_speculative_with,
-    graph_workspace_admission_bytes, ConstraintMask, CountingDecode, Decode, DecodePath,
-    DecodeRecord, FinishReason, GenerationConfig, GraphRunner, GraphTally, MtpProposer,
-    NgramProposer, NoProposer, Proposer, RequestSpan, RewindableConstraintMask, SpeculativePrompt,
-    StepModel, StreamEvent,
+    graph_workspace_admission_bytes, prefill_restored, Boundary, ConstraintMask, CountingDecode,
+    Decode, DecodePath, DecodeRecord, DraftModelProposer, FinishReason, GenerationConfig,
+    GraphRunner, GraphTally, MtpProposer, NgramProposer, NoProposer, PrefixCache, PrefixStats,
+    Proposer, RequestSpan, RewindableConstraintMask, SpeculativePrompt, StepModel, StreamEvent,
 };
 use crate::device::select_device;
 use crate::gguf::GgufCheckpoint;
@@ -51,6 +52,28 @@ use crate::primitives::{KvCache, StepKvCache, Weights};
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "candle-llama";
+
+/// Why a multimodal request bypasses the cross-turn prefix cache (sc-24437).
+const PREFIX_MULTIMODAL: &str = "a multimodal prompt is never cached — its image / video / audio \
+                                 rows are not in the token key";
+/// Why a request's own prefix-cache snapshot was not taken (sc-24437, E7).
+const PREFIX_NOT_ADMITTED: &str =
+    "not kept: admission could not hold this request's snapshot beside it";
+/// Why a request's own prefix-cache snapshot was dropped.
+const PREFIX_COPY_FAILED: &str = "not kept: the snapshot copy failed";
+/// Why a request on a paged KV cache keeps no snapshot: its blocks are shared through the pool's
+/// own copy-on-write, and the prefix cache does not copy them out.
+const PREFIX_PAGED_NOT_SNAPSHOTTED: &str = "not kept: paged KV backing is not snapshotted";
+
+/// The prefix-cache reason for a failed [`PrefixCache::store`]: the paged backing's typed refusal
+/// (`Unsupported` — the only one a snapshot raises) is named as such; anything else is a failed
+/// copy.
+fn prefix_store_reason(error: &crate::Error) -> &'static str {
+    match error {
+        crate::Error::Unsupported(_) => PREFIX_PAGED_NOT_SNAPSHOTTED,
+        _ => PREFIX_COPY_FAILED,
+    }
+}
 
 /// The loaded decoder behind the provider: the generic Llama-family [`CausalLm`] or the Qwen3.6
 /// hybrid [`Qwen35Model`] (DeltaNet linear attention + gated full attention), both driven through the
@@ -805,6 +828,66 @@ pub struct LlamaProvider {
     /// KV cache, the default — or [`DecodePath::Reference`], the `Decode` loop kept as the parity
     /// oracle. Selected with [`LlamaProvider::set_decode_path`].
     decode_path: DecodePath,
+    /// The cross-turn prefix cache (sc-24437): one per loaded model, every decoder family, under
+    /// the byte budget [`load`](Self::load) admitted.
+    prefix: Mutex<PrefixCache>,
+    /// The resident draft model for `draft_model` speculation (sc-24436), present iff the load
+    /// named a compatible one ([`LoadSpec::draft_source`]); `draft_model` is advertised exactly
+    /// then. A second decoder on the target's device, driven by the engine as a
+    /// [`DraftModelProposer`] with its own static cache per request.
+    draft: Option<ResidentDraft>,
+    /// What became of the load's named draft (resident, or refused with the reason), reported in
+    /// [`TextLlm::load_report`]. `None` when no draft was named.
+    draft_report: Option<DraftReport>,
+}
+
+/// A draft model resident beside its target (sc-24436).
+struct ResidentDraft {
+    /// The draft decoder.
+    model: Decoder,
+    /// Leading draft ids it may propose — its tokenizer's tokens
+    /// ([`core_llm::draft_compatibility`]); a padding row never becomes a draft.
+    proposable: usize,
+    /// The target's logits width, which the draft's logits are shaped to.
+    width: usize,
+    /// The draft's own context window (`0`: unbounded): a request reaching past it runs `auto`
+    /// instead ([`core_llm::fit_draft_context`], E2).
+    context: usize,
+}
+
+/// The load spec of a named draft (sc-24436): its own source, text-only, at the target's
+/// load-time tier and CUDA-graph policy, naming no draft itself.
+fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
+    LoadSpec {
+        source: source.to_string(),
+        projector_source: None,
+        quantize: spec.quantize,
+        cuda_graphs: spec.cuda_graphs,
+        // A draft keeps no cross-turn prefix cache of its own (sc-24437).
+        prefix_cache_bytes: Some(0),
+        draft_source: None,
+    }
+}
+
+/// What a request's `draft_model` proposer holds beside the target (E7, sc-24436): the draft's
+/// own prefill of the same prompt and a static cache of the request's reach plus the `K + 1`
+/// draft positions a step writes, with — for a hybrid draft — the `K + 2` retained recurrent
+/// checkpoints [`DraftModelProposer`] keeps. `None` on overflow.
+fn draft_request_bytes(
+    draft: &Decoder,
+    admitted_prompt: usize,
+    max_new_tokens: u32,
+    drafts: u32,
+) -> Option<u64> {
+    core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
+        admitted_prompt,
+        max_new_tokens.checked_add(drafts.checked_add(1)?)?,
+        draft.memory_geometry_with_checkpoints(usize::try_from(drafts).ok()?.checked_add(2)?),
+        0,
+        0,
+        EAGER_ATTN_QUERY_CHUNK_SIZE,
+        1,
+    )
 }
 
 /// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
@@ -830,6 +913,10 @@ pub struct LoadRecord {
     /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
     /// follows the process switch.
     pub cuda_graphs: Option<bool>,
+    /// The cross-turn prefix cache's byte budget the load settled (sc-24437): the requested
+    /// budget clamped to the headroom admission left. `None` for a provider assembled without a
+    /// load.
+    pub prefix_cache_bytes: Option<u64>,
 }
 
 impl LoadRecord {
@@ -863,6 +950,8 @@ impl LoadRecord {
             requested: self.requested,
             projections,
             cuda_graphs: self.cuda_graphs,
+            prefix_cache_bytes: self.prefix_cache_bytes,
+            draft: None,
         }
     }
 }
@@ -1228,6 +1317,94 @@ impl LlamaProvider {
         self.decode_path
     }
 
+    /// The cross-turn prefix cache's byte budget (sc-24437) — what the load admitted for it.
+    pub fn prefix_cache_budget(&self) -> u64 {
+        self.prefix_cache().budget_bytes()
+    }
+
+    /// Bytes the prefix cache holds now (never more than
+    /// [`prefix_cache_budget`](Self::prefix_cache_budget)).
+    pub fn prefix_cache_resident_bytes(&self) -> u64 {
+        self.prefix_cache().resident_bytes()
+    }
+
+    /// The prefix cache's cumulative reuse accounting.
+    pub fn prefix_cache_stats(&self) -> PrefixStats {
+        self.prefix_cache().stats()
+    }
+
+    fn prefix_cache(&self) -> std::sync::MutexGuard<'_, PrefixCache> {
+        self.prefix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Where the rendered conversation ends and the generation prompt begins, when that is a
+    /// strict token prefix of `prompt_ids` (sc-24437): the point the hybrid decoder's prefix-cache
+    /// snapshot is taken at, because the next chat turn re-renders these messages and extends
+    /// them (whatever the template later does to this turn's reply). `None` when the template
+    /// renders the messages differently without a generation prompt.
+    fn conversation_boundary(
+        &self,
+        messages: &[Message],
+        req: &TextLlmRequest,
+        prompt_ids: &[i32],
+    ) -> Option<usize> {
+        let rendered = self
+            .template
+            .render_with(
+                messages,
+                &RenderOptions {
+                    add_generation_prompt: false,
+                    enable_thinking: req.enable_thinking_kwarg(),
+                    reasoning_effort: req.reasoning_effort,
+                    preserve_thinking: req.preserve_thinking,
+                    tools: &req.tools,
+                },
+            )
+            .ok()?;
+        let ids = self.tokenizer.encode(&rendered, false).ok()?;
+        let len = ids.len();
+        (len > 0
+            && len < prompt_ids.len()
+            && ids.iter().zip(prompt_ids).all(|(&a, &b)| a as i32 == b))
+        .then_some(len)
+    }
+
+    /// An upper bound on the bytes of the prefix-cache snapshot a text request on the engine
+    /// takes (sc-24437), which its admission adds: the softmax KV copy of up to `positions`
+    /// positions after the run, or the hybrid's whole cache at the conversation `boundary` — its
+    /// attention KV, one recurrent state and, with `mtp`, the head's KV and a hidden row (at 4
+    /// bytes an element). `None` on overflow.
+    fn prefix_snapshot_bytes(
+        &self,
+        positions: usize,
+        boundary: Option<usize>,
+        mtp: bool,
+    ) -> Option<u64> {
+        match (&self.model, boundary) {
+            (Decoder::Causal(_), _) => u64::try_from(self.model.static_kv_bytes(positions)).ok(),
+            (Decoder::Qwen35(m), Some(b)) => {
+                let c = m.config();
+                let head = if mtp {
+                    (c.mtp_num_hidden_layers as u64)
+                        .checked_mul(c.num_kv_heads.max(0) as u64)?
+                        .checked_mul(c.head_dim.max(0) as u64)?
+                        .checked_mul(2 * 4)?
+                        .checked_mul(b as u64)?
+                        .checked_add((c.hidden_size.max(0) as u64).checked_mul(4)?)?
+                } else {
+                    0
+                };
+                u64::try_from(m.static_kv_bytes(b))
+                    .ok()?
+                    .checked_add(u64::try_from(m.recurrent_state_bytes(1)).ok()?)?
+                    .checked_add(head)
+            }
+            (Decoder::Qwen35(_), None) => Some(0),
+        }
+    }
+
     /// Which loop this request decodes on, and why a resolved proposer could not run when it
     /// could not (sc-24433, epic sc-24432 E2): the engine with the plan's proposer (MTP, prompt
     /// lookup) and depth; the engine with no proposer for a request whose speculation is off (the
@@ -1251,7 +1428,7 @@ impl LlamaProvider {
             SpeculativePlan::Run {
                 proposer: SpeculativeProposer::DraftModel,
                 ..
-            } => (
+            } if self.draft.is_none() => (
                 plain,
                 Some(
                     "speculative: `draft_model` has no draft model loaded on this provider; \
@@ -1337,9 +1514,45 @@ impl LlamaProvider {
             host_load_budget(device.is_cuda(), budget),
         )?;
         core_llm::admit_request_memory(host_required, host_available)?;
-        if let Some(device_required) = device_required {
-            core_llm::admit_request_memory(device_required, request_available_memory(&device)?)?;
+        let device_available = device_required
+            .map(|_| request_available_memory(&device))
+            .transpose()?;
+        if let (Some(device_required), Some(available)) = (device_required, device_available) {
+            core_llm::admit_request_memory(device_required, available)?;
         }
+        // A named draft (sc-24436, E7) is priced beside the admitted target in both domains.
+        let draft = Self::admit_draft(
+            spec,
+            device.is_cuda(),
+            (host_required, host_available),
+            device_required.zip(device_available),
+        )?;
+        // The cross-turn prefix cache's budget (sc-24437, E7): what the load asked for, clamped to
+        // the headroom this admission leaves beside the target and any admitted draft in the
+        // domain the cache lives in — the device's on CUDA, the host's otherwise — so the cache can
+        // never push the load past it.
+        let draft_estimate = match &draft {
+            Some((draft_spec, None)) => {
+                Some(Self::load_memory_estimate(draft_spec, device.is_cuda())?)
+            }
+            _ => None,
+        };
+        let prefix_budget = match device_required.zip(device_available) {
+            Some((required, available)) => core_llm::prefix_cache_budget(
+                spec.prefix_cache_bytes,
+                required.saturating_add(
+                    draft_estimate
+                        .and_then(|e| e.device_required_bytes)
+                        .unwrap_or(0),
+                ),
+                available,
+            ),
+            None => core_llm::prefix_cache_budget(
+                spec.prefix_cache_bytes,
+                host_required.saturating_add(draft_estimate.map_or(0, |e| e.host_required_bytes)),
+                host_available,
+            ),
+        };
 
         let requested = match spec.quantize {
             None => None,
@@ -1364,7 +1577,225 @@ impl LlamaProvider {
         };
         provider.load_record.requested = spec.quantize;
         provider.load_record.cuda_graphs = Some(cuda_graphs);
+        provider.load_record.prefix_cache_bytes = Some(prefix_budget);
+        provider.prefix = Mutex::new(PrefixCache::with_budget(prefix_budget));
+        match draft {
+            None => {}
+            Some((draft_spec, Some(refusal))) => {
+                provider.draft_report = Some(DraftReport::refused(draft_spec.source, refusal));
+            }
+            Some((draft_spec, None)) => {
+                provider.attach_draft(&draft_spec, &device, requested.as_ref())
+            }
+        }
         Ok(provider)
+    }
+
+    /// Price a named draft beside the target (sc-24436, E7) in both allocation domains — `host`
+    /// and, on CUDA, `device`, each `(target required, available)` — before any weight is read.
+    /// `Ok(None)`: no draft named. `Ok(Some((draft spec, refusal)))`: the draft's load spec and,
+    /// when it cannot be priced or does not fit beside the target, the named refusal (the target
+    /// loads alone, E2). `Err` only when the target alone does not fit — the ordinary refusal.
+    fn admit_draft(
+        spec: &LoadSpec,
+        cuda: bool,
+        host: (u64, u64),
+        device: Option<(u64, u64)>,
+    ) -> CoreResult<Option<(LoadSpec, Option<String>)>> {
+        let Some(source) = spec.draft_source.as_deref() else {
+            return Ok(None);
+        };
+        let draft_spec = draft_load_spec(spec, source);
+        let refusal = match Self::load_memory_estimate(&draft_spec, cuda) {
+            Err(e) => {
+                core_llm::admit_request_memory(host.0, host.1)?;
+                if let Some((required, available)) = device {
+                    core_llm::admit_request_memory(required, available)?;
+                }
+                Some(format!("draft model: its load cannot be priced ({e})"))
+            }
+            Ok(estimate) => {
+                let host =
+                    core_llm::admit_draft_load(host.0, estimate.host_required_bytes, host.1)?;
+                let device = match (device, estimate.device_required_bytes) {
+                    (Some((target, available)), Some(draft)) => {
+                        core_llm::admit_draft_load(target, draft, available)?
+                    }
+                    (Some((target, available)), None) => {
+                        core_llm::admit_request_memory(target, available)?;
+                        None
+                    }
+                    (None, _) => None,
+                };
+                host.or(device)
+            }
+        };
+        Ok(Some((draft_spec, refusal)))
+    }
+
+    /// Load the draft `spec` names on the target's `device` and keep it only if it can propose
+    /// for this target ([`core_llm::draft_compatibility`]): resident — `draft_model` advertised
+    /// — or refused with the reason in the load report, the target unaffected either way
+    /// (sc-24436, E2). A draft that ships a `tokenizer.json` is checked before any weight is read.
+    fn attach_draft(
+        &mut self,
+        spec: &LoadSpec,
+        device: &Device,
+        requested: Option<&ProjectionFormat>,
+    ) {
+        let source = spec.source.clone();
+        let path = Path::new(&source);
+        let target_logits = self.model.memory_geometry().vocab_size as usize;
+        let early = Tokenizer::from_file(path.join("tokenizer.json"))
+            .ok()
+            .and_then(|tokenizer| self.tokenizer.vocabulary_mismatch(&tokenizer))
+            .map(|why| {
+                format!("draft model: its tokenizer vocabulary is not the target's ({why})")
+            });
+        let early = early.or_else(|| {
+            ensure_supported_device(path, device)
+                .err()
+                .map(|e| format!("draft model: {e}"))
+        });
+        let outcome = match early {
+            Some(why) => Err(why),
+            None => {
+                let loaded = if crate::gguf::is_gguf_path(&source) {
+                    Self::load_gguf(
+                        path,
+                        None,
+                        device,
+                        requested.and_then(ProjectionFormat::ggml),
+                    )
+                } else {
+                    Self::load_dir(path, device, requested)
+                };
+                match loaded {
+                    Err(e) => Err(format!("draft model: its load failed ({e})")),
+                    Ok(draft) => core_llm::draft_compatibility(
+                        &self.tokenizer,
+                        target_logits,
+                        &draft.tokenizer,
+                        draft.model.memory_geometry().vocab_size as usize,
+                    )
+                    .map(|proposable| ResidentDraft {
+                        proposable,
+                        width: target_logits,
+                        context: draft.descriptor.capabilities.max_context_tokens,
+                        model: draft.model,
+                    }),
+                }
+            }
+        };
+        self.draft_report = Some(match outcome {
+            Ok(model) => {
+                self.draft = Some(model);
+                let max_depth = self.verify_depth_bound();
+                self.descriptor
+                    .capabilities
+                    .speculative
+                    .push(core_llm::draft_model_capabilities(max_depth));
+                DraftReport::resident(source)
+            }
+            Err(why) => DraftReport::refused(source, why),
+        });
+    }
+
+    /// What a request on `route` is admitted against before any preprocessing: the target's
+    /// priced request ([`priced_request_bytes`]) and, on a `draft_model` route, the resident
+    /// draft's beside it ([`draft_bytes`](Self::draft_bytes), E7). `None` on overflow.
+    fn request_bytes(
+        &self,
+        route: DecodeRoute,
+        prompt: usize,
+        max_new_tokens: u32,
+        vision_workspace: u64,
+    ) -> Option<u64> {
+        priced_request_bytes(
+            &self.model,
+            route,
+            prompt,
+            max_new_tokens,
+            vision_workspace,
+            cuda_graphs_enabled(),
+        )?
+        .checked_add(self.draft_bytes(route, prompt, max_new_tokens)?)
+    }
+
+    /// What a Gemma 4 spliced-prompt request on `route` is admitted against once its expanded
+    /// prompt (`prompt` positions) is known: the target's static preallocation of the prompt, the
+    /// budget and the verify overshoot ([`spliced_prompt_bytes`]) and, on a `draft_model` route,
+    /// the resident draft's request over the same expanded prompt (E7). `None` on overflow.
+    fn spliced_request_bytes(
+        &self,
+        route: DecodeRoute,
+        prompt: usize,
+        max_new_tokens: u32,
+    ) -> Option<u64> {
+        spliced_prompt_bytes(
+            &self.model,
+            prompt.checked_add(usize::try_from(max_new_tokens).ok()?)?,
+            route.drafts(),
+            cuda_graphs_enabled(),
+        )?
+        .checked_add(self.draft_bytes(route, prompt, max_new_tokens)?)
+    }
+
+    /// What a request on `route` holds for the resident draft beside the target (E7, sc-24436):
+    /// [`draft_request_bytes`] on a `draft_model` route, `0` otherwise. `None` on overflow.
+    fn draft_bytes(&self, route: DecodeRoute, prompt: usize, max_new_tokens: u32) -> Option<u64> {
+        match (route, self.draft.as_ref()) {
+            (
+                DecodeRoute::Engine {
+                    proposer: ProposerKind::DraftModel,
+                    drafts,
+                },
+                Some(draft),
+            ) => draft_request_bytes(&draft.model, prompt, max_new_tokens, drafts),
+            _ => Some(0),
+        }
+    }
+
+    /// The model's verify-depth bound: the depth its descriptor advertises for prompt lookup (the
+    /// per-model bound, sc-24438), which `draft_model` advertises too — every draft is one more
+    /// verify row whichever proposer drew it (sc-24436). Every decoder advertises prompt lookup;
+    /// one draft per step otherwise.
+    fn verify_depth_bound(&self) -> u32 {
+        self.descriptor
+            .capabilities
+            .proposer(SpeculativeProposer::PromptLookup)
+            .map_or(1, |lookup| lookup.max_depth)
+    }
+
+    /// The resident draft's context window (`0`: no draft, or an unbounded one).
+    fn draft_context(&self) -> usize {
+        self.draft.as_ref().map_or(0, |draft| draft.context)
+    }
+
+    /// The `draft_model` proposer over the resident draft for a request of at most `capacity`
+    /// positions proposing `drafts` per step (sc-24436).
+    fn draft_proposer(&self, capacity: usize, drafts: usize) -> CoreResult<Box<dyn Proposer + '_>> {
+        match self.draft.as_ref() {
+            Some(ResidentDraft {
+                model: Decoder::Causal(draft),
+                proposable,
+                width,
+                ..
+            }) => Ok(Box::new(
+                DraftModelProposer::new(draft, capacity, drafts).with_vocab(*proposable, *width),
+            )),
+            Some(ResidentDraft {
+                model: Decoder::Qwen35(draft),
+                proposable,
+                width,
+                ..
+            }) => Ok(Box::new(
+                DraftModelProposer::new(draft, capacity, drafts).with_vocab(*proposable, *width),
+            )),
+            None => Err(CoreError::Load(
+                "`draft_model` was routed without a resident draft".into(),
+            )),
+        }
     }
 
     /// The memory a [`load`](Self::load) of `spec` admits against before it reads a single
@@ -1436,6 +1867,7 @@ impl LlamaProvider {
             payload_bytes: payload,
             host_required_bytes: host_required,
             device_required_bytes: device_required,
+            prefix_cache_bytes: core_llm::requested_prefix_cache_bytes(spec.prefix_cache_bytes),
             source_bytes: on_device(working.source),
             cast_copy_bytes: on_device(working.cast),
             quantized_copy_bytes: on_device(working.copy),
@@ -1663,12 +2095,18 @@ impl LlamaProvider {
             constraint_table: OnceCell::new(),
             last_decode: Mutex::new(None),
             decode_path: DecodePath::StepModel,
+            prefix: Mutex::new(PrefixCache::with_budget(
+                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+            )),
+            draft: None,
+            draft_report: None,
             vision,
             gemma4,
             load_record: LoadRecord {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                prefix_cache_bytes: None,
             },
         })
     }
@@ -1799,6 +2237,11 @@ impl LlamaProvider {
                 stop_tokens: ck.stop_tokens,
                 last_decode: Mutex::new(None),
                 decode_path: DecodePath::StepModel,
+                prefix: Mutex::new(PrefixCache::with_budget(
+                    core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                )),
+                draft: None,
+                draft_report: None,
                 constraint_table: OnceCell::new(),
                 vision,
                 gemma4: None,
@@ -1854,6 +2297,11 @@ impl LlamaProvider {
             stop_tokens,
             last_decode: Mutex::new(None),
             decode_path: DecodePath::StepModel,
+            prefix: Mutex::new(PrefixCache::with_budget(
+                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+            )),
+            draft: None,
+            draft_report: None,
             constraint_table: OnceCell::new(),
             vision: None, // GGUF is the dense Llama-family path only — no Qwen3.6 VLM.
             // Likewise no Gemma 4 front-ends: the GGUF path reconstructs a dense text decoder,
@@ -1863,6 +2311,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                prefix_cache_bytes: None,
             },
         })
     }
@@ -1913,6 +2362,11 @@ impl LlamaProvider {
             stop_tokens,
             last_decode: Mutex::new(None),
             decode_path: DecodePath::StepModel,
+            prefix: Mutex::new(PrefixCache::with_budget(
+                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+            )),
+            draft: None,
+            draft_report: None,
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
@@ -2272,6 +2726,13 @@ pub struct LoadMemoryEstimate {
     /// headroom over it, `cast_copy_bytes`, `quantized_copy_bytes` and any external projector's
     /// bound.
     pub device_required_bytes: Option<u64>,
+    /// The cross-turn prefix cache's budget the load asks for (sc-24437):
+    /// [`LoadSpec::prefix_cache_bytes`], else [`core_llm::DEFAULT_PREFIX_CACHE_BYTES`]. Memory
+    /// the loaded model may hold **beside** the required bytes, in the domain the cache lives in
+    /// (the device's on CUDA, the host's otherwise). It is not part of either required figure:
+    /// `load` clamps it to the headroom its admission leaves, so it never refuses a load by
+    /// itself, and reports the settled budget in [`core_llm::LoadReport::prefix_cache_bytes`].
+    pub prefix_cache_bytes: u64,
     /// The source the load holds resident on the device while it builds the decoder: the
     /// payload of a safetensors or Prism checkpoint, the dense f32 map a llama-family GGUF is
     /// dequantized into (`0` off CUDA).
@@ -3239,7 +3700,10 @@ impl TextLlm for LlamaProvider {
     }
 
     fn load_report(&self) -> Option<core_llm::LoadReport> {
-        Some(self.load_record.report())
+        Some(core_llm::LoadReport {
+            draft: self.draft_report.clone(),
+            ..self.load_record.report()
+        })
     }
 
     fn generate(
@@ -3353,34 +3817,98 @@ impl TextLlm for LlamaProvider {
         // The backend-neutral speculative resolution (core-llm, sc-24433): `auto` runs MTP where
         // the checkpoint has a head, else prompt lookup; anything the plan cannot deliver is
         // named in the report's `fallbacks` (epic sc-24432 E2), never a silent downgrade.
-        let resolution =
-            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities);
+        // A `draft_model` request reaching past the draft's own context window runs `auto`
+        // instead, by name (sc-24436, E2).
+        let resolution = core_llm::fit_draft_context(
+            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities),
+            &self.descriptor.capabilities,
+            self.draft_context(),
+            admitted_prompt,
+            req.max_new_tokens,
+        );
         // Which loop decodes this request (sc-24140): decided once, so admission prices the
         // cache and graphs that loop will actually hold.
-        let (route, route_fallback) =
+        let (mut route, route_fallback) =
             self.decode_route(resolution.plan, multimodal && !gemma4_mm_request);
-        let fallbacks: Vec<String> = resolution
+        let mut fallbacks: Vec<String> = resolution
             .fallback
             .into_iter()
             .chain(route_fallback)
             .collect();
-        let required = priced_request_bytes(
-            &self.model,
+        let required = self
+            .request_bytes(route, admitted_prompt, req.max_new_tokens, vision_workspace)
+            .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
+        // The cross-turn prefix cache (sc-24437) serves the engine's text routes. It keys on token
+        // ids, which cannot tell two images (or clips) behind the same placeholder ids apart — a
+        // multimodal prompt neither reads nor feeds it — and the reference loop is the parity
+        // oracle, which always prefills cold; the report names either. The hybrid decoder
+        // snapshots at the end of the rendered conversation, the prefix the next turn extends.
+        let prefix_on = self.prefix_cache().budget_bytes() > 0;
+        let prefix_route = !multimodal && !gemma4_mm_request && route != DecodeRoute::Reference;
+        let (mut prefix_path, mut prefix_reason) = if !prefix_on {
+            ("off", None)
+        } else if multimodal || gemma4_mm_request {
+            ("bypassed", Some(PREFIX_MULTIMODAL))
+        } else if !prefix_route {
+            (
+                "bypassed",
+                Some("the reference decode loop is the parity oracle and always prefills cold"),
+            )
+        } else {
+            ("miss", None)
+        };
+        let prefix_mtp = matches!(
             route,
-            admitted_prompt,
-            req.max_new_tokens,
-            vision_workspace,
-            cuda_graphs_enabled(),
-        )
-        .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
+            DecodeRoute::Engine {
+                proposer: ProposerKind::Mtp,
+                ..
+            }
+        );
+        let prefix_boundary = match &self.model {
+            Decoder::Qwen35(_) if prefix_on && prefix_route => {
+                self.conversation_boundary(messages, req, &prompt_ids)
+            }
+            _ => None,
+        };
+        let snapshot_bytes = self
+            .prefix_snapshot_bytes(
+                prompt_ids.len().saturating_add(req.max_new_tokens as usize),
+                prefix_boundary,
+                prefix_mtp,
+            )
+            .ok_or_else(|| CoreError::InvalidRequest("prefix snapshot estimate overflow".into()))?;
         let available = request_available_memory(self.model.device())?;
+        // Held prefix-cache entries are reclaimable memory (E7): a request that would not fit
+        // evicts them least-recently-used first, and the snapshot it would leave behind is
+        // admitted with it — or not taken, so caching never makes a request fail and never takes
+        // memory admission did not grant.
+        let prefix_admission = if prefix_on && prefix_route {
+            self.prefix_cache()
+                .admit(required, snapshot_bytes, available)
+        } else {
+            core_llm::PrefixAdmission {
+                available: self.prefix_cache().reclaim_for(required, available),
+                snapshot: false,
+            }
+        };
+        let keep_prefix = prefix_admission.snapshot;
+        if prefix_on && prefix_route && !keep_prefix {
+            prefix_reason = Some(PREFIX_NOT_ADMITTED);
+        }
         core_llm::admit_request_memory_with_geometry(
             admitted_prompt,
             req.max_new_tokens,
             self.descriptor.capabilities.max_context_tokens,
-            required,
-            available,
+            if keep_prefix {
+                required.saturating_add(snapshot_bytes)
+            } else {
+                required
+            },
+            prefix_admission.available,
         )?;
+        let prefix_boundary = prefix_boundary.filter(|_| keep_prefix);
+        let mut prefix_hit = 0usize;
+        let mut prefill_forwards = 1usize;
 
         self.model
             .device()
@@ -3414,6 +3942,35 @@ impl TextLlm for LlamaProvider {
             prompt_len,
             req.max_new_tokens,
         )?;
+        // A Gemma 4 prompt's soft-token expansion is known only now: a `draft_model` route checks
+        // the draft's context window again against the effective prompt (E2). Nothing has been
+        // allocated for the route yet; the priced draft is only an over-estimate.
+        if let DecodeRoute::Engine {
+            proposer: ProposerKind::DraftModel,
+            drafts,
+        } = route
+        {
+            let fit = core_llm::fit_draft_context(
+                core_llm::SpeculativeResolution {
+                    plan: SpeculativePlan::Run {
+                        proposer: SpeculativeProposer::DraftModel,
+                        depth: drafts,
+                    },
+                    fallback: None,
+                },
+                &self.descriptor.capabilities,
+                self.draft_context(),
+                prompt_len,
+                req.max_new_tokens,
+            );
+            if let Some(why) = fit.fallback {
+                let (refit, route_fallback) =
+                    self.decode_route(fit.plan, multimodal && !gemma4_mm_request);
+                route = refit;
+                fallbacks.push(why);
+                fallbacks.extend(route_fallback);
+            }
+        }
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -3584,11 +4141,20 @@ impl TextLlm for LlamaProvider {
                     }
                     _ => None,
                 };
-                // The MTP head pairs the target's hidden rows with its drafts; prompt lookup and
-                // the plain loop do not need them.
+                // The MTP head pairs the target's hidden rows with its drafts; prompt lookup, a
+                // draft model and the plain loop do not need them.
                 let speculative = mtp_proposer.is_some();
                 let mut ngram_proposer = NgramProposer::default();
                 let mut no_proposer = NoProposer;
+                // A resident draft model (sc-24436) over the effective prompt: its cache spans the
+                // expanded prompt plus the budget.
+                let mut draft_proposer = match route_proposer {
+                    ProposerKind::DraftModel => Some(self.draft_proposer(
+                        prompt_len.saturating_add(config.max_new_tokens),
+                        drafts,
+                    )?),
+                    _ => None,
+                };
                 let constraint = json_mask
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
@@ -3635,13 +4201,15 @@ impl TextLlm for LlamaProvider {
                             .map_err(|e| to_core(e.into()))?;
                         let prefill = generation_started.elapsed();
                         let decode_started = std::time::Instant::now();
-                        let proposer: &mut dyn Proposer = match mtp_proposer.as_mut() {
-                            Some(mtp) => mtp,
-                            None if route_proposer == ProposerKind::PromptLookup => {
-                                &mut ngram_proposer
-                            }
-                            None => &mut no_proposer,
-                        };
+                        let proposer: &mut dyn Proposer =
+                            match (mtp_proposer.as_mut(), draft_proposer.as_deref_mut()) {
+                                (Some(mtp), _) => mtp,
+                                (None, Some(draft)) => draft,
+                                (None, None) if route_proposer == ProposerKind::PromptLookup => {
+                                    &mut ngram_proposer
+                                }
+                                (None, None) => &mut no_proposer,
+                            };
                         let run = generate_speculative_with(
                             stepper,
                             proposer,
@@ -3651,7 +4219,9 @@ impl TextLlm for LlamaProvider {
                                 hidden: speculative.then_some(hidden),
                                 history: &m.expanded_ids,
                                 position_delta: *delta,
-                                warm_proposer: false,
+                                // The MTP head was warmed from the fused rows above; any other
+                                // proposer (a draft model) warms over the expanded prompt ids.
+                                warm_proposer: !speculative,
                             },
                             &config,
                             drafts,
@@ -3671,11 +4241,46 @@ impl TextLlm for LlamaProvider {
                         run
                     }
                     None => {
+                        // Text: prefill on top of the longest prefix the cross-turn cache
+                        // restores (sc-24437) — its snapshot at the conversation boundary taken
+                        // on the way — then the engine warms the proposer (an MTP head resumes
+                        // from the head state stored at the restored boundary) and decodes.
                         target
                             .device()
                             .synchronize()
                             .map_err(|e| to_core(e.into()))?;
                         let prefill_started = generation_started;
+                        let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
+                        let mut cache = target
+                            .new_cache_for(capacity, drafts)
+                            .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        let restored = self
+                            .prefix_cache()
+                            .restore_into(&mut cache, &prompt_ids, speculative)
+                            .map_err(to_core)?;
+                        let prefilled = prefill_restored(
+                            stepper,
+                            &mut cache,
+                            restored,
+                            &prompt_ids,
+                            prefix_boundary,
+                            speculative,
+                            &req.cancel,
+                        )
+                        .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        // Measured, not looked up: the positions the prefill did not feed.
+                        prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
+                        prefill_forwards = prefilled.forwards;
+                        if prefix_hit > 0 {
+                            prefix_path = "hit";
+                        }
+                        let snapshot = prefilled.boundary;
+                        if let Some(head) = mtp_proposer.take() {
+                            mtp_proposer = Some(
+                                head.resume_from(prefilled.mtp)
+                                    .capture_at(snapshot.as_ref().map(Boundary::len)),
+                            );
+                        }
                         let mut prefill = None;
                         let mut decode_started = None;
                         let mut boundary = || -> crate::error::Result<()> {
@@ -3684,17 +4289,26 @@ impl TextLlm for LlamaProvider {
                             decode_started = Some(std::time::Instant::now());
                             Ok(())
                         };
-                        let proposer: &mut dyn Proposer = match mtp_proposer.as_mut() {
-                            Some(mtp) => mtp,
-                            None if route_proposer == ProposerKind::PromptLookup => {
-                                &mut ngram_proposer
-                            }
-                            None => &mut no_proposer,
-                        };
+                        let proposer: &mut dyn Proposer =
+                            match (mtp_proposer.as_mut(), draft_proposer.as_deref_mut()) {
+                                (Some(mtp), _) => mtp,
+                                (None, Some(draft)) => draft,
+                                (None, None) if route_proposer == ProposerKind::PromptLookup => {
+                                    &mut ngram_proposer
+                                }
+                                (None, None) => &mut no_proposer,
+                            };
                         let run = generate_speculative_with(
                             stepper,
                             proposer,
-                            SpeculativePrompt::Tokens(&prompt_ids),
+                            SpeculativePrompt::Prefilled {
+                                cache: &mut cache,
+                                logits: prefilled.logits,
+                                hidden: prefilled.hidden,
+                                history: &prompt_ids,
+                                position_delta: 0,
+                                warm_proposer: true,
+                            },
                             &config,
                             drafts,
                             &req.cancel,
@@ -3711,6 +4325,13 @@ impl TextLlm for LlamaProvider {
                         phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
+                        let captured = mtp_proposer.as_mut().and_then(MtpProposer::take_captured);
+                        if let Err(e) =
+                            self.prefix_cache()
+                                .store(&prompt_ids, &[], &cache, snapshot, captured)
+                        {
+                            prefix_reason = Some(prefix_store_reason(&e));
+                        }
                         run
                     }
                 };
@@ -3718,7 +4339,10 @@ impl TextLlm for LlamaProvider {
                     mtp_stats = Some(MtpStats {
                         proposed_tokens: u32::try_from(run.stats.proposed).unwrap_or(u32::MAX),
                         accepted_tokens: u32::try_from(run.stats.accepted).unwrap_or(u32::MAX),
-                        target_forwards: u32::try_from(run.stats.forwards).unwrap_or(u32::MAX),
+                        target_forwards: u32::try_from(
+                            run.stats.forwards + prefill_forwards.saturating_sub(1),
+                        )
+                        .unwrap_or(u32::MAX),
                     });
                 }
                 engine_record = Some(run.record);
@@ -3746,10 +4370,19 @@ impl TextLlm for LlamaProvider {
                 let drafts = drafts as usize;
                 let mut ngram_proposer = NgramProposer::default();
                 let mut no_proposer = NoProposer;
-                let proposer: &mut dyn Proposer = if route_proposer == ProposerKind::PromptLookup {
-                    &mut ngram_proposer
-                } else {
-                    &mut no_proposer
+                // A resident draft model (sc-24436): its cache spans the effective prompt (the
+                // Gemma 4 soft-token expansion included) plus the budget.
+                let mut draft_proposer = match route_proposer {
+                    ProposerKind::DraftModel => Some(self.draft_proposer(
+                        prompt_len.saturating_add(config.max_new_tokens),
+                        drafts,
+                    )?),
+                    _ => None,
+                };
+                let proposer: &mut dyn Proposer = match draft_proposer.as_deref_mut() {
+                    Some(draft) => draft,
+                    None if route_proposer == ProposerKind::PromptLookup => &mut ngram_proposer,
+                    None => &mut no_proposer,
                 };
                 let constraint = json_mask
                     .as_mut()
@@ -3771,21 +4404,18 @@ impl TextLlm for LlamaProvider {
                         // spans included) is only known here, so its static preallocation is
                         // admitted here, before anything is allocated.
                         let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
-                        let required = spliced_prompt_bytes(
-                            &self.model,
-                            capacity,
-                            drafts as u32,
-                            cuda_graphs_enabled(),
-                        )
-                        .ok_or_else(|| {
-                            CoreError::InvalidRequest("request memory estimate overflow".into())
-                        })?;
+                        let required = self
+                            .spliced_request_bytes(route, m.expanded_ids.len(), req.max_new_tokens)
+                            .ok_or_else(|| {
+                                CoreError::InvalidRequest("request memory estimate overflow".into())
+                            })?;
+                        let available = request_available_memory(model.device())?;
                         core_llm::admit_request_memory_with_geometry(
                             m.expanded_ids.len(),
                             req.max_new_tokens,
                             self.descriptor.capabilities.max_context_tokens,
                             required,
-                            request_available_memory(model.device())?,
+                            self.prefix_cache().reclaim_for(required, available),
                         )?;
                         let mut cache = model
                             .new_cache_for(capacity, drafts)
@@ -3828,10 +4458,36 @@ impl TextLlm for LlamaProvider {
                         run
                     }
                     None => {
+                        // Text: prefill on top of the longest prefix the cross-turn cache
+                        // restores (sc-24437), decode, then keep a copy of the request's KV.
                         model
                             .device()
                             .synchronize()
                             .map_err(|e| to_core(e.into()))?;
+                        let capacity = prompt_ids.len().saturating_add(config.max_new_tokens);
+                        let mut cache = model
+                            .new_cache_for(capacity, drafts)
+                            .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        let restored = self
+                            .prefix_cache()
+                            .restore_into(&mut cache, &prompt_ids, false)
+                            .map_err(to_core)?;
+                        let prefilled = prefill_restored(
+                            stepper,
+                            &mut cache,
+                            restored,
+                            &prompt_ids,
+                            None,
+                            false,
+                            &req.cancel,
+                        )
+                        .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        // Measured, not looked up: the positions the prefill did not feed.
+                        prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
+                        prefill_forwards = prefilled.forwards;
+                        if prefix_hit > 0 {
+                            prefix_path = "hit";
+                        }
                         let mut prefill = None;
                         let mut decode_started = None;
                         let mut boundary = || -> crate::error::Result<()> {
@@ -3843,7 +4499,14 @@ impl TextLlm for LlamaProvider {
                         let run = generate_speculative_with(
                             stepper,
                             proposer,
-                            SpeculativePrompt::Tokens(&prompt_ids),
+                            SpeculativePrompt::Prefilled {
+                                cache: &mut cache,
+                                logits: prefilled.logits,
+                                hidden: None,
+                                history: &prompt_ids,
+                                position_delta: 0,
+                                warm_proposer: true,
+                            },
                             &config,
                             drafts,
                             &req.cancel,
@@ -3860,6 +4523,17 @@ impl TextLlm for LlamaProvider {
                         phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
+                        if keep_prefix {
+                            if let Err(e) = self.prefix_cache().store(
+                                &prompt_ids,
+                                &run.output.tokens,
+                                &cache,
+                                None,
+                                None,
+                            ) {
+                                prefix_reason = Some(prefix_store_reason(&e));
+                            }
+                        }
                         run
                     }
                 };
@@ -4040,8 +4714,15 @@ impl TextLlm for LlamaProvider {
         // prefill — supplies the host-side counters and every tally. Both records name the
         // proposer that ran: `none` for a request whose speculation is off, including one whose
         // option resolved to no proposer (AC3, sc-24130) — the reference loop never runs one.
-        let decode_record = match engine_record {
-            Some(record) => record.with_request_span(&request_span),
+        // The engine counts a caller's prefill as one forward; a prefill split at the
+        // conversation boundary (sc-24437) ran two.
+        let extra_prefill = prefill_forwards.saturating_sub(1) as u64;
+        let mut decode_record = match engine_record {
+            Some(mut record) => {
+                record.target_forwards += extra_prefill;
+                record.prefill_forwards += extra_prefill;
+                record.with_request_span(&request_span)
+            }
             None => DecodeRecord::plain(
                 DecodePath::Reference,
                 counted.forwards() + extra_forwards,
@@ -4056,6 +4737,9 @@ impl TextLlm for LlamaProvider {
                 cuda_graphs_enabled(),
             )),
         };
+        decode_record.prefix_hit_tokens = prefix_hit as u64;
+        decode_record.prefix_cache = prefix_path;
+        decode_record.prefix_cache_reason = prefix_reason;
         *self
             .last_decode
             .lock()
@@ -5670,6 +6354,8 @@ mod tests {
             projector_source: None,
             quantize: Some(core_llm::Quantize::Nvfp4),
             cuda_graphs: None,
+            prefix_cache_bytes: None,
+            draft_source: None,
         }
     }
 
@@ -7143,6 +7829,245 @@ mod tests {
         assert_eq!(provider.decode_path(), DecodePath::Reference);
     }
 
+    /// sc-24436: with a resident draft, a `draft_model` plan runs the engine with the draft as
+    /// its proposer — the reference selector does not change that — and admission prices the
+    /// draft's own prefill and cache on top of the target's (E7); a Qwen3-VL generic-causal
+    /// multimodal request, which has no step-seam prefill, falls back by name.
+    #[test]
+    fn a_resident_draft_routes_draft_model_onto_the_engine_and_is_priced() {
+        use super::DecodeRoute;
+        use core_llm::{SpeculativePlan, SpeculativeProposer, TextLlm};
+
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let mut provider = super::LlamaProvider::load(&fixture.spec_with_draft()).unwrap();
+        assert!(provider.load_report().unwrap().draft.unwrap().is_resident());
+        let plan = SpeculativePlan::Run {
+            proposer: SpeculativeProposer::DraftModel,
+            depth: 3,
+        };
+        let route = DecodeRoute::Engine {
+            proposer: ProposerKind::DraftModel,
+            drafts: 3,
+        };
+        assert_eq!(provider.decode_route(plan, false), (route, None));
+        provider
+            .set_decode_path(DecodePath::Reference)
+            .expect("the reference loop is selectable");
+        assert_eq!(provider.decode_route(plan, false), (route, None));
+        let (fallback, why) = provider.decode_route(plan, true);
+        assert_eq!(fallback, DecodeRoute::Reference);
+        assert!(why
+            .unwrap()
+            .contains("`draft_model` needs the step-seam engine"));
+
+        // E7: the draft's request is priced beside the target's, only on its own route.
+        let (prompt, budget) = (40usize, 24u32);
+        let draft = &provider.draft.as_ref().unwrap().model;
+        let expected = super::draft_request_bytes(draft, prompt, budget, 3).unwrap();
+        assert!(expected > 0);
+        assert_eq!(provider.draft_bytes(route, prompt, budget), Some(expected));
+        let geometry = draft.memory_geometry_with_checkpoints(5);
+        let reach = (prompt as u64 + u64::from(budget) + 4)
+            * geometry.layers
+            * geometry.kv_heads
+            * geometry.head_dim
+            * geometry.element_bytes
+            * 2;
+        assert!(
+            expected >= reach,
+            "the draft cache spans the request's reach plus K + 1"
+        );
+        assert_eq!(
+            provider.draft_bytes(DecodeRoute::PLAIN_ENGINE, prompt, budget),
+            Some(0)
+        );
+        let lookup = DecodeRoute::Engine {
+            proposer: ProposerKind::PromptLookup,
+            drafts: 3,
+        };
+        assert_eq!(provider.draft_bytes(lookup, prompt, budget), Some(0));
+
+        // Both admission prices carry the draft on its route: the pre-preprocessing one every
+        // request takes, and the Gemma 4 spliced-prompt one over the expanded prompt.
+        assert_eq!(
+            provider.request_bytes(route, prompt, budget, 0),
+            Some(provider.request_bytes(lookup, prompt, budget, 0).unwrap() + expected)
+        );
+        assert_eq!(
+            provider.spliced_request_bytes(route, prompt, budget),
+            Some(
+                provider
+                    .spliced_request_bytes(lookup, prompt, budget)
+                    .unwrap()
+                    + expected
+            )
+        );
+    }
+
+    /// sc-24436 E7, end to end: under a memory budget that holds the target's own request but
+    /// not the draft's beside it, a `draft_model` request is refused as resource-exhausted while
+    /// `off` and prompt lookup at the same depth are admitted. The budget override is process
+    /// state, so the check runs in a child process of its own.
+    #[test]
+    fn a_draft_model_request_is_refused_without_room_for_the_draft() {
+        use super::DecodeRoute;
+        use core_llm::{Sampling, Speculative, SpeculativePlan, SpeculativeProposer, TextLlm};
+
+        const CHILD: &str = "SCENEWORKS_DRAFT_ADMISSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = std::thread::current().name().unwrap().to_owned();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .env_remove(core_llm::AVAILABLE_MEMORY_OVERRIDE)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        // The cross-turn prefix cache is off here (sc-24437): its held entries are reclaimable
+        // (E7), so with it on the draft request would evict the earlier requests' entries and fit
+        // — this test pins the draft's own admission boundary, not the cache's.
+        let mut spec = fixture.spec_with_draft();
+        spec.prefix_cache_bytes = Some(0);
+        let provider = super::LlamaProvider::load(&spec).unwrap();
+        let prompts = core_llm_testkit::draft_model_prompts();
+        let budget = 8u32;
+        let request = |speculative| {
+            core_llm_testkit::bench_request(&prompts[0], speculative, &Sampling::greedy(), budget)
+        };
+        let off = request(Speculative::Off);
+        let lookup = request(Speculative::proposer(SpeculativeProposer::PromptLookup, 3));
+        let draft = request(Speculative::proposer(SpeculativeProposer::DraftModel, 3));
+        let prompt = provider
+            .generate(&off, &mut |_| {})
+            .unwrap()
+            .usage
+            .prompt_tokens as usize;
+        let price = |plan| {
+            let (route, _) = provider.decode_route(plan, false);
+            provider.request_bytes(route, prompt, budget, 0).unwrap()
+        };
+        let run = |proposer| SpeculativePlan::Run { proposer, depth: 3 };
+        // The target's request at depth 3 plus the draft's own beside it, priced independently
+        // of the route's admission so the refusal below is the admission's, not this sum's.
+        let lookup_price = price(run(SpeculativeProposer::PromptLookup));
+        let draft_price =
+            super::draft_request_bytes(&provider.draft.as_ref().unwrap().model, prompt, budget, 3)
+                .unwrap();
+        let with_draft = lookup_price + draft_price;
+        let target_only = price(SpeculativePlan::Off).max(lookup_price);
+        assert!(draft_price > 0 && target_only < with_draft);
+        assert!(matches!(
+            provider
+                .decode_route(run(SpeculativeProposer::DraftModel), false)
+                .0,
+            DecodeRoute::Engine {
+                proposer: ProposerKind::DraftModel,
+                ..
+            }
+        ));
+        std::env::set_var(
+            core_llm::AVAILABLE_MEMORY_OVERRIDE,
+            (with_draft - 1).to_string(),
+        );
+        for admitted in [&off, &lookup] {
+            provider
+                .generate(admitted, &mut |_| {})
+                .expect("the target's own request fits the budget");
+        }
+        let refused =
+            provider.generate(&draft, &mut |_| panic!("a refused request emitted a token"));
+        assert!(
+            matches!(refused, Err(core_llm::Error::RequestResourceExhausted(_))),
+            "{refused:?}"
+        );
+        std::env::remove_var(core_llm::AVAILABLE_MEMORY_OVERRIDE);
+        let admitted = provider.generate(&draft, &mut |_| {}).unwrap();
+        assert_eq!(
+            admitted.decode.unwrap().proposer,
+            ProposerKind::DraftModel,
+            "with room it runs the draft"
+        );
+    }
+
+    /// sc-24436 E7: a named draft is admitted at load only beside the target, in the host domain
+    /// and (on CUDA) the device domain; without room it is refused by name and the target still
+    /// loads; a target that does not fit is refused exactly as before.
+    #[test]
+    fn a_draft_is_admitted_at_load_only_beside_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let spec = fixture.spec_with_draft();
+        let target = super::LlamaProvider::load_memory_estimate(&spec, false)
+            .unwrap()
+            .host_required_bytes;
+        let draft = super::LlamaProvider::load_memory_estimate(
+            &core_llm::LoadSpec::dense(fixture.draft.to_string_lossy()),
+            false,
+        )
+        .unwrap()
+        .host_required_bytes;
+        assert!(
+            draft > 0 && draft < target,
+            "the draft is the smaller model"
+        );
+        let admit = |host, device| super::LlamaProvider::admit_draft(&spec, false, host, device);
+
+        let (draft_spec, refusal) = admit((target, target + draft), None).unwrap().unwrap();
+        assert_eq!(refusal, None);
+        assert_eq!(draft_spec.source, fixture.draft.to_string_lossy());
+        assert_eq!(draft_spec.draft_source, None);
+        let (_, refusal) = admit((target, target + draft - 1), None).unwrap().unwrap();
+        assert!(refusal.unwrap().starts_with("draft model:"));
+        assert!(
+            admit((target, target - 1), None).is_err(),
+            "the target alone"
+        );
+        // Off CUDA the draft carries no device bytes, so a full device domain refuses nothing.
+        let (_, refusal) = admit((target, u64::MAX), Some((target, target)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refusal, None,
+            "an off-CUDA draft estimate carries no device bytes"
+        );
+        // On CUDA the device domain refuses the draft on its own, with the host unbounded.
+        let device_bytes = |spec: &core_llm::LoadSpec| {
+            super::LlamaProvider::load_memory_estimate(spec, true)
+                .unwrap()
+                .device_required_bytes
+                .unwrap()
+        };
+        let target_device = device_bytes(&spec);
+        let draft_device =
+            device_bytes(&core_llm::LoadSpec::dense(fixture.draft.to_string_lossy()));
+        assert!(draft_device > 0);
+        let cuda =
+            |device| super::LlamaProvider::admit_draft(&spec, true, (target, u64::MAX), device);
+        let (_, refusal) = cuda(Some((target_device, target_device + draft_device)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(refusal, None, "room for both on the device");
+        let (_, refusal) = cuda(Some((target_device, target_device + draft_device - 1)))
+            .unwrap()
+            .unwrap();
+        let refusal = refusal.expect("no device room for the draft");
+        assert!(refusal.starts_with("draft model:"), "{refusal}");
+        // No draft named: nothing to admit.
+        assert!(super::LlamaProvider::admit_draft(
+            &core_llm::LoadSpec::dense(fixture.target.to_string_lossy()),
+            false,
+            (target, target),
+            None
+        )
+        .unwrap()
+        .is_none());
+    }
+
     /// sc-24433: a Qwen3-VL generic-causal multimodal request has no step-seam prefill, so a
     /// prompt-lookup plan falls back to the reference loop — and says so.
     #[test]
@@ -7273,9 +8198,13 @@ mod tests {
         assert_eq!(report.proposer, ProposerKind::None);
         // `Auto` on a snapshot without a head: the engine with no proposer, since sc-24140.
         assert_eq!(report.path, "step_model");
+        // The prefill forward plus one per generated token after the first — and one more: the
+        // prefill splits at the end of the rendered conversation, where the prefix cache
+        // snapshots the hybrid's recurrent state (sc-24437).
+        assert_eq!(report.prefix_cache.path, "miss");
         assert_eq!(
             report.target_forwards,
-            u64::from(out.usage.generated_tokens)
+            u64::from(out.usage.generated_tokens) + 1
         );
 
         // `None` keeps the process switch at load (off here); the report says so.
@@ -8361,6 +9290,401 @@ mod tests {
         } else {
             assert_eq!(record.sampler.label(), "host:device_unavailable");
             assert_eq!(record.sampler.host_draws, draws);
+        }
+    }
+
+    /// The cross-turn prefix cache through the provider (sc-24437).
+    mod prefix_cache {
+        use super::super::*;
+        use super::{synthetic_tokenizer_json, tiny_causal_from, tiny_llama_parts, write_snapshot};
+        use core_llm::Speculative;
+
+        fn tokenizer(vocab: usize) -> Tokenizer {
+            Tokenizer::from_json(&synthetic_tokenizer_json(vocab)).unwrap()
+        }
+
+        fn causal_provider() -> LlamaProvider {
+            let (cfg, weights) = tiny_llama_parts();
+            LlamaProvider::from_parts(tiny_causal_from(cfg, weights), tokenizer(40), vec![])
+        }
+
+        fn qwen35_provider(with_mtp: bool) -> LlamaProvider {
+            let (model, mtp) = if with_mtp {
+                let (_, model, head) = crate::models::qwen35::tests::text_model_with_mtp();
+                (model, Some(head))
+            } else {
+                (crate::models::qwen35::tests::text_model().1, None)
+            };
+            let mut descriptor = descriptor_for_qwen35(model.config());
+            if mtp.is_some() {
+                descriptor.capabilities.mtp = Some(core_llm::MtpCapabilities {
+                    max_draft_tokens: u32::MAX,
+                    recommended_draft_tokens: 3,
+                });
+            }
+            LlamaProvider {
+                descriptor,
+                model: Decoder::Qwen35(model),
+                mtp,
+                ..LlamaProvider::from_parts(
+                    tiny_causal_from(tiny_llama_parts().0, tiny_llama_parts().1),
+                    tokenizer(50),
+                    vec![],
+                )
+            }
+        }
+
+        fn chat(messages: Vec<Message>, speculative: Speculative) -> TextLlmRequest {
+            TextLlmRequest {
+                messages,
+                sampling: Sampling::greedy(),
+                max_new_tokens: 8,
+                seed: Some(3),
+                speculative: Some(speculative),
+                ..Default::default()
+            }
+        }
+
+        fn run(provider: &LlamaProvider, req: &TextLlmRequest) -> (TextLlmOutput, Vec<u32>) {
+            let mut ids = Vec::new();
+            let out = provider
+                .generate(req, &mut |ev| {
+                    if let CoreEvent::Token { id, .. } = ev {
+                        ids.push(id);
+                    }
+                })
+                .unwrap();
+            (out, ids)
+        }
+
+        fn rendered_ids(
+            provider: &LlamaProvider,
+            req: &TextLlmRequest,
+            generation: bool,
+        ) -> Vec<i32> {
+            let text = provider
+                .template
+                .render_with(
+                    &req.messages,
+                    &RenderOptions {
+                        add_generation_prompt: generation,
+                        enable_thinking: req.enable_thinking_kwarg(),
+                        reasoning_effort: req.reasoning_effort,
+                        preserve_thinking: req.preserve_thinking,
+                        tools: &req.tools,
+                    },
+                )
+                .unwrap();
+            provider
+                .tokenizer
+                .encode(&text, false)
+                .unwrap()
+                .into_iter()
+                .map(|id| id as i32)
+                .collect()
+        }
+
+        /// A cold run: the reference `Decode` loop on a fresh provider (no engine, no cache).
+        fn reference(fresh: LlamaProvider, req: &TextLlmRequest) -> Vec<u32> {
+            let mut fresh = fresh;
+            fresh.set_decode_path(DecodePath::Reference).unwrap();
+            run(&fresh, &chat(req.messages.clone(), Speculative::Off)).1
+        }
+
+        /// AC1 on the softmax family through the provider: turn 2 restores the shared run of turn
+        /// 1's cached `prompt + reply` (N), and decodes exactly what a cold run decodes.
+        #[test]
+        fn a_causal_second_turn_reports_its_prefix_hit_and_matches_a_cold_run() {
+            let provider = causal_provider();
+            let user = Message::user("t3 t9 t4 t11 t3 t9");
+            let turn1 = chat(vec![user.clone()], Speculative::Off);
+            let (out1, ids1) = run(&provider, &turn1);
+            assert_eq!(out1.decode.as_ref().unwrap().prefix_hit_tokens, 0, "cold");
+            assert_eq!(out1.decode.as_ref().unwrap().prefix_cache.path, "miss");
+            assert_eq!(provider.prefix_cache_stats().inserted, 1);
+
+            let turn2 = chat(
+                vec![
+                    user,
+                    Message::assistant(out1.text.clone()),
+                    Message::user("t5 t7"),
+                ],
+                Speculative::Off,
+            );
+            let p1 = rendered_ids(&provider, &turn1, true);
+            let p2 = rendered_ids(&provider, &turn2, true);
+            let mut held = p1.clone();
+            held.extend(ids1.iter().map(|&t| t as i32));
+            held.truncate(p1.len() + ids1.len() - 1);
+            let n = held
+                .iter()
+                .zip(&p2)
+                .take_while(|(a, b)| a == b)
+                .count()
+                .min(p2.len() - 1);
+            assert!(n >= p1.len() - 1, "turn 2 extends turn 1's prompt: {n}");
+
+            let (out2, ids2) = run(&provider, &turn2);
+            let report = out2.decode.unwrap();
+            assert_eq!(report.prefix_hit_tokens, n as u64);
+            assert_eq!(
+                (
+                    report.prefix_cache.path.as_str(),
+                    report.prefix_cache.reason.as_deref()
+                ),
+                ("hit", None)
+            );
+            assert_eq!(report, provider.last_decode_record().unwrap().report(false));
+            assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+            assert_eq!(ids2, run(&causal_provider(), &turn2).1);
+            assert_eq!(ids2, reference(causal_provider(), &turn2));
+            assert!(provider.prefix_cache_resident_bytes() <= provider.prefix_cache_budget());
+        }
+
+        /// AC2 through the provider: the hybrid snapshots at the end of turn 1's conversation;
+        /// turn 2 and turn 3 restore the recurrent state there (the ring's oldest position) and
+        /// match a cold run — plain and with the MTP head resuming from the stored boundary.
+        #[test]
+        fn a_qwen35_second_turn_restores_the_boundary_state_and_matches_a_cold_run() {
+            for speculative in [
+                Speculative::Off,
+                Speculative::proposer(SpeculativeProposer::Mtp, 3),
+            ] {
+                let mtp = speculative != Speculative::Off;
+                let provider = qwen35_provider(mtp);
+                let user = Message::user("t3 t9 t4 t11 t3 t9 t4 t11");
+                let turn1 = chat(vec![user.clone()], speculative);
+                let (out1, _) = run(&provider, &turn1);
+                assert_eq!(out1.decode.as_ref().unwrap().prefix_hit_tokens, 0);
+                let boundary = rendered_ids(&provider, &turn1, false).len();
+                assert_eq!(provider.prefix_cache().keys().len(), 1);
+                assert_eq!(provider.prefix_cache().keys()[0].len(), boundary);
+                let held = provider.prefix_cache_resident_bytes();
+                let estimate = provider
+                    .prefix_snapshot_bytes(0, Some(boundary), mtp)
+                    .unwrap();
+                assert!(held > 0 && held <= estimate, "{held} > {estimate}");
+
+                for next in ["t5 t7", "t8 t2 t6"] {
+                    let turn = chat(
+                        vec![
+                            user.clone(),
+                            Message::assistant(out1.text.clone()),
+                            Message::user(next),
+                        ],
+                        speculative,
+                    );
+                    let (out, ids) = run(&provider, &turn);
+                    let report = out.decode.unwrap();
+                    assert_eq!(report.prefix_hit_tokens, boundary as u64, "{speculative:?}");
+                    assert_eq!(report.prefix_cache.path, "hit");
+                    assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+                    if mtp {
+                        assert_eq!(report.proposer, ProposerKind::Mtp);
+                        assert!(report.proposed_tokens > 0);
+                    }
+                    assert_eq!(ids, run(&qwen35_provider(mtp), &turn).1, "{speculative:?}");
+                    assert_eq!(
+                        ids,
+                        reference(qwen35_provider(mtp), &turn),
+                        "{speculative:?}"
+                    );
+                }
+            }
+        }
+
+        /// The reference loop (the parity oracle) never reads or feeds the cache, and says so.
+        #[test]
+        fn the_reference_loop_prefills_cold_and_names_why() {
+            let mut provider = causal_provider();
+            provider.set_decode_path(DecodePath::Reference).unwrap();
+            let req = chat(vec![Message::user("t3 t9 t4")], Speculative::Off);
+            for _ in 0..2 {
+                let report = run(&provider, &req).0.decode.unwrap();
+                assert_eq!(report.prefix_hit_tokens, 0);
+                assert_eq!(report.prefix_cache.path, "bypassed");
+                let reason = report.prefix_cache.reason.unwrap();
+                assert!(reason.starts_with("the reference decode loop"), "{reason}");
+                assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+            }
+            assert!(provider.prefix_cache().is_empty());
+        }
+
+        /// Sets the operational memory override for one scope (tests run on one thread,
+        /// `.cargo/config.toml`, so no other test observes it).
+        struct MemoryOverride;
+
+        impl MemoryOverride {
+            fn set(bytes: u64) -> Self {
+                std::env::set_var(core_llm::AVAILABLE_MEMORY_OVERRIDE, bytes.to_string());
+                Self
+            }
+        }
+
+        impl Drop for MemoryOverride {
+            fn drop(&mut self) {
+                std::env::remove_var(core_llm::AVAILABLE_MEMORY_OVERRIDE);
+            }
+        }
+
+        /// E7 at load: the budget is what the load's admission leaves, never more; at the exact
+        /// boundary the load still loads, with no cache.
+        #[test]
+        fn the_load_admits_the_prefix_cache_budget_up_to_its_headroom() {
+            let (cfg, weights) = tiny_llama_parts();
+            let dir = write_snapshot(&cfg, &weights, 40);
+            let mut spec = LoadSpec::dense(dir.path().display().to_string());
+            let required = LlamaProvider::load_memory_estimate(&spec, false)
+                .unwrap()
+                .host_required_bytes;
+            let headroom = 4096;
+            // The estimate names what the load asks for, beside what it requires.
+            let asked = |spec: &LoadSpec| {
+                LlamaProvider::load_memory_estimate(spec, false)
+                    .unwrap()
+                    .prefix_cache_bytes
+            };
+            assert_eq!(asked(&spec), core_llm::DEFAULT_PREFIX_CACHE_BYTES);
+            spec.prefix_cache_bytes = Some(u64::MAX);
+            assert_eq!(asked(&spec), u64::MAX);
+            assert_eq!(
+                LlamaProvider::load_memory_estimate(&spec, false)
+                    .unwrap()
+                    .host_required_bytes,
+                required,
+                "the budget is never part of what the load requires"
+            );
+            {
+                let _budget = MemoryOverride::set(required + headroom);
+                let provider = LlamaProvider::load(&spec).unwrap();
+                assert_eq!(provider.prefix_cache_budget(), headroom);
+                assert_eq!(
+                    provider.load_report().unwrap().prefix_cache_bytes,
+                    Some(headroom),
+                    "the report names the settled budget"
+                );
+                spec.prefix_cache_bytes = Some(100);
+                assert_eq!(
+                    LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
+                    100
+                );
+                spec.prefix_cache_bytes = None;
+                assert_eq!(
+                    LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
+                    headroom.min(core_llm::DEFAULT_PREFIX_CACHE_BYTES)
+                );
+            }
+            spec.prefix_cache_bytes = Some(u64::MAX);
+            {
+                // At the boundary the budget settles down to nothing rather than refusing.
+                let _budget = MemoryOverride::set(required);
+                let provider = LlamaProvider::load(&spec).unwrap();
+                assert_eq!(provider.prefix_cache_budget(), 0);
+                assert_eq!(provider.load_report().unwrap().prefix_cache_bytes, Some(0));
+            }
+            {
+                let _budget = MemoryOverride::set(required - 1);
+                assert!(LlamaProvider::load(&spec).is_err(), "past admission");
+            }
+        }
+
+        /// A paged KV cache keeps no snapshot and the report says why — not as a failed copy.
+        #[test]
+        fn a_paged_cache_names_why_it_keeps_no_snapshot() {
+            let model = tiny_causal_from(tiny_llama_parts().0, tiny_llama_parts().1);
+            let mut cache = model.new_paged_step_cache(4);
+            let prompt = [3, 9, 4, 11, 5];
+            StepModel::forward_step(
+                &model,
+                &mut cache,
+                crate::decode::StepRequest::last(&prompt),
+            )
+            .unwrap();
+            let err = PrefixCache::with_budget(1 << 30)
+                .store(&prompt, &[], &cache, None, None)
+                .unwrap_err();
+            assert_eq!(prefix_store_reason(&err), PREFIX_PAGED_NOT_SNAPSHOTTED);
+            assert_eq!(
+                prefix_store_reason(&crate::Error::Msg("copy".into())),
+                PREFIX_COPY_FAILED
+            );
+        }
+
+        fn required_bytes(provider: &LlamaProvider, req: &TextLlmRequest) -> u64 {
+            let prompt = rendered_ids(provider, req, true);
+            priced_request_bytes(
+                &provider.model,
+                DecodeRoute::PLAIN_ENGINE,
+                prompt.len(),
+                req.max_new_tokens,
+                0,
+                false,
+            )
+            .unwrap()
+        }
+
+        /// E7 per request, on the softmax family: a request keeps its KV copy only when memory
+        /// holds the request and the copy; held entries are evicted to make room, and one byte
+        /// short of that the request still runs — without keeping anything.
+        #[test]
+        fn a_request_keeps_its_snapshot_only_when_admission_holds_it() {
+            let req = chat(vec![Message::user("t11 t12 t13 t14")], Speculative::Off);
+            let probe = causal_provider();
+            let prompt = rendered_ids(&probe, &req, true);
+            let required = required_bytes(&probe, &req);
+            let snapshot = probe
+                .prefix_snapshot_bytes(prompt.len() + req.max_new_tokens as usize, None, false)
+                .unwrap();
+            {
+                let provider = causal_provider();
+                let _budget = MemoryOverride::set(required + snapshot - 1);
+                let report = provider
+                    .generate(&req, &mut |_| {})
+                    .unwrap()
+                    .decode
+                    .unwrap();
+                assert!(provider.prefix_cache().is_empty(), "no room: nothing kept");
+                let reason = report.prefix_cache.reason.unwrap();
+                assert!(reason.starts_with("not kept: admission"), "{reason}");
+            }
+            {
+                let provider = causal_provider();
+                let _budget = MemoryOverride::set(required + snapshot);
+                provider.generate(&req, &mut |_| {}).unwrap();
+                assert_eq!(provider.prefix_cache().len(), 1);
+                assert!(provider.prefix_cache_resident_bytes() <= snapshot);
+            }
+            // With an entry held, a request short by exactly the entry reclaims it.
+            let provider = causal_provider();
+            run(
+                &provider,
+                &chat(vec![Message::user("t3 t9 t4")], Speculative::Off),
+            );
+            let held = provider.prefix_cache_resident_bytes();
+            assert!(held > 0);
+            {
+                let _budget = MemoryOverride::set(required - held - 1);
+                let err = provider.generate(&req, &mut |_| {}).unwrap_err();
+                assert!(
+                    matches!(err, CoreError::RequestResourceExhausted(_)),
+                    "{err}"
+                );
+                assert_eq!(
+                    provider.prefix_cache_resident_bytes(),
+                    held,
+                    "kept on refusal"
+                );
+            }
+            {
+                let _budget = MemoryOverride::set(required - held);
+                let before = provider.prefix_cache_stats().evicted;
+                provider.generate(&req, &mut |_| {}).unwrap();
+                assert_eq!(provider.prefix_cache_stats().evicted - before, 1);
+                assert!(
+                    provider.prefix_cache().is_empty(),
+                    "no room left for its own copy"
+                );
+            }
         }
     }
 }

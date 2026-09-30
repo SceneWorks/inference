@@ -30,10 +30,51 @@ use crate::primitives::sampler::argmax_rows_tensor;
 /// target-selected and therefore always-valid token); the later, recursively drafted state is
 /// discarded on commit even when its tokens were accepted, because replay must pair accepted
 /// tokens with the **target's** hidden rows rather than the head's own.
+///
+/// **Prefix-cache resume (story sc-24437).** A prompt whose leading `M` positions came from the
+/// cross-turn prefix cache is prefilled from `M` on, so the target returns hidden rows only for
+/// positions `M..P`. The warm-up pairs `embed(x[j + 1])` with `H[j]`, so it needs the head's cache
+/// at the boundary plus `H[M - 1]` — an [`MtpBoundary`] the prefix cache stored beside the target
+/// state ([`resume_from`](Self::resume_from)); it then seeds only positions `M..P`.
+/// [`capture_at`](Self::capture_at) records the same state at a boundary inside this prompt for a
+/// later request to resume from.
 pub struct MtpProposer<'a> {
     mtp: &'a Qwen35Mtp,
     cache: Qwen35MtpCache,
     after_cur: Option<Qwen35MtpCache>,
+    resume: Option<MtpBoundary>,
+    capture_at: Option<usize>,
+    captured: Option<MtpBoundary>,
+}
+
+/// The MTP head's state at a prompt boundary `len` (story sc-24437): its cache after warming on
+/// the first `len` prompt positions and the target's final-normalized hidden row `H[len - 1]` the
+/// next warm-up pair needs. Immutable once captured: the head's growing KV is replaced, never
+/// written in place, so a resumed clone cannot reach it.
+#[derive(Clone, Debug)]
+pub struct MtpBoundary {
+    cache: Qwen35MtpCache,
+    hidden: Tensor,
+    len: usize,
+}
+
+impl MtpBoundary {
+    /// The prompt positions the state covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the boundary covers no position (never true for a captured boundary).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Bytes the state holds (the head's KV plus the hidden row).
+    pub fn bytes(&self) -> usize {
+        self.cache
+            .bytes()
+            .saturating_add(crate::primitives::decode_cache::tensor_bytes(&self.hidden))
+    }
 }
 
 impl<'a> MtpProposer<'a> {
@@ -43,7 +84,30 @@ impl<'a> MtpProposer<'a> {
             mtp,
             cache: mtp.new_cache(),
             after_cur: None,
+            resume: None,
+            capture_at: None,
+            captured: None,
         }
+    }
+
+    /// Resume from a prefix-cache boundary: the next [`warm`](Proposer::warm) is handed the full
+    /// prompt but hidden rows only for positions `boundary.len()..` and seeds from there.
+    pub fn resume_from(mut self, boundary: Option<MtpBoundary>) -> Self {
+        self.resume = boundary;
+        self
+    }
+
+    /// Record the head's state at prompt position `len` during the next warm-up (see
+    /// [`take_captured`](Self::take_captured)); ignored unless `len` falls strictly inside the
+    /// warmed span.
+    pub fn capture_at(mut self, len: Option<usize>) -> Self {
+        self.capture_at = len;
+        self
+    }
+
+    /// The state captured by [`capture_at`](Self::capture_at), once.
+    pub fn take_captured(&mut self) -> Option<MtpBoundary> {
+        self.captured.take()
     }
 
     /// Warm the predictor from a **multimodal** prompt: the fused (vision-spliced) prompt
@@ -91,12 +155,65 @@ impl Proposer for MtpProposer<'_> {
         let hidden = prompt_hidden.ok_or_else(|| {
             Error::Msg("MtpProposer: the target did not return prompt hidden states".into())
         })?;
-        // embed(token[j + 1]) is paired with hidden[j]; the first generated token is paired with
-        // the last prompt hidden row at the first draft step.
-        if prompt.len() > 1 {
-            let previous = hidden.narrow(1, 0, prompt.len() - 1)?;
-            self.mtp
-                .warm_sequence(&prompt[1..], &previous, 1, &mut self.cache)?;
+        // embed(token[j + 1]) is paired with hidden[j] at position j + 1; the first generated token
+        // is paired with the last prompt hidden row at the first draft step. `hidden` holds the
+        // rows the target prefilled: every prompt position cold, positions `offset..` when resuming
+        // from a prefix-cache boundary at `offset` (whose `H[offset - 1]` the boundary carries).
+        let (offset, boundary_row) = match self.resume.take() {
+            Some(b) => {
+                self.cache = b.cache;
+                (b.len, Some(b.hidden))
+            }
+            None => (0, None),
+        };
+        let rows = hidden.dim(1)?;
+        if offset >= prompt.len() || rows != prompt.len() - offset {
+            return Err(Error::Msg(format!(
+                "MtpProposer: {rows} hidden rows for a {}-token prompt resumed at {offset}",
+                prompt.len()
+            )));
+        }
+        let target_rows = |start: usize, n: usize| -> Result<Tensor> {
+            match &boundary_row {
+                Some(row) if start + 1 == offset => {
+                    if n == 1 {
+                        Ok(row.clone())
+                    } else {
+                        Ok(Tensor::cat(&[row, &hidden.narrow(1, 0, n - 1)?], 1)?)
+                    }
+                }
+                _ => Ok(hidden.narrow(1, start - offset, n)?),
+            }
+        };
+        let first = offset.max(1);
+        let split = self
+            .capture_at
+            .take()
+            .filter(|&b| b > offset && b < prompt.len());
+        let mut segments = Vec::with_capacity(2);
+        let mut from = first;
+        if let Some(b) = split {
+            segments.push(from..b);
+            from = b;
+        }
+        segments.push(from..prompt.len());
+        for segment in segments {
+            if !segment.is_empty() {
+                let previous = target_rows(segment.start - 1, segment.len())?;
+                self.mtp.warm_sequence(
+                    &prompt[segment.clone()],
+                    &previous,
+                    segment.start as i32,
+                    &mut self.cache,
+                )?;
+            }
+            if split == Some(segment.end) {
+                self.captured = Some(MtpBoundary {
+                    cache: self.cache.clone(),
+                    hidden: target_rows(segment.end - 1, 1)?.copy()?,
+                    len: segment.end,
+                });
+            }
         }
         Ok(())
     }
@@ -248,12 +365,19 @@ impl Proposer for NgramProposer {
 /// start plus a replay when its cache only checkpoints step starts (it asks the cache to retain
 /// `K + 2` checkpoints so that start survives the draft steps; a hybrid draft therefore holds
 /// `K + 3` recurrent states, which whoever admits a draft-model request must price).
+///
+/// A draft padded differently from its target ([`with_vocab`](Self::with_vocab)) proposes only
+/// its tokenizer's ids, over logits the target's width.
 pub struct DraftModelProposer<'a, D: StepModel> {
     draft: &'a D,
     cache: Option<D::Cache>,
     budget: usize,
     max_drafts: usize,
     base: i32,
+    /// Leading draft ids a draft may be drawn from (the tokenizer's tokens the draft scores).
+    proposable: usize,
+    /// The target's logits width, which the draft's logits are shaped to.
+    width: usize,
     /// Draft-model forwards issued (its own cost, separate from the target's).
     pub draft_forwards: u64,
 }
@@ -269,8 +393,37 @@ impl<'a, D: StepModel> DraftModelProposer<'a, D> {
             budget: capacity,
             max_drafts,
             base: 0,
+            proposable: draft.vocab_size(),
+            width: draft.vocab_size(),
             draft_forwards: 0,
         }
+    }
+
+    /// Draw drafts only from the first `proposable` draft ids, over logits `width` wide — the
+    /// target's — with every other id at `-inf`: a draft whose padding rows differ from its
+    /// target's ([`core_llm::draft_compatibility`]) never proposes a padding id, and its `q`
+    /// covers the target's id space.
+    pub fn with_vocab(mut self, proposable: usize, width: usize) -> Self {
+        self.proposable = proposable.min(self.draft.vocab_size()).min(width);
+        self.width = width;
+        self
+    }
+
+    /// The draft's `[1, vocab]` logits over the target's ids.
+    pub(crate) fn shaped(&self, logits: Tensor) -> Result<Tensor> {
+        if self.proposable == self.width && self.width == self.draft.vocab_size() {
+            return Ok(logits);
+        }
+        let last = logits.rank() - 1;
+        let kept = logits.narrow(last, 0, self.proposable)?;
+        if self.width == self.proposable {
+            return Ok(kept);
+        }
+        let mut pad = logits.dims().to_vec();
+        pad[last] = self.width - self.proposable;
+        let pad =
+            Tensor::full(f32::NEG_INFINITY, pad, logits.device())?.to_dtype(logits.dtype())?;
+        Ok(Tensor::cat(&[&kept, &pad], last)?)
     }
 
     fn take_cache(&mut self) -> Result<D::Cache> {
@@ -286,7 +439,7 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
     }
 
     fn vocab_size(&self) -> Option<usize> {
-        Some(self.draft.vocab_size())
+        Some(self.width)
     }
 
     fn warm(&mut self, prompt: &[i32], _: Option<&Tensor>) -> Result<()> {
@@ -318,7 +471,10 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
     fn commit(&mut self, cur: i32, accepted: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
         let base = self.base;
         let mut cache = self.take_cache()?;
-        let target = base + 1 + accepted.len() as i32;
+        // A host-sampled run stops drafting at a stop token without feeding it, so an accepted
+        // stop leaves the cache one short of `base + 1 + accepted`: keep what was fed (the run
+        // ends at that stop).
+        let target = (base + 1 + accepted.len() as i32).min(cache.len());
         let result = match cache.rollback_to(target) {
             Ok(()) => Ok(()),
             Err(Error::RollbackUnavailable { .. }) => cache.rollback_to(base).and_then(|()| {
@@ -356,7 +512,7 @@ impl<D: StepModel> DraftModelProposer<'_, D> {
                     .logits;
                 self.draft_forwards += 1;
                 if step < k {
-                    feed = argmax_rows_tensor(&logits)?.reshape((1, 1))?;
+                    feed = argmax_rows_tensor(&self.shaped(logits)?)?.reshape((1, 1))?;
                     drafts.push(feed.clone());
                 }
             }
@@ -379,7 +535,7 @@ impl<D: StepModel> DraftModelProposer<'_, D> {
                 .logits;
             self.draft_forwards += 1;
             if step < k {
-                let (d, dist) = sampler.sample_draft(&logits, &draft_history)?;
+                let (d, dist) = sampler.sample_draft(&self.shaped(logits)?, &draft_history)?;
                 if let Some(dist) = dist {
                     dists.push(dist);
                 }

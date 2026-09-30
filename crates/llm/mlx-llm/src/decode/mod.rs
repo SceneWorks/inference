@@ -23,13 +23,19 @@ pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
-    generate_speculative, CacheRollback, DraftSampler, EngineOptions, LogitsScope, MlxSampler,
-    NoProposer, Pipelining, Proposal, ProposeContext, Proposer, RewindableConstraintMask, Rollback,
-    SampledToken, SnapshotRollback, SpeculativePrompt, SpeculativeRun, SpeculativeTarget,
-    StepTarget, TargetOutput, TokenSampler, TruncateRollback,
+    generate_speculative, CacheRollback, CheckpointRingRollback, DraftSampler, EngineOptions,
+    LogitsScope, MlxSampler, NoProposer, Pipelining, Proposal, ProposeContext, Proposer,
+    RewindableConstraintMask, Rollback, SampledToken, SnapshotRollback, SpeculativePrompt,
+    SpeculativeRun, SpeculativeTarget, StepTarget, TargetOutput, TokenSampler, TruncateRollback,
 };
-pub use prefix::{generate_cached, generate_cached_with, PrefixCache, PrefixStats};
-pub use proposers::{generate_qwen35_mtp, MtpProposer, NgramProposer, Qwen35MtpMultimodalPrompt};
+pub use prefix::{
+    generate_cached, generate_cached_with, prefill_restored, prefill_with_prefix, Boundary,
+    PrefixCache, PrefixEntry, PrefixPrefill, PrefixSnapshot, PrefixStats, Restored,
+};
+pub use proposers::{
+    generate_qwen35_mtp, DraftModelProposer, MtpBoundary, MtpProposer, NgramProposer,
+    Qwen35MtpMultimodalPrompt,
+};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };

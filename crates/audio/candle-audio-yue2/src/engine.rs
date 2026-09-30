@@ -114,12 +114,28 @@ pub struct IdentityKeys {
     pub tier: &'static str,
     /// The AR stages' mode (`none` / `fp8`, upstream's `quantization`, sc-22995).
     pub ar: &'static str,
+    /// The decoder execution dtype; legacy FP32 keeps its historical identity shape.
+    pub vae_dtype: DType,
+    /// Explicit stage policy; Legacy keeps the existing stage-key shape.
+    pub compute_policy: gen_core::Yue2ComputePolicy,
 }
 
 impl IdentityKeys {
+    fn bind_policy(&self, mut input: Value) -> Value {
+        if self.compute_policy != gen_core::Yue2ComputePolicy::Legacy {
+            input
+                .as_array_mut()
+                .expect("stage identity is an array")
+                .push(json!({
+                    "compute_policy": policy_name(self.compute_policy)
+                }));
+        }
+        input
+    }
+
     /// The plan stage for `request` sampled with `abc`.
     pub fn plan(&self, request: &SongRequest, abc: &Sampling) -> String {
-        identity_of(&json!([
+        identity_of(&self.bind_policy(json!([
             IDENTITY_SCHEMA,
             "plan",
             PROTOCOL_VERSION,
@@ -131,12 +147,12 @@ impl IdentityKeys {
             self.device,
             self.runtime,
             {"tier": self.tier, "ar": self.ar},
-        ]))
+        ])))
     }
 
     /// The semantic stage for `plan` sampled with `semantic`.
     pub fn semantic(&self, plan: &SymbolicPlan, semantic: &Sampling) -> String {
-        identity_of(&json!([
+        identity_of(&self.bind_policy(json!([
             IDENTITY_SCHEMA,
             "semantic",
             PROTOCOL_VERSION,
@@ -148,7 +164,7 @@ impl IdentityKeys {
             self.device,
             self.runtime,
             {"tier": self.tier, "ar": self.ar},
-        ]))
+        ])))
     }
 
     /// The acoustic stage identity of [`crate::nar`] (weights, dtype, prefix, codes, noise, steps,
@@ -176,7 +192,7 @@ impl IdentityKeys {
         vae: &Value,
         weights: &Value,
     ) -> String {
-        identity_of(&json!({
+        let mut input = json!({
             "schema": IDENTITY_SCHEMA,
             "kind": "cached_decode",
             "source": source,
@@ -185,14 +201,21 @@ impl IdentityKeys {
             "weights": weights,
             "device": self.device,
             "runtime": self.runtime,
-        }))
+        });
+        if self.vae_dtype != DType::F32 {
+            input["vae_dtype"] = json!(dtype_name(self.vae_dtype));
+        }
+        if self.compute_policy != gen_core::Yue2ComputePolicy::Legacy {
+            input["compute_policy"] = json!(policy_name(self.compute_policy));
+        }
+        identity_of(&input)
     }
 
     /// The synthesis stage: [`Self::nar`] plus the device, runtime and tier. Not the AR mode: the
     /// acoustic stage always runs the tier's own weights (the FP8 AR mode is restored to BF16
     /// before it, [`crate::fp8`]), so its latents are the same in both modes.
     pub fn synthesis(&self, semantic: &SemanticResult, generation: &GenerationConfig) -> String {
-        identity_of(&json!([
+        identity_of(&self.bind_policy(json!([
             IDENTITY_SCHEMA,
             "synthesis",
             self.nar(semantic, generation),
@@ -200,7 +223,7 @@ impl IdentityKeys {
             self.device,
             self.runtime,
             {"tier": self.tier},
-        ]))
+        ])))
     }
 }
 
@@ -432,6 +455,8 @@ pub struct Yue2Engine {
     /// The MoT's compute dtype, device and weights digest, fixed at load (offload moves AR
     /// weights to host memory and back but changes none of these).
     dtype: DType,
+    vae_dtype: DType,
+    compute_policy: gen_core::Yue2ComputePolicy,
     device: Device,
     weights_sha256: String,
     /// The loaded weight tier and the AR mode (sc-22995).
@@ -510,6 +535,51 @@ fn dtype_name(dtype: DType) -> &'static str {
     }
 }
 
+fn policy_name(policy: gen_core::Yue2ComputePolicy) -> &'static str {
+    match policy {
+        gen_core::Yue2ComputePolicy::Legacy => "legacy",
+        gen_core::Yue2ComputePolicy::Auto => "auto",
+        gen_core::Yue2ComputePolicy::Bf16 => "bf16",
+        gen_core::Yue2ComputePolicy::Fp32 => "fp32",
+    }
+}
+
+fn check_stage_compute(
+    policy: gen_core::Yue2ComputePolicy,
+    model: DType,
+    vae: DType,
+    device: &Device,
+    ar: ArPrecision,
+) -> gen_core::Result<()> {
+    use gen_core::Yue2ComputePolicy as Policy;
+    let valid = match policy {
+        Policy::Legacy => matches!(model, DType::F32 | DType::BF16) && vae == DType::F32,
+        Policy::Auto => {
+            model
+                == if device.is_cpu() {
+                    DType::F32
+                } else {
+                    DType::BF16
+                }
+                && vae == DType::F32
+        }
+        Policy::Bf16 => !device.is_cpu() && model == DType::BF16 && vae == DType::BF16,
+        Policy::Fp32 => model == DType::F32 && vae == DType::F32,
+    };
+    if !valid {
+        return Err(gen_core::Error::Unsupported(format!(
+            "yue2: {policy:?} requires matching supported MoT/VAE stage dtypes on {device:?}; got {model:?}/{vae:?}"
+        )));
+    }
+    if ar == ArPrecision::Fp8 && !matches!(policy, Policy::Auto | Policy::Legacy) {
+        return Err(gen_core::Error::Unsupported(
+            "yue2: experimental FP8 AR requires explicit Auto stage mixing (or a legacy load)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn device_name(device: &Device) -> &'static str {
     match device {
         Device::Cpu => "cpu",
@@ -579,6 +649,32 @@ impl Yue2Engine {
         generation: GenerationConfig,
         options: EngineOptions,
     ) -> gen_core::Result<Self> {
+        Self::load_with_stage_compute(
+            dirs,
+            dtype,
+            DType::F32,
+            gen_core::Yue2ComputePolicy::Legacy,
+            device,
+            precision,
+            generation,
+            options,
+        )
+    }
+
+    /// Load at an explicit YuE2 stage compute policy. A VAE dtype mismatch is refused before
+    /// snapshot verification, so a strict BF16/F32 request never silently runs a mixed decoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with_stage_compute(
+        dirs: &SnapshotDirs,
+        dtype: DType,
+        vae_dtype: DType,
+        compute_policy: gen_core::Yue2ComputePolicy,
+        device: &Device,
+        precision: ModelPrecision,
+        generation: GenerationConfig,
+        options: EngineOptions,
+    ) -> gen_core::Result<Self> {
+        check_stage_compute(compute_policy, dtype, vae_dtype, device, precision.ar)?;
         if precision.ar == ArPrecision::Fp8 {
             fp8::check_fp8_request(precision.tier.unwrap_or(Tier::Bf16), dtype, device)?;
         }
@@ -623,6 +719,8 @@ impl Yue2Engine {
             tokenizer,
             nar: Mutex::new(nar),
             dtype,
+            vae_dtype,
+            compute_policy,
             device,
             weights_sha256,
             tier,
@@ -693,6 +791,8 @@ impl Yue2Engine {
                 Yue2TextTokenizer::padded_for_tests(&bytes).expect("synthetic table parses")
             },
             dtype: nar.lm().dtype(),
+            vae_dtype: DType::F32,
+            compute_policy: gen_core::Yue2ComputePolicy::Legacy,
             device: nar.lm().device().clone(),
             tier: nar.lm().tier(),
             attention_heads: nar.lm().config().num_attention_heads,
@@ -720,6 +820,17 @@ impl Yue2Engine {
     #[cfg(test)]
     pub(crate) fn with_checked_decoders(mut self, dirs: SnapshotDirs) -> Self {
         self.vae_source = VaeSource::FixtureChecked(dirs);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_stage_compute(
+        mut self,
+        policy: gen_core::Yue2ComputePolicy,
+        vae_dtype: DType,
+    ) -> Self {
+        self.compute_policy = policy;
+        self.vae_dtype = vae_dtype;
         self
     }
 
@@ -897,11 +1008,12 @@ impl Yue2Engine {
             VaeSource::Snapshots(dirs) => {
                 let verified = snapshot::resolve_component(vae_component(variant), dirs)?;
                 let device = &self.device;
-                Yue2Vae::load(&verified, VaeParts::DecoderOnly, device).map_err(vae_error)?
+                Yue2Vae::load_with_dtype(&verified, VaeParts::DecoderOnly, device, self.vae_dtype)
+                    .map_err(vae_error)?
             }
             #[cfg(test)]
             VaeSource::Fixture | VaeSource::FixtureChecked(_) => {
-                crate::vae::tests::tiny(variant, VaeParts::DecoderOnly)
+                crate::vae::tests::tiny_with_dtype(variant, VaeParts::DecoderOnly, self.vae_dtype)
             }
         };
         let vae = Arc::new(vae);
@@ -942,7 +1054,7 @@ impl Yue2Engine {
             QueryTile::ScoreElements(n) => json!({"score_elements": n}),
         };
         let (dtype, device) = (dtype_name(self.dtype), device_name(&self.device));
-        json!({
+        let mut config = json!({
             "engine": ENGINE_ID,
             "protocol": PROTOCOL_VERSION,
             "generation": generation,
@@ -959,7 +1071,7 @@ impl Yue2Engine {
             "weight_tier": self.tier.name(),
             "precision_policy": "sc-22995 V2 (candle_audio_yue2::precision)",
             "model_dtype": dtype,
-            "vae_dtype": crate::precision::VAE_DTYPE,
+            "vae_dtype": dtype_name(self.vae_dtype),
             "vae_decode": decode,
             "vae_core_frames": core,
             "vae_halo_frames": halo,
@@ -976,7 +1088,26 @@ impl Yue2Engine {
                 "source_sha256": SOURCE_DIGEST,
             },
             "validation_status": "unvalidated",
-        })
+        });
+        if self.compute_policy != gen_core::Yue2ComputePolicy::Legacy {
+            config["compute_policy"] = json!(policy_name(self.compute_policy));
+            config["effective_stage_dtypes"] = json!({
+                "ar": dtype,
+                "nar": dtype,
+                "vae_decoder": dtype_name(self.vae_dtype),
+                "vae_encoder": dtype_name(self.vae_dtype),
+            });
+            config["fp32_numerical_internals"] = json!({
+                "rmsnorm_reduction": true,
+                "nar_sinusoid_construction": true,
+                "logits_and_sampling": true,
+                "vae_checkpoint_preparation": true,
+                "vae_posterior_softplus": true,
+                "durable_latents_and_wav": true,
+                "ggml_quantized_matmul_operand_and_result": self.tier != Tier::Bf16,
+            });
+        }
+        config
     }
 
     /// The effective configuration without its memory controls ([`MEMORY_CONFIG_KEYS`]): what a
@@ -1051,6 +1182,8 @@ impl Yue2Engine {
             runtime: SOURCE_DIGEST,
             tier: self.tier.name(),
             ar: self.ar.name(),
+            vae_dtype: self.vae_dtype,
+            compute_policy: self.compute_policy,
         }
     }
 
@@ -1374,6 +1507,39 @@ mod identity_tests {
         .unwrap()
     }
 
+    #[test]
+    fn fp8_is_only_compatible_with_auto_or_historical_legacy_policy() {
+        for policy in [
+            gen_core::Yue2ComputePolicy::Bf16,
+            gen_core::Yue2ComputePolicy::Fp32,
+        ] {
+            let dtype = if policy == gen_core::Yue2ComputePolicy::Bf16 {
+                DType::BF16
+            } else {
+                DType::F32
+            };
+            let err = check_stage_compute(policy, dtype, dtype, &Device::Cpu, ArPrecision::Fp8)
+                .unwrap_err();
+            assert!(matches!(err, gen_core::Error::Unsupported(_)));
+        }
+        check_stage_compute(
+            gen_core::Yue2ComputePolicy::Auto,
+            DType::F32,
+            DType::F32,
+            &Device::Cpu,
+            ArPrecision::Fp8,
+        )
+        .unwrap();
+        check_stage_compute(
+            gen_core::Yue2ComputePolicy::Legacy,
+            DType::F32,
+            DType::F32,
+            &Device::Cpu,
+            ArPrecision::Fp8,
+        )
+        .unwrap();
+    }
+
     /// The run identity binds the result-changing configuration — tier, dtype, device, AR mode,
     /// generation settings, decoder — and none of the memory controls
     /// ([`MEMORY_CONFIG_KEYS`]), which `config.json` still records.
@@ -1457,5 +1623,39 @@ mod identity_tests {
         // The device is bound by name; the stage identities bind it too (see
         // `run::tests::every_stage_identity_binds_every_input_it_depends_on`).
         assert_eq!(projected["device"], "cpu");
+    }
+
+    #[test]
+    fn explicit_policy_and_vae_dtype_bind_run_identity_without_changing_legacy() {
+        let base = Yue2Engine::synthetic(EngineOptions::default());
+        let settings = base.default_settings();
+        let request = request();
+        let legacy_id = base.run_identity(&request, &settings).unwrap();
+        let legacy_config = base.effective_config(&request, &settings);
+        assert!(legacy_config.get("compute_policy").is_none());
+        assert_eq!(legacy_config["vae_dtype"], "float32");
+
+        let auto = Yue2Engine::synthetic(EngineOptions::default())
+            .with_stage_compute(gen_core::Yue2ComputePolicy::Auto, DType::F32);
+        assert_ne!(auto.run_identity(&request, &settings).unwrap(), legacy_id);
+        assert_eq!(
+            auto.effective_config(&request, &settings)["compute_policy"],
+            "auto"
+        );
+
+        let strict = Yue2Engine::synthetic(EngineOptions::default())
+            .with_stage_compute(gen_core::Yue2ComputePolicy::Bf16, DType::BF16);
+        assert_ne!(strict.run_identity(&request, &settings).unwrap(), legacy_id);
+        assert_ne!(
+            strict.run_identity(&request, &settings).unwrap(),
+            auto.run_identity(&request, &settings).unwrap()
+        );
+        assert_eq!(
+            strict.effective_config(&request, &settings)["vae_dtype"],
+            "bfloat16"
+        );
+
+        let fp32 = base.with_stage_compute(gen_core::Yue2ComputePolicy::Fp32, DType::F32);
+        assert_ne!(fp32.run_identity(&request, &settings).unwrap(), legacy_id);
     }
 }

@@ -66,6 +66,23 @@ pub enum Error {
         vocab: usize,
     },
 
+    /// A forward would take a DeltaNet checkpoint window past the tokens it was armed to record
+    /// (story sc-24435) — more than the speculative width admission priced. Refused before the
+    /// forward runs, with the cache untouched; typed so the cap is never mistaken for another
+    /// fault.
+    #[error(
+        "the DeltaNet checkpoint window holds {recorded} tokens and is armed for {max_tokens}: a \
+         {requested}-token forward would exceed it"
+    )]
+    CheckpointWindowFull {
+        /// Tokens the window has recorded.
+        recorded: i32,
+        /// Tokens the refused forward carried.
+        requested: i32,
+        /// The most the window records.
+        max_tokens: i32,
+    },
+
     /// Anything else, with a human-readable message.
     #[error("{0}")]
     Msg(String),
