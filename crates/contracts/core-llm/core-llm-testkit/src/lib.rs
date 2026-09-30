@@ -32,9 +32,9 @@ pub mod comparison;
 pub mod speculative;
 pub mod starvector;
 pub use speculative::{
-    check_speculative_greedy_parity, greedy_request, run_speculative_bench, speculative_prompt_set,
-    BenchConfig, BenchDocument, BenchPrompt, BenchRow, ParityCase, ParityRow, PromptClass,
-    BENCH_SCHEMA,
+    bench_request, check_speculative_greedy_parity, parse_bench_sampling, run_speculative_bench,
+    sampling_json, speculative_prompt_set, BenchConfig, BenchDocument, BenchPrompt, BenchRow,
+    ParityCase, ParityRow, PromptClass, BENCH_SCHEMA,
 };
 pub use starvector::{
     check_starvector_bounded_fixture, check_starvector_cancellation, check_starvector_descriptor,

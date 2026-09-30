@@ -108,21 +108,81 @@ pub fn speculative_prompt_set() -> Vec<BenchPrompt> {
     ]
 }
 
-/// A greedy request over `prompt` with `speculative` set explicitly (never the legacy field), seed
-/// pinned — the request both the parity suite and the benchmark send.
-pub fn greedy_request(
+/// A request over `prompt` under `sampling` with `speculative` set explicitly (never the legacy
+/// field), seed pinned — the request the parity suite (greedy) and the benchmark (its configured
+/// [`BenchConfig::sampling`]) send.
+pub fn bench_request(
     prompt: &BenchPrompt,
     speculative: Speculative,
+    sampling: &Sampling,
     max_new_tokens: u32,
 ) -> TextLlmRequest {
     TextLlmRequest {
         messages: prompt.messages.clone(),
-        sampling: Sampling::greedy(),
+        sampling: *sampling,
         max_new_tokens,
         seed: Some(0),
         speculative: Some(speculative),
         ..Default::default()
     }
+}
+
+/// An `f32` knob as the JSON number of its shortest decimal form (`0.7`, not `0.699999988…`).
+fn f32_json(x: f32) -> Value {
+    x.to_string()
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+        .map_or(Value::Null, Value::Number)
+}
+
+/// The benchmark document's record of a [`Sampling`]: every knob, by its field name.
+pub fn sampling_json(sampling: &Sampling) -> Value {
+    json!({
+        "temperature": f32_json(sampling.temperature),
+        "top_p": f32_json(sampling.top_p),
+        "top_k": sampling.top_k,
+        "presence_penalty": f32_json(sampling.presence_penalty),
+        "repetition_penalty": f32_json(sampling.repetition_penalty),
+        "repetition_context": sampling.repetition_context,
+    })
+}
+
+/// Parse a benchmark sampling spec: `"greedy"`, or a JSON object of [`sampling_json`]'s keys, each
+/// optional over [`Sampling::greedy`] (so `{"temperature": 0.7, "top_p": 0.9}` is a seeded
+/// stochastic run). An unknown key or a mistyped value is an error, never ignored.
+pub fn parse_bench_sampling(spec: &str) -> Result<Sampling, String> {
+    let value: Value =
+        serde_json::from_str(spec).map_err(|e| format!("sampling `{spec}` is not JSON: {e}"))?;
+    let mut sampling = Sampling::greedy();
+    if value == json!("greedy") {
+        return Ok(sampling);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("sampling `{spec}` is neither \"greedy\" nor an object"))?;
+    for (key, v) in object {
+        let float = || {
+            v.as_f64()
+                .map(|x| x as f32)
+                .ok_or_else(|| format!("sampling `{key}` must be a number, got {v}"))
+        };
+        let count = || {
+            v.as_u64()
+                .and_then(|x| usize::try_from(x).ok())
+                .ok_or_else(|| format!("sampling `{key}` must be a non-negative integer, got {v}"))
+        };
+        match key.as_str() {
+            "temperature" => sampling.temperature = float()?,
+            "top_p" => sampling.top_p = float()?,
+            "top_k" => sampling.top_k = count()?,
+            "presence_penalty" => sampling.presence_penalty = float()?,
+            "repetition_penalty" => sampling.repetition_penalty = float()?,
+            "repetition_context" => sampling.repetition_context = count()?,
+            other => return Err(format!("sampling has no knob `{other}`")),
+        }
+    }
+    Ok(sampling)
 }
 
 /// The observable result of one generation: the streamed token events, the output text, the
@@ -205,7 +265,12 @@ pub fn check_speculative_greedy_parity(
     for prompt in prompts {
         let off = match observe(
             provider,
-            &greedy_request(prompt, Speculative::Off, max_new_tokens),
+            &bench_request(
+                prompt,
+                Speculative::Off,
+                &Sampling::greedy(),
+                max_new_tokens,
+            ),
         ) {
             Ok(off) => off,
             Err(e) => {
@@ -228,7 +293,12 @@ pub fn check_speculative_greedy_parity(
             );
             let run = match observe(
                 provider,
-                &greedy_request(prompt, case.speculative, max_new_tokens),
+                &bench_request(
+                    prompt,
+                    case.speculative,
+                    &Sampling::greedy(),
+                    max_new_tokens,
+                ),
             ) {
                 Ok(run) => run,
                 Err(e) => {
@@ -289,6 +359,9 @@ pub struct BenchConfig {
     pub backend: String,
     /// Tokens generated per row.
     pub max_new_tokens: u32,
+    /// The sampling every row runs under (seed pinned to 0): [`Sampling::greedy`] for the
+    /// greedy baseline, or a seeded stochastic setting — the product's `auto` + temperature path.
+    pub sampling: Sampling,
     /// The options each prompt runs under, in row order.
     pub options: Vec<Speculative>,
     /// Run each (prompt, option) once untimed before the measured run.
@@ -372,7 +445,7 @@ impl BenchDocument {
             "model": self.config.model,
             "backend": self.config.backend,
             "max_new_tokens": self.config.max_new_tokens,
-            "sampling": "greedy",
+            "sampling": sampling_json(&self.config.sampling),
             "warmup": self.config.warmup,
             "options": self.config.options,
             "rows": self.rows.iter().map(BenchRow::to_json).collect::<Vec<_>>(),
@@ -393,9 +466,9 @@ impl BenchDocument {
     }
 }
 
-/// Run the benchmark: every prompt under every option in `config.options`, greedy, one
-/// [`BenchRow`] each. Fails on the first request the provider refuses or cannot generate — a
-/// benchmark row that silently went missing would read as coverage.
+/// Run the benchmark: every prompt under every option in `config.options`, under
+/// `config.sampling`, one [`BenchRow`] each. Fails on the first request the provider refuses or
+/// cannot generate — a benchmark row that silently went missing would read as coverage.
 pub fn run_speculative_bench(
     provider: &dyn TextLlm,
     prompts: &[BenchPrompt],
@@ -404,7 +477,7 @@ pub fn run_speculative_bench(
     let mut rows = Vec::with_capacity(prompts.len() * config.options.len());
     for prompt in prompts {
         for &option in &config.options {
-            let req = greedy_request(prompt, option, config.max_new_tokens);
+            let req = bench_request(prompt, option, &config.sampling, config.max_new_tokens);
             let tag = format!(
                 "[{}] {}",
                 prompt.id,
@@ -544,6 +617,14 @@ mod tests {
                     .into(),
                     proposer,
                     draft_tokens: plan.depth(),
+                    // What the stub was asked to sample with, so the bench's threading of
+                    // `BenchConfig::sampling` into the request is observable.
+                    sampler: if req.sampling.is_greedy() {
+                        "none"
+                    } else {
+                        "host:stub"
+                    }
+                    .into(),
                     verify_steps: if speculating { 4 } else { 0 },
                     proposed_tokens: if speculating { 8 } else { 0 },
                     accepted_tokens: if speculating { 6 } else { 0 },
@@ -622,6 +703,7 @@ mod tests {
                 Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
             ],
             warmup: true,
+            sampling: Sampling::greedy(),
         };
         let prompts = speculative_prompt_set();
         let doc = run_speculative_bench(&stub(false, false), &prompts, &config).unwrap();
@@ -632,8 +714,11 @@ mod tests {
             json["options"][1],
             json!({"proposer": "prompt_lookup", "depth": 4})
         );
+        assert_eq!(json["sampling"], sampling_json(&Sampling::greedy()));
+        assert_eq!(json["sampling"]["temperature"], 0.0);
         let off = &json["rows"][0];
         assert_eq!(off["prompt_id"], "code_edit");
+        assert_eq!(off["sampler"], "none");
         assert_eq!(off["class"], "predictable");
         assert_eq!(off["requested"], "off");
         assert_eq!(off["proposer"], "none");
@@ -666,5 +751,46 @@ mod tests {
             doc.write_new(&path).is_err(),
             "a sealed baseline is never overwritten"
         );
+
+        // A seeded stochastic run: the document records the knobs, and every request carried them.
+        let stochastic = parse_bench_sampling(r#"{"temperature": 0.7, "top_p": 0.9}"#).unwrap();
+        let doc = run_speculative_bench(
+            &stub(false, false),
+            &prompts[..1],
+            &BenchConfig {
+                sampling: stochastic,
+                ..config
+            },
+        )
+        .unwrap();
+        let json = doc.to_json();
+        assert_eq!(
+            json["sampling"],
+            json!({"temperature": 0.7, "top_p": 0.9, "top_k": 0, "presence_penalty": 0.0,
+                   "repetition_penalty": 1.0, "repetition_context": 0})
+        );
+        for row in json["rows"].as_array().unwrap() {
+            assert_eq!(row["sampler"], "host:stub", "{row}");
+        }
+    }
+
+    #[test]
+    fn a_bench_sampling_spec_parses_over_greedy_and_refuses_what_it_cannot_read() {
+        assert_eq!(
+            parse_bench_sampling("\"greedy\"").unwrap(),
+            Sampling::greedy()
+        );
+        let s = parse_bench_sampling(r#"{"temperature": 0.7, "top_p": 0.9, "top_k": 20}"#).unwrap();
+        assert_eq!((s.temperature, s.top_p, s.top_k), (0.7, 0.9, 20));
+        assert_eq!(s.repetition_penalty, 1.0, "unset knobs stay greedy's");
+        for bad in [
+            "greedy",
+            r#""sample""#,
+            r#"{"temp": 0.7}"#,
+            r#"{"temperature": "hot"}"#,
+            r#"{"top_k": -1}"#,
+        ] {
+            assert!(parse_bench_sampling(bad).is_err(), "{bad}");
+        }
     }
 }

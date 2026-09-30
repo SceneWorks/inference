@@ -66,7 +66,8 @@ pub enum SpeculativeProposer {
 }
 
 impl SpeculativeProposer {
-    /// Every proposer, in the order [`Speculative::Auto`] prefers them.
+    /// Every proposer, in declaration order; [`Speculative::Auto`] considers only `mtp` then
+    /// `prompt_lookup` ([`resolve_speculative`](crate::resolve_speculative)).
     pub const ALL: [SpeculativeProposer; 3] = [
         SpeculativeProposer::Mtp,
         SpeculativeProposer::PromptLookup,
