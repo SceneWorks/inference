@@ -57,6 +57,8 @@ pub struct DevicePositions {
     index: Tensor,
     rope: Tensor,
     device: Device,
+    /// What the buffers hold now: `(len, rope_delta, ring_slots)` of the last stage.
+    staged: std::cell::Cell<Option<(i32, i32, Option<usize>)>>,
 }
 
 impl DevicePositions {
@@ -69,6 +71,7 @@ impl DevicePositions {
             index: Tensor::zeros(INDEX_LEN, DType::U32, device)?,
             rope: Tensor::zeros(MAX_DEVICE_STEP_TOKENS, DType::F32, device)?,
             device: device.clone(),
+            staged: std::cell::Cell::new(None),
         })
     }
 
@@ -104,11 +107,15 @@ impl DevicePositions {
     /// `rope_delta`; ring slots modulo `ring_slots` when the cache keeps a checkpoint ring) into
     /// the device buffers, in place. A no-op while a capture is recording
     /// ([`capturing`]): the runner staged them before the capture began, and an upload inside it
-    /// would never replay.
+    /// would never replay. Also a no-op when the buffers already hold exactly these positions
+    /// (the runner stages before the step, the model's forward stages again).
     pub fn stage(&self, len: i32, rope_delta: i32, ring_slots: Option<usize>) -> Result<()> {
-        if capturing() {
+        let key = (len, rope_delta, ring_slots);
+        if capturing() || self.staged.get() == Some(key) {
             return Ok(());
         }
+        // Invalidated first: a failed upload leaves nothing claimed.
+        self.staged.set(None);
         let (index, rope) = Self::values(len, rope_delta, ring_slots)?;
         self.index
             .slice_set(&Tensor::from_vec(index, INDEX_LEN, &self.device)?, 0, 0)?;
@@ -117,6 +124,7 @@ impl DevicePositions {
             0,
             0,
         )?;
+        self.staged.set(Some(key));
         Ok(())
     }
 

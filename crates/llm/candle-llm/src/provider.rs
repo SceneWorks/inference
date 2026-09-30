@@ -7164,9 +7164,11 @@ mod tests {
         let (mut on, mut off) = (load(true), load(false));
         let engine = run(&on);
         assert_eq!(engine.path, DecodePath::StepModel);
-        assert_eq!(
-            engine.cuda_graphs.eager + engine.cuda_graphs.replayed,
-            engine.target_forwards,
+        // Every target forward went through the runner — once each, or, for the step a graph is
+        // captured at (sc-24441: the dense decoders capture on CUDA), as the eager reference plus
+        // the eager re-run of the capture check.
+        assert!(
+            engine.cuda_graphs.eager + engine.cuda_graphs.replayed >= engine.target_forwards,
             "every step of the Off request went through the runner: {}",
             engine.cuda_graphs.describe()
         );

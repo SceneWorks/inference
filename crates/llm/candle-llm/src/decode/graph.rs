@@ -1430,6 +1430,10 @@ mod cuda {
         let base = cache.len();
         match plan {
             Plan::WarmUp => {
+                // The step's host data goes up first, outside the guard (see `guarded_request`).
+                let ids = request.tokens.ids(&device)?;
+                cache.stage_positions()?;
+                let request = guarded_request(&request, &ids);
                 // Under the parameter-cache guard: every layout parameter this shape's step uploads
                 // lands in the cache the capture step then reuses (see the module docs).
                 let _htod = dev.enable_cuda_graph_htod_cache();
@@ -1444,6 +1448,10 @@ mod cuda {
                 Ok(out)
             }
             Plan::Capture => {
+                // The step's host data goes up first, outside the guard (see `guarded_request`).
+                let ids = request.tokens.ids(&device)?;
+                cache.stage_positions()?;
+                let request = guarded_request(&request, &ids);
                 // The guard spans the eager reference and the recording: the recording must find
                 // every layout parameter cached (a miss fails the step, never records an upload).
                 let htod = dev.enable_cuda_graph_htod_cache();
@@ -1588,6 +1596,21 @@ mod cuda {
                 }
                 Err(reason) => fall_back(runner, cache, request, base, reason),
             },
+        }
+    }
+
+    /// The step as it runs under the parameter-cache guard: its tokens already on the device
+    /// (`ids`), so nothing the guarded forward does uploads host data. (Under the guard a small
+    /// upload goes through the vendored candle's per-thread content cache, whose device buffers
+    /// are freed when the thread exits — on Windows after the driver has detached the thread, a
+    /// failure cudarc records on the model's context and a later operation on another thread
+    /// would report. The cache's positions are staged before the guard for the same reason; its
+    /// `stage_positions` skips values it already staged.)
+    fn guarded_request<'a>(request: &StepRequest<'_>, ids: &'a Tensor) -> StepRequest<'a> {
+        StepRequest {
+            tokens: StepTokens::Device(ids),
+            scope: request.scope,
+            want_hidden: request.want_hidden,
         }
     }
 
@@ -3220,6 +3243,56 @@ mod cuda_tests {
         }
     }
 
+    /// A request decoded through the runner on a thread that then exits leaves nothing recorded
+    /// on the model's CUDA context: the guarded steps upload no host data (their tokens and
+    /// positions go up before the guard), so no per-thread cache holds device buffers the
+    /// thread's exit would free after the driver detached it. The model keeps decoding on another
+    /// thread afterwards.
+    #[test]
+    fn a_runner_thread_exit_leaves_the_models_context_clean() {
+        let Some((_guard, device, dev)) = device() else {
+            return;
+        };
+        let (w, cfg) = crate::models::llama::tests::tiny_qwen3(64, false, &device);
+        let model = crate::models::CausalLm::from_weights(&w, "", cfg).unwrap();
+        let prompt = [1i32, 7, 3, 42, 9];
+        let config = greedy(12);
+        dev.cuda_stream().context().check_err().unwrap();
+        let (graphs, tally) = std::thread::scope(|s| {
+            s.spawn(|| {
+                let runner = GraphRunner::new(&model);
+                let (out, record) = generate_step(
+                    &runner,
+                    &prompt,
+                    &config,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                    None,
+                )
+                .unwrap();
+                (out.tokens, record.cuda_graphs)
+            })
+            .join()
+            .unwrap()
+        });
+        assert!(tally.replayed > 0, "{}", tally.describe());
+        assert_eq!(
+            dev.cuda_stream().context().check_err(),
+            Ok(()),
+            "the runner thread's exit recorded an error on the model's context"
+        );
+        let (eager, _) = generate_step(
+            &model,
+            &prompt,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(eager.tokens, graphs);
+    }
+
     /// The census of warmed production steps recorded as the runner records them (under the
     /// parameter-cache guard): decode and 4-token verify steps of the hybrid on the engine's
     /// cache hold no host copy and no escaping allocation — the ring and the static KV are
@@ -3237,23 +3310,25 @@ mod cuda_tests {
         hybrid
             .forward_step(&mut cache, StepRequest::last(&prompt))
             .unwrap();
-        // Warm each shape under the guard, as the runner's warm-up does.
-        {
+        // The step tokens on the device, as the runner stages them (a host upload inside a
+        // recording is refused by the guard).
+        let one = crate::primitives::input_ids(&[3], &device).unwrap();
+        let four = crate::primitives::input_ids(&[4, 5, 6, 7], &device).unwrap();
+        // Warm each shape under the guard, as the runner's warm-up does (positions staged first).
+        for ids in [&one, &four] {
+            cache.stage_positions().unwrap();
             let Device::Cuda(dev) = &device else {
                 unreachable!()
             };
             let _htod = dev.enable_cuda_graph_htod_cache();
             hybrid
-                .forward_step(&mut cache, StepRequest::last(&[3]))
-                .unwrap();
-            hybrid
-                .forward_step(&mut cache, StepRequest::all(&[4, 5, 6, 7]))
+                .forward_step(&mut cache, StepRequest::all_ids(ids))
                 .unwrap();
         }
-        let decode = census_step(&hybrid, &mut cache, StepRequest::last(&[5]))
+        let decode = census_step(&hybrid, &mut cache, StepRequest::last_ids(&one))
             .unwrap()
             .expect("the decode step records");
-        let verify = census_step(&hybrid, &mut cache, StepRequest::all(&[4, 5, 6, 7]))
+        let verify = census_step(&hybrid, &mut cache, StepRequest::all_ids(&four))
             .unwrap()
             .expect("the verify step records");
         for (name, census) in [("1-token", decode), ("4-token", verify)] {
@@ -3311,16 +3386,19 @@ mod cuda_tests {
                 .reshape((rows, n))
                 .unwrap()
         };
-        let plain = step(&input(0.3)).unwrap();
+        // Inputs are built before any guard: under it a small host upload would go through the
+        // per-thread content cache (see `guarded_request`).
+        let x = input(0.3);
+        let plain = step(&x).unwrap();
         let guarded = {
             let _htod = dev.enable_cuda_graph_htod_cache();
-            step(&input(0.3)).unwrap()
+            step(&x).unwrap()
         };
         assert!(
             bit_identical(&plain, &guarded).unwrap(),
             "eager bits unchanged"
         );
-        let after = step(&input(0.3)).unwrap();
+        let after = step(&x).unwrap();
         assert!(
             bit_identical(&plain, &after).unwrap(),
             "and after the guard"
