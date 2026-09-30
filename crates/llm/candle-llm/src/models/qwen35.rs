@@ -14,9 +14,9 @@
 //!   `sigmoid(gate)` before the output projection).
 //!
 //! Each decoder layer is `input_layernorm → mixer → residual → post_attention_layernorm → MLP →
-//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank (`MoeFfn`, the
-//! 35B-A3B). The KV cache (full-attn layers) and the recurrent [`DeltaNetCache`] (linear
-//! layers) live side by side in a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next
+//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank (the shared
+//! [`SparseMoe`] block, the 35B-A3B). The KV cache (full-attn layers) and the recurrent
+//! [`DeltaNetCache`] (linear layers) live side by side in a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next
 //! `(1 + weight)` convention; the recurrence accumulates in f32 (matching the reference GPU kernel)
 //! while the rest of the decoder runs in the device compute dtype (bf16 on GPU, f32 on CPU).
 
@@ -34,6 +34,7 @@ use crate::primitives::gated_delta::{
     causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
 };
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu};
 use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
 use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, WeightCensus};
 use crate::primitives::quant::is_ggml_block_tensor;
@@ -157,7 +158,7 @@ impl QwenEmbedding {
 pub type MropePositions = (Vec<i32>, Vec<i32>, Vec<i32>, i32);
 
 /// Mixture-of-Experts FFN parameters (`qwen3_5_moe`, the 35B-A3B): the routed-expert count / top-k
-/// and the per-expert + shared-expert FFN widths that drive the un-fused `MoeFfn`.
+/// and the per-expert + shared-expert FFN widths that drive the MoE block.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeParams {
     pub num_experts: i32,
@@ -540,86 +541,14 @@ impl Mlp {
     }
 }
 
-/// Sparse Mixture-of-Experts FFN (`Qwen3_5MoeSparseMoeBlock`, the 35B-A3B): a softmax router over
-/// `experts` (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
-/// **sigmoid-gated** shared expert. Each expert runs only on its routed tokens (gathered, then
-/// scatter-added back), so active compute scales with `experts_per_tok` (~3B of 35B). The fused
-/// checkpoint tensors (`experts.gate_up_proj` / `experts.down_proj`) are un-fused into per-expert
-/// [`Mlp`]s at load. Routing mirrors the generic [`MoeMlp`](super::llama) bank's CPU path.
-struct MoeFfn {
-    router: Tensor, // [num_experts, hidden]
-    experts: Vec<Mlp>,
-    shared: Mlp,
-    shared_gate: Tensor, // [1, hidden] sigmoid gate
-    experts_per_tok: usize,
-}
-
-impl MoeFfn {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, s, h) = x.dims3()?;
-        let t = b * s;
-        let dtype = x.dtype();
-        let device = x.device();
-        let xf = x.reshape((t, h))?;
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Router probabilities (f32 softmax for a stable top-k), pulled to host.
-        let logits = xf.matmul(&self.router.t()?)?; // [t, E]
-        crate::primitives::host_sync::note_host_sync();
-        let probs =
-            candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?.to_vec2::<f32>()?;
-
-        // Invert the per-token top-k into per-expert (token, weight) lists, renormalized to sum 1.
-        let mut routed: Vec<Vec<(u32, f32)>> = vec![Vec::new(); num_experts];
-        for (ti, row) in probs.iter().enumerate() {
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
-            let top = &idx[..k];
-            let denom = top
-                .iter()
-                .map(|&e| row[e])
-                .sum::<f32>()
-                .max(f32::MIN_POSITIVE);
-            for &e in top {
-                routed[e].push((ti as u32, row[e] / denom));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = Tensor::zeros((t, h), dtype, device)?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len();
-            let idx = Tensor::from_vec(
-                toks.iter().map(|&(ti, _)| ti).collect::<Vec<u32>>(),
-                (n,),
-                device,
-            )?;
-            let wts = Tensor::from_vec(
-                toks.iter().map(|&(_, w)| w).collect::<Vec<f32>>(),
-                (n, 1),
-                device,
-            )?
-            .to_dtype(dtype)?;
-            let xe = xf.index_select(&idx, 0)?; // [n, h]
-            let ye = self.experts[e].forward(&xe)?.broadcast_mul(&wts)?; // [n, h]
-            out = out.index_add(&idx, &ye, 0)?;
-        }
-
-        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
-        let shared = self.shared.forward(&xf)?;
-        let sg = sigmoid(&xf.matmul(&self.shared_gate.t()?)?)?; // [t, 1]
-        Ok((out + shared.broadcast_mul(&sg)?)?.reshape((b, s, h))?)
-    }
-}
-
 /// The per-layer FFN: a dense SwiGLU (27B) or a sparse MoE block (35B-A3B).
+///
+/// The MoE block is the crate's shared [`SparseMoe`] (sc-24440): a softmax router over the experts
+/// (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
+/// **sigmoid-gated** shared expert, routed on the device.
 enum Ffn {
     Dense(Mlp),
-    Moe(MoeFfn),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -660,14 +589,7 @@ impl DecoderLayer {
         }
         match &self.ffn {
             Ffn::Dense(m) => m.record(census),
-            Ffn::Moe(moe) => {
-                census.record_tensor(&moe.router);
-                census.record_tensor(&moe.shared_gate);
-                moe.shared.record(census);
-                for e in &moe.experts {
-                    e.record(census);
-                }
-            }
+            Ffn::Moe(moe) => moe.record(census),
         }
     }
 }
@@ -2579,23 +2501,27 @@ impl Qwen35Model {
                     for e in 0..moe.num_experts as usize {
                         let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?; // [2·mi, hidden]
                         let dn = down.narrow(0, e, 1)?.squeeze(0)?; // [hidden, mi]
-                        experts.push(Mlp {
+                        experts.push(SwiGlu {
                             gate: expert(&gate_up_key, gu.narrow(0, 0, mi)?, gate_up_stored)?,
                             up: expert(&gate_up_key, gu.narrow(0, mi, mi)?, gate_up_stored)?,
                             down: expert(&down_key, dn, down_stored)?,
                         });
                     }
-                    Ffn::Moe(MoeFfn {
-                        router: req(lp("mlp.gate.weight"))?,
+                    Ffn::Moe(SparseMoe::new(
+                        req(lp("mlp.gate.weight"))?,
                         experts,
-                        shared: Mlp {
+                        SwiGlu {
                             gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
                             up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
                             down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
                         },
-                        shared_gate: req(lp("mlp.shared_expert_gate.weight"))?,
-                        experts_per_tok: moe.experts_per_tok,
-                    })
+                        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+                        MoeRouting {
+                            experts_per_tok: moe.experts_per_tok,
+                            norm_topk_prob: true,
+                            routed_scaling_factor: 1.0,
+                        },
+                    )?)
                 }
             };
             layers.push(DecoderLayer {
@@ -2716,14 +2642,18 @@ impl StepModel for Qwen35Model {
     }
 
     /// Not replayable as a CUDA graph on this revision (story sc-24134), declared so the runner
-    /// refuses before any capture: the MoE block (35B-A3B) pulls its router probabilities to
-    /// the host every step (`moe_router_host_read`), and every step's positions are Rust-side
+    /// refuses before any capture: an MoE block (35B-A3B) whose experts Candle cannot index by a
+    /// device id (quantized) dispatches them from host-read routes (`moe_expert_host_dispatch`;
+    /// the router itself runs on the device since sc-24440), and every step's positions are Rust-side
     /// scalars — the RoPE tables built on the host for `offset`, the KV written at
     /// `slice_set(offset)`, attention bounded by `narrow(len)` — which a graph would replay at
     /// the captured position (`positions_host_scalar`).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
-        if self.cfg.moe.is_some() {
-            return Err("moe_router_host_read");
+        if let Some(reason) = self.layers.iter().find_map(|l| match &l.ffn {
+            Ffn::Moe(m) => m.graph_refusal(),
+            Ffn::Dense(_) => None,
+        }) {
+            return Err(reason);
         }
         Err("positions_host_scalar")
     }
@@ -2843,6 +2773,7 @@ impl crate::models::VlmDecode for Qwen35Model {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -3218,6 +3149,82 @@ pub(crate) mod tests {
         );
     }
 
+    /// AC (sc-24443): chunkwise prefill leaves Qwen35 greedy decoding unchanged against the
+    /// per-token reference recurrence — a short and a multi-chunk prompt, a speculative-verify-width
+    /// forward and the decode steps after it, on a plain cache and on a checkpointing (ringed) one.
+    #[test]
+    fn greedy_tokens_match_the_per_token_reference_recurrence() {
+        let (_cfg, model) = text_model();
+        let argmax_rows = |logits: &Tensor| -> Vec<u32> {
+            let v = *logits.dims().last().unwrap();
+            host(logits)
+                .chunks(v)
+                .map(|r| {
+                    r.iter()
+                        .enumerate()
+                        .fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                        .0 as u32
+                })
+                .collect()
+        };
+        let run = |prompt: &[u32], ringed: bool| -> (Vec<u32>, Vec<f32>) {
+            let mut cache = if ringed {
+                model.new_cache_with_checkpoints(3)
+            } else {
+                model.new_cache()
+            };
+            let n = prompt.len() as i32;
+            let mut logits = Vec::new();
+            let pre = model.decode_logits(&ids(prompt), &mut cache, 0).unwrap();
+            let mut next = argmax_rows(&pre)[0];
+            logits.extend(host(&pre));
+            let verify = model
+                .forward(
+                    &ids(&[next, (next + 1) % 50, (next + 2) % 50]),
+                    &mut cache,
+                    n,
+                )
+                .unwrap();
+            let mut out = argmax_rows(&verify);
+            logits.extend(host(&verify));
+            next = out[2];
+            for i in 0..6 {
+                let step = model
+                    .decode_logits(&ids(&[next]), &mut cache, n + 3 + i)
+                    .unwrap();
+                next = argmax_rows(&step)[0];
+                out.push(next);
+                logits.extend(host(&step));
+            }
+            (out, logits)
+        };
+        let long: Vec<u32> = (0..90).map(|i| (i * 7 + 3) % 50).collect();
+        for prompt in [&[1u32, 7, 3, 42, 9, 2][..], &long[..]] {
+            for ringed in [false, true] {
+                let (tokens, logits) = run(prompt, ringed);
+                let (ref_tokens, ref_logits) =
+                    crate::primitives::gated_delta::with_per_token_reference(|| {
+                        run(prompt, ringed)
+                    });
+                let md = logits
+                    .iter()
+                    .zip(&ref_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "prompt len {} ringed={ringed}: max logit diff vs per-token {md:.2e}",
+                    prompt.len()
+                );
+                assert_eq!(tokens, ref_tokens, "prompt len {}", prompt.len());
+                assert!(
+                    md < 1e-4,
+                    "prompt len {}: max logit diff {md}",
+                    prompt.len()
+                );
+            }
+        }
+    }
+
     /// The whole Gated DeltaNet layer, validated against the numeric oracle from the exact
     /// `Qwen3_5GatedDeltaNet.forward` reference (4-way in-projection → short conv → contiguous q|k|v
     /// split → L2-norm + q-scale → GQA delta recurrence → gated RMS-norm(z) → out-proj). The same
@@ -3340,23 +3347,28 @@ pub(crate) mod tests {
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            experts.push(Mlp {
+            experts.push(SwiGlu {
                 gate: proj(gate_w),
                 up: proj(up_w),
                 down: proj(dn),
             });
         }
-        let moe = MoeFfn {
-            router: mk("router", &[e, h]),
+        let moe = SparseMoe::new(
+            mk("router", &[e, h]),
             experts,
-            shared: Mlp {
+            SwiGlu {
                 gate: proj(mk("sh_gate", &[mi, h])),
                 up: proj(mk("sh_up", &[mi, h])),
                 down: proj(mk("sh_down", &[h, mi])),
             },
-            shared_gate: mk("sh_gatew", &[1, h]),
-            experts_per_tok: k,
-        };
+            Some(mk("sh_gatew", &[1, h])),
+            MoeRouting {
+                experts_per_tok: k,
+                norm_topk_prob: true,
+                routed_scaling_factor: 1.0,
+            },
+        )
+        .unwrap();
 
         let out = moe.forward(&mk("x", &[1, 1, h])).unwrap();
         assert_eq!(out.dims(), &[1, 1, h]);
@@ -3419,15 +3431,21 @@ pub(crate) mod tests {
             let (Ffn::Moe(d), Ffn::Moe(q)) = (&d.ffn, &q.ffn) else {
                 panic!("an MoE layer")
             };
-            for (e, (de, qe)) in d.experts.iter().zip(&q.experts).enumerate() {
-                assert_eq!(qe.gate.kind(), crate::primitives::ProjectionKind::Ggml);
-                let hidden = de.gate.forward(&x).unwrap();
-                for (name, dp, qp, input) in [
-                    ("gate", &de.gate, &qe.gate, &x),
-                    ("up", &de.up, &qe.up, &x),
-                    ("down", &de.down, &qe.down, &hidden),
+            for e in 0..d.num_experts() {
+                assert_eq!(
+                    q.expert_kind(e, ExpertPart::Gate),
+                    crate::primitives::ProjectionKind::Ggml
+                );
+                let hidden = d.expert_projection(e, ExpertPart::Gate, &x).unwrap();
+                for (name, part, input) in [
+                    ("gate", ExpertPart::Gate, &x),
+                    ("up", ExpertPart::Up, &x),
+                    ("down", ExpertPart::Down, &hidden),
                 ] {
-                    let err = rel(&qp.forward(input).unwrap(), &dp.forward(input).unwrap());
+                    let err = rel(
+                        &q.expert_projection(e, part, input).unwrap(),
+                        &d.expert_projection(e, part, input).unwrap(),
+                    );
                     assert!(err < 0.02, "expert {e} {name}: relative error {err}");
                 }
                 experts += 1;
