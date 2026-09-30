@@ -17,9 +17,10 @@ use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
     JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults,
-    MtpMode, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, SpeculativePlan,
+    SpeculativeProposer, StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingSegmenter, Tokenizer,
+    ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
@@ -1510,20 +1511,26 @@ impl TextLlm for LlamaProvider {
             admitted_prompt,
             req.max_new_tokens,
         )?;
+        // The backend-neutral speculative resolution (core-llm, sc-24433). This backend runs
+        // only the MTP proposer (its generic speculative engine is epic sc-24432's MLX story)
+        // and advertises nothing else, so `auto` resolves to MTP where the checkpoint has a head
+        // and to plain decoding otherwise; an explicit other proposer never passes validation.
+        let speculative =
+            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities)
+                .plan;
+        let mtp_depth = match speculative {
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::Mtp,
+                depth,
+            } => Some(depth),
+            _ => None,
+        };
         let required = estimate_mlx_request_bytes(
             admitted_prompt,
             req.max_new_tokens,
             self.model.memory_geometry(),
             vision_workspace,
-            match req.mtp {
-                MtpMode::Off => 0,
-                MtpMode::Auto => self
-                    .descriptor
-                    .capabilities
-                    .mtp
-                    .map_or(0, |c| c.recommended_draft_tokens),
-                MtpMode::Enabled { draft_tokens } => draft_tokens,
-            },
+            mtp_depth.unwrap_or(0),
             self.model.workspace_contract(),
         )
         .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
@@ -1570,19 +1577,17 @@ impl TextLlm for LlamaProvider {
             stop_tokens: self.stop_tokens.clone(),
         };
 
-        let mut mtp_draft_tokens = match req.mtp {
-            MtpMode::Off => None,
-            MtpMode::Auto => self
-                .descriptor
-                .capabilities
-                .mtp
-                .map(|caps| caps.recommended_draft_tokens as usize),
-            MtpMode::Enabled { draft_tokens } => Some(draft_tokens as usize),
-        };
+        let mut mtp_draft_tokens = mtp_depth.map(|depth| depth as usize);
         // Gemma 4 has no Qwen predictor. Qwen multimodal prompts use the fused-embedding MTP route
         // below, including their explicit three-axis positions and continuation delta.
         if mtp_draft_tokens.is_some() && gemma4_mm_request {
-            if matches!(req.mtp, MtpMode::Enabled { .. }) {
+            if matches!(
+                req.speculative_mode(),
+                core_llm::Speculative::Proposer {
+                    proposer: SpeculativeProposer::Mtp,
+                    ..
+                }
+            ) {
                 return Err(CoreError::Unsupported(
                     "[mlx-llama] native Qwen MTP is unavailable for Gemma 4 prompts".into(),
                 ));
@@ -1996,6 +2001,9 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             // chat template renders tool calls (sc-7636).
             supports_tools: false,
             mtp: None,
+            // Weightless default: none. The MLX speculative engine (epic sc-24432) advertises its
+            // proposers here; until then MTP rides the legacy `mtp` field.
+            speculative: Vec::new(),
             // JSON-constrained decoding (sc-7166).
             supported_constraints: vec![ConstraintKind::Json],
         },

@@ -274,7 +274,7 @@ fn ac1_ac2_engine_greedy_fixture_rows_against_speculative_off() {
         run.record.kv_cache.label(),
         run.record.proposer.label(),
     );
-    assert_eq!(run.record.proposer, ProposerKind::Ngram);
+    assert_eq!(run.record.proposer, ProposerKind::PromptLookup);
     assert_eq!(run.record.path, DecodePath::PromptLookup);
     assert_eq!(
         run.record.host_syncs_per_verify_step(),
@@ -735,7 +735,7 @@ fn llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate() {
             record.proposer.label(),
         );
         assert_eq!(record.path, DecodePath::PromptLookup);
-        assert_eq!(record.proposer, ProposerKind::Ngram);
+        assert_eq!(record.proposer, ProposerKind::PromptLookup);
         assert_eq!(run.output.tokens.len(), FIXTURE_TOKENS);
         assert_eq!(
             record.host_syncs_per_verify_step(),

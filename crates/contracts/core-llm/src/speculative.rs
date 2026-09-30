@@ -23,89 +23,161 @@
 //! ## The unified engine's policy (epic sc-24128, story sc-24130)
 //! The Candle engine runs **one** speculative loop over its step-model seam with pluggable
 //! proposers; the parts of that loop that are policy rather than tensor work live here so MLX can
-//! adopt them unchanged: which proposer a request resolves to ([`resolve_mtp_plan`],
-//! [`ProposerKind`]) and the verify decision ([`greedy_commit`] for greedy, [`accept_token`] for
+//! adopt them unchanged: which proposer a request resolves to ([`resolve_speculative`],
+//! [`ProposerKind`]; the proposer-agnostic request option since sc-24433) and the verify decision ([`greedy_commit`] for greedy, [`accept_token`] for
 //! stochastic — the same acceptance rule as before, unchanged).
 //!
 //! [`mlx-llm`]: https://github.com/SceneWorks/mlx-llm
 
 /// Which proposal source a speculative run used (epic sc-24128, story sc-24130). Every decode
 /// record names one, so "which proposer ran" is visible per request and a request that resolved
-/// to no proposer says so (`none`) rather than silently downgrading.
+/// to no proposer says so (`none`) rather than silently downgrading. The labels are the request
+/// vocabulary of [`SpeculativeProposer`](crate::SpeculativeProposer) plus `none` (sc-24433).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProposerKind {
-    /// No proposer: the token-at-a-time path (also what [`MtpMode::Auto`](crate::MtpMode::Auto)
-    /// resolves to on a model without an MTP head).
+    /// No proposer: the token-at-a-time path (also what a request whose speculation resolved to
+    /// nothing runs — its [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) says why).
     #[default]
     None,
     /// The checkpoint-native multi-token-prediction head.
     Mtp,
     /// Prompt lookup: [`ngram_propose`] over the context.
-    Ngram,
+    PromptLookup,
     /// A separate draft model.
-    Draft,
+    DraftModel,
 }
 
 impl ProposerKind {
-    /// Stable lower-case label for logs and evidence rows (`none`, `mtp`, `ngram`, `draft`).
+    /// Stable lower-case label for logs and evidence rows (`none`, `mtp`, `prompt_lookup`,
+    /// `draft_model`).
     pub fn label(self) -> &'static str {
         match self {
             ProposerKind::None => "none",
             ProposerKind::Mtp => "mtp",
-            ProposerKind::Ngram => "ngram",
-            ProposerKind::Draft => "draft",
+            ProposerKind::PromptLookup => "prompt_lookup",
+            ProposerKind::DraftModel => "draft_model",
         }
     }
 }
 
-/// What a request's [`MtpMode`](crate::MtpMode) resolves to against the loaded model
-/// ([`resolve_mtp_plan`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MtpPlan {
+impl From<crate::SpeculativeProposer> for ProposerKind {
+    fn from(proposer: crate::SpeculativeProposer) -> Self {
+        match proposer {
+            crate::SpeculativeProposer::Mtp => ProposerKind::Mtp,
+            crate::SpeculativeProposer::PromptLookup => ProposerKind::PromptLookup,
+            crate::SpeculativeProposer::DraftModel => ProposerKind::DraftModel,
+        }
+    }
+}
+
+/// What a request's [`Speculative`](crate::Speculative) option resolves to against the loaded
+/// model ([`resolve_speculative`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpeculativePlan {
     /// Decode token-at-a-time; the record names `proposer=none`.
+    #[default]
     Off,
-    /// Run the MTP proposer with `draft_tokens` drafts per verify step.
-    Mtp {
-        /// Drafts proposed per target verification pass.
-        draft_tokens: u32,
+    /// Run `proposer` with `depth` drafts per verify step.
+    Run {
+        /// The proposal source.
+        proposer: crate::SpeculativeProposer,
+        /// Drafts proposed per target verification pass (`>= 1`).
+        depth: u32,
     },
 }
 
-impl MtpPlan {
-    /// The proposer this plan runs.
+impl SpeculativePlan {
+    /// The proposer this plan runs (`none` when off).
     pub fn proposer(self) -> ProposerKind {
         match self {
-            MtpPlan::Off => ProposerKind::None,
-            MtpPlan::Mtp { .. } => ProposerKind::Mtp,
+            SpeculativePlan::Off => ProposerKind::None,
+            SpeculativePlan::Run { proposer, .. } => proposer.into(),
         }
     }
 
     /// The draft width, or `None` when off.
-    pub fn draft_tokens(self) -> Option<u32> {
+    pub fn depth(self) -> Option<u32> {
         match self {
-            MtpPlan::Off => None,
-            MtpPlan::Mtp { draft_tokens } => Some(draft_tokens),
+            SpeculativePlan::Off => None,
+            SpeculativePlan::Run { depth, .. } => Some(depth),
         }
     }
 }
 
-/// Resolve a request's MTP mode against what the model advertises — the backend-neutral mode
-/// policy both engines apply: `Off` never speculates; `Auto` runs the advertised recommended
-/// width when the model has a head and decodes normally (`proposer=none`) when it does not;
-/// `Enabled` runs exactly the requested width (its admissibility is checked by
-/// [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request) before this point, so
-/// an un-advertised `Enabled` here is the caller's contract violation and resolves to `Off`
-/// rather than inventing a width).
-pub fn resolve_mtp_plan(
-    mode: crate::MtpMode,
-    advertised: Option<crate::MtpCapabilities>,
-) -> MtpPlan {
-    match (mode, advertised) {
-        (crate::MtpMode::Off, _) | (_, None) => MtpPlan::Off,
-        (crate::MtpMode::Auto, Some(cap)) => MtpPlan::Mtp {
-            draft_tokens: cap.recommended_draft_tokens,
+/// A resolved speculative option: the plan to run and, when the request asked for more than the
+/// plan delivers, the named reason ([`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks),
+/// epic sc-24432 E2) — never a silent downgrade.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpeculativeResolution {
+    /// What to run.
+    pub plan: SpeculativePlan,
+    /// Why the plan is less than the request asked for, when it is.
+    pub fallback: Option<String>,
+}
+
+/// Resolve a request's speculative option against what the loaded model advertises — the
+/// backend-neutral policy both engines apply (epic sc-24432 E4):
+///
+/// * `off` never speculates;
+/// * `auto` runs MTP at its recommended depth where the model has a head, else prompt lookup at
+///   its recommended depth, else decodes plainly with the reason named;
+/// * `{proposer, depth}` runs exactly that. Its admissibility (advertised, `1 ..= max_depth`) is
+///   checked by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
+///   first, so an un-advertised proposer here is the caller's contract violation: it resolves to
+///   `off` with the reason named rather than inventing a proposer, and a depth outside the
+///   advertised range is clamped into it, also named.
+pub fn resolve_speculative(
+    mode: crate::Speculative,
+    capabilities: &crate::TextLlmCapabilities,
+) -> SpeculativeResolution {
+    use crate::{Speculative, SpeculativeProposer};
+    let run = |proposer, depth| SpeculativeResolution {
+        plan: SpeculativePlan::Run { proposer, depth },
+        fallback: None,
+    };
+    match mode {
+        Speculative::Off => SpeculativeResolution::default(),
+        Speculative::Auto => [SpeculativeProposer::Mtp, SpeculativeProposer::PromptLookup]
+            .into_iter()
+            .find_map(|p| capabilities.proposer(p))
+            .map(|cap| {
+                run(
+                    cap.proposer,
+                    cap.recommended_depth.clamp(1, cap.max_depth.max(1)),
+                )
+            })
+            .unwrap_or_else(|| SpeculativeResolution {
+                plan: SpeculativePlan::Off,
+                fallback: Some(
+                    "speculative: auto found no proposer this model can run (no MTP head, no \
+                     prompt lookup on this backend)"
+                        .into(),
+                ),
+            }),
+        Speculative::Proposer { proposer, depth } => match capabilities.proposer(proposer) {
+            None => SpeculativeResolution {
+                plan: SpeculativePlan::Off,
+                fallback: Some(format!(
+                    "speculative: `{proposer}` is not available for this model"
+                )),
+            },
+            Some(cap) => {
+                let clamped = depth.clamp(1, cap.max_depth.max(1));
+                SpeculativeResolution {
+                    plan: SpeculativePlan::Run {
+                        proposer,
+                        depth: clamped,
+                    },
+                    fallback: (clamped != depth).then(|| {
+                        format!(
+                            "speculative: `{proposer}` depth {depth} clamped to {clamped} \
+                             (advertised 1..={})",
+                            cap.max_depth
+                        )
+                    }),
+                }
+            }
         },
-        (crate::MtpMode::Enabled { draft_tokens }, Some(_)) => MtpPlan::Mtp { draft_tokens },
     }
 }
 
@@ -295,39 +367,95 @@ mod tests {
 
     // --- mode resolution and the greedy commit (sc-24130) ---
 
+    /// sc-24433 AC2: `auto` resolves to MTP where a head exists, else prompt lookup, else off
+    /// with a named reason; an explicit proposer runs as asked; nothing resolves silently.
     #[test]
-    fn mtp_mode_resolves_against_the_advertised_head() {
-        use crate::{MtpCapabilities, MtpMode};
-        let cap = Some(MtpCapabilities {
-            max_draft_tokens: 5,
-            recommended_draft_tokens: 3,
-        });
-        assert_eq!(resolve_mtp_plan(MtpMode::Off, cap), MtpPlan::Off);
-        assert_eq!(resolve_mtp_plan(MtpMode::Off, None), MtpPlan::Off);
-        // Auto on a model without a head decodes normally and says so.
-        let none = resolve_mtp_plan(MtpMode::Auto, None);
-        assert_eq!(none, MtpPlan::Off);
-        assert_eq!(none.proposer(), ProposerKind::None);
-        assert_eq!(none.proposer().label(), "none");
-        assert_eq!(none.draft_tokens(), None);
-        let auto = resolve_mtp_plan(MtpMode::Auto, cap);
-        assert_eq!(auto, MtpPlan::Mtp { draft_tokens: 3 });
-        assert_eq!(auto.proposer(), ProposerKind::Mtp);
-        assert_eq!(auto.draft_tokens(), Some(3));
+    fn speculative_option_resolves_against_the_advertised_proposers() {
+        use crate::{
+            MtpCapabilities, MtpMode, ProposerCapabilities, Speculative, SpeculativeProposer,
+            TextLlmCapabilities,
+        };
+        let lookup = ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 8,
+            recommended_depth: 4,
+        };
+        let head = TextLlmCapabilities {
+            mtp: Some(MtpCapabilities {
+                max_draft_tokens: 5,
+                recommended_draft_tokens: 3,
+            }),
+            speculative: vec![lookup],
+            ..Default::default()
+        };
+        let no_head = TextLlmCapabilities {
+            speculative: vec![lookup],
+            ..Default::default()
+        };
+        let nothing = TextLlmCapabilities::default();
+        let plan = |mode, caps: &TextLlmCapabilities| resolve_speculative(mode, caps);
+        let run = |proposer, depth| SpeculativePlan::Run { proposer, depth };
+
         assert_eq!(
-            resolve_mtp_plan(MtpMode::Enabled { draft_tokens: 5 }, cap),
-            MtpPlan::Mtp { draft_tokens: 5 }
+            plan(Speculative::Off, &head),
+            SpeculativeResolution::default()
         );
-        // An un-advertised Enabled is the caller's contract violation (validate rejects it
-        // first); the resolver never invents a width.
+        let auto = plan(Speculative::Auto, &head);
+        assert_eq!(auto.plan, run(SpeculativeProposer::Mtp, 3));
+        assert_eq!(auto.fallback, None);
+        assert_eq!(auto.plan.proposer(), ProposerKind::Mtp);
+        let auto = plan(Speculative::Auto, &no_head);
+        assert_eq!(auto.plan, run(SpeculativeProposer::PromptLookup, 4));
+        assert_eq!(auto.plan.proposer().label(), "prompt_lookup");
+        assert_eq!(auto.plan.depth(), Some(4));
+        let auto = plan(Speculative::Auto, &nothing);
+        assert_eq!(auto.plan, SpeculativePlan::Off);
+        assert_eq!(auto.plan.proposer(), ProposerKind::None);
+        assert!(auto.fallback.unwrap().contains("auto found no proposer"));
+
+        // The legacy mode is the same option.
         assert_eq!(
-            resolve_mtp_plan(MtpMode::Enabled { draft_tokens: 5 }, None),
-            MtpPlan::Off
+            plan(MtpMode::Enabled { draft_tokens: 3 }.into(), &head).plan,
+            run(SpeculativeProposer::Mtp, 3)
         );
+        assert_eq!(
+            plan(MtpMode::Auto.into(), &no_head).plan,
+            auto_plan(&no_head)
+        );
+
+        let explicit = Speculative::proposer(SpeculativeProposer::PromptLookup, 2);
+        assert_eq!(
+            plan(explicit, &head).plan,
+            run(SpeculativeProposer::PromptLookup, 2)
+        );
+        let unadvertised = plan(
+            Speculative::proposer(SpeculativeProposer::DraftModel, 2),
+            &head,
+        );
+        assert_eq!(unadvertised.plan, SpeculativePlan::Off);
+        assert!(unadvertised
+            .fallback
+            .unwrap()
+            .contains("`draft_model` is not available"));
+        let too_deep = plan(
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 20),
+            &head,
+        );
+        assert_eq!(too_deep.plan, run(SpeculativeProposer::PromptLookup, 8));
+        assert!(too_deep.fallback.unwrap().contains("depth 20 clamped to 8"));
+
         assert_eq!(ProposerKind::default(), ProposerKind::None);
-        assert_eq!(ProposerKind::Ngram.label(), "ngram");
-        assert_eq!(ProposerKind::Draft.label(), "draft");
+        assert_eq!(ProposerKind::PromptLookup.label(), "prompt_lookup");
+        assert_eq!(ProposerKind::DraftModel.label(), "draft_model");
         assert_eq!(ProposerKind::Mtp.label(), "mtp");
+        assert_eq!(
+            ProposerKind::from(SpeculativeProposer::DraftModel),
+            ProposerKind::DraftModel
+        );
+    }
+
+    fn auto_plan(caps: &crate::TextLlmCapabilities) -> SpeculativePlan {
+        resolve_speculative(crate::Speculative::Auto, caps).plan
     }
 
     #[test]

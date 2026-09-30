@@ -433,13 +433,18 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             ProposerKind::Mtp => DecodePath::Mtp {
                 drafts: u32::try_from(drafts).unwrap_or(u32::MAX),
             },
-            ProposerKind::Ngram => DecodePath::PromptLookup,
-            ProposerKind::Draft => DecodePath::DraftModel,
+            ProposerKind::PromptLookup => DecodePath::PromptLookup,
+            ProposerKind::DraftModel => DecodePath::DraftModel,
         };
         let record = DecodeRecord::speculative(path, stats, generated.len(), span.counters())
             .with_kv_cache(cache.kv_kind())
             .with_attn_formulation(model.attn_formulation(cache))
             .with_proposer(kind)
+            .with_drafts(if kind == ProposerKind::None {
+                0
+            } else {
+                u32::try_from(drafts).unwrap_or(u32::MAX)
+            })
             .with_verify_syncs(verify_host_syncs)
             .with_span_tallies(&span);
         SpeculativeRun {
@@ -1273,7 +1278,7 @@ mod tests {
             let run = run(&model, &mut proposer, &PROMPT, &config, k);
             assert_eq!(run.output.tokens, expected, "n-gram K={k} diverged");
             assert_eq!(run.record.path, DecodePath::PromptLookup);
-            assert_eq!(run.record.proposer, ProposerKind::Ngram);
+            assert_eq!(run.record.proposer, ProposerKind::PromptLookup);
             assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
             assert!(run.stats.proposed > 0, "the repetitive prompt must draft");
         }
@@ -1298,7 +1303,7 @@ mod tests {
                 let run = run(&model, &mut proposer, &PROMPT, &config, k);
                 assert_eq!(run.output.tokens, expected, "draft={name} K={k} diverged");
                 assert_eq!(run.record.path, DecodePath::DraftModel);
-                assert_eq!(run.record.proposer, ProposerKind::Draft);
+                assert_eq!(run.record.proposer, ProposerKind::DraftModel);
                 assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
                 assert!(proposer.draft_forwards > run.stats.verify_steps as u64);
                 if name == "same" {
@@ -1651,7 +1656,7 @@ mod tests {
     struct Wrong(Vec<i32>);
     impl Proposer for Wrong {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::Draft
+            ProposerKind::DraftModel
         }
         fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
             Ok(())
@@ -1786,7 +1791,7 @@ mod tests {
     }
     impl Proposer for Over {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::Draft
+            ProposerKind::DraftModel
         }
         fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
             Ok(())
@@ -1878,7 +1883,7 @@ mod tests {
         let run = run(&model, &mut proposer, &prompt, &config, 3);
         assert_eq!(run.output.tokens, vec![2, 3]);
         assert_eq!(run.output.finish_reason, FinishReason::StopToken);
-        assert_eq!(run.record.proposer, ProposerKind::Draft);
+        assert_eq!(run.record.proposer, ProposerKind::DraftModel);
         // Drafts up to and including the stop token: 3 and 4.
         assert_eq!(
             run.stats.proposed, 2,
@@ -1913,7 +1918,7 @@ mod tests {
         );
         let mut n = NgramProposer::default();
         let via_ngram = run(&model, &mut n, &PROMPT, &config, 3);
-        assert_eq!(via_ngram.record.proposer, ProposerKind::Ngram);
+        assert_eq!(via_ngram.record.proposer, ProposerKind::PromptLookup);
         assert_eq!(via_ngram.record.host_syncs_per_verify_step(), Some(1.0));
     }
 

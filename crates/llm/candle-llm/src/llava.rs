@@ -650,6 +650,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             // Vision/caption path only; no tool calling (mirrors the mlx JoyCaption provider).
             supports_tools: false,
             mtp: None,
+            speculative: Vec::new(),
             supported_constraints: Vec::new(),
         },
     }

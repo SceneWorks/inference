@@ -212,7 +212,7 @@ impl Default for NgramProposer {
 
 impl Proposer for NgramProposer {
     fn kind(&self) -> ProposerKind {
-        ProposerKind::Ngram
+        ProposerKind::PromptLookup
     }
 
     fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
@@ -282,7 +282,7 @@ impl<'a, D: StepModel> DraftModelProposer<'a, D> {
 
 impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
     fn kind(&self) -> ProposerKind {
-        ProposerKind::Draft
+        ProposerKind::DraftModel
     }
 
     fn vocab_size(&self) -> Option<usize> {

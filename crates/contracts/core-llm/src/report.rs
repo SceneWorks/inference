@@ -120,10 +120,11 @@ pub struct DecodeReport {
     /// The decode implementation (`reference`, `step_model`, `mtp`, `prompt_lookup`,
     /// `draft_model`).
     pub path: String,
-    /// Which proposer ran. `none` includes an [`MtpMode::Auto`](crate::MtpMode::Auto) request
-    /// that resolved to no proposer on a model without an MTP head.
+    /// Which proposer actually ran (`none`, `mtp`, `prompt_lookup`, `draft_model`). `none`
+    /// includes a request whose speculative option resolved to no proposer — the reason is then
+    /// in [`fallbacks`](Self::fallbacks).
     pub proposer: ProposerKind,
-    /// Draft tokens per verification pass when a proposer ran.
+    /// Draft tokens per verification pass (the depth) when a proposer ran.
     pub draft_tokens: Option<u32>,
     /// The sampler path: `device`, `host:<reason>` (for example `host:penalty`), or `none`.
     pub sampler: String,
@@ -143,8 +144,32 @@ pub struct DecodeReport {
     pub proposed_tokens: u64,
     /// Draft tokens accepted by target verification.
     pub accepted_tokens: u64,
+    /// Target verification passes the engine took — with no proposer every decode step is a
+    /// one-token verify pass; `0` on a loop that does not verify (the reference loop). The
+    /// denominator of [`mean_accepted_length`](Self::mean_accepted_length).
+    pub verify_steps: u64,
     /// Verify steps recovered by a step-start rollback plus a replay forward.
     pub replay_forwards: u64,
+    /// Every fallback this request took that no sub-report above already names (epic sc-24432
+    /// E2/E3): the speculative option resolving to less than it asked for, or a proposer that
+    /// could not run on the path this request decoded on. Each entry leads with the feature
+    /// (`speculative: …`). Empty when nothing fell back. The sampler's host reason, the
+    /// CUDA-graph fallback, the NVFP4 path and the fused-primitive reason stay in
+    /// [`sampler`](Self::sampler), [`cuda_graphs`](Self::cuda_graphs),
+    /// [`nvfp4_projections`](Self::nvfp4_projections) and
+    /// [`fused_primitives`](Self::fused_primitives).
+    pub fallbacks: Vec<String>,
+}
+
+impl DecodeReport {
+    /// The realized mean accepted length: draft tokens accepted per verification pass
+    /// (`accepted_tokens / verify_steps`), or `None` when no proposer ran or no verify step did.
+    /// Each verify step also commits one target-chosen token, so tokens per verify step is this
+    /// plus one.
+    pub fn mean_accepted_length(&self) -> Option<f64> {
+        (self.proposer != ProposerKind::None && self.verify_steps > 0)
+            .then(|| self.accepted_tokens as f64 / self.verify_steps as f64)
+    }
 }
 
 /// The resident count and bytes of one kind of projection weight after a load.
@@ -197,6 +222,22 @@ mod tests {
             graphs.starts_with("cuda_graphs: ") && graphs.contains("mlx"),
             "{graphs}"
         );
+    }
+
+    #[test]
+    fn mean_accepted_length_is_accepted_drafts_per_verify_step() {
+        let mut report = DecodeReport {
+            verify_steps: 4,
+            ..DecodeReport::default()
+        };
+        assert_eq!(report.mean_accepted_length(), None, "no proposer ran");
+        report.proposer = ProposerKind::PromptLookup;
+        report.verify_steps = 0;
+        assert_eq!(report.mean_accepted_length(), None, "no verify step ran");
+        report.verify_steps = 4;
+        report.accepted_tokens = 6;
+        assert_eq!(report.mean_accepted_length(), Some(1.5));
+        assert!(report.fallbacks.is_empty());
     }
 
     #[test]

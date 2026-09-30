@@ -13,6 +13,21 @@ pub struct MtpCapabilities {
     pub recommended_draft_tokens: u32,
 }
 
+/// One speculative proposer a loaded model can run, and its depth limits (epic sc-24432 E4).
+/// Advertised in [`TextLlmCapabilities::speculative`]; read through
+/// [`TextLlmCapabilities::proposer`], which also answers for a provider that still advertises MTP
+/// only through the legacy [`TextLlmCapabilities::mtp`] field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProposerCapabilities {
+    /// The proposal source.
+    pub proposer: crate::SpeculativeProposer,
+    /// The largest depth (draft tokens per verification pass) the backend runs for this proposer;
+    /// a request above it is refused by [`TextLlmCapabilities::validate_request`].
+    pub max_depth: u32,
+    /// The depth [`Speculative::Auto`](crate::Speculative::Auto) runs.
+    pub recommended_depth: u32,
+}
+
 /// Upstream-recommended sampling presets for a model whose thinking and non-thinking modes use
 /// different distributions. These are discovery metadata: a client may initialize controls from
 /// the applicable preset, then sends an ordinary explicit [`Sampling`] request.
@@ -69,8 +84,15 @@ pub struct TextLlmCapabilities {
     /// section and it emits parseable `<tool_call>` blocks. `false` ⇒ a request carrying
     /// [`tools`](crate::TextLlmRequest::tools) is rejected (never silently dropped).
     pub supports_tools: bool,
-    /// Native in-checkpoint MTP support and limits. `None` means an explicit MTP request is rejected.
+    /// Native in-checkpoint MTP support and limits — the legacy advertisement, still read for
+    /// MTP when [`speculative`](Self::speculative) carries no MTP entry. `None` there too means an
+    /// explicit MTP request is rejected.
     pub mtp: Option<MtpCapabilities>,
+    /// The speculative proposers this loaded model runs and their depth limits (epic sc-24432
+    /// E4). Empty = none beyond a legacy [`mtp`](Self::mtp) advertisement. Query one proposer with
+    /// [`proposer`](Self::proposer), all of them with
+    /// [`speculative_proposers`](Self::speculative_proposers).
+    pub speculative: Vec<ProposerCapabilities>,
     /// The output constraint KINDS this provider can enforce (empty = none).
     ///
     /// Kinds, not [`Constraint`] values: a provider cannot know in advance which schema or
@@ -83,6 +105,33 @@ impl TextLlmCapabilities {
     /// Whether a given constraint is supported, compared by [`ConstraintKind`].
     pub fn supports_constraint(&self, c: &Constraint) -> bool {
         self.supported_constraints.contains(&c.kind())
+    }
+
+    /// What this model advertises for `proposer`: its [`speculative`](Self::speculative) entry,
+    /// else — for MTP only — the legacy [`mtp`](Self::mtp) advertisement.
+    pub fn proposer(&self, proposer: crate::SpeculativeProposer) -> Option<ProposerCapabilities> {
+        let legacy_mtp = match (proposer, self.mtp) {
+            (crate::SpeculativeProposer::Mtp, Some(mtp)) => Some(ProposerCapabilities {
+                proposer,
+                max_depth: mtp.max_draft_tokens,
+                recommended_depth: mtp.recommended_draft_tokens,
+            }),
+            _ => None,
+        };
+        self.speculative
+            .iter()
+            .find(|c| c.proposer == proposer)
+            .copied()
+            .or(legacy_mtp)
+    }
+
+    /// Every advertised proposer (the legacy MTP advertisement included), in
+    /// [`SpeculativeProposer::ALL`](crate::SpeculativeProposer::ALL) order.
+    pub fn speculative_proposers(&self) -> Vec<ProposerCapabilities> {
+        crate::SpeculativeProposer::ALL
+            .into_iter()
+            .filter_map(|p| self.proposer(p))
+            .collect()
     }
 
     /// Validate a request against these capabilities. Providers call this from
@@ -162,19 +211,30 @@ impl TextLlmCapabilities {
             )));
         }
 
-        if let crate::MtpMode::Enabled { draft_tokens } = req.mtp {
-            let Some(mtp) = self.mtp else {
+        if req.speculative.is_some() && req.mtp != crate::MtpMode::Off {
+            return reject(
+                "set either `speculative` or the legacy `mtp`, not both (legacy `mtp` maps onto \
+                 `speculative`)"
+                    .into(),
+            );
+        }
+        // An explicit proposer must be advertised and its depth within the advertised limit;
+        // `auto` and `off` never refuse (auto resolves to what the model offers, or runs plain
+        // with the reason named).
+        if let crate::Speculative::Proposer { proposer, depth } = req.speculative_mode() {
+            let Some(cap) = self.proposer(proposer) else {
                 return Err(Error::Unsupported(format!(
-                    "[{id}] provider does not support multi-token prediction (MTP)"
+                    "[{id}] provider does not support speculative decoding with the \
+                     `{proposer}` proposer"
                 )));
             };
-            if draft_tokens == 0 {
-                return reject("MTP draft_tokens must be >= 1".into());
+            if depth == 0 {
+                return reject(format!("speculative `{proposer}` depth must be >= 1"));
             }
-            if draft_tokens > mtp.max_draft_tokens {
+            if depth > cap.max_depth {
                 return reject(format!(
-                    "MTP draft_tokens {draft_tokens} exceeds cap {}",
-                    mtp.max_draft_tokens
+                    "speculative `{proposer}` depth {depth} exceeds cap {}",
+                    cap.max_depth
                 ));
             }
         }
@@ -308,6 +368,72 @@ mod tests {
             caps.validate_request("test", &req),
             Err(Error::InvalidRequest(_))
         ));
+    }
+
+    /// sc-24433: an explicit proposer is checked against the per-proposer advertisement (legacy
+    /// MTP included), `auto` never refuses, and the new option and the legacy field cannot both
+    /// be set.
+    #[test]
+    fn explicit_proposers_are_checked_per_proposer_and_the_two_fields_cannot_both_be_set() {
+        use crate::{Speculative, SpeculativeProposer};
+        let lookup = ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 8,
+            recommended_depth: 4,
+        };
+        let caps = TextLlmCapabilities {
+            speculative: vec![lookup],
+            mtp: Some(MtpCapabilities {
+                max_draft_tokens: 5,
+                recommended_draft_tokens: 3,
+            }),
+            ..Default::default()
+        };
+        let mtp = ProposerCapabilities {
+            proposer: SpeculativeProposer::Mtp,
+            max_depth: 5,
+            recommended_depth: 3,
+        };
+        assert_eq!(
+            caps.proposer(SpeculativeProposer::PromptLookup),
+            Some(lookup)
+        );
+        assert_eq!(
+            caps.proposer(SpeculativeProposer::Mtp),
+            Some(mtp),
+            "legacy mirror"
+        );
+        assert_eq!(caps.proposer(SpeculativeProposer::DraftModel), None);
+        assert_eq!(caps.speculative_proposers(), vec![mtp, lookup]);
+
+        let mut req = request();
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4));
+        caps.validate_request("test", &req).unwrap();
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 9));
+        let err = caps.validate_request("test", &req).unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)));
+        assert!(err.to_string().contains("exceeds cap 8"), "{err}");
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 0));
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2));
+        let err = caps.validate_request("test", &req).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)));
+        assert!(err.to_string().contains("`draft_model`"), "{err}");
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::Mtp, 5));
+        caps.validate_request("test", &req).unwrap();
+        req.speculative = Some(Speculative::Auto);
+        TextLlmCapabilities::default()
+            .validate_request("test", &req)
+            .unwrap();
+
+        req.mtp = MtpMode::Auto;
+        let err = caps.validate_request("test", &req).unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+        req.speculative = None;
+        caps.validate_request("test", &req).unwrap();
     }
 
     #[test]
