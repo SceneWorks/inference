@@ -37,6 +37,7 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositions};
 use crate::primitives::attention::{sdpa, sdpa_gqa, sdpa_gqa_causal, AttnFormulation, AttnMask};
 use crate::primitives::decode_cache::DecodeCache;
+use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
 use crate::primitives::nn::{
     embed, gelu, rms_norm, rms_norm_residual, rms_norm_unscaled, soft_cap, swiglu,
@@ -280,6 +281,15 @@ pub struct CausalLm {
     /// Which KV cache [`StepModel::new_cache_for`] builds: [`KvCacheKind::Static`] (the default) or
     /// [`KvCacheKind::Growing`] (the reference concat, through the same seam).
     step_kv_cache: KvCacheKind,
+    /// [`CausalLm::rope`] / [`CausalLm::rope_full`] with their inverse frequencies on the device:
+    /// the device-positions path builds a step's RoPE tables from the staged positions with them
+    /// (sc-24441).
+    device_rope: DeviceRope,
+    device_rope_full: Option<DeviceRope>,
+    /// Whether a static step cache stages its positions on the device (sc-24441; see
+    /// [`CausalLm::set_device_positions`]). On by default on CUDA, where it is what makes the step
+    /// capturable as a CUDA graph; off on the CPU, where the host path serves.
+    device_positions: bool,
 }
 
 /// The LM head and the device its weight lives on (the last shard's, or the embedding's when
@@ -728,6 +738,12 @@ impl CausalLm {
         // normal load, distinct blocks when the `Weights` were placed by a sharded loader.
         let layer_devices: Vec<Device> =
             layers.iter().map(|l| l.input_ln.device().clone()).collect();
+        let device_rope = DeviceRope::new(&rope, &device)?;
+        let device_rope_full = rope_full
+            .as_ref()
+            .map(|r| DeviceRope::new(r, &device))
+            .transpose()?;
+        let device_positions = device.is_cuda();
         Ok(Self {
             embed_tokens,
             layers,
@@ -748,6 +764,9 @@ impl CausalLm {
             cfg,
             attn_formulation: AttnFormulation::Gqa,
             step_kv_cache: KvCacheKind::Static,
+            device_rope,
+            device_rope_full,
+            device_positions,
         })
     }
 
@@ -886,7 +905,84 @@ impl CausalLm {
                 capacity: max_positions,
             });
         }
-        StepKvCache::preallocated(&self.kv_layout(), capacity)
+        let cache = StepKvCache::preallocated(&self.kv_layout(), capacity)?;
+        if self.device_positions_active() {
+            cache.with_device_positions()
+        } else {
+            Ok(cache)
+        }
+    }
+
+    /// Select whether a static step cache stages its positions on the device (sc-24441): the
+    /// RoPE tables built from device positions, the K/V written at a device-held index and
+    /// attention through the length-aware [`candle_quant_kernels::decode_attention()`] — the path
+    /// a CUDA graph can replay, and the one the eager static path runs too, so graphs on and off
+    /// are the same arithmetic. On by default on CUDA; on the CPU it is off by default (the host
+    /// path serves) and can be switched on to exercise the same logic. Applies to caches built
+    /// afterwards, and only when the model supports it ([`CausalLm::device_positions_support`]).
+    pub fn set_device_positions(&mut self, on: bool) {
+        self.device_positions = on;
+    }
+
+    /// Whether static step caches are asked to stage device positions (the setting).
+    pub fn device_positions(&self) -> bool {
+        self.device_positions
+    }
+
+    /// Why this decoder's step cannot run on device positions, as a stable label (`Ok` when it
+    /// can): a Gemma 4 KV-sharing tail cannot continue a cached generation at all
+    /// (`kv_shared_layers`), a pipeline-sharded stack spans devices one position buffer cannot
+    /// serve (`pipeline_sharded`), and the length-aware attention takes F32/BF16 operands no wider
+    /// than [`candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM`] and must compile on the device
+    /// (`decode_attention_dtype`, `decode_attention_head_dim`, `decode_attention_unavailable`).
+    pub fn device_positions_support(&self) -> std::result::Result<(), &'static str> {
+        if self.kv_sharing {
+            return Err("kv_shared_layers");
+        }
+        if self
+            .layer_devices
+            .iter()
+            .any(|d| !d.same_device(&self.device))
+        {
+            return Err("pipeline_sharded");
+        }
+        if !candle_quant_kernels::decode_attention::served_dtype(self.dtype) {
+            return Err("decode_attention_dtype");
+        }
+        let widest = self
+            .kv_layout()
+            .layers
+            .iter()
+            .flatten()
+            .map(|l| l.key_dim.max(l.value_dim))
+            .max()
+            .unwrap_or(0);
+        if widest > candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM {
+            return Err("decode_attention_head_dim");
+        }
+        if candle_quant_kernels::decode_attention::available(&self.device).is_err() {
+            return Err("decode_attention_unavailable");
+        }
+        Ok(())
+    }
+
+    /// Whether a static step cache built now stages device positions (the setting, and the
+    /// model supports it).
+    pub fn device_positions_active(&self) -> bool {
+        self.device_positions && self.device_positions_support().is_ok()
+    }
+
+    /// The step's RoPE tables from the staged device positions (one pair per layer type).
+    fn device_rope_tables(&self, positions: &DevicePositions, s: usize) -> Result<RopeTables> {
+        let pos = positions.rope_positions(s)?;
+        Ok(RopeTables {
+            primary: self.device_rope.cos_sin(&pos, self.dtype)?,
+            full: self
+                .device_rope_full
+                .as_ref()
+                .map(|r| r.cos_sin(&pos, self.dtype))
+                .transpose()?,
+        })
     }
 
     /// A step-seam cache on the growing backing — the reference concat, through the seam.
@@ -966,6 +1062,31 @@ impl CausalLm {
     /// cache's formulation: final hidden states `[b, s, hidden]` (pre-norm).
     fn step_hidden(&self, embeds: &Tensor, cache: &mut StepKvCache) -> Result<Tensor> {
         let s = embeds.dim(1)?;
+        // The device-positions path (sc-24441): a cached decode / verify step on a static cache
+        // that stages its positions reads every position from the device — RoPE, KV write,
+        // attention length and mask — so the step is replayable as a CUDA graph. The prompt
+        // prefill (from an empty cache, whatever its length) and any longer step take the host
+        // path below; both keep the cache's host length in step.
+        if s <= MAX_DEVICE_STEP_TOKENS
+            && DecodeCache::len(cache) > 0
+            && cache.device_positions().is_some()
+        {
+            cache.stage_positions()?;
+            let tables = match cache.device_positions() {
+                Some(positions) => self.device_rope_tables(positions, s)?,
+                None => unreachable!("checked above"),
+            };
+            return self.run_decoder_stack_collecting(
+                embeds,
+                cache,
+                &tables,
+                AttnMask::Causal,
+                None,
+                AttnFormulation::Gqa,
+                false,
+                true,
+            );
+        }
         let offset = DecodeCache::len(cache) + cache.rope_delta();
         let tables = self.rope_tables_seq(s as i32, offset)?;
         let formulation = self.cache_formulation(cache);
@@ -976,6 +1097,7 @@ impl CausalLm {
             AttnMask::Causal,
             None,
             formulation,
+            false,
             false,
         )
     }
@@ -1143,6 +1265,7 @@ impl CausalLm {
             Some(&mut out),
             self.attn_formulation,
             false,
+            false,
         )?;
         if let Some(last) = out.last_mut() {
             *last = rms_norm(last, &self.norm, self.cfg.rms_norm_eps as f64)?;
@@ -1271,6 +1394,7 @@ impl CausalLm {
                     shared_kv: &mut shared_kv,
                     formulation: self.attn_formulation,
                     additive_gqa: false,
+                    step: StepAttention::Reference,
                 };
                 self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, &mut state)
             },
@@ -1459,6 +1583,7 @@ impl CausalLm {
             None,
             self.attn_formulation,
             additive_gqa,
+            false,
         )
     }
 
@@ -1475,7 +1600,30 @@ impl CausalLm {
         mut collect: Option<&mut Vec<Tensor>>,
         formulation: AttnFormulation,
         additive_gqa: bool,
+        indexed: bool,
     ) -> Result<Tensor> {
+        // A short cached causal step on a model whose static caches stage device positions
+        // attends with the length-aware decode attention on every cache (see
+        // `StepAttention::Decode`), from the cache's length before the step. A forward from an
+        // empty cache (a prompt prefill, a text encoder) keeps the reference attention.
+        let decode_start = (!indexed
+            && cache.offset() > 0
+            && formulation == AttnFormulation::Gqa
+            && !additive_gqa
+            && matches!(mask, AttnMask::Causal)
+            && input_embeds.dim(1)? <= MAX_DEVICE_STEP_TOKENS
+            && self.device_positions_active())
+        .then(|| {
+            let start = u32::try_from(cache.offset())
+                .map_err(|_| Error::Msg(format!("negative cache length {}", cache.offset())))?;
+            Ok::<_, Error>(Tensor::new(&[start], &self.device)?)
+        })
+        .transpose()?;
+        let step = match (indexed, &decode_start) {
+            (true, _) => StepAttention::Indexed,
+            (false, Some(start)) => StepAttention::Decode(start),
+            (false, None) => StepAttention::Reference,
+        };
         // Gemma 4's KV-sharing tail reads keys/values published **within one forward**. Upstream
         // keeps `shared_kv_states` alive across decode steps (they are the prefill's full-length
         // keys); this decoder does not carry them in the cache, so a continued generation would
@@ -1539,6 +1687,7 @@ impl CausalLm {
                 shared_kv: &mut shared_kv,
                 formulation,
                 additive_gqa,
+                step,
             };
             h = layer.forward(&h, cos_d, sin_d, layer_mask, &mut state)?;
             if let Some(sink) = collect.as_deref_mut() {
@@ -1682,17 +1831,22 @@ impl StepModel for CausalLm {
         self.effective_attn_formulation(self.cache_formulation(cache))
     }
 
-    /// Not replayable as a CUDA graph (story sc-24134), declared so the runner refuses before any
-    /// capture: a Mixture-of-Experts layer pulls its router probabilities to the host every step
-    /// for the top-k (`moe_router_host_read`), and every step's positions are Rust-side scalars —
-    /// the RoPE offset taken from the cache's length, the KV written at that offset, attention
-    /// bounded by the host-side length — which a graph would replay at the captured position
-    /// (`positions_host_scalar`).
+    /// Replayable as a CUDA graph (stories sc-24134, sc-24441) when every per-step position is
+    /// device data: with device positions on (the CUDA default) a dense stack's step reads its
+    /// RoPE positions, KV write index and attention length from the cache's staged buffers. Still
+    /// declared uncapturable, so the runner refuses before any capture: a Mixture-of-Experts layer
+    /// pulls its router probabilities to the host every step for the top-k
+    /// (`moe_router_host_read`); with device positions off the positions are Rust-side scalars
+    /// (`positions_host_scalar`); and a stack the device path does not serve says why
+    /// ([`CausalLm::device_positions_support`]).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
         if self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_))) {
             return Err("moe_router_host_read");
         }
-        Err("positions_host_scalar")
+        if !self.device_positions {
+            return Err("positions_host_scalar");
+        }
+        self.device_positions_support()
     }
 
     fn device(&self) -> &Device {
@@ -1931,6 +2085,26 @@ struct LayerState<'a> {
     /// [`CausalLm::decode_logits_masked_gqa`]); `false` keeps every other masked caller on the
     /// `repeat_kv` + [`sdpa`] arithmetic it has always run.
     additive_gqa: bool,
+    /// How a short causal step attends (sc-24441; see [`StepAttention`]).
+    step: StepAttention<'a>,
+}
+
+/// How a layer attends on one forward (sc-24441).
+#[derive(Clone, Copy)]
+enum StepAttention<'a> {
+    /// The formulation's `sdpa_gqa` / `repeat_kv` + `sdpa` over the cache's K/V — every prefill,
+    /// every masked batch, and every step where the device-positions path is off.
+    Reference,
+    /// The device-positions step: K/V written through [`KvCache::update_indexed`] at the start the
+    /// cache staged on the device, attention by the length-aware
+    /// [`candle_quant_kernels::decode_attention()`] over the layer's whole static buffers. Set by
+    /// [`CausalLm::step_hidden`] on a cache that stages positions; the mask is causal.
+    Indexed,
+    /// The same length-aware attention over the K/V an ordinary cache returns (a growing cache,
+    /// the reference loop), from the step start `start` (`[1]` `u32`): short causal steps of a
+    /// model whose static caches stage device positions attend with one arithmetic on every
+    /// cache, so the reference loop and the static path stay token-identical by construction.
+    Decode(&'a Tensor),
 }
 
 impl LlamaLayer {
@@ -2094,7 +2268,7 @@ impl Attention {
     ) -> Result<Tensor> {
         match self {
             Attention::Gqa(a) => a.forward(x, cos, sin, mask, state),
-            Attention::Mla(a) => a.forward(x, cos, sin, mask, &mut *state.cache, state.layer_idx),
+            Attention::Mla(a) => a.forward(x, cos, sin, mask, state),
         }
     }
 
@@ -2304,6 +2478,33 @@ impl LlamaAttention {
                     })?;
                 (q, k, v)
             }
+            None if matches!(state.step, StepAttention::Indexed) => {
+                // The device-positions step (sc-24441): K/V written at the staged device start,
+                // attention over the layer's whole static buffers bounded on the device — causal,
+                // this layer's sliding window and soft-cap included. (A KV-sharing stack never
+                // takes this path: `device_positions_support` refuses it.)
+                let (q, k, v) = self.project(x, cos, sin)?;
+                let kv = state
+                    .cache
+                    .update_indexed(state.layer_idx, &k, &v)?
+                    .ok_or_else(|| {
+                        Error::Msg(
+                            "device-positions step on a cache without device positions".into(),
+                        )
+                    })?;
+                let out = candle_quant_kernels::decode_attention(
+                    &q,
+                    &kv.keys,
+                    &kv.values,
+                    &kv.start,
+                    candle_quant_kernels::DecodeAttnSpec {
+                        scale: self.scale,
+                        softcap: self.softcap,
+                        window: self.sliding_window.map(|w| w.max(1) as usize),
+                    },
+                )?;
+                return self.output(&out);
+            }
             None => {
                 let (q, k, v) = self.project(x, cos, sin)?;
                 if self.stores_shared_kv {
@@ -2315,6 +2516,20 @@ impl LlamaAttention {
                 (q, k_all, v_all)
             }
         };
+        if let StepAttention::Decode(start) = state.step {
+            let out = candle_quant_kernels::decode_attention(
+                &q,
+                &k_all.contiguous()?,
+                &v_all.contiguous()?,
+                start,
+                candle_quant_kernels::DecodeAttnSpec {
+                    scale: self.scale,
+                    softcap: self.softcap,
+                    window: self.sliding_window.map(|w| w.max(1) as usize),
+                },
+            )?;
+            return self.output(&out);
+        }
         let mask = self.layer_mask(mask);
         // [b, heads, s, head_dim]. Un-expanded where the formulation asks for it and the layer can
         // express it (plain causal, no soft-cap — a sliding layer's mask is `SlidingCausal` here);
@@ -2531,9 +2746,9 @@ impl MlaAttention {
         cos: &Tensor,
         sin: &Tensor,
         mask: AttnMask<'_>,
-        cache: &mut dyn KvCache,
-        layer_idx: usize,
+        state: &mut LayerState<'_>,
     ) -> Result<Tensor> {
+        let (cache, layer_idx, step) = (&mut *state.cache, state.layer_idx, state.step);
         let (b, s, _) = x.dims3()?;
         let nh = self.num_heads;
         let (nope, rope, vhd) = (
@@ -2587,8 +2802,35 @@ impl MlaAttention {
             .contiguous()?;
         let v = value.transpose(1, 2)?.contiguous()?;
 
-        let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
-        let out = sdpa(&q, &k_all, &v_all, self.scale, None, mask)?; // [b, nh, s, v_head_dim]
+        // The device-positions step (sc-24441): the same write and length-aware attention as the
+        // grouped-query layers, with keys (`qk_nope + qk_rope`) wider than values.
+        let spec = candle_quant_kernels::DecodeAttnSpec {
+            scale: self.scale,
+            softcap: None,
+            window: None,
+        };
+        let out = match step {
+            StepAttention::Indexed => {
+                let kv = cache.update_indexed(layer_idx, &k, &v)?.ok_or_else(|| {
+                    Error::Msg("device-positions step on a cache without device positions".into())
+                })?;
+                candle_quant_kernels::decode_attention(&q, &kv.keys, &kv.values, &kv.start, spec)?
+            }
+            StepAttention::Decode(start) => {
+                let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
+                candle_quant_kernels::decode_attention(
+                    &q,
+                    &k_all.contiguous()?,
+                    &v_all.contiguous()?,
+                    start,
+                    spec,
+                )?
+            }
+            StepAttention::Reference => {
+                let (k_all, v_all) = cache.update(layer_idx, &k, &v)?;
+                sdpa(&q, &k_all, &v_all, self.scale, None, mask)? // [b, nh, s, v_head_dim]
+            }
+        };
         let out = out
             .transpose(1, 2)?
             .contiguous()?
@@ -2732,12 +2974,12 @@ fn join(prefix: &str, suffix: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A tiny `Qwen3ForCausalLM` (the Qwen3-8B block shape: explicit head_dim, per-head q/k
     /// RMSNorm, GQA) with `vocab` rows, deterministic weights on `device` (sc-24140).
-    fn tiny_qwen3(vocab: usize, tie: bool, device: &Device) -> (Weights, ModelConfig) {
+    pub(crate) fn tiny_qwen3(vocab: usize, tie: bool, device: &Device) -> (Weights, ModelConfig) {
         const HIDDEN: usize = 64;
         const INTER: usize = 96;
         const HEADS: usize = 4;

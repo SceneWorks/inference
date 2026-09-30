@@ -127,7 +127,8 @@ impl DecodeRoute {
     }
 }
 
-/// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens: on
+/// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens (the
+/// engine's device-positions step buffers included, [`Decoder::device_step_bytes`]): on
 /// the reference geometry for the reference loop, and on the step seam's geometry whenever the
 /// engine runs — its cache keeps a per-token checkpoint ring of `K + 2` recurrent states per
 /// linear layer the reference cache does not (sc-24131; `2` with no proposer), and its verify
@@ -156,14 +157,13 @@ fn priced_request_bytes(
         DecodeRoute::Reference => model.memory_geometry(),
     };
     let graph_workspace = match route {
-        DecodeRoute::Engine { drafts } => engine_graph_workspace(
-            model,
-            drafts,
-            u64::try_from(admitted_prompt)
+        DecodeRoute::Engine { drafts } => {
+            let positions = u64::try_from(admitted_prompt)
                 .ok()?
-                .checked_add(u64::from(max_new_tokens))?,
-            cuda_graphs,
-        )?,
+                .checked_add(u64::from(max_new_tokens))?;
+            engine_graph_workspace(model, drafts, positions, cuda_graphs)?
+                .checked_add(model.device_step_bytes(drafts, positions)?)?
+        }
         DecodeRoute::Reference => 0,
     };
     core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
@@ -203,13 +203,58 @@ fn engine_graph_workspace(
 /// CUDA-graph runner wraps the engine (`cuda_graphs`) — its graph workspace over the same reach
 /// (sc-24140). `None` on overflow.
 fn spliced_prompt_bytes(model: &Decoder, capacity: usize, cuda_graphs: bool) -> Option<u64> {
-    let graphs = engine_graph_workspace(model, 0, u64::try_from(capacity).ok()?, cuda_graphs)?;
+    let positions = u64::try_from(capacity).ok()?;
+    let graphs = engine_graph_workspace(model, 0, positions, cuda_graphs)?;
     u64::try_from(model.static_kv_bytes(capacity))
         .ok()?
-        .checked_add(graphs)
+        .checked_add(graphs)?
+        .checked_add(model.device_step_bytes(0, positions)?)
 }
 
 impl Decoder {
+    /// Device bytes the engine's device-positions step (sc-24441) holds beyond the static KV, for
+    /// a request whose prompt and budget reach `positions` positions with `drafts` drafts per
+    /// verify step: the cache's staged position buffers ([`DevicePositions::BYTES`]) and one
+    /// step's length-aware attention workspace — a `drafts + 1`-token step over the whole
+    /// capacity, the widest head ([`candle_quant_kernels::decode_attention_workspace_bytes`]; it is
+    /// freed after each layer, so one is live at a time). `0` when the decoder's caches do not
+    /// stage device positions. `None` on overflow.
+    ///
+    /// [`DevicePositions::BYTES`]: crate::primitives::DevicePositions::BYTES
+    fn device_step_bytes(&self, drafts: u32, positions: u64) -> Option<u64> {
+        let (active, heads, head_dim) = match self {
+            Decoder::Causal(m) => (
+                m.device_positions_active(),
+                m.config().num_heads,
+                m.kv_layout()
+                    .layers
+                    .iter()
+                    .flatten()
+                    .map(|l| l.key_dim.max(l.value_dim))
+                    .max()
+                    .unwrap_or(0),
+            ),
+            Decoder::Qwen35(m) => (
+                m.device_positions_active(),
+                m.config().num_heads,
+                m.config().head_dim.max(0) as usize,
+            ),
+        };
+        if !active {
+            return Some(0);
+        }
+        let capacity = usize::try_from(positions.checked_add(u64::from(drafts))?).ok()?;
+        let queries = usize::try_from(drafts.checked_add(1)?).ok()?;
+        let workspace = candle_quant_kernels::decode_attention_workspace_bytes(
+            1,
+            heads.max(0) as usize,
+            queries,
+            capacity,
+            head_dim,
+        );
+        u64::try_from(crate::primitives::DevicePositions::BYTES.checked_add(workspace)?).ok()
+    }
+
     /// Bytes a static KV cache of `capacity` positions preallocates for this decoder (the
     /// model's own `static_kv_bytes`) — what a request that ran past that capacity was refused
     /// for (sc-24140).

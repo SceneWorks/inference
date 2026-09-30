@@ -19,6 +19,7 @@
 
 pub mod attention;
 pub mod decode_cache;
+pub mod device_positions;
 pub mod fused;
 pub mod gated_delta;
 pub mod host_sync;
@@ -40,6 +41,7 @@ pub use attention::{
     AttnMask,
 };
 pub use decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
+pub use device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 pub use fused::{
     fused_kernels_enabled, fused_tally, set_fused_kernels, FusedTally, FUSED_KERNELS_ENV,
 };
@@ -53,8 +55,8 @@ pub use host_sync::{
     sampler_counters, SamplerCounters,
 };
 pub use kv_cache::{
-    kv_materialize_count, note_kv_materialize, storage_address, ContiguousKvCache, KvCache,
-    KvCacheKind, StaticKvCache,
+    kv_materialize_count, note_kv_materialize, storage_address, ContiguousKvCache, IndexedKv,
+    KvCache, KvCacheKind, StaticKvCache,
 };
 pub use nn::{
     conv2d, embed, gelu, gelu_erf, input_ids, input_ids_batch, layer_norm, linear, rms_norm,

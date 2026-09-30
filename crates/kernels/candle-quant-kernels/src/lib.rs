@@ -27,6 +27,11 @@
 //!   decode-sized alternative to the W4A4 cuBLASLt forward, with a typed refusal for everything
 //!   else so the caller falls back to cuBLASLt visibly.
 //!
+//! - [`mod@decode_attention`] — the length-aware decode attention and device-indexed copies
+//!   (sc-24441): attention over a static KV cache whose step position is read on the device, so a
+//!   CUDA graph of the decode step replays at any position; deterministic by fixed key chunking,
+//!   with a host reference of the same arithmetic.
+//!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
 //!
@@ -34,6 +39,7 @@
 //! capability floors, the kernel descriptors and the fused primitives' input checks only.
 
 pub mod cublaslt;
+pub mod decode_attention;
 pub mod fused_decode;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
@@ -52,6 +58,11 @@ pub use cublaslt::{
 };
 #[cfg(feature = "cuda")]
 pub use cublaslt::{CublasLt, DevNvfp4};
+pub use decode_attention::{
+    check_decode_attention, decode_attention, decode_attention_reference,
+    decode_attention_workspace_bytes, read_slot, write_rows_at, DecodeAttnPlan, DecodeAttnSpec,
+    DECODE_ATTENTION_SRC, DECODE_ATTN_CHUNK, DECODE_ATTN_MAX_HEAD_DIM,
+};
 pub use fused_decode::{
     check_rms_norm, check_rms_norm_rope, check_swiglu, FusedError, FusedRefusal, RmsNormPlan,
     RopePlan, FUSED_DECODE_SRC, FUSED_ROPE_MAX_HEAD_DIM,
@@ -78,14 +89,19 @@ pub use nvrtc::{device_compute_cap, CompiledKernel};
 pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource};
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
-/// primitives, the NVFP4 decode GEMV and the fused NVFP4 activation quantizer.
+/// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer and the length-aware
+/// decode attention.
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
 /// (sc-24164). A `KernelSource` added anywhere in the workspace without being listed in one of
 /// the two fails `candle-llm`'s `every_workspace_kernel_source_is_registered`.
-pub const NVRTC_SOURCES: &[KernelSource] =
-    &[FUSED_DECODE_SRC, NVFP4_GEMV_SRC, cublaslt::NVFP4_QUANT_SRC];
+pub const NVRTC_SOURCES: &[KernelSource] = &[
+    FUSED_DECODE_SRC,
+    NVFP4_GEMV_SRC,
+    cublaslt::NVFP4_QUANT_SRC,
+    DECODE_ATTENTION_SRC,
+];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 
 /// Poison-tolerant `Mutex` lock for the handle's overwrite-on-miss caches — the same recovery

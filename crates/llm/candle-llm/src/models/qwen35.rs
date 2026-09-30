@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{repeat_kv, sdpa, sdpa_gqa_causal, AttnFormulation, AttnMask};
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
+use crate::primitives::device_positions::{DevicePositions, DeviceRope, MAX_DEVICE_STEP_TOKENS};
 use crate::primitives::gated_delta::{
     causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
 };
@@ -364,7 +365,19 @@ impl GatedDeltaNet {
         }
     }
 
+    #[cfg(test)]
     fn forward(&self, x: &Tensor, cache: &mut DeltaNetCache) -> Result<Tensor> {
+        self.forward_at(x, cache, None)
+    }
+
+    /// [`forward`](Self::forward) with the checkpoint ring read and written through the device
+    /// indices of `positions` when they are staged (sc-24441, see [`DeltaNetCache::advance_at`]).
+    fn forward_at(
+        &self,
+        x: &Tensor,
+        cache: &mut DeltaNetCache,
+        positions: Option<&DevicePositions>,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
         // Four independent in-projections (dtype follows the projection weights).
@@ -379,8 +392,8 @@ impl GatedDeltaNet {
 
         // Short conv over the q‖k‖v channels (only these are convolved), seeded by the cache tail,
         // then a *contiguous* split into q [key_dim] ‖ k [key_dim] ‖ v [value_dim] and reshape to heads.
-        let conv_state = match cache.conv_state() {
-            Some(cs) => cs.clone(),
+        let conv_state = match cache.live_conv_state(positions)? {
+            Some(cs) => cs,
             None => Tensor::zeros((b, self.conv_kernel - 1, self.conv_dim), dt, x.device())?,
         };
         let (conv_out, conv_trace) =
@@ -410,13 +423,14 @@ impl GatedDeltaNet {
         let beta = sigmoid(&b_in)?;
         let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
         let f = DType::F32;
-        let y = cache.advance(
+        let y = cache.advance_at(
             &conv_trace,
             &qn.to_dtype(f)?,
             &kn.to_dtype(f)?,
             &vc.to_dtype(f)?,
             &g.to_dtype(f)?,
             &beta.to_dtype(f)?,
+            positions,
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
@@ -450,8 +464,14 @@ struct Qwen35Attention {
 /// are token-identical by construction; [`AttnFormulation::Expanded`] keeps the pre-S4
 /// `repeat_kv` + [`sdpa`] arithmetic selectable on the growing slot as a labelled comparison row.
 enum KvSlot<'a> {
-    Growing(&'a mut AttnKv),
-    Static(&'a mut StaticKvCache),
+    /// The growing reference slot; with a step start, a short cached step attends with the
+    /// length-aware decode attention (sc-24441).
+    Growing(&'a mut AttnKv, Option<&'a Tensor>),
+    /// A static slot written at its host offset; the start as for `Growing`.
+    Static(&'a mut StaticKvCache, Option<&'a Tensor>),
+    /// The static cache on the device-positions step (sc-24441): written at the staged device
+    /// start, attended by the length-aware decode attention over the whole buffers.
+    Indexed(&'a mut StaticKvCache, &'a DevicePositions),
 }
 
 impl Qwen35Attention {
@@ -486,16 +506,35 @@ impl Qwen35Attention {
             .contiguous()?;
         let v = v.transpose(1, 2)?.contiguous()?;
 
+        let decode = |q: &Tensor, k_all: &Tensor, v_all: &Tensor, start: &Tensor| {
+            candle_quant_kernels::decode_attention(
+                q,
+                &k_all.contiguous()?,
+                &v_all.contiguous()?,
+                start,
+                candle_quant_kernels::DecodeAttnSpec {
+                    scale: self.scale,
+                    softcap: None,
+                    window: None,
+                },
+            )
+        };
         let out = match (cache, formulation) {
+            // A short cached step of a model with device positions (sc-24441): the static
+            // path's length-aware attention, over the growing concat — one arithmetic still.
+            (KvSlot::Growing(growing, Some(start)), AttnFormulation::Gqa) => {
+                let (k_all, v_all) = growing.update(&k, &v)?;
+                decode(&q, &k_all, &v_all, start)?
+            }
             // Reference path: growing concat, then the same grouped-query attention the static
             // path runs (the S4 decision: one attention arithmetic for both slots).
-            (KvSlot::Growing(growing), AttnFormulation::Gqa) => {
+            (KvSlot::Growing(growing, _), AttnFormulation::Gqa) => {
                 let (k_all, v_all) = growing.update(&k, &v)?;
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
             }
             // The pre-S4 reference arithmetic, selectable only for comparison rows: growing
             // concat, GQA expanded per step, eager/fused SDPA.
-            (KvSlot::Growing(growing), AttnFormulation::Expanded) => {
+            (KvSlot::Growing(growing, _), AttnFormulation::Expanded) => {
                 let (k_all, v_all) = growing.update(&k, &v)?;
                 let k_all = repeat_kv(&k_all, self.groups)?;
                 let v_all = repeat_kv(&v_all, self.groups)?;
@@ -504,9 +543,30 @@ impl Qwen35Attention {
             // Static path: in-place write, bounded views, grouped-query attention over them —
             // no `cat`, no `repeat_kv`, no copy of the cached history. The formulation selector
             // does not apply: expanding would be exactly the copy this cache exists to remove.
-            (KvSlot::Static(fixed), _) => {
+            (KvSlot::Static(fixed, Some(start)), _) => {
+                let (k_all, v_all) = fixed.update(0, &k, &v)?;
+                decode(&q, &k_all, &v_all, start)?
+            }
+            (KvSlot::Static(fixed, None), _) => {
                 let (k_all, v_all) = fixed.update(0, &k, &v)?;
                 sdpa_gqa_causal(&q, &k_all, &v_all, self.scale)? // [b,H,s,hd]
+            }
+            // The device-positions step: the same write and causal grouped-query attention, with
+            // the position read on the device so the step replays as a CUDA graph.
+            (KvSlot::Indexed(fixed, positions), _) => {
+                let start = positions.start()?;
+                let (k_all, v_all) = fixed.update_at(0, &k, &v, &start)?;
+                candle_quant_kernels::decode_attention(
+                    &q,
+                    &k_all,
+                    &v_all,
+                    &start,
+                    candle_quant_kernels::DecodeAttnSpec {
+                        scale: self.scale,
+                        softcap: None,
+                        window: None,
+                    },
+                )? // [b,H,s,hd]
             }
         };
         let merged = out
@@ -681,14 +741,41 @@ impl DecoderLayer {
         cache: &mut Qwen35LayerCache,
         formulation: AttnFormulation,
     ) -> Result<Tensor> {
+        self.forward_with(x, cos, sin, cache, formulation, None, None)
+    }
+
+    /// [`forward`](Self::forward) on the device-positions step when `positions` is set
+    /// (sc-24441): a static attention slot writes and attends at the staged device start, a
+    /// DeltaNet ring is indexed on the device. With `decode_start` set instead, an ordinary
+    /// attention slot attends with the same length-aware decode attention from that host-staged
+    /// start.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cache: &mut Qwen35LayerCache,
+        formulation: AttnFormulation,
+        positions: Option<&DevicePositions>,
+        decode_start: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
         let r = match (&self.mixer, cache) {
-            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward(&normed, c)?,
-            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => {
-                a.forward(&normed, cos, sin, KvSlot::Growing(c), formulation)?
-            }
+            (Mixer::Delta(d), Qwen35LayerCache::Delta(c)) => d.forward_at(&normed, c, positions)?,
+            (Mixer::Attn(a), Qwen35LayerCache::Attn(c)) => a.forward(
+                &normed,
+                cos,
+                sin,
+                KvSlot::Growing(c, decode_start),
+                formulation,
+            )?,
             (Mixer::Attn(a), Qwen35LayerCache::StaticAttn(c)) => {
-                a.forward(&normed, cos, sin, KvSlot::Static(c), formulation)?
+                let slot = match positions {
+                    Some(p) => KvSlot::Indexed(c, p),
+                    None => KvSlot::Static(c, decode_start),
+                };
+                a.forward(&normed, cos, sin, slot, formulation)?
             }
             _ => return Err(Error::Msg("qwen3_5: cache/mixer type mismatch".into())),
         };
@@ -857,6 +944,9 @@ pub struct Qwen35Cache {
     /// Added to the cache position to form the RoPE position of every token a
     /// [`StepModel::forward_step`] feeds (see [`set_rope_delta`](Self::set_rope_delta)).
     rope_delta: i32,
+    /// The device-staged step positions of a static cache built with them (sc-24441; see
+    /// [`Qwen35Model::set_device_positions`]); `None` otherwise.
+    positions: Option<DevicePositions>,
 }
 
 impl Qwen35Cache {
@@ -874,6 +964,26 @@ impl Qwen35Cache {
             max_checkpoints: self.max_checkpoints,
             recurrent_shape: self.recurrent_shape.clone(),
             rope_delta: self.rope_delta,
+            // Own buffers (staged per step, so nothing to copy).
+            positions: self
+                .positions
+                .as_ref()
+                .map(|p| DevicePositions::new(p.device()))
+                .transpose()?,
+        })
+    }
+
+    /// The staged device positions, when this cache keeps them (sc-24441).
+    pub fn device_positions(&self) -> Option<&DevicePositions> {
+        self.positions.as_ref()
+    }
+
+    /// The linear layers' checkpoint-ring length (`None` without a ring): what the device ring
+    /// indices are taken modulo.
+    fn ring_slots(&self) -> Option<usize> {
+        self.layers.iter().find_map(|l| match l {
+            Qwen35LayerCache::Delta(c) => c.ring_spec().map(|s| s.slots),
+            _ => None,
         })
     }
 
@@ -1175,7 +1285,8 @@ impl DecodeCache for Qwen35Cache {
         Qwen35Cache::kv_kind(self)
     }
 
-    /// A CUDA-graph replay (story sc-24134) needs every state tensor at a stable address. The
+    /// A CUDA-graph replay (stories sc-24134, sc-24441) needs every state tensor at a stable
+    /// address and every per-step position on the device. The
     /// static KV buffers are, and so is a linear layer's recurrent state once it keeps the
     /// per-token checkpoint ring (sc-24131): the live state is a view of the newest preallocated
     /// ring slot, written in place, so a recorded step leaves no allocation alive past it (the
@@ -1183,10 +1294,10 @@ impl DecodeCache for Qwen35Cache {
     /// which replaced both states of every linear layer per step, read `escaped=96` on the 27B).
     /// A ring-less linear layer — the reference caches ([`REFERENCE_MAX_CHECKPOINTS`]) — still
     /// replaces its state per step and says `deltanet_state_unstable`; a growing `AttnKv` cache
-    /// says `growing_kv`. A cache that passes is still refused by its model: [`Qwen35Model`]'s
-    /// positions are Rust-side scalars (`positions_host_scalar`) — the static KV write offset
-    /// and the ring slot a step writes alike — so this cache keeps the trait's refusing
-    /// `replay_advance`.
+    /// says `growing_kv`. The positions are device data only on a cache built with device
+    /// positions ([`Qwen35Model::set_device_positions`], the CUDA default): the static KV write
+    /// offset, the attention length, the RoPE positions and the ring slots are staged there;
+    /// without them they are Rust-side scalars (`positions_host_scalar`).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
         for layer in &self.layers {
             match layer {
@@ -1195,6 +1306,69 @@ impl DecodeCache for Qwen35Cache {
                 }
                 Qwen35LayerCache::Attn(_) => return Err("growing_kv"),
                 Qwen35LayerCache::Delta(_) | Qwen35LayerCache::StaticAttn(_) => {}
+            }
+        }
+        if self.positions.is_none() {
+            return Err("positions_host_scalar");
+        }
+        Ok(())
+    }
+
+    /// The cache's own address folded with every checkpoint ring's buffer addresses: a ring
+    /// reallocated by [`set_max_checkpoints`](Qwen35Cache::set_max_checkpoints) (a deeper
+    /// retention mid-request) moves the buffers a captured graph writes, so the identity changes
+    /// and the runner drops its graphs instead of replaying into freed memory (sc-24441).
+    fn graph_identity(&self) -> usize {
+        let mut id = self as *const Self as usize;
+        if let Ok(rings) = self.recurrent_ring_addresses() {
+            for (conv, ssm) in rings {
+                id = id.rotate_left(7) ^ conv ^ ssm.rotate_left(13);
+            }
+        }
+        id
+    }
+
+    /// Stage the next step's start, RoPE positions (offset + delta) and ring slots on the device.
+    fn stage_positions(&mut self) -> Result<()> {
+        match &self.positions {
+            Some(p) => p.stage(self.offset(), self.rope_delta, self.ring_slots()),
+            None => Ok(()),
+        }
+    }
+
+    /// A replayed `n`-token step's host side (sc-24441): the capacity check, every static
+    /// attention layer's length and every linear layer's ring bookkeeping — what the forward
+    /// does on the host, with the device work done by the graph.
+    fn replay_advance(&mut self, n: usize) -> Result<()> {
+        if self.positions.is_none() {
+            return Err(Error::Unsupported(
+                "Qwen35Cache::replay_advance: only a cache with device positions backs a graph \
+                 replay"
+                    .into(),
+            ));
+        }
+        self.begin_forward(n)?;
+        // Every layer's bookkeeping is checked before any moves: a linear layer that cannot
+        // replay (no live state) refuses before an attention layer has advanced.
+        for l in &self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                if c.offset() == 0 || c.ssm_state().is_none() {
+                    return Err(Error::Msg(
+                        "Qwen35Cache::replay_advance: no live recurrent state to replay from"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => c.replay_advance(n)?,
+                Qwen35LayerCache::StaticAttn(s) => s.advance(n)?,
+                Qwen35LayerCache::Attn(_) => {
+                    return Err(Error::Msg(
+                        "Qwen35Cache::replay_advance: a growing KV slot cannot replay".into(),
+                    ))
+                }
             }
         }
         Ok(())
@@ -1220,6 +1394,12 @@ pub struct Qwen35Model {
     /// (the same arithmetic as the static cache); [`AttnFormulation::Expanded`] is the pre-S4
     /// `repeat_kv` + `sdpa` arithmetic, selectable for comparison rows only.
     attn_formulation: AttnFormulation,
+    /// [`Qwen35Model::rope`] with its inverse frequencies on the device, for the step's RoPE
+    /// tables on the device-positions path (sc-24441).
+    device_rope: DeviceRope,
+    /// Whether a static cache stages its positions on the device (sc-24441; see
+    /// [`Qwen35Model::set_device_positions`]): on by default on CUDA, off on the CPU.
+    device_positions: bool,
 }
 
 /// The checkpoint-native Qwen3.8 multi-token predictor.
@@ -1760,6 +1940,7 @@ impl Qwen35Model {
             max_checkpoints,
             recurrent_shape: shape,
             rope_delta: 0,
+            positions: None,
         }
     }
 
@@ -1815,11 +1996,16 @@ impl Qwen35Model {
                 )?)
             });
         }
+        let positions = self
+            .device_positions_active()
+            .then(|| DevicePositions::new(&self.device))
+            .transpose()?;
         Ok(Qwen35Cache {
             layers,
             max_checkpoints,
             recurrent_shape: shape,
             rope_delta: 0,
+            positions,
         })
     }
 
@@ -1870,6 +2056,46 @@ impl Qwen35Model {
         self.attn_formulation
     }
 
+    /// Select whether a static cache stages its positions on the device (sc-24441): RoPE tables
+    /// from device positions, the full-attention K/V written at a device-held index and attended
+    /// by the length-aware [`candle_quant_kernels::decode_attention()`], the DeltaNet checkpoint
+    /// ring indexed on the device — the path a CUDA graph can replay, and the one the eager static
+    /// path runs too, so graphs on and off are the same arithmetic. On by default on CUDA; off by
+    /// default on the CPU (the host path serves), where it can be switched on to exercise the same
+    /// logic. Applies to caches built afterwards, and only when the model supports it
+    /// ([`Qwen35Model::device_positions_support`]).
+    pub fn set_device_positions(&mut self, on: bool) {
+        self.device_positions = on;
+    }
+
+    /// Whether static caches are asked to stage device positions (the setting).
+    pub fn device_positions(&self) -> bool {
+        self.device_positions
+    }
+
+    /// Why this decoder's step cannot run on device positions (`Ok` when it can): the
+    /// length-aware attention takes F32/BF16 heads no wider than
+    /// [`candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM`] and must compile on the device
+    /// (`decode_attention_dtype`, `decode_attention_head_dim`, `decode_attention_unavailable`).
+    pub fn device_positions_support(&self) -> std::result::Result<(), &'static str> {
+        if !candle_quant_kernels::decode_attention::served_dtype(self.dtype) {
+            return Err("decode_attention_dtype");
+        }
+        if self.cfg.head_dim.max(0) as usize > candle_quant_kernels::DECODE_ATTN_MAX_HEAD_DIM {
+            return Err("decode_attention_head_dim");
+        }
+        if candle_quant_kernels::decode_attention::available(&self.device).is_err() {
+            return Err("decode_attention_unavailable");
+        }
+        Ok(())
+    }
+
+    /// Whether a static cache built now stages device positions (the setting, and the model
+    /// supports it).
+    pub fn device_positions_active(&self) -> bool {
+        self.device_positions && self.device_positions_support().is_ok()
+    }
+
     /// The device the model's tensors live on.
     pub fn device(&self) -> &Device {
         &self.device
@@ -1877,11 +2103,65 @@ impl Qwen35Model {
 
     /// Run the decoder stack over `input_ids` `[B, S]` at sequence `offset`, returning the final
     /// hidden states `[B, S, hidden]` (before the final norm / lm_head).
+    ///
+    /// A cached decode / verify step (at most [`MAX_DEVICE_STEP_TOKENS`] tokens, past position
+    /// zero) on a cache that stages device positions, at the cache's own position, runs the
+    /// device-positions path (sc-24441): every position the step's kernels read — RoPE, KV
+    /// write, attention length, ring slots — is device data, so the step replays as a CUDA
+    /// graph. Anything else runs the host path, where a short cached step of a model with device
+    /// positions still attends with the same length-aware attention (so the growing reference
+    /// cache and the static path stay one arithmetic); both keep the cache's host-side state
+    /// identical.
     fn hidden(&self, input_ids: &Tensor, cache: &mut Qwen35Cache, offset: i32) -> Result<Tensor> {
         let h = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
-        let s = h.dim(1)? as i32;
-        let (cos, sin) = self.rope.cos_sin(s, offset, self.dtype, &self.device)?;
+        let s = h.dim(1)?;
+        if s <= MAX_DEVICE_STEP_TOKENS
+            && cache.offset() > 0
+            && cache.positions.is_some()
+            && offset == cache.offset() + cache.rope_delta()
+        {
+            cache.stage_positions()?;
+            cache.begin_forward(s)?;
+            let Qwen35Cache {
+                layers, positions, ..
+            } = cache;
+            let positions = positions.as_ref().expect("checked above");
+            let (cos, sin) = self
+                .device_rope
+                .cos_sin(&positions.rope_positions(s)?, self.dtype)?;
+            let mut h = h;
+            for (layer, slot) in self.layers.iter().zip(layers.iter_mut()) {
+                h = layer.forward_with(
+                    &h,
+                    &cos,
+                    &sin,
+                    slot,
+                    self.attn_formulation,
+                    Some(positions),
+                    None,
+                )?;
+            }
+            return Ok(h);
+        }
+        let (cos, sin) = self
+            .rope
+            .cos_sin(s as i32, offset, self.dtype, &self.device)?;
         self.hidden_from_embeds(&h, &cos, &sin, cache)
+    }
+
+    /// The step start a short cached step attends from with the length-aware decode attention
+    /// on an ordinary (growing, or static without device positions) cache — `Some` exactly when
+    /// this model's static caches stage device positions, the growing slots attend un-expanded
+    /// ([`AttnFormulation::Gqa`]) and the step is a cached decode / verify step (sc-24441).
+    fn decode_start(&self, cache: &Qwen35Cache, s: usize) -> Result<Option<Tensor>> {
+        if s > MAX_DEVICE_STEP_TOKENS
+            || cache.offset() <= 0
+            || self.attn_formulation != AttnFormulation::Gqa
+            || !self.device_positions_active()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Tensor::new(&[cache.offset() as u32], &self.device)?))
     }
 
     /// Run the decoder stack over precomputed input `embeds` `[B, S, hidden]` with the given RoPE
@@ -1894,10 +2174,19 @@ impl Qwen35Model {
         sin: &Tensor,
         cache: &mut Qwen35Cache,
     ) -> Result<Tensor> {
+        let decode_start = self.decode_start(cache, embeds.dim(1)?)?;
         cache.begin_forward(embeds.dim(1)?)?;
         let mut h = embeds.clone();
         for (layer, slot) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            h = layer.forward(&h, cos, sin, slot, self.attn_formulation)?;
+            h = layer.forward_with(
+                &h,
+                cos,
+                sin,
+                slot,
+                self.attn_formulation,
+                None,
+                decode_start.as_ref(),
+            )?;
         }
         Ok(h)
     }
@@ -2465,11 +2754,15 @@ impl Qwen35Model {
         }
 
         let rope = Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false);
+        let device_rope = DeviceRope::new(&rope, &device)?;
+        let device_positions = device.is_cuda();
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            device_rope,
+            device_positions,
             rope,
             eps,
             cfg,
@@ -2572,17 +2865,22 @@ impl StepModel for Qwen35Model {
         }
     }
 
-    /// Not replayable as a CUDA graph on this revision (story sc-24134), declared so the runner
-    /// refuses before any capture: the MoE block (35B-A3B) pulls its router probabilities to
-    /// the host every step (`moe_router_host_read`), and every step's positions are Rust-side
-    /// scalars — the RoPE tables built on the host for `offset`, the KV written at
-    /// `slice_set(offset)`, attention bounded by `narrow(len)` — which a graph would replay at
-    /// the captured position (`positions_host_scalar`).
+    /// Replayable as a CUDA graph (stories sc-24134, sc-24441) when every per-step position is
+    /// device data: with device positions on (the CUDA default) a dense step reads its RoPE
+    /// positions, KV write index, attention length and DeltaNet ring slots from the cache's
+    /// staged buffers. Still declared uncapturable, so the runner refuses before any capture: the
+    /// MoE block (35B-A3B) pulls its router probabilities to the host every step
+    /// (`moe_router_host_read`); with device positions off the positions are Rust-side scalars
+    /// (`positions_host_scalar`); and a model the device path does not serve says why
+    /// ([`Qwen35Model::device_positions_support`]).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
         if self.cfg.moe.is_some() {
             return Err("moe_router_host_read");
         }
-        Err("positions_host_scalar")
+        if !self.device_positions {
+            return Err("positions_host_scalar");
+        }
+        self.device_positions_support()
     }
 
     fn device(&self) -> &Device {
@@ -3358,7 +3656,6 @@ pub(crate) mod tests {
 
     /// The synthetic decoder's weights moved to `device` (bf16 on a GPU, f32 on CPU: what the
     /// loader would produce there).
-    #[cfg(feature = "cuda")]
     fn synthetic_weights_on(cfg: &Qwen35Config, device: &Device) -> Weights {
         let cpu = synthetic_weights(cfg);
         Weights::from_map(
@@ -3374,8 +3671,8 @@ pub(crate) mod tests {
         )
     }
 
-    /// [`text_model`] built on `device` (the CUDA-graph runner's tests).
-    #[cfg(feature = "cuda")]
+    /// [`text_model`] built on `device` (the CUDA-graph runner's tests; the CPU for the
+    /// device-positions parity).
     pub(crate) fn text_model_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model = Qwen35Model::from_weights(
@@ -3390,7 +3687,6 @@ pub(crate) mod tests {
     /// The synthetic decoder with **every** layer a full-attention layer (interval 1: no
     /// Gated DeltaNet state), on `device` — the shape whose static cache holds nothing but
     /// stable-address KV buffers (story sc-24134).
-    #[cfg(feature = "cuda")]
     pub(crate) fn text_model_attention_only_on(device: &Device) -> (Qwen35Config, Qwen35Model) {
         let mut json = cfg_json();
         json["text_config"]["full_attention_interval"] = json!(1);
@@ -4538,18 +4834,27 @@ pub(crate) mod tests {
         assert_eq!(cache.static_kv_addresses().unwrap(), addresses);
     }
 
-    /// sc-24134 after sc-24131: the cache's CUDA-graph declaration. A linear layer that keeps the
-    /// per-token checkpoint ring holds its state at stable addresses, so the engine's static cache
-    /// passes — before and after a forward — and the model's own `positions_host_scalar` is what
-    /// refuses it; a ring-less linear layer still replaces its state per step
-    /// (`deltanet_state_unstable`, including once a ring is dropped), and a growing attention
-    /// cache is `growing_kv`.
+    /// sc-24134 after sc-24131 and sc-24441: the CUDA-graph declarations. A linear layer that
+    /// keeps the per-token checkpoint ring holds its state at stable addresses; with device
+    /// positions (off by default on the CPU) the static cache and the model pass — before and
+    /// after a forward — and without them both say `positions_host_scalar`. A ring-less linear
+    /// layer still replaces its state per step (`deltanet_state_unstable`, including once a ring
+    /// is dropped), and a growing attention cache is `growing_kv`.
     #[test]
     fn graph_support_accepts_the_ringed_static_cache_and_names_the_rest() {
-        let (_cfg, model) = text_model();
+        let (_cfg, mut model) = text_model();
+        assert!(!model.device_positions(), "off on the CPU by default");
         assert_eq!(model.graph_support(), Err("positions_host_scalar"));
+        let host_positions = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert_eq!(
+            DecodeCache::graph_support(&host_positions),
+            Err("positions_host_scalar")
+        );
+        model.set_device_positions(true);
+        assert_eq!(model.graph_support(), Ok(()));
 
         let mut ringed = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        assert!(ringed.device_positions().is_some());
         assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
         model
             .forward_step(&mut ringed, StepRequest::last(&[1, 7, 3]))
@@ -4558,6 +4863,14 @@ pub(crate) mod tests {
             .forward_step(&mut ringed, StepRequest::last(&[5]))
             .unwrap();
         assert_eq!(DecodeCache::graph_support(&ringed), Ok(()));
+        // A deeper retention reallocates the rings a captured graph writes: the identity moves,
+        // so the runner drops its graphs.
+        let identity = DecodeCache::graph_identity(&ringed);
+        assert_eq!(identity, DecodeCache::graph_identity(&ringed), "stable");
+        ringed
+            .set_max_checkpoints(STEP_MAX_CHECKPOINTS + 2)
+            .unwrap();
+        assert_ne!(identity, DecodeCache::graph_identity(&ringed));
         ringed.set_max_checkpoints(0).unwrap();
         assert_eq!(
             DecodeCache::graph_support(&ringed),
@@ -4573,6 +4886,171 @@ pub(crate) mod tests {
         );
         let growing = model.new_cache_with_checkpoints(STEP_MAX_CHECKPOINTS);
         assert_eq!(DecodeCache::graph_support(&growing), Err("growing_kv"));
+    }
+
+    fn assert_rows_close(what: &str, a: &Tensor, b: &Tensor) {
+        assert_eq!(a.dims(), b.dims(), "{what}: shape");
+        let (a, b) = (host(a), host(b));
+        let scale = b.iter().fold(1f32, |m, x| m.max(x.abs()));
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                (x - y).abs() <= 1e-4 * scale,
+                "{what}: [{i}] device positions {x} vs host {y}"
+            );
+        }
+    }
+
+    /// sc-24441 AC (CPU half): the device-positions step path — RoPE from device positions, the
+    /// full-attention K/V written at a device index and attended by the length-aware decode
+    /// attention, the DeltaNet ring read and written through device slot indices — agrees with
+    /// the host path to f32 rounding through a prefill, decodes, a 4-token verify with hidden
+    /// states, a rollback into it (a ring-slot selection) and decodes past it, on the hybrid and
+    /// the attention-only configs; greedy tokens through the step driver and the speculative
+    /// engine are identical; and the cache's host bookkeeping (lengths, restorable positions) is
+    /// the same on both paths.
+    #[test]
+    fn device_positions_steps_match_the_host_path() {
+        use crate::decode::{
+            generate_speculative, generate_step, CancelFlag, GenerationConfig, NgramProposer,
+            SpeculativePrompt,
+        };
+        let device = Device::Cpu;
+        for (what, build) in [
+            (
+                "hybrid",
+                text_model_on as fn(&Device) -> (Qwen35Config, Qwen35Model),
+            ),
+            ("attention-only", text_model_attention_only_on),
+        ] {
+            let (_, host_model) = build(&device);
+            let (_, mut dev_model) = build(&device);
+            dev_model.set_device_positions(true);
+            let mut hc = host_model.new_cache_for(40, 3).unwrap();
+            let mut dc = dev_model.new_cache_for(40, 3).unwrap();
+            assert!(hc.device_positions().is_none() && dc.device_positions().is_some());
+            // The growing reference cache of the device-positions model: one arithmetic with its
+            // static path, bit for bit.
+            let mut gc = dev_model.new_cache_with_checkpoints(3);
+            let steps: [(&[i32], bool); 6] = [
+                (&[1, 7, 3, 42, 9, 1, 7], false),
+                (&[3], false),
+                (&[5], false),
+                (&[4, 5, 6, 7], true),
+                (&[8], false),
+                (&[2], false),
+            ];
+            for (n, (tokens, all)) in steps.iter().enumerate() {
+                let req = if *all {
+                    StepRequest::all(tokens).with_hidden(true)
+                } else {
+                    StepRequest::last(tokens)
+                };
+                let h = host_model.forward_step(&mut hc, req).unwrap();
+                let d = dev_model.forward_step(&mut dc, req).unwrap();
+                let g = dev_model.forward_step(&mut gc, req).unwrap();
+                assert_rows_close(&format!("{what} step {n}"), &d.logits, &h.logits);
+                assert_eq!(host(&g.logits), host(&d.logits), "{what} step {n}: growing");
+                if let (Some(dh), Some(hh)) = (&d.hidden, &h.hidden) {
+                    assert_rows_close(&format!("{what} step {n} hidden"), dh, hh);
+                }
+                assert_eq!(hc.offset(), dc.offset());
+                assert_eq!(hc.checkpoint_offsets(), dc.checkpoint_offsets());
+                if *all {
+                    let back = hc.offset() - 2;
+                    hc.rollback_to(back).unwrap();
+                    dc.rollback_to(back).unwrap();
+                    gc.rollback_to(back).unwrap();
+                }
+            }
+            let mut config = GenerationConfig {
+                max_new_tokens: 12,
+                seed: Some(0),
+                stop_tokens: Vec::new(),
+                ..Default::default()
+            };
+            config.sampling.temperature = 0.0;
+            let prompt = [1i32, 7, 3, 42, 9, 1, 7, 3];
+            let step = |m: &Qwen35Model| {
+                generate_step(m, &prompt, &config, &CancelFlag::new(), &mut |_| {}, None)
+                    .unwrap()
+                    .0
+                    .tokens
+            };
+            let greedy = step(&host_model);
+            assert_eq!(step(&dev_model), greedy, "{what}: step driver");
+            let spec = |m: &Qwen35Model| {
+                generate_speculative(
+                    m,
+                    &mut NgramProposer { max_ngram: 3 },
+                    SpeculativePrompt::Tokens(&prompt),
+                    &config,
+                    3,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                    None,
+                )
+                .unwrap()
+                .output
+                .tokens
+            };
+            assert_eq!(spec(&dev_model), spec(&host_model), "{what}: speculative");
+            assert_eq!(spec(&dev_model), greedy, "{what}: greedy-exact");
+        }
+    }
+
+    /// sc-24441: a replayed step's host side ([`DecodeCache::replay_advance`]) leaves the cache
+    /// exactly where the forward it stands for does — lengths, the restorable window and the live
+    /// ring views — and refuses where a replay could not be correct (no device positions, or no
+    /// live state to read at position zero).
+    #[test]
+    fn replay_advance_does_the_forwards_bookkeeping() {
+        let (_, mut model) = text_model();
+        model.set_device_positions(true);
+        let mut forward = model.new_cache_for(32, 3).unwrap();
+        let mut replayed = model.new_cache_for(32, 3).unwrap();
+        assert!(
+            DecodeCache::replay_advance(&mut replayed, 1).is_err(),
+            "nothing to replay from at position zero"
+        );
+        for c in [&mut forward, &mut replayed] {
+            model
+                .forward_step(c, StepRequest::last(&[1, 7, 3, 42]))
+                .unwrap();
+        }
+        for n in [1usize, 4, 1] {
+            let tokens = vec![5i32; n];
+            model
+                .forward_step(&mut forward, StepRequest::all(&tokens))
+                .unwrap();
+            DecodeCache::stage_positions(&mut replayed).unwrap();
+            DecodeCache::replay_advance(&mut replayed, n).unwrap();
+            assert_eq!(forward.offset(), replayed.offset());
+            assert_eq!(forward.checkpoint_offsets(), replayed.checkpoint_offsets());
+            let views = |c: &Qwen35Cache| -> Vec<usize> {
+                c.recurrent_states()
+                    .iter()
+                    .flat_map(|(conv, ssm)| {
+                        [conv.unwrap(), ssm.unwrap()]
+                            .map(|t| crate::primitives::storage_address(t).unwrap())
+                    })
+                    .collect()
+            };
+            let rings = |c: &Qwen35Cache| c.recurrent_ring_addresses().unwrap();
+            // The live views sit at the same slot offsets of each cache's own ring.
+            let offsets = |c: &Qwen35Cache| -> Vec<usize> {
+                let base: Vec<usize> = rings(c).iter().flat_map(|(a, b)| [*a, *b]).collect();
+                views(c).iter().zip(&base).map(|(v, b)| v - b).collect()
+            };
+            assert_eq!(offsets(&forward), offsets(&replayed));
+        }
+        let mut host = {
+            model.set_device_positions(false);
+            model.new_cache_for(32, 3).unwrap()
+        };
+        model
+            .forward_step(&mut host, StepRequest::last(&[1, 7]))
+            .unwrap();
+        assert!(DecodeCache::replay_advance(&mut host, 1).is_err());
     }
 
     /// **E6.** The static cache is bounded by the request and the model: a capacity of zero is a

@@ -39,11 +39,21 @@
 //! a slot-index change: no copy, no allocation. The per-token write is an output of the recurrence
 //! step ([`gated_delta_recurrence_with_sink`]): a fused decode kernel (sc-24000) produces the same
 //! thing by writing each token's state into its ring slot directly.
+//!
+//! ## Device-indexed slots (story sc-24441)
+//!
+//! Which slot is live and which slots a step writes move with the position, so a step that picks
+//! them on the host bakes the position into its kernels. With [`DevicePositions`] staged, a step
+//! reads the live state out of the slot the device index names ([`candle_quant_kernels::read_slot`])
+//! and writes each token's state to the slot its device index names
+//! ([`candle_quant_kernels::write_rows_at`]) — the same values the host-indexed step reads and
+//! writes, at a CUDA-graph-replayable address; the host keeps exactly the same bookkeeping.
 
 use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
 use crate::primitives::decode_cache::tensor_bytes;
+use crate::primitives::device_positions::DevicePositions;
 use crate::primitives::kv_cache::storage_address;
 use crate::primitives::nn::{rms_norm, silu};
 
@@ -314,6 +324,18 @@ impl StateRing {
         Ok(())
     }
 
+    /// [`write`](Self::write) into the slot the device `u32` `slot` names (sc-24441).
+    fn write_at(&self, slot: &Tensor, conv: &Tensor, ssm: &Tensor) -> Result<()> {
+        candle_quant_kernels::write_rows_at(
+            &self.conv,
+            &conv.contiguous()?.unsqueeze(0)?,
+            slot,
+            0,
+        )?;
+        candle_quant_kernels::write_rows_at(&self.ssm, &ssm.contiguous()?.unsqueeze(0)?, slot, 0)?;
+        Ok(())
+    }
+
     fn views(&self, position: i32) -> Result<(Tensor, Tensor)> {
         let slot = self.slot(position);
         Ok((
@@ -541,6 +563,55 @@ impl DeltaNetCache {
         g: &Tensor,
         beta: &Tensor,
     ) -> Result<Tensor> {
+        self.advance_at(conv, q, k, v, g, beta, None)
+    }
+
+    /// Whether a step on `positions` reads and writes the ring through device indices: device
+    /// positions staged, and a ring to index.
+    fn device_indexed<'p>(
+        &self,
+        positions: Option<&'p DevicePositions>,
+    ) -> Option<&'p DevicePositions> {
+        positions.filter(|_| self.spec.is_some())
+    }
+
+    /// The conv tail the next step is seeded with: the live one, or — with device positions and a
+    /// ring (sc-24441) — a copy of the slot the device index names (the same values, read at a
+    /// replayable address). `None` at position zero (the caller seeds zeros).
+    pub fn live_conv_state(
+        &mut self,
+        positions: Option<&DevicePositions>,
+    ) -> Result<Option<Tensor>> {
+        match self.device_indexed(positions) {
+            Some(positions) if self.offset > 0 => {
+                self.preallocate()?;
+                let ring = self.ring.as_ref().expect("preallocated");
+                Ok(Some(candle_quant_kernels::read_slot(
+                    &ring.conv,
+                    &positions.ring_read()?,
+                )?))
+            }
+            _ => Ok(self.conv_state.clone()),
+        }
+    }
+
+    /// [`advance`](Self::advance), with the ring read and written through the device indices of
+    /// `positions` when they are staged (see the module docs): the live SSM state comes from the
+    /// slot `positions.ring_read()` names and token `t`'s state goes to `positions.ring_write(t)`
+    /// — at position zero the recurrence starts from zeros, as the host path does. The host
+    /// bookkeeping (offset, restorable window, live views) is identical either way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_at(
+        &mut self,
+        conv: &ConvTrace,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        positions: Option<&DevicePositions>,
+    ) -> Result<Tensor> {
+        let positions = self.device_indexed(positions);
         self.preallocate()?;
         let t = q.dim(1)?;
         if conv.tokens() != t {
@@ -575,19 +646,28 @@ impl DeltaNetCache {
                     if ti < first_write {
                         return Ok(());
                     }
-                    let position = offset + ti as i32 + 1;
-                    ring.write(position, &conv.tail_after(ti)?, state)
+                    match positions {
+                        Some(p) => ring.write_at(&p.ring_write(ti)?, &conv.tail_after(ti)?, state),
+                        None => {
+                            let position = offset + ti as i32 + 1;
+                            ring.write(position, &conv.tail_after(ti)?, state)
+                        }
+                    }
                 };
-                gated_delta_recurrence_with_sink(
-                    q,
-                    k,
-                    v,
-                    g,
-                    beta,
-                    self.ssm_state.as_ref(),
-                    &mut sink,
-                )
-                .and_then(|(y, _)| Ok((y, ring.views(next)?)))
+                // Device-indexed: the live state is a copy of the slot the device index names
+                // (the slot `ssm_state` is a view of), taken before any write.
+                let live = match positions {
+                    Some(p) if offset > 0 => {
+                        Some(candle_quant_kernels::read_slot(&ring.ssm, &p.ring_read()?)?)
+                    }
+                    _ => None,
+                };
+                let state = match positions {
+                    Some(_) => live.as_ref(),
+                    None => self.ssm_state.as_ref(),
+                };
+                gated_delta_recurrence_with_sink(q, k, v, g, beta, state, &mut sink)
+                    .and_then(|(y, _)| Ok((y, ring.views(next)?)))
             }
             None => gated_delta_recurrence(q, k, v, g, beta, self.ssm_state.as_ref()).and_then(
                 |(y, final_state)| Ok((y, (conv.tail_after(t - 1)?.contiguous()?, final_state))),
@@ -611,6 +691,36 @@ impl DeltaNetCache {
         self.ssm_state = Some(ssm_state);
         self.offset = next;
         Ok(y)
+    }
+
+    /// The host side of a `t`-token step whose device work a CUDA-graph replay did (sc-24441):
+    /// exactly the restorable-window and live-view bookkeeping [`advance_at`](Self::advance_at)
+    /// does with device positions, and the position advances by `t`. Needs the ring, and a
+    /// position past zero — at zero the recorded step would read a slot that holds no state
+    /// (the eager step seeds zeros there instead).
+    pub fn replay_advance(&mut self, t: usize) -> Result<()> {
+        if self.offset == 0 || self.ssm_state.is_none() {
+            return Err(Error::Msg(format!(
+                "DeltaNetCache::replay_advance: no live state at position {} to replay from",
+                self.offset
+            )));
+        }
+        self.preallocate()?;
+        let Some(ring) = self.ring.as_mut() else {
+            return Err(Error::Msg(
+                "DeltaNetCache::replay_advance: a graph replay needs the checkpoint ring".into(),
+            ));
+        };
+        let offset = self.offset;
+        let next = offset + t as i32;
+        let slots = ring.slots;
+        ring.lo = ring.lo.max(offset + t.min(slots) as i32 + 1 - slots as i32);
+        ring.lo = ring.lo.max(next + 1 - slots as i32).max(1);
+        let (conv, ssm) = ring.views(next)?;
+        self.conv_state = Some(conv);
+        self.ssm_state = Some(ssm);
+        self.offset = next;
+        Ok(())
     }
 
     /// Store an externally computed post-step `(conv_state, ssm_state)` and advance the position

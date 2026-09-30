@@ -200,11 +200,12 @@ fn provider_records_the_decode_path_it_ran() {
     );
 }
 
-/// sc-24134 × sc-24138: with the CUDA-graph switch on, the llama family's engine path runs
-/// through the graph runner as the MTP path does — every step eager (the prefill included), and
-/// the record names why no graph ran (the build or device here; the family's own
-/// `positions_host_scalar` on a CUDA own-stream device) rather than a bare `graph: none`. With
-/// the switch off the model runs bare and the record is `graph: none`.
+/// sc-24134 × sc-24138 × sc-24441: with the CUDA-graph switch on, the llama family's engine path
+/// runs through the graph runner as the MTP path does, and the record says which graph path ran:
+/// on a CUDA own-stream device the decode step is captured and replays (`graph_path =
+/// captured`, no fallback); elsewhere every step is eager and the record names why (the build or
+/// device) rather than a bare `graph: none`. With the switch off the model runs bare and the
+/// record is `graph: none`.
 ///
 /// The switch is a load option (sc-24139): each case loads the provider under it
 /// (`LoadSpec::cuda_graphs`), since a CUDA load settles the model's stream then and every
@@ -229,22 +230,46 @@ fn causal_engine_requests_record_the_graph_runner() {
 
     let on = record(true);
     assert_eq!(on.path, DecodePath::StepModel, "the engine ran");
-    assert_eq!(
-        on.cuda_graphs.label(),
-        "eager",
-        "{}",
-        on.cuda_graphs.describe()
-    );
-    assert_eq!(
-        on.cuda_graphs.eager, on.target_forwards,
-        "every target forward went through the runner, eager"
-    );
-    assert_eq!((on.cuda_graphs.replayed, on.cuda_graphs.captured), (0, 0));
-    assert!(
-        on.cuda_graphs.fallback_reason.is_some(),
-        "{}",
-        on.cuda_graphs.describe()
-    );
+    let capturable = cfg!(feature = "cuda")
+        && !cfg!(feature = "flash-attn")
+        && candle_llm::device::select_device().unwrap().is_cuda();
+    if capturable {
+        assert_eq!(
+            on.cuda_graphs.fallback_reason,
+            None,
+            "{}",
+            on.cuda_graphs.describe()
+        );
+        assert!(
+            on.cuda_graphs.captured <= 1,
+            "{}",
+            on.cuda_graphs.describe()
+        );
+        let expected = if on.cuda_graphs.replayed > 0 {
+            "captured"
+        } else {
+            "eager"
+        };
+        assert_eq!(on.report(true).graph_path, expected);
+    } else {
+        assert_eq!(
+            on.cuda_graphs.label(),
+            "eager",
+            "{}",
+            on.cuda_graphs.describe()
+        );
+        assert_eq!(
+            on.cuda_graphs.eager, on.target_forwards,
+            "every target forward went through the runner, eager"
+        );
+        assert_eq!((on.cuda_graphs.replayed, on.cuda_graphs.captured), (0, 0));
+        assert!(
+            on.cuda_graphs.fallback_reason.is_some(),
+            "{}",
+            on.cuda_graphs.describe()
+        );
+        assert_eq!(on.report(true).graph_path, "eager");
+    }
 
     let off = record(false);
     assert_eq!(off.path, DecodePath::StepModel);

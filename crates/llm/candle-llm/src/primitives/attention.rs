@@ -21,7 +21,10 @@
 //! (different reduction order), the same tolerance the batched / prefix-reuse GPU paths carry.
 //!
 //! [`sdpa_gqa_causal`] (epic sc-24128, story sc-24132) is the **zero-copy grouped-query** causal
-//! attention the static-KV decode path runs: queries `[b, H, s, d]` against un-expanded keys/values
+//! attention the static-KV path runs for a prompt prefill (and, on a model without device
+//! positions, for every step; since sc-24441 a cached decode / verify step of a model with device
+//! positions — the CUDA default — attends with the length-aware
+//! [`candle_quant_kernels::decode_attention()`] on every cache instead): queries `[b, H, s, d]` against un-expanded keys/values
 //! `[b, Hkv, L, d]`, with the `H / Hkv` query groups folded into the query-sequence axis so one
 //! batched matmul per side serves every group — no [`repeat_kv`] expansion, and no `contiguous`
 //! copy of the cache's narrowed K/V views (the matmul reads their strides directly). The causal

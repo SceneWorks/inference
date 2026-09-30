@@ -133,6 +133,13 @@ pub struct DecodeReport {
     pub attention: String,
     /// The CUDA-graph runner's part.
     pub cuda_graphs: CudaGraphsReport,
+    /// Which graph path served the generation's steps (epic sc-24432 E3): `captured` when a
+    /// captured, verified CUDA graph replayed at least one step (warm-up, self-check and prefill
+    /// steps still run eager), `eager` when steps went through the graph runner but none replayed
+    /// ([`CudaGraphsReport::fallback_reason`] names why), `none` when no step went through the
+    /// runner (the switch was off, or the path does not use it), or a backend without CUDA
+    /// graphs.
+    pub graph_path: String,
     /// NVFP4 projection calls by path (`none` for a model without NVFP4 projections).
     pub nvfp4_projections: PathReport,
     /// Fused-versus-reference primitive runs.
