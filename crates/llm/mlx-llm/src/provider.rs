@@ -2574,8 +2574,9 @@ mod tests {
     #[test]
     fn fused_request_estimate_tracks_chunked_attention_and_last_row_logits() {
         // Frozen Qwen3.8 parent geometry. This prompt size reproduces the campaign's long-context
-        // scale: eager prompt-squared scores dominate hundreds of GB, while MLX runs eight query
-        // rows per fused call and projects one final row to the vocabulary.
+        // scale: eager prompt-squared scores dominate hundreds of GB, while MLX's fused full and
+        // vector kernels materialize no score matrix (priced conservatively as one 8-query-row score
+        // tile per call) and the decoder projects one final row to the vocabulary.
         let geometry = LlmMemoryGeometry {
             query_heads: 40,
             kv_heads: 4,
