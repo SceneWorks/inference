@@ -50,6 +50,7 @@ pub mod constraint;
 pub mod detok;
 pub mod error;
 pub mod message;
+pub mod mtp_head;
 pub mod output;
 pub mod paging;
 pub mod prefix;
@@ -80,6 +81,9 @@ pub use constraint::{
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
+pub use mtp_head::{
+    companion_mtp_prefix, read_companion_mtp_config, CompanionMtpGeometry, COMPANION_MTP_MODEL_TYPE,
+};
 pub use output::{
     Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,
 };

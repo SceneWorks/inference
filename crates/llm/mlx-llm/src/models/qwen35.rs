@@ -1511,82 +1511,26 @@ fn build_mtp_predictor(
     })
 }
 
-/// The `model_type` of a standalone Qwen3.8 MTP proposal head (e.g. `EigenLabs/Qwen3.8-27B-MTP-4bit`,
-/// `mlx-community/Qwen3.8-27B-MTP-4bit`): one predictor layer, no embeddings, no LM head.
-pub const COMPANION_MTP_MODEL_TYPE: &str = "qwen3_5_mtp";
-
-/// Refuse a companion head whose config disagrees with the target on anything the predictor
-/// computes with. Every mismatch is named, not just the first.
-fn companion_geometry_mismatches(head: &Qwen35Config, target: &Qwen35Config) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut int = |name: &str, head: i64, target: i64| {
-        if head != target {
-            out.push(format!("{name} {head} != target {target}"));
+impl Qwen35Config {
+    /// This config projected onto the backend-neutral companion-head contract (sc-24444, E8): the
+    /// one geometry check both backends refuse a mismatched head by.
+    pub fn companion_mtp_geometry(&self) -> core_llm::CompanionMtpGeometry {
+        core_llm::CompanionMtpGeometry {
+            hidden_size: self.hidden_size,
+            num_attention_heads: self.num_heads,
+            num_key_value_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            intermediate_size: self.intermediate_size,
+            vocab_size: self.vocab_size,
+            rotary_dim: self.rotary_dim(),
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            mrope_section: self.mrope_section_resolved(),
+            mtp_num_hidden_layers: self.mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings: self.mtp_use_dedicated_embeddings,
+            moe: self.moe.is_some(),
         }
-    };
-    int(
-        "hidden_size",
-        head.hidden_size.into(),
-        target.hidden_size.into(),
-    );
-    int(
-        "num_attention_heads",
-        head.num_heads.into(),
-        target.num_heads.into(),
-    );
-    int(
-        "num_key_value_heads",
-        head.num_kv_heads.into(),
-        target.num_kv_heads.into(),
-    );
-    int("head_dim", head.head_dim.into(), target.head_dim.into());
-    int(
-        "intermediate_size",
-        head.intermediate_size.into(),
-        target.intermediate_size.into(),
-    );
-    int(
-        "vocab_size",
-        head.vocab_size.into(),
-        target.vocab_size.into(),
-    );
-    int(
-        "rotary_dim",
-        head.rotary_dim().into(),
-        target.rotary_dim().into(),
-    );
-    if head.mtp_num_hidden_layers != 1 {
-        out.push(format!(
-            "mtp_num_hidden_layers {} (this runtime runs exactly one predictor layer)",
-            head.mtp_num_hidden_layers
-        ));
     }
-    if head.rms_norm_eps != target.rms_norm_eps {
-        out.push(format!(
-            "rms_norm_eps {} != target {}",
-            head.rms_norm_eps, target.rms_norm_eps
-        ));
-    }
-    if head.rope_theta != target.rope_theta {
-        out.push(format!(
-            "rope_theta {} != target {}",
-            head.rope_theta, target.rope_theta
-        ));
-    }
-    if head.mrope_section_resolved() != target.mrope_section_resolved() {
-        out.push(format!(
-            "mrope_section {:?} != target {:?}",
-            head.mrope_section_resolved(),
-            target.mrope_section_resolved()
-        ));
-    }
-    if head.mtp_use_dedicated_embeddings {
-        out.push("mtp_use_dedicated_embeddings is true (the head must share the target's)".into());
-    }
-    if head.moe.is_some() {
-        out.push("the head declares a MoE predictor".into());
-    }
-    out
 }
 
 /// The `[out, in]` a stored projection computes, whether dense or stored-quantized.
@@ -1609,7 +1553,7 @@ fn logical_matrix_shape(
 
 impl Qwen35Model {
     /// Attach a standalone Qwen3.8 MTP proposal head (a directory holding its `config.json` and
-    /// `*.safetensors`, `model_type` [`COMPANION_MTP_MODEL_TYPE`]) to a target that has none of its
+    /// `*.safetensors`, `model_type` [`core_llm::COMPANION_MTP_MODEL_TYPE`]) to a target that has none of its
     /// own — the Prism/Bonsai path, whose packed artifact ships no `mtp.*` tensors.
     ///
     /// The head owns only its predictor layer; it reads token embeddings and projects logits
@@ -1633,21 +1577,11 @@ impl Qwen35Model {
                 "a MoE target has no MTP predictor path on this architecture".into(),
             ));
         }
-        let config_path = dir.join("config.json");
-        let value: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&config_path)
-                .map_err(|e| Error::Config(format!("read {}: {e}", config_path.display())))?,
-        )
-        .map_err(|e| Error::Config(format!("parse {}: {e}", config_path.display())))?;
-        let model_type = value.get("model_type").and_then(|v| v.as_str());
-        if model_type != Some(COMPANION_MTP_MODEL_TYPE) {
-            return Err(Error::Config(format!(
-                "companion MTP head `model_type` must be `{COMPANION_MTP_MODEL_TYPE}`, got {}",
-                model_type.unwrap_or("none")
-            )));
-        }
+        let value =
+            core_llm::read_companion_mtp_config(dir).map_err(|e| Error::Config(e.to_string()))?;
         let head_cfg = Qwen35Config::from_json(&value)?;
-        let mismatches = companion_geometry_mismatches(&head_cfg, &self.cfg);
+        let head_geometry = head_cfg.companion_mtp_geometry();
+        let mismatches = head_geometry.mismatches(&self.cfg.companion_mtp_geometry());
         if !mismatches.is_empty() {
             return Err(Error::Config(format!(
                 "companion MTP head geometry does not match the target: {}",
@@ -1655,36 +1589,12 @@ impl Qwen35Model {
             )));
         }
         let w = Weights::from_dir(dir)?;
-        let prefix = match (w.contains("fc.weight"), w.contains("mtp.fc.weight")) {
-            (true, false) => "",
-            (false, true) => "mtp.",
-            (true, true) => {
-                return Err(Error::Config(
-                    "companion MTP head has both bare and `mtp.`-prefixed tensors".into(),
-                ))
-            }
-            (false, false) => return Err(Error::MissingTensor("fc.weight".into())),
-        };
-        let c = &self.cfg;
-        let (h, heads, kv, hd, inter) = (
-            c.hidden_size,
-            c.num_heads,
-            c.num_kv_heads,
-            c.head_dim,
-            c.intermediate_size,
-        );
+        let prefix = core_llm::companion_mtp_prefix(|key| w.contains(key))
+            .map_err(|e| Error::Config(e.to_string()))?;
         let stored = head_cfg.quantization;
         let mut wrong = Vec::new();
-        for (name, expected) in [
-            ("fc", [h, 2 * h]),
-            ("layers.0.self_attn.q_proj", [2 * heads * hd, h]),
-            ("layers.0.self_attn.k_proj", [kv * hd, h]),
-            ("layers.0.self_attn.v_proj", [kv * hd, h]),
-            ("layers.0.self_attn.o_proj", [h, heads * hd]),
-            ("layers.0.mlp.gate_proj", [inter, h]),
-            ("layers.0.mlp.up_proj", [inter, h]),
-            ("layers.0.mlp.down_proj", [h, inter]),
-        ] {
+        for (name, [rows, cols]) in head_geometry.matrices() {
+            let expected = [rows as i32, cols as i32];
             let key = format!("{prefix}{name}.weight");
             match logical_matrix_shape(&w, &key, stored) {
                 Some(actual) if actual == expected => {}
@@ -1694,15 +1604,8 @@ impl Qwen35Model {
                 None => wrong.push(format!("`{name}` is missing or not a matrix")),
             }
         }
-        for (name, expected) in [
-            ("pre_fc_norm_embedding", h),
-            ("pre_fc_norm_hidden", h),
-            ("norm", h),
-            ("layers.0.input_layernorm", h),
-            ("layers.0.post_attention_layernorm", h),
-            ("layers.0.self_attn.q_norm", hd),
-            ("layers.0.self_attn.k_norm", hd),
-        ] {
+        for (name, expected) in head_geometry.norms() {
+            let expected = expected as i32;
             match w
                 .get(&format!("{prefix}{name}.weight"))
                 .map(|a| a.shape().to_vec())
@@ -2541,6 +2444,7 @@ pub(crate) mod tests {
     fn prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation() {
         use crate::decode::{generate, CancelFlag};
         use crate::primitives::prism::tests::with_unfused_rotation;
+        use crate::primitives::prism::{recording_rotation_routes, RotationRoute};
 
         let fixture = crate::synthetic::prism_qwen35(11);
         let cfg = Qwen35Config::from_json(&fixture.config).unwrap();
@@ -2561,8 +2465,35 @@ pub(crate) mod tests {
             .unwrap();
             (bits(&hidden), bits(&logits), out.tokens)
         };
-        let fused = run();
-        let unfused = with_unfused_rotation(run);
+        // Count the routes, not just the numbers: the two paths are bit-identical by
+        // construction, so only the route shows the fused kernel actually ran.
+        let fused_count = |routes: &[RotationRoute]| {
+            routes
+                .iter()
+                .filter(|r| **r == RotationRoute::Fused)
+                .count()
+        };
+        let (fused, fused_routes) = mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            recording_rotation_routes(run)
+        });
+        let (unfused, unfused_routes) =
+            mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+                recording_rotation_routes(|| with_unfused_rotation(run))
+            });
+        assert!(
+            fused_count(&fused_routes) > 0,
+            "the fused rotation never ran: {fused_routes:?}"
+        );
+        assert!(
+            !fused_routes.contains(&RotationRoute::Unfused),
+            "every rotation at the fixture's widths is fused: {fused_routes:?}"
+        );
+        assert_eq!(
+            fused_count(&unfused_routes),
+            0,
+            "the oracle run used the kernel"
+        );
+        assert!(!unfused_routes.is_empty());
         assert!(fused.0 == unfused.0, "prefill hidden states differ");
         assert!(fused.1 == unfused.1, "prefill logits differ");
         assert_eq!(fused.2, unfused.2, "greedy tokens differ");
@@ -2658,6 +2589,35 @@ pub(crate) mod tests {
         assert!(err.contains("intermediate_size 128 != target 256"), "{err}");
         assert!(err.contains("num_key_value_heads 2 != target 1"), "{err}");
 
+        // Each field the predictor computes with but no tensor shape reveals is its own named
+        // refusal: `vocab_size` is the only guard against a head for another tokenizer.
+        for (field, value, named) in [
+            ("vocab_size", json!(65), "vocab_size 65 != target 64"),
+            (
+                "partial_rotary_factor",
+                json!(0.25),
+                "rotary_dim 16 != target 32",
+            ),
+            (
+                "rope_theta",
+                json!(1000000.0),
+                "rope_theta 1000000 != target 10000000",
+            ),
+            (
+                "rms_norm_eps",
+                json!(1e-5),
+                "rms_norm_eps 0.00001 != target 0.000001",
+            ),
+        ] {
+            let mut other = text.clone();
+            other[field] = value;
+            let head = crate::test_fixture::Fixture::new("mlx-head-field-", None);
+            crate::synthetic::write_companion_head(&head, &other, 3, None);
+            let err = model.attach_companion_mtp(&head).unwrap_err().to_string();
+            assert!(err.contains("geometry does not match"), "{field}: {err}");
+            assert!(err.contains(named), "{field}: {err}");
+        }
+
         // The config matches but a stored tensor does not.
         let tensor_mismatch = crate::test_fixture::Fixture::new("mlx-head-tensors-", None);
         crate::synthetic::write_companion_head(&tensor_mismatch, text, 3, Some(128));
@@ -2707,6 +2667,40 @@ pub(crate) mod tests {
             err.contains("already carries its own MTP predictor"),
             "{err}"
         );
+    }
+
+    /// Story sc-24444: a companion head's RMSNorm vectors follow the zero-centred Qwen3.8
+    /// checkpoint convention (`1 + w`) whatever the target's own convention — a Prism target's
+    /// norms are direct multipliers, the head's are not (the published Qwen3.8 heads'
+    /// `pre_fc_norm_embedding` values are all negative, mean ≈ −0.46).
+    #[test]
+    fn a_companion_heads_norms_are_applied_as_one_plus_w() {
+        let fixture = crate::synthetic::prism_qwen35(11);
+        let cfg = Qwen35Config::from_json(&fixture.config).unwrap();
+        let mut model =
+            Qwen35Model::from_prism_weights(&fixture.weights, cfg, &fixture.pack).unwrap();
+        let head = crate::test_fixture::Fixture::new("mlx-head-norm-", None);
+        crate::synthetic::write_companion_head(&head, &fixture.config["text_config"], 3, None);
+        let path = head.join("model.safetensors");
+        let mut tensors = Array::load_safetensors(&path).unwrap();
+        // The load is lazy: materialize every tensor before overwriting the file it reads.
+        mlx_rs::transforms::eval(tensors.values()).unwrap();
+        tensors.insert(
+            "pre_fc_norm_embedding.weight".into(),
+            Array::from_slice(&[-0.5f32; 128], &[128])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        Array::save_safetensors(tensors.iter().map(|(k, v)| (k.as_str(), v)), None, &path).unwrap();
+        model.attach_companion_mtp(&head).unwrap();
+        let applied = model
+            .mtp
+            .as_ref()
+            .unwrap()
+            .pre_fc_norm_embedding
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        assert_eq!(applied.as_slice::<f32>(), [0.5f32; 128]);
     }
 
     #[test]

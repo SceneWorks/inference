@@ -786,8 +786,9 @@ pub struct LoadSpec {
     /// Bonsai 2 27B Prism target, whose packed checkpoint ships no MTP head — that the provider
     /// attaches to the target so `{proposer: mtp}` can run. The head borrows the target's
     /// embedding and LM head. `None` loads the target alone. An accelerator, never a requirement
-    /// (E2): a head the backend cannot attach (mismatched geometry, unreadable, over the admission
-    /// budget, a backend without companion heads) leaves the target loaded without it, and the
+    /// (E2): a head the backend cannot attach (mismatched geometry by the shared
+    /// [`CompanionMtpGeometry`](crate::CompanionMtpGeometry) check, unreadable, over the admission
+    /// budget, a target outside the Qwen3.5/3.8 family) leaves the target loaded without it, and the
     /// general text providers (MLX and Candle `LlamaProvider`) name the reason in
     /// [`LoadReport::fallbacks`](crate::LoadReport::fallbacks); a head attached is advertised as the
     /// `mtp` proposer. Task-specific providers (captioners, SVG generators) ignore it. Distinct from

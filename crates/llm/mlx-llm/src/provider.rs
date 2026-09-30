@@ -621,7 +621,7 @@ impl LlamaProvider {
         let required = crate::load_memory::required_bytes(spec)?;
         let available = core_llm::effective_memory_budget(
             core_llm::available_host_memory_bytes(),
-            core_llm::operational_memory_override()?,
+            load_memory_budget()?,
         )?;
         core_llm::admit_request_memory(required, available)?;
         let mut load_report = core_llm::LoadReport {
@@ -2324,6 +2324,36 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
             .advertise_mtp(max_depth, MTP_RECOMMENDED_DEPTH);
     }
     d
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's operational load budget on this thread ([`with_load_budget`]); the process-wide
+    /// [`core_llm::AVAILABLE_MEMORY_OVERRIDE`] would leak into every concurrently loading test.
+    static LOAD_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with load admission capped at `budget` bytes on this thread.
+#[cfg(test)]
+pub(crate) fn with_load_budget<R>(budget: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOAD_BUDGET.with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(LOAD_BUDGET.with(|b| b.replace(Some(budget))));
+    f()
+}
+
+/// The operational budget load admission caps measured availability with
+/// ([`core_llm::operational_memory_override`]).
+fn load_memory_budget() -> CoreResult<Option<u64>> {
+    #[cfg(test)]
+    if let Some(budget) = LOAD_BUDGET.with(std::cell::Cell::get) {
+        return Ok(Some(budget));
+    }
+    core_llm::operational_memory_override()
 }
 
 /// Admit a companion MTP head's resident bytes on top of the already-admitted target (E7).
@@ -4255,7 +4285,7 @@ mod tests {
     }
 
     /// Story sc-24444 AC2: a Prism snapshot loaded with a companion head advertises MTP, and
-    /// `{proposer: mtp}` at depths 1, 3 and 7 — through the real load path and the provider's
+    /// `{proposer: mtp}` at depths 1, 3 and the advertised max — through the real load path and the provider's
     /// engine — emits exactly `off`'s greedy tokens, with the report naming the head as the
     /// proposer that ran.
     #[test]
@@ -4268,11 +4298,13 @@ mod tests {
         assert_eq!(provider.descriptor().family, "prism_hadamard_qwen35");
         let report = provider.load_report().unwrap();
         assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
-        assert!(provider
+        // The companion head advertises the same backend-true depth a native head does (sc-24438).
+        let advertised = provider
             .descriptor()
             .capabilities
             .proposer(SpeculativeProposer::Mtp)
-            .is_some());
+            .expect("the attached head is advertised");
+        assert_eq!(advertised.recommended_depth, MTP_RECOMMENDED_DEPTH);
 
         let (off, off_ids) = run(&provider, &prism_request(Speculative::Off));
         assert_eq!(off_ids.len(), 20);
@@ -4286,7 +4318,7 @@ mod tests {
             plain_loop(&provider, &prism_request(Speculative::Off))
         );
         assert_eq!(off.decode.unwrap().proposer, ProposerKind::None);
-        for depth in [1, 3, 7] {
+        for depth in [1, 3, advertised.max_depth] {
             let req = prism_request(Speculative::proposer(SpeculativeProposer::Mtp, depth));
             let (out, ids) = run(&provider, &req);
             assert_eq!(ids, off_ids, "depth {depth}");
@@ -4403,6 +4435,30 @@ mod tests {
             "{refused}"
         );
         assert!(refused.contains(&head_bytes.to_string()), "{refused}");
+
+        // Through the real load: a budget that fits the target but not target + head refuses the
+        // head by name and loads the target without MTP; one more byte admits both.
+        let short = with_load_budget(target + head_bytes - 1, || LlamaProvider::load(&with_head))
+            .expect("the target fits and still loads (E2)");
+        let fallbacks = short.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(
+            fallbacks[0].starts_with("mtp_head: refused by load admission"),
+            "{fallbacks:?}"
+        );
+        assert!(short
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        let fits = with_load_budget(target + head_bytes, || LlamaProvider::load(&with_head))
+            .expect("target + head fit");
+        assert!(fits.load_report().unwrap().fallbacks.is_empty());
+        assert!(fits
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_some());
 
         let provider = LlamaProvider::load(&with_head).unwrap();
         let price = |route| {

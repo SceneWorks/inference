@@ -10,9 +10,10 @@
 
 use mlx_rs::fast::MetalKernel;
 use mlx_rs::ops::{dequantize, multiply, quantized_matmul};
-use mlx_rs::{Array, Device, DeviceType, Dtype};
+use mlx_rs::{Array, Dtype, Stream};
 
 use crate::error::{Error, Result};
+use crate::primitives::stream_is_gpu;
 
 const GROUP_SIZE: i32 = 128;
 const BITS: i32 = 2;
@@ -235,17 +236,56 @@ thread_local! {
         const { std::cell::OnceCell::new() };
 }
 
-/// Whether [`block_hadamard`] dispatches the fused kernel for this input.
-fn fused_rotation_applies(x: &Array, block: i32) -> Result<bool> {
+/// Which rotation implementation [`block_hadamard`] ran — recorded (test builds only), so a test
+/// can assert the route, not just the numbers (the fused kernel and the unfused chain are
+/// bit-identical by construction, so numbers alone cannot tell them apart).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RotationRoute {
+    /// One fused Metal kernel dispatch.
+    Fused,
+    /// One run of the unfused op chain.
+    Unfused,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROTATION_ROUTES: std::cell::RefCell<Option<Vec<RotationRoute>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record(route: RotationRoute) {
+    ROTATION_ROUTES.with(|r| {
+        if let Some(routes) = r.borrow_mut().as_mut() {
+            routes.push(route);
+        }
+    });
+}
+
+/// Run `f`, returning every [`RotationRoute`] [`block_hadamard`] recorded on this thread.
+#[cfg(test)]
+pub(crate) fn recording_rotation_routes<R>(f: impl FnOnce() -> R) -> (R, Vec<RotationRoute>) {
+    let previous = ROTATION_ROUTES.with(|r| r.replace(Some(Vec::new())));
+    let out = f();
+    let routes = ROTATION_ROUTES
+        .with(|r| r.replace(previous))
+        .unwrap_or_default();
+    (out, routes)
+}
+
+/// Whether [`block_hadamard`] dispatches the fused kernel for this input on `stream` (the stream
+/// the dispatch will run on — a custom Metal kernel runs only on a GPU stream).
+fn fused_rotation_applies(x: &Array, block: i32, stream: &Stream) -> bool {
     let shape_ok = (2..=FUSED_MAX_BLOCK).contains(&block)
         && (block as u32).is_power_of_two()
         && matches!(x.dtype(), Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32)
         && x.size() > 0;
     #[cfg(test)]
     if tests::FORCE_UNFUSED.with(std::cell::Cell::get) {
-        return Ok(false);
+        return false;
     }
-    Ok(shape_ok && matches!(Device::try_default()?.get_type()?, DeviceType::Gpu))
+    shape_ok && stream_is_gpu(stream)
 }
 
 fn fused_block_hadamard(
@@ -255,6 +295,7 @@ fn fused_block_hadamard(
     block: i32,
     width: i32,
     inverse: bool,
+    stream: &Stream,
 ) -> Result<Array> {
     let rows = i32::try_from(x.size() / block as usize)
         .map_err(|_| Error::Msg("Prism fused rotation has too many rows".into()))?;
@@ -292,7 +333,7 @@ fn fused_block_hadamard(
             .template_arg("RW", read_width)
             .template_arg("W", width)
             .template_arg("INVERSE", inverse)
-            .run()?;
+            .run_device(stream)?;
         outputs
             .pop()
             .ok_or_else(|| Error::Msg("Prism fused rotation returned no output".into()))
@@ -320,9 +361,16 @@ fn block_hadamard(
             signs.shape()
         )));
     }
-    if fused_rotation_applies(x, block)? {
-        fused_block_hadamard(x, signs, scale, block, width, inverse)
+    // Resolve the stream once: the device check and the kernel dispatch must see the same one
+    // (the task-local stream when set, which need not be on the process default device).
+    let stream = Stream::task_local_or_default();
+    if fused_rotation_applies(x, block, &stream) {
+        #[cfg(test)]
+        record(RotationRoute::Fused);
+        fused_block_hadamard(x, signs, scale, block, width, inverse, &stream)
     } else {
+        #[cfg(test)]
+        record(RotationRoute::Unfused);
         block_hadamard_unfused(x, signs, block, inverse, hadamard_scale(block))
     }
 }
@@ -472,6 +520,11 @@ pub(crate) mod tests {
     /// every activation dtype — plus smaller power-of-two blocks covering each final-radix branch.
     #[test]
     fn fused_rotation_is_bit_identical_to_the_unfused_chain() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), fused_rotation_matches_at_every_case);
+    }
+
+    fn fused_rotation_matches_at_every_case() {
+        let gpu = Stream::task_local_or_default();
         let mut cases = Vec::new();
         for width in [5120, 6144, 17408] {
             cases.push((width, 1024));
@@ -499,9 +552,10 @@ pub(crate) mod tests {
                     let signs = random_signs(width, seed + 10_000);
                     let scale = Array::from_slice(&[hadamard_scale(block)], &[1]);
                     for inverse in [false, true] {
-                        assert!(fused_rotation_applies(&x, block).unwrap());
-                        let fused = fused_block_hadamard(&x, &signs, &scale, block, width, inverse)
-                            .unwrap();
+                        assert!(fused_rotation_applies(&x, block, &gpu));
+                        let fused =
+                            fused_block_hadamard(&x, &signs, &scale, block, width, inverse, &gpu)
+                                .unwrap();
                         let reference = block_hadamard_unfused(
                             &x,
                             &signs,
@@ -525,6 +579,11 @@ pub(crate) mod tests {
     /// Signed zeros, exact powers of two and extreme finite values keep their exact bits too.
     #[test]
     fn fused_rotation_matches_on_edge_values() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), fused_rotation_matches_edge_values);
+    }
+
+    fn fused_rotation_matches_edge_values() {
+        let gpu = Stream::task_local_or_default();
         let width = 1024;
         let mut values = vec![0.0f32; width as usize];
         for (i, v) in values.iter_mut().enumerate() {
@@ -546,7 +605,7 @@ pub(crate) mod tests {
             let x = x.as_dtype(dtype).unwrap();
             for inverse in [false, true] {
                 let fused =
-                    fused_block_hadamard(&x, &signs, &scale, width, width, inverse).unwrap();
+                    fused_block_hadamard(&x, &signs, &scale, width, width, inverse, &gpu).unwrap();
                 let reference =
                     block_hadamard_unfused(&x, &signs, width, inverse, hadamard_scale(width))
                         .unwrap();
@@ -556,17 +615,48 @@ pub(crate) mod tests {
     }
 
     /// A block MLX splits into two passes (> 8192) stays on the unfused chain, as does a forced
-    /// oracle run; the dispatcher never hands the kernel a shape it was not proven on.
+    /// oracle run or a CPU stream; the dispatcher never hands the kernel a shape it was not proven
+    /// on, nor a stream it cannot run on.
     #[test]
     fn rotation_dispatch_uses_the_kernel_only_where_it_is_proven() {
+        let gpu = Stream::gpu();
         let x = Array::zeros::<f32>(&[1, 16384]).unwrap();
-        assert!(!fused_rotation_applies(&x, 16384).unwrap());
-        assert!(!fused_rotation_applies(&x, 1536).unwrap());
-        assert!(fused_rotation_applies(&x, 1024).unwrap());
-        with_unfused_rotation(|| assert!(!fused_rotation_applies(&x, 1024).unwrap()));
-        assert!(fused_rotation_applies(&x, 1024).unwrap());
+        assert!(!fused_rotation_applies(&x, 16384, &gpu));
+        assert!(!fused_rotation_applies(&x, 1536, &gpu));
+        assert!(fused_rotation_applies(&x, 1024, &gpu));
+        assert!(!fused_rotation_applies(&x, 1024, &Stream::cpu()));
+        with_unfused_rotation(|| assert!(!fused_rotation_applies(&x, 1024, &gpu)));
+        assert!(fused_rotation_applies(&x, 1024, &gpu));
         let ints = Array::zeros::<i32>(&[1, 1024]).unwrap();
-        assert!(!fused_rotation_applies(&ints, 1024).unwrap());
+        assert!(!fused_rotation_applies(&ints, 1024, &gpu));
+    }
+
+    /// The route follows the stream ops are issued on: a task-local GPU stream runs the fused
+    /// kernel on that stream even when the process default device is the CPU (another test may
+    /// have set it — the default device is process-global), bit-identical to the unfused chain.
+    #[test]
+    fn fused_rotation_runs_on_the_task_local_gpu_stream_under_a_cpu_default_device() {
+        let _cpu_default = crate::primitives::kv_cache::testing::CpuStream::enter();
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let width = 5120;
+            let key = mlx_rs::random::key(31).unwrap();
+            let x = mlx_rs::random::normal::<f32>(&[1, 3, width][..], None, None, Some(&key))
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let signs = random_signs(width, 32);
+            let scale = Array::from_slice(&[hadamard_scale(1024)], &[1]);
+            for inverse in [false, true] {
+                let (fused, routes) = recording_rotation_routes(|| {
+                    block_hadamard(&x, &signs, &scale, 1024, inverse).unwrap()
+                });
+                assert_eq!(routes, [RotationRoute::Fused], "inverse {inverse}");
+                let reference =
+                    block_hadamard_unfused(&x, &signs, 1024, inverse, hadamard_scale(1024))
+                        .unwrap();
+                assert!(bits(&fused) == bits(&reference), "inverse {inverse}");
+            }
+        });
     }
 
     #[test]
