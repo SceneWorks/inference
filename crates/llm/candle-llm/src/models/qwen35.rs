@@ -3098,6 +3098,82 @@ pub(crate) mod tests {
         );
     }
 
+    /// AC (sc-24443): chunkwise prefill leaves Qwen35 greedy decoding unchanged against the
+    /// per-token reference recurrence — a short and a multi-chunk prompt, a speculative-verify-width
+    /// forward and the decode steps after it, on a plain cache and on a checkpointing (ringed) one.
+    #[test]
+    fn greedy_tokens_match_the_per_token_reference_recurrence() {
+        let (_cfg, model) = text_model();
+        let argmax_rows = |logits: &Tensor| -> Vec<u32> {
+            let v = *logits.dims().last().unwrap();
+            host(logits)
+                .chunks(v)
+                .map(|r| {
+                    r.iter()
+                        .enumerate()
+                        .fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                        .0 as u32
+                })
+                .collect()
+        };
+        let run = |prompt: &[u32], ringed: bool| -> (Vec<u32>, Vec<f32>) {
+            let mut cache = if ringed {
+                model.new_cache_with_checkpoints(3)
+            } else {
+                model.new_cache()
+            };
+            let n = prompt.len() as i32;
+            let mut logits = Vec::new();
+            let pre = model.decode_logits(&ids(prompt), &mut cache, 0).unwrap();
+            let mut next = argmax_rows(&pre)[0];
+            logits.extend(host(&pre));
+            let verify = model
+                .forward(
+                    &ids(&[next, (next + 1) % 50, (next + 2) % 50]),
+                    &mut cache,
+                    n,
+                )
+                .unwrap();
+            let mut out = argmax_rows(&verify);
+            logits.extend(host(&verify));
+            next = out[2];
+            for i in 0..6 {
+                let step = model
+                    .decode_logits(&ids(&[next]), &mut cache, n + 3 + i)
+                    .unwrap();
+                next = argmax_rows(&step)[0];
+                out.push(next);
+                logits.extend(host(&step));
+            }
+            (out, logits)
+        };
+        let long: Vec<u32> = (0..90).map(|i| (i * 7 + 3) % 50).collect();
+        for prompt in [&[1u32, 7, 3, 42, 9, 2][..], &long[..]] {
+            for ringed in [false, true] {
+                let (tokens, logits) = run(prompt, ringed);
+                let (ref_tokens, ref_logits) =
+                    crate::primitives::gated_delta::with_per_token_reference(|| {
+                        run(prompt, ringed)
+                    });
+                let md = logits
+                    .iter()
+                    .zip(&ref_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "prompt len {} ringed={ringed}: max logit diff vs per-token {md:.2e}",
+                    prompt.len()
+                );
+                assert_eq!(tokens, ref_tokens, "prompt len {}", prompt.len());
+                assert!(
+                    md < 1e-4,
+                    "prompt len {}: max logit diff {md}",
+                    prompt.len()
+                );
+            }
+        }
+    }
+
     /// The whole Gated DeltaNet layer, validated against the numeric oracle from the exact
     /// `Qwen3_5GatedDeltaNet.forward` reference (4-way in-projection → short conv → contiguous q|k|v
     /// split → L2-norm + q-scale → GQA delta recurrence → gated RMS-norm(z) → out-proj). The same
