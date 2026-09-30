@@ -2644,15 +2644,13 @@ fn validate_receipt_compression(
         // device arrays, it describes the receipt's KV length, and the whole physical
         // representation (device + host copy + staged tail) is below the dense geometry.
         COMPRESSED_PERSISTENT_KV => {
-            if compression.device_code_bytes == 0
-                || device_bytes != Some(receipt.memory.persistent_kv_bytes)
-                || compression.storage_tokens != receipt.geometry.kv_length
-            {
-                return Err(
-                    "compressed persistent KV does not reconcile with the coordinate's measured storage"
-                        .into(),
-                );
-            }
+            coordinate_storage_reconciles(
+                compression.device_code_bytes,
+                device_bytes,
+                compression.storage_tokens,
+                receipt.memory.persistent_kv_bytes,
+                receipt.geometry.kv_length,
+            )?;
             if compression.physical_kv_bytes >= receipt.memory.dense_theoretical_kv_bytes {
                 return Err(
                     "compressed persistent KV representation disagrees with its evidence".into(),
@@ -2672,6 +2670,26 @@ fn validate_receipt_compression(
     }
     if compression.full_cache_dequantizations != 0 {
         return Err("compressed row reconstructed a dense full cache".into());
+    }
+    Ok(())
+}
+
+/// A compressed coordinate's measured storage must be its persistent KV exactly: the MLX-resident
+/// device share equals `memory.persistentKvBytes` and the storage describes `geometry.kvLength`.
+pub(crate) fn coordinate_storage_reconciles(
+    device_code_bytes: u64,
+    device_bytes: Option<u64>,
+    storage_tokens: u64,
+    persistent_kv_bytes: u64,
+    kv_length: u64,
+) -> Result<(), String> {
+    if device_code_bytes == 0
+        || device_bytes != Some(persistent_kv_bytes)
+        || storage_tokens != kv_length
+    {
+        return Err(format!(
+            "compressed persistent KV does not reconcile with the coordinate's measured storage: device bytes {device_bytes:?} (codes {device_code_bytes}) vs persistentKvBytes {persistent_kv_bytes}; storageTokens {storage_tokens} vs kvLength {kv_length}"
+        ));
     }
     Ok(())
 }
@@ -7606,6 +7624,16 @@ impl ProductObserver {
         self.compressed_storage_peak = None;
     }
 
+    /// The coordinate operation's storage at its persistent-KV peak (test inspection).
+    #[cfg(test)]
+    pub(crate) fn coordinate_storage_peak(
+        &self,
+    ) -> Option<crate::primitives::CompressedCacheStorage> {
+        self.coordinate_scope
+            .as_ref()
+            .and_then(|scope| scope.storage_peak)
+    }
+
     /// Close the coordinate operation: compressed evidence recorded so far describes the measured
     /// operation, and anything recorded afterwards is lifecycle evidence of the same observer.
     pub fn end_coordinate_operation(&mut self) {
@@ -8000,11 +8028,15 @@ impl Observer for ProductObserver {
     /// Keep the storage at the persistent-KV peak: the largest device share (which is what
     /// `cache_snapshot` reports as persistent KV), then the largest whole physical footprint, so
     /// the receipt's physical bytes describe the same instant as `memory.persistentKvBytes`.
+    /// Device arrays grow only by whole blocks and the dense residual is a fixed group, so the
+    /// peak is a plateau across every append inside the last block: the latest (most live tokens)
+    /// instant of it is the one whose length is the receipt's `kvLength`.
     fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
         let key = |s: &crate::primitives::CompressedCacheStorage| {
             (
                 s.device_bytes(),
                 s.device_bytes().saturating_add(s.host_payload_bytes),
+                s.tokens,
             )
         };
         if self

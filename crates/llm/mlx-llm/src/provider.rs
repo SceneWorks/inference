@@ -4758,6 +4758,103 @@ mod tests {
         assert_eq!(capture.releases, vec![*capture.snapshots.last().unwrap()]);
     }
 
+    /// SC-20671 storage reconciliation through the real decode loop, at 2- and 4-bit: a prompt
+    /// that crosses a 256-token block boundary leaves a pending residual, and the decode that
+    /// follows (including a group flush) stays inside the last block, so the device share is a
+    /// plateau. The coordinate storage the campaign observer keeps must be the plateau's latest
+    /// instant: its device share is the largest persistent snapshot and its length the largest
+    /// live length (the Mac2 32k single-shot row recorded the prefill instant, 32836 tokens,
+    /// against a kvLength of 32843).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_coordinate_storage_reconciles_across_a_block_plateau() {
+        #[derive(Default)]
+        struct StorageCapture {
+            snapshots: Vec<(u64, u64)>,
+            storage: Vec<crate::primitives::CompressedCacheStorage>,
+        }
+        impl crate::campaign::Observer for StorageCapture {
+            fn phase(&mut self, _name: &'static str) {}
+            fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+            fn cache_snapshot(&mut self, bytes: u64, tokens: u64, _capacity: u64, _element: u64) {
+                self.snapshots.push((bytes, tokens));
+            }
+            fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+                self.storage.push(*storage);
+            }
+        }
+        let model = tiny_packed_capable_model();
+        // 300 prompt tokens: one full block plus 44 (a 12-token residual after 32-token groups).
+        let prompt = (0..300).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
+        for method in crate::campaign::CompressedKvMethod::ALL {
+            let arm = method.arm().unwrap();
+            let decoder = PackedCampaignDecoder {
+                model: &model,
+                arm: &arm,
+                selection_fallbacks: RefCell::new(Vec::new()),
+            };
+            let mut capture = StorageCapture::default();
+            let config = GenerationConfig {
+                max_new_tokens: 30,
+                seed: Some(0),
+                ..Default::default()
+            };
+            crate::decode::generate_with_observer(
+                &decoder,
+                &prompt,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                Some(&mut capture),
+            )
+            .unwrap();
+            let mut observer = crate::campaign::ProductObserver::new();
+            observer.begin_coordinate_operation();
+            for storage in &capture.storage {
+                crate::campaign::Observer::compressed_storage(&mut observer, storage);
+            }
+            observer.end_coordinate_operation();
+            let peak = observer.coordinate_storage_peak().unwrap();
+            let persistent = capture
+                .snapshots
+                .iter()
+                .map(|(bytes, _)| *bytes)
+                .max()
+                .unwrap();
+            let kv_length = capture
+                .snapshots
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .max()
+                .unwrap();
+            // The scenario is the failing one: several instants share the peak device share.
+            let plateau = capture
+                .storage
+                .iter()
+                .filter(|storage| storage.device_bytes() == persistent)
+                .map(|storage| storage.tokens)
+                .collect::<Vec<_>>();
+            assert!(
+                plateau.len() > 1 && plateau[0] < kv_length,
+                "{method:?} {plateau:?}"
+            );
+            assert!(
+                kv_length > 300 && kv_length < 512,
+                "{method:?} decode stays in block two"
+            );
+            crate::campaign::coordinate_storage_reconciles(
+                peak.device_code_bytes,
+                Some(peak.device_bytes()),
+                peak.tokens,
+                persistent,
+                kv_length,
+            )
+            .unwrap_or_else(|error| panic!("{method:?}: {error}"));
+        }
+    }
+
     /// SC-20671 steady decode on a tiny model: both arms decode exactly the fixed length through
     /// stop tokens (every vocabulary id is declared one), and a compressed arm whose reader is
     /// refused fails closed instead of timing a dense decode under the compressed label.
