@@ -541,9 +541,10 @@ mod tests {
                 family: "stub".into(),
                 backend: "test".into(),
                 capabilities: TextLlmCapabilities {
+                    // The backends' finite ceiling (sc-24438: 8 verify rows = 7 drafts).
                     speculative: vec![ProposerCapabilities {
                         proposer: SpeculativeProposer::PromptLookup,
-                        max_depth: 8,
+                        max_depth: 7,
                         recommended_depth: 4,
                     }],
                     ..Default::default()
