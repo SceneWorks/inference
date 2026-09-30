@@ -17,6 +17,7 @@ pub mod attention;
 pub mod coherence;
 pub mod gated_delta;
 pub mod kv_cache;
+pub mod moe;
 pub mod nn;
 pub mod paged_kv_cache;
 pub mod prism;
@@ -32,6 +33,7 @@ pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
 pub use kv_cache::{ContiguousKvCache, KvCache};
+pub use moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
 pub use nn::{
     conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
     soft_cap,

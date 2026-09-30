@@ -1,7 +1,7 @@
 //! Host-synchronization accounting (epic sc-24128, story sc-24129).
 //!
 //! Every time the decode path pulls a tensor to the host — the sampler's device argmax, the
-//! penalized-logits transfer, an MoE router read — the GPU pipeline drains. The fast-decode work
+//! penalized-logits transfer, an MoE grouped dispatch's route read — the GPU pipeline drains. The fast-decode work
 //! (unified speculation, CUDA graphs) is largely about removing those drains, so they are counted
 //! where they happen and reported per request through
 //! [`DecodeRecord`](crate::decode::DecodeRecord).

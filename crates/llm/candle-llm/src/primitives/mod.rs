@@ -23,6 +23,7 @@ pub mod fused;
 pub mod gated_delta;
 pub mod host_sync;
 pub mod kv_cache;
+pub mod moe;
 pub mod nn;
 pub mod nvfp4_path;
 pub mod paged_kv_cache;
