@@ -321,6 +321,56 @@ pub fn phys_footprint(pid: u32) -> io::Result<PhysFootprint> {
     })
 }
 
+/// Poll interval of a settled footprint read.
+pub const FOOTPRINT_SETTLE_POLL: Duration = Duration::from_millis(10);
+/// Consecutive unchanged reads (250 ms at the poll interval) that make a footprint settled.
+pub const FOOTPRINT_SETTLE_STABLE_READS: u32 = 25;
+/// Upper bound on the reads of one settled sample (3 s at the poll interval).
+pub const FOOTPRINT_SETTLE_MAX_READS: u32 = 300;
+/// Footprint change (bytes) below which two reads count as unchanged.
+pub const FOOTPRINT_SETTLE_TOLERANCE_BYTES: u64 = 1024 * 1024;
+
+/// `pid`'s `phys_footprint` after it stops changing. Darwin returns memory MLX just freed (Metal
+/// buffers) to the process footprint asynchronously: measured on an 0.9 GB free, the footprint
+/// holds its pre-free value for 60-105 ms and then falls in steps. `/usr/bin/footprint` took long
+/// enough to launch that it always read after the drop; a bare syscall reads before it, which made
+/// a released row look 1.1 GB over its weights-loaded boundary (sc-20671 W1 row 2). A settled read
+/// polls until the footprint is unchanged for [`FOOTPRINT_SETTLE_STABLE_READS`] consecutive reads,
+/// bounded by [`FOOTPRINT_SETTLE_MAX_READS`] (then the latest read is returned).
+pub fn settled_phys_footprint(pid: u32) -> io::Result<PhysFootprint> {
+    settle_footprint(
+        || phys_footprint(pid),
+        || thread::sleep(FOOTPRINT_SETTLE_POLL),
+        FOOTPRINT_SETTLE_STABLE_READS,
+        FOOTPRINT_SETTLE_MAX_READS,
+    )
+}
+
+fn settle_footprint(
+    mut read: impl FnMut() -> io::Result<PhysFootprint>,
+    mut wait: impl FnMut(),
+    stable_reads: u32,
+    max_reads: u32,
+) -> io::Result<PhysFootprint> {
+    let mut latest = read()?;
+    let mut anchor = latest.current_bytes;
+    let mut stable = 0;
+    for _ in 1..max_reads {
+        wait();
+        latest = read()?;
+        if latest.current_bytes.abs_diff(anchor) <= FOOTPRINT_SETTLE_TOLERANCE_BYTES {
+            stable += 1;
+            if stable >= stable_reads {
+                break;
+            }
+        } else {
+            anchor = latest.current_bytes;
+            stable = 0;
+        }
+    }
+    Ok(latest)
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn phys_footprint(_pid: u32) -> io::Result<PhysFootprint> {
     Err(io::Error::new(
@@ -1566,6 +1616,83 @@ mod tests {
         }
         assert_eq!(probe.footprint_reads, 20);
         assert!(gone(failure.pid.unwrap()));
+    }
+
+    /// A settled read waits out a delayed staircase release and returns the settled value;
+    /// the read count is bounded.
+    #[test]
+    fn settled_footprint_waits_for_an_asynchronous_release() {
+        let footprint = |current_bytes| PhysFootprint {
+            current_bytes,
+            lifetime_peak_bytes: 1_000_000_000,
+        };
+        const MB: u64 = 1024 * 1024;
+        // 6 reads at the pre-free value, a two-step drop, then flat.
+        let trace = [900, 900, 900, 900, 900, 900, 650, 130]
+            .iter()
+            .map(|mb| mb * MB)
+            .collect::<Vec<_>>();
+        let mut reads = 0_usize;
+        let settled = settle_footprint(
+            || {
+                reads += 1;
+                Ok(footprint(*trace.get(reads - 1).unwrap_or(&(130 * MB))))
+            },
+            || {},
+            10,
+            100,
+        )
+        .unwrap();
+        assert_eq!(settled.current_bytes, 130 * MB);
+        assert_eq!(reads, trace.len() + 10);
+        // A footprint that never stops moving returns its latest read at the bound.
+        let mut moving = 0_u64;
+        let bounded = settle_footprint(
+            || {
+                moving += 2 * MB;
+                Ok(footprint(moving))
+            },
+            || {},
+            10,
+            50,
+        )
+        .unwrap();
+        assert_eq!(bounded.current_bytes, 100 * MB);
+        // Sub-tolerance jitter counts as settled.
+        let mut jitter = 0_u64;
+        let steady = settle_footprint(
+            || {
+                jitter += 1;
+                Ok(footprint(500 * MB + (jitter % 2) * 4096))
+            },
+            || {},
+            5,
+            100,
+        )
+        .unwrap();
+        assert!(steady.current_bytes >= 500 * MB);
+        assert_eq!(jitter, 6);
+    }
+
+    /// Real hardware: memory MLX frees is visible in a settled read, not an immediate one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn settled_footprint_sees_freed_mlx_memory_leave_the_process() {
+        let pid = std::process::id();
+        let before = settled_phys_footprint(pid).unwrap().current_bytes;
+        {
+            let block = mlx_rs::Array::ones::<f32>(&[64 * 1024 * 1024]).unwrap();
+            let doubled = block.multiply(mlx_rs::Array::from_f32(2.0)).unwrap();
+            doubled.eval().unwrap();
+        }
+        mlx_rs::memory::clear_cache();
+        let settled = settled_phys_footprint(pid).unwrap().current_bytes;
+        // 512 MiB was allocated and freed; the settled read is back near the pre-allocation
+        // footprint (well under half the allocation above it).
+        assert!(
+            settled < before + 256 * 1024 * 1024,
+            "freed MLX memory still counted: before={before} settled={settled}"
+        );
     }
 
     /// The syscall reads the same ledger `/usr/bin/footprint` prints, for a child holding 64 MiB.

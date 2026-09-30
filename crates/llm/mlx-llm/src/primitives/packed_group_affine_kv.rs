@@ -1197,6 +1197,20 @@ struct ParityCase {
 pub fn group_affine_kernel_fp32_parity_errors(
     reader: &CompiledKernelHandle,
 ) -> std::result::Result<Vec<f64>, String> {
+    group_affine_kernel_fp32_parity_errors_at(reader, 128)
+}
+
+/// [`group_affine_kernel_fp32_parity_errors`] at `head_dimension` (a multiple of the quantization
+/// group), so a model's gate runs the kernel at the width it actually decodes with.
+pub fn group_affine_kernel_fp32_parity_errors_at(
+    reader: &CompiledKernelHandle,
+    head_dimension: usize,
+) -> std::result::Result<Vec<f64>, String> {
+    if head_dimension == 0 || !head_dimension.is_multiple_of(PACKED_METAL_QUANT_GROUP_SIZE) {
+        return Err(format!(
+            "packed kernel parity head dimension {head_dimension} is not a multiple of the quantization group"
+        ));
+    }
     const SPLIT_HISTORY: usize = 525;
     // One batch row, one query position, two query heads per KV head: two threadgroup rows.
     if crate::primitives::packed_metal::packed_kv_split_count(2, SPLIT_HISTORY, 1) < 2 {
@@ -1221,7 +1235,7 @@ pub fn group_affine_kernel_fp32_parity_errors(
     ];
     let mut errors = Vec::new();
     for case in cases {
-        errors.extend(group_affine_parity_case(reader, &case)?);
+        errors.extend(group_affine_parity_case(reader, &case, head_dimension)?);
     }
     mlx_rs::memory::clear_cache();
     Ok(errors)
@@ -1230,32 +1244,32 @@ pub fn group_affine_kernel_fp32_parity_errors(
 fn group_affine_parity_case(
     reader: &CompiledKernelHandle,
     case: &ParityCase,
+    width: usize,
 ) -> std::result::Result<Vec<f64>, String> {
     const QUERY_HEADS: usize = 4;
     const KV_HEADS: usize = 2;
-    const WIDTH: usize = 128;
     let tokens = case.history;
-    let query = (0..QUERY_HEADS * case.query_len * WIDTH)
+    let query = (0..QUERY_HEADS * case.query_len * width)
         .map(|index| (index as i32 % 17 - 8) as f32 * 0.05)
         .collect::<Vec<_>>();
     // A slow per-token ramp on K makes score maxima differ across KV splits, so the split-KV
     // rescaling is observable (the periodic base pattern alone would give every split equal maxima).
-    let keys = (0..KV_HEADS * tokens * WIDTH)
+    let keys = (0..KV_HEADS * tokens * width)
         .map(|index| {
-            let token = (index / WIDTH) % tokens;
+            let token = (index / width) % tokens;
             (index as i32 % 29 - 14) as f32 * 0.05 + (token % 97) as f32 * 0.004
         })
         .collect::<Vec<_>>();
-    let values = (0..KV_HEADS * tokens * WIDTH)
+    let values = (0..KV_HEADS * tokens * width)
         .map(|index| (index as i32 % 23 - 11) as f32 * 0.05)
         .collect::<Vec<_>>();
-    let shape = [1, KV_HEADS as i32, tokens as i32, WIDTH as i32];
+    let shape = [1, KV_HEADS as i32, tokens as i32, width as i32];
     let mut cache = PackedGroupAffineKvCache::new(
         reader.cache_identity(),
         1,
         1,
         KV_HEADS,
-        WIDTH,
+        width,
         PACKED_METAL_QUANT_GROUP_SIZE,
     )
     .map_err(|e| format!("packed kernel parity cache: {e}"))?;
@@ -1277,7 +1291,7 @@ fn group_affine_parity_case(
     }
     let q = Array::from_slice(
         &query,
-        &[1, QUERY_HEADS as i32, case.query_len as i32, WIDTH as i32],
+        &[1, QUERY_HEADS as i32, case.query_len as i32, width as i32],
     );
     let mask = match case.mask {
         PackedAttentionMask::None => crate::primitives::packed_metal::PackedMask::None,
@@ -1307,12 +1321,12 @@ fn group_affine_parity_case(
             kv_heads: KV_HEADS,
             query_len: case.query_len,
             kv_len: tokens,
-            head_dim: WIDTH,
+            head_dim: width,
         },
         &query,
-        |_, head, token, channel| dequantized_keys[(head * tokens + token) * WIDTH + channel],
-        |_, head, token, channel| dequantized_values[(head * tokens + token) * WIDTH + channel],
-        (WIDTH as f32).powf(-0.5),
+        |_, head, token, channel| dequantized_keys[(head * tokens + token) * width + channel],
+        |_, head, token, channel| dequantized_values[(head * tokens + token) * width + channel],
+        (width as f32).powf(-0.5),
         case.mask,
     )
     .map_err(|e| format!("packed kernel parity oracle: {e}"))?;
@@ -1322,7 +1336,7 @@ fn group_affine_parity_case(
         .zip(expected)
         .map(|(actual, expected)| f64::from((*actual - expected).abs()))
         .collect::<Vec<_>>();
-    if errors.len() != QUERY_HEADS * case.query_len * WIDTH {
+    if errors.len() != QUERY_HEADS * case.query_len * width {
         return Err("packed kernel parity output has the wrong shape".into());
     }
     Ok(errors)
@@ -5765,6 +5779,17 @@ mod tests {
                 max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
                 "{family:?}: max parity error {max}"
             );
+            // The SC-20676 gate runs at the model's own head dimension.
+            for width in [64, 256] {
+                let errors = group_affine_kernel_fp32_parity_errors_at(&reader, width).unwrap();
+                assert_eq!(errors.len(), (4 + 4 * 5 + 4) * width);
+                let max = errors.iter().copied().fold(0.0, f64::max);
+                assert!(
+                    max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
+                    "{family:?} at {width}: max parity error {max}"
+                );
+            }
+            assert!(group_affine_kernel_fp32_parity_errors_at(&reader, 100).is_err());
         }
     }
 

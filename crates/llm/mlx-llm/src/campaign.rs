@@ -1515,7 +1515,7 @@ pub struct ReceiptCompileAttribution {
     pub first_dispatch_excess_ms: f64,
     /// Steady-state dispatch durations the noise band is read from: the four post-first measured
     /// repeats of a cold row, or the five measured repeats that follow a warm row's warmups.
-    /// Absent only on legacy `-v1` receipts, as are the four fields below.
+    /// Required, like the band and resolution below (`Option` only for construction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noise_samples_ms: Option<Vec<f64>>,
     /// `max - min` of [`Self::noise_samples_ms`]: run-to-run spread of the same dispatch.
@@ -1536,9 +1536,6 @@ pub struct ReceiptCompileAttribution {
 
 /// Compile attribution that records the first-dispatch excess against a measured noise band.
 pub const COMPILE_ATTRIBUTION_METHOD: &str = "first-dispatch-minus-steady-v2";
-/// Receipts accepted before sc-20671 recorded the band; they were admitted only with a positive
-/// excess and carry none of the band fields.
-const LEGACY_COMPILE_ATTRIBUTION_METHOD: &str = "first-dispatch-minus-steady-v1";
 /// Unresolved: the first dispatch was not slower than steady state.
 pub const COMPILE_COST_NOT_SLOWER: &str = "first-dispatch-not-slower-than-steady";
 /// Unresolved: the positive excess does not exceed the steady noise band.
@@ -1608,6 +1605,10 @@ pub struct ReceiptQuality {
     /// kernel streams of the primary repeat differ (`null` when identical).
     #[serde(rename = "freeRunningFirstDivergence")]
     pub free_running_first_divergence: Option<u64>,
+    /// Teacher-forced greedy agreement of each measured repeat; `greedyTokenAgreement` is their
+    /// minimum.
+    #[serde(rename = "greedyTokenAgreementByRepeat")]
+    pub greedy_token_agreement_by_repeat: Vec<f64>,
     #[serde(rename = "structuredToolAgreement")]
     pub structured_tool_agreement: f64,
     #[serde(rename = "needleRetrieval")]
@@ -2049,6 +2050,8 @@ impl ReceiptBuilder {
         self.template.quality.greedy_agreement_method = GREEDY_AGREEMENT_METHOD.into();
         self.template.quality.free_running_first_divergence =
             self.quality.free_running_first_divergence;
+        self.template.quality.greedy_token_agreement_by_repeat =
+            self.quality.greedy_agreement_by_repeat.clone();
         self.template.quality.structured_tool_agreement = metrics.structured_tool_agreement;
         self.template.quality.needle_retrieval = metrics.needle_retrieval;
         self.template.quality.needle_discriminating = self.quality.needle_discriminating;
@@ -2940,6 +2943,18 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if receipt.quality.greedy_agreement_method != GREEDY_AGREEMENT_METHOD {
         return Err("greedy agreement is not teacher-forced".into());
     }
+    let by_repeat = &receipt.quality.greedy_token_agreement_by_repeat;
+    if by_repeat.len() != 5
+        || by_repeat.iter().any(|value| !(0.0..=1.0).contains(value))
+        || by_repeat
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+            .to_bits()
+            != receipt.quality.greedy_token_agreement.to_bits()
+    {
+        return Err("greedy agreement is not the minimum over the five recorded repeats".into());
+    }
     if !receipt.quality.parity_max_error.is_finite()
         || !receipt.quality.perplexity_delta.is_finite()
         || receipt.quality.parity_max_error < 0.0
@@ -3756,52 +3771,159 @@ pub fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
     .map_err(|error| error.to_string())
 }
 
-/// A completed row's measured wall time (row-start to row-end host state) and its context.
+/// A refused estimate must exceed the row deadline by this factor, so estimation error alone
+/// never refuses a row that would have finished.
+pub const DURATION_REFUSAL_MARGIN: f64 = 1.25;
+/// Assumed bits per parameter of the 4-bit candidate's MLX weights (4-bit codes plus group
+/// scales/biases). It converts weight bytes into a parameter count for the attention crossover.
+const CANDIDATE_BITS_PER_PARAMETER: f64 = 4.5;
+
+/// Row shape as it drives work: how many fixture halves run and how many full-context prefills
+/// the row issues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowWork {
+    /// Candidate and reference fixture halves: `2 * (warmups + 5 repeats)`.
+    pub halves: u64,
+    /// Full-context prefills: every half runs 4 fixtures, each a quality request plus the
+    /// coordinate operation (2 sequences for supported-batch, plus the secondary chunked operation
+    /// on a batch+chunked row), then 5 steady decodes and one teacher-forced kernel pass.
+    pub prefills: u64,
+}
+
+pub fn row_work(process_temperature: &str, request_mode: &str, prefill_mode: &str) -> RowWork {
+    let warmups = if process_temperature == "warm" { 2 } else { 0 };
+    let halves = 2 * (warmups + 5);
+    let operation_units = match (request_mode, prefill_mode) {
+        ("supported-batch", "chunked") => 3,
+        ("supported-batch", _) => 2,
+        _ => 1,
+    };
+    RowWork {
+        halves,
+        prefills: halves * 4 * (1 + operation_units) + 5 + 1,
+    }
+}
+
+/// Prefill cost of a `tokens`-long context, up to a constant: linear (projections and MLP) plus
+/// quadratic attention, equal at `crossover` tokens. This sets the effective exponent between 1
+/// and 2 from the model itself.
+pub fn prefill_scale(tokens: f64, crossover: f64) -> f64 {
+    tokens * (1.0 + tokens / crossover)
+}
+
+/// A completed row's measurements that the pre-row estimate scales from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowDurationBasis {
+    pub coordinate: String,
     pub family: String,
     pub context_window_tokens: u64,
     pub context_target_tokens: u64,
+    /// Row-start to row-end host-state span.
     pub wall_seconds: f64,
+    /// One sequence's full-context prefill: the measured coordinate prefill over its batch.
+    pub prefill_seconds: f64,
+    pub work: RowWork,
+    /// Context length at which attention matches the linear per-token cost:
+    /// `parameters / (2 * layers * query_heads * head_dimension)`.
+    pub attention_crossover_tokens: f64,
 }
 
-/// The duration basis a completed receipt provides, if its host states bound a positive span.
+/// The basis a completed receipt provides. A chunked row's measured prefill is the short suffix
+/// after a prefix hit, not a full-context prefill, so it provides none.
 pub fn row_duration_basis(receipt: &Receipt) -> Option<RowDurationBasis> {
     let [start, end] = receipt.provenance.host_states.as_slice() else {
         return None;
     };
+    if receipt.matrix.prefill_mode == "chunked" {
+        return None;
+    }
     let wall_seconds =
         utc_timestamp_seconds(&end.captured_at)? - utc_timestamp_seconds(&start.captured_at)?;
-    (wall_seconds.is_finite() && wall_seconds > 0.0 && receipt.geometry.context_target_tokens > 0)
-        .then(|| RowDurationBasis {
-            family: receipt.matrix.family.clone(),
-            context_window_tokens: receipt.geometry.context_window_tokens,
-            context_target_tokens: receipt.geometry.context_target_tokens,
-            wall_seconds,
-        })
+    let geometry = &receipt.geometry;
+    let prefill_seconds = receipt.timings.prefill_ms / 1_000.0 / geometry.batch.max(1) as f64;
+    let parameters = receipt.memory.model_weights_bytes as f64 * 8.0 / CANDIDATE_BITS_PER_PARAMETER;
+    let attention_width = 2 * geometry.layers * geometry.query_heads * geometry.head_dimension;
+    let valid = wall_seconds.is_finite()
+        && wall_seconds > 0.0
+        && prefill_seconds.is_finite()
+        && prefill_seconds > 0.0
+        && geometry.context_target_tokens > 0
+        && attention_width > 0
+        && parameters > 0.0;
+    valid.then(|| RowDurationBasis {
+        coordinate: format!(
+            "{}-{}-{}-{}-{}",
+            receipt.matrix.family,
+            receipt.matrix.context_band,
+            receipt.matrix.request_mode,
+            receipt.matrix.prefill_mode,
+            receipt.matrix.process_temperature
+        ),
+        family: receipt.matrix.family.clone(),
+        context_window_tokens: geometry.context_window_tokens,
+        context_target_tokens: geometry.context_target_tokens,
+        wall_seconds,
+        prefill_seconds,
+        work: row_work(
+            &receipt.matrix.process_temperature,
+            &receipt.matrix.request_mode,
+            &receipt.matrix.prefill_mode,
+        ),
+        attention_crossover_tokens: parameters / attention_width as f64,
+    })
 }
 
-/// A lower-bound duration estimate for a `family` row of `context_band`: the smallest measured
-/// seconds per context token among completed same-family rows, times the row's band target. It is
-/// linear although long-context prefill is superlinear, so a row it already puts over the deadline
-/// cannot finish. `None` when no same-family row has completed.
+/// A pre-row duration estimate and its parts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowDurationEstimate {
+    pub seconds: f64,
+    /// Measured context-independent time (loads, fixtures' decode, steady decode, overhead),
+    /// scaled only by the fixture-half count.
+    pub fixed_seconds: f64,
+    /// Full-context prefills, scaled by [`prefill_scale`].
+    pub prefill_seconds: f64,
+    pub basis_coordinate: String,
+}
+
+/// Estimate a row from the largest-context completed row of the same family.
+///
+/// The basis row's wall time is split into its measured prefill part
+/// (`prefills x per-sequence prefill`) and the fixed remainder. The fixed part is scaled only by
+/// the fixture-half ratio; the prefill part is scaled by the target row's prefill count and
+/// `prefill_scale(target) / prefill_scale(basis)`. The reference arm is assumed to prefill at
+/// the candidate's rate. `None` when no same-family row with a full-context prefill has completed.
 pub fn estimate_row_seconds(
     family: &str,
     context_band: &str,
+    target: RowWork,
     basis: &[RowDurationBasis],
-) -> Option<(f64, usize)> {
-    let same_family = basis
+) -> Option<RowDurationEstimate> {
+    let row = basis
         .iter()
         .filter(|row| row.family == family)
-        .collect::<Vec<_>>();
-    let rate = same_family
-        .iter()
-        .map(|row| row.wall_seconds / row.context_target_tokens as f64)
-        .fold(None, |min: Option<f64>, rate| {
-            Some(min.map_or(rate, |m| m.min(rate)))
-        })?;
-    let target = context_band_target(same_family[0].context_window_tokens, context_band).ok()?;
-    Some((rate * target as f64, same_family.len()))
+        .max_by_key(|row| row.context_target_tokens)?;
+    let target_tokens = context_band_target(row.context_window_tokens, context_band).ok()? as f64;
+    let basis_prefill = row.work.prefills as f64 * row.prefill_seconds;
+    let basis_fixed = (row.wall_seconds - basis_prefill).max(0.0);
+    let fixed_seconds = basis_fixed * target.halves as f64 / row.work.halves as f64;
+    let prefill_seconds = target.prefills as f64
+        * row.prefill_seconds
+        * prefill_scale(target_tokens, row.attention_crossover_tokens)
+        / prefill_scale(
+            row.context_target_tokens as f64,
+            row.attention_crossover_tokens,
+        );
+    Some(RowDurationEstimate {
+        seconds: fixed_seconds + prefill_seconds,
+        fixed_seconds,
+        prefill_seconds,
+        basis_coordinate: row.coordinate.clone(),
+    })
+}
+
+/// Whether an estimate refuses a row: it must exceed the deadline by [`DURATION_REFUSAL_MARGIN`].
+pub fn duration_estimate_refuses(estimate: &RowDurationEstimate, deadline_seconds: u64) -> bool {
+    estimate.seconds > deadline_seconds as f64 * DURATION_REFUSAL_MARGIN
 }
 
 /// Atomically publish the whole eight-coordinate receipt collection. Individual worker output is
@@ -4361,6 +4483,8 @@ pub struct OperatorStop {
 pub enum CampaignOutcome {
     Completed,
     StoppedByOperator(OperatorStop),
+    /// Every row was attempted but these were refused before spawn; nothing is published.
+    IncompleteWithRefusals(Vec<String>),
 }
 
 impl CampaignOutcome {
@@ -4368,6 +4492,7 @@ impl CampaignOutcome {
         match self {
             Self::Completed => 0,
             Self::StoppedByOperator(_) => OPERATOR_STOP_EXIT_CODE,
+            Self::IncompleteWithRefusals(_) => 1,
         }
     }
 }
@@ -4497,7 +4622,8 @@ pub(crate) fn operator_stop_before_row(
 pub(crate) enum RowStep {
     /// Accept the row from the resume directory; `Ok(false)` means it must run.
     Resume,
-    /// Spawn, supervise, and accept the row's worker.
+    /// Spawn, supervise, and accept the row's worker; `Ok(false)` records a pre-spawn refusal
+    /// and the loop continues with the next row.
     Run,
 }
 
@@ -4509,7 +4635,8 @@ pub(crate) fn drive_rows(
     logs: &Path,
     kind: &str,
     mut row: impl FnMut(usize, RowStep) -> Result<bool, String>,
-) -> Result<Option<OperatorStop>, String> {
+) -> Result<DriveOutcome, String> {
+    let mut refused = Vec::new();
     for (index, slug) in slugs.iter().enumerate() {
         if row(index, RowStep::Resume)? {
             eprintln!("coordinate {}/{} resumed: {slug}", index + 1, slugs.len());
@@ -4518,12 +4645,34 @@ pub(crate) fn drive_rows(
         if let Some(stop) =
             operator_stop_before_row(stop_files, logs, kind, index, slug, slugs.len())?
         {
-            return Ok(Some(stop));
+            return Ok(DriveOutcome {
+                stop: Some(stop),
+                refused,
+            });
         }
-        row(index, RowStep::Run)?;
-        eprintln!("coordinate {}/{} accepted: {slug}", index + 1, slugs.len());
+        if row(index, RowStep::Run)? {
+            eprintln!("coordinate {}/{} accepted: {slug}", index + 1, slugs.len());
+        } else {
+            eprintln!(
+                "coordinate {}/{} refused before spawn: {slug}",
+                index + 1,
+                slugs.len()
+            );
+            refused.push(slug.clone());
+        }
     }
-    Ok(None)
+    Ok(DriveOutcome {
+        stop: None,
+        refused,
+    })
+}
+
+/// How the parent's row loop ended: an operator stop, and the rows refused before spawn (whose
+/// unaccepted records are in the logs).
+#[derive(Debug)]
+pub(crate) struct DriveOutcome {
+    pub(crate) stop: Option<OperatorStop>,
+    pub(crate) refused: Vec<String>,
 }
 
 /// Immutable parent inputs.  The only model-related choices are snapshot paths; model identity,
@@ -4975,24 +5124,36 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
             };
             let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
-            // Pre-row duration estimate from the rows already completed (a lower bound): a row it
-            // puts over the deadline is refused before it spawns instead of burning the deadline.
+            // Pre-row duration estimate from completed same-family rows. A row whose estimate
+            // exceeds the deadline by the margin is refused before it spawns; the campaign then
+            // continues with the next row and ends incomplete-with-refusals.
             let basis = prepared
                 .iter()
                 .filter_map(|item| serde_json::from_slice::<Receipt>(&item.bundle.receipt).ok())
                 .filter_map(|receipt| row_duration_basis(&receipt))
                 .collect::<Vec<_>>();
-            let estimate =
-                estimate_row_seconds(row.coordinate.family, row.coordinate.context_band, &basis);
+            let estimate = estimate_row_seconds(
+                row.coordinate.family,
+                row.coordinate.context_band,
+                row_work(
+                    row.coordinate.process_temperature,
+                    row.coordinate.request_mode,
+                    row.coordinate.prefill_mode,
+                ),
+                &basis,
+            );
             let deadline_seconds = policy.row_deadline_seconds;
             let estimate_record = serde_json::json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "kind": "sc-20671-row-duration-estimate",
                 "coordinate": slug,
-                "estimatedSeconds": estimate.map(|(seconds, _)| seconds),
-                "basisRows": estimate.map_or(0, |(_, rows)| rows),
+                "estimatedSeconds": estimate.as_ref().map(|e| e.seconds),
+                "fixedSeconds": estimate.as_ref().map(|e| e.fixed_seconds),
+                "prefillSeconds": estimate.as_ref().map(|e| e.prefill_seconds),
+                "basisCoordinate": estimate.as_ref().map(|e| e.basis_coordinate.clone()),
                 "rowDeadlineSeconds": deadline_seconds,
-                "method": "min completed same-family seconds per context token x band target (linear lower bound)",
+                "refusalMargin": DURATION_REFUSAL_MARGIN,
+                "method": "basis wall time split into measured full-context prefills and a fixed remainder; fixed scaled by fixture halves, prefill by count x T(1+T/Tattn) ratio",
             });
             fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
             fs::write(
@@ -5000,34 +5161,34 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 seal_json(&estimate_record)?.0,
             )
             .map_err(|e| e.to_string())?;
-            match estimate {
-                Some((seconds, rows)) => eprintln!(
-                    "sc20671-kv-baseline: coordinate {slug} estimated at >= {seconds:.0}s from {rows} completed {} row(s); row deadline {deadline_seconds}s",
-                    row.coordinate.family
+            match &estimate {
+                Some(estimate) => eprintln!(
+                    "sc20671-kv-baseline: coordinate {slug} estimated at {:.0}s (fixed {:.0}s + prefill {:.0}s, from {}); row deadline {deadline_seconds}s",
+                    estimate.seconds, estimate.fixed_seconds, estimate.prefill_seconds, estimate.basis_coordinate
                 ),
                 None => eprintln!(
-                    "sc20671-kv-baseline: coordinate {slug} has no completed {} row to estimate from; row deadline {deadline_seconds}s",
+                    "sc20671-kv-baseline: coordinate {slug} has no completed full-prefill {} row to estimate from; row deadline {deadline_seconds}s",
                     row.coordinate.family
                 ),
             }
-            if let Some((seconds, rows)) = estimate {
-                if seconds > deadline_seconds as f64 {
-                    let detail = format!(
-                        "estimated duration {seconds:.0}s (lower bound from {rows} completed {} row(s)) exceeds the {deadline_seconds}s row deadline",
-                        row.coordinate.family
-                    );
-                    return Err(unaccepted_row_error(
-                        &unaccepted,
-                        "sc-20671-unaccepted-row",
-                        &slug,
-                        &admission,
-                        ("DurationEstimate", &detail, None, None),
-                        format!(
-                            "coordinate {slug} refused before spawn: {detail}; valid earlier rows remain in {}",
-                            launch.resume_dir.display()
-                        ),
-                    ));
-                }
+            if let Some(estimate) = estimate
+                .as_ref()
+                .filter(|estimate| duration_estimate_refuses(estimate, deadline_seconds))
+            {
+                let detail = format!(
+                    "estimated duration {:.0}s (from {}) exceeds the {deadline_seconds}s row deadline by more than {DURATION_REFUSAL_MARGIN}x",
+                    estimate.seconds, estimate.basis_coordinate
+                );
+                let message = unaccepted_row_error(
+                    &unaccepted,
+                    "sc-20671-unaccepted-row",
+                    &slug,
+                    &admission,
+                    ("DurationEstimate", &detail, None, None),
+                    format!("coordinate {slug} refused before spawn: {detail}"),
+                );
+                eprintln!("sc20671-kv-baseline: {message}; continuing with the next row");
+                return Ok(false);
             }
             let status = match campaign_supervisor::run_guarded(
                 &mut command,
@@ -5090,8 +5251,18 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
             Ok(true)
         },
     )?;
-    if let Some(stop) = stopped {
+    if let Some(stop) = stopped.stop {
         return Ok(CampaignOutcome::StoppedByOperator(stop));
+    }
+    if !stopped.refused.is_empty() {
+        // Every other row ran; the campaign is not complete and is never published.
+        eprintln!(
+            "sc20671-kv-baseline: campaign incomplete: {} row(s) refused before spawn ({}); accepted rows remain in {}",
+            stopped.refused.len(),
+            stopped.refused.join(", "),
+            launch.resume_dir.display()
+        );
+        return Ok(CampaignOutcome::IncompleteWithRefusals(stopped.refused));
     }
     publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?;
     Ok(CampaignOutcome::Completed)
@@ -5481,24 +5652,30 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             }
             .map_err(|e| format!("load teacher-forcing candidate session: {e}"))?;
             let forcing_baseline = forcing_session.load_start_sample.mlx_active_bytes;
-            let teacher_forced = reference_repeats
+            // One forced pass per distinct reference stream (greedy reference repeats are usually
+            // identical, and each pass is a full-context prefill).
+            let stop_tokens = forcing_session.provider.campaign_stop_tokens().to_vec();
+            let streams = reference_repeats
                 .iter()
-                .enumerate()
-                .map(|(repeat, reference)| {
-                    teacher_forced_kernel_choices(
-                        &forcing_session,
-                        &prompt,
-                        &row.coordinate,
-                        &reference.kernel,
-                    )
+                .map(|reference| {
+                    stream_tokens(&reference.kernel.quality_observation.token_probabilities)
+                })
+                .collect::<Vec<_>>();
+            let teacher_forced = force_distinct_streams(&streams, |stream| {
+                teacher_forced_kernel_choices(&forcing_session, &prompt, &row.coordinate, stream)
                     .map_err(|e| {
                         format!(
-                            "teacher-forced repeat {repeat} for {}: {e}",
+                            "teacher-forced pass for {}: {e}",
                             coordinate_slug(&row.coordinate)
                         )
                     })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+            })?
+            .into_iter()
+            .map(|choices| TeacherForcedChoices {
+                choices,
+                stop_tokens: stop_tokens.clone(),
+            })
+            .collect::<Vec<_>>();
             drop(forcing_session);
             quiesce_campaign_active_memory(forcing_baseline).map_err(|e| {
                 format!(
@@ -6117,6 +6294,8 @@ pub struct QualityObservation {
     /// Observation only: the first position at which the free-running candidate and reference
     /// kernel streams differ (`None` when identical).
     pub free_running_first_divergence: Option<u64>,
+    /// Teacher-forced greedy agreement of every measured repeat, in order (empty for one suite).
+    pub greedy_agreement_by_repeat: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7227,7 +7406,9 @@ fn valid_phys_footprint_source(source: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn sample_memory(pid: u32) -> std::io::Result<MemorySample> {
-    let footprint = crate::campaign_supervisor::phys_footprint(pid)?;
+    // Settled: freed Metal memory leaves `phys_footprint` asynchronously (see
+    // `settled_phys_footprint`), and the release check compares against the weights-loaded read.
+    let footprint = crate::campaign_supervisor::settled_phys_footprint(pid)?;
     Ok(MemorySample {
         captured_at: timestamp_now(),
         pid,
@@ -7944,7 +8125,7 @@ pub fn quality_from_product_fixtures(
     expected_needle: &str,
     reference: QualityReference,
     kernel_parity_errors: Option<&[f64]>,
-    teacher_forced_candidate: Option<&[i32]>,
+    teacher_forced_candidate: Option<&TeacherForcedChoices>,
 ) -> Result<QualityObservation, String> {
     if reference == QualityReference::DenseKvSameWeights
         && [
@@ -7969,7 +8150,9 @@ pub fn quality_from_product_fixtures(
     // Greedy agreement is teacher-forced: the candidate's own greedy choice at every position of
     // the reference stream. A free-running cascade after one argmax flip is recorded separately.
     let (greedy_matches, greedy_total) = match teacher_forced_candidate {
-        Some(candidate_choices) => teacher_forced_agreement(candidate_choices, &reference_stream),
+        Some(forced) => {
+            teacher_forced_agreement(&forced.choices, &reference_stream, &forced.stop_tokens)
+        }
         None => token_agreement(
             &kernel_candidate.quality_observation.token_probabilities,
             &kernel_reference.quality_observation.token_probabilities,
@@ -8020,6 +8203,7 @@ pub fn quality_from_product_fixtures(
         needle_discriminating,
         tool_discriminating,
         free_running_first_divergence: first_divergence(&candidate_stream, &reference_stream),
+        greedy_agreement_by_repeat: Vec::new(),
     })
 }
 
@@ -8028,13 +8212,22 @@ fn stream_tokens(probabilities: &[(i32, f64)]) -> Vec<i32> {
 }
 
 /// Teacher-forced agreement: at each position of the `reference` stream, whether the candidate's
-/// greedy choice (given the reference prefix) is the reference token. A position the candidate
-/// never reached counts as a mismatch; the denominator is always the reference length.
-pub fn teacher_forced_agreement(candidate_choices: &[i32], reference: &[i32]) -> (u64, u64) {
+/// greedy choice (given the reference prefix) is the reference token. The reference stream keeps
+/// its stop token, so its stop position counts: there the candidate agrees when it also chooses a
+/// stop token. A position the candidate never reached counts as a mismatch; the denominator is
+/// always the reference length.
+pub fn teacher_forced_agreement(
+    candidate_choices: &[i32],
+    reference: &[i32],
+    stop_tokens: &[i32],
+) -> (u64, u64) {
     let matches = candidate_choices
         .iter()
         .zip(reference)
-        .filter(|(candidate, reference)| candidate == reference)
+        .filter(|(candidate, reference)| {
+            candidate == reference
+                || (stop_tokens.contains(reference) && stop_tokens.contains(candidate))
+        })
         .count() as u64;
     (matches, reference.len() as u64)
 }
@@ -8119,7 +8312,7 @@ pub struct ProductFixtureSuite {
     pub steady_decode: Option<SteadyDecodeMeasurement>,
     /// The candidate's greedy choice at every position of this repeat's reference kernel stream
     /// (teacher-forced). Required for measured repeats; warmups do not carry it.
-    pub teacher_forced_candidate: Option<Vec<i32>>,
+    pub teacher_forced_candidate: Option<TeacherForcedChoices>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -8328,16 +8521,15 @@ fn teacher_forced_kernel_choices(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
-    reference: &ProductFixtureResult,
+    forced: &[i32],
 ) -> core_llm::Result<Vec<i32>> {
     let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
-    let forced = stream_tokens(&reference.quality_observation.token_probabilities);
     if forced.is_empty() {
         return Err(core_llm::Error::InvalidRequest(
             "reference kernel stream is empty; nothing to teacher-force".into(),
         ));
     }
-    let mut observer = ProductObserver::teacher_forced(forced);
+    let mut observer = ProductObserver::teacher_forced(forced.to_vec());
     run_dense_lifecycle_request_on_session(
         session,
         &kernel_prompt,
@@ -8346,7 +8538,64 @@ fn teacher_forced_kernel_choices(
         &mut observer,
     )?;
     let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
+    if session.compressed().is_some() {
+        forced_pass_stayed_compressed(&observation.packed_evidence, &observation.dense_fallbacks)
+            .map_err(core_llm::Error::Load)?;
+    }
     Ok(stream_tokens(&observation.token_probabilities))
+}
+
+/// Run `force` once per distinct stream and return its result for every stream, in order.
+pub fn force_distinct_streams<E>(
+    streams: &[Vec<i32>],
+    mut force: impl FnMut(&[i32]) -> Result<Vec<i32>, E>,
+) -> Result<Vec<Vec<i32>>, E> {
+    let mut forced = std::collections::BTreeMap::<&[i32], Vec<i32>>::new();
+    streams
+        .iter()
+        .map(|stream| {
+            if let Some(choices) = forced.get(stream.as_slice()) {
+                return Ok(choices.clone());
+            }
+            let choices = force(stream)?;
+            forced.insert(stream, choices.clone());
+            Ok(choices)
+        })
+        .collect()
+}
+
+/// A compressed row's teacher-forced pass must decode wholly on the fused compressed reader, like
+/// its steady decode: a pass that fell back to dense would measure dense agreement under a
+/// compressed label. Refused (fail closed) otherwise.
+pub fn forced_pass_stayed_compressed(
+    evidence: &[crate::primitives::PackedCacheEvidence],
+    dense_fallbacks: &[(String, String)],
+) -> Result<(), String> {
+    let fused = evidence
+        .first()
+        .is_some_and(|first| first.accepted_direct_calls > 0)
+        && evidence.iter().all(|cache| {
+            cache.fallback_reasons.is_empty()
+                && !cache.dense_active
+                && cache.full_cache_dequantizations == 0
+                && cache.failed_dispatches == 0
+        })
+        && dense_fallbacks.is_empty();
+    if !fused {
+        return Err(
+            "teacher-forced pass did not decode wholly on the fused compressed reader; the row is refused"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The candidate's greedy choice at every position of a reference stream, and the stop tokens the
+/// generation ends on (any stop token agrees with a reference stop token).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeacherForcedChoices {
+    pub choices: Vec<i32>,
+    pub stop_tokens: Vec<i32>,
 }
 
 fn run_product_fixture_half_on_session_bounded(
@@ -8493,7 +8742,7 @@ impl ProductFixtureSuite {
             &self.needle,
             self.reference,
             self.kernel_parity_errors.as_deref(),
-            self.teacher_forced_candidate.as_deref(),
+            self.teacher_forced_candidate.as_ref(),
         )
     }
 }
@@ -8584,8 +8833,7 @@ fn validate_compile_attribution(
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
-    if (attribution.method != COMPILE_ATTRIBUTION_METHOD
-        && attribution.method != LEGACY_COMPILE_ATTRIBUTION_METHOD)
+    if attribution.method != COMPILE_ATTRIBUTION_METHOD
         || attribution.operation != expected_coordinate_operation(matrix)?
         || attribution.source != expected_source
         || attribution.probe_durations_ms.len() != expected_len
@@ -8630,19 +8878,6 @@ fn validate_compile_attribution(
         return Err(format!(
             "compile attribution does not recompute: first={first:.6}ms steady={steady:.6}ms excess={excess:.6}ms"
         ));
-    }
-    if attribution.method == LEGACY_COMPILE_ATTRIBUTION_METHOD {
-        // Legacy receipts were admitted only with a positive excess and carry no band.
-        if excess <= 0.0
-            || attribution.noise_samples_ms.is_some()
-            || attribution.noise_band_ms.is_some()
-            || attribution.compile_cost_resolved.is_some()
-            || attribution.compile_cost_ms.is_some()
-            || attribution.compile_cost_unresolved_reason.is_some()
-        {
-            return Err("legacy compile attribution is not a positive band-free excess".into());
-        }
-        return Ok(());
     }
     let samples = attribution
         .noise_samples_ms
@@ -8693,14 +8928,9 @@ fn noise_band(samples: &[f64]) -> f64 {
     max - min
 }
 
-/// `timings.coldCompileMs`: the resolved compile cost (`None` below the noise band); legacy
-/// receipts alias the positive excess they were admitted with.
+/// `timings.coldCompileMs`: the resolved compile cost (`None` below the noise band).
 fn cold_compile_alias(attribution: &ReceiptCompileAttribution) -> Option<f64> {
-    if attribution.method == LEGACY_COMPILE_ATTRIBUTION_METHOD {
-        Some(attribution.first_dispatch_excess_ms)
-    } else {
-        attribution.compile_cost_ms
-    }
+    attribution.compile_cost_ms
 }
 
 fn compile_cost_summary(attribution: &ReceiptCompileAttribution) -> String {
@@ -8711,7 +8941,7 @@ fn compile_cost_summary(attribution: &ReceiptCompileAttribution) -> String {
     ) {
         (Some(cost), _, Some(band)) => format!("{cost} ms (noise band {band} ms)"),
         (None, Some(reason), Some(band)) => format!("unresolved: {reason} (noise band {band} ms)"),
-        _ => format!("{} ms (legacy)", attribution.first_dispatch_excess_ms),
+        _ => "invalid compile attribution".into(),
     }
 }
 
@@ -9302,11 +9532,38 @@ fn receipt_quality_over_repeats(
         .split_first()
         .ok_or("product receipt requires its fixture repeats")?;
     let mut quality = primary.quality()?;
+    let ratio = |q: &QualityObservation| {
+        if q.greedy_total == 0 {
+            Err("teacher-forced greedy agreement has zero positions".to_string())
+        } else {
+            Ok(q.greedy_matches as f64 / q.greedy_total as f64)
+        }
+    };
+    quality.greedy_agreement_by_repeat = vec![ratio(&quality)?];
+    let mut weakest = (
+        ratio(&quality)?,
+        quality.greedy_matches,
+        quality.greedy_total,
+    );
     for repeat in repeats {
         let repeat = repeat.quality()?;
         quality.needle_discriminating &= repeat.needle_discriminating;
         quality.tool_discriminating &= repeat.tool_discriminating;
+        let agreement = ratio(&repeat)?;
+        quality.greedy_agreement_by_repeat.push(agreement);
+        if agreement < weakest.0 {
+            weakest = (agreement, repeat.greedy_matches, repeat.greedy_total);
+        }
+        quality.free_running_first_divergence = match (
+            quality.free_running_first_divergence,
+            repeat.free_running_first_divergence,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
     }
+    // The gate is the weakest repeat's agreement; every repeat's value is recorded.
+    (quality.greedy_matches, quality.greedy_total) = (weakest.1, weakest.2);
     Ok(quality)
 }
 
@@ -9735,7 +9992,7 @@ fn product_receipt(
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: release_evidence(weights_loaded, release), admission, dense_kv_share_bps: 0, below_memory_material_share: false },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:None,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,greedy_token_agreement_by_repeat:Vec::new(),structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -10041,12 +10298,15 @@ pub(crate) mod tests {
                 QualityReference::DenseKvSameWeights,
             )
             .unwrap();
-            suite.teacher_forced_candidate = Some(stream_tokens(
-                &suite
-                    .kernel_reference
-                    .quality_observation
-                    .token_probabilities,
-            ));
+            suite.teacher_forced_candidate = Some(TeacherForcedChoices {
+                choices: stream_tokens(
+                    &suite
+                        .kernel_reference
+                        .quality_observation
+                        .token_probabilities,
+                ),
+                stop_tokens: Vec::new(),
+            });
             suite
         };
         let mut invalid_dense_tool = half("I cannot help with that.");
@@ -10084,6 +10344,23 @@ pub(crate) mod tests {
         let forced = repeats[1].teacher_forced_candidate.take();
         assert!(receipt_quality_over_repeats(&repeats).is_err());
         repeats[1].teacher_forced_candidate = forced;
+        // The receipt's greedy agreement is the weakest repeat's; each repeat is recorded.
+        let flipped = repeats[1]
+            .teacher_forced_candidate
+            .clone()
+            .map(|mut forced| {
+                forced.choices[0] += 1000;
+                forced
+            });
+        let original = std::mem::replace(&mut repeats[1].teacher_forced_candidate, flipped);
+        let weakest = receipt_quality_over_repeats(&repeats).unwrap();
+        let total = weakest.greedy_total;
+        assert_eq!(weakest.greedy_matches, total - 1);
+        assert_eq!(
+            weakest.greedy_agreement_by_repeat,
+            vec![1.0, (total - 1) as f64 / total as f64]
+        );
+        repeats[1].teacher_forced_candidate = original;
         let anded = receipt_quality_over_repeats(&repeats).unwrap();
         assert!(!anded.needle_discriminating);
         assert!(!anded.tool_discriminating);
@@ -11121,6 +11398,7 @@ pub(crate) mod tests {
             needle_discriminating: true,
             tool_discriminating: true,
             free_running_first_divergence: None,
+            greedy_agreement_by_repeat: vec![1.0; 5],
         };
         let metrics = compute_quality(&raw).unwrap();
         assert_eq!(metrics.parity_max_error, 0.0002);
@@ -11366,7 +11644,7 @@ pub(crate) mod tests {
                 cold_compile_ms: Some(1.0),
                 warm_compile_ms: 1.0,
                 compile_attribution: ReceiptCompileAttribution {
-                    method: "first-dispatch-minus-steady-v1".into(),
+                    method: COMPILE_ATTRIBUTION_METHOD.into(),
                     operation: "single-shot-generation".into(),
                     source: "measured-repeats".into(),
                     probe_durations_ms: vec![3.0, 1.0, 1.0, 1.0, 1.0],
@@ -11379,10 +11657,10 @@ pub(crate) mod tests {
                     first_dispatch_ms: 3.0,
                     steady_dispatch_ms: 1.0,
                     first_dispatch_excess_ms: 2.0,
-                    noise_samples_ms: None,
-                    noise_band_ms: None,
-                    compile_cost_resolved: None,
-                    compile_cost_ms: None,
+                    noise_samples_ms: Some(vec![1.0; 4]),
+                    noise_band_ms: Some(0.0),
+                    compile_cost_resolved: Some(true),
+                    compile_cost_ms: Some(2.0),
                     compile_cost_unresolved_reason: None,
                 },
                 samples: vec![],
@@ -11401,6 +11679,7 @@ pub(crate) mod tests {
                 greedy_token_agreement: 1.0,
                 greedy_agreement_method: GREEDY_AGREEMENT_METHOD.into(),
                 free_running_first_divergence: None,
+                greedy_token_agreement_by_repeat: vec![1.0; 5],
                 structured_tool_agreement: 1.0,
                 needle_retrieval: 1.0,
                 needle_discriminating: true,
@@ -11539,7 +11818,7 @@ pub(crate) mod tests {
             })
             .collect();
         let compile_attribution = ReceiptCompileAttribution {
-            method: "first-dispatch-minus-steady-v1".into(),
+            method: COMPILE_ATTRIBUTION_METHOD.into(),
             operation: "single-shot-generation".into(),
             source: "measured-repeats".into(),
             probe_durations_ms: vec![3.0, 1.0, 1.0, 1.0, 1.0],
@@ -11552,10 +11831,10 @@ pub(crate) mod tests {
             first_dispatch_ms: 3.0,
             steady_dispatch_ms: 1.0,
             first_dispatch_excess_ms: 2.0,
-            noise_samples_ms: None,
-            noise_band_ms: None,
-            compile_cost_resolved: None,
-            compile_cost_ms: None,
+            noise_samples_ms: Some(vec![1.0; 4]),
+            noise_band_ms: Some(0.0),
+            compile_cost_resolved: Some(true),
+            compile_cost_ms: Some(2.0),
             compile_cost_unresolved_reason: None,
         };
         let quality = QualityObservation {
@@ -11574,6 +11853,7 @@ pub(crate) mod tests {
             needle_discriminating: true,
             tool_discriminating: true,
             free_running_first_divergence: None,
+            greedy_agreement_by_repeat: vec![1.0; 5],
         };
         ReceiptBuilder {
             template,
@@ -13522,73 +13802,233 @@ pub(crate) mod tests {
         // The candidate's own choice at every reference position: one flip at position 1.
         let forced_choices = [5, 99, 7, 8, 9, 10, 11, 12, 13, 14];
         assert_eq!(
-            teacher_forced_agreement(&forced_choices, &reference),
+            teacher_forced_agreement(&forced_choices, &reference, &[]),
             (9, 10)
         );
         // A shorter forced run counts the unreached positions as mismatches.
         assert_eq!(
-            teacher_forced_agreement(&forced_choices[..4], &reference),
+            teacher_forced_agreement(&forced_choices[..4], &reference, &[]),
             (3, 10)
         );
         // Free running, the same flip cascades: every later token differs.
         let free_running = [5, 99, 1, 2, 3, 4, 0, 0, 0, 0];
-        assert_eq!(teacher_forced_agreement(&free_running, &reference), (1, 10));
+        assert_eq!(
+            teacher_forced_agreement(&free_running, &reference, &[]),
+            (1, 10)
+        );
+        // The reference stream keeps its stop token: at that position the candidate agrees when
+        // it also stops (with any stop token), and disagrees when it keeps generating.
+        let stopped = [5, 6, 2];
+        assert_eq!(
+            teacher_forced_agreement(&[5, 6, 3], &stopped, &[2, 3]),
+            (3, 3)
+        );
+        assert_eq!(
+            teacher_forced_agreement(&[5, 6, 7], &stopped, &[2, 3]),
+            (2, 3)
+        );
+        assert_eq!(teacher_forced_agreement(&[5, 6], &stopped, &[2, 3]), (2, 3));
         assert_eq!(first_divergence(&free_running, &reference), Some(1));
         assert_eq!(first_divergence(&reference, &reference), None);
         assert_eq!(first_divergence(&reference[..3], &reference), Some(3));
         assert_eq!(first_divergence(&[], &[1]), Some(0));
     }
 
-    // Helpers keep the estimate test's assertions free of clock-shaped names (they read fixture
-    // arithmetic, not a clock).
-    fn completed_row(family: &str, target: u64, wall: f64) -> RowDurationBasis {
-        RowDurationBasis {
-            family: family.into(),
-            context_window_tokens: 131_072,
-            context_target_tokens: target,
-            wall_seconds: wall,
+    /// The forced pass runs once per distinct reference stream; its compressed arm must stay on
+    /// the fused reader.
+    #[test]
+    fn forced_passes_are_deduplicated_and_must_stay_compressed() {
+        let streams = vec![vec![1, 2], vec![1, 2], vec![3], vec![1, 2], vec![3]];
+        let mut passes = Vec::new();
+        let forced = force_distinct_streams::<String>(&streams, |stream| {
+            passes.push(stream.to_vec());
+            Ok(stream.iter().map(|token| token + 10).collect())
+        })
+        .unwrap();
+        assert_eq!(passes, vec![vec![1, 2], vec![3]]);
+        assert_eq!(
+            forced,
+            vec![vec![11, 12], vec![11, 12], vec![13], vec![11, 12], vec![13]]
+        );
+        let fused = crate::primitives::PackedCacheEvidence {
+            accepted_direct_calls: 3,
+            ..Default::default()
+        };
+        forced_pass_stayed_compressed(std::slice::from_ref(&fused), &[]).unwrap();
+        let edits: [fn(&mut crate::primitives::PackedCacheEvidence); 5] = [
+            |e| e.accepted_direct_calls = 0,
+            |e| e.dense_active = true,
+            |e| e.full_cache_dequantizations = 1,
+            |e| e.failed_dispatches = 1,
+            |e| {
+                e.fallback_reasons
+                    .push(("decode".into(), "additive mask".into()))
+            },
+        ];
+        for edit in edits {
+            let mut evidence = fused.clone();
+            edit(&mut evidence);
+            assert!(forced_pass_stayed_compressed(&[evidence], &[]).is_err());
         }
+        assert!(forced_pass_stayed_compressed(&[], &[]).is_err());
+        assert!(forced_pass_stayed_compressed(
+            std::slice::from_ref(&fused),
+            &[("chunked-prefix-seed".into(), "dense store".into())]
+        )
+        .is_err());
     }
 
+    /// The receipt's greedy agreement is the minimum over the repeats; each is recorded.
+    #[test]
+    fn greedy_agreement_gates_on_the_weakest_repeat() {
+        let mut receipt = builder_test_receipt();
+        receipt.quality.greedy_token_agreement_by_repeat = vec![1.0, 0.9, 1.0, 1.0, 0.95];
+        receipt.quality.greedy_token_agreement = 0.9;
+        validate_receipt_semantics(&receipt).expect("minimum recorded");
+        let mut not_min = receipt.clone();
+        not_min.quality.greedy_token_agreement = 1.0;
+        assert!(validate_receipt_semantics(&not_min)
+            .unwrap_err()
+            .contains("minimum over the five"));
+        let mut short = receipt.clone();
+        short.quality.greedy_token_agreement_by_repeat.pop();
+        assert!(validate_receipt_semantics(&short).is_err());
+    }
+
+    // Helpers keep the estimate test's assertions free of clock-shaped names (they read fixture
+    // arithmetic, not a clock).
     fn epoch(value: &str) -> Option<f64> {
         utc_timestamp_seconds(value)
     }
 
-    fn lower_bound(family: &str, band: &str, history: &[RowDurationBasis]) -> Option<(f64, usize)> {
-        estimate_row_seconds(family, band, history)
+    /// A synthetic completed Llama-3.2-3B-shaped row: `wall` total, `prefill` per sequence.
+    fn completed_row(
+        band: &str,
+        request_mode: &str,
+        prefill_mode: &str,
+        temperature: &str,
+        target: u64,
+        wall: f64,
+        prefill: f64,
+    ) -> RowDurationBasis {
+        RowDurationBasis {
+            coordinate: format!("llama-{band}-{request_mode}-{prefill_mode}-{temperature}"),
+            family: "llama".into(),
+            context_window_tokens: 131_072,
+            context_target_tokens: target,
+            wall_seconds: wall,
+            prefill_seconds: prefill,
+            work: row_work(temperature, request_mode, prefill_mode),
+            // 1.8 GB of 4.5-bit weights over 2 x 28 layers x 24 heads x 128.
+            attention_crossover_tokens: 1.8e9 * 8.0 / 4.5 / (2.0 * 28.0 * 24.0 * 128.0),
+        }
     }
 
-    fn measured_span(receipt: &Receipt) -> Option<(String, f64)> {
-        row_duration_basis(receipt).map(|row| (row.family, row.wall_seconds))
+    fn predicted(band: &str, history: &[RowDurationBasis]) -> Option<(u64, u64, u64, String)> {
+        estimate_row_seconds(
+            "llama",
+            band,
+            row_work("warm", "single", "single-shot"),
+            history,
+        )
+        .map(|e| {
+            (
+                e.seconds.round() as u64,
+                e.fixed_seconds.round() as u64,
+                e.prefill_seconds.round() as u64,
+                e.basis_coordinate,
+            )
+        })
     }
 
-    /// The pre-row duration estimate is a linear lower bound from completed same-family rows.
+    /// The estimate scales only the measured full-context prefills of the nearest completed
+    /// same-family row; fixed costs are not scaled by context. The 32 -> 1024 -> 32768 -> 130560
+    /// progression.
     #[test]
-    fn row_duration_estimate_is_a_same_family_linear_lower_bound() {
+    fn row_duration_estimate_scales_only_the_prefill_part() {
         assert_eq!(epoch("1970-01-01T00:00:00Z"), Some(0.0));
         assert_eq!(epoch("2026-01-01T00:00:00Z"), Some(1_767_225_600.0));
         assert_eq!(epoch("2024-02-29T12:30:15.250Z"), Some(1_709_209_815.25));
         assert_eq!(epoch("not a time"), None);
-        assert_eq!(lower_bound("llama", "short", &[]), None);
         assert_eq!(
-            lower_bound("llama", "short", &[completed_row("qwen", 32, 60.0)]),
-            None
+            row_work("cold", "single", "chunked"),
+            RowWork {
+                halves: 10,
+                prefills: 86
+            }
         );
-        let history = [
-            completed_row("llama", 32, 64.0),       // 2 per token
-            completed_row("llama", 8_192, 4_096.0), // 0.5 per token: the lower bound
-            completed_row("qwen", 8_192, 1.0),      // another family never lowers it
-        ];
-        let target = context_band_target(131_072, "memory-material").unwrap() as f64;
         assert_eq!(
-            lower_bound("llama", "memory-material", &history),
-            Some((0.5 * target, 2))
+            row_work("warm", "supported-batch", "single-shot"),
+            RowWork {
+                halves: 14,
+                prefills: 174
+            }
         );
+        assert_eq!(predicted("memory-material", &[]), None);
+        // After only the 32-token row a chunked prefill is a suffix, so it provides no basis;
+        // the harness logs and never refuses.
+        let medium = completed_row(
+            "medium",
+            "supported-batch",
+            "single-shot",
+            "warm",
+            1_024,
+            600.0,
+            0.2,
+        );
+        // Medium: 174 x 0.2 s of prefill, the other 565.2 s fixed. Memory-material (32768):
+        // fixed 565.2 s (same 14 halves) + 118 prefills x 0.2 s x the scale ratio.
+        let (total, fixed, prefill, basis) =
+            predicted("memory-material", std::slice::from_ref(&medium)).unwrap();
+        assert_eq!(basis, "llama-medium-supported-batch-single-shot-warm");
+        assert_eq!(fixed, 565);
+        let ratio = prefill_scale(32_768.0, medium.attention_crossover_tokens)
+            / prefill_scale(1_024.0, medium.attention_crossover_tokens);
+        assert_eq!(prefill, (118.0 * 0.2 * ratio).round() as u64);
+        assert_eq!(total, fixed + prefill);
+        // The rejected whole-row-per-token estimate would have been 600 / 1024 x 32768 = 19200 s.
+        assert!(total < 4_000, "{total}");
+        // With the 32768 row measured (9 s prefill, 29 min wall), fit-boundary scales from it.
+        let material = completed_row(
+            "memory-material",
+            "single",
+            "single-shot",
+            "warm",
+            32_768,
+            1_740.0,
+            9.0,
+        );
+        let (total, fixed, prefill, basis) =
+            predicted("fit-boundary", &[medium, material.clone()]).unwrap();
+        assert_eq!(basis, "llama-memory-material-single-single-shot-warm");
+        assert_eq!(fixed, 678);
+        let target = context_band_target(131_072, "fit-boundary").unwrap() as f64;
+        let ratio = prefill_scale(target, material.attention_crossover_tokens)
+            / prefill_scale(32_768.0, material.attention_crossover_tokens);
+        assert_eq!(prefill, (118.0 * 9.0 * ratio).round() as u64);
+        assert_eq!(total, fixed + prefill);
+        // A qwen row is never a basis for llama.
+        let mut qwen = completed_row("medium", "single", "single-shot", "warm", 1_024, 1.0, 0.001);
+        qwen.family = "qwen".into();
+        assert_eq!(predicted("memory-material", &[qwen]), None);
+        // Refusal needs the margin over the deadline.
+        let estimate = RowDurationEstimate {
+            seconds: 12_000.0,
+            fixed_seconds: 0.0,
+            prefill_seconds: 12_000.0,
+            basis_coordinate: String::new(),
+        };
+        assert!(!duration_estimate_refuses(&estimate, 10_000));
+        assert!(duration_estimate_refuses(&estimate, 9_000));
+        // A chunked receipt provides no basis; a single-shot one does.
         let receipt = builder_test_receipt();
         assert_eq!(
-            measured_span(&receipt),
-            Some((receipt.matrix.family.clone(), 10.0))
+            row_duration_basis(&receipt).map(|row| row.work),
+            Some(row_work("cold", "single", "single-shot"))
         );
+        let mut chunked = receipt.clone();
+        chunked.matrix.prefill_mode = "chunked".into();
+        assert!(row_duration_basis(&chunked).is_none());
     }
 
     /// Between sessions MLX may keep a residual within the slack; a larger one still fails.
@@ -13825,39 +14265,10 @@ pub(crate) mod tests {
             .is_err());
         }
 
-        // Receipts accepted before the band existed stay valid only as positive band-free excess.
-        let mut legacy = cold.clone();
-        legacy.method = LEGACY_COMPILE_ATTRIBUTION_METHOD.into();
-        assert!(validate_compile_attribution(&legacy, &cold_matrix).is_err());
-        legacy.noise_samples_ms = None;
-        legacy.noise_band_ms = None;
-        legacy.compile_cost_resolved = None;
-        legacy.compile_cost_ms = None;
-        legacy.compile_cost_unresolved_reason = None;
-        validate_compile_attribution(&legacy, &cold_matrix).unwrap();
-        assert_eq!(cold_compile_alias(&legacy), Some(14.5));
-        for edit in [
-            (|a: &mut ReceiptCompileAttribution| {
-                a.noise_samples_ms = Some(vec![4.0, 5.0, 6.0, 7.0])
-            }) as fn(&mut ReceiptCompileAttribution),
-            |a| a.noise_band_ms = Some(3.0),
-            |a| a.compile_cost_resolved = Some(true),
-            |a| a.compile_cost_ms = Some(14.5),
-            |a| a.compile_cost_unresolved_reason = Some(COMPILE_COST_WITHIN_NOISE.into()),
-        ] {
-            let mut banded = legacy.clone();
-            edit(&mut banded);
-            assert!(validate_compile_attribution(&banded, &cold_matrix).is_err());
-        }
-        let json = serde_json::to_value(&legacy).unwrap();
-        assert!(json.get("noiseBandMs").is_none(), "{json}");
-        let mut legacy_flat = flat.clone();
-        legacy_flat.method = LEGACY_COMPILE_ATTRIBUTION_METHOD.into();
-        legacy_flat.noise_samples_ms = None;
-        legacy_flat.noise_band_ms = None;
-        legacy_flat.compile_cost_resolved = None;
-        legacy_flat.compile_cost_unresolved_reason = None;
-        assert!(validate_compile_attribution(&legacy_flat, &cold_matrix).is_err());
+        // The retired v1 method (positive excess, no band) is no longer accepted.
+        let mut retired = cold.clone();
+        retired.method = "first-dispatch-minus-steady-v1".into();
+        assert!(validate_compile_attribution(&retired, &cold_matrix).is_err());
     }
 
     #[test]
@@ -13900,6 +14311,8 @@ pub(crate) mod tests {
         ran: Vec<usize>,
         /// Simulates the operator touching the stop file while this row's worker is running.
         touch_stop_during: Option<usize>,
+        /// Simulates a pre-spawn duration refusal of this row.
+        refuse: Option<usize>,
         stop_file: PathBuf,
     }
 
@@ -13909,11 +14322,16 @@ pub(crate) mod tests {
                 root: root.to_path_buf(),
                 ran: Vec::new(),
                 touch_stop_during: None,
+                refuse: None,
                 stop_file: stop_file.to_path_buf(),
             }
         }
 
         fn drive(&mut self, slugs: &[String]) -> Result<Option<OperatorStop>, String> {
+            self.drive_all(slugs).map(|outcome| outcome.stop)
+        }
+
+        fn drive_all(&mut self, slugs: &[String]) -> Result<DriveOutcome, String> {
             let (root, stop_file) = (self.root.clone(), self.stop_file.clone());
             drive_rows(
                 slugs,
@@ -13929,6 +14347,9 @@ pub(crate) mod tests {
                     match step {
                         RowStep::Resume => Ok(marker.exists()),
                         RowStep::Run => {
+                            if self.refuse == Some(index) {
+                                return Ok(false);
+                            }
                             if self.touch_stop_during == Some(index) {
                                 fs::write(&stop_file, b"").unwrap();
                             }
@@ -13940,6 +14361,24 @@ pub(crate) mod tests {
                 },
             )
         }
+    }
+
+    /// A pre-spawn refusal never aborts the campaign: later rows still run, and the loop reports
+    /// the refused rows.
+    #[test]
+    fn a_refused_row_does_not_stop_later_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join(OPERATOR_STOP_FILE_NAME);
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        rows.refuse = Some(1);
+        let outcome = rows.drive_all(&stop_slugs()).unwrap();
+        assert!(outcome.stop.is_none());
+        assert_eq!(outcome.refused, vec!["row-b".to_string()]);
+        assert_eq!(rows.ran, vec![0, 2, 3]);
+        assert_eq!(
+            CampaignOutcome::IncompleteWithRefusals(outcome.refused).exit_code(),
+            1
+        );
     }
 
     fn stop_slugs() -> Vec<String> {

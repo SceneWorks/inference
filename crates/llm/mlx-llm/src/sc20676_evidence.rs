@@ -20,8 +20,8 @@ use crate::campaign;
 use crate::campaign_supervisor::{self, RunRequest, SystemProbe};
 use crate::config::Architecture;
 use crate::decode::{
-    generate_from_prefill, generate_from_prefill_observed, generate_with_cache, CancelFlag,
-    FinishReason, GenerationConfig, StreamEvent,
+    generate_from_prefill, generate_from_prefill_observed, generate_with_cache,
+    generate_with_cache_observed, CancelFlag, FinishReason, GenerationConfig, StreamEvent,
 };
 use crate::models::CausalLm;
 use crate::primitives::nn::to_f32_host;
@@ -448,7 +448,7 @@ fn validate_worker_binding(
         || arm.executable_sha256 != executable_sha256
         || arm.family != family
         || arm.mode != mode
-        || &arm.provenance != provenance
+        || host_independent(&arm.provenance) != host_independent(provenance)
         || !seen_pids.insert(arm.worker_pid)
     {
         return Err("SC-20676 worker nonce/PID/executable/provenance binding failed".into());
@@ -968,7 +968,7 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
     {
         return Err("SC-20676 baseline model binding does not match the receipt family".into());
     }
-    if receipt.dense.provenance != receipt.packed.provenance
+    if host_independent(&receipt.dense.provenance) != host_independent(&receipt.packed.provenance)
         || !is_revision(&receipt.dense.provenance.inference_revision)
         || !is_revision(&receipt.dense.provenance.scene_works_revision)
         || receipt.dense.provenance.inference_revision != receipt.baseline.inference_revision
@@ -983,7 +983,10 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         ]
         .iter()
         .any(|field| field.is_empty())
-        || !sc20676_unthrottled_thermal_state(&receipt.dense.provenance.thermal_state)
+        || [&receipt.dense, &receipt.packed].iter().any(|arm| {
+            arm.provenance.power_mode.is_empty()
+                || !sc20676_unthrottled_thermal_state(&arm.provenance.thermal_state)
+        })
     {
         return Err("SC-20676 worker provenance is incomplete or differs by arm".into());
     }
@@ -1213,7 +1216,8 @@ fn worker_provenance() -> std::result::Result<Sc20676Provenance, String> {
 
 /// Records the model's own greedy choice at every position while the decode loop is fed `forced`.
 struct TeacherForcedChoices {
-    forced: Vec<i32>,
+    /// `None` records an ordinary generation's sampled stream.
+    forced: Option<Vec<i32>>,
     choices: Vec<i32>,
 }
 
@@ -1221,7 +1225,10 @@ impl campaign::Observer for TeacherForcedChoices {
     fn phase(&mut self, _name: &'static str) {}
     fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
     fn teacher_forced_token(&mut self, step: usize) -> campaign::TeacherForcing {
-        self.forced
+        let Some(forced) = &self.forced else {
+            return campaign::TeacherForcing::Off;
+        };
+        forced
             .get(step)
             .map_or(campaign::TeacherForcing::Exhausted, |token| {
                 campaign::TeacherForcing::Token(*token)
@@ -1251,7 +1258,7 @@ fn packed_teacher_forced_choices(
         .decode_logits(&input_ids(ids), cache.as_mut(), 0)
         .map_err(|e| e.to_string())?;
     let mut observer = TeacherForcedChoices {
-        forced: forced.to_vec(),
+        forced: Some(forced.to_vec()),
         choices: Vec::new(),
     };
     generate_from_prefill_observed(
@@ -1265,8 +1272,12 @@ fn packed_teacher_forced_choices(
         &mut observer,
     )
     .map_err(|e| e.to_string())?;
+    // Like the steady decode, the forced pass must stay on the fused compressed reader.
+    let evidence = model.packed_cache_evidence(cache.as_ref());
     cache.reset().map_err(|e| e.to_string())?;
     drop(cache);
+    let evidence = evidence.ok_or("teacher-forced packed cache exposed no evidence")?;
+    campaign::forced_pass_stayed_compressed(std::slice::from_ref(&evidence), &[])?;
     Ok(observer.choices)
 }
 
@@ -1968,19 +1979,25 @@ pub fn run_sc20676_worker(
     if dense_observed_kv_bytes == 0 {
         return Err("dense parity control did not increase the MLX resident boundary".into());
     }
-    let dense_tokens = {
+    // `dense_tokens` is the emitted text stream; `dense_stream` is every sampled token, including
+    // a terminating stop token, so the forced pass also checks the packed arm stops there.
+    let (dense_tokens, dense_stream) = {
         let mut dense = model.new_cache();
-        let generated = generate_with_cache(
+        let mut recorder = TeacherForcedChoices {
+            forced: None,
+            choices: Vec::new(),
+        };
+        let generated = generate_with_cache_observed(
             &model,
             &ids,
             &mut dense,
             &config,
             &CancelFlag::new(),
-            &mut |_| {},
+            &mut recorder,
         )
         .map_err(|e| e.to_string())?;
         dense.reset().map_err(|e| e.to_string())?;
-        generated.tokens
+        (generated.tokens, recorder.choices)
     };
     // The dense parity controls are deliberately outside the packed arm's measurement window.
     // Their cache objects are dropped, allocator cache is purged, and MLX high-water is reset
@@ -2200,16 +2217,16 @@ pub fn run_sc20676_worker(
     // Kernel parity gate: the packed reader against an independent host-fp32
     // dequantize-then-attend reference over the same stored codes.
     let kernel_parity_errors =
-        crate::primitives::group_affine_kernel_fp32_parity_errors(&retained)?;
+        crate::primitives::group_affine_kernel_fp32_parity_errors_at(&retained, head_dimension)?;
     if kernel_parity_errors.is_empty() || kernel_parity_errors.iter().any(|e| !e.is_finite()) {
         return Err("SC-20676 kernel parity produced no finite errors".into());
     }
     let kernel_parity_max_error = kernel_parity_errors.iter().copied().fold(0.0, f64::max);
     // Teacher-forced greedy agreement: the packed model decodes the dense stream.
     let forced_choices =
-        packed_teacher_forced_choices(&model, &retained, &ids, &config, &dense_tokens)?;
+        packed_teacher_forced_choices(&model, &retained, &ids, &config, &dense_stream)?;
     let (forced_matches, forced_total) =
-        campaign::teacher_forced_agreement(&forced_choices, &dense_tokens);
+        campaign::teacher_forced_agreement(&forced_choices, &dense_stream, &config.stop_tokens);
     if forced_total == 0 {
         return Err("SC-20676 dense stream is empty; greedy agreement is undefined".into());
     }
@@ -2477,6 +2494,16 @@ struct ArmFamilyInput {
     baseline_manifest_sha256: String,
 }
 
+/// Provenance without the arm's host power/thermal state: each arm records its own start state,
+/// and a change between arms (e.g. nominal to fair) is not an identity change.
+fn host_independent(provenance: &Sc20676Provenance) -> Sc20676Provenance {
+    Sc20676Provenance {
+        power_mode: String::new(),
+        thermal_state: String::new(),
+        ..provenance.clone()
+    }
+}
+
 fn arm_resume_identity(
     inputs: &[ArmFamilyInput],
     executable_sha256: &str,
@@ -2504,7 +2531,7 @@ fn arm_resume_identity(
         "executableSha256": executable_sha256,
         "policySha256": policy_sha256,
         "runNonce": nonce,
-        "provenance": provenance,
+        "provenance": host_independent(provenance),
         "families": families,
     }))
 }
@@ -3751,6 +3778,42 @@ mod tests {
         let equal = receipt().finish().unwrap();
         assert!(equal.throughput_comparison.confidence_intervals_overlap);
         assert!(!equal.throughput_comparison.packed_slower_beyond_noise);
+    }
+
+    /// Host power/thermal state is each arm's own start observation, never arm identity: a
+    /// nominal dense arm and a fair packed arm still form one receipt and one resume binding.
+    #[test]
+    fn host_state_is_recorded_per_arm_not_part_of_arm_identity() {
+        let mut receipt = receipt();
+        receipt.packed.provenance.thermal_state = "fair".into();
+        receipt.packed.provenance.power_mode = "different".into();
+        reseal_arm(&mut receipt.packed);
+        receipt.throughput_comparison =
+            sc20676_throughput_comparison(&receipt.dense, &receipt.packed).unwrap();
+        let sealed = receipt
+            .clone()
+            .finish()
+            .expect("host state may differ between arms");
+        assert_eq!(sealed.packed.provenance.thermal_state, "fair");
+        assert_eq!(
+            host_independent(&sealed.dense.provenance),
+            host_independent(&sealed.packed.provenance)
+        );
+        let mut throttled = receipt.clone();
+        throttled.packed.provenance.thermal_state = "serious".into();
+        reseal_arm(&mut throttled.packed);
+        assert!(
+            throttled.finish().is_err(),
+            "a throttled arm start is refused"
+        );
+        let mut other_source = receipt.clone();
+        other_source.packed.provenance.inference_revision = "c".repeat(40);
+        reseal_arm(&mut other_source.packed);
+        assert!(other_source.finish().is_err());
+        // The resume identity carries no host state.
+        let identity = arm_resume_identity(&[], "e", "f", &receipt.packed.provenance, "n").unwrap();
+        assert_eq!(identity["provenance"]["thermalState"], "");
+        assert_eq!(identity["provenance"]["powerMode"], "");
     }
 
     /// Post-release MLX counters may keep a small recorded allocator residual; a material leak

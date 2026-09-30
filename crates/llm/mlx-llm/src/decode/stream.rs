@@ -533,6 +533,41 @@ pub fn generate_from_prefill(
     )
 }
 
+/// [`generate_with_cache`] with a campaign observer attached to the decode loop, so the observer
+/// sees every sampled token including a terminating stop token.
+pub(crate) fn generate_with_cache_observed(
+    decoder: &dyn Decode,
+    prompt_ids: &[i32],
+    cache: &mut dyn KvCache,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    observer: &mut dyn crate::campaign::Observer,
+) -> Result<GenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    if prompt_ids.is_empty() || cache.offset() != 0 {
+        return Err(Error::Msg(
+            "generate_with_cache_observed requires a prompt and an empty cache".into(),
+        ));
+    }
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    let logits = decoder.step(&input_ids(prompt_ids), cache, 0)?;
+    decode_loop(
+        decoder,
+        cache,
+        logits,
+        rng,
+        prompt_ids.to_vec(),
+        config,
+        cancel,
+        &mut |_| {},
+        None,
+        None,
+        &mut Some(observer),
+    )
+}
+
 /// [`generate_from_prefill`] with a campaign observer attached to the decode loop (used for
 /// teacher-forced greedy agreement; product generation never attaches one here).
 #[allow(clippy::too_many_arguments)]

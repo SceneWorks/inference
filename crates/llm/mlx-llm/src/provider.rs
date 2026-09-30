@@ -1091,6 +1091,11 @@ impl LlamaProvider {
     /// Drop campaign-only shared-prefix ownership before a post-request release sample. Ordinary
     /// serving has no access to this cache; campaign workers must not let it retain MLX arrays and
     /// then claim that request-scoped cache memory was released.
+    /// The stop tokens every product generation of this provider ends on.
+    pub(crate) fn campaign_stop_tokens(&self) -> &[i32] {
+        &self.stop_tokens
+    }
+
     pub(crate) fn campaign_release_cache_state(&self) {
         self.campaign_prefix_cache.borrow_mut().take();
     }
