@@ -157,6 +157,22 @@ impl ContiguousKvCache {
             .transpose()
     }
 
+    /// Every populated layer's K and V block-buffer addresses (evaluated first), in layer order —
+    /// equal before and after an update exactly when the update wrote the buffers in place.
+    #[cfg(test)]
+    pub(crate) fn buffer_addresses(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .flatten()
+            .flat_map(|s| {
+                [
+                    testing::buffer_address(&s.keys),
+                    testing::buffer_address(&s.values),
+                ]
+            })
+            .collect()
+    }
+
     /// Construct a cache pre-populated with per-layer `(keys, values)` — the seam the prefix cache
     /// (story 7168) reuses a shared prefix's KV through. Each entry is `[batch, n_kv_heads, seq,
     /// head_dim]` (keys already-RoPE'd); the cache then reports [`KvCache::offset`] equal to that
@@ -377,6 +393,22 @@ pub(crate) mod testing {
             .unwrap()
             .as_slice::<f32>()
             .to_vec()
+    }
+
+    /// The address of `a`'s data buffer (evaluated first) — buffer identity, for asserting that a
+    /// cache wrote in place rather than into a fresh copy.
+    pub(crate) fn buffer_address(a: &Array) -> usize {
+        a.eval().unwrap();
+        // SAFETY: `a` is evaluated and outlives the call; only the pointer value is read.
+        unsafe {
+            let p = a.as_ptr();
+            (match a.dtype() {
+                Dtype::Float32 => mlx_sys::mlx_array_data_float32(p) as usize,
+                Dtype::Bfloat16 => mlx_sys::mlx_array_data_bfloat16(p) as usize,
+                Dtype::Float16 => mlx_sys::mlx_array_data_float16(p) as usize,
+                other => panic!("buffer_address: unsupported dtype {other:?}"),
+            }) as usize
+        }
     }
 
     /// One position `[b=1, h=1, s=1, d=2]` carrying `(tag, tag + 0.5)`.

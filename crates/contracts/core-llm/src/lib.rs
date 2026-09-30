@@ -105,24 +105,26 @@ pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use report::{
-    BackendCapabilities, CudaGraphsReport, DecodeReport, FeatureSupport, LoadReport, PathReport,
-    ProjectionReport,
+    BackendCapabilities, CudaGraphsReport, DecodeReport, DraftReport, FeatureSupport, LoadReport,
+    PathReport, ProjectionReport,
 };
 pub use request::{
     HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
     Speculative, SpeculativeProposer, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
-    admit_request_memory, admit_request_memory_with_geometry, available_host_memory_bytes,
-    checkpoint_payload_bytes, checkpoint_staging_bytes, effective_memory_budget,
-    estimate_chunked_request_bytes, estimate_chunked_request_bytes_with_recurrent_copies,
-    estimate_request_bytes, operational_memory_override, LlmMemoryGeometry,
+    admit_draft_load, admit_request_memory, admit_request_memory_with_geometry,
+    available_host_memory_bytes, checkpoint_payload_bytes, checkpoint_staging_bytes,
+    effective_memory_budget, estimate_chunked_request_bytes,
+    estimate_chunked_request_bytes_with_recurrent_copies, estimate_request_bytes,
+    estimate_request_bytes_with_recurrent_copies, operational_memory_override, LlmMemoryGeometry,
     AVAILABLE_MEMORY_OVERRIDE,
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{
-    accept_greedy_run, accept_token, greedy_commit, ngram_propose, resolve_speculative, Acceptance,
-    ProposerKind, SpeculativePlan, SpeculativeResolution,
+    accept_greedy_run, accept_token, draft_compatibility, draft_model_capabilities,
+    fit_draft_context, greedy_commit, ngram_propose, resolve_speculative, Acceptance, ProposerKind,
+    SpeculativePlan, SpeculativeResolution, DRAFT_MODEL_RECOMMENDED_DEPTH,
 };
 pub use starvector::{
     generated_token_budget, validate_advertised_generated_token_cap,

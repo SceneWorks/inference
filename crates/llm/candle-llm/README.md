@@ -207,11 +207,21 @@ oracle, selectable with `LlamaProvider::set_decode_path(DecodePath::Reference)`.
 Speculation is chosen per request through core-llm's one proposer-agnostic option (sc-24433,
 `TextLlmRequest::speculative`: `off | auto | {proposer: mtp|prompt_lookup|draft_model, depth}`; the
 legacy `mtp` field maps onto it). Every decoder this provider loads advertises prompt lookup
-(`PROMPT_LOOKUP_MAX_DEPTH` = 8, recommended 4) and a qwen3_5 checkpoint with a head also MTP; `auto`
+(`PROMPT_LOOKUP_MAX_DEPTH` = 7, recommended 4) and a qwen3_5 checkpoint with a head — dense or
+sparse-MoE predictor layer, fused or per-expert experts — also MTP at the same depth (sc-24438: a
+deeper request runs at 7, the clamp named in `DecodeReport::fallbacks`); `auto`
 resolves to MTP where the head exists, else prompt lookup, and the engine runs the resolved
 proposer (`decode::MtpProposer` / `decode::NgramProposer`) for both decoder families. A proposer
 that cannot run on the request's path (a Qwen3-VL multimodal request decodes on the reference loop)
-falls back with its reason in `DecodeReport::fallbacks`. The greedy parity suite and the
+falls back with its reason in `DecodeReport::fallbacks`. A load names a draft model with
+`LoadSpec::with_draft` (sc-24436): it loads beside the target on the same device at the same tier,
+admitted with it (a draft without room, an unreadable one, one whose tokenizer vocabulary is not
+the target's, or one scoring more ids than the target is refused by name in `LoadReport::draft`
+and the target loads alone; a draft padded less than its target proposes only its tokenizer's
+ids), and only a resident draft advertises `draft_model` (the model's prompt-lookup depth bound,
+recommended 4) — which the engine then runs with `decode::DraftModelProposer`, pricing the
+draft's own prefill and cache in request admission. A request whose reach outruns the draft's own
+context window runs `auto` instead, the reason named in `DecodeReport::fallbacks`. The greedy parity suite and the
 benchmark harness are core-llm-testkit's `check_speculative_greedy_parity` /
 `run_speculative_bench`; `tests/speculative_bench.rs` drives the harness on real weights.
 

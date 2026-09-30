@@ -225,6 +225,46 @@ pub struct LoadReport {
     /// when the cache is off or no headroom was left; `None` where the provider has no prefix
     /// cache or was assembled without a load.
     pub prefix_cache_bytes: Option<u64>,
+    /// The draft model the load named ([`LoadSpec::draft_source`](crate::LoadSpec::draft_source),
+    /// epic sc-24432 story sc-24436): resident, or refused with the reason named. `None` when no
+    /// draft was named.
+    pub draft: Option<DraftReport>,
+}
+
+/// What became of a load's named draft model (sc-24436). A draft never fails the load (epic
+/// sc-24432 E2): it is resident — and `draft_model` advertised — or refused with the reason
+/// named and the target loaded alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DraftReport {
+    /// The draft source the load named.
+    pub source: String,
+    /// Why the draft was not loaded (a tokenizer vocabulary that is not the target's, logits over
+    /// more ids than the target's, an unreadable source, no room beside the target), or `None`
+    /// when it is resident.
+    pub refusal: Option<String>,
+}
+
+impl DraftReport {
+    /// A resident draft.
+    pub fn resident(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            refusal: None,
+        }
+    }
+
+    /// A refused draft, with the reason.
+    pub fn refused(source: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            refusal: Some(reason.into()),
+        }
+    }
+
+    /// Whether the draft is resident (and `draft_model` advertised).
+    pub fn is_resident(&self) -> bool {
+        self.refusal.is_none()
+    }
 }
 
 #[cfg(test)]

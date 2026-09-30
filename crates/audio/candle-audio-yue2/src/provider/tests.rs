@@ -14,7 +14,9 @@ use candle_audio::gen_core::{
 use serde_json::Value;
 
 use super::*;
-use crate::run::{verify_run, AUDIO_WAV, CONFIG_JSON, REQUEST_JSON, RESULT_JSON};
+use crate::run::{
+    verify_run, AUDIO_WAV, CONFIG_JSON, REQUEST_JSON, RESULT_JSON, SOURCE_GENERATION_JSON,
+};
 
 /// A SheetSage2 transcription of a public-domain recording (the committed sc-23003 oracle, also
 /// used by the cover module's tests): a full score with chord symbols, and its melody-only form.
@@ -46,6 +48,34 @@ fn spec_with(root: &Path, standard: bool, legacy: bool) -> LoadSpec {
 
 fn spec(root: &Path, legacy: bool) -> LoadSpec {
     spec_with(root, true, legacy)
+}
+
+#[test]
+fn stage_policy_is_explicit_and_cpu_bf16_refuses_before_weights() {
+    let base = LoadSpec::new(WeightsSource::Dir("/not-loaded".into()));
+    let cpu = Device::Cpu;
+    assert_eq!(stage_dtypes(&base, &cpu).unwrap(), (DType::F32, DType::F32));
+    let auto = base
+        .clone()
+        .with_yue2_compute_policy(Yue2ComputePolicy::Auto);
+    assert_eq!(stage_dtypes(&auto, &cpu).unwrap(), (DType::F32, DType::F32));
+    let f32 = base
+        .clone()
+        .with_yue2_compute_policy(Yue2ComputePolicy::Fp32);
+    assert_eq!(stage_dtypes(&f32, &cpu).unwrap(), (DType::F32, DType::F32));
+    let bf16 = base.with_yue2_compute_policy(Yue2ComputePolicy::Bf16);
+    let err = stage_dtypes(&bf16, &cpu).unwrap_err();
+    assert!(
+        matches!(err, gen_core::Error::Unsupported(ref reason) if reason.contains("requires an accelerator"))
+    );
+    for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+        let mut selected = f32.clone();
+        selected.quantize = quant;
+        assert_eq!(
+            stage_dtypes(&selected, &cpu).unwrap(),
+            (DType::F32, DType::F32)
+        );
+    }
 }
 
 /// Load `yue2` through the explicit registry with the synthetic engine.
@@ -1270,6 +1300,58 @@ fn a_cached_decode_resumes_under_other_decode_tiling() {
         audio_of(again.output.unwrap()).samples,
         audio_of(first.output.unwrap()).samples
     );
+}
+
+/// A verified latent can be a source for a fresh target-policy decode. Its published waveform
+/// remains tied to the target policy; the original source config is immutable provenance.
+#[test]
+fn a_new_policy_redecodes_verified_latents_with_its_own_identity_and_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = load_synthetic(&spec(tmp.path(), true)).unwrap();
+    let source = tmp.path().join("song");
+    old.generate(&song_request(Some(&source)), &mut |_| {})
+        .unwrap();
+    let source_result = verify_run(&source, None).unwrap();
+    let source_config = read_json(&source.join(CONFIG_JSON));
+    assert!(source_config.get("compute_policy").is_none());
+
+    let auto =
+        load_synthetic(&spec(tmp.path(), true).with_yue2_compute_policy(Yue2ComputePolicy::Auto))
+            .unwrap();
+    let target = tmp.path().join("redecoded");
+    let request = |resume: bool| GenerationRequest {
+        audio: Some(AudioParams {
+            song: Some(SongParams {
+                cached_latents: Some(source.clone()),
+                decoder: Some(SongDecoder::Legacy),
+                ..Default::default()
+            }),
+            artifacts: Some(AudioArtifacts {
+                dir: target.clone(),
+                resume,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    auto.generate(&request(false), &mut |_| {}).unwrap();
+    let output = verify_run(&target, None).unwrap();
+    let config = read_json(&target.join(CONFIG_JSON));
+    let provenance = read_json(&target.join(SOURCE_GENERATION_JSON));
+    assert_eq!(config["compute_policy"], "auto");
+    assert_eq!(config["vae_dtype"], "float32");
+    assert_eq!(provenance["config"], source_config);
+    assert_eq!(provenance["identity"], source_result["identity"]);
+    assert_eq!(output["latent"], source_result["latent"]);
+    assert_ne!(output["identity"], source_result["identity"]);
+
+    let before = std::fs::read(target.join(RESULT_JSON)).unwrap();
+    let err = match old.generate(&request(true), &mut |_| {}) {
+        Ok(_) => panic!("a different target policy must not reuse the waveform"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("identity"), "{err}");
+    assert_eq!(std::fs::read(target.join(RESULT_JSON)).unwrap(), before);
 }
 
 /// What does change a result is still bound: resuming a completed run with another seed, other

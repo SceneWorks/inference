@@ -146,7 +146,10 @@ impl PrefixSnapshot for Qwen35Cache {
         }
     }
 
-    fn into_entry(self, mtp: Option<MtpBoundary>) -> PrefixEntry {
+    fn into_entry(mut self, mtp: Option<MtpBoundary>) -> PrefixEntry {
+        // An entry is the state at its boundary alone: no checkpoint window rides along into the
+        // store (charged, and handed to every restore, as if it were live state).
+        self.discard_checkpoints();
         PrefixEntry::Hybrid { cache: self, mtp }
     }
 
@@ -642,8 +645,8 @@ mod engine_tests {
         fn cache_len(&self, cache: &T::Cache) -> i32 {
             self.inner.cache_len(cache)
         }
-        fn rollback(&self) -> T::Rollback {
-            self.inner.rollback()
+        fn rollback(&self, width: usize) -> T::Rollback {
+            self.inner.rollback(width)
         }
         fn forward(
             &self,
@@ -806,6 +809,72 @@ mod engine_tests {
         other.extend_from_slice(&[1, 2]);
         let restored = pc.restore::<Qwen35Cache>(&other, false).unwrap();
         assert!(restored.is_none());
+    }
+
+    /// A hybrid entry is the state at its boundary alone (sc-24435 x sc-24437): a cache stored
+    /// while a DeltaNet checkpoint window is open (recording) keeps no window in the store — it
+    /// is charged exactly what a cache that never recorded holds — and a restore of it carries
+    /// none, so the restored cache can return to no earlier position.
+    #[test]
+    fn a_stored_hybrid_entry_carries_no_checkpoint_window() {
+        let model = qwen35(false);
+        let prompt = [3, 9, 4, 11, 3, 9, 4, 11];
+        let fwd = |cache: &mut Qwen35Cache, ids: &[i32], at: i32| {
+            SpeculativeTarget::forward(
+                &model,
+                cache,
+                &input_ids(ids),
+                at,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap();
+        };
+        let mut plain = model.new_cache();
+        fwd(&mut plain, &prompt, 0);
+        let mut live = model.new_cache();
+        fwd(&mut live, &prompt[..6], 0);
+        live.arm_checkpoints(4);
+        fwd(&mut live, &prompt[6..], 6);
+        assert!(
+            live.checkpointed_tokens() > 0,
+            "the window is open and recording"
+        );
+        assert!(
+            live.bytes() > plain.bytes(),
+            "the window is charged while live"
+        );
+
+        let mut pc = PrefixCache::with_budget(1 << 30);
+        pc.store(
+            &prompt,
+            &[],
+            live.clone(),
+            Some(Boundary {
+                len: prompt.len(),
+                cache: live,
+            }),
+            None,
+        );
+        assert_eq!(
+            pc.resident_bytes(),
+            plain.bytes(),
+            "charged its live state only"
+        );
+        let mut next = prompt.to_vec();
+        next.push(20);
+        let restored = pc
+            .restore::<Qwen35Cache>(&next, false)
+            .unwrap()
+            .expect("a hit");
+        assert_eq!(restored.reused, prompt.len());
+        assert_eq!(restored.cache.checkpointed_tokens(), 0);
+        let at = prompt.len() as i32;
+        assert_eq!(
+            restored.cache.restorable(),
+            at..at,
+            "no checkpoint window restored"
+        );
     }
 
     /// The boundary snapshot is independent of the live cache it was taken from (MLX arrays are

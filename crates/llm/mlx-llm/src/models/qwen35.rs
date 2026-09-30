@@ -20,13 +20,14 @@
 use std::cell::Cell;
 
 use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis};
+use mlx_rs::transforms::async_eval;
 use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -372,7 +373,8 @@ impl GatedDeltaNet {
             Some(cs) => cs.clone(),
             None => zeros3(b, self.conv_kernel - 1, self.conv_dim, dt)?,
         };
-        let (conv_out, new_conv) = causal_depthwise_conv(&mixed, &self.conv_weight, &conv_state)?;
+        let (conv_out, conv_trace) =
+            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
         let cp = split_sections(&conv_out, &[self.key_dim, 2 * self.key_dim], 2)?;
         let qc = cp[0].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
         let kc = cp[1].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
@@ -385,25 +387,24 @@ impl GatedDeltaNet {
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel). GQA
         // (q/k from Hk key heads → Hv value heads) is handled inside the recurrence primitive.
+        // The cache advances itself: an armed (speculative verify) forward also keeps every
+        // token's state for the checkpoint ring (sc-24435).
         let beta = sigmoid(&b_in)?;
         let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
         let f32 = Dtype::Float32;
-        let (y, new_ssm) = gated_delta_recurrence(
+        let y = cache.advance(
+            conv_trace,
             &qn.as_dtype(f32)?,
             &kn.as_dtype(f32)?,
             &vc.as_dtype(f32)?,
             &g.as_dtype(f32)?,
             &beta.as_dtype(f32)?,
-            cache.ssm_state.as_ref(),
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
         let out = rms_norm_gated(&y.as_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
-        let result = self
-            .out_proj
-            .forward(&out.reshape(&[b, s, self.value_dim])?)?;
-        cache.update(new_conv, new_ssm, s);
-        Ok(result)
+        self.out_proj
+            .forward(&out.reshape(&[b, s, self.value_dim])?)
     }
 }
 
@@ -542,9 +543,10 @@ impl DecoderLayer {
 /// 16 of these layers; the per-token concat cost ~370 MB of unreusable buffers per token at 5.6k
 /// context).
 ///
-/// `Clone` is a buffer-sharing snapshot — the MTP loop's rollback (`target_cache.clone()` /
-/// `mtp_cache.clone()`) stays correct because the in-place write copies rather than donates while
-/// a snapshot holds the buffer.
+/// `Clone` is a buffer-sharing snapshot — a snapshot rollback (the MTP predictor's `MtpCache`, the
+/// engine's generic `SnapshotRollback`) stays correct because the in-place write copies rather
+/// than donates while a snapshot holds the buffer. The hybrid target itself rolls back through
+/// [`Qwen35Cache::truncate`] and never takes one.
 #[derive(Clone, Debug)]
 pub struct AttnKv {
     kv: ContiguousKvCache,
@@ -584,6 +586,12 @@ impl AttnKv {
     fn reset(&mut self) {
         self.kv.reset();
     }
+
+    /// Keep positions `0..len` — bookkeeping only: the rolled-back positions stay in the block
+    /// buffer as padding and the next update overwrites them in place.
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        self.kv.truncate(len)
+    }
 }
 
 /// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, growing KV for
@@ -595,9 +603,41 @@ pub enum Qwen35LayerCache {
 }
 
 /// The hybrid decoder's cache: one slot per decoder layer.
-#[derive(Clone, Debug)]
+///
+/// It rolls back without a forward: [`arm_checkpoints`](Self::arm_checkpoints) opens a checkpoint
+/// window in every DeltaNet layer (the ring, sc-24435) — the state there and after every token of
+/// each forward until the window closes stays restorable — after which
+/// [`truncate`](Self::truncate) to any position of the window selects the kept states and
+/// truncates the attention KV by offset: the speculative engine's direct rollback. `Clone` is a
+/// buffer-sharing snapshot (a clone held across a forward makes the attention KV's in-place write
+/// copy its block); the engine never takes one.
+#[derive(Debug)]
 pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
+}
+
+impl Clone for Qwen35Cache {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        CACHE_CLONES.with(|c| c.set(c.get() + 1));
+        Self {
+            layers: self.layers.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of [`Qwen35Cache`] clones on this thread.
+    static CACHE_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f`, returning how many times a [`Qwen35Cache`] was cloned on this thread meanwhile.
+#[cfg(test)]
+pub(crate) fn counting_cache_clones<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    let before = CACHE_CLONES.with(|c| c.get());
+    let out = f();
+    (out, CACHE_CLONES.with(|c| c.get()) - before)
 }
 
 impl Qwen35Cache {
@@ -624,20 +664,179 @@ impl Qwen35Cache {
     }
 
     /// Bytes the cache's arrays hold: every attention layer's KV block buffers plus every linear
-    /// layer's conv tail and recurrent state — what the prefix cache charges an entry holding this
-    /// cache (story sc-24437).
+    /// layer's resident recurrent bytes ([`DeltaNetCache::resident_bytes`]: the live conv tail
+    /// and recurrent state, plus any checkpoint window still open) — what the prefix cache charges
+    /// an entry holding this cache (story sc-24437). A stored entry's window is closed, so it is
+    /// charged exactly its live state.
     pub fn bytes(&self) -> u64 {
         self.layers
             .iter()
             .map(|l| match l {
                 Qwen35LayerCache::Attn(a) => a.kv.bytes(),
-                Qwen35LayerCache::Delta(c) => [&c.conv_state, &c.ssm_state]
-                    .into_iter()
-                    .flatten()
-                    .map(|a| a.nbytes() as u64)
-                    .sum(),
+                Qwen35LayerCache::Delta(c) => c.resident_bytes() as u64,
             })
             .sum()
+    }
+
+    /// Open a checkpoint window at the current position in every DeltaNet layer: the state here
+    /// and after every token of each forward until the window closes stays restorable, so
+    /// [`truncate`](Self::truncate) can return to any of those positions without a forward. The
+    /// speculative engine opens one per verify step (a draft model's proposal spans several
+    /// forwards in one window); prefill and plain decode never do, so they keep the
+    /// final-state-only recurrence. The window records at most `max_tokens` tokens — the
+    /// `width + 1` of a speculative width, what [`Qwen35Model::checkpoint_ring_bytes`] prices: a
+    /// forward past that is [`Error::CheckpointWindowFull`], refused by the first DeltaNet layer
+    /// (layer 0 of every hybrid schedule) before any layer's cache is written.
+    pub fn arm_checkpoints(&mut self, max_tokens: i32) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.arm_checkpoints(max_tokens);
+            }
+        }
+    }
+
+    /// Tokens the DeltaNet layers' checkpoint windows hold, summed over the layers (`0` when no
+    /// layer records).
+    #[cfg(test)]
+    pub(crate) fn checkpointed_tokens(&self) -> i32 {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                Qwen35LayerCache::Delta(c) => c.checkpointed_tokens(),
+                Qwen35LayerCache::Attn(_) => 0,
+            })
+            .sum()
+    }
+
+    /// Every DeltaNet layer's live `(conv_state, ssm_state)` on the host, in layer order.
+    #[cfg(test)]
+    pub(crate) fn delta_states(&self) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let host = |a: &Array| {
+            a.as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => {
+                    c.live_state().map(|(conv, ssm)| (host(conv), host(ssm)))
+                }
+                Qwen35LayerCache::Attn(_) => None,
+            })
+            .collect()
+    }
+
+    /// Drop every DeltaNet layer's checkpoint window, open or closed
+    /// ([`DeltaNetCache::discard_checkpoints`]): the cache holds only its live state at
+    /// [`offset`](Self::offset) — what a cross-turn prefix-cache entry keeps (sc-24437).
+    pub fn discard_checkpoints(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.discard_checkpoints();
+            }
+        }
+    }
+
+    /// Close the checkpoint window: later forwards stop recording (and drop it).
+    pub fn close_checkpoints(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.close_checkpoints();
+            }
+        }
+    }
+
+    /// The positions [`truncate`](Self::truncate) can return to besides `0` and the current one:
+    /// the checkpoint window's (the ring's depth).
+    pub fn restorable(&self) -> std::ops::Range<i32> {
+        let offset = self.offset();
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => Some(c.restorable()),
+                Qwen35LayerCache::Attn(_) => None,
+            })
+            .reduce(|a, b| a.start.max(b.start)..a.end.min(b.end))
+            .unwrap_or(0..offset)
+    }
+
+    /// Keep positions `0..len` and close the checkpoint window: `len == offset()` only closes it
+    /// and `0` is a reset; otherwise every DeltaNet layer restores the state it kept at `len` and
+    /// the attention KV drops the positions past it by offset (its buffer is kept and written in
+    /// place by the next forward). A `len` outside the checkpoint window
+    /// ([`restorable`](Self::restorable)) is [`Error::Unsupported`] and leaves the cache
+    /// untouched. The restored states are scheduled for evaluation (asynchronously) so the
+    /// checkpoints they were read from free as soon as the next forward drops the window.
+    pub fn truncate(&mut self, len: i32) -> Result<()> {
+        let offset = self.offset();
+        if len < 0 || len > offset {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: cannot truncate to {len} with {offset} positions cached"
+            )));
+        }
+        if len == offset {
+            self.close_checkpoints();
+            return Ok(());
+        }
+        if len == 0 {
+            self.reset();
+            return Ok(());
+        }
+        if let Some(Qwen35LayerCache::Delta(c)) = self
+            .layers
+            .iter()
+            .find(|l| matches!(l, Qwen35LayerCache::Delta(c) if !c.can_rollback_to(len)))
+        {
+            let held = c.restorable();
+            return Err(Error::Unsupported(format!(
+                "Qwen35Cache: cannot truncate {offset} positions to {len}: the DeltaNet \
+                 checkpoint window holds positions {}..{}",
+                held.start, held.end
+            )));
+        }
+        let mut restored = Vec::new();
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => {
+                    c.rollback_to(len)?;
+                    if let Some((conv, ssm)) = c.live_state() {
+                        restored.extend([conv.clone(), ssm.clone()]);
+                    }
+                }
+                Qwen35LayerCache::Attn(a) => a.truncate(len)?,
+            }
+        }
+        async_eval(&restored)?;
+        Ok(())
+    }
+
+    /// Bytes of recurrent state the DeltaNet layers hold: every live state plus the checkpoint
+    /// ring (the attention KV is excluded) — what admission prices as the request's recurrent
+    /// footprint.
+    pub fn recurrent_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                Qwen35LayerCache::Delta(c) => c.resident_bytes(),
+                Qwen35LayerCache::Attn(_) => 0,
+            })
+            .sum()
+    }
+
+    /// The attention layers' K and V block-buffer addresses, in layer order — equal across steps
+    /// exactly when the forwards wrote them in place.
+    #[cfg(test)]
+    pub(crate) fn attn_buffer_addresses(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Attn(a) => Some(a.kv.buffer_addresses()),
+                Qwen35LayerCache::Delta(_) => None,
+            })
+            .flatten()
+            .collect()
     }
 }
 
@@ -725,6 +924,32 @@ impl Qwen35Model {
             layers: (0..mtp.layers.len()).map(|_| AttnKv::default()).collect(),
             steps: 0,
         })
+    }
+
+    /// The bytes a speculative run of `width` drafts per step adds to the recurrent footprint
+    /// through the DeltaNet checkpoint ring (sc-24435), over the live state: per linear layer,
+    /// `width + 2` slots of one recurrent state (`Hv·Dv·Dk`) plus `K` conv rows (`conv_dim`), all
+    /// at 4 bytes per element. That covers the most a checkpoint window holds for a verify step of
+    /// `width + 1` tokens — the state at the window start, the `width + 1` per-token states, and
+    /// the conv tails (`K - 1` rows) plus the forward's conv input (`width + K` rows) — whatever
+    /// the conv dtype. `None` on overflow (the caller fails closed).
+    pub fn checkpoint_ring_bytes(&self, width: usize) -> Option<u64> {
+        let c = &self.cfg;
+        let n = |v: i32| u64::try_from(v).ok();
+        let linear = (0..c.num_layers).filter(|&i| c.is_linear(i)).count() as u64;
+        let state = n(c.linear_num_value_heads)?
+            .checked_mul(n(c.linear_value_head_dim)?)?
+            .checked_mul(n(c.linear_key_head_dim)?)?;
+        let conv_dim = n(c.linear_num_key_heads)?
+            .checked_mul(n(c.linear_key_head_dim)?)?
+            .checked_mul(2)?
+            .checked_add(n(c.linear_num_value_heads)?.checked_mul(n(c.linear_value_head_dim)?)?)?;
+        let conv = conv_dim.checked_mul(n(c.linear_conv_kernel_dim)?)?;
+        let slots = u64::try_from(width).ok()?.checked_add(2)?;
+        linear
+            .checked_mul(slots)?
+            .checked_mul(state.checked_add(conv)?)?
+            .checked_mul(4)
     }
 
     /// A fresh per-layer cache (linear vs full-attn slot per the schedule).
@@ -1383,72 +1608,7 @@ impl Qwen35Model {
                     eps,
                 })
             };
-            let ffn = match &cfg.moe {
-                // Dense SwiGLU (27B).
-                None => Ffn::Dense(Mlp {
-                    gate: proj_q(lp("mlp.gate_proj.weight"))?,
-                    up: proj_q(lp("mlp.up_proj.weight"))?,
-                    down: proj_q(lp("mlp.down_proj.weight"))?,
-                }),
-                // Sparse MoE (35B-A3B): the routed experts stay stacked for the gathered matmul.
-                // `experts.gate_up_proj` is [E, 2·moe_inter, hidden] (gate rows ‖ up rows, matching
-                // the reference `linear(x, gate_up_proj[e]).chunk(2, -1)`); `experts.down_proj` is
-                // [E, hidden, moe_inter]. A snapshot that stores each expert separately (quantized
-                // parts) is stacked from its per-expert projections instead.
-                Some(moe) => {
-                    let h = cfg.hidden_size;
-                    let mi = moe.moe_intermediate_size;
-                    let expert0 = lp("mlp.experts.0.gate_proj");
-                    let split_stored = ["scales", "biases"]
-                        .iter()
-                        .any(|part| w.contains(&format!("{expert0}.{part}")));
-                    let (gate, up, down) = if stored_quant.is_some() || split_stored {
-                        let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
-                        for e in 0..moe.num_experts {
-                            gate.push(proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?);
-                            up.push(proj_q(lp(&format!("mlp.experts.{e}.up_proj.weight")))?);
-                            down.push(proj_q(lp(&format!("mlp.experts.{e}.down_proj.weight")))?);
-                        }
-                        (
-                            SwitchLinear::stack(gate)?,
-                            SwitchLinear::stack(up)?,
-                            SwitchLinear::stack(down)?,
-                        )
-                    } else {
-                        let e = moe.num_experts;
-                        // [E, 2, mi, h]: `take` along the gate/up axis yields each half contiguous.
-                        let gate_up =
-                            req(lp("mlp.experts.gate_up_proj"))?.reshape(&[e, 2, mi, h])?;
-                        let half = |i: i32| -> Result<Array> {
-                            Ok(gate_up
-                                .take_axis(Array::from_slice(&[i], &[1]), 1)?
-                                .reshape(&[e, mi, h])?)
-                        };
-                        (
-                            SwitchLinear::load(half(0)?, quant)?,
-                            SwitchLinear::load(half(1)?, quant)?,
-                            SwitchLinear::load(req(lp("mlp.experts.down_proj"))?, quant)?,
-                        )
-                    };
-                    Ffn::Moe(SparseMoe::new(
-                        req(lp("mlp.gate.weight"))?,
-                        gate,
-                        up,
-                        down,
-                        SwiGlu {
-                            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
-                            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
-                            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
-                        },
-                        Some(req(lp("mlp.shared_expert_gate.weight"))?),
-                        MoeRouting {
-                            experts_per_tok: moe.experts_per_tok,
-                            norm_topk_prob: true,
-                            routed_scaling_factor: 1.0,
-                        },
-                    )?)
-                }
-            };
+            let ffn = build_ffn(w, &dp(&format!("layers.{i}.")), &cfg, quant, &proj_q)?;
             layers.push(DecoderLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
@@ -1474,12 +1634,6 @@ impl Qwen35Model {
                             .into(),
                     ));
                 }
-                if cfg.moe.is_some() {
-                    return Err(Error::Config(
-                        "qwen3_5 MTP with a MoE predictor is not supported by this architecture"
-                            .into(),
-                    ));
-                }
                 let lp = |s: &str| format!("mtp.layers.0.{s}");
                 let layer = DecoderLayer {
                     input_ln: norm_w(lp("input_layernorm.weight"))?,
@@ -1497,11 +1651,10 @@ impl Qwen35Model {
                         scale: (cfg.head_dim as f32).powf(-0.5),
                         eps,
                     }),
-                    ffn: Ffn::Dense(Mlp {
-                        gate: proj_q(lp("mlp.gate_proj.weight"))?,
-                        up: proj_q(lp("mlp.up_proj.weight"))?,
-                        down: proj_q(lp("mlp.down_proj.weight"))?,
-                    }),
+                    // The predictor layer carries the body's FFN choice: the dense MLP (27B) or
+                    // the sparse-MoE block (35B-A3B), in either expert layout (vLLM
+                    // `qwen3_5_mtp.py`, sc-24438).
+                    ffn: build_ffn(w, "mtp.layers.0.", &cfg, quant, &proj_q)?,
                     eps,
                 };
                 Some(MtpPredictor {
@@ -1535,6 +1688,86 @@ impl Qwen35Model {
         w.verify_accessed_gpu_view()?;
         Ok(model)
     }
+}
+
+/// The FFN of the decoder or MTP predictor layer whose tensors live under `lp` (the layer prefix
+/// with its trailing dot: `model.language_model.layers.3.`, `mtp.layers.0.`): a dense SwiGLU (27B)
+/// or the sparse-MoE block (35B-A3B). The body and the MTP head share it, so a predictor layer
+/// takes exactly the body's FFN choice and expert layout (sc-24438). `proj_q` is the loader's
+/// projection reader (stored-quantized, load-time-quantized, Prism or dense).
+///
+/// MoE experts stay stacked for the gathered matmul. The fused layout (Qwen3.6) stores
+/// `experts.gate_up_proj` `[E, 2·moe_inter, hidden]` (gate rows ‖ up rows, matching the reference
+/// `linear(x, gate_up_proj[e]).chunk(2, -1)`) and `experts.down_proj` `[E, hidden, moe_inter]`.
+/// A snapshot that stores each expert under its own key — the bf16 Qwen3.5 release
+/// (`experts.{e}.{gate,up,down}_proj.weight`) or a quantized conversion (their `.scales` /
+/// `.biases` parts) — is stacked from its per-expert projections instead.
+fn build_ffn(
+    w: &Weights,
+    lp: &str,
+    cfg: &Qwen35Config,
+    quant: Option<QuantSpec>,
+    proj_q: &dyn Fn(String) -> Result<Projection>,
+) -> Result<Ffn> {
+    let lp = |s: &str| format!("{lp}{s}");
+    let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+    let Some(moe) = &cfg.moe else {
+        return Ok(Ffn::Dense(Mlp {
+            gate: proj_q(lp("mlp.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.up_proj.weight"))?,
+            down: proj_q(lp("mlp.down_proj.weight"))?,
+        }));
+    };
+    let h = cfg.hidden_size;
+    let mi = moe.moe_intermediate_size;
+    let expert0 = lp("mlp.experts.0.gate_proj");
+    let per_expert = ["weight", "scales", "biases"]
+        .iter()
+        .any(|part| w.contains(&format!("{expert0}.{part}")));
+    let (gate, up, down) = if cfg.quantization.is_some() || per_expert {
+        let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
+        for e in 0..moe.num_experts {
+            gate.push(proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?);
+            up.push(proj_q(lp(&format!("mlp.experts.{e}.up_proj.weight")))?);
+            down.push(proj_q(lp(&format!("mlp.experts.{e}.down_proj.weight")))?);
+        }
+        (
+            SwitchLinear::stack(gate)?,
+            SwitchLinear::stack(up)?,
+            SwitchLinear::stack(down)?,
+        )
+    } else {
+        let e = moe.num_experts;
+        // [E, 2, mi, h]: `take` along the gate/up axis yields each half contiguous.
+        let gate_up = req(lp("mlp.experts.gate_up_proj"))?.reshape(&[e, 2, mi, h])?;
+        let half = |i: i32| -> Result<Array> {
+            Ok(gate_up
+                .take_axis(Array::from_slice(&[i], &[1]), 1)?
+                .reshape(&[e, mi, h])?)
+        };
+        (
+            SwitchLinear::load(half(0)?, quant)?,
+            SwitchLinear::load(half(1)?, quant)?,
+            SwitchLinear::load(req(lp("mlp.experts.down_proj"))?, quant)?,
+        )
+    };
+    Ok(Ffn::Moe(SparseMoe::new(
+        req(lp("mlp.gate.weight"))?,
+        gate,
+        up,
+        down,
+        SwiGlu {
+            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
+            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
+        },
+        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        MoeRouting {
+            experts_per_tok: moe.experts_per_tok,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+        },
+    )?))
 }
 
 impl KvCache for Qwen35Cache {
@@ -1575,8 +1808,8 @@ impl KvCache for Qwen35Cache {
         ))
     }
 
-    fn truncate(&mut self, _len: i32) -> Result<()> {
-        Err(Error::Msg("Qwen35Cache: truncate not yet supported".into()))
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        Qwen35Cache::truncate(self, len)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -1764,10 +1997,11 @@ pub(crate) mod tests {
     #[test]
     fn attn_kv_clone_snapshot_survives_in_place_updates_and_rolls_back() {
         let _cpu = CpuStream::enter();
-        // The MTP loop rolls back by restoring a `clone()` taken before the trial (there is no
-        // truncate on the hybrid cache). While the trial writes in place, the snapshot must stay
-        // exactly what it was, and continuing from it must match a reference that never saw the
-        // trial — across a block boundary, so the trial both overwrites padding and grows.
+        // A snapshot rollback (the MTP predictor cache, the engine's generic `SnapshotRollback`)
+        // restores a `clone()` taken before the trial. While the trial writes in place, the
+        // snapshot must stay exactly what it was, and continuing from it must match a reference
+        // that never saw the trial — across a block boundary, so the trial both overwrites padding
+        // and grows.
         let block = 4;
         let mut slot = AttnKv::with_block_tokens(block);
         let mut reference = ConcatReference::new();
@@ -1881,6 +2115,10 @@ pub(crate) mod tests {
     }
 
     fn synthetic_weights_with_prefix(cfg: &Qwen35Config, pfx: &str) -> Weights {
+        Weights::from_map(synthetic_tensors_with_prefix(cfg, pfx))
+    }
+
+    fn synthetic_tensors_with_prefix(cfg: &Qwen35Config, pfx: &str) -> HashMap<String, Array> {
         let h = cfg.hidden_size;
         let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
         let value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads;
@@ -2047,7 +2285,7 @@ pub(crate) mod tests {
                 &[h, cfg.intermediate_size],
             );
         }
-        Weights::from_map(m)
+        m
     }
 
     pub(crate) fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
@@ -2914,7 +3152,7 @@ pub(crate) mod tests {
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
     /// expert. Same 4-layer 3:1 mixer schedule as [`cfg_json`].
-    fn cfg_json_moe() -> serde_json::Value {
+    pub(crate) fn cfg_json_moe() -> serde_json::Value {
         let mut v = cfg_json();
         let tc = v["text_config"].as_object_mut().unwrap();
         tc.insert("model_type".into(), json!("qwen3_5_moe_text"));
@@ -2923,6 +3161,214 @@ pub(crate) mod tests {
         tc.insert("moe_intermediate_size".into(), json!(16));
         tc.insert("shared_expert_intermediate_size".into(), json!(16));
         v
+    }
+
+    /// [`cfg_json_moe`] with a configured MTP head — the 35B-A3B checkpoint's layout (sc-24438).
+    pub(crate) fn cfg_json_moe_mtp() -> serde_json::Value {
+        let mut v = cfg_json_moe();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("mtp_num_hidden_layers".into(), json!(1));
+        tc.insert("mtp_use_dedicated_embeddings".into(), json!(false));
+        v
+    }
+
+    /// Synthetic tensors for a sparse-MoE `cfg` with an MTP head whose predictor layer carries a
+    /// sparse-MoE FFN (router, experts, shared expert) instead of the dense MLP — as the 35B-A3B
+    /// checkpoint ships it (sc-24438) — with every MoE tensor (body and head) seeded **non-zero
+    /// random**. `fused` stores the experts as the Qwen3.6 release does (`experts.gate_up_proj` /
+    /// `experts.down_proj`); otherwise each expert under its own keys, as the bf16 Qwen3.5 release
+    /// does (`experts.{e}.{gate,up,down}_proj.weight`) — the same values either way.
+    pub(crate) fn seeded_moe_mtp_tensors(
+        cfg: &Qwen35Config,
+        fused: bool,
+    ) -> HashMap<String, Array> {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let moe = cfg.moe.as_ref().expect("a MoE config");
+        let h = cfg.hidden_size;
+        let (e, mi, si) = (
+            moe.num_experts,
+            moe.moe_intermediate_size,
+            moe.shared_expert_intermediate_size,
+        );
+        let mut m = synthetic_tensors_with_prefix(cfg, "model.language_model");
+        for dense in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(m
+                .remove(&format!("mtp.layers.0.mlp.{dense}.weight"))
+                .is_some());
+        }
+        let mut rng = SplitMix64::new(0x5EED_24438);
+        let mut layers: Vec<String> = (0..cfg.num_layers)
+            .map(|i| format!("model.language_model.layers.{i}."))
+            .collect();
+        layers.push("mtp.layers.0.".into());
+        for lp in layers {
+            let mut rand = |key: &str, shape: &[i32]| {
+                let n: i32 = shape.iter().product();
+                let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.8).collect();
+                m.insert(format!("{lp}{key}"), Array::from_slice(&data, shape));
+                data
+            };
+            let gate_up = rand("mlp.experts.gate_up_proj", &[e, 2 * mi, h]);
+            let down = rand("mlp.experts.down_proj", &[e, h, mi]);
+            rand("mlp.gate.weight", &[e, h]);
+            rand("mlp.shared_expert.gate_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.up_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.down_proj.weight", &[h, si]);
+            rand("mlp.shared_expert_gate.weight", &[1, h]);
+            if !fused {
+                m.remove(&format!("{lp}mlp.experts.gate_up_proj"));
+                m.remove(&format!("{lp}mlp.experts.down_proj"));
+                let (rows, bank) = ((mi * h) as usize, (2 * mi * h) as usize);
+                for x in 0..e as usize {
+                    let key = |p: &str| format!("{lp}mlp.experts.{x}.{p}_proj.weight");
+                    let gu = &gate_up[x * bank..(x + 1) * bank];
+                    m.insert(key("gate"), Array::from_slice(&gu[..rows], &[mi, h]));
+                    m.insert(key("up"), Array::from_slice(&gu[rows..], &[mi, h]));
+                    let dn = &down[x * rows..(x + 1) * rows];
+                    m.insert(key("down"), Array::from_slice(dn, &[h, mi]));
+                }
+            }
+        }
+        m
+    }
+
+    fn load_moe_mtp(cfg: &Qwen35Config, tensors: HashMap<String, Array>) -> Qwen35Model {
+        Qwen35Model::from_weights(
+            &Weights::from_map(tensors),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .expect("a MoE checkpoint with an MTP head loads")
+    }
+
+    fn host_f32(a: &Array) -> Vec<f32> {
+        a.as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
+    }
+
+    /// sc-24438 AC2 (a): a sparse-MoE checkpoint carrying an MTP head loads the head — its
+    /// predictor layer the body's sparse-MoE block — and the fused (Qwen3.6) and per-expert
+    /// (Qwen3.5) expert layouts of the same seeded non-zero weights give identical target logits
+    /// and identical `mtp_step` logits / hidden state.
+    #[test]
+    fn a_moe_mtp_head_runs_identically_in_both_expert_layouts() {
+        let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
+        let fused = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, true));
+        let split = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, false));
+        for model in [&fused, &split] {
+            assert!(model.has_mtp());
+            let Ffn::Moe(_) = &model.mtp.as_ref().unwrap().layers[0].ffn else {
+                panic!("the predictor layer is the sparse-MoE block");
+            };
+        }
+        let ids = Array::from_slice(&[1i32, 7, 3, 42], &[1, 4]);
+        let run = |model: &Qwen35Model| {
+            let hidden = model.hidden(&ids, &mut model.new_cache(), 0).unwrap();
+            let mut cache = model.new_mtp_cache().unwrap();
+            let shifted = Array::from_slice(&[7i32, 3, 42, 9], &[1, 4]);
+            let (mtp_hidden, mtp_logits) =
+                model.mtp_step(&shifted, &hidden, &mut cache, 0).unwrap();
+            (
+                host_f32(&hidden),
+                host_f32(&mtp_hidden),
+                host_f32(&mtp_logits),
+            )
+        };
+        let (a, b) = (run(&fused), run(&split));
+        assert!(
+            a.2.iter().any(|x| x.abs() > 1e-3),
+            "non-degenerate MTP logits"
+        );
+        assert_eq!(a.0, b.0, "target hidden");
+        assert_eq!(a.1, b.1, "MTP hidden");
+        assert_eq!(a.2, b.2, "MTP logits");
+    }
+
+    /// sc-24438 AC2 (b): the MTP predictor layer's FFN, built by the loader under the
+    /// `mtp.layers.0.` prefix from the `Qwen3_5MoeSparseMoeBlock.forward` oracle's weights (the
+    /// fused layout and the per-expert split of it), reproduces the oracle's output — the check
+    /// [`moe_ffn_matches_qwen3_5_moe_reference`] holds the block itself to, at bf16 tolerance.
+    #[test]
+    fn the_mtp_layer_ffn_matches_the_moe_reference() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
+        let arr = |k: &str| -> Vec<f32> {
+            json[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let (h, e, mi) = (8i32, 6i32, 4i32);
+        let mut v = cfg_json_moe_mtp();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("hidden_size".into(), json!(h));
+        tc.insert("moe_intermediate_size".into(), json!(mi));
+        tc.insert("shared_expert_intermediate_size".into(), json!(mi));
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        assert_eq!(
+            (
+                cfg.moe.unwrap().num_experts,
+                cfg.moe.unwrap().experts_per_tok
+            ),
+            (e, 2)
+        );
+        for fused in [true, false] {
+            let mut m = seeded_moe_mtp_tensors(&cfg, fused);
+            let lp = |s: &str| format!("mtp.layers.0.mlp.{s}");
+            let mut put = |key: String, data: &[f32], shape: &[i32]| {
+                m.insert(key, Array::from_slice(data, shape));
+            };
+            let (gate_up, down) = (arr("gate_up"), arr("down"));
+            if fused {
+                put(lp("experts.gate_up_proj"), &gate_up, &[e, 2 * mi, h]);
+                put(lp("experts.down_proj"), &down, &[e, h, mi]);
+            } else {
+                let rows = (mi * h) as usize;
+                for x in 0..e as usize {
+                    let gu = &gate_up[x * 2 * rows..(x + 1) * 2 * rows];
+                    let key = |p: &str| lp(&format!("experts.{x}.{p}_proj.weight"));
+                    put(key("gate"), &gu[..rows], &[mi, h]);
+                    put(key("up"), &gu[rows..], &[mi, h]);
+                    put(key("down"), &down[x * rows..(x + 1) * rows], &[h, mi]);
+                }
+            }
+            put(lp("gate.weight"), &arr("router"), &[e, h]);
+            put(
+                lp("shared_expert.gate_proj.weight"),
+                &arr("sh_gate"),
+                &[mi, h],
+            );
+            put(lp("shared_expert.up_proj.weight"), &arr("sh_up"), &[mi, h]);
+            put(
+                lp("shared_expert.down_proj.weight"),
+                &arr("sh_down"),
+                &[h, mi],
+            );
+            put(lp("shared_expert_gate.weight"), &arr("sh_gatew"), &[1, h]);
+            let model = load_moe_mtp(&cfg, m);
+            let ffn = &model.mtp.as_ref().unwrap().layers[0].ffn;
+            let got = host_f32(
+                &ffn.forward(&Array::from_slice(&arr("x"), &[1, 1, h]))
+                    .unwrap(),
+            );
+            let exp = arr("expected_output");
+            let md = got
+                .iter()
+                .zip(&exp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // The loader stores weights in bf16 (the block test above runs f32): bf16's 2^-8
+            // relative step on outputs of magnitude ~0.5, far below a wrong route or expert.
+            assert!(
+                md < 5e-3,
+                "fused {fused}: MTP-layer ffn vs reference: max abs diff {md}\n got {got:?}\n \
+                 exp {exp:?}"
+            );
+        }
     }
 
     /// The MoE FFN block, validated against a numeric oracle from the exact
@@ -3705,5 +4151,215 @@ pub(crate) mod tests {
             .as_slice::<f32>()
             .iter()
             .all(|x| x.is_finite()));
+    }
+
+    // ---- The DeltaNet checkpoint ring at the model level (sc-24435). ----
+
+    /// Feed `tokens` one forward each, returning the last forward's logits on the host.
+    fn step_each(model: &Qwen35Model, cache: &mut Qwen35Cache, tokens: &[i32]) -> Vec<f32> {
+        let mut last = Vec::new();
+        for &t in tokens {
+            let offset = cache.offset();
+            let logits = model
+                .decode_logits(&crate::primitives::input_ids(&[t]), cache, offset)
+                .unwrap();
+            last = host(&logits);
+        }
+        last
+    }
+
+    fn prefilled(model: &Qwen35Model, prompt: &[i32]) -> Qwen35Cache {
+        let mut cache = model.new_cache();
+        let logits = model
+            .decode_logits(&crate::primitives::input_ids(prompt), &mut cache, 0)
+            .unwrap();
+        logits.eval().unwrap();
+        cache
+    }
+
+    const RING_PROMPT: [i32; 6] = [3, 9, 4, 11, 3, 9];
+
+    /// The draft-model shape of the ring seam: one checkpoint window opened at the step start
+    /// spans several single-token forwards (and a multi-token one), and the hybrid cache truncates
+    /// to **each** position of it — the DeltaNet layers restore their kept state, the attention KV
+    /// drops the rest by offset — after which the next forward's logits are exactly those of a
+    /// cache that never saw the dropped tokens.
+    #[test]
+    fn a_checkpoint_window_over_several_forwards_truncates_to_each_position() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        let p = RING_PROMPT.len() as i32;
+        let drafts = [4, 11, 7, 20];
+        let next = 13;
+        for j in 0..=drafts.len() {
+            let mut cache = prefilled(&model, &RING_PROMPT);
+            cache.arm_checkpoints(drafts.len() as i32);
+            step_each(&model, &mut cache, &drafts);
+            assert_eq!(cache.restorable(), p..p + drafts.len() as i32);
+            cache.truncate(p + j as i32).unwrap();
+            assert_eq!(cache.offset(), p + j as i32);
+            let got = step_each(&model, &mut cache, &[next]);
+            let mut reference = prefilled(&model, &RING_PROMPT);
+            step_each(&model, &mut reference, &drafts[..j]);
+            let want = step_each(&model, &mut reference, &[next]);
+            assert_eq!(got, want, "truncated to {j} kept drafts");
+        }
+
+        // A multi-token forward inside the window (the verify shape) followed by a single token.
+        let mut cache = prefilled(&model, &RING_PROMPT);
+        cache.arm_checkpoints(4);
+        let offset = cache.offset();
+        model
+            .decode_logits(
+                &crate::primitives::input_ids(&drafts[..3]),
+                &mut cache,
+                offset,
+            )
+            .unwrap()
+            .eval()
+            .unwrap();
+        step_each(&model, &mut cache, &drafts[3..]);
+        assert_eq!(cache.restorable(), p..p + 4);
+        cache.truncate(p + 2).unwrap();
+        let got = step_each(&model, &mut cache, &[next]);
+        // The reference never saw the third token.
+        let mut reference = prefilled(&model, &RING_PROMPT);
+        step_each(&model, &mut reference, &drafts[..2]);
+        let want = step_each(&model, &mut reference, &[next]);
+        let max = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // The kept states came out of a 3-token forward, the reference's out of single-token
+        // ones: equal up to the multi-row projection's bf16 rounding.
+        assert!(max < 5e-2, "restored-from-verify logits differ by {max}");
+    }
+
+    /// `truncate` is refused (typed, cache untouched) outside the checkpoint window — with no
+    /// window at all, and before the window's start — and a truncation closes the window: the
+    /// next forward records nothing and drops it. `0` is a reset and the current length a no-op,
+    /// through the [`KvCache`] trait too.
+    #[test]
+    fn truncate_outside_the_checkpoint_window_is_refused_and_closes_it() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        let p = RING_PROMPT.len() as i32;
+        let mut cache = prefilled(&model, &RING_PROMPT);
+        step_each(&model, &mut cache, &[4, 11]);
+        let err = cache.truncate(p + 1).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "no window: {err}");
+        assert_eq!(cache.offset(), p + 2);
+
+        cache.arm_checkpoints(2);
+        step_each(&model, &mut cache, &[7, 20]);
+        let err = cache.truncate(p + 1).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "before the window: {err}"
+        );
+        assert_eq!(
+            cache.offset(),
+            p + 4,
+            "a refused truncate leaves the cache untouched"
+        );
+        assert!(cache.truncate(p + 5).is_err(), "past the end");
+
+        KvCache::truncate(&mut cache, p + 3).unwrap();
+        assert_eq!(cache.offset(), p + 3);
+        step_each(&model, &mut cache, &[5]);
+        assert!(
+            cache.restorable().is_empty(),
+            "the truncation closed the window"
+        );
+        assert!(cache.truncate(p + 3).is_err());
+
+        let offset = cache.offset();
+        KvCache::truncate(&mut cache, offset).unwrap();
+        assert_eq!(cache.offset(), p + 4);
+        KvCache::truncate(&mut cache, 0).unwrap();
+        assert_eq!(cache.offset(), 0);
+    }
+
+    /// sc-24435: a checkpoint window armed for `2` tokens refuses a 3-token forward (typed)
+    /// before any layer runs — the offset, every DeltaNet state and the attention KV are as they
+    /// were, so the next forward's logits are a never-refused cache's.
+    #[test]
+    fn a_forward_past_the_armed_window_is_refused_untouched() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        let p = RING_PROMPT.len() as i32;
+        let mut cache = prefilled(&model, &RING_PROMPT);
+        cache.arm_checkpoints(2);
+        let before = cache.delta_states();
+        let err = model
+            .decode_logits(&crate::primitives::input_ids(&[4, 11, 7]), &mut cache, p)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::CheckpointWindowFull {
+                    recorded: 0,
+                    requested: 3,
+                    max_tokens: 2
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(cache.offset(), p);
+        assert_eq!(cache.delta_states(), before);
+        assert_eq!(cache.checkpointed_tokens(), 0);
+        let got = step_each(&model, &mut cache, &[4, 11]);
+        let want = step_each(&model, &mut prefilled(&model, &RING_PROMPT), &[4, 11]);
+        assert_eq!(got, want);
+    }
+
+    /// E7 (sc-24435): the checkpoint ring's resident memory — the window's start state plus every
+    /// kept per-token state and conv input, measured on the cache — never exceeds what
+    /// [`Qwen35Model::checkpoint_ring_bytes`] prices for the speculative width, for a verify step
+    /// (`width + 1` tokens in one forward, the cap the window is armed with) and for a draft
+    /// model's window (`width` single-token forwards). Keeping every position — a full acceptance,
+    /// `truncate(offset())` — closes the window, so the next forward records nothing and releases
+    /// the ring.
+    #[test]
+    fn the_checkpoint_ring_footprint_is_what_admission_prices() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        for width in [1usize, 4, 8] {
+            let priced = model.checkpoint_ring_bytes(width).unwrap() as usize;
+            let cap = width as i32 + 1;
+            let tokens: Vec<i32> = (0..cap).map(|i| 4 + i).collect();
+            let released = |cache: &mut Qwen35Cache, live: usize, label: &str| {
+                let offset = cache.offset();
+                cache.truncate(offset).unwrap();
+                step_each(&model, cache, &[5]);
+                assert!(cache.restorable().is_empty(), "{label}: the window closed");
+                assert_eq!(cache.checkpointed_tokens(), 0, "{label}: nothing recorded");
+                assert_eq!(cache.recurrent_bytes(), live, "{label}: the ring released");
+            };
+
+            let mut cache = prefilled(&model, &RING_PROMPT);
+            let live = cache.recurrent_bytes();
+            cache.arm_checkpoints(cap);
+            step_each(&model, &mut cache, &tokens[..width]);
+            let ring = cache.recurrent_bytes() - live;
+            assert!(
+                ring > 0 && ring <= priced,
+                "draft {width}: ring {ring} B, priced {priced} B"
+            );
+            released(&mut cache, live, &format!("draft {width}"));
+
+            let mut cache = prefilled(&model, &RING_PROMPT);
+            cache.arm_checkpoints(cap);
+            let offset = cache.offset();
+            model
+                .decode_logits(&crate::primitives::input_ids(&tokens), &mut cache, offset)
+                .unwrap()
+                .eval()
+                .unwrap();
+            let ring = cache.recurrent_bytes() - live;
+            assert!(
+                ring > 0 && ring <= priced,
+                "verify {width}: ring {ring} B, priced {priced} B"
+            );
+            released(&mut cache, live, &format!("verify {width}"));
+        }
+        assert!(model.checkpoint_ring_bytes(8) > model.checkpoint_ring_bytes(4));
     }
 }

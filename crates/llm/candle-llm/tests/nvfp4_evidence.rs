@@ -416,6 +416,7 @@ fn nvfp4_real_weight_evidence() {
         quantize: Some(core_llm::Quantize::Nvfp4),
         cuda_graphs: None,
         prefix_cache_bytes: None,
+        draft_source: None,
     })
     .expect("provider NVFP4 load");
     let provider_load_secs = started.elapsed().as_secs_f64();
@@ -469,6 +470,7 @@ fn nvfp4_refused_on_cpu_for_the_real_snapshot() {
         quantize: Some(core_llm::Quantize::Nvfp4),
         cuda_graphs: None,
         prefix_cache_bytes: None,
+        draft_source: None,
     }) {
         Err(core_llm::Error::Unsupported(msg)) => {
             assert!(msg.starts_with("nvfp4: "), "{msg}");

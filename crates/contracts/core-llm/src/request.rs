@@ -45,7 +45,8 @@ pub enum MtpMode {
     Auto,
     /// Require MTP and propose at most `draft_tokens` tokens per target verification pass.
     Enabled {
-        /// Number of speculative draft tokens. Must be within the provider's advertised limit.
+        /// Number of speculative draft tokens (`>= 1`). Above the provider's advertised limit it
+        /// runs at that limit, the clamp named in the decode report (sc-24438).
         draft_tokens: u32,
     },
 }
@@ -129,8 +130,10 @@ pub enum Speculative {
     /// backend offers neither ([`resolve_speculative`](crate::speculative::resolve_speculative)).
     Auto,
     /// Exactly this proposer, proposing up to `depth` tokens per target verification pass. A
-    /// proposer the model does not advertise, a zero depth, or a depth above the advertised
-    /// maximum is refused by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request).
+    /// proposer the model does not advertise, or a zero depth, is refused by
+    /// [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request); a
+    /// depth above the advertised maximum runs at that maximum, the clamp named in
+    /// [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) (sc-24438).
     Proposer {
         /// The proposal source.
         proposer: SpeculativeProposer,
@@ -745,6 +748,10 @@ mod tests {
             spec.cuda_graphs.is_none(),
             "a dense load keeps the backend's graph default"
         );
+        assert!(spec.draft_source.is_none(), "no draft unless one is named");
+        let spec = spec.with_draft("draft-dir");
+        assert_eq!(spec.draft_source.as_deref(), Some("draft-dir"));
+        assert_eq!(spec.source, "model.gguf", "naming a draft keeps the target");
     }
 }
 
@@ -777,6 +784,21 @@ pub struct LoadSpec {
     /// `Some(0)` turns the cache off. The load admits it: the settled budget is this clamped to
     /// the headroom the load's own admission leaves ([`prefix_cache_budget`](crate::prefix_cache_budget)).
     pub prefix_cache_bytes: Option<u64>,
+    /// An optional **draft model** for [`SpeculativeProposer::DraftModel`] speculation (epic
+    /// sc-24432, story sc-24436): a snapshot directory (or other source the provider loads) of a
+    /// smaller model sharing the target's tokenizer. The provider loads it beside the target as a
+    /// second resident model with its own decode cache, applying the same load-time
+    /// [`quantize`](Self::quantize) tier, and counts its weights in load admission and its cache
+    /// in request admission. `None` (the default) loads no draft, exactly as before.
+    ///
+    /// A draft never fails the load: one the provider cannot use — a tokenizer vocabulary that is
+    /// not the target's, logits over more ids than the target's, an unreadable source, or no room
+    /// beside the target — is refused with the reason named in
+    /// [`LoadReport::draft`](crate::LoadReport::draft), the target loads alone, and `draft_model`
+    /// is not advertised. `draft_model` is advertised in
+    /// [`TextLlmCapabilities::speculative`](crate::TextLlmCapabilities::speculative) only while a
+    /// compatible draft is resident.
+    pub draft_source: Option<String>,
 }
 
 /// Load-time quantization request.
@@ -803,12 +825,20 @@ impl LoadSpec {
             quantize: None,
             cuda_graphs: None,
             prefix_cache_bytes: None,
+            draft_source: None,
         }
     }
 
     /// Associate an exact multimodal projector artifact with this model load.
     pub fn with_projector(mut self, source: impl Into<String>) -> Self {
         self.projector_source = Some(source.into());
+        self
+    }
+
+    /// Name a draft model to load beside the target for `draft_model` speculation
+    /// ([`draft_source`](Self::draft_source)).
+    pub fn with_draft(mut self, source: impl Into<String>) -> Self {
+        self.draft_source = Some(source.into());
         self
     }
 }

@@ -21,9 +21,12 @@
 //!    for a penalized or constrained greedy run, and the distribution-preserving
 //!    [`accept_token`] rejection rule for a stochastic run (E1).
 //! 4. **Recover** the cache to `[cur, accepted…]` through the target's [`CacheRollback`]: a
-//!    [`Rollback::Direct`] truncation where the cache supports it (the softmax KV cache), else the
-//!    cache is [`Rollback::Restored`] to the step start and the kept prefix is **replayed** in one
-//!    forward (the Qwen35 hybrid, whose DeltaNet state cannot be truncated). Both are counted.
+//!    [`Rollback::Direct`] truncation where the cache supports it — the softmax KV cache by
+//!    offset ([`TruncateRollback`]), the Qwen35 hybrid by selecting its DeltaNet checkpoint
+//!    ring's row for the last kept token and truncating its attention KV by offset
+//!    ([`CheckpointRingRollback`], sc-24435) — else the cache is [`Rollback::Restored`] to the
+//!    step start and the kept prefix is **replayed** in one forward ([`SnapshotRollback`], for a
+//!    cache that can do neither). Both are counted.
 //! 5. **Commit** through the shared event path: stop tokens, constraint advance, the caller's
 //!    stop predicate and the budget, then the proposer reconciles its own state
 //!    ([`Proposer::commit`]).
@@ -115,7 +118,7 @@ pub enum Rollback {
 /// strategy lives for one run; [`begin`](Self::begin) precedes every verify forward that carries
 /// drafts and [`recover`](Self::recover) ends that step.
 pub trait CacheRollback<C> {
-    /// Stable lower-case label (`truncate`, `snapshot_replay`).
+    /// Stable lower-case label (`truncate`, `checkpoint_ring`, `snapshot_replay`).
     fn label(&self) -> &'static str;
     /// Remember whatever a later recovery needs, before the verify forward writes the cache. The
     /// cache is lent mutably so a strategy can arm per-step state inside it (a DeltaNet checkpoint
@@ -146,11 +149,13 @@ impl<C: KvCache> CacheRollback<C> for TruncateRollback {
     }
 }
 
-/// Snapshot-and-replay rollback for a cache whose state cannot be truncated (the Qwen35 hybrid's
-/// DeltaNet recurrence): the step start is cloned before the verify forward — MLX arrays are
-/// refcounted and the KV slots copy on write, so the clone is cheap — and a partial acceptance
+/// Snapshot-and-replay rollback for a cache that can neither truncate nor checkpoint: the step
+/// start is cloned before the verify forward — MLX arrays are refcounted, so the clone itself is
+/// cheap, but while it is held every in-place KV write copies its block — and a partial acceptance
 /// restores it, after which the engine replays the kept prefix. The snapshot is released at the
-/// end of every step so the next step's in-place cache writes never copy a buffer it still holds.
+/// end of every step. No shipped target uses it since the Qwen35 hybrid rolls back through its
+/// checkpoint ring ([`CheckpointRingRollback`]); it remains the generic fallback the
+/// [`Rollback::Restored`] path serves.
 #[derive(Clone, Debug)]
 pub struct SnapshotRollback<C> {
     snapshot: Option<C>,
@@ -184,6 +189,47 @@ impl<C: Clone + KvCache> CacheRollback<C> for SnapshotRollback<C> {
     }
 }
 
+/// Direct rollback for the Qwen35 hybrid through its DeltaNet checkpoint ring (sc-24435):
+/// [`begin`](CacheRollback::begin) opens a checkpoint window at the step start, so every forward
+/// until the recovery — the verify forward, or a draft model's several proposal forwards — keeps
+/// each token's recurrent + conv state, and [`recover`](CacheRollback::recover) truncates to the
+/// kept prefix and closes the window: the DeltaNet layers select the state kept at the last kept
+/// position and the attention KV drops the rejected positions by offset. No replay forward, and no
+/// snapshot: the cache is never cloned, so the forwards write the attention KV block in place.
+///
+/// The window is armed for `width + 1` tokens — a full verify step of `width` drafts, or a draft
+/// model's proposal of fewer single-token forwards — the most
+/// [`Qwen35Model::checkpoint_ring_bytes`] prices for `width`; a forward past it is refused
+/// ([`Error::CheckpointWindowFull`]) rather than growing the ring unpriced.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointRingRollback {
+    max_tokens: i32,
+}
+
+impl CheckpointRingRollback {
+    /// The ring rollback for a run of up to `width` drafts per step.
+    pub fn new(width: usize) -> Self {
+        let max_tokens = i32::try_from(width).map_or(i32::MAX, |w| w.saturating_add(1));
+        Self { max_tokens }
+    }
+}
+
+impl CacheRollback<Qwen35Cache> for CheckpointRingRollback {
+    fn label(&self) -> &'static str {
+        "checkpoint_ring"
+    }
+
+    fn begin(&mut self, cache: &mut Qwen35Cache) {
+        cache.arm_checkpoints(self.max_tokens);
+    }
+
+    fn recover(&mut self, cache: &mut Qwen35Cache, keep: i32) -> Result<Rollback> {
+        // Also closes the window when everything was kept (`keep == offset`).
+        cache.truncate(keep)?;
+        Ok(Rollback::Direct)
+    }
+}
+
 /// A target model the engine verifies against.
 pub trait SpeculativeTarget {
     /// The target's decode cache.
@@ -195,8 +241,9 @@ pub trait SpeculativeTarget {
     fn new_cache(&self) -> Self::Cache;
     /// Positions the cache holds — the next forward's first cache position.
     fn cache_len(&self, cache: &Self::Cache) -> i32;
-    /// A fresh rollback strategy for one run.
-    fn rollback(&self) -> Self::Rollback;
+    /// A fresh rollback strategy for one run proposing up to `width` drafts per verify step (so
+    /// a verify forward carries at most `width + 1` tokens).
+    fn rollback(&self, width: usize) -> Self::Rollback;
     /// Run the `[1, n]` int32 token `ids` through the target, appending them to `cache`.
     /// `rope_offset` is the RoPE position of the first id (the cache length plus any multimodal
     /// continuation shift). The ids are an array, not a host slice, so a step's input can be a
@@ -229,7 +276,7 @@ impl SpeculativeTarget for CausalLm {
         cache.offset()
     }
 
-    fn rollback(&self) -> TruncateRollback {
+    fn rollback(&self, _: usize) -> TruncateRollback {
         TruncateRollback
     }
 
@@ -273,7 +320,7 @@ impl SpeculativeTarget for CausalLm {
 
 impl SpeculativeTarget for Qwen35Model {
     type Cache = Qwen35Cache;
-    type Rollback = SnapshotRollback<Qwen35Cache>;
+    type Rollback = CheckpointRingRollback;
 
     fn new_cache(&self) -> Qwen35Cache {
         Qwen35Model::new_cache(self)
@@ -283,8 +330,8 @@ impl SpeculativeTarget for Qwen35Model {
         cache.offset()
     }
 
-    fn rollback(&self) -> SnapshotRollback<Qwen35Cache> {
-        SnapshotRollback::default()
+    fn rollback(&self, width: usize) -> CheckpointRingRollback {
+        CheckpointRingRollback::new(width)
     }
 
     fn forward(
@@ -360,7 +407,7 @@ impl SpeculativeTarget for StepTarget<'_> {
         cache.offset()
     }
 
-    fn rollback(&self) -> TruncateRollback {
+    fn rollback(&self, _: usize) -> TruncateRollback {
         TruncateRollback
     }
 
@@ -882,7 +929,7 @@ where
         arrays.extend(warm.as_ref());
         timer.finish_prefill(arrays)?;
     }
-    let mut rollback = target.rollback();
+    let mut rollback = target.rollback(width);
 
     // A cancel that tripped during the prefill ends the run before its first draw, exactly as the
     // plain loop's per-step check does.
@@ -1292,7 +1339,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::config::{Architecture, ModelConfig};
-    use crate::decode::proposers::{MtpProposer, NgramProposer};
+    use crate::decode::proposers::{DraftModelProposer, MtpProposer, NgramProposer};
     use crate::decode::stream::generate_with;
     use crate::models::qwen35::tests::{cfg_json, cfg_json_mtp, synthetic_weights};
     use crate::models::Qwen35Config;
@@ -1309,10 +1356,18 @@ pub(crate) mod tests {
     /// The tiny random llama-family decoder over a `vocab`-entry vocabulary (hidden 16, two
     /// layers), drawn from one fixed seed.
     pub(crate) fn tiny_llama(vocab: i32) -> CausalLm {
+        causal_model(vocab, 2)
+    }
+
+    /// The tiny llama-family decoder over `vocab` ids with its first `layers` layers. The weights
+    /// are drawn in a fixed order (embedding, output projection, then layer by layer), so a
+    /// shallower model is the deeper one with its later layers skipped — a draft that shares the
+    /// target's embedding, output projection and first layer (sc-24436).
+    pub(crate) fn causal_model(vocab: i32, layers: usize) -> CausalLm {
         let cfg = ModelConfig {
             hidden_size: 16,
             intermediate_size: 32,
-            num_layers: 2,
+            num_layers: layers,
             num_heads: 4,
             num_kv_heads: 2,
             head_dim: 4,
@@ -1604,8 +1659,9 @@ pub(crate) mod tests {
     }
 
     /// AC1: greedy prompt lookup emits exactly the plain loop's tokens — plain, penalized and
-    /// constrained — on the Causal target (direct truncation) and the Qwen35 hybrid (snapshot
-    /// restore + replay), while actually proposing, accepting and rejecting.
+    /// constrained — on the Causal target (direct truncation) and the Qwen35 hybrid (its DeltaNet
+    /// checkpoint ring, sc-24435: direct, never a replay forward), while actually proposing,
+    /// accepting and rejecting.
     #[test]
     fn greedy_prompt_lookup_is_the_plain_loop_and_recovers_both_ways() {
         let causal = causal();
@@ -1659,11 +1715,8 @@ pub(crate) mod tests {
                     "hybrid {name}: lookup ran: {s:?}"
                 );
             }
-            assert_eq!(
-                s.direct_rollbacks, 0,
-                "hybrid {name}: DeltaNet cannot truncate"
-            );
-            assert_eq!(run.report.replay_forwards, s.replays as u64);
+            assert_eq!(s.replays, 0, "hybrid {name}: the ring never replays");
+            assert_eq!(run.report.replay_forwards, 0, "hybrid {name}");
         }
         // The plain greedy fixture exercises every recovery kind at least once.
         let run = engine(
@@ -1683,11 +1736,16 @@ pub(crate) mod tests {
             4,
             None,
         );
-        assert!(run.stats.replays > 0, "{:?}", run.stats);
+        assert!(
+            run.stats.direct_rollbacks > 0 && run.stats.replays == 0,
+            "{:?}",
+            run.stats
+        );
     }
 
     /// AC1: greedy MTP emits exactly the plain loop's tokens (plain, penalized, constrained) on
-    /// the Qwen35 MTP fixture, whose adversarial drafts force the snapshot-replay recovery.
+    /// the Qwen35 MTP fixture, whose adversarial drafts force a partial rejection — recovered
+    /// through the checkpoint ring, with zero replay forwards (sc-24435).
     #[test]
     fn greedy_mtp_is_the_plain_loop() {
         let model = qwen35(true);
@@ -1709,13 +1767,420 @@ pub(crate) mod tests {
             assert_eq!(b.accepted, a.accepted, "{name}: constraint");
             assert_accounting(&format!("mtp {name}"), &run, &config);
             assert!(
-                run.stats.proposed > 0 && run.stats.replays > 0,
+                run.stats.proposed > 0 && run.stats.direct_rollbacks > 0,
                 "{name}: {:?}",
                 run.stats
             );
+            assert_eq!(run.stats.replays, 0, "{name}: the ring never replays");
+            assert_eq!(run.report.replay_forwards, 0, "{name}");
             assert_eq!(run.report.path, "mtp");
             assert_eq!(run.report.proposer, ProposerKind::Mtp);
             assert_eq!(run.report.draft_tokens, Some(3));
+        }
+    }
+
+    /// The Qwen35 target under test: every forward is delegated to the model, then the attention
+    /// KV's block-buffer addresses are recorded (the in-place probe) — rolled back by `R`, the
+    /// checkpoint ring the target ships with or the step-start snapshot it replaced. A
+    /// [`LogitsScope::Last`] forward (the prefill, a no-draft step, a replay) runs outside any
+    /// checkpoint window: it must leave the cache recording nothing.
+    struct Observed<'m, R> {
+        model: &'m Qwen35Model,
+        addresses: std::cell::RefCell<Vec<Vec<usize>>>,
+        rollback: fn(usize) -> R,
+    }
+
+    impl<'m, R> Observed<'m, R> {
+        fn new(model: &'m Qwen35Model, rollback: fn(usize) -> R) -> Self {
+            Self {
+                model,
+                addresses: Default::default(),
+                rollback,
+            }
+        }
+    }
+
+    impl<R: CacheRollback<Qwen35Cache>> SpeculativeTarget for Observed<'_, R> {
+        type Cache = Qwen35Cache;
+        type Rollback = R;
+
+        fn new_cache(&self) -> Qwen35Cache {
+            self.model.new_cache()
+        }
+
+        fn cache_len(&self, cache: &Qwen35Cache) -> i32 {
+            cache.offset()
+        }
+
+        fn rollback(&self, width: usize) -> R {
+            (self.rollback)(width)
+        }
+
+        fn forward(
+            &self,
+            cache: &mut Qwen35Cache,
+            ids: &Array,
+            rope_offset: i32,
+            scope: LogitsScope,
+            want_hidden: bool,
+        ) -> Result<TargetOutput> {
+            let out = SpeculativeTarget::forward(
+                self.model,
+                cache,
+                ids,
+                rope_offset,
+                scope,
+                want_hidden,
+            )?;
+            if scope == LogitsScope::Last {
+                assert_eq!(
+                    cache.checkpointed_tokens(),
+                    0,
+                    "a forward outside a verify step recorded checkpoints"
+                );
+            }
+            self.addresses
+                .borrow_mut()
+                .push(cache.attn_buffer_addresses());
+            Ok(out)
+        }
+
+        fn attention_label(&self) -> &'static str {
+            "gqa"
+        }
+    }
+
+    /// A proposer wrapper recording each step's `(proposed, accepted)` draft counts.
+    struct Tally<P> {
+        inner: P,
+        proposed: usize,
+        steps: Vec<(usize, usize)>,
+    }
+
+    impl<P> Tally<P> {
+        fn new(inner: P) -> Self {
+            Self {
+                inner,
+                proposed: 0,
+                steps: Vec::new(),
+            }
+        }
+
+        /// Steps whose every proposed draft was accepted.
+        fn full_acceptances(&self) -> usize {
+            self.steps.iter().filter(|&&(p, a)| p > 0 && a == p).count()
+        }
+
+        /// Steps that rejected a proposed draft.
+        fn partial_rejections(&self) -> usize {
+            self.steps.iter().filter(|&&(p, a)| a < p).count()
+        }
+    }
+
+    /// A Qwen35 proposer run against the observed target: the model is what it proposes from.
+    impl<'m, R, P> Proposer<Observed<'m, R>> for Tally<P>
+    where
+        R: CacheRollback<Qwen35Cache>,
+        P: Proposer<Qwen35Model>,
+    {
+        fn kind(&self) -> ProposerKind {
+            self.inner.kind()
+        }
+
+        fn wants_hidden(&self) -> bool {
+            self.inner.wants_hidden()
+        }
+
+        fn warm(
+            &mut self,
+            target: &Observed<'m, R>,
+            prompt: &[i32],
+            hidden: Option<&Array>,
+        ) -> Result<Option<Array>> {
+            self.inner.warm(target.model, prompt, hidden)
+        }
+
+        fn propose(
+            &mut self,
+            target: &Observed<'m, R>,
+            ctx: &ProposeContext<'_>,
+            sampler: &mut DraftSampler<'_, '_>,
+        ) -> Result<Proposal> {
+            let proposal = self.inner.propose(target.model, ctx, sampler)?;
+            self.proposed = proposal.drafts.len();
+            Ok(proposal)
+        }
+
+        fn commit(
+            &mut self,
+            target: &Observed<'m, R>,
+            cur: i32,
+            accepted: &[i32],
+            kept_hidden: Option<&Array>,
+            position: i32,
+        ) -> Result<()> {
+            self.steps
+                .push((std::mem::take(&mut self.proposed), accepted.len()));
+            self.inner
+                .commit(target.model, cur, accepted, kept_hidden, position)
+        }
+    }
+
+    /// AC1 + AC2 (sc-24435): on the Qwen35 hybrid, prompt lookup and MTP recover every partial
+    /// rejection through the DeltaNet checkpoint ring — zero replay forwards, the greedy tokens
+    /// of the plain loop — and no step clones the target cache: across every forward after the
+    /// prefill (full-acceptance steps included) the attention KV block buffers keep their
+    /// addresses, i.e. every forward wrote them in place. The recurrence routes show the ring's
+    /// cost is confined to the verify steps: prefill and no-draft steps run the final-state
+    /// kernel, each verify step with drafts the checkpoint kernel.
+    ///
+    /// The probe is shown to see a copy: under the step-start snapshot the ring replaced, the same
+    /// run clones the cache every verify step, the in-place write then lands in a fresh block,
+    /// and a partial rejection costs a replay forward — with the same tokens.
+    #[test]
+    fn the_hybrid_rolls_back_through_its_checkpoint_ring_without_replay_or_clone() {
+        use crate::models::qwen35::counting_cache_clones;
+        use crate::primitives::gated_delta::{recording_routes, Route};
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            let linear_layers = 3;
+            for (label, model, mtp) in [
+                ("prompt lookup", qwen35(false), false),
+                ("mtp", qwen35(true), true),
+            ] {
+                let config = greedy(24);
+                let expected = plain(&model, &PROMPT, &config, None);
+                let ring = Observed::new(&model, CheckpointRingRollback::new);
+                let run_with = |proposer: &mut dyn FnMut() -> SpeculativeRun| {
+                    let ((run, clones), routes) =
+                        recording_routes(|| counting_cache_clones(proposer));
+                    (run, clones, routes)
+                };
+                let mut lookup = Tally::new(NgramProposer::default());
+                let mut head = Tally::new(MtpProposer::new());
+                let (run, clones, routes) = run_with(&mut || {
+                    if mtp {
+                        engine(&ring, &mut head, &PROMPT, &config, 3, None)
+                    } else {
+                        engine(&ring, &mut lookup, &PROMPT, &config, 4, None)
+                    }
+                });
+                let (full, partial, steps) = if mtp {
+                    (
+                        head.full_acceptances(),
+                        head.partial_rejections(),
+                        head.steps.clone(),
+                    )
+                } else {
+                    (
+                        lookup.full_acceptances(),
+                        lookup.partial_rejections(),
+                        lookup.steps.clone(),
+                    )
+                };
+                assert_eq!(run.output.tokens, expected.tokens, "{label}: != plain loop");
+                assert_accounting(label, &run, &config);
+                assert!(partial > 0, "{label}: a partial rejection ran: {steps:?}");
+                assert_eq!(run.report.replay_forwards, 0, "{label}: {:?}", run.report);
+                assert_eq!(run.stats.direct_rollbacks, partial, "{label}");
+                assert_eq!(clones, 0, "{label}: the target cache is never cloned");
+                let addresses = ring.addresses.borrow();
+                assert_eq!(addresses.len() as u64, run.report.target_forwards);
+                assert!(
+                    addresses.windows(2).all(|w| w[0] == w[1]),
+                    "{label}: the attention KV moved: {addresses:?}"
+                );
+                if !mtp {
+                    // The adversarial MTP head never has a draft accepted; the lookup fixture
+                    // covers the full-acceptance steps.
+                    assert!(full > 0, "{label}: a full acceptance ran: {steps:?}");
+                }
+                let drafted = steps.iter().filter(|&&(p, _)| p > 0).count();
+                let count = |r: Route| routes.iter().filter(|&&x| x == r).count();
+                assert_eq!(
+                    count(Route::CheckpointKernel),
+                    linear_layers * drafted,
+                    "{label}: {routes:?}"
+                );
+                assert_eq!(
+                    count(Route::Kernel),
+                    linear_layers * (1 + steps.len() - drafted),
+                    "{label}: prefill and no-draft steps keep the final-state kernel"
+                );
+                assert_eq!(count(Route::Ops) + count(Route::Chunked), 0, "{label}");
+            }
+
+            // A full acceptance closes the window: an oracle proposing the plain loop's own next
+            // token (always accepted) every other step, so each full acceptance is followed by a
+            // no-draft step, whose forward the observed target checks records nothing.
+            struct Oracle {
+                expected: Vec<i32>,
+                steps: usize,
+            }
+            impl<T: SpeculativeTarget + ?Sized> Proposer<T> for Oracle {
+                fn kind(&self) -> ProposerKind {
+                    ProposerKind::PromptLookup
+                }
+                fn warm(&mut self, _: &T, _: &[i32], _: Option<&Array>) -> Result<Option<Array>> {
+                    Ok(None)
+                }
+                fn propose(
+                    &mut self,
+                    _: &T,
+                    ctx: &ProposeContext<'_>,
+                    _: &mut DraftSampler<'_, '_>,
+                ) -> Result<Proposal> {
+                    self.steps += 1;
+                    let next = self.expected.get(ctx.history.len() - PROMPT.len());
+                    Ok(Proposal {
+                        drafts: next
+                            .filter(|_| self.steps % 2 == 1)
+                            .copied()
+                            .into_iter()
+                            .collect(),
+                        dists: Vec::new(),
+                    })
+                }
+                fn commit(
+                    &mut self,
+                    _: &T,
+                    _: i32,
+                    _: &[i32],
+                    _: Option<&Array>,
+                    _: i32,
+                ) -> Result<()> {
+                    Ok(())
+                }
+            }
+            let model = qwen35(false);
+            let config = greedy(12);
+            let expected = plain(&model, &PROMPT, &config, None).tokens;
+            let ring = Observed::new(&model, CheckpointRingRollback::new);
+            let mut oracle = Tally::new(Oracle {
+                expected: expected.clone(),
+                steps: 0,
+            });
+            let run = engine(&ring, &mut oracle, &PROMPT, &config, 4, None);
+            assert_eq!(run.output.tokens, expected, "oracle: != plain loop");
+            let followed = oracle
+                .steps
+                .windows(2)
+                .filter(|w| w[0] == (1, 1) && w[1].0 == 0)
+                .count();
+            assert!(
+                followed > 0,
+                "a no-draft step followed a full acceptance: {:?}",
+                oracle.steps
+            );
+
+            // The contrast: the same lookup run on the step-start snapshot.
+            let model = qwen35(false);
+            let config = greedy(24);
+            let snapshot = Observed::new(&model, |_| SnapshotRollback::<Qwen35Cache>::default());
+            let (run, clones) = counting_cache_clones(|| {
+                engine(
+                    &snapshot,
+                    &mut Tally::new(NgramProposer::default()),
+                    &PROMPT,
+                    &config,
+                    4,
+                    None,
+                )
+            });
+            assert_eq!(
+                run.output.tokens,
+                plain(&model, &PROMPT, &config, None).tokens,
+                "replay recovers the same tokens"
+            );
+            assert!(run.stats.replays > 0, "{:?}", run.stats);
+            assert!(clones > 0, "the snapshot clones every verify step");
+            let addresses = snapshot.addresses.borrow();
+            assert!(
+                addresses.windows(2).any(|w| w[0] != w[1]),
+                "a held snapshot makes the in-place write copy its block"
+            );
+        });
+    }
+
+    /// The draft-model window through the [`CacheRollback`] seam (sc-24435; the shape a draft
+    /// proposer drives on its own cache): one `begin`, three separate single-token forwards, then
+    /// `recover` to each position from the step start (nothing kept) to all three kept. The
+    /// window is armed for `width + 1` tokens, so width 2 fits exactly these three forwards and
+    /// refuses a fourth (typed, the cache untouched). Every
+    /// recovery is direct, its DeltaNet state is bit-exact that of a cache that only ever saw the
+    /// kept tokens, the next forward's logits are too (the attention KV was truncated by offset),
+    /// and that forward records nothing — full acceptance included.
+    #[test]
+    fn the_ring_recovers_a_draft_window_of_single_token_forwards() {
+        let model = qwen35(false);
+        let step = |cache: &mut Qwen35Cache, ids: &[i32]| -> Vec<f32> {
+            let offset = cache.offset();
+            let out = SpeculativeTarget::forward(
+                &model,
+                cache,
+                &input_ids(ids),
+                offset,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap();
+            out.logits
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        let prefilled = || {
+            let mut cache = model.new_cache();
+            step(&mut cache, &PROMPT);
+            cache
+        };
+        let start = PROMPT.len() as i32;
+        let drafts = [4, 11, 7];
+        for kept in 0..=drafts.len() {
+            let mut cache = prefilled();
+            let mut rollback = SpeculativeTarget::rollback(&model, 2);
+            rollback.begin(&mut cache);
+            for &d in &drafts {
+                step(&mut cache, &[d]);
+            }
+            // A fourth forward would outgrow what width 2 prices: refused, cache untouched.
+            let before = cache.delta_states();
+            let offset = cache.offset();
+            let err = SpeculativeTarget::forward(
+                &model,
+                &mut cache,
+                &input_ids(&[20]),
+                offset,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::CheckpointWindowFull { max_tokens: 3, .. }),
+                "{err}"
+            );
+            assert_eq!((cache.offset(), cache.delta_states()), (offset, before));
+            let keep = start + kept as i32;
+            assert_eq!(
+                rollback.recover(&mut cache, keep).unwrap(),
+                Rollback::Direct
+            );
+            assert_eq!(cache.offset(), keep);
+            let mut reference = prefilled();
+            for &d in &drafts[..kept] {
+                step(&mut reference, &[d]);
+            }
+            assert_eq!(
+                cache.delta_states(),
+                reference.delta_states(),
+                "kept {kept}: restored state"
+            );
+            assert_eq!(
+                step(&mut cache, &[13]),
+                step(&mut reference, &[13]),
+                "kept {kept}: next logits"
+            );
+            assert_eq!(cache.checkpointed_tokens(), 0, "kept {kept}: window closed");
         }
     }
 
@@ -1875,6 +2340,460 @@ pub(crate) mod tests {
             run.report.verify_steps + 1,
             "one decision per step"
         );
+    }
+
+    // ---- Draft-model speculation on the engine (epic sc-24432, story sc-24436). ----
+
+    /// Every greedy configuration through [`DraftModelProposer`] over `draft` against the plain
+    /// loop on `target`: identical tokens and constraint advance, a report naming `draft_model`.
+    /// Returns each configuration's counters.
+    fn draft_matches_plain<T, D>(
+        label: &str,
+        target: &T,
+        draft: &D,
+        vocab: usize,
+    ) -> Vec<SpeculativeStats>
+    where
+        T: SpeculativeTarget + crate::decode::Decode,
+        D: SpeculativeTarget,
+    {
+        let mut all = Vec::new();
+        for (name, config, constrained, _) in configs()
+            .into_iter()
+            .filter(|c| !c.0.contains("stochastic"))
+        {
+            let (mut a, mut b) = (Forbid::new(vocab, &[1, 9]), Forbid::new(vocab, &[1, 9]));
+            let expected = plain(target, &PROMPT, &config, constrained.then_some(&mut a));
+            let mut proposer = DraftModelProposer::new(draft, 4);
+            let run = engine(
+                target,
+                &mut proposer,
+                &PROMPT,
+                &config,
+                4,
+                constrained.then_some(&mut b),
+            );
+            assert_eq!(run.output.tokens, expected.tokens, "{label} {name}");
+            assert_eq!(b.accepted, a.accepted, "{label} {name}: constraint");
+            assert_eq!(run.report.path, "draft_model", "{label} {name}");
+            assert_eq!(
+                run.report.proposer,
+                ProposerKind::DraftModel,
+                "{label} {name}"
+            );
+            assert_eq!(run.report.draft_tokens, Some(4), "{label} {name}");
+            assert!(run.stats.proposed > 0, "{label} {name}: the draft proposed");
+            assert!(proposer.draft_forwards > 0, "{label} {name}");
+            all.push(run.stats);
+        }
+        all
+    }
+
+    /// sc-24436 AC1 (engine half): a draft model proposes through the one engine loop and every
+    /// greedy configuration emits exactly the plain loop's tokens, whichever way each cache rolls
+    /// back — a truncating target with a truncating layer-skip draft (accepted and rejected
+    /// drafts), the hybrid target (its DeltaNet checkpoint ring, sc-24435: direct, never a
+    /// replay) with a softmax draft, a softmax target with the hybrid as its draft (the draft
+    /// recovers its own proposal window through its ring), and the hybrid drafting for an
+    /// identical hybrid (every draft accepted).
+    #[test]
+    fn greedy_draft_model_is_the_plain_loop_on_every_cache_pairing() {
+        let stats = draft_matches_plain("causal/causal", &causal(), &causal_model(24, 1), 24);
+        let (accepted, proposed) = stats
+            .iter()
+            .fold((0, 0), |(a, p), s| (a + s.accepted, p + s.proposed));
+        assert!(
+            accepted > 0 && accepted < proposed,
+            "the layer-skip draft is accepted and rejected: {accepted} of {proposed}"
+        );
+        assert!(stats.iter().any(|s| s.direct_rollbacks > 0), "{stats:?}");
+
+        let stats = draft_matches_plain("hybrid/causal", &qwen35(false), &causal_model(50, 1), 50);
+        assert!(
+            stats
+                .iter()
+                .all(|s| s.replays == 0 && s.direct_rollbacks > 0),
+            "the hybrid target recovers through its ring: {stats:?}"
+        );
+
+        draft_matches_plain("causal/hybrid", &causal_model(50, 2), &qwen35(false), 50);
+
+        let stats = draft_matches_plain("hybrid/hybrid", &qwen35(false), &qwen35(false), 50);
+        assert!(
+            stats.iter().all(|s| s.accepted == s.proposed),
+            "a draft identical to its target is always accepted: {stats:?}"
+        );
+    }
+
+    /// sc-24436 E1: a stochastic draft hands the engine the proposal distribution `q` each draft
+    /// was drawn from — one per draft, each containing its draft — so the exact rejection rule
+    /// compares the target's `p` against the draft's own `q`; seeded runs reproduce.
+    #[test]
+    fn a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded() {
+        let target = causal();
+        let draft = causal_model(24, 1);
+        let config = stochastic(20);
+        let mut proposer = DraftModelProposer::new(&draft, 4);
+        Proposer::<CausalLm>::warm(&mut proposer, &target, &PROMPT, None).unwrap();
+        let mut history = PROMPT.to_vec();
+        history.push(5);
+        let mut sampler = MlxSampler::from_config(&config);
+        let mut draft_sampler = DraftSampler {
+            config: &config,
+            sampler: &mut sampler,
+            constraint: None,
+            advanced: false,
+        };
+        let ctx = ProposeContext {
+            cur: 5,
+            history: &history,
+            previous_hidden: None,
+            position: PROMPT.len() as i32,
+            max_drafts: 4,
+        };
+        let proposal = proposer.propose(&target, &ctx, &mut draft_sampler).unwrap();
+        assert_eq!(proposal.drafts.len(), 4);
+        assert_eq!(
+            proposal.dists.len(),
+            proposal.drafts.len(),
+            "one q per draft"
+        );
+        for (i, (token, q)) in proposal.drafts.iter().zip(&proposal.dists).enumerate() {
+            assert!(
+                q.iter().any(|&(t, w)| t == *token && w > 0.0),
+                "{token} in {q:?}"
+            );
+            // Each `q` is the draft model's own shaped distribution at its position: the
+            // sampler's distribution over a fresh draft prefill of everything before the draft.
+            let mut before = history.clone();
+            before.extend_from_slice(&proposal.drafts[..i]);
+            let expected = MlxSampler::from_config(&config)
+                .distribution(&last_logits(&draft, &before), &before, None)
+                .unwrap();
+            assert_distribution_eq(q, &expected, &format!("q of draft {i}"));
+        }
+        assert!(
+            proposal.dists.iter().any(|q| q.len() > 1),
+            "a stochastic draft is not a point mass: {:?}",
+            proposal.dists
+        );
+        // The prompt, `cur` and all but the last draft are in the draft cache.
+        assert_eq!(proposer.draft_forwards, 1 + 4);
+
+        let run = |seed| {
+            let mut config = stochastic(20);
+            config.seed = Some(seed);
+            engine(
+                &target,
+                &mut DraftModelProposer::new(&draft, 3),
+                &PROMPT,
+                &config,
+                3,
+                None,
+            )
+        };
+        let (a, b) = (run(11), run(11));
+        assert_eq!(a.output.tokens, b.output.tokens);
+        assert_eq!(a.output.tokens.len(), 20);
+        assert_eq!(a.report.proposer, ProposerKind::DraftModel);
+        assert!(a.stats.proposed > 0 && a.stats.accepted <= a.stats.proposed);
+    }
+
+    /// The last-position logits of a fresh prefill of `ids` through `model`, `[1, vocab]`.
+    fn last_logits<M: SpeculativeTarget>(model: &M, ids: &[i32]) -> Array {
+        let mut cache = model.new_cache();
+        model
+            .forward(&mut cache, &input_ids(ids), 0, LogitsScope::Last, false)
+            .unwrap()
+            .logits
+    }
+
+    fn host_row(logits: &Array) -> Vec<f32> {
+        logits
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
+    }
+
+    /// Two `(token, weight)` sets name the same tokens with weights equal to within `1e-4`
+    /// (after normalizing each: `accept_token` normalizes, so only the shape matters).
+    fn assert_distribution_eq(got: &[(i32, f32)], want: &[(i32, f32)], label: &str) {
+        let norm = |d: &[(i32, f32)]| {
+            let total: f32 = d.iter().map(|&(_, w)| w).sum();
+            let mut d: Vec<(i32, f32)> = d.iter().map(|&(t, w)| (t, w / total)).collect();
+            d.sort_by_key(|&(t, _)| t);
+            d
+        };
+        let (got, want) = (norm(got), norm(want));
+        assert_eq!(
+            got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+            "{label}: tokens {got:?} vs {want:?}"
+        );
+        for (&(t, a), &(_, b)) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1e-4, "{label}: token {t}: {a} vs {b}");
+        }
+    }
+
+    /// A [`DraftModelProposer`] that, after every commit, holds the draft's state against the
+    /// committed sequence: the draft cache plus the queued committed tokens are exactly the
+    /// committed history, the queue is that history's tail, and the draft's logits for the next
+    /// position equal a fresh draft prefill of the history — whatever rollback strategy the
+    /// draft's cache recovers through. Counts the commits that kept some but not all of the
+    /// drafts the proposal fed (a partial acceptance past the step start) and those that kept
+    /// every fed draft.
+    struct CheckedDraft<'d, D: SpeculativeTarget> {
+        inner: DraftModelProposer<'d, D>,
+        draft: &'d D,
+        history: Vec<i32>,
+        partial: usize,
+        full: usize,
+    }
+
+    impl<'d, D: SpeculativeTarget> CheckedDraft<'d, D>
+    where
+        D::Cache: Clone,
+    {
+        fn new(draft: &'d D, drafts: usize) -> Self {
+            Self {
+                inner: DraftModelProposer::new(draft, drafts),
+                draft,
+                history: Vec::new(),
+                partial: 0,
+                full: 0,
+            }
+        }
+
+        fn check(&self) {
+            let (cache, pending, _) = self.inner.state();
+            let cache = cache.expect("warmed");
+            let held = self.draft.cache_len(cache) as usize;
+            assert_eq!(
+                held + pending.len(),
+                self.history.len(),
+                "draft cache {held} + queued {pending:?} != committed {}",
+                self.history.len()
+            );
+            assert_eq!(
+                pending,
+                &self.history[held..],
+                "the queue is the history's tail"
+            );
+            let probe = 5;
+            let mut tail = pending.to_vec();
+            tail.push(probe);
+            let mut resumed = cache.clone();
+            let got = self
+                .draft
+                .forward(
+                    &mut resumed,
+                    &input_ids(&tail),
+                    held as i32,
+                    LogitsScope::Last,
+                    false,
+                )
+                .unwrap()
+                .logits;
+            let mut all = self.history.clone();
+            all.push(probe);
+            let (got, want) = (host_row(&got), host_row(&last_logits(self.draft, &all)));
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst < 1e-3,
+                "draft logits after commit drift from a fresh prefill by {worst}"
+            );
+        }
+    }
+
+    impl<T, D> Proposer<T> for CheckedDraft<'_, D>
+    where
+        T: SpeculativeTarget,
+        D: SpeculativeTarget,
+        D::Cache: Clone,
+    {
+        fn kind(&self) -> ProposerKind {
+            ProposerKind::DraftModel
+        }
+        fn warm(&mut self, t: &T, prompt: &[i32], h: Option<&Array>) -> Result<Option<Array>> {
+            self.history = prompt.to_vec();
+            self.inner.warm(t, prompt, h)
+        }
+        fn propose(
+            &mut self,
+            t: &T,
+            ctx: &ProposeContext<'_>,
+            sampler: &mut DraftSampler<'_, '_>,
+        ) -> Result<Proposal> {
+            self.inner.propose(t, ctx, sampler)
+        }
+        fn commit(
+            &mut self,
+            t: &T,
+            cur: i32,
+            accepted: &[i32],
+            h: Option<&Array>,
+            position: i32,
+        ) -> Result<()> {
+            let (_, _, fed) = self.inner.state();
+            match fed {
+                Some(fed) if fed > 0 && accepted.len() >= fed => self.full += 1,
+                Some(fed) if !accepted.is_empty() && accepted.len() < fed => self.partial += 1,
+                _ => {}
+            }
+            self.inner.commit(t, cur, accepted, h, position)?;
+            self.history.push(cur);
+            self.history.extend_from_slice(accepted);
+            self.check();
+            Ok(())
+        }
+    }
+
+    /// sc-24436: after every commit the draft's cache is the committed sequence — its length
+    /// plus the queued tokens is the history, and its next logits are a fresh prefill's — for a
+    /// draft that restores its step start (the Qwen35 hybrid) and one that truncates, under
+    /// greedy, penalized and constrained targets whose verify accepts some fed drafts and
+    /// rejects the rest, and ones that accept every fed draft. Generic over the draft's own
+    /// rollback strategy, so a strategy that keeps K − 1 single-token draft forwards between one
+    /// `begin` and `recover` (the DeltaNet checkpoint ring) is held to the same invariant.
+    #[test]
+    fn a_draft_cache_is_the_committed_sequence_after_every_commit() {
+        fn run_checked<T, D>(label: &str, target: &T, draft: &D, vocab: usize) -> (usize, usize)
+        where
+            T: SpeculativeTarget + crate::decode::Decode,
+            D: SpeculativeTarget,
+            D::Cache: Clone,
+        {
+            let (mut partial, mut full) = (0, 0);
+            for (name, config, constrained, _) in configs()
+                .into_iter()
+                .filter(|c| !c.0.contains("stochastic"))
+            {
+                let (mut a, mut b) = (Forbid::new(vocab, &[1, 9]), Forbid::new(vocab, &[1, 9]));
+                let expected = plain(target, &PROMPT, &config, constrained.then_some(&mut a));
+                let mut proposer = CheckedDraft::new(draft, 4);
+                let run = engine(
+                    target,
+                    &mut proposer,
+                    &PROMPT,
+                    &config,
+                    4,
+                    constrained.then_some(&mut b),
+                );
+                assert_eq!(run.output.tokens, expected.tokens, "{label} {name}");
+                partial += proposer.partial;
+                full += proposer.full;
+            }
+            (partial, full)
+        }
+        // The hybrid draft (its checkpoint ring) for a softmax target that disagrees with it, and
+        // for an identical hybrid target that keeps every fed draft.
+        let (partial, _) = run_checked("causal/hybrid", &causal_model(50, 2), &qwen35(false), 50);
+        let (_, full) = run_checked("hybrid/hybrid", &qwen35(false), &qwen35(false), 50);
+        assert!(
+            partial > 0 && full > 0,
+            "hybrid draft: {partial} partial and {full} full keeps"
+        );
+        // A truncating draft (layer skip) for its deeper target.
+        let (partial, full) = run_checked("causal/causal", &causal(), &causal_model(24, 1), 24);
+        assert!(
+            partial > 0 && full > 0,
+            "causal draft: {partial} partial and {full} full keeps"
+        );
+    }
+
+    /// sc-24436: a stop token the draft proposes and the target accepts ends the run exactly as
+    /// the plain loop does, on the host draft path (a penalty, a near-zero temperature) and the
+    /// greedy one, for a truncating and a checkpoint-ring draft — and the draft's cache is
+    /// still the committed sequence after that commit (the proposal stopped drafting at the
+    /// stop without feeding it).
+    #[test]
+    fn a_draft_proposed_stop_token_accepted_by_the_target_ends_the_run() {
+        fn check<T>(label: &str, target: &T)
+        where
+            T: SpeculativeTarget + crate::decode::Decode,
+            T::Cache: Clone,
+        {
+            let mut cold = greedy(24);
+            cold.sampling.temperature = 0.01;
+            let mut light = greedy(24);
+            light.sampling.presence_penalty = 0.01;
+            for (name, mut config) in [("greedy", greedy(24)), ("penalized", light), ("cold", cold)]
+            {
+                // The draft is the target itself, so every draft — the stop included — is
+                // accepted. The stream the stop is cut from: the plain loop's for a greedy
+                // decision, the same seeded draft run's for a sampled one (speculation consumes
+                // the seeded stream differently from the plain loop).
+                // The draft's state is checked against the committed sequence after every commit,
+                // the one that accepts the stop included.
+                let draft_run = |config: &GenerationConfig| {
+                    engine(
+                        target,
+                        &mut CheckedDraft::new(target, 4),
+                        &PROMPT,
+                        config,
+                        4,
+                        None,
+                    )
+                };
+                let stream = if name == "cold" {
+                    draft_run(&config).output.tokens
+                } else {
+                    plain(target, &PROMPT, &config, None).tokens
+                };
+                // A stop first appearing a few tokens in, so drafts carry it; it is not emitted.
+                let end = (4..stream.len())
+                    .find(|&i| !stream[..i].contains(&stream[i]))
+                    .unwrap();
+                config.stop_tokens = vec![stream[end]];
+                let run = draft_run(&config);
+                assert_eq!(run.output.tokens, stream[..end], "{label} {name}");
+                assert_eq!(
+                    run.output.finish_reason,
+                    FinishReason::StopToken,
+                    "{label} {name}"
+                );
+                assert_eq!(run.stats.accepted, run.stats.proposed, "{label} {name}");
+            }
+        }
+        check("causal", &causal());
+        check("hybrid", &qwen35(false));
+    }
+
+    /// sc-24436: a draft whose padding differs from its target's proposes only its tokenizer's
+    /// ids, over logits the target's width, and greedy output is still the target's own.
+    #[test]
+    fn a_draft_padded_differently_proposes_only_tokenizer_ids() {
+        let draft = causal_model(24, 1);
+        let proposer = DraftModelProposer::new(&draft, 4).with_vocab(20, 28);
+        let mut row = vec![0f32; 24];
+        row[22] = 10.0;
+        row[3] = 1.0;
+        let shaped = host_row(&proposer.shaped(Array::from_slice(&row, &[1, 24])).unwrap());
+        assert_eq!(shaped.len(), 28);
+        assert_eq!(&shaped[..20], &row[..20]);
+        assert!(shaped[20..].iter().all(|x| *x == f32::NEG_INFINITY));
+        // Same width, proposable = the whole width: untouched.
+        let untouched = DraftModelProposer::new(&draft, 4).with_vocab(24, 24);
+        assert_eq!(
+            host_row(&untouched.shaped(Array::from_slice(&row, &[1, 24])).unwrap()),
+            row
+        );
+        // Through the engine: the target scores 24 ids, the draft proposes from its first 20.
+        let target = causal();
+        for config in [greedy(20), penalized(20)] {
+            let expected = plain(&target, &PROMPT, &config, None);
+            let mut proposer = DraftModelProposer::new(&draft, 4).with_vocab(20, 24);
+            let run = engine(&target, &mut proposer, &PROMPT, &config, 4, None);
+            assert_eq!(run.output.tokens, expected.tokens);
+            assert!(run.stats.proposed > 0);
+        }
     }
 
     /// The constraint is rewound only when something advanced it: never on the `off` loop, and on
