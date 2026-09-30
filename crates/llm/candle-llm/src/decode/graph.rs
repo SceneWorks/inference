@@ -1428,6 +1428,15 @@ mod cuda {
             }
         };
         let base = cache.len();
+        if base == 0 {
+            // A step from an empty cache is a prompt prefill: never captured, so it runs plain
+            // eager — outside the parameter-cache guard (the prefill builds host-side RoPE tables
+            // and masks, uploads a guarded forward must not make; see `guarded_request`) and
+            // outside the warm-up bookkeeping.
+            let out = model.forward_step(cache, request)?;
+            note_eager(None);
+            return Ok(out);
+        }
         match plan {
             Plan::WarmUp => {
                 // The step's host data goes up first, outside the guard (see `guarded_request`).
@@ -3245,9 +3254,12 @@ mod cuda_tests {
 
     /// A request decoded through the runner on a thread that then exits leaves nothing recorded
     /// on the model's CUDA context: the guarded steps upload no host data (their tokens and
-    /// positions go up before the guard), so no per-thread cache holds device buffers the
-    /// thread's exit would free after the driver detached it. The model keeps decoding on another
-    /// thread afterwards.
+    /// positions go up before the guard, and the prompt prefill — host RoPE tables and masks —
+    /// runs outside it), so no per-thread cache holds device buffers the thread's exit would
+    /// free after the driver detached it (on Windows that free fails with
+    /// `CUDA_ERROR_NOT_INITIALIZED`, recorded on the context for the next operation to report —
+    /// what this test caught on the CUDA lane). The model keeps decoding on another thread
+    /// afterwards.
     #[test]
     fn a_runner_thread_exit_leaves_the_models_context_clean() {
         let Some((_guard, device, dev)) = device() else {
