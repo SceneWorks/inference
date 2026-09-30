@@ -1,0 +1,16 @@
+{
+  "id": "yue2:q4:cuda:strict-fp32-standard",
+  "tier": "q4",
+  "decoder": "standard",
+  "computePolicy": "fp32",
+  "request": {
+    "planning": "off",
+    "style": "indie pop, female vocal, acoustic guitar, bass, steady drums",
+    "lyrics": "[verse]\nMorning light, I hear your song\n\n[chorus]\nHold on, sing along",
+    "seed": 831004,
+    "semanticSampling": {
+      "minTokens": 200,
+      "maxTokens": 200
+    }
+  }
+}

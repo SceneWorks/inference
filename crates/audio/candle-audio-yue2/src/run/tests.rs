@@ -846,7 +846,7 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
     };
     let b = ids(&base);
     // (key change, which of [plan, semantic, synthesis, nar, cached decode] must change)
-    let cases: [(&str, crate::engine::IdentityKeys, [bool; 5]); 7] = [
+    let cases: [(&str, crate::engine::IdentityKeys, [bool; 5]); 8] = [
         (
             "tier",
             crate::engine::IdentityKeys {
@@ -899,6 +899,14 @@ fn every_stage_identity_binds_every_input_it_depends_on() {
             "runtime",
             crate::engine::IdentityKeys {
                 runtime: "another-build",
+                ..base.clone()
+            },
+            [true, true, true, false, true],
+        ),
+        (
+            "compute policy",
+            crate::engine::IdentityKeys {
+                compute_policy: candle_audio::gen_core::Yue2ComputePolicy::Auto,
                 ..base.clone()
             },
             [true, true, true, false, true],
