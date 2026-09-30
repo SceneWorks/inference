@@ -5,7 +5,9 @@
 //! These are pure data transforms (no model, no I/O), so they're unit-tested directly. The server
 //! ([`crate::main`]) wires them to a TCP socket + a loaded `core_llm::TextLlm` provider.
 
-use mlx_llm::core_llm::{Constraint, Content, Message, Role, Sampling, TextLlmRequest};
+use mlx_llm::core_llm::{
+    Constraint, Content, Message, MtpMode, Role, Sampling, Speculative, TextLlmRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -40,6 +42,14 @@ pub struct ChatRequest {
     pub stop: Option<StringOrVec>,
     /// `{"type":"json_object"}` ⇒ constrain output to valid JSON.
     pub response_format: Option<ResponseFormat>,
+    /// Speculative decoding (non-OpenAI extension, epic sc-24432 E4): `"off"`, `"auto"` or
+    /// `{"proposer": "mtp" | "prompt_lookup" | "draft_model", "depth": N}`, mapped onto the
+    /// contract's `speculative` option. The legacy `mtp` field (`{"mode": "off" | "auto"}`,
+    /// `{"mode": "enabled", "draft_tokens": N}`) is read into the same option; sending both is a
+    /// duplicate field, and an unknown value in either is refused by the contract's parser — a
+    /// 400, never silently decoded as `off`. Omitted ⇒ `off`.
+    #[serde(default, alias = "mtp")]
+    pub speculative: Option<Speculative>,
 }
 
 /// One chat turn. `content` is a string or an array of typed parts (the vision wire form); this
@@ -167,8 +177,10 @@ impl ChatRequest {
             thinking: Default::default(),
             reasoning_effort: None,
             preserve_thinking: None,
-            speculative: None,
-            mtp: Default::default(),
+            // The request's speculative option (or its legacy `mtp` spelling) as sent; the
+            // provider validates it against what the loaded model advertises (sc-24438).
+            speculative: self.speculative,
+            mtp: MtpMode::Off,
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
@@ -327,6 +339,69 @@ mod tests {
             .into_text_llm_request()
             .unwrap();
         assert_eq!(r2.stop, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// sc-24438 AC3: the new `speculative` option and the legacy `mtp` shape both reach the
+    /// contract as sent (never forced to off), and an omitted option is `off`.
+    #[test]
+    fn speculative_and_the_legacy_mtp_field_map_onto_the_contract() {
+        use mlx_llm::core_llm::SpeculativeProposer;
+        let spec = |extra: &str| {
+            parse(&format!(
+                r#"{{"messages":[{{"role":"user","content":"x"}}]{extra}}}"#
+            ))
+            .into_text_llm_request()
+            .unwrap()
+        };
+        let r = spec("");
+        assert_eq!(r.speculative, None);
+        assert_eq!(r.speculative_mode(), Speculative::Off);
+        for (extra, want) in [
+            (r#","speculative":"auto""#, Speculative::Auto),
+            (r#","speculative":"off""#, Speculative::Off),
+            (
+                r#","speculative":{"proposer":"prompt_lookup","depth":4}"#,
+                Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
+            ),
+            (
+                r#","speculative":{"proposer":"mtp","depth":12}"#,
+                Speculative::proposer(SpeculativeProposer::Mtp, 12),
+            ),
+            (r#","mtp":{"mode":"auto"}"#, Speculative::Auto),
+            (r#","mtp":{"mode":"off"}"#, Speculative::Off),
+            (
+                r#","mtp":{"mode":"enabled","draft_tokens":3}"#,
+                Speculative::proposer(SpeculativeProposer::Mtp, 3),
+            ),
+        ] {
+            let r = spec(extra);
+            assert_eq!(r.speculative, Some(want), "{extra}");
+            assert_eq!(r.speculative_mode(), want, "{extra}");
+            assert_eq!(r.mtp, MtpMode::Off, "{extra}");
+        }
+    }
+
+    /// sc-24438 AC3: an unknown speculative value — in either field — or both fields at once is
+    /// a parse error (the server's 400), never ignored.
+    #[test]
+    fn unknown_speculative_values_are_refused_not_ignored() {
+        for extra in [
+            r#","speculative":"fast""#,
+            r#","speculative":true"#,
+            r#","speculative":{"proposer":"ngram","depth":2}"#,
+            r#","speculative":{"proposer":"mtp","depth":-1}"#,
+            r#","speculative":{"proposer":"mtp"}"#,
+            r#","speculative":{"proposer":"mtp","depth":2,"width":3}"#,
+            r#","mtp":{"mode":"always"}"#,
+            r#","mtp":{"mode":"enabled"}"#,
+            r#","mtp":"sometimes""#,
+            r#","speculative":"auto","mtp":{"mode":"auto"}"#,
+        ] {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"x"}}]{extra}}}"#);
+            let err = serde_json::from_str::<ChatRequest>(&body)
+                .expect_err(&format!("{extra} must be refused"));
+            assert!(!err.to_string().is_empty(), "{extra}");
+        }
     }
 
     #[test]

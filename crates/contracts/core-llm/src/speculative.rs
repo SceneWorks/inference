@@ -121,11 +121,12 @@ pub struct SpeculativeResolution {
 /// * `off` never speculates;
 /// * `auto` runs MTP at its recommended depth where the model has a head, else prompt lookup at
 ///   its recommended depth, else decodes plainly with the reason named;
-/// * `{proposer, depth}` runs exactly that. Its admissibility (advertised, `1 ..= max_depth`) is
+/// * `{proposer, depth}` runs that proposer. Its admissibility (advertised, `depth >= 1`) is
 ///   checked by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
 ///   first, so an un-advertised proposer here is the caller's contract violation: it resolves to
-///   `off` with the reason named rather than inventing a proposer, and a depth outside the
-///   advertised range is clamped into it, also named.
+///   `off` with the reason named rather than inventing a proposer. A depth above the advertised
+///   `max_depth` — the backend-true bound — is clamped to it and the clamp named in the fallback
+///   (sc-24438), never refused and never run past the bound.
 pub fn resolve_speculative(
     mode: crate::Speculative,
     capabilities: &crate::TextLlmCapabilities,
@@ -178,6 +179,50 @@ pub fn resolve_speculative(
                 }
             }
         },
+    }
+}
+
+/// [`resolve_speculative`] for a loaded model whose checkpoint carries an MTP head the backend
+/// loaded past without running (`skipped_mtp` names why — e.g. a sparse-MoE predictor layer,
+/// sc-24438). The capabilities do not advertise such a head, so an explicit `mtp` request decodes
+/// without a proposer and `auto` resolves over what the model does advertise; both name the
+/// skipped head in the fallback (epic sc-24432 E2) — the head's absence is never silent and never
+/// a load failure. `None`, or a model that does advertise MTP, is exactly [`resolve_speculative`].
+pub fn resolve_speculative_with_skipped_mtp(
+    mode: crate::Speculative,
+    capabilities: &crate::TextLlmCapabilities,
+    skipped_mtp: Option<&str>,
+) -> SpeculativeResolution {
+    use crate::{Speculative, SpeculativeProposer};
+    let resolution = resolve_speculative(mode, capabilities);
+    let Some(why) = skipped_mtp else {
+        return resolution;
+    };
+    if capabilities.proposer(SpeculativeProposer::Mtp).is_some() {
+        return resolution;
+    }
+    match mode {
+        Speculative::Proposer {
+            proposer: SpeculativeProposer::Mtp,
+            ..
+        } => SpeculativeResolution {
+            plan: SpeculativePlan::Off,
+            fallback: Some(format!(
+                "speculative: `mtp` is not run on this checkpoint ({why}); decoded without a \
+                 proposer"
+            )),
+        },
+        Speculative::Auto => {
+            let note = format!("speculative: auto skipped this checkpoint's `mtp` head ({why})");
+            SpeculativeResolution {
+                plan: resolution.plan,
+                fallback: Some(match resolution.fallback {
+                    Some(more) => format!("{note}; {more}"),
+                    None => note,
+                }),
+            }
+        }
+        _ => resolution,
     }
 }
 
@@ -451,6 +496,95 @@ mod tests {
         assert_eq!(
             ProposerKind::from(SpeculativeProposer::DraftModel),
             ProposerKind::DraftModel
+        );
+    }
+
+    /// sc-24438 AC1: a request above the advertised max depth — new option or legacy `mtp` —
+    /// runs at the max, and the clamp is named; a request within it is untouched.
+    #[test]
+    fn a_too_deep_request_is_clamped_to_the_advertised_max_and_named() {
+        use crate::{MtpMode, Speculative, SpeculativeProposer, TextLlmCapabilities};
+        let mut caps = TextLlmCapabilities::default();
+        caps.advertise_mtp(7, 3);
+        let legacy = resolve_speculative(MtpMode::Enabled { draft_tokens: 40 }.into(), &caps);
+        assert_eq!(
+            legacy.plan,
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::Mtp,
+                depth: 7
+            }
+        );
+        assert_eq!(
+            legacy.fallback.as_deref(),
+            Some("speculative: `mtp` depth 40 clamped to 7 (advertised 1..=7)")
+        );
+        let within = resolve_speculative(Speculative::proposer(SpeculativeProposer::Mtp, 7), &caps);
+        assert_eq!(within.plan.depth(), Some(7));
+        assert_eq!(within.fallback, None);
+    }
+
+    /// sc-24438 AC2 (E2): a checkpoint MTP head the backend skipped is named — explicit `mtp`
+    /// decodes plainly, `auto` runs what the model advertises — and changes nothing when absent.
+    #[test]
+    fn a_skipped_mtp_head_falls_back_by_name() {
+        use crate::{
+            MtpMode, ProposerCapabilities, Speculative, SpeculativeProposer, TextLlmCapabilities,
+        };
+        let lookup = TextLlmCapabilities {
+            speculative: vec![ProposerCapabilities {
+                proposer: SpeculativeProposer::PromptLookup,
+                max_depth: 7,
+                recommended_depth: 4,
+            }],
+            ..Default::default()
+        };
+        let why = "sparse-MoE predictor layer";
+        let skipped = |mode: Speculative, caps: &TextLlmCapabilities| {
+            resolve_speculative_with_skipped_mtp(mode, caps, Some(why))
+        };
+
+        let explicit = skipped(Speculative::proposer(SpeculativeProposer::Mtp, 3), &lookup);
+        assert_eq!(explicit.plan, SpeculativePlan::Off);
+        assert_eq!(
+            explicit.fallback.as_deref(),
+            Some(
+                "speculative: `mtp` is not run on this checkpoint (sparse-MoE predictor layer); \
+                 decoded without a proposer"
+            )
+        );
+        let legacy = skipped(MtpMode::Enabled { draft_tokens: 3 }.into(), &lookup);
+        assert_eq!(legacy, explicit);
+
+        let auto = skipped(Speculative::Auto, &lookup);
+        assert_eq!(
+            auto.plan,
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::PromptLookup,
+                depth: 4
+            }
+        );
+        assert!(auto
+            .fallback
+            .unwrap()
+            .contains("auto skipped this checkpoint's `mtp` head (sparse-MoE predictor layer)"));
+        let nothing = skipped(Speculative::Auto, &TextLlmCapabilities::default());
+        assert_eq!(nothing.plan, SpeculativePlan::Off);
+        let why_nothing = nothing.fallback.unwrap();
+        assert!(why_nothing.contains("skipped this checkpoint's `mtp` head"));
+        assert!(why_nothing.contains("auto found no proposer"));
+
+        assert_eq!(
+            skipped(Speculative::Off, &lookup),
+            SpeculativeResolution::default()
+        );
+        let lookup_run = Speculative::proposer(SpeculativeProposer::PromptLookup, 2);
+        assert_eq!(
+            skipped(lookup_run, &lookup),
+            resolve_speculative(lookup_run, &lookup)
+        );
+        assert_eq!(
+            resolve_speculative_with_skipped_mtp(Speculative::Auto, &lookup, None),
+            resolve_speculative(Speculative::Auto, &lookup)
         );
     }
 

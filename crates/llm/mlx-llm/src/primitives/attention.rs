@@ -29,7 +29,7 @@ const MASK_NEG: f32 = -1e30;
 /// view over `[B, L, H, D]` storage, and the tripwire read it with mlx-rs `as_slice`, which ignores
 /// strides. Production consumers transpose/reshape (stride-aware) and never saw wrong numbers. The
 /// kernel matches an f64 host reference (`sc7430_fused_sdpa_matches_host_at_long_qlen`).
-const MLX_SDPA_VECTOR_MAX_QLEN: i32 = 8;
+pub(crate) const MLX_SDPA_VECTOR_MAX_QLEN: i32 = 8;
 
 /// Largest `q_len × gqa_factor` MLX's vector kernel serves (`(query_sequence_length * gqa_factor)
 /// <= 32`); a wider GQA group falls back even at `q_len <= 8`.

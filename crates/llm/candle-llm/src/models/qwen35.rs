@@ -79,7 +79,8 @@ pub(crate) fn quantizes_tensor(key: &str) -> bool {
 /// num_layers`) or of the configured MTP head. The one rule both load admission prices the
 /// quantized copy by and the snapshot preparer stores GGML blocks for (sc-19375).
 pub(crate) fn loads_quantized(cfg: &Qwen35Config, prefix: &str, key: &str) -> bool {
-    let mtp_layers = cfg.mtp_num_hidden_layers;
+    // A skipped head (sc-24438) is never built, so never priced or prepared.
+    let mtp_layers = cfg.loaded_mtp_layers();
     let loaded = match super::split_layer_key(key) {
         Some((root, layer, _)) => {
             (root == prefix && layer < cfg.num_layers) || (root == "mtp" && layer < mtp_layers)
@@ -292,6 +293,28 @@ impl Qwen35Config {
         let base = half / 3;
         let rem = half % 3;
         [base + (rem > 0) as usize, base + (rem > 1) as usize, base]
+    }
+
+    /// Why this checkpoint's configured MTP head is loaded past instead of run (sc-24438), or
+    /// `None` when it has none or the runtime runs it. A sparse-MoE checkpoint (the 35B-A3B)
+    /// ships its predictor layer with a sparse-MoE FFN; [`Qwen35Mtp`] builds the frozen dense-FFN
+    /// predictor, so the target loads and decodes and the head is skipped — named in every
+    /// request that asks for it (epic sc-24432 E2), never a load failure.
+    pub fn mtp_skip_reason(&self) -> Option<&'static str> {
+        (self.mtp_num_hidden_layers > 0 && self.moe.is_some()).then_some(
+            "its MTP predictor layer is a sparse-MoE block, which the Candle MTP proposer does \
+             not run",
+        )
+    }
+
+    /// The MTP predictor layers a load builds: the configured count, or none when the head is
+    /// skipped ([`mtp_skip_reason`](Self::mtp_skip_reason)).
+    pub fn loaded_mtp_layers(&self) -> usize {
+        if self.mtp_skip_reason().is_some() {
+            0
+        } else {
+            self.mtp_num_hidden_layers
+        }
     }
 
     /// Whether layer `i` (0-indexed) is a linear (Gated DeltaNet) layer; otherwise full attention.

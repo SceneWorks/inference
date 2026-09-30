@@ -137,8 +137,11 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     let dir = write_tiny_qwen38_snapshot();
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string())).unwrap();
     let mtp = provider.descriptor().capabilities.mtp.unwrap();
-    assert_eq!(mtp.recommended_draft_tokens, 3);
-    assert_eq!(mtp.max_draft_tokens, u32::MAX);
+    assert_eq!(
+        mtp.recommended_draft_tokens,
+        mlx_llm::provider::MTP_RECOMMENDED_DEPTH
+    );
+    assert_eq!(mtp.max_draft_tokens, mlx_llm::provider::MTP_MAX_DEPTH);
 
     let ar = provider
         .generate(

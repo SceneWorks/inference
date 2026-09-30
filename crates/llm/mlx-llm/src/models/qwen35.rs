@@ -213,6 +213,17 @@ impl Qwen35Config {
         [base + (rem > 0) as usize, base + (rem > 1) as usize, base]
     }
 
+    /// Why this checkpoint's configured MTP head is loaded past instead of run (sc-24438), or
+    /// `None` when it has none or the runtime runs it. A sparse-MoE checkpoint (the 35B-A3B)
+    /// ships its predictor layer with a sparse-MoE FFN; the MTP proposer here builds a dense-FFN
+    /// predictor, so the target loads and decodes and the head is skipped — named in every
+    /// request that asks for it (epic sc-24432 E2), never a load failure.
+    pub fn mtp_skip_reason(&self) -> Option<&'static str> {
+        (self.mtp_num_hidden_layers > 0 && self.moe.is_some()).then_some(
+            "its MTP predictor layer is a sparse-MoE block, which the MLX MTP proposer does not run",
+        )
+    }
+
     /// Whether layer `i` (0-indexed) is a linear (Gated DeltaNet) layer; otherwise full attention.
     pub fn is_linear(&self, i: usize) -> bool {
         !(i + 1).is_multiple_of(self.full_attention_interval)
@@ -720,6 +731,12 @@ impl Qwen35Model {
     /// Whether this snapshot loaded a complete native multi-token predictor.
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    /// Why the checkpoint's MTP head was loaded past instead of run
+    /// ([`Qwen35Config::mtp_skip_reason`], sc-24438); `None` when there is no head or it loaded.
+    pub fn skipped_mtp(&self) -> Option<&'static str> {
+        self.cfg.mtp_skip_reason()
     }
 
     /// A fresh MTP attention cache. Returns `None` for ordinary Qwen3.5/3.6 snapshots without the
@@ -1452,6 +1469,9 @@ impl Qwen35Model {
         }
 
         let mtp = match cfg.mtp_num_hidden_layers {
+            // A head the runtime does not run (a sparse-MoE predictor, sc-24438): its `mtp.*`
+            // tensors are left unread and the target decodes; requests name the skipped head.
+            _ if cfg.mtp_skip_reason().is_some() => None,
             0 => {
                 if w.keys().any(|key| key.starts_with("mtp.")) {
                     return Err(Error::Config(
@@ -1464,12 +1484,6 @@ impl Qwen35Model {
                 if cfg.mtp_use_dedicated_embeddings {
                     return Err(Error::Config(
                         "qwen3_5 dedicated MTP embeddings are not supported by this architecture"
-                            .into(),
-                    ));
-                }
-                if cfg.moe.is_some() {
-                    return Err(Error::Config(
-                        "qwen3_5 MTP with a MoE predictor is not supported by this architecture"
                             .into(),
                     ));
                 }
@@ -1874,6 +1888,10 @@ pub(crate) mod tests {
     }
 
     fn synthetic_weights_with_prefix(cfg: &Qwen35Config, pfx: &str) -> Weights {
+        Weights::from_map(synthetic_tensors_with_prefix(cfg, pfx))
+    }
+
+    fn synthetic_tensors_with_prefix(cfg: &Qwen35Config, pfx: &str) -> HashMap<String, Array> {
         let h = cfg.hidden_size;
         let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
         let value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads;
@@ -2040,7 +2058,7 @@ pub(crate) mod tests {
                 &[h, cfg.intermediate_size],
             );
         }
-        Weights::from_map(m)
+        m
     }
 
     pub(crate) fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
@@ -2806,7 +2824,7 @@ pub(crate) mod tests {
 
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
     /// expert. Same 4-layer 3:1 mixer schedule as [`cfg_json`].
-    fn cfg_json_moe() -> serde_json::Value {
+    pub(crate) fn cfg_json_moe() -> serde_json::Value {
         let mut v = cfg_json();
         let tc = v["text_config"].as_object_mut().unwrap();
         tc.insert("model_type".into(), json!("qwen3_5_moe_text"));
@@ -2815,6 +2833,83 @@ pub(crate) mod tests {
         tc.insert("moe_intermediate_size".into(), json!(16));
         tc.insert("shared_expert_intermediate_size".into(), json!(16));
         v
+    }
+
+    /// [`cfg_json_moe`] with a configured MTP head — the 35B-A3B checkpoint's layout (sc-24438).
+    pub(crate) fn cfg_json_moe_mtp() -> serde_json::Value {
+        let mut v = cfg_json_moe();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("mtp_num_hidden_layers".into(), json!(1));
+        tc.insert("mtp_use_dedicated_embeddings".into(), json!(false));
+        v
+    }
+
+    /// Synthetic tensors for a sparse-MoE `cfg` with an MTP head whose predictor layer carries a
+    /// sparse-MoE FFN (stacked experts, router, shared expert) instead of the dense MLP — as the
+    /// MoE checkpoint ships it (sc-24438).
+    pub(crate) fn synthetic_moe_mtp_tensors(cfg: &Qwen35Config) -> HashMap<String, Array> {
+        let moe = cfg.moe.as_ref().expect("a MoE config");
+        let h = cfg.hidden_size;
+        let (mi, si) = (
+            moe.moe_intermediate_size,
+            moe.shared_expert_intermediate_size,
+        );
+        let mut m = synthetic_tensors_with_prefix(cfg, "model.language_model");
+        let lp = |s: &str| format!("mtp.layers.0.{s}");
+        for dense in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(m.remove(&lp(&format!("mlp.{dense}.weight"))).is_some());
+        }
+        t(
+            &mut m,
+            &lp("mlp.experts.gate_up_proj"),
+            &[moe.num_experts, 2 * mi, h],
+        );
+        t(
+            &mut m,
+            &lp("mlp.experts.down_proj"),
+            &[moe.num_experts, h, mi],
+        );
+        t(&mut m, &lp("mlp.gate.weight"), &[moe.num_experts, h]);
+        t(&mut m, &lp("mlp.shared_expert.gate_proj.weight"), &[si, h]);
+        t(&mut m, &lp("mlp.shared_expert.up_proj.weight"), &[si, h]);
+        t(&mut m, &lp("mlp.shared_expert.down_proj.weight"), &[h, si]);
+        t(&mut m, &lp("mlp.shared_expert_gate.weight"), &[1, h]);
+        m
+    }
+
+    /// sc-24438 AC2: a sparse-MoE checkpoint carrying an MTP head loads (the head is skipped, its
+    /// tensors unread, the reason named) and the target decodes; the same config without MoE still
+    /// loads its head.
+    #[test]
+    fn a_moe_checkpoint_with_an_mtp_head_loads_and_skips_the_head() {
+        let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+        let w = Weights::from_map(synthetic_moe_mtp_tensors(&cfg));
+        let model = Qwen35Model::from_weights(&w, "model.language_model", cfg.clone())
+            .expect("a MoE checkpoint with an MTP head loads");
+        assert!(!model.has_mtp());
+        assert!(model.new_mtp_cache().is_none());
+        assert!(model.skipped_mtp().unwrap().contains("sparse-MoE"));
+        let mut cache = model.new_cache();
+        let ids = Array::from_slice(&[1i32, 7, 3], &[1, 3]);
+        let logits = model.forward(&ids, &mut cache, 0).unwrap();
+        assert_eq!(logits.shape(), &[1, 3, cfg.vocab_size]);
+
+        let dense = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
+        assert_eq!(dense.mtp_skip_reason(), None);
+        assert!(qwen35_dense_with_mtp(&dense).has_mtp());
+        assert_eq!(
+            Qwen35Config::from_json(&cfg_json_moe())
+                .unwrap()
+                .mtp_skip_reason(),
+            None,
+            "no head, nothing skipped"
+        );
+    }
+
+    fn qwen35_dense_with_mtp(cfg: &Qwen35Config) -> Qwen35Model {
+        Qwen35Model::from_weights(&synthetic_weights(cfg), "model.language_model", cfg.clone())
+            .unwrap()
     }
 
     /// The MoE FFN block, validated against a numeric oracle from the exact

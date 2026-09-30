@@ -21,8 +21,10 @@ pub struct MtpCapabilities {
 pub struct ProposerCapabilities {
     /// The proposal source.
     pub proposer: crate::SpeculativeProposer,
-    /// The largest depth (draft tokens per verification pass) the backend runs for this proposer;
-    /// a request above it is refused by [`TextLlmCapabilities::validate_request`].
+    /// The largest depth (draft tokens per verification pass) the backend runs for this proposer —
+    /// a finite, backend-true bound, never `u32::MAX` (epic sc-24432 E4). A request above it is
+    /// clamped to it by [`resolve_speculative`](crate::resolve_speculative), and the clamp is named
+    /// in [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) (sc-24438).
     pub max_depth: u32,
     /// The depth [`Speculative::Auto`](crate::Speculative::Auto) runs.
     pub recommended_depth: u32,
@@ -125,6 +127,27 @@ impl TextLlmCapabilities {
             .or(legacy_mtp)
     }
 
+    /// Advertise an in-checkpoint MTP head at `max_depth` drafts per verify step, running
+    /// `recommended_depth` (clamped into `1..=max_depth`) under
+    /// [`Speculative::Auto`](crate::Speculative::Auto) — on the per-proposer
+    /// [`speculative`](Self::speculative) list **and** the legacy [`mtp`](Self::mtp) field, so the
+    /// two advertisements always agree (sc-24438, E4). Replaces any earlier MTP advertisement.
+    pub fn advertise_mtp(&mut self, max_depth: u32, recommended_depth: u32) {
+        let max_depth = max_depth.max(1);
+        let recommended_depth = recommended_depth.clamp(1, max_depth);
+        self.mtp = Some(MtpCapabilities {
+            max_draft_tokens: max_depth,
+            recommended_draft_tokens: recommended_depth,
+        });
+        self.speculative
+            .retain(|c| c.proposer != crate::SpeculativeProposer::Mtp);
+        self.speculative.push(ProposerCapabilities {
+            proposer: crate::SpeculativeProposer::Mtp,
+            max_depth,
+            recommended_depth,
+        });
+    }
+
     /// Every advertised proposer (the legacy MTP advertisement included), in
     /// [`SpeculativeProposer::ALL`](crate::SpeculativeProposer::ALL) order.
     pub fn speculative_proposers(&self) -> Vec<ProposerCapabilities> {
@@ -138,6 +161,21 @@ impl TextLlmCapabilities {
     /// [`TextLlm::validate`](crate::TextLlm::validate). Rejects (rather than silently ignoring)
     /// anything outside the declared surface.
     pub fn validate_request(&self, id: &str, req: &TextLlmRequest) -> Result<()> {
+        self.validate_request_with_skipped_mtp(id, req, false)
+    }
+
+    /// [`validate_request`](Self::validate_request) for a loaded model whose checkpoint carries an
+    /// MTP head the backend loaded past without running (`mtp_skipped`, sc-24438 — e.g. a
+    /// sparse-MoE predictor layer). An explicit `mtp` request is then admitted rather than refused
+    /// as unsupported: it decodes without a proposer, the skipped head named in its report
+    /// ([`resolve_speculative_with_skipped_mtp`](crate::resolve_speculative_with_skipped_mtp),
+    /// epic sc-24432 E2). Everything else is validated exactly as `validate_request` does.
+    pub fn validate_request_with_skipped_mtp(
+        &self,
+        id: &str,
+        req: &TextLlmRequest,
+        mtp_skipped: bool,
+    ) -> Result<()> {
         let reject = |msg: String| Err(Error::InvalidRequest(format!("[{id}] {msg}")));
 
         if req.messages.is_empty() {
@@ -218,24 +256,21 @@ impl TextLlmCapabilities {
                     .into(),
             );
         }
-        // An explicit proposer must be advertised and its depth within the advertised limit;
-        // `auto` and `off` never refuse (auto resolves to what the model offers, or runs plain
-        // with the reason named).
+        // An explicit proposer must be advertised (or be a checkpoint MTP head the backend
+        // skipped, which falls back by name) and ask for at least one draft. A depth above the
+        // advertised maximum is not refused: `resolve_speculative` clamps it and names the clamp
+        // in the report (sc-24438). `auto` and `off` never refuse (auto resolves to what the model
+        // offers, or runs plain with the reason named).
         if let crate::Speculative::Proposer { proposer, depth } = req.speculative_mode() {
-            let Some(cap) = self.proposer(proposer) else {
+            let skipped_head = mtp_skipped && proposer == crate::SpeculativeProposer::Mtp;
+            if self.proposer(proposer).is_none() && !skipped_head {
                 return Err(Error::Unsupported(format!(
                     "[{id}] provider does not support speculative decoding with the \
                      `{proposer}` proposer"
                 )));
-            };
+            }
             if depth == 0 {
                 return reject(format!("speculative `{proposer}` depth must be >= 1"));
-            }
-            if depth > cap.max_depth {
-                return reject(format!(
-                    "speculative `{proposer}` depth {depth} exceeds cap {}",
-                    cap.max_depth
-                ));
             }
         }
 
@@ -363,16 +398,86 @@ mod tests {
             caps.validate_request("test", &req),
             Err(Error::InvalidRequest(_))
         ));
+        // sc-24438: a depth above the advertised maximum is admitted — the resolver clamps it and
+        // names the clamp in the report — rather than refused.
         req.mtp = MtpMode::Enabled { draft_tokens: 5 };
+        caps.validate_request("test", &req).unwrap();
+    }
+
+    /// sc-24438 (E4): one call advertises MTP on both the per-proposer list and the legacy field,
+    /// with the same finite numbers, and replaces an earlier advertisement.
+    #[test]
+    fn advertising_mtp_keeps_the_legacy_field_and_the_proposer_list_in_agreement() {
+        use crate::SpeculativeProposer;
+        let mut caps = TextLlmCapabilities::default();
+        caps.advertise_mtp(7, 3);
+        let legacy = caps.mtp.unwrap();
+        let listed = caps
+            .speculative
+            .iter()
+            .find(|c| c.proposer == SpeculativeProposer::Mtp)
+            .copied()
+            .unwrap();
+        assert_eq!(legacy.max_draft_tokens, listed.max_depth);
+        assert_eq!(legacy.recommended_draft_tokens, listed.recommended_depth);
+        assert_eq!((listed.max_depth, listed.recommended_depth), (7, 3));
+        assert_eq!(caps.proposer(SpeculativeProposer::Mtp), Some(listed));
+
+        // Re-advertising replaces (one MTP entry), and the recommendation never exceeds the max.
+        caps.advertise_mtp(2, 3);
+        assert_eq!(
+            caps.speculative
+                .iter()
+                .filter(|c| c.proposer == SpeculativeProposer::Mtp)
+                .count(),
+            1
+        );
+        let mtp = caps.proposer(SpeculativeProposer::Mtp).unwrap();
+        assert_eq!((mtp.max_depth, mtp.recommended_depth), (2, 2));
+        assert_eq!(
+            caps.mtp,
+            Some(MtpCapabilities {
+                max_draft_tokens: 2,
+                recommended_draft_tokens: 2
+            })
+        );
+    }
+
+    /// sc-24438 (E2): a checkpoint MTP head the backend skipped admits an explicit `mtp` request
+    /// (it falls back by name at generate) instead of refusing it as unsupported; nothing else
+    /// about validation changes.
+    #[test]
+    fn a_skipped_mtp_head_admits_an_explicit_mtp_request() {
+        use crate::{Speculative, SpeculativeProposer};
+        let caps = TextLlmCapabilities::default();
+        let mut req = request();
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::Mtp, 3));
         assert!(matches!(
             caps.validate_request("test", &req),
+            Err(Error::Unsupported(_))
+        ));
+        caps.validate_request_with_skipped_mtp("test", &req, true)
+            .unwrap();
+        req.speculative = None;
+        req.mtp = MtpMode::Enabled { draft_tokens: 3 };
+        caps.validate_request_with_skipped_mtp("test", &req, true)
+            .unwrap();
+        req.mtp = MtpMode::Enabled { draft_tokens: 0 };
+        assert!(matches!(
+            caps.validate_request_with_skipped_mtp("test", &req, true),
             Err(Error::InvalidRequest(_))
+        ));
+        req.mtp = MtpMode::Off;
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2));
+        assert!(matches!(
+            caps.validate_request_with_skipped_mtp("test", &req, true),
+            Err(Error::Unsupported(_))
         ));
     }
 
     /// sc-24433: an explicit proposer is checked against the per-proposer advertisement (legacy
     /// MTP included), `auto` never refuses, and the new option and the legacy field cannot both
-    /// be set.
+    /// be set. (Since sc-24438 a too-deep request is clamped by the resolver, not refused.)
     #[test]
     fn explicit_proposers_are_checked_per_proposer_and_the_two_fields_cannot_both_be_set() {
         use crate::{Speculative, SpeculativeProposer};
@@ -409,10 +514,9 @@ mod tests {
         let mut req = request();
         req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4));
         caps.validate_request("test", &req).unwrap();
+        // Above the advertised max: admitted, the resolver clamps it by name (sc-24438).
         req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 9));
-        let err = caps.validate_request("test", &req).unwrap_err();
-        assert!(matches!(err, Error::InvalidRequest(_)));
-        assert!(err.to_string().contains("exceeds cap 8"), "{err}");
+        caps.validate_request("test", &req).unwrap();
         req.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 0));
         assert!(matches!(
             caps.validate_request("test", &req),

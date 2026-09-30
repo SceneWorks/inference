@@ -782,6 +782,113 @@ mod tests {
         );
     }
 
+    /// A provider advertising prompt lookup only, validating through the contract and recording
+    /// the speculative option of every request it generates for.
+    struct SpeculativeRecorder {
+        descriptor: core_llm::TextLlmDescriptor,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<core_llm::Speculative>>>,
+    }
+
+    impl TextLlm for SpeculativeRecorder {
+        fn descriptor(&self) -> &core_llm::TextLlmDescriptor {
+            &self.descriptor
+        }
+        fn validate(&self, req: &core_llm::TextLlmRequest) -> core_llm::Result<()> {
+            self.descriptor
+                .capabilities
+                .validate_request(&self.descriptor.id, req)
+        }
+        fn generate(
+            &self,
+            req: &core_llm::TextLlmRequest,
+            _: &mut dyn FnMut(StreamEvent),
+        ) -> core_llm::Result<core_llm::TextLlmOutput> {
+            self.seen.lock().unwrap().push(req.speculative_mode());
+            Ok(core_llm::TextLlmOutput {
+                text: "ok".into(),
+                finish_reason: Some(core_llm::FinishReason::Stop),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// POST one chat body and return the whole response.
+    fn post_chat(addr: SocketAddr, body: &str) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        write!(
+            s,
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
+    }
+
+    /// sc-24438 AC3, end to end over the socket: the new `speculative` option and the legacy
+    /// `mtp` shape reach the provider as sent; an unknown value, both fields at once, or a
+    /// proposer the model does not advertise is a 400 and never reaches generation.
+    #[test]
+    fn the_speculative_field_reaches_the_provider_and_unknown_values_are_400() {
+        use core_llm::{ProposerCapabilities, Speculative, SpeculativeProposer};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = SpeculativeRecorder {
+            descriptor: core_llm::TextLlmDescriptor {
+                id: "recorder".into(),
+                family: "stub".into(),
+                backend: "test".into(),
+                capabilities: core_llm::TextLlmCapabilities {
+                    speculative: vec![ProposerCapabilities {
+                        proposer: SpeculativeProposer::PromptLookup,
+                        max_depth: 7,
+                        recommended_depth: 4,
+                    }],
+                    ..Default::default()
+                },
+            },
+            seen: seen.clone(),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            serve(&listener, &recorder, "m", ConnectionLimits::PRODUCTION);
+        });
+        let body = |extra: &str| {
+            format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"max_tokens":2{extra}}}"#)
+        };
+
+        for (extra, want) in [
+            (
+                r#","speculative":{"proposer":"prompt_lookup","depth":3}"#,
+                Speculative::proposer(SpeculativeProposer::PromptLookup, 3),
+            ),
+            (r#","speculative":"auto""#, Speculative::Auto),
+            (r#","mtp":{"mode":"auto"}"#, Speculative::Auto),
+            ("", Speculative::Off),
+        ] {
+            let resp = post_chat(addr, &body(extra));
+            assert!(resp.starts_with("HTTP/1.1 200"), "{extra}: {resp:?}");
+            assert_eq!(seen.lock().unwrap().pop(), Some(want), "{extra}");
+        }
+        for extra in [
+            r#","speculative":"warp""#,
+            r#","speculative":{"proposer":"ngram","depth":2}"#,
+            r#","mtp":{"mode":"always"}"#,
+            r#","speculative":"auto","mtp":{"mode":"auto"}"#,
+            r#","speculative":{"proposer":"draft_model","depth":2}"#,
+        ] {
+            let resp = post_chat(addr, &body(extra));
+            assert!(resp.starts_with("HTTP/1.1 400"), "{extra}: {resp:?}");
+            assert!(resp.contains("invalid_request"), "{extra}: {resp:?}");
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no refused request generated"
+        );
+    }
+
     #[test]
     fn internal_error_body_does_not_expose_backend_detail() {
         let secret = "/Users/private/models/checkpoint.safetensors";
