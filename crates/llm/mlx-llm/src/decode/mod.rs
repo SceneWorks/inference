@@ -25,8 +25,8 @@ pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
     generate_speculative, CacheRollback, DraftSampler, EngineOptions, LogitsScope, MlxSampler,
     NoProposer, Proposal, ProposeContext, Proposer, RewindableConstraintMask, Rollback,
-    SnapshotRollback, SpeculativePrompt, SpeculativeRun, SpeculativeTarget, TargetOutput,
-    TokenSampler, TruncateRollback,
+    SampledToken, SnapshotRollback, SpeculativePrompt, SpeculativeRun, SpeculativeTarget,
+    StepTarget, TargetOutput, TokenSampler, TruncateRollback,
 };
 pub use prefix::{generate_cached, generate_cached_with, PrefixCache, PrefixStats};
 pub use proposers::{generate_qwen35_mtp, MtpProposer, NgramProposer, Qwen35MtpMultimodalPrompt};

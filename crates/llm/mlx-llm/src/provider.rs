@@ -1240,6 +1240,11 @@ impl RewindableConstraintMask for JsonMask<'_> {
     }
 
     fn rewind(&mut self, checkpoint: usize) {
+        // Nothing was accepted since the checkpoint: the state is already there, and a rebuild +
+        // replay of every accepted token would make each constrained step O(n).
+        if checkpoint == self.accepted.len() {
+            return;
+        }
         self.accepted.truncate(checkpoint);
         self.inner = JsonConstraint::new(self.table, self.stop_ids.iter().copied());
         self.reasoning_tail.clear();
@@ -3618,6 +3623,21 @@ mod tests {
     #[test]
     fn speculative_requests_emit_the_off_tokens_and_off_is_the_plain_loop() {
         use core_llm::Speculative;
+        // The absolute accounting of a budget-bound run without stop tokens: the first token
+        // comes from the prefill and each verify step commits its accepted drafts plus one; every
+        // forward is the prefill, a verify step or a recovery replay.
+        let accounting = |label: &str, ids: &[u32], report: &core_llm::DecodeReport| {
+            assert_eq!(
+                ids.len() as u64,
+                1 + report.verify_steps + report.accepted_tokens,
+                "{label}: {report:?}"
+            );
+            assert_eq!(
+                report.target_forwards,
+                1 + report.verify_steps + report.replay_forwards,
+                "{label}: {report:?}"
+            );
+        };
         for (label, provider, proposer, depth) in [
             (
                 "causal prompt lookup",
@@ -3638,7 +3658,12 @@ mod tests {
             assert_eq!(off_ids, plain, "{label}: off != the plain loop");
             assert_eq!(off.text, provider.tokenizer.decode(&plain, true).unwrap());
             assert_eq!(off_ids.len(), 16, "{label}: runs to the budget");
+            assert!(
+                provider.stop_tokens.is_empty(),
+                "{label}: accounting needs no stop tokens"
+            );
             let report = off.decode.expect("off reports its decode path");
+            accounting(label, &off_ids, &report);
             assert_eq!(report.path, "step_model", "{label}");
             assert_eq!(report.proposer, ProposerKind::None, "{label}");
             assert_eq!(report.draft_tokens, None, "{label}");
@@ -3659,6 +3684,12 @@ mod tests {
             assert_eq!(spec_ids, off_ids, "{label}: speculative != off");
             assert_eq!(spec.text, off.text, "{label}");
             let report = spec.decode.expect("a speculative run reports");
+            accounting(label, &spec_ids, &report);
+            // The lookup fixture accepts drafts, so its pin covers full-acceptance steps (the
+            // MTP fixture's adversarial head never has one accepted).
+            if proposer == SpeculativeProposer::PromptLookup {
+                assert!(report.accepted_tokens > 0, "{label}: {report:?}");
+            }
             assert_eq!(report.proposer, ProposerKind::from(proposer), "{label}");
             assert_eq!(report.path, ProposerKind::from(proposer).label(), "{label}");
             assert_eq!(report.draft_tokens, Some(depth), "{label}");

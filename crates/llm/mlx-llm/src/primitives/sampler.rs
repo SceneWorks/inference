@@ -22,7 +22,9 @@ use std::collections::BinaryHeap;
 use mlx_rs::ops::indexing::{argmax, argmax_axis};
 use mlx_rs::{Array, Dtype};
 
-use crate::error::Result;
+use core_llm::{HostSampleReason, SamplerPath};
+
+use crate::error::{Error, Result};
 
 /// A pluggable random source for the categorical draw. Greedy decoding never touches it, so an
 /// unused RNG produces bit-identical (deterministic) output.
@@ -115,22 +117,47 @@ pub fn sample(
     rng: &mut impl TokenRng,
     allowed: Option<&[bool]>,
 ) -> Result<i32> {
+    Ok(sample_with_path(logits, history, params, rng, allowed)?.0)
+}
+
+/// [`sample`], also returning where the draw actually happened: [`SamplerPath::Device`] when the
+/// on-device argmax fast path ran, else [`SamplerPath::Host`] with the reason the row came to the
+/// host (a constraint mask, a penalty, or a positive temperature MLX has no device sampler for).
+/// The path is the branch that ran, never re-derived from the request, so the speculative engine's
+/// report measures it (epic sc-24432, story sc-24434).
+///
+/// A constrained row whose mask allows no token is [`Error::NoAllowedToken`] — never a silent
+/// draw of a forbidden id.
+pub fn sample_with_path(
+    logits: &Array,
+    history: &[i32],
+    params: &SamplingParams,
+    rng: &mut impl TokenRng,
+    allowed: Option<&[bool]>,
+) -> Result<(i32, SamplerPath)> {
     // Fast path: pure greedy, no penalty, no constraint -> on-device argmax (1-element transfer).
     if params.is_plain_greedy() && allowed.is_none() {
-        return argmax_device(logits);
+        return Ok((argmax_device(logits)?, SamplerPath::Device));
     }
+    let host = SamplerPath::Host(if allowed.is_some() {
+        HostSampleReason::Constraint
+    } else if params.presence_penalty != 0.0 || params.repetition_penalty != 1.0 {
+        HostSampleReason::Penalty
+    } else {
+        HostSampleReason::DeviceUnavailable
+    });
 
     let v = penalized_logits(logits, history, params, allowed)?;
 
     // Greedy after mask/penalty have been applied to the host logits.
     if params.temperature <= 0.0 {
-        return Ok(argmax_host(&v));
+        return Ok((argmax_host(&v), host));
     }
 
     let weights = nucleus_weights(&v, params);
     let total: f32 = weights.iter().map(|x| x.1).sum();
     if total <= 0.0 || !total.is_finite() {
-        return Ok(argmax_host(&v)); // everything masked / -inf; deterministic fallback
+        return Ok((argmax_host(&v), host)); // a NaN / -inf row; deterministic fallback
     }
 
     // Categorical inverse-CDF draw over the (unnormalised) weights.
@@ -138,10 +165,10 @@ pub fn sample(
     for (i, w) in &weights {
         target -= *w;
         if target <= 0.0 {
-            return Ok(*i as i32);
+            return Ok((*i as i32, host));
         }
     }
-    Ok(weights.last().map(|x| x.0).unwrap_or(0) as i32)
+    Ok((weights.last().map(|x| x.0).unwrap_or(0) as i32, host))
 }
 
 /// The shaped candidate distribution `sample` would draw from for a **stochastic** (`temperature >
@@ -162,7 +189,8 @@ pub fn shaped_candidates(
 }
 
 /// Pull `logits` to host f32 and apply the constraint mask + repetition penalty (the position-shaping
-/// shared by `sample` and [`shaped_candidates`]).
+/// shared by `sample` and [`shaped_candidates`]). A mask that allows no id of the row is
+/// [`Error::NoAllowedToken`].
 fn penalized_logits(
     logits: &Array,
     history: &[i32],
@@ -171,6 +199,11 @@ fn penalized_logits(
 ) -> Result<Vec<f32>> {
     let lf = logits.as_dtype(Dtype::Float32)?;
     let mut v: Vec<f32> = lf.as_slice::<f32>().to_vec();
+    if let Some(mask) = allowed {
+        if !mask.iter().take(v.len()).any(|&a| a) {
+            return Err(Error::NoAllowedToken { vocab: v.len() });
+        }
+    }
     penalize_host(&mut v, history, params, allowed);
     Ok(v)
 }
@@ -270,10 +303,11 @@ pub fn argmax_rows_device(logits: &Array) -> Result<Vec<i32>> {
 }
 
 /// The target distribution a speculative acceptance test ([`core_llm::speculative::accept_token`])
-/// checks a draft against: [`shaped_candidates`], or — when nothing survives the shaping (every
-/// logit masked, a NaN or `+inf` maximum) — the point mass on the penalized row's argmax, which is
-/// the token [`sample`] itself commits for such a row. Never empty, so a degenerate row can never
-/// accept a draft (or commit a fallback id) the row did not choose.
+/// checks a draft against: [`shaped_candidates`], or — when nothing survives the shaping (a NaN or
+/// `+inf` maximum) — the point mass on the penalized row's argmax, which is the token [`sample`]
+/// itself commits for such a row. Never empty, so a degenerate row can never accept a draft (or
+/// commit a fallback id) the row did not choose. A constrained row whose mask allows no token is
+/// [`Error::NoAllowedToken`], exactly as in [`sample`].
 pub fn acceptance_target(
     logits: &Array,
     history: &[i32],
@@ -476,6 +510,81 @@ mod tests {
         let mask = [true, false, false, false];
         let mut rng = SplitMix64::new(0);
         assert_eq!(sample(&l, &[], &params, &mut rng, Some(&mask)).unwrap(), 0);
+    }
+
+    /// A constrained row whose mask allows nothing is a typed error from every sampling entry
+    /// point — greedy, stochastic and the speculative acceptance target — never the old silent
+    /// fallback to id 0 (a forbidden token). An allowed id past the row does not count.
+    #[test]
+    fn a_fully_masked_row_is_a_named_error() {
+        let l = logits(&[0.1, 0.2, 9.0, 0.3]);
+        let stochastic = SamplingParams {
+            temperature: 0.8,
+            ..Default::default()
+        };
+        for mask in [
+            &[false; 4][..],
+            &[false, false, false, false, true][..],
+            &[][..],
+        ] {
+            for params in [SamplingParams::default(), stochastic] {
+                let mut rng = SplitMix64::new(0);
+                let err = sample_with_path(&l, &[], &params, &mut rng, Some(mask)).unwrap_err();
+                assert!(
+                    matches!(err, Error::NoAllowedToken { vocab: 4 }),
+                    "{mask:?} {params:?}: {err}"
+                );
+                let err = acceptance_target(&l, &[], &params, Some(mask)).unwrap_err();
+                assert!(
+                    matches!(err, Error::NoAllowedToken { vocab: 4 }),
+                    "{mask:?} {params:?}: {err}"
+                );
+            }
+        }
+        // One allowed id is enough.
+        let mut rng = SplitMix64::new(0);
+        let mask = [false, false, false, true];
+        let t = sample(&l, &[], &SamplingParams::default(), &mut rng, Some(&mask)).unwrap();
+        assert_eq!(t, 3);
+    }
+
+    /// The reported path is the branch that ran: the on-device argmax only for a plain greedy,
+    /// unconstrained draw; otherwise the host, with the reason the row came there.
+    #[test]
+    fn sample_with_path_reports_the_branch_that_ran() {
+        let l = logits(&[0.1, 0.2, 9.0, 0.3]);
+        let mut rng = SplitMix64::new(0);
+        let greedy = SamplingParams::default();
+        let penalized = SamplingParams {
+            presence_penalty: 0.5,
+            ..Default::default()
+        };
+        let stochastic = SamplingParams {
+            temperature: 0.8,
+            ..Default::default()
+        };
+        let mask = [true; 4];
+        for (params, allowed, path) in [
+            (greedy, None, SamplerPath::Device),
+            (
+                greedy,
+                Some(&mask[..]),
+                SamplerPath::Host(HostSampleReason::Constraint),
+            ),
+            (
+                penalized,
+                None,
+                SamplerPath::Host(HostSampleReason::Penalty),
+            ),
+            (
+                stochastic,
+                None,
+                SamplerPath::Host(HostSampleReason::DeviceUnavailable),
+            ),
+        ] {
+            let (_, got) = sample_with_path(&l, &[], &params, &mut rng, allowed).unwrap();
+            assert_eq!(got, path, "{params:?} {allowed:?}");
+        }
     }
 
     #[test]
