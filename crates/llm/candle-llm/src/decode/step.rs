@@ -235,7 +235,7 @@ pub trait StepModel {
 
     /// Whether this model's step can be captured as a CUDA graph at all (story sc-24134, E5):
     /// `Err` names a known reason the step is not replayable — a device->host read inside the
-    /// step (a MoE router that pulls its probabilities to the host), positions or offsets that
+    /// step (an MoE expert bank dispatched from host-read routes), positions or offsets that
     /// only exist as Rust-side scalars. The runner checks this before any capture; the default
     /// is `Ok` and the runner's census of the captured graph is the second gate.
     fn graph_support(&self) -> std::result::Result<(), &'static str> {

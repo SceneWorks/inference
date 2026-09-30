@@ -38,6 +38,7 @@ use crate::models::deepstack::{self, deepstack_fused_decoder_layers, MropePositi
 use crate::primitives::attention::{sdpa, sdpa_gqa, sdpa_gqa_causal, AttnFormulation, AttnMask};
 use crate::primitives::decode_cache::DecodeCache;
 use crate::primitives::kv_cache::{KvCache, KvCacheKind};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu};
 use crate::primitives::nn::{
     embed, gelu, rms_norm, rms_norm_residual, rms_norm_unscaled, soft_cap, swiglu,
 };
@@ -581,11 +582,10 @@ impl CausalLm {
                 let mut experts = Vec::with_capacity(moe.num_experts);
                 for e in 0..moe.num_experts {
                     let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
-                    experts.push(LlamaMlp {
+                    experts.push(SwiGlu {
                         gate: proj(ep("gate_proj.weight"))?,
                         up: proj(ep("up_proj.weight"))?,
                         down: proj(ep("down_proj.weight"))?,
-                        gelu: false,
                     });
                 }
                 // Shared expert key stem: DeepSeek packs `n_shared_experts` into `mlp.shared_experts`
@@ -596,24 +596,25 @@ impl CausalLm {
                     "mlp.shared_expert"
                 };
                 let shared_gate_key = lp("mlp.shared_expert_gate.weight");
-                Ffn::Moe(MoeMlp {
-                    router: req(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                Ffn::Moe(SparseMoe::new(
+                    req(lp("mlp.gate.weight"))?, // [num_experts, hidden]
                     experts,
-                    shared: LlamaMlp {
+                    SwiGlu {
                         gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
                         up: proj(lp(&format!("{shared_stem}.up_proj.weight")))?,
                         down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
-                        gelu: false,
                     },
-                    shared_gate: if w.contains(&shared_gate_key) {
+                    if w.contains(&shared_gate_key) {
                         Some(req(shared_gate_key)?) // [1, hidden]
                     } else {
                         None
                     },
-                    experts_per_tok: moe.num_experts_per_tok,
-                    norm_topk_prob: moe.norm_topk_prob,
-                    routed_scaling_factor: moe.routed_scaling_factor,
-                })
+                    MoeRouting {
+                        experts_per_tok: moe.num_experts_per_tok,
+                        norm_topk_prob: moe.norm_topk_prob,
+                        routed_scaling_factor: moe.routed_scaling_factor,
+                    },
+                )?)
             } else {
                 // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
                 // `use_double_wide_mlp` doubles this layer's inner width on Gemma 4's KV-sharing
@@ -1683,14 +1684,18 @@ impl StepModel for CausalLm {
     }
 
     /// Not replayable as a CUDA graph (story sc-24134), declared so the runner refuses before any
-    /// capture: a Mixture-of-Experts layer pulls its router probabilities to the host every step
-    /// for the top-k (`moe_router_host_read`), and every step's positions are Rust-side scalars —
+    /// capture: a Mixture-of-Experts layer whose experts Candle cannot index by a device id
+    /// (quantized) dispatches them from host-read routes (`moe_expert_host_dispatch`; the router
+    /// itself runs on the device since sc-24440), and every step's positions are Rust-side scalars —
     /// the RoPE offset taken from the cache's length, the KV written at that offset, attention
     /// bounded by the host-side length — which a graph would replay at the captured position
     /// (`positions_host_scalar`).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
-        if self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_))) {
-            return Err("moe_router_host_read");
+        if let Some(reason) = self.layers.iter().find_map(|l| match &l.ffn {
+            Ffn::Moe(m) => m.graph_refusal(),
+            Ffn::Dense(_) => None,
+        }) {
+            return Err(reason);
         }
         Err("positions_host_scalar")
     }
@@ -1969,15 +1974,7 @@ impl LlamaLayer {
         }
         match &self.ffn {
             Ffn::Dense(m) => m.record(census),
-            Ffn::Moe(m) => {
-                census.record_tensor(&m.router);
-                if let Some(gate) = &m.shared_gate {
-                    census.record_tensor(gate);
-                }
-                for expert in m.experts.iter().chain([&m.shared]) {
-                    expert.record(census);
-                }
-            }
+            Ffn::Moe(m) => m.record(census),
         }
     }
 
@@ -2051,10 +2048,11 @@ impl LlamaLayer {
     }
 }
 
-/// A layer's feed-forward network: a dense SwiGLU MLP, or a sparse Mixture-of-Experts bank.
+/// A layer's feed-forward network: a dense SwiGLU MLP, or a sparse Mixture-of-Experts bank (the
+/// shared [`SparseMoe`] block — Qwen2-MoE, DeepSeek-V2).
 enum Ffn {
     Dense(LlamaMlp),
-    Moe(MoeMlp),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -2623,102 +2621,6 @@ impl LlamaMlp {
             swiglu(&g, &up)?
         };
         self.down.forward(&gated)
-    }
-}
-
-/// A sparse Mixture-of-Experts feed-forward (Qwen2-MoE, DeepSeek-V2): a softmax router over `experts`
-/// (top-k per token) plus an always-on `shared` expert. Correctness-first — each expert runs **only
-/// on its routed tokens** (gathered, then scatter-added back), so the active compute scales with
-/// `experts_per_tok`, not the full bank. Top-k selection is done on the host (Candle has no fused
-/// top-k); `n_group`/`topk_group` group-limited routing (DeepSeek-V2-236B / V3) is not modelled —
-/// the verification model (V2-Lite) uses plain greedy top-k.
-struct MoeMlp {
-    /// Router weight `[num_experts, hidden]`.
-    router: Tensor,
-    experts: Vec<LlamaMlp>,
-    shared: LlamaMlp,
-    /// Shared-expert sigmoid gate `[1, hidden]` (Qwen2-MoE); `None` ⇒ the shared expert is added
-    /// ungated (DeepSeek-V2).
-    shared_gate: Option<Tensor>,
-    experts_per_tok: usize,
-    norm_topk_prob: bool,
-    /// Multiplier on the (un-normalized) routed weights — DeepSeek's `routed_scaling_factor`; `1.0`
-    /// for Qwen2-MoE. Ignored when `norm_topk_prob` (the weights are renormalized instead).
-    routed_scaling_factor: f32,
-}
-
-impl MoeMlp {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, s, h) = x.dims3()?;
-        let t = b * s;
-        let dtype = x.dtype();
-        let device = x.device();
-        let xf = x.reshape((t, h))?;
-
-        // Router probabilities (computed in f32 for a stable top-k), pulled to host.
-        let logits = xf.matmul(&self.router.t()?)?; // [t, E]
-        let probs = candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?;
-        let probs = probs.to_vec2::<f32>()?; // [t][E]
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Invert the per-token top-k into per-expert (token, weight) lists.
-        let mut routed: Vec<Vec<(u32, f32)>> = vec![Vec::new(); num_experts];
-        for (ti, row) in probs.iter().enumerate() {
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
-            let top = &idx[..k];
-            // Renormalize the top-k weights to sum to 1, or (when not normalizing) apply the routed
-            // scaling factor — matching the reference gate's two branches.
-            let (denom, post_scale) = if self.norm_topk_prob {
-                let sum = top
-                    .iter()
-                    .map(|&e| row[e])
-                    .sum::<f32>()
-                    .max(f32::MIN_POSITIVE);
-                (sum, 1.0)
-            } else {
-                (1.0, self.routed_scaling_factor)
-            };
-            for &e in top {
-                routed[e].push((ti as u32, row[e] / denom * post_scale));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = Tensor::zeros((t, h), dtype, device)?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len();
-            let idx = Tensor::from_vec(
-                toks.iter().map(|&(ti, _)| ti).collect::<Vec<u32>>(),
-                (n,),
-                device,
-            )?;
-            let wts = Tensor::from_vec(
-                toks.iter().map(|&(_, w)| w).collect::<Vec<f32>>(),
-                (n, 1),
-                device,
-            )?
-            .to_dtype(dtype)?;
-            let xe = xf.index_select(&idx, 0)?; // [n, h]
-            let ye = self.experts[e].forward(&xe)?.broadcast_mul(&wts)?; // [n, h]
-            out = out.index_add(&idx, &ye, 0)?;
-        }
-
-        // Always-on shared expert: Qwen2 gates it by sigmoid(x · shared_gateᵀ); DeepSeek packs several
-        // shared experts into one MLP and adds them ungated.
-        let shared = self.shared.forward(&xf)?;
-        let shared = match &self.shared_gate {
-            Some(g) => {
-                let sg = candle_nn::ops::sigmoid(&xf.matmul(&g.t()?)?)?; // [t, 1]
-                shared.broadcast_mul(&sg)?
-            }
-            None => shared,
-        };
-        Ok((out + shared)?.reshape((b, s, h))?)
     }
 }
 
