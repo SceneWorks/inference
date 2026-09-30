@@ -1,5 +1,7 @@
 //! Standalone SC-20676 real-model evidence harness. An operator stop file halts the parent between
 //! arms with exit status 75 (resumable with the same resume directory).
+//! `parent --kv-bits 4` runs the packed arms with 4-bit group-affine codes (default 2); the width
+//! is part of the resume identity, so 2-bit and 4-bit arms never resume into each other.
 
 fn main() -> std::process::ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();

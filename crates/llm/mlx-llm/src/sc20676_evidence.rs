@@ -26,8 +26,8 @@ use crate::decode::{
 use crate::models::CausalLm;
 use crate::primitives::nn::to_f32_host;
 use crate::primitives::{
-    input_ids, CacheRoute, CompiledKernelHandle, KvCache, PackedCacheEvidence, PackedMetalKernel,
-    Weights,
+    input_ids, packed_metal_identity, CacheRoute, CompiledKernelHandle, KvCache,
+    PackedCacheEvidence, PackedCodeBits, PackedMetalGpuFamily, PackedMetalKernel, Weights,
 };
 use crate::{Error, ModelConfig, Result};
 
@@ -916,9 +916,13 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         .warm_packed
         .as_ref()
         .ok_or("packed arm lacks warm representation evidence")?;
-    if packed.representation_identity != "sc-20676-packed-group-affine-v1"
+    // Either code width, each bound to its own reader identity; the run's width is bound by
+    // the resume identity (`require_arm_code_bits`).
+    if PackedCodeBits::from_bits(packed.bits)
+        .map(packed_metal_identity)
+        .ok()
+        != Some(packed.representation_identity.as_str())
         || packed.representation_version != 2
-        || packed.bits != 2
         || packed.quantization_group_size != 32
         || packed.accepted_direct_calls == 0
         || packed.full_cache_dequantizations != 0
@@ -2360,6 +2364,7 @@ pub fn run_sc20676_worker(
     policy: &campaign::CampaignSafetyPolicy,
     captured_provenance: &Sc20676Provenance,
     reference: Option<&Sc20676ReferenceStream>,
+    bits: PackedCodeBits,
 ) -> std::result::Result<Sc20676Arm, String> {
     let started = Instant::now();
     if (mode == "packed") != reference.is_some() {
@@ -2608,7 +2613,12 @@ pub fn run_sc20676_worker(
     let weights_loaded = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
     // The cache clone/snapshot contract owns this non-threaded Metal object through its existing
     // `Arc` handle; it is never sent across threads by this single-worker harness.
-    let kernel = PackedMetalKernel::new().map_err(|e| e.to_string())?;
+    let kernel = PackedMetalKernel::for_identity_family_and_bits(
+        packed_metal_identity(bits),
+        PackedMetalGpuFamily::ConservativeUnknownApple,
+        bits,
+    )
+    .map_err(|e| e.to_string())?;
     let head_dimension =
         usize::try_from(cfg.head_dim).map_err(|_| "SC-20676 head dimension does not fit usize")?;
     let tuning = kernel
@@ -3310,6 +3320,55 @@ fn arm_resume_identity(
     }))
 }
 
+/// Packed-code width of a run: `kvBits` in its resume identity, absent for the 2-bit default so
+/// 2-bit identities (and their resume directories) are unchanged.
+fn identity_kv_bits(identity: &serde_json::Value) -> std::result::Result<PackedCodeBits, String> {
+    match identity.get("kvBits") {
+        None => Ok(PackedCodeBits::Two),
+        Some(value) => value
+            .as_u64()
+            .and_then(|bits| u8::try_from(bits).ok())
+            .filter(|bits| *bits != 2)
+            .ok_or_else(|| "SC-20676 resume identity has a malformed kvBits".to_string())
+            .and_then(|bits| PackedCodeBits::from_bits(bits).map_err(|e| e.to_string())),
+    }
+}
+
+/// Record a non-default packed-code width in a resume identity.
+fn bind_identity_kv_bits(identity: &mut serde_json::Value, bits: PackedCodeBits) {
+    if bits != PackedCodeBits::Two {
+        identity["kvBits"] = bits.bits().into();
+    }
+}
+
+/// `--kv-bits 2|4` (default 2): the packed arms' code width.
+fn kv_bits_flag(args: &[String]) -> std::result::Result<PackedCodeBits, String> {
+    match args.iter().position(|arg| arg == "--kv-bits") {
+        None => Ok(PackedCodeBits::Two),
+        Some(index) => args
+            .get(index + 1)
+            .and_then(|value| value.parse::<u8>().ok())
+            .ok_or_else(|| "--kv-bits requires 2 or 4".to_string())
+            .and_then(|bits| PackedCodeBits::from_bits(bits).map_err(|e| e.to_string())),
+    }
+}
+
+/// A packed arm must carry the run's code width (a dense arm carries no packed evidence).
+fn require_arm_code_bits(
+    arm: &Sc20676Arm,
+    bits: PackedCodeBits,
+) -> std::result::Result<(), String> {
+    if arm.mode == "packed" && arm.packed.as_ref().map(|packed| packed.bits) != Some(bits.bits()) {
+        return Err(format!(
+            "SC-20676 {}-{} arm is not a {}-bit packed arm",
+            arm.family,
+            arm.mode,
+            bits.bits()
+        ));
+    }
+    Ok(())
+}
+
 fn arm_identity_bytes(value: &serde_json::Value) -> std::result::Result<Vec<u8>, String> {
     campaign::canonical_json_bytes(value).map_err(|e| e.to_string())
 }
@@ -3555,6 +3614,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             );
         }
         let arm_provenance = worker_arm_provenance(&identity, worker_provenance()?)?;
+        let bits = identity_kv_bits(&identity)?;
         let reference = if required_flag(args, "--mode")? == "packed" {
             Some(read_reference_arm(
                 Path::new(&required_flag(args, "--reference-arm")?),
@@ -3575,8 +3635,10 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             &policy,
             &arm_provenance,
             reference.as_ref(),
+            bits,
         )?;
         validate_arm(&arm)?;
+        require_arm_code_bits(&arm, bits)?;
         let output = PathBuf::from(required_flag(args, "--out")?);
         if output.exists() {
             return Err("worker output path already exists".into());
@@ -3657,6 +3719,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             baseline_manifest_sha256: file_sha256(&baseline_campaign.join("campaign.json"))?,
         });
     }
+    let bits = kv_bits_flag(args)?;
     let mut identity = arm_resume_identity(
         &inputs,
         &executable_sha256,
@@ -3664,6 +3727,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
         &current_provenance,
         &proposed_nonce,
     )?;
+    bind_identity_kv_bits(&mut identity, bits);
     let (identity_sha256, nonce, expected_provenance) =
         prepare_arm_resume(&worker_root, &mut identity)?;
     let staging = parent.join(format!(
@@ -3720,6 +3784,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                     &expected_provenance,
                     &mut worker_pids,
                 )?;
+                require_arm_code_bits(&arm, bits)?;
                 eprintln!("SC-20676 resumed validated arm {slug}");
                 return Ok(ArmStep::Accepted(Box::new(arm)));
             }
@@ -3860,6 +3925,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                 &expected_provenance,
                 &mut worker_pids,
             )?;
+            require_arm_code_bits(&arm, bits)?;
             eprintln!("SC-20676 accepted validated arm {slug}");
             Ok(ArmStep::Accepted(Box::new(arm)))
         })?;
@@ -4331,6 +4397,71 @@ mod tests {
         let mut bad = receipt();
         bad.thresholds.contract_hash = digest();
         assert!(validate_sc20676_receipt(&bad).is_err());
+    }
+
+    /// A 4-bit run is its own receipt: its packed evidence carries the 4-bit reader identity, a
+    /// width/identity mismatch is refused, and the run's width is bound through the resume
+    /// identity (absent for the 2-bit default, so 2-bit identities are unchanged).
+    #[test]
+    fn packed_code_width_is_bound_to_its_identity_and_the_run() {
+        let four_bit = |receipt: &mut Sc20676Receipt, identity: &str| {
+            for evidence in [
+                receipt.packed.packed.as_mut().unwrap(),
+                receipt.packed.warm_packed.as_mut().unwrap(),
+            ] {
+                evidence.bits = 4;
+                evidence.representation_identity = identity.into();
+            }
+            reseal_arm(&mut receipt.packed);
+        };
+        let mut good = receipt();
+        four_bit(&mut good, "sc-20676-packed-group-affine-b4-v1");
+        let good = good.finish().unwrap();
+        validate_sc20676_receipt(&good).unwrap();
+        let mut mislabeled = receipt();
+        four_bit(&mut mislabeled, "sc-20676-packed-group-affine-v1");
+        assert_eq!(
+            mislabeled.finish().unwrap_err(),
+            "SC-20676 packed representation contract is not proven"
+        );
+
+        assert!(require_arm_code_bits(&good.packed, PackedCodeBits::Four).is_ok());
+        assert!(require_arm_code_bits(&good.packed, PackedCodeBits::Two)
+            .unwrap_err()
+            .contains("not a 2-bit packed arm"));
+        assert!(require_arm_code_bits(&receipt().packed, PackedCodeBits::Four).is_err());
+        assert!(require_arm_code_bits(&good.dense, PackedCodeBits::Four).is_ok());
+
+        let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            kv_bits_flag(&args(&["parent"])).unwrap(),
+            PackedCodeBits::Two
+        );
+        assert_eq!(
+            kv_bits_flag(&args(&["parent", "--kv-bits", "4"])).unwrap(),
+            PackedCodeBits::Four
+        );
+        for bad in [&["--kv-bits"][..], &["--kv-bits", "3"], &["--kv-bits", "x"]] {
+            assert!(kv_bits_flag(&args(bad)).is_err(), "{bad:?}");
+        }
+        let mut identity = serde_json::json!({ "kind": "sc-20676-arm-resume" });
+        let default_bytes = campaign::canonical_json_bytes(&identity).unwrap();
+        bind_identity_kv_bits(&mut identity, PackedCodeBits::Two);
+        assert_eq!(
+            campaign::canonical_json_bytes(&identity).unwrap(),
+            default_bytes
+        );
+        assert_eq!(identity_kv_bits(&identity).unwrap(), PackedCodeBits::Two);
+        bind_identity_kv_bits(&mut identity, PackedCodeBits::Four);
+        assert_eq!(identity_kv_bits(&identity).unwrap(), PackedCodeBits::Four);
+        for malformed in [
+            serde_json::json!(2),
+            serde_json::json!(3),
+            serde_json::json!("4"),
+        ] {
+            identity["kvBits"] = malformed;
+            assert!(identity_kv_bits(&identity).is_err());
+        }
     }
     #[test]
     fn timing_memory_output_and_baseline_tampering_fail_closed() {

@@ -1320,18 +1320,35 @@ pub struct ProductGeometry {
 /// SC-20677 RVQ/RaBitQ caches) is one variant here plus its cache selection and kernel parity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressedKvMethod {
-    /// SC-20675 packed 2-bit group-affine cache read by the SC-20676 fused Metal kernel.
+    /// SC-20675 packed 2-bit group-affine cache read by the SC-20676 fused Metal kernel. Its
+    /// identifier stays `group-affine` so earlier receipts and resume identities keep binding.
     GroupAffine,
+    /// The same cache and reader with 4-bit (KIVI-style) codes, group 32.
+    GroupAffine4,
 }
 
 impl CompressedKvMethod {
-    pub const ALL: [Self; 1] = [Self::GroupAffine];
+    pub const ALL: [Self; 2] = [Self::GroupAffine, Self::GroupAffine4];
 
     /// Stable receipt/CLI identifier.
     pub fn id(self) -> &'static str {
         match self {
             Self::GroupAffine => "group-affine",
+            Self::GroupAffine4 => "group-affine-4",
         }
+    }
+
+    /// Code width of this method's packed cache.
+    pub fn code_bits(self) -> crate::primitives::PackedCodeBits {
+        match self {
+            Self::GroupAffine => crate::primitives::PackedCodeBits::Two,
+            Self::GroupAffine4 => crate::primitives::PackedCodeBits::Four,
+        }
+    }
+
+    /// Representation identity this method's cache and reader carry (recorded on receipts).
+    pub fn representation_identity(self) -> &'static str {
+        crate::primitives::packed_metal_identity(self.code_bits())
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -1352,17 +1369,20 @@ impl CompressedKvMethod {
     /// any device this arm can dispatch on qualifies for the recent-family profile.
     pub fn kernel_gpu_family(self) -> crate::primitives::PackedMetalGpuFamily {
         match self {
-            Self::GroupAffine => crate::primitives::PackedMetalGpuFamily::Apple7OrNewer,
+            Self::GroupAffine | Self::GroupAffine4 => {
+                crate::primitives::PackedMetalGpuFamily::Apple7OrNewer
+            }
         }
     }
 
     /// Build this method's retained fused reader once per campaign session.
     pub fn arm(self) -> Result<CompressedKvArm, String> {
         let reader = match self {
-            Self::GroupAffine => {
-                let kernel = crate::primitives::PackedMetalKernel::for_identity_and_family(
-                    crate::primitives::PACKED_METAL_DEFAULT_IDENTITY,
+            Self::GroupAffine | Self::GroupAffine4 => {
+                let kernel = crate::primitives::PackedMetalKernel::for_identity_family_and_bits(
+                    self.representation_identity(),
                     self.kernel_gpu_family(),
+                    self.code_bits(),
                 )
                 .map_err(|e| e.to_string())?;
                 // The single-threaded campaign worker owns this non-Send Metal object through the
@@ -1406,7 +1426,7 @@ impl CompressedKvArm {
         model: &crate::models::CausalLm,
     ) -> crate::primitives::DecoderCacheSelection {
         match self.method {
-            CompressedKvMethod::GroupAffine => {
+            CompressedKvMethod::GroupAffine | CompressedKvMethod::GroupAffine4 => {
                 model.select_cache_with_packed_reader(self.reader.clone(), 1, 1, false)
             }
         }
@@ -1416,7 +1436,7 @@ impl CompressedKvArm {
     /// dequantize-then-attend reference over the exact stored codes.
     pub fn kernel_parity_errors(&self) -> Result<Vec<f64>, String> {
         match self.method {
-            CompressedKvMethod::GroupAffine => {
+            CompressedKvMethod::GroupAffine | CompressedKvMethod::GroupAffine4 => {
                 crate::primitives::group_affine_kernel_fp32_parity_errors(&self.reader)
             }
         }
@@ -6092,7 +6112,8 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 ///
 /// `--mode compressed --kv-method <method>` (parent, preflight, and worker) runs every scheduled
 /// row with its KV held in that method's compressed cache and fused decode attention, gated
-/// against a dense-KV reference arm on the same candidate weights (SC-20676). The GPU-window
+/// against a dense-KV reference arm on the same candidate weights (SC-20676). Methods:
+/// `group-affine` (2-bit codes) and `group-affine-4` (4-bit codes), both group 32. The GPU-window
 /// launch of the compressed campaign is one command from the inference checkout:
 ///
 /// ```text
@@ -10528,6 +10549,13 @@ pub fn compressed_receipt_block(
     let first = evidence
         .first()
         .ok_or("compressed arm produced no compressed cache evidence")?;
+    if first.bits != method.code_bits().bits() {
+        return Err(format!(
+            "compressed arm for {} produced {}-bit evidence",
+            method.id(),
+            first.bits
+        ));
+    }
     let mut fallbacks = std::collections::BTreeMap::<(String, String), u64>::new();
     let mut kernel_paths =
         std::collections::BTreeMap::<(String, String, String), (String, u64)>::new();
@@ -13999,6 +14027,13 @@ pub(crate) mod tests {
         compress_test_receipt(&mut receipt, block);
         validate_sealed_receipt(&receipt).expect("a reasoned dense coordinate is a valid row");
 
+        // A method is bound to its code width: 2-bit evidence cannot become a 4-bit receipt.
+        assert_eq!(
+            compressed_receipt_block(CompressedKvMethod::GroupAffine4, &primary, &[&primary])
+                .unwrap_err(),
+            "compressed arm for group-affine-4 produced 2-bit evidence"
+        );
+
         // A primary that never closed its coordinate scope cannot be classified.
         primary.coordinate_scope = None;
         assert!(
@@ -14027,6 +14062,28 @@ pub(crate) mod tests {
             .unwrap(),
             Some(CompressedKvMethod::GroupAffine)
         );
+        assert_eq!(
+            compressed_mode_flags(&args(&[
+                "parent",
+                "--mode",
+                "compressed",
+                "--kv-method",
+                "group-affine-4"
+            ]))
+            .unwrap(),
+            Some(CompressedKvMethod::GroupAffine4)
+        );
+        for method in CompressedKvMethod::ALL {
+            assert_eq!(CompressedKvMethod::parse(method.id()), Ok(method));
+        }
+        assert_eq!(
+            CompressedKvMethod::GroupAffine.representation_identity(),
+            "sc-20676-packed-group-affine-v1"
+        );
+        assert_eq!(
+            CompressedKvMethod::GroupAffine4.representation_identity(),
+            "sc-20676-packed-group-affine-b4-v1"
+        );
         for bad in [
             &["--mode", "compressed"][..],
             &["--kv-method", "group-affine"],
@@ -14045,6 +14102,13 @@ pub(crate) mod tests {
             resume_identity_mode(&identity).unwrap(),
             Some(CompressedKvMethod::GroupAffine)
         );
+        let two_bit = canonical_json_bytes(&identity).unwrap();
+        bind_resume_mode(&mut identity, Some(CompressedKvMethod::GroupAffine4));
+        assert_eq!(
+            resume_identity_mode(&identity).unwrap(),
+            Some(CompressedKvMethod::GroupAffine4)
+        );
+        assert_ne!(canonical_json_bytes(&identity).unwrap(), two_bit);
         identity["kvMethod"] = serde_json::Value::Null;
         assert!(resume_identity_mode(&identity).is_err());
     }
@@ -14052,18 +14116,17 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn group_affine_fused_reader_parity_is_within_the_frozen_contract() {
-        let errors = CompressedKvMethod::GroupAffine
-            .arm()
-            .unwrap()
-            .kernel_parity_errors()
-            .unwrap();
-        // Decode (S_q = 1), causal prefill chunk (S_q = 5), and split-KV decode (S_q = 1) cases.
-        assert_eq!(errors.len(), 4 * 128 * (1 + 5 + 1));
-        let max = errors.iter().copied().fold(0.0, f64::max);
-        assert!(
-            max <= COMPRESSED_PARITY_MAX_ERROR,
-            "fused reader parity {max}"
-        );
+        for method in CompressedKvMethod::ALL {
+            let errors = method.arm().unwrap().kernel_parity_errors().unwrap();
+            // Decode (S_q = 1), causal prefill chunk (S_q = 5), and split-KV decode (S_q = 1).
+            assert_eq!(errors.len(), 4 * 128 * (1 + 5 + 1));
+            let max = errors.iter().copied().fold(0.0, f64::max);
+            assert!(
+                max <= COMPRESSED_PARITY_MAX_ERROR,
+                "{}: fused reader parity {max}",
+                method.id()
+            );
+        }
     }
 
     #[test]
