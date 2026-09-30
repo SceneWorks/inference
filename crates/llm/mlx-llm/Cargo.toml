@@ -25,6 +25,9 @@ autotests = false
 # pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
 # with mlx-gen's pin so the two still build ONE mlx-rs.
 mlx-rs = { workspace = true }
+# The raw MLX C API, for the stream → device query the Gated DeltaNet kernel dispatch needs
+# (a custom Metal kernel only runs on a GPU stream; mlx-rs exposes no stream-device getter).
+mlx-sys = { workspace = true }
 # The backend-neutral contract this crate implements.
 core-llm = { workspace = true }
 # Error plumbing for the engine surface.

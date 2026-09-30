@@ -24,6 +24,7 @@
 //! normalisation, and in/out projections (the full layer) build on this in the layer story (sc-7628).
 //! GQA is handled by repeating each of the `Hk` key/query heads to the `Hv` value heads.
 
+use mlx_rs::fast::MetalKernel;
 use mlx_rs::nn::{silu, softplus};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, exp, multiply, subtract, sum_axis};
 use mlx_rs::transforms::eval;
@@ -45,18 +46,484 @@ pub fn compute_g(a: &Array, a_log: &Array, dt_bias: &Array) -> Result<Array> {
     Ok(g.as_dtype(a.dtype())?)
 }
 
-/// Run the gated delta recurrence over a `[B, T, ·]` chunk, a faithful port of the
-/// `mlx_lm.models.gated_delta` ops path.
+/// Run the gated delta recurrence over a `[B, T, ·]` chunk — the entry point every Qwen35-family
+/// linear layer reaches (sc-24443).
 ///
 /// Shapes: `q`, `k` are `[B, T, Hk, Dk]`; `v` is `[B, T, Hv, Dv]`; `g` (the per-step gate from
 /// [`compute_g`]) and `beta` are `[B, T, Hv]`; `state` (the carried recurrent state, or `None` to
-/// start from zeros) is `[B, Hv, Dv, Dk]`. Returns the per-step output `y` `[B, T, Hv, Dv]` and the
-/// final `state` `[B, Hv, Dv, Dk]` — feed `state` back in for the next chunk / decode step (T = 1).
+/// start from zeros) is `[B, Hv, Dv, Dk]`. Returns the per-step output `y` `[B, T, Hv, Dv]` (in
+/// `q`'s dtype) and the final `state` `[B, Hv, Dv, Dk]` (in the carried state's dtype, or `q`'s
+/// when starting from zeros) — feed `state` back in for the next chunk / decode step.
 ///
-/// GQA: when `Hv > Hk` each key/query head is repeated `Hv / Hk` times so it pairs with the value
-/// heads (`Hv` must be a multiple of `Hk`). The math runs in the inputs' dtype, matching the ops
-/// reference (the layer story can lift accumulation to f32 to match the GPU kernel where it matters).
+/// GQA: when `Hv > Hk` each key/query head pairs with `Hv / Hk` value heads (`Hv` must be a
+/// multiple of `Hk`).
+///
+/// Dispatch (every route matches [`gated_delta_recurrence_ops`] — see the tests' error budgets;
+/// the kernel and chunked routes accumulate in f32 whatever the input dtype, the op route in the
+/// inputs' dtype, which Qwen35 makes f32):
+/// - **GPU, any `T`** — decode (`T = 1`), speculative verify (`T = M`) and prefill: the fused
+///   Metal recurrence ([`gated_delta_kernel`]), one dispatch per [`KERNEL_MAX_STEPS`] tokens with
+///   the state in registers. It is measured faster than the chunkwise form on Metal at every
+///   length (release, Qwen3.6-27B linear-layer dims `Hk = 16, Hv = 48, Dk = Dv = 128`: 1.7 ms vs
+///   2.7 ms at 512 tokens, 7.3 ms vs 11.3 ms at 2048, against 40 / 161 ms for the op loop) and it
+///   is exact f32, whereas MLX runs f32 GEMMs as TF32 on NAX GPUs (M5+), which puts the
+///   chunkwise form ~2e-3 off the reference there.
+/// - **CPU stream, `T ≥ `[`CHUNKED_PREFILL_MIN_TOKENS`]** — the chunkwise-parallel form
+///   ([`gated_delta_chunked`]; a custom Metal kernel cannot run off the GPU, and the CPU GEMMs are
+///   exact f32).
+/// - **CPU stream, shorter `T`** — the op-by-op reference.
+///
+/// The recurrent state layout is unchanged by every path: `[B, Hv, Dv, Dk]`, the value-major form
+/// `y = S · q` reads, so a caller that checkpoints states (the planned DeltaNet ring, sc-24435)
+/// stores exactly what this returns.
 pub fn gated_delta_recurrence(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array)> {
+    #[cfg(test)]
+    if FORCE_OPS_REFERENCE.with(|f| f.get()) {
+        return gated_delta_recurrence_ops(q, k, v, g, beta, state);
+    }
+    let t = q.shape()[1];
+    let (y, next) = if default_stream_is_gpu() {
+        kernel_segmented(q, k, v, g, beta, state)?
+    } else if t >= CHUNKED_PREFILL_MIN_TOKENS {
+        gated_delta_chunked(q, k, v, g, beta, state)?
+    } else {
+        return gated_delta_recurrence_ops(q, k, v, g, beta, state);
+    };
+    let state_dtype = state.map_or(q.dtype(), Array::dtype);
+    Ok((cast_to(y, q.dtype())?, cast_to(next, state_dtype)?))
+}
+
+/// The most tokens one [`gated_delta_kernel`] dispatch runs: a longer sequence is split into
+/// dispatches carrying the state, so no single command stays on the GPU long enough to approach
+/// the Metal watchdog (a dispatch is ~15 ms at Qwen3.6-27B dims) however long the prompt is.
+pub const KERNEL_MAX_STEPS: i32 = 4096;
+
+/// [`gated_delta_kernel`] over `T` in dispatches of at most [`KERNEL_MAX_STEPS`] tokens.
+fn kernel_segmented(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let t = q.shape()[1];
+    if t <= KERNEL_MAX_STEPS {
+        return gated_delta_kernel(q, k, v, g, beta, state);
+    }
+    let mut state = state.cloned();
+    let mut ys = Vec::new();
+    let mut start = 0;
+    while start < t {
+        let end = (start + KERNEL_MAX_STEPS).min(t);
+        let part = |x: &Array| slice_axis(x, 1, start, end);
+        let (y, next) = gated_delta_kernel(
+            &part(q)?,
+            &part(k)?,
+            &part(v)?,
+            &part(g)?,
+            &part(beta)?,
+            state.as_ref(),
+        )?;
+        ys.push(y);
+        state = Some(next);
+        start = end;
+    }
+    let refs: Vec<&Array> = ys.iter().collect();
+    Ok((
+        concatenate_axis(&refs, 1)?,
+        state.expect("t > 0 ran a segment"),
+    ))
+}
+
+/// The shortest sequence [`gated_delta_recurrence`] runs chunkwise on a CPU stream (one full
+/// chunk); shorter ones take the op-by-op reference.
+pub const CHUNKED_PREFILL_MIN_TOKENS: i32 = GDN_CHUNK;
+
+/// Tokens per chunk of the chunkwise-parallel form (the flash-linear-attention default).
+const GDN_CHUNK: i32 = 64;
+
+/// Chunks whose intra-chunk work is batched into one graph before the carried state and outputs
+/// are evaluated: bounds the prefill's transient to `GDN_SEGMENT_CHUNKS · GDN_CHUNK` tokens'
+/// `[C, C]` matrices however long the prompt is (the role `EVAL_CHUNK` plays in the ops path).
+const GDN_SEGMENT_CHUNKS: i32 = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch routing [`gated_delta_recurrence`] to the op-by-op reference on this thread,
+    /// so a model-level test can compare the production dispatch against the reference path.
+    static FORCE_OPS_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with [`gated_delta_recurrence`] forced onto the op-by-op reference (this thread only).
+#[cfg(test)]
+pub(crate) fn with_ops_reference<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_OPS_REFERENCE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_OPS_REFERENCE.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether ops issued now land on a GPU stream (the task-local default stream if one is set,
+/// else the default device's) — the only place a custom Metal kernel can run.
+fn default_stream_is_gpu() -> bool {
+    let stream = mlx_rs::Stream::task_local_or_default();
+    // SAFETY: `dev` is created and freed here; `stream` outlives both calls.
+    unsafe {
+        let mut dev = mlx_sys::mlx_device_new();
+        let mut ty: mlx_sys::mlx_device_type = mlx_sys::mlx_device_type__MLX_CPU;
+        let ok = mlx_sys::mlx_stream_get_device(&mut dev, stream.as_ptr()) == 0
+            && mlx_sys::mlx_device_get_type(&mut ty, dev) == 0;
+        mlx_sys::mlx_device_free(dev);
+        ok && ty == mlx_sys::mlx_device_type__MLX_GPU
+    }
+}
+
+fn cast_to(x: Array, dtype: Dtype) -> Result<Array> {
+    Ok(if x.dtype() == dtype {
+        x
+    } else {
+        x.as_dtype(dtype)?
+    })
+}
+
+/// The fused recurrence body. One SIMD group (32 lanes) owns one `(batch, value head, value row)`
+/// state row `S[dv, :]`, `ceil(Dk/32)` elements per lane kept in registers across all `T` steps;
+/// each step decays it, reads `S·k` / `S·q` with a `simd_sum`, and writes the delta. GQA maps a
+/// value head to its key head by index (no repeated q/k). Inputs of any float dtype are read as
+/// f32; `y` and `state_out` are f32. Same per-step operation order as
+/// [`gated_delta_recurrence_ops`] (the reductions differ only in summation order).
+const GDN_KERNEL_SOURCE: &str = r#"
+    const uint n = thread_position_in_grid.z;
+    const uint b_idx = n / Hv;
+    const uint hv_idx = n % Hv;
+    const uint hk_idx = hv_idx / (Hv / Hk);
+    constexpr int n_per_t = (Dk + 31) / 32;
+    const int lane = thread_position_in_threadgroup.x;
+    const uint dv_idx = thread_position_in_grid.y;
+    const int steps = t_len;
+
+    auto q_ = q + (b_idx * steps * Hk + hk_idx) * Dk;
+    auto k_ = k + (b_idx * steps * Hk + hk_idx) * Dk;
+    auto v_ = v + (b_idx * steps * Hv + hv_idx) * Dv;
+    auto y_ = y + (b_idx * steps * Hv + hv_idx) * Dv;
+    auto g_ = g + b_idx * steps * Hv + hv_idx;
+    auto beta_ = beta + b_idx * steps * Hv + hv_idx;
+    auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+    auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+    float st[n_per_t];
+    for (int i = 0; i < n_per_t; ++i) {
+        const int s = n_per_t * lane + i;
+        st[i] = s < Dk ? static_cast<float>(i_state[s]) : 0.0f;
+    }
+    for (int t = 0; t < steps; ++t) {
+        const float decay = static_cast<float>(g_[0]);
+        float kv_mem = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+            const int s = n_per_t * lane + i;
+            if (s < Dk) {
+                st[i] = st[i] * decay;
+                kv_mem += st[i] * static_cast<float>(k_[s]);
+            }
+        }
+        kv_mem = simd_sum(kv_mem);
+        const float delta =
+            (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[0]);
+        float out = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+            const int s = n_per_t * lane + i;
+            if (s < Dk) {
+                st[i] = st[i] + static_cast<float>(k_[s]) * delta;
+                out += st[i] * static_cast<float>(q_[s]);
+            }
+        }
+        out = simd_sum(out);
+        if (thread_index_in_simdgroup == 0) {
+            y_[dv_idx] = out;
+        }
+        q_ += Hk * Dk;
+        k_ += Hk * Dk;
+        v_ += Hv * Dv;
+        y_ += Hv * Dv;
+        g_ += Hv;
+        beta_ += Hv;
+    }
+    for (int i = 0; i < n_per_t; ++i) {
+        const int s = n_per_t * lane + i;
+        if (s < Dk) {
+            o_state[s] = st[i];
+        }
+    }
+"#;
+
+/// The gated delta recurrence as one fused Metal kernel (decode `T = 1`, verify `T = M`, or any
+/// `T`): the whole `T`-step loop runs on the GPU with the state in registers. Shapes as
+/// [`gated_delta_recurrence`]; inputs may be f32/bf16/f16 and are accumulated in f32; returns
+/// `(y [B,T,Hv,Dv], state [B,Hv,Dv,Dk])`, **both f32**. GPU only.
+pub fn gated_delta_kernel(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let qs = q.shape();
+    let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
+    let vs = v.shape();
+    let (hv, dv) = (vs[2], vs[3]);
+    let state = match state {
+        Some(s) => s.clone(),
+        None => zeros_state(b, hv, dv, dk, Dtype::Float32)?,
+    };
+    let steps = Array::from_int(t);
+    let kernel = MetalKernel::new(
+        "sceneworks_gated_delta_step",
+        &["q", "k", "v", "g", "beta", "state_in", "t_len"],
+        &["y", "state_out"],
+        GDN_KERNEL_SOURCE,
+    )?;
+    // Four value rows per threadgroup when they divide `Dv` (the grid is exact either way).
+    let rows = if dv % 4 == 0 {
+        4
+    } else if dv % 2 == 0 {
+        2
+    } else {
+        1
+    };
+    let mut out = kernel
+        .apply()
+        .inputs([q, k, v, g, beta, &state, &steps])
+        .output_shape([b, t, hv, dv], Dtype::Float32)
+        .output_shape([b, hv, dv, dk], Dtype::Float32)
+        .template_arg("Dk", dk)
+        .template_arg("Dv", dv)
+        .template_arg("Hk", hk)
+        .template_arg("Hv", hv)
+        .grid(32, dv, b * hv)
+        .thread_group(32, rows, 1)
+        .run()?;
+    let next = out.pop().expect("two kernel outputs");
+    let y = out.pop().expect("two kernel outputs");
+    Ok((y, next))
+}
+
+/// The gated delta recurrence in its **chunkwise-parallel** form (the WY / flash-linear-attention
+/// `chunk_gated_delta_rule` formulation), for prefill. Shapes as [`gated_delta_recurrence`];
+/// inputs of any float dtype are computed in f32 and `(y, state)` are returned **f32**.
+///
+/// Within a chunk of `C` tokens starting from state `S₀`, with `Γᵢ = ∏_{j≤i} gⱼ` (a cumulative
+/// sum of `ln g`), the per-token deltas `δᵢ = βᵢ(vᵢ − gᵢSᵢ₋₁kᵢ)` solve the unit-lower-triangular
+/// system `(I + A) Δ = V_β − (K_β Γ) S₀ᵀ` with `Aᵢⱼ = βᵢ (Γᵢ/Γⱼ) kᵢ·kⱼ` (`i > j`), so with
+/// `T = (I + A)⁻¹`, `U = T V_β` and `W = T (K_β Γ)` (all chunks at once):
+///
+/// ```text
+///   Δ    = U − W S₀ᵀ
+///   Y    = (Q Γ) S₀ᵀ + ((Q Kᵀ) ⊙ Γᵢ/Γⱼ, j ≤ i) Δ
+///   S_C  = Γ_C S₀ + Δᵀ (K Γ_C/Γ)
+/// ```
+///
+/// Only the `S₀ → S_C` hand-off is sequential (one step per chunk, not per token). `T` is built
+/// by block doubling — `T₂ₛ = Tₛ − Tₛ Eₛ Tₛ`, `Eₛ` the part of `A` inside the `2s`-diagonal
+/// blocks but outside the `s`-diagonal ones — which is exact block forward substitution. Every
+/// exponent is `≤ 0` (`g ∈ (0, 1]`), so nothing overflows; a gate that underflowed to 0 is
+/// clamped to the smallest normal f32 before its log.
+pub fn gated_delta_chunked(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let f32 = Dtype::Float32;
+    let c = GDN_CHUNK;
+    let qs = q.shape();
+    let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
+    let vs = v.shape();
+    let (hv, dv) = (vs[2], vs[3]);
+    let (q, k) = if hv != hk {
+        let r = hv / hk;
+        (repeat_heads(q, r)?, repeat_heads(k, r)?)
+    } else {
+        (q.clone(), k.clone())
+    };
+
+    // Pad T to whole chunks with inert steps (g = 1, β = 0, k = q = v = 0 leave the state as is),
+    // then lay every tensor out per head and chunk: [B, Hv, nC, C, ·].
+    let n_chunks = (t + c - 1) / c;
+    let pad = n_chunks * c - t;
+    let heads_first = |x: &Array, fill: f32, d: i32| -> Result<Array> {
+        let x = x.as_dtype(f32)?;
+        let x = if pad > 0 {
+            let mut shape = x.shape().to_vec();
+            shape[1] = pad;
+            let filler = mlx_rs::ops::full::<f32>(&shape, Array::from_f32(fill))?;
+            concatenate_axis(&[&x, &filler], 1)?
+        } else {
+            x
+        };
+        if d == 0 {
+            // [B, Tp, Hv] → [B, Hv, nC, C]
+            Ok(x.transpose_axes(&[0, 2, 1])?
+                .reshape(&[b, hv, n_chunks, c])?)
+        } else {
+            // [B, Tp, Hv, D] → [B, Hv, nC, C, D]
+            Ok(x.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, hv, n_chunks, c, d])?)
+        }
+    };
+    let q = heads_first(&q, 0.0, dk)?;
+    let k = heads_first(&k, 0.0, dk)?;
+    let v = heads_first(v, 0.0, dv)?;
+    let g = heads_first(g, 1.0, 0)?;
+    let beta = heads_first(beta, 0.0, 0)?;
+
+    let masks = ChunkMasks::new(c)?;
+    let mut state = match state {
+        Some(s) => s.as_dtype(f32)?,
+        None => zeros_state(b, hv, dv, dk, f32)?,
+    };
+    let mut ys: Vec<Array> = Vec::with_capacity(n_chunks as usize);
+    let mut seg_start = 0;
+    while seg_start < n_chunks {
+        let n = GDN_SEGMENT_CHUNKS.min(n_chunks - seg_start);
+        let seg = |x: &Array| -> Result<Array> { slice_axis(x, 2, seg_start, seg_start + n) };
+        let (qc, kc, vc, gc, bc) = (seg(&q)?, seg(&k)?, seg(&v)?, seg(&g)?, seg(&beta)?);
+
+        // Intra-chunk work, batched over the segment's chunks: [B, Hv, n, C, ·].
+        let log_g = mlx_rs::ops::log(&mlx_rs::ops::maximum(
+            &gc,
+            Array::from_f32(f32::MIN_POSITIVE),
+        )?)?;
+        let cum = log_g.cumsum(-1, None, None)?; // ln Γᵢ           [B,Hv,n,C]
+        let gamma = exp(&cum)?; // Γᵢ                              [B,Hv,n,C]
+        let diff = subtract(&cum.expand_dims(-1)?, &cum.expand_dims(-2)?)?; // ln Γᵢ − ln Γⱼ
+        let decay = multiply(
+            &exp(&mlx_rs::ops::minimum(&diff, Array::from_f32(0.0))?)?,
+            &masks.lower,
+        )?; // Γᵢ/Γⱼ for j ≤ i, else 0                            [B,Hv,n,C,C]
+        let k_t = kc.swap_axes(-1, -2)?;
+        let kb = multiply(&kc, &bc.expand_dims(-1)?)?; // β k
+        let a = multiply(
+            &multiply(&mlx_rs::ops::matmul(&kb, &k_t)?, &decay)?,
+            &masks.strict,
+        )?; // Aᵢⱼ, i > j
+        let tinv = unit_lower_inverse(&a, &masks)?; // (I + A)⁻¹
+        let w = mlx_rs::ops::matmul(&tinv, &multiply(&kb, &gamma.expand_dims(-1)?)?)?; // [..,C,Dk]
+        let u = mlx_rs::ops::matmul(&tinv, &multiply(&vc, &bc.expand_dims(-1)?)?)?; // [..,C,Dv]
+        let q_gamma = multiply(&qc, &gamma.expand_dims(-1)?)?; // Q Γ
+        let qk = multiply(&mlx_rs::ops::matmul(&qc, &k_t)?, &decay)?; // causal (Q Kᵀ) ⊙ Γᵢ/Γⱼ
+        let last = slice_axis(&cum, -1, c - 1, c)?; // ln Γ_C          [B,Hv,n,1]
+        let k_tail = multiply(&kc, &exp(&subtract(&last, &cum)?)?.expand_dims(-1)?)?; // K Γ_C/Γ
+        let chunk_decay = exp(&last)?; // Γ_C                          [B,Hv,n,1]
+
+        // The sequential hand-off, one step per chunk.
+        for i in 0..n {
+            let pick = |x: &Array| -> Result<Array> {
+                Ok(slice_axis(x, 2, i, i + 1)?.squeeze_axes(&[2])?)
+            };
+            let s_t = state.swap_axes(-1, -2)?; // S₀ᵀ [B,Hv,Dk,Dv]
+            let delta = subtract(&pick(&u)?, &mlx_rs::ops::matmul(&pick(&w)?, &s_t)?)?; // [B,Hv,C,Dv]
+            let y = add(
+                &mlx_rs::ops::matmul(&pick(&q_gamma)?, &s_t)?,
+                &mlx_rs::ops::matmul(&pick(&qk)?, &delta)?,
+            )?; // [B,Hv,C,Dv]
+            let carried = multiply(&state, &pick(&chunk_decay)?.expand_dims(-1)?)?; // Γ_C S₀
+            state = add(
+                &carried,
+                &mlx_rs::ops::matmul(&delta.swap_axes(-1, -2)?, &pick(&k_tail)?)?,
+            )?; // + Δᵀ (K Γ_C/Γ)
+            ys.push(y);
+        }
+        seg_start += n;
+        if seg_start < n_chunks {
+            // Materialize this segment's outputs and the carried state so its [C, C] transients
+            // free before the next segment is built.
+            eval(ys.iter().chain(std::iter::once(&state)))?;
+        }
+    }
+    let refs: Vec<&Array> = ys.iter().collect();
+    let y = concatenate_axis(&refs, 2)?; // [B,Hv,Tp,Dv]
+    let y = slice_axis(&y, 2, 0, t)?.transpose_axes(&[0, 2, 1, 3])?; // [B,T,Hv,Dv]
+    Ok((y, state))
+}
+
+/// Constant `[C, C]` masks of the chunkwise form, plus the block-doubling bands.
+struct ChunkMasks {
+    /// `1` where `j ≤ i`.
+    lower: Array,
+    /// `1` where `j < i`.
+    strict: Array,
+    /// The identity.
+    eye: Array,
+    /// For each doubling level `s` (1, 2, 4, …, C/2): `1` where `i, j` share a `2s` block but
+    /// not an `s` block.
+    bands: Vec<Array>,
+}
+
+impl ChunkMasks {
+    fn new(c: i32) -> Result<Self> {
+        let n = c as usize;
+        let build = |f: &dyn Fn(usize, usize) -> bool| -> Array {
+            let data: Vec<f32> = (0..n * n)
+                .map(|x| if f(x / n, x % n) { 1.0 } else { 0.0 })
+                .collect();
+            Array::from_slice(&data, &[c, c])
+        };
+        let mut bands = Vec::new();
+        let mut s = 1usize;
+        while s < n {
+            bands.push(build(&|i, j| i / (2 * s) == j / (2 * s) && i / s != j / s));
+            s *= 2;
+        }
+        Ok(Self {
+            lower: build(&|i, j| j <= i),
+            strict: build(&|i, j| j < i),
+            eye: build(&|i, j| i == j),
+            bands,
+        })
+    }
+}
+
+/// `(I + A)⁻¹` for strictly-lower-triangular `A` `[…, C, C]` by block doubling:
+/// `T₁ = I`, `T₂ₛ = Tₛ − Tₛ (A ⊙ bandₛ) Tₛ` — exact, since `bandₛ` holds exactly the one
+/// off-diagonal block each `2s` block adds and `Eₛ Tₛ Eₛ = 0`.
+fn unit_lower_inverse(a: &Array, masks: &ChunkMasks) -> Result<Array> {
+    let mut inv = broadcast_to(&masks.eye, a.shape())?;
+    for band in &masks.bands {
+        let e = multiply(a, band)?;
+        let correction = mlx_rs::ops::matmul(&mlx_rs::ops::matmul(&inv, &e)?, &inv)?;
+        inv = subtract(&inv, &correction)?;
+    }
+    Ok(inv)
+}
+
+/// `x[.., start..end, ..]` along `axis` (negative counts from the end).
+fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
+    let idx: Vec<i32> = (start..end).collect();
+    let arr = Array::from_slice(&idx, &[idx.len() as i32]);
+    Ok(x.take_axis(&arr, axis)?)
+}
+
+/// The op-by-op gated delta recurrence — a faithful port of the `mlx_lm.models.gated_delta` ops
+/// path (`gated_delta_ops` / `_gated_delta_step_ops`), one graph node group per token. It is the
+/// **numeric reference** the fused kernel and the chunked form are tested against, and the path
+/// [`gated_delta_recurrence`] takes off the GPU. Shapes as [`gated_delta_recurrence`]; the math runs
+/// in the inputs' dtype.
+pub fn gated_delta_recurrence_ops(
     q: &Array,
     k: &Array,
     v: &Array,
@@ -459,13 +926,242 @@ mod tests {
         assert!(cache.conv_state.is_none());
     }
 
-    /// A long prefill must not exhaust the Metal allocator. The recurrence builds the whole `t`-step
-    /// graph before a single eval, eagerly allocating per-step index buffers; without periodic flushing
-    /// a sequence past ~100k steps trips the allocator's resource limit and the next gather fails with a
-    /// spurious "expected a non-empty mlx_array". `t = 130_000` clears that limit (~5 buffers/step >
-    /// 499_000) and must now complete because the recurrence flushes every `EVAL_CHUNK` steps. Marked
-    /// `ignore` only for runtime (the loop is long), not flakiness — it is the direct regression guard
-    /// for the high-res-image vision crash.
+    /// Deterministic uniform `[-1, 1)` values (a 64-bit LCG), so the parity fixtures need no RNG state.
+    fn lcg(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// Model-shaped recurrence inputs: L2-normalized q (scaled by `1/√Dk`) and k, gates from
+    /// [`compute_g`], `β = sigmoid(b)`, plus a non-zero carried state — all rounded through `dtype`
+    /// so the f32 reference sees exactly the values the path under test reads.
+    struct Inputs {
+        q: Array,
+        k: Array,
+        v: Array,
+        g: Array,
+        beta: Array,
+        state: Array,
+    }
+
+    fn inputs(dims: [i32; 6], dtype: Dtype, seed: u64) -> Inputs {
+        let [b, t, hk, hv, dk, dv] = dims;
+        let n = |shape: &[i32]| shape.iter().product::<i32>() as usize;
+        let arr = |shape: &[i32], s: u64| Array::from_slice(&lcg(n(shape), seed ^ s), shape);
+        let l2 = |x: Array| -> Array {
+            let norm =
+                mlx_rs::ops::sqrt(sum_axis(multiply(&x, &x).unwrap(), -1, true).unwrap() + 1e-6f32)
+                    .unwrap();
+            mlx_rs::ops::divide(&x, &norm).unwrap()
+        };
+        let round = |x: Array| x.as_dtype(dtype).unwrap();
+        let q = l2(arr(&[b, t, hk, dk], 1)) * (dk as f32).powf(-0.5);
+        let k = l2(arr(&[b, t, hk, dk], 2));
+        let a = arr(&[b, t, hv], 4) * 3.0f32;
+        let a_log = arr(&[hv], 5);
+        let dt_bias = arr(&[hv], 6);
+        Inputs {
+            q: round(q),
+            k: round(k),
+            v: round(arr(&[b, t, hv, dv], 3)),
+            g: round(compute_g(&a, &a_log, &dt_bias).unwrap()),
+            beta: round(sigmoid(&(arr(&[b, t, hv], 7) * 2.0f32)).unwrap()),
+            state: arr(&[b, hv, dv, dk], 8) * 0.5f32,
+        }
+    }
+
+    /// Host copy in logical (row-major) order. `as_slice` reads raw memory, and an elementwise op
+    /// keeps a permuted input's layout (the chunked `y` is a transposed view), so materialize with
+    /// one (no view offset) and walk the strides.
+    fn host32(x: &Array) -> Vec<f32> {
+        let x = add(x.as_dtype(Dtype::Float32).unwrap(), Array::from_f32(0.0)).unwrap();
+        x.eval().unwrap();
+        let (shape, strides) = (x.shape().to_vec(), x.strides().to_vec());
+        let data = x.as_slice::<f32>();
+        let mut out = Vec::with_capacity(x.size());
+        let mut idx = vec![0i32; shape.len()];
+        for _ in 0..x.size() {
+            let at: usize = idx
+                .iter()
+                .zip(&strides)
+                .map(|(&i, &s)| i as usize * s)
+                .sum();
+            out.push(data[at]);
+            for d in (0..shape.len()).rev() {
+                idx[d] += 1;
+                if idx[d] < shape[d] {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
+        out
+    }
+
+    /// `(max |a − r| / max |r|, max |a − r|)` — scale-relative and absolute error against the
+    /// reference `r` (never a cosine: that is scale-invariant).
+    fn errors(a: &Array, r: &Array) -> (f32, f32) {
+        let (a, r) = (host32(a), host32(r));
+        assert_eq!(a.len(), r.len());
+        assert!(a.iter().all(|x| x.is_finite()), "non-finite output");
+        let abs = max_abs_diff(&a, &r);
+        let scale = r.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        (abs / scale, abs)
+    }
+
+    /// The f32 op-by-op reference on the (already dtype-rounded) inputs.
+    fn reference(x: &Inputs, carry: bool) -> (Array, Array) {
+        let f = |a: &Array| a.as_dtype(Dtype::Float32).unwrap();
+        let state = carry.then(|| f(&x.state));
+        gated_delta_recurrence_ops(
+            &f(&x.q),
+            &f(&x.k),
+            &f(&x.v),
+            &f(&x.g),
+            &f(&x.beta),
+            state.as_ref(),
+        )
+        .unwrap()
+    }
+
+    type Path =
+        fn(&Array, &Array, &Array, &Array, &Array, Option<&Array>) -> Result<(Array, Array)>;
+
+    /// Run `path` against the f32 reference over `(label, dims)` × {f32, bf16, f16} × {zero, carried
+    /// state}, asserting `y` and the final state within `rel` (scale-relative) and `abs`.
+    fn assert_matches_reference(
+        path: Path,
+        name: &str,
+        cases: &[(&str, [i32; 6])],
+        rel: f32,
+        abs: f32,
+    ) {
+        for &(label, dims) in cases {
+            for dtype in [Dtype::Float32, Dtype::Bfloat16, Dtype::Float16] {
+                for carry in [false, true] {
+                    let x = inputs(dims, dtype, dims.iter().product::<i32>() as u64);
+                    let state = carry.then_some(&x.state);
+                    let (y, s) = path(&x.q, &x.k, &x.v, &x.g, &x.beta, state).unwrap();
+                    let (y_ref, s_ref) = reference(&x, carry);
+                    assert_eq!(y.shape(), y_ref.shape());
+                    assert_eq!(s.shape(), s_ref.shape());
+                    let (y_rel, y_abs) = errors(&y, &y_ref);
+                    let (s_rel, s_abs) = errors(&s, &s_ref);
+                    eprintln!(
+                        "{name} {label} {dims:?} {dtype:?} carry={carry}: y rel {y_rel:.2e} abs \
+                         {y_abs:.2e} | state rel {s_rel:.2e} abs {s_abs:.2e}"
+                    );
+                    assert!(
+                        y_rel <= rel && y_abs <= abs && s_rel <= rel && s_abs <= abs,
+                        "{name} {label} {dtype:?} carry={carry}: y rel {y_rel} abs {y_abs}, \
+                         state rel {s_rel} abs {s_abs} (budget rel {rel} abs {abs})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC (sc-24443): the fused Metal recurrence matches the op-by-op reference within 1e-5
+    /// scale-relative at decode (`T = 1`), verify width (`T = 4`) and prefill (`T = 512`) shapes —
+    /// GQA ×2 at the Qwen3.6 head dims, a batch of two, and tiny non-multiple-of-32 head dims —
+    /// on f32, bf16 and f16 inputs (accumulated in f32), from a zero and from a carried state.
+    #[test]
+    fn metal_kernel_matches_ops_reference() {
+        assert_matches_reference(
+            gated_delta_kernel,
+            "kernel",
+            &[
+                ("decode", [1, 1, 2, 4, 128, 128]),
+                ("verify", [1, 4, 2, 4, 128, 128]),
+                ("prefill", [1, 512, 2, 4, 128, 128]),
+                ("prefill", [1, 2048, 2, 4, 128, 128]),
+                ("batch2", [2, 5, 1, 2, 64, 32]),
+                ("tiny-dims", [1, 7, 2, 4, 4, 6]),
+            ],
+            1e-5,
+            1e-5,
+        );
+    }
+
+    /// AC (sc-24443): the chunkwise prefill matches the per-token reference's outputs and final
+    /// state at 512 and 2048 tokens (plus a batch of two at a length that is not a whole number of
+    /// chunks), on f32, bf16 and f16 inputs, from a zero and from a carried state. Run on the CPU
+    /// stream — the route [`gated_delta_recurrence`] gives it, where GEMMs are exact f32 (MLX's
+    /// GPU GEMMs are TF32 on NAX hardware, a ~2e-3 floor for any matmul formulation).
+    #[test]
+    fn chunked_prefill_matches_ops_reference() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            assert_matches_reference(
+                gated_delta_chunked,
+                "chunked",
+                &[
+                    ("512", [1, 512, 2, 4, 128, 128]),
+                    ("2048", [1, 2048, 2, 4, 128, 128]),
+                    ("ragged", [2, 300, 1, 2, 64, 32]),
+                ],
+                2e-5,
+                2e-5,
+            )
+        });
+    }
+
+    /// The dispatcher's contract: every route agrees with the reference — the GPU kernel at any
+    /// length (split into dispatches past [`KERNEL_MAX_STEPS`]), and on a CPU stream (where a Metal
+    /// kernel cannot run) the chunked form from [`CHUNKED_PREFILL_MIN_TOKENS`] and the op loop
+    /// below it — and output dtypes follow the inputs (y in `q`'s dtype, state in the carried
+    /// state's).
+    #[test]
+    fn dispatch_routes_by_device_and_length_and_keeps_dtypes() {
+        let check = |t: i32, dims: [i32; 4]| {
+            let [hk, hv, dk, dv] = dims;
+            let x = inputs([1, t, hk, hv, dk, dv], Dtype::Float32, t as u64);
+            let (y, s) =
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+            let (y_ref, s_ref) = reference(&x, true);
+            let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+            assert!(ey.0 < 2e-5 && es.0 < 2e-5, "t={t}: y {ey:?} state {es:?}");
+        };
+        for t in [1, 4, 200] {
+            check(t, [2, 4, 32, 16]);
+        }
+        check(KERNEL_MAX_STEPS + 37, [1, 2, 32, 8]);
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
+            for t in [
+                3,
+                CHUNKED_PREFILL_MIN_TOKENS - 1,
+                CHUNKED_PREFILL_MIN_TOKENS,
+                150,
+            ] {
+                check(t, [2, 4, 32, 16]);
+            }
+        });
+
+        let x = inputs([1, 3, 2, 4, 32, 16], Dtype::Bfloat16, 9);
+        let (y, s) = gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, None).unwrap();
+        assert_eq!((y.dtype(), s.dtype()), (Dtype::Bfloat16, Dtype::Bfloat16));
+        let (_, s) =
+            gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+        assert_eq!(s.dtype(), Dtype::Float32);
+    }
+
+    /// A long prefill must not exhaust the Metal allocator. The op-by-op path builds the whole
+    /// `t`-step graph before a single eval, eagerly allocating per-step index buffers; without
+    /// periodic flushing a sequence past ~100k steps trips the allocator's resource limit and the
+    /// next gather fails with a spurious "expected a non-empty mlx_array". `t = 130_000` clears that
+    /// limit (~5 buffers/step > 499_000) and must complete because the op path flushes every
+    /// `EVAL_CHUNK` steps; the production dispatch (the fused kernel, split every
+    /// [`KERNEL_MAX_STEPS`] tokens) must complete too and agree with it. Marked `ignore` only for
+    /// runtime (the loop is long), not flakiness — it is the direct regression guard for the
+    /// high-res-image vision crash.
     #[test]
     #[ignore = "slow: 130k-step recurrence; guards the long-prefill Metal buffer-limit regression"]
     fn long_prefill_does_not_exhaust_buffer_limit() {
@@ -475,11 +1171,13 @@ mod tests {
         let v = Array::from_slice(&vec![0.03f32; t as usize], &[1, t, 1, 1]);
         let g = Array::from_slice(&vec![0.9f32; t as usize], &[1, t, 1]);
         let beta = Array::from_slice(&vec![0.5f32; t as usize], &[1, t, 1]);
-        let (y, state) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None)
+        let (y, state) = gated_delta_recurrence_ops(&q, &k, &v, &g, &beta, None)
             .expect("long recurrence must not exhaust the Metal allocator");
         assert_eq!(y.shape(), &[1, t, 1, 1]);
         assert_eq!(state.shape(), &[1, 1, 1, 1]);
         // Force a final materialization so a deferred allocator failure can't hide behind laziness.
         eval([&y, &state]).unwrap();
+        let (y_fast, state_fast) = gated_delta_recurrence(&q, &k, &v, &g, &beta, None).unwrap();
+        assert!(errors(&y_fast, &y).0 < 1e-5 && errors(&state_fast, &state).0 < 1e-5);
     }
 }
