@@ -151,6 +151,8 @@ fn run_quantized_conformance(env_var: &str, quant: Quantize) {
         quantize: Some(quant),
         cuda_graphs: None,
         mtp_head_source: None,
+        prefix_cache_bytes: None,
+        draft_source: None,
     };
     textllm_conformance(
         || {

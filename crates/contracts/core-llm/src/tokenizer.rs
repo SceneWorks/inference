@@ -191,6 +191,35 @@ impl Tokenizer {
         self.inner.get_vocab_size(true)
     }
 
+    /// Why `other` does not share this tokenizer's vocabulary — every token string (added tokens
+    /// included) mapping to the same id — or `None` when it does. The draft-model compatibility
+    /// test (sc-24436): a draft's token ids are verified by the target as the target's own, so
+    /// equal sizes are not enough; the first differing token (in id order) is named.
+    pub fn vocabulary_mismatch(&self, other: &Tokenizer) -> Option<String> {
+        let ours = self.inner.get_vocab(true);
+        let theirs = other.inner.get_vocab(true);
+        if ours.len() != theirs.len() {
+            return Some(format!(
+                "vocabulary sizes differ ({} vs {} tokens)",
+                ours.len(),
+                theirs.len()
+            ));
+        }
+        let mut entries: Vec<(&String, &u32)> = ours.iter().collect();
+        entries.sort_by_key(|(token, id)| (**id, (*token).clone()));
+        entries
+            .into_iter()
+            .find_map(|(token, &id)| match theirs.get(token) {
+                Some(&other_id) if other_id == id => None,
+                Some(&other_id) => Some(format!(
+                    "token {token:?} is id {id} in one and {other_id} in the other"
+                )),
+                None => Some(format!(
+                    "token {token:?} (id {id}) is missing from the other vocabulary"
+                )),
+            })
+    }
+
     /// Build the per-vocab decode table for constrained decoding: the literal text of each token id
     /// (empty for special ids), plus the special-id set. Run once and cache — this decodes
     /// every id in the vocabulary. Delegates to [`build_constraint_decode_table`], the single
@@ -300,6 +329,32 @@ mod tests {
 
     fn tiny() -> Tokenizer {
         Tokenizer::from_json(TINY_JSON).unwrap()
+    }
+
+    #[test]
+    fn a_vocabulary_matches_only_token_for_token() {
+        let t = tiny();
+        assert_eq!(t.vocabulary_mismatch(&tiny()), None);
+        // Same size, one token renamed: equal sizes are not a shared vocabulary.
+        let renamed = Tokenizer::from_json(&TINY_JSON.replace("\"foo\"", "\"bar\"")).unwrap();
+        let why = t.vocabulary_mismatch(&renamed).unwrap();
+        assert!(why.contains("\"foo\"") && why.contains("missing"), "{why}");
+        // Same tokens, two ids swapped.
+        let swapped = Tokenizer::from_json(
+            &TINY_JSON
+                .replace("\"hello\": 1", "\"hello\": 9")
+                .replace("\"world\": 2", "\"hello\": 2")
+                .replace("\"hello\": 9", "\"world\": 1"),
+        )
+        .unwrap();
+        let why = t.vocabulary_mismatch(&swapped).unwrap();
+        assert!(why.contains("is id 1 in one and 2 in the other"), "{why}");
+        // A different size is named as such.
+        let grown =
+            Tokenizer::from_json(&TINY_JSON.replace("\"foo\": 3", "\"foo\": 3, \"baz\": 4"))
+                .unwrap();
+        let why = t.vocabulary_mismatch(&grown).unwrap();
+        assert!(why.contains("4 vs 5 tokens"), "{why}");
     }
 
     #[test]

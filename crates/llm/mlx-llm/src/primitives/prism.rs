@@ -631,32 +631,56 @@ pub(crate) mod tests {
         assert!(!fused_rotation_applies(&ints, 1024, &gpu));
     }
 
-    /// The route follows the stream ops are issued on: a task-local GPU stream runs the fused
-    /// kernel on that stream even when the process default device is the CPU (another test may
-    /// have set it — the default device is process-global), bit-identical to the unfused chain.
+    /// The route follows the stream ops are issued on, never the process default device: a
+    /// task-local GPU stream inside a task-local CPU scope runs the fused kernel on that stream,
+    /// bit-identical to the unfused chain, and once it closes the enclosing CPU scope takes the
+    /// unfused chain again. Both scopes are task-local (switching the process default device races
+    /// every parallel test in this binary — sc-24439).
     #[test]
-    fn fused_rotation_runs_on_the_task_local_gpu_stream_under_a_cpu_default_device() {
-        let _cpu_default = crate::primitives::kv_cache::testing::CpuStream::enter();
-        mlx_rs::with_new_default_stream(Stream::gpu(), || {
-            let width = 5120;
-            let key = mlx_rs::random::key(31).unwrap();
-            let x = mlx_rs::random::normal::<f32>(&[1, 3, width][..], None, None, Some(&key))
+    fn fused_rotation_runs_on_the_task_local_gpu_stream_inside_a_cpu_scope() {
+        let width = 5120;
+        let signs = random_signs(width, 32);
+        let scale = Array::from_slice(&[hadamard_scale(1024)], &[1]);
+        let input = |seed| {
+            let key = mlx_rs::random::key(seed).unwrap();
+            mlx_rs::random::normal::<f32>(&[1, 3, width][..], None, None, Some(&key))
                 .unwrap()
                 .as_dtype(Dtype::Bfloat16)
-                .unwrap();
-            let signs = random_signs(width, 32);
-            let scale = Array::from_slice(&[hadamard_scale(1024)], &[1]);
-            for inverse in [false, true] {
-                let (fused, routes) = recording_rotation_routes(|| {
-                    block_hadamard(&x, &signs, &scale, 1024, inverse).unwrap()
-                });
-                assert_eq!(routes, [RotationRoute::Fused], "inverse {inverse}");
-                let reference =
-                    block_hadamard_unfused(&x, &signs, 1024, inverse, hadamard_scale(1024))
-                        .unwrap();
-                assert!(bits(&fused) == bits(&reference), "inverse {inverse}");
-            }
+                .unwrap()
+        };
+        crate::primitives::kv_cache::testing::on_cpu(|| {
+            mlx_rs::with_new_default_stream(Stream::gpu(), || {
+                let x = input(31);
+                for inverse in [false, true] {
+                    let (fused, routes) = recording_rotation_routes(|| {
+                        block_hadamard(&x, &signs, &scale, 1024, inverse).unwrap()
+                    });
+                    assert_eq!(routes, [RotationRoute::Fused], "inverse {inverse}");
+                    let reference =
+                        block_hadamard_unfused(&x, &signs, 1024, inverse, hadamard_scale(1024))
+                            .unwrap();
+                    assert!(bits(&fused) == bits(&reference), "inverse {inverse}");
+                }
+            });
+            let x = input(33);
+            let (_, routes) = recording_rotation_routes(|| {
+                block_hadamard(&x, &signs, &scale, 1024, false).unwrap()
+            });
+            assert_eq!(
+                routes,
+                [RotationRoute::Unfused],
+                "the enclosing CPU scope is restored"
+            );
         });
+        // The kernel dispatches on the stream it is handed, not the default one: MLX refuses a
+        // custom Metal kernel on a CPU stream.
+        let x = input(34);
+        let on_cpu = fused_block_hadamard(&x, &signs, &scale, 1024, width, false, &Stream::cpu())
+            .and_then(|y| Ok(y.eval()?));
+        assert!(
+            on_cpu.is_err(),
+            "the kernel ignored the stream it was handed"
+        );
     }
 
     #[test]

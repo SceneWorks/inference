@@ -20,6 +20,11 @@ pub struct LlmMemoryGeometry {
 }
 
 /// Conservative checked estimate for request-owned native memory.
+///
+/// With `mtp_width > 0` the recurrent-state term is charged three times — the live state plus the
+/// copies a clone/replay MTP loop holds while it verifies and restores. A backend whose
+/// `geometry.recurrent_bytes` already prices every rollback copy its cache holds uses
+/// [`estimate_request_bytes_with_recurrent_copies`] instead.
 pub fn estimate_request_bytes(
     prompt_tokens: usize,
     max_new_tokens: u32,
@@ -27,6 +32,32 @@ pub fn estimate_request_bytes(
     vision_workspace_bytes: u64,
     mtp_width: u32,
 ) -> Option<u64> {
+    estimate_request_bytes_with_recurrent_copies(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        if mtp_width > 0 { 3 } else { 1 },
+    )
+}
+
+/// [`estimate_request_bytes`] with the recurrent-state multiplier chosen by the caller:
+/// `geometry.recurrent_bytes` is charged exactly `recurrent_copies` times, whatever `mtp_width`
+/// is. Every other term is identical. The eager counterpart of
+/// [`estimate_chunked_request_bytes_with_recurrent_copies`], with the same contract:
+/// `recurrent_copies == 0` is refused (`None`).
+pub fn estimate_request_bytes_with_recurrent_copies(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    recurrent_copies: u64,
+) -> Option<u64> {
+    if recurrent_copies == 0 {
+        return None;
+    }
     let prompt = u64::try_from(prompt_tokens).ok()?;
     let total = prompt.checked_add(u64::from(max_new_tokens))?;
     // Eager prefill materializes scores, the additive mask, and softmax weights.
@@ -67,11 +98,7 @@ pub fn estimate_request_bytes(
         .checked_add(mtp)?
         .checked_add(vision_workspace_bytes)?
         .checked_add(activations)?
-        .checked_add(
-            geometry
-                .recurrent_bytes
-                .checked_mul(if mtp_width > 0 { 3 } else { 1 })?,
-        )
+        .checked_add(geometry.recurrent_bytes.checked_mul(recurrent_copies)?)
 }
 
 /// Conservative checked estimate for a request whose attention implementation bounds the number
@@ -177,6 +204,27 @@ pub fn admit_request_memory(required: u64, available: u64) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Load admission for a target plus a named draft model (epic sc-24432 E7, story sc-24436): the
+/// draft's weights are admitted **beside** the target's, never instead of them. `Err` when the
+/// target alone does not fit — the ordinary load refusal, a draft never masks it; `Ok(None)` when
+/// both fit (load the draft); `Ok(Some(reason))` when the target fits but the draft does not
+/// fit beside it — the draft is refused with that reason and the target loads alone (E2: a
+/// draft never fails the load).
+pub fn admit_draft_load(
+    target_required: u64,
+    draft_required: u64,
+    available: u64,
+) -> Result<Option<String>> {
+    admit_request_memory(target_required, available)?;
+    Ok(match target_required.checked_add(draft_required) {
+        Some(both) if both <= available => None,
+        _ => Some(format!(
+            "draft model: its load needs an estimated {draft_required} bytes beside the \
+             target's {target_required}, but only {available} bytes are available"
+        )),
+    })
 }
 
 /// Reject an architecturally valid generation request with typed preallocation evidence.
@@ -337,6 +385,21 @@ pub fn checkpoint_staging_bytes(source: &std::path::Path) -> Result<u64> {
 mod tests {
     use super::*;
 
+    /// E7: a draft is admitted only beside the target; a target that does not fit is refused as
+    /// before (a draft never masks it), and a draft without room is refused by name while the
+    /// target still loads.
+    #[test]
+    fn a_draft_is_admitted_beside_the_target_or_refused_by_name() {
+        assert_eq!(admit_draft_load(60, 40, 100).unwrap(), None);
+        let why = admit_draft_load(60, 41, 100).unwrap().unwrap();
+        assert!(
+            why.starts_with("draft model:") && why.contains("41") && why.contains("100"),
+            "{why}"
+        );
+        assert!(admit_draft_load(101, 0, 100).is_err(), "the target alone");
+        assert!(admit_draft_load(60, u64::MAX, 100).unwrap().is_some());
+    }
+
     #[test]
     fn estimate_is_checked_and_prices_quadratic_prefill() {
         let geometry = LlmMemoryGeometry {
@@ -429,6 +492,25 @@ mod tests {
         // Zero copies would drop the recurrent state from admission: refused.
         assert_eq!(with(5, 0), None);
         assert_eq!(with(5, u64::MAX / 2), None, "the multiplication is checked");
+
+        // The eager estimate takes the same multiplier.
+        let eager = |mtp_width, copies| {
+            estimate_request_bytes_with_recurrent_copies(1_000, 64, geometry, 0, mtp_width, copies)
+        };
+        let once = eager(5, 1).unwrap();
+        assert_eq!(eager(5, 3).unwrap() - once, 2 * recurrent);
+        assert_eq!(
+            estimate_request_bytes(1_000, 64, geometry, 0, 5),
+            eager(5, 3)
+        );
+        assert_eq!(
+            estimate_request_bytes(1_000, 64, geometry, 0, 0),
+            eager(0, 1)
+        );
+        let mtp_terms = estimate_request_bytes(1_000, 64, no_recurrent, 0, 5).unwrap()
+            - estimate_request_bytes(1_000, 64, no_recurrent, 0, 0).unwrap();
+        assert_eq!(once - eager(0, 1).unwrap(), mtp_terms);
+        assert_eq!(eager(5, 0), None);
     }
 
     #[test]

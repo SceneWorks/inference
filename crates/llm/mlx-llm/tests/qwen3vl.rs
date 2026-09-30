@@ -466,6 +466,8 @@ fn qwen3vl_vision_q4_q8_import_path() {
             quantize: Some(q),
             cuda_graphs: None,
             mtp_head_source: None,
+            prefix_cache_bytes: None,
+            draft_source: None,
         };
 
         // The concrete provider exposes `is_quantized()` — assert the decoder actually quantized

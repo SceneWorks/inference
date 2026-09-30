@@ -755,6 +755,10 @@ mod tests {
         let spec = spec.with_mtp_head("head");
         assert_eq!(spec.mtp_head_source.as_deref(), Some("head"));
         assert_eq!(spec.projector_source.as_deref(), Some("projector.gguf"));
+        assert!(spec.draft_source.is_none(), "no draft unless one is named");
+        let spec = spec.with_draft("draft-dir");
+        assert_eq!(spec.draft_source.as_deref(), Some("draft-dir"));
+        assert_eq!(spec.source, "model.gguf", "naming a draft keeps the target");
     }
 }
 
@@ -794,6 +798,27 @@ pub struct LoadSpec {
     /// `mtp` proposer. Task-specific providers (captioners, SVG generators) ignore it. Distinct from
     /// a separate draft *model*, which is a whole decoder with its own embeddings.
     pub mtp_head_source: Option<String>,
+    /// Byte budget of the cross-turn prefix cache (story sc-24437): the KV (and, for a hybrid
+    /// decoder, recurrent state) of earlier requests' prefixes, reused when a later prompt
+    /// extends one. `None` asks for [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES);
+    /// `Some(0)` turns the cache off. The load admits it: the settled budget is this clamped to
+    /// the headroom the load's own admission leaves ([`prefix_cache_budget`](crate::prefix_cache_budget)).
+    pub prefix_cache_bytes: Option<u64>,
+    /// An optional **draft model** for [`SpeculativeProposer::DraftModel`] speculation (epic
+    /// sc-24432, story sc-24436): a snapshot directory (or other source the provider loads) of a
+    /// smaller model sharing the target's tokenizer. The provider loads it beside the target as a
+    /// second resident model with its own decode cache, applying the same load-time
+    /// [`quantize`](Self::quantize) tier, and counts its weights in load admission and its cache
+    /// in request admission. `None` (the default) loads no draft, exactly as before.
+    ///
+    /// A draft never fails the load: one the provider cannot use — a tokenizer vocabulary that is
+    /// not the target's, logits over more ids than the target's, an unreadable source, or no room
+    /// beside the target — is refused with the reason named in
+    /// [`LoadReport::draft`](crate::LoadReport::draft), the target loads alone, and `draft_model`
+    /// is not advertised. `draft_model` is advertised in
+    /// [`TextLlmCapabilities::speculative`](crate::TextLlmCapabilities::speculative) only while a
+    /// compatible draft is resident.
+    pub draft_source: Option<String>,
 }
 
 /// Load-time quantization request.
@@ -820,6 +845,8 @@ impl LoadSpec {
             quantize: None,
             cuda_graphs: None,
             mtp_head_source: None,
+            prefix_cache_bytes: None,
+            draft_source: None,
         }
     }
 
@@ -833,6 +860,13 @@ impl LoadSpec {
     /// ([`mtp_head_source`](Self::mtp_head_source)).
     pub fn with_mtp_head(mut self, source: impl Into<String>) -> Self {
         self.mtp_head_source = Some(source.into());
+        self
+    }
+
+    /// Name a draft model to load beside the target for `draft_model` speculation
+    /// ([`draft_source`](Self::draft_source)).
+    pub fn with_draft(mut self, source: impl Into<String>) -> Self {
+        self.draft_source = Some(source.into());
         self
     }
 }

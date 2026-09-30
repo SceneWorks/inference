@@ -151,6 +151,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         quantize: args.quantize,
         cuda_graphs: None,
         mtp_head_source: args.mtp_head.clone(),
+        prefix_cache_bytes: None,
+        draft_source: None,
     };
     let provider = registry.load_textllm(&provider_id, &spec)?;
     // An optional accelerator the load could not attach is named, never fatal (sc-24444).
