@@ -29,7 +29,8 @@ use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
-use crate::primitives::nn::{embed, linear, rms_norm, silu};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
+use crate::primitives::nn::{embed, rms_norm, silu};
 use crate::primitives::prism::PrismEmbedding;
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
@@ -438,86 +439,15 @@ impl Mlp {
     }
 }
 
-/// Sparse Mixture-of-Experts FFN (`Qwen3_5MoeSparseMoeBlock`, the 35B-A3B): a softmax router over
-/// `experts` (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
-/// **sigmoid-gated** shared expert. Each expert runs only on its routed tokens (gathered, then
-/// scatter-added back), so active compute scales with `experts_per_tok` (≈3B of 35B). The fused
-/// checkpoint tensors (`experts.gate_up_proj` / `experts.down_proj`) are un-fused into per-expert
-/// [`Mlp`]s at load.
-#[derive(Debug)]
-struct MoeFfn {
-    router: Array, // [num_experts, hidden]
-    experts: Vec<Mlp>,
-    shared: Mlp,
-    shared_gate: Array, // [1, hidden] sigmoid gate
-    experts_per_tok: usize,
-}
-
-impl MoeFfn {
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s, h) = (sh[0], sh[1], sh[2]);
-        let t = b * s;
-        let dtype = x.dtype();
-        let xf = x.reshape(&[t, h])?;
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Router probabilities (f32 softmax on the host, for a stable top-k), then invert the
-        // per-token top-k into per-expert (token, weight) lists with the weights renormalized to 1.
-        let logits = linear(&xf, &self.router, None)?; // [t, num_experts]
-        let logits = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let mut routed: Vec<Vec<(i32, f32)>> = vec![Vec::new(); num_experts];
-        for ti in 0..t as usize {
-            let row = &logits[ti * num_experts..(ti + 1) * num_experts];
-            let m = row.iter().copied().fold(f32::MIN, f32::max);
-            let exps: Vec<f32> = row.iter().map(|&x| (x - m).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-            let top = &idx[..k];
-            let denom = top
-                .iter()
-                .map(|&e| probs[e])
-                .sum::<f32>()
-                .max(f32::MIN_POSITIVE);
-            for &e in top {
-                routed[e].push((ti as i32, probs[e] / denom));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = zeros3(t, 1, h, dtype)?.reshape(&[t, h])?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len() as i32;
-            let idx_i: Vec<i32> = toks.iter().map(|&(ti, _)| ti).collect();
-            let idx_u: Vec<u32> = toks.iter().map(|&(ti, _)| ti as u32).collect();
-            let wts: Vec<f32> = toks.iter().map(|&(_, w)| w).collect();
-            let idx = Array::from_slice(&idx_i, &[n]);
-            let idx_u = Array::from_slice(&idx_u, &[n]);
-            let wts = Array::from_slice(&wts, &[n, 1]).as_dtype(dtype)?;
-            let xe = xf.take_axis(&idx, 0)?; // [n, h]
-            let ye = multiply(&self.experts[e].forward(&xe)?, &wts)?.reshape(&[n, 1, h])?;
-            out = mlx_rs::ops::indexing::scatter_add_single(&out, &idx_u, &ye, 0)?;
-        }
-
-        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
-        let shared = self.shared.forward(&xf)?;
-        let sg = sigmoid(&linear(&xf, &self.shared_gate, None)?)?; // [t, 1]
-        let shared = multiply(&shared, &sg)?;
-        Ok(add(&out, &shared)?.reshape(&[b, s, h])?)
-    }
-}
-
 /// The per-layer FFN: a dense SwiGLU (27B) or a sparse MoE block (35B-A3B).
+///
+/// The MoE block is the crate's shared [`SparseMoe`] (sc-24440): a softmax router over the stacked
+/// experts (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
+/// **sigmoid-gated** shared expert, routed and dispatched on the device.
 #[derive(Debug)]
 enum Ffn {
     Dense(Mlp),
-    Moe(MoeFfn),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -1394,52 +1324,63 @@ impl Qwen35Model {
                     up: proj_q(lp("mlp.up_proj.weight"))?,
                     down: proj_q(lp("mlp.down_proj.weight"))?,
                 }),
-                // Sparse MoE (35B-A3B): un-fuse the stacked expert tensors into per-expert SwiGLUs.
+                // Sparse MoE (35B-A3B): the routed experts stay stacked for the gathered matmul.
                 // `experts.gate_up_proj` is [E, 2·moe_inter, hidden] (gate rows ‖ up rows, matching
                 // the reference `linear(x, gate_up_proj[e]).chunk(2, -1)`); `experts.down_proj` is
-                // [E, hidden, moe_inter].
+                // [E, hidden, moe_inter]. A snapshot that stores each expert separately (quantized
+                // parts) is stacked from its per-expert projections instead.
                 Some(moe) => {
                     let h = cfg.hidden_size;
                     let mi = moe.moe_intermediate_size;
-                    let mut experts = Vec::with_capacity(moe.num_experts as usize);
                     let expert0 = lp("mlp.experts.0.gate_proj");
                     let split_stored = ["scales", "biases"]
                         .iter()
                         .any(|part| w.contains(&format!("{expert0}.{part}")));
-                    if stored_quant.is_some() || split_stored {
+                    let (gate, up, down) = if stored_quant.is_some() || split_stored {
+                        let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
                         for e in 0..moe.num_experts {
-                            experts.push(Mlp {
-                                gate: proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?,
-                                up: proj_q(lp(&format!("mlp.experts.{e}.up_proj.weight")))?,
-                                down: proj_q(lp(&format!("mlp.experts.{e}.down_proj.weight")))?,
-                            });
+                            gate.push(proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?);
+                            up.push(proj_q(lp(&format!("mlp.experts.{e}.up_proj.weight")))?);
+                            down.push(proj_q(lp(&format!("mlp.experts.{e}.down_proj.weight")))?);
                         }
+                        (
+                            SwitchLinear::stack(gate)?,
+                            SwitchLinear::stack(up)?,
+                            SwitchLinear::stack(down)?,
+                        )
                     } else {
-                        let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
-                        let down = req(lp("mlp.experts.down_proj"))?;
-                        for e in 0..moe.num_experts {
-                            let sel = Array::from_slice(&[e], &[1]);
-                            let gu = gate_up.take_axis(&sel, 0)?.reshape(&[2 * mi, h])?;
-                            let parts = split_sections(&gu, &[mi], 0)?; // [gate_w, up_w]
-                            let dn = down.take_axis(&sel, 0)?.reshape(&[h, mi])?;
-                            experts.push(Mlp {
-                                gate: Projection::load(parts[0].clone(), quant)?,
-                                up: Projection::load(parts[1].clone(), quant)?,
-                                down: Projection::load(dn, quant)?,
-                            });
-                        }
-                    }
-                    Ffn::Moe(MoeFfn {
-                        router: req(lp("mlp.gate.weight"))?,
-                        experts,
-                        shared: Mlp {
+                        let e = moe.num_experts;
+                        // [E, 2, mi, h]: `take` along the gate/up axis yields each half contiguous.
+                        let gate_up =
+                            req(lp("mlp.experts.gate_up_proj"))?.reshape(&[e, 2, mi, h])?;
+                        let half = |i: i32| -> Result<Array> {
+                            Ok(gate_up
+                                .take_axis(Array::from_slice(&[i], &[1]), 1)?
+                                .reshape(&[e, mi, h])?)
+                        };
+                        (
+                            SwitchLinear::load(half(0)?, quant)?,
+                            SwitchLinear::load(half(1)?, quant)?,
+                            SwitchLinear::load(req(lp("mlp.experts.down_proj"))?, quant)?,
+                        )
+                    };
+                    Ffn::Moe(SparseMoe::new(
+                        req(lp("mlp.gate.weight"))?,
+                        gate,
+                        up,
+                        down,
+                        SwiGlu {
                             gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
                             up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
                             down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
                         },
-                        shared_gate: req(lp("mlp.shared_expert_gate.weight"))?,
-                        experts_per_tok: moe.experts_per_tok,
-                    })
+                        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+                        MoeRouting {
+                            experts_per_tok: moe.experts_per_tok,
+                            norm_topk_prob: true,
+                            routed_scaling_factor: 1.0,
+                        },
+                    )?)
                 }
             };
             layers.push(DecoderLayer {
@@ -2804,6 +2745,107 @@ pub(crate) mod tests {
         );
     }
 
+    /// AC (sc-24443): the Gated DeltaNet dispatch (fused Metal kernel for prefill, decode and
+    /// verify) leaves Qwen35 greedy decoding unchanged against the op-by-op reference recurrence —
+    /// for a short and a multi-chunk prompt, a speculative-verify-width forward, and the decode
+    /// steps after it — on the production bf16 path, with every logit within one bf16 ULP of the
+    /// reference's. Runs on a GPU stream (the kernel's route) whatever the process default device.
+    #[test]
+    fn greedy_tokens_match_the_ops_reference_recurrence() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), greedy_tokens_match_on_the_gpu);
+    }
+
+    fn greedy_tokens_match_on_the_gpu() {
+        use crate::primitives::gated_delta::{recording_routes, with_ops_reference, Route};
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let model =
+            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg)
+                .unwrap();
+        let argmax_rows = |logits: &Array| -> Vec<i32> {
+            let rows = logits.as_dtype(Dtype::Float32).unwrap();
+            let v = *rows.shape().last().unwrap() as usize;
+            host(&rows)
+                .chunks(v)
+                .map(|r| {
+                    r.iter()
+                        .enumerate()
+                        .fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                        .0 as i32
+                })
+                .collect()
+        };
+        // Prefill, a 3-token verify block, then 6 greedy decode steps; every row's argmax.
+        let run = |prompt: &[i32]| -> (Vec<i32>, Vec<f32>) {
+            let mut cache = model.new_cache();
+            let n = prompt.len() as i32;
+            let mut out = Vec::new();
+            let mut logits = Vec::new();
+            let pre = model
+                .decode_logits(&Array::from_slice(prompt, &[1, n]), &mut cache, 0)
+                .unwrap();
+            let mut next = argmax_rows(&pre)[0];
+            logits.extend(host(&pre.as_dtype(Dtype::Float32).unwrap()));
+            let block = [next, (next + 1) % 50, (next + 2) % 50];
+            let verify = model
+                .forward(&Array::from_slice(&block, &[1, 3]), &mut cache, n)
+                .unwrap();
+            let rows = argmax_rows(&verify);
+            out.extend(&rows);
+            logits.extend(host(&verify.as_dtype(Dtype::Float32).unwrap()));
+            next = rows[2];
+            for i in 0..6 {
+                let step = model
+                    .decode_logits(&Array::from_slice(&[next], &[1, 1]), &mut cache, n + 3 + i)
+                    .unwrap();
+                next = argmax_rows(&step)[0];
+                out.push(next);
+                logits.extend(host(&step.as_dtype(Dtype::Float32).unwrap()));
+            }
+            (out, logits)
+        };
+        let long: Vec<i32> = (0..90).map(|i| (i * 7 + 3) % 50).collect();
+        for prompt in [&[1i32, 7, 3, 42, 9, 2][..], &long[..]] {
+            let ((tokens, logits), routes) = recording_routes(|| run(prompt));
+            let ((ref_tokens, ref_logits), ref_routes) =
+                recording_routes(|| with_ops_reference(|| run(prompt)));
+            // The production run took the fused kernel for every recurrence call and the reference
+            // run the op loop — so the comparison is kernel against ops, not a path against itself.
+            assert!(
+                !routes.is_empty() && routes.iter().all(|r| *r == Route::Kernel),
+                "production routes {routes:?}"
+            );
+            assert!(
+                !ref_routes.is_empty() && ref_routes.iter().all(|r| *r == Route::Ops),
+                "reference routes {ref_routes:?}"
+            );
+            let md = logits
+                .iter()
+                .zip(&ref_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // The logits are bf16: one ULP at the largest reference logit's binade (8 significand
+            // bits, so the spacing in [2^e, 2^(e+1)) is 2^(e-7)) bounds a last-bit rounding flip.
+            let scale = ref_logits.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let ulp = 2f32.powi(scale.log2().floor() as i32 - 7);
+            eprintln!(
+                "prompt len {}: max logit diff vs ops reference {md:.2e} (bf16 ulp {ulp:.2e} at \
+                 |logit| {scale:.2e})",
+                prompt.len()
+            );
+            assert_eq!(
+                tokens,
+                ref_tokens,
+                "prompt len {}: greedy tokens diverged (max logit diff {md})",
+                prompt.len()
+            );
+            assert!(
+                md <= ulp,
+                "prompt len {}: max logit diff {md} exceeds one bf16 ulp {ulp}",
+                prompt.len()
+            );
+        }
+    }
+
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
     /// expert. Same 4-layer 3:1 mixer schedule as [`cfg_json`].
     fn cfg_json_moe() -> serde_json::Value {
@@ -2819,8 +2861,8 @@ pub(crate) mod tests {
 
     /// The MoE FFN block, validated against a numeric oracle from the exact
     /// `Qwen3_5MoeSparseMoeBlock.forward` reference: softmax router → top-k → renormalize → per-expert
-    /// SwiGLU (gathered/scattered) → sigmoid-gated shared expert. Builds the block via the same
-    /// un-fuse path as the loader (`experts.gate_up_proj` → per-expert gate/up). Single token (S=1) so
+    /// SwiGLU → sigmoid-gated shared expert. Builds the shared [`SparseMoe`] block via the same split
+    /// as the loader (`experts.gate_up_proj` → stacked gate / up banks). Single token (S=1) so
     /// MLX runs the exact GEMV path and the match is tight; regenerate with `/tmp/gen_moe.py`.
     #[test]
     fn moe_ffn_matches_qwen3_5_moe_reference() {
@@ -2838,36 +2880,36 @@ pub(crate) mod tests {
         let mk = |key: &str, shape: &[i32]| Array::from_slice(&arr(key), shape);
         let proj = |a: Array| Projection::load(a, None).unwrap();
 
-        // Un-fuse experts.gate_up_proj / down_proj into per-expert SwiGLUs (mirrors the loader).
-        let gate_up = mk("gate_up", &[e, 2 * mi, h]);
-        let down = mk("down", &[e, h, mi]);
-        let mut experts = Vec::new();
-        for ei in 0..e {
-            let sel = Array::from_slice(&[ei], &[1]);
-            let gu = gate_up
-                .take_axis(&sel, 0)
+        // Split experts.gate_up_proj into the stacked gate / up banks (mirrors the loader).
+        let gate_up = mk("gate_up", &[e, 2 * mi, h])
+            .reshape(&[e, 2, mi, h])
+            .unwrap();
+        let half = |i: i32| {
+            gate_up
+                .take_axis(Array::from_slice(&[i], &[1]), 1)
                 .unwrap()
-                .reshape(&[2 * mi, h])
-                .unwrap();
-            let parts = split_sections(&gu, &[mi], 0).unwrap();
-            let dn = down.take_axis(&sel, 0).unwrap().reshape(&[h, mi]).unwrap();
-            experts.push(Mlp {
-                gate: proj(parts[0].clone()),
-                up: proj(parts[1].clone()),
-                down: proj(dn),
-            });
-        }
-        let moe = MoeFfn {
-            router: mk("router", &[e, h]),
-            experts,
-            shared: Mlp {
+                .reshape(&[e, mi, h])
+                .unwrap()
+        };
+        let bank = |a: Array| SwitchLinear::load(a, None).unwrap();
+        let moe = SparseMoe::new(
+            mk("router", &[e, h]),
+            bank(half(0)),
+            bank(half(1)),
+            bank(mk("down", &[e, h, mi])),
+            SwiGlu {
                 gate: proj(mk("sh_gate", &[mi, h])),
                 up: proj(mk("sh_up", &[mi, h])),
                 down: proj(mk("sh_down", &[h, mi])),
             },
-            shared_gate: mk("sh_gatew", &[1, h]),
-            experts_per_tok: k,
-        };
+            Some(mk("sh_gatew", &[1, h])),
+            MoeRouting {
+                experts_per_tok: k,
+                norm_topk_prob: true,
+                routed_scaling_factor: 1.0,
+            },
+        )
+        .unwrap();
 
         let out = moe.forward(&mk("x", &[1, 1, h])).unwrap();
         assert_eq!(out.shape(), &[1, 1, h]);
