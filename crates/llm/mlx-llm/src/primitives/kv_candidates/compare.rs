@@ -1,6 +1,7 @@
 //! SC-20677 matched-budget comparison harness.
 //!
-//! Runs the existing group-affine reader (SC-20675/SC-20676) and every [`super::rvq`] and
+//! Runs the existing group-affine reader (SC-20675/SC-20676, 2-bit and 4-bit codes) and every
+//! [`super::rvq`] and
 //! [`super::rabitq`] configuration over the same K/V and query, then emits one JSON report with
 //! provenance, exact resident bytes, attention error against an exact fp32 attention over the
 //! input K/V, implementation parity against an independent fp32 dequantize-then-attend oracle,
@@ -41,20 +42,36 @@ use super::{
 use crate::error::{Error, Result};
 use crate::primitives::kv_cache::{CacheRoute, PackedAttentionMask};
 use crate::primitives::packed_group_affine_kv::{
-    CompiledKernelHandle, DenseFallbackEvent, PackedGroupAffineKvCache, StagedReaderLayer,
-    PACKED_METAL_QUANT_GROUP_SIZE,
+    CompiledKernelHandle, DenseFallbackEvent, PackedCodeBits, PackedGroupAffineKvCache,
+    StagedReaderLayer, PACKED_METAL_QUANT_GROUP_SIZE,
 };
-use crate::primitives::packed_metal::{PackedMask, PackedMetalKernel};
+use crate::primitives::packed_metal::{PackedMask, PackedMetalGpuFamily, PackedMetalKernel};
 use crate::primitives::sampler::SplitMix64;
 
 pub const REPORT_SCHEMA: &str = "sc-20677-kv-candidate-comparison/v1";
-const GROUP_AFFINE_IDENTITY: &str = "sc-20677-group-affine-b2-g32";
+/// Representation identity of the group-affine candidate at each code width.
+const fn group_affine_identity(bits: PackedCodeBits) -> &'static str {
+    match bits {
+        PackedCodeBits::Two => "sc-20677-group-affine-b2-g32",
+        PackedCodeBits::Four => "sc-20677-group-affine-b4-g32",
+    }
+}
+
+/// Config label of the group-affine candidate (`b<bits>-g<group>`).
+fn group_affine_config(bits: PackedCodeBits) -> String {
+    format!("b{}-g{PACKED_METAL_QUANT_GROUP_SIZE}", bits.bits())
+}
+
+/// The incumbent: the SC-20673 qualified `b2-g32` configuration the budget and quality points
+/// are anchored on.
+const INCUMBENT_BITS: PackedCodeBits = PackedCodeBits::Two;
 
 // ---------------------------------------------------------------------------------------------
 // Group-affine adapter over the existing SC-20675 cache and retained SC-20676 reader.
 // ---------------------------------------------------------------------------------------------
 
 pub struct GroupAffineCandidate {
+    bits: PackedCodeBits,
     cache: PackedGroupAffineKvCache,
     kernel: Arc<PackedMetalKernel>,
     staged_arguments: Option<StagedReaderLayer>,
@@ -64,7 +81,12 @@ pub struct GroupAffineCandidate {
 
 impl GroupAffineCandidate {
     #[allow(clippy::arc_with_non_send_sync)]
-    pub fn new(batch: usize, kv_heads: usize, head_dim: usize) -> Result<Self> {
+    pub fn new(
+        bits: PackedCodeBits,
+        batch: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
         if !candidate_head_dimension_supported(head_dim) {
             return Err(Error::Unsupported(
                 CandidateFallbackReason::UnsupportedHeadDimension
@@ -72,17 +94,24 @@ impl GroupAffineCandidate {
                     .into(),
             ));
         }
-        let mut cache = PackedGroupAffineKvCache::new(
-            GROUP_AFFINE_IDENTITY,
+        let identity = group_affine_identity(bits);
+        let mut cache = PackedGroupAffineKvCache::with_bits(
+            identity,
             1,
             batch,
             kv_heads,
             head_dim,
             PACKED_METAL_QUANT_GROUP_SIZE,
+            bits,
         )?;
-        let kernel = Arc::new(PackedMetalKernel::for_identity(GROUP_AFFINE_IDENTITY)?);
+        let kernel = Arc::new(PackedMetalKernel::for_identity_family_and_bits(
+            identity,
+            PackedMetalGpuFamily::ConservativeUnknownApple,
+            bits,
+        )?);
         cache.bind_compiled_handle(CompiledKernelHandle::new(kernel.clone()))?;
         Ok(Self {
+            bits,
             cache,
             kernel,
             staged_arguments: None,
@@ -115,7 +144,7 @@ impl CompressedKvCandidate for GroupAffineCandidate {
     }
 
     fn config(&self) -> String {
-        format!("b2-g{PACKED_METAL_QUANT_GROUP_SIZE}")
+        group_affine_config(self.bits)
     }
 
     fn representation(&self) -> CandidateRepresentation {
@@ -125,7 +154,7 @@ impl CompressedKvCandidate for GroupAffineCandidate {
         CandidateRepresentation {
             family: self.family().into(),
             config: self.config(),
-            identity: GROUP_AFFINE_IDENTITY.into(),
+            identity: group_affine_identity(self.bits).into(),
             version: self.cache.representation().version,
             batch: self.geometry.batch,
             kv_heads: self.geometry.kv_heads,
@@ -677,16 +706,19 @@ fn measure_accepted(
 /// `(family, config, candidate-or-construction-refusal)`.
 pub type CandidateEntry = (String, String, Result<Box<dyn CompressedKvCandidate>>);
 
-/// The comparison set (E5): the incumbent group-affine reader, packed RVQ at 1..=3 bits per
-/// stage for K and V independently, and both RaBitQ score estimators.
+/// The comparison set (E5): the group-affine reader at the incumbent 2-bit and the 4-bit code
+/// width, packed RVQ at 1..=3 bits per stage for K and V independently, and both RaBitQ score
+/// estimators.
 pub fn candidate_set(batch: usize, kv_heads: usize, head_dim: usize) -> Vec<CandidateEntry> {
     let mut set: Vec<CandidateEntry> = Vec::new();
-    set.push((
-        "group-affine".into(),
-        format!("b2-g{PACKED_METAL_QUANT_GROUP_SIZE}"),
-        GroupAffineCandidate::new(batch, kv_heads, head_dim)
-            .map(|c| Box::new(c) as Box<dyn CompressedKvCandidate>),
-    ));
+    for bits in PackedCodeBits::ALL {
+        set.push((
+            "group-affine".into(),
+            group_affine_config(bits),
+            GroupAffineCandidate::new(bits, batch, kv_heads, head_dim)
+                .map(|c| Box::new(c) as Box<dyn CompressedKvCandidate>),
+        ));
+    }
     for key_bits in 1..=3 {
         for value_bits in 1..=3 {
             let config = RvqConfig {
@@ -942,9 +974,10 @@ pub fn compare_case(
                 ),
             })
             .collect();
+    let incumbent_config = group_affine_config(INCUMBENT_BITS);
     let incumbent = results
         .iter()
-        .find(|r| r.family == "group-affine" && r.is_compressed());
+        .find(|r| r.family == "group-affine" && r.config == incumbent_config && r.is_compressed());
     let budgets = budget_points(
         incumbent
             .and_then(|r| r.representation.as_ref())
@@ -1144,6 +1177,7 @@ mod tests {
     /// 1-bit keys, so value-side RaBitQ regressions are caught by the value round-trip SNR test.
     const QUALITY_CEILINGS: &[(&str, f64)] = &[
         ("b2-g32", 0.82),
+        ("b4-g32", 0.135),
         ("k1x2-v1x2", 0.62),
         ("k1x2-v2x2", 0.49),
         ("k1x2-v3x2", 0.46),
@@ -1340,7 +1374,7 @@ mod tests {
         };
         let case = synthetic_case(shape, 7, PackedAttentionMask::Causal, None);
         let report = compare_case(&case, 1, &[], &[]).unwrap();
-        assert_eq!(report.results.len(), 1 + 9 + 4);
+        assert_eq!(report.results.len(), 2 + 9 + 4);
         let error = |config: &str| {
             report
                 .results
@@ -1356,7 +1390,8 @@ mod tests {
                 result.family, result.config, result.quality_vs_exact
             );
         }
-        // More RVQ bits must strictly reduce attention error.
+        // Finer group-affine codes and more RVQ bits must strictly reduce attention error.
+        assert!(error("b4-g32") < error("b2-g32"));
         assert!(error("k3x2-v3x2") < error("k2x2-v2x2"));
         assert!(error("k2x2-v2x2") < error("k1x2-v1x2"));
         for result in &report.results {
@@ -1426,7 +1461,8 @@ mod tests {
         let query = Array::from_slice(&case.query, &[1, 4, 1, 128]);
         query.eval().unwrap();
         let families: Vec<Box<dyn CompressedKvCandidate>> = vec![
-            Box::new(GroupAffineCandidate::new(1, 2, 128).unwrap()),
+            Box::new(GroupAffineCandidate::new(PackedCodeBits::Two, 1, 2, 128).unwrap()),
+            Box::new(GroupAffineCandidate::new(PackedCodeBits::Four, 1, 2, 128).unwrap()),
             Box::new(
                 RvqKvCandidate::new(
                     RvqConfig {
@@ -1542,7 +1578,6 @@ mod tests {
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn group_affine_kernel_profile_follows_the_selected_path() {
-        use crate::primitives::packed_metal::PackedMetalGpuFamily;
         let request = |query_len| {
             synthetic_case(
                 SyntheticShape {
@@ -1559,7 +1594,7 @@ mod tests {
             )
             .request
         };
-        let mut candidate = GroupAffineCandidate::new(1, 2, 128).unwrap();
+        let mut candidate = GroupAffineCandidate::new(INCUMBENT_BITS, 1, 2, 128).unwrap();
         let conservative = candidate.kernel_profile(&request(64));
         assert_eq!(conservative.kernel, "sc20676_split_kv_simdgroup");
         assert_eq!(
@@ -1571,9 +1606,10 @@ mod tests {
         );
         assert_eq!(conservative.gpu_family, "conservative-unknown-apple");
         candidate.kernel = Arc::new(
-            PackedMetalKernel::for_identity_and_family(
-                GROUP_AFFINE_IDENTITY,
+            PackedMetalKernel::for_identity_family_and_bits(
+                group_affine_identity(INCUMBENT_BITS),
                 PackedMetalGpuFamily::Apple7OrNewer,
+                INCUMBENT_BITS,
             )
             .unwrap(),
         );

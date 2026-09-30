@@ -1,7 +1,9 @@
-//! Physically packed 2-bit group-affine KV representation (SC-20675) and its SC-20676 decoder route.
+//! Physically packed group-affine KV representation (SC-20675) and its SC-20676 decoder route.
 //!
-//! Codes are four 2-bit values per byte and each group has an f16 scale and zero. Two stores share
-//! one device layout:
+//! Codes are [`PackedCodeBits`] wide (2-bit: four per byte, the SC-20673 qualified candidate;
+//! 4-bit: two per byte, the KIVI-style candidate) and each group has an f16 scale and zero. The
+//! code width is a property of the cache and of its reader; a snapshot records it and a reader or
+//! snapshot of another width is refused. Two stores share one device layout:
 //!
 //! * The host CPU reference ([`PackedGroupAffineKvCache::append`]) quantizes on the CPU, owns the
 //!   deterministic snapshot/lifecycle contract, and uploads only its new packed deltas into a
@@ -35,13 +37,87 @@ use mlx_rs::{Array, Dtype};
 
 const MAGIC: &[u8; 8] = b"SW20675\0";
 const VERSION: u32 = 2;
-const BITS: u8 = 2;
-/// Four independent 2-bit codes fit in one byte. This is a packing property, not the affine
-/// quantization group selected by the qualified candidate.
-pub const PACKED_CODES_PER_BYTE: usize = 4;
-/// SC-20673 qualified the `b=2,g=32` group-affine candidate. K groups span tokens and V groups span
-/// channels, but both use this same quantization group width.
+/// SC-20673 qualified the `b=2,g=32` group-affine candidate; `b=4,g=32` shares the group. K groups
+/// span tokens and V groups span channels, but both use this same quantization group width.
 pub const PACKED_METAL_QUANT_GROUP_SIZE: usize = 32;
+
+/// Code width of a packed group-affine cache. Codes of one width are packed little-end-first into
+/// bytes (`8 / bits` per byte); a group's `2^bits` levels span `[min, max]` as
+/// `zero + scale · code` with `scale = max((max − min) / (2^bits − 1), ε)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PackedCodeBits {
+    /// SC-20673 qualified `b=2` (four codes per byte).
+    #[default]
+    Two,
+    /// KIVI-style `b=4` (two codes per byte).
+    Four,
+}
+
+impl PackedCodeBits {
+    pub const ALL: [Self; 2] = [Self::Two, Self::Four];
+
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Two => 2,
+            Self::Four => 4,
+        }
+    }
+
+    /// Supported widths only; any other value is refused.
+    pub fn from_bits(bits: u8) -> Result<Self> {
+        match bits {
+            2 => Ok(Self::Two),
+            4 => Ok(Self::Four),
+            other => Err(Error::Config(format!(
+                "packed group-affine code width {other} is unsupported (expected 2 or 4)"
+            ))),
+        }
+    }
+
+    /// Independent codes packed into one byte. A packing property, not the affine group.
+    pub const fn codes_per_byte(self) -> usize {
+        8 / self.bits() as usize
+    }
+
+    /// Largest code (`2^bits − 1`).
+    pub const fn max_code(self) -> u8 {
+        (1u8 << self.bits()) - 1
+    }
+
+    /// Quantization step divisor `2^bits − 1`, exactly as the GPU quantizer uses it.
+    pub fn levels(self) -> f32 {
+        f32::from(self.max_code())
+    }
+
+    /// Bytes holding `codes` codes.
+    pub const fn code_bytes(self, codes: usize) -> usize {
+        codes.div_ceil(self.codes_per_byte())
+    }
+
+    fn shift(self, index: usize) -> usize {
+        (index % self.codes_per_byte()) * usize::from(self.bits())
+    }
+
+    /// OR `code` into slot `index` of a zero-initialized packed byte run.
+    fn pack(self, bytes: &mut [u8], index: usize, code: u8) {
+        bytes[index / self.codes_per_byte()] |= code << self.shift(index);
+    }
+
+    fn unpack(self, bytes: &[u8], index: usize) -> u8 {
+        (bytes[index / self.codes_per_byte()] >> self.shift(index)) & self.max_code()
+    }
+
+    /// CPU reference quantization of one group's value: `clamp(round((x − min) / scale), 0,
+    /// 2^bits − 1)`.
+    fn quantize(self, value: f32, min: f32, scale: f32) -> u8 {
+        ((value - min) / scale).round().clamp(0.0, self.levels()) as u8
+    }
+
+    /// CPU reference group scale.
+    fn scale(self, min: f32, max: f32) -> f32 {
+        ((max - min) / self.levels()).max(f32::EPSILON)
+    }
+}
 
 /// MLX exposes array extents as signed `i32`s, while packed-cache storage uses `usize`.
 /// Keep that conversion at the array boundary so a large host-side cache can never wrap into an
@@ -196,6 +272,11 @@ pub trait RetainedPackedKernel: fmt::Debug {
     fn kernel_selection(&self, _args: &PackedAttentionArgs<'_>) -> Option<PackedKernelSelection> {
         None
     }
+    /// Code width this reader was built to read. A cache of another width refuses to bind it.
+    /// Readers that predate the 4-bit representation read the qualified 2-bit layout.
+    fn code_bits(&self) -> PackedCodeBits {
+        PackedCodeBits::Two
+    }
 }
 
 /// Lifetime-owned, type-erased compiled-kernel slot.  `Arc` keeps the real backend object alive
@@ -226,6 +307,11 @@ impl CompiledKernelHandle {
         self.inner.retained_host_bytes_estimate()
     }
 
+    /// Code width the retained reader reads (see [`RetainedPackedKernel::code_bits`]).
+    pub fn code_bits(&self) -> PackedCodeBits {
+        self.inner.code_bits()
+    }
+
     fn is_warmed(&self) -> bool {
         self.warmed.load(Ordering::Acquire)
     }
@@ -240,6 +326,7 @@ impl fmt::Debug for CompiledKernelHandle {
         f.debug_struct("CompiledKernelHandle")
             .field("cache_identity", &self.cache_identity())
             .field("backend", &self.backend())
+            .field("code_bits", &self.code_bits().bits())
             .field(
                 "retained_host_bytes_estimate",
                 &self.retained_host_bytes_estimate(),
@@ -319,6 +406,8 @@ pub struct PackedCacheRequest {
     pub kv_heads: usize,
     pub head_dimension: usize,
     pub group_size: usize,
+    /// Code width of the staged packed cache; the bound reader must read the same width.
+    pub bits: PackedCodeBits,
     pub query_length: usize,
     pub has_mask: bool,
 }
@@ -334,6 +423,7 @@ impl PackedCacheRequest {
             kv_heads: 0,
             head_dimension: 0,
             group_size: 0,
+            bits: PackedCodeBits::Two,
             query_length: 0,
             has_mask: false,
         }
@@ -1124,13 +1214,14 @@ pub fn select_decoder_cache(request: PackedCacheRequest) -> DecoderCacheSelectio
             format!("packed Metal quantization group size must be {PACKED_METAL_QUANT_GROUP_SIZE}"),
         );
     }
-    let staged = match PackedGroupAffineKvCache::new(
+    let staged = match PackedGroupAffineKvCache::with_bits(
         request.identity,
         request.layers,
         request.batch,
         request.kv_heads,
         request.head_dimension,
         request.group_size,
+        request.bits,
     ) {
         Ok(cache) => cache,
         Err(error) => {
@@ -1193,7 +1284,8 @@ struct ParityCase {
 /// device representation holds, reconstructed by MLX dequantization independently of the kernel.
 /// Cases cover multiple K groups plus a residual tail at decode (77 tokens), a causal prefill chunk
 /// (`S_q = 5`) over that history, and a history long enough for the split-KV heuristic to choose
-/// several splits. Returns every per-element absolute error.
+/// several splits. The cache is built at the reader's [`CompiledKernelHandle::code_bits`], so a
+/// 4-bit reader is checked on 4-bit codes. Returns every per-element absolute error.
 pub fn group_affine_kernel_fp32_parity_errors(
     reader: &CompiledKernelHandle,
 ) -> std::result::Result<Vec<f64>, String> {
@@ -1264,13 +1356,14 @@ fn group_affine_parity_case(
         .map(|index| (index as i32 % 23 - 11) as f32 * 0.05)
         .collect::<Vec<_>>();
     let shape = [1, KV_HEADS as i32, tokens as i32, width as i32];
-    let mut cache = PackedGroupAffineKvCache::new(
+    let mut cache = PackedGroupAffineKvCache::with_bits(
         reader.cache_identity(),
         1,
         1,
         KV_HEADS,
         width,
         PACKED_METAL_QUANT_GROUP_SIZE,
+        reader.code_bits(),
     )
     .map_err(|e| format!("packed kernel parity cache: {e}"))?;
     cache
@@ -1344,6 +1437,7 @@ fn group_affine_parity_case(
 
 #[derive(Clone, Debug)]
 struct PackedTensor {
+    bits: PackedCodeBits,
     rows: usize,
     width: usize,
     groups: usize,
@@ -1353,13 +1447,20 @@ struct PackedTensor {
 }
 
 impl PackedTensor {
-    fn new(rows: usize, width: usize, group_size: usize, capacity_rows: usize) -> Self {
+    fn new(
+        bits: PackedCodeBits,
+        rows: usize,
+        width: usize,
+        group_size: usize,
+        capacity_rows: usize,
+    ) -> Self {
         let groups = width.div_ceil(group_size);
         Self {
+            bits,
             rows,
             width,
             groups,
-            codes: Vec::with_capacity(capacity_rows * width.div_ceil(PACKED_CODES_PER_BYTE)),
+            codes: Vec::with_capacity(capacity_rows * bits.code_bytes(width)),
             scales: Vec::with_capacity(capacity_rows * groups),
             zeros: Vec::with_capacity(capacity_rows * groups),
         }
@@ -1370,22 +1471,24 @@ impl PackedTensor {
             return Err(Error::Config("packed KV row width mismatch".into()));
         }
         let code_start = self.codes.len();
+        let bits = self.bits;
         self.codes
-            .resize(code_start + self.width.div_ceil(PACKED_CODES_PER_BYTE), 0);
+            .resize(code_start + bits.code_bytes(self.width), 0);
         for group in 0..self.groups {
             let start = group * group_size;
             let end = (start + group_size).min(self.width);
             let slice = &values[start..end];
             let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
             let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let scale = ((max - min) / 3.0).max(f32::EPSILON);
+            let scale = bits.scale(min, max);
             self.scales.push(f16::from_f32(scale));
             self.zeros.push(f16::from_f32(min));
             for (i, value) in slice.iter().copied().enumerate() {
-                let code = ((value - min) / scale).round().clamp(0.0, 3.0) as u8;
-                let index = start + i;
-                self.codes[code_start + index / PACKED_CODES_PER_BYTE] |=
-                    code << ((index % PACKED_CODES_PER_BYTE) * 2);
+                bits.pack(
+                    &mut self.codes[code_start..],
+                    start + i,
+                    bits.quantize(value, min, scale),
+                );
             }
         }
         self.rows += 1;
@@ -1397,11 +1500,9 @@ impl PackedTensor {
             return Err(Error::Config("packed KV row out of range".into()));
         }
         let mut out = Vec::with_capacity(self.width);
+        let row_codes = &self.codes[row * self.bits.code_bytes(self.width)..];
         for i in 0..self.width {
-            let code = (self.codes
-                [row * self.width.div_ceil(PACKED_CODES_PER_BYTE) + i / PACKED_CODES_PER_BYTE]
-                >> ((i % PACKED_CODES_PER_BYTE) * 2))
-                & 3;
+            let code = self.bits.unpack(row_codes, i);
             let group = i / group_size;
             out.push(
                 self.zeros[row * self.groups + group].to_f32()
@@ -1413,8 +1514,7 @@ impl PackedTensor {
 
     fn truncate(&mut self, rows: usize) {
         self.rows = rows;
-        self.codes
-            .truncate(rows * self.width.div_ceil(PACKED_CODES_PER_BYTE));
+        self.codes.truncate(rows * self.bits.code_bytes(self.width));
         self.scales.truncate(rows * self.groups);
         self.zeros.truncate(rows * self.groups);
     }
@@ -1429,7 +1529,7 @@ impl PackedTensor {
 
     fn reserve_rows(&mut self, rows: usize) {
         self.codes.reserve(
-            rows.saturating_mul(self.width.div_ceil(PACKED_CODES_PER_BYTE))
+            rows.saturating_mul(self.bits.code_bytes(self.width))
                 .saturating_sub(self.codes.len()),
         );
         self.scales.reserve(
@@ -1445,9 +1545,10 @@ impl PackedTensor {
 
 /// Key storage groups tokens per channel (`[B,H,ceil(S/group),D]`).  Only an
 /// incomplete final token group is staged densely; every completed group is
-/// physically 2-bit codes plus f16 scale/zero metadata.
+/// physically `bits`-wide codes plus f16 scale/zero metadata.
 #[derive(Clone, Debug)]
 struct TokenGroupKeyTensor {
+    bits: PackedCodeBits,
     rows: usize,
     width: usize,
     group_size: usize,
@@ -1461,17 +1562,22 @@ struct TokenGroupKeyTensor {
 }
 
 impl TokenGroupKeyTensor {
-    fn new(rows: usize, width: usize, group_size: usize, capacity_tokens: usize) -> Self {
+    fn new(
+        bits: PackedCodeBits,
+        rows: usize,
+        width: usize,
+        group_size: usize,
+        capacity_tokens: usize,
+    ) -> Self {
         let groups = capacity_tokens.div_ceil(group_size);
         Self {
+            bits,
             rows,
             width,
             group_size,
             complete_tokens: 0,
             pending_tokens: 0,
-            codes: Vec::with_capacity(
-                rows * groups * (group_size * width).div_ceil(PACKED_CODES_PER_BYTE),
-            ),
+            codes: Vec::with_capacity(rows * groups * bits.code_bytes(group_size * width)),
             scales: Vec::with_capacity(rows * groups * width),
             zeros: Vec::with_capacity(rows * groups * width),
             pending: Vec::with_capacity(rows * group_size.saturating_sub(1) * width),
@@ -1487,7 +1593,7 @@ impl TokenGroupKeyTensor {
     }
 
     fn code_bytes_per_group(&self) -> usize {
-        (self.group_size * self.width).div_ceil(PACKED_CODES_PER_BYTE)
+        self.bits.code_bytes(self.group_size * self.width)
     }
 
     fn append(&mut self, values: &[f32], step: usize) -> Result<()> {
@@ -1519,6 +1625,7 @@ impl TokenGroupKeyTensor {
             .resize(code_start + self.rows * self.code_bytes_per_group(), 0);
         let code_bytes_per_group = self.code_bytes_per_group();
         let group_index = self.complete_groups();
+        let bits = self.bits;
         for row in 0..self.rows {
             for channel in 0..self.width {
                 let min = (0..self.group_size)
@@ -1527,17 +1634,16 @@ impl TokenGroupKeyTensor {
                 let max = (0..self.group_size)
                     .map(|token| self.pending[(token * self.rows + row) * self.width + channel])
                     .fold(f32::NEG_INFINITY, f32::max);
-                let scale = ((max - min) / 3.0).max(f32::EPSILON);
+                let scale = bits.scale(min, max);
                 self.scales.push(f16::from_f32(scale));
                 self.zeros.push(f16::from_f32(min));
                 for token in 0..self.group_size {
                     let value = self.pending[(token * self.rows + row) * self.width + channel];
-                    let code = ((value - min) / scale).round().clamp(0.0, 3.0) as u8;
-                    let code_index = (token * self.width) + channel;
-                    self.codes[code_start
-                        + row * code_bytes_per_group
-                        + code_index / PACKED_CODES_PER_BYTE] |=
-                        code << ((code_index % PACKED_CODES_PER_BYTE) * 2);
+                    bits.pack(
+                        &mut self.codes[code_start + row * code_bytes_per_group..],
+                        token * self.width + channel,
+                        bits.quantize(value, min, scale),
+                    );
                 }
             }
         }
@@ -1607,10 +1713,9 @@ impl TokenGroupKeyTensor {
         let metadata_base = (group * self.rows + row) * self.width;
         let mut out = Vec::with_capacity(self.width);
         for channel in 0..self.width {
-            let code_index = local_token * self.width + channel;
-            let code = (self.codes[code_base + code_index / PACKED_CODES_PER_BYTE]
-                >> ((code_index % PACKED_CODES_PER_BYTE) * 2))
-                & 3;
+            let code = self
+                .bits
+                .unpack(&self.codes[code_base..], local_token * self.width + channel);
             out.push(
                 self.zeros[metadata_base + channel].to_f32()
                     + self.scales[metadata_base + channel].to_f32() * code as f32,
@@ -1667,6 +1772,7 @@ struct PackedGeometry {
     heads: usize,
     dim: usize,
     group: usize,
+    bits: PackedCodeBits,
 }
 
 impl PackedGeometry {
@@ -1674,10 +1780,10 @@ impl PackedGeometry {
         self.batch * self.heads
     }
     fn key_words(self) -> usize {
-        (self.group * self.dim).div_ceil(PACKED_CODES_PER_BYTE)
+        self.bits.code_bytes(self.group * self.dim)
     }
     fn value_words(self) -> usize {
-        self.dim.div_ceil(PACKED_CODES_PER_BYTE)
+        self.bits.code_bytes(self.dim)
     }
     fn value_groups(self) -> usize {
         self.dim.div_ceil(self.group)
@@ -1741,15 +1847,22 @@ fn materialized(array: &Array) -> Result<Array> {
     crate::primitives::nn::contiguous(&multiply(array, &one)?)
 }
 
-/// Unpack four 2-bit codes per byte along the last axis: `[..., W]` Uint8 → `[..., 4W]` Float32.
-fn unpack_codes(codes: &Array) -> Result<Array> {
+/// Unpack `8 / bits` codes per byte along the last axis, low bits first: `[..., W]` Uint8 →
+/// `[..., W · 8 / bits]` Float32. Integer place-value arithmetic, independent of the kernels'
+/// shift-and-mask decoding.
+fn unpack_codes(codes: &Array, bits: PackedCodeBits) -> Result<Array> {
+    let per_byte = bits.codes_per_byte();
     let mut shape = codes.shape().to_vec();
     let last = shape.len() - 1;
-    shape[last] *= 4;
+    shape[last] *= i32::try_from(per_byte)
+        .map_err(|_| Error::Msg("internal packed code width conversion failed".into()))?;
     let widened = codes.as_dtype(Dtype::Uint32)?.expand_dims(-1)?;
-    let place = Array::from_slice(&[1u32, 4, 16, 64], &[4]);
-    let shifted = floor_divide(&widened, &place)?;
-    let digits = remainder(&shifted, Array::from_slice(&[4u32], &[1]))?;
+    let levels = u32::from(bits.max_code()) + 1;
+    let place = (0..per_byte)
+        .map(|k| levels.pow(k as u32))
+        .collect::<Vec<_>>();
+    let shifted = floor_divide(&widened, Array::from_slice(&place, &[per_byte as i32]))?;
+    let digits = remainder(&shifted, Array::from_slice(&[levels], &[1]))?;
     Ok(digits.reshape(&shape)?.as_dtype(Dtype::Float32)?)
 }
 
@@ -1761,7 +1874,7 @@ fn dequantize_key_groups(
     scales: &Array,
     zeros: &Array,
 ) -> Result<Array> {
-    let codes = unpack_codes(codes)?;
+    let codes = unpack_codes(codes, geometry.bits)?;
     let (b, h, g, group, d) = (
         codes.shape()[0],
         codes.shape()[1],
@@ -1784,7 +1897,7 @@ fn dequantize_value_rows(
     scales: &Array,
     zeros: &Array,
 ) -> Result<Array> {
-    let codes = unpack_codes(codes)?;
+    let codes = unpack_codes(codes, geometry.bits)?;
     let (b, h, t) = (codes.shape()[0], codes.shape()[1], codes.shape()[2]);
     let (groups, group) = (
         i32::try_from(geometry.value_groups())
@@ -1816,6 +1929,7 @@ fn dequantize_value_rows(
 #[derive(Clone, Debug)]
 struct DevicePackedLayer {
     authoritative: bool,
+    bits: PackedCodeBits,
     capacity_tokens: usize,
     /// Leading tokens whose K is quantized (a multiple of the group size).
     key_packed_tokens: usize,
@@ -1879,6 +1993,7 @@ impl DevicePackedLayer {
         };
         Ok(Self {
             authoritative,
+            bits: geometry.bits,
             capacity_tokens,
             key_packed_tokens: 0,
             value_packed_tokens: 0,
@@ -2035,6 +2150,7 @@ impl DevicePackedLayer {
             key_packed_tokens: self.key_packed_tokens,
             value_packed_tokens: self.value_packed_tokens,
             kv_tokens: self.kv_tokens(),
+            code_bits: self.bits,
             mask,
         }
     }
@@ -2158,6 +2274,7 @@ fn row_major_outer_rows<T: Copy>(
 pub struct PackedGroupAffineKvCache {
     identity: String,
     group_size: usize,
+    bits: PackedCodeBits,
     batch: usize,
     kv_heads: usize,
     head_dimension: usize,
@@ -2180,6 +2297,7 @@ pub struct PackedGroupAffineKvCache {
 }
 
 impl PackedGroupAffineKvCache {
+    /// A cache of the qualified 2-bit representation.
     pub fn new(
         identity: impl Into<String>,
         layers: usize,
@@ -2188,6 +2306,27 @@ impl PackedGroupAffineKvCache {
         head_dimension: usize,
         group_size: usize,
     ) -> Result<Self> {
+        Self::with_bits(
+            identity,
+            layers,
+            batch,
+            kv_heads,
+            head_dimension,
+            group_size,
+            PackedCodeBits::Two,
+        )
+    }
+
+    /// A cache whose codes are `bits` wide.
+    pub fn with_bits(
+        identity: impl Into<String>,
+        layers: usize,
+        batch: usize,
+        kv_heads: usize,
+        head_dimension: usize,
+        group_size: usize,
+        bits: PackedCodeBits,
+    ) -> Result<Self> {
         if group_size == 0 || head_dimension == 0 || batch == 0 || kv_heads == 0 || layers == 0 {
             return Err(Error::Config("invalid packed KV shape".into()));
         }
@@ -2195,6 +2334,7 @@ impl PackedGroupAffineKvCache {
         Ok(Self {
             identity: identity.into(),
             group_size,
+            bits,
             batch,
             kv_heads,
             head_dimension,
@@ -2232,6 +2372,7 @@ impl PackedGroupAffineKvCache {
         let cap = self.capacity.max(1);
         let width = self.row_width();
         let group_size = self.group_size;
+        let bits = self.bits;
         let rows = self.rows();
         let slot = self
             .layers
@@ -2239,8 +2380,14 @@ impl PackedGroupAffineKvCache {
             .ok_or_else(|| Error::Config("layer out of range".into()))?;
         if slot.is_none() {
             *slot = Some(LayerStorage {
-                keys: TokenGroupKeyTensor::new(rows, width, group_size, cap),
-                values: PackedTensor::new(self.logical_len * rows, width, group_size, rows * cap),
+                keys: TokenGroupKeyTensor::new(bits, rows, width, group_size, cap),
+                values: PackedTensor::new(
+                    bits,
+                    self.logical_len * rows,
+                    width,
+                    group_size,
+                    rows * cap,
+                ),
             });
         }
         Ok(slot.as_mut().expect("initialized layer"))
@@ -2508,7 +2655,7 @@ impl PackedGroupAffineKvCache {
             identity: self.identity.clone(),
             version: VERSION,
             group_size: self.group_size,
-            bits: BITS,
+            bits: self.bits.bits(),
             batch: self.batch,
             kv_heads: self.kv_heads,
             head_dimension: self.head_dimension,
@@ -2559,6 +2706,10 @@ impl PackedGroupAffineKvCache {
     pub fn no_dense_mirror(&self) -> bool {
         true
     }
+    /// Code width of this cache's packed representation.
+    pub fn code_bits(&self) -> PackedCodeBits {
+        self.bits
+    }
     pub fn compiled_handle(&self) -> Option<&CompiledKernelHandle> {
         self.handle.as_ref()
     }
@@ -2568,6 +2719,13 @@ impl PackedGroupAffineKvCache {
         }
         if handle.backend() != "mlx-metal" {
             return Err(Error::Config("compiled handle backend mismatch".into()));
+        }
+        if handle.code_bits() != self.bits {
+            return Err(Error::Config(format!(
+                "compiled handle reads {}-bit codes but the cache stores {}-bit codes",
+                handle.code_bits().bits(),
+                self.bits.bits()
+            )));
         }
         if !packed_metal_cache_geometry_supported(self.head_dimension, self.group_size) {
             return Err(Error::Config(
@@ -2586,6 +2744,7 @@ impl PackedGroupAffineKvCache {
             heads: self.kv_heads,
             dim: self.head_dimension,
             group: self.group_size,
+            bits: self.bits,
         }
     }
 
@@ -2719,6 +2878,7 @@ impl PackedGroupAffineKvCache {
                     keys,
                     values,
                     groups,
+                    self.bits,
                 )?;
             let replacement = if remainder > 0 {
                 // The flush consumed the whole residual, so the remainder is the fresh suffix.
@@ -3374,7 +3534,7 @@ impl PackedGroupAffineKvCache {
         ] {
             out.extend((n as u64).to_le_bytes());
         }
-        out.push(BITS);
+        out.push(self.bits.bits());
         for layer in &self.layers {
             out.push(layer.is_some() as u8);
             if let Some(layer) = layer {
@@ -3449,7 +3609,7 @@ impl PackedGroupAffineKvCache {
             || nums[2] as usize != self.kv_heads
             || nums[3] as usize != self.head_dimension
             || nums[7] as usize != self.layers.len()
-            || take(&mut p, 1)?[0] != BITS
+            || take(&mut p, 1)?[0] != self.bits.bits()
         {
             return Err(Error::Config(
                 "snapshot quantization or shape mismatch".into(),
@@ -3496,9 +3656,7 @@ impl PackedGroupAffineKvCache {
             let expected_key_codes = key_groups
                 .checked_mul(rows)
                 .and_then(|value| {
-                    value.checked_mul(
-                        (self.group_size * self.head_dimension).div_ceil(PACKED_CODES_PER_BYTE),
-                    )
+                    value.checked_mul(self.bits.code_bytes(self.group_size * self.head_dimension))
                 })
                 .ok_or_else(|| Error::Config("snapshot key code length overflow".into()))?;
             if key_code_len != expected_key_codes as u64 {
@@ -3546,7 +3704,7 @@ impl PackedGroupAffineKvCache {
                 .ok_or_else(|| Error::Config("snapshot value row overflow".into()))?;
             let value_code_len = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
             let expected_value_codes = expected_rows
-                .checked_mul(self.head_dimension.div_ceil(PACKED_CODES_PER_BYTE))
+                .checked_mul(self.bits.code_bytes(self.head_dimension))
                 .ok_or_else(|| Error::Config("snapshot value code overflow".into()))?;
             if value_rows != expected_rows as u64 || value_code_len != expected_value_codes as u64 {
                 return Err(Error::Config("snapshot value code shape mismatch".into()));
@@ -3573,6 +3731,7 @@ impl PackedGroupAffineKvCache {
             }
             restored.push(Some(LayerStorage {
                 keys: TokenGroupKeyTensor {
+                    bits: self.bits,
                     rows,
                     width: self.head_dimension,
                     group_size: self.group_size,
@@ -3584,6 +3743,7 @@ impl PackedGroupAffineKvCache {
                     pending,
                 },
                 values: PackedTensor {
+                    bits: self.bits,
                     rows: expected_rows,
                     width: self.head_dimension,
                     groups: self.head_dimension.div_ceil(self.group_size),
@@ -3681,6 +3841,7 @@ mod tests {
                 kv_heads,
                 head_dimension,
                 group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                bits: PackedCodeBits::Two,
                 query_length: 1,
                 has_mask: false,
             },
@@ -3949,6 +4110,184 @@ mod tests {
         assert!(incompatible.restore(&snapshot).is_err());
         assert_eq!(incompatible.representation(), before);
     }
+
+    #[test]
+    fn code_width_is_recorded_and_a_snapshot_of_another_width_is_refused_without_mutation() {
+        assert_eq!(PackedCodeBits::from_bits(2).unwrap(), PackedCodeBits::Two);
+        assert_eq!(PackedCodeBits::from_bits(4).unwrap(), PackedCodeBits::Four);
+        for unsupported in [0, 1, 3, 8] {
+            assert!(PackedCodeBits::from_bits(unsupported).is_err());
+        }
+        assert_eq!(
+            (
+                PackedCodeBits::Four.codes_per_byte(),
+                PackedCodeBits::Four.max_code()
+            ),
+            (2, 15)
+        );
+        for (stored, other) in [
+            (PackedCodeBits::Two, PackedCodeBits::Four),
+            (PackedCodeBits::Four, PackedCodeBits::Two),
+        ] {
+            let payload = data(3, 1, 8, -2.0);
+            let mut source =
+                PackedGroupAffineKvCache::with_bits("m", 1, 1, 1, 8, 4, stored).unwrap();
+            source.append(0, &payload, &payload, 3).unwrap();
+            assert_eq!(source.representation().bits, stored.bits());
+            let snapshot = source.save().unwrap();
+            let mut same = PackedGroupAffineKvCache::with_bits("m", 1, 1, 1, 8, 4, stored).unwrap();
+            same.restore(&snapshot).unwrap();
+            assert_same_rows(&source, &same);
+            let mut incompatible =
+                PackedGroupAffineKvCache::with_bits("m", 1, 1, 1, 8, 4, other).unwrap();
+            let resident = data(2, 1, 8, 5.0);
+            incompatible.append(0, &resident, &resident, 2).unwrap();
+            let (before, rows) = (
+                incompatible.representation(),
+                incompatible.read_row(0, 1, 0).unwrap(),
+            );
+            let error = incompatible.restore(&snapshot).unwrap_err().to_string();
+            assert!(error.contains("quantization or shape mismatch"), "{error}");
+            assert_eq!(incompatible.representation(), before);
+            assert_eq!(incompatible.read_row(0, 1, 0).unwrap(), rows);
+        }
+    }
+
+    /// A reader built for another code width is refused at binding, and the decoder factory falls
+    /// back to dense before any packed mutation.
+    #[test]
+    fn a_reader_of_another_code_width_is_refused_before_mutation() {
+        let two_bit_reader = CompiledKernelHandle::new(Arc::new(TestPackedKernel {
+            calls: AtomicUsize::new(0),
+            fail_on: None,
+            cancel_on_failure: false,
+        }));
+        assert_eq!(two_bit_reader.code_bits(), PackedCodeBits::Two);
+        let mut cache = PackedGroupAffineKvCache::with_bits(
+            "test-packed",
+            1,
+            1,
+            1,
+            64,
+            PACKED_METAL_QUANT_GROUP_SIZE,
+            PackedCodeBits::Four,
+        )
+        .unwrap();
+        let error = cache
+            .bind_compiled_handle(two_bit_reader.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("reads 2-bit codes but the cache stores 4-bit codes"),
+            "{error}"
+        );
+        assert!(cache.compiled_handle().is_none());
+        let selection = select_decoder_cache_with_reader(
+            PackedCacheRequest {
+                enabled: true,
+                backend: "mlx-metal".into(),
+                identity: "test-packed".into(),
+                layers: 1,
+                batch: 1,
+                kv_heads: 1,
+                head_dimension: 64,
+                group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                bits: PackedCodeBits::Four,
+                query_length: 1,
+                has_mask: false,
+            },
+            two_bit_reader,
+        );
+        let CacheRoute::DenseFallback { reason } = selection.route() else {
+            panic!("a cross-width reader must not select the packed route");
+        };
+        assert!(
+            reason.contains("packed reader rejected before mutation"),
+            "{reason}"
+        );
+    }
+
+    /// Stored bytes per resident token and KV head, read from the live storage, are exactly the
+    /// representation's arithmetic: `D·b/8` code bytes for K and for V, plus two f16 per channel per
+    /// 32-token K group and two f16 per 32-channel V group.
+    #[test]
+    fn stored_bytes_per_token_are_exact_for_each_code_width() {
+        let (width, group, heads, tokens) = (128, 32, 2, 4096 + 13);
+        let keys = pseudo_random_outliers(1, heads, tokens, width, 0x0b17_5eed);
+        let values = pseudo_random_outliers(1, heads, tokens, width, 0x5eed_0b17);
+        for (bits, per_token) in [(PackedCodeBits::Two, 96), (PackedCodeBits::Four, 160)] {
+            let mut cache =
+                PackedGroupAffineKvCache::with_bits("m", 1, 1, heads, width, group, bits).unwrap();
+            cache.append(0, &keys, &values, tokens).unwrap();
+            let [key_codes, key_metadata, pending, value_codes, value_metadata] =
+                cache.layer_component_bytes(0).unwrap();
+            let (complete, tail) = (4096, 13);
+            let code_bytes = width * usize::from(bits.bits()) / 8;
+            assert_eq!(key_codes, heads * complete * code_bytes, "{bits:?}");
+            assert_eq!(
+                key_metadata,
+                heads * (complete / group) * width * 4,
+                "{bits:?}"
+            );
+            assert_eq!(pending, heads * tail * width * 4, "{bits:?}");
+            assert_eq!(value_codes, heads * tokens * code_bytes, "{bits:?}");
+            assert_eq!(
+                value_metadata,
+                heads * tokens * (width / group) * 4,
+                "{bits:?}"
+            );
+            assert_eq!(
+                cache.logical_stored_bytes(),
+                key_codes + key_metadata + pending + value_codes + value_metadata
+            );
+            // Per quantized token and KV head (the dense residual excluded): K + V codes and metadata.
+            let quantized = key_codes
+                + key_metadata
+                + value_codes / tokens * complete
+                + value_metadata / tokens * complete;
+            assert_eq!(quantized, per_token * complete * heads, "{bits:?}");
+            #[cfg(target_os = "macos")]
+            {
+                // The device-resident decoder layout stores the same bytes per quantized token;
+                // the incomplete group stays a dense residual of the input dtype (f16 here).
+                let mut device = device_cache_bits(1, heads, width, bits);
+                device
+                    .append_device(
+                        0,
+                        &bhsd(&keys, 1, heads, tokens, width)
+                            .as_dtype(Dtype::Float16)
+                            .unwrap(),
+                        &bhsd(&values, 1, heads, tokens, width)
+                            .as_dtype(Dtype::Float16)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let (codes, metadata) = device.retained_device_component_bytes();
+                assert_eq!(codes, heads * complete * 2 * code_bytes, "{bits:?}");
+                assert_eq!(
+                    metadata,
+                    heads * (complete * 32 + tail * width * 2 * 2),
+                    "{bits:?}"
+                );
+                assert_eq!(
+                    codes + metadata - heads * tail * width * 4,
+                    per_token * complete * heads
+                );
+                let layer = device.device_layers[0].as_ref().unwrap();
+                let capacity = layer.capacity_tokens;
+                assert_eq!(
+                    array_bytes(&layer.key_codes) + array_bytes(&layer.value_codes),
+                    (heads * capacity * 2 * code_bytes) as u64,
+                    "{bits:?}: physical code arrays"
+                );
+            }
+            // bf16 dense K+V is 4·D = 512 bytes per token and head.
+            eprintln!(
+                "{bits:?}: {per_token} B/token/head vs dense bf16 512 ({:.2}% reduction)",
+                100.0 * (1.0 - per_token as f64 / 512.0)
+            );
+        }
+    }
     #[test]
     fn fallback_is_explicit_and_cancel_is_safe() {
         let mut c = PackedGroupAffineKvCache::new("m", 1, 1, 1, 3, 2).unwrap();
@@ -4045,6 +4384,7 @@ mod tests {
             kv_heads: 1,
             head_dimension: 0,
             group_size: 32,
+            bits: PackedCodeBits::Two,
             query_length: 1,
             has_mask: false,
         });
@@ -4059,6 +4399,7 @@ mod tests {
             kv_heads: 2,
             head_dimension: 64,
             group_size: 32,
+            bits: PackedCodeBits::Two,
             query_length: 1,
             has_mask: false,
         });
@@ -4094,6 +4435,7 @@ mod tests {
                 kv_heads: 1,
                 head_dimension: 64,
                 group_size: 32,
+                bits: PackedCodeBits::Two,
                 query_length: 1,
                 has_mask: false,
             },
@@ -4161,6 +4503,7 @@ mod tests {
                 kv_heads: 1,
                 head_dimension: 64,
                 group_size: 32,
+                bits: PackedCodeBits::Two,
                 query_length: 1,
                 has_mask: true,
             },
@@ -4190,6 +4533,7 @@ mod tests {
                 kv_heads: 1,
                 head_dimension: 64,
                 group_size: 4,
+                bits: PackedCodeBits::Two,
                 query_length: 1,
                 has_mask: false,
             },
@@ -4253,6 +4597,7 @@ mod tests {
             kv_heads: 1,
             head_dimension: 64,
             group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+            bits: PackedCodeBits::Two,
             query_length: 1,
             has_mask: false,
         };
@@ -4465,6 +4810,7 @@ mod tests {
                 kv_heads: 1,
                 head_dimension: 64,
                 group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                bits: PackedCodeBits::Two,
                 query_length: 1,
                 has_mask: false,
             },
@@ -4864,6 +5210,7 @@ mod tests {
                     kv_heads: 1,
                     head_dimension: 64,
                     group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                    bits: PackedCodeBits::Two,
                     query_length: 1,
                     has_mask: false,
                 },
@@ -5042,6 +5389,7 @@ mod tests {
                 kv_heads: 1,
                 head_dimension,
                 group_size,
+                bits: PackedCodeBits::Two,
                 query_length,
                 has_mask: false,
             });
@@ -5126,7 +5474,7 @@ mod tests {
         }
         let storage = cache.layers[0].as_ref().unwrap();
         let key_bytes = storage.keys.code_bytes_per_group();
-        let value_bytes = width.div_ceil(PACKED_CODES_PER_BYTE);
+        let value_bytes = cache.code_bits().code_bytes(width);
         let value_groups = width.div_ceil(group);
         let groups = step.div_ceil(group);
         let expected_kc =
@@ -5219,6 +5567,7 @@ mod tests {
         query_heads: usize,
         mask: PackedAttentionMask,
         family: crate::primitives::packed_metal::PackedMetalGpuFamily,
+        bits: PackedCodeBits,
     ) {
         use crate::primitives::attention::{sdpa, AttnMask};
         use crate::primitives::packed_attention::{attention_f32_masked, PackedAttentionShape};
@@ -5228,7 +5577,7 @@ mod tests {
         const QUERY_LEN: usize = 2;
         const KV_LEN: usize = 5;
         let identity = format!(
-            "oracle-{dtype:?}-{head_dimension}-{kv_heads}-{query_heads}-{mask:?}-{family:?}"
+            "oracle-{dtype:?}-{head_dimension}-{kv_heads}-{query_heads}-{mask:?}-{family:?}-{bits:?}"
         );
         let keys = (0..BATCH * kv_heads * KV_LEN * head_dimension)
             .map(|index| ((index * 17 + 11) % 67) as f32 * 0.015625 - 0.5)
@@ -5240,13 +5589,14 @@ mod tests {
             .map(|index| ((index * 13 + 5) % 53) as f32 * 0.0078125 - 0.2)
             .collect::<Vec<_>>();
 
-        let mut cache = PackedGroupAffineKvCache::new(
+        let mut cache = PackedGroupAffineKvCache::with_bits(
             identity.clone(),
             1,
             BATCH,
             kv_heads,
             head_dimension,
             PACKED_METAL_QUANT_GROUP_SIZE,
+            bits,
         )
         .unwrap();
         cache.append(0, &keys, &values, KV_LEN).unwrap();
@@ -5339,7 +5689,7 @@ mod tests {
 
         cache
             .bind_compiled_handle(CompiledKernelHandle::new(Arc::new(
-                PackedMetalKernel::for_identity_and_family(identity, family).unwrap(),
+                PackedMetalKernel::for_identity_family_and_bits(identity, family, bits).unwrap(),
             )))
             .unwrap();
         let packed_mask = match mask {
@@ -5402,43 +5752,47 @@ mod tests {
     fn real_metal_group32_matches_dense_sdpa_and_independent_oracle_across_full_surface() {
         use crate::primitives::packed_metal::PackedMetalGpuFamily;
 
-        let dtypes = [
-            mlx_rs::Dtype::Float16,
-            mlx_rs::Dtype::Bfloat16,
-            mlx_rs::Dtype::Float32,
-        ];
-        let dimensions = [64, 128, 256];
-        let masks = [
-            PackedAttentionMask::None,
-            PackedAttentionMask::Causal,
-            PackedAttentionMask::SlidingWindow(3),
-        ];
-        for (dtype_index, dtype) in dtypes.into_iter().enumerate() {
-            for (dimension_index, dimension) in dimensions.into_iter().enumerate() {
-                let case = dtype_index * dimensions.len() + dimension_index;
+        for bits in PackedCodeBits::ALL {
+            let dtypes = [
+                mlx_rs::Dtype::Float16,
+                mlx_rs::Dtype::Bfloat16,
+                mlx_rs::Dtype::Float32,
+            ];
+            let dimensions = [64, 128, 256];
+            let masks = [
+                PackedAttentionMask::None,
+                PackedAttentionMask::Causal,
+                PackedAttentionMask::SlidingWindow(3),
+            ];
+            for (dtype_index, dtype) in dtypes.into_iter().enumerate() {
+                for (dimension_index, dimension) in dimensions.into_iter().enumerate() {
+                    let case = dtype_index * dimensions.len() + dimension_index;
+                    assert_real_metal_dense_sdpa_case(
+                        dtype,
+                        dimension,
+                        2,
+                        4,
+                        masks[case % masks.len()],
+                        if case.is_multiple_of(2) {
+                            PackedMetalGpuFamily::ConservativeUnknownApple
+                        } else {
+                            PackedMetalGpuFamily::Apple7OrNewer
+                        },
+                        bits,
+                    );
+                }
+            }
+            for (kv_heads, query_heads) in [(2, 2), (1, 4), (2, 4)] {
                 assert_real_metal_dense_sdpa_case(
-                    dtype,
-                    dimension,
-                    2,
-                    4,
-                    masks[case % masks.len()],
-                    if case.is_multiple_of(2) {
-                        PackedMetalGpuFamily::ConservativeUnknownApple
-                    } else {
-                        PackedMetalGpuFamily::Apple7OrNewer
-                    },
+                    mlx_rs::Dtype::Float32,
+                    64,
+                    kv_heads,
+                    query_heads,
+                    PackedAttentionMask::Causal,
+                    PackedMetalGpuFamily::Apple7OrNewer,
+                    bits,
                 );
             }
-        }
-        for (kv_heads, query_heads) in [(2, 2), (1, 4), (2, 4)] {
-            assert_real_metal_dense_sdpa_case(
-                mlx_rs::Dtype::Float32,
-                64,
-                kv_heads,
-                query_heads,
-                PackedAttentionMask::Causal,
-                PackedMetalGpuFamily::Apple7OrNewer,
-            );
         }
     }
 
@@ -5447,188 +5801,212 @@ mod tests {
     #[allow(clippy::arc_with_non_send_sync)]
     fn real_metal_adapter_dispatch_matches_nonuniform_fp32_reference_with_gqa_and_tail() {
         use crate::primitives::packed_metal::{PackedMask, PackedMetalKernel};
-
-        let (batch, kv_heads, q_heads, step, width, group) = (2, 2, 4, 5, 64, 32);
-        let mut keys = Vec::with_capacity(batch * kv_heads * step * width);
-        let mut values = Vec::with_capacity(batch * kv_heads * step * width);
-        for row in 0..batch * kv_heads {
-            for token in 0..step {
-                for channel in 0..width {
-                    keys.push(
-                        row as f32 * 32.0
-                            + (token / group) as f32 * 8.0
-                            + (token % group) as f32 * 2.0
-                            + channel as f32,
-                    );
-                    values.push(
-                        row as f32 * 32.0
-                            + token as f32 * 8.0
-                            + (channel / group) as f32 * 4.0
-                            + (channel % group) as f32,
-                    );
-                }
-            }
-        }
-        let mut cache =
-            PackedGroupAffineKvCache::new("device-layout", 1, batch, kv_heads, width, group)
-                .unwrap();
-        cache.append(0, &keys, &values, step).unwrap();
-        let (_, dequantized_keys, dequantized_values) = cache.evaluated_dense_layer(0).unwrap();
-        let query_values = (0..batch * q_heads * width)
-            .map(|index| (index as i32 % 7 - 3) as f32 * 0.01)
-            .collect::<Vec<_>>();
-        let query = Array::from_slice(
-            &query_values,
-            &[batch as i32, q_heads as i32, 1, width as i32],
-        );
-        let mut expected = vec![0.0f32; batch * q_heads * width];
-        for b in 0..batch {
-            for qh in 0..q_heads {
-                let kh = qh / (q_heads / kv_heads);
-                let row = b * kv_heads + kh;
-                let q_base = (b * q_heads + qh) * width;
-                let mut scores = Vec::with_capacity(step);
+        for bits in PackedCodeBits::ALL {
+            let (batch, kv_heads, q_heads, step, width, group) = (2, 2, 4, 5, 64, 32);
+            let mut keys = Vec::with_capacity(batch * kv_heads * step * width);
+            let mut values = Vec::with_capacity(batch * kv_heads * step * width);
+            for row in 0..batch * kv_heads {
                 for token in 0..step {
-                    let mut dot = 0.0f32;
                     for channel in 0..width {
-                        dot += query_values[q_base + channel]
-                            * dequantized_keys[(row * step + token) * width + channel];
+                        keys.push(
+                            row as f32 * 32.0
+                                + (token / group) as f32 * 8.0
+                                + (token % group) as f32 * 2.0
+                                + channel as f32,
+                        );
+                        values.push(
+                            row as f32 * 32.0
+                                + token as f32 * 8.0
+                                + (channel / group) as f32 * 4.0
+                                + (channel % group) as f32,
+                        );
                     }
-                    scores.push(dot / (width as f32).sqrt());
-                }
-                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let weights = scores
-                    .iter()
-                    .map(|score| (*score - maximum).exp())
-                    .collect::<Vec<_>>();
-                let norm = weights.iter().sum::<f32>();
-                for channel in 0..width {
-                    let mut total = 0.0f32;
-                    for token in 0..step {
-                        total += weights[token]
-                            * dequantized_values[(row * step + token) * width + channel];
-                    }
-                    expected[q_base + channel] = total / norm;
                 }
             }
-        }
-        cache
+            let mut cache = PackedGroupAffineKvCache::with_bits(
+                "device-layout",
+                1,
+                batch,
+                kv_heads,
+                width,
+                group,
+                bits,
+            )
+            .unwrap();
+            cache.append(0, &keys, &values, step).unwrap();
+            let (_, dequantized_keys, dequantized_values) = cache.evaluated_dense_layer(0).unwrap();
+            let query_values = (0..batch * q_heads * width)
+                .map(|index| (index as i32 % 7 - 3) as f32 * 0.01)
+                .collect::<Vec<_>>();
+            let query = Array::from_slice(
+                &query_values,
+                &[batch as i32, q_heads as i32, 1, width as i32],
+            );
+            let mut expected = vec![0.0f32; batch * q_heads * width];
+            for b in 0..batch {
+                for qh in 0..q_heads {
+                    let kh = qh / (q_heads / kv_heads);
+                    let row = b * kv_heads + kh;
+                    let q_base = (b * q_heads + qh) * width;
+                    let mut scores = Vec::with_capacity(step);
+                    for token in 0..step {
+                        let mut dot = 0.0f32;
+                        for channel in 0..width {
+                            dot += query_values[q_base + channel]
+                                * dequantized_keys[(row * step + token) * width + channel];
+                        }
+                        scores.push(dot / (width as f32).sqrt());
+                    }
+                    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let weights = scores
+                        .iter()
+                        .map(|score| (*score - maximum).exp())
+                        .collect::<Vec<_>>();
+                    let norm = weights.iter().sum::<f32>();
+                    for channel in 0..width {
+                        let mut total = 0.0f32;
+                        for token in 0..step {
+                            total += weights[token]
+                                * dequantized_values[(row * step + token) * width + channel];
+                        }
+                        expected[q_base + channel] = total / norm;
+                    }
+                }
+            }
+            cache
             .bind_compiled_handle(CompiledKernelHandle::new(Arc::new(
-                PackedMetalKernel::for_identity("device-layout").unwrap(),
+                PackedMetalKernel::for_identity_family_and_bits("device-layout", crate::primitives::packed_metal::PackedMetalGpuFamily::ConservativeUnknownApple, bits).unwrap(),
             )))
             .unwrap();
-        let output = cache
-            .dispatch_packed(0, &query, PackedMask::Causal)
-            .unwrap();
-        let actual = output.as_slice::<f32>();
-        for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (actual - expected).abs() <= 2e-3,
-                "index {index}: {actual} != {expected}"
-            );
+            let output = cache
+                .dispatch_packed(0, &query, PackedMask::Causal)
+                .unwrap();
+            let actual = output.as_slice::<f32>();
+            for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 2e-3,
+                    "index {index}: {actual} != {expected}"
+                );
+            }
+            let steady = cache
+                .dispatch_packed(0, &query, PackedMask::Causal)
+                .unwrap();
+            assert_eq!(steady.as_slice::<f32>(), actual);
+            assert_eq!(cache.direct_dispatches(), 2);
+            assert_eq!(cache.full_cache_dequantizations(), 0);
+            let telemetry = cache.dispatch_telemetry();
+            assert_eq!(telemetry.cold_dispatches, 1);
+            assert_eq!(telemetry.steady_dispatches, 1);
         }
-        let steady = cache
-            .dispatch_packed(0, &query, PackedMask::Causal)
-            .unwrap();
-        assert_eq!(steady.as_slice::<f32>(), actual);
-        assert_eq!(cache.direct_dispatches(), 2);
-        assert_eq!(cache.full_cache_dequantizations(), 0);
-        let telemetry = cache.dispatch_telemetry();
-        assert_eq!(telemetry.cold_dispatches, 1);
-        assert_eq!(telemetry.steady_dispatches, 1);
     }
 
     #[test]
     fn deterministic_pseudorandom_outliers_pack_identically_across_arbitrary_chunks() {
-        let (batch, heads, step, width, group) = (2, 3, 11, 7, 4);
-        let keys = pseudo_random_outliers(batch, heads, step, width, 0x5eed_beef);
-        let values = pseudo_random_outliers(batch, heads, step, width, 0x0123_4567);
-        let mut one = PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
-        one.append(0, &keys, &values, step).unwrap();
-        let mut chunks = PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
-        for (start, len) in [(0, 2), (2, 1), (3, 4), (7, 1), (8, 3)] {
-            chunks
-                .append(
-                    0,
-                    &token_range(&keys, batch, heads, step, width, start, len),
-                    &token_range(&values, batch, heads, step, width, start, len),
-                    len,
-                )
-                .unwrap();
-        }
-        assert_same_rows(&one, &chunks);
-        for token in 0..step {
-            for row in 0..batch * heads {
-                let (k, v) = one.read_row(0, token, row).unwrap();
-                assert!(k.iter().chain(v.iter()).all(|value| value.is_finite()));
+        for bits in PackedCodeBits::ALL {
+            let (batch, heads, step, width, group) = (2, 3, 11, 7, 4);
+            let keys = pseudo_random_outliers(batch, heads, step, width, 0x5eed_beef);
+            let values = pseudo_random_outliers(batch, heads, step, width, 0x0123_4567);
+            let mut one =
+                PackedGroupAffineKvCache::with_bits("m", 1, batch, heads, width, group, bits)
+                    .unwrap();
+            one.append(0, &keys, &values, step).unwrap();
+            let mut chunks =
+                PackedGroupAffineKvCache::with_bits("m", 1, batch, heads, width, group, bits)
+                    .unwrap();
+            for (start, len) in [(0, 2), (2, 1), (3, 4), (7, 1), (8, 3)] {
+                chunks
+                    .append(
+                        0,
+                        &token_range(&keys, batch, heads, step, width, start, len),
+                        &token_range(&values, batch, heads, step, width, start, len),
+                        len,
+                    )
+                    .unwrap();
+            }
+            assert_same_rows(&one, &chunks);
+            for token in 0..step {
+                for row in 0..batch * heads {
+                    let (k, v) = one.read_row(0, token, row).unwrap();
+                    assert!(k.iter().chain(v.iter()).all(|value| value.is_finite()));
+                }
             }
         }
     }
 
     #[test]
     fn rollback_reappend_clears_packed_tails_and_requantizes_cut_key_groups() {
-        let (batch, heads, width, group) = (1, 2, 5, 4);
-        let original_keys = bhst_data(batch, heads, 6, width, -1000.0);
-        let original_values = bhst_data(batch, heads, 6, width, 1000.0);
-        let replacement_keys = bhst_data(batch, heads, 3, width, 700.0);
-        let replacement_values = bhst_data(batch, heads, 3, width, -700.0);
-        let mut rolled = PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
-        rolled
-            .append(0, &original_keys, &original_values, 6)
-            .unwrap();
-        rolled.rollback(3).unwrap();
-        rolled
-            .append(0, &replacement_keys, &replacement_values, 3)
-            .unwrap();
+        for bits in PackedCodeBits::ALL {
+            let (batch, heads, width, group) = (1, 2, 5, 4);
+            let original_keys = bhst_data(batch, heads, 6, width, -1000.0);
+            let original_values = bhst_data(batch, heads, 6, width, 1000.0);
+            let replacement_keys = bhst_data(batch, heads, 3, width, 700.0);
+            let replacement_values = bhst_data(batch, heads, 3, width, -700.0);
+            let mut rolled =
+                PackedGroupAffineKvCache::with_bits("m", 1, batch, heads, width, group, bits)
+                    .unwrap();
+            rolled
+                .append(0, &original_keys, &original_values, 6)
+                .unwrap();
+            rolled.rollback(3).unwrap();
+            rolled
+                .append(0, &replacement_keys, &replacement_values, 3)
+                .unwrap();
 
-        let mut expected_keys = Vec::new();
-        let mut expected_values = Vec::new();
-        for row in 0..batch * heads {
-            let prefix = row * 6 * width;
-            let suffix = row * 3 * width;
-            expected_keys.extend_from_slice(&original_keys[prefix..prefix + 3 * width]);
-            expected_keys.extend_from_slice(&replacement_keys[suffix..suffix + 3 * width]);
-            expected_values.extend_from_slice(&original_values[prefix..prefix + 3 * width]);
-            expected_values.extend_from_slice(&replacement_values[suffix..suffix + 3 * width]);
+            let mut expected_keys = Vec::new();
+            let mut expected_values = Vec::new();
+            for row in 0..batch * heads {
+                let prefix = row * 6 * width;
+                let suffix = row * 3 * width;
+                expected_keys.extend_from_slice(&original_keys[prefix..prefix + 3 * width]);
+                expected_keys.extend_from_slice(&replacement_keys[suffix..suffix + 3 * width]);
+                expected_values.extend_from_slice(&original_values[prefix..prefix + 3 * width]);
+                expected_values.extend_from_slice(&replacement_values[suffix..suffix + 3 * width]);
+            }
+            let mut expected =
+                PackedGroupAffineKvCache::with_bits("m", 1, batch, heads, width, group, bits)
+                    .unwrap();
+            expected
+                .append(0, &expected_keys, &expected_values, 6)
+                .unwrap();
+            assert_same_rows(&rolled, &expected);
+            assert_eq!(rolled.logical_len(), 6);
         }
-        let mut expected =
-            PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
-        expected
-            .append(0, &expected_keys, &expected_values, 6)
-            .unwrap();
-        assert_same_rows(&rolled, &expected);
-        assert_eq!(rolled.logical_len(), 6);
     }
 
     #[test]
     fn pending_key_groups_snapshot_and_byte_accounting_are_strict() {
-        let (batch, heads, step, width, group) = (2, 1, 5, 7, 3);
-        let keys = bhst_data(batch, heads, step, width, 0.0);
-        let mut values = bhst_data(batch, heads, step, width, 0.0);
-        values[0] = -1000.0;
-        let last = values.len() - 1;
-        values[last] = 1000.0;
-        let mut cache = PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
-        cache.append(0, &keys, &values, step).unwrap();
-        let bytes_before = cache.logical_stored_bytes();
-        assert!(cache.allocated_vec_bytes() >= bytes_before);
-        assert!(cache.process_visible_bytes_estimate() >= cache.allocated_vec_bytes());
-        let snapshot = cache.save().unwrap();
-        let mut restored =
-            PackedGroupAffineKvCache::new("m", 1, batch, heads, width, group).unwrap();
-        restored.restore(&snapshot).unwrap();
-        assert_same_rows(&cache, &restored);
-        assert_eq!(
-            cache.logical_stored_bytes(),
-            restored.logical_stored_bytes()
-        );
-        let mut corrupt = snapshot.clone();
-        let midpoint = corrupt.len() / 2;
-        corrupt[midpoint] ^= 0x01;
-        assert!(restored.restore(&corrupt).is_err());
-        assert_same_rows(&cache, &restored);
-        cache.clear();
-        assert_eq!(cache.logical_stored_bytes(), 0);
+        for bits in PackedCodeBits::ALL {
+            let (batch, heads, step, width, group) = (2, 1, 5, 7, 3);
+            let keys = bhst_data(batch, heads, step, width, 0.0);
+            let mut values = bhst_data(batch, heads, step, width, 0.0);
+            values[0] = -1000.0;
+            let last = values.len() - 1;
+            values[last] = 1000.0;
+            let mut cache =
+                PackedGroupAffineKvCache::with_bits("m", 1, batch, heads, width, group, bits)
+                    .unwrap();
+            cache.append(0, &keys, &values, step).unwrap();
+            let bytes_before = cache.logical_stored_bytes();
+            assert!(cache.allocated_vec_bytes() >= bytes_before);
+            assert!(cache.process_visible_bytes_estimate() >= cache.allocated_vec_bytes());
+            let snapshot = cache.save().unwrap();
+            let mut restored =
+                PackedGroupAffineKvCache::with_bits("m", 1, batch, heads, width, group, bits)
+                    .unwrap();
+            restored.restore(&snapshot).unwrap();
+            assert_same_rows(&cache, &restored);
+            assert_eq!(
+                cache.logical_stored_bytes(),
+                restored.logical_stored_bytes()
+            );
+            let mut corrupt = snapshot.clone();
+            let midpoint = corrupt.len() / 2;
+            corrupt[midpoint] ^= 0x01;
+            assert!(restored.restore(&corrupt).is_err());
+            assert_same_rows(&cache, &restored);
+            cache.clear();
+            assert_eq!(cache.logical_stored_bytes(), 0);
+        }
     }
 
     #[test]
@@ -5652,14 +6030,20 @@ mod tests {
         )
     }
 
-    fn device_cache(batch: usize, heads: usize, width: usize) -> PackedGroupAffineKvCache {
-        PackedGroupAffineKvCache::new(
+    fn device_cache_bits(
+        batch: usize,
+        heads: usize,
+        width: usize,
+        bits: PackedCodeBits,
+    ) -> PackedGroupAffineKvCache {
+        PackedGroupAffineKvCache::with_bits(
             "test-packed",
             1,
             batch,
             heads,
             width,
             PACKED_METAL_QUANT_GROUP_SIZE,
+            bits,
         )
         .unwrap()
     }
@@ -5676,13 +6060,22 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn device_append_quantizes_bit_identically_to_the_cpu_reference_across_chunks_and_growth() {
-        let (batch, heads, width) = (2, 2, 64);
+        for bits in PackedCodeBits::ALL {
+            for width in [64, 128] {
+                assert_device_append_matches_cpu_reference(bits, width);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_device_append_matches_cpu_reference(bits: PackedCodeBits, width: usize) {
+        let (batch, heads) = (2, 2);
         let step = 301;
         let keys = pseudo_random_outliers(batch, heads, step, width, 0xabad_cafe);
         let values = pseudo_random_outliers(batch, heads, step, width, 0x1dea_f00d);
-        let mut host = device_cache(batch, heads, width);
+        let mut host = device_cache_bits(batch, heads, width, bits);
         host.append(0, &keys, &values, step).unwrap();
-        let mut device = device_cache(batch, heads, width);
+        let mut device = device_cache_bits(batch, heads, width, bits);
         for (start, len) in [(0, 1), (1, 30), (31, 5), (36, 41), (77, 224)] {
             let k = token_range(&keys, batch, heads, step, width, start, len);
             let v = token_range(&values, batch, heads, step, width, start, len);
@@ -5708,7 +6101,16 @@ mod tests {
         assert_eq!(layer.key_packed_tokens, groups * 32);
         assert_eq!(layer.value_packed_tokens, groups * 32);
         assert_eq!(layer.key_tail_rows, step - groups * 32);
-        let key_words = 32 * width / PACKED_CODES_PER_BYTE;
+        let key_words = 32 * width / bits.codes_per_byte();
+        assert_eq!(
+            layer.key_codes.shape()[3] as usize,
+            key_words,
+            "{bits:?}: packed key row width"
+        );
+        assert_eq!(
+            layer.value_codes.shape()[3] as usize,
+            width / bits.codes_per_byte()
+        );
         assert_eq!(
             host_readback::<u8>(&live_rows(&layer.key_codes, groups).unwrap()),
             row_major_outer_rows(&storage.keys.codes, groups, rows, key_words).unwrap()
@@ -5724,7 +6126,7 @@ mod tests {
         }
         let packed = groups * 32;
         let value_rows = |source: &[u8]| {
-            let words = width / PACKED_CODES_PER_BYTE;
+            let words = width / bits.codes_per_byte();
             row_major_outer_rows(&source[..packed * rows * words], packed, rows, words).unwrap()
         };
         assert_eq!(
@@ -5765,31 +6167,35 @@ mod tests {
     #[allow(clippy::arc_with_non_send_sync)]
     fn fused_reader_matches_independent_fp32_oracle_at_campaign_tolerance() {
         use crate::primitives::packed_metal::{PackedMetalGpuFamily, PackedMetalKernel};
-        for family in [
-            PackedMetalGpuFamily::ConservativeUnknownApple,
-            PackedMetalGpuFamily::Apple7OrNewer,
-        ] {
-            let reader = CompiledKernelHandle::new(Arc::new(
-                PackedMetalKernel::for_identity_and_family("parity", family).unwrap(),
-            ));
-            let errors = group_affine_kernel_fp32_parity_errors(&reader).unwrap();
-            assert_eq!(errors.len(), 4 * 128 + 4 * 5 * 128 + 4 * 128);
-            let max = errors.iter().copied().fold(0.0, f64::max);
-            assert!(
-                max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
-                "{family:?}: max parity error {max}"
-            );
-            // The SC-20676 gate runs at the model's own head dimension.
-            for width in [64, 256] {
-                let errors = group_affine_kernel_fp32_parity_errors_at(&reader, width).unwrap();
-                assert_eq!(errors.len(), (4 + 4 * 5 + 4) * width);
+        for bits in PackedCodeBits::ALL {
+            for family in [
+                PackedMetalGpuFamily::ConservativeUnknownApple,
+                PackedMetalGpuFamily::Apple7OrNewer,
+            ] {
+                let reader = CompiledKernelHandle::new(Arc::new(
+                    PackedMetalKernel::for_identity_family_and_bits("parity", family, bits)
+                        .unwrap(),
+                ));
+                let errors = group_affine_kernel_fp32_parity_errors(&reader).unwrap();
+                assert_eq!(errors.len(), 4 * 128 + 4 * 5 * 128 + 4 * 128);
                 let max = errors.iter().copied().fold(0.0, f64::max);
                 assert!(
                     max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
-                    "{family:?} at {width}: max parity error {max}"
+                    "{family:?}: max parity error {max}"
                 );
+                eprintln!("campaign parity {bits:?} {family:?} D=128: max abs {max}");
+                // The SC-20676 gate runs at the model's own head dimension.
+                for width in [64, 256] {
+                    let errors = group_affine_kernel_fp32_parity_errors_at(&reader, width).unwrap();
+                    assert_eq!(errors.len(), (4 + 4 * 5 + 4) * width);
+                    let max = errors.iter().copied().fold(0.0, f64::max);
+                    assert!(
+                        max <= crate::campaign::COMPRESSED_PARITY_MAX_ERROR,
+                        "{family:?} at {width}: max parity error {max}"
+                    );
+                }
+                assert!(group_affine_kernel_fp32_parity_errors_at(&reader, 100).is_err());
             }
-            assert!(group_affine_kernel_fp32_parity_errors_at(&reader, 100).is_err());
         }
     }
 
@@ -5804,139 +6210,148 @@ mod tests {
         use crate::primitives::packed_metal::{
             PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
         };
-        let cases = [
-            (Dtype::Float32, 64, 2, 4, 77, 1, PackedAttentionMask::None),
-            (
-                Dtype::Float16,
-                128,
-                2,
-                6,
-                100,
-                3,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Bfloat16,
-                256,
-                1,
-                2,
-                70,
-                1,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Float32,
-                128,
-                2,
-                4,
-                131,
-                4,
-                PackedAttentionMask::SlidingWindow(45),
-            ),
-            (
-                Dtype::Float32,
-                64,
-                4,
-                4,
-                32,
-                32,
-                PackedAttentionMask::Causal,
-            ),
-        ];
-        for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
-            cases.into_iter().enumerate()
-        {
-            let batch = 2;
-            // Clamped outliers, then a distinct range per 32-channel group and per token so every
-            // K channel group and V channel-group scale/zero differs (a wrong metadata index is
-            // numerically visible).
-            let shaped = |seed: u64| {
-                pseudo_random_outliers(batch, kv_heads, tokens, width, seed)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        let (channel, token) = (i % width, (i / width) % tokens);
-                        value.clamp(-4.0, 4.0) * (0.25 + (channel / 32) as f32 * 0.5)
-                            + (channel / 32) as f32 * 0.75
-                            - (token % 7) as f32 * 0.125
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let keys = shaped(11 + index as u64);
-            let values = shaped(97 + index as u64);
-            let queries = (0..batch * query_heads * query_len * width)
-                .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
-                .collect::<Vec<_>>();
-            let mut cache = device_cache(batch, kv_heads, width);
-            cache
-                .append_device(
-                    0,
-                    &bhsd(&keys, batch, kv_heads, tokens, width)
-                        .as_dtype(dtype)
-                        .unwrap(),
-                    &bhsd(&values, batch, kv_heads, tokens, width)
-                        .as_dtype(dtype)
-                        .unwrap(),
+        for bits in PackedCodeBits::ALL {
+            let cases = [
+                (Dtype::Float32, 64, 2, 4, 77, 1, PackedAttentionMask::None),
+                (
+                    Dtype::Float16,
+                    128,
+                    2,
+                    6,
+                    100,
+                    3,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Bfloat16,
+                    256,
+                    1,
+                    2,
+                    70,
+                    1,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Float32,
+                    128,
+                    2,
+                    4,
+                    131,
+                    4,
+                    PackedAttentionMask::SlidingWindow(45),
+                ),
+                (
+                    Dtype::Float32,
+                    64,
+                    4,
+                    4,
+                    32,
+                    32,
+                    PackedAttentionMask::Causal,
+                ),
+            ];
+            for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
+                cases.into_iter().enumerate()
+            {
+                let batch = 2;
+                // Clamped outliers, then a distinct range per 32-channel group and per token so every
+                // K channel group and V channel-group scale/zero differs (a wrong metadata index is
+                // numerically visible).
+                let shaped = |seed: u64| {
+                    pseudo_random_outliers(batch, kv_heads, tokens, width, seed)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, value)| {
+                            let (channel, token) = (i % width, (i / width) % tokens);
+                            value.clamp(-4.0, 4.0) * (0.25 + (channel / 32) as f32 * 0.5)
+                                + (channel / 32) as f32 * 0.75
+                                - (token % 7) as f32 * 0.125
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let keys = shaped(11 + index as u64);
+                let values = shaped(97 + index as u64);
+                let queries = (0..batch * query_heads * query_len * width)
+                    .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
+                    .collect::<Vec<_>>();
+                let mut cache = device_cache_bits(batch, kv_heads, width, bits);
+                cache
+                    .append_device(
+                        0,
+                        &bhsd(&keys, batch, kv_heads, tokens, width)
+                            .as_dtype(dtype)
+                            .unwrap(),
+                        &bhsd(&values, batch, kv_heads, tokens, width)
+                            .as_dtype(dtype)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let query = bhsd(&queries, batch, query_heads, query_len, width)
+                    .as_dtype(dtype)
+                    .unwrap();
+                let query_f32 = host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap());
+                let (_, dense_keys, dense_values) = cache.evaluated_dense_layer(0).unwrap();
+                let reference = attention_f32_masked(
+                    PackedAttentionShape {
+                        batch,
+                        query_heads,
+                        kv_heads,
+                        query_len,
+                        kv_len: tokens,
+                        head_dim: width,
+                    },
+                    &query_f32,
+                    |b, h, t, d| dense_keys[((b * kv_heads + h) * tokens + t) * width + d],
+                    |b, h, t, d| dense_values[((b * kv_heads + h) * tokens + t) * width + d],
+                    (width as f32).powf(-0.5),
+                    mask,
                 )
                 .unwrap();
-            let query = bhsd(&queries, batch, query_heads, query_len, width)
-                .as_dtype(dtype)
-                .unwrap();
-            let query_f32 = host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap());
-            let (_, dense_keys, dense_values) = cache.evaluated_dense_layer(0).unwrap();
-            let reference = attention_f32_masked(
-                PackedAttentionShape {
-                    batch,
-                    query_heads,
-                    kv_heads,
-                    query_len,
-                    kv_len: tokens,
-                    head_dim: width,
-                },
-                &query_f32,
-                |b, h, t, d| dense_keys[((b * kv_heads + h) * tokens + t) * width + d],
-                |b, h, t, d| dense_values[((b * kv_heads + h) * tokens + t) * width + d],
-                (width as f32).powf(-0.5),
-                mask,
-            )
-            .unwrap();
-            let packed_mask = match mask {
-                PackedAttentionMask::None => PackedMask::None,
-                PackedAttentionMask::Causal => PackedMask::Causal,
-                PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
-                PackedAttentionMask::Additive => unreachable!(),
-            };
-            let tolerance = match dtype {
-                Dtype::Float32 => 1e-4,
-                Dtype::Float16 => 4e-2,
-                _ => 8e-2,
-            };
-            let layer = cache.device_layers[0].as_ref().unwrap();
-            let args = layer.args(&query, packed_mask);
-            let mut single = None;
-            for family in [
-                PackedMetalGpuFamily::ConservativeUnknownApple,
-                PackedMetalGpuFamily::Apple7OrNewer,
-            ] {
-                let kernel = PackedMetalKernel::for_identity_and_family("sweep", family).unwrap();
-                for splits in [1, 2, 3, 7, 64] {
-                    let output = kernel
-                        .dispatch_with_splits(&args, Some(splits))
-                        .unwrap()
-                        .as_dtype(Dtype::Float32)
-                        .unwrap();
-                    let output = host_readback::<f32>(&output);
-                    for (i, (actual, expected)) in output.iter().zip(&reference).enumerate() {
-                        assert!(
+                let packed_mask = match mask {
+                    PackedAttentionMask::None => PackedMask::None,
+                    PackedAttentionMask::Causal => PackedMask::Causal,
+                    PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
+                    PackedAttentionMask::Additive => unreachable!(),
+                };
+                let tolerance = match dtype {
+                    Dtype::Float32 => 1e-4,
+                    Dtype::Float16 => 4e-2,
+                    _ => 8e-2,
+                };
+                let layer = cache.device_layers[0].as_ref().unwrap();
+                let args = layer.args(&query, packed_mask);
+                let mut single = None;
+                let mut case_max = 0.0f32;
+                for family in [
+                    PackedMetalGpuFamily::ConservativeUnknownApple,
+                    PackedMetalGpuFamily::Apple7OrNewer,
+                ] {
+                    let kernel =
+                        PackedMetalKernel::for_identity_family_and_bits("sweep", family, bits)
+                            .unwrap();
+                    for splits in [1, 2, 3, 7, 64] {
+                        let output = kernel
+                            .dispatch_with_splits(&args, Some(splits))
+                            .unwrap()
+                            .as_dtype(Dtype::Float32)
+                            .unwrap();
+                        let output = host_readback::<f32>(&output);
+                        for (i, (actual, expected)) in output.iter().zip(&reference).enumerate() {
+                            case_max = case_max.max((actual - expected).abs());
+                            assert!(
                             (actual - expected).abs() <= tolerance,
-                            "case {index} {family:?} splits {splits} element {i}: {actual} != {expected}"
+                            "{bits:?} case {index} {family:?} splits {splits} element {i}: {actual} != {expected}"
                         );
-                    }
-                    let single = single.get_or_insert_with(|| output.clone());
-                    for (actual, expected) in output.iter().zip(single.iter()) {
-                        assert!((actual - expected).abs() <= tolerance / 4.0);
+                        }
+                        let single = single.get_or_insert_with(|| output.clone());
+                        for (actual, expected) in output.iter().zip(single.iter()) {
+                            assert!((actual - expected).abs() <= tolerance / 4.0);
+                        }
                     }
                 }
+                eprintln!(
+                    "per-row parity {bits:?} case {index} {dtype:?} D={width}: max abs {case_max}"
+                );
             }
         }
     }
@@ -6047,47 +6462,50 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn device_trim_into_a_completed_group_restages_the_quantized_prefix() {
-        let (batch, heads, width, tokens) = (1, 2, 64, 77);
-        let keys = pseudo_random_outliers(batch, heads, tokens, width, 21);
-        let values = pseudo_random_outliers(batch, heads, tokens, width, 22);
-        let mut cache = device_cache(batch, heads, width);
-        cache
-            .append_device(
-                0,
-                &bhsd(&keys, batch, heads, tokens, width),
-                &bhsd(&values, batch, heads, tokens, width),
-            )
-            .unwrap();
-        let (_, full_keys, full_values) = cache.evaluated_dense_layer(0).unwrap();
-        for keep in [70, 40, 32, 5] {
-            cache.trim(keep).unwrap();
-            let (resident, kept_keys, kept_values) = cache.evaluated_dense_layer(0).unwrap();
-            assert_eq!(resident, keep);
-            let layer = cache.device_layers[0].as_ref().unwrap();
-            assert_eq!(layer.key_packed_tokens, keep / 32 * 32);
-            assert_eq!(layer.key_tail_rows, keep % 32);
-            for row in 0..batch * heads {
-                let prefix = |full: &[f32]| {
-                    full[row * tokens * width..(row * tokens + keep) * width].to_vec()
-                };
-                let kept =
-                    |dense: &[f32]| dense[row * keep * width..(row + 1) * keep * width].to_vec();
-                assert_eq!(
-                    kept(&kept_keys),
-                    prefix(&full_keys),
-                    "keep {keep} row {row}"
-                );
-                assert_eq!(
-                    kept(&kept_values),
-                    prefix(&full_values),
-                    "keep {keep} row {row}"
-                );
+        for bits in PackedCodeBits::ALL {
+            let (batch, heads, width, tokens) = (1, 2, 64, 77);
+            let keys = pseudo_random_outliers(batch, heads, tokens, width, 21);
+            let values = pseudo_random_outliers(batch, heads, tokens, width, 22);
+            let mut cache = device_cache_bits(batch, heads, width, bits);
+            cache
+                .append_device(
+                    0,
+                    &bhsd(&keys, batch, heads, tokens, width),
+                    &bhsd(&values, batch, heads, tokens, width),
+                )
+                .unwrap();
+            let (_, full_keys, full_values) = cache.evaluated_dense_layer(0).unwrap();
+            for keep in [70, 40, 32, 5] {
+                cache.trim(keep).unwrap();
+                let (resident, kept_keys, kept_values) = cache.evaluated_dense_layer(0).unwrap();
+                assert_eq!(resident, keep);
+                let layer = cache.device_layers[0].as_ref().unwrap();
+                assert_eq!(layer.key_packed_tokens, keep / 32 * 32);
+                assert_eq!(layer.key_tail_rows, keep % 32);
+                for row in 0..batch * heads {
+                    let prefix = |full: &[f32]| {
+                        full[row * tokens * width..(row * tokens + keep) * width].to_vec()
+                    };
+                    let kept = |dense: &[f32]| {
+                        dense[row * keep * width..(row + 1) * keep * width].to_vec()
+                    };
+                    assert_eq!(
+                        kept(&kept_keys),
+                        prefix(&full_keys),
+                        "keep {keep} row {row}"
+                    );
+                    assert_eq!(
+                        kept(&kept_values),
+                        prefix(&full_values),
+                        "keep {keep} row {row}"
+                    );
+                }
             }
+            assert!(
+                cache.save().is_err(),
+                "a dense value residual cannot be snapshotted"
+            );
         }
-        assert!(
-            cache.save().is_err(),
-            "a dense value residual cannot be snapshotted"
-        );
     }
 
     /// The decoder route end to end: a long first step attends densely over its own fresh K/V
@@ -6100,129 +6518,145 @@ mod tests {
         use crate::primitives::attention::{sdpa, AttnMask};
         use crate::primitives::packed_attention::{attention_f32_masked, PackedAttentionShape};
         use crate::primitives::packed_metal::PackedMetalKernel;
-        let (heads, query_heads, width, prompt) = (2, 4, 128, 40);
-        let reader = CompiledKernelHandle::new(Arc::new(
-            PackedMetalKernel::for_identity("decoder-e2e").unwrap(),
-        ));
-        let mut cache = select_decoder_cache_with_reader(
-            PackedCacheRequest {
-                enabled: true,
-                backend: "mlx-metal".into(),
-                identity: "decoder-e2e".into(),
-                layers: 1,
-                batch: 1,
-                kv_heads: heads,
-                head_dimension: width,
-                group_size: PACKED_METAL_QUANT_GROUP_SIZE,
-                query_length: 1,
-                has_mask: false,
-            },
-            reader,
-        )
-        .into_cache();
-        let scale = (width as f32).powf(-0.5);
-        let clamp = |values: Vec<f32>| {
-            values
-                .into_iter()
-                .map(|v| v.clamp(-3.0, 3.0))
-                .collect::<Vec<_>>()
-        };
-        let keys = bhsd(
-            &clamp(pseudo_random_outliers(1, heads, prompt, width, 31)),
-            1,
-            heads,
-            prompt,
-            width,
-        );
-        let values = bhsd(
-            &clamp(pseudo_random_outliers(1, heads, prompt, width, 32)),
-            1,
-            heads,
-            prompt,
-            width,
-        );
-        let queries = bhsd(
-            &(0..query_heads * prompt * width)
-                .map(|i| ((i * 13 + 1) % 41) as f32 * 0.03 - 0.6)
-                .collect::<Vec<_>>(),
-            1,
-            query_heads,
-            prompt,
-            width,
-        );
-        let first = cache
-            .try_packed_attention(
-                0,
-                &queries,
-                &keys,
-                &values,
-                PackedAttentionMask::Causal,
-                scale,
-                false,
+        for bits in PackedCodeBits::ALL {
+            let (heads, query_heads, width, prompt) = (2, 4, 128, 40);
+            let reader = CompiledKernelHandle::new(Arc::new(
+                PackedMetalKernel::for_identity_family_and_bits(
+                    "decoder-e2e",
+                    crate::primitives::packed_metal::PackedMetalGpuFamily::ConservativeUnknownApple,
+                    bits,
+                )
+                .unwrap(),
+            ));
+            let mut cache = select_decoder_cache_with_reader(
+                PackedCacheRequest {
+                    enabled: true,
+                    backend: "mlx-metal".into(),
+                    identity: "decoder-e2e".into(),
+                    layers: 1,
+                    batch: 1,
+                    kv_heads: heads,
+                    head_dimension: width,
+                    group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                    bits,
+                    query_length: 1,
+                    has_mask: false,
+                },
+                reader,
             )
-            .unwrap()
-            .unwrap();
-        let dense = sdpa(&queries, &keys, &values, scale, AttnMask::Causal).unwrap();
-        assert_eq!(host_readback::<f32>(&first), host_readback::<f32>(&dense));
-        let evidence = cache.packed_evidence().unwrap();
-        assert_eq!(
-            evidence.accepted_direct_calls, 0,
-            "no reader dispatch for the fresh-only step"
-        );
-        assert_eq!(cache.offset(), prompt as i32);
-
-        for step in 0..3 {
-            let q = bhsd(
-                &vec![0.05 * (step + 1) as f32; query_heads * width],
+            .into_cache();
+            let scale = (width as f32).powf(-0.5);
+            let clamp = |values: Vec<f32>| {
+                values
+                    .into_iter()
+                    .map(|v| v.clamp(-3.0, 3.0))
+                    .collect::<Vec<_>>()
+            };
+            let keys = bhsd(
+                &clamp(pseudo_random_outliers(1, heads, prompt, width, 31)),
                 1,
-                query_heads,
-                1,
+                heads,
+                prompt,
                 width,
             );
-            let fresh = clamp(pseudo_random_outliers(1, heads, 1, width, 40 + step as u64));
-            let kv = bhsd(&fresh, 1, heads, 1, width);
-            let output = cache
-                .try_packed_attention(0, &q, &kv, &kv, PackedAttentionMask::Causal, scale, false)
+            let values = bhsd(
+                &clamp(pseudo_random_outliers(1, heads, prompt, width, 32)),
+                1,
+                heads,
+                prompt,
+                width,
+            );
+            let queries = bhsd(
+                &(0..query_heads * prompt * width)
+                    .map(|i| ((i * 13 + 1) % 41) as f32 * 0.03 - 0.6)
+                    .collect::<Vec<_>>(),
+                1,
+                query_heads,
+                prompt,
+                width,
+            );
+            let first = cache
+                .try_packed_attention(
+                    0,
+                    &queries,
+                    &keys,
+                    &values,
+                    PackedAttentionMask::Causal,
+                    scale,
+                    false,
+                )
                 .unwrap()
                 .unwrap();
-            let packed = cache
-                .as_any_mut()
-                .downcast_mut::<DenseFallbackPackedDecoderCache>()
-                .unwrap();
-            let (tokens, dense_keys, dense_values) =
-                packed.staged.evaluated_dense_layer(0).unwrap();
-            assert_eq!(tokens, prompt + step + 1);
-            let reference = attention_f32_masked(
-                PackedAttentionShape {
-                    batch: 1,
+            let dense = sdpa(&queries, &keys, &values, scale, AttnMask::Causal).unwrap();
+            assert_eq!(host_readback::<f32>(&first), host_readback::<f32>(&dense));
+            let evidence = cache.packed_evidence().unwrap();
+            assert_eq!(
+                evidence.accepted_direct_calls, 0,
+                "no reader dispatch for the fresh-only step"
+            );
+            assert_eq!(cache.offset(), prompt as i32);
+
+            for step in 0..3 {
+                let q = bhsd(
+                    &vec![0.05 * (step + 1) as f32; query_heads * width],
+                    1,
                     query_heads,
-                    kv_heads: heads,
-                    query_len: 1,
-                    kv_len: tokens,
-                    head_dim: width,
-                },
-                &host_readback::<f32>(&q),
-                |_, h, t, d| dense_keys[(h * tokens + t) * width + d],
-                |_, h, t, d| dense_values[(h * tokens + t) * width + d],
-                scale,
-                PackedAttentionMask::Causal,
-            )
-            .unwrap();
-            for (actual, expected) in host_readback::<f32>(&output).iter().zip(&reference) {
-                assert!((actual - expected).abs() <= 1e-4, "{actual} != {expected}");
+                    1,
+                    width,
+                );
+                let fresh = clamp(pseudo_random_outliers(1, heads, 1, width, 40 + step as u64));
+                let kv = bhsd(&fresh, 1, heads, 1, width);
+                let output = cache
+                    .try_packed_attention(
+                        0,
+                        &q,
+                        &kv,
+                        &kv,
+                        PackedAttentionMask::Causal,
+                        scale,
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let packed = cache
+                    .as_any_mut()
+                    .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                    .unwrap();
+                let (tokens, dense_keys, dense_values) =
+                    packed.staged.evaluated_dense_layer(0).unwrap();
+                assert_eq!(tokens, prompt + step + 1);
+                let reference = attention_f32_masked(
+                    PackedAttentionShape {
+                        batch: 1,
+                        query_heads,
+                        kv_heads: heads,
+                        query_len: 1,
+                        kv_len: tokens,
+                        head_dim: width,
+                    },
+                    &host_readback::<f32>(&q),
+                    |_, h, t, d| dense_keys[(h * tokens + t) * width + d],
+                    |_, h, t, d| dense_values[(h * tokens + t) * width + d],
+                    scale,
+                    PackedAttentionMask::Causal,
+                )
+                .unwrap();
+                for (actual, expected) in host_readback::<f32>(&output).iter().zip(&reference) {
+                    assert!((actual - expected).abs() <= 1e-4, "{actual} != {expected}");
+                }
             }
+            let evidence = cache.packed_evidence().unwrap();
+            assert_eq!(evidence.accepted_direct_calls, 3);
+            assert_eq!(evidence.full_cache_dequantizations, 0);
+            assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
+            assert!(evidence.accepted_uploaded_packed_bytes > 0);
+            let storage = cache.compressed_storage().unwrap().unwrap();
+            assert_eq!(
+                storage.host_payload_bytes, 0,
+                "the decoder route keeps no host copy"
+            );
+            assert_eq!(storage.tokens, (prompt + 3) as u64);
         }
-        let evidence = cache.packed_evidence().unwrap();
-        assert_eq!(evidence.accepted_direct_calls, 3);
-        assert_eq!(evidence.full_cache_dequantizations, 0);
-        assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
-        assert!(evidence.accepted_uploaded_packed_bytes > 0);
-        let storage = cache.compressed_storage().unwrap().unwrap();
-        assert_eq!(
-            storage.host_payload_bytes, 0,
-            "the decoder route keeps no host copy"
-        );
-        assert_eq!(storage.tokens, (prompt + 3) as u64);
     }
 
     /// Prefix import quantizes on append into the packed representation (no reconstruction); it
@@ -6343,202 +6777,205 @@ mod tests {
         use crate::primitives::packed_metal::{
             PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
         };
-        let cases = [
-            (
-                Dtype::Float32,
-                64,
-                2,
-                6,
-                300,
-                9,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Float32,
-                128,
-                2,
-                4,
-                333,
-                33,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Float32,
-                128,
-                1,
-                3,
-                401,
-                128,
-                PackedAttentionMask::SlidingWindow(77),
-            ),
-            (
-                Dtype::Float32,
-                64,
-                2,
-                2,
-                530,
-                257,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Float32,
-                256,
-                1,
-                2,
-                110,
-                33,
-                PackedAttentionMask::Causal,
-            ),
-            (Dtype::Float32, 64, 1, 3, 150, 33, PackedAttentionMask::None),
-            (
-                Dtype::Float16,
-                128,
-                2,
-                6,
-                290,
-                33,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Bfloat16,
-                64,
-                1,
-                4,
-                270,
-                128,
-                PackedAttentionMask::SlidingWindow(200),
-            ),
-            (
-                Dtype::Float32,
-                256,
-                1,
-                2,
-                300,
-                33,
-                PackedAttentionMask::SlidingWindow(90),
-            ),
-            // Host reference cache: V rows quantize per token, K keeps its incomplete group dense.
-            (
-                Dtype::Float32,
-                128,
-                2,
-                4,
-                333,
-                33,
-                PackedAttentionMask::Causal,
-            ),
-        ];
-        const HOST_MIRROR_CASE: usize = 9;
-        let kernel = PackedMetalKernel::for_identity_and_family(
-            "tiled",
-            PackedMetalGpuFamily::Apple7OrNewer,
-        )
-        .unwrap();
-        let mut maxima = Vec::new();
-        for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
-            cases.into_iter().enumerate()
-        {
-            let batch = if index % 2 == 0 { 2 } else { 1 };
-            // Distinct ranges per token and per 32-channel group so a wrong K group, V row, or
-            // metadata index is numerically visible.
-            let shaped = |seed: u64| {
-                pseudo_random_outliers(batch, kv_heads, tokens, width, seed)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        let (channel, token) = (i % width, (i / width) % tokens);
-                        value.clamp(-4.0, 4.0) * (0.25 + (channel / 32) as f32 * 0.5)
-                            + (channel / 32) as f32 * 0.75
-                            - (token % 7) as f32 * 0.125
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let keys = shaped(211 + index as u64);
-            let values = shaped(307 + index as u64);
-            let queries = (0..batch * query_heads * query_len * width)
-                .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
-                .collect::<Vec<_>>();
-            let mut cache = device_cache(batch, kv_heads, width);
-            if index == HOST_MIRROR_CASE {
-                cache.append(0, &keys, &values, tokens).unwrap();
-            } else {
-                cache
-                    .append_device(
-                        0,
-                        &bhsd(&keys, batch, kv_heads, tokens, width)
-                            .as_dtype(dtype)
-                            .unwrap(),
-                        &bhsd(&values, batch, kv_heads, tokens, width)
-                            .as_dtype(dtype)
-                            .unwrap(),
-                    )
+        for bits in PackedCodeBits::ALL {
+            let cases = [
+                (
+                    Dtype::Float32,
+                    64,
+                    2,
+                    6,
+                    300,
+                    9,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Float32,
+                    128,
+                    2,
+                    4,
+                    333,
+                    33,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Float32,
+                    128,
+                    1,
+                    3,
+                    401,
+                    128,
+                    PackedAttentionMask::SlidingWindow(77),
+                ),
+                (
+                    Dtype::Float32,
+                    64,
+                    2,
+                    2,
+                    530,
+                    257,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Float32,
+                    256,
+                    1,
+                    2,
+                    110,
+                    33,
+                    PackedAttentionMask::Causal,
+                ),
+                (Dtype::Float32, 64, 1, 3, 150, 33, PackedAttentionMask::None),
+                (
+                    Dtype::Float16,
+                    128,
+                    2,
+                    6,
+                    290,
+                    33,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Bfloat16,
+                    64,
+                    1,
+                    4,
+                    270,
+                    128,
+                    PackedAttentionMask::SlidingWindow(200),
+                ),
+                (
+                    Dtype::Float32,
+                    256,
+                    1,
+                    2,
+                    300,
+                    33,
+                    PackedAttentionMask::SlidingWindow(90),
+                ),
+                // Host reference cache: V rows quantize per token, K keeps its incomplete group dense.
+                (
+                    Dtype::Float32,
+                    128,
+                    2,
+                    4,
+                    333,
+                    33,
+                    PackedAttentionMask::Causal,
+                ),
+            ];
+            const HOST_MIRROR_CASE: usize = 9;
+            let kernel = PackedMetalKernel::for_identity_family_and_bits(
+                "tiled",
+                PackedMetalGpuFamily::Apple7OrNewer,
+                bits,
+            )
+            .unwrap();
+            let mut maxima = Vec::new();
+            for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
+                cases.into_iter().enumerate()
+            {
+                let batch = if index % 2 == 0 { 2 } else { 1 };
+                // Distinct ranges per token and per 32-channel group so a wrong K group, V row, or
+                // metadata index is numerically visible.
+                let shaped = |seed: u64| {
+                    pseudo_random_outliers(batch, kv_heads, tokens, width, seed)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, value)| {
+                            let (channel, token) = (i % width, (i / width) % tokens);
+                            value.clamp(-4.0, 4.0) * (0.25 + (channel / 32) as f32 * 0.5)
+                                + (channel / 32) as f32 * 0.75
+                                - (token % 7) as f32 * 0.125
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let keys = shaped(211 + index as u64);
+                let values = shaped(307 + index as u64);
+                let queries = (0..batch * query_heads * query_len * width)
+                    .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
+                    .collect::<Vec<_>>();
+                let mut cache = device_cache_bits(batch, kv_heads, width, bits);
+                if index == HOST_MIRROR_CASE {
+                    cache.append(0, &keys, &values, tokens).unwrap();
+                } else {
+                    cache
+                        .append_device(
+                            0,
+                            &bhsd(&keys, batch, kv_heads, tokens, width)
+                                .as_dtype(dtype)
+                                .unwrap(),
+                            &bhsd(&values, batch, kv_heads, tokens, width)
+                                .as_dtype(dtype)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+                let query = bhsd(&queries, batch, query_heads, query_len, width)
+                    .as_dtype(dtype)
                     .unwrap();
-            }
-            let query = bhsd(&queries, batch, query_heads, query_len, width)
-                .as_dtype(dtype)
-                .unwrap();
-            let reference = tiled_oracle(
-                &cache,
-                &host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap()),
-                PackedAttentionShape {
-                    batch,
-                    query_heads,
-                    kv_heads,
-                    query_len,
-                    kv_len: tokens,
-                    head_dim: width,
-                },
-                mask,
-            );
-            let packed_mask = match mask {
-                PackedAttentionMask::None => PackedMask::None,
-                PackedAttentionMask::Causal => PackedMask::Causal,
-                PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
-                PackedAttentionMask::Additive => unreachable!(),
-            };
-            let tolerance = match dtype {
-                Dtype::Float32 => 1e-4,
-                Dtype::Float16 => 4e-2,
-                _ => 8e-2,
-            };
-            let staged = cache.staged_reader_arguments(0).unwrap();
-            let args = staged.args(&query, packed_mask);
-            assert!(
-                args.key_packed_tokens > 0 && args.key_packed_tokens < tokens,
-                "case {index} exercises packed K groups and the K residual"
-            );
-            assert_eq!(
-                args.value_packed_tokens == tokens,
-                index == HOST_MIRROR_CASE,
-                "only the host-mirror case packs every V row ahead of K"
-            );
-            let mut single: Option<Vec<f32>> = None;
-            let mut case_max = 0.0f32;
-            for splits in [1, 2, 5] {
-                let output = host_readback::<f32>(
-                    &kernel
-                        .dispatch_tiled(&args, Some(splits))
-                        .unwrap()
-                        .as_dtype(Dtype::Float32)
-                        .unwrap(),
+                let reference = tiled_oracle(
+                    &cache,
+                    &host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap()),
+                    PackedAttentionShape {
+                        batch,
+                        query_heads,
+                        kv_heads,
+                        query_len,
+                        kv_len: tokens,
+                        head_dim: width,
+                    },
+                    mask,
                 );
-                assert_eq!(output.len(), reference.len());
-                for (i, (actual, expected)) in output.iter().zip(&reference).enumerate() {
-                    let error = (actual - expected).abs();
-                    case_max = case_max.max(error);
-                    assert!(
-                        error <= tolerance,
-                        "case {index} splits {splits} element {i}: {actual} != {expected}"
+                let packed_mask = match mask {
+                    PackedAttentionMask::None => PackedMask::None,
+                    PackedAttentionMask::Causal => PackedMask::Causal,
+                    PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
+                    PackedAttentionMask::Additive => unreachable!(),
+                };
+                let tolerance = match dtype {
+                    Dtype::Float32 => 1e-4,
+                    Dtype::Float16 => 4e-2,
+                    _ => 8e-2,
+                };
+                let staged = cache.staged_reader_arguments(0).unwrap();
+                let args = staged.args(&query, packed_mask);
+                assert!(
+                    args.key_packed_tokens > 0 && args.key_packed_tokens < tokens,
+                    "{bits:?} case {index} exercises packed K groups and the K residual"
+                );
+                assert_eq!(
+                    args.value_packed_tokens == tokens,
+                    index == HOST_MIRROR_CASE,
+                    "only the host-mirror case packs every V row ahead of K"
+                );
+                let mut single: Option<Vec<f32>> = None;
+                let mut case_max = 0.0f32;
+                for splits in [1, 2, 5] {
+                    let output = host_readback::<f32>(
+                        &kernel
+                            .dispatch_tiled(&args, Some(splits))
+                            .unwrap()
+                            .as_dtype(Dtype::Float32)
+                            .unwrap(),
                     );
+                    assert_eq!(output.len(), reference.len());
+                    for (i, (actual, expected)) in output.iter().zip(&reference).enumerate() {
+                        let error = (actual - expected).abs();
+                        case_max = case_max.max(error);
+                        assert!(
+                        error <= tolerance,
+                        "{bits:?} case {index} splits {splits} element {i}: {actual} != {expected}"
+                    );
+                    }
+                    let single = single.get_or_insert_with(|| output.clone());
+                    for (actual, expected) in output.iter().zip(single.iter()) {
+                        assert!((actual - expected).abs() <= tolerance / 4.0);
+                    }
                 }
-                let single = single.get_or_insert_with(|| output.clone());
-                for (actual, expected) in output.iter().zip(single.iter()) {
-                    assert!((actual - expected).abs() <= tolerance / 4.0);
-                }
+                maxima.push((index, dtype, case_max));
             }
-            maxima.push((index, dtype, case_max));
+            eprintln!("tiled parity max abs error per case: {maxima:?}");
         }
-        eprintln!("tiled parity max abs error per case: {maxima:?}");
     }
 
     /// The NAX tiled reader against the independent fp32 oracle at the tolerances the dense bf16/f16
@@ -6559,261 +6996,288 @@ mod tests {
             mlx_nax_available, PackedKernelPath, PackedMask, PackedMetalGpuFamily,
             PackedMetalKernel,
         };
-        assert!(
-            mlx_nax_available().unwrap(),
-            "mlx::core::metal::is_nax_available() is false on this host"
-        );
-        let cases = [
-            (
-                Dtype::Bfloat16,
-                128,
-                2,
-                6,
-                333,
-                33,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Float16,
-                64,
-                2,
-                4,
-                300,
-                16,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Bfloat16,
-                64,
-                1,
-                3,
-                401,
-                128,
-                PackedAttentionMask::SlidingWindow(77),
-            ),
-            (
-                Dtype::Float16,
-                128,
-                2,
-                2,
-                530,
-                128,
-                PackedAttentionMask::None,
-            ),
-            (
-                Dtype::Bfloat16,
-                64,
-                1,
-                2,
-                2100,
-                2048,
-                PackedAttentionMask::Causal,
-            ),
-            (
-                Dtype::Float16,
-                128,
-                1,
-                3,
-                290,
-                33,
-                PackedAttentionMask::SlidingWindow(200),
-            ),
-            (
-                Dtype::Float16,
-                128,
-                1,
-                2,
-                2090,
-                2048,
-                PackedAttentionMask::SlidingWindow(700),
-            ),
-            // Host reference cache: V rows quantize per token, K keeps its incomplete group dense.
-            (
-                Dtype::Bfloat16,
-                128,
-                2,
-                4,
-                333,
-                33,
-                PackedAttentionMask::Causal,
-            ),
-        ];
-        const HOST_MIRROR_CASE: usize = 7;
-        let kernel =
-            PackedMetalKernel::for_identity_and_family("nax", PackedMetalGpuFamily::Apple7OrNewer)
-                .unwrap();
-        assert!(kernel.nax_available());
-        let mut maxima = Vec::new();
-        for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
-            cases.into_iter().enumerate()
-        {
-            let batch = if index % 2 == 0 && query_len < 2048 {
-                2
-            } else {
-                1
-            };
-            let shaped = |seed: u64| {
-                pseudo_random_outliers(batch, kv_heads, tokens, width, seed)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        let (channel, token) = (i % width, (i / width) % tokens);
-                        value.clamp(-4.0, 4.0) * (0.25 + (channel / 32) as f32 * 0.5)
-                            + (channel / 32) as f32 * 0.75
-                            - (token % 7) as f32 * 0.125
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let keys = shaped(411 + index as u64);
-            let values = shaped(507 + index as u64);
-            let queries = (0..batch * query_heads * query_len * width)
-                .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
-                .collect::<Vec<_>>();
-            let mut cache = device_cache(batch, kv_heads, width);
-            if index == HOST_MIRROR_CASE {
-                cache.append(0, &keys, &values, tokens).unwrap();
-            } else {
-                cache
-                    .append_device(
-                        0,
-                        &bhsd(&keys, batch, kv_heads, tokens, width)
-                            .as_dtype(dtype)
-                            .unwrap(),
-                        &bhsd(&values, batch, kv_heads, tokens, width)
-                            .as_dtype(dtype)
-                            .unwrap(),
-                    )
-                    .unwrap();
-            }
-            let query = bhsd(&queries, batch, query_heads, query_len, width)
-                .as_dtype(dtype)
-                .unwrap();
-            let reference = tiled_oracle(
-                &cache,
-                &host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap()),
-                PackedAttentionShape {
-                    batch,
-                    query_heads,
-                    kv_heads,
-                    query_len,
-                    kv_len: tokens,
-                    head_dim: width,
-                },
-                mask,
-            );
-            let packed_mask = match mask {
-                PackedAttentionMask::None => PackedMask::None,
-                PackedAttentionMask::Causal => PackedMask::Causal,
-                PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
-                PackedAttentionMask::Additive => unreachable!(),
-            };
-            let tolerance = match dtype {
-                Dtype::Float16 => 4e-2,
-                _ => 8e-2,
-            };
-            let staged = cache.staged_reader_arguments(0).unwrap();
-            let args = staged.args(&query, packed_mask);
+        for bits in PackedCodeBits::ALL {
             assert!(
-                args.key_packed_tokens > 0 && args.key_packed_tokens < tokens,
-                "case {index} exercises packed K groups and the K residual"
+                mlx_nax_available().unwrap(),
+                "mlx::core::metal::is_nax_available() is false on this host"
             );
-            assert_eq!(
-                args.value_packed_tokens == tokens,
-                index == HOST_MIRROR_CASE,
-                "only the host-mirror case packs every V row ahead of K"
-            );
-            assert!(
-                matches!(
-                    kernel.planned_path(&args).unwrap(),
-                    PackedKernelPath::NaxTiled { .. }
+            let cases = [
+                (
+                    Dtype::Bfloat16,
+                    128,
+                    2,
+                    6,
+                    333,
+                    33,
+                    PackedAttentionMask::Causal,
                 ),
-                "case {index} plans the NAX kernel"
-            );
-            let mut single: Option<Vec<f32>> = None;
-            let (mut case_abs, mut case_rel) = (0.0f32, 0.0f32);
-            for splits in [1, 2, 5] {
-                let output = host_readback::<f32>(
+                (
+                    Dtype::Float16,
+                    64,
+                    2,
+                    4,
+                    300,
+                    16,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Bfloat16,
+                    64,
+                    1,
+                    3,
+                    401,
+                    128,
+                    PackedAttentionMask::SlidingWindow(77),
+                ),
+                (
+                    Dtype::Float16,
+                    128,
+                    2,
+                    2,
+                    530,
+                    128,
+                    PackedAttentionMask::None,
+                ),
+                (
+                    Dtype::Bfloat16,
+                    64,
+                    1,
+                    2,
+                    2100,
+                    2048,
+                    PackedAttentionMask::Causal,
+                ),
+                (
+                    Dtype::Float16,
+                    128,
+                    1,
+                    3,
+                    290,
+                    33,
+                    PackedAttentionMask::SlidingWindow(200),
+                ),
+                (
+                    Dtype::Float16,
+                    128,
+                    1,
+                    2,
+                    2090,
+                    2048,
+                    PackedAttentionMask::SlidingWindow(700),
+                ),
+                // Host reference cache: V rows quantize per token, K keeps its incomplete group dense.
+                (
+                    Dtype::Bfloat16,
+                    128,
+                    2,
+                    4,
+                    333,
+                    33,
+                    PackedAttentionMask::Causal,
+                ),
+            ];
+            const HOST_MIRROR_CASE: usize = 7;
+            let kernel = PackedMetalKernel::for_identity_family_and_bits(
+                "nax",
+                PackedMetalGpuFamily::Apple7OrNewer,
+                bits,
+            )
+            .unwrap();
+            assert!(kernel.nax_available());
+            let mut maxima = Vec::new();
+            for (index, (dtype, width, kv_heads, query_heads, tokens, query_len, mask)) in
+                cases.into_iter().enumerate()
+            {
+                let batch = if index % 2 == 0 && query_len < 2048 {
+                    2
+                } else {
+                    1
+                };
+                let shaped = |seed: u64| {
+                    pseudo_random_outliers(batch, kv_heads, tokens, width, seed)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, value)| {
+                            let (channel, token) = (i % width, (i / width) % tokens);
+                            value.clamp(-4.0, 4.0) * (0.25 + (channel / 32) as f32 * 0.5)
+                                + (channel / 32) as f32 * 0.75
+                                - (token % 7) as f32 * 0.125
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let keys = shaped(411 + index as u64);
+                // 4-bit codes keep this fixture's V outliers that 2-bit codes flatten, which would
+                // push outputs past |4|, where one bf16 ULP (2^-5) exceeds the unchanged
+                // split-vs-single bound (tol/4 = 2e-2) and correctly rounded outputs may differ by
+                // it (f16: past |16|). The 4-bit pass therefore scales V into the range the bound
+                // can resolve (asserted below), leaving every bound as is.
+                let value_scale = match bits {
+                    PackedCodeBits::Two => 1.0,
+                    PackedCodeBits::Four => 0.75,
+                };
+                let values = shaped(507 + index as u64)
+                    .into_iter()
+                    .map(|value| value * value_scale)
+                    .collect::<Vec<_>>();
+                let queries = (0..batch * query_heads * query_len * width)
+                    .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
+                    .collect::<Vec<_>>();
+                let mut cache = device_cache_bits(batch, kv_heads, width, bits);
+                if index == HOST_MIRROR_CASE {
+                    cache.append(0, &keys, &values, tokens).unwrap();
+                } else {
+                    cache
+                        .append_device(
+                            0,
+                            &bhsd(&keys, batch, kv_heads, tokens, width)
+                                .as_dtype(dtype)
+                                .unwrap(),
+                            &bhsd(&values, batch, kv_heads, tokens, width)
+                                .as_dtype(dtype)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+                let query = bhsd(&queries, batch, query_heads, query_len, width)
+                    .as_dtype(dtype)
+                    .unwrap();
+                let reference = tiled_oracle(
+                    &cache,
+                    &host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap()),
+                    PackedAttentionShape {
+                        batch,
+                        query_heads,
+                        kv_heads,
+                        query_len,
+                        kv_len: tokens,
+                        head_dim: width,
+                    },
+                    mask,
+                );
+                let packed_mask = match mask {
+                    PackedAttentionMask::None => PackedMask::None,
+                    PackedAttentionMask::Causal => PackedMask::Causal,
+                    PackedAttentionMask::SlidingWindow(window) => PackedMask::SlidingWindow(window),
+                    PackedAttentionMask::Additive => unreachable!(),
+                };
+                let tolerance = match dtype {
+                    Dtype::Float16 => 4e-2,
+                    _ => 8e-2,
+                };
+                let staged = cache.staged_reader_arguments(0).unwrap();
+                let args = staged.args(&query, packed_mask);
+                assert!(
+                    args.key_packed_tokens > 0 && args.key_packed_tokens < tokens,
+                    "{bits:?} case {index} exercises packed K groups and the K residual"
+                );
+                assert_eq!(
+                    args.value_packed_tokens == tokens,
+                    index == HOST_MIRROR_CASE,
+                    "only the host-mirror case packs every V row ahead of K"
+                );
+                assert!(
+                    matches!(
+                        kernel.planned_path(&args).unwrap(),
+                        PackedKernelPath::NaxTiled { .. }
+                    ),
+                    "{bits:?} case {index} plans the NAX kernel"
+                );
+                let mut single: Option<Vec<f32>> = None;
+                let (mut case_abs, mut case_rel) = (0.0f32, 0.0f32);
+                for splits in [1, 2, 5] {
+                    let output = host_readback::<f32>(
+                        &kernel
+                            .dispatch_nax(&args, Some(splits))
+                            .unwrap()
+                            .as_dtype(Dtype::Float32)
+                            .unwrap(),
+                    );
+                    assert_eq!(output.len(), reference.len());
+                    for (i, (actual, expected)) in output.iter().zip(&reference).enumerate() {
+                        let error = (actual - expected).abs();
+                        case_abs = case_abs.max(error);
+                        case_rel = case_rel.max(error / expected.abs().max(1e-2));
+                        assert!(
+                        error <= tolerance,
+                        "{bits:?} case {index} splits {splits} element {i}: {actual} != {expected}"
+                    );
+                    }
+                    let single = single.get_or_insert_with(|| output.clone());
+                    // Magnitude below which one output ULP stays under tol/4 (bf16 2^-5 from 4,
+                    // f16 2^-6 from 16).
+                    let resolvable = if dtype == Dtype::Bfloat16 { 4.0 } else { 16.0 };
+                    assert!(
+                        bits == PackedCodeBits::Two
+                            || single.iter().all(|value| value.abs() < resolvable),
+                        "{bits:?} case {index}: fixture outputs exceed the resolvable range"
+                    );
+                    for (actual, expected) in output.iter().zip(single.iter()) {
+                        assert!((actual - expected).abs() <= tolerance / 4.0);
+                    }
+                }
+                // Same inputs through the fp32 tiled kernel: both read the identical representation, so
+                // they differ only by 16-bit tile rounding and output rounding.
+                let tiled = host_readback::<f32>(
                     &kernel
-                        .dispatch_nax(&args, Some(splits))
+                        .dispatch_tiled(&args, None)
                         .unwrap()
                         .as_dtype(Dtype::Float32)
                         .unwrap(),
                 );
-                assert_eq!(output.len(), reference.len());
-                for (i, (actual, expected)) in output.iter().zip(&reference).enumerate() {
-                    let error = (actual - expected).abs();
-                    case_abs = case_abs.max(error);
-                    case_rel = case_rel.max(error / expected.abs().max(1e-2));
+                let mut case_tiled = 0.0f32;
+                for (i, (nax, tiled)) in single.as_ref().unwrap().iter().zip(&tiled).enumerate() {
+                    let error = (nax - tiled).abs() / tiled.abs().max(1.0);
+                    case_tiled = case_tiled.max(error);
                     assert!(
-                        error <= tolerance,
-                        "case {index} splits {splits} element {i}: {actual} != {expected}"
+                        error <= 2e-2,
+                        "{bits:?} case {index} element {i}: NAX {nax} != tiled {tiled}"
                     );
                 }
-                let single = single.get_or_insert_with(|| output.clone());
-                for (actual, expected) in output.iter().zip(single.iter()) {
-                    assert!((actual - expected).abs() <= tolerance / 4.0);
-                }
+                maxima.push((
+                    index, dtype, width, query_len, case_abs, case_rel, case_tiled,
+                ));
             }
-            // Same inputs through the fp32 tiled kernel: both read the identical representation, so
-            // they differ only by 16-bit tile rounding and output rounding.
-            let tiled = host_readback::<f32>(
-                &kernel
-                    .dispatch_tiled(&args, None)
-                    .unwrap()
-                    .as_dtype(Dtype::Float32)
-                    .unwrap(),
+            eprintln!(
+                "NAX parity (case, dtype, D, S_q, max abs, max rel, max vs tiled): {maxima:?}"
             );
-            let mut case_tiled = 0.0f32;
-            for (i, (nax, tiled)) in single.as_ref().unwrap().iter().zip(&tiled).enumerate() {
-                let error = (nax - tiled).abs() / tiled.abs().max(1.0);
-                case_tiled = case_tiled.max(error);
-                assert!(
-                    error <= 2e-2,
-                    "case {index} element {i}: NAX {nax} != tiled {tiled}"
-                );
-            }
-            maxima.push((
-                index, dtype, width, query_len, case_abs, case_rel, case_tiled,
-            ));
-        }
-        eprintln!("NAX parity (case, dtype, D, S_q, max abs, max rel, max vs tiled): {maxima:?}");
 
-        // D = 256 and f32 queries keep the fp32 tiled kernel, with the recorded reason.
-        for (width, dtype) in [(256, Dtype::Bfloat16), (128, Dtype::Float32)] {
-            let selection = kernel.nax_selection(width, dtype);
-            assert!(!selection.selected, "D {width} {dtype:?}");
-            let descriptor = kernel.kernel_descriptor(64, width, dtype).unwrap();
-            assert_eq!(
-                descriptor.kernel,
-                "sc20676_tiled_multi_row_simdgroup_matrix"
-            );
-            assert_eq!(descriptor.selection, selection.selection);
-            assert_eq!(descriptor.selection_reason, selection.reason);
-            let mut cache = device_cache(1, 1, width);
-            let kv = bhsd(
-                &pseudo_random_outliers(1, 1, 80, width, 3)
-                    .into_iter()
-                    .map(|value| value.clamp(-3.0, 3.0))
-                    .collect::<Vec<_>>(),
-                1,
-                1,
-                80,
-                width,
-            )
-            .as_dtype(dtype)
-            .unwrap();
-            cache.append_device(0, &kv, &kv).unwrap();
-            let query = bhsd(&vec![0.1; 2 * 64 * width], 1, 2, 64, width)
+            // D = 256 and f32 queries keep the fp32 tiled kernel, with the recorded reason.
+            for (width, dtype) in [(256, Dtype::Bfloat16), (128, Dtype::Float32)] {
+                let selection = kernel.nax_selection(width, dtype);
+                assert!(!selection.selected, "D {width} {dtype:?}");
+                let descriptor = kernel.kernel_descriptor(64, width, dtype).unwrap();
+                assert_eq!(
+                    descriptor.kernel,
+                    "sc20676_tiled_multi_row_simdgroup_matrix"
+                );
+                assert_eq!(descriptor.selection, selection.selection);
+                assert_eq!(descriptor.selection_reason, selection.reason);
+                let mut cache = device_cache_bits(1, 1, width, bits);
+                let kv = bhsd(
+                    &pseudo_random_outliers(1, 1, 80, width, 3)
+                        .into_iter()
+                        .map(|value| value.clamp(-3.0, 3.0))
+                        .collect::<Vec<_>>(),
+                    1,
+                    1,
+                    80,
+                    width,
+                )
                 .as_dtype(dtype)
                 .unwrap();
-            let staged = cache.staged_reader_arguments(0).unwrap();
-            let args = staged.args(&query, PackedMask::Causal);
-            assert!(matches!(
-                kernel.planned_path(&args).unwrap(),
-                PackedKernelPath::Tiled { .. }
-            ));
-            let refused = kernel.dispatch_nax(&args, None).unwrap_err().to_string();
-            assert!(refused.contains(selection.reason), "{refused}");
+                cache.append_device(0, &kv, &kv).unwrap();
+                let query = bhsd(&vec![0.1; 2 * 64 * width], 1, 2, 64, width)
+                    .as_dtype(dtype)
+                    .unwrap();
+                let staged = cache.staged_reader_arguments(0).unwrap();
+                let args = staged.args(&query, PackedMask::Causal);
+                assert!(matches!(
+                    kernel.planned_path(&args).unwrap(),
+                    PackedKernelPath::Tiled { .. }
+                ));
+                let refused = kernel.dispatch_nax(&args, None).unwrap_err().to_string();
+                assert!(refused.contains(selection.reason), "{refused}");
+            }
         }
     }
 
@@ -6831,134 +7295,143 @@ mod tests {
             mlx_nax_available, packed_tiled_min_query_tokens, PackedKernelPath, PackedMask,
             PackedMetalGpuFamily, PackedMetalKernel,
         };
-        assert_eq!(packed_tiled_min_query_tokens(64), 16);
-        assert_eq!(packed_tiled_min_query_tokens(128), 16);
-        assert_eq!(packed_tiled_min_query_tokens(256), 32);
-        let nax = mlx_nax_available().unwrap();
-        let conservative = PackedMetalKernel::for_identity("route").unwrap();
-        assert!(!conservative.nax_available());
-        let recent = PackedMetalKernel::for_identity_and_family(
-            "route",
-            PackedMetalGpuFamily::Apple7OrNewer,
-        )
-        .unwrap();
-        assert_eq!(recent.nax_available(), nax);
-        let recent_without_nax = PackedMetalKernel::for_identity_and_family(
-            "route",
-            PackedMetalGpuFamily::Apple7OrNewer,
-        )
-        .unwrap()
-        .without_nax();
-        for width in [128, 256] {
-            let tokens = 96;
-            let data = pseudo_random_outliers(1, 2, tokens, width, 9)
-                .into_iter()
-                .map(|value| value.clamp(-3.0, 3.0))
-                .collect::<Vec<_>>();
-            let mut cache = device_cache(1, 2, width);
-            let kv = bhsd(&data, 1, 2, tokens, width);
-            cache.append_device(0, &kv, &kv).unwrap();
-            let layer = cache.device_layers[0].as_ref().unwrap();
-            let threshold = packed_tiled_min_query_tokens(width);
-            for (query_len, dtype) in [1, threshold - 1, threshold]
-                .into_iter()
-                .flat_map(|len| [(len, Dtype::Float32), (len, Dtype::Bfloat16)])
-            {
-                let query = bhsd(
-                    &(0..6 * query_len * width)
-                        .map(|i| ((i * 7 + 1) % 23) as f32 * 0.04 - 0.4)
-                        .collect::<Vec<_>>(),
-                    1,
-                    6,
-                    query_len,
-                    width,
-                )
-                .as_dtype(dtype)
-                .unwrap();
-                let args = layer.args(&query, PackedMask::Causal);
-                for (kernel, qualified, kernel_nax) in [
-                    (&conservative, false, false),
-                    (&recent, true, nax),
-                    (&recent_without_nax, true, false),
-                ] {
-                    let path = kernel.planned_path(&args).unwrap();
-                    let multi_row = qualified && query_len >= threshold;
-                    let nax_expected =
-                        multi_row && kernel_nax && width == 128 && dtype == Dtype::Bfloat16;
-                    let expected = match (multi_row, nax_expected) {
-                        (false, _) => "sc20676_split_kv_simdgroup",
-                        (true, false) => "sc20676_tiled_multi_row_simdgroup_matrix",
-                        (true, true) => "sc20676_nax_tiled_matmul2d",
-                    };
-                    let context = format!(
+        for bits in PackedCodeBits::ALL {
+            assert_eq!(packed_tiled_min_query_tokens(64), 16);
+            assert_eq!(packed_tiled_min_query_tokens(128), 16);
+            assert_eq!(packed_tiled_min_query_tokens(256), 32);
+            let nax = mlx_nax_available().unwrap();
+            let conservative = PackedMetalKernel::for_identity_family_and_bits(
+                "route",
+                crate::primitives::packed_metal::PackedMetalGpuFamily::ConservativeUnknownApple,
+                bits,
+            )
+            .unwrap();
+            assert!(!conservative.nax_available());
+            let recent = PackedMetalKernel::for_identity_family_and_bits(
+                "route",
+                PackedMetalGpuFamily::Apple7OrNewer,
+                bits,
+            )
+            .unwrap();
+            assert_eq!(recent.nax_available(), nax);
+            let recent_without_nax = PackedMetalKernel::for_identity_family_and_bits(
+                "route",
+                PackedMetalGpuFamily::Apple7OrNewer,
+                bits,
+            )
+            .unwrap()
+            .without_nax();
+            for width in [128, 256] {
+                let tokens = 96;
+                let data = pseudo_random_outliers(1, 2, tokens, width, 9)
+                    .into_iter()
+                    .map(|value| value.clamp(-3.0, 3.0))
+                    .collect::<Vec<_>>();
+                let mut cache = device_cache_bits(1, 2, width, bits);
+                let kv = bhsd(&data, 1, 2, tokens, width);
+                cache.append_device(0, &kv, &kv).unwrap();
+                let layer = cache.device_layers[0].as_ref().unwrap();
+                let threshold = packed_tiled_min_query_tokens(width);
+                for (query_len, dtype) in [1, threshold - 1, threshold]
+                    .into_iter()
+                    .flat_map(|len| [(len, Dtype::Float32), (len, Dtype::Bfloat16)])
+                {
+                    let query = bhsd(
+                        &(0..6 * query_len * width)
+                            .map(|i| ((i * 7 + 1) % 23) as f32 * 0.04 - 0.4)
+                            .collect::<Vec<_>>(),
+                        1,
+                        6,
+                        query_len,
+                        width,
+                    )
+                    .as_dtype(dtype)
+                    .unwrap();
+                    let args = layer.args(&query, PackedMask::Causal);
+                    for (kernel, qualified, kernel_nax) in [
+                        (&conservative, false, false),
+                        (&recent, true, nax),
+                        (&recent_without_nax, true, false),
+                    ] {
+                        let path = kernel.planned_path(&args).unwrap();
+                        let multi_row = qualified && query_len >= threshold;
+                        let nax_expected =
+                            multi_row && kernel_nax && width == 128 && dtype == Dtype::Bfloat16;
+                        let expected = match (multi_row, nax_expected) {
+                            (false, _) => "sc20676_split_kv_simdgroup",
+                            (true, false) => "sc20676_tiled_multi_row_simdgroup_matrix",
+                            (true, true) => "sc20676_nax_tiled_matmul2d",
+                        };
+                        let context = format!(
                         "D {width} S_q {query_len} {dtype:?} qualified {qualified} nax {kernel_nax}"
                     );
-                    assert_eq!(
-                        (
-                            matches!(path, PackedKernelPath::Tiled { .. }),
-                            matches!(path, PackedKernelPath::NaxTiled { .. })
-                        ),
-                        (multi_row && !nax_expected, nax_expected),
-                        "{context}: {path:?}"
-                    );
-                    let (PackedKernelPath::Tiled { splits }
-                    | PackedKernelPath::PerRow { splits }
-                    | PackedKernelPath::NaxTiled { splits }) = path;
-                    assert_eq!(kernel.planned_splits(&args).unwrap(), splits);
-                    let descriptor = kernel.kernel_descriptor(query_len, width, dtype).unwrap();
-                    assert_eq!(descriptor.kernel, expected, "{context}");
-                    if multi_row {
-                        let nax_selection = kernel.nax_selection(width, dtype);
-                        assert_eq!(descriptor.selection, nax_selection.selection, "{context}");
                         assert_eq!(
-                            descriptor.selection_reason, nax_selection.reason,
+                            (
+                                matches!(path, PackedKernelPath::Tiled { .. }),
+                                matches!(path, PackedKernelPath::NaxTiled { .. })
+                            ),
+                            (multi_row && !nax_expected, nax_expected),
+                            "{context}: {path:?}"
+                        );
+                        let (PackedKernelPath::Tiled { splits }
+                        | PackedKernelPath::PerRow { splits }
+                        | PackedKernelPath::NaxTiled { splits }) = path;
+                        assert_eq!(kernel.planned_splits(&args).unwrap(), splits);
+                        let descriptor = kernel.kernel_descriptor(query_len, width, dtype).unwrap();
+                        assert_eq!(descriptor.kernel, expected, "{context}");
+                        if multi_row {
+                            let nax_selection = kernel.nax_selection(width, dtype);
+                            assert_eq!(descriptor.selection, nax_selection.selection, "{context}");
+                            assert_eq!(
+                                descriptor.selection_reason, nax_selection.reason,
+                                "{context}"
+                            );
+                        }
+                        // The dispatch-time selection the cache records is this descriptor's.
+                        let recorded = kernel.kernel_selection(&args).unwrap();
+                        assert_eq!(
+                            (recorded.kernel, recorded.selection, recorded.reason),
+                            (
+                                descriptor.kernel,
+                                descriptor.selection,
+                                descriptor.selection_reason
+                            ),
                             "{context}"
                         );
+                        assert_eq!(
+                            Some(recorded.query_dtype),
+                            crate::primitives::packed_query_dtype_name(dtype)
+                        );
+                        assert!(crate::primitives::packed_kernel_path_valid(
+                            kernel.gpu_family().as_str(),
+                            recorded.kernel,
+                            recorded.selection,
+                            recorded.query_dtype
+                        ));
+                        let readback = |array: Array| {
+                            host_readback::<f32>(&array.as_dtype(Dtype::Float32).unwrap())
+                        };
+                        let routed = readback(kernel.dispatch(&args).unwrap());
+                        let named = readback(match path {
+                            PackedKernelPath::Tiled { splits } => {
+                                kernel.dispatch_tiled(&args, Some(splits)).unwrap()
+                            }
+                            PackedKernelPath::PerRow { splits } => {
+                                kernel.dispatch_with_splits(&args, Some(splits)).unwrap()
+                            }
+                            PackedKernelPath::NaxTiled { splits } => {
+                                kernel.dispatch_nax(&args, Some(splits)).unwrap()
+                            }
+                        });
+                        assert_eq!(routed, named, "{context} {path:?}");
+                        assert_eq!(
+                            kernel.dispatch_nax(&args, None).is_ok(),
+                            kernel_nax && width == 128 && dtype == Dtype::Bfloat16,
+                            "{context}: the NAX seam follows nax_selection"
+                        );
                     }
-                    // The dispatch-time selection the cache records is this descriptor's.
-                    let recorded = kernel.kernel_selection(&args).unwrap();
-                    assert_eq!(
-                        (recorded.kernel, recorded.selection, recorded.reason),
-                        (
-                            descriptor.kernel,
-                            descriptor.selection,
-                            descriptor.selection_reason
-                        ),
-                        "{context}"
-                    );
-                    assert_eq!(
-                        Some(recorded.query_dtype),
-                        crate::primitives::packed_query_dtype_name(dtype)
-                    );
-                    assert!(crate::primitives::packed_kernel_path_valid(
-                        kernel.gpu_family().as_str(),
-                        recorded.kernel,
-                        recorded.selection,
-                        recorded.query_dtype
-                    ));
-                    let readback = |array: Array| {
-                        host_readback::<f32>(&array.as_dtype(Dtype::Float32).unwrap())
-                    };
-                    let routed = readback(kernel.dispatch(&args).unwrap());
-                    let named = readback(match path {
-                        PackedKernelPath::Tiled { splits } => {
-                            kernel.dispatch_tiled(&args, Some(splits)).unwrap()
-                        }
-                        PackedKernelPath::PerRow { splits } => {
-                            kernel.dispatch_with_splits(&args, Some(splits)).unwrap()
-                        }
-                        PackedKernelPath::NaxTiled { splits } => {
-                            kernel.dispatch_nax(&args, Some(splits)).unwrap()
-                        }
-                    });
-                    assert_eq!(routed, named, "{context} {path:?}");
-                    assert_eq!(
-                        kernel.dispatch_nax(&args, None).is_ok(),
-                        kernel_nax && width == 128 && dtype == Dtype::Bfloat16,
-                        "{context}: the NAX seam follows nax_selection"
-                    );
+                    assert!(conservative.dispatch_tiled(&args, None).is_err());
                 }
-                assert!(conservative.dispatch_tiled(&args, None).is_err());
             }
         }
     }
@@ -6977,162 +7450,169 @@ mod tests {
             mlx_nax_available, PackedKernelPath, PackedMask, PackedMetalGpuFamily,
             PackedMetalKernel,
         };
-        let (heads, query_heads, width) = (2, 6, 128);
-        let nax = mlx_nax_available().unwrap();
-        for (dtype, tolerance) in [(Dtype::Float32, 1e-4), (Dtype::Bfloat16, 8e-2)] {
-            let kernel = Arc::new(
-                PackedMetalKernel::for_identity_and_family(
-                    "decoder-tiled",
-                    PackedMetalGpuFamily::Apple7OrNewer,
+        for bits in PackedCodeBits::ALL {
+            let (heads, query_heads, width) = (2, 6, 128);
+            let nax = mlx_nax_available().unwrap();
+            for (dtype, tolerance) in [(Dtype::Float32, 1e-4), (Dtype::Bfloat16, 8e-2)] {
+                let kernel = Arc::new(
+                    PackedMetalKernel::for_identity_family_and_bits(
+                        "decoder-tiled",
+                        PackedMetalGpuFamily::Apple7OrNewer,
+                        bits,
+                    )
+                    .unwrap(),
+                );
+                let reader = CompiledKernelHandle::new(kernel.clone());
+                let mut cache = select_decoder_cache_with_reader(
+                    PackedCacheRequest {
+                        enabled: true,
+                        backend: "mlx-metal".into(),
+                        identity: "decoder-tiled".into(),
+                        layers: 1,
+                        batch: 1,
+                        kv_heads: heads,
+                        head_dimension: width,
+                        group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                        bits,
+                        query_length: 40,
+                        has_mask: false,
+                    },
+                    reader,
                 )
-                .unwrap(),
-            );
-            let reader = CompiledKernelHandle::new(kernel.clone());
-            let mut cache = select_decoder_cache_with_reader(
-                PackedCacheRequest {
-                    enabled: true,
-                    backend: "mlx-metal".into(),
-                    identity: "decoder-tiled".into(),
-                    layers: 1,
-                    batch: 1,
-                    kv_heads: heads,
-                    head_dimension: width,
-                    group_size: PACKED_METAL_QUANT_GROUP_SIZE,
-                    query_length: 40,
-                    has_mask: false,
-                },
-                reader,
-            )
-            .into_cache();
-            let scale = (width as f32).powf(-0.5);
-            let mut offset = 0;
-            for (chunk, rows) in [40usize, 33, 128].into_iter().enumerate() {
-                let fresh = |seed: u64| {
-                    bhsd(
-                        &pseudo_random_outliers(1, heads, rows, width, seed)
-                            .into_iter()
-                            .map(|value| value.clamp(-3.0, 3.0))
+                .into_cache();
+                let scale = (width as f32).powf(-0.5);
+                let mut offset = 0;
+                for (chunk, rows) in [40usize, 33, 128].into_iter().enumerate() {
+                    let fresh = |seed: u64| {
+                        bhsd(
+                            &pseudo_random_outliers(1, heads, rows, width, seed)
+                                .into_iter()
+                                .map(|value| value.clamp(-3.0, 3.0))
+                                .collect::<Vec<_>>(),
+                            1,
+                            heads,
+                            rows,
+                            width,
+                        )
+                        .as_dtype(dtype)
+                        .unwrap()
+                    };
+                    let (keys, values) = (fresh(50 + chunk as u64), fresh(60 + chunk as u64));
+                    let query = bhsd(
+                        &(0..query_heads * rows * width)
+                            .map(|i| ((i * 13 + chunk) % 41) as f32 * 0.03 - 0.6)
                             .collect::<Vec<_>>(),
                         1,
-                        heads,
+                        query_heads,
                         rows,
                         width,
                     )
                     .as_dtype(dtype)
-                    .unwrap()
-                };
-                let (keys, values) = (fresh(50 + chunk as u64), fresh(60 + chunk as u64));
-                let query = bhsd(
-                    &(0..query_heads * rows * width)
-                        .map(|i| ((i * 13 + chunk) % 41) as f32 * 0.03 - 0.6)
-                        .collect::<Vec<_>>(),
-                    1,
-                    query_heads,
-                    rows,
-                    width,
-                )
-                .as_dtype(dtype)
-                .unwrap();
-                let query_values = host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap());
-                let output = cache
-                    .try_packed_attention(
-                        0,
-                        &query,
-                        &keys,
-                        &values,
+                    .unwrap();
+                    let query_values =
+                        host_readback::<f32>(&query.as_dtype(Dtype::Float32).unwrap());
+                    let output = cache
+                        .try_packed_attention(
+                            0,
+                            &query,
+                            &keys,
+                            &values,
+                            PackedAttentionMask::Causal,
+                            scale,
+                            false,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    offset += rows;
+                    if chunk == 0 {
+                        continue;
+                    }
+                    let packed = cache
+                        .as_any_mut()
+                        .downcast_mut::<DenseFallbackPackedDecoderCache>()
+                        .unwrap();
+                    let reference = tiled_oracle(
+                        &packed.staged,
+                        &query_values,
+                        PackedAttentionShape {
+                            batch: 1,
+                            query_heads,
+                            kv_heads: heads,
+                            query_len: rows,
+                            kv_len: offset,
+                            head_dim: width,
+                        },
                         PackedAttentionMask::Causal,
-                        scale,
-                        false,
-                    )
-                    .unwrap()
-                    .unwrap();
-                offset += rows;
-                if chunk == 0 {
-                    continue;
-                }
-                let packed = cache
-                    .as_any_mut()
-                    .downcast_mut::<DenseFallbackPackedDecoderCache>()
-                    .unwrap();
-                let reference = tiled_oracle(
-                    &packed.staged,
-                    &query_values,
-                    PackedAttentionShape {
-                        batch: 1,
-                        query_heads,
-                        kv_heads: heads,
-                        query_len: rows,
-                        kv_len: offset,
-                        head_dim: width,
-                    },
-                    PackedAttentionMask::Causal,
-                );
-                let output = host_readback::<f32>(&output.as_dtype(Dtype::Float32).unwrap());
-                for (actual, expected) in output.iter().zip(&reference) {
-                    assert!(
-                        (actual - expected).abs() <= tolerance,
-                        "{dtype:?}: {actual} != {expected}"
+                    );
+                    let output = host_readback::<f32>(&output.as_dtype(Dtype::Float32).unwrap());
+                    for (actual, expected) in output.iter().zip(&reference) {
+                        assert!(
+                            (actual - expected).abs() <= tolerance,
+                            "{dtype:?}: {actual} != {expected}"
+                        );
+                    }
+                    // The step ran the planned multi-row kernel: its output is bit-identical to a
+                    // direct dispatch of the kernel planned_path names over the same representation.
+                    let staged = packed.staged.staged_reader_arguments(0).unwrap();
+                    let args = staged.args(&query, PackedMask::Causal);
+                    let direct = match kernel.planned_path(&args).unwrap() {
+                        PackedKernelPath::NaxTiled { splits }
+                            if dtype == Dtype::Bfloat16 && nax =>
+                        {
+                            kernel.dispatch_nax(&args, Some(splits)).unwrap()
+                        }
+                        PackedKernelPath::Tiled { splits } if dtype == Dtype::Float32 || !nax => {
+                            kernel.dispatch_tiled(&args, Some(splits)).unwrap()
+                        }
+                        path => panic!("{dtype:?} chunk {chunk} of {rows} rows planned {path:?}"),
+                    };
+                    assert_eq!(
+                        output,
+                        host_readback::<f32>(&direct.as_dtype(Dtype::Float32).unwrap()),
+                        "{dtype:?} chunk {chunk} output is not the planned kernel's"
                     );
                 }
-                // The step ran the planned multi-row kernel: its output is bit-identical to a
-                // direct dispatch of the kernel planned_path names over the same representation.
-                let staged = packed.staged.staged_reader_arguments(0).unwrap();
-                let args = staged.args(&query, PackedMask::Causal);
-                let direct = match kernel.planned_path(&args).unwrap() {
-                    PackedKernelPath::NaxTiled { splits } if dtype == Dtype::Bfloat16 && nax => {
-                        kernel.dispatch_nax(&args, Some(splits)).unwrap()
-                    }
-                    PackedKernelPath::Tiled { splits } if dtype == Dtype::Float32 || !nax => {
-                        kernel.dispatch_tiled(&args, Some(splits)).unwrap()
-                    }
-                    path => panic!("{dtype:?} chunk {chunk} of {rows} rows planned {path:?}"),
+                let evidence = cache.packed_evidence().unwrap();
+                assert_eq!(evidence.accepted_direct_calls, 2);
+                // Both packed chunks are recorded under the path they actually ran.
+                let (kernel, selection, query_dtype) = match (dtype, nax) {
+                    (Dtype::Bfloat16, true) => (
+                        crate::primitives::PACKED_NAX_KERNEL,
+                        crate::primitives::PACKED_SELECTION_NAX,
+                        "bfloat16",
+                    ),
+                    (Dtype::Bfloat16, false) => (
+                        crate::primitives::PACKED_TILED_KERNEL,
+                        crate::primitives::PACKED_SELECTION_NAX_UNAVAILABLE,
+                        "bfloat16",
+                    ),
+                    _ => (
+                        crate::primitives::PACKED_TILED_KERNEL,
+                        if nax {
+                            crate::primitives::PACKED_SELECTION_F32_QUERY
+                        } else {
+                            crate::primitives::PACKED_SELECTION_NAX_UNAVAILABLE
+                        },
+                        "float32",
+                    ),
                 };
                 assert_eq!(
-                    output,
-                    host_readback::<f32>(&direct.as_dtype(Dtype::Float32).unwrap()),
-                    "{dtype:?} chunk {chunk} output is not the planned kernel's"
+                    evidence
+                        .kernel_paths
+                        .iter()
+                        .map(|path| (
+                            path.kernel.as_str(),
+                            path.selection.as_str(),
+                            path.query_dtype.as_str(),
+                            path.calls
+                        ))
+                        .collect::<Vec<_>>(),
+                    vec![(kernel, selection, query_dtype, 2)],
+                    "{dtype:?}"
                 );
+                assert_eq!(evidence.full_cache_dequantizations, 0);
+                assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
             }
-            let evidence = cache.packed_evidence().unwrap();
-            assert_eq!(evidence.accepted_direct_calls, 2);
-            // Both packed chunks are recorded under the path they actually ran.
-            let (kernel, selection, query_dtype) = match (dtype, nax) {
-                (Dtype::Bfloat16, true) => (
-                    crate::primitives::PACKED_NAX_KERNEL,
-                    crate::primitives::PACKED_SELECTION_NAX,
-                    "bfloat16",
-                ),
-                (Dtype::Bfloat16, false) => (
-                    crate::primitives::PACKED_TILED_KERNEL,
-                    crate::primitives::PACKED_SELECTION_NAX_UNAVAILABLE,
-                    "bfloat16",
-                ),
-                _ => (
-                    crate::primitives::PACKED_TILED_KERNEL,
-                    if nax {
-                        crate::primitives::PACKED_SELECTION_F32_QUERY
-                    } else {
-                        crate::primitives::PACKED_SELECTION_NAX_UNAVAILABLE
-                    },
-                    "float32",
-                ),
-            };
-            assert_eq!(
-                evidence
-                    .kernel_paths
-                    .iter()
-                    .map(|path| (
-                        path.kernel.as_str(),
-                        path.selection.as_str(),
-                        path.query_dtype.as_str(),
-                        path.calls
-                    ))
-                    .collect::<Vec<_>>(),
-                vec![(kernel, selection, query_dtype, 2)],
-                "{dtype:?}"
-            );
-            assert_eq!(evidence.full_cache_dequantizations, 0);
-            assert!(!evidence.dense_active && evidence.fallback_reasons.is_empty());
         }
     }
 }

@@ -1322,6 +1322,7 @@ mod tests {
             kv_heads: 1,
             head_dimension: 64,
             group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+            bits: crate::primitives::PackedCodeBits::Two,
             query_length: 1,
             has_mask: false,
         };
