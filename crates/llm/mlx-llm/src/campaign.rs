@@ -2565,6 +2565,20 @@ fn validate_receipt_compression(
     {
         return Err("compressed representation identity is incomplete".into());
     }
+    // Each method names exactly one representation: its code width and reader identity.
+    let method = CompressedKvMethod::parse(&compression.method)?;
+    if compression.bits != u64::from(method.code_bits().bits())
+        || compression.representation_identity != method.representation_identity()
+    {
+        return Err(format!(
+            "compressed method {} is {}-bit {} but the receipt records {}-bit {}",
+            method.id(),
+            method.code_bits().bits(),
+            method.representation_identity(),
+            compression.bits,
+            compression.representation_identity
+        ));
+    }
     let device_bytes = compression
         .device_code_bytes
         .checked_add(compression.device_metadata_bytes);
@@ -10556,6 +10570,13 @@ pub fn compressed_receipt_block(
             first.bits
         ));
     }
+    if first.representation_identity != method.representation_identity() {
+        return Err(format!(
+            "compressed arm for {} produced {} evidence",
+            method.id(),
+            first.representation_identity
+        ));
+    }
     let mut fallbacks = std::collections::BTreeMap::<(String, String), u64>::new();
     let mut kernel_paths =
         std::collections::BTreeMap::<(String, String, String), (String, u64)>::new();
@@ -14033,6 +14054,18 @@ pub(crate) mod tests {
                 .unwrap_err(),
             "compressed arm for group-affine-4 produced 2-bit evidence"
         );
+        // ...and to its reader identity: 4-bit evidence under the 2-bit identity is refused.
+        for item in &mut primary.packed_evidence {
+            item.bits = 4;
+        }
+        assert_eq!(
+            compressed_receipt_block(CompressedKvMethod::GroupAffine4, &primary, &[&primary])
+                .unwrap_err(),
+            "compressed arm for group-affine-4 produced sc-20676-packed-group-affine-v1 evidence"
+        );
+        for item in &mut primary.packed_evidence {
+            item.bits = 2;
+        }
 
         // A primary that never closed its coordinate scope cannot be classified.
         primary.coordinate_scope = None;
@@ -14041,6 +14074,44 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("no coordinate-operation scope")
         );
+    }
+
+    #[test]
+    fn compressed_receipt_method_is_bound_to_its_width_and_identity() {
+        let validate = |edit: &dyn Fn(&mut ReceiptCompression)| {
+            let mut block = test_compression_block();
+            edit(&mut block);
+            let mut receipt = builder_test_receipt();
+            compress_test_receipt(&mut receipt, block);
+            validate_sealed_receipt(&receipt)
+        };
+        let set = |method: &'static str, bits: u64, identity: &'static str| {
+            move |block: &mut ReceiptCompression| {
+                block.method = method.into();
+                block.bits = bits;
+                block.representation_identity = identity.into();
+            }
+        };
+        const B2: &str = "sc-20676-packed-group-affine-v1";
+        const B4: &str = "sc-20676-packed-group-affine-b4-v1";
+        validate(&set("group-affine", 2, B2)).unwrap();
+        validate(&set("group-affine-4", 4, B4)).unwrap();
+        for (method, bits, identity) in [
+            ("group-affine-4", 2, B2),
+            ("group-affine-4", 4, B2),
+            ("group-affine-4", 2, B4),
+            ("group-affine", 4, B4),
+            ("group-affine", 2, B4),
+            ("group-affine", 4, B2),
+        ] {
+            let error = validate(&set(method, bits, identity)).unwrap_err();
+            assert!(
+                error.contains(&format!("compressed method {method} is")),
+                "{method}/{bits}/{identity}: {error}"
+            );
+        }
+        let error = validate(&set("rvq-unwired", 2, B2)).unwrap_err();
+        assert!(error.contains("unknown compressed KV method"), "{error}");
     }
 
     #[test]

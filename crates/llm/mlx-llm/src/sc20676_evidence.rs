@@ -947,6 +947,9 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         || arm.memory.packed_metadata_bytes == 0
         || arm.memory.packed_device_bytes == 0
         || arm.continuation_dispatches == 0
+        // The warm pass reads the same representation as the primary.
+        || warm.bits != packed.bits
+        || warm.representation_identity != packed.representation_identity
         || !warm.kernel_warmed
         || warm.accepted_direct_calls == 0
         || warm.full_cache_dequantizations != 0
@@ -4184,6 +4187,10 @@ mod tests {
             }),
             packed: packed.then(packed_evidence),
             warm_packed: packed.then_some(PackedCacheEvidence {
+                representation_identity: "sc-20676-packed-group-affine-v1".into(),
+                representation_version: 2,
+                bits: 2,
+                quantization_group_size: 32,
                 accepted_direct_calls: 2,
                 kernel_paths: conservative_paths(2),
                 kernel_warmed: true,
@@ -4424,6 +4431,23 @@ mod tests {
             mislabeled.finish().unwrap_err(),
             "SC-20676 packed representation contract is not proven"
         );
+        // The warm pass must carry the primary's width and identity.
+        for (bits, identity) in [
+            (2, "sc-20676-packed-group-affine-b4-v1"),
+            (4, "sc-20676-packed-group-affine-v1"),
+        ] {
+            let mut split = receipt();
+            four_bit(&mut split, "sc-20676-packed-group-affine-b4-v1");
+            let warm = split.packed.warm_packed.as_mut().unwrap();
+            warm.bits = bits;
+            warm.representation_identity = identity.into();
+            reseal_arm(&mut split.packed);
+            assert_eq!(
+                split.finish().unwrap_err(),
+                "SC-20676 packed representation contract is not proven",
+                "warm {bits}-bit {identity}"
+            );
+        }
 
         assert!(require_arm_code_bits(&good.packed, PackedCodeBits::Four).is_ok());
         assert!(require_arm_code_bits(&good.packed, PackedCodeBits::Two)

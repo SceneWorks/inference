@@ -7106,19 +7106,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 let keys = shaped(411 + index as u64);
-                // 4-bit codes keep this fixture's V outliers that 2-bit codes flatten, which would
-                // push outputs past |4|, where one bf16 ULP (2^-5) exceeds the unchanged
-                // split-vs-single bound (tol/4 = 2e-2) and correctly rounded outputs may differ by
-                // it (f16: past |16|). The 4-bit pass therefore scales V into the range the bound
-                // can resolve (asserted below), leaving every bound as is.
-                let value_scale = match bits {
-                    PackedCodeBits::Two => 1.0,
-                    PackedCodeBits::Four => 0.75,
-                };
-                let values = shaped(507 + index as u64)
-                    .into_iter()
-                    .map(|value| value * value_scale)
-                    .collect::<Vec<_>>();
+                let values = shaped(507 + index as u64);
                 let queries = (0..batch * query_heads * query_len * width)
                     .map(|i| ((i * 37 + 3) % 61) as f32 * 0.02 - 0.6)
                     .collect::<Vec<_>>();
@@ -7203,16 +7191,14 @@ mod tests {
                     );
                     }
                     let single = single.get_or_insert_with(|| output.clone());
-                    // Magnitude below which one output ULP stays under tol/4 (bf16 2^-5 from 4,
-                    // f16 2^-6 from 16).
-                    let resolvable = if dtype == Dtype::Bfloat16 { 4.0 } else { 16.0 };
-                    assert!(
-                        bits == PackedCodeBits::Two
-                            || single.iter().all(|value| value.abs() < resolvable),
-                        "{bits:?} case {index}: fixture outputs exceed the resolvable range"
-                    );
+                    // Split and single pass round the same fp32 result to the 16-bit output, so
+                    // they may differ by one output ULP, which grows with |x| (bf16 2^-5 from 4):
+                    // the bound is relative above 1, the form the NAX-vs-tiled check below uses.
                     for (actual, expected) in output.iter().zip(single.iter()) {
-                        assert!((actual - expected).abs() <= tolerance / 4.0);
+                        assert!(
+                            (actual - expected).abs() <= tolerance / 4.0 * expected.abs().max(1.0),
+                            "{bits:?} case {index} splits {splits}: {actual} != single {expected}"
+                        );
                     }
                 }
                 // Same inputs through the fp32 tiled kernel: both read the identical representation, so
