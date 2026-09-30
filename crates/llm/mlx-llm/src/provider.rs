@@ -3764,4 +3764,85 @@ mod tests {
         assert_eq!(snapshot, price(&hybrid, SpeculativeRoute::Mtp { width: 3 }));
         assert!(snapshot > price(&hybrid, SpeculativeRoute::Plain));
     }
+
+    /// E1/E8: the backend-neutral greedy parity suite (core-llm-testkit) — the one Candle runs —
+    /// holds on both MLX decoders: prompt lookup at depths 1, 3, the recommended 4 and the max,
+    /// `auto`, and on the Qwen3.8 head MTP at depths 1 and 3, each emitting exactly `off`'s
+    /// stream with a report naming its proposer; and something was actually drafted and accepted.
+    #[test]
+    fn the_backend_neutral_parity_suite_holds_on_both_decoders() {
+        use core_llm::Speculative;
+        use core_llm_testkit::{BenchPrompt, ParityCase, PromptClass};
+        let prompts = vec![
+            BenchPrompt::user(
+                "repeat",
+                PromptClass::Predictable,
+                "t3 t9 t4 t11 t3 t9 t4 t11 t3 t9 t4 t11",
+            ),
+            BenchPrompt::user("sparse", PromptClass::OpenEnded, "t5 t8 t1 t20 t13"),
+        ];
+        let lookup = |depth| ParityCase {
+            speculative: Speculative::proposer(SpeculativeProposer::PromptLookup, depth),
+            expect_proposer: ProposerKind::PromptLookup,
+        };
+        let mtp = |depth| ParityCase {
+            speculative: Speculative::proposer(SpeculativeProposer::Mtp, depth),
+            expect_proposer: ProposerKind::Mtp,
+        };
+        let auto = |expect_proposer| ParityCase {
+            speculative: Speculative::Auto,
+            expect_proposer,
+        };
+        let depths = [
+            1,
+            3,
+            PROMPT_LOOKUP_RECOMMENDED_DEPTH,
+            PROMPT_LOOKUP_MAX_DEPTH,
+        ];
+        for (label, provider, cases) in [
+            (
+                "causal",
+                causal_provider(),
+                depths
+                    .map(lookup)
+                    .into_iter()
+                    .chain([auto(ProposerKind::PromptLookup)])
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "qwen35 mtp",
+                qwen35_mtp_provider(),
+                depths
+                    .map(lookup)
+                    .into_iter()
+                    .chain([mtp(1), mtp(3), auto(ProposerKind::Mtp)])
+                    .collect(),
+            ),
+        ] {
+            let rows =
+                core_llm_testkit::check_speculative_greedy_parity(&provider, &prompts, &cases, 20)
+                    .unwrap_or_else(|failures| panic!("{label}: {failures}"));
+            assert_eq!(rows.len(), prompts.len() * cases.len(), "{label}");
+            assert!(
+                rows.iter().all(|r| r.report.fallbacks.is_empty()),
+                "{label}: nothing fell back"
+            );
+            let drafted = |kind| {
+                rows.iter()
+                    .filter(|r| r.report.proposer == kind)
+                    .any(|r| r.report.proposed_tokens > 0)
+            };
+            assert!(
+                drafted(ProposerKind::PromptLookup),
+                "{label}: lookup drafted"
+            );
+            assert!(
+                rows.iter().any(|r| r.report.accepted_tokens > 0),
+                "{label}: some draft was accepted"
+            );
+            if label == "qwen35 mtp" {
+                assert!(drafted(ProposerKind::Mtp), "{label}: the head drafted");
+            }
+        }
+    }
 }
