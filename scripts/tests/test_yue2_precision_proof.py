@@ -51,12 +51,14 @@ class PrecisionControlTests(unittest.TestCase):
             "106 /opt/actions-runner/bin/Runner.Worker",
             "107 /bin/zsh",
             "108 /Applications/Safari.app/Contents/MacOS/Safari",
+            "109 /tmp/mlx-gen",
+            "110 /tmp/candle-gen",
         )) + "\n"
         result = type("Result", (), {"returncode": 0, "stdout": rows, "stderr": ""})()
         with patch.object(CONTROL.subprocess, "run", return_value=result) as run:
             raw, busy = CONTROL.metal_census()
         self.assertEqual(raw, rows)
-        self.assertEqual([int(line.split()[0]) for line in busy], [101, 102, 103, 104, 105])
+        self.assertEqual([int(line.split()[0]) for line in busy], [101, 102, 103, 104, 105, 109, 110])
         self.assertEqual(run.call_args.args[0], ["/bin/ps", "-axo", "pid=,comm="])
 
     def test_one_exact_ignored_test_must_execute(self):

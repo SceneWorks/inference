@@ -140,6 +140,7 @@ def metal_worker_executable(name: str) -> bool:
         or re.fullmatch(r"real_weight_tiling(?:-[0-9a-f]+)?", name)
         or name.startswith(("mlx-gen-", "mlx_gen_", "candle-gen-", "candle_gen_"))
         or name in {
+            "mlx-gen", "mlx_gen", "candle-gen", "candle_gen",
             "sceneworks-worker", "sceneworks-rust-api", "sceneworks-api",
             "memory-mlx-adapter", "memory-candle-adapter", "candle_audio_yue2",
             "candle-audio-yue2",
