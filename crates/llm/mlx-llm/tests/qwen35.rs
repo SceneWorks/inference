@@ -137,8 +137,19 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     let dir = write_tiny_qwen38_snapshot();
     let provider = LlamaProvider::load(&LoadSpec::dense(dir.path().display().to_string())).unwrap();
     let mtp = provider.descriptor().capabilities.mtp.unwrap();
-    assert_eq!(mtp.recommended_draft_tokens, 3);
-    assert_eq!(mtp.max_draft_tokens, u32::MAX);
+    assert_eq!(
+        mtp.recommended_draft_tokens,
+        mlx_llm::provider::MTP_RECOMMENDED_DEPTH
+    );
+    // 2q/1kv/hd 4: a head dim the vector kernel does not serve, so the 8-row bound (sc-24438).
+    assert_eq!(
+        mtp.max_draft_tokens,
+        mlx_llm::provider::speculative_max_depth([(2, 1, 4, 4)])
+    );
+    assert_eq!(
+        mtp.max_draft_tokens,
+        mlx_llm::provider::SPECULATIVE_MAX_DEPTH
+    );
 
     let ar = provider
         .generate(

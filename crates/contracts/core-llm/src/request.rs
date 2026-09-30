@@ -45,7 +45,8 @@ pub enum MtpMode {
     Auto,
     /// Require MTP and propose at most `draft_tokens` tokens per target verification pass.
     Enabled {
-        /// Number of speculative draft tokens. Must be within the provider's advertised limit.
+        /// Number of speculative draft tokens (`>= 1`). Above the provider's advertised limit it
+        /// runs at that limit, the clamp named in the decode report (sc-24438).
         draft_tokens: u32,
     },
 }
@@ -129,8 +130,10 @@ pub enum Speculative {
     /// backend offers neither ([`resolve_speculative`](crate::speculative::resolve_speculative)).
     Auto,
     /// Exactly this proposer, proposing up to `depth` tokens per target verification pass. A
-    /// proposer the model does not advertise, a zero depth, or a depth above the advertised
-    /// maximum is refused by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request).
+    /// proposer the model does not advertise, or a zero depth, is refused by
+    /// [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request); a
+    /// depth above the advertised maximum runs at that maximum, the clamp named in
+    /// [`DecodeReport::fallbacks`](crate::DecodeReport::fallbacks) (sc-24438).
     Proposer {
         /// The proposal source.
         proposer: SpeculativeProposer,
