@@ -13,13 +13,13 @@
 //!
 //! * A **dense** bank (every expert a plain `[out, in]` weight, the unquantized load) is held
 //!   stacked (`[experts, out, in]`). A decode-sized step — at most [`DEVICE_DISPATCH_MAX_ROWS`]
-//!   tokens, and no more (token, slot) pairs than experts — gathers each pair's expert weights by
-//!   its device index and runs one batched matmul per projection: no host read and shapes fixed by
-//!   the step, so nothing in it stops a graph capture (whether a recorded step replays is still
-//!   the graph runner's census to decide — candle uploads some ops' layouts from the host). Every
-//!   (token, slot) pair is its own one-row product, so a row never depends on its batch; the
-//!   products are accumulated in ascending expert order, the order the grouped loop below adds
-//!   them, so a one-token step reproduces the grouped dispatch bit for bit.
+//!   tokens — gathers each (token, slot) pair's expert weights by its device index and runs one
+//!   batched matmul per projection: no host read and shapes fixed by the step, so nothing in it
+//!   stops a graph capture (whether a recorded step replays is still the graph runner's census to
+//!   decide — candle uploads some ops' layouts from the host). Every (token, slot) pair is its own
+//!   one-row product, so a row never depends on its batch; the products are accumulated in
+//!   ascending expert order, the order the grouped loop below adds them, so a one-token step
+//!   reproduces the grouped dispatch bit for bit.
 //! * Larger batches (a prefill), and banks Candle cannot index by a device id — GGML-quantized,
 //!   NVFP4 or Prism experts, each its own kernel with no gathered matmul — are dispatched
 //!   grouped: the device-computed routes are read back once (one counted host sync), each expert
@@ -27,8 +27,16 @@
 //!   routing arithmetic of the pre-change block, fed by the device router. A model with such a
 //!   bank therefore still reads the device during a decode step and says so in
 //!   [`SparseMoe::graph_refusal`] (`moe_expert_host_dispatch`).
+//! * On the **CPU** every step is dispatched grouped. A host read costs nothing there (the tensors
+//!   already live in host memory, and there is no graph to break), and the grouped dispatch reads
+//!   each routed expert's weights in place where the stacked one first copies them: measured
+//!   1.5–1.8x slower stacked at 64 experts / k = 8 / hidden 1024 / expert FFN 512, t = 1–8
+//!   (`tests::stacked_vs_grouped_cpu_timing`). [`with_device_dispatch`] forces the GPU choice on
+//!   the CPU so tests exercise the dispatch a GPU step takes.
 
-use candle_core::{DType, Tensor};
+use std::cell::Cell;
+
+use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
 use crate::primitives::host_sync::note_host_sync;
@@ -42,6 +50,38 @@ pub const DEVICE_DISPATCH_MAX_ROWS: usize = 8;
 
 /// The graph-capture refusal of a model whose MoE bank is dispatched from host-read routes.
 pub const REASON_EXPERT_HOST_DISPATCH: &str = "moe_expert_host_dispatch";
+
+thread_local! {
+    static FORCE_DEVICE_DISPATCH: Cell<bool> = const { Cell::new(false) };
+    static DEVICE_DISPATCHES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Run `f` with this thread's MoE steps dispatched as on a GPU even when the tensors live on the
+/// CPU (which otherwise dispatches every step grouped — see the module docs). Test support: it lets
+/// a CPU test drive the stacked device dispatch through a whole model.
+pub fn with_device_dispatch<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_DEVICE_DISPATCH.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_DEVICE_DISPATCH.with(|c| c.replace(true)));
+    f()
+}
+
+/// MoE layer steps this thread has run through the stacked device dispatch (monotone; take
+/// deltas). With [`host_sync_count`](crate::primitives::host_sync_count) it says which dispatch a
+/// step's MoE layers took: every layer on the device, none reading back.
+pub fn moe_device_dispatch_count() -> u64 {
+    DEVICE_DISPATCHES.with(Cell::get)
+}
+
+/// Whether reading routes back to the host would cost `device` a pipeline drain: every GPU, and
+/// the CPU only when [`with_device_dispatch`] says to act like one.
+fn host_reads_stall(device: &Device) -> bool {
+    !device.is_cpu() || FORCE_DEVICE_DISPATCH.with(Cell::get)
+}
 
 /// A SwiGLU MLP over three projections: a routed expert of a bank Candle cannot stack, or the
 /// always-on shared expert.
@@ -223,13 +263,18 @@ impl SparseMoe {
         self.routing.experts_per_tok.clamp(1, self.num_experts)
     }
 
-    /// Why a step through this block cannot be captured as a CUDA graph, if it cannot: a bank
-    /// Candle cannot index by a device id is dispatched from host-read routes.
+    /// Whether a `t`-row step takes the stacked device dispatch on a GPU: the bank is stacked and
+    /// the step is decode-sized. The one dispatch decision — [`forward`](Self::forward) and
+    /// [`graph_refusal`](Self::graph_refusal) both read it.
+    fn device_dispatch(&self, t: usize) -> bool {
+        matches!(self.bank, ExpertBank::Stacked { .. }) && t <= DEVICE_DISPATCH_MAX_ROWS
+    }
+
+    /// Why a decode step through this block cannot be captured as a CUDA graph, if it cannot: a
+    /// decode-sized step (up to [`DEVICE_DISPATCH_MAX_ROWS`] tokens) that is not dispatched on the
+    /// device reads its routes back to the host.
     pub fn graph_refusal(&self) -> Option<&'static str> {
-        match self.bank {
-            ExpertBank::Stacked { .. } => None,
-            ExpertBank::PerExpert(_) => Some(REASON_EXPERT_HOST_DISPATCH),
-        }
+        (!self.device_dispatch(DEVICE_DISPATCH_MAX_ROWS)).then_some(REASON_EXPERT_HOST_DISPATCH)
     }
 
     /// Route every token on the device: the top-k expert ids `[t, k]` (u32, most probable first)
@@ -269,8 +314,9 @@ impl SparseMoe {
         let (ids, weights) = self.route(&xf)?;
         let routed = match &self.bank {
             ExpertBank::Stacked { gate, up, down }
-                if t <= DEVICE_DISPATCH_MAX_ROWS && t * self.top_k() <= self.num_experts =>
+                if self.device_dispatch(t) && host_reads_stall(xf.device()) =>
             {
+                DEVICE_DISPATCHES.with(|c| c.set(c.get().wrapping_add(1)));
                 dispatch_stacked(&xf, &ids, &weights, [gate, up, down])?
             }
             _ => self.dispatch_grouped(&xf, &ids, &weights)?,
@@ -389,6 +435,8 @@ fn dispatch_stacked(
     let k = ids.dim(1)?;
     // Visit each token's experts in ascending id order: the grouped dispatch adds them in that
     // order, and matching it keeps the two paths bit-identical.
+    // `ids` is `route`'s fresh `[t, k]` tensor: candle's CPU arg-sort reads from the start of the
+    // storage whatever a view's offset, so a narrowed view would sort the wrong rows.
     let (ids, perm) = ids.sort_last_dim(true)?;
     let weights = weights.gather(&perm, 1)?.to_dtype(xf.dtype())?; // [t, k]
     let flat = ids.flatten_all()?; // [t·k]
@@ -475,6 +523,12 @@ mod tests {
         norm_topk_prob: false,
         routed_scaling_factor: 2.5,
     };
+    /// Enough slots that the order the routed products are summed in shows in the bits.
+    const WIDE_K: MoeRouting = MoeRouting {
+        experts_per_tok: 6,
+        norm_topk_prob: true,
+        routed_scaling_factor: 1.0,
+    };
 
     /// The device router picks the top-k and weights them exactly as the host router did.
     #[test]
@@ -514,31 +568,29 @@ mod tests {
     }
 
     /// A single-token step through the stacked device dispatch is bit-identical to the grouped
-    /// dispatch (each routed expert sees exactly one row either way). A multi-row device step is
-    /// row-for-row bit-identical to running its tokens one at a time — every (token, slot) pair is
-    /// its own one-row product — and agrees with the grouped dispatch (whose per-expert GEMMs
-    /// span several rows) to rounding.
+    /// dispatch (each routed expert sees exactly one row either way). A multi-row device dispatch
+    /// is row-for-row bit-identical to dispatching its tokens' routes one at a time — every
+    /// (token, slot) pair is its own one-row product — and agrees with the grouped dispatch (whose
+    /// per-expert GEMMs span several rows) to rounding. (The router's own `[t, hidden]` matmul is a
+    /// plain GEMM whose rounding the backend may vary with `t`; the dispatch is compared on one
+    /// set of routes.)
     #[test]
     fn stacked_device_dispatch_matches_the_grouped_dispatch() {
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        for routing in [NORM, SCALED] {
+        for routing in [NORM, SCALED, WIDE_K] {
             let moe = block(8, 32, 16, routing, None);
             let ExpertBank::Stacked { gate, up, down } = &moe.bank else {
                 panic!("a dense bank stacks")
             };
-            let device = |x: &Tensor| {
-                let (ids, weights) = moe.route(x).unwrap();
-                host(&dispatch_stacked(x, &ids, &weights, [gate, up, down]).unwrap())
+            let device = |x: &Tensor, ids: &Tensor, weights: &Tensor| {
+                host(&dispatch_stacked(x, ids, weights, [gate, up, down]).unwrap())
             };
-            let grouped = |x: &Tensor| {
-                let (ids, weights) = moe.route(x).unwrap();
-                host(&moe.dispatch_grouped(x, &ids, &weights).unwrap())
-            };
-            let max_t = 8 / routing.experts_per_tok;
-            for t in 1..=max_t {
+            for t in 1..=DEVICE_DISPATCH_MAX_ROWS {
                 let mut rng = SplitMix64::new(0x2444_0200 + t as u64);
                 let x = randn(&[t, 32], &mut rng);
-                let (d, g) = (device(&x), grouped(&x));
+                let (ids, weights) = moe.route(&x).unwrap();
+                let d = device(&x, &ids, &weights);
+                let g = host(&moe.dispatch_grouped(&x, &ids, &weights).unwrap());
                 if t == 1 {
                     assert_eq!(bits(&d), bits(&g), "{routing:?}: device vs grouped");
                 } else {
@@ -549,8 +601,14 @@ mod tests {
                         .fold(0.0, f32::max);
                     assert!(md < 1e-6, "t={t} {routing:?}: device vs grouped {md}");
                 }
-                for ti in 0..t {
-                    let row = device(&x.narrow(0, ti, 1).unwrap());
+                let ids_host = ids.to_vec2::<u32>().unwrap();
+                for (ti, row_ids) in ids_host.iter().enumerate() {
+                    let one = |a: &Tensor| a.narrow(0, ti, 1).unwrap();
+                    // Fresh storage, not a view: candle's CPU arg-sort ignores a view's start
+                    // offset (it would sort row 0), and `route` never hands out a view.
+                    let row_ids =
+                        Tensor::from_slice(row_ids, (1, row_ids.len()), &Device::Cpu).unwrap();
+                    let row = device(&one(&x), &row_ids, &one(&weights));
                     assert_eq!(
                         bits(&d[ti * 32..(ti + 1) * 32]),
                         bits(&row),
@@ -561,33 +619,183 @@ mod tests {
         }
     }
 
-    /// A decode step through a dense bank reads nothing back; a quantized bank's grouped dispatch
-    /// reads its routes once — and says so as its graph refusal.
+    /// Syncs and device dispatches a `forward` of `x` issues on this thread.
+    fn step_counts(moe: &SparseMoe, x: &Tensor) -> (u64, u64) {
+        let (syncs, dispatches) = (host_sync_count(), moe_device_dispatch_count());
+        moe.forward(x).unwrap();
+        (
+            host_sync_count() - syncs,
+            moe_device_dispatch_count() - dispatches,
+        )
+    }
+
+    /// A decode step through a dense bank, dispatched as on a GPU, reads nothing back; a quantized
+    /// bank's grouped dispatch reads its routes once — and says so as its graph refusal. On the
+    /// CPU the dense bank goes grouped too (a host read is free there).
     #[test]
     fn host_reads_follow_the_bank() {
         let x = randn(&[1, 1, 64], &mut SplitMix64::new(3));
         let dense = block(8, 64, 64, NORM, None);
-        let before = host_sync_count();
-        dense.forward(&x).unwrap();
-        assert_eq!(host_sync_count() - before, 0);
+        assert_eq!(with_device_dispatch(|| step_counts(&dense, &x)), (0, 1));
         assert_eq!(dense.graph_refusal(), None);
+        assert_eq!(
+            step_counts(&dense, &x),
+            (1, 0),
+            "the CPU dispatches grouped"
+        );
 
         let q8 = block(8, 64, 64, NORM, Some(QuantSpec::q8()));
         assert_eq!(
             q8.expert_kind(0, ExpertPart::Gate),
             crate::primitives::projection::ProjectionKind::Ggml
         );
-        let before = host_sync_count();
-        q8.forward(&x).unwrap();
-        assert_eq!(host_sync_count() - before, 1);
+        assert_eq!(with_device_dispatch(|| step_counts(&q8, &x)), (1, 0));
         assert_eq!(q8.graph_refusal(), Some(REASON_EXPERT_HOST_DISPATCH));
     }
 
+    /// The graph refusal and `forward` make one decision: a full decode batch
+    /// ([`DEVICE_DISPATCH_MAX_ROWS`] tokens) through 8 experts at k = 2 — more (token, slot) pairs
+    /// than experts — is dispatched on the device and not refused; a prefill-sized step is not.
+    #[test]
+    fn the_graph_refusal_matches_the_dispatch_forward_takes() {
+        let dense = block(8, 64, 64, NORM, None);
+        let decode = randn(&[1, DEVICE_DISPATCH_MAX_ROWS, 64], &mut SplitMix64::new(4));
+        assert_eq!(dense.graph_refusal(), None);
+        assert_eq!(
+            with_device_dispatch(|| step_counts(&dense, &decode)),
+            (0, 1)
+        );
+        let prefill = randn(
+            &[1, DEVICE_DISPATCH_MAX_ROWS + 1, 64],
+            &mut SplitMix64::new(5),
+        );
+        assert_eq!(
+            with_device_dispatch(|| step_counts(&dense, &prefill)),
+            (1, 0)
+        );
+    }
+
+    /// Timing, not a gate: the stacked device dispatch against the grouped dispatch on the CPU at
+    /// a real-model-shaped layer (64 experts, k = 8, hidden 1024, expert FFN 512). Run by hand:
+    ///
+    /// ```text
+    /// cargo test -p candle-llm --release --lib moe::tests::stacked_vs_grouped_cpu_timing \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing; run by hand with --release"]
+    fn stacked_vs_grouped_cpu_timing() {
+        let (e, h, inter, k) = (64, 1024, 512, 8);
+        let routing = MoeRouting {
+            experts_per_tok: k,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+        };
+        let moe = block(e, h, inter, routing, None);
+        let ExpertBank::Stacked { gate, up, down } = &moe.bank else {
+            panic!("a dense bank stacks")
+        };
+        let median_ms = |f: &dyn Fn()| {
+            f();
+            let mut v: Vec<f64> = (0..15)
+                .map(|_| {
+                    let at = std::time::Instant::now();
+                    f();
+                    at.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for t in [1, 4, 8] {
+            let x = randn(&[t, h], &mut SplitMix64::new(t as u64));
+            let (ids, weights) = moe.route(&x).unwrap();
+            let stacked = median_ms(&|| {
+                dispatch_stacked(&x, &ids, &weights, [gate, up, down]).unwrap();
+            });
+            let grouped = median_ms(&|| {
+                moe.dispatch_grouped(&x, &ids, &weights).unwrap();
+            });
+            eprintln!(
+                "t={t} E={e} k={k} h={h} ffn={inter}: stacked {stacked:.3} ms, grouped \
+                 {grouped:.3} ms ({:.2}x)",
+                stacked / grouped
+            );
+        }
+    }
+
     /// Every device→host read in this module goes through [`read_routes`], so the host-sync
-    /// counter cannot miss one.
+    /// counter cannot miss one: no host-read spelling (method, UFCS or a move to the CPU) appears
+    /// anywhere else. And the device path — [`SparseMoe::route`] and [`dispatch_stacked`] — calls
+    /// only the device tensor ops named here, so a host read hidden in a helper (in this module or
+    /// another) cannot enter it either. A new op on that path is added to `DEVICE_OPS` on purpose.
     #[test]
     fn host_reads_go_through_read_routes() {
-        const RAW_READS: [&str; 5] = [".to_vec0", ".to_vec1", ".to_vec2", ".to_vec3", ".to_scalar"];
+        const RAW_READS: [&str; 9] = [
+            "to_vec0",
+            "to_vec1",
+            "to_vec2",
+            "to_vec3",
+            "to_scalar",
+            "to_device",
+            "Device::Cpu",
+            "storage_and_layout",
+            "to_cpu_storage",
+        ];
+        const DEVICE_PATH: [&str; 2] = ["route", "dispatch_stacked"];
+        const DEVICE_OPS: [&str; 28] = [
+            "Ok",
+            "f64::from",
+            "Tensor::zeros",
+            "candle_nn::ops::softmax_last_dim",
+            "swiglu",
+            "project",
+            "top_k",
+            "matmul",
+            "t",
+            "to_dtype",
+            "arg_sort_last_dim",
+            "sort_last_dim",
+            "narrow",
+            "contiguous",
+            "gather",
+            "broadcast_div",
+            "broadcast_mul",
+            "broadcast_as",
+            "dims2",
+            "dim",
+            "dtype",
+            "device",
+            "flatten_all",
+            "unsqueeze",
+            "squeeze",
+            "reshape",
+            "index_select",
+            "transpose",
+        ];
+        // The callee of every `name(` / `path::name(` / `name::<T>(` on a line.
+        fn calls(line: &str) -> Vec<String> {
+            let b = line.as_bytes();
+            let mut out = Vec::new();
+            for (i, _) in line.match_indices('(') {
+                let mut end = i;
+                if end > 0 && b[end - 1] == b'>' {
+                    // A turbofish: step back over `::<…>`.
+                    match line[..end].rfind("::<") {
+                        Some(at) => end = at,
+                        None => continue,
+                    }
+                }
+                let start = line[..end]
+                    .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+                    .map_or(0, |at| at + 1);
+                let name = &line[start..end];
+                if !name.is_empty() && !name.starts_with(':') {
+                    out.push(name.to_owned());
+                }
+            }
+            out
+        }
         let source = include_str!("moe.rs");
         let code = &source[..source
             .find("#[cfg(test)]\nmod tests {")
@@ -599,14 +807,21 @@ mod tests {
             if trimmed.starts_with("//") {
                 continue;
             }
-            if let Some(at) = trimmed.find("fn ") {
+            let signature = trimmed.find("fn ").map(|at| {
                 current_fn = trimmed[at + 3..]
                     .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                     .next()
                     .unwrap_or_default();
-            }
+            });
             if RAW_READS.iter().any(|r| line.contains(r)) && current_fn != "read_routes" {
                 raw.push(format!("line {}: {}", n + 1, line.trim()));
+            }
+            if DEVICE_PATH.contains(&current_fn) && signature.is_none() {
+                for callee in calls(line.split("//").next().unwrap_or_default()) {
+                    if !DEVICE_OPS.contains(&callee.as_str()) {
+                        raw.push(format!("line {}: `{callee}` on the device path", n + 1));
+                    }
+                }
             }
         }
         assert!(raw.is_empty(), "uncounted host reads:\n{}", raw.join("\n"));

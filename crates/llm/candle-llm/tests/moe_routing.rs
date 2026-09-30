@@ -9,8 +9,15 @@
 //!   read back to the host every layer, per-expert token lists, `index_add` scatter). They were
 //!   captured by running this file on the base branch (`f4ce41e50`) *before* the router changed,
 //!   so a match is parity with the old router — not the new router agreeing with itself.
-//! * **No host read in the router.** A decode step on an MoE fixture issues zero counted
-//!   device→host transfers ([`host_sync_count`]); the old router issued one per MoE layer.
+//! * **No host read in the router.** A decode step on an MoE fixture, dispatched as on a GPU
+//!   ([`with_device_dispatch`]), runs every MoE layer through the stacked device dispatch
+//!   ([`moe_device_dispatch_count`]) and issues zero counted device→host transfers
+//!   ([`host_sync_count`]). The counter only sees reads that note themselves: the old Qwen3.6-MoE
+//!   router counted its read, the old `CausalLm` one (Qwen2-MoE, DeepSeek-V2) did not, so the
+//!   device-dispatch count is what separates the old router from the new for those two. A read
+//!   hidden inside the new router itself is the source lint's to catch
+//!   (`primitives::moe::tests::host_reads_go_through_read_routes`): Candle exposes no hook on a
+//!   CPU tensor read.
 //! * **No MoE graph refusal.** [`StepModel::graph_support`] no longer names
 //!   `moe_router_host_read` for an MoE model.
 //!
@@ -28,6 +35,7 @@ use serde_json::{json, Map, Value};
 use candle_llm::config::ModelConfig;
 use candle_llm::decode::StepModel;
 use candle_llm::models::{CausalLm, Qwen35Config, Qwen35Model};
+use candle_llm::primitives::moe::{moe_device_dispatch_count, with_device_dispatch};
 use candle_llm::primitives::{
     host_sync_count, input_ids, QuantSpec, SplitMix64, TokenRng, Weights,
 };
@@ -453,7 +461,8 @@ fn greedy_cases() -> Vec<(&'static str, Vec<i32>)> {
     ]
 }
 
-/// **AC1.** Every MoE family's greedy tokens are identical to the pre-change router's.
+/// **AC1.** Every MoE family's greedy tokens are identical to the pre-change router's — through
+/// the CPU's grouped dispatch and through the stacked device dispatch a GPU step takes.
 #[test]
 fn moe_greedy_tokens_match_the_pre_change_router() {
     let cases = greedy_cases();
@@ -483,7 +492,8 @@ fn moe_greedy_tokens_match_the_pre_change_router() {
         &std::fs::read_to_string(golden_path()).expect("the MoE greedy goldens are committed"),
     )
     .unwrap();
-    for (name, got) in &cases {
+    let device = with_device_dispatch(greedy_cases);
+    for (name, got) in cases.iter().chain(&device) {
         let want: Vec<i32> = golden[*name]
             .as_array()
             .unwrap_or_else(|| panic!("{name}: missing from the MoE greedy goldens"))
@@ -497,46 +507,57 @@ fn moe_greedy_tokens_match_the_pre_change_router() {
     }
 }
 
-/// **AC2.** A decode step on an MoE fixture performs zero host reads: the old router pulled its
-/// probabilities to the host once per MoE layer, each a counted host sync.
+/// Prefill [`PROMPT`] through `step` (`tokens`, `offset`), then count the host syncs and MoE
+/// device dispatches of one decode step — both dispatched as a GPU would dispatch them.
+fn decode_step_counts(mut step: impl FnMut(&[i32], i32)) -> (u64, u64) {
+    with_device_dispatch(|| {
+        step(&PROMPT, 0);
+        let (syncs, dispatches) = (host_sync_count(), moe_device_dispatch_count());
+        step(&[7], PROMPT.len() as i32);
+        (
+            host_sync_count() - syncs,
+            moe_device_dispatch_count() - dispatches,
+        )
+    })
+}
+
+/// **AC2.** A decode step on an MoE fixture routes every MoE layer on the device and reads nothing
+/// back to the host (see the module docs for what each counter can and cannot see).
 #[test]
 fn an_moe_decode_step_reads_nothing_back_to_the_host() {
     let dev = Device::Cpu;
     let (q2, q2w) = qwen2_moe(TINY, false, 0x2444_0001);
     let (ds, dsw) = deepseek_v2(0x2444_0003);
-    for (name, model) in [
-        ("qwen2_moe", causal(&q2, &q2w, None)),
-        ("deepseek_v2", causal(&ds, &dsw, None)),
+    // Qwen2-MoE: every layer sparse; DeepSeek-V2: the first layer dense.
+    for (name, model, moe_layers) in [
+        ("qwen2_moe", causal(&q2, &q2w, None), TINY.layers as u64),
+        ("deepseek_v2", causal(&ds, &dsw, None), 2),
     ] {
         let mut cache = model.new_cache();
-        model
-            .decode_logits(&input_ids(&PROMPT, &dev).unwrap(), &mut cache, 0)
-            .unwrap();
-        let ids = input_ids(&[7], &dev).unwrap();
-        let before = host_sync_count();
-        let logits = model
-            .decode_logits(&ids, &mut cache, PROMPT.len() as i32)
-            .unwrap();
-        let syncs = host_sync_count() - before;
-        assert_eq!(syncs, 0, "{name}: a decode step read the device {syncs}x");
-        drop(logits);
+        let counts = decode_step_counts(|tokens, offset| {
+            model
+                .decode_logits(&input_ids(tokens, &dev).unwrap(), &mut cache, offset)
+                .unwrap();
+        });
+        assert_eq!(
+            counts,
+            (0, moe_layers),
+            "{name}: (host syncs, MoE layers dispatched on the device) of a decode step"
+        );
     }
 
     let (q35, q35w) = qwen35_moe(0x2444_0004);
     let model = qwen35(&q35, &q35w);
     let mut cache = model.new_cache();
-    model
-        .decode_logits(&input_ids(&PROMPT, &dev).unwrap(), &mut cache, 0)
-        .unwrap();
-    let ids = input_ids(&[7], &dev).unwrap();
-    let before = host_sync_count();
-    model
-        .decode_logits(&ids, &mut cache, PROMPT.len() as i32)
-        .unwrap();
-    let syncs = host_sync_count() - before;
+    let counts = decode_step_counts(|tokens, offset| {
+        model
+            .decode_logits(&input_ids(tokens, &dev).unwrap(), &mut cache, offset)
+            .unwrap();
+    });
     assert_eq!(
-        syncs, 0,
-        "qwen35_moe: a decode step read the device {syncs}x"
+        counts,
+        (0, 4),
+        "qwen35_moe: (host syncs, MoE layers dispatched on the device) of a decode step"
     );
 }
 

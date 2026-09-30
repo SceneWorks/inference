@@ -154,6 +154,12 @@ impl SwitchLinear {
         })
     }
 
+    /// The experts stacked on the leading axis.
+    pub fn num_experts(&self) -> usize {
+        let (Self::Dense { weight } | Self::Quantized { weight, .. }) = self;
+        weight.shape().first().copied().unwrap_or(0) as usize
+    }
+
     /// Whether the bank is quantized.
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. })
@@ -220,7 +226,9 @@ pub struct SparseMoe {
 
 impl SparseMoe {
     /// Assemble the block. `router` is `[experts, hidden]`; `gate` / `up` / `down` are the stacked
-    /// routed-expert projections (`[experts, inter, hidden]` / `[experts, hidden, inter]`).
+    /// routed-expert projections (`[experts, inter, hidden]` / `[experts, hidden, inter]`). A bank
+    /// whose expert count disagrees with the router's rows is refused: the gathered matmuls would
+    /// index past it without complaint.
     pub fn new(
         router: Array,
         gate: SwitchLinear,
@@ -235,6 +243,14 @@ impl SparseMoe {
             return Err(Error::Config(
                 "an MoE router needs at least one expert".into(),
             ));
+        }
+        for (name, bank) in [("gate", &gate), ("up", &up), ("down", &down)] {
+            if bank.num_experts() != num_experts {
+                return Err(Error::Config(format!(
+                    "an MoE router over {num_experts} experts needs as many {name} experts, got {}",
+                    bank.num_experts()
+                )));
+            }
         }
         Ok(Self {
             router,
@@ -471,6 +487,12 @@ mod tests {
         out
     }
 
+    const NORM: MoeRouting = MoeRouting {
+        experts_per_tok: 2,
+        norm_topk_prob: true,
+        routed_scaling_factor: 1.0,
+    };
+
     fn max_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
             .zip(b)
@@ -577,5 +599,51 @@ mod tests {
             SwitchLinear::stack(parts),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    /// A router whose row count disagrees with the expert banks is refused at load (dense and
+    /// quantized banks alike), never handed to `gather_mm` / `gather_qmm` as an out-of-range index.
+    #[test]
+    fn a_router_that_disagrees_with_the_bank_is_refused() {
+        let mut rng = SplitMix64::new(2);
+        let (e, h, inter) = (4, 64, 64);
+        for quant in [None, Some(QuantSpec::q8())] {
+            let bank = |rng: &mut SplitMix64, out: i32, inn: i32| {
+                SwitchLinear::load(randn(&[e, out, inn], rng), quant).unwrap()
+            };
+            let shared = || SwiGlu {
+                gate: Projection::load(randn(&[inter, h], &mut SplitMix64::new(3)), None).unwrap(),
+                up: Projection::load(randn(&[inter, h], &mut SplitMix64::new(4)), None).unwrap(),
+                down: Projection::load(randn(&[h, inter], &mut SplitMix64::new(5)), None).unwrap(),
+            };
+            let (gate, up, down) = (
+                bank(&mut rng, inter, h),
+                bank(&mut rng, inter, h),
+                bank(&mut rng, h, inter),
+            );
+            let short = SparseMoe::new(
+                randn(&[e - 1, h], &mut rng),
+                gate,
+                up,
+                down,
+                shared(),
+                None,
+                NORM,
+            );
+            assert!(
+                matches!(short, Err(Error::Config(_))),
+                "{quant:?}: a router one row short is accepted"
+            );
+            let whole = SparseMoe::new(
+                randn(&[e, h], &mut rng),
+                bank(&mut rng, inter, h),
+                bank(&mut rng, inter, h),
+                bank(&mut rng, h, inter),
+                shared(),
+                None,
+                NORM,
+            );
+            assert!(whole.is_ok(), "{quant:?}: a matching router is refused");
+        }
     }
 }
