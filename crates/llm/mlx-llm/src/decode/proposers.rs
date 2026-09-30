@@ -1,7 +1,8 @@
-//! The MLX engine's proposal sources (epic sc-24432, story sc-24434): prompt lookup
-//! ([`NgramProposer`], any target) and the native Qwen3.8 multi-token predictor ([`MtpProposer`],
-//! the Qwen35 target). Each implements [`Proposer`]; the loop that verifies, accepts and rolls back
-//! is the one [`engine`](super::engine).
+//! The MLX engine's proposal sources (epic sc-24432, stories sc-24434 and sc-24436): prompt
+//! lookup ([`NgramProposer`], any target), the native Qwen3.8 multi-token predictor
+//! ([`MtpProposer`], the Qwen35 target) and a separate draft model ([`DraftModelProposer`], any
+//! target and any draft decoder). Each implements [`Proposer`]; the loop that verifies, accepts
+//! and rolls back is the one [`engine`](super::engine).
 
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
@@ -11,8 +12,9 @@ use core_llm::ProposerKind;
 
 use crate::decode::cancel::CancelFlag;
 use crate::decode::engine::{
-    generate_speculative, seq_rows, DraftSampler, EngineOptions, Proposal, ProposeContext,
-    Proposer, RewindableConstraintMask, SpeculativePrompt, SpeculativeTarget,
+    generate_speculative, seq_rows, CacheRollback, DraftSampler, EngineOptions, LogitsScope,
+    Proposal, ProposeContext, Proposer, RewindableConstraintMask, Rollback, SpeculativePrompt,
+    SpeculativeTarget,
 };
 use crate::decode::speculative::SpeculativeStats;
 use crate::decode::stream::{GenerationConfig, GenerationOutput, StreamEvent};
@@ -58,6 +60,145 @@ impl<T: SpeculativeTarget + ?Sized> Proposer<T> for NgramProposer {
     }
 
     fn commit(&mut self, _: &T, _: i32, _: &[i32], _: Option<&Array>, _: i32) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A separate **draft model** as a proposer (sc-24436): any decoder behind the engine's own
+/// [`SpeculativeTarget`] seam — its cache and its rollback policy come with it — proposing up to
+/// `K` drafts autoregressively from its own distribution `q`, which a stochastic run hands to the
+/// exact rejection rule. The draft must score the target's token ids (the provider checks the
+/// tokenizer vocabulary and logits width at load, [`core_llm::draft_compatibility`]).
+///
+/// The draft's cache holds only target-confirmed tokens between steps. A proposal feeds the
+/// committed tokens the cache has not seen yet together with `cur` in one forward, marks that
+/// point as the step start ([`CacheRollback::begin`]), then feeds each draft but the last. The
+/// commit keeps the accepted drafts already fed — by truncation, or by restoring the step start
+/// on a cache that cannot truncate (the Qwen35 hybrid) — and queues the rest of the accepted run
+/// for the next proposal's first forward, so no step pays an extra draft forward to catch up.
+pub struct DraftModelProposer<'d, D: SpeculativeTarget + ?Sized> {
+    draft: &'d D,
+    cache: Option<D::Cache>,
+    rollback: D::Rollback,
+    /// Committed tokens not yet in the draft cache, fed ahead of `cur` by the next proposal.
+    pending: Vec<i32>,
+    /// Drafts the last proposal wrote into the cache past the step start (`None`: no proposal
+    /// this step, so `cur` itself was never fed).
+    fed: Option<usize>,
+    /// Draft-model forwards issued (its own cost, separate from the target's).
+    pub draft_forwards: u64,
+}
+
+impl<'d, D: SpeculativeTarget + ?Sized> DraftModelProposer<'d, D> {
+    /// A proposer over `draft`.
+    pub fn new(draft: &'d D) -> Self {
+        Self {
+            draft,
+            cache: None,
+            rollback: draft.rollback(),
+            pending: Vec::new(),
+            fed: None,
+            draft_forwards: 0,
+        }
+    }
+
+    fn cache(&mut self) -> Result<&mut D::Cache> {
+        self.cache
+            .as_mut()
+            .ok_or_else(|| Error::Msg("DraftModelProposer: propose before warm".into()))
+    }
+
+    /// Run `ids` through the draft at the end of its cache, returning the last row's logits.
+    fn feed(&mut self, ids: &[i32]) -> Result<Array> {
+        let draft = self.draft;
+        let cache = self.cache()?;
+        let offset = draft.cache_len(cache);
+        let out = draft.forward(cache, ids, offset, LogitsScope::Last, false)?;
+        self.draft_forwards += 1;
+        Ok(out.logits)
+    }
+}
+
+impl<T, D> Proposer<T> for DraftModelProposer<'_, D>
+where
+    T: SpeculativeTarget + ?Sized,
+    D: SpeculativeTarget + ?Sized,
+{
+    fn kind(&self) -> ProposerKind {
+        ProposerKind::DraftModel
+    }
+
+    fn warm(&mut self, _: &T, prompt: &[i32], _: Option<&Array>) -> Result<Option<Array>> {
+        self.cache = Some(self.draft.new_cache());
+        self.pending.clear();
+        self.fed = None;
+        // The draft prefill's logits are the warm-up graph the engine synchronizes at the prefill
+        // boundary; the first proposal feeds `cur` after it.
+        Ok(Some(self.feed(prompt)?))
+    }
+
+    fn propose(
+        &mut self,
+        _: &T,
+        ctx: &ProposeContext<'_>,
+        sampler: &mut DraftSampler<'_, '_>,
+    ) -> Result<Proposal> {
+        let mut confirmed = std::mem::take(&mut self.pending);
+        confirmed.push(ctx.cur);
+        let mut logits = self.feed(&confirmed)?;
+        let cache = self
+            .cache
+            .as_mut()
+            .ok_or_else(|| Error::Msg("DraftModelProposer: propose before warm".into()))?;
+        // Everything up to `cur` is target-confirmed: the step start a rejection returns to.
+        self.rollback.begin(cache);
+
+        let mut fed = 0usize;
+        let mut drafts = Vec::with_capacity(ctx.max_drafts);
+        let mut dists = Vec::with_capacity(ctx.max_drafts);
+        let mut draft_history = ctx.history.to_vec();
+        for step in 0..ctx.max_drafts {
+            let (token, dist) = sampler.sample_draft(&logits, &draft_history)?;
+            dists.extend(dist);
+            drafts.push(token);
+            draft_history.push(token);
+            if sampler.is_stop(token) || step + 1 == ctx.max_drafts {
+                break;
+            }
+            logits = self.feed(&[token])?;
+            fed += 1;
+        }
+        self.fed = Some(fed);
+        Ok(Proposal { drafts, dists })
+    }
+
+    fn commit(
+        &mut self,
+        _: &T,
+        cur: i32,
+        accepted: &[i32],
+        _: Option<&Array>,
+        _: i32,
+    ) -> Result<()> {
+        let Some(fed) = self.fed.take() else {
+            // A step with no proposal (the budget clamped it to no drafts): `cur` was never fed.
+            self.pending.push(cur);
+            return Ok(());
+        };
+        let draft = self.draft;
+        let rollback = &mut self.rollback;
+        let cache = self
+            .cache
+            .as_mut()
+            .ok_or_else(|| Error::Msg("DraftModelProposer: commit before warm".into()))?;
+        let kept = accepted.len().min(fed);
+        let step_start = draft.cache_len(cache) - fed as i32;
+        self.pending = match rollback.recover(cache, step_start + kept as i32)? {
+            // The cache holds `cur` and the first `kept` accepted drafts.
+            Rollback::Direct => accepted[kept..].to_vec(),
+            // Back at the step start (just past `cur`): the whole accepted run is still to feed.
+            Rollback::Restored => accepted.to_vec(),
+        };
         Ok(())
     }
 }

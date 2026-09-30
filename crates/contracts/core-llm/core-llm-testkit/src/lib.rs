@@ -29,8 +29,13 @@ use core_llm::{
 use std::path::PathBuf;
 
 pub mod comparison;
+pub mod draft_model;
 pub mod speculative;
 pub mod starvector;
+pub use draft_model::{
+    check_draft_model_refused, check_draft_model_resident, draft_model_parity_cases,
+    draft_model_prompts, write_draft_model_fixture, DraftModelFixture, DRAFT_FIXTURE_VOCAB,
+};
 pub use speculative::{
     bench_request, check_speculative_greedy_parity, parse_bench_sampling, run_speculative_bench,
     sampling_json, speculative_prompt_set, BenchConfig, BenchDocument, BenchPrompt, BenchRow,

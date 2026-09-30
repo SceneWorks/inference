@@ -1107,7 +1107,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::config::{Architecture, ModelConfig};
-    use crate::decode::proposers::{MtpProposer, NgramProposer};
+    use crate::decode::proposers::{DraftModelProposer, MtpProposer, NgramProposer};
     use crate::decode::stream::generate_with;
     use crate::models::qwen35::tests::{cfg_json, cfg_json_mtp, synthetic_weights};
     use crate::models::Qwen35Config;
@@ -1118,14 +1118,22 @@ pub(crate) mod tests {
     /// A tiny random llama-family decoder (vocab 24) whose greedy continuation of [`PROMPT`]
     /// repeats its context, so prompt lookup proposes, accepts and rejects.
     pub(crate) fn causal() -> CausalLm {
+        causal_model(24, 2)
+    }
+
+    /// The tiny llama-family decoder over `vocab` ids with its first `layers` layers. The weights
+    /// are drawn in a fixed order (embedding, output projection, then layer by layer), so a
+    /// shallower model is the deeper one with its later layers skipped — a draft that shares the
+    /// target's embedding, output projection and first layer (sc-24436).
+    pub(crate) fn causal_model(vocab: i32, layers: usize) -> CausalLm {
         let cfg = ModelConfig {
             hidden_size: 16,
             intermediate_size: 32,
-            num_layers: 2,
+            num_layers: layers,
             num_heads: 4,
             num_kv_heads: 2,
             head_dim: 4,
-            vocab_size: 24,
+            vocab_size: vocab,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             rope_scaling: None,
@@ -1645,5 +1653,203 @@ pub(crate) mod tests {
             run.report.verify_steps + 1,
             "one decision per step"
         );
+    }
+
+    // ---- Draft-model speculation on the engine (epic sc-24432, story sc-24436). ----
+
+    /// Every greedy configuration through [`DraftModelProposer`] over `draft` against the plain
+    /// loop on `target`: identical tokens and constraint advance, a report naming `draft_model`.
+    /// Returns each configuration's counters.
+    fn draft_matches_plain<T, D>(
+        label: &str,
+        target: &T,
+        draft: &D,
+        vocab: usize,
+    ) -> Vec<SpeculativeStats>
+    where
+        T: SpeculativeTarget + crate::decode::Decode,
+        D: SpeculativeTarget,
+    {
+        let mut all = Vec::new();
+        for (name, config, constrained, _) in configs()
+            .into_iter()
+            .filter(|c| !c.0.contains("stochastic"))
+        {
+            let (mut a, mut b) = (Forbid::new(vocab, &[1, 9]), Forbid::new(vocab, &[1, 9]));
+            let expected = plain(target, &PROMPT, &config, constrained.then_some(&mut a));
+            let mut proposer = DraftModelProposer::new(draft);
+            let run = engine(
+                target,
+                &mut proposer,
+                &PROMPT,
+                &config,
+                4,
+                constrained.then_some(&mut b),
+            );
+            assert_eq!(run.output.tokens, expected.tokens, "{label} {name}");
+            assert_eq!(b.accepted, a.accepted, "{label} {name}: constraint");
+            assert_eq!(run.report.path, "draft_model", "{label} {name}");
+            assert_eq!(
+                run.report.proposer,
+                ProposerKind::DraftModel,
+                "{label} {name}"
+            );
+            assert_eq!(run.report.draft_tokens, Some(4), "{label} {name}");
+            assert!(run.stats.proposed > 0, "{label} {name}: the draft proposed");
+            assert!(proposer.draft_forwards > 0, "{label} {name}");
+            all.push(run.stats);
+        }
+        all
+    }
+
+    /// sc-24436 AC1 (engine half): a draft model proposes through the one engine loop and every
+    /// greedy configuration emits exactly the plain loop's tokens, whichever way each cache rolls
+    /// back — a truncating target with a truncating layer-skip draft (accepted and rejected
+    /// drafts), the hybrid target (snapshot + replay) with a softmax draft, a softmax target with
+    /// the hybrid as its draft (the draft restores its own step start), and the hybrid drafting
+    /// for an identical hybrid (every draft accepted).
+    #[test]
+    fn greedy_draft_model_is_the_plain_loop_on_every_cache_pairing() {
+        let stats = draft_matches_plain("causal/causal", &causal(), &causal_model(24, 1), 24);
+        let (accepted, proposed) = stats
+            .iter()
+            .fold((0, 0), |(a, p), s| (a + s.accepted, p + s.proposed));
+        assert!(
+            accepted > 0 && accepted < proposed,
+            "the layer-skip draft is accepted and rejected: {accepted} of {proposed}"
+        );
+        assert!(stats.iter().any(|s| s.direct_rollbacks > 0), "{stats:?}");
+
+        let stats = draft_matches_plain("hybrid/causal", &qwen35(false), &causal_model(50, 1), 50);
+        assert!(stats.iter().all(|s| s.direct_rollbacks == 0), "{stats:?}");
+
+        draft_matches_plain("causal/hybrid", &causal_model(50, 2), &qwen35(false), 50);
+
+        let stats = draft_matches_plain("hybrid/hybrid", &qwen35(false), &qwen35(false), 50);
+        assert!(
+            stats.iter().all(|s| s.accepted == s.proposed),
+            "a draft identical to its target is always accepted: {stats:?}"
+        );
+    }
+
+    /// sc-24436 E1: a stochastic draft hands the engine the proposal distribution `q` each draft
+    /// was drawn from — one per draft, each containing its draft — so the exact rejection rule
+    /// compares the target's `p` against the draft's own `q`; seeded runs reproduce.
+    #[test]
+    fn a_stochastic_draft_model_reports_one_q_per_draft_and_is_seeded() {
+        let target = causal();
+        let draft = causal_model(24, 1);
+        let config = stochastic(20);
+        let mut proposer = DraftModelProposer::new(&draft);
+        Proposer::<CausalLm>::warm(&mut proposer, &target, &PROMPT, None).unwrap();
+        let mut history = PROMPT.to_vec();
+        history.push(5);
+        let mut sampler = MlxSampler::from_config(&config);
+        let mut draft_sampler = DraftSampler {
+            config: &config,
+            sampler: &mut sampler,
+            constraint: None,
+        };
+        let ctx = ProposeContext {
+            cur: 5,
+            history: &history,
+            previous_hidden: None,
+            position: PROMPT.len() as i32,
+            max_drafts: 4,
+        };
+        let proposal = proposer.propose(&target, &ctx, &mut draft_sampler).unwrap();
+        assert_eq!(proposal.drafts.len(), 4);
+        assert_eq!(
+            proposal.dists.len(),
+            proposal.drafts.len(),
+            "one q per draft"
+        );
+        for (draft, q) in proposal.drafts.iter().zip(&proposal.dists) {
+            assert!(
+                q.iter().any(|&(t, w)| t == *draft && w > 0.0),
+                "{draft} in {q:?}"
+            );
+            // Weights need not be normalized (`accept_token` normalizes each set).
+            assert!(q.iter().all(|&(_, w)| w >= 0.0), "{q:?}");
+        }
+        // The prompt, `cur` and all but the last draft are in the draft cache.
+        assert_eq!(proposer.draft_forwards, 1 + 4);
+
+        let run = |seed| {
+            let mut config = stochastic(20);
+            config.seed = Some(seed);
+            engine(
+                &target,
+                &mut DraftModelProposer::new(&draft),
+                &PROMPT,
+                &config,
+                3,
+                None,
+            )
+        };
+        let (a, b) = (run(11), run(11));
+        assert_eq!(a.output.tokens, b.output.tokens);
+        assert_eq!(a.output.tokens.len(), 20);
+        assert_eq!(a.report.proposer, ProposerKind::DraftModel);
+        assert!(a.stats.proposed > 0 && a.stats.accepted <= a.stats.proposed);
+    }
+
+    /// E1 through the engine's own verify decision: over drafts drawn from a proposal `q`, the
+    /// committed token is distributed as the target's shaped `p` — with the point mass a lookup
+    /// reports and with the actual `q` a draft model reports (the `p / q` ratio then decides).
+    /// The MLX twin of Candle's `stochastic_decision_preserves_the_target_distribution_chi_square`.
+    #[test]
+    fn stochastic_decision_preserves_the_target_distribution_chi_square() {
+        use core_llm::speculative::sample_weighted;
+        let vocab = 5usize;
+        let p_logits = [1.0f32, 2.2, 0.3, 1.7, -0.5];
+        let mut config = greedy(1);
+        config.sampling.temperature = 1.0;
+        config.sampling.top_p = 1.0;
+        config.sampling.top_k = 0;
+        let mut rows = p_logits.to_vec();
+        rows.extend(vec![0.0f32; vocab]);
+        let logits = Array::from_slice(&rows, &[1, 2, vocab as i32]);
+        let q: Vec<(i32, f32)> = vec![(0, 0.4), (1, 0.1), (2, 0.2), (3, 0.1), (4, 0.2)];
+        let max = p_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<f64> = p_logits.iter().map(|&x| ((x - max) as f64).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        let n = 20_000usize;
+        let point_mass = |t: i32| vec![(t, 1.0f32)];
+        let draft_q = |_: i32| q.clone();
+        type DistOf<'a> = &'a dyn Fn(i32) -> Vec<(i32, f32)>;
+        let cases: [(&str, DistOf<'_>); 2] = [("point mass", &point_mass), ("draft q", &draft_q)];
+        for (name, dist_of) in cases {
+            let mut sampler = MlxSampler::new(config.sampling, 0x5eed);
+            let mut proposals = SplitMix64::new(0x24436);
+            let mut counts = vec![0u64; vocab];
+            for _ in 0..n {
+                let proposed = sample_weighted(&q, proposals.next_f32(), 0);
+                let (committed, _) = decide(
+                    &logits,
+                    &[proposed],
+                    &[dist_of(proposed)],
+                    &[],
+                    &config,
+                    &mut sampler,
+                    None,
+                )
+                .unwrap();
+                counts[committed[0] as usize] += 1;
+            }
+            let chi2: f64 = counts
+                .iter()
+                .enumerate()
+                .map(|(t, &c)| {
+                    let expected = n as f64 * weights[t] / total;
+                    (c as f64 - expected).powi(2) / expected
+                })
+                .sum();
+            // 4 degrees of freedom: chi-square 99.9 % critical value 18.47.
+            assert!(
+                chi2 < 18.47,
+                "{name}: chi-square {chi2:.2} over counts {counts:?}"
+            );
+        }
     }
 }

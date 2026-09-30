@@ -179,6 +179,27 @@ pub fn admit_request_memory(required: u64, available: u64) -> Result<()> {
     Ok(())
 }
 
+/// Load admission for a target plus a named draft model (epic sc-24432 E7, story sc-24436): the
+/// draft's weights are admitted **beside** the target's, never instead of them. `Err` when the
+/// target alone does not fit — the ordinary load refusal, a draft never masks it; `Ok(None)` when
+/// both fit (load the draft); `Ok(Some(reason))` when the target fits but the draft does not
+/// fit beside it — the draft is refused with that reason and the target loads alone (E2: a
+/// draft never fails the load).
+pub fn admit_draft_load(
+    target_required: u64,
+    draft_required: u64,
+    available: u64,
+) -> Result<Option<String>> {
+    admit_request_memory(target_required, available)?;
+    Ok(match target_required.checked_add(draft_required) {
+        Some(both) if both <= available => None,
+        _ => Some(format!(
+            "draft model: its load needs an estimated {draft_required} bytes beside the \
+             target's {target_required}, but only {available} bytes are available"
+        )),
+    })
+}
+
 /// Reject an architecturally valid generation request with typed preallocation evidence.
 pub fn admit_request_memory_with_geometry(
     prompt_tokens: usize,
@@ -336,6 +357,21 @@ pub fn checkpoint_staging_bytes(source: &std::path::Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E7: a draft is admitted only beside the target; a target that does not fit is refused as
+    /// before (a draft never masks it), and a draft without room is refused by name while the
+    /// target still loads.
+    #[test]
+    fn a_draft_is_admitted_beside_the_target_or_refused_by_name() {
+        assert_eq!(admit_draft_load(60, 40, 100).unwrap(), None);
+        let why = admit_draft_load(60, 41, 100).unwrap().unwrap();
+        assert!(
+            why.starts_with("draft model:") && why.contains("41") && why.contains("100"),
+            "{why}"
+        );
+        assert!(admit_draft_load(101, 0, 100).is_err(), "the target alone");
+        assert!(admit_draft_load(60, u64::MAX, 100).unwrap().is_some());
+    }
 
     #[test]
     fn estimate_is_checked_and_prices_quadratic_prefill() {

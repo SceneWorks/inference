@@ -211,7 +211,13 @@ legacy `mtp` field maps onto it). Every decoder this provider loads advertises p
 resolves to MTP where the head exists, else prompt lookup, and the engine runs the resolved
 proposer (`decode::MtpProposer` / `decode::NgramProposer`) for both decoder families. A proposer
 that cannot run on the request's path (a Qwen3-VL multimodal request decodes on the reference loop)
-falls back with its reason in `DecodeReport::fallbacks`. The greedy parity suite and the
+falls back with its reason in `DecodeReport::fallbacks`. A load names a draft model with
+`LoadSpec::with_draft` (sc-24436): it loads beside the target on the same device at the same tier,
+admitted with it (a draft without room, an unreadable one, or one whose tokenizer vocabulary or
+logits width is not the target's is refused by name in `LoadReport::draft` and the target loads
+alone), and only a resident draft advertises `draft_model` (depth 1..=8, recommended 4) — which
+the engine then runs with `decode::DraftModelProposer`, pricing the draft's own prefill and cache
+in request admission. The greedy parity suite and the
 benchmark harness are core-llm-testkit's `check_speculative_greedy_parity` /
 `run_speculative_bench`; `tests/speculative_bench.rs` drives the harness on real weights.
 

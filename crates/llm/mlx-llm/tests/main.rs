@@ -38,6 +38,9 @@ mod continuous;
 #[path = "contract_roundtrip.rs"]
 mod contract_roundtrip;
 
+#[path = "draft_model.rs"]
+mod draft_model;
+
 #[path = "gemma4_decoder.rs"]
 mod gemma4_decoder;
 

@@ -181,6 +181,50 @@ pub fn resolve_speculative(
     }
 }
 
+/// The deepest draft-model proposal a provider runs (sc-24436): drafts per verify step, so the
+/// verify forward carries at most `1 + 8` positions — the same bound as prompt lookup. Every draft
+/// is one draft-model forward, so past this depth a rejected tail costs more draft forwards than
+/// an accepted run saves target forwards.
+pub const DRAFT_MODEL_MAX_DEPTH: u32 = 8;
+
+/// The draft-model depth advertised as recommended (sc-24436): four drafts per verify step.
+pub const DRAFT_MODEL_RECOMMENDED_DEPTH: u32 = 4;
+
+/// The `draft_model` advertisement a provider carries while a compatible draft is resident
+/// (sc-24436). Both backends advertise exactly this, so the depth bound is one policy.
+pub fn draft_model_capabilities() -> crate::ProposerCapabilities {
+    crate::ProposerCapabilities {
+        proposer: crate::SpeculativeProposer::DraftModel,
+        max_depth: DRAFT_MODEL_MAX_DEPTH,
+        recommended_depth: DRAFT_MODEL_RECOMMENDED_DEPTH,
+    }
+}
+
+/// Whether a draft model can propose for a target (sc-24436), or the named reason it cannot.
+/// The target verifies each draft id as its own token and the acceptance rule compares the two
+/// models' distributions row for row, so the draft must share the target's tokenizer vocabulary
+/// token for token ([`Tokenizer::vocabulary_mismatch`](crate::Tokenizer::vocabulary_mismatch))
+/// and produce logits over the same number of ids (`*_logits` — the models' `vocab_size`, which
+/// may exceed the tokenizer's by padding rows). The reason leads with `draft model:`.
+pub fn draft_compatibility(
+    target: &crate::Tokenizer,
+    target_logits: usize,
+    draft: &crate::Tokenizer,
+    draft_logits: usize,
+) -> Result<(), String> {
+    if let Some(why) = target.vocabulary_mismatch(draft) {
+        return Err(format!(
+            "draft model: its tokenizer vocabulary is not the target's ({why})"
+        ));
+    }
+    if target_logits != draft_logits {
+        return Err(format!(
+            "draft model: it scores {draft_logits} token ids, the target {target_logits}"
+        ));
+    }
+    Ok(())
+}
+
 /// The greedy verify decision in one call: the committed run (accepted drafts + the bonus token)
 /// and how many drafts were accepted, from the target's per-position argmax
 /// (`target_argmax.len() == drafts.len() + 1`, see [`accept_greedy_run`]). Every committed token is
@@ -451,6 +495,65 @@ mod tests {
         assert_eq!(
             ProposerKind::from(SpeculativeProposer::DraftModel),
             ProposerKind::DraftModel
+        );
+    }
+
+    fn word_tokenizer(prefix: &str, vocab: usize) -> crate::Tokenizer {
+        let entries: Vec<String> = (0..vocab)
+            .map(|i| format!("\"{prefix}{i}\": {i}"))
+            .collect();
+        crate::Tokenizer::from_json(&format!(
+            r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+                "decoder": null,
+                "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "{prefix}0" }} }}"#,
+            entries.join(", ")
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_draft_must_share_the_vocabulary_and_the_logits_width() {
+        use crate::{Speculative, SpeculativeProposer};
+        let target = word_tokenizer("t", 8);
+        assert_eq!(
+            draft_compatibility(&target, 8, &word_tokenizer("t", 8), 8),
+            Ok(())
+        );
+        // A tokenizer of the same size over different tokens is refused by name.
+        let why = draft_compatibility(&target, 8, &word_tokenizer("w", 8), 8).unwrap_err();
+        assert!(
+            why.starts_with("draft model: its tokenizer vocabulary is not the target's"),
+            "{why}"
+        );
+        // A shared tokenizer with a different logits width (padding rows) is refused too.
+        let why = draft_compatibility(&target, 8, &word_tokenizer("t", 8), 16).unwrap_err();
+        assert!(why.contains("scores 16 token ids, the target 8"), "{why}");
+
+        let caps = draft_model_capabilities();
+        assert_eq!(caps.proposer, SpeculativeProposer::DraftModel);
+        assert_eq!(
+            (caps.max_depth, caps.recommended_depth),
+            (DRAFT_MODEL_MAX_DEPTH, DRAFT_MODEL_RECOMMENDED_DEPTH)
+        );
+        assert!(caps.recommended_depth <= caps.max_depth);
+        // Advertised, `{proposer: draft_model}` runs at the requested depth.
+        let resident = crate::TextLlmCapabilities {
+            speculative: vec![caps],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_speculative(
+                Speculative::proposer(SpeculativeProposer::DraftModel, 3),
+                &resident
+            ),
+            SpeculativeResolution {
+                plan: SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::DraftModel,
+                    depth: 3
+                },
+                fallback: None
+            }
         );
     }
 
