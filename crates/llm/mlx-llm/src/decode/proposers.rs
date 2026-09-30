@@ -75,9 +75,10 @@ impl<T: SpeculativeTarget + ?Sized> Proposer<T> for NgramProposer {
 /// The draft's cache holds only target-confirmed tokens between steps. A proposal feeds the
 /// committed tokens the cache has not seen yet together with `cur` in one forward, marks that
 /// point as the step start ([`CacheRollback::begin`]), then feeds each draft but the last. The
-/// commit keeps the accepted drafts already fed — by truncation, or by restoring the step start
-/// on a cache that cannot truncate (the Qwen35 hybrid) — and queues the rest of the accepted run
-/// for the next proposal's first forward, so no step pays an extra draft forward to catch up.
+/// commit keeps the accepted drafts already fed — by truncation, by the Qwen35 hybrid's DeltaNet
+/// checkpoint ring (sc-24435), or by restoring the step start on a cache that can do neither — and
+/// queues the rest of the accepted run for the next proposal's first forward, so no step pays an
+/// extra draft forward to catch up.
 ///
 /// A draft padded differently from its target ([`with_vocab`](Self::with_vocab)) proposes only
 /// its tokenizer's ids, over logits the target's width.
@@ -98,12 +99,15 @@ pub struct DraftModelProposer<'d, D: SpeculativeTarget + ?Sized> {
 }
 
 impl<'d, D: SpeculativeTarget + ?Sized> DraftModelProposer<'d, D> {
-    /// A proposer over `draft`.
-    pub fn new(draft: &'d D) -> Self {
+    /// A proposer over `draft` for a run of up to `drafts` drafts per step. The draft's rollback
+    /// is built for that width: a proposal window — `cur`'s forward marks the step start, then at
+    /// most `drafts - 1` single-token forwards — never outgrows it (the Qwen35 hybrid's
+    /// checkpoint ring is armed for `drafts + 1` tokens, sc-24435).
+    pub fn new(draft: &'d D, drafts: usize) -> Self {
         Self {
             draft,
             cache: None,
-            rollback: draft.rollback(),
+            rollback: draft.rollback(drafts),
             vocab: None,
             pending: Vec::new(),
             fed: None,
