@@ -6,6 +6,10 @@
 # baseline_evidence_ref (optional, default inference_ref): the inference SHA whose completed A1
 # evidence ($HOME/kv-poc/<sha>-runs/evidence/sc20671-dense) A3 binds. sc20676 itself refuses it
 # unless that SHA is an ancestor of inference_ref with an unchanged SC-20671 dense closure.
+# a3_bits (optional, default "2"): comma list of A3 `--kv-bits` values (2, 4), run in list order.
+# a2_methods (optional, default "group-affine"): comma list of A2 `--kv-method` values
+# (group-affine, group-affine-4), run in list order. At most 2 values each: the a3/a2 jobs' hard
+# timeouts are sized for two sequential invocations (kv-poc-campaign.yml TIMEOUTS).
 # Either way every value is validated here, so a typo fails in seconds on a hosted runner instead
 # of queueing a self-hosted job on a label no runner carries (which waits silently forever).
 set -euo pipefail
@@ -20,6 +24,8 @@ if [ "$EVENT_NAME" = "push" ]; then
   label="$(read_key runner_label rw-krea)"
   phases="$(read_key phases "")"
   baseline_sha="$(read_key baseline_evidence_ref "")"
+  a3_bits="$(read_key a3_bits 2)"
+  a2_methods="$(read_key a2_methods group-affine)"
   source_desc="$file @ ${GITHUB_SHA}"
 else
   mode="$DISPATCH_MODE"
@@ -28,6 +34,8 @@ else
   label="$DISPATCH_RUNNER_LABEL"
   phases="$DISPATCH_PHASES"
   baseline_sha="$DISPATCH_BASELINE_EVIDENCE_REF"
+  a3_bits="${DISPATCH_A3_BITS:-2}"
+  a2_methods="${DISPATCH_A2_METHODS:-group-affine}"
   source_desc="workflow_dispatch inputs"
 fi
 
@@ -64,6 +72,25 @@ for p in $order; do
 done
 [ -n "$canonical" ] || [ "$mode" != w1 ] || fail "mode w1 needs at least one phase"
 
+# The A3 --kv-bits / A2 --kv-method lists: known values only (they also name the evidence dirs),
+# no duplicates (two invocations would share one resume dir), 1..2 values (the hard timeouts).
+value_list() { # <key> <list> <allowed values...>; sets $listed to the canonical comma list
+  local key="$1" list="${2// /}" seen="" v vals
+  shift 2
+  [ -n "$list" ] || fail "$key must name at least one value (allowed: $*)"
+  IFS=',' read -r -a vals <<< "$list"
+  for v in "${vals[@]}"; do
+    case " $* " in *" $v "*) ;; *) fail "$key: unknown value '$v' (allowed: $*)" ;; esac
+    case ",$seen," in *",$v,"*) fail "$key: '$v' is listed twice" ;; esac
+    seen="${seen:+$seen,}$v"
+  done
+  [ "${#vals[@]}" -le 2 ] || fail "$key takes at most 2 values (the job timeouts are sized for 2), got '$list'"
+  listed="$seen"
+}
+# Not in $(...): `fail` must print its ::error line to the job log, not into a variable.
+value_list a3_bits "$a3_bits" 2 4; a3_bits="$listed"
+value_list a2_methods "$a2_methods" group-affine group-affine-4; a2_methods="$listed"
+
 runs_on="$(jq -cn --arg l "$label" '["self-hosted","macOS","ARM64",$l]')"
 {
   echo "mode=$mode"
@@ -73,6 +100,8 @@ runs_on="$(jq -cn --arg l "$label" '["self-hosted","macOS","ARM64",$l]')"
   echo "runner_label=$label"
   # Bounded by commas so `contains(phases, ',a1,')` can never match a prefix.
   echo "phases=${canonical},"
+  echo "a3_bits=$a3_bits"
+  echo "a2_methods=$a2_methods"
   echo "runs_on=$runs_on"
 } >> "$GITHUB_OUTPUT"
 
@@ -88,5 +117,7 @@ runs_on="$(jq -cn --arg l "$label" '["self-hosted","macOS","ARM64",$l]')"
   echo "| A3 dense baseline evidence | \`$baseline_sha\` |"
   echo "| runner label | \`$label\` |"
   echo "| phases | \`${canonical#,}\` |"
+  echo "| A3 --kv-bits | \`$a3_bits\` |"
+  echo "| A2 --kv-method | \`$a2_methods\` |"
 } >> "$GITHUB_STEP_SUMMARY"
 cat "$GITHUB_STEP_SUMMARY"

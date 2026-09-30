@@ -5,6 +5,12 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 # become a required check.
 #   W1 (mode=w1), the LLM KV campaign, with the exact commands of the dev-Mac prep's W1-COMMANDS.sh:
 #     A1 dense sc20671 -> A3 packed sc20676 -> A2 compressed sc20671 -> B sc20677 capture + compare.
+#     A3 runs once per `a3_bits` value (`--kv-bits`, default "2") and A2 once per `a2_methods`
+#     value (`--kv-method`, default "group-affine"), sequentially in one job, each invocation with
+#     its own resume + evidence dirs (sc20676-b<b>-resume, evidence/sc20676-packed-b<b>;
+#     sc20671-compressed-<m>-resume, evidence/sc20671-compressed-<m>). At most 2 values each.
+#     An A3 QUALITY GATE FAILED (recorded evidence, exit 0) never skips the next value; a stop
+#     ends the list (stopped=true); a hard failure ends the list and fails the job.
 #   W2 (mode=w2), the media campaigns (docs/architecture/SC_20684_*.md, SC_20686_*.md):
 #     C  SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV) -> D SC-20686 Metal matrix (18
 #     coordinates incl. the A14B Lightning default, normal + cancel arms) -> D-control (the same
@@ -17,8 +23,10 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #
 # TRIGGERS
 #   * push to `kv-poc-run/**`: parameters come from `.github/kv-poc-run.json` on the pushed commit
-#     ({mode, inference_ref, sceneworks_ref, runner_label, phases}, plus an optional
-#     baseline_evidence_ref: the inference SHA whose A1 evidence A3 binds, default inference_ref).
+#     ({mode, inference_ref, sceneworks_ref, runner_label, phases}, plus the optional
+#     baseline_evidence_ref: the inference SHA whose A1 evidence A3 binds, default inference_ref;
+#     a3_bits: comma list of 2|4, default "2"; a2_methods: comma list of
+#     group-affine|group-affine-4, default "group-affine").
 #     This is how the campaign runs before this file reaches `main` (a workflow_dispatch workflow
 #     must exist on the default branch to be dispatched). Start W1 by flipping "mode" to "w1" in
 #     that file and pushing; start W2 with "mode": "w2" and an inference_ref that carries the W2 sources (SC-20686 product_load /
@@ -57,6 +65,9 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 # media-64.json deadlineSeconds 3600 = 60 min) plus 20 min (W1) or 30 min (W2: the SC-20686 adapter
 # re-hashes the arm's snapshot, up to ~81 GB for VACE-Fun, after every arm), so a timeout can only
 # land after a row has already overrun its own deadline -- never mid-row on a healthy row.
+# A3 and A2 budget PER INVOCATION (the budget restarts at each list value) and any stop ends the
+# list, so only the last invocation can overrun: their hard timeout is 2 x budget (the 2-value
+# list maximum config.sh enforces) + 300 + 20 = a3 440, a2 980 min.
 
 on:
   push:
@@ -89,6 +100,14 @@ on:
         description: "Inference SHA whose completed A1 evidence ($HOME/kv-poc/<sha>-runs/evidence/sc20671-dense) A3 binds. Empty = inference_ref. sc20676 refuses it unless it is an ancestor of inference_ref with an unchanged SC-20671 dense closure."
         type: string
         default: ""
+      a3_bits:
+        description: "A3 --kv-bits values, comma list of 2|4 run in order (max 2), e.g. 2,4"
+        type: string
+        default: "2"
+      a2_methods:
+        description: "A2 --kv-method values, comma list of group-affine|group-affine-4 run in order (max 2)"
+        type: string
+        default: "group-affine"
 
 permissions:
   contents: read
@@ -116,6 +135,8 @@ jobs:
       baseline_evidence_sha: ${{ steps.resolve.outputs.baseline_evidence_sha }}
       runner_label: ${{ steps.resolve.outputs.runner_label }}
       phases: ${{ steps.resolve.outputs.phases }}
+      a3_bits: ${{ steps.resolve.outputs.a3_bits }}
+      a2_methods: ${{ steps.resolve.outputs.a2_methods }}
       runs_on: ${{ steps.resolve.outputs.runs_on }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -133,6 +154,8 @@ jobs:
           DISPATCH_RUNNER_LABEL: ${{ inputs.runner_label }}
           DISPATCH_PHASES: ${{ inputs.phases }}
           DISPATCH_BASELINE_EVIDENCE_REF: ${{ inputs.baseline_evidence_ref }}
+          DISPATCH_A3_BITS: ${{ inputs.a3_bits }}
+          DISPATCH_A2_METHODS: ${{ inputs.a2_methods }}
         run: bash .github/kv-poc/config.sh
 
   probe:
@@ -211,20 +234,22 @@ jobs:
           retention-days: 30
 
   a3:
-    name: "A3 packed arms (sc20676)"
+    name: "A3 packed arms, kv-bits ${{ needs.config.outputs.a3_bits }} (sc20676)"
     needs: [config, build, a1]
     if: >-
       ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a3,')
       && needs.build.result == 'success'
       && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
-    timeout-minutes: 380
+    # 2 invocations x 60 soft + 300 row deadline + 20 (TIMEOUTS above).
+    timeout-minutes: 440
     outputs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       BASELINE_EVIDENCE_SHA: ${{ needs.config.outputs.baseline_evidence_sha }}
+      KV_A3_BITS: ${{ needs.config.outputs.a3_bits }}
       KV_SOFT_BUDGET_MIN: "60"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -248,7 +273,7 @@ jobs:
           retention-days: 30
 
   a2:
-    name: "A2 compressed group-affine (sc20671)"
+    name: "A2 compressed ${{ needs.config.outputs.a2_methods }} (sc20671)"
     needs: [config, build, a1, a3]
     if: >-
       ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a2,')
@@ -256,12 +281,14 @@ jobs:
       && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
       && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true' }}
     runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
-    timeout-minutes: 650
+    # 2 invocations x 330 soft + 300 row deadline + 20 (TIMEOUTS above).
+    timeout-minutes: 980
     outputs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_A2_METHODS: ${{ needs.config.outputs.a2_methods }}
       KV_SOFT_BUDGET_MIN: "330"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
