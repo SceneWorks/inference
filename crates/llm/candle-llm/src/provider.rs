@@ -830,7 +830,16 @@ pub struct LoadRecord {
     /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
     /// follows the process switch.
     pub cuda_graphs: Option<bool>,
+    /// Whether the load named a companion MTP head ([`LoadSpec::mtp_head_source`]). Candle does
+    /// not attach companion heads (sc-24444 is MLX-only), so a requested one is always reported
+    /// as a named load fallback; the target loads without it (epic sc-24432 E2).
+    pub mtp_head_requested: bool,
 }
+
+/// The load fallback Candle names for a requested companion MTP head.
+pub const CANDLE_MTP_HEAD_FALLBACK: &str =
+    "mtp_head: the Candle backend does not attach companion \
+     MTP heads; the model loaded without one (a checkpoint's own MTP head is still used)";
 
 impl LoadRecord {
     /// The backend-neutral report a product renders (sc-24139): the requested format, the
@@ -863,6 +872,11 @@ impl LoadRecord {
             requested: self.requested,
             projections,
             cuda_graphs: self.cuda_graphs,
+            fallbacks: self
+                .mtp_head_requested
+                .then(|| CANDLE_MTP_HEAD_FALLBACK.to_string())
+                .into_iter()
+                .collect(),
         }
     }
 }
@@ -1364,6 +1378,7 @@ impl LlamaProvider {
         };
         provider.load_record.requested = spec.quantize;
         provider.load_record.cuda_graphs = Some(cuda_graphs);
+        provider.load_record.mtp_head_requested = spec.mtp_head_source.is_some();
         Ok(provider)
     }
 
@@ -1669,6 +1684,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                mtp_head_requested: false,
             },
         })
     }
@@ -1863,6 +1879,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                mtp_head_requested: false,
             },
         })
     }
@@ -5322,6 +5339,25 @@ mod tests {
         )
     }
 
+    /// Story sc-24444 / epic sc-24432 E2: Candle attaches no companion MTP head, so a requested
+    /// one is named in the load report rather than silently dropped or failing the load.
+    #[test]
+    fn a_requested_companion_mtp_head_is_a_named_candle_load_fallback() {
+        let record = crate::provider::LoadRecord {
+            mtp_head_requested: true,
+            ..crate::provider::LoadRecord::default()
+        };
+        assert_eq!(
+            record.report().fallbacks,
+            vec![crate::provider::CANDLE_MTP_HEAD_FALLBACK.to_string()]
+        );
+        assert!(crate::provider::CANDLE_MTP_HEAD_FALLBACK.starts_with("mtp_head: "));
+        assert!(crate::provider::LoadRecord::default()
+            .report()
+            .fallbacks
+            .is_empty());
+    }
+
     /// sc-24140: a llama-family load reports its weight census (the `LoadRecord` said `None` for
     /// every non-qwen3_5 architecture), and the requested format reaches `CausalLm`: dense keeps
     /// all 3 × 7 projections and the head dense; `Quantize::Q8` makes the layer projections GGML
@@ -5635,6 +5671,7 @@ mod tests {
             projector_source: None,
             quantize: Some(core_llm::Quantize::Nvfp4),
             cuda_graphs: None,
+            mtp_head_source: None,
         }
     }
 

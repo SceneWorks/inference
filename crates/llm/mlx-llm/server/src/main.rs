@@ -79,6 +79,8 @@ struct Args {
     port: u16,
     quantize: Option<Quantize>,
     provider: Option<String>,
+    /// A companion MTP head directory attached to the model (sc-24444).
+    mtp_head: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -87,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
     let mut port = 8080u16;
     let mut quantize = None;
     let mut provider = None;
+    let mut mtp_head = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut next = || args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -95,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
             "--host" => host = next()?,
             "--port" | "-p" => port = next()?.parse().map_err(|_| "invalid --port".to_string())?,
             "--provider" => provider = Some(next()?),
+            "--mtp-head" => mtp_head = Some(next()?),
             "--quant" => {
                 quantize = Some(match next()?.as_str() {
                     "q4" => Quantize::Q4,
@@ -103,7 +107,7 @@ fn parse_args() -> Result<Args, String> {
                 })
             }
             "-h" | "--help" => {
-                println!("usage: mlx-llm-server --model <dir> [--host 127.0.0.1] [--port 8080] [--quant q4|q8] [--provider <id>]");
+                println!("usage: mlx-llm-server --model <dir> [--host 127.0.0.1] [--port 8080] [--quant q4|q8] [--provider <id>] [--mtp-head <dir>]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?}")),
@@ -115,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
         port,
         quantize,
         provider,
+        mtp_head,
     })
 }
 
@@ -145,8 +150,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         projector_source: None,
         quantize: args.quantize,
         cuda_graphs: None,
+        mtp_head_source: args.mtp_head.clone(),
     };
     let provider = registry.load_textllm(&provider_id, &spec)?;
+    // An optional accelerator the load could not attach is named, never fatal (sc-24444).
+    for fallback in provider
+        .load_report()
+        .map(|report| report.fallbacks)
+        .unwrap_or_default()
+    {
+        eprintln!("load fallback: {fallback}");
+    }
 
     // A friendly default model name for responses (the snapshot dir's basename).
     let default_model = std::path::Path::new(&args.model)

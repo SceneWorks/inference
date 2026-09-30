@@ -200,6 +200,10 @@ pub struct LoadReport {
     /// load. `None` where the switch does not apply — a provider that never routes decode steps
     /// through a CUDA-graph runner — so a product shows the settled value, not the request.
     pub cuda_graphs: Option<bool>,
+    /// Every optional accelerator the load was asked for but did not attach, each leading with
+    /// the feature (`mtp_head: …`), so a product can show why (epic sc-24432 E2: the model still
+    /// loaded; the accelerator is absent). Empty when everything requested was attached.
+    pub fallbacks: Vec<String>,
 }
 
 #[cfg(test)]

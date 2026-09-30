@@ -564,6 +564,7 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
             projector_source: None,
             quantize,
             cuda_graphs: None,
+            mtp_head_source: None,
         };
         let p = LlamaProvider::load(&spec)
             .unwrap_or_else(|e| panic!("load gemma4 (quantize={quantize:?}): {e}"));

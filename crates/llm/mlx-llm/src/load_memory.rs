@@ -34,8 +34,16 @@ pub(crate) fn required_bytes(spec: &LoadSpec) -> Result<u64> {
         // Other loaders and explicit quantization retain their conservative conversion bound.
         return source.checked_mul(2).ok_or_else(overflow);
     }
+    source
+        .checked_add(safetensors_dir_extra(path)?)
+        .ok_or_else(overflow)
+}
+
+/// The conversion intermediates every `*.safetensors` header in `dir` implies
+/// ([`safetensors_extra`]), read header-only.
+fn safetensors_dir_extra(dir: &Path) -> Result<u64> {
     let mut additional = 0u64;
-    for entry in std::fs::read_dir(path).map_err(|e| Error::Load(e.to_string()))? {
+    for entry in std::fs::read_dir(dir).map_err(|e| Error::Load(e.to_string()))? {
         let path = entry.map_err(|e| Error::Load(e.to_string()))?.path();
         if path.extension().and_then(|s| s.to_str()) != Some("safetensors") {
             continue;
@@ -59,7 +67,31 @@ pub(crate) fn required_bytes(spec: &LoadSpec) -> Result<u64> {
             .checked_add(safetensors_extra(&header)?)
             .ok_or_else(overflow)?;
     }
-    source.checked_add(additional).ok_or_else(overflow)
+    Ok(additional)
+}
+
+/// Resident bytes a companion MTP head adds to a load (epic sc-24432 E7, story sc-24444): its
+/// safetensors payload (packed words, affine scales/biases and norm vectors stay resident in the
+/// predictor) plus the conversion intermediates the header implies — the BF16 cast of any wider
+/// float and the `1 + w` norm results. Header-only; never constructs a tensor. The head's
+/// per-request attention cache is priced by request admission on the `mtp` route.
+pub(crate) fn companion_head_bytes(dir: &Path) -> Result<u64> {
+    if !dir.is_dir() {
+        return Err(Error::Load(format!(
+            "companion MTP head `{}` is not a directory",
+            dir.display()
+        )));
+    }
+    let payload = core_llm::checkpoint_payload_bytes(dir)?;
+    if payload == 0 {
+        return Err(Error::Load(format!(
+            "companion MTP head `{}` holds no .safetensors",
+            dir.display()
+        )));
+    }
+    payload
+        .checked_add(safetensors_dir_extra(dir)?)
+        .ok_or_else(overflow)
 }
 
 fn safetensors_extra(header: &Value) -> Result<u64> {
