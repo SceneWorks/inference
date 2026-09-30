@@ -771,6 +771,12 @@ pub struct LoadSpec {
     /// generation in [`DecodeReport::cuda_graphs`](crate::DecodeReport::cuda_graphs) where the
     /// backend reports one. Backends without CUDA ignore it.
     pub cuda_graphs: Option<bool>,
+    /// Byte budget of the cross-turn prefix cache (story sc-24437): the KV (and, for a hybrid
+    /// decoder, recurrent state) of earlier requests' prefixes, reused when a later prompt
+    /// extends one. `None` asks for [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES);
+    /// `Some(0)` turns the cache off. The load admits it: the settled budget is this clamped to
+    /// the headroom the load's own admission leaves ([`prefix_cache_budget`](crate::prefix_cache_budget)).
+    pub prefix_cache_bytes: Option<u64>,
 }
 
 /// Load-time quantization request.
@@ -796,6 +802,7 @@ impl LoadSpec {
             projector_source: None,
             quantize: None,
             cuda_graphs: None,
+            prefix_cache_bytes: None,
         }
     }
 

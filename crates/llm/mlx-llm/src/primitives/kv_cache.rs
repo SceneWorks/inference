@@ -214,6 +214,16 @@ impl ContiguousKvCache {
             .collect()
     }
 
+    /// Bytes the cache's block buffers hold (padding included) — what the prefix cache charges an
+    /// entry that keeps this cache (story sc-24437).
+    pub fn bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|s| (s.keys.nbytes() + s.values.nbytes()) as u64)
+            .sum()
+    }
+
     /// Round `n` up to a whole number of blocks.
     fn blocks_for(&self, n: i32) -> i32 {
         (n + self.block - 1) / self.block * self.block

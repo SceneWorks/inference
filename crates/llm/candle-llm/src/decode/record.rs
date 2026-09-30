@@ -171,6 +171,14 @@ pub struct DecodeRecord {
     /// cuBLASLt run happened (`rows` for a prefill, `disabled` with the switch off, …).
     /// `Nvfp4PathTally::label` gives `gemv` / `cublaslt` / `mixed` / `none` (a non-NVFP4 model).
     pub nvfp4_projections: Nvfp4PathTally,
+    /// Leading prompt tokens the cross-turn prefix cache restored instead of prefilling
+    /// (story sc-24437; `0` on a path it does not serve).
+    pub prefix_hit_tokens: u64,
+    /// The prefix cache's part (`hit`, `miss`, `off`, `bypassed`, or `none` on a path it is not
+    /// wired to) — see [`core_llm::DecodeReport::prefix_cache`].
+    pub prefix_cache: &'static str,
+    /// Why the cache was bypassed, or why this request's state was not kept.
+    pub prefix_cache_reason: Option<&'static str>,
 }
 
 impl DecodeRecord {
@@ -201,6 +209,9 @@ impl DecodeRecord {
             fused_primitives: FusedTally::default(),
             cuda_graphs: GraphTally::default(),
             nvfp4_projections: Nvfp4PathTally::default(),
+            prefix_hit_tokens: 0,
+            prefix_cache: "none",
+            prefix_cache_reason: None,
         }
     }
 
@@ -312,6 +323,9 @@ impl DecodeRecord {
             fused_primitives: FusedTally::default(),
             cuda_graphs: GraphTally::default(),
             nvfp4_projections: Nvfp4PathTally::default(),
+            prefix_hit_tokens: 0,
+            prefix_cache: "none",
+            prefix_cache_reason: None,
         }
     }
 
@@ -394,6 +408,11 @@ impl DecodeRecord {
             accepted_tokens: self.accepted_tokens,
             verify_steps: self.verify_steps,
             replay_forwards: self.replay_forwards,
+            prefix_hit_tokens: self.prefix_hit_tokens,
+            prefix_cache: core_llm::PathReport {
+                path: self.prefix_cache.to_string(),
+                reason: self.prefix_cache_reason.map(str::to_string),
+            },
             fallbacks: Vec::new(),
         }
     }

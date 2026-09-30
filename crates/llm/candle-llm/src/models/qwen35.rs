@@ -1147,6 +1147,130 @@ impl Qwen35Cache {
     }
 }
 
+/// A [`Qwen35Cache`]'s state after its first `len` positions, held by the cross-turn prefix cache
+/// (story sc-24437): every full-attention layer's KV `[1, heads, len, dim]` and every linear
+/// layer's conv tail and recurrent state — **copies**, so the live cache's in-place writes (the
+/// static KV buffers, the checkpoint ring) can never reach it.
+#[derive(Clone, Debug)]
+pub struct Qwen35PrefixState {
+    layers: Vec<Qwen35PrefixLayer>,
+    len: usize,
+}
+
+#[derive(Clone, Debug)]
+enum Qwen35PrefixLayer {
+    Attn(Option<(Tensor, Tensor)>),
+    Delta(Option<(Tensor, Tensor)>),
+}
+
+impl Qwen35PrefixState {
+    /// The positions the state covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the state covers no position.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Bytes the held tensors occupy.
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().fold(0usize, |acc, l| {
+            let (Qwen35PrefixLayer::Attn(Some((a, b))) | Qwen35PrefixLayer::Delta(Some((a, b)))) =
+                l
+            else {
+                return acc;
+            };
+            acc.saturating_add(tensor_bytes(a))
+                .saturating_add(tensor_bytes(b))
+        })
+    }
+}
+
+impl Qwen35Cache {
+    /// Copy the cache's whole state — it must hold exactly the positions a later request resumes
+    /// at, because a recurrent state exists only at the position it was taken (story sc-24437).
+    pub fn prefix_snapshot(&self) -> Result<Qwen35PrefixState> {
+        let len = self.offset().max(0) as usize;
+        let copy_kv = |k: &Tensor, v: &Tensor| -> Result<(Tensor, Tensor)> {
+            Ok((k.narrow(2, 0, len)?.copy()?, v.narrow(2, 0, len)?.copy()?))
+        };
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| {
+                Ok(match l {
+                    Qwen35LayerCache::Delta(c) => {
+                        Qwen35PrefixLayer::Delta(match (c.conv_state(), c.ssm_state()) {
+                            (Some(conv), Some(ssm)) => Some((conv.copy()?, ssm.copy()?)),
+                            _ => None,
+                        })
+                    }
+                    Qwen35LayerCache::Attn(a) => Qwen35PrefixLayer::Attn(
+                        a.kv.as_ref().map(|(k, v)| copy_kv(k, v)).transpose()?,
+                    ),
+                    Qwen35LayerCache::StaticAttn(s) => {
+                        let (k, v) = s.views(0)?;
+                        Qwen35PrefixLayer::Attn(Some(copy_kv(&k, &v)?))
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Qwen35PrefixState { layers, len })
+    }
+
+    /// Seed an **empty** cache with `state`, positioning it at `state.len()`: the attention KV is
+    /// written at positions `0..len` (into a static layer's buffers, or held by a growing one,
+    /// which never writes in place), and each linear layer takes the stored conv tail and
+    /// recurrent state as its live state at `len` — through its checkpoint ring when it keeps
+    /// one, so `len` is the ring's oldest restorable position and a verify step's rollback never
+    /// reaches below it. The stored tensors are never written.
+    pub fn restore_prefix(&mut self, state: &Qwen35PrefixState) -> Result<()> {
+        if self.offset() != 0 {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: a prefix restores into an empty cache, not one at {}",
+                self.offset()
+            )));
+        }
+        if state.layers.len() != self.layers.len() {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: a {}-layer prefix state for a {}-layer cache",
+                state.layers.len(),
+                self.layers.len()
+            )));
+        }
+        let len = i32::try_from(state.len)
+            .map_err(|_| Error::Msg("Qwen35Cache: prefix length overflow".into()))?;
+        for (slot, stored) in self.layers.iter_mut().zip(&state.layers) {
+            match (slot, stored) {
+                (Qwen35LayerCache::Delta(c), Qwen35PrefixLayer::Delta(Some((conv, ssm)))) => {
+                    c.update(conv.clone(), ssm.clone(), len)?
+                }
+                (Qwen35LayerCache::Attn(a), Qwen35PrefixLayer::Attn(Some((k, v)))) => {
+                    a.kv = Some((k.clone(), v.clone()))
+                }
+                (Qwen35LayerCache::StaticAttn(s), Qwen35PrefixLayer::Attn(Some((k, v)))) => {
+                    s.update(0, k, v)?;
+                }
+                (Qwen35LayerCache::Delta(_), Qwen35PrefixLayer::Delta(None))
+                | (
+                    Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_),
+                    Qwen35PrefixLayer::Attn(None),
+                ) if len == 0 => {}
+                _ => {
+                    self.reset();
+                    return Err(Error::Msg(
+                        "Qwen35Cache: the prefix state's layer schedule does not match the cache"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DecodeCache for Qwen35Cache {
     fn len(&self) -> i32 {
         self.offset()
@@ -1260,6 +1384,25 @@ impl Qwen35MtpCache {
         for layer in &mut self.layers {
             layer.kv = None;
         }
+    }
+
+    /// Bytes the predictor's KV holds (story sc-24437).
+    pub fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .fold(0usize, |acc, l| acc.saturating_add(l.bytes()))
+    }
+
+    /// Every layer's keys then values, flattened to f32 (test comparison of two warm-ups).
+    #[cfg(test)]
+    pub(crate) fn flat_keys(&self) -> Result<Vec<f32>> {
+        let mut out = Vec::new();
+        for (k, v) in self.layers.iter().filter_map(|l| l.kv.as_ref()) {
+            for t in [k, v] {
+                out.extend(t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?);
+            }
+        }
+        Ok(out)
     }
 }
 

@@ -150,6 +150,18 @@ pub struct DecodeReport {
     pub verify_steps: u64,
     /// Verify steps recovered by a step-start rollback plus a replay forward.
     pub replay_forwards: u64,
+    /// Leading prompt tokens whose cache state came from the cross-turn prefix cache instead of a
+    /// prefill forward (story sc-24437): the prefill ran only the prompt past them. `0` on a miss,
+    /// when the cache is off, and on a request it refuses (a multimodal prompt — its reason is in
+    /// [`fallbacks`](Self::fallbacks)).
+    pub prefix_hit_tokens: u64,
+    /// The cross-turn prefix cache's part in this request (story sc-24437): `hit` (a stored
+    /// prefix was restored — [`prefix_hit_tokens`](Self::prefix_hit_tokens) of it), `miss`
+    /// (looked up, nothing reusable), `off` (the load settled a zero budget), `bypassed` (the
+    /// request never reads or feeds the cache — the reason names why, e.g. a multimodal prompt
+    /// whose image / video / audio rows are not in the token key), or `none` (a decode path the
+    /// cache is not wired to). The reason also names why a request's own state was not kept.
+    pub prefix_cache: PathReport,
     /// Every fallback this request took that no sub-report above already names (epic sc-24432
     /// E2/E3): the speculative option resolving to less than it asked for, or a proposer that
     /// could not run on the path this request decoded on. Each entry leads with the feature

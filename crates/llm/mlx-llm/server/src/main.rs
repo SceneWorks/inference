@@ -145,6 +145,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         projector_source: None,
         quantize: args.quantize,
         cuda_graphs: None,
+        prefix_cache_bytes: None,
     };
     let provider = registry.load_textllm(&provider_id, &spec)?;
 

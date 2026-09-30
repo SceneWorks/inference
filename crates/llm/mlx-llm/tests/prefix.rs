@@ -127,7 +127,7 @@ fn run_suite(fx: Fixture) {
         "baselines should generate"
     );
 
-    let mut pc = PrefixCache::new(16);
+    let mut pc = PrefixCache::with_budget(1 << 30);
 
     // First cached request: cold (nothing stored yet) but must equal the baseline, and it stores
     // p1 + base1 for reuse.
@@ -301,7 +301,7 @@ fn budget_finished_entry_supports_extension() {
     let prompt: Vec<i32> = vec![1, 2, 3, 4, 5];
     let max_new = 6;
 
-    let mut pc = PrefixCache::new(16);
+    let mut pc = PrefixCache::with_budget(1 << 30);
     let out1 = generate_cached(
         &model,
         &prompt,

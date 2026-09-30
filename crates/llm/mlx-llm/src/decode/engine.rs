@@ -991,6 +991,8 @@ fn report<T: SpeculativeTarget + ?Sized>(
         accepted_tokens: stats.accepted as u64,
         verify_steps: stats.verify_steps as u64,
         replay_forwards: stats.replays as u64,
+        prefix_hit_tokens: 0,
+        prefix_cache: none(),
         fallbacks: Vec::new(),
     }
 }
