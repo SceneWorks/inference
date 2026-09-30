@@ -81,8 +81,13 @@ fn assert_abs_close(got: &[f32], want: &[f32], rel: f32, what: &str) {
     );
 }
 
+/// Logical row-major readback. The reshape copies a non-row-contiguous view (MLX's fused full
+/// attention kernel returns a permuted-dense `[B, H, L, D]` view) into logical order, which a raw
+/// `as_slice` would not (sc-24442).
 fn host(a: &Array) -> Vec<f32> {
     a.as_dtype(Dtype::Float32)
+        .unwrap()
+        .reshape(&[-1])
         .unwrap()
         .as_slice::<f32>()
         .to_vec()
@@ -701,15 +706,15 @@ fn gemma4_sliding_window_attention_ignores_keys_outside_the_window() {
     );
 }
 
-/// The sliding mask survives the prefill path too (`q_len > 8` chunks through MLX's
-/// broken-kernel mitigation), where the mask is sliced per chunk rather than applied whole.
+/// The sliding mask survives the prefill path too (`q_len > 8` tiles through MLX's vector
+/// kernel), where the mask is sliced per tile rather than applied whole.
 #[test]
 fn gemma4_sliding_window_prefill_matches_the_eager_reference() {
-    // `head_dim = 64` and `q_len = 16` deliberately land on MLX's broken-fused-kernel envelope
-    // (`q_len > 8`, multi-head, power-of-two head dim), so `sdpa` routes this through the chunked
-    // prefill — the path that slices the materialized window mask's query axis per chunk. At a
-    // smaller head dim the chunker never runs and this test would prove nothing about it.
-    let (heads, seq, head_dim, window) = (2i32, 16i32, 64i32, 5i32);
+    // `head_dim = 256` (Gemma's) and `q_len = 16` deliberately land on `sdpa`'s vector-kernel tile
+    // route (MLX's fused full kernel does not serve head dim 256) — the path that slices the
+    // materialized window mask's query axis per tile. Head dims 64/80/128 run 16 rows as one
+    // fused call and would prove nothing about the slicing.
+    let (heads, seq, head_dim, window) = (2i32, 16i32, 256i32, 5i32);
     let mut rng = SplitMix64::new(0xB0B);
     let randn = |n: usize, rng: &mut SplitMix64| -> Vec<f32> {
         (0..n).map(|_| (rng.next_f32() - 0.5) * 2.0).collect()
