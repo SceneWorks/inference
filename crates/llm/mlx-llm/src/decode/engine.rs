@@ -628,8 +628,9 @@ impl DraftSampler<'_, '_> {
 }
 
 /// The inverse-CDF draw over an unnormalised, never-empty distribution given a uniform `u` in
-/// `[0, 1)` — [`sample`](crate::primitives::sample)'s host walk.
-fn draw_from(dist: &[(i32, f32)], u: f32) -> i32 {
+/// `[0, 1)` — [`sample`](crate::primitives::sample)'s host walk; the draft rule of every MLX
+/// speculative loop.
+pub(crate) fn draw_from(dist: &[(i32, f32)], u: f32) -> i32 {
     let total: f32 = dist.iter().map(|x| x.1).sum();
     let mut target = u * total;
     for &(token, weight) in dist {
@@ -771,6 +772,17 @@ pub struct SpeculativeRun {
     pub stats: SpeculativeStats,
     /// The measured decode report (fallbacks are the caller's to add).
     pub report: DecodeReport,
+    /// The cache length the committed sequence accounts for: the prompt (or the caller's prefilled
+    /// cache) plus every emitted token that has been fed back through the target — all of them
+    /// after a stop-token end, all but the last otherwise (the last emitted token is the next
+    /// forward's input). This is the length a [`Pipelining::Off`] run leaves, and the one a caller
+    /// continuing a [`SpeculativePrompt::Prefilled`] cache resumes from: a pipelined run that ended
+    /// with a discarded look-ahead ([`SpeculativeStats::discarded`]) — or a speculative step whose
+    /// accepted drafts ran past the end — leaves rows beyond it (every row up to it is exact).
+    /// An attention cache truncates back to it; a recurrent-state target (the Qwen35 hybrid's
+    /// DeltaNet layers) cannot, so a caller that will continue such a cache runs with
+    /// [`Pipelining::Off`].
+    pub committed_cache_len: i32,
     timer: Option<GenerationTimer>,
 }
 
@@ -796,7 +808,8 @@ impl SpeculativeRun {
 /// enqueued past the budget; when step `t` ends the run (a stop token, the caller's stop predicate,
 /// a cancel) the already-enqueued step `t + 1` is discarded unread — never emitted — and counted
 /// ([`SpeculativeStats::discarded`]). A caller-prefilled cache then holds that discarded position
-/// past the committed tokens (every committed position is still exact). The draws, and so the
+/// past the committed tokens (every committed position is still exact);
+/// [`SpeculativeRun::committed_cache_len`] is where the committed sequence ends. The draws, and so the
 /// output, are the same with or without pipelining ([`Pipelining::Off`]).
 ///
 /// A **speculative** run (any proposer) is not pipelined: the proposer must read the committed
@@ -853,12 +866,21 @@ where
                     stats: SpeculativeStats,
                     sampler: &dyn TokenSampler,
                     timer: Option<GenerationTimer>,
+                    start_len: i32,
                     on_event: &mut dyn FnMut(StreamEvent)| {
         on_event(StreamEvent::Done {
             reason: finish,
             generated: generated.len(),
         });
+        // Every emitted token was fed back unless it is the last one and the run ended on it (a
+        // stop token is never emitted, so a stop-token end fed them all).
+        let fed = if finish == FinishReason::StopToken {
+            generated.len()
+        } else {
+            generated.len().saturating_sub(1)
+        };
         SpeculativeRun {
+            committed_cache_len: start_len + fed as i32,
             output: GenerationOutput {
                 tokens: generated,
                 finish_reason: finish,
@@ -876,7 +898,13 @@ where
         if let Some(timer) = timer.as_mut() {
             timer.finish_prefill(std::iter::empty())?;
         }
-        return Ok(finished(generated, finish, stats, sampler, timer, on_event));
+        let start_len = match &prompt {
+            SpeculativePrompt::Prefilled { cache, .. } => target.cache_len(cache),
+            SpeculativePrompt::Tokens(_) => 0,
+        };
+        return Ok(finished(
+            generated, finish, stats, sampler, timer, start_len, on_event,
+        ));
     }
 
     // ---- Prefill (or adopt the caller's), warm the proposer, close the prefill phase. ----
@@ -901,6 +929,7 @@ where
         }
     };
     stats.forwards += 1;
+    let start_len = target.cache_len(cache);
     let warm = proposer.warm(target, &history, prompt_hidden.as_ref())?;
     let mut previous_hidden = match prompt_hidden.as_ref() {
         Some(h) => Some(last_row(h)?),
@@ -918,7 +947,9 @@ where
     // plain loop's per-step check does.
     if cancel.is_cancelled() {
         finish = FinishReason::Cancelled;
-        return Ok(finished(generated, finish, stats, sampler, timer, on_event));
+        return Ok(finished(
+            generated, finish, stats, sampler, timer, start_len, on_event,
+        ));
     }
 
     // ---- First token: an ordinary draw from the prefill logits. ----
@@ -1005,7 +1036,9 @@ where
                 }
             };
         }
-        return Ok(finished(generated, finish, stats, sampler, timer, on_event));
+        return Ok(finished(
+            generated, finish, stats, sampler, timer, start_len, on_event,
+        ));
     }
     // The next forward consumes the draw as drawn (device-resident or not); the host id serves
     // the stop check, the history, the constraint and the event.
@@ -1025,7 +1058,9 @@ where
     let mut release = BufferRelease::new();
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
-        return Ok(finished(generated, finish, stats, sampler, timer, on_event));
+        return Ok(finished(
+            generated, finish, stats, sampler, timer, start_len, on_event,
+        ));
     }
     if let Some(c) = constraint.as_mut() {
         c.accept(first);
@@ -1213,7 +1248,9 @@ where
         };
     }
 
-    Ok(finished(generated, finish, stats, sampler, timer, on_event))
+    Ok(finished(
+        generated, finish, stats, sampler, timer, start_len, on_event,
+    ))
 }
 
 /// The run's measured report. Backend features MLX does not have (CUDA graphs, NVFP4
@@ -2420,6 +2457,23 @@ pub(crate) mod tests {
         pipelining: Pipelining,
         stop_after: StopAfter,
     ) -> SpeculativeRun {
+        off_run_from(
+            target,
+            SpeculativePrompt::Tokens(&PROMPT),
+            config,
+            pipelining,
+            stop_after,
+        )
+    }
+
+    /// [`off_run`] from `prompt` (a caller-prefilled cache, say).
+    fn off_run_from<T: SpeculativeTarget>(
+        target: &T,
+        prompt: SpeculativePrompt<'_, T::Cache>,
+        config: &GenerationConfig,
+        pipelining: Pipelining,
+        stop_after: StopAfter,
+    ) -> SpeculativeRun {
         let cancel = CancelFlag::new();
         let emitted = std::cell::Cell::new(0usize);
         let predicate = || matches!(stop_after, Some((n, false)) if emitted.get() >= n);
@@ -2427,7 +2481,7 @@ pub(crate) mod tests {
         let run = generate_speculative(
             target,
             &mut NoProposer,
-            SpeculativePrompt::Tokens(&PROMPT),
+            prompt,
             config,
             0,
             &cancel,
@@ -2619,6 +2673,198 @@ pub(crate) mod tests {
         );
         assert_eq!(run.report.sampler, "host:constraint");
         assert_eq!(run.stats.pipelined, 0);
+    }
+
+    /// A target that records, at each forward, how many host reads the sampling seam had made
+    /// since the run began — when each step was enqueued relative to the token reads.
+    struct ReadsAtForward<'a, T> {
+        inner: &'a T,
+        start: HostTransfers,
+        reads: std::cell::RefCell<Vec<u64>>,
+    }
+
+    impl<T: SpeculativeTarget> SpeculativeTarget for ReadsAtForward<'_, T> {
+        type Cache = T::Cache;
+        type Rollback = T::Rollback;
+
+        fn new_cache(&self) -> T::Cache {
+            self.inner.new_cache()
+        }
+
+        fn cache_len(&self, cache: &T::Cache) -> i32 {
+            self.inner.cache_len(cache)
+        }
+
+        fn rollback(&self) -> T::Rollback {
+            self.inner.rollback()
+        }
+
+        fn forward(
+            &self,
+            cache: &mut T::Cache,
+            ids: &Array,
+            rope_offset: i32,
+            scope: LogitsScope,
+            want_hidden: bool,
+        ) -> Result<TargetOutput> {
+            let reads = host_transfers().since(self.start).reads;
+            self.reads.borrow_mut().push(reads);
+            self.inner
+                .forward(cache, ids, rope_offset, scope, want_hidden)
+        }
+
+        fn attention_label(&self) -> &'static str {
+            self.inner.attention_label()
+        }
+    }
+
+    /// The pipelining is real: step `t + 1`'s forward is enqueued before token `t` is read back.
+    /// With the prefill first, the `k`-th forward (`k >= 1`) runs after `k - 1` token reads under
+    /// `Auto` — one behind the unpipelined loop, whose `k`-th forward follows `k` reads.
+    #[test]
+    fn a_pipelined_step_is_enqueued_before_the_previous_token_is_read() {
+        let model = causal();
+        for (pipelining, expected) in [
+            (Pipelining::Auto, vec![0, 0, 1, 2, 3, 4, 5, 6]),
+            (Pipelining::Off, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+        ] {
+            let target = ReadsAtForward {
+                inner: &model,
+                start: host_transfers(),
+                reads: Default::default(),
+            };
+            let run = off_run(&target, &top_p(8), pipelining, None);
+            assert_eq!(run.output.tokens.len(), 8);
+            assert_eq!(target.reads.into_inner(), expected, "{pipelining:?}");
+        }
+    }
+
+    /// Every device-to-host read a decode loop makes goes through the counted sampling seam
+    /// ([`SampledToken::resolve`], the sampler's row copy), so the AC2 counter sees them all: no
+    /// loop in `decode/` reads an array back itself. A source scan of the non-test code.
+    #[test]
+    fn decode_loops_make_no_uncounted_host_read() {
+        let sources = [
+            ("engine.rs", include_str!("engine.rs")),
+            ("stream.rs", include_str!("stream.rs")),
+            ("prefix.rs", include_str!("prefix.rs")),
+            ("batch.rs", include_str!("batch.rs")),
+            ("continuous.rs", include_str!("continuous.rs")),
+            ("speculative.rs", include_str!("speculative.rs")),
+            ("proposers.rs", include_str!("proposers.rs")),
+        ];
+        let host_reads = [
+            ".item::<",
+            ".item(",
+            ".try_item",
+            "as_slice::<",
+            "try_as_slice",
+            "as_slice_unchecked",
+        ];
+        for (name, src) in sources {
+            let code = src.split("\n#[cfg(test)]").next().unwrap();
+            for read in host_reads {
+                assert!(
+                    !code.contains(read),
+                    "decode/{name} reads an array back outside the counted seam (`{read}`)"
+                );
+            }
+        }
+    }
+
+    /// A pipelined run that ends with a discarded look-ahead reports the committed cache length —
+    /// the unpipelined run's — and a caller continuing its prefilled cache from there (truncating
+    /// the look-ahead row) gets a cold forward's logits.
+    #[test]
+    fn a_pipelined_end_reports_the_committed_cache_length() {
+        let model = causal();
+        let prefilled_run = |config: &GenerationConfig, pipelining, stop_after| {
+            let mut cache = model.new_cache();
+            let logits = SpeculativeTarget::forward(
+                &model,
+                &mut cache,
+                &input_ids(&PROMPT),
+                0,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap()
+            .logits;
+            let run = off_run_from(
+                &model,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &PROMPT,
+                    position_delta: 0,
+                },
+                config,
+                pipelining,
+                stop_after,
+            );
+            (run, cache)
+        };
+        let free = off_run(&model, &top_p(20), Pipelining::Off, None)
+            .output
+            .tokens;
+        let mut stopping = top_p(20);
+        stopping.stop_tokens = vec![free[7]];
+        let ends: [(&str, &GenerationConfig, StopAfter); 4] = [
+            ("stop token", &stopping, None),
+            ("stop predicate", &top_p(20), Some((5, false))),
+            ("cancel", &top_p(20), Some((5, true))),
+            ("budget", &top_p(6), None),
+        ];
+        for (end, config, stop_after) in ends {
+            let (off, off_cache) = prefilled_run(config, Pipelining::Off, stop_after);
+            let (on, mut on_cache) = prefilled_run(config, Pipelining::Auto, stop_after);
+            assert_eq!(on.output.tokens, off.output.tokens, "{end}");
+            let tokens = &on.output.tokens;
+            let fed = if on.output.finish_reason == FinishReason::StopToken {
+                tokens.len()
+            } else {
+                tokens.len() - 1
+            };
+            let committed = PROMPT.len() as i32 + fed as i32;
+            assert_eq!(off.committed_cache_len, committed, "{end}");
+            assert_eq!(
+                off_cache.offset(),
+                committed,
+                "{end}: off leaves the committed rows"
+            );
+            assert_eq!(on.committed_cache_len, committed, "{end}");
+            let discarded = if end == "budget" { 0 } else { 1 };
+            assert_eq!(on.stats.discarded, discarded, "{end}");
+            assert_eq!(on_cache.offset(), committed + discarded as i32, "{end}");
+
+            // Continue from the committed length with the next input: the last emitted token, or
+            // the stop token that ended the run.
+            let next = if fed == tokens.len() {
+                stopping.stop_tokens[0]
+            } else {
+                tokens[fed]
+            };
+            on_cache.truncate(on.committed_cache_len).unwrap();
+            let warm = model
+                .decode_logits(&input_ids(&[next]), &mut on_cache, on.committed_cache_len)
+                .unwrap();
+            let mut sequence = PROMPT.to_vec();
+            sequence.extend_from_slice(&tokens[..fed]);
+            sequence.push(next);
+            let mut cold_cache = model.new_cache();
+            let cold = model
+                .decode_logits(&input_ids(&sequence), &mut cold_cache, 0)
+                .unwrap();
+            let host = crate::primitives::kv_cache::testing::host;
+            let (warm, cold) = (host(&warm), host(&cold));
+            let drift = warm
+                .iter()
+                .zip(&cold)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(drift < 1e-4, "{end}: continuation drift {drift}");
+        }
     }
 
     /// A seeded device-sampled run is reproducible, and a different seed draws differently: the

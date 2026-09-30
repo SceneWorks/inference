@@ -1659,95 +1659,97 @@ pub fn vision_merged_token_count(grid_thw: [i32; 3], spatial_merge_size: i32) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::primitives::kv_cache::testing::{host, tok, ConcatReference, CpuStream};
+    use crate::primitives::kv_cache::testing::{host, on_cpu, tok, ConcatReference};
     use serde_json::json;
     use std::collections::HashMap;
 
     #[test]
     fn attn_kv_matches_concat_reference_across_a_block_boundary() {
-        let _cpu = CpuStream::enter();
-        // The full-attention slot is a one-layer block cache: 3-token prefill + enough single
-        // tokens to cross the block boundary twice, every returned K/V equal to a naive concat,
-        // and `offset` reporting live positions rather than the padded buffer length.
-        let block = 4;
-        let mut slot = AttnKv::with_block_tokens(block);
-        let mut reference = ConcatReference::new();
-        assert_eq!(slot.offset(), 0);
-        assert_eq!(slot.batch_size(), 0);
+        on_cpu(|| {
+            // The full-attention slot is a one-layer block cache: 3-token prefill + enough single
+            // tokens to cross the block boundary twice, every returned K/V equal to a naive concat,
+            // and `offset` reporting live positions rather than the padded buffer length.
+            let block = 4;
+            let mut slot = AttnKv::with_block_tokens(block);
+            let mut reference = ConcatReference::new();
+            assert_eq!(slot.offset(), 0);
+            assert_eq!(slot.batch_size(), 0);
 
-        let prefill_k = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
-        let prefill_v = Array::from_slice(&[9.0f32, 9.5, 8.0, 8.5, 7.0, 7.5], &[1, 1, 3, 2]);
-        let (sk, sv) = slot.update(&prefill_k, &prefill_v).unwrap();
-        let (rk, rv) = reference.update(&prefill_k, &prefill_v);
-        assert_eq!(host(&sk), host(&rk));
-        assert_eq!(host(&sv), host(&rv));
-        assert_eq!(slot.offset(), 3);
-        assert_eq!(slot.batch_size(), 1);
+            let prefill_k = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
+            let prefill_v = Array::from_slice(&[9.0f32, 9.5, 8.0, 8.5, 7.0, 7.5], &[1, 1, 3, 2]);
+            let (sk, sv) = slot.update(&prefill_k, &prefill_v).unwrap();
+            let (rk, rv) = reference.update(&prefill_k, &prefill_v);
+            assert_eq!(host(&sk), host(&rk));
+            assert_eq!(host(&sv), host(&rv));
+            assert_eq!(slot.offset(), 3);
+            assert_eq!(slot.batch_size(), 1);
 
-        for i in 0..7 {
-            let k = tok(10.0 + i as f32);
-            let v = tok(20.0 + i as f32);
-            let (sk, sv) = slot.update(&k, &v).unwrap();
-            let (rk, rv) = reference.update(&k, &v);
-            assert_eq!(sk.shape(), rk.shape(), "update {i}: shape");
-            assert_eq!(host(&sk), host(&rk), "update {i}: keys");
-            assert_eq!(host(&sv), host(&rv), "update {i}: values");
-            assert_eq!(slot.offset(), 4 + i, "update {i}: offset is live positions");
-        }
-        // 10 live positions in a 12-position buffer: offset must not read the padding.
-        assert_eq!(slot.offset(), 10);
-        assert_ne!(slot.offset(), 12);
+            for i in 0..7 {
+                let k = tok(10.0 + i as f32);
+                let v = tok(20.0 + i as f32);
+                let (sk, sv) = slot.update(&k, &v).unwrap();
+                let (rk, rv) = reference.update(&k, &v);
+                assert_eq!(sk.shape(), rk.shape(), "update {i}: shape");
+                assert_eq!(host(&sk), host(&rk), "update {i}: keys");
+                assert_eq!(host(&sv), host(&rv), "update {i}: values");
+                assert_eq!(slot.offset(), 4 + i, "update {i}: offset is live positions");
+            }
+            // 10 live positions in a 12-position buffer: offset must not read the padding.
+            assert_eq!(slot.offset(), 10);
+            assert_ne!(slot.offset(), 12);
 
-        slot.reset();
-        assert_eq!(slot.offset(), 0);
-        assert_eq!(slot.batch_size(), 0);
+            slot.reset();
+            assert_eq!(slot.offset(), 0);
+            assert_eq!(slot.batch_size(), 0);
+        })
     }
 
     #[test]
     fn attn_kv_clone_snapshot_survives_in_place_updates_and_rolls_back() {
-        let _cpu = CpuStream::enter();
-        // The MTP loop rolls back by restoring a `clone()` taken before the trial (there is no
-        // truncate on the hybrid cache). While the trial writes in place, the snapshot must stay
-        // exactly what it was, and continuing from it must match a reference that never saw the
-        // trial — across a block boundary, so the trial both overwrites padding and grows.
-        let block = 4;
-        let mut slot = AttnKv::with_block_tokens(block);
-        let mut reference = ConcatReference::new();
-        let prompt = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
-        slot.update(&prompt, &prompt).unwrap();
-        reference.update(&prompt, &prompt);
+        on_cpu(|| {
+            // The MTP loop rolls back by restoring a `clone()` taken before the trial (there is no
+            // truncate on the hybrid cache). While the trial writes in place, the snapshot must stay
+            // exactly what it was, and continuing from it must match a reference that never saw the
+            // trial — across a block boundary, so the trial both overwrites padding and grows.
+            let block = 4;
+            let mut slot = AttnKv::with_block_tokens(block);
+            let mut reference = ConcatReference::new();
+            let prompt = Array::from_slice(&[0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[1, 1, 3, 2]);
+            slot.update(&prompt, &prompt).unwrap();
+            reference.update(&prompt, &prompt);
 
-        let snapshot = slot.clone();
-        let snapshot_k_before = host(reference.k.as_ref().unwrap());
+            let snapshot = slot.clone();
+            let snapshot_k_before = host(reference.k.as_ref().unwrap());
 
-        // Trial: 3 draft tokens (positions 3..6) — fills the block and grows into a second one.
-        for i in 0..3 {
-            let d = tok(100.0 + i as f32);
-            slot.update(&d, &d).unwrap();
-        }
-        assert_eq!(slot.offset(), 6);
-        assert_eq!(
-            snapshot.offset(),
-            3,
-            "snapshot offset untouched by the trial"
-        );
-        let (snap_k, _) = snapshot.kv.peek(0).unwrap().unwrap();
-        assert_eq!(
-            host(&snap_k),
-            snapshot_k_before,
-            "snapshot contents untouched by the trial's in-place writes"
-        );
+            // Trial: 3 draft tokens (positions 3..6) — fills the block and grows into a second one.
+            for i in 0..3 {
+                let d = tok(100.0 + i as f32);
+                slot.update(&d, &d).unwrap();
+            }
+            assert_eq!(slot.offset(), 6);
+            assert_eq!(
+                snapshot.offset(),
+                3,
+                "snapshot offset untouched by the trial"
+            );
+            let (snap_k, _) = snapshot.kv.peek(0).unwrap().unwrap();
+            assert_eq!(
+                host(&snap_k),
+                snapshot_k_before,
+                "snapshot contents untouched by the trial's in-place writes"
+            );
 
-        // Reject everything: restore the snapshot and replay the accepted path.
-        let mut slot = snapshot;
-        for i in 0..5 {
-            let t = tok(200.0 + i as f32);
-            let (sk, sv) = slot.update(&t, &t).unwrap();
-            let (rk, rv) = reference.update(&t, &t);
-            assert_eq!(host(&sk), host(&rk), "replay {i}: keys");
-            assert_eq!(host(&sv), host(&rv), "replay {i}: values");
-        }
-        assert_eq!(slot.offset(), 8);
+            // Reject everything: restore the snapshot and replay the accepted path.
+            let mut slot = snapshot;
+            for i in 0..5 {
+                let t = tok(200.0 + i as f32);
+                let (sk, sv) = slot.update(&t, &t).unwrap();
+                let (rk, rv) = reference.update(&t, &t);
+                assert_eq!(host(&sk), host(&rk), "replay {i}: keys");
+                assert_eq!(host(&sv), host(&rv), "replay {i}: values");
+            }
+            assert_eq!(slot.offset(), 8);
+        })
     }
 
     #[test]
@@ -3241,10 +3243,15 @@ pub(crate) mod tests {
                 tc.insert("full_attention_interval".into(), json!(2));
                 let cfg = Qwen35Config::from_json(&v).unwrap();
                 assert!(!cfg.is_linear(1) && !cfg.is_linear(3));
-                // Random (not periodic) values so greedy steps are rarely near-ties.
+                // Random (not periodic) values so greedy steps are rarely near-ties. Drawn in key
+                // order: a `HashMap`'s iteration order is randomized per process, so drawing in it
+                // gave every test process different weights — and the occasional draw whose
+                // step-0 drift crosses the bound (the sc-24439 "flake").
                 let mut rng = SplitMix64::new(0x2444_2350 + (hd * 16 + nh + nkv) as u64);
-                let weights: HashMap<String, Array> = synthetic_weights(&cfg)
-                    .into_map()
+                let mut entries: Vec<(String, Array)> =
+                    synthetic_weights(&cfg).into_map().into_iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                let weights: HashMap<String, Array> = entries
                     .into_iter()
                     .map(|(key, a)| {
                         let n = a.size();

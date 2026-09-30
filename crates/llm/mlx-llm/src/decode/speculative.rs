@@ -27,10 +27,10 @@
 
 use mlx_rs::Array;
 
-use core_llm::speculative::{accept_greedy_run, accept_token, sample_weighted, Acceptance};
+use core_llm::speculative::{accept_greedy_run, accept_token, Acceptance};
 
 use crate::decode::cancel::CancelFlag;
-use crate::decode::engine::{generate_speculative, EngineOptions, SpeculativePrompt};
+use crate::decode::engine::{draw_from, generate_speculative, EngineOptions, SpeculativePrompt};
 use crate::decode::proposers::NgramProposer;
 use crate::decode::stream::{
     default_seed, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
@@ -40,7 +40,7 @@ use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::KvCache;
-use crate::primitives::sampler::{sample, shaped_candidates, SplitMix64, TokenRng};
+use crate::primitives::sampler::{draw_token, shaped_candidates, SplitMix64, TokenRng};
 
 /// Knobs for prompt-lookup speculation.
 #[derive(Clone, Copy, Debug)]
@@ -180,7 +180,7 @@ pub fn generate_draft_speculative(
     stats.forwards += 1;
     let mut history: Vec<i32> = prompt_ids.to_vec();
 
-    let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
+    let first = draw_token(&logits_last, &history, &config.sampling, &mut rng, None)?;
     // The sample evaluated the target's prefill graph; the draft's is only pulled by its first
     // draft step, so force it here and retire both prefills' logits together — each would
     // otherwise live to the end of the function. The release itself is taken on the loop's first
@@ -227,10 +227,17 @@ pub fn generate_draft_speculative(
             let off = draft_cache.offset();
             let dl = draft.decode_logits(&input_ids(&[feed]), &mut draft_cache, off)?;
             if step < k {
-                if !greedy {
-                    draft_dists.push(shaped_candidates(&dl, &draft_hist, &config.sampling, None)?);
-                }
-                let d = sample(&dl, &draft_hist, &config.sampling, &mut rng, None)?;
+                // The engine's draft rule (`DraftSampler::sample_draft`): a stochastic draft is
+                // drawn from the proposal distribution `q` itself, so it is exactly the `q` the
+                // acceptance test divides by; a greedy draft is the shared sampler's argmax.
+                let d = if greedy {
+                    draw_token(&dl, &draft_hist, &config.sampling, &mut rng, None)?
+                } else {
+                    let q = shaped_candidates(&dl, &draft_hist, &config.sampling, None)?;
+                    let d = draw_from(&q, rng.next_f32());
+                    draft_dists.push(q);
+                    d
+                };
                 drafts.push(d);
                 draft_hist.push(d);
                 feed = d;
@@ -312,8 +319,8 @@ fn decide_greedy(
     let mut hist_i = history.to_vec();
     for i in 0..m {
         let row = logits_row(logits_all, i)?;
-        // Greedy ⇒ `sample` returns the (penalty-aware) argmax; rng is untouched.
-        target_argmax.push(sample(&row, &hist_i, &config.sampling, rng, None)?);
+        // Greedy ⇒ the shared sampler returns the (penalty-aware) argmax; rng is untouched.
+        target_argmax.push(draw_token(&row, &hist_i, &config.sampling, rng, None)?);
         if (i as usize) < drafts.len() {
             hist_i.push(drafts[i as usize]);
         }
@@ -359,10 +366,10 @@ fn decide_stochastic(
         }
     }
     if !rejected {
-        // Every draft accepted ⇒ draw the bonus from the position past the last draft.
+        // Every draft accepted ⇒ draw the bonus from the position past the last draft, on the
+        // shared sampler as the engine does.
         let row = logits_row(logits_all, drafts.len() as i32)?;
-        let target = shaped_candidates(&row, &hist_i, &config.sampling, None)?;
-        committed.push(sample_weighted(&target, rng.next_f32(), 0));
+        committed.push(draw_token(&row, &hist_i, &config.sampling, rng, None)?);
     }
     Ok((committed, accepted))
 }
@@ -372,4 +379,53 @@ fn logits_row(all: &Array, i: i32) -> Result<Array> {
     let idx = Array::from_slice(&[i], &[1]);
     let sh = all.shape();
     Ok(all.take_axis(&idx, 1)?.reshape(&[sh[0], sh[2]])?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::engine::tests::causal;
+    use crate::decode::generate;
+
+    /// Draft-model speculation draws by the shared rule every MLX decode loop uses: with no
+    /// drafts (`num_draft = 0`, the exactness gate) a seeded temperature-0.8 / top-p-0.9 run is the
+    /// plain loop's, first token and all. (Top-p is what separates the rules: the heap-order
+    /// reference walks the nucleus heaviest-first, the shared sampler in vocabulary order.)
+    #[test]
+    fn draft_speculation_draws_by_the_shared_sampler() {
+        let (target, draft) = (causal(), causal());
+        let prompt = [3, 9, 4, 11, 3, 9, 4, 11];
+        for seed in [7, 8, 9] {
+            let config = GenerationConfig {
+                max_new_tokens: 12,
+                sampling: crate::primitives::sampler::SamplingParams {
+                    temperature: 0.8,
+                    top_p: 0.9,
+                    ..Default::default()
+                },
+                seed: Some(seed),
+                stop_tokens: Vec::new(),
+            };
+            let expected =
+                generate(&target, &prompt, &config, &CancelFlag::new(), &mut |_| {}).unwrap();
+            let (out, _) = generate_draft_speculative(
+                &target,
+                &draft,
+                &prompt,
+                &config,
+                &SpeculativeConfig {
+                    max_ngram: 3,
+                    num_draft: 0,
+                },
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                out.tokens[0], expected.tokens[0],
+                "seed {seed}: first token"
+            );
+            assert_eq!(out.tokens, expected.tokens, "seed {seed}");
+        }
+    }
 }

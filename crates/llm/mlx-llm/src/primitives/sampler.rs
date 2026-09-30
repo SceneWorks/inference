@@ -236,6 +236,10 @@ impl SamplingParams {
 /// Sample the next token id from `logits` on the **host reference** (see the module docs; the
 /// decode loops draw through [`sample_with_path`]).
 ///
+/// This is the heap-order reference kept for the mlx-gen media pipelines' seeded parity with their
+/// upstream references; mlx-llm decode loops must draw through [`draw_token`] /
+/// [`sample_with_path`] instead.
+///
 /// * `logits` — `[vocab]` or `[1, vocab]` for the current (last) position.
 /// * `history` — token ids already in the sequence (prompt + generated), for the repetition
 ///   penalty. Pass an empty slice when the penalty is disabled.
@@ -426,13 +430,14 @@ pub fn sample_device(logits: &Array, params: &SamplingParams, u: f32) -> Result<
             let heavier_or_equal = cumsum(&kept, 0, true, true)?;
             let heavier = heavier_or_equal.subtract(&kept)?;
             let threshold = sum(&kept, None)?.multiply(Array::from_f32(params.top_p.max(0.0)))?;
-            let heaviest = Array::from_slice(
-                &(0..vocab).map(|i| i == vocab - 1).collect::<Vec<bool>>(),
-                &[vocab],
-            );
-            let in_nucleus = heavier.lt(&threshold)?.logical_or(&heaviest)?;
-            let lightest = mlx_rs::ops::r#where(&in_nucleus, &asc, Array::from_f32(f32::INFINITY))?
-                .min(None)?;
+            let in_nucleus = heavier.lt(&threshold)?;
+            // The heaviest entry bounds the floor from above, built on the device: no per-draw
+            // vocab-length host mask.
+            let lightest = minimum(
+                mlx_rs::ops::r#where(&in_nucleus, &asc, Array::from_f32(f32::INFINITY))?
+                    .min(None)?,
+                asc.index(vocab - 1),
+            )?;
             floor = Some(match floor {
                 Some(kth) => maximum(&kth, &lightest)?,
                 None => lightest,
@@ -1171,6 +1176,38 @@ mod tests {
             let gi: Vec<usize> = got.iter().map(|x| x.0).collect();
             let ei: Vec<usize> = expected.iter().map(|x| x.0).collect();
             assert_eq!(gi, ei, "top_p={top_p}");
+        }
+    }
+
+    /// The heaviest weight always bounds the top-p floor, even when the nucleus is empty
+    /// (`top_p = 0`): the floor is the maximum weight, so every token tied at the maximum stays
+    /// kept (the documented threshold-tie rule) and the uniform picks among them.
+    #[test]
+    fn an_empty_nucleus_keeps_every_token_tied_at_the_maximum() {
+        let row = [2.0, 0.1, 2.0, -1.0];
+        let params = SamplingParams {
+            temperature: 0.7,
+            top_p: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(device_draw(&row, &params, 0.25), 0);
+        assert_eq!(device_draw(&row, &params, 0.75), 2);
+    }
+
+    /// The device draw builds nothing vocab-sized on the host: every per-draw array is derived on
+    /// the device from the logits (only scalar knobs and the uniform cross host→device). A source
+    /// scan, since MLX exposes no upload counter.
+    #[test]
+    fn the_device_draw_uploads_no_host_built_array() {
+        let src = include_str!("sampler.rs");
+        let start = src.find("pub fn sample_device(").expect("sample_device");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("end of sample_device")];
+        for host_built in ["from_slice", "from_iter", "collect", "vec!", "Vec<"] {
+            assert!(
+                !body.contains(host_built),
+                "sample_device builds a host array per draw (`{host_built}`)"
+            );
         }
     }
 }
