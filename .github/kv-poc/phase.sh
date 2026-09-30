@@ -286,8 +286,22 @@ case "$phase" in
     ;;
 esac
 
+# A3 publishes a measured quality-gate miss as evidence; it is never reported as a pass.
+gate_note=""
+if [ "$rc" = 0 ] && [ "$phase" = a3 ] && [ -f "$OUT/complete-matrix.json" ]; then
+  # Families whose gate did not pass (empty = every gate passed); an unreadable matrix never passes.
+  failed="$(python3.12 -c 'import json, sys; m = json.load(open(sys.argv[1])); print(",".join(r["family"] for r in m["receipts"] if r.get("qualityGatePassed") is not True) or ("" if m.get("qualityGatePassed") is True else "matrix"))' "$OUT/complete-matrix.json")" \
+    || failed="an unreadable complete-matrix.json"
+  if [ -n "$failed" ]; then
+    echo "::warning title=A3 quality gate FAILED::packed quality gate failed for ${failed}; the receipts record each failed metric (qualityGate.failures). Evidence, NOT a pass."
+    gate_note=" -- QUALITY GATE FAILED for ${failed} (evidence recorded, NOT a pass)"
+  else
+    gate_note=" -- quality gate passed"
+  fi
+fi
+
 case "$rc" in
-  0) finish 0 false "completed" ;;
+  0) finish 0 false "completed${gate_note}" ;;
   75)
     reason="$(cat "$CTL/stop-requested" 2>/dev/null || echo "stop file present")"
     echo "::notice title=phase $phase stopped::$reason; re-dispatch the same parameters to resume"
