@@ -2957,7 +2957,8 @@ mod cuda_tests {
         let start = graph_tally();
         for (i, t) in [3i32, 7, 11, 2, 7, 5, 9, 4, 8, 6].into_iter().enumerate() {
             if i == 6 {
-                // Steps 0–1 warm up and capture, 2 is the verified replay, 3–5 replay.
+                // Step 0 (from an empty cache) runs plain eager, 1–2 warm up and capture, 3 is the
+                // verified replay, 4–5 replay.
                 assert_eq!(runner.captured_graphs(), 1);
                 super::cuda::FAIL_NEXT_LAUNCH.with(|f| f.set(true));
             }
@@ -2984,8 +2985,8 @@ mod cuda_tests {
         let tally = graph_tally().since(&start);
         eprintln!("[runner] failed launch: {}", tally.describe());
         assert_eq!(
-            tally.replayed, 4,
-            "the verified replay and three replays before the failure"
+            tally.replayed, 3,
+            "the verified replay and two replays before the failure"
         );
         assert_eq!(runner.refusal(), Some(REASON_LAUNCH_FAILED));
         assert_eq!(runner.captured_graphs(), 0);
