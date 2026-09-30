@@ -981,27 +981,82 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
     {
         return Err("SC-20676 packed kernel profile does not match baseline model geometry".into());
     }
-    if receipt.dense.prompt_tokens < SC20676_MIN_LONG_CONTEXT_TOKENS as u64
-        || receipt.dense.prompt_tokens != receipt.baseline.context_payload_tokens
-        || receipt.packed.prompt_tokens != receipt.baseline.context_payload_tokens
-        || receipt.dense.input.ids_len != receipt.baseline.context_payload_tokens
-        || receipt.packed.input.ids_len != receipt.baseline.context_payload_tokens
-        || receipt.dense.run_nonce != receipt.packed.run_nonce
-        || receipt.dense.executable_sha256 != receipt.packed.executable_sha256
-        || !is_digest(&receipt.dense.snapshot_inventory_sha256)
-        || receipt.dense.snapshot_inventory_sha256 != receipt.packed.snapshot_inventory_sha256
-        || receipt.dense.snapshot_inventory_sha256 != receipt.baseline.snapshot_inventory_sha256
-        || receipt.dense.input != receipt.packed.input
-        || receipt.dense.output.logits_len != receipt.packed.output.logits_len
-        || receipt.dense.output.logits_shape != receipt.packed.output.logits_shape
-        || receipt.dense.output.logits_dtype != receipt.packed.output.logits_dtype
-        || receipt.dense.output.token_len != receipt.packed.output.token_len
-        || receipt.dense.output.tokens_sha256 != receipt.packed.output.tokens_sha256
-        || !receipt.dense.elapsed_ms.is_finite()
-        || !receipt.packed.elapsed_ms.is_finite()
-    {
-        return Err("SC-20676 receipt arm evidence is incomplete".into());
+    let (dense, packed, baseline) = (&receipt.dense, &receipt.packed, &receipt.baseline);
+    let mut checks = NamedChecks::default();
+    checks.require(
+        dense.prompt_tokens >= SC20676_MIN_LONG_CONTEXT_TOKENS as u64,
+        || {
+            format!(
+                "dense.promptTokens {} < {SC20676_MIN_LONG_CONTEXT_TOKENS}",
+                dense.prompt_tokens
+            )
+        },
+    );
+    for arm in [dense, packed] {
+        checks.require(arm.prompt_tokens == baseline.context_payload_tokens, || {
+            format!(
+                "{}.promptTokens {} != baseline.contextPayloadTokens {}",
+                arm.mode, arm.prompt_tokens, baseline.context_payload_tokens
+            )
+        });
+        checks.require(arm.input.ids_len == baseline.context_payload_tokens, || {
+            format!(
+                "{}.input.idsLen {} != baseline.contextPayloadTokens {}",
+                arm.mode, arm.input.ids_len, baseline.context_payload_tokens
+            )
+        });
+        checks.require(arm.elapsed_ms.is_finite(), || {
+            format!("{}.elapsedMs {} is not finite", arm.mode, arm.elapsed_ms)
+        });
     }
+    checks.differ("runNonce", &dense.run_nonce, &packed.run_nonce);
+    checks.differ(
+        "executableSha256",
+        &dense.executable_sha256,
+        &packed.executable_sha256,
+    );
+    checks.require(is_digest(&dense.snapshot_inventory_sha256), || {
+        format!(
+            "dense.snapshotInventorySha256 {:?} is not a digest",
+            dense.snapshot_inventory_sha256
+        )
+    });
+    checks.differ(
+        "snapshotInventorySha256",
+        &dense.snapshot_inventory_sha256,
+        &packed.snapshot_inventory_sha256,
+    );
+    checks.require(
+        dense.snapshot_inventory_sha256 == baseline.snapshot_inventory_sha256,
+        || {
+            format!(
+                "dense.snapshotInventorySha256 {} != baseline {}",
+                dense.snapshot_inventory_sha256, baseline.snapshot_inventory_sha256
+            )
+        },
+    );
+    checks.differ("input", &dense.input, &packed.input);
+    checks.differ(
+        "output.logitsLen",
+        &dense.output.logits_len,
+        &packed.output.logits_len,
+    );
+    checks.differ(
+        "output.logitsShape",
+        &dense.output.logits_shape,
+        &packed.output.logits_shape,
+    );
+    checks.differ(
+        "output.logitsDtype",
+        &dense.output.logits_dtype,
+        &packed.output.logits_dtype,
+    );
+    checks.differ(
+        "output.tokenLen",
+        &dense.output.token_len,
+        &packed.output.token_len,
+    );
+    checks.finish("SC-20676 receipt arm evidence is incomplete")?;
     let model = campaign::benchmark_model(&receipt.dense.family, false)?;
     let expected_model_id = format!(
         "{}@{};architecture={};inventory={}",
@@ -1016,42 +1071,98 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
     {
         return Err("SC-20676 baseline model binding does not match the receipt family".into());
     }
-    if host_independent(&receipt.dense.provenance) != host_independent(&receipt.packed.provenance)
-        || !is_revision(&receipt.dense.provenance.inference_revision)
-        || !is_revision(&receipt.dense.provenance.scene_works_revision)
-        || receipt.dense.provenance.inference_revision != receipt.baseline.closure.harness_revision
-        || receipt.dense.provenance.scene_works_revision != receipt.baseline.scene_works_revision
-        || !is_digest(&receipt.dense.provenance.dependency_lock_sha256)
-        || [
-            receipt.dense.provenance.os.as_str(),
-            receipt.dense.provenance.xcode.as_str(),
-            receipt.dense.provenance.hardware.as_str(),
-            receipt.dense.provenance.power_mode.as_str(),
-            receipt.dense.provenance.thermal_state.as_str(),
-        ]
-        .iter()
-        .any(|field| field.is_empty())
-        || [&receipt.dense, &receipt.packed].iter().any(|arm| {
-            arm.provenance.power_mode.is_empty()
-                || !sc20676_unthrottled_thermal_state(&arm.provenance.thermal_state)
-        })
-    {
-        return Err("SC-20676 worker provenance is incomplete or differs by arm".into());
+    let mut checks = NamedChecks::default();
+    for difference in provenance_differences(
+        &host_independent(&dense.provenance),
+        &host_independent(&packed.provenance),
+    )? {
+        checks
+            .0
+            .push(format!("dense/packed provenance {difference}"));
     }
-    let packed = receipt.packed.packed.as_ref().expect("checked above");
-    if packed.accepted_direct_calls == 0
-        || packed.full_cache_dequantizations != 0
-        || packed.dense_active
-        || packed.retained_device_packed_logical_bytes == 0
-        || receipt.packed.continuation_dispatches == 0
-        || receipt
-            .packed
+    checks.require(is_revision(&dense.provenance.inference_revision), || {
+        format!(
+            "provenance.inferenceRevision {:?} is not a commit id",
+            dense.provenance.inference_revision
+        )
+    });
+    checks.require(is_revision(&dense.provenance.scene_works_revision), || {
+        format!(
+            "provenance.sceneWorksRevision {:?} is not a commit id",
+            dense.provenance.scene_works_revision
+        )
+    });
+    checks.require(
+        dense.provenance.inference_revision == baseline.closure.harness_revision,
+        || {
+            format!(
+                "provenance.inferenceRevision {} != baseline.closure.harnessRevision {}",
+                dense.provenance.inference_revision, baseline.closure.harness_revision
+            )
+        },
+    );
+    checks.require(
+        dense.provenance.scene_works_revision == baseline.scene_works_revision,
+        || {
+            format!(
+                "provenance.sceneWorksRevision {} != baseline.sceneWorksRevision {}",
+                dense.provenance.scene_works_revision, baseline.scene_works_revision
+            )
+        },
+    );
+    checks.require(is_digest(&dense.provenance.dependency_lock_sha256), || {
+        "provenance.dependencyLockSha256 is not a digest".into()
+    });
+    for (name, value) in [
+        ("os", &dense.provenance.os),
+        ("xcode", &dense.provenance.xcode),
+        ("hardware", &dense.provenance.hardware),
+    ] {
+        checks.require(!value.is_empty(), || format!("provenance.{name} is empty"));
+    }
+    for arm in [dense, packed] {
+        checks.require(!arm.provenance.power_mode.is_empty(), || {
+            format!("{}.provenance.powerMode is empty", arm.mode)
+        });
+        checks.require(
+            sc20676_unthrottled_thermal_state(&arm.provenance.thermal_state),
+            || {
+                format!(
+                    "{}.provenance.thermalState {:?} is not nominal/fair",
+                    arm.mode, arm.provenance.thermal_state
+                )
+            },
+        );
+    }
+    checks.finish("SC-20676 worker provenance is incomplete or differs by arm")?;
+    let evidence = packed.packed.as_ref().expect("checked above");
+    let mut checks = NamedChecks::default();
+    checks.require(evidence.accepted_direct_calls != 0, || {
+        "packed.acceptedDirectCalls is 0".into()
+    });
+    checks.require(evidence.full_cache_dequantizations == 0, || {
+        format!(
+            "packed.fullCacheDequantizations is {}",
+            evidence.full_cache_dequantizations
+        )
+    });
+    checks.require(!evidence.dense_active, || {
+        "packed.denseActive is true".into()
+    });
+    checks.require(evidence.retained_device_packed_logical_bytes != 0, || {
+        "packed.retainedDevicePackedLogicalBytes is 0".into()
+    });
+    checks.require(packed.continuation_dispatches != 0, || {
+        "continuationDispatches is 0".into()
+    });
+    checks.require(
+        packed
             .warm_packed
             .as_ref()
-            .is_none_or(|warm| !warm.kernel_warmed || warm.steady_dispatches == 0)
-    {
-        return Err("SC-20676 packed arm did not prove direct warm compressed decode".into());
-    }
+            .is_some_and(|warm| warm.kernel_warmed && warm.steady_dispatches != 0),
+        || "warmPacked is absent, unwarmed, or has no steady dispatches".into(),
+    );
+    checks.finish("SC-20676 packed arm did not prove direct warm compressed decode")?;
     let quality = receipt
         .packed
         .quality
@@ -1061,20 +1172,74 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         &receipt.dense.output.needle_output,
         &receipt.packed.output.needle_output,
     );
-    if !quality.kernel_parity_max_error.is_finite()
-        || quality.kernel_parity_max_error < 0.0
-        || quality.kernel_parity_max_error > receipt.thresholds.max_kernel_parity_error
-        || !quality.max_logit_abs_error.is_finite()
-        || quality.max_logit_abs_error < 0.0
-        || quality.greedy_agreement_method != campaign::GREEDY_AGREEMENT_METHOD
-        || !(0.0..=1.0).contains(&quality.greedy_token_agreement)
-        || quality.greedy_token_agreement < receipt.thresholds.min_greedy_token_agreement
-        || quality.needle_retrieval != needle_retrieval
-        || quality.needle_discriminating != needle_discriminating
-        || !quality.needle_retrieval
-    {
-        return Err("SC-20676 packed quality is outside declared bounds".into());
-    }
+    let mut checks = NamedChecks::default();
+    checks.require(
+        quality.kernel_parity_max_error.is_finite()
+            && quality.kernel_parity_max_error >= 0.0
+            && quality.kernel_parity_max_error <= receipt.thresholds.max_kernel_parity_error,
+        || {
+            format!(
+                "quality.kernelParityMaxError {} outside [0, {}]",
+                quality.kernel_parity_max_error, receipt.thresholds.max_kernel_parity_error
+            )
+        },
+    );
+    checks.require(
+        quality.max_logit_abs_error.is_finite() && quality.max_logit_abs_error >= 0.0,
+        || {
+            format!(
+                "quality.maxLogitAbsError {} is not a finite non-negative value",
+                quality.max_logit_abs_error
+            )
+        },
+    );
+    checks.require(
+        quality.greedy_agreement_method == campaign::GREEDY_AGREEMENT_METHOD,
+        || {
+            format!(
+                "quality.greedyAgreementMethod {:?} != {:?}",
+                quality.greedy_agreement_method,
+                campaign::GREEDY_AGREEMENT_METHOD
+            )
+        },
+    );
+    checks.require(
+        (0.0..=1.0).contains(&quality.greedy_token_agreement)
+            && quality.greedy_token_agreement >= receipt.thresholds.min_greedy_token_agreement,
+        || {
+            format!(
+                "quality.greedyTokenAgreement {} < {} (teacher-forced)",
+                quality.greedy_token_agreement, receipt.thresholds.min_greedy_token_agreement
+            )
+        },
+    );
+    // The free-running greedy streams: equal whenever teacher-forced agreement is complete.
+    checks.require(
+        dense.output.tokens_sha256 == packed.output.tokens_sha256,
+        || {
+            format!(
+                "output.tokensSha256 (free-running greedy stream) dense={} packed={}",
+                dense.output.tokens_sha256, packed.output.tokens_sha256
+            )
+        },
+    );
+    checks.require(
+        quality.needle_retrieval == needle_retrieval
+            && quality.needle_discriminating == needle_discriminating,
+        || {
+            format!(
+                "quality needle flags (retrieval={}, discriminating={}) do not recompute ({needle_retrieval}, {needle_discriminating})",
+                quality.needle_retrieval, quality.needle_discriminating
+            )
+        },
+    );
+    checks.require(quality.needle_retrieval, || {
+        format!(
+            "quality.needleRetrieval is false: dense needle output {:?}, packed {:?}",
+            dense.output.needle_output, packed.output.needle_output
+        )
+    });
+    checks.finish("SC-20676 packed quality is outside declared bounds")?;
     if receipt.throughput_comparison
         != sc20676_throughput_comparison(&receipt.dense, &receipt.packed)?
     {
@@ -2667,6 +2832,32 @@ fn host_independent(provenance: &Sc20676Provenance) -> Sc20676Provenance {
     }
 }
 
+/// Every failing named check of one validation stage, so a refusal says exactly what failed.
+#[derive(Default)]
+struct NamedChecks(Vec<String>);
+
+impl NamedChecks {
+    fn require(&mut self, ok: bool, failure: impl FnOnce() -> String) {
+        if !ok {
+            self.0.push(failure());
+        }
+    }
+
+    fn differ<T: PartialEq + std::fmt::Debug>(&mut self, field: &str, dense: &T, packed: &T) {
+        self.require(dense == packed, || {
+            format!("{field} differs by arm: dense={dense:?} packed={packed:?}")
+        });
+    }
+
+    fn finish(self, stage: &str) -> std::result::Result<(), String> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("{stage}: {}", self.0.join("; ")))
+        }
+    }
+}
+
 /// Each differing provenance field as `field: captured=<value> worker=<value>`.
 fn provenance_differences(
     captured: &Sc20676Provenance,
@@ -2866,6 +3057,98 @@ fn read_bound_arm(
     Ok(arm)
 }
 
+/// One arm of the fixed schedule: accepted (fresh or resumed), or an operator stop before it.
+enum ArmStep {
+    Accepted(Box<Sc20676Arm>),
+    Stopped(campaign::OperatorStop),
+}
+
+enum ArmSchedule {
+    /// `[family][dense, packed]` in input order.
+    Complete(Vec<Vec<Sc20676Arm>>),
+    Stopped(campaign::OperatorStop),
+}
+
+/// Run the fixed four-arm schedule (each family's dense then packed arm, families in input order)
+/// through `obtain(input, mode, arm_index)`. No receipt is assembled here.
+fn run_arm_schedule(
+    inputs: &[ArmFamilyInput],
+    mut obtain: impl FnMut(&ArmFamilyInput, &str, usize) -> std::result::Result<ArmStep, String>,
+) -> std::result::Result<ArmSchedule, String> {
+    let mut family_arms = Vec::with_capacity(inputs.len());
+    let mut arm_index = 0_usize;
+    for input in inputs {
+        let mut arms = Vec::with_capacity(2);
+        for mode in ["dense", "packed"] {
+            match obtain(input, mode, arm_index)? {
+                ArmStep::Accepted(arm) => arms.push(*arm),
+                ArmStep::Stopped(stop) => return Ok(ArmSchedule::Stopped(stop)),
+            }
+            arm_index += 1;
+        }
+        family_arms.push(arms);
+    }
+    Ok(ArmSchedule::Complete(family_arms))
+}
+
+fn family_receipt(
+    input: &ArmFamilyInput,
+    arms: Vec<Sc20676Arm>,
+    policy: &campaign::CampaignSafetyPolicy,
+) -> std::result::Result<Sc20676Receipt, String> {
+    let (dense, packed) = take_validated_family_arms(arms)?;
+    // Resumed and fresh arms alike must have run under the captured policy's cap/reserve.
+    dense.admission.validate_against(policy)?;
+    packed.admission.validate_against(policy)?;
+    let throughput_comparison = sc20676_throughput_comparison(&dense, &packed)?;
+    if throughput_comparison.packed_slower_beyond_noise {
+        eprintln!(
+            "SC-20676 {}: packed steady decode is slower than dense beyond noise ({:.3} vs {:.3} tok/s); recorded, not refused",
+            input.family,
+            throughput_comparison.packed_mean_tokens_per_second,
+            throughput_comparison.dense_mean_tokens_per_second
+        );
+    }
+    Sc20676Receipt {
+        schema_version: 0,
+        harness_version: String::new(),
+        receipt_sha256: String::new(),
+        baseline: input.baseline.clone(),
+        thresholds: Sc20676Thresholds::default(),
+        dense,
+        packed,
+        throughput_comparison,
+    }
+    .finish()
+}
+
+/// Seal one receipt per family, after the whole schedule. Every family's refusal is reported, each
+/// naming its family and the failing checks.
+fn assemble_family_receipts(
+    inputs: &[ArmFamilyInput],
+    family_arms: Vec<Vec<Sc20676Arm>>,
+    policy: &campaign::CampaignSafetyPolicy,
+) -> std::result::Result<Vec<Sc20676Receipt>, String> {
+    if family_arms.len() != inputs.len() {
+        return Err("SC-20676 arm schedule does not cover every family".into());
+    }
+    let mut receipts = Vec::with_capacity(inputs.len());
+    let mut refusals = Vec::new();
+    for (input, arms) in inputs.iter().zip(family_arms) {
+        match family_receipt(input, arms, policy) {
+            Ok(receipt) => receipts.push(receipt),
+            Err(error) => refusals.push(format!("{}: {error}", input.family)),
+        }
+    }
+    if !refusals.is_empty() {
+        return Err(format!(
+            "SC-20676 receipt refused after all arms ran (arms kept for resume): {}",
+            refusals.join(" | ")
+        ));
+    }
+    Ok(receipts)
+}
+
 /// Parent spawns a fresh dense and packed child for each family.  Workers write untrusted arm
 /// files; only this parent binds them to an already-sealed SC-20671 baseline and produces a seal.
 pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOutcome, String> {
@@ -3043,106 +3326,100 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
         }
     }
     let result = (|| -> std::result::Result<campaign::CampaignOutcome, String> {
-        let mut receipts = Vec::new();
         let mut worker_pids = std::collections::BTreeSet::new();
-        let mut arm_index = 0_usize;
-        for input in &inputs {
+        let schedule = run_arm_schedule(&inputs, |input, worker_mode, before_arm| {
             let family = input.family;
             let target_prompt_tokens = input.baseline.context_payload_tokens.to_string();
-            let mut arms = Vec::new();
-            for worker_mode in ["dense", "packed"] {
-                let slug = format!("{family}-{worker_mode}");
-                let before_arm = arm_index;
-                arm_index += 1;
-                let arm_path = worker_root.join(format!("{slug}.json"));
-                let binding_path = worker_root.join(format!("{slug}.binding.json"));
-                if arm_path.exists() || binding_path.exists() {
-                    if !arm_path.exists() || !binding_path.exists() {
-                        return Err(format!(
-                            "SC-20676 partial resume arm {slug} must be repaired explicitly"
-                        ));
-                    }
-                    arms.push(read_bound_arm(
-                        &worker_root,
-                        input,
-                        worker_mode,
-                        &identity_sha256,
-                        &nonce,
-                        &executable_sha256,
-                        &expected_provenance,
-                        &mut worker_pids,
-                    )?);
-                    eprintln!("SC-20676 resumed validated arm {slug}");
-                    continue;
+            let slug = format!("{family}-{worker_mode}");
+            let arm_path = worker_root.join(format!("{slug}.json"));
+            let binding_path = worker_root.join(format!("{slug}.binding.json"));
+            if arm_path.exists() || binding_path.exists() {
+                if !arm_path.exists() || !binding_path.exists() {
+                    return Err(format!(
+                        "SC-20676 partial resume arm {slug} must be repaired explicitly"
+                    ));
                 }
-                // Between arms only: a running worker is never signalled.
-                if let Some(stop) = campaign::operator_stop_before_row(
-                    &stop_files,
-                    &worker_root.join("logs"),
-                    "sc-20676-operator-stop",
-                    before_arm,
-                    &slug,
-                    allowed.len(),
-                )? {
-                    return Ok(campaign::CampaignOutcome::StoppedByOperator(stop));
-                }
-                let (total_tokens, request_tokens) = sc20676_admitted_tokens(
+                let arm = read_bound_arm(
+                    &worker_root,
+                    input,
                     worker_mode,
-                    input.baseline.context_payload_tokens,
-                    &policy,
+                    &identity_sha256,
+                    &nonce,
+                    &executable_sha256,
+                    &expected_provenance,
+                    &mut worker_pids,
                 )?;
-                let admission = sc20676_runtime_admission(
-                    family,
-                    &input.snapshot,
-                    total_tokens,
-                    request_tokens,
-                    &policy,
-                )?;
-                let mut command = Command::new(&executable);
-                command
-                    .arg("worker")
-                    .arg("--snapshot")
-                    .arg(&input.snapshot)
-                    .arg("--family")
-                    .arg(family)
-                    .arg("--mode")
-                    .arg(worker_mode)
-                    .arg("--run-nonce")
-                    .arg(&nonce)
-                    .arg("--executable-sha256")
-                    .arg(&executable_sha256)
-                    .arg("--context-payload-tokens")
-                    .arg(&target_prompt_tokens)
-                    .arg("--out")
-                    .arg(&arm_path)
-                    .arg("--safety-policy")
-                    .arg(&policy_path)
-                    .arg("--policy-sha256")
-                    .arg(&policy_sha256)
-                    .arg("--resume-identity")
-                    .arg(worker_root.join("identity.json"))
-                    .arg("--resume-identity-sha256")
-                    .arg(&identity_sha256);
-                let logs = worker_root.join("logs");
-                let log_prefix = campaign::unused_attempt_prefix(&logs, &slug)
-                    .ok_or("SC-20676 no unused bounded worker log path")?;
-                let request = RunRequest {
-                    context_tokens: total_tokens,
-                    request_tokens,
-                    stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
-                    stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
-                };
-                let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
-                let status = match campaign_supervisor::run_guarded(
-                    &mut command,
-                    &request,
-                    &policy.supervisor(),
-                    &mut SystemProbe,
-                ) {
-                    Ok(status) => status,
-                    Err(failure) => {
-                        let reason = format!("{:?}", failure.reason);
-                        return Err(campaign::unaccepted_row_error(
+                eprintln!("SC-20676 resumed validated arm {slug}");
+                return Ok(ArmStep::Accepted(Box::new(arm)));
+            }
+            // Between arms only: a running worker is never signalled.
+            if let Some(stop) = campaign::operator_stop_before_row(
+                &stop_files,
+                &worker_root.join("logs"),
+                "sc-20676-operator-stop",
+                before_arm,
+                &slug,
+                allowed.len(),
+            )? {
+                return Ok(ArmStep::Stopped(stop));
+            }
+            let (total_tokens, request_tokens) = sc20676_admitted_tokens(
+                worker_mode,
+                input.baseline.context_payload_tokens,
+                &policy,
+            )?;
+            let admission = sc20676_runtime_admission(
+                family,
+                &input.snapshot,
+                total_tokens,
+                request_tokens,
+                &policy,
+            )?;
+            let mut command = Command::new(&executable);
+            command
+                .arg("worker")
+                .arg("--snapshot")
+                .arg(&input.snapshot)
+                .arg("--family")
+                .arg(family)
+                .arg("--mode")
+                .arg(worker_mode)
+                .arg("--run-nonce")
+                .arg(&nonce)
+                .arg("--executable-sha256")
+                .arg(&executable_sha256)
+                .arg("--context-payload-tokens")
+                .arg(&target_prompt_tokens)
+                .arg("--out")
+                .arg(&arm_path)
+                .arg("--safety-policy")
+                .arg(&policy_path)
+                .arg("--policy-sha256")
+                .arg(&policy_sha256)
+                .arg("--resume-identity")
+                .arg(worker_root.join("identity.json"))
+                .arg("--resume-identity-sha256")
+                .arg(&identity_sha256);
+            let logs = worker_root.join("logs");
+            let log_prefix = campaign::unused_attempt_prefix(&logs, &slug)
+                .ok_or("SC-20676 no unused bounded worker log path")?;
+            let request = RunRequest {
+                context_tokens: total_tokens,
+                request_tokens,
+                stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
+                stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
+            };
+            let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
+            let status = match campaign_supervisor::run_guarded(
+                &mut command,
+                &request,
+                &policy.supervisor(),
+                &mut SystemProbe,
+            ) {
+                Ok(status) => status,
+                Err(failure) => {
+                    let reason = format!("{:?}", failure.reason);
+                    return Err(campaign::unaccepted_row_error(
                             &unaccepted,
                             "sc-20676-unaccepted-arm",
                             &slug,
@@ -3158,10 +3435,10 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                                 failure.detail, failure.pid, request.stderr_path.display(), worker_root.display(),
                             ),
                         ));
-                    }
-                };
-                if !status.success() {
-                    return Err(campaign::unaccepted_row_error(
+                }
+            };
+            if !status.success() {
+                return Err(campaign::unaccepted_row_error(
                         &unaccepted,
                         "sc-20676-unaccepted-arm",
                         &slug,
@@ -3172,67 +3449,52 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                             request.stderr_path.display(), worker_root.display(),
                         ),
                     ));
-                }
-                let bytes = fs::read(&arm_path).map_err(|e| e.to_string())?;
-                let arm: Sc20676Arm = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-                let mut candidate_pids = worker_pids.clone();
-                validate_worker_binding(
-                    &arm,
-                    family,
-                    worker_mode,
-                    &nonce,
-                    &executable_sha256,
-                    &expected_provenance,
-                    &mut candidate_pids,
-                )?;
-                if arm.snapshot_inventory_sha256 != input.baseline.snapshot_inventory_sha256 {
-                    return Err(format!("SC-20676 {slug} snapshot inventory changed"));
-                }
-                let binding = arm_identity_bytes(&arm_binding(&identity_sha256, &arm, &bytes))?;
-                let staging_binding =
-                    binding_path.with_extension(format!("json.staging-{}", std::process::id()));
-                if staging_binding.exists() {
-                    return Err(format!("SC-20676 partial binding staging for {slug}"));
-                }
-                fs::write(&staging_binding, binding).map_err(|e| e.to_string())?;
-                fs::rename(staging_binding, &binding_path).map_err(|e| e.to_string())?;
-                arms.push(read_bound_arm(
-                    &worker_root,
-                    input,
-                    worker_mode,
-                    &identity_sha256,
-                    &nonce,
-                    &executable_sha256,
-                    &expected_provenance,
-                    &mut worker_pids,
-                )?);
-                eprintln!("SC-20676 accepted validated arm {slug}");
             }
-            let (dense, packed) = take_validated_family_arms(arms)?;
-            // Resumed and fresh arms alike must have run under the captured policy's cap/reserve.
-            dense.admission.validate_against(&policy)?;
-            packed.admission.validate_against(&policy)?;
-            let throughput_comparison = sc20676_throughput_comparison(&dense, &packed)?;
-            if throughput_comparison.packed_slower_beyond_noise {
-                eprintln!(
-                    "SC-20676 {family}: packed steady decode is slower than dense beyond noise ({:.3} vs {:.3} tok/s); recorded, not refused",
-                    throughput_comparison.packed_mean_tokens_per_second,
-                    throughput_comparison.dense_mean_tokens_per_second
-                );
+            let bytes = fs::read(&arm_path).map_err(|e| e.to_string())?;
+            let arm: Sc20676Arm = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let mut candidate_pids = worker_pids.clone();
+            validate_worker_binding(
+                &arm,
+                family,
+                worker_mode,
+                &nonce,
+                &executable_sha256,
+                &expected_provenance,
+                &mut candidate_pids,
+            )?;
+            if arm.snapshot_inventory_sha256 != input.baseline.snapshot_inventory_sha256 {
+                return Err(format!("SC-20676 {slug} snapshot inventory changed"));
             }
-            let receipt = Sc20676Receipt {
-                schema_version: 0,
-                harness_version: String::new(),
-                receipt_sha256: String::new(),
-                baseline: input.baseline.clone(),
-                thresholds: Sc20676Thresholds::default(),
-                dense,
-                packed,
-                throughput_comparison,
+            let binding = arm_identity_bytes(&arm_binding(&identity_sha256, &arm, &bytes))?;
+            let staging_binding =
+                binding_path.with_extension(format!("json.staging-{}", std::process::id()));
+            if staging_binding.exists() {
+                return Err(format!("SC-20676 partial binding staging for {slug}"));
             }
-            .finish()?;
-            receipts.push(receipt);
-        }
+            fs::write(&staging_binding, binding).map_err(|e| e.to_string())?;
+            fs::rename(staging_binding, &binding_path).map_err(|e| e.to_string())?;
+            let arm = read_bound_arm(
+                &worker_root,
+                input,
+                worker_mode,
+                &identity_sha256,
+                &nonce,
+                &executable_sha256,
+                &expected_provenance,
+                &mut worker_pids,
+            )?;
+            eprintln!("SC-20676 accepted validated arm {slug}");
+            Ok(ArmStep::Accepted(Box::new(arm)))
+        })?;
+        let family_arms = match schedule {
+            ArmSchedule::Complete(family_arms) => family_arms,
+            ArmSchedule::Stopped(stop) => {
+                return Ok(campaign::CampaignOutcome::StoppedByOperator(stop))
+            }
+        };
+        // Every arm has run (or resumed) before any family is judged, so one family's refusal
+        // never leaves the other family's evidence uncollected.
+        let receipts = assemble_family_receipts(&inputs, family_arms, &policy)?;
         validate_complete_matrix_receipts(&receipts)?;
         fs::create_dir(&staging).map_err(|e| e.to_string())?;
         let mut receipt_file_sha256 = std::collections::BTreeMap::new();
@@ -4454,5 +4716,150 @@ mod tests {
         let mut other_harness = reused;
         other_harness.baseline.closure.harness_revision = "d".repeat(40);
         assert!(other_harness.finish().is_err());
+    }
+
+    fn family_input(family: &'static str) -> ArmFamilyInput {
+        let mut baseline = receipt().baseline;
+        if family == "qwen" {
+            let model = campaign::benchmark_model("qwen", false).unwrap();
+            baseline.model_repository = model.repository.into();
+            baseline.model_revision = model.revision.into();
+            baseline.model_id = format!(
+                "{}@{};architecture={};inventory={}",
+                model.repository,
+                model.revision,
+                model.architecture,
+                baseline.snapshot_inventory_sha256
+            );
+            baseline.campaign_session_id = "d".repeat(64);
+        }
+        ArmFamilyInput {
+            family,
+            snapshot: PathBuf::new(),
+            baseline,
+            snapshot_bytes: 100,
+            baseline_manifest_sha256: digest(),
+        }
+    }
+    fn family_arm(family: &str, mode: &str) -> Sc20676Arm {
+        let mut arm = arm(mode);
+        arm.family = family.into();
+        reseal_arm(&mut arm);
+        arm
+    }
+    fn fixture_policy() -> campaign::CampaignSafetyPolicy {
+        campaign::CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1 << 30,
+            child_footprint_cap_bytes: 1 << 30,
+            max_context_tokens: 4096,
+            max_request_tokens: 4096,
+            stdout_cap_bytes: 100,
+            stderr_cap_bytes: 100,
+        }
+    }
+
+    /// Run 36676488532: the llama pair was judged before any qwen arm ran, and its refusal said
+    /// only "arm evidence is incomplete" (the free-running token streams differed). The parent
+    /// sequence now runs all four arms first, then names every failing check per family.
+    #[test]
+    fn parent_runs_all_four_arms_before_judging_and_names_each_failure() {
+        let inputs = [family_input("llama"), family_input("qwen")];
+        let policy = fixture_policy();
+        let mut calls = Vec::new();
+        let schedule = run_arm_schedule(&inputs, |input, mode, index| {
+            calls.push(format!("{index}:{}-{mode}", input.family));
+            let mut arm = family_arm(input.family, mode);
+            if input.family == "llama" && mode == "dense" {
+                arm.output.needle_output = "SC206076-NEEDLE-9b7a2e. I".into();
+            }
+            if input.family == "llama" && mode == "packed" {
+                // The real llama packed arm: one teacher-forced miss in 16 tokens.
+                arm.output.tokens_sha256 = "c".repeat(64);
+                arm.output.needle_output = "SC2060766-NEEDLE-9b7a2e.".into();
+                let quality = arm.quality.as_mut().unwrap();
+                quality.greedy_token_agreement = 0.9375;
+                quality.needle_retrieval = false;
+                quality.needle_discriminating = false;
+            }
+            reseal_arm(&mut arm);
+            Ok(ArmStep::Accepted(Box::new(arm)))
+        })
+        .unwrap();
+        assert_eq!(
+            calls,
+            [
+                "0:llama-dense",
+                "1:llama-packed",
+                "2:qwen-dense",
+                "3:qwen-packed"
+            ]
+        );
+        let ArmSchedule::Complete(family_arms) = schedule else {
+            panic!("no operator stop was requested");
+        };
+        let error = assemble_family_receipts(&inputs, family_arms, &policy).unwrap_err();
+        for expected in [
+            "after all arms ran",
+            "llama: SC-20676 packed quality is outside declared bounds",
+            "quality.greedyTokenAgreement 0.9375 < 0.999",
+            "output.tokensSha256 (free-running greedy stream)",
+            "quality.needleRetrieval is false",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in {error}");
+        }
+        assert!(!error.contains("qwen:"), "{error}");
+        assert!(!error.contains("incomplete"), "{error}");
+
+        // The same sequence with passing arms seals one receipt per family, in order.
+        let ArmSchedule::Complete(family_arms) = run_arm_schedule(&inputs, |input, mode, _| {
+            Ok(ArmStep::Accepted(Box::new(family_arm(input.family, mode))))
+        })
+        .unwrap() else {
+            panic!("no operator stop was requested");
+        };
+        let receipts = assemble_family_receipts(&inputs, family_arms, &policy).unwrap();
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|r| r.dense.family.as_str())
+                .collect::<Vec<_>>(),
+            ["llama", "qwen"]
+        );
+        validate_complete_matrix_receipts(&receipts).unwrap();
+
+        // An operator stop before arm 2 ends the schedule there; nothing is assembled.
+        let mut ran = 0;
+        let stopped = run_arm_schedule(&inputs, |input, mode, index| {
+            if index == 2 {
+                return Ok(ArmStep::Stopped(campaign::OperatorStop {
+                    before_row: index,
+                    row: format!("{}-{mode}", input.family),
+                    rows_total: 4,
+                    record: PathBuf::new(),
+                }));
+            }
+            ran += 1;
+            Ok(ArmStep::Accepted(Box::new(family_arm(input.family, mode))))
+        })
+        .unwrap();
+        assert!(matches!(stopped, ArmSchedule::Stopped(stop) if stop.before_row == 2));
+        assert_eq!(ran, 2);
+    }
+
+    #[test]
+    fn arm_evidence_refusal_names_the_field_and_both_values() {
+        let mut other_input = receipt();
+        other_input.packed.input.ids_sha256 = "c".repeat(64);
+        reseal_arm(&mut other_input.packed);
+        let error = validate_sc20676_receipt_core(&other_input).unwrap_err();
+        assert!(
+            error.starts_with("SC-20676 receipt arm evidence is incomplete: input differs by arm"),
+            "{error}"
+        );
+        assert!(error.contains(&"c".repeat(64)), "{error}");
     }
 }
