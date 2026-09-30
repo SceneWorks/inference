@@ -1988,19 +1988,18 @@ impl TextLlm for LlamaProvider {
 /// The deepest speculative proposal any proposer runs on MLX (sc-24438, epic sc-24432 E4): drafts
 /// per verify step, so the verify forward carries at most `1 + 7 = 8` query rows.
 ///
-/// Why 7: [`MLX_SDPA_VECTOR_MAX_QLEN`](crate::primitives::attention::MLX_SDPA_VECTOR_MAX_QLEN) is
-/// 8 — the widest query MLX 0.32's single-pass **vector** SDPA kernel (its decode kernel, the one
-/// every plain `q_len = 1` step runs) takes. A verify of up to 8 rows stays on that kernel: one
-/// fused call per attention layer, no score matrix, the same kernel as the plain step it must
-/// agree with token for token. Past 8 rows the same verify moves to the prefill-shaped fused
-/// **full** kernel (head dims 64/80/128, 32-row query blocks, so a 9-row verify pays for a whole
-/// block) or — for head dims only the vector kernel serves, like the Qwen35 hybrid's 256 — to a
-/// second vector-kernel tile per layer: the per-step verify cost stops being flat in the depth
-/// exactly where speculation needs it flat. (A GQA group wider than 4 narrows the vector kernel
-/// to `32 / gqa` rows; a verify between that and 8 rows is split into vector-kernel tiles — still
-/// the decode kernel, still no score matrix — so the bound stays the kernel's `q_len` limit.)
-/// sc-24442 removed the old 8-row cap on *fused* SDPA; this is the width the decode kernel
-/// serves, not that cap.
+/// Why 7: the attention primitive's `MLX_SDPA_VECTOR_MAX_QLEN` is 8 — the widest query MLX
+/// 0.32's single-pass **vector** SDPA kernel takes. That is its decode kernel, the one every plain
+/// `q_len = 1` step runs. A verify of up to 8 rows stays on it: one fused call per attention
+/// layer, no score matrix, the same kernel as the plain step it must agree with token for token.
+/// Past 8 rows the same verify moves to the fused **full** kernel (head dims 64/80/128), whose
+/// query blocks are sized for prefill, or — for head dims only the vector kernel serves, like the
+/// Qwen35 hybrid's 256 — to a second vector-kernel tile per layer: the per-step verify cost stops
+/// being flat in the depth exactly where speculation needs it flat. (A GQA group wider than 4
+/// narrows the vector kernel to `32 / gqa` rows; a verify between that and 8 rows is split into
+/// vector-kernel tiles — still the decode kernel, still no score matrix — so the bound stays the
+/// kernel's `q_len` limit.) sc-24442 removed the old 8-row cap on *fused* SDPA; this is the width
+/// the decode kernel serves, not that cap.
 pub const SPECULATIVE_MAX_DEPTH: u32 =
     crate::primitives::attention::MLX_SDPA_VECTOR_MAX_QLEN as u32 - 1;
 
