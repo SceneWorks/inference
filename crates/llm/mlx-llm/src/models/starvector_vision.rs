@@ -37,9 +37,19 @@ pub struct StarVectorClipVision {
 impl StarVectorClipVision {
     /// Load every image-tower tensor from the exact StarVector-1B namespaced checkpoint.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Self::from_weights_with_layers(w, prefix, LAYERS)
+    }
+
+    /// [`from_weights`](Self::from_weights) with an explicit depth — the published tower has
+    /// [`LAYERS`]; a shallower one is a shape-valid test fixture.
+    pub(crate) fn from_weights_with_layers(
+        w: &Weights,
+        prefix: &str,
+        depth: usize,
+    ) -> Result<Self> {
         let visual = |suffix: &str| format!("{prefix}.visual_encoder.{suffix}");
-        let mut layers = Vec::with_capacity(LAYERS);
-        for index in 0..LAYERS {
+        let mut layers = Vec::with_capacity(depth);
+        for index in 0..depth {
             layers.push(ClipBlock::from_weights(
                 w,
                 &visual(&format!("transformer.resblocks.{index}")),

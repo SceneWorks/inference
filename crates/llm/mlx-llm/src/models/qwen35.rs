@@ -1649,7 +1649,7 @@ pub fn vision_merged_token_count(grid_thw: [i32; 3], spatial_merge_size: i32) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::primitives::kv_cache::testing::{host, tok, ConcatReference, CpuStream};
     use serde_json::json;
@@ -1765,7 +1765,7 @@ mod tests {
         assert!((dense.item::<f32>() - source[0]).abs() < 1e-6);
     }
 
-    fn cfg_json() -> serde_json::Value {
+    pub(crate) fn cfg_json() -> serde_json::Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.
         json!({
             "text_config": {
@@ -1984,11 +1984,11 @@ mod tests {
         Weights::from_map(m)
     }
 
-    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+    pub(crate) fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
         synthetic_weights_with_prefix(cfg, "model.language_model")
     }
 
-    fn cfg_json_mtp() -> serde_json::Value {
+    pub(crate) fn cfg_json_mtp() -> serde_json::Value {
         let mut v = cfg_json();
         let tc = v["text_config"].as_object_mut().unwrap();
         tc.insert("mtp_num_hidden_layers".into(), json!(1));
@@ -2233,8 +2233,9 @@ mod tests {
     #[test]
     fn mtp_generation_covers_verification_rollback_stop_and_cancel() {
         use crate::decode::{
-            generate, generate_qwen35_mtp, generate_qwen35_mtp_with_timings, CancelFlag,
-            ConstraintMask, FinishReason, GenerationConfig, RewindableConstraintMask,
+            generate, generate_qwen35_mtp, generate_speculative, CancelFlag, ConstraintMask,
+            EngineOptions, FinishReason, GenerationConfig, MtpProposer, RewindableConstraintMask,
+            SpeculativePrompt,
         };
         use crate::primitives::sampler::SamplingParams;
 
@@ -2285,19 +2286,25 @@ mod tests {
         };
         let target_only =
             generate(&model, &[1, 2, 3], &greedy, &CancelFlag::new(), &mut |_| {}).unwrap();
-        let (timed, stats) = generate_qwen35_mtp_with_timings(
+        let mut timed = generate_speculative(
             &model,
-            &[1, 2, 3],
+            &mut MtpProposer::new(),
+            SpeculativePrompt::Tokens(&[1, 2, 3]),
             &greedy,
             2,
             &CancelFlag::new(),
             &mut |_| {},
-            None,
-            None,
+            EngineOptions {
+                prefill_clock: Some(std::time::Instant::now()),
+                ..EngineOptions::default()
+            },
         )
         .unwrap();
-        let speculative = timed.output;
-        let _timings = timed.timer.finish();
+        let _timings = timed
+            .take_timer()
+            .expect("a timed run keeps its timer")
+            .finish();
+        let (speculative, stats) = (timed.output, timed.stats);
         assert_eq!(
             speculative.tokens, target_only.tokens,
             "adversarial MTP drafts must not change greedy target output"
@@ -2423,8 +2430,8 @@ mod tests {
         use std::time::Instant;
 
         use crate::decode::{
-            generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
-            CancelFlag, GenerationConfig, Qwen35MtpMultimodalPrompt,
+            generate_speculative, CancelFlag, EngineOptions, GenerationConfig, MtpProposer,
+            Qwen35MtpMultimodalPrompt, SpeculativePrompt,
         };
         use crate::primitives::sampler::SamplingParams;
 
@@ -2458,33 +2465,54 @@ mod tests {
             seed: Some(17),
             stop_tokens: Vec::new(),
         };
-        let (text, text_stats) = generate_qwen35_mtp_with_timings(
+        let clock = || EngineOptions {
+            prefill_clock: Some(Instant::now()),
+            ..EngineOptions::default()
+        };
+        let mut text = generate_speculative(
             &model,
-            &ids,
+            &mut MtpProposer::new(),
+            SpeculativePrompt::Tokens(&ids),
             &config,
             2,
             &CancelFlag::new(),
             &mut |_| {},
-            None,
-            None,
+            clock(),
         )
         .unwrap();
-        let (visual, visual_stats) = generate_qwen35_mtp_multimodal_with_timings(
+        // The multimodal route: the caller prefills the fused embeddings under explicit M-RoPE
+        // positions and the proposer seeds from those same embeddings.
+        let mut visual_cache = model.new_cache();
+        let (visual_hidden, visual_logits) = model
+            .prefill_hidden_and_last_logits_from_embeds_with_deepstack(
+                prompt.embeddings,
+                prompt.positions,
+                &mut visual_cache,
+                prompt.visual_pos_mask,
+                prompt.deepstack,
+            )
+            .unwrap();
+        let mut visual = generate_speculative(
             &model,
-            &prompt,
+            &mut MtpProposer::multimodal(&prompt),
+            SpeculativePrompt::Prefilled {
+                cache: &mut visual_cache,
+                logits: visual_logits,
+                hidden: Some(visual_hidden),
+                history: prompt.input_ids,
+                position_delta: prompt.continuation_delta,
+            },
             &config,
             2,
             &CancelFlag::new(),
             &mut |_| {},
-            None,
-            None,
-            Instant::now(),
+            clock(),
         )
         .unwrap();
         assert_eq!(visual.output.tokens, text.output.tokens);
-        assert_eq!(visual_stats, text_stats);
-        let _ = text.timer.finish();
-        let _ = visual.timer.finish();
+        assert_eq!(visual.stats, text.stats);
+        let _ = text.take_timer().unwrap().finish();
+        let _ = visual.take_timer().unwrap().finish();
 
         // Alter the middle row as an encoded visual feature. Both the target prefill and shifted
         // MTP seed must consume that fused row rather than re-embedding placeholder token id 2.
