@@ -76,6 +76,13 @@ pub struct SpeculativeStats {
     pub replays: usize,
     /// Partially accepted verify steps recovered by a direct cache rollback (no forward).
     pub direct_rollbacks: usize,
+    /// Decode steps the pipelined loop enqueued before the previous token was read back (story
+    /// sc-24439); `0` for a run that was not pipelined.
+    pub pipelined: usize,
+    /// Pipelined look-ahead forwards discarded unread because the token before them ended the run
+    /// (at most one per run). `forwards` counts them: forwards = prefill + verify steps + replays +
+    /// discarded.
+    pub discarded: usize,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and

@@ -1746,7 +1746,7 @@ impl TextLlm for LlamaProvider {
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
                                     prefill_clock: clock,
-                                    sampler: None,
+                                    ..EngineOptions::default()
                                 },
                             )
                         }
@@ -1781,7 +1781,7 @@ impl TextLlm for LlamaProvider {
                                         .map(|m| m as &mut dyn RewindableConstraintMask),
                                     should_stop: should_stop_opt,
                                     prefill_clock: clock,
-                                    sampler: None,
+                                    ..EngineOptions::default()
                                 },
                             )
                         }
@@ -1823,7 +1823,7 @@ impl TextLlm for LlamaProvider {
                                 .map(|m| m as &mut dyn RewindableConstraintMask),
                             should_stop: should_stop_opt,
                             prefill_clock: None,
-                            sampler: None,
+                            ..EngineOptions::default()
                         },
                     )
                 }
@@ -1835,7 +1835,7 @@ impl TextLlm for LlamaProvider {
                             .map(|m| m as &mut dyn RewindableConstraintMask),
                         should_stop: should_stop_opt,
                         prefill_clock: Some(Instant::now()),
-                        sampler: None,
+                        ..EngineOptions::default()
                     };
                     match &self.model {
                         Decoder::Causal(model) => generate_speculative(

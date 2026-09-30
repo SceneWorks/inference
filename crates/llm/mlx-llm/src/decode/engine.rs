@@ -36,11 +36,12 @@
 //! A new proposal source (a draft model, a companion MTP head) is a [`Proposer`] impl; a cache that
 //! can roll back per token (a DeltaNet checkpoint ring) is a [`CacheRollback`] impl returning
 //! [`Rollback::Direct`], armed per step through [`CacheRollback::begin`]'s `&mut` cache; a
-//! device-side or pipelined sampler is a [`TokenSampler`] impl handed to [`EngineOptions::sampler`]
-//! whose draws may stay device-resident ([`SampledToken::Device`]) — the loop feeds the next forward
-//! from the array and reads the id back only for the stop check, history, constraint and event. Any
-//! step-only [`Decode`] model runs the `off` loop through [`StepTarget`]. None of them touches this
-//! loop.
+//! sampler is a [`TokenSampler`] impl handed to [`EngineOptions::sampler`] whose draws may stay
+//! device-resident ([`SampledToken::Device`]) — the loop feeds the next forward from the array and
+//! reads the id back only for the stop check, history, constraint and event; the default
+//! [`MlxSampler`] draws greedy and temperature / top-k / top-p on the device, and the `off` loop
+//! pipelines such draws ([`generate_speculative`], story sc-24439). Any step-only [`Decode`] model
+//! runs the `off` loop through [`StepTarget`]. None of them touches this loop.
 //!
 //! The verify-vs-decode kernel caveat of [`speculative`](super::speculative) applies: a multi-token
 //! verify rounds a few bf16 ULP differently from the single-token step, so on real weights a greedy
@@ -48,8 +49,8 @@
 
 use std::time::Instant;
 
-use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::transforms::{async_eval, eval};
+use mlx_rs::Array;
 
 use core_llm::speculative::{accept_token, greedy_commit, Acceptance};
 use core_llm::{
@@ -67,6 +68,7 @@ use crate::error::{Error, Result};
 use crate::models::{CausalLm, Qwen35Cache, Qwen35Model};
 use crate::primitives::input_ids;
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
+pub use crate::primitives::sampler::SampledToken;
 use crate::primitives::sampler::{
     acceptance_target, argmax_rows_device, sample_with_path, SamplingParams, SplitMix64, TokenRng,
 };
@@ -396,40 +398,6 @@ impl SpeculativeTarget for StepTarget<'_> {
 // The sampler seam.
 // ---------------------------------------------------------------------------------------------
 
-/// One drawn token: already on the host, or still device-resident — a single-element integer
-/// array the next forward can consume before it is ever read back. The engine resolves a device
-/// token to the host only where it must (the stop-token check, the history / penalty window, the
-/// constraint, the emitted event) and feeds the next step's forward from the array itself, so a
-/// pipelined sampler (story sc-24439) can enqueue step `t + 1` before step `t`'s id is read.
-#[derive(Clone, Debug)]
-pub enum SampledToken {
-    /// The id, on the host.
-    Host(i32),
-    /// A one-element integer array holding the id, on the device.
-    Device(Array),
-}
-
-impl SampledToken {
-    /// The id on the host (a device token is evaluated and read back).
-    pub fn resolve(&self) -> Result<i32> {
-        match self {
-            SampledToken::Host(id) => Ok(*id),
-            SampledToken::Device(id) => {
-                Ok(id.reshape(&[-1])?.as_dtype(Dtype::Int32)?.item::<i32>())
-            }
-        }
-    }
-
-    /// The `[1, 1]` int32 input ids of the forward that consumes this token — built from the
-    /// device array without reading it back.
-    pub fn input(&self) -> Result<Array> {
-        match self {
-            SampledToken::Host(id) => Ok(input_ids(&[*id])),
-            SampledToken::Device(id) => Ok(id.as_dtype(Dtype::Int32)?.reshape(&[1, 1])?),
-        }
-    }
-}
-
 /// The engine's token draws — the seam a device sampler plugs in behind. Every draw is recorded,
 /// so [`path`](Self::path) is measured rather than inferred from the request.
 pub trait TokenSampler {
@@ -459,12 +427,19 @@ pub trait TokenSampler {
     /// Where the run's draws happened: `Host(reason)` if any was on the host (the latest host
     /// reason), `Device` if all were on the device, `None` if nothing was drawn.
     fn path(&self) -> Option<SamplerPath>;
+    /// Whether a draw reads the `history` window (a repetition / presence penalty). The engine
+    /// pipelines only a sampler that does not: a look-ahead draw is made before the token it
+    /// follows is known on the host, so its history is one token short. Conservatively `true`.
+    fn reads_history(&self) -> bool {
+        true
+    }
 }
 
-/// The MLX sampler: [`sample_with_path`] with the seeded [`SplitMix64`], plain-greedy draws taken
-/// as the on-device argmax and everything else on the host (MLX has no device sampler for
-/// temperature, penalties or a constraint mask). Every draw is recorded at the branch that ran, and
-/// every token is returned resolved ([`SampledToken::Host`]).
+/// The MLX sampler: the shared decode sampler [`sample_with_path`] with the seeded [`SplitMix64`].
+/// Plain greedy and temperature / top-k / top-p draws stay on the device and are returned
+/// unevaluated ([`SampledToken::Device`]) — only the chosen id is ever read back, and the engine
+/// can pipeline them; a penalty, a constraint or a degenerate temperature draws on the host and
+/// says why. Every draw is recorded at the branch that ran.
 #[derive(Clone, Debug)]
 pub struct MlxSampler {
     params: SamplingParams,
@@ -493,7 +468,7 @@ impl MlxSampler {
     }
 
     fn penalized(&self) -> bool {
-        self.params.repetition_penalty != 1.0 || self.params.presence_penalty != 0.0
+        self.params.is_penalized()
     }
 
     fn note_host(&mut self, reason: HostSampleReason) {
@@ -523,7 +498,7 @@ impl TokenSampler for MlxSampler {
         let (token, path) =
             sample_with_path(logits, history, &self.params, &mut self.rng, allowed)?;
         self.note(path);
-        Ok(SampledToken::Host(token))
+        Ok(token)
     }
 
     fn argmax_rows(&mut self, logits: &Array) -> Result<Vec<i32>> {
@@ -558,6 +533,10 @@ impl TokenSampler for MlxSampler {
             (0, _) => Some(SamplerPath::Device),
             _ => self.last_host.map(SamplerPath::Host),
         }
+    }
+
+    fn reads_history(&self) -> bool {
+        self.penalized()
     }
 }
 
@@ -620,18 +599,24 @@ impl DraftSampler<'_, '_> {
     /// Sample one draft from `[1, vocab]` `logits` given the provisional `draft_history`: the
     /// token and — for a stochastic run — its proposal distribution. Advances the constraint by
     /// the draft unless it is a stop token (the engine rewinds the constraint after the proposal).
+    ///
+    /// A stochastic draft is drawn from the returned distribution itself (one uniform of the seeded
+    /// stream, the host reference's inverse-CDF walk), so the draft is exactly distributed as the
+    /// `q` the acceptance test divides by — a device draw from the same knobs matches `q` only in
+    /// distribution, and only up to threshold ties.
     pub fn sample_draft(&mut self, logits: &Array, draft_history: &[i32]) -> Result<DraftSample> {
-        let dist = if self.greedy() {
-            None
-        } else {
-            let mask = self.constraint.as_mut().map(|c| c.allowed());
-            Some(self.sampler.distribution(logits, draft_history, mask)?)
-        };
+        let greedy = self.greedy();
         let mask = self.constraint.as_mut().map(|c| c.allowed());
-        let draft = self
-            .sampler
-            .sample(logits, draft_history, mask)?
-            .resolve()?;
+        let (draft, dist) = if greedy {
+            let draft = self
+                .sampler
+                .sample(logits, draft_history, mask)?
+                .resolve()?;
+            (draft, None)
+        } else {
+            let dist = self.sampler.distribution(logits, draft_history, mask)?;
+            (draw_from(&dist, self.sampler.uniform()), Some(dist))
+        };
         if !self.is_stop(draft) {
             if let Some(c) = self.constraint.as_mut() {
                 c.accept(draft);
@@ -640,6 +625,20 @@ impl DraftSampler<'_, '_> {
         }
         Ok((draft, dist))
     }
+}
+
+/// The inverse-CDF draw over an unnormalised, never-empty distribution given a uniform `u` in
+/// `[0, 1)` — [`sample`](crate::primitives::sample)'s host walk.
+fn draw_from(dist: &[(i32, f32)], u: f32) -> i32 {
+    let total: f32 = dist.iter().map(|x| x.1).sum();
+    let mut target = u * total;
+    for &(token, weight) in dist {
+        target -= weight;
+        if target <= 0.0 {
+            return token;
+        }
+    }
+    dist.last().map_or(0, |x| x.0)
 }
 
 /// A proposal source for the engine over target `T`. Implementations:
@@ -750,6 +749,18 @@ pub struct EngineOptions<'a, 'c> {
     pub prefill_clock: Option<Instant>,
     /// The sampler; `None` runs an [`MlxSampler`] seeded from the config.
     pub sampler: Option<&'a mut (dyn TokenSampler + 'c)>,
+    /// Whether the token-at-a-time loop may pipeline (see [`generate_speculative`]).
+    pub pipelining: Pipelining,
+}
+
+/// Whether [`generate_speculative`] pipelines its token-at-a-time loop (story sc-24439).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pipelining {
+    /// Pipeline wherever it applies.
+    #[default]
+    Auto,
+    /// Never: read every token back before the next step is enqueued (the parity reference).
+    Off,
 }
 
 /// A finished engine run.
@@ -775,6 +786,24 @@ impl SpeculativeRun {
 /// (`0`, or [`NoProposer`], is the token-at-a-time loop). Returns [`Error::Canceled`] if `cancel`
 /// is already set before any inference; a mid-run cancel returns the partial output as
 /// [`FinishReason::Cancelled`].
+///
+/// ## Pipelining (story sc-24439)
+/// The token-at-a-time loop ([`NoProposer`]) is **pipelined** when the draws are device-resident
+/// and independent of the host: no constraint, and a sampler that does not read the history
+/// ([`TokenSampler::reads_history`]). Step `t + 1`'s forward and draw are enqueued on step `t`'s
+/// unevaluated token and handed to the device ([`async_eval`]) *before* step `t`'s id is read back,
+/// so the device computes the next step while the host commits this one. The look-ahead is never
+/// enqueued past the budget; when step `t` ends the run (a stop token, the caller's stop predicate,
+/// a cancel) the already-enqueued step `t + 1` is discarded unread — never emitted — and counted
+/// ([`SpeculativeStats::discarded`]). A caller-prefilled cache then holds that discarded position
+/// past the committed tokens (every committed position is still exact). The draws, and so the
+/// output, are the same with or without pipelining ([`Pipelining::Off`]).
+///
+/// A **speculative** run (any proposer) is not pipelined: the proposer must read the committed
+/// token on the host — the n-gram context, the MTP head's hidden row — before it can draft the next
+/// step, and the verify decision reads the drafts' rows, so there is no next step to enqueue before
+/// this one is read back. A penalized or constrained run is not pipelined either: its draws read
+/// the host history / grammar that the unread token would advance.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_speculative<T, P>(
     target: &T,
@@ -798,6 +827,7 @@ where
         should_stop,
         prefill_clock,
         sampler,
+        pipelining,
     } = options;
     let mut owned_sampler;
     let sampler: &mut dyn TokenSampler = match sampler {
@@ -896,6 +926,87 @@ where
         let mask = constraint.as_mut().map(|c| c.allowed());
         sampler.sample(&logits, &history, mask)?
     };
+    if pipelining == Pipelining::Auto
+        && kind == ProposerKind::None
+        && constraint.is_none()
+        && !wants_hidden
+        && !sampler.reads_history()
+    {
+        if let Some(warm) = warm.as_ref() {
+            eval([warm])?;
+        }
+        drop(warm);
+        drop(prompt_hidden);
+        let mut prefill_logits = Some(logits);
+        let mut pending = first;
+        let mut release = BufferRelease::new();
+        loop {
+            // Enqueue step t + 1 on step t's unread token, then read step t back while the device
+            // runs it. Never past the budget; a host draw is already read back, so it waits.
+            let ahead = if pending.is_device() && generated.len() + 1 < config.max_new_tokens {
+                let position = target.cache_len(cache) + position_delta;
+                let out =
+                    target.forward(cache, &pending.input()?, position, LogitsScope::Last, false)?;
+                let next = sampler.sample(&out.logits, &history, None)?;
+                if let SampledToken::Device(id) = &next {
+                    async_eval([id])?;
+                }
+                stats.forwards += 1;
+                stats.pipelined += 1;
+                Some(next)
+            } else {
+                None
+            };
+            let token = pending.resolve()?;
+            // The first read-back evaluated the prefill: its prompt-length logits retire here and
+            // the post-prefill buffer release rides the first `advance` below.
+            drop(prefill_logits.take());
+            let end = if config.stop_tokens.contains(&token) {
+                Some(FinishReason::StopToken)
+            } else {
+                on_event(StreamEvent::Token {
+                    id: token,
+                    step: generated.len(),
+                });
+                generated.push(token);
+                history.push(token);
+                if should_stop.is_some_and(|stop| stop()) {
+                    Some(FinishReason::Stopped)
+                } else if generated.len() >= config.max_new_tokens {
+                    Some(FinishReason::MaxTokens)
+                } else if cancel.is_cancelled() {
+                    Some(FinishReason::Cancelled)
+                } else {
+                    None
+                }
+            };
+            if let Some(end) = end {
+                finish = end;
+                if ahead.is_some() {
+                    stats.discarded += 1; // enqueued, never read back, never emitted
+                }
+                break;
+            }
+            release.advance(1);
+            stats.verify_steps += 1;
+            pending = match ahead {
+                Some(next) => next,
+                None => {
+                    let position = target.cache_len(cache) + position_delta;
+                    let out = target.forward(
+                        cache,
+                        &input_ids(&[token]),
+                        position,
+                        LogitsScope::Last,
+                        false,
+                    )?;
+                    stats.forwards += 1;
+                    sampler.sample(&out.logits, &history, None)?
+                }
+            };
+        }
+        return Ok(finished(generated, finish, stats, sampler, timer, on_event));
+    }
     // The next forward consumes the draw as drawn (device-resident or not); the host id serves
     // the stop check, the history, the constraint and the event.
     let mut cur_input = first.input()?;
@@ -1291,6 +1402,7 @@ pub(crate) mod tests {
     use crate::decode::stream::generate_with;
     use crate::models::qwen35::tests::{cfg_json, cfg_json_mtp, synthetic_weights};
     use crate::models::Qwen35Config;
+    use crate::primitives::sampler::{host_transfers, HostTransfers};
     use crate::primitives::Weights;
 
     // ---- Fixtures: a tiny random llama-family decoder and the synthetic Qwen35 hybrid. ----
@@ -1304,13 +1416,19 @@ pub(crate) mod tests {
     /// The tiny random llama-family decoder over a `vocab`-entry vocabulary (hidden 16, two
     /// layers), drawn from one fixed seed.
     pub(crate) fn tiny_llama(vocab: i32) -> CausalLm {
+        synthetic_llama(16, 2, vocab)
+    }
+
+    /// A random llama-family decoder of width `hidden` (four query heads, two KV heads, a 2x MLP)
+    /// and `layers` layers over a `vocab`-entry vocabulary, drawn from one fixed seed.
+    fn synthetic_llama(hidden: i32, layers: usize, vocab: i32) -> CausalLm {
         let cfg = ModelConfig {
-            hidden_size: 16,
-            intermediate_size: 32,
-            num_layers: 2,
+            hidden_size: hidden,
+            intermediate_size: 2 * hidden,
+            num_layers: layers,
             num_heads: 4,
             num_kv_heads: 2,
-            head_dim: 4,
+            head_dim: hidden / 4,
             vocab_size: vocab,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
@@ -1532,12 +1650,7 @@ pub(crate) mod tests {
             ("greedy", greedy(20), false, "device"),
             ("penalized", penalized(20), false, "host:penalty"),
             ("constrained", greedy(20), true, "host:constraint"),
-            (
-                "stochastic",
-                stochastic(20),
-                false,
-                "host:device_unavailable",
-            ),
+            ("stochastic", stochastic(20), false, "device"),
             (
                 "constrained stochastic",
                 stochastic(20),
@@ -1588,6 +1701,13 @@ pub(crate) mod tests {
             assert_eq!((report.proposed_tokens, report.accepted_tokens), (0, 0));
             assert_eq!(report.mean_accepted_length(), None, "{name}");
             assert_eq!(report.sampler, sampler, "{name}");
+            // Device draws pipeline every step after the first; host draws never do.
+            let pipelined = if sampler == "device" { 19 } else { 0 };
+            assert_eq!(run.stats.pipelined, pipelined, "{name}");
+            assert_eq!(
+                run.stats.discarded, 0,
+                "{name}: a budget end enqueues nothing past it"
+            );
         }
     }
 
@@ -2277,5 +2397,277 @@ pub(crate) mod tests {
             .forward(&mut cache, &input_ids(&[1, 2]), 0, LogitsScope::All, false)
             .unwrap_err();
         assert!(err.to_string().contains("cannot verify drafts"), "{err}");
+    }
+
+    // ---- Pipelining and the device sampler (story sc-24439). ----
+
+    /// Temperature 0.7 / top-p 0.9 — the device sampler's request.
+    fn top_p(max_new_tokens: usize) -> GenerationConfig {
+        let mut config = greedy(max_new_tokens);
+        config.sampling.temperature = 0.7;
+        config.sampling.top_p = 0.9;
+        config
+    }
+
+    /// Stop the caller's way after this many tokens: `false` through the stop predicate, `true` by
+    /// tripping the cancel flag from the event sink.
+    type StopAfter = Option<(usize, bool)>;
+
+    /// An `off` run with `pipelining`, stopping the caller's way when asked ([`StopAfter`]).
+    fn off_run<T: SpeculativeTarget>(
+        target: &T,
+        config: &GenerationConfig,
+        pipelining: Pipelining,
+        stop_after: StopAfter,
+    ) -> SpeculativeRun {
+        let cancel = CancelFlag::new();
+        let emitted = std::cell::Cell::new(0usize);
+        let predicate = || matches!(stop_after, Some((n, false)) if emitted.get() >= n);
+        let mut events = Vec::new();
+        let run = generate_speculative(
+            target,
+            &mut NoProposer,
+            SpeculativePrompt::Tokens(&PROMPT),
+            config,
+            0,
+            &cancel,
+            &mut |e| {
+                if matches!(e, StreamEvent::Token { .. }) {
+                    emitted.set(emitted.get() + 1);
+                    if matches!(stop_after, Some((n, true)) if emitted.get() >= n) {
+                        cancel.cancel();
+                    }
+                }
+                events.push(e);
+            },
+            EngineOptions {
+                should_stop: Some(&predicate),
+                pipelining,
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let ids: Vec<i32> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Token { id, .. } => Some(*id),
+                StreamEvent::Done { .. } => None,
+            })
+            .collect();
+        assert_eq!(ids, run.output.tokens, "nothing past the end is emitted");
+        run
+    }
+
+    /// AC1: pipelining is invisible in the output. On the Causal and Qwen35 targets, greedy and
+    /// seeded device-sampled runs emit exactly the unpipelined run's tokens — to the budget, and
+    /// ending on a stop token, the caller's stop predicate and a cancel, where the enqueued
+    /// look-ahead is discarded unread (one forward, never emitted).
+    fn pipelining_is_invisible_on<T: SpeculativeTarget + crate::decode::Decode>(target: &T) {
+        for (name, config) in [("greedy", greedy(20)), ("top-p", top_p(20))] {
+            let off = off_run(target, &config, Pipelining::Off, None);
+            let on = off_run(target, &config, Pipelining::Auto, None);
+            assert_eq!(on.output.tokens, off.output.tokens, "{name}");
+            assert_eq!(on.output.tokens.len(), 20, "{name}");
+            assert_eq!((on.stats.pipelined, off.stats.pipelined), (19, 0), "{name}");
+            assert_eq!(on.stats.discarded, 0, "{name}");
+            assert_eq!(
+                on.report.target_forwards, off.report.target_forwards,
+                "{name}"
+            );
+            if name == "greedy" {
+                assert_eq!(
+                    on.output.tokens,
+                    plain(target, &PROMPT, &config, None).tokens
+                );
+            }
+
+            let mut stopping = config.clone();
+            stopping.stop_tokens = vec![on.output.tokens[7]];
+            let first_stop = on
+                .output
+                .tokens
+                .iter()
+                .position(|t| *t == on.output.tokens[7]);
+            let ends: [(&str, &GenerationConfig, StopAfter); 3] = [
+                ("stop token", &stopping, None),
+                ("stop predicate", &config, Some((5, false))),
+                ("cancel", &config, Some((5, true))),
+            ];
+            for (end, config, stop_after) in ends {
+                let off = off_run(target, config, Pipelining::Off, stop_after);
+                let on = off_run(target, config, Pipelining::Auto, stop_after);
+                let label = format!("{name} / {end}");
+                assert_eq!(on.output.tokens, off.output.tokens, "{label}");
+                assert_eq!(on.output.finish_reason, off.output.finish_reason, "{label}");
+                let (len, reason) = match end {
+                    "stop token" => (first_stop.unwrap(), FinishReason::StopToken),
+                    "stop predicate" => (5, FinishReason::Stopped),
+                    _ => (5, FinishReason::Cancelled),
+                };
+                assert_eq!(
+                    (on.output.tokens.len(), on.output.finish_reason),
+                    (len, reason),
+                    "{label}"
+                );
+                assert_eq!(
+                    on.stats.discarded, 1,
+                    "{label}: the look-ahead is discarded"
+                );
+                assert_eq!(
+                    on.report.target_forwards,
+                    off.report.target_forwards + 1,
+                    "{label}: the discarded look-ahead is a forward that ran"
+                );
+                assert_eq!(on.report.verify_steps, off.report.verify_steps, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn pipelining_is_invisible_on_the_causal_and_hybrid_targets() {
+        pipelining_is_invisible_on(&causal());
+        pipelining_is_invisible_on(&qwen35(false));
+    }
+
+    /// AC1 (speculative half): a run with a proposer is never pipelined — the proposer reads the
+    /// committed token on the host before it drafts — so prompt lookup and MTP report no pipelined
+    /// steps while the greedy output stays the plain loop's.
+    #[test]
+    fn speculative_runs_are_not_pipelined() {
+        let causal = causal();
+        let lookup = engine(
+            &causal,
+            &mut NgramProposer::default(),
+            &PROMPT,
+            &greedy(20),
+            4,
+            None,
+        );
+        let hybrid = qwen35(true);
+        let mtp = engine(
+            &hybrid,
+            &mut MtpProposer::new(),
+            &PROMPT,
+            &greedy(20),
+            2,
+            None,
+        );
+        for (label, run) in [("prompt lookup", &lookup), ("mtp", &mtp)] {
+            assert_eq!(run.stats.pipelined, 0, "{label}");
+            assert!(run.stats.verify_steps > 0, "{label}");
+        }
+        assert_eq!(
+            lookup.output.tokens,
+            plain(&causal, &PROMPT, &greedy(20), None).tokens
+        );
+    }
+
+    /// AC2: a temperature 0.7 / top-p 0.9 request draws on the device (`sampler = device`) and
+    /// moves exactly one token id per step to the host — counted — pipelined or not; a greedy
+    /// request likewise; a penalized request copies the whole row every step.
+    #[test]
+    fn a_top_p_request_samples_on_the_device_one_id_per_step() {
+        let model = causal();
+        for pipelining in [Pipelining::Auto, Pipelining::Off] {
+            for (name, config) in [("top-p", top_p(16)), ("greedy", greedy(16))] {
+                let before = host_transfers();
+                let run = off_run(&model, &config, pipelining, None);
+                let moved = host_transfers().since(before);
+                assert_eq!(run.report.sampler, "device", "{name} {pipelining:?}");
+                assert_eq!(run.output.tokens.len(), 16);
+                assert_eq!(
+                    moved,
+                    HostTransfers {
+                        reads: 16,
+                        elements: 16
+                    },
+                    "{name} {pipelining:?}: one id per step"
+                );
+            }
+        }
+        let before = host_transfers();
+        let run = off_run(&model, &penalized(16), Pipelining::Auto, None);
+        let moved = host_transfers().since(before);
+        assert_eq!(run.report.sampler, "host:penalty");
+        assert_eq!(
+            moved.elements,
+            16 * 24,
+            "a penalized draw copies the vocab row"
+        );
+    }
+
+    /// AC3: a repetition-penalty request samples on the host, says so with its reason, and is not
+    /// pipelined (its draw reads the history the unread token would extend); a constrained one
+    /// likewise with its own reason.
+    #[test]
+    fn a_penalized_or_constrained_request_reports_the_host_path_and_is_not_pipelined() {
+        let model = causal();
+        let mut repetition = top_p(12);
+        repetition.sampling.repetition_penalty = 1.2;
+        repetition.sampling.repetition_context = 16;
+        let run = off_run(&model, &repetition, Pipelining::Auto, None);
+        assert_eq!(run.report.sampler, "host:penalty");
+        assert_eq!(run.stats.pipelined, 0);
+        let mut forbid = Forbid::new(24, &[1, 9]);
+        let run = engine(
+            &model,
+            &mut NoProposer,
+            &PROMPT,
+            &top_p(12),
+            0,
+            Some(&mut forbid),
+        );
+        assert_eq!(run.report.sampler, "host:constraint");
+        assert_eq!(run.stats.pipelined, 0);
+    }
+
+    /// A seeded device-sampled run is reproducible, and a different seed draws differently: the
+    /// seed still drives the device draws (the documented change is only that they are not the
+    /// host sampler's per-seed draws).
+    #[test]
+    fn seeded_device_sampling_is_reproducible() {
+        let model = causal();
+        let a = off_run(&model, &top_p(24), Pipelining::Auto, None);
+        let b = off_run(&model, &top_p(24), Pipelining::Auto, None);
+        assert_eq!(a.output.tokens, b.output.tokens);
+        let mut other = top_p(24);
+        other.seed = Some(8);
+        let c = off_run(&model, &other, Pipelining::Auto, None);
+        assert_ne!(a.output.tokens, c.output.tokens);
+    }
+
+    /// Pipelining overlap microbenchmark (manual, `--ignored`; prints, asserts nothing timed): a
+    /// synthetic ~0.25 GB decoder (hidden 1024, 6 layers, vocab 32k), 128 tokens, pipelining off
+    /// and on alternated seven times each, greedy and top-p; the median decode rate of each. The
+    /// output is identical either way (asserted); the rate shows the host work the look-ahead
+    /// hides behind the device. Run it with `--release` for representative host overhead.
+    #[test]
+    #[ignore = "manual timing microbenchmark"]
+    fn pipelining_overlap_microbench() {
+        let model = synthetic_llama(1024, 6, 32_000);
+        for (name, config) in [("greedy", greedy(128)), ("top-p", top_p(128))] {
+            let mut tokens = None;
+            let mut rates = [Vec::new(), Vec::new()];
+            off_run(&model, &config, Pipelining::Auto, None); // warm the kernels
+            for _ in 0..7 {
+                for (slot, pipelining) in
+                    [Pipelining::Off, Pipelining::Auto].into_iter().enumerate()
+                {
+                    let started = Instant::now();
+                    let run = off_run(&model, &config, pipelining, None);
+                    let secs = started.elapsed().as_secs_f64();
+                    rates[slot].push(run.output.tokens.len() as f64 / secs);
+                    let first = tokens.get_or_insert_with(|| run.output.tokens.clone());
+                    assert_eq!(first, &run.output.tokens, "{name}");
+                }
+            }
+            for rates in &mut rates {
+                rates.sort_by(f64::total_cmp);
+            }
+            eprintln!(
+                "{name:>6}: off {:.1} tok/s, pipelined {:.1} tok/s (medians of 7)",
+                rates[0][3], rates[1][3]
+            );
+        }
     }
 }
