@@ -25,8 +25,8 @@ class PrecisionControlTests(unittest.TestCase):
             prepared = control.prepare_cases(templates, root / "metal-cases", "metal")
             self.assertEqual(len(prepared["cases"]), 7)
             for name in control.NAMES:
-                original = json.loads((templates / f"{name}.json").read_text())
-                copied = json.loads((root / "metal-cases" / f"{name}.json").read_text())
+                original = json.loads((templates / f"{name}.json").read_text(encoding="utf-8"))
+                copied = json.loads((root / "metal-cases" / f"{name}.json").read_text(encoding="utf-8"))
                 self.assertEqual(copied.pop("id"), original.pop("id").replace(":cuda:", ":metal:"))
                 self.assertEqual(copied, original)
             with self.assertRaisesRegex(ValueError, "already exists"):
@@ -40,7 +40,7 @@ class PrecisionControlTests(unittest.TestCase):
                 source = MODULE_PATH.parent / "yue2-app-precision-cases" / f"{name}.json"
                 root.joinpath("templates", f"{name}.json").write_bytes(source.read_bytes())
             target = root / "templates" / "strict-bf16-standard.json"
-            target.write_text(target.read_text().replace("831004", "831005"))
+            target.write_text(target.read_text(encoding="utf-8").replace("831004", "831005"), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "changed"):
                 control.prepare_cases(root / "templates", root / "cases", "cuda")
 
@@ -57,15 +57,15 @@ class PrecisionControlTests(unittest.TestCase):
                             "engineModelDtype": "bfloat16", "engineVaeDtype": "bfloat16"},
                 "measured": {"peakBytes": 1024, "stages": stages},
             }
-            record.write_text(json.dumps(body))
+            record.write_text(json.dumps(body), encoding="utf-8")
             self.assertEqual(control.verify_record(record, "cuda", "strict-bf16-legacy")["effective_vae_dtype"], "bfloat16")
             body["outcome"]["engineVaeDtype"] = "float32"
-            record.write_text(json.dumps(body))
+            record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "effective engineVaeDtype"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy")
             body["outcome"]["engineVaeDtype"] = "bfloat16"
             body["identity"]["decoder"]["repo"] = "m-a-p/YuE2-Vae"
-            record.write_text(json.dumps(body))
+            record.write_text(json.dumps(body), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "decoder identity"):
                 control.verify_record(record, "cuda", "strict-bf16-legacy")
 
@@ -77,12 +77,13 @@ class PrecisionControlTests(unittest.TestCase):
             engine.mkdir()
             app_sha, engine_sha = "a" * 40, "b" * 40
             (app / "Cargo.toml").write_text(
-                f'candle-kernels = {{ git = "https://github.com/SceneWorks/inference", rev = "{engine_sha}" }}\n'
+                f'candle-kernels = {{ git = "https://github.com/SceneWorks/inference", rev = "{engine_sha}" }}\n',
+                encoding="utf-8",
             )
             with patch.object(control, "git", side_effect=lambda root, *args:
                               (app_sha if root == app else engine_sha) if args[0] == "rev-parse" else ""):
                 self.assertEqual(control.verify_sources(app, engine, app_sha, engine_sha)["app_pins"], [engine_sha])
-                (app / "Cargo.toml").write_text((app / "Cargo.toml").read_text().replace(engine_sha, "c" * 40))
+                (app / "Cargo.toml").write_text((app / "Cargo.toml").read_text(encoding="utf-8").replace(engine_sha, "c" * 40), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "pin"):
                     control.verify_sources(app, engine, app_sha, engine_sha)
 
@@ -95,7 +96,7 @@ class PrecisionControlTests(unittest.TestCase):
                  patch.object(control.shutil, "disk_usage", return_value=types.SimpleNamespace(free=10 ** 12)):
                 with self.assertRaisesRegex(ValueError, "competing physical-device"):
                     control.preflight("cuda", evidence, "before-test")
-            record = json.loads((evidence / "preflight-before-test.json").read_text())
+            record = json.loads((evidence / "preflight-before-test.json").read_text(encoding="utf-8"))
             self.assertFalse(record["admitted"])
             self.assertEqual(record["competing_processes"], ["123 C worker"])
 
@@ -143,14 +144,14 @@ class PrecisionControlTests(unittest.TestCase):
                     "measured": {"peakBytes": 1024, "stages": {
                         stage: {"peakBytes": 1024, "samples": 1} for stage in control.STAGES}},
                 }
-                (run.parent / "record.json").write_text(json.dumps(body))
+                (run.parent / "record.json").write_text(json.dumps(body), encoding="utf-8")
             verdict = control.collect(profile, evidence, "cuda")
             self.assertEqual(len(verdict["listening_audio"]), 7)
-            self.assertEqual(len(json.loads((evidence / "audio-inventory.json").read_text())["cases"]), 7)
+            self.assertEqual(len(json.loads((evidence / "audio-inventory.json").read_text(encoding="utf-8"))["cases"]), 7)
             self.assertEqual(list(evidence.rglob("*.wav")), [])
 
     def test_wav_artifacts_use_only_fresh_run_owned_profile_glob(self):
-        workflow = (MODULE_PATH.parents[2] / ".github/workflows/yue2-app-precision-profile.yml").read_text()
+        workflow = (MODULE_PATH.parents[2] / ".github/workflows/yue2-app-precision-profile.yml").read_text(encoding="utf-8")
         self.assertEqual(workflow.count("path: ${{ env.APP_RUN_ROOT }}/profile/**/run/audio.wav"), 2)
         self.assertEqual(workflow.count("if: always() && steps.run-root.outcome == 'success'"), 4)
         self.assertEqual(workflow.count("id: run-root"), 2)

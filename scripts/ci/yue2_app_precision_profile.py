@@ -89,7 +89,7 @@ def sha256_stream(path: Path) -> str:
 
 
 def git(root: Path, *args: str) -> str:
-    return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+    return subprocess.check_output(["git", "-C", str(root), *args], text=True, encoding="utf-8").strip()
 
 
 def verify_sources(app: Path, engine: Path, app_sha: str, engine_sha: str) -> dict:
@@ -98,7 +98,7 @@ def verify_sources(app: Path, engine: Path, app_sha: str, engine_sha: str) -> di
         require(git(root, "rev-parse", "HEAD") == expected, f"{label} checkout SHA mismatch")
         require(not git(root, "status", "--porcelain", "--untracked-files=normal"), f"{label} checkout is dirty")
     pins = re.findall(r'SceneWorks/inference",\s*rev\s*=\s*"([0-9a-f]{40})"',
-                      (app / "Cargo.toml").read_text())
+                      (app / "Cargo.toml").read_text(encoding="utf-8"))
     require(bool(pins) and all(pin == engine_sha for pin in pins),
             "app Cargo inference pins are not exact engine SHA")
     return {"app_sha": app_sha, "engine_sha": engine_sha, "app_pins": pins}
@@ -113,18 +113,18 @@ def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
         source = template_dir / f"{name}.json"
         require(source.is_file(), f"missing fixed case {name}")
         require(sha256(source) == CASE_SOURCE_SHA256[name], f"fixed case {name} changed")
-        body = json.loads(source.read_text())
+        body = json.loads(source.read_text(encoding="utf-8"))
         tier, _, decoder, policy, _, _ = CASES[name]
         require(body.get("id") == case_id("cuda", name), f"unexpected source ID in {name}")
         require(body.get("tier") == tier and body.get("decoder") == decoder and
                 body.get("computePolicy") == policy, f"unexpected fixed case fields in {name}")
         body["id"] = case_id(backend, name)
         target = destination / f"{name}.json"
-        target.write_text(json.dumps(body, indent=2) + "\n")
+        target.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
         rows.append({"name": name, "case_id": body["id"], "source_sha256": sha256(source),
                      "run_case_sha256": sha256(target)})
     manifest = {"backend": backend, "cases": rows}
-    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
 
 
@@ -141,8 +141,8 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
     memory = None
     available = None
     if backend == "metal":
-        memory = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
-        stat = subprocess.check_output(["vm_stat"], text=True)
+        memory = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, encoding="utf-8").strip())
+        stat = subprocess.check_output(["vm_stat"], text=True, encoding="utf-8")
         page = re.search(r"page size of (\d+) bytes", stat)
         counts = re.findall(r"^Pages (free|inactive|speculative):\s+(\d+)\.", stat, re.M)
         require(page is not None and {key for key, _ in counts} == {"free", "inactive", "speculative"},
@@ -156,19 +156,19 @@ def preflight(backend: str, evidence: Path, label: str) -> dict:
     if backend == "metal" and (memory < REFERENCE_PEAK or available < REFERENCE_PEAK):
         errors.append(f"physical/available memory {memory}/{available} below observed F32 reference {REFERENCE_PEAK}")
     record = {"backend": backend, "label": label, "runner": os.environ.get("RUNNER_NAME"),
-              "hostname": os.environ.get("COMPUTERNAME") or subprocess.check_output(["hostname"], text=True).strip(),
+              "hostname": os.environ.get("COMPUTERNAME") or subprocess.check_output(["hostname"], text=True, encoding="utf-8").strip(),
               "disk_free_bytes": disk, "physical_memory_bytes": memory, "available_memory_bytes": available,
               "minimum_disk_bytes": MIN_FREE_DISK, "observed_cpu_reference_peak_bytes": REFERENCE_PEAK,
               "census": census, "competing_processes": busy, "admitted": not errors, "errors": errors}
     evidence.mkdir(parents=True, exist_ok=True)
-    (evidence / f"preflight-{label}.json").write_text(json.dumps(record, indent=2) + "\n")
+    (evidence / f"preflight-{label}.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     require(not errors, "; ".join(errors))
     return record
 
 
 def verify_record(record_path: Path, backend: str, name: str) -> dict:
     require(name in NAMES and backend in ("cuda", "metal"), "unknown case/backend")
-    row = json.loads(record_path.read_text())
+    row = json.loads(record_path.read_text(encoding="utf-8"))
     _, case_name, decoder, policy, model_dtype, vae_dtype = CASES[name]
     require(row.get("caseId") == case_id(backend, name) and row.get("backend") == backend,
             "record case/backend mismatch")
@@ -235,9 +235,10 @@ def collect(profile_dir: Path, evidence: Path, backend: str) -> dict:
     verdict = {"backend": backend, "cases": rows, "status": "completed",
                "listening_audio": [row["listening_audio"] for row in rows]}
     (evidence / "audio-inventory.json").write_text(
-        json.dumps({"backend": backend, "status": "completed", "cases": verdict["listening_audio"]}, indent=2) + "\n"
+        json.dumps({"backend": backend, "status": "completed", "cases": verdict["listening_audio"]}, indent=2) + "\n",
+        encoding="utf-8",
     )
-    (evidence / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
+    (evidence / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
     return verdict
 
 
@@ -268,7 +269,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
     environment = os.environ.copy()
     environment.pop("HF_HUB_CACHE", None)
     environment.pop("HUGGINGFACE_HUB_CACHE", None)
-    manifest = json.loads((cases / "manifest.json").read_text())
+    manifest = json.loads((cases / "manifest.json").read_text(encoding="utf-8"))
     require(manifest.get("backend") == backend and
             [row.get("name") for row in manifest.get("cases", [])] == list(NAMES),
             "run-owned case manifest/backend mismatch")
@@ -280,7 +281,7 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
             case = cases / f"{name}.json"
             require(case.is_file(), f"missing run-owned case {name}")
             require(sha256(case) == row.get("run_case_sha256"), f"run-owned case {name} changed")
-            require(json.loads(case.read_text()).get("id") == case_id(backend, name),
+            require(json.loads(case.read_text(encoding="utf-8")).get("id") == case_id(backend, name),
                     f"run-owned case {name} has wrong backend")
             preflight(backend, evidence, f"before-{name}")
             command = ["node", "scripts/yue2-memory-profile.mjs", "capture", "--case-file", str(case),
@@ -289,13 +290,13 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
             if backend == "metal":
                 command.extend(("--budget-minutes", "120"))
             for label, argv in (("dry-run", [*command, "--dry-run"]), ("capture", command)):
-                with (evidence / f"{name}-{label}.log").open("w") as log:
+                with (evidence / f"{name}-{label}.log").open("w", encoding="utf-8") as log:
                     status = subprocess.run(argv, cwd=app, env=environment,
                                             stdout=log, stderr=subprocess.STDOUT, check=False).returncode
                 require(status == 0, f"{name} {label} exited {status}; see retained log")
             record = output / case_id(backend, name).replace(":", "__") / "record.json"
             verify_record(record, backend, name)
-            with (evidence / f"{name}-check.log").open("w") as log:
+            with (evidence / f"{name}-check.log").open("w", encoding="utf-8") as log:
                 status = subprocess.run(["node", "--input-type=module", "-e", OFF_PLAN_CHECK,
                                          str(record), str(case)],
                                         cwd=app, env=environment, stdout=log,
@@ -303,7 +304,8 @@ def run_captures(app: Path, engine: Path, data: Path, output: Path, evidence: Pa
             require(status == 0, f"{name} off-plan closure/currency check exited {status}")
             completed_audio.append(verify_audio(output, backend, name))
             (evidence / "audio-inventory.json").write_text(
-                json.dumps({"backend": backend, "status": "partial", "cases": completed_audio}, indent=2) + "\n"
+                json.dumps({"backend": backend, "status": "partial", "cases": completed_audio}, indent=2) + "\n",
+                encoding="utf-8",
             )
         return collect(output, evidence, backend)
     finally:
@@ -331,7 +333,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "verify-sources":
         result = verify_sources(Path(args.app), Path(args.engine), args.app_sha, args.engine_sha)
-        Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
+        Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     elif args.command == "prepare-cases":
         result = prepare_cases(Path(args.templates), Path(args.destination), args.backend)
     elif args.command == "preflight":

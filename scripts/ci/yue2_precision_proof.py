@@ -117,14 +117,14 @@ def query_compute_apps_rows(output: str) -> list[str]:
 
 def cuda_census() -> tuple[str, list[str]]:
     command = ["nvidia-smi", "pmon", "-i", "0", "-c", "1", "-s", "um"]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=20, encoding="utf-8")
     if result.returncode == 0:
         return result.stdout, compute_capable_rows(result.stdout)
     # Some Windows drivers do not expose pmon. The supported apps query has no
     # C/G type, so conservatively refuse every process it reports.
     fallback = subprocess.run(
         ["nvidia-smi", "-i", "0", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
-        capture_output=True, text=True, timeout=20,
+        capture_output=True, text=True, timeout=20, encoding="utf-8"
     )
     require(fallback.returncode == 0,
             f"CUDA census unavailable: pmon: {result.stderr.strip()}; query-compute-apps: {fallback.stderr.strip()}")
@@ -149,7 +149,7 @@ def metal_worker_executable(name: str) -> bool:
 
 
 def metal_census() -> tuple[str, list[str]]:
-    result = subprocess.run(["/bin/ps", "-axo", "pid=,comm="], capture_output=True, text=True, timeout=20)
+    result = subprocess.run(["/bin/ps", "-axo", "pid=,comm="], capture_output=True, text=True, timeout=20, encoding="utf-8")
     require(result.returncode == 0, f"ps executable census failed: {result.stderr.strip()}")
     busy = []
     # Executable names only: argv/controller text must not cause a false positive.
@@ -166,7 +166,7 @@ def metal_census() -> tuple[str, list[str]]:
 def sample_cuda() -> dict:
     started = time.time_ns()
     command = ["nvidia-smi", "--query-gpu=timestamp,index,memory.used,memory.free", "--format=csv,noheader,nounits"]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10, encoding="utf-8")
     require(result.returncode == 0, result.stderr.strip() or "nvidia-smi sample failed")
     return {"started_utc_ns": started, "ended_utc_ns": time.time_ns(),
             "method": "nvidia-smi query-gpu", "raw": result.stdout.strip()}
@@ -177,7 +177,7 @@ def sample_metal(pid: int) -> dict:
     with tempfile.TemporaryDirectory(prefix="yue2-footprint-") as temp:
         output = Path(temp) / "footprint.json"
         command = ["/usr/bin/footprint", "--noCategories", "-j", str(output), "-p", str(pid)]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=20, encoding="utf-8")
         require(result.returncode == 0, result.stderr.strip() or "footprint sample failed")
         payload = json.loads(output.read_text(encoding="utf-8"))
         matches = [p for p in payload.get("processes", []) if p.get("pid") == pid]
@@ -302,10 +302,10 @@ def execute(args: argparse.Namespace) -> None:
     require(not args.app_sha or re.fullmatch(r"[0-9a-f]{40}", args.app_sha) is not None,
             "optional caller app SHA must be full lowercase hex")
     require(os.environ.get("GITHUB_SHA") == args.engine_sha, "checked-out engine SHA differs from dispatch input")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, encoding="utf-8").stdout.strip()
     require(head == args.engine_sha, "engine checkout moved after build")
     dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
-                           capture_output=True, text=True, check=True).stdout
+                           capture_output=True, text=True, check=True, encoding="utf-8").stdout
     require(not dirty.strip(), "engine source became dirty before hardware execution")
     runner = os.environ.get("RUNNER_NAME", "")
     if args.backend == "metal":

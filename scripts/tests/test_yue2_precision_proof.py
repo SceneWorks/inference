@@ -84,7 +84,7 @@ class PrecisionControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "vae_real_reference.safetensors").write_bytes(b"wrong reference")
-            (root / "reference-provenance.json").write_text(json.dumps({"engine_sha": "a" * 40, "sha256": CONTROL.REFERENCE_SHA256}))
+            (root / "reference-provenance.json").write_text(json.dumps({"engine_sha": "a" * 40, "sha256": CONTROL.REFERENCE_SHA256}), encoding="utf-8")
             args = type("Args", (), {"directory": root, "engine_sha": "a" * 40})()
             with self.assertRaisesRegex(RuntimeError, "digest differs"):
                 CONTROL.verify_reference(args)
@@ -118,7 +118,7 @@ class PrecisionControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receipt.json"
             def check(value):
-                path.write_text(json.dumps(value))
+                path.write_text(json.dumps(value), encoding="utf-8")
                 CONTROL.validate_receipt(path, "cuda", Path("/persistent/audio/run-1"))
             check(receipt)
             for mutation in (
@@ -133,7 +133,7 @@ class PrecisionControlTests(unittest.TestCase):
                     check(changed)
 
     def test_workflow_is_dispatch_only_and_selects_one_new_test(self):
-        source = WORKFLOW.read_text()
+        source = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", source)
         self.assertNotIn("schedule:", source)
         self.assertIn("options: [fixture, cuda, metal]", source)
