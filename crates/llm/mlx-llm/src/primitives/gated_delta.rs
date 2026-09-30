@@ -905,11 +905,13 @@ pub fn rms_norm_gated(x: &Array, weight: &Array, gate: &Array, eps: f32) -> Resu
 /// copy of the cache. The window spans any number of forwards (a verify step is one; a draft
 /// model's autoregressive proposal is several) and closes on a rollback,
 /// [`close_checkpoints`](Self::close_checkpoints), [`update`](Self::update) or
-/// [`reset`](Self::reset); the next forward after that drops what it kept. Holding a window of
-/// `N` tokens costs `N + 1` recurrent states and about `N + 2K` conv rows per layer on top of the
-/// live state — what request admission prices for the speculative width. Forwards outside a
-/// window (prefill, plain decode) take the final-state-only [`gated_delta_recurrence`] and pay
-/// nothing.
+/// [`reset`](Self::reset); the next forward after that drops what it kept. A window records at
+/// most the `max_tokens` it was armed with: a forward that would take it past that is refused
+/// ([`Error::CheckpointWindowFull`]) before it runs. Holding a window of `N` tokens costs `N + 1`
+/// recurrent states and about `N + 2K` conv rows per layer on top of the live state — what
+/// request admission prices for the speculative width, whose `width + 1` tokens are the cap the
+/// speculative engine arms. Forwards outside a window (prefill, plain decode) take the
+/// final-state-only [`gated_delta_recurrence`] and pay nothing.
 #[derive(Clone, Debug, Default)]
 pub struct DeltaNetCache {
     /// The short-conv history (previous `K-1` tokens), or `None` before the first step.
@@ -926,6 +928,8 @@ pub struct DeltaNetCache {
 struct CheckpointWindow {
     /// The position the window was opened at.
     start: i32,
+    /// The most tokens the window records; a forward past it is refused.
+    max_tokens: i32,
     /// The live `(conv_state, ssm_state)` at `start` (`None` on a cache that has not run).
     at_start: Option<(Array, Array)>,
     /// The forwards recorded since `start`, in order and contiguous.
@@ -973,10 +977,13 @@ impl DeltaNetCache {
 
     /// Open a checkpoint window at the current position (dropping any previous one): the state
     /// here and after every token of each forward until the window closes stays restorable by
-    /// [`rollback_to`](Self::rollback_to).
-    pub fn arm_checkpoints(&mut self) {
+    /// [`rollback_to`](Self::rollback_to). The window records at most `max_tokens` tokens: a
+    /// forward that would record more is [`Error::CheckpointWindowFull`] and leaves the cache
+    /// untouched.
+    pub fn arm_checkpoints(&mut self, max_tokens: i32) {
         self.window = Some(CheckpointWindow {
             start: self.offset,
+            max_tokens,
             at_start: self.live_state().map(|(c, s)| (c.clone(), s.clone())),
             chunks: Vec::new(),
             open: true,
@@ -999,7 +1006,9 @@ impl DeltaNetCache {
     /// Inside an open checkpoint window the forward's per-token states are kept (a multi-token
     /// forward runs [`gated_delta_recurrence_checkpointed`]); otherwise it runs the
     /// final-state-only [`gated_delta_recurrence`] and drops any closed window, whose positions it
-    /// has moved past.
+    /// has moved past. A forward that would take an open window past the `max_tokens` it was armed
+    /// with is [`Error::CheckpointWindowFull`], refused before anything runs: the cache is
+    /// untouched.
     pub fn advance(
         &mut self,
         conv: ConvTrace,
@@ -1016,7 +1025,20 @@ impl DeltaNetCache {
                 conv.tokens()
             )));
         }
-        let recording = self.window.as_ref().is_some_and(|w| w.open);
+        let recording = match self.window.as_ref() {
+            Some(w) if w.open => {
+                let recorded = self.checkpointed_tokens();
+                if recorded + t > w.max_tokens {
+                    return Err(Error::CheckpointWindowFull {
+                        recorded,
+                        requested: t,
+                        max_tokens: w.max_tokens,
+                    });
+                }
+                true
+            }
+            _ => false,
+        };
         if !recording {
             // Released before the new graph is built. A live state restored from the window is a
             // lazy row gather that keeps it alive until evaluated — the hybrid cache schedules that
@@ -1822,6 +1844,11 @@ mod tests {
 
         /// Feed tokens `a..b` to `cache` as one forward.
         fn feed(&self, cache: &mut DeltaNetCache, a: i32, b: i32) {
+            self.try_feed(cache, a, b).unwrap();
+        }
+
+        /// [`feed`](Self::feed), returning the forward's error.
+        fn try_feed(&self, cache: &mut DeltaNetCache, a: i32, b: i32) -> Result<()> {
             let part = |x: &Array| slice_axis(x, 1, a, b).unwrap();
             let seed = cache
                 .conv_state
@@ -1829,17 +1856,16 @@ mod tests {
                 .unwrap_or_else(|| Array::from_slice(&[0.0f32; 18], &[1, 3, 6]));
             let (_, trace) =
                 causal_depthwise_conv_traced(&part(&self.conv_in), &self.conv_w, &seed).unwrap();
-            let y = cache
-                .advance(
-                    trace,
-                    &part(&self.x.q),
-                    &part(&self.x.k),
-                    &part(&self.x.v),
-                    &part(&self.x.g),
-                    &part(&self.x.beta),
-                )
-                .unwrap();
+            let y = cache.advance(
+                trace,
+                &part(&self.x.q),
+                &part(&self.x.k),
+                &part(&self.x.v),
+                &part(&self.x.g),
+                &part(&self.x.beta),
+            )?;
             y.eval().unwrap();
+            Ok(())
         }
 
         /// A cache that saw tokens `0..p` as one forward, then `p..n` one at a time — no window.
@@ -1874,7 +1900,9 @@ mod tests {
             let mut cache = DeltaNetCache::new();
             let ((), routes) = recording_routes(|| {
                 s.feed(&mut cache, 0, p);
-                cache.arm_checkpoints();
+                // One token of slack past what the window records, so only the close below keeps
+                // a later forward out of it.
+                cache.arm_checkpoints(n - p + 1);
                 s.feed(&mut cache, p, p + 3);
                 for i in p + 3..n {
                     s.feed(&mut cache, i, i + 1);
@@ -1894,6 +1922,18 @@ mod tests {
             assert_eq!(cache.restorable(), p..n);
             assert_eq!(cache.checkpointed_tokens(), n - p);
             let windowed = cache.resident_bytes();
+
+            // Keeping every position (a full acceptance) closes the window too: the next forward
+            // records nothing and releases it.
+            let mut kept = cache.clone();
+            kept.rollback_to(n).unwrap();
+            s.feed(&mut kept, n, n + 1);
+            assert_eq!(
+                kept.checkpointed_tokens(),
+                0,
+                "a kept window stopped recording"
+            );
+            assert!(kept.restorable().is_empty());
 
             for j in p..=n {
                 let mut rolled = cache.clone();
@@ -1941,6 +1981,49 @@ mod tests {
             reset.rollback_to(0).unwrap();
             assert_eq!(reset.offset(), 0);
             assert!(reset.live_state().is_none());
+        });
+    }
+
+    /// sc-24435: a checkpoint window records at most the tokens it was armed for. A forward that
+    /// would take it past that — one forward too wide, or one single-token forward too many — is
+    /// refused (typed) before it runs: offset, live state and the window are untouched, and the
+    /// window still rolls back to its start.
+    #[test]
+    fn a_checkpoint_window_refuses_a_forward_past_its_cap() {
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let p = 4;
+            let s = FeedSeq::new(p + 3);
+            let mut cache = DeltaNetCache::new();
+            s.feed(&mut cache, 0, p);
+            cache.arm_checkpoints(2);
+            let before = live(&cache);
+            let err = s.try_feed(&mut cache, p, p + 3).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::CheckpointWindowFull {
+                        recorded: 0,
+                        requested: 3,
+                        max_tokens: 2
+                    }
+                ),
+                "{err}"
+            );
+            assert_eq!((cache.offset(), live(&cache)), (p, before));
+            assert_eq!(cache.checkpointed_tokens(), 0);
+
+            s.feed(&mut cache, p, p + 1);
+            s.feed(&mut cache, p + 1, p + 2);
+            let full = live(&cache);
+            let err = s.try_feed(&mut cache, p + 2, p + 3).unwrap_err();
+            assert!(
+                matches!(err, Error::CheckpointWindowFull { recorded: 2, .. }),
+                "{err}"
+            );
+            assert_eq!((cache.offset(), live(&cache)), (p + 2, full));
+            assert_eq!(cache.restorable(), p..p + 2);
+            cache.rollback_to(p).unwrap();
+            assert_eq!(live(&cache), live(&s.reference(p, p)));
         });
     }
 

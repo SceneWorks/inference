@@ -2456,12 +2456,16 @@ fn estimate_mlx_request_bytes(
     contract: MlxWorkspaceContract<'_>,
 ) -> Option<u64> {
     match contract {
-        MlxWorkspaceContract::Eager => core_llm::estimate_request_bytes(
+        // The recurrent term once: the only MLX decoder with recurrent state (the Qwen35 hybrid,
+        // eager for MoE) rolls back through its checkpoint ring, whose bytes the caller folds into
+        // `geometry.recurrent_bytes`, and is never cloned; a causal decoder holds none.
+        MlxWorkspaceContract::Eager => core_llm::estimate_request_bytes_with_recurrent_copies(
             prompt_tokens,
             max_new_tokens,
             geometry,
             vision_workspace_bytes,
             mtp_width,
+            1,
         ),
         MlxWorkspaceContract::Chunked => core_llm::estimate_chunked_request_bytes(
             prompt_tokens,
@@ -3514,6 +3518,26 @@ mod tests {
         }
     }
 
+    /// The MoE hybrid (`qwen3_5_moe`), which admission prices on the eager contract.
+    fn qwen35_moe_provider() -> LlamaProvider {
+        use crate::models::qwen35::tests::{cfg_json_moe, synthetic_weights};
+        let cfg = Qwen35Config::from_json(&cfg_json_moe()).unwrap();
+        let model =
+            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg)
+                .unwrap();
+        LlamaProvider {
+            descriptor: descriptor_for_qwen35(model.config()),
+            model: Decoder::Qwen35(model),
+            tokenizer: word_tokenizer(50),
+            template: Box::new(Llama3Template),
+            stop_tokens: Vec::new(),
+            constraint_table: OnceCell::new(),
+            vision: None,
+            gemma4: None,
+            _prism_vision_weights: None,
+        }
+    }
+
     fn spec_request(speculative: core_llm::Speculative) -> TextLlmRequest {
         TextLlmRequest {
             messages: vec![Message::user("t3 t9 t4 t11 t3 t9 t4 t11 t3 t9 t4 t11")],
@@ -3850,6 +3874,35 @@ mod tests {
                 price(&hybrid, SpeculativeRoute::Mtp { width }),
                 off + ring + 2 * kv + w * rows,
                 "mtp {width}: the ring plus the predictor cache and verify rows"
+            );
+        }
+
+        // The MoE hybrid prices on the eager contract, with the same once-charged recurrent term.
+        let moe = qwen35_moe_provider();
+        let Decoder::Qwen35(model) = &moe.model else {
+            unreachable!("the MoE fixture")
+        };
+        assert!(matches!(
+            moe.model.workspace_contract(),
+            MlxWorkspaceContract::Eager
+        ));
+        let off = price(&moe, SpeculativeRoute::Plain);
+        let g = moe.model.memory_geometry();
+        let kv_position = g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let rows = (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let kv = (64 + 32) * kv_position;
+        for width in [1usize, 3, 8] {
+            let ring = model.checkpoint_ring_bytes(width).unwrap();
+            let w = width as u64;
+            assert_eq!(
+                price(&moe, SpeculativeRoute::PromptLookup { width }),
+                off + ring + w * (kv_position + rows),
+                "moe lookup {width}"
+            );
+            assert_eq!(
+                price(&moe, SpeculativeRoute::Mtp { width }),
+                off + ring + 2 * kv + w * rows,
+                "moe mtp {width}: the ring and the live state charged once"
             );
         }
     }

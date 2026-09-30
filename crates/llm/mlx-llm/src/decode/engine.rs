@@ -196,8 +196,23 @@ impl<C: Clone + KvCache> CacheRollback<C> for SnapshotRollback<C> {
 /// kept prefix and closes the window: the DeltaNet layers select the state kept at the last kept
 /// position and the attention KV drops the rejected positions by offset. No replay forward, and no
 /// snapshot: the cache is never cloned, so the forwards write the attention KV block in place.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CheckpointRingRollback;
+///
+/// The window is armed for `width + 1` tokens — a full verify step of `width` drafts, or a draft
+/// model's proposal of fewer single-token forwards — the most
+/// [`Qwen35Model::checkpoint_ring_bytes`] prices for `width`; a forward past it is refused
+/// ([`Error::CheckpointWindowFull`]) rather than growing the ring unpriced.
+#[derive(Clone, Copy, Debug)]
+pub struct CheckpointRingRollback {
+    max_tokens: i32,
+}
+
+impl CheckpointRingRollback {
+    /// The ring rollback for a run of up to `width` drafts per step.
+    pub fn new(width: usize) -> Self {
+        let max_tokens = i32::try_from(width).map_or(i32::MAX, |w| w.saturating_add(1));
+        Self { max_tokens }
+    }
+}
 
 impl CacheRollback<Qwen35Cache> for CheckpointRingRollback {
     fn label(&self) -> &'static str {
@@ -205,7 +220,7 @@ impl CacheRollback<Qwen35Cache> for CheckpointRingRollback {
     }
 
     fn begin(&mut self, cache: &mut Qwen35Cache) {
-        cache.arm_checkpoints();
+        cache.arm_checkpoints(self.max_tokens);
     }
 
     fn recover(&mut self, cache: &mut Qwen35Cache, keep: i32) -> Result<Rollback> {
@@ -226,8 +241,9 @@ pub trait SpeculativeTarget {
     fn new_cache(&self) -> Self::Cache;
     /// Positions the cache holds — the next forward's first cache position.
     fn cache_len(&self, cache: &Self::Cache) -> i32;
-    /// A fresh rollback strategy for one run.
-    fn rollback(&self) -> Self::Rollback;
+    /// A fresh rollback strategy for one run proposing up to `width` drafts per verify step (so
+    /// a verify forward carries at most `width + 1` tokens).
+    fn rollback(&self, width: usize) -> Self::Rollback;
     /// Run the `[1, n]` int32 token `ids` through the target, appending them to `cache`.
     /// `rope_offset` is the RoPE position of the first id (the cache length plus any multimodal
     /// continuation shift). The ids are an array, not a host slice, so a step's input can be a
@@ -260,7 +276,7 @@ impl SpeculativeTarget for CausalLm {
         cache.offset()
     }
 
-    fn rollback(&self) -> TruncateRollback {
+    fn rollback(&self, _: usize) -> TruncateRollback {
         TruncateRollback
     }
 
@@ -314,8 +330,8 @@ impl SpeculativeTarget for Qwen35Model {
         cache.offset()
     }
 
-    fn rollback(&self) -> CheckpointRingRollback {
-        CheckpointRingRollback
+    fn rollback(&self, width: usize) -> CheckpointRingRollback {
+        CheckpointRingRollback::new(width)
     }
 
     fn forward(
@@ -391,7 +407,7 @@ impl SpeculativeTarget for StepTarget<'_> {
         cache.offset()
     }
 
-    fn rollback(&self) -> TruncateRollback {
+    fn rollback(&self, _: usize) -> TruncateRollback {
         TruncateRollback
     }
 
@@ -913,7 +929,7 @@ where
         arrays.extend(warm.as_ref());
         timer.finish_prefill(arrays)?;
     }
-    let mut rollback = target.rollback();
+    let mut rollback = target.rollback(width);
 
     // A cancel that tripped during the prefill ends the run before its first draw, exactly as the
     // plain loop's per-step check does.
@@ -1751,24 +1767,26 @@ pub(crate) mod tests {
 
     /// The Qwen35 target under test: every forward is delegated to the model, then the attention
     /// KV's block-buffer addresses are recorded (the in-place probe) — rolled back by `R`, the
-    /// checkpoint ring the target ships with or the step-start snapshot it replaced.
+    /// checkpoint ring the target ships with or the step-start snapshot it replaced. A
+    /// [`LogitsScope::Last`] forward (the prefill, a no-draft step, a replay) runs outside any
+    /// checkpoint window: it must leave the cache recording nothing.
     struct Observed<'m, R> {
         model: &'m Qwen35Model,
         addresses: std::cell::RefCell<Vec<Vec<usize>>>,
-        rollback: std::marker::PhantomData<R>,
+        rollback: fn(usize) -> R,
     }
 
     impl<'m, R> Observed<'m, R> {
-        fn new(model: &'m Qwen35Model) -> Self {
+        fn new(model: &'m Qwen35Model, rollback: fn(usize) -> R) -> Self {
             Self {
                 model,
                 addresses: Default::default(),
-                rollback: std::marker::PhantomData,
+                rollback,
             }
         }
     }
 
-    impl<R: CacheRollback<Qwen35Cache> + Default> SpeculativeTarget for Observed<'_, R> {
+    impl<R: CacheRollback<Qwen35Cache>> SpeculativeTarget for Observed<'_, R> {
         type Cache = Qwen35Cache;
         type Rollback = R;
 
@@ -1780,8 +1798,8 @@ pub(crate) mod tests {
             cache.offset()
         }
 
-        fn rollback(&self) -> R {
-            R::default()
+        fn rollback(&self, width: usize) -> R {
+            (self.rollback)(width)
         }
 
         fn forward(
@@ -1800,6 +1818,13 @@ pub(crate) mod tests {
                 scope,
                 want_hidden,
             )?;
+            if scope == LogitsScope::Last {
+                assert_eq!(
+                    cache.checkpointed_tokens(),
+                    0,
+                    "a forward outside a verify step recorded checkpoints"
+                );
+            }
             self.addresses
                 .borrow_mut()
                 .push(cache.attn_buffer_addresses());
@@ -1841,7 +1866,7 @@ pub(crate) mod tests {
     /// A Qwen35 proposer run against the observed target: the model is what it proposes from.
     impl<'m, R, P> Proposer<Observed<'m, R>> for Tally<P>
     where
-        R: CacheRollback<Qwen35Cache> + Default,
+        R: CacheRollback<Qwen35Cache>,
         P: Proposer<Qwen35Model>,
     {
         fn kind(&self) -> ProposerKind {
@@ -1910,7 +1935,7 @@ pub(crate) mod tests {
             ] {
                 let config = greedy(24);
                 let expected = plain(&model, &PROMPT, &config, None);
-                let ring = Observed::<CheckpointRingRollback>::new(&model);
+                let ring = Observed::new(&model, CheckpointRingRollback::new);
                 let run_with = |proposer: &mut dyn FnMut() -> SpeculativeRun| {
                     let ((run, clones), routes) =
                         recording_routes(|| counting_cache_clones(proposer));
@@ -1970,10 +1995,73 @@ pub(crate) mod tests {
                 assert_eq!(count(Route::Ops) + count(Route::Chunked), 0, "{label}");
             }
 
+            // A full acceptance closes the window: an oracle proposing the plain loop's own next
+            // token (always accepted) every other step, so each full acceptance is followed by a
+            // no-draft step, whose forward the observed target checks records nothing.
+            struct Oracle {
+                expected: Vec<i32>,
+                steps: usize,
+            }
+            impl<T: SpeculativeTarget + ?Sized> Proposer<T> for Oracle {
+                fn kind(&self) -> ProposerKind {
+                    ProposerKind::PromptLookup
+                }
+                fn warm(&mut self, _: &T, _: &[i32], _: Option<&Array>) -> Result<Option<Array>> {
+                    Ok(None)
+                }
+                fn propose(
+                    &mut self,
+                    _: &T,
+                    ctx: &ProposeContext<'_>,
+                    _: &mut DraftSampler<'_, '_>,
+                ) -> Result<Proposal> {
+                    self.steps += 1;
+                    let next = self.expected.get(ctx.history.len() - PROMPT.len());
+                    Ok(Proposal {
+                        drafts: next
+                            .filter(|_| self.steps % 2 == 1)
+                            .copied()
+                            .into_iter()
+                            .collect(),
+                        dists: Vec::new(),
+                    })
+                }
+                fn commit(
+                    &mut self,
+                    _: &T,
+                    _: i32,
+                    _: &[i32],
+                    _: Option<&Array>,
+                    _: i32,
+                ) -> Result<()> {
+                    Ok(())
+                }
+            }
+            let model = qwen35(false);
+            let config = greedy(12);
+            let expected = plain(&model, &PROMPT, &config, None).tokens;
+            let ring = Observed::new(&model, CheckpointRingRollback::new);
+            let mut oracle = Tally::new(Oracle {
+                expected: expected.clone(),
+                steps: 0,
+            });
+            let run = engine(&ring, &mut oracle, &PROMPT, &config, 4, None);
+            assert_eq!(run.output.tokens, expected, "oracle: != plain loop");
+            let followed = oracle
+                .steps
+                .windows(2)
+                .filter(|w| w[0] == (1, 1) && w[1].0 == 0)
+                .count();
+            assert!(
+                followed > 0,
+                "a no-draft step followed a full acceptance: {:?}",
+                oracle.steps
+            );
+
             // The contrast: the same lookup run on the step-start snapshot.
             let model = qwen35(false);
             let config = greedy(24);
-            let snapshot = Observed::<SnapshotRollback<Qwen35Cache>>::new(&model);
+            let snapshot = Observed::new(&model, |_| SnapshotRollback::<Qwen35Cache>::default());
             let (run, clones) = counting_cache_clones(|| {
                 engine(
                     &snapshot,
@@ -1997,6 +2085,89 @@ pub(crate) mod tests {
                 "a held snapshot makes the in-place write copy its block"
             );
         });
+    }
+
+    /// The draft-model window through the [`CacheRollback`] seam (sc-24435; the shape a draft
+    /// proposer drives on its own cache): one `begin`, three separate single-token forwards, then
+    /// `recover` to each position from the step start (nothing kept) to all three kept. The
+    /// window is armed for `width + 1` tokens, so width 2 fits exactly these three forwards and
+    /// refuses a fourth (typed, the cache untouched). Every
+    /// recovery is direct, its DeltaNet state is bit-exact that of a cache that only ever saw the
+    /// kept tokens, the next forward's logits are too (the attention KV was truncated by offset),
+    /// and that forward records nothing — full acceptance included.
+    #[test]
+    fn the_ring_recovers_a_draft_window_of_single_token_forwards() {
+        let model = qwen35(false);
+        let step = |cache: &mut Qwen35Cache, ids: &[i32]| -> Vec<f32> {
+            let offset = cache.offset();
+            let out = SpeculativeTarget::forward(
+                &model,
+                cache,
+                &input_ids(ids),
+                offset,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap();
+            out.logits
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        let prefilled = || {
+            let mut cache = model.new_cache();
+            step(&mut cache, &PROMPT);
+            cache
+        };
+        let start = PROMPT.len() as i32;
+        let drafts = [4, 11, 7];
+        for kept in 0..=drafts.len() {
+            let mut cache = prefilled();
+            let mut rollback = SpeculativeTarget::rollback(&model, 2);
+            rollback.begin(&mut cache);
+            for &d in &drafts {
+                step(&mut cache, &[d]);
+            }
+            // A fourth forward would outgrow what width 2 prices: refused, cache untouched.
+            let before = cache.delta_states();
+            let offset = cache.offset();
+            let err = SpeculativeTarget::forward(
+                &model,
+                &mut cache,
+                &input_ids(&[20]),
+                offset,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, Error::CheckpointWindowFull { max_tokens: 3, .. }),
+                "{err}"
+            );
+            assert_eq!((cache.offset(), cache.delta_states()), (offset, before));
+            let keep = start + kept as i32;
+            assert_eq!(
+                rollback.recover(&mut cache, keep).unwrap(),
+                Rollback::Direct
+            );
+            assert_eq!(cache.offset(), keep);
+            let mut reference = prefilled();
+            for &d in &drafts[..kept] {
+                step(&mut reference, &[d]);
+            }
+            assert_eq!(
+                cache.delta_states(),
+                reference.delta_states(),
+                "kept {kept}: restored state"
+            );
+            assert_eq!(
+                step(&mut cache, &[13]),
+                step(&mut reference, &[13]),
+                "kept {kept}: next logits"
+            );
+            assert_eq!(cache.checkpointed_tokens(), 0, "kept {kept}: window closed");
+        }
     }
 
     /// AC2 (engine half): the report names the proposer, its depth, the verify steps and accepted
