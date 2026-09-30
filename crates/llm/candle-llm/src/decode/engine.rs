@@ -1896,6 +1896,155 @@ mod tests {
         assert_eq!(run.stats.verify_steps, 1);
     }
 
+    #[test]
+    fn a_stochastic_draft_model_hands_over_its_own_q_per_draft() {
+        // sc-24436 E1: each stochastic draft's `q` is the draft model's own shaped distribution
+        // at its position — the sampler's candidates over a fresh draft prefill of everything
+        // before it — so the exact rejection rule compares the target's `p` with the draft's `q`.
+        let (_cfg, draft) = text_model_with_layers(6);
+        let config = stochastic(20);
+        let mut proposer = DraftModelProposer::new(&draft, PROMPT.len() + 24, 4);
+        proposer.warm(&PROMPT, None).unwrap();
+        let mut history = PROMPT.to_vec();
+        history.push(5);
+        let cur_ids = input_ids(&[5], &Device::Cpu).unwrap();
+        let ctx = ProposeContext {
+            cur: 5,
+            cur_ids: &cur_ids,
+            history: &history,
+            previous_hidden: None,
+            position: PROMPT.len() as i32,
+            max_drafts: 4,
+        };
+        let mut rng = SplitMix64::new(11);
+        let mut sampler = DraftSampler {
+            config: &config,
+            rng: &mut rng,
+            constraint: None,
+            device_greedy: false,
+        };
+        let proposal = proposer.propose(&ctx, &mut sampler).unwrap();
+        let Some(Drafts::Host(drafts)) = proposal.drafts else {
+            panic!("a stochastic draft samples on the host");
+        };
+        assert_eq!(drafts.len(), 4);
+        assert_eq!(proposal.dists.len(), 4, "one q per draft");
+        let norm = |d: &[(i32, f32)]| {
+            let total: f32 = d.iter().map(|&(_, w)| w).sum();
+            let mut d: Vec<(i32, f32)> = d.iter().map(|&(t, w)| (t, w / total)).collect();
+            d.sort_by_key(|&(t, _)| t);
+            d
+        };
+        for (i, q) in proposal.dists.iter().enumerate() {
+            let mut before = history.clone();
+            before.extend_from_slice(&drafts[..i]);
+            let mut cache = draft.new_cache_for(before.len() + 1, 1).unwrap();
+            let logits = draft
+                .forward_step(&mut cache, StepRequest::last(&before))
+                .unwrap()
+                .logits;
+            let want = norm(&shaped_candidates(&logits, &before, &config.sampling, None).unwrap());
+            let got = norm(q);
+            assert_eq!(
+                got.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+                want.iter().map(|&(t, _)| t).collect::<Vec<_>>(),
+                "draft {i}: q names {got:?}, the draft's distribution {want:?}"
+            );
+            for (&(t, a), &(_, b)) in got.iter().zip(&want) {
+                assert!((a - b).abs() < 1e-4, "draft {i}: token {t}: {a} vs {b}");
+            }
+        }
+        assert!(
+            proposal.dists.iter().any(|q| q.len() > 1),
+            "a stochastic draft is not a point mass: {:?}",
+            proposal.dists
+        );
+    }
+
+    #[test]
+    fn host_sampled_drafts_end_at_an_accepted_stop_token() {
+        // sc-24436: on the host path (a penalty, a temperature) the draft model stops drafting at
+        // a stop token without feeding it, so its cache holds one position fewer than the
+        // accepted run; when the target accepts the drafts through that stop the commit keeps
+        // what was fed rather than rolling past the cache — the request ends at its stop, whether
+        // the draft cache truncates or only restores its step start.
+        let mut penalized = greedy(10);
+        penalized.sampling.presence_penalty = 0.01;
+        let mut cold = greedy(10);
+        cold.sampling.temperature = 0.01;
+        for (name, mut config) in [("penalized", penalized), ("stochastic", cold)] {
+            config.stop_tokens = vec![4];
+            for step_start_only in [false, true] {
+                let model = Ramp {
+                    vocab: 7,
+                    forwards: Cell::new(0),
+                    step_start_only,
+                };
+                let prompt = [0, 1];
+                let mut proposer =
+                    DraftModelProposer::new(&model, prompt.len() + config.max_new_tokens, 3);
+                let run = run(&model, &mut proposer, &prompt, &config, 3);
+                let label = format!("{name} step_start_only={step_start_only}");
+                assert_eq!(run.output.tokens, vec![2, 3], "{label}");
+                assert_eq!(run.output.finish_reason, FinishReason::StopToken, "{label}");
+                assert_eq!(
+                    (run.stats.proposed, run.stats.accepted),
+                    (2, 2),
+                    "{label}: the drafts through the stop token, all accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_draft_padded_differently_proposes_only_tokenizer_ids_over_the_target_width() {
+        // sc-24436: a draft with its own padding rows (8 logits over a 7-token tokenizer) drafts
+        // for a target 9 logits wide: its logits are shaped to the target's width with the
+        // padding at -inf, so the engine accepts it and a padding id is never proposed.
+        let target = Ramp {
+            vocab: 9,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        };
+        let draft = Ramp {
+            vocab: 8,
+            forwards: Cell::new(0),
+            step_start_only: false,
+        };
+        let proposer = DraftModelProposer::new(&draft, 16, 3).with_vocab(7, 9);
+        assert_eq!(Proposer::vocab_size(&proposer), Some(9));
+        // A draft row peaking on its padding id 7.
+        let mut row = vec![0f32; 8];
+        row[7] = 10.0;
+        row[5] = 1.0;
+        let shaped = proposer
+            .shaped(Tensor::from_vec(row, (1, 8), &Device::Cpu).unwrap())
+            .unwrap();
+        let shaped = shaped.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(shaped.len(), 9);
+        assert_eq!(&shaped[..7], &[0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        assert!(shaped[7..].iter().all(|x| *x == f32::NEG_INFINITY));
+        // Every draft the engine sees is a tokenizer id, on both draft paths; greedy output is
+        // the target's own.
+        let mut penalized = greedy(12);
+        penalized.sampling.presence_penalty = 0.01;
+        for config in [greedy(12), penalized] {
+            let (expected, _) = generate_step(
+                &target,
+                &[0, 1],
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+            .unwrap();
+            let mut proposer = DraftModelProposer::new(&draft, 14, 3).with_vocab(7, 9);
+            let run = run(&target, &mut proposer, &[0, 1], &config, 3);
+            assert_eq!(run.output.tokens, expected.tokens);
+            assert!(run.stats.proposed > 0);
+        }
+    }
+
     // ---- Stochastic: seed-deterministic, and the decision preserves the target distribution ----
 
     #[test]

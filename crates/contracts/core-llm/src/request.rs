@@ -748,6 +748,10 @@ mod tests {
             spec.cuda_graphs.is_none(),
             "a dense load keeps the backend's graph default"
         );
+        assert!(spec.draft_source.is_none(), "no draft unless one is named");
+        let spec = spec.with_draft("draft-dir");
+        assert_eq!(spec.draft_source.as_deref(), Some("draft-dir"));
+        assert_eq!(spec.source, "model.gguf", "naming a draft keeps the target");
     }
 }
 
@@ -774,6 +778,21 @@ pub struct LoadSpec {
     /// generation in [`DecodeReport::cuda_graphs`](crate::DecodeReport::cuda_graphs) where the
     /// backend reports one. Backends without CUDA ignore it.
     pub cuda_graphs: Option<bool>,
+    /// An optional **draft model** for [`SpeculativeProposer::DraftModel`] speculation (epic
+    /// sc-24432, story sc-24436): a snapshot directory (or other source the provider loads) of a
+    /// smaller model sharing the target's tokenizer. The provider loads it beside the target as a
+    /// second resident model with its own decode cache, applying the same load-time
+    /// [`quantize`](Self::quantize) tier, and counts its weights in load admission and its cache
+    /// in request admission. `None` (the default) loads no draft, exactly as before.
+    ///
+    /// A draft never fails the load: one the provider cannot use — a tokenizer vocabulary that is
+    /// not the target's, logits over more ids than the target's, an unreadable source, or no room
+    /// beside the target — is refused with the reason named in
+    /// [`LoadReport::draft`](crate::LoadReport::draft), the target loads alone, and `draft_model`
+    /// is not advertised. `draft_model` is advertised in
+    /// [`TextLlmCapabilities::speculative`](crate::TextLlmCapabilities::speculative) only while a
+    /// compatible draft is resident.
+    pub draft_source: Option<String>,
 }
 
 /// Load-time quantization request.
@@ -799,12 +818,20 @@ impl LoadSpec {
             projector_source: None,
             quantize: None,
             cuda_graphs: None,
+            draft_source: None,
         }
     }
 
     /// Associate an exact multimodal projector artifact with this model load.
     pub fn with_projector(mut self, source: impl Into<String>) -> Self {
         self.projector_source = Some(source.into());
+        self
+    }
+
+    /// Name a draft model to load beside the target for `draft_model` speculation
+    /// ([`draft_source`](Self::draft_source)).
+    pub fn with_draft(mut self, source: impl Into<String>) -> Self {
+        self.draft_source = Some(source.into());
         self
     }
 }

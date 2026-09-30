@@ -29,7 +29,9 @@ pub use engine::{
     StepTarget, TargetOutput, TokenSampler, TruncateRollback,
 };
 pub use prefix::{generate_cached, generate_cached_with, PrefixCache, PrefixStats};
-pub use proposers::{generate_qwen35_mtp, MtpProposer, NgramProposer, Qwen35MtpMultimodalPrompt};
+pub use proposers::{
+    generate_qwen35_mtp, DraftModelProposer, MtpProposer, NgramProposer, Qwen35MtpMultimodalPrompt,
+};
 pub use speculative::{
     generate_draft_speculative, generate_prompt_lookup, SpeculativeConfig, SpeculativeStats,
 };
