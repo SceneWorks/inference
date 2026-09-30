@@ -70,8 +70,8 @@ pub fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<Tensor>
     Ok(g.to_dtype(orig)?)
 }
 
-/// Run the gated delta recurrence over a `[B, T, ·]` chunk, a faithful port of the
-/// `mlx_lm.models.gated_delta` ops path.
+/// Run the gated delta recurrence over a `[B, T, ·]` chunk — the entry point every Qwen35-family
+/// linear layer reaches without a checkpoint ring.
 ///
 /// Shapes: `q`, `k` are `[B, T, Hk, Dk]`; `v` is `[B, T, Hv, Dv]`; `g` (the per-step gate from
 /// [`compute_g`]) and `beta` are `[B, T, Hv]`; `state` (the carried recurrent state, or `None` to
@@ -80,6 +80,11 @@ pub fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<Tensor>
 ///
 /// GQA: when `Hv > Hk` each key/query head is repeated `Hv / Hk` times so it pairs with the value
 /// heads (`Hv` must be a multiple of `Hk`).
+///
+/// A sequence of at least [`CHUNKED_PREFILL_MIN_TOKENS`] runs in the chunkwise-parallel form
+/// ([`gated_delta_chunked`], sc-24443) — batched matmuls instead of a per-token loop — and returns
+/// `y` in `q`'s dtype and the state in the carried state's (or `q`'s); shorter ones (decode,
+/// speculative verify) run the per-token reference ([`gated_delta_recurrence_per_token`]).
 pub fn gated_delta_recurrence(
     q: &Tensor,
     k: &Tensor,
@@ -88,16 +93,95 @@ pub fn gated_delta_recurrence(
     beta: &Tensor,
     state: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
-    gated_delta_recurrence_with_sink(q, k, v, g, beta, state, &mut |_, _| Ok(()))
+    gated_delta_recurrence_with_sink(q, k, v, g, beta, state, q.dim(1)?, &mut |_, _| Ok(()))
 }
 
-/// [`gated_delta_recurrence`] that also hands every token's **post-step state** to `sink` —
-/// `sink(ti, state_after_token_ti)` with `state` `[B, Hv, Dv, Dk]`, in token order, before the next
-/// token runs. This is the per-token checkpoint output of the recurrence step (sc-24131):
-/// [`DeltaNetCache::advance`] writes each state into its ring slot from here, and a fused decode
-/// kernel (sc-24000) keeps the same contract by writing the slot itself. The returned final state
-/// is the last one handed to `sink`. An error from `sink` aborts the recurrence.
+/// [`gated_delta_recurrence`] that also hands the **post-step state** of every token from
+/// `sink_from` on to `sink` — `sink(ti, state_after_token_ti)` with `state` `[B, Hv, Dv, Dk]`, in
+/// token order, before the next token runs. This is the per-token checkpoint output of the
+/// recurrence step (sc-24131): [`DeltaNetCache::advance`] writes each state into its ring slot
+/// from here (only its last `slots` tokens, so it passes `sink_from = T - slots`), and a fused
+/// decode kernel (sc-24000) keeps the same contract by writing the slot itself. The tokens before
+/// `sink_from` hand no state out, so once there are at least [`CHUNKED_PREFILL_MIN_TOKENS`] of
+/// them they run chunkwise ([`gated_delta_chunked`], sc-24443) and only the sunk tail steps per
+/// token. The returned final state is the post-step state of the last token (the last one handed
+/// to `sink` when `sink_from < T`). An error from `sink` aborts the recurrence.
+#[allow(clippy::too_many_arguments)]
 pub fn gated_delta_recurrence_with_sink(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+    sink_from: usize,
+    sink: &mut dyn FnMut(usize, &Tensor) -> Result<()>,
+) -> Result<(Tensor, Tensor)> {
+    let t = q.dim(1)?;
+    let chunked = sink_from.min(t);
+    #[cfg(test)]
+    let chunked = if FORCE_PER_TOKEN.with(|f| f.get()) {
+        0
+    } else {
+        chunked
+    };
+    if chunked < CHUNKED_PREFILL_MIN_TOKENS {
+        return gated_delta_recurrence_per_token(q, k, v, g, beta, state, sink);
+    }
+    let head = |x: &Tensor| x.narrow(1, 0, chunked);
+    let (y_head, s_head) = gated_delta_chunked(
+        &head(q)?,
+        &head(k)?,
+        &head(v)?,
+        &head(g)?,
+        &head(beta)?,
+        state,
+    )?;
+    let state_dtype = state.map_or(q.dtype(), Tensor::dtype);
+    let y_head = y_head.to_dtype(q.dtype())?;
+    let s_head = s_head.to_dtype(state_dtype)?;
+    if chunked == t {
+        return Ok((y_head, s_head));
+    }
+    let tail = |x: &Tensor| x.narrow(1, chunked, t - chunked);
+    let (y_tail, s_tail) = gated_delta_recurrence_per_token(
+        &tail(q)?,
+        &tail(k)?,
+        &tail(v)?,
+        &tail(g)?,
+        &tail(beta)?,
+        Some(&s_head),
+        &mut |ti, s| sink(chunked + ti, s),
+    )?;
+    Ok((Tensor::cat(&[&y_head, &y_tail], 1)?, s_tail))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only switch routing [`gated_delta_recurrence_with_sink`] to the per-token reference on
+    /// this thread, so a model-level test can compare the production dispatch against it.
+    static FORCE_PER_TOKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the recurrence forced onto the per-token reference (this thread only).
+#[cfg(test)]
+pub(crate) fn with_per_token_reference<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_PER_TOKEN.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_PER_TOKEN.with(|c| c.replace(true)));
+    f()
+}
+
+/// The per-token (op-by-op) gated delta recurrence — the faithful port of the
+/// `mlx_lm.models.gated_delta` ops path, one step per token, handing **every** token's post-step
+/// state to `sink`. It is the **numeric reference** the chunked form is tested against and the path
+/// decode and speculative verify take. Shapes as [`gated_delta_recurrence`]; the math runs in the
+/// inputs' dtype.
+pub fn gated_delta_recurrence_per_token(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -137,6 +221,228 @@ pub fn gated_delta_recurrence_with_sink(
     let refs: Vec<&Tensor> = ys.iter().collect();
     let y = Tensor::cat(&refs, 1)?; // [B,T,Hv,Dv]
     Ok((y, state))
+}
+
+/// The shortest run of un-checkpointed tokens the recurrence computes chunkwise (one full
+/// chunk); shorter runs step per token.
+pub const CHUNKED_PREFILL_MIN_TOKENS: usize = GDN_CHUNK;
+
+/// Tokens per chunk of the chunkwise-parallel form (the flash-linear-attention default).
+const GDN_CHUNK: usize = 64;
+
+/// Chunks whose intra-chunk work is batched together: bounds the prefill's `[C, C]` transients to
+/// `GDN_SEGMENT_CHUNKS · GDN_CHUNK` tokens' worth however long the prompt is.
+const GDN_SEGMENT_CHUNKS: usize = 8;
+
+/// The gated delta recurrence in its **chunkwise-parallel** form (the WY / flash-linear-attention
+/// `chunk_gated_delta_rule` formulation, sc-24443), for prefill. Shapes as
+/// [`gated_delta_recurrence`]; inputs of any float dtype are computed in f32 and `(y, state)` are
+/// returned **f32**. Every device runs it (plain tensor ops).
+///
+/// Within a chunk of `C` tokens starting from state `S₀`, with `Γᵢ = ∏_{j≤i} gⱼ` (a cumulative
+/// sum of `ln g`), the per-token deltas `δᵢ = βᵢ(vᵢ − gᵢSᵢ₋₁kᵢ)` solve the unit-lower-triangular
+/// system `(I + A) Δ = V_β − (K_β Γ) S₀ᵀ` with `Aᵢⱼ = βᵢ (Γᵢ/Γⱼ) kᵢ·kⱼ` (`i > j`), so with
+/// `T = (I + A)⁻¹`, `U = T V_β` and `W = T (K_β Γ)` (all of a segment's chunks at once):
+///
+/// ```text
+///   Δ    = U − W S₀ᵀ
+///   Y    = (Q Γ) S₀ᵀ + ((Q Kᵀ) ⊙ Γᵢ/Γⱼ, j ≤ i) Δ
+///   S_C  = Γ_C S₀ + Δᵀ (K Γ_C/Γ)
+/// ```
+///
+/// Only the `S₀ → S_C` hand-off is sequential (one step per chunk, not per token). `T` is built
+/// by block doubling — `T₂ₛ = Tₛ − Tₛ Eₛ Tₛ`, `Eₛ` the part of `A` inside the `2s`-diagonal
+/// blocks but outside the `s`-diagonal ones — which is exact block forward substitution. Every
+/// exponent is `≤ 0` (`g ∈ (0, 1]`), so nothing overflows; a gate that underflowed to 0 is
+/// clamped to the smallest normal f32 before its log.
+pub fn gated_delta_chunked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
+    let f = DType::F32;
+    let c = GDN_CHUNK;
+    let (b, t, hk, dk) = q.dims4()?;
+    let (_, _, hv, dv) = v.dims4()?;
+    let dev = q.device();
+
+    // Pad T to whole chunks with inert steps (g = 1, β = 0, k = q = v = 0 leave the state as is),
+    // then lay every tensor out per head and chunk: [N = B·Hv, nC, C, ·].
+    let n_chunks = t.div_ceil(c);
+    let pad = n_chunks * c - t;
+    let n = b * hv;
+    let heads_first = |x: &Tensor, fill: f64| -> Result<Tensor> {
+        let x = x.to_dtype(f)?;
+        let x = if pad > 0 {
+            let mut shape = x.dims().to_vec();
+            shape[1] = pad;
+            let filler = Tensor::ones(shape, f, dev)?.affine(fill, 0.0)?;
+            Tensor::cat(&[&x, &filler], 1)?
+        } else {
+            x
+        };
+        Ok(match x.rank() {
+            // [B, Tp, Hv] → [N, nC, C]
+            3 => x.transpose(1, 2)?.contiguous()?.reshape((n, n_chunks, c))?,
+            // [B, Tp, Hv, D] → [N, nC, C, D]
+            _ => {
+                let d = x.dim(3)?;
+                x.transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((n, n_chunks, c, d))?
+            }
+        })
+    };
+    // GQA-expand q/k as statement temporaries, so each prompt-sized expansion frees as soon as
+    // it is laid out.
+    let expand = |x: &Tensor| -> Result<Tensor> {
+        if hv != hk {
+            repeat_heads(x, hv / hk)
+        } else {
+            Ok(x.clone())
+        }
+    };
+    let q = heads_first(&expand(q)?, 0.0)?;
+    let k = heads_first(&expand(k)?, 0.0)?;
+    let v = heads_first(v, 0.0)?;
+    let g = heads_first(g, 1.0)?;
+    let beta = heads_first(beta, 0.0)?;
+
+    let masks = ChunkMasks::new(c, dev)?;
+    let mut state = match state {
+        Some(s) => s.to_dtype(f)?.reshape((n, dv, dk))?,
+        None => Tensor::zeros((n, dv, dk), f, dev)?,
+    };
+    let mut ys: Vec<Tensor> = Vec::with_capacity(n_chunks);
+    let mut seg_start = 0;
+    while seg_start < n_chunks {
+        let m = GDN_SEGMENT_CHUNKS.min(n_chunks - seg_start);
+        // This segment's chunks folded into the batch: [N·m, C, ·].
+        let seg = |x: &Tensor| -> Result<Tensor> {
+            let x = x.narrow(1, seg_start, m)?.contiguous()?;
+            Ok(match x.rank() {
+                3 => x.reshape((n * m, c))?,
+                _ => {
+                    let d = x.dim(3)?;
+                    x.reshape((n * m, c, d))?
+                }
+            })
+        };
+        let (qc, kc, vc, gc, bc) = (seg(&q)?, seg(&k)?, seg(&v)?, seg(&g)?, seg(&beta)?);
+
+        let log_g = gc.maximum(f32::MIN_POSITIVE)?.log()?;
+        let cum = log_g.cumsum(1)?; // ln Γᵢ                                  [N·m, C]
+        let gamma = cum.exp()?.unsqueeze(2)?; // Γᵢ                           [N·m, C, 1]
+        let diff = cum.unsqueeze(2)?.broadcast_sub(&cum.unsqueeze(1)?)?; // ln Γᵢ − ln Γⱼ
+        let decay = diff.minimum(0f32)?.exp()?.broadcast_mul(&masks.lower)?; // Γᵢ/Γⱼ, j ≤ i
+        let k_t = kc.transpose(1, 2)?.contiguous()?; //                        [N·m, Dk, C]
+        let beta_col = bc.unsqueeze(2)?;
+        let kb = kc.broadcast_mul(&beta_col)?; // β k
+        let a = kb.matmul(&k_t)?.mul(&decay)?.broadcast_mul(&masks.strict)?; // Aᵢⱼ, i > j
+        let tinv = unit_lower_inverse(&a, &masks)?; // (I + A)⁻¹
+        let w = tinv.matmul(&kb.broadcast_mul(&gamma)?)?; //                    [N·m, C, Dk]
+        let u = tinv.matmul(&vc.broadcast_mul(&beta_col)?)?; //                 [N·m, C, Dv]
+        let q_gamma = qc.broadcast_mul(&gamma)?; // Q Γ
+        let qk = qc.matmul(&k_t)?.mul(&decay)?; // causal (Q Kᵀ) ⊙ Γᵢ/Γⱼ
+        let last = cum.narrow(1, c - 1, 1)?; // ln Γ_C                         [N·m, 1]
+        let k_tail = kc.broadcast_mul(&last.broadcast_sub(&cum)?.exp()?.unsqueeze(2)?)?; // K Γ_C/Γ
+        let chunk_decay = last.exp()?; // Γ_C                                  [N·m, 1]
+
+        // Back to [N, m, ·] to walk the segment's chunks in order.
+        let per_chunk = |x: &Tensor| -> Result<Tensor> {
+            let mut shape = vec![n, m];
+            shape.extend_from_slice(&x.dims()[1..]);
+            Ok(x.reshape(shape)?)
+        };
+        let (w, u, q_gamma, qk, k_tail, chunk_decay) = (
+            per_chunk(&w)?,
+            per_chunk(&u)?,
+            per_chunk(&q_gamma)?,
+            per_chunk(&qk)?,
+            per_chunk(&k_tail)?,
+            per_chunk(&chunk_decay)?,
+        );
+        for i in 0..m {
+            let pick = |x: &Tensor| -> Result<Tensor> { Ok(x.narrow(1, i, 1)?.squeeze(1)?) };
+            let s_t = state.transpose(1, 2)?.contiguous()?; // S₀ᵀ              [N, Dk, Dv]
+            let delta = pick(&u)?.sub(&pick(&w)?.contiguous()?.matmul(&s_t)?)?; // [N, C, Dv]
+            let y = pick(&q_gamma)?
+                .contiguous()?
+                .matmul(&s_t)?
+                .add(&pick(&qk)?.contiguous()?.matmul(&delta)?)?; //             [N, C, Dv]
+            let carried = state.broadcast_mul(&pick(&chunk_decay)?.unsqueeze(2)?)?; // Γ_C S₀
+            state = carried.add(
+                &delta
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .matmul(&pick(&k_tail)?.contiguous()?)?,
+            )?; // + Δᵀ (K Γ_C/Γ)                                               [N, Dv, Dk]
+            ys.push(y);
+        }
+        seg_start += m;
+    }
+    // One copy out: the per-chunk outputs free once concatenated, and the padded [N, Tp, Dv]
+    // result reshapes as a view so the narrow + transpose materialize in a single `contiguous`.
+    let y = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?; // [N, Tp, Dv]
+    drop(ys);
+    let y = y
+        .reshape((b, hv, n_chunks * c, dv))?
+        .narrow(2, 0, t)?
+        .transpose(1, 2)?
+        .contiguous()?; // [B, T, Hv, Dv]
+    Ok((y, state.reshape((b, hv, dv, dk))?))
+}
+
+/// Constant `[C, C]` masks of the chunkwise form, plus the block-doubling bands.
+struct ChunkMasks {
+    /// `1` where `j ≤ i`.
+    lower: Tensor,
+    /// `1` where `j < i`.
+    strict: Tensor,
+    /// The identity.
+    eye: Tensor,
+    /// For each doubling level `s` (1, 2, 4, …, C/2): `1` where `i, j` share a `2s` block but
+    /// not an `s` block.
+    bands: Vec<Tensor>,
+}
+
+impl ChunkMasks {
+    fn new(c: usize, dev: &Device) -> Result<Self> {
+        let build = |f: &dyn Fn(usize, usize) -> bool| -> Result<Tensor> {
+            let data: Vec<f32> = (0..c * c)
+                .map(|x| if f(x / c, x % c) { 1.0 } else { 0.0 })
+                .collect();
+            Ok(Tensor::from_vec(data, (c, c), dev)?)
+        };
+        let mut bands = Vec::new();
+        let mut s = 1usize;
+        while s < c {
+            bands.push(build(&|i, j| i / (2 * s) == j / (2 * s) && i / s != j / s)?);
+            s *= 2;
+        }
+        Ok(Self {
+            lower: build(&|i, j| j <= i)?,
+            strict: build(&|i, j| j < i)?,
+            eye: build(&|i, j| i == j)?,
+            bands,
+        })
+    }
+}
+
+/// `(I + A)⁻¹` for strictly-lower-triangular `A` `[M, C, C]` by block doubling:
+/// `T₁ = I`, `T₂ₛ = Tₛ − Tₛ (A ⊙ bandₛ) Tₛ` — exact, since `bandₛ` holds exactly the one
+/// off-diagonal block each `2s` block adds and `Eₛ Tₛ Eₛ = 0`.
+fn unit_lower_inverse(a: &Tensor, masks: &ChunkMasks) -> Result<Tensor> {
+    let mut inv = masks.eye.broadcast_as(a.shape())?.contiguous()?;
+    for band in &masks.bands {
+        let e = a.broadcast_mul(band)?;
+        let correction = inv.matmul(&e)?.matmul(&inv)?;
+        inv = inv.sub(&correction)?;
+    }
+    Ok(inv)
 }
 
 /// Causal depthwise short convolution over `[B, S, C]` with per-channel kernel `weight` `[C, K]`
@@ -585,6 +891,7 @@ impl DeltaNetCache {
                     g,
                     beta,
                     self.ssm_state.as_ref(),
+                    first_write,
                     &mut sink,
                 )
                 .and_then(|(y, _)| Ok((y, ring.views(next)?)))
@@ -1113,6 +1420,222 @@ mod tests {
         assert!(max_abs_diff(&host(&actual_state), &host(&carried.unwrap())) < 1e-5);
     }
 
+    /// Deterministic uniform `[-1, 1)` values (a 64-bit LCG), so the parity fixtures need no RNG state.
+    fn lcg(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((x >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// The device the chunked-parity tests run on: the build's GPU backend when one is compiled
+    /// in and present (so the CUDA and Metal lanes execute the chunked form on the GPU), else CPU.
+    fn test_device() -> Device {
+        #[cfg(feature = "cuda")]
+        let device = Device::cuda_if_available(0).unwrap();
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let device = Device::metal_if_available(0).unwrap();
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = Device::Cpu;
+        device
+    }
+
+    /// Model-shaped recurrence inputs `(q, k, v, g, β, carried state)` on [`test_device`]:
+    /// L2-normalized q (scaled by `1/√Dk`) and k, gates from [`compute_g`], `β = sigmoid(b)` — all
+    /// rounded through `dtype` so the f32 reference sees exactly the values the path under test
+    /// reads.
+    fn model_inputs(dims: [usize; 6], dtype: DType, seed: u64) -> [Tensor; 6] {
+        let [b, t, hk, hv, dk, dv] = dims;
+        let dev = &test_device();
+        let arr = |shape: &[usize], s: u64| {
+            let n = shape.iter().product();
+            Tensor::from_vec(lcg(n, seed ^ s), shape, dev).unwrap()
+        };
+        let l2 = |x: Tensor| {
+            let norm = x
+                .sqr()
+                .unwrap()
+                .sum_keepdim(3)
+                .unwrap()
+                .affine(1.0, 1e-6)
+                .unwrap();
+            x.broadcast_div(&norm.sqrt().unwrap()).unwrap()
+        };
+        let round = |x: Tensor| x.to_dtype(dtype).unwrap();
+        let q = l2(arr(&[b, t, hk, dk], 1))
+            .affine((dk as f64).powf(-0.5), 0.0)
+            .unwrap();
+        let k = l2(arr(&[b, t, hk, dk], 2));
+        let a = arr(&[b, t, hv], 4).affine(3.0, 0.0).unwrap();
+        let g = compute_g(&a, &arr(&[hv], 5), &arr(&[hv], 6)).unwrap();
+        let beta = candle_nn::ops::sigmoid(&arr(&[b, t, hv], 7).affine(2.0, 0.0).unwrap()).unwrap();
+        [
+            round(q),
+            round(k),
+            round(arr(&[b, t, hv, dv], 3)),
+            round(g),
+            round(beta),
+            arr(&[b, hv, dv, dk], 8).affine(0.5, 0.0).unwrap(),
+        ]
+    }
+
+    /// `(max |a − r| / max |r|, max |a − r|)` — scale-relative and absolute error against the
+    /// reference `r` (never a cosine: that is scale-invariant).
+    fn errors(a: &Tensor, r: &Tensor) -> (f32, f32) {
+        assert_eq!(a.dims(), r.dims());
+        let (a, r) = (host(a), host(r));
+        assert!(a.iter().all(|x| x.is_finite()), "non-finite output");
+        let abs = max_abs_diff(&a, &r);
+        let scale = r.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        (abs / scale, abs)
+    }
+
+    /// The f32 per-token reference on (already dtype-rounded) inputs.
+    fn per_token_reference(x: &[Tensor; 6], carry: bool) -> (Tensor, Tensor) {
+        let f = |t: &Tensor| t.to_dtype(DType::F32).unwrap();
+        let state = carry.then(|| f(&x[5]));
+        gated_delta_recurrence_per_token(
+            &f(&x[0]),
+            &f(&x[1]),
+            &f(&x[2]),
+            &f(&x[3]),
+            &f(&x[4]),
+            state.as_ref(),
+            &mut |_, _| Ok(()),
+        )
+        .unwrap()
+    }
+
+    /// AC (sc-24443): the chunkwise prefill matches the per-token reference's outputs and final
+    /// state at 512 and 2048 tokens (plus a batch of two at a length that is not a whole number of
+    /// chunks), GQA ×2 at the Qwen3.6 head dims, on f32, bf16 and f16 inputs (computed in f32),
+    /// from a zero and from a carried state.
+    #[test]
+    fn chunked_prefill_matches_per_token_reference() {
+        let cases: [(&str, [usize; 6]); 3] = [
+            ("512", [1, 512, 2, 4, 128, 128]),
+            ("2048", [1, 2048, 2, 4, 128, 128]),
+            ("ragged", [2, 300, 1, 2, 64, 32]),
+        ];
+        for (label, dims) in cases {
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                for carry in [false, true] {
+                    let x = model_inputs(dims, dtype, dims.iter().product::<usize>() as u64);
+                    let state = carry.then_some(&x[5]);
+                    let (y, s) =
+                        gated_delta_chunked(&x[0], &x[1], &x[2], &x[3], &x[4], state).unwrap();
+                    assert_eq!((y.dtype(), s.dtype()), (DType::F32, DType::F32));
+                    let (y_ref, s_ref) = per_token_reference(&x, carry);
+                    let (y_rel, y_abs) = errors(&y, &y_ref);
+                    let (s_rel, s_abs) = errors(&s, &s_ref);
+                    eprintln!(
+                        "chunked {label} {dims:?} {dtype:?} carry={carry}: y rel {y_rel:.2e} abs \
+                         {y_abs:.2e} | state rel {s_rel:.2e} abs {s_abs:.2e}"
+                    );
+                    assert!(
+                        y_rel <= 2e-5 && y_abs <= 2e-5 && s_rel <= 2e-5 && s_abs <= 2e-5,
+                        "chunked {label} {dtype:?} carry={carry}: y rel {y_rel} abs {y_abs}, \
+                         state rel {s_rel} abs {s_abs}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The dispatch: a prefill runs its un-checkpointed head chunkwise and steps only the sunk
+    /// tail per token — every sunk state and the outputs match the per-token reference — while a
+    /// run shorter than one chunk (decode, verify) stays per-token; outputs keep the input dtypes.
+    #[test]
+    fn prefill_runs_its_head_chunkwise_and_sinks_the_tail_per_token() {
+        let x = model_inputs([1, 200, 2, 4, 32, 16], DType::F32, 11);
+        let (y_ref, _) = per_token_reference(&x, true);
+        let mut ref_states = Vec::new();
+        gated_delta_recurrence_per_token(
+            &x[0],
+            &x[1],
+            &x[2],
+            &x[3],
+            &x[4],
+            Some(&x[5]),
+            &mut |ti, s| {
+                ref_states.push((ti, s.clone()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        for sink_from in [0, 63, 64, 190, 200] {
+            let mut seen = Vec::new();
+            let (y, last) = gated_delta_recurrence_with_sink(
+                &x[0],
+                &x[1],
+                &x[2],
+                &x[3],
+                &x[4],
+                Some(&x[5]),
+                sink_from,
+                &mut |ti, s| {
+                    seen.push((ti, s.clone()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(errors(&y, &y_ref).0 < 2e-5, "sink_from {sink_from}");
+            assert!(
+                errors(&last, &ref_states[199].1).0 < 2e-5,
+                "sink_from {sink_from}"
+            );
+            // A head shorter than one chunk steps per token, sinking every token.
+            let first = if sink_from < CHUNKED_PREFILL_MIN_TOKENS {
+                0
+            } else {
+                sink_from
+            };
+            assert_eq!(
+                seen.iter().map(|(ti, _)| *ti).collect::<Vec<_>>(),
+                (first..200).collect::<Vec<_>>()
+            );
+            for (ti, s) in &seen {
+                assert!(errors(s, &ref_states[*ti].1).0 < 2e-5, "state after {ti}");
+            }
+        }
+        let bf = model_inputs([1, 100, 2, 4, 32, 16], DType::BF16, 12);
+        let (y, s) = gated_delta_recurrence(&bf[0], &bf[1], &bf[2], &bf[3], &bf[4], None).unwrap();
+        assert_eq!((y.dtype(), s.dtype()), (DType::BF16, DType::BF16));
+        let (_, s) =
+            gated_delta_recurrence(&bf[0], &bf[1], &bf[2], &bf[3], &bf[4], Some(&bf[5])).unwrap();
+        assert_eq!(s.dtype(), DType::F32);
+    }
+
+    /// A checkpointing cache's long prefill (chunkwise head, per-token ringed tail) restores every
+    /// ringed position to the state a token-at-a-time decode reaches.
+    #[test]
+    fn ring_prefill_with_a_chunked_head_restores_the_per_token_states() {
+        let device = test_device();
+        let fixture = ring_inputs_on(150, 2, &device);
+        let mut cache = DeltaNetCache::with_ring(ring_spec_on(4, device)).unwrap();
+        feed(&mut cache, &fixture, 0, 150);
+        assert_eq!(cache.restorable(), vec![147, 148, 149]);
+        for n in [150, 149, 148, 147] {
+            cache.rollback_to(n).unwrap();
+            let (conv, ssm) = live(&cache).unwrap();
+            let (fconv, fssm) = fresh_state(&fixture, n as usize).unwrap();
+            let scale = fssm.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert_eq!(conv, fconv, "conv tail after {n}");
+            assert!(
+                max_abs_diff(&ssm, &fssm) <= 2e-5 * scale,
+                "ssm after {n}: {}",
+                max_abs_diff(&ssm, &fssm)
+            );
+        }
+    }
+
     #[test]
     fn compute_g_is_in_unit_interval_and_shaped() {
         // g = exp(−positive) ∈ (0, 1]: a per-head forget gate.
@@ -1374,40 +1897,48 @@ mod tests {
     type Fixture = (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 
     fn ring_spec(slots: usize) -> RingSpec {
+        ring_spec_on(slots, Device::Cpu)
+    }
+
+    fn ring_spec_on(slots: usize, device: Device) -> RingSpec {
         RingSpec {
             slots,
             conv_dims: (RB, RK - 1, RC),
             conv_dtype: DType::F32,
             ssm_dims: (RB, RHV, RDV, RDK),
             ssm_dtype: DType::F32,
-            device: Device::Cpu,
+            device,
         }
     }
 
     /// Seeded recurrence inputs for `t` tokens plus the conv input `x [B, t, C]`.
     fn ring_inputs(t: usize, salt: usize) -> Fixture {
+        ring_inputs_on(t, salt, &Device::Cpu)
+    }
+
+    /// [`ring_inputs`] on `dev`.
+    fn ring_inputs_on(t: usize, salt: usize, dev: &Device) -> Fixture {
         let sample = |len: usize, s: usize, scale: f32| -> Vec<f32> {
             (0..len)
                 .map(|i| ((i * 31 + s * 7) % 41) as f32 * scale - 20.0 * scale)
                 .collect()
         };
-        let cpu = &Device::Cpu;
         let q = Tensor::from_vec(
             sample(t * RHK * RDK, salt + 1, 0.05),
             (RB, t, RHK, RDK),
-            cpu,
+            dev,
         )
         .unwrap();
         let k = Tensor::from_vec(
             sample(t * RHK * RDK, salt + 2, 0.04),
             (RB, t, RHK, RDK),
-            cpu,
+            dev,
         )
         .unwrap();
         let v = Tensor::from_vec(
             sample(t * RHV * RDV, salt + 3, 0.06),
             (RB, t, RHV, RDV),
-            cpu,
+            dev,
         )
         .unwrap();
         let g = Tensor::from_vec(
@@ -1416,7 +1947,7 @@ mod tests {
                 .map(|x| 0.95 + x)
                 .collect(),
             (RB, t, RHV),
-            cpu,
+            dev,
         )
         .unwrap();
         let beta = Tensor::from_vec(
@@ -1425,10 +1956,10 @@ mod tests {
                 .map(|x| 0.5 + x)
                 .collect(),
             (RB, t, RHV),
-            cpu,
+            dev,
         )
         .unwrap();
-        let x = Tensor::from_vec(sample(t * RC, salt + 6, 0.1), (RB, t, RC), cpu).unwrap();
+        let x = Tensor::from_vec(sample(t * RC, salt + 6, 0.1), (RB, t, RC), dev).unwrap();
         (q, k, v, g, beta, x)
     }
 
@@ -1439,10 +1970,10 @@ mod tests {
     /// Feed tokens `start..start+len` of the fixture through `cache` (one `advance`).
     fn feed(cache: &mut DeltaNetCache, fixture: &Fixture, start: usize, len: usize) -> Tensor {
         let (q, k, v, g, beta, x) = fixture;
-        let weight = Tensor::from_slice(CW, (RC, RK), &Device::Cpu).unwrap();
+        let weight = Tensor::from_slice(CW, (RC, RK), x.device()).unwrap();
         let conv_state = match cache.conv_state() {
             Some(c) => c.clone(),
-            None => Tensor::zeros((RB, RK - 1, RC), DType::F32, &Device::Cpu).unwrap(),
+            None => Tensor::zeros((RB, RK - 1, RC), DType::F32, x.device()).unwrap(),
         };
         let (_out, trace) =
             causal_depthwise_conv_traced(&narrow_t(x, start, len), &weight, &conv_state).unwrap();
@@ -1477,7 +2008,7 @@ mod tests {
         let (q, k, v, g, beta, _) = ring_inputs(4, 0);
         let mut seen = Vec::new();
         let (_, final_state) =
-            gated_delta_recurrence_with_sink(&q, &k, &v, &g, &beta, None, &mut |ti, s| {
+            gated_delta_recurrence_with_sink(&q, &k, &v, &g, &beta, None, 0, &mut |ti, s| {
                 seen.push((ti, host(s)));
                 Ok(())
             })
@@ -1500,7 +2031,7 @@ mod tests {
         }
         assert_eq!(seen.last().unwrap().1, host(&final_state));
         // A sink error aborts the recurrence.
-        let err = gated_delta_recurrence_with_sink(&q, &k, &v, &g, &beta, None, &mut |_, _| {
+        let err = gated_delta_recurrence_with_sink(&q, &k, &v, &g, &beta, None, 0, &mut |_, _| {
             Err(Error::Msg("stop".into()))
         });
         assert!(matches!(err, Err(Error::Msg(m)) if m == "stop"));
