@@ -4155,12 +4155,23 @@ impl TextLlm for LlamaProvider {
             tool_calls,
             usage,
             mtp: mtp_stats,
-            decode: Some(core_llm::DecodeReport {
-                fallbacks,
-                ..decode_record.report(cuda_graphs_on)
-            }),
+            decode: Some(request_report(&decode_record, cuda_graphs_on, fallbacks)),
             finish_reason: Some(finish),
         })
+    }
+}
+
+/// The request's [`core_llm::DecodeReport`]: the decode record's report under the load's graph
+/// switch, carrying the speculative resolution's and the route's fallback reasons verbatim (epic
+/// sc-24432 E2) — the record is the engine's and starts with none.
+fn request_report(
+    record: &DecodeRecord,
+    cuda_graphs_on: bool,
+    fallbacks: Vec<String>,
+) -> core_llm::DecodeReport {
+    core_llm::DecodeReport {
+        fallbacks,
+        ..record.report(cuda_graphs_on)
     }
 }
 
@@ -7346,6 +7357,267 @@ mod tests {
         (dir, provider)
     }
 
+    /// The Qwen-VL vision specials of the synthetic VLM fixtures: the last three ids of the
+    /// vocabulary, in `(vision_start, image_pad, vision_end)` order.
+    fn vl_special_ids(vocab: usize) -> (usize, usize, usize) {
+        (vocab - 3, vocab - 2, vocab - 1)
+    }
+
+    /// [`synthetic_tokenizer_json`] with the Qwen-VL specials (`<|vision_start|>`,
+    /// `<|image_pad|>`, `<|vision_end|>`) in place of the vocabulary's last three pieces, as added
+    /// tokens so the placeholder string the provider renders tokenizes to exactly those ids.
+    fn synthetic_vl_tokenizer_json(vocab: usize) -> String {
+        let (start, pad, end) = vl_special_ids(vocab);
+        let specials = [
+            (start, "<|vision_start|>"),
+            (pad, "<|image_pad|>"),
+            (end, "<|vision_end|>"),
+        ];
+        let piece = |i: usize| {
+            specials
+                .iter()
+                .find(|(id, _)| *id == i)
+                .map_or_else(|| format!("t{i}"), |(_, s)| s.to_string())
+        };
+        let entries: Vec<String> = (0..vocab)
+            .map(|i| format!("\"{}\": {i}", piece(i)))
+            .collect();
+        let added: Vec<String> = specials
+            .iter()
+            .map(|(id, content)| {
+                format!(
+                    r#"{{ "id": {id}, "content": "{content}", "single_word": false,
+                         "lstrip": false, "rstrip": false, "normalized": false,
+                         "special": true }}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{
+                "version": "1.0",
+                "added_tokens": [{}],
+                "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }},
+                "post_processor": null,
+                "decoder": null,
+                "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }}
+            }}"#,
+            added.join(", "),
+            entries.join(", ")
+        )
+    }
+
+    /// A seeded one-block Qwen3-VL ViT tower (`model.visual.*`, no DeepStack taps) of the image
+    /// processor's own geometry (patch 16, temporal patch 2, merge 2), whose merger emits
+    /// `out_hidden` rows, and its `vision_config`: a 256 × 256 image is 64 language tokens.
+    fn synthetic_vision_tower(out_hidden: usize) -> (serde_json::Value, HashMap<String, Tensor>) {
+        use crate::primitives::{SplitMix64, TokenRng};
+        let (hid, inter, heads, positions) = (16usize, 32usize, 2usize, 16usize);
+        let merge_dim = hid * 4;
+        let mut rng = SplitMix64::new(0x0056_1510);
+        let mut rand = |dims: &[usize]| {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| rng.next_f32() - 0.5).collect();
+            Tensor::from_vec(data, dims.to_vec(), &candle_core::Device::Cpu).unwrap()
+        };
+        let mut w = HashMap::new();
+        let mut put = |key: &str, dims: &[usize]| {
+            w.insert(format!("model.visual.{key}"), rand(dims));
+        };
+        put("patch_embed.proj.weight", &[hid, 3, 2, 16, 16]);
+        put("patch_embed.proj.bias", &[hid]);
+        put("pos_embed.weight", &[positions, hid]);
+        for (key, dims) in [
+            ("norm1.weight", vec![hid]),
+            ("norm1.bias", vec![hid]),
+            ("norm2.weight", vec![hid]),
+            ("norm2.bias", vec![hid]),
+            ("attn.qkv.weight", vec![3 * hid, hid]),
+            ("attn.qkv.bias", vec![3 * hid]),
+            ("attn.proj.weight", vec![hid, hid]),
+            ("attn.proj.bias", vec![hid]),
+            ("mlp.linear_fc1.weight", vec![inter, hid]),
+            ("mlp.linear_fc1.bias", vec![inter]),
+            ("mlp.linear_fc2.weight", vec![hid, inter]),
+            ("mlp.linear_fc2.bias", vec![hid]),
+        ] {
+            put(&format!("blocks.0.{key}"), &dims);
+        }
+        put("merger.norm.weight", &[hid]);
+        put("merger.norm.bias", &[hid]);
+        put("merger.linear_fc1.weight", &[merge_dim, merge_dim]);
+        put("merger.linear_fc1.bias", &[merge_dim]);
+        put("merger.linear_fc2.weight", &[out_hidden, merge_dim]);
+        put("merger.linear_fc2.bias", &[out_hidden]);
+        let config = serde_json::json!({
+            "depth": 1, "hidden_size": hid, "num_heads": heads, "intermediate_size": inter,
+            "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2,
+            "out_hidden_size": out_hidden, "num_position_embeddings": positions
+        });
+        (config, w)
+    }
+
+    /// Write a synthetic VLM snapshot: `config`, the Qwen-VL tokenizer, and `weights` stored f32.
+    fn write_vl_snapshot(
+        config: &serde_json::Value,
+        weights: &HashMap<String, Tensor>,
+        vocab: usize,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("candle-vl-fixture-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer.json"),
+            synthetic_vl_tokenizer_json(vocab),
+        )
+        .unwrap();
+        candle_core::safetensors::save(weights, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
+
+    /// A tiny Qwen3-VL (`qwen3_vl`: the generic-causal `CausalLm` decoder under
+    /// `model.language_model.*`, interleaved M-RoPE) with a [`synthetic_vision_tower`], loaded as
+    /// a provider (keep the directory alive with it) — the Causal multimodal fixture (sc-24433).
+    fn synthetic_qwen3vl_provider() -> (tempfile::TempDir, super::LlamaProvider) {
+        let (vocab, hidden, heads, layers) = (40usize, 32usize, 4usize, 3usize);
+        let head_dim = hidden / heads;
+        let (_, llama) = llama_parts(vocab, hidden, 64, heads, 2, layers);
+        let mut weights: HashMap<String, Tensor> = llama
+            .into_iter()
+            .map(|(k, t)| match k.strip_prefix("model.") {
+                Some(rest) => (format!("model.language_model.{rest}"), t),
+                None => (k, t),
+            })
+            .collect();
+        for i in 0..layers {
+            for norm in ["q_norm", "k_norm"] {
+                weights.insert(
+                    format!("model.language_model.layers.{i}.self_attn.{norm}.weight"),
+                    Tensor::ones(head_dim, candle_core::DType::F32, &candle_core::Device::Cpu)
+                        .unwrap(),
+                );
+            }
+        }
+        let (vision_config, vision) = synthetic_vision_tower(hidden);
+        weights.extend(vision);
+        let config = serde_json::json!({
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "model_type": "qwen3_vl",
+            "image_token_id": vl_special_ids(vocab).1,
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "qwen3_vl_text",
+                "hidden_size": hidden, "intermediate_size": 64, "num_hidden_layers": layers,
+                "num_attention_heads": heads, "num_key_value_heads": 2, "head_dim": head_dim,
+                "vocab_size": vocab, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                "max_position_embeddings": 512,
+                "rope_scaling": {
+                    "mrope_interleaved": true, "mrope_section": [2, 1, 1], "rope_type": "default"
+                }
+            },
+            "vision_config": vision_config,
+        });
+        let dir = write_vl_snapshot(&config, &weights, vocab);
+        let provider = super::LlamaProvider::load(&core_llm::LoadSpec::dense(
+            dir.path().display().to_string(),
+        ))
+        .expect("load the synthetic Qwen3-VL snapshot");
+        assert!(matches!(provider.model, Decoder::Causal(_)), "a CausalLm");
+        assert!(provider.descriptor.capabilities.supports_vision);
+        (dir, provider)
+    }
+
+    /// The synthetic Qwen3.5 hybrid ([`synthetic_qwen35_snapshot_without_mtp`]'s decoder) with a
+    /// [`synthetic_vision_tower`], loaded as a provider (keep the directory alive with it) — the
+    /// Qwen35 multimodal fixture (sc-24433).
+    fn synthetic_qwen35_vl_provider() -> (tempfile::TempDir, super::LlamaProvider) {
+        let (cfg, weights, cfg_json) = crate::models::qwen35::tests::text_model_snapshot_parts();
+        let vocab = cfg.vocab_size as usize;
+        let mut tensors: HashMap<String, Tensor> = weights
+            .keys()
+            .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
+            .collect();
+        let (vision_config, vision) = synthetic_vision_tower(cfg.hidden_size as usize);
+        tensors.extend(vision);
+        let mut text_config = cfg_json["text_config"].clone();
+        // Room for the 64 image tokens beside the prompt and the continuation.
+        text_config["max_position_embeddings"] = serde_json::json!(512);
+        let config = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "image_token_id": vl_special_ids(vocab).1,
+            "text_config": text_config,
+            "vision_config": vision_config,
+        });
+        let dir = write_vl_snapshot(&config, &tensors, vocab);
+        let provider = super::LlamaProvider::load(&core_llm::LoadSpec::dense(
+            dir.path().display().to_string(),
+        ))
+        .expect("load the synthetic Qwen3.5 VLM snapshot");
+        assert!(matches!(provider.model, Decoder::Qwen35(_)), "the hybrid");
+        assert!(provider.descriptor.capabilities.supports_vision);
+        (dir, provider)
+    }
+
+    /// A 256 × 256 RGB gradient (the image processor's minimum area: 64 language tokens).
+    fn gradient_image() -> core_llm::ImageRef {
+        let (w, h) = (256u32, 256u32);
+        let pixels = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                [x as u8, y as u8, ((x + y) / 2) as u8]
+            })
+            .collect();
+        core_llm::ImageRef::new(w, h, pixels).unwrap()
+    }
+
+    /// The multimodal fixture prompts: the gradient image then a repetitive text turn, and the
+    /// text turn then the image (the placeholder run sits mid-prompt, not only at its head).
+    fn image_fixture_prompts() -> Vec<core_llm_testkit::BenchPrompt> {
+        use core_llm::{Content, Message, Role};
+        use core_llm_testkit::{BenchPrompt, PromptClass};
+        let text = "t3 t7 t11 t2 t7 t11 t3 t7 t11 t2";
+        let prompt = |id: &str, content: Vec<Content>| BenchPrompt {
+            id: id.into(),
+            class: PromptClass::Predictable,
+            messages: vec![Message {
+                role: Role::User,
+                content,
+                thinking: None,
+                tool_calls: Vec::new(),
+            }],
+        };
+        vec![
+            prompt(
+                "image_then_text",
+                vec![Content::Image(gradient_image()), Content::text(text)],
+            ),
+            prompt(
+                "text_then_image",
+                vec![Content::text(text), Content::Image(gradient_image())],
+            ),
+        ]
+    }
+
+    /// The streamed token events of one generation, and its output.
+    fn token_events(
+        provider: &super::LlamaProvider,
+        req: &core_llm::TextLlmRequest,
+    ) -> (Vec<(u32, String)>, core_llm::TextLlmOutput) {
+        use core_llm::{StreamEvent, TextLlm};
+        let mut events = Vec::new();
+        let out = provider
+            .generate(req, &mut |event| {
+                if let StreamEvent::Token { id, text, .. } = event {
+                    events.push((id, text));
+                }
+            })
+            .expect("generate");
+        (events, out)
+    }
+
     /// The fixture prompts of the speculative parity suite: repetitive enough that prompt lookup
     /// finds matches in the prompt and in the looping greedy continuation of a random decoder.
     fn fixture_prompts() -> Vec<core_llm_testkit::BenchPrompt> {
@@ -7413,7 +7685,7 @@ mod tests {
     /// lookup (the report says so) and emits the `off` greedy stream token for token.
     #[test]
     fn prompt_lookup_is_greedy_exact_on_the_qwen3_causal_fixture() {
-        let (_dir, provider) = synthetic_causal_provider();
+        let (_dir, mut provider) = synthetic_causal_provider();
         let rows = core_llm_testkit::check_speculative_greedy_parity(
             &provider,
             &fixture_prompts(),
@@ -7424,6 +7696,35 @@ mod tests {
         assert_eq!(rows.len(), 2 * 5);
         assert!(rows.iter().all(|r| r.report.path == "prompt_lookup"));
         assert_rows_drafted(&rows);
+
+        // The `off` the table was compared against is the engine with no proposer; it is in turn
+        // the reference `Decode` loop's stream, token event for token event.
+        let off = |prompt| {
+            core_llm_testkit::bench_request(
+                prompt,
+                core_llm::Speculative::Off,
+                &core_llm::Sampling::greedy(),
+                24,
+            )
+        };
+        let prompts = fixture_prompts();
+        let engine: Vec<_> = prompts
+            .iter()
+            .map(|prompt| {
+                let (events, out) = token_events(&provider, &off(prompt));
+                assert_eq!(out.decode.unwrap().path, "step_model");
+                events
+            })
+            .collect();
+        provider
+            .set_decode_path(DecodePath::Reference)
+            .expect("the reference loop is selectable");
+        for (prompt, engine) in prompts.iter().zip(engine) {
+            let (reference, out) = token_events(&provider, &off(prompt));
+            assert_eq!(out.decode.unwrap().path, "reference");
+            assert_eq!(reference.len(), 24, "{}", prompt.id);
+            assert_eq!(reference, engine, "{}: engine off vs reference", prompt.id);
+        }
     }
 
     /// sc-24433 AC1 (Qwen35) and AC2: on the qwen3_5 hybrid without a head the same table holds
@@ -7475,6 +7776,120 @@ mod tests {
             .all(|r| r.report.proposer == ProposerKind::Mtp && r.report.draft_tokens == Some(3)));
     }
 
+    /// sc-24433 (scope e): on the qwen3_5 hybrid a multimodal request runs prompt lookup over the
+    /// image-expanded history — the placeholder run included — and is greedy-exact against `off`.
+    /// A placeholder id a proposal copies is verified like any other draft: the verify forward
+    /// embeds it as the text token it is at a text position, exactly what the token-at-a-time loop
+    /// does when the model emits it, so lookup over the spliced history is sound (at worst a
+    /// rejected draft).
+    #[test]
+    fn prompt_lookup_is_greedy_exact_on_a_qwen35_multimodal_request() {
+        use core_llm::{Speculative, SpeculativeProposer};
+        use core_llm_testkit::ParityCase;
+
+        let (_dir, provider) = synthetic_qwen35_vl_provider();
+        let lookup = |depth| ParityCase {
+            speculative: Speculative::proposer(SpeculativeProposer::PromptLookup, depth),
+            expect_proposer: ProposerKind::PromptLookup,
+        };
+        let rows = core_llm_testkit::check_speculative_greedy_parity(
+            &provider,
+            &image_fixture_prompts(),
+            &[
+                lookup(1),
+                lookup(super::PROMPT_LOOKUP_RECOMMENDED_DEPTH),
+                lookup(super::PROMPT_LOOKUP_MAX_DEPTH),
+                ParityCase {
+                    speculative: Speculative::Auto,
+                    expect_proposer: ProposerKind::PromptLookup,
+                },
+            ],
+            24,
+        )
+        .unwrap_or_else(|failures| panic!("{failures}"));
+        assert_eq!(rows.len(), 2 * 4);
+        assert!(rows.iter().all(|r| r.report.path == "prompt_lookup"));
+        assert!(rows.iter().all(|r| r.generated_tokens == 24));
+        assert_rows_drafted(&rows);
+        // The rows ran the multimodal prefill: the 64 image tokens are in the prompt.
+        let (_, out) = token_events(
+            &provider,
+            &core_llm_testkit::bench_request(
+                &image_fixture_prompts()[1],
+                Speculative::Auto,
+                &core_llm::Sampling::greedy(),
+                4,
+            ),
+        );
+        assert!(out.usage.prompt_tokens > 64, "{:?}", out.usage);
+    }
+
+    /// sc-24433 / epic sc-24432 E2, end to end: `auto` on a Qwen3-VL (generic-causal) multimodal
+    /// request resolves to prompt lookup, which that request's reference-loop prefill cannot run —
+    /// the output's report names the route fallback, decodes with no proposer, and emits the
+    /// `off` stream. The same request text-only runs prompt lookup with no fallback.
+    #[test]
+    fn a_route_fallback_reaches_the_output_report() {
+        use core_llm::{Sampling, Speculative};
+
+        let (_dir, provider) = synthetic_qwen3vl_provider();
+        let prompts = image_fixture_prompts();
+        let request = |speculative| {
+            core_llm_testkit::bench_request(&prompts[0], speculative, &Sampling::greedy(), 12)
+        };
+        let (auto_events, auto) = token_events(&provider, &request(Speculative::Auto));
+        let report = auto.decode.expect("reported");
+        assert_eq!(report.fallbacks.len(), 1, "{:?}", report.fallbacks);
+        assert!(
+            report.fallbacks[0]
+                .starts_with("speculative: `prompt_lookup` needs the step-seam engine"),
+            "{:?}",
+            report.fallbacks
+        );
+        assert_eq!(report.path, "reference");
+        assert_eq!(report.proposer, ProposerKind::None);
+        let (off_events, off) = token_events(&provider, &request(Speculative::Off));
+        assert!(off.decode.unwrap().fallbacks.is_empty());
+        assert_eq!(
+            auto_events, off_events,
+            "the fallback decodes the off stream"
+        );
+
+        let text_only = core_llm_testkit::bench_request(
+            &fixture_prompts()[0],
+            Speculative::Auto,
+            &Sampling::greedy(),
+            12,
+        );
+        let report = token_events(&provider, &text_only).1.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::PromptLookup);
+        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+    }
+
+    /// The report the output carries is the record's, with the provider's fallback reasons passed
+    /// through verbatim and in order.
+    #[test]
+    fn the_request_report_carries_the_provider_fallbacks_verbatim() {
+        let record =
+            crate::decode::DecodeRecord::plain(DecodePath::Reference, 3, 3, Default::default());
+        let reasons = vec![
+            "speculative: `mtp` is not available for this model".to_string(),
+            "speculative: second reason".to_string(),
+        ];
+        let report = super::request_report(&record, true, reasons.clone());
+        assert_eq!(report.fallbacks, reasons);
+        assert_eq!(
+            report,
+            core_llm::DecodeReport {
+                fallbacks: reasons,
+                ..record.report(true)
+            }
+        );
+        assert!(super::request_report(&record, false, Vec::new())
+            .fallbacks
+            .is_empty());
+    }
+
     /// sc-24433 AC3: the benchmark harness runs the whole prompt set (predictable and open-ended)
     /// on the Qwen3 fixture under `off`, prompt lookup and `auto`, and writes one baseline-format
     /// JSON row per (prompt, option) with the report's proposer and accepted length.
@@ -7492,6 +7907,7 @@ mod tests {
                 Speculative::Auto,
             ],
             warmup: false,
+            sampling: core_llm::Sampling::greedy(),
         };
         let prompts = core_llm_testkit::speculative_prompt_set();
         let doc = core_llm_testkit::run_speculative_bench(&provider, &prompts, &config)
@@ -7531,6 +7947,34 @@ mod tests {
             rows[0]["mean_accepted_length"].is_null(),
             "off never verifies drafts"
         );
+        assert_eq!(json["sampling"]["temperature"], 0.0);
+
+        // The product's default on candle-cuda is `auto` + temperature: a seeded stochastic run
+        // of the same table records its knobs and every row's sampler path.
+        let stochastic = core_llm_testkit::BenchConfig {
+            sampling: core_llm_testkit::parse_bench_sampling(
+                r#"{"temperature": 0.7, "top_p": 0.9}"#,
+            )
+            .unwrap(),
+            ..config
+        };
+        let doc = core_llm_testkit::run_speculative_bench(&provider, &prompts, &stochastic)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let json = doc.to_json();
+        assert_eq!(json["sampling"]["temperature"], 0.7);
+        assert_eq!(json["sampling"]["top_p"], 0.9);
+        let rows = json["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 5 * 3);
+        for row in rows {
+            let sampler = row["sampler"].as_str().unwrap_or_else(|| panic!("{row}"));
+            assert!(!sampler.is_empty() && sampler != "none", "{row}");
+            if provider.model.device().is_cpu() {
+                // No device sampler on the CPU: every stochastic draw is the host's.
+                assert_eq!(sampler, "host:device_unavailable", "{row}");
+            }
+            assert_eq!(row["generated_tokens"], 12);
+        }
+        assert_eq!(rows[1]["proposer"], "prompt_lookup");
     }
 
     /// sc-24134, sc-24139, sc-24140: with the CUDA-graph switch on — the one the provider was
