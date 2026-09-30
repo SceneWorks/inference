@@ -21,7 +21,8 @@
 //!    [`generate_prompt_lookup`], the Qwen3.8 MTP head), cache-rollback strategies and samplers,
 //!    which the provider runs for every text request and which reports a
 //!    [`core_llm::DecodeReport`]; [`generate_draft_speculative`] is draft-model speculative
-//!    decoding (story 7172). All are driven by `core_llm`'s backend-neutral proposer +
+//!    decoding (story 7172), on the same engine with a draft model as its proposer since
+//!    sc-24436. All are driven by `core_llm`'s backend-neutral proposer +
 //!    distribution-preserving acceptance sampler.
 //! 4. [`provider`] — implements the backend-neutral [`core_llm::TextLlm`] contract over the engine
 //!    and exposes it (`mlx-llama`) for explicit runtime composition.

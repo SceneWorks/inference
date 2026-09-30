@@ -23,10 +23,12 @@ use core_llm::{
     TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
 };
 
+use core_llm::DraftReport;
+
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_speculative, ConstraintMask, Decode, EngineOptions, FinishReason, GenerationConfig,
-    MtpProposer, NgramProposer, NoProposer, Proposer, Qwen35MtpMultimodalPrompt,
+    generate_speculative, ConstraintMask, Decode, DraftModelProposer, EngineOptions, FinishReason,
+    GenerationConfig, MtpProposer, NgramProposer, NoProposer, Proposer, Qwen35MtpMultimodalPrompt,
     RewindableConstraintMask, SpeculativePrompt, SpeculativeTarget, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
@@ -566,6 +568,78 @@ pub struct LlamaProvider {
     /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
     /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
     _prism_vision_weights: Option<Weights>,
+    /// The resident draft model for `draft_model` speculation (sc-24436), present iff the load
+    /// named a compatible one ([`LoadSpec::draft_source`]); `draft_model` is advertised exactly
+    /// then. A second decoder with its own cache per request, driven as a proposer by the engine.
+    draft: Option<ResidentDraft>,
+    /// What the load settled: the requested weight format and what became of a named draft
+    /// (resident, or refused with the reason). Read through [`TextLlm::load_report`].
+    load_report: core_llm::LoadReport,
+}
+
+/// A draft model resident beside its target (sc-24436).
+struct ResidentDraft {
+    /// The draft decoder.
+    model: Decoder,
+    /// Leading draft ids it may propose — its tokenizer's tokens
+    /// ([`core_llm::draft_compatibility`]); a padding row never becomes a draft.
+    proposable: usize,
+    /// The target's logits width, which the draft's logits are shaped to.
+    width: usize,
+    /// The draft's own context window (`0`: unbounded): a request reaching past it runs `auto`
+    /// instead ([`core_llm::fit_draft_context`], E2).
+    context: usize,
+}
+
+/// What a load does with its named draft model (sc-24436), decided before any weight is read.
+enum DraftPlan {
+    /// No draft named.
+    None,
+    /// Admitted beside the target: load it from this spec.
+    Load(LoadSpec),
+    /// Refused before loading (unpriceable, or no room beside the target).
+    Refused(DraftReport),
+}
+
+impl DraftPlan {
+    /// Price a named draft beside the target (E7): its load estimate is admitted together with
+    /// the target's. `Err` only when the target alone does not fit — a draft never fails the load
+    /// (E2); a draft that cannot be priced or does not fit beside the target is refused by name.
+    fn admit(spec: &LoadSpec, target_required: u64, available: u64) -> CoreResult<Self> {
+        let Some(source) = spec.draft_source.as_deref() else {
+            core_llm::admit_request_memory(target_required, available)?;
+            return Ok(DraftPlan::None);
+        };
+        let draft_spec = draft_load_spec(spec, source);
+        let draft_required = match crate::load_memory::required_bytes(&draft_spec) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                core_llm::admit_request_memory(target_required, available)?;
+                return Ok(DraftPlan::Refused(DraftReport::refused(
+                    source,
+                    format!("draft model: its load cannot be priced ({e})"),
+                )));
+            }
+        };
+        Ok(
+            match core_llm::admit_draft_load(target_required, draft_required, available)? {
+                None => DraftPlan::Load(draft_spec),
+                Some(why) => DraftPlan::Refused(DraftReport::refused(source, why)),
+            },
+        )
+    }
+}
+
+/// The load spec of a named draft: its own source, text-only, at the target's load-time tier
+/// (a quantization tier covers every model the load makes resident) and naming no draft itself.
+fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
+    LoadSpec {
+        source: source.to_string(),
+        projector_source: None,
+        quantize: spec.quantize,
+        cuda_graphs: spec.cuda_graphs,
+        draft_source: None,
+    }
 }
 
 /// The same Qwen3.5/3.8 decoder appears under `model.language_model` in VLM snapshots and
@@ -586,6 +660,20 @@ fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static st
     }
 }
 
+/// The MLX projection format of a load-time quantization tier. NVFP4 is a CUDA sm_120
+/// capability (sc-24135): refused by name, never substituted.
+fn quant_spec(quantize: Quantize) -> CoreResult<QuantSpec> {
+    match quantize {
+        Quantize::Q4 => Ok(QuantSpec::q4()),
+        Quantize::Q8 => Ok(QuantSpec::q8()),
+        Quantize::Nvfp4 => Err(CoreError::Unsupported(
+            "nvfp4: NVFP4 projections need a CUDA device with compute capability >= sm_120; the \
+             MLX backend has no NVFP4 GEMM"
+                .into(),
+        )),
+    }
+}
+
 impl LlamaProvider {
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
@@ -600,27 +688,76 @@ impl LlamaProvider {
                     .into(),
             ));
         }
-        let quant = spec
-            .quantize
-            .map(|q| match q {
-                Quantize::Q4 => Ok(QuantSpec::q4()),
-                Quantize::Q8 => Ok(QuantSpec::q8()),
-                // sc-24135: NVFP4 is a CUDA sm_120 capability; refuse by name, never substitute —
-                // before admission, so a memory refusal cannot mask it.
-                Quantize::Nvfp4 => Err(CoreError::Unsupported(
-                    "nvfp4: NVFP4 projections need a CUDA device with compute capability >= \
-                     sm_120; the MLX backend has no NVFP4 GEMM"
-                        .into(),
-                )),
-            })
-            .transpose()?;
+        // sc-24135: NVFP4 is refused by name before admission, so a memory refusal cannot mask it.
+        let quant = spec.quantize.map(quant_spec).transpose()?;
         let required = crate::load_memory::required_bytes(spec)?;
         let available = core_llm::effective_memory_budget(
             core_llm::available_host_memory_bytes(),
             core_llm::operational_memory_override()?,
         )?;
-        core_llm::admit_request_memory(required, available)?;
+        let draft = DraftPlan::admit(spec, required, available)?;
 
+        let mut provider = Self::load_admitted(spec, quant)?;
+        provider.load_report.requested = spec.quantize;
+        match draft {
+            DraftPlan::None => {}
+            DraftPlan::Refused(report) => provider.load_report.draft = Some(report),
+            DraftPlan::Load(draft_spec) => provider.attach_draft(&draft_spec),
+        }
+        Ok(provider)
+    }
+
+    /// Load the draft `spec` names beside this target and keep it only if it can propose for it
+    /// ([`core_llm::draft_compatibility`]): resident — `draft_model` advertised — or refused
+    /// with the reason in the load report, the target unaffected either way (sc-24436, E2).
+    fn attach_draft(&mut self, spec: &LoadSpec) {
+        let source = spec.source.clone();
+        let target_logits = self.model.memory_geometry().vocab_size as usize;
+        // The tokenizer is checked before any draft weight is touched when the draft ships one.
+        let early = Tokenizer::from_file(Path::new(&source).join("tokenizer.json"))
+            .ok()
+            .and_then(|tokenizer| self.tokenizer.vocabulary_mismatch(&tokenizer))
+            .map(|why| {
+                format!("draft model: its tokenizer vocabulary is not the target's ({why})")
+            });
+        let outcome = match early {
+            Some(why) => Err(why),
+            None => match spec.quantize.map(quant_spec).transpose() {
+                Err(e) => Err(format!("draft model: {e}")),
+                Ok(quant) => match Self::load_admitted(spec, quant) {
+                    Err(e) => Err(format!("draft model: its load failed ({e})")),
+                    Ok(draft) => core_llm::draft_compatibility(
+                        &self.tokenizer,
+                        target_logits,
+                        &draft.tokenizer,
+                        draft.model.memory_geometry().vocab_size as usize,
+                    )
+                    .map(|proposable| ResidentDraft {
+                        proposable,
+                        width: target_logits,
+                        context: draft.descriptor.capabilities.max_context_tokens,
+                        model: draft.model,
+                    }),
+                },
+            },
+        };
+        self.load_report.draft = Some(match outcome {
+            Ok(model) => {
+                self.draft = Some(model);
+                let max_depth = self.verify_depth_bound();
+                self.descriptor
+                    .capabilities
+                    .speculative
+                    .push(core_llm::draft_model_capabilities(max_depth));
+                DraftReport::resident(source)
+            }
+            Err(why) => DraftReport::refused(source, why),
+        });
+    }
+
+    /// [`load`](Self::load) after admission: the target decoder, its tokenizer, template and
+    /// multimodal front-ends, with no draft.
+    fn load_admitted(spec: &LoadSpec, quant: Option<QuantSpec>) -> CoreResult<Self> {
         let dir = Path::new(&spec.source);
         if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
             return Self::load_prism_gguf(spec, dir);
@@ -778,6 +915,8 @@ impl LlamaProvider {
             vision,
             gemma4,
             _prism_vision_weights: prism_vision_weights,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
         })
     }
 
@@ -836,6 +975,8 @@ impl LlamaProvider {
             vision,
             gemma4: None,
             _prism_vision_weights: None,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
         })
     }
 
@@ -868,6 +1009,8 @@ impl LlamaProvider {
             vision: None,
             gemma4: None,
             _prism_vision_weights: None,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
         }
     }
 
@@ -1390,6 +1533,10 @@ impl TextLlm for LlamaProvider {
         &self.descriptor
     }
 
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.load_report.clone())
+    }
+
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
         self.descriptor
             .capabilities
@@ -1503,6 +1650,15 @@ impl TextLlm for LlamaProvider {
             core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities);
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
+        // A `draft_model` request reaching past the draft's own context window runs `auto`
+        // instead, by name (sc-24436, E2).
+        let route = self.fit_draft_route(
+            route,
+            admitted_prompt,
+            req.max_new_tokens,
+            gemma4_mm_request,
+            &mut fallbacks,
+        );
         let required = self
             .speculative_request_bytes(route, admitted_prompt, req.max_new_tokens, vision_workspace)
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
@@ -1541,6 +1697,16 @@ impl TextLlm for LlamaProvider {
             prompt_len,
             req.max_new_tokens,
         )?;
+        // A Gemma 4 prompt's soft-token expansion is known only now: a `draft_model` route checks
+        // the draft's context window again against the effective prompt (E2). Nothing has been
+        // allocated for the route yet; the priced draft is only an over-estimate.
+        let route = self.fit_draft_route(
+            route,
+            prompt_len,
+            req.max_new_tokens,
+            gemma4_mm_request,
+            &mut fallbacks,
+        );
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -1730,7 +1896,7 @@ impl TextLlm for LlamaProvider {
                                         &m.deepstack,
                                     )
                                     .map_err(to_core)?;
-                                (route.plain_proposer(), logits, None)
+                                (route.plain_proposer(self.draft.as_ref()), logits, None)
                             };
                             generate_speculative(
                                 model,
@@ -1769,7 +1935,7 @@ impl TextLlm for LlamaProvider {
                                 .map_err(to_core)?;
                             generate_speculative(
                                 model,
-                                &mut *route.plain_proposer(),
+                                &mut *route.plain_proposer(self.draft.as_ref()),
                                 SpeculativePrompt::Prefilled {
                                     cache: &mut cache,
                                     logits,
@@ -1811,7 +1977,7 @@ impl TextLlm for LlamaProvider {
                         .map_err(to_core)?;
                     generate_speculative(
                         model,
-                        &mut *route.plain_proposer(),
+                        &mut *route.plain_proposer(self.draft.as_ref()),
                         SpeculativePrompt::Prefilled {
                             cache: &mut cache,
                             logits,
@@ -1846,7 +2012,7 @@ impl TextLlm for LlamaProvider {
                     match &self.model {
                         Decoder::Causal(model) => generate_speculative(
                             model,
-                            &mut *route.plain_proposer(),
+                            &mut *route.plain_proposer(self.draft.as_ref()),
                             SpeculativePrompt::Tokens(&prompt_ids),
                             &config,
                             width,
@@ -1858,7 +2024,7 @@ impl TextLlm for LlamaProvider {
                             let mut proposer: Box<dyn Proposer<Qwen35Model>> = if route.is_mtp() {
                                 Box::new(MtpProposer::new())
                             } else {
-                                route.plain_proposer()
+                                route.plain_proposer(self.draft.as_ref())
                             };
                             generate_speculative(
                                 model,
@@ -2074,19 +2240,22 @@ fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
 }
 
 /// The proposer a request runs on the engine, after its resolved plan meets the request's shape
-/// (sc-24434). `width` is the drafts per verify step (`0` for plain decoding).
+/// (sc-24434, sc-24436). `width` is the drafts per verify step (`0` for plain decoding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SpeculativeRoute {
     Plain,
     Mtp { width: usize },
     PromptLookup { width: usize },
+    DraftModel { width: usize },
 }
 
 impl SpeculativeRoute {
     fn width(self) -> usize {
         match self {
             SpeculativeRoute::Plain => 0,
-            SpeculativeRoute::Mtp { width } | SpeculativeRoute::PromptLookup { width } => width,
+            SpeculativeRoute::Mtp { width }
+            | SpeculativeRoute::PromptLookup { width }
+            | SpeculativeRoute::DraftModel { width } => width,
         }
     }
 
@@ -2094,19 +2263,37 @@ impl SpeculativeRoute {
         matches!(self, SpeculativeRoute::Mtp { .. })
     }
 
-    /// The proposer for any target: prompt lookup, or none. (MTP needs the Qwen35 target.)
-    fn plain_proposer<'a, T: SpeculativeTarget + 'a>(self) -> Box<dyn Proposer<T> + 'a> {
-        match self {
-            SpeculativeRoute::PromptLookup { .. } => Box::new(NgramProposer::default()),
-            SpeculativeRoute::Plain | SpeculativeRoute::Mtp { .. } => Box::new(NoProposer),
+    /// The proposer for any target: prompt lookup, the resident `draft` model, or none. (MTP
+    /// needs the Qwen35 target.)
+    fn plain_proposer<'a, T: SpeculativeTarget + 'a>(
+        self,
+        draft: Option<&'a ResidentDraft>,
+    ) -> Box<dyn Proposer<T> + 'a> {
+        match (self, draft) {
+            (SpeculativeRoute::PromptLookup { .. }, _) => Box::new(NgramProposer::default()),
+            (SpeculativeRoute::DraftModel { width: drafts }, Some(resident)) => {
+                let (proposable, width) = (resident.proposable, resident.width);
+                match &resident.model {
+                    Decoder::Causal(draft) => Box::new(
+                        DraftModelProposer::new(draft, drafts).with_vocab(proposable, width),
+                    ),
+                    Decoder::Qwen35(draft) => Box::new(
+                        DraftModelProposer::new(draft, drafts).with_vocab(proposable, width),
+                    ),
+                }
+            }
+            // `speculative_route` routes `draft_model` only with a resident draft.
+            (SpeculativeRoute::DraftModel { .. }, None)
+            | (SpeculativeRoute::Plain | SpeculativeRoute::Mtp { .. }, _) => Box::new(NoProposer),
         }
     }
 }
 
 impl LlamaProvider {
-    /// The request's admission price under its speculative route. Prompt lookup rolls back
-    /// without a forward or a copy on both decoders — a softmax decoder by truncation, the Qwen35
-    /// hybrid through its DeltaNet checkpoint ring (sc-24435) — so it pays its verify overshoot
+    /// The request's admission price under its speculative route. Prompt lookup and a draft
+    /// model's verify roll back without a forward or a copy on both decoders — a softmax decoder
+    /// by truncation, the Qwen35 hybrid through its DeltaNet checkpoint ring (sc-24435) — so they
+    /// pay their verify overshoot
     /// (`width` more KV positions and `width` more hidden + logit rows) and, on the hybrid, the
     /// ring ([`Qwen35Model::checkpoint_ring_bytes`]). MTP keeps the predictor-cache pricing
     /// (`width` in the estimate) plus the ring; the ring replaced the step-start snapshot, so the
@@ -2125,7 +2312,7 @@ impl LlamaProvider {
                 .checked_add(m.checkpoint_ring_bytes(width)?)?;
         }
         let (priced_width, overshoot) = match route {
-            SpeculativeRoute::PromptLookup { width } => {
+            SpeculativeRoute::PromptLookup { width } | SpeculativeRoute::DraftModel { width } => {
                 let width = u64::try_from(width).ok()?;
                 let kv_position = geometry
                     .layers
@@ -2141,7 +2328,7 @@ impl LlamaProvider {
             }
             other => (u32::try_from(other.width()).ok()?, 0),
         };
-        estimate_mlx_request_bytes(
+        let target = estimate_mlx_request_bytes(
             prompt_tokens,
             max_new_tokens,
             geometry,
@@ -2149,12 +2336,90 @@ impl LlamaProvider {
             priced_width,
             self.model.workspace_contract(),
         )?
-        .checked_add(overshoot)
+        .checked_add(overshoot)?;
+        // The draft model's own request (E7, sc-24436): its prefill of the same prompt and a
+        // cache that grows over the whole run plus the provisional drafts a step writes past the
+        // committed tokens — and, when the draft is the hybrid, the checkpoint ring its proposal
+        // window holds (sc-24435), armed for the same `width`: no snapshot, no replay.
+        let draft = match (route, self.draft.as_ref().map(|d| &d.model)) {
+            (SpeculativeRoute::DraftModel { width }, Some(draft)) => {
+                let mut geometry = draft.memory_geometry();
+                if let Decoder::Qwen35(m) = draft {
+                    geometry.recurrent_bytes = geometry
+                        .recurrent_bytes
+                        .checked_add(m.checkpoint_ring_bytes(width)?)?;
+                }
+                estimate_mlx_request_bytes(
+                    prompt_tokens,
+                    max_new_tokens.checked_add(u32::try_from(width).ok()?)?,
+                    geometry,
+                    0,
+                    0,
+                    draft.workspace_contract(),
+                )?
+            }
+            _ => 0,
+        };
+        target.checked_add(draft)
+    }
+
+    /// The model's verify-depth bound: the depth its descriptor advertises for prompt lookup (the
+    /// per-model bound, sc-24438), which `draft_model` advertises too — every draft is one more
+    /// verify row whichever proposer drew it (sc-24436). Every decoder advertises prompt lookup;
+    /// one draft per step otherwise.
+    fn verify_depth_bound(&self) -> u32 {
+        self.descriptor
+            .capabilities
+            .proposer(SpeculativeProposer::PromptLookup)
+            .map_or(1, |lookup| lookup.max_depth)
+    }
+
+    /// The resident draft's context window (`0`: no draft, or an unbounded one).
+    fn draft_context(&self) -> usize {
+        self.draft.as_ref().map_or(0, |draft| draft.context)
+    }
+
+    /// A `draft_model` route whose request — `prompt_tokens` + `max_new_tokens` and a step's
+    /// overshoot — outruns the resident draft's context window runs what `auto` resolves to
+    /// instead, the reason named in `fallbacks` ([`core_llm::fit_draft_context`], sc-24436 E2).
+    /// Any other route is returned unchanged.
+    fn fit_draft_route(
+        &self,
+        route: SpeculativeRoute,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+        gemma4_mm_request: bool,
+        fallbacks: &mut Vec<String>,
+    ) -> SpeculativeRoute {
+        let SpeculativeRoute::DraftModel { width } = route else {
+            return route;
+        };
+        let fit = core_llm::fit_draft_context(
+            core_llm::SpeculativeResolution {
+                plan: SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::DraftModel,
+                    depth: width as u32,
+                },
+                fallback: None,
+            },
+            &self.descriptor.capabilities,
+            self.draft_context(),
+            prompt_tokens,
+            max_new_tokens,
+        );
+        match fit.fallback {
+            None => route,
+            Some(why) => {
+                fallbacks.push(why);
+                self.speculative_route(fit.plan, gemma4_mm_request, fallbacks)
+            }
+        }
     }
 
     /// Route a resolved speculative plan onto what this request can run, naming every downgrade
     /// in `fallbacks` (E2): MTP needs a loaded Qwen3.8 predictor and a text or Qwen-VL prompt, and
-    /// no draft model is ever loaded on this provider.
+    /// `draft_model` a resident draft (sc-24436) — it runs on every prompt shape, the draft
+    /// proposing over the effective prompt ids.
     fn speculative_route(
         &self,
         plan: SpeculativePlan,
@@ -2189,6 +2454,12 @@ impl LlamaProvider {
                 proposer: SpeculativeProposer::PromptLookup,
                 depth,
             } => SpeculativeRoute::PromptLookup {
+                width: depth as usize,
+            },
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::DraftModel,
+                depth,
+            } if self.draft.is_some() => SpeculativeRoute::DraftModel {
                 width: depth as usize,
             },
             SpeculativePlan::Run {
@@ -3589,6 +3860,8 @@ mod tests {
             vision: None,
             gemma4: None,
             _prism_vision_weights: None,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
         }
     }
 
@@ -3609,6 +3882,8 @@ mod tests {
             vision: None,
             gemma4: None,
             _prism_vision_weights: None,
+            draft: None,
+            load_report: core_llm::LoadReport::default(),
         }
     }
 
@@ -3875,6 +4150,193 @@ mod tests {
             why[0].contains("`draft_model` has no draft model"),
             "{why:?}"
         );
+    }
+
+    /// The causal fixture with its own first layer resident as the draft model (sc-24436).
+    fn causal_provider_with_draft() -> LlamaProvider {
+        let mut provider = causal_provider();
+        provider.draft = Some(ResidentDraft {
+            model: Decoder::Causal(crate::decode::engine::tests::causal_model(24, 1)),
+            proposable: 24,
+            width: 24,
+            context: 0,
+        });
+        let max_depth = provider.verify_depth_bound();
+        provider
+            .descriptor
+            .capabilities
+            .speculative
+            .push(core_llm::draft_model_capabilities(max_depth));
+        provider
+    }
+
+    /// sc-24436: with a resident draft `draft_model` routes onto the engine for every prompt
+    /// shape and decodes exactly `off`'s greedy stream with a report naming it; admission prices
+    /// the draft's own prefill and cache on top of the target's (E7).
+    #[test]
+    fn a_resident_draft_routes_draft_model_and_is_priced() {
+        use core_llm::Speculative;
+        let provider = causal_provider_with_draft();
+        let plan = SpeculativePlan::Run {
+            proposer: SpeculativeProposer::DraftModel,
+            depth: 3,
+        };
+        for gemma4 in [false, true] {
+            let mut why = Vec::new();
+            assert_eq!(
+                provider.speculative_route(plan, gemma4, &mut why),
+                SpeculativeRoute::DraftModel { width: 3 }
+            );
+            assert!(why.is_empty(), "{why:?}");
+        }
+        let (draft, ids) = run(
+            &provider,
+            &spec_request(Speculative::proposer(SpeculativeProposer::DraftModel, 3)),
+        );
+        let (off, off_ids) = run(&provider, &spec_request(Speculative::Off));
+        assert_eq!(ids, off_ids);
+        assert_eq!(draft.text, off.text);
+        let report = draft.decode.unwrap();
+        assert_eq!(report.proposer, ProposerKind::DraftModel);
+        assert_eq!(report.draft_tokens, Some(3));
+        assert!(report.proposed_tokens > 0 && report.fallbacks.is_empty());
+
+        let price = |route| {
+            provider
+                .speculative_request_bytes(route, 64, 32, 0)
+                .unwrap()
+        };
+        let lookup = price(SpeculativeRoute::PromptLookup { width: 4 });
+        let with_draft = price(SpeculativeRoute::DraftModel { width: 4 });
+        let draft_model = &provider.draft.as_ref().unwrap().model;
+        let draft_request = estimate_mlx_request_bytes(
+            64,
+            32 + 4,
+            draft_model.memory_geometry(),
+            0,
+            0,
+            draft_model.workspace_contract(),
+        )
+        .unwrap();
+        assert!(draft_request > 0);
+        assert_eq!(
+            with_draft,
+            lookup + draft_request,
+            "the target's verify overshoot plus the draft's own request"
+        );
+        // Without a resident draft nothing extra is priced (and the route never forms).
+        assert_eq!(
+            causal_provider().speculative_request_bytes(
+                SpeculativeRoute::DraftModel { width: 4 },
+                64,
+                32,
+                0
+            ),
+            Some(lookup)
+        );
+    }
+
+    /// sc-24436 E2: a `draft_model` route whose request outruns the draft's context window — the
+    /// prompt (the Gemma 4 expansion included, at its second check), the budget and a step's
+    /// `K + 1` positions — runs `auto` (prompt lookup on this target) by name; within it the
+    /// route stands, and an unbounded draft never falls back.
+    #[test]
+    fn a_draft_route_past_the_draft_context_runs_auto_by_name() {
+        let mut provider = causal_provider_with_draft();
+        provider.draft.as_mut().unwrap().context = 20;
+        let draft = SpeculativeRoute::DraftModel { width: 3 };
+        for gemma4 in [false, true] {
+            let mut why = Vec::new();
+            assert_eq!(
+                provider.fit_draft_route(draft, 10, 6, gemma4, &mut why),
+                draft
+            );
+            assert!(why.is_empty(), "{why:?}");
+            let fallen = provider.fit_draft_route(draft, 10, 7, gemma4, &mut why);
+            assert_eq!(
+                fallen,
+                SpeculativeRoute::PromptLookup {
+                    width: PROMPT_LOOKUP_RECOMMENDED_DEPTH as usize
+                }
+            );
+            assert_eq!(why.len(), 1);
+            assert!(
+                why[0].contains("exceeds the draft model's context window 20"),
+                "{why:?}"
+            );
+            // Other routes are untouched.
+            let lookup = SpeculativeRoute::PromptLookup { width: 3 };
+            assert_eq!(
+                provider.fit_draft_route(lookup, 10, 700, gemma4, &mut why),
+                lookup
+            );
+        }
+        provider.draft.as_mut().unwrap().context = 0;
+        let mut why = Vec::new();
+        assert_eq!(
+            provider.fit_draft_route(draft, 10, 7000, false, &mut why),
+            draft
+        );
+    }
+
+    /// sc-24436 E7: a named draft is admitted at load only beside the target; without room — or
+    /// when it cannot be priced — it is refused by name and the target still loads; a target
+    /// that does not fit is refused exactly as before.
+    #[test]
+    fn a_draft_is_admitted_at_load_only_beside_the_target() {
+        let root = crate::test_fixture::Fixture::new("mlx-llm-draft-admission-", None);
+        let fixture = core_llm_testkit::write_draft_model_fixture(&root).unwrap();
+        let spec = fixture.spec_with_draft();
+        let target = crate::load_memory::required_bytes(&spec).unwrap();
+        let draft =
+            crate::load_memory::required_bytes(&LoadSpec::dense(fixture.draft.to_string_lossy()))
+                .unwrap();
+        assert!(
+            draft > 0 && draft < target,
+            "the draft is the smaller model"
+        );
+
+        match DraftPlan::admit(&spec, target, target + draft).unwrap() {
+            DraftPlan::Load(draft_spec) => {
+                assert_eq!(draft_spec.source, fixture.draft.to_string_lossy());
+                assert_eq!(draft_spec.draft_source, None);
+            }
+            _ => panic!("room for both loads the draft"),
+        }
+        match DraftPlan::admit(&spec, target, target + draft - 1).unwrap() {
+            DraftPlan::Refused(report) => {
+                assert!(!report.is_resident());
+                assert!(report.refusal.unwrap().starts_with("draft model:"));
+            }
+            _ => panic!("no room beside the target refuses the draft"),
+        }
+        assert!(
+            DraftPlan::admit(&spec, target, target - 1).is_err(),
+            "the target alone"
+        );
+        let missing = LoadSpec::dense(fixture.target.to_string_lossy())
+            .with_draft(root.join("no-such-draft").to_string_lossy());
+        match DraftPlan::admit(&missing, target, u64::MAX).unwrap() {
+            DraftPlan::Refused(report) => {
+                assert!(report.refusal.unwrap().contains("cannot be priced"))
+            }
+            _ => panic!("an unpriceable draft is refused"),
+        }
+        let unnamed = LoadSpec::dense(fixture.target.to_string_lossy());
+        assert!(matches!(
+            DraftPlan::admit(&unnamed, target, target).unwrap(),
+            DraftPlan::None
+        ));
+
+        // End to end, an unloadable draft never fails the target's load.
+        let provider = LlamaProvider::load(&missing).unwrap();
+        let report = provider.load_report().unwrap().draft.unwrap();
+        assert!(!report.is_resident());
+        assert!(provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::DraftModel)
+            .is_none());
     }
 
     /// Both decoder families advertise prompt lookup (the engine runs it on either) at their
@@ -4239,6 +4701,45 @@ mod tests {
                 price(&moe, SpeculativeRoute::Mtp { width }),
                 off + ring + 2 * kv + w * rows,
                 "moe mtp {width}: the ring and the live state charged once"
+            );
+        }
+
+        // A draft model (sc-24436) on the hybrid target verifies like prompt lookup: the ring
+        // plus the overshoot. A hybrid draft holds its own proposal window in its ring, armed for
+        // the same width: its request prices that ring, never a snapshot.
+        for width in [1usize, 4] {
+            assert_eq!(
+                price(&hybrid, SpeculativeRoute::DraftModel { width }),
+                price(&hybrid, SpeculativeRoute::PromptLookup { width }),
+                "hybrid target, draft {width}: the ring plus the overshoot"
+            );
+        }
+        let mut drafted = causal_provider();
+        drafted.draft = Some(ResidentDraft {
+            model: Decoder::Qwen35(crate::decode::engine::tests::qwen35(false)),
+            proposable: 24,
+            width: 24,
+            context: 0,
+        });
+        let Some(Decoder::Qwen35(draft)) = drafted.draft.as_ref().map(|d| &d.model) else {
+            unreachable!("the hybrid draft")
+        };
+        for width in [1usize, 4] {
+            let mut geometry = drafted.draft.as_ref().unwrap().model.memory_geometry();
+            geometry.recurrent_bytes += draft.checkpoint_ring_bytes(width).unwrap();
+            let draft_request = estimate_mlx_request_bytes(
+                64,
+                32 + width as u32,
+                geometry,
+                0,
+                0,
+                drafted.draft.as_ref().unwrap().model.workspace_contract(),
+            )
+            .unwrap();
+            assert_eq!(
+                price(&drafted, SpeculativeRoute::DraftModel { width }),
+                price(&causal, SpeculativeRoute::PromptLookup { width }) + draft_request,
+                "hybrid draft {width}: its request with its ring, no snapshot"
             );
         }
     }
