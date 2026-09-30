@@ -46,7 +46,8 @@ pub use fused::{
 #[doc(hidden)]
 pub use fused::{fused_policy_guard, FusedPolicyGuard};
 pub use gated_delta::{
-    causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv, compute_g, gated_delta_chunked, gated_delta_recurrence,
+    gated_delta_recurrence_per_token, rms_norm_gated, DeltaNetCache, CHUNKED_PREFILL_MIN_TOKENS,
 };
 pub use host_sync::{
     host_sync_count, last_host_reason, note_host_sync, note_logits_to_host, note_sampler_path,

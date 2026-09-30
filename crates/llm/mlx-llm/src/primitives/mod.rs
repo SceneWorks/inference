@@ -29,7 +29,9 @@ pub mod weights;
 pub use attention::{repeat_kv, sdpa, sdpa_capped, sdpa_causal, sliding_causal_mask, AttnMask};
 pub use coherence::verify_gpu_view;
 pub use gated_delta::{
-    causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv, compute_g, gated_delta_chunked, gated_delta_kernel,
+    gated_delta_recurrence, gated_delta_recurrence_ops, rms_norm_gated, DeltaNetCache,
+    CHUNKED_PREFILL_MIN_TOKENS, KERNEL_MAX_STEPS,
 };
 pub use kv_cache::{ContiguousKvCache, KvCache};
 pub use nn::{

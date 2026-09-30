@@ -2123,6 +2123,18 @@ const MLX_EVAL_BUFFER_WINDOW: u64 = 11;
 /// independently allocated output row per prompt token until its final concatenate.
 const MLX_ALLOCATION_PAGE_BYTES: u64 = 16 * 1024;
 /// The recurrence creates five one-element index buffers per step and evaluates every 256 steps.
+///
+/// These `QWEN35_RECURRENCE_*` terms price the op-by-op recurrence the frozen allocator peaks were
+/// measured on. Since sc-24443 the GPU runs the fused Metal kernel instead. Its prompt-sized
+/// buffers are its f32 `y` output and the row-contiguous copies MLX makes of non-contiguous `q`,
+/// `k` and `v` inputs — `2·Hk·Dk + 2·Hv·Dv` elements per token, never more than the
+/// `2·Hv·Dk + 2·Hv·Dv` priced here (`Hv ≥ Hk`). Past `KERNEL_MAX_STEPS` tokens the per-dispatch
+/// input gathers replace those copies and the final concatenate of the per-dispatch outputs adds
+/// one more `Hv·Dv`, still within the priced width while `Hv·Dv ≤ 2·(Hv − Hk)·Dk` (Qwen3.6-27B:
+/// `Hv = 3·Hk`, `Dk = Dv`). Its recurrent state is fixed-size, covered by the 256 × 5 state-array
+/// term, and it allocates neither the per-step index buffers nor the page-padded per-token `y`
+/// rows priced below. On the GPU these terms are therefore a conservative upper bound for those
+/// geometries (the op path remains the CPU-stream route for short runs).
 const QWEN35_RECURRENCE_EVAL_CHUNK: u64 = 256;
 const QWEN35_RECURRENCE_INDEX_BUFFERS: u64 = 5;
 /// Each lazy recurrence step creates five state-shaped arrays: the decayed state, the state-key
