@@ -2507,7 +2507,7 @@ mod cuda_tests {
 
     impl Proposer for FixedDrafts {
         fn kind(&self) -> ProposerKind {
-            ProposerKind::Ngram
+            ProposerKind::PromptLookup
         }
         fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
             Ok(())

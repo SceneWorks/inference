@@ -71,7 +71,8 @@ pub mod tool;
 
 pub use cancel::CancelFlag;
 pub use capabilities::{
-    ModelSamplingDefaults, MtpCapabilities, TextLlmCapabilities, TextLlmDescriptor,
+    ModelSamplingDefaults, MtpCapabilities, ProposerCapabilities, TextLlmCapabilities,
+    TextLlmDescriptor,
 };
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
@@ -105,7 +106,7 @@ pub use report::{
 };
 pub use request::{
     HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
-    TextLlmRequest, ThinkingMode,
+    Speculative, SpeculativeProposer, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
     admit_request_memory, admit_request_memory_with_geometry, available_host_memory_bytes,
@@ -116,8 +117,8 @@ pub use resource::{
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{
-    accept_greedy_run, accept_token, greedy_commit, ngram_propose, resolve_mtp_plan, Acceptance,
-    MtpPlan, ProposerKind,
+    accept_greedy_run, accept_token, greedy_commit, ngram_propose, resolve_speculative, Acceptance,
+    ProposerKind, SpeculativePlan, SpeculativeResolution,
 };
 pub use starvector::{
     generated_token_budget, validate_advertised_generated_token_cap,

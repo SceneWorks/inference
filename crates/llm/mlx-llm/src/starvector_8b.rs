@@ -460,6 +460,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_preserve_thinking: false,
             supports_tools: false,
             mtp: None,
+            speculative: Vec::new(),
             supported_constraints: Vec::new(),
         },
     }

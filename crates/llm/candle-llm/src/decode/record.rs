@@ -136,9 +136,12 @@ pub struct DecodeRecord {
     /// selected for a comparison row. Reported from the model, which owns the selector.
     pub attn_formulation: AttnFormulation,
     /// Which proposer ran (sc-24130): `none` on the token-at-a-time paths — including a request
-    /// whose [`MtpMode::Auto`](core_llm::MtpMode::Auto) resolved to no proposer, which is thereby
-    /// visible rather than a silent downgrade — else `mtp` / `ngram` / `draft`.
+    /// whose speculative option resolved to no proposer, which is thereby visible rather than a
+    /// silent downgrade — else `mtp` / `prompt_lookup` / `draft_model`.
     pub proposer: ProposerKind,
+    /// Draft tokens per verify step the engine ran its proposer with (sc-24433) — the request's
+    /// resolved depth, whatever the proposer; `0` when no proposer ran.
+    pub drafts: u32,
     /// Verify steps the speculative engine took (0 on non-speculative paths).
     pub verify_steps: u64,
     /// Verify steps whose partial acceptance was recovered by a direct cache rollback into the
@@ -190,6 +193,7 @@ impl DecodeRecord {
             kv_cache: KvCacheKind::Growing,
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
+            drafts: 0,
             verify_steps: 0,
             direct_rollbacks: 0,
             replay_forwards: 0,
@@ -209,6 +213,12 @@ impl DecodeRecord {
     /// The same record with `proposer` set — the engine stamps the proposer it ran.
     pub fn with_proposer(mut self, proposer: ProposerKind) -> Self {
         self.proposer = proposer;
+        self
+    }
+
+    /// The same record with `drafts` set — the engine stamps the depth its proposer ran with.
+    pub fn with_drafts(mut self, drafts: u32) -> Self {
+        self.drafts = drafts;
         self
     }
 
@@ -291,6 +301,10 @@ impl DecodeRecord {
             kv_cache: KvCacheKind::Growing,
             attn_formulation: AttnFormulation::Gqa,
             proposer: ProposerKind::None,
+            drafts: match path {
+                DecodePath::Mtp { drafts } => drafts,
+                _ => 0,
+            },
             verify_steps: stats.verify_steps as u64,
             direct_rollbacks: stats.direct_rollbacks as u64,
             replay_forwards: stats.replays as u64,
@@ -347,12 +361,11 @@ impl DecodeRecord {
     /// The backend-neutral report a product renders (sc-24139): the same labels as the evidence
     /// rows. `cuda_graphs_enabled` is the graph switch the request ran under (the loaded model's
     /// `LoadSpec::cuda_graphs`, else the process switch at load), which the tally alone cannot
-    /// say: a request that never reached the runner reads `none` either way.
+    /// say: a request that never reached the runner reads `none` either way. The report's
+    /// `fallbacks` start empty: the record is the engine's, and the speculative resolution and
+    /// route that may fall back are the provider's, which appends their reasons.
     pub fn report(&self, cuda_graphs_enabled: bool) -> core_llm::DecodeReport {
-        let draft_tokens = match self.path {
-            DecodePath::Mtp { drafts } => Some(drafts),
-            _ => None,
-        };
+        let draft_tokens = (self.proposer != ProposerKind::None).then_some(self.drafts);
         core_llm::DecodeReport {
             path: self.path.label().to_string(),
             proposer: self.proposer,
@@ -379,7 +392,9 @@ impl DecodeRecord {
             target_forwards: self.target_forwards,
             proposed_tokens: self.proposed_tokens,
             accepted_tokens: self.accepted_tokens,
+            verify_steps: self.verify_steps,
             replay_forwards: self.replay_forwards,
+            fallbacks: Vec::new(),
         }
     }
 }
@@ -636,11 +651,11 @@ mod tests {
         let stamped = plain
             .with_kv_cache(KvCacheKind::Static)
             .with_attn_formulation(AttnFormulation::Expanded)
-            .with_proposer(ProposerKind::Ngram);
+            .with_proposer(ProposerKind::PromptLookup);
         assert_eq!(stamped.kv_cache, KvCacheKind::Static);
         assert_eq!(stamped.attn_formulation, AttnFormulation::Expanded);
         assert_eq!(stamped.attn_formulation.label(), "expanded");
-        assert_eq!(stamped.proposer, ProposerKind::Ngram);
+        assert_eq!(stamped.proposer, ProposerKind::PromptLookup);
 
         let spec = DecodeRecord::speculative(
             DecodePath::Mtp { drafts: 3 },
@@ -738,7 +753,7 @@ mod tests {
         // ... which the engine's record, measured after it, does not see.
         let engine = DecodeRecord::plain(DecodePath::StepModel, 5, 4, SpanCounters::default())
             .with_kv_cache(KvCacheKind::Static)
-            .with_proposer(ProposerKind::Ngram);
+            .with_proposer(ProposerKind::PromptLookup);
         let record = engine.with_request_span(&span);
         assert_eq!(record.host_syncs, 1);
         assert_eq!(record.nvfp4_projections.gemv, 1);
@@ -758,7 +773,7 @@ mod tests {
                 5,
                 4,
                 KvCacheKind::Static,
-                ProposerKind::Ngram
+                ProposerKind::PromptLookup
             )
         );
     }
