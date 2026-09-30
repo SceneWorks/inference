@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import types
@@ -73,19 +74,39 @@ class PrecisionControlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             app = Path(directory) / "app"
             engine = Path(directory) / "engine"
+            source_control = Path(directory) / "control"
             app.mkdir()
             engine.mkdir()
-            app_sha, engine_sha = "a" * 40, "b" * 40
+            source_control.mkdir()
+            app_sha, engine_sha, control_sha = "a" * 40, "b" * 40, "c" * 40
             (app / "Cargo.toml").write_text(
                 f'candle-kernels = {{ git = "https://github.com/SceneWorks/inference", rev = "{engine_sha}" }}\n',
                 encoding="utf-8",
             )
-            with patch.object(control, "git", side_effect=lambda root, *args:
-                              (app_sha if root == app else engine_sha) if args[0] == "rev-parse" else ""):
-                self.assertEqual(control.verify_sources(app, engine, app_sha, engine_sha)["app_pins"], [engine_sha])
+            with patch.dict("os.environ", {"GITHUB_SHA": control_sha}), \
+                 patch.object(control, "git", side_effect=lambda root, *args:
+                              {app: app_sha, engine: engine_sha, source_control: control_sha}[root]
+                              if args[0] == "rev-parse" else "") as git_mock:
+                self.assertEqual(control.verify_sources(app, engine, source_control, app_sha, engine_sha,
+                                                       control_sha)["control_sha"], control_sha)
+                with self.assertRaisesRegex(ValueError, "workflow control SHA"):
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, "d" * 40)
+                git_mock.side_effect = lambda root, *args: (
+                    {app: app_sha, engine: "d" * 40, source_control: control_sha}[root]
+                    if args[0] == "rev-parse" else "")
+                with self.assertRaisesRegex(ValueError, "engine checkout SHA"):
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, control_sha)
+                git_mock.side_effect = lambda root, *args: (
+                    {app: app_sha, engine: engine_sha, source_control: "d" * 40}[root]
+                    if args[0] == "rev-parse" else "")
+                with self.assertRaisesRegex(ValueError, "control checkout SHA"):
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, control_sha)
+                git_mock.side_effect = lambda root, *args: (
+                    {app: app_sha, engine: engine_sha, source_control: control_sha}[root]
+                    if args[0] == "rev-parse" else "")
                 (app / "Cargo.toml").write_text((app / "Cargo.toml").read_text(encoding="utf-8").replace(engine_sha, "c" * 40), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "pin"):
-                    control.verify_sources(app, engine, app_sha, engine_sha)
+                    control.verify_sources(app, engine, source_control, app_sha, engine_sha, control_sha)
 
     def test_busy_cuda_preflight_refuses_and_records_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -156,6 +177,12 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertEqual(workflow.count("if: always() && steps.run-root.outcome == 'success'"), 4)
         self.assertEqual(workflow.count("id: run-root"), 2)
         self.assertNotIn("${{ env.APP_EVIDENCE }}/**/audio.wav", workflow)
+        self.assertIn("expected_control_sha:", workflow)
+        self.assertIn("--control control --app-sha", workflow)
+        self.assertLess(workflow.index("Select the app checkout's pinned Rust channel"),
+                        workflow.index("uses: ./app/.github/actions/prepare-rust-runner"))
+        self.assertIn("RUSTUP_TOOLCHAIN=", workflow)
+        self.assertIn("Verify selected app Rust channel", workflow)
 
 
 if __name__ == "__main__":

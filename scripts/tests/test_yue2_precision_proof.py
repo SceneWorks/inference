@@ -14,6 +14,19 @@ WORKFLOW = ROOT / ".github/workflows/yue2-precision-proof.yml"
 
 
 class PrecisionControlTests(unittest.TestCase):
+    def test_workflow_control_and_engine_revisions_are_independent_and_exact(self):
+        engine, control = "a" * 40, "b" * 40
+        result = type("Result", (), {"stdout": engine + "\n"})()
+        with patch.dict("os.environ", {"GITHUB_SHA": control}), \
+             patch.object(CONTROL.subprocess, "run", return_value=result):
+            CONTROL.verify_revisions(engine, control)
+            with self.assertRaisesRegex(RuntimeError, "control SHA differs"):
+                CONTROL.verify_revisions(engine, "c" * 40)
+            with self.assertRaisesRegex(RuntimeError, "engine checkout differs"):
+                CONTROL.verify_revisions("c" * 40, control)
+            with self.assertRaisesRegex(RuntimeError, "control SHA must be"):
+                CONTROL.verify_revisions(engine, "short")
+
     def test_pmon_refuses_compute_and_mixed_compute_graphics(self):
         output = "# gpu pid type fb sm\n0 111 G 12 0\n0 222 C+G 0 0\n0 333 C 256 75\n"
         self.assertEqual(CONTROL.compute_capable_rows(output), ["0 222 C+G 0 0", "0 333 C 256 75"])
@@ -149,6 +162,12 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertIn("yue2-precision-listening-metal-cc-by-nc-internal-", source)
         self.assertIn("test \"$RUNNER_NAME\" = nax-macos-2", source)
         self.assertIn("--test precision_real_weights", source)
+        self.assertIn("expected_control_sha:", source)
+        self.assertIn("ref: ${{ inputs.expected_engine_sha }}", source)
+        self.assertLess(source.index("Select checked Git Bash before pinned Rust"),
+                        source.index("uses: dtolnay/rust-toolchain@"))
+        self.assertIn('if not exist "C:\\Program Files\\Git\\bin\\bash.exe" exit /b 1', source)
+        self.assertIn('echo C:\\Program Files\\Git\\bin>>"%GITHUB_PATH%"', source)
         self.assertNotIn("tier_quality_against_the_f32_reference", source)
         self.assertNotIn("registered_loader_generates_a_song_with_every_artifact", source)
         self.assertNotIn("SIGKILL", source)

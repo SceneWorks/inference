@@ -92,16 +92,19 @@ def git(root: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(root), *args], text=True, encoding="utf-8").strip()
 
 
-def verify_sources(app: Path, engine: Path, app_sha: str, engine_sha: str) -> dict:
-    require(bool(HEX40.fullmatch(app_sha)) and bool(HEX40.fullmatch(engine_sha)), "exact lowercase 40-hex SHAs required")
-    for root, expected, label in ((app, app_sha, "app"), (engine, engine_sha, "engine")):
+def verify_sources(app: Path, engine: Path, control: Path, app_sha: str, engine_sha: str, control_sha: str) -> dict:
+    require(all(HEX40.fullmatch(sha) for sha in (app_sha, engine_sha, control_sha)),
+            "exact lowercase 40-hex SHAs required")
+    require(os.environ.get("GITHUB_SHA") == control_sha, "workflow control SHA differs from dispatch input")
+    for root, expected, label in ((app, app_sha, "app"), (engine, engine_sha, "engine"),
+                                  (control, control_sha, "control")):
         require(git(root, "rev-parse", "HEAD") == expected, f"{label} checkout SHA mismatch")
         require(not git(root, "status", "--porcelain", "--untracked-files=normal"), f"{label} checkout is dirty")
     pins = re.findall(r'SceneWorks/inference",\s*rev\s*=\s*"([0-9a-f]{40})"',
                       (app / "Cargo.toml").read_text(encoding="utf-8"))
     require(bool(pins) and all(pin == engine_sha for pin in pins),
             "app Cargo inference pins are not exact engine SHA")
-    return {"app_sha": app_sha, "engine_sha": engine_sha, "app_pins": pins}
+    return {"app_sha": app_sha, "engine_sha": engine_sha, "control_sha": control_sha, "app_pins": pins}
 
 
 def prepare_cases(template_dir: Path, destination: Path, backend: str) -> dict:
@@ -316,7 +319,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     verify = sub.add_parser("verify-sources")
-    for field in ("app", "engine", "app-sha", "engine-sha", "output"):
+    for field in ("app", "engine", "control", "app-sha", "engine-sha", "control-sha", "output"):
         verify.add_argument(f"--{field}", required=True)
     prepare = sub.add_parser("prepare-cases")
     for field in ("templates", "destination", "backend"):
@@ -332,7 +335,8 @@ def main() -> int:
         captures.add_argument(f"--{field}", required=True)
     args = parser.parse_args()
     if args.command == "verify-sources":
-        result = verify_sources(Path(args.app), Path(args.engine), args.app_sha, args.engine_sha)
+        result = verify_sources(Path(args.app), Path(args.engine), Path(args.control),
+                                args.app_sha, args.engine_sha, args.control_sha)
         Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     elif args.command == "prepare-cases":
         result = prepare_cases(Path(args.templates), Path(args.destination), args.backend)

@@ -44,6 +44,14 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def verify_revisions(engine_sha: str, control_sha: str) -> None:
+    require(re.fullmatch(r"[0-9a-f]{40}", engine_sha) is not None, "engine SHA must be full lowercase hex")
+    require(re.fullmatch(r"[0-9a-f]{40}", control_sha) is not None, "control SHA must be full lowercase hex")
+    require(os.environ.get("GITHUB_SHA") == control_sha, "workflow control SHA differs from dispatch input")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, encoding="utf-8").stdout.strip()
+    require(head == engine_sha, "engine checkout differs from dispatch input")
+
+
 def resolve_binary(args: argparse.Namespace) -> None:
     candidates = []
     for line in args.build_json.read_text(encoding="utf-8").splitlines():
@@ -298,12 +306,9 @@ def execute(args: argparse.Namespace) -> None:
     require(args.binary.is_file(), f"test binary missing: {args.binary}")
     require(not args.work_dir.exists(), "refuse to reuse an earlier precision listening directory")
     require(args.work_dir.parent.is_dir(), "persistent listening parent is unavailable")
-    require(re.fullmatch(r"[0-9a-f]{40}", args.engine_sha) is not None, "engine SHA must be full lowercase hex")
+    verify_revisions(args.engine_sha, args.control_sha)
     require(not args.app_sha or re.fullmatch(r"[0-9a-f]{40}", args.app_sha) is not None,
             "optional caller app SHA must be full lowercase hex")
-    require(os.environ.get("GITHUB_SHA") == args.engine_sha, "checked-out engine SHA differs from dispatch input")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, encoding="utf-8").stdout.strip()
-    require(head == args.engine_sha, "engine checkout moved after build")
     dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"],
                            capture_output=True, text=True, check=True, encoding="utf-8").stdout
     require(not dirty.strip(), "engine source became dirty before hardware execution")
@@ -377,7 +382,7 @@ def execute(args: argparse.Namespace) -> None:
         for wav in sorted(args.work_dir.rglob("*.wav")):
             local_audio.append({"path": str(wav), "sha256": sha256(wav), "bytes": wav.stat().st_size})
     report = {"schema": "yue2-precision-control-v1", "backend": args.backend,
-              "engine_sha": args.engine_sha, "caller_app_sha": args.app_sha,
+              "engine_sha": args.engine_sha, "control_sha": args.control_sha, "caller_app_sha": args.app_sha,
               "runner_name": runner, "binary_sha256": sha256(args.binary),
               "reference_sha256": sha256(reference), "started_utc_ns": started,
               "persistent_listening_dir": str(args.work_dir), "local_audio": local_audio,
@@ -421,6 +426,7 @@ def main() -> None:
     p.add_argument("--evidence", type=Path, required=True)
     p.add_argument("--work-dir", type=Path, required=True)
     p.add_argument("--engine-sha", required=True)
+    p.add_argument("--control-sha", required=True)
     p.add_argument("--app-sha", default="")
     args = parser.parse_args()
     {"resolve-binary": resolve_binary, "verify-reference": verify_reference, "run": execute}[args.mode](args)
