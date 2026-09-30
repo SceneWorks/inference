@@ -1,12 +1,22 @@
 //! Rotary position embeddings.
 //!
 //! Modelled byte-for-byte on the working mlx-gen RoPE (prompt-refine / JoyCaption `Llama3Rope`,
-//! sensenova/flux2 `apply_rope`): inverse frequencies and the cos/sin tables are built on the host
-//! and lifted to the device. Rotation supports both the GPT-NeoX / HF **rotate-half**
+//! sensenova/flux2 `apply_rope`). Rotation supports both the GPT-NeoX / HF **rotate-half**
 //! (split-the-head-in-half) convention and the GPT-J **interleaved** (adjacent even/odd pairs)
-//! convention, over the full head dim or a leading **partial** slice. We deliberately keep this
-//! hand-rolled rather than calling `mlx_rs::fast::rope` so the Llama-3 / YaRN frequency schedules stay
-//! explicit and bit-comparable to the reference engines the generating stacks are validated against.
+//! convention, over the full head dim or a leading **partial** slice. The Llama-3 / YaRN /
+//! proportional frequency schedules are computed explicitly (not via `mlx_rs::fast::rope`'s `base`),
+//! and the rotation stays the HF `x·cos + rotate_half(x)·sin` over `(cos, sin)` tables rounded to the
+//! compute dtype, so outputs remain bit-comparable to the reference engines the generating stacks are
+//! validated against. (`fast::rope` rotates in f32 with `metal::fast::cos/sin` and one rounding —
+//! different bits, and inexpressible for M-RoPE's per-channel positions.)
+//!
+//! **Device-resident tables (sc-24442).** The inverse-frequency schedule is lifted to the device
+//! once, when the [`Rope`] is built, laid out in its rotation convention; every table
+//! ([`Rope::cos_sin`], [`Rope::cos_sin_at`], both M-RoPE forms) is then `positions ⊗ freq_row` →
+//! `cos`/`sin` on the device. A forward step uploads nothing but its positions (or, for contiguous
+//! positions, not even those — they are an on-device `arange`). The products are the same IEEE f32
+//! multiplications the host used to do, so every table is **bit-identical** to the former host
+//! construction (`device_tables_are_bit_identical_to_host_construction`).
 //!
 //! The family covered: **standard** RoPE (also Qwen3 — same rotation, config theta), **Llama-3
 //! scaled** RoPE (NTK-by-parts wavelength smoothing), **partial + interleaved** RoPE (GLM-4, the
@@ -15,17 +25,22 @@
 //! from: [`Rope::mrope_cos_sin`] composes three of those into the Qwen2-VL / Qwen2.5-VL M-RoPE
 //! tables (and serves the sensenova Qwen3 MRoPE consolidation).
 
+use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::ops::{add, concatenate_axis, cos, multiply, sin, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
 
-/// A rotary embedding: the host-side inverse-frequency table, the head dimension it rotates, and the
-/// pairing convention.
+/// A rotary embedding: the inverse-frequency schedule (host copy + its device-resident row), the
+/// head dimension it rotates, and the pairing convention.
 #[derive(Clone, Debug)]
 pub struct Rope {
     /// `inv_freq[i]`, length `dim / 2`.
     inv_freq: Vec<f32>,
+    /// `inv_freq` laid out per channel in the rotation convention — NeoX `cat(inv_freq, inv_freq)`,
+    /// interleaved each frequency twice — as a device-resident f32 `[dim]` row, built once. Every
+    /// table is `positions ⊗ freq_row`.
+    freq_row: Array,
     /// The number of (last-axis) dimensions RoPE rotates — `head_dim` for full rotary, less for a
     /// partial schedule (GLM-4, DeepSeek MLA). Equals `inv_freq.len() * 2`.
     dim: i32,
@@ -35,6 +50,22 @@ pub struct Rope {
 }
 
 impl Rope {
+    /// The one constructor: lift the schedule to its device row.
+    fn new(inv_freq: Vec<f32>, dim: i32, interleaved: bool) -> Self {
+        let row: Vec<f32> = if interleaved {
+            inv_freq.iter().flat_map(|&f| [f, f]).collect()
+        } else {
+            inv_freq.iter().chain(&inv_freq).copied().collect()
+        };
+        let freq_row = Array::from_slice(&row, &[row.len() as i32]);
+        Self {
+            inv_freq,
+            freq_row,
+            dim,
+            interleaved,
+        }
+    }
+
     /// Standard RoPE: `inv_freq[i] = theta^(-2i / head_dim)`.
     ///
     /// This also covers **Qwen3** (Qwen3 uses standard RoPE — its distinctive per-head q/k norm
@@ -44,11 +75,7 @@ impl Rope {
         let inv_freq = (0..half)
             .map(|i| 1.0 / theta.powf((2 * i) as f32 / head_dim as f32))
             .collect();
-        Self {
-            inv_freq,
-            dim: head_dim,
-            interleaved: false,
-        }
+        Self::new(inv_freq, head_dim, false)
     }
 
     /// Partial RoPE over the first `rotary_dim` dimensions (`inv_freq[i] = theta^(-2i / rotary_dim)`),
@@ -60,11 +87,7 @@ impl Rope {
         let inv_freq = (0..half)
             .map(|i| 1.0 / theta.powf((2 * i) as f32 / rotary_dim as f32))
             .collect();
-        Self {
-            inv_freq,
-            dim: rotary_dim,
-            interleaved,
-        }
+        Self::new(inv_freq, rotary_dim, interleaved)
     }
 
     /// **Proportional** RoPE (`rope_type: "proportional"`, new in Gemma 4's `full_attention`
@@ -110,11 +133,7 @@ impl Rope {
                 }
             })
             .collect();
-        Self {
-            inv_freq,
-            dim: head_dim,
-            interleaved: false,
-        }
+        Self::new(inv_freq, head_dim, false)
     }
 
     /// YaRN-scaled RoPE (DeepSeek-V2's `rope_scaling` "yarn" schedule), over `rope_dim` dimensions.
@@ -160,11 +179,7 @@ impl Rope {
                 freq_inter * ramp + freq_extra * (1.0 - ramp)
             })
             .collect();
-        Self {
-            inv_freq,
-            dim: rope_dim,
-            interleaved: true,
-        }
+        Self::new(inv_freq, rope_dim, true)
     }
 
     /// Llama-3 scaled RoPE (the `rope_scaling` "llama3" NTK-by-parts schedule).
@@ -198,11 +213,7 @@ impl Rope {
                 }
             })
             .collect();
-        Self {
-            inv_freq,
-            dim: head_dim,
-            interleaved: false,
-        }
+        Self::new(inv_freq, head_dim, false)
     }
 
     /// The head dimension this RoPE rotates.
@@ -222,36 +233,28 @@ impl Rope {
 
     /// Build `(cos, sin)` tables for `seq_len` contiguous positions starting at `offset`. Each is
     /// `[1, seq_len, dim]` in `dtype` (pass `Dtype::Bfloat16` to match the bf16 decoders, or
-    /// `Dtype::Float32` for the f32 vision path).
+    /// `Dtype::Float32` for the f32 vision path). The positions are an on-device `arange` — nothing
+    /// is uploaded.
     pub fn cos_sin(&self, seq_len: i32, offset: i32, dtype: Dtype) -> Result<(Array, Array)> {
-        let positions: Vec<i32> = (0..seq_len).map(|s| offset + s).collect();
-        self.cos_sin_at(&positions, dtype)
+        let positions = Array::arange::<i32, i32>(offset, offset + seq_len, None)?;
+        self.tables(&positions, dtype)
     }
 
     /// Build `(cos, sin)` tables for an explicit list of positions — the building block for packed
     /// / paged batches and for multi-axis (3D) RoPE, which is three of these concatenated.
     pub fn cos_sin_at(&self, positions: &[i32], dtype: Dtype) -> Result<(Array, Array)> {
-        let n = positions.len() as i32;
-        // The per-position angle table, laid out to match the rotation convention:
-        //   NeoX        → cat(freqs, freqs)         (`apply_rope` pairs dim i with i + dim/2)
-        //   interleaved → each freq repeated twice  (`apply_rope` pairs dim 2i with 2i+1)
-        let mut emb = Vec::with_capacity(positions.len() * self.dim as usize);
-        for &pos in positions {
-            if self.interleaved {
-                for &f in &self.inv_freq {
-                    emb.push(pos as f32 * f);
-                    emb.push(pos as f32 * f);
-                }
-            } else {
-                for &f in &self.inv_freq {
-                    emb.push(pos as f32 * f);
-                }
-                for &f in &self.inv_freq {
-                    emb.push(pos as f32 * f);
-                }
-            }
-        }
-        let emb = Array::from_slice(&emb, &[1, n, self.dim]);
+        let positions = Array::from_slice(positions, &[positions.len() as i32]);
+        self.tables(&positions, dtype)
+    }
+
+    /// `(cos, sin)` of `positions ⊗ freq_row`, `[1, n, dim]` in `dtype`, all on the device. The
+    /// angle table (`emb`) is laid out to match the rotation convention: NeoX `cat(freqs, freqs)`
+    /// (`apply_rope` pairs dim `i` with `i + dim/2`), interleaved each freq twice (`apply_rope`
+    /// pairs dim `2i` with `2i+1`).
+    fn tables(&self, positions: &Array, dtype: Dtype) -> Result<(Array, Array)> {
+        let n = positions.shape()[0];
+        let pos = positions.as_dtype(Dtype::Float32)?.reshape(&[1, n, 1])?;
+        let emb = multiply(&pos, &self.freq_row.reshape(&[1, 1, self.dim])?)?;
         let cos_t = cos(&emb)?.as_dtype(dtype)?;
         let sin_t = sin(&emb)?.as_dtype(dtype)?;
         Ok((cos_t, sin_t))
@@ -374,27 +377,30 @@ impl Rope {
         }
 
         // Per-channel axis assignment: T (0) by default; H (1) / W (2) on their interleaved indices.
-        let mut axis_of = vec![0usize; half];
+        let mut axis_of = vec![0i32; half];
         for (axis, offset) in [(1usize, 1usize), (2usize, 2usize)] {
             let length = (sections[axis] * 3).min(half);
             let mut c = offset;
             while c < length {
-                axis_of[c] = axis;
+                axis_of[c] = axis as i32;
                 c += 3;
             }
         }
 
-        // emb row = cat(freqs, freqs), freqs[c] = position_ids[axis_of[c]] · inv_freq[c].
-        let mut emb = Vec::with_capacity(l * self.dim as usize);
-        #[allow(clippy::needless_range_loop)] // p cross-indexes all three position rows
-        for p in 0..l {
-            let freqs: Vec<f32> = (0..half)
-                .map(|c| position_ids[axis_of[c]][p] as f32 * self.inv_freq[c])
-                .collect();
-            emb.extend_from_slice(&freqs);
-            emb.extend_from_slice(&freqs);
-        }
-        let emb = Array::from_slice(&emb, &[1, l as i32, self.dim]);
+        // On the device: `pos[p, c] = position_ids[axis_of[c]][p]`, `freqs = pos · inv_freq` (the
+        // NeoX row's first half), emb row = cat(freqs, freqs). Only the positions and the
+        // `half`-long channel→axis map are uploaded.
+        let l = l as i32;
+        let rows: Vec<i32> = position_ids
+            .iter()
+            .flat_map(|r| r.iter().copied())
+            .collect();
+        let rows = Array::from_slice(&rows, &[3, l]).as_dtype(Dtype::Float32)?;
+        let axis_of = Array::from_slice(&axis_of, &[half as i32]);
+        let pos = rows.take_axis(&axis_of, 0)?.transpose_axes(&[1, 0])?; // [L, half]
+        let inv = self.freq_row.index(..half as i32);
+        let freqs = multiply(&pos, &inv)?;
+        let emb = concatenate_axis(&[&freqs, &freqs], 1)?.reshape(&[1, l, self.dim])?;
         let cos_t = cos(&emb)?.as_dtype(dtype)?;
         let sin_t = sin(&emb)?.as_dtype(dtype)?;
         Ok((cos_t, sin_t))
@@ -446,6 +452,150 @@ pub fn apply_rope(x: &Array, cos: &Array, sin: &Array, interleaved: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-sc-24442 **host** table construction, kept verbatim as the parity oracle: the angle
+    /// row `pos as f32 * inv_freq` built on the host in the rotation convention, lifted, then
+    /// `cos`/`sin` on the device.
+    fn host_tables(rope: &Rope, positions: &[i32], dtype: Dtype) -> (Array, Array) {
+        let mut emb = Vec::with_capacity(positions.len() * rope.dim() as usize);
+        for &pos in positions {
+            if rope.interleaved() {
+                for &f in rope.inv_freq() {
+                    emb.push(pos as f32 * f);
+                    emb.push(pos as f32 * f);
+                }
+            } else {
+                for &f in rope.inv_freq() {
+                    emb.push(pos as f32 * f);
+                }
+                for &f in rope.inv_freq() {
+                    emb.push(pos as f32 * f);
+                }
+            }
+        }
+        let emb = Array::from_slice(&emb, &[1, positions.len() as i32, rope.dim()]);
+        (
+            cos(&emb).unwrap().as_dtype(dtype).unwrap(),
+            sin(&emb).unwrap().as_dtype(dtype).unwrap(),
+        )
+    }
+
+    /// The pre-sc-24442 host interleaved-M-RoPE angle construction, verbatim.
+    fn host_mrope_interleaved(
+        rope: &Rope,
+        rows: [&[i32]; 3],
+        sections: [usize; 3],
+        dtype: Dtype,
+    ) -> (Array, Array) {
+        let half = rope.inv_freq().len();
+        let mut axis_of = vec![0usize; half];
+        for (axis, offset) in [(1usize, 1usize), (2usize, 2usize)] {
+            let length = (sections[axis] * 3).min(half);
+            let mut c = offset;
+            while c < length {
+                axis_of[c] = axis;
+                c += 3;
+            }
+        }
+        let l = rows[0].len();
+        let mut emb = Vec::new();
+        #[allow(clippy::needless_range_loop)] // p cross-indexes all three position rows
+        for p in 0..l {
+            let freqs: Vec<f32> = (0..half)
+                .map(|c| rows[axis_of[c]][p] as f32 * rope.inv_freq()[c])
+                .collect();
+            emb.extend_from_slice(&freqs);
+            emb.extend_from_slice(&freqs);
+        }
+        let emb = Array::from_slice(&emb, &[1, l as i32, rope.dim()]);
+        (
+            cos(&emb).unwrap().as_dtype(dtype).unwrap(),
+            sin(&emb).unwrap().as_dtype(dtype).unwrap(),
+        )
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        a.as_dtype(Dtype::Float32)
+            .unwrap()
+            .reshape(&[-1])
+            .unwrap()
+            .as_slice::<f32>()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    }
+
+    /// **AC (sc-24442): device-resident tables are bit-identical to the host construction they
+    /// replace** — for every schedule the engine builds (standard, partial NeoX, partial
+    /// interleaved, Llama-3, YaRN, proportional), contiguous (`cos_sin`, on-device `arange`) and
+    /// explicit (`cos_sin_at`) positions, up to 131k, in f32 and bf16; and for both M-RoPE layouts
+    /// with genuinely 3-D positions. Bit identity here is what keeps every decoder's greedy tokens
+    /// unchanged.
+    #[test]
+    fn device_tables_are_bit_identical_to_host_construction() {
+        let ropes = [
+            Rope::standard(128, 1_000_000.0),
+            Rope::partial(64, 10_000_000.0, false),
+            Rope::partial(64, 10_000.0, true),
+            Rope::llama3(128, 500_000.0, 8.0, 1.0, 4.0, 8192.0),
+            Rope::yarn(64, 10_000.0, 40.0, 32.0, 1.0, 4096.0),
+            Rope::proportional(512, 1_000_000.0, 0.25, 1.0),
+        ];
+        let explicit = [0, 1, 7, 255, 1023, 4095, 8191, 32_767, 65_535, 131_071, 3];
+        for rope in &ropes {
+            for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+                for (len, offset) in [(1, 0), (1, 131_000), (17, 0), (40, 8000)] {
+                    let positions: Vec<i32> = (offset..offset + len).collect();
+                    let (c, s) = rope.cos_sin(len, offset, dtype).unwrap();
+                    let (hc, hs) = host_tables(rope, &positions, dtype);
+                    assert_eq!(c.shape(), hc.shape());
+                    assert_eq!(bits(&c), bits(&hc), "cos {rope:?} len {len} @ {offset}");
+                    assert_eq!(bits(&s), bits(&hs), "sin {rope:?} len {len} @ {offset}");
+                }
+                let (c, s) = rope.cos_sin_at(&explicit, dtype).unwrap();
+                let (hc, hs) = host_tables(rope, &explicit, dtype);
+                assert_eq!(bits(&c), bits(&hc), "cos_at {rope:?}");
+                assert_eq!(bits(&s), bits(&hs), "sin_at {rope:?}");
+            }
+        }
+
+        let t: Vec<i32> = (0..23).collect();
+        let h: Vec<i32> = (0..23).map(|i| 4000 + i / 3).collect();
+        let w: Vec<i32> = (0..23).map(|i| (i * 5) % 11).collect();
+        let q36 = Rope::partial(Q36_ROT, Q36_THETA, false);
+        let q3vl = Rope::standard(QWEN_HEAD_DIM, 5_000_000.0);
+        for (rope, sections) in [(&q36, Q36_SECTIONS), (&q3vl, [24, 20, 20])] {
+            let (c, s) = rope
+                .mrope_interleaved_cos_sin([&t, &h, &w], sections, Dtype::Bfloat16)
+                .unwrap();
+            let (hc, hs) = host_mrope_interleaved(rope, [&t, &h, &w], sections, Dtype::Bfloat16);
+            assert_eq!(bits(&c), bits(&hc), "interleaved mrope cos");
+            assert_eq!(bits(&s), bits(&hs), "interleaved mrope sin");
+        }
+        // Chunked (Qwen2.5-VL) M-RoPE: each chunk is the matching axis' host table's chunk.
+        let rope = Rope::standard(QWEN_HEAD_DIM, QWEN_THETA);
+        let (c, _) = rope
+            .mrope_cos_sin([&t, &h, &w], QWEN_SECTIONS, Dtype::Float32)
+            .unwrap();
+        let axis_tables = [&t, &h, &w].map(|r| bits(&host_tables(&rope, r, Dtype::Float32).0));
+        let got = bits(&c);
+        let hd = QWEN_HEAD_DIM as usize;
+        let doubled = [16usize, 24, 24, 16, 24, 24];
+        for pos in 0..t.len() {
+            let mut ch = 0;
+            for (chunk, &width) in doubled.iter().enumerate() {
+                for _ in 0..width {
+                    let i = pos * hd + ch;
+                    assert_eq!(
+                        got[i],
+                        axis_tables[chunk % 3][i],
+                        "chunked mrope [{pos},{ch}]"
+                    );
+                    ch += 1;
+                }
+            }
+        }
+    }
 
     #[test]
     fn standard_inv_freq_matches_formula() {

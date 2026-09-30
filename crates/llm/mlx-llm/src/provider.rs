@@ -35,7 +35,7 @@ use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
-use crate::primitives::attention::SDPA_MAX_FUSED_QLEN;
+use crate::primitives::attention::SDPA_SCORE_TILE_QLEN;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -2385,7 +2385,7 @@ fn estimate_qwen35_workspace_extra_bytes(
     // buffers for the rest of its evaluator window, so price those additional tiles here.
     let attention_window = checked_product([
         prompt,
-        prompt.min(SDPA_MAX_FUSED_QLEN as u64),
+        prompt.min(SDPA_SCORE_TILE_QLEN as u64),
         query_heads,
         3,
         MLX_EVAL_BUFFER_WINDOW.checked_sub(1)?,
@@ -2447,7 +2447,7 @@ fn estimate_mlx_request_bytes(
             geometry,
             vision_workspace_bytes,
             mtp_width,
-            SDPA_MAX_FUSED_QLEN as usize,
+            SDPA_SCORE_TILE_QLEN as usize,
         ),
         MlxWorkspaceContract::Qwen35 { config, prism } => {
             let base = core_llm::estimate_chunked_request_bytes(
@@ -2456,7 +2456,7 @@ fn estimate_mlx_request_bytes(
                 geometry,
                 vision_workspace_bytes,
                 mtp_width,
-                SDPA_MAX_FUSED_QLEN as usize,
+                SDPA_SCORE_TILE_QLEN as usize,
             )?;
             base.checked_add(estimate_qwen35_workspace_extra_bytes(
                 prompt_tokens,
@@ -2739,8 +2739,9 @@ mod tests {
     #[test]
     fn fused_request_estimate_tracks_chunked_attention_and_last_row_logits() {
         // Frozen Qwen3.8 parent geometry. This prompt size reproduces the campaign's long-context
-        // scale: eager prompt-squared scores dominate hundreds of GB, while MLX runs eight query
-        // rows per fused call and projects one final row to the vocabulary.
+        // scale: eager prompt-squared scores dominate hundreds of GB, while MLX's fused full and
+        // vector kernels materialize no score matrix (priced conservatively as one 8-query-row score
+        // tile per call) and the decoder projects one final row to the vocabulary.
         let geometry = LlmMemoryGeometry {
             query_heads: 40,
             kv_heads: 4,
