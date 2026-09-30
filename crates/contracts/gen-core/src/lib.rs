@@ -229,8 +229,9 @@ pub use runtime::{
     LoadShapeDeclarationResult, LoadSpec, MoeExpert, OffloadPolicy, PidWeights, PinnedWeightsFile,
     Precision, PreparedFilePins, PreviewFrame, PreviewSink, Progress, PromptEnhancementOutcome,
     PromptEnhancementReport, PromptEnhancementSink, Quant, WeightsSource, Yue2ArMode,
-    BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT, COMFYUI_VAE_COMPONENT,
-    KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT, VAE_COMPONENT,
+    Yue2ComputePolicy, BASE_SNAPSHOT_COMPONENT, COMFYUI_TEXT_ENCODER_COMPONENT,
+    COMFYUI_VAE_COMPONENT, KREA_CONVROT_DIT_COMPONENT, LTX_SPATIAL_UPSCALER_COMPONENT,
+    VAE_COMPONENT,
 };
 pub use sd3_encoder_artifacts::{
     resolve_sd3_text_encoder_artifacts, Sd3TextEncoderArtifactError, Sd3TextEncoderArtifacts,
