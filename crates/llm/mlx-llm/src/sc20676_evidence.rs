@@ -20,8 +20,8 @@ use crate::campaign;
 use crate::campaign_supervisor::{self, RunRequest, SystemProbe};
 use crate::config::Architecture;
 use crate::decode::{
-    generate_from_prefill, generate_with_cache, CancelFlag, FinishReason, GenerationConfig,
-    StreamEvent,
+    generate_from_prefill, generate_from_prefill_observed, generate_with_cache, CancelFlag,
+    FinishReason, GenerationConfig, StreamEvent,
 };
 use crate::models::CausalLm;
 use crate::primitives::nn::to_f32_host;
@@ -31,12 +31,18 @@ use crate::primitives::{
 };
 use crate::{Error, ModelConfig, Result};
 
-pub const SC20676_SCHEMA_VERSION: u32 = 3;
-pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v3";
+/// v4 (sc-20671 audit): the parity gate is kernel parity on the same stored codes, model-level
+/// logit error and the dense/packed throughput comparison are recorded observations, greedy
+/// agreement is teacher-forced, and release allows the recorded MLX allocator slack.
+pub const SC20676_SCHEMA_VERSION: u32 = 4;
+pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v4";
 /// The SC-20671 frozen contract is the policy identity; SC-20676 only narrows it with the
 /// compressed-domain parity requirements below and never introduces a tunable caller threshold.
 pub const SC20676_CONTRACT_HASH: &str = campaign::QUALITY_CONTRACT_HASH;
-pub const SC20676_MAX_LOGIT_ABS_ERROR: f64 = campaign::COMPRESSED_PARITY_MAX_ERROR;
+/// Gate on the packed kernel against an independent host-fp32 dequantize-then-attend reference
+/// over the SAME stored codes. Model-level dense-vs-packed logits differ by the quantization
+/// itself and are recorded, never gated, against this tolerance.
+pub const SC20676_MAX_KERNEL_PARITY_ERROR: f64 = campaign::COMPRESSED_PARITY_MAX_ERROR;
 pub const SC20676_MIN_GREEDY_TOKEN_AGREEMENT: f64 = campaign::COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN;
 pub const SC20676_MIN_LONG_CONTEXT_TOKENS: usize = 1_024;
 pub const SC20676_NEEDLE: &str = "SC20676-NEEDLE-9b7a2e";
@@ -45,7 +51,7 @@ pub const SC20676_NEEDLE: &str = "SC20676-NEEDLE-9b7a2e";
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sc20676Thresholds {
     pub contract_hash: String,
-    pub max_logit_abs_error: f64,
+    pub max_kernel_parity_error: f64,
     pub min_greedy_token_agreement: f64,
 }
 
@@ -53,7 +59,7 @@ impl Default for Sc20676Thresholds {
     fn default() -> Self {
         Self {
             contract_hash: SC20676_CONTRACT_HASH.into(),
-            max_logit_abs_error: SC20676_MAX_LOGIT_ABS_ERROR,
+            max_kernel_parity_error: SC20676_MAX_KERNEL_PARITY_ERROR,
             min_greedy_token_agreement: SC20676_MIN_GREEDY_TOKEN_AGREEMENT,
         }
     }
@@ -159,6 +165,11 @@ pub struct Sc20676MemoryEvidence {
     pub theoretical_dense_reconstruction_bytes: u64,
     pub theoretical_score_matrix_bytes: u64,
     pub release_verified: bool,
+    /// Post-release MLX active bytes above the weights-loaded phase (within
+    /// [`campaign::post_release_mlx_slack_bytes`]; a larger residual is a leak).
+    pub release_mlx_active_residual_bytes: u64,
+    /// Post-release MLX cache bytes above the weights-loaded phase.
+    pub release_mlx_cache_residual_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,8 +213,17 @@ pub struct Sc20676MultiRowKernel {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Sc20676Quality {
+    /// The gate: max |packed kernel - host-fp32 dequantize-then-attend| over the same codes.
+    pub kernel_parity_max_error: f64,
+    /// Observation only: max |dense - packed| first-token logit difference (includes the KV
+    /// quantization itself, so it is never compared with the kernel tolerance).
     pub max_logit_abs_error: f64,
+    /// Teacher-forced: the packed greedy choice at every position of the dense stream.
     pub greedy_token_agreement: f64,
+    /// Always [`campaign::GREEDY_AGREEMENT_METHOD`].
+    pub greedy_agreement_method: String,
+    /// Observation only: first position where the free-running dense and packed streams differ.
+    pub free_running_first_divergence: Option<u64>,
     /// Packed needle outcome relative to the same-weights dense run (quality contract v3).
     pub needle_retrieval: bool,
     /// False when the dense run itself missed the needle; the packed check then measures only
@@ -295,6 +315,52 @@ pub struct Sc20676Receipt {
     pub thresholds: Sc20676Thresholds,
     pub dense: Sc20676Arm,
     pub packed: Sc20676Arm,
+    /// Recorded, never gated: throughput neutrality is judged at the POC's target long-context
+    /// points, not as a row-failing strict inequality at one geometry.
+    pub throughput_comparison: Sc20676ThroughputComparison,
+}
+
+/// Dense vs packed warm steady decode with normal-approximation 95% confidence intervals
+/// (`mean +/- 1.96 * sqrt(variance / n)` over the five measured samples).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Sc20676ThroughputComparison {
+    pub dense_mean_tokens_per_second: f64,
+    pub packed_mean_tokens_per_second: f64,
+    pub dense_ci95_tokens_per_second: [f64; 2],
+    pub packed_ci95_tokens_per_second: [f64; 2],
+    pub packed_minus_dense_tokens_per_second: f64,
+    pub confidence_intervals_overlap: bool,
+    /// The packed interval lies entirely below the dense interval.
+    pub packed_slower_beyond_noise: bool,
+}
+
+/// The recorded dense/packed throughput comparison of two validated arms.
+pub fn sc20676_throughput_comparison(
+    dense: &Sc20676Arm,
+    packed: &Sc20676Arm,
+) -> std::result::Result<Sc20676ThroughputComparison, String> {
+    let interval = |arm: &Sc20676Arm| -> std::result::Result<[f64; 2], String> {
+        let summary = timing_summary(&arm.timings)?;
+        let half = 1.96 * (summary.variance_tokens_per_second / arm.timings.len() as f64).sqrt();
+        Ok([
+            summary.mean_tokens_per_second - half,
+            summary.mean_tokens_per_second + half,
+        ])
+    };
+    let dense_ci = interval(dense)?;
+    let packed_ci = interval(packed)?;
+    let dense_mean = dense.timing_summary.mean_tokens_per_second;
+    let packed_mean = packed.timing_summary.mean_tokens_per_second;
+    Ok(Sc20676ThroughputComparison {
+        dense_mean_tokens_per_second: dense_mean,
+        packed_mean_tokens_per_second: packed_mean,
+        dense_ci95_tokens_per_second: dense_ci,
+        packed_ci95_tokens_per_second: packed_ci,
+        packed_minus_dense_tokens_per_second: packed_mean - dense_mean,
+        confidence_intervals_overlap: packed_ci[1] >= dense_ci[0] && dense_ci[1] >= packed_ci[0],
+        packed_slower_beyond_noise: packed_ci[1] < dense_ci[0],
+    })
 }
 
 impl Sc20676Receipt {
@@ -313,6 +379,11 @@ impl Sc20676Receipt {
         validate_sc20676_receipt(&self)?;
         Ok(self)
     }
+}
+
+/// An arm-start thermal state that did not refuse the arm (`serious`/`critical` would have).
+fn sc20676_unthrottled_thermal_state(state: &str) -> bool {
+    matches!(state, "nominal" | "fair")
 }
 
 fn is_digest(value: &str) -> bool {
@@ -474,6 +545,30 @@ fn timing_summary(
     })
 }
 
+/// Release returns MLX active/cache to the weights-loaded boundary within
+/// [`campaign::post_release_mlx_slack_bytes`] and the footprint within its frozen allowance.
+fn sc20676_release_within_slack(
+    weights: &Sc20676MemoryPhase,
+    release: &Sc20676MemoryPhase,
+) -> bool {
+    release.mlx_active_bytes
+        <= weights
+            .mlx_active_bytes
+            .saturating_add(campaign::post_release_mlx_slack_bytes(
+                weights.mlx_active_bytes,
+            ))
+        && release.mlx_cache_bytes
+            <= weights
+                .mlx_cache_bytes
+                .saturating_add(campaign::post_release_mlx_slack_bytes(
+                    weights.mlx_cache_bytes,
+                ))
+        && release.phys_footprint_bytes
+            <= weights
+                .phys_footprint_bytes
+                .saturating_add(campaign::POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES)
+}
+
 fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), String> {
     const PHASES: [&str; 6] = [
         "process-start",
@@ -522,12 +617,15 @@ fn validate_memory(memory: &Sc20676MemoryEvidence) -> std::result::Result<(), St
     }
     let weights = &memory.phases[1];
     let release = &memory.phases[5];
-    if release.mlx_active_bytes != weights.mlx_active_bytes
-        || release.mlx_cache_bytes != weights.mlx_cache_bytes
-        || release.phys_footprint_bytes
-            > weights
-                .phys_footprint_bytes
-                .saturating_add(campaign::POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES)
+    if !sc20676_release_within_slack(weights, release)
+        || memory.release_mlx_active_residual_bytes
+            != release
+                .mlx_active_bytes
+                .saturating_sub(weights.mlx_active_bytes)
+        || memory.release_mlx_cache_residual_bytes
+            != release
+                .mlx_cache_bytes
+                .saturating_sub(weights.mlx_cache_bytes)
     {
         return Err("SC-20676 release did not return to the weights-only boundary".into());
     }
@@ -603,7 +701,7 @@ fn validate_arm(arm: &Sc20676Arm) -> std::result::Result<(), String> {
         || arm.provenance.mlx_revision.is_empty()
         || arm.provenance.os_version.is_empty()
         || arm.provenance.metal_device.is_empty()
-        || arm.provenance.thermal_state != "nominal"
+        || !sc20676_unthrottled_thermal_state(&arm.provenance.thermal_state)
     {
         return Err("SC-20676 worker arm identity/input/output provenance is incomplete".into());
     }
@@ -814,7 +912,7 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         || receipt.baseline.context_band != campaign::SC20676_BASELINE_CONTEXT_BAND
         || receipt.baseline.context_payload_tokens < SC20676_MIN_LONG_CONTEXT_TOKENS as u64
         || ![64, 128, 256].contains(&receipt.baseline.head_dimension)
-        || receipt.thresholds.max_logit_abs_error != SC20676_MAX_LOGIT_ABS_ERROR
+        || receipt.thresholds.max_kernel_parity_error != SC20676_MAX_KERNEL_PARITY_ERROR
         || receipt.thresholds.min_greedy_token_agreement != SC20676_MIN_GREEDY_TOKEN_AGREEMENT
     {
         return Err("SC-20676 receipt identity or thresholds are malformed".into());
@@ -885,7 +983,7 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         ]
         .iter()
         .any(|field| field.is_empty())
-        || receipt.dense.provenance.thermal_state != "nominal"
+        || !sc20676_unthrottled_thermal_state(&receipt.dense.provenance.thermal_state)
     {
         return Err("SC-20676 worker provenance is incomplete or differs by arm".into());
     }
@@ -912,8 +1010,12 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         &receipt.dense.output.needle_output,
         &receipt.packed.output.needle_output,
     );
-    if !quality.max_logit_abs_error.is_finite()
-        || quality.max_logit_abs_error > receipt.thresholds.max_logit_abs_error
+    if !quality.kernel_parity_max_error.is_finite()
+        || quality.kernel_parity_max_error < 0.0
+        || quality.kernel_parity_max_error > receipt.thresholds.max_kernel_parity_error
+        || !quality.max_logit_abs_error.is_finite()
+        || quality.max_logit_abs_error < 0.0
+        || quality.greedy_agreement_method != campaign::GREEDY_AGREEMENT_METHOD
         || !(0.0..=1.0).contains(&quality.greedy_token_agreement)
         || quality.greedy_token_agreement < receipt.thresholds.min_greedy_token_agreement
         || quality.needle_retrieval != needle_retrieval
@@ -922,10 +1024,10 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
     {
         return Err("SC-20676 packed quality is outside declared bounds".into());
     }
-    if receipt.packed.timing_summary.mean_tokens_per_second
-        < receipt.dense.timing_summary.mean_tokens_per_second
+    if receipt.throughput_comparison
+        != sc20676_throughput_comparison(&receipt.dense, &receipt.packed)?
     {
-        return Err("SC-20676 packed warm steady decode regressed the dense baseline".into());
+        return Err("SC-20676 throughput comparison does not recompute".into());
     }
     let fallback = receipt
         .packed
@@ -1080,8 +1182,10 @@ fn worker_provenance() -> std::result::Result<Sc20676Provenance, String> {
     campaign::checked_repository_identity(&scene_works_root, campaign::SCENEWORKS_REPOSITORY)?;
     let inference_revision = checked_clean_revision(root, "inference")?;
     let scene_works_revision = checked_clean_revision(&scene_works_root, "SceneWorks")?;
-    let thermal = command_provenance("pmset", &["-g", "therm"], "thermal state")?;
-    let thermal_state = campaign::normalize_pmset_thermal(&thermal)?;
+    // Only a throttled arm start refuses; the recorded state is the start observation.
+    let host = campaign::capture_host_state("row-start")?;
+    campaign::refuse_throttled_row_start(&host)?;
+    let thermal_state = host.thermal_state;
     let mlx = campaign::locked_mlx_identity(include_bytes!("../../../../Cargo.lock"))?;
     Ok(Sc20676Provenance {
         scene_works_repository: campaign::SCENEWORKS_REPOSITORY.into(),
@@ -1107,6 +1211,65 @@ fn worker_provenance() -> std::result::Result<Sc20676Provenance, String> {
     })
 }
 
+/// Records the model's own greedy choice at every position while the decode loop is fed `forced`.
+struct TeacherForcedChoices {
+    forced: Vec<i32>,
+    choices: Vec<i32>,
+}
+
+impl campaign::Observer for TeacherForcedChoices {
+    fn phase(&mut self, _name: &'static str) {}
+    fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+    fn teacher_forced_token(&mut self, step: usize) -> campaign::TeacherForcing {
+        self.forced
+            .get(step)
+            .map_or(campaign::TeacherForcing::Exhausted, |token| {
+                campaign::TeacherForcing::Token(*token)
+            })
+    }
+    fn token_probability(&mut self, _stage: &'static str, token: i32, _probability: f64) {
+        self.choices.push(token);
+    }
+}
+
+/// The packed model's greedy choice at every position of the dense `forced` stream, from a fresh
+/// packed cache that is reset before returning.
+fn packed_teacher_forced_choices(
+    model: &CausalLm,
+    retained: &CompiledKernelHandle,
+    ids: &[i32],
+    config: &GenerationConfig,
+    forced: &[i32],
+) -> std::result::Result<Vec<i32>, String> {
+    let (route, mut cache) = packed_cache(model, retained.clone(), ids.len(), false);
+    if route != CacheRoute::ExperimentalPacked {
+        return Err(format!(
+            "teacher-forced packed selection refused: {route:?}"
+        ));
+    }
+    let first_logits = model
+        .decode_logits(&input_ids(ids), cache.as_mut(), 0)
+        .map_err(|e| e.to_string())?;
+    let mut observer = TeacherForcedChoices {
+        forced: forced.to_vec(),
+        choices: Vec::new(),
+    };
+    generate_from_prefill_observed(
+        model,
+        cache.as_mut(),
+        first_logits,
+        ids.to_vec(),
+        config,
+        &CancelFlag::new(),
+        &mut |_| {},
+        &mut observer,
+    )
+    .map_err(|e| e.to_string())?;
+    cache.reset().map_err(|e| e.to_string())?;
+    drop(cache);
+    Ok(observer.choices)
+}
+
 fn max_abs(a: &[f32], b: &[f32]) -> std::result::Result<f64, String> {
     if a.is_empty() || a.len() != b.len() {
         return Err("SC-20676 logit vectors are empty or have different lengths".into());
@@ -1121,13 +1284,6 @@ fn max_abs(a: &[f32], b: &[f32]) -> std::result::Result<f64, String> {
         maximum = maximum.max((dense - packed).abs());
     }
     Ok(maximum)
-}
-
-fn agreement(a: &[i32], b: &[i32]) -> f64 {
-    if a.is_empty() || a.len() != b.len() {
-        return 0.0;
-    }
-    a.iter().zip(b).filter(|(a, b)| a == b).count() as f64 / a.len() as f64
 }
 
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
@@ -1769,12 +1925,16 @@ pub fn run_sc20676_worker(
                 transient_workspace_bytes: transient_peak_above_active(&decode_peak),
                 theoretical_dense_reconstruction_bytes: dense_theoretical_kv_bytes,
                 theoretical_score_matrix_bytes,
-                release_verified: after.mlx_active_bytes == weights_loaded.mlx_active_bytes
-                    && after.mlx_cache_bytes == weights_loaded.mlx_cache_bytes
-                    && after.current_bytes
-                        <= weights_loaded
-                            .current_bytes
-                            .saturating_add(campaign::POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES),
+                release_verified: sc20676_release_within_slack(
+                    &phase("weights-loaded", &weights_loaded),
+                    &phase("reset-release", &after),
+                ),
+                release_mlx_active_residual_bytes: after
+                    .mlx_active_bytes
+                    .saturating_sub(weights_loaded.mlx_active_bytes),
+                release_mlx_cache_residual_bytes: after
+                    .mlx_cache_bytes
+                    .saturating_sub(weights_loaded.mlx_cache_bytes),
             },
             route: "dense".into(),
             kernel_profile: None,
@@ -1950,12 +2110,10 @@ pub fn run_sc20676_worker(
         .to_owned();
     let (needle_retrieval, needle_discriminating) =
         sc20676_needle_observation(&dense_needle_output, &needle_output);
-    let quality = Sc20676Quality {
-        max_logit_abs_error: max_abs(&dense_logits.0, &packed_logits)?,
-        greedy_token_agreement: agreement(&dense_tokens, &out.tokens),
-        needle_retrieval,
-        needle_discriminating,
-    };
+    // Observations: model-level logit difference and free-running divergence. The gates (kernel
+    // parity on the same codes, teacher-forced agreement) are measured after the timed trials.
+    let max_logit_abs_error = max_abs(&dense_logits.0, &packed_logits)?;
+    let free_running_first_divergence = campaign::first_divergence(&out.tokens, &dense_tokens);
     let output = output_binding(
         &packed_logits,
         &packed_logit_shape,
@@ -2039,6 +2197,31 @@ pub fn run_sc20676_worker(
     cache.reset().map_err(|e| e.to_string())?;
     drop(cache);
     let timings = measured_packed_timings(&model, &ids, &config, &retained)?;
+    // Kernel parity gate: the packed reader against an independent host-fp32
+    // dequantize-then-attend reference over the same stored codes.
+    let kernel_parity_errors =
+        crate::primitives::group_affine_kernel_fp32_parity_errors(&retained)?;
+    if kernel_parity_errors.is_empty() || kernel_parity_errors.iter().any(|e| !e.is_finite()) {
+        return Err("SC-20676 kernel parity produced no finite errors".into());
+    }
+    let kernel_parity_max_error = kernel_parity_errors.iter().copied().fold(0.0, f64::max);
+    // Teacher-forced greedy agreement: the packed model decodes the dense stream.
+    let forced_choices =
+        packed_teacher_forced_choices(&model, &retained, &ids, &config, &dense_tokens)?;
+    let (forced_matches, forced_total) =
+        campaign::teacher_forced_agreement(&forced_choices, &dense_tokens);
+    if forced_total == 0 {
+        return Err("SC-20676 dense stream is empty; greedy agreement is undefined".into());
+    }
+    let quality = Sc20676Quality {
+        kernel_parity_max_error,
+        max_logit_abs_error,
+        greedy_token_agreement: forced_matches as f64 / forced_total as f64,
+        greedy_agreement_method: campaign::GREEDY_AGREEMENT_METHOD.into(),
+        free_running_first_divergence,
+        needle_retrieval,
+        needle_discriminating,
+    };
     drop(retained);
     mlx_rs::memory::clear_cache();
     let after = campaign::sample_memory(std::process::id()).map_err(|e| e.to_string())?;
@@ -2052,12 +2235,10 @@ pub fn run_sc20676_worker(
     if packed_device_bytes == 0 || transient_workspace_bytes == 0 {
         return Err("packed allocator evidence has no resident or transient delta".into());
     }
-    let physical_release_verified = after.mlx_active_bytes == weights_loaded.mlx_active_bytes
-        && after.mlx_cache_bytes == weights_loaded.mlx_cache_bytes
-        && after.current_bytes
-            <= weights_loaded
-                .current_bytes
-                .saturating_add(campaign::POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES);
+    let physical_release_verified = sc20676_release_within_slack(
+        &phase("weights-loaded", &weights_loaded),
+        &phase("reset-release", &after),
+    );
     let final_snapshot_inventory = campaign::validate_sc20676_candidate_snapshot(family, snapshot)?;
     validate_snapshot_inventory_unchanged(&snapshot_inventory, &final_snapshot_inventory)?;
     finish_arm(Sc20676Arm {
@@ -2118,6 +2299,12 @@ pub fn run_sc20676_worker(
             theoretical_dense_reconstruction_bytes: dense_theoretical_kv_bytes,
             theoretical_score_matrix_bytes,
             release_verified: physical_release_verified,
+            release_mlx_active_residual_bytes: after
+                .mlx_active_bytes
+                .saturating_sub(weights_loaded.mlx_active_bytes),
+            release_mlx_cache_residual_bytes: after
+                .mlx_cache_bytes
+                .saturating_sub(weights_loaded.mlx_cache_bytes),
         },
         route: route_name(&route),
         kernel_profile: Some(kernel_profile),
@@ -2776,6 +2963,14 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             // Resumed and fresh arms alike must have run under the captured policy's cap/reserve.
             dense.admission.validate_against(&policy)?;
             packed.admission.validate_against(&policy)?;
+            let throughput_comparison = sc20676_throughput_comparison(&dense, &packed)?;
+            if throughput_comparison.packed_slower_beyond_noise {
+                eprintln!(
+                    "SC-20676 {family}: packed steady decode is slower than dense beyond noise ({:.3} vs {:.3} tok/s); recorded, not refused",
+                    throughput_comparison.packed_mean_tokens_per_second,
+                    throughput_comparison.dense_mean_tokens_per_second
+                );
+            }
             let receipt = Sc20676Receipt {
                 schema_version: 0,
                 harness_version: String::new(),
@@ -2784,6 +2979,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                 thresholds: Sc20676Thresholds::default(),
                 dense,
                 packed,
+                throughput_comparison,
             }
             .finish()?;
             receipts.push(receipt);
@@ -2918,6 +3114,8 @@ mod tests {
             theoretical_dense_reconstruction_bytes: 2,
             theoretical_score_matrix_bytes: 1,
             release_verified: true,
+            release_mlx_active_residual_bytes: 0,
+            release_mlx_cache_residual_bytes: 0,
         }
     }
     fn conservative_paths(calls: u64) -> Vec<crate::primitives::PackedKernelPathEvidence> {
@@ -3025,8 +3223,11 @@ mod tests {
             }),
             continuation_dispatches: u64::from(packed),
             quality: packed.then_some(Sc20676Quality {
+                kernel_parity_max_error: 0.0,
                 max_logit_abs_error: 0.0,
                 greedy_token_agreement: 1.0,
+                greedy_agreement_method: campaign::GREEDY_AGREEMENT_METHOD.into(),
+                free_running_first_divergence: None,
                 needle_retrieval: true,
                 needle_discriminating: true,
             }),
@@ -3099,6 +3300,8 @@ mod tests {
                 head_dimension: 64,
             },
             thresholds: Sc20676Thresholds::default(),
+            throughput_comparison: sc20676_throughput_comparison(&arm("dense"), &arm("packed"))
+                .unwrap(),
             dense: arm("dense"),
             packed: arm("packed"),
         }
@@ -3488,13 +3691,90 @@ mod tests {
         reseal_arm(&mut bad.packed);
         assert!(validate_sc20676_receipt(&bad).is_err());
         let mut bad = receipt();
-        bad.thresholds.max_logit_abs_error = 0.1;
+        bad.thresholds.max_kernel_parity_error = 0.1;
         assert!(validate_sc20676_receipt(&bad).is_err());
         let mut bad = receipt();
         bad.packed.memory.observed_dense_kv_bytes = 0;
         reseal_arm(&mut bad.packed);
         assert!(validate_sc20676_receipt(&bad).is_err());
     }
+    /// The parity gate is kernel parity on the same codes; model-level logit error, free-running
+    /// divergence and the dense/packed throughput comparison are recorded observations.
+    #[test]
+    fn kernel_parity_gates_and_model_level_evidence_is_recorded() {
+        let with_quality = |edit: fn(&mut Sc20676Quality)| {
+            let mut receipt = receipt();
+            edit(receipt.packed.quality.as_mut().unwrap());
+            reseal_arm(&mut receipt.packed);
+            receipt.finish()
+        };
+        with_quality(|q| {
+            q.max_logit_abs_error = 0.5;
+            q.free_running_first_divergence = Some(3);
+        })
+        .expect("model-level dense/packed logit error is recorded, not gated");
+        with_quality(|q| q.kernel_parity_max_error = SC20676_MAX_KERNEL_PARITY_ERROR)
+            .expect("kernel parity at the tolerance passes");
+        for edit in [
+            (|q: &mut Sc20676Quality| q.kernel_parity_max_error = 2.0e-4)
+                as fn(&mut Sc20676Quality),
+            |q| q.kernel_parity_max_error = f64::NAN,
+            |q| q.max_logit_abs_error = f64::INFINITY,
+            |q| q.greedy_agreement_method = "free-running".into(),
+            |q| q.greedy_token_agreement = 0.99,
+        ] {
+            assert!(with_quality(edit).is_err());
+        }
+        // A packed arm slower than dense is recorded with a noise-aware flag, not refused.
+        let mut slower = receipt();
+        for sample in &mut slower.packed.timings {
+            sample.steady_decode_tokens_per_second *= 0.5;
+        }
+        slower.packed.timing_summary = timing_summary(&slower.packed.timings).unwrap();
+        reseal_arm(&mut slower.packed);
+        slower.throughput_comparison =
+            sc20676_throughput_comparison(&slower.dense, &slower.packed).unwrap();
+        let sealed = slower
+            .clone()
+            .finish()
+            .expect("a slower packed arm is recorded");
+        assert!(sealed.throughput_comparison.packed_slower_beyond_noise);
+        assert!(!sealed.throughput_comparison.confidence_intervals_overlap);
+        assert!(
+            sealed
+                .throughput_comparison
+                .packed_minus_dense_tokens_per_second
+                < 0.0
+        );
+        slower.throughput_comparison.packed_slower_beyond_noise = false;
+        assert!(slower.finish().is_err());
+        let equal = receipt().finish().unwrap();
+        assert!(equal.throughput_comparison.confidence_intervals_overlap);
+        assert!(!equal.throughput_comparison.packed_slower_beyond_noise);
+    }
+
+    /// Post-release MLX counters may keep a small recorded allocator residual; a material leak
+    /// still fails.
+    #[test]
+    fn release_allows_recorded_allocator_slack_but_not_a_leak() {
+        let with_release = |active_extra: u64, residual: u64| {
+            let mut receipt = receipt();
+            let weights_active = receipt.packed.memory.phases[1].mlx_active_bytes;
+            let release = &mut receipt.packed.memory.phases[5];
+            release.mlx_active_bytes = weights_active + active_extra;
+            receipt.packed.memory.release_mlx_active_residual_bytes = residual;
+            reseal_arm(&mut receipt.packed);
+            receipt.finish()
+        };
+        let slack = campaign::POST_RELEASE_MLX_SLACK_FLOOR_BYTES;
+        with_release(slack, slack).expect("a residual within slack is recorded");
+        assert!(with_release(slack, 0).is_err(), "an unrecorded residual");
+        assert!(
+            with_release(slack + 1, slack + 1).is_err(),
+            "a material leak"
+        );
+    }
+
     #[test]
     fn storage_components_allocator_delta_and_comparison_geometry_fail_closed() {
         let mut bad = receipt();

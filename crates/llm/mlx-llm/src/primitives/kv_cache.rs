@@ -574,16 +574,17 @@ impl KvCache for ContiguousKvCache {
         let tokens = u64::try_from(slot.offset)
             .map_err(|_| crate::error::Error::Msg("KV sequence length overflows u64".into()))?;
         if grew {
+            // The grown buffer is the layer's new persistent cache (the `append` event below and
+            // the retained snapshot). What coexists with it transiently is only the retired
+            // pre-growth buffer, so that is the transient: recording old + new here would count
+            // the new buffer twice against a peak floor of persistent + transient.
             if let Some(prior_bytes) = prior_bytes {
-                let coexistence = prior_bytes.checked_add(retained_bytes).ok_or_else(|| {
-                    crate::error::Error::Msg("block growth coexistence overflows u64".into())
-                })?;
                 self.events.push(CacheEvent {
                     layer,
-                    operation: "dense_block_growth_coexistence",
+                    operation: "dense_block_growth_retired_buffer",
                     role: "output",
                     lifetime: "transient",
-                    bytes: coexistence,
+                    bytes: prior_bytes,
                     tokens,
                 });
             }
@@ -811,11 +812,12 @@ mod tests {
         let event = cache
             .events()
             .iter()
-            .find(|event| event.operation == "dense_block_growth_coexistence")
-            .expect("block growth must publish old and new buffers' coexistence");
+            .find(|event| event.operation == "dense_block_growth_retired_buffer")
+            .expect("block growth must publish the retired pre-growth buffer");
         assert_eq!(event.role, "output");
         assert_eq!(event.lifetime, "transient");
-        assert_eq!(event.bytes, 768);
+        // Only the 256-byte retired buffer; the 512-byte grown buffer is the persistent cache.
+        assert_eq!(event.bytes, 256);
         assert_eq!(event.tokens, 5);
         cache.reset().unwrap();
         assert_eq!(cache.retained_snapshot().unwrap(), None);
@@ -823,6 +825,43 @@ mod tests {
         assert_eq!(release.operation, "cache_release");
         assert_eq!(release.lifetime, "released");
         assert_eq!(release.bytes, 512);
+    }
+
+    /// A chunk that lands exactly on a block boundary, then growth: persistent + the largest
+    /// transient equals the true coexistence peak (every layer's grown buffer plus one retired
+    /// buffer), never the double-counted old + new.
+    #[test]
+    fn block_growth_at_a_boundary_is_counted_once_in_the_peak_floor() {
+        let _cpu = CpuStream::enter();
+        const LAYERS: usize = 2;
+        let mut cache = ContiguousKvCache::with_block_tokens(LAYERS, 4);
+        let chunk = arange4(1, 2, 4, 4); // lands exactly on the 4-token block boundary
+        let one = arange4(1, 2, 1, 4);
+        for layer in 0..LAYERS {
+            cache.update(layer, &chunk, &chunk).unwrap();
+        }
+        let (before, ..) = cache.retained_snapshot().unwrap().unwrap();
+        assert!(cache
+            .events()
+            .iter()
+            .all(|event| event.lifetime != "transient"));
+        for layer in 0..LAYERS {
+            cache.update(layer, &one, &one).unwrap();
+        }
+        let (after, ..) = cache.retained_snapshot().unwrap().unwrap();
+        let per_layer_old = before / LAYERS as u64;
+        let per_layer_new = after / LAYERS as u64;
+        let transient = cache
+            .events()
+            .iter()
+            .filter(|event| event.lifetime == "transient")
+            .map(|event| event.bytes)
+            .max()
+            .unwrap();
+        // True peak: the last layer's old and new buffers coexist beside every grown layer.
+        let true_peak = per_layer_new * LAYERS as u64 + per_layer_old;
+        assert_eq!(after + transient, true_peak);
+        assert!(after + transient < after + per_layer_old + per_layer_new);
     }
 
     #[test]

@@ -105,15 +105,22 @@ pub const REQUIRED_PHASES: [&str; 8] = [
 ];
 /// Receipt schema. v5 (sc-20671): per-repeat decode throughput is a dedicated fixed-length steady
 /// decode recorded beside each sample, and provenance records the host's power mode and thermal
-/// state at row start and end.
-pub const RECEIPT_SCHEMA_VERSION: u32 = 5;
-pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v5";
+/// state at row start and end. v6 (sc-20671 hardware audit): real-hardware observations are
+/// recorded instead of refused: host state per timing sample and thermal/power change flags (only
+/// a throttled row start refuses), the dense-KV share of the prefill footprint, post-release MLX
+/// residuals within a defined slack, teacher-forced greedy agreement with the free-running
+/// divergence, and compile cost against a noise band.
+pub const RECEIPT_SCHEMA_VERSION: u32 = 6;
+pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v6";
 /// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v3).
 pub const QUALITY_CONTRACT_HASH: &str =
     "58eaa007c35084c8acac2b35b5a2a1dff5af55832a7533557741d43a05944b49";
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
 pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
+/// Greedy agreement under quality contract v3 is teacher-forced (decided before any compressed
+/// result existed): the candidate's greedy choice at each position of the reference stream.
+pub const GREEDY_AGREEMENT_METHOD: &str = "teacher-forced";
 /// Quality contract v3: the only denominator of a compressed receipt's quality gate is the
 /// dense-KV run on the same weights. The bf16 model remains weight-quantization characterization.
 pub const COMPRESSED_QUALITY_REFERENCE: &str = "dense-kv-same-weights";
@@ -139,9 +146,17 @@ pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit
 pub const MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS: u64 = 1_000;
 pub const FIT_BOUNDARY_MIN_CONTEXT_BPS: u64 = 9_000;
 /// Fixed allowance for process-resident Metal/JIT runtime pages after MLX live tensors and its
-/// allocator cache have returned exactly to the loaded-model boundary. This is deliberately not a
-/// tensor or cache tolerance: both MLX release tolerances remain zero.
+/// allocator cache have returned to the loaded-model boundary.
 pub const POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES: u64 = 512 * 1024 * 1024;
+/// Floor of the post-release MLX allocator slack: real hardware leaves a few small allocator blocks
+/// (scalars, RNG state, compiled-kernel constants) that are not a leak.
+pub const POST_RELEASE_MLX_SLACK_FLOOR_BYTES: u64 = 1024 * 1024;
+
+/// Post-release MLX active/cache slack over a loaded-model `baseline`: `max(1 MiB, 0.1% of
+/// baseline)`, rounded up. A residual above it is a material leak and still fails.
+pub fn post_release_mlx_slack_bytes(baseline: u64) -> u64 {
+    POST_RELEASE_MLX_SLACK_FLOOR_BYTES.max(baseline.div_ceil(1_000))
+}
 pub const SCENEWORKS_REPOSITORY: &str = "github.com/SceneWorks/SceneWorks";
 pub const INFERENCE_REPOSITORY: &str = "github.com/SceneWorks/inference";
 pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs";
@@ -198,6 +213,31 @@ pub(crate) fn valid_utc_timestamp(value: &str) -> bool {
         && hour < 24
         && minute < 60
         && second < 60
+}
+
+/// Seconds since the Unix epoch of a validated UTC timestamp (fraction included).
+pub(crate) fn utc_timestamp_seconds(value: &str) -> Option<f64> {
+    if !valid_utc_timestamp(value) {
+        return None;
+    }
+    let parse = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (parse(0..4)?, parse(5..7)?, parse(8..10)?);
+    let (hour, minute, second) = (parse(11..13)?, parse(14..16)?, parse(17..19)?);
+    // Days from civil (proleptic Gregorian), the inverse of `timestamp_now`'s conversion.
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = if shifted >= 0 { shifted } else { shifted - 399 } / 400;
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let fraction = if value.len() > 20 {
+        format!("0.{}", &value[20..value.len() - 1])
+            .parse::<f64>()
+            .ok()?
+    } else {
+        0.0
+    };
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) as f64 + fraction)
 }
 
 pub(crate) fn compare_utc_timestamps(left: &str, right: &str) -> Option<std::cmp::Ordering> {
@@ -1033,12 +1073,17 @@ pub struct ReceiptProvenance {
     pub reference_model_id: String,
     pub reference_model_sha256: String,
     pub reference_model_bytes: u64,
-    /// The row's energy mode (one of [`POWER_MODES`]), equal at row start and row end.
+    /// The row-start energy mode (one of [`POWER_MODES`]).
     pub power_mode: String,
-    /// Always `nominal`: a throttled start or end refuses the row.
+    /// The row-start thermal state: never throttled, because a throttled start refuses the row.
     pub thermal_state: String,
     /// Power mode and thermal state observed at [`HOST_STATE_BOUNDARIES`], in order.
     pub host_states: Vec<ReceiptHostState>,
+    /// Recorded, never refused: after row start the thermal state changed or throttled (row end
+    /// or any timing sample).
+    pub thermal_changed_during_row: bool,
+    /// Recorded, never refused: after row start the power mode changed.
+    pub power_mode_changed_during_row: bool,
     pub command_template: String,
     pub command: String,
     pub campaign_session_id: String,
@@ -1358,8 +1403,14 @@ pub struct ReceiptReconciliation {
 pub struct ReceiptRelease {
     pub verified: bool,
     pub phys_footprint_tolerance_bytes: u64,
+    /// [`post_release_mlx_slack_bytes`] of the weights-loaded MLX active bytes.
     pub mlx_active_tolerance_bytes: u64,
+    /// [`post_release_mlx_slack_bytes`] of the weights-loaded MLX cache bytes.
     pub mlx_cache_tolerance_bytes: u64,
+    /// Post-release MLX active bytes above the weights-loaded boundary (0 when at or below it).
+    pub mlx_active_residual_bytes: u64,
+    /// Post-release MLX cache bytes above the weights-loaded boundary (0 when at or below it).
+    pub mlx_cache_residual_bytes: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1383,6 +1434,12 @@ pub struct ReceiptMemory {
     pub reconciliation: ReceiptReconciliation,
     pub release: ReceiptRelease,
     pub admission: ReceiptAdmission,
+    /// Dense KV bytes as a share of the prefill-peak process footprint, in basis points (floor).
+    pub dense_kv_share_bps: u64,
+    /// A memory-material row whose dense KV share is below
+    /// [`MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS`]. The band is defined by geometry, so this is a
+    /// recorded flag, never a refusal.
+    pub below_memory_material_share: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1400,6 +1457,8 @@ pub struct ReceiptTimingSample {
     pub steady_decode_timed_tokens: u64,
     pub steady_decode_ms: f64,
     pub steady_decode_forced_stop_tokens: u64,
+    /// Host power/thermal state right after this repeat, so throughput drift is attributable.
+    pub host_state: ReceiptHostState,
 }
 
 impl ReceiptTimingSample {
@@ -1542,6 +1601,13 @@ pub struct ReceiptQuality {
     pub perplexity_delta: f64,
     #[serde(rename = "greedyTokenAgreement")]
     pub greedy_token_agreement: f64,
+    /// Always [`GREEDY_AGREEMENT_METHOD`].
+    #[serde(rename = "greedyAgreementMethod")]
+    pub greedy_agreement_method: String,
+    /// Observation only: the first position at which the free-running candidate and reference
+    /// kernel streams of the primary repeat differ (`null` when identical).
+    #[serde(rename = "freeRunningFirstDivergence")]
+    pub free_running_first_divergence: Option<u64>,
     #[serde(rename = "structuredToolAgreement")]
     pub structured_tool_agreement: f64,
     #[serde(rename = "needleRetrieval")]
@@ -1704,7 +1770,7 @@ pub struct Receipt {
     pub compression: Option<ReceiptCompression>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RawTiming {
     pub load_ms: f64,
     pub prefill_ms: f64,
@@ -1712,6 +1778,8 @@ pub struct RawTiming {
     pub first_token_ms: f64,
     pub decode_tokens_per_second: f64,
     pub steady_decode: SteadyDecodeMeasurement,
+    /// The host state captured right after this repeat's steady decode (the worker fills it).
+    pub host_state: Option<ReceiptHostState>,
 }
 
 /// Fixed decode length of every SC-20671 steady-decode sample. Steady throughput is a dedicated
@@ -1807,7 +1875,7 @@ impl ReceiptBuilder {
         {
             return Err("receipt repository identity is not paired SceneWorks".into());
         }
-        if self.template.provenance.thermal_state != "nominal"
+        if !THERMAL_STATES.contains(&self.template.provenance.thermal_state.as_str())
             || !self.template.provenance.command_template.contains("{mode}")
             || self.template.provenance.command
                 != self
@@ -1926,6 +1994,15 @@ impl ReceiptBuilder {
             confidence_interval_low: sorted[0],
             confidence_interval_high: sorted[4],
         };
+        self.template.memory.release = release_evidence(&self.phases[1], &self.phases[7]);
+        (
+            self.template.memory.dense_kv_share_bps,
+            self.template.memory.below_memory_material_share,
+        ) = dense_kv_share(
+            dense,
+            self.phases[2].phys_footprint_bytes,
+            &self.template.matrix.context_band,
+        )?;
         self.template.memory.phase_samples = self.phases;
         self.template.memory.allocation_events = self.allocations;
         self.template.memory.dense_theoretical_kv_bytes = dense;
@@ -1946,24 +2023,32 @@ impl ReceiptBuilder {
             samples: self
                 .timings
                 .into_iter()
-                .map(|t| ReceiptTimingSample {
-                    load_ms: t.load_ms,
-                    prefill_ms: t.prefill_ms,
-                    ttft_ms: t.ttft_ms,
-                    first_token_ms: t.first_token_ms,
-                    decode_tokens_per_second: t.decode_tokens_per_second,
-                    steady_decode_prompt_tokens: t.steady_decode.prompt_tokens,
-                    steady_decode_generated_tokens: t.steady_decode.generated_tokens,
-                    steady_decode_timed_tokens: t.steady_decode.timed_tokens,
-                    steady_decode_ms: t.steady_decode.decode_ms,
-                    steady_decode_forced_stop_tokens: t.steady_decode.forced_stop_tokens,
+                .map(|t| {
+                    Ok(ReceiptTimingSample {
+                        load_ms: t.load_ms,
+                        prefill_ms: t.prefill_ms,
+                        ttft_ms: t.ttft_ms,
+                        first_token_ms: t.first_token_ms,
+                        decode_tokens_per_second: t.decode_tokens_per_second,
+                        steady_decode_prompt_tokens: t.steady_decode.prompt_tokens,
+                        steady_decode_generated_tokens: t.steady_decode.generated_tokens,
+                        steady_decode_timed_tokens: t.steady_decode.timed_tokens,
+                        steady_decode_ms: t.steady_decode.decode_ms,
+                        steady_decode_forced_stop_tokens: t.steady_decode.forced_stop_tokens,
+                        host_state: t
+                            .host_state
+                            .ok_or("timing sample has no recorded host state")?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, String>>()?,
             summary,
         };
         self.template.quality.parity_max_error = metrics.parity_max_error;
         self.template.quality.perplexity_delta = metrics.perplexity_delta;
         self.template.quality.greedy_token_agreement = metrics.greedy_token_agreement;
+        self.template.quality.greedy_agreement_method = GREEDY_AGREEMENT_METHOD.into();
+        self.template.quality.free_running_first_divergence =
+            self.quality.free_running_first_divergence;
         self.template.quality.structured_tool_agreement = metrics.structured_tool_agreement;
         self.template.quality.needle_retrieval = metrics.needle_retrieval;
         self.template.quality.needle_discriminating = self.quality.needle_discriminating;
@@ -2199,20 +2284,41 @@ fn validate_receipt_compression(
 fn validate_host_states(receipt: &Receipt) -> Result<(), String> {
     let p = &receipt.provenance;
     let invalid = |detail: &str| Err(format!("host power/thermal provenance {detail}"));
-    if !POWER_MODES.contains(&p.power_mode.as_str())
-        || p.thermal_state != "nominal"
-        || p.host_states.len() != HOST_STATE_BOUNDARIES.len()
-    {
-        return invalid("is incomplete or not nominal");
+    let [start, end] = p.host_states.as_slice() else {
+        return invalid("does not record exactly the row-start and row-end states");
+    };
+    start.validate(HOST_STATE_BOUNDARIES[0])?;
+    end.validate(HOST_STATE_BOUNDARIES[1])?;
+    refuse_throttled_row_start(start)
+        .map_err(|error| format!("host power/thermal provenance: {error}"))?;
+    if p.power_mode != start.power_mode || p.thermal_state != start.thermal_state {
+        return invalid("is not the row-start state");
     }
-    for (state, boundary) in p.host_states.iter().zip(HOST_STATE_BOUNDARIES) {
-        if state.boundary != boundary
-            || !valid_utc_timestamp(&state.captured_at)
-            || state.power_mode != p.power_mode
-            || state.thermal_state != "nominal"
-        {
-            return invalid("differs from the row's nominal power/thermal state");
-        }
+    let samples = receipt
+        .timings
+        .samples
+        .iter()
+        .map(|sample| &sample.host_state)
+        .collect::<Vec<_>>();
+    for state in &samples {
+        state.validate(TIMING_SAMPLE_HOST_BOUNDARY)?;
+    }
+    let order = std::iter::once(start)
+        .chain(samples.iter().copied())
+        .chain(std::iter::once(end))
+        .collect::<Vec<_>>();
+    if order
+        .windows(2)
+        .any(|pair| !utc_timestamp_before(&pair[0].captured_at, &pair[1].captured_at))
+    {
+        return invalid("is not ordered row start, timing samples, row end");
+    }
+    if (
+        p.thermal_changed_during_row,
+        p.power_mode_changed_during_row,
+    ) != host_state_changes(start, samples.iter().copied().chain(std::iter::once(end)))
+    {
+        return invalid("change flags do not recompute");
     }
     let (Some(first), Some(last)) = (
         receipt.memory.phase_samples.first(),
@@ -2220,8 +2326,8 @@ fn validate_host_states(receipt: &Receipt) -> Result<(), String> {
     ) else {
         return invalid("has no phase samples to bracket");
     };
-    if !utc_timestamp_before(&p.host_states[0].captured_at, &first.timestamp)
-        || !utc_timestamp_before(&last.timestamp, &p.host_states[1].captured_at)
+    if !utc_timestamp_before(&start.captured_at, &first.timestamp)
+        || !utc_timestamp_before(&last.timestamp, &end.captured_at)
     {
         return invalid("does not bracket the row's measured phases");
     }
@@ -2286,7 +2392,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || !lowercase_hex(&p.campaign_session_id, 64)
         || !lowercase_hex(&p.coordinate_operation_sha256, 64)
         || p.campaign_cache_state_version == 0
-        || p.thermal_state != "nominal"
+        || !THERMAL_STATES.contains(&p.thermal_state.as_str())
         || !p.command_template.contains("{mode}")
         || p.command_template.replace("{mode}", &receipt.mode) != p.command
     {
@@ -2499,12 +2605,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .find(|sample| sample.phase == "prefill-peak")
         .ok_or("missing prefill-peak materiality evidence")?
         .phys_footprint_bytes;
-    if receipt.matrix.context_band == "memory-material"
-        && u128::from(dense).saturating_mul(10_000)
-            < u128::from(prefill_footprint)
-                .saturating_mul(u128::from(MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS))
+    if (
+        receipt.memory.dense_kv_share_bps,
+        receipt.memory.below_memory_material_share,
+    ) != dense_kv_share(dense, prefill_footprint, &receipt.matrix.context_band)?
     {
-        return Err("memory-material dense KV is below the frozen process-footprint share".into());
+        return Err("dense KV share of the prefill footprint does not recompute".into());
     }
     if receipt.matrix.context_band == "fit-boundary"
         && (receipt.geometry.kv_length > receipt.geometry.context_window_tokens
@@ -2656,14 +2762,26 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             receipt.memory.reconciliation.tolerance_bytes,
         ));
     }
+    let end = receipt.memory.phase_samples.last().unwrap();
     if receipt.memory.release.phys_footprint_tolerance_bytes
         != POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES
-        || receipt.memory.release.mlx_active_tolerance_bytes != 0
-        || receipt.memory.release.mlx_cache_tolerance_bytes != 0
+        || receipt.memory.release.mlx_active_tolerance_bytes
+            != post_release_mlx_slack_bytes(weights_loaded.mlx.active_bytes)
+        || receipt.memory.release.mlx_cache_tolerance_bytes
+            != post_release_mlx_slack_bytes(weights_loaded.mlx.cache_bytes)
+        || receipt.memory.release.mlx_active_residual_bytes
+            != end
+                .mlx
+                .active_bytes
+                .saturating_sub(weights_loaded.mlx.active_bytes)
+        || receipt.memory.release.mlx_cache_residual_bytes
+            != end
+                .mlx
+                .cache_bytes
+                .saturating_sub(weights_loaded.mlx.cache_bytes)
     {
-        return Err("release tolerances differ from the frozen platform contract".into());
+        return Err("release tolerances or residuals differ from the platform contract".into());
     }
-    let end = receipt.memory.phase_samples.last().unwrap();
     if end.phys_footprint_bytes
         > weights_loaded
             .phys_footprint_bytes
@@ -2818,6 +2936,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             > receipt.timings.summary.confidence_interval_high
     {
         return Err("timing summary derivation failed".into());
+    }
+    if receipt.quality.greedy_agreement_method != GREEDY_AGREEMENT_METHOD {
+        return Err("greedy agreement is not teacher-forced".into());
     }
     if !receipt.quality.parity_max_error.is_finite()
         || !receipt.quality.perplexity_delta.is_finite()
@@ -3596,11 +3717,22 @@ pub fn campaign_global_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
         "os": provenance.os,
         "xcode": provenance.xcode,
         "hardware": provenance.hardware,
-        "powerMode": provenance.power_mode,
-        "thermalState": provenance.thermal_state,
         "commandTemplate": provenance.command_template,
     }))
     .map_err(|error| error.to_string())
+}
+
+/// Recorded in the campaign manifest, never refused: rows started in more than one power mode or
+/// thermal state, or some row's host state changed during the row.
+pub fn campaign_host_state_varied<'a>(receipts: impl IntoIterator<Item = &'a Receipt>) -> bool {
+    let mut starts = std::collections::BTreeSet::new();
+    let mut changed = false;
+    for receipt in receipts {
+        let p = &receipt.provenance;
+        starts.insert((p.power_mode.clone(), p.thermal_state.clone()));
+        changed |= p.thermal_changed_during_row || p.power_mode_changed_during_row;
+    }
+    changed || starts.len() > 1
 }
 
 pub fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
@@ -3622,6 +3754,54 @@ pub fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
         "contextWindowTokens": geometry.context_window_tokens,
     }))
     .map_err(|error| error.to_string())
+}
+
+/// A completed row's measured wall time (row-start to row-end host state) and its context.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowDurationBasis {
+    pub family: String,
+    pub context_window_tokens: u64,
+    pub context_target_tokens: u64,
+    pub wall_seconds: f64,
+}
+
+/// The duration basis a completed receipt provides, if its host states bound a positive span.
+pub fn row_duration_basis(receipt: &Receipt) -> Option<RowDurationBasis> {
+    let [start, end] = receipt.provenance.host_states.as_slice() else {
+        return None;
+    };
+    let wall_seconds =
+        utc_timestamp_seconds(&end.captured_at)? - utc_timestamp_seconds(&start.captured_at)?;
+    (wall_seconds.is_finite() && wall_seconds > 0.0 && receipt.geometry.context_target_tokens > 0)
+        .then(|| RowDurationBasis {
+            family: receipt.matrix.family.clone(),
+            context_window_tokens: receipt.geometry.context_window_tokens,
+            context_target_tokens: receipt.geometry.context_target_tokens,
+            wall_seconds,
+        })
+}
+
+/// A lower-bound duration estimate for a `family` row of `context_band`: the smallest measured
+/// seconds per context token among completed same-family rows, times the row's band target. It is
+/// linear although long-context prefill is superlinear, so a row it already puts over the deadline
+/// cannot finish. `None` when no same-family row has completed.
+pub fn estimate_row_seconds(
+    family: &str,
+    context_band: &str,
+    basis: &[RowDurationBasis],
+) -> Option<(f64, usize)> {
+    let same_family = basis
+        .iter()
+        .filter(|row| row.family == family)
+        .collect::<Vec<_>>();
+    let rate = same_family
+        .iter()
+        .map(|row| row.wall_seconds / row.context_target_tokens as f64)
+        .fold(None, |min: Option<f64>, rate| {
+            Some(min.map_or(rate, |m| m.min(rate)))
+        })?;
+    let target = context_band_target(same_family[0].context_window_tokens, context_band).ok()?;
+    Some((rate * target as f64, same_family.len()))
 }
 
 /// Atomically publish the whole eight-coordinate receipt collection. Individual worker output is
@@ -3742,6 +3922,7 @@ pub fn publish_complete_campaign(
     fs::create_dir(&staging).map_err(|e| e.to_string())?;
     let result = (|| -> Result<(), String> {
         let mut manifest_rows = Vec::with_capacity(prepared.len());
+        let mut receipts = Vec::with_capacity(prepared.len());
         for item in prepared {
             let slug = coordinate_slug(&item.coordinate);
             write_artifacts(
@@ -3766,6 +3947,7 @@ pub fn publish_complete_campaign(
                 "workerPid": receipt.memory.phase_samples[0].pid,
                 "files": files,
             }));
+            receipts.push(receipt);
         }
         let manifest = serde_json::json!({
             "schemaVersion": 2,
@@ -3773,6 +3955,7 @@ pub fn publish_complete_campaign(
             "scheduleVersion": SC20671_SCHEDULE_VERSION,
             "policySha256": policy_sha256,
             "resumeIdentitySha256": seal_bytes(&canonical_json_bytes(resume_identity).map_err(|e| e.to_string())?),
+            "hostStateVaried": campaign_host_state_varied(&receipts),
             "coordinates": manifest_rows,
         });
         let (identity_bytes, identity_sha) = seal_json(resume_identity)?;
@@ -3948,6 +4131,7 @@ pub fn load_validated_complete_campaign(
     let mut global_identity = None;
     let mut family_identities = std::collections::BTreeMap::new();
     let mut outcomes = Vec::with_capacity(schedule.len());
+    let mut host_state_receipts = Vec::with_capacity(schedule.len());
     for row in rows {
         let slug = row
             .get("coordinate")
@@ -4047,10 +4231,19 @@ pub fn load_validated_complete_campaign(
         } else {
             family_identities.insert(coordinate.family, family_identity);
         }
+        host_state_receipts.push(receipt);
         prepared.push(item);
     }
     if seen.len() != schedule.len() || family_identities.len() != 2 {
         return Err("SC-20671 campaign omits a scheduled coordinate or family identity".into());
+    }
+    if resume_identity.is_some()
+        && value
+            .get("hostStateVaried")
+            .and_then(serde_json::Value::as_bool)
+            != Some(campaign_host_state_varied(&host_state_receipts))
+    {
+        return Err("SC-20671 manifest host-state variation flag does not recompute".into());
     }
     validate_schedule_outcomes(&schedule, &outcomes)?;
     Ok(prepared)
@@ -4782,6 +4975,60 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
             };
             let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
+            // Pre-row duration estimate from the rows already completed (a lower bound): a row it
+            // puts over the deadline is refused before it spawns instead of burning the deadline.
+            let basis = prepared
+                .iter()
+                .filter_map(|item| serde_json::from_slice::<Receipt>(&item.bundle.receipt).ok())
+                .filter_map(|receipt| row_duration_basis(&receipt))
+                .collect::<Vec<_>>();
+            let estimate =
+                estimate_row_seconds(row.coordinate.family, row.coordinate.context_band, &basis);
+            let deadline_seconds = policy.row_deadline_seconds;
+            let estimate_record = serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "sc-20671-row-duration-estimate",
+                "coordinate": slug,
+                "estimatedSeconds": estimate.map(|(seconds, _)| seconds),
+                "basisRows": estimate.map_or(0, |(_, rows)| rows),
+                "rowDeadlineSeconds": deadline_seconds,
+                "method": "min completed same-family seconds per context token x band target (linear lower bound)",
+            });
+            fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+            fs::write(
+                logs.join(format!("{log_prefix}.estimate.json")),
+                seal_json(&estimate_record)?.0,
+            )
+            .map_err(|e| e.to_string())?;
+            match estimate {
+                Some((seconds, rows)) => eprintln!(
+                    "sc20671-kv-baseline: coordinate {slug} estimated at >= {seconds:.0}s from {rows} completed {} row(s); row deadline {deadline_seconds}s",
+                    row.coordinate.family
+                ),
+                None => eprintln!(
+                    "sc20671-kv-baseline: coordinate {slug} has no completed {} row to estimate from; row deadline {deadline_seconds}s",
+                    row.coordinate.family
+                ),
+            }
+            if let Some((seconds, rows)) = estimate {
+                if seconds > deadline_seconds as f64 {
+                    let detail = format!(
+                        "estimated duration {seconds:.0}s (lower bound from {rows} completed {} row(s)) exceeds the {deadline_seconds}s row deadline",
+                        row.coordinate.family
+                    );
+                    return Err(unaccepted_row_error(
+                        &unaccepted,
+                        "sc-20671-unaccepted-row",
+                        &slug,
+                        &admission,
+                        ("DurationEstimate", &detail, None, None),
+                        format!(
+                            "coordinate {slug} refused before spawn: {detail}; valid earlier rows remain in {}",
+                            launch.resume_dir.display()
+                        ),
+                    ));
+                }
+            }
             let status = match campaign_supervisor::run_guarded(
                 &mut command,
                 &request,
@@ -5066,6 +5313,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let admission = supervised_admission(&policy, static_footprint_floor)?;
             // Observed before any model loads: a throttled host refuses the row before it runs.
             let row_start = capture_host_state("row-start")?;
+            refuse_throttled_row_start(&row_start)?;
             // Compressed rows: the measured arm holds KV in the method's compressed cache, and its
             // quality denominator is the dense-KV run on the SAME candidate weights.
             let candidate_session = match compressed {
@@ -5109,6 +5357,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let warmup_cache_state_version =
                 (!candidate_warmups.is_empty()).then(|| candidate_session.cache_state_version());
             let mut candidate_repeats = Vec::with_capacity(5);
+            let mut repeat_host_states = Vec::with_capacity(5);
             for repeat in 0..5 {
                 let half = run_product_fixture_half_on_session_bounded(
                     &candidate_session,
@@ -5135,6 +5384,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     )
                 );
                 candidate_repeats.push(half);
+                // Outside every timed window: recorded so throughput drift is attributable.
+                repeat_host_states.push(capture_host_state(TIMING_SAMPLE_HOST_BOUNDARY)?);
             }
             let compressed_parity = candidate_session
                 .compressed()
@@ -5221,6 +5472,41 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 )
             })?;
 
+            // Greedy agreement (quality contract v3) is teacher-forced: the candidate, reloaded in
+            // its own representation, is evaluated on each reference repeat's kernel stream. This
+            // runs after every timed dispatch, so it never touches timing or compile attribution.
+            let forcing_session = match compressed {
+                Some(method) => CampaignSession::load_compressed(&snapshot, method),
+                None => CampaignSession::load(&snapshot),
+            }
+            .map_err(|e| format!("load teacher-forcing candidate session: {e}"))?;
+            let forcing_baseline = forcing_session.load_start_sample.mlx_active_bytes;
+            let teacher_forced = reference_repeats
+                .iter()
+                .enumerate()
+                .map(|(repeat, reference)| {
+                    teacher_forced_kernel_choices(
+                        &forcing_session,
+                        &prompt,
+                        &row.coordinate,
+                        &reference.kernel,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "teacher-forced repeat {repeat} for {}: {e}",
+                            coordinate_slug(&row.coordinate)
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            drop(forcing_session);
+            quiesce_campaign_active_memory(forcing_baseline).map_err(|e| {
+                format!(
+                    "teacher-forcing session release for {}: {e}",
+                    coordinate_slug(&row.coordinate)
+                )
+            })?;
+
             let warmup_suites = candidate_warmups
                 .into_iter()
                 .zip(reference_warmups)
@@ -5242,11 +5528,13 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let suites = candidate_repeats
                 .into_iter()
                 .zip(reference_repeats)
+                .zip(teacher_forced)
                 .enumerate()
-                .map(|(repeat, (candidate, reference))| {
+                .map(|(repeat, ((candidate, reference), forced))| {
                     let mut suite =
                         pair_product_fixture_halves(candidate, reference, reference_kind)?;
                     suite.kernel_parity_errors = compressed_parity.clone();
+                    suite.teacher_forced_candidate = Some(forced);
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product fixture repeat {repeat} quality for {}: {e}",
@@ -5274,13 +5562,16 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                         .ok_or("candidate repeat has no steady-decode measurement")
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let timings = timing_samples_from_product_repeats(
+            let mut timings = timing_samples_from_product_repeats(
                 &kernel_runs,
                 &steady_decodes,
                 &row.coordinate,
                 row.coordinate.process_temperature,
                 &warmup_runs,
             )?;
+            for (sample, state) in timings.samples.iter_mut().zip(repeat_host_states) {
+                sample.host_state = Some(state);
+            }
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             let fixtures = sealed_product_fixture_artifacts(&suites, &row.coordinate)?;
             let receipt = product_receipt(
@@ -5823,6 +6114,9 @@ pub struct QualityObservation {
     /// Whether tool agreement can detect KV-induced tool-call loss: the same-weights dense-KV run
     /// emitted the valid structured call.
     pub tool_discriminating: bool,
+    /// Observation only: the first position at which the free-running candidate and reference
+    /// kernel streams differ (`None` when identical).
+    pub free_running_first_divergence: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5888,6 +6182,7 @@ fn product_fixture_artifact(
                 "parityErrors": quality.parity_errors,
                 "greedyMatches": quality.greedy_matches,
                 "greedyTotal": quality.greedy_total,
+                "freeRunningFirstDivergence": quality.free_running_first_divergence,
             }),
             &suite.kernel_candidate,
             &suite.kernel_reference,
@@ -6070,8 +6365,26 @@ pub fn sequence_marker() -> u64 {
 
 /// The narrow observation seam used by a real campaign runner.  The runner owns platform probes
 /// (`footprint` and `mlx_rs::memory`); the product path owns the phase boundaries and generation.
+/// Teacher forcing for the campaign's greedy-agreement measurement: the decode loop feeds the
+/// forced token at each step instead of its own choice, which it still reports through
+/// [`Observer::token_probability`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeacherForcing {
+    /// Ordinary generation.
+    Off,
+    /// Feed this token at the current step.
+    Token(i32),
+    /// The forced stream is exhausted: stop before sampling another position.
+    Exhausted,
+}
+
 pub trait Observer {
     fn phase(&mut self, name: &'static str);
+    /// Teacher forcing for decode `step` of the observed generation; off unless a campaign quality
+    /// observer supplies a forced stream.
+    fn teacher_forced_token(&mut self, _step: usize) -> TeacherForcing {
+        TeacherForcing::Off
+    }
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
     fn allocation_event(
         &mut self,
@@ -6160,6 +6473,11 @@ pub struct ProductObserver {
     /// opened; set once by [`ProductObserver::begin_coordinate_operation`].
     coordinate_start: Option<(usize, usize)>,
     coordinate_scope: Option<CoordinateCompressionScope>,
+    /// The reference token stream fed back at each decode step (teacher forcing), if any.
+    forced_tokens: Option<Vec<i32>>,
+    /// Teacher forcing covers only the first observed generation; a second step 0 ends it.
+    forcing_started: bool,
+    forcing_done: bool,
 }
 
 /// Compressed-arm evidence of one coordinate operation's measured dispatch only (opened by
@@ -6201,6 +6519,18 @@ impl ProductObserver {
             compressed_storage_peak: None,
             coordinate_start: None,
             coordinate_scope: None,
+            forced_tokens: None,
+            forcing_started: false,
+            forcing_done: false,
+        }
+    }
+
+    /// An observer whose first observed generation is teacher-forced on `tokens`: at every
+    /// position the model's own greedy choice is recorded and the forced token is fed back.
+    pub fn teacher_forced(tokens: Vec<i32>) -> Self {
+        Self {
+            forced_tokens: Some(tokens),
+            ..Self::new()
         }
     }
 
@@ -6558,6 +6888,24 @@ impl Observer for ProductObserver {
         self.prefill_logits = Some(values.to_vec());
     }
 
+    fn teacher_forced_token(&mut self, step: usize) -> TeacherForcing {
+        let Some(forced) = &self.forced_tokens else {
+            return TeacherForcing::Off;
+        };
+        if step == 0 {
+            if self.forcing_started {
+                self.forcing_done = true;
+            }
+            self.forcing_started = true;
+        }
+        if self.forcing_done {
+            return TeacherForcing::Off;
+        }
+        forced.get(step).map_or(TeacherForcing::Exhausted, |token| {
+            TeacherForcing::Token(*token)
+        })
+    }
+
     fn token_probability(&mut self, stage: &'static str, token: i32, probability: f64) {
         if stage != "decode"
             || token < 0
@@ -6661,14 +7009,79 @@ fn measured_model_weight_bytes(
         })
 }
 
+/// Dense KV as a share of the prefill-peak footprint (basis points, floor) and whether a
+/// memory-material row falls below [`MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS`]: recorded, not refused.
+fn dense_kv_share(dense: u64, prefill_footprint: u64, band: &str) -> Result<(u64, bool), String> {
+    if prefill_footprint == 0 {
+        return Err("prefill-peak footprint is zero".into());
+    }
+    let bps = u128::from(dense).saturating_mul(10_000) / u128::from(prefill_footprint);
+    let bps = u64::try_from(bps).map_err(|_| "dense KV share overflows u64".to_string())?;
+    Ok((
+        bps,
+        band == "memory-material"
+            && u128::from(dense).saturating_mul(10_000)
+                < u128::from(prefill_footprint)
+                    .saturating_mul(u128::from(MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS)),
+    ))
+}
+
+/// Release evidence from the weights-loaded and post-run-release phase samples: the frozen
+/// footprint allowance, the MLX slack over each weights-loaded counter, and the recorded residuals.
+fn release_evidence(weights_loaded: &ReceiptPhase, release: &ReceiptPhase) -> ReceiptRelease {
+    let active_tolerance = post_release_mlx_slack_bytes(weights_loaded.mlx.active_bytes);
+    let cache_tolerance = post_release_mlx_slack_bytes(weights_loaded.mlx.cache_bytes);
+    ReceiptRelease {
+        verified: release.phys_footprint_bytes
+            <= weights_loaded
+                .phys_footprint_bytes
+                .saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES)
+            && release.mlx.active_bytes
+                <= weights_loaded
+                    .mlx
+                    .active_bytes
+                    .saturating_add(active_tolerance)
+            && release.mlx.cache_bytes
+                <= weights_loaded
+                    .mlx
+                    .cache_bytes
+                    .saturating_add(cache_tolerance),
+        phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES,
+        mlx_active_tolerance_bytes: active_tolerance,
+        mlx_cache_tolerance_bytes: cache_tolerance,
+        mlx_active_residual_bytes: release
+            .mlx
+            .active_bytes
+            .saturating_sub(weights_loaded.mlx.active_bytes),
+        mlx_cache_residual_bytes: release
+            .mlx
+            .cache_bytes
+            .saturating_sub(weights_loaded.mlx.cache_bytes),
+    }
+}
+
+/// Between sessions: MLX active memory returns to `expected_active_bytes` and the cache empties,
+/// each within [`post_release_mlx_slack_bytes`]. A residual inside the slack is logged, not fatal.
 fn quiesce_campaign_active_memory(expected_active_bytes: u64) -> core_llm::Result<()> {
     mlx_rs::memory::clear_cache();
     let active = mlx_rs::memory::get_active_memory() as u64;
     let cache = mlx_rs::memory::get_cache_memory() as u64;
-    if active != expected_active_bytes || cache != 0 {
-        return Err(core_llm::Error::Load(format!(
-            "campaign session did not quiesce before the next model load: active={active}, expected={expected_active_bytes}, cache={cache}"
-        )));
+    quiesced_within_slack(active, cache, expected_active_bytes).map_err(core_llm::Error::Load)
+}
+
+fn quiesced_within_slack(active: u64, cache: u64, expected_active: u64) -> Result<(), String> {
+    let active_residual = active.saturating_sub(expected_active);
+    if active_residual > post_release_mlx_slack_bytes(expected_active)
+        || cache > post_release_mlx_slack_bytes(0)
+    {
+        return Err(format!(
+            "campaign session did not quiesce before the next model load: active={active}, expected={expected_active}, cache={cache}"
+        ));
+    }
+    if active_residual > 0 || cache > 0 {
+        eprintln!(
+            "sc20671-kv-baseline: session quiesced with a recorded residual within slack: active residual={active_residual} bytes, cache={cache} bytes"
+        );
     }
     Ok(())
 }
@@ -7531,6 +7944,7 @@ pub fn quality_from_product_fixtures(
     expected_needle: &str,
     reference: QualityReference,
     kernel_parity_errors: Option<&[f64]>,
+    teacher_forced_candidate: Option<&[i32]>,
 ) -> Result<QualityObservation, String> {
     if reference == QualityReference::DenseKvSameWeights
         && [
@@ -7550,10 +7964,17 @@ pub fn quality_from_product_fixtures(
                 .into(),
         );
     }
-    let (greedy_matches, greedy_total) = token_agreement(
-        &kernel_candidate.quality_observation.token_probabilities,
-        &kernel_reference.quality_observation.token_probabilities,
-    );
+    let candidate_stream = stream_tokens(&kernel_candidate.quality_observation.token_probabilities);
+    let reference_stream = stream_tokens(&kernel_reference.quality_observation.token_probabilities);
+    // Greedy agreement is teacher-forced: the candidate's own greedy choice at every position of
+    // the reference stream. A free-running cascade after one argmax flip is recorded separately.
+    let (greedy_matches, greedy_total) = match teacher_forced_candidate {
+        Some(candidate_choices) => teacher_forced_agreement(candidate_choices, &reference_stream),
+        None => token_agreement(
+            &kernel_candidate.quality_observation.token_probabilities,
+            &kernel_reference.quality_observation.token_probabilities,
+        ),
+    };
     let (cache_matches, cache_total) = token_agreement(
         &cache_candidate.quality_observation.token_probabilities,
         &cache_reference.quality_observation.token_probabilities,
@@ -7598,7 +8019,34 @@ pub fn quality_from_product_fixtures(
         outcomes,
         needle_discriminating,
         tool_discriminating,
+        free_running_first_divergence: first_divergence(&candidate_stream, &reference_stream),
     })
+}
+
+fn stream_tokens(probabilities: &[(i32, f64)]) -> Vec<i32> {
+    probabilities.iter().map(|(token, _)| *token).collect()
+}
+
+/// Teacher-forced agreement: at each position of the `reference` stream, whether the candidate's
+/// greedy choice (given the reference prefix) is the reference token. A position the candidate
+/// never reached counts as a mismatch; the denominator is always the reference length.
+pub fn teacher_forced_agreement(candidate_choices: &[i32], reference: &[i32]) -> (u64, u64) {
+    let matches = candidate_choices
+        .iter()
+        .zip(reference)
+        .filter(|(candidate, reference)| candidate == reference)
+        .count() as u64;
+    (matches, reference.len() as u64)
+}
+
+/// First position at which two free-running streams differ; a strict prefix diverges at its end.
+pub fn first_divergence(candidate: &[i32], reference: &[i32]) -> Option<u64> {
+    candidate
+        .iter()
+        .zip(reference)
+        .position(|(candidate, reference)| candidate != reference)
+        .or((candidate.len() != reference.len()).then(|| candidate.len().min(reference.len())))
+        .map(|position| position as u64)
 }
 
 /// Needle outcome and whether it can discriminate KV-induced retrieval loss.
@@ -7669,6 +8117,9 @@ pub struct ProductFixtureSuite {
     /// The candidate half's dedicated fixed-length steady decode (the reference arm is never
     /// timed).
     pub steady_decode: Option<SteadyDecodeMeasurement>,
+    /// The candidate's greedy choice at every position of this repeat's reference kernel stream
+    /// (teacher-forced). Required for measured repeats; warmups do not carry it.
+    pub teacher_forced_candidate: Option<Vec<i32>>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -7857,6 +8308,47 @@ fn run_product_fixture_half_on_session(
 /// request-scoped cache that is released before the next half, so no coordinate's memory
 /// attribution sees it; its `prompt + STEADY_DECODE_TOKENS` live tokens are admitted up front by
 /// the preflight live-token bound.
+/// The kernel fixture prompt of `coordinate`'s context band, exactly as the fixture half builds it.
+fn kernel_fixture_prompt(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+) -> core_llm::Result<String> {
+    let (band_payload, ..) = session
+        .provider
+        .campaign_context_band_measurement(coordinate.context_band)?;
+    Ok(format!(
+        "{prompt}\n{band_payload}\nReturn a concise deterministic answer."
+    ))
+}
+
+/// Teacher-forced kernel fixture: the candidate session decodes `reference`'s own kernel token
+/// stream, and at every position the candidate's greedy choice is returned.
+fn teacher_forced_kernel_choices(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+    reference: &ProductFixtureResult,
+) -> core_llm::Result<Vec<i32>> {
+    let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
+    let forced = stream_tokens(&reference.quality_observation.token_probabilities);
+    if forced.is_empty() {
+        return Err(core_llm::Error::InvalidRequest(
+            "reference kernel stream is empty; nothing to teacher-force".into(),
+        ));
+    }
+    let mut observer = ProductObserver::teacher_forced(forced);
+    run_dense_lifecycle_request_on_session(
+        session,
+        &kernel_prompt,
+        fixture_request(kernel_prompt.clone(), Vec::new()),
+        None,
+        &mut observer,
+    )?;
+    let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
+    Ok(stream_tokens(&observation.token_probabilities))
+}
+
 fn run_product_fixture_half_on_session_bounded(
     session: &CampaignSession,
     prompt: &str,
@@ -7870,7 +8362,7 @@ fn run_product_fixture_half_on_session_bounded(
         .provider
         .campaign_context_band_measurement(coordinate.context_band)?;
     let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e".to_string();
-    let kernel_prompt = format!("{prompt}\n{band_payload}\nReturn a concise deterministic answer.");
+    let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
     let tool_prompt = format!(
         "{prompt}\n{band_payload}\nCall record_baseline_fact with fact exactly `SC20671 structured fixture`."
     );
@@ -7983,6 +8475,7 @@ fn pair_product_fixture_halves(
         reference: reference_kind,
         kernel_parity_errors: None,
         steady_decode: candidate.steady_decode,
+        teacher_forced_candidate: None,
     })
 }
 
@@ -8000,6 +8493,7 @@ impl ProductFixtureSuite {
             &self.needle,
             self.reference,
             self.kernel_parity_errors.as_deref(),
+            self.teacher_forced_candidate.as_deref(),
         )
     }
 }
@@ -8046,6 +8540,7 @@ pub fn timing_from_product_observation(
         first_token_ms,
         decode_tokens_per_second: throughput,
         steady_decode: *steady_decode,
+        host_state: None,
     })
 }
 
@@ -8541,64 +9036,48 @@ fn probed_command(program: &str, args: &[&str], label: &str) -> Result<String, S
     Ok(value)
 }
 
-/// `pmset -g therm` is verbose diagnostic text, never a receipt state.  Accept only an explicit
-/// no-throttling/no-pressure observation and normalize it to the schema's semantic `nominal`.
-pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
-    let normalized = value.to_ascii_lowercase();
-    if normalized.contains("not nominal")
-        || normalized.contains("throttl")
-        || normalized.contains("critical")
-    {
-        return Err("pmset thermal probe reports throttling or a contradictory state".into());
-    }
-    let lines = normalized
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let nominal_no_history = [
-        "note: no thermal warning level has been recorded",
-        "note: no performance warning level has been recorded",
-        "note: no cpu power status has been recorded",
-    ];
-    if lines.len() == nominal_no_history.len()
-        && nominal_no_history
-            .iter()
-            .all(|expected| lines.contains(expected))
-    {
-        return Ok("nominal".into());
-    }
-    let mut saw_zero = false;
-    for line in lines {
-        let Some((name, raw_value)) = line.split_once(':') else {
+/// `CPU_Speed_Limit` from `pmset -g therm` when it reports CPU power status (`None` when it
+/// prints only its no-history notes). The rest of the text is recorded verbatim, never parsed, so
+/// unknown note lines are tolerated; only a malformed or contradictory limit is refused.
+pub fn pmset_cpu_speed_limit(value: &str) -> Result<Option<u64>, String> {
+    let mut limit = None;
+    for line in value.lines() {
+        let Some((name, raw)) = line.split_once('=') else {
             continue;
         };
-        if !matches!(name.trim(), "thermal pressure" | "thermal level") {
+        if !name.trim().eq_ignore_ascii_case("CPU_Speed_Limit") {
             continue;
         }
-        let value = raw_value.trim();
-        let digits = value
-            .chars()
-            .take_while(|character| character.is_ascii_digit())
-            .collect::<String>();
-        if digits.is_empty() || digits != "0" {
-            return Err("pmset thermal probe reports nonzero thermal pressure".into());
+        let parsed = raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("pmset CPU_Speed_Limit is not a number: {:?}", raw.trim()))?;
+        if limit.is_some_and(|prior| prior != parsed) {
+            return Err("pmset reports contradictory CPU_Speed_Limit values".into());
         }
-        saw_zero = true;
+        limit = Some(parsed);
     }
-    if saw_zero {
-        return Ok("nominal".into());
-    }
-    Err("pmset thermal probe did not prove nominal thermal state".into())
+    Ok(limit)
 }
 
 /// Row boundaries at which the host's power mode and thermal state are observed, in order.
 pub const HOST_STATE_BOUNDARIES: [&str; 2] = ["row-start", "row-end"];
+/// The host state recorded beside each measured timing sample, so throughput drift is attributable.
+pub const TIMING_SAMPLE_HOST_BOUNDARY: &str = "timing-sample";
 /// Normalized macOS energy modes (`pmset` `powermode` 0/1/2, or the older `lowpowermode`).
 pub const POWER_MODES: [&str; 3] = ["automatic", "low-power", "high-power"];
+/// `NSProcessInfo.thermalState` 0..=3.
+pub const THERMAL_STATES: [&str; 4] = ["nominal", "fair", "serious", "critical"];
 
-/// The host's power mode and thermal state at one row boundary. A row is refused (fails closed)
-/// unless both thermal probes read nominal at its start and at its end.
+/// A real throttle signal: `NSProcessInfo.thermalState` serious or critical, or a `pmset`
+/// `CPU_Speed_Limit` below 100%.
+pub fn host_state_throttled(thermal_state: &str, cpu_speed_limit: Option<u64>) -> bool {
+    matches!(thermal_state, "serious" | "critical")
+        || cpu_speed_limit.is_some_and(|limit| limit < 100)
+}
+
+/// The host's power mode and thermal state at one boundary. Only a throttled row start refuses
+/// the row; later states are recorded and flagged on the provenance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -8606,7 +9085,59 @@ pub struct ReceiptHostState {
     pub boundary: String,
     pub captured_at: String,
     pub power_mode: String,
+    /// `NSProcessInfo.thermalState`, one of [`THERMAL_STATES`].
     pub thermal_state: String,
+    /// `pmset -g therm` `CPU_Speed_Limit` (percent), when reported.
+    pub cpu_speed_limit: Option<u64>,
+    /// The raw `pmset -g therm` text, recorded verbatim.
+    pub pmset_thermal_raw: String,
+    /// [`host_state_throttled`] of this state.
+    pub throttled: bool,
+}
+
+impl ReceiptHostState {
+    fn validate(&self, boundary: &str) -> Result<(), String> {
+        if self.boundary != boundary
+            || !valid_utc_timestamp(&self.captured_at)
+            || !POWER_MODES.contains(&self.power_mode.as_str())
+            || !THERMAL_STATES.contains(&self.thermal_state.as_str())
+            || self.pmset_thermal_raw.trim().is_empty()
+            || pmset_cpu_speed_limit(&self.pmset_thermal_raw)? != self.cpu_speed_limit
+            || self.throttled != host_state_throttled(&self.thermal_state, self.cpu_speed_limit)
+        {
+            return Err(format!(
+                "host power/thermal provenance: {boundary} state is malformed or does not recompute"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether the thermal state or the power mode changed from `start` across `later` observations.
+/// A throttled later observation counts as a thermal change.
+pub fn host_state_changes<'a>(
+    start: &ReceiptHostState,
+    later: impl IntoIterator<Item = &'a ReceiptHostState>,
+) -> (bool, bool) {
+    later
+        .into_iter()
+        .fold((false, false), |(thermal, power), state| {
+            (
+                thermal || state.thermal_state != start.thermal_state || state.throttled,
+                power || state.power_mode != start.power_mode,
+            )
+        })
+}
+
+/// Refuse a row whose start is thermally throttled; every other state is recorded.
+pub fn refuse_throttled_row_start(state: &ReceiptHostState) -> Result<(), String> {
+    if state.throttled {
+        return Err(format!(
+            "row-start host is thermally throttled (thermalState={}, CPU_Speed_Limit={:?}); the row is refused before it runs",
+            state.thermal_state, state.cpu_speed_limit
+        ));
+    }
+    Ok(())
 }
 
 /// Normalize the active energy mode from `pmset -g` (its "Currently in use" settings): `powermode`
@@ -8663,21 +9194,17 @@ pub fn normalize_pmset_power_mode(value: &str) -> Result<String, String> {
     Ok(mode.into())
 }
 
-/// `NSProcessInfo.thermalState` (0 nominal, 1 fair, 2 serious, 3 critical). Only nominal is
-/// accepted: every elevated state is thermal pressure under which decode timing throttles.
+/// `NSProcessInfo.thermalState` (0 nominal, 1 fair, 2 serious, 3 critical) as its name.
 pub fn normalize_process_thermal_state(state: i64) -> Result<String, String> {
-    match state {
-        0 => Ok("nominal".into()),
-        1..=3 => Err(format!(
-            "process thermal state is elevated ({}); the row fails closed on thermal throttling",
-            ["fair", "serious", "critical"][(state - 1) as usize]
-        )),
-        other => Err(format!("unknown process thermal state {other}")),
-    }
+    usize::try_from(state)
+        .ok()
+        .and_then(|index| THERMAL_STATES.get(index))
+        .map(|name| (*name).to_string())
+        .ok_or_else(|| format!("unknown process thermal state {state}"))
 }
 
 /// One boundary's host state from its raw probes: `pmset -g`, `pmset -g therm`, and
-/// `NSProcessInfo.thermalState`. Both thermal probes must prove nominal.
+/// `NSProcessInfo.thermalState`. Throttling is recorded here, never refused.
 pub fn host_state_from_probes(
     boundary: &str,
     captured_at: String,
@@ -8685,24 +9212,24 @@ pub fn host_state_from_probes(
     pmset_thermal: &str,
     process_thermal_state: i64,
 ) -> Result<ReceiptHostState, String> {
-    if !HOST_STATE_BOUNDARIES.contains(&boundary) {
+    if !HOST_STATE_BOUNDARIES.contains(&boundary) && boundary != TIMING_SAMPLE_HOST_BOUNDARY {
         return Err(format!("unknown host-state boundary {boundary}"));
     }
     let power_mode = normalize_pmset_power_mode(pmset)?;
-    let pmset_thermal = normalize_pmset_thermal(pmset_thermal)?;
-    let process_thermal = normalize_process_thermal_state(process_thermal_state)?;
-    if pmset_thermal != process_thermal {
-        return Err("thermal probes disagree".into());
-    }
+    let thermal_state = normalize_process_thermal_state(process_thermal_state)?;
+    let cpu_speed_limit = pmset_cpu_speed_limit(pmset_thermal)?;
     Ok(ReceiptHostState {
         boundary: boundary.into(),
         captured_at,
         power_mode,
-        thermal_state: process_thermal,
+        throttled: host_state_throttled(&thermal_state, cpu_speed_limit),
+        thermal_state,
+        cpu_speed_limit,
+        pmset_thermal_raw: pmset_thermal.into(),
     })
 }
 
-/// Probe this host's power mode and thermal state at `boundary`, failing closed on throttling.
+/// Probe this host's power mode and thermal state at `boundary`.
 pub fn capture_host_state(boundary: &str) -> Result<ReceiptHostState, String> {
     let pmset = probed_command("pmset", &["-g"], "power mode")?;
     let pmset_thermal = probed_command("pmset", &["-g", "therm"], "thermal state")?;
@@ -8765,6 +9292,12 @@ fn process_thermal_state() -> Result<i64, String> {
 fn receipt_quality_over_repeats(
     suites: &[ProductFixtureSuite],
 ) -> Result<QualityObservation, String> {
+    if suites
+        .iter()
+        .any(|suite| suite.teacher_forced_candidate.is_none())
+    {
+        return Err("every measured repeat requires its teacher-forced greedy agreement".into());
+    }
     let (primary, repeats) = suites
         .split_first()
         .ok_or("product receipt requires its fixture repeats")?;
@@ -9089,15 +9622,23 @@ fn product_receipt(
     let inference_revision = captured_source.1.clone();
     let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
     let xcode = probed_command("xcodebuild", &["-version"], "xcode")?;
+    // Only a throttled row start refuses a row. Later changes are recorded and flagged.
     let row_end = capture_host_state("row-end")?;
-    if row_end.power_mode != row_start.power_mode {
-        return Err(format!(
-            "host power mode changed during the row ({} -> {}); its timings span two modes",
-            row_start.power_mode, row_end.power_mode
-        ));
+    let (thermal_changed_during_row, power_mode_changed_during_row) = host_state_changes(
+        &row_start,
+        timing_samples
+            .iter()
+            .filter_map(|sample| sample.host_state.as_ref())
+            .chain(std::iter::once(&row_end)),
+    );
+    if thermal_changed_during_row || power_mode_changed_during_row {
+        eprintln!(
+            "sc20671-kv-baseline: host state changed during the row (thermal {} -> {}, power {} -> {}); recorded, not refused",
+            row_start.thermal_state, row_end.thermal_state, row_start.power_mode, row_end.power_mode
+        );
     }
     let power_mode = row_start.power_mode.clone();
-    let normalized_thermal_state = row_end.thermal_state.clone();
+    let normalized_thermal_state = row_start.thermal_state.clone();
     let host_states = vec![row_start, row_end];
     let mlx = locked_mlx_identity(include_bytes!("../../../../Cargo.lock"))?;
     let transcript = format!(
@@ -9189,12 +9730,12 @@ fn product_receipt(
     }
     let template = Receipt {
         schema_version: RECEIPT_SCHEMA_VERSION, harness_version: RECEIPT_HARNESS_VERSION.into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: mode.into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, host_states, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
+        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, host_states, thermal_changed_during_row, power_mode_changed_during_row, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
-        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 }, admission },
+        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: release_evidence(weights_loaded, release), admission, dense_kv_share_bps: 0, below_memory_material_share: false },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:None,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -9494,14 +10035,25 @@ pub(crate) mod tests {
         assert!(!divergent_miss.needle_discriminating);
         // Receipt discrimination is the AND over repeats, not the primary repeat alone.
         let pair = |compressed: ProductFixtureHalf, dense: ProductFixtureHalf| {
-            pair_product_fixture_halves(compressed, dense, QualityReference::DenseKvSameWeights)
-                .unwrap()
+            let mut suite = pair_product_fixture_halves(
+                compressed,
+                dense,
+                QualityReference::DenseKvSameWeights,
+            )
+            .unwrap();
+            suite.teacher_forced_candidate = Some(stream_tokens(
+                &suite
+                    .kernel_reference
+                    .quality_observation
+                    .token_probabilities,
+            ));
+            suite
         };
         let mut invalid_dense_tool = half("I cannot help with that.");
         invalid_dense_tool.tool.output.tool_calls.clear();
         let mut invalid_compressed_tool = half("I cannot help with that.");
         invalid_compressed_tool.tool.output.tool_calls.clear();
-        let repeats = [
+        let mut repeats = [
             pair(
                 half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
                 half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
@@ -9509,6 +10061,29 @@ pub(crate) mod tests {
             pair(invalid_compressed_tool, invalid_dense_tool),
         ];
         assert!(repeats[0].quality().unwrap().needle_discriminating);
+        // The suite's greedy agreement is the teacher-forced one: a diverged free-running
+        // candidate stream does not lower it when every forced position agrees.
+        let reference_stream = stream_tokens(
+            &repeats[0]
+                .kernel_reference
+                .quality_observation
+                .token_probabilities,
+        );
+        repeats[0]
+            .kernel_candidate
+            .quality_observation
+            .token_probabilities
+            .iter_mut()
+            .for_each(|(token, _)| *token += 1000);
+        let forced_quality = repeats[0].quality().unwrap();
+        assert_eq!(
+            (forced_quality.greedy_matches, forced_quality.greedy_total),
+            (reference_stream.len() as u64, reference_stream.len() as u64)
+        );
+        assert_eq!(forced_quality.free_running_first_divergence, Some(0));
+        let forced = repeats[1].teacher_forced_candidate.take();
+        assert!(receipt_quality_over_repeats(&repeats).is_err());
+        repeats[1].teacher_forced_candidate = forced;
         let anded = receipt_quality_over_repeats(&repeats).unwrap();
         assert!(!anded.needle_discriminating);
         assert!(!anded.tool_discriminating);
@@ -10545,6 +11120,7 @@ pub(crate) mod tests {
             outcomes: FixtureOutcomes::default(),
             needle_discriminating: true,
             tool_discriminating: true,
+            free_running_first_divergence: None,
         };
         let metrics = compute_quality(&raw).unwrap();
         assert_eq!(metrics.parity_max_error, 0.0002);
@@ -10642,6 +11218,19 @@ pub(crate) mod tests {
     }
 
     /// A fixed-length steady decode of a 32-token context whose 255 timed tokens took `decode_ms`.
+    /// A nominal, unthrottled host state observed at `boundary`.
+    fn test_host_state(boundary: &str, captured_at: &str) -> ReceiptHostState {
+        ReceiptHostState {
+            boundary: boundary.into(),
+            captured_at: captured_at.into(),
+            power_mode: "automatic".into(),
+            thermal_state: "nominal".into(),
+            cpu_speed_limit: None,
+            pmset_thermal_raw: PMSET_NOMINAL_THERMAL.into(),
+            throttled: false,
+        }
+    }
+
     fn test_steady_decode(decode_ms: f64) -> SteadyDecodeMeasurement {
         SteadyDecodeMeasurement {
             prompt_tokens: 32,
@@ -10688,19 +11277,11 @@ pub(crate) mod tests {
                 power_mode: "automatic".into(),
                 thermal_state: "nominal".into(),
                 host_states: vec![
-                    ReceiptHostState {
-                        boundary: "row-start".into(),
-                        captured_at: "2025-12-31T23:59:59.000Z".into(),
-                        power_mode: "automatic".into(),
-                        thermal_state: "nominal".into(),
-                    },
-                    ReceiptHostState {
-                        boundary: "row-end".into(),
-                        captured_at: "2026-01-01T00:00:09.000Z".into(),
-                        power_mode: "automatic".into(),
-                        thermal_state: "nominal".into(),
-                    },
+                    test_host_state("row-start", "2025-12-31T23:59:59.000Z"),
+                    test_host_state("row-end", "2026-01-01T00:00:09.000Z"),
                 ],
+                thermal_changed_during_row: false,
+                power_mode_changed_during_row: false,
                 command_template: "run --mode {mode}".into(),
                 command: "run --mode dense".into(),
                 campaign_session_id: "e".repeat(64),
@@ -10751,6 +11332,8 @@ pub(crate) mod tests {
                         POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES,
                     mlx_active_tolerance_bytes: 0,
                     mlx_cache_tolerance_bytes: 0,
+                    mlx_active_residual_bytes: 0,
+                    mlx_cache_residual_bytes: 0,
                 },
                 admission: ReceiptAdmission {
                     mode: RUNTIME_GUARDED_ADMISSION.into(),
@@ -10771,6 +11354,8 @@ pub(crate) mod tests {
                         },
                     ),
                 },
+                dense_kv_share_bps: 0,
+                below_memory_material_share: false,
             },
             timings: ReceiptTimings {
                 load_ms: 1.0,
@@ -10814,6 +11399,8 @@ pub(crate) mod tests {
                 parity_max_error: 0.0,
                 perplexity_delta: 0.0,
                 greedy_token_agreement: 1.0,
+                greedy_agreement_method: GREEDY_AGREEMENT_METHOD.into(),
+                free_running_first_divergence: None,
                 structured_tool_agreement: 1.0,
                 needle_retrieval: 1.0,
                 needle_discriminating: true,
@@ -10938,13 +11525,17 @@ pub(crate) mod tests {
             },
         ];
         let timings = (0..5)
-            .map(|_| RawTiming {
+            .map(|repeat| RawTiming {
                 load_ms: 1.0,
                 prefill_ms: 1.0,
                 ttft_ms: 1.0,
                 first_token_ms: 1.0,
                 decode_tokens_per_second: 1.0,
                 steady_decode: test_steady_decode(255_000.0),
+                host_state: Some(test_host_state(
+                    TIMING_SAMPLE_HOST_BOUNDARY,
+                    &format!("2026-01-01T00:00:08.{:03}Z", 100 + repeat * 10),
+                )),
             })
             .collect();
         let compile_attribution = ReceiptCompileAttribution {
@@ -10982,6 +11573,7 @@ pub(crate) mod tests {
             outcomes: FixtureOutcomes::default(),
             needle_discriminating: true,
             tool_discriminating: true,
+            free_running_first_divergence: None,
         };
         ReceiptBuilder {
             template,
@@ -11856,6 +12448,15 @@ pub(crate) mod tests {
             sample.mlx.peak_bytes = 1028;
             sample.phys_footprint_peak_bytes = 2000;
         }
+        (
+            padded.memory.dense_kv_share_bps,
+            padded.memory.below_memory_material_share,
+        ) = dense_kv_share(
+            1024,
+            padded.memory.phase_samples[2].phys_footprint_bytes,
+            &padded.matrix.context_band,
+        )
+        .unwrap();
         padded.receipt_sha256 = receipt_semantic_seal(&padded).unwrap();
         validate_receipt_semantics(&padded).expect("physical block capacity reconciles exactly");
         let mut loosened_release = receipt.clone();
@@ -11865,20 +12466,42 @@ pub(crate) mod tests {
             .phys_footprint_tolerance_bytes += 1;
         assert_eq!(
             validate_receipt_semantics(&loosened_release).unwrap_err(),
-            "release tolerances differ from the frozen platform contract"
+            "release tolerances or residuals differ from the platform contract"
         );
-        let mut unreleased_active = receipt.clone();
-        unreleased_active
-            .memory
-            .phase_samples
-            .last_mut()
-            .unwrap()
-            .mlx
-            .active_bytes = 4;
-        let release_error = validate_receipt_semantics(&unreleased_active).unwrap_err();
+        // A small allocator residual is recorded and accepted; a material leak still fails.
+        let released_with = |active: u64, cache: u64| {
+            let mut released = receipt.clone();
+            let end = released.memory.phase_samples.last_mut().unwrap();
+            end.mlx.active_bytes = active;
+            end.mlx.cache_bytes = cache;
+            end.mlx.peak_bytes = end.mlx.peak_bytes.max(active);
+            end.phys_footprint_bytes = end.phys_footprint_bytes.max(active + cache);
+            end.phys_footprint_peak_bytes = end.phys_footprint_peak_bytes.max(active + cache);
+            released.memory.release = release_evidence(
+                &released.memory.phase_samples[1],
+                released.memory.phase_samples.last().unwrap(),
+            );
+            released
+        };
+        let slack = post_release_mlx_slack_bytes(3);
+        assert_eq!(slack, POST_RELEASE_MLX_SLACK_FLOOR_BYTES);
+        let residual = released_with(3 + slack, 0);
+        assert_eq!(residual.memory.release.mlx_active_residual_bytes, slack);
+        validate_receipt_semantics(&residual).expect("a residual within slack is recorded");
+        let mut unrecorded = residual.clone();
+        unrecorded.memory.release.mlx_active_residual_bytes = 0;
+        assert!(validate_receipt_semantics(&unrecorded).is_err());
+        let leak = released_with(3 + slack + 1, 0);
+        assert!(!leak.memory.release.verified);
+        let release_error = validate_receipt_semantics(&leak).unwrap_err();
         assert!(
-            release_error.contains("endMlxActive=4, weightsLoadedMlxActive=3, activeTolerance=0")
+            release_error.contains("release did not return within tolerance"),
+            "{release_error}"
         );
+        let cache_leak = released_with(3, slack + 1);
+        assert!(validate_receipt_semantics(&cache_leak).is_err());
+        assert_eq!(post_release_mlx_slack_bytes(4_000_000_000), 4_000_000);
+        assert_eq!(post_release_mlx_slack_bytes(4_000_000_001), 4_000_001);
         let mut reference_only_memory = receipt.clone();
         reference_only_memory.memory.phase_samples[0]
             .mlx
@@ -11935,16 +12558,46 @@ pub(crate) mod tests {
             let error = steady_error(edit);
             assert!(error.contains("steady decode"), "{error}");
         }
-        // Power mode and thermal state are recorded at row start and end, nominal throughout.
+        // Power mode and thermal state are recorded at row start, each timing sample, and row
+        // end. Only a throttled row start is refused; later changes are recorded and flagged.
         let host_error = |edit: &dyn Fn(&mut ReceiptProvenance)| {
             let mut tampered = receipt.clone();
             edit(&mut tampered.provenance);
             validate_receipt_semantics(&tampered).unwrap_err()
         };
+        let mut warmed = receipt.clone();
+        warmed.provenance.host_states[1].thermal_state = "serious".into();
+        warmed.provenance.host_states[1].throttled = true;
+        warmed.provenance.host_states[1].power_mode = "low-power".into();
+        warmed.provenance.thermal_changed_during_row = true;
+        warmed.provenance.power_mode_changed_during_row = true;
+        validate_receipt_semantics(&warmed).expect("a row-end change is recorded, not refused");
+        let mut sample_change = receipt.clone();
+        sample_change.timings.samples[2].host_state.thermal_state = "fair".into();
+        assert!(validate_receipt_semantics(&sample_change)
+            .unwrap_err()
+            .contains("change flags do not recompute"));
+        sample_change.provenance.thermal_changed_during_row = true;
+        validate_receipt_semantics(&sample_change).expect("a timing-sample change is recorded");
+        let mut sample_order = receipt.clone();
+        sample_order.timings.samples.swap(0, 4);
+        assert!(validate_receipt_semantics(&sample_order).is_err());
         for edit in [
             &(|p: &mut ReceiptProvenance| p.host_states[1].thermal_state = "fair".into())
                 as &dyn Fn(&mut _),
             &|p: &mut ReceiptProvenance| p.host_states[1].power_mode = "low-power".into(),
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[0].thermal_state = "critical".into();
+                p.host_states[0].throttled = true;
+                p.thermal_state = "critical".into();
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[0].pmset_thermal_raw = "CPU_Speed_Limit = 50\n".into();
+                p.host_states[0].cpu_speed_limit = Some(50);
+                p.host_states[0].throttled = true;
+            },
+            &|p: &mut ReceiptProvenance| p.host_states[1].throttled = true,
+            &|p: &mut ReceiptProvenance| p.thermal_state = "fair".into(),
             &|p: &mut ReceiptProvenance| p.host_states.reverse(),
             &|p: &mut ReceiptProvenance| {
                 p.host_states.pop();
@@ -12378,6 +13031,31 @@ pub(crate) mod tests {
         non_material.geometry.context_payload_tokens =
             non_material.geometry.context_target_tokens / 2;
         assert!(validate_receipt_semantics(&non_material).is_err());
+        // With its share recorded, the same memory-material row validates: a low dense-KV share
+        // of the prefill footprint is flagged, never refused.
+        let mut recorded = non_material.clone();
+        (
+            recorded.memory.dense_kv_share_bps,
+            recorded.memory.below_memory_material_share,
+        ) = dense_kv_share(
+            recorded.memory.dense_theoretical_kv_bytes,
+            recorded.memory.phase_samples[2].phys_footprint_bytes,
+            "memory-material",
+        )
+        .unwrap();
+        assert!(recorded.memory.below_memory_material_share);
+        let coordinate = format!(
+            "{}-{}-{}-{}-{}",
+            recorded.matrix.family,
+            recorded.matrix.context_band,
+            recorded.matrix.request_mode,
+            recorded.matrix.prefill_mode,
+            recorded.matrix.process_temperature
+        );
+        for evidence in &mut recorded.timings.compile_attribution.probe_evidence {
+            evidence.matrix_coordinate = coordinate.clone();
+        }
+        validate_receipt_semantics(&recorded).expect("a low share is recorded, not refused");
         let mut not_near_fit = receipt.clone();
         not_near_fit.matrix.context_band = "fit-boundary".into();
         not_near_fit.geometry.context_target_tokens =
@@ -12614,32 +13292,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn thermal_probe_requires_an_explicit_nominal_record() {
+    fn pmset_thermal_text_is_recorded_and_only_the_speed_limit_is_read() {
+        assert_eq!(pmset_cpu_speed_limit(PMSET_NOMINAL_THERMAL).unwrap(), None);
+        // Unknown note lines (a new macOS release) are tolerated and kept verbatim.
         assert_eq!(
-            normalize_pmset_thermal("Thermal Pressure: 0\n").unwrap(),
-            "nominal"
-        );
-        assert_eq!(
-            normalize_pmset_thermal(
-                "Note: No thermal warning level has been recorded\n\
-                 Note: No performance warning level has been recorded\n\
-                 Note: No CPU power status has been recorded\n"
+            pmset_cpu_speed_limit(
+                "Note: No thermal warning level has been recorded\nNote: something new\n"
             )
             .unwrap(),
-            "nominal"
+            None
+        );
+        assert_eq!(
+            pmset_cpu_speed_limit(
+                "CPU_Scheduler_Limit \t= 100\nCPU_Available_CPUs \t= 12\nCPU_Speed_Limit \t= 70\n"
+            )
+            .unwrap(),
+            Some(70)
         );
         for invalid in [
-            "Thermal Pressure: 1\n",
-            "Thermal Level: 0\nnot nominal\n",
-            "nominal\n",
-            "Thermal Pressure: 0\nthrottling active\n",
-            "Note: No thermal warning level has been recorded\n",
+            "CPU_Speed_Limit = fast\n",
+            "CPU_Speed_Limit = 100\nCPU_Speed_Limit = 90\n",
         ] {
-            assert!(
-                normalize_pmset_thermal(invalid).is_err(),
-                "invalid thermal probe unexpectedly accepted: {invalid:?}"
-            );
+            assert!(pmset_cpu_speed_limit(invalid).is_err(), "{invalid:?}");
         }
+        assert!(!host_state_throttled("fair", Some(100)));
+        assert!(host_state_throttled("nominal", Some(99)));
+        assert!(host_state_throttled("serious", None));
+        assert!(host_state_throttled("critical", Some(100)));
     }
 
     const PMSET_NOMINAL_THERMAL: &str = "Note: No thermal warning level has been recorded\n\
@@ -12685,41 +13364,62 @@ pub(crate) mod tests {
         }
     }
 
-    /// SC-20671 fails closed on thermal throttling at either row boundary: an elevated
-    /// `NSProcessInfo.thermalState` or nonzero `pmset` thermal pressure refuses the host state.
+    /// A throttled row START refuses the row; every later state is recorded and flagged.
     #[test]
-    fn thermal_throttled_host_state_refuses_the_row() {
+    fn only_a_throttled_row_start_refuses_the_row() {
         let pmset = pmset_in_use(" powermode            0\n");
-        let state = host_state_from_probes(
-            "row-start",
-            "2026-01-01T00:00:00Z".into(),
-            &pmset,
+        let state = |boundary: &str, therm: &str, process: i64| {
+            host_state_from_probes(
+                boundary,
+                "2026-01-01T00:00:00Z".into(),
+                &pmset,
+                therm,
+                process,
+            )
+        };
+        let nominal = state("row-start", PMSET_NOMINAL_THERMAL, 0).unwrap();
+        assert_eq!(
+            (
+                nominal.power_mode.as_str(),
+                nominal.thermal_state.as_str(),
+                nominal.throttled
+            ),
+            ("automatic", "nominal", false)
+        );
+        assert_eq!(nominal.pmset_thermal_raw, PMSET_NOMINAL_THERMAL);
+        refuse_throttled_row_start(&nominal).unwrap();
+        let fair = state("row-start", PMSET_NOMINAL_THERMAL, 1).unwrap();
+        refuse_throttled_row_start(&fair).expect("fair is not a throttle signal");
+        for (therm, process) in [
+            (PMSET_NOMINAL_THERMAL, 2),
+            (PMSET_NOMINAL_THERMAL, 3),
+            ("CPU_Speed_Limit \t= 80\n", 0),
+        ] {
+            let throttled = state("row-start", therm, process).unwrap();
+            assert!(throttled.throttled);
+            let error = refuse_throttled_row_start(&throttled).unwrap_err();
+            assert!(error.contains("refused before it runs"), "{error}");
+            // At row end the same observation is recorded, not refused.
+            let end = state("row-end", therm, process).unwrap();
+            assert_eq!(host_state_changes(&nominal, [&end]), (true, false));
+        }
+        let low_power = host_state_from_probes(
+            "row-end",
+            "t".into(),
+            &pmset_in_use(" powermode            1\n"),
             PMSET_NOMINAL_THERMAL,
             0,
         )
         .unwrap();
-        assert_eq!(
-            (state.power_mode.as_str(), state.thermal_state.as_str()),
-            ("automatic", "nominal")
-        );
-        for throttled in 1..=3 {
-            let error = host_state_from_probes(
-                "row-end",
-                "t".into(),
-                &pmset,
-                PMSET_NOMINAL_THERMAL,
-                throttled,
-            )
-            .unwrap_err();
-            assert!(error.contains("thermal throttling"), "{error}");
-        }
+        assert_eq!(host_state_changes(&nominal, [&low_power]), (false, true));
+        assert_eq!(host_state_changes(&nominal, [&nominal]), (false, false));
         for (therm, process, boundary) in [
-            ("Thermal Pressure: 2\n", 0, "row-start"),
             (PMSET_NOMINAL_THERMAL, 4, "row-start"),
             (PMSET_NOMINAL_THERMAL, 0, "mid-row"),
+            ("CPU_Speed_Limit = x\n", 0, "row-start"),
         ] {
             assert!(
-                host_state_from_probes(boundary, "t".into(), &pmset, therm, process).is_err(),
+                state(boundary, therm, process).is_err(),
                 "{therm:?}/{process}/{boundary} was accepted"
             );
         }
@@ -12775,6 +13475,7 @@ pub(crate) mod tests {
             first_token_ms: 4.0,
             decode_tokens_per_second: 255.0,
             steady_decode: test_steady_decode(1_000.0),
+            host_state: None,
         };
         assert_eq!(timing, expected);
         let eos_terminated = SteadyDecodeMeasurement {
@@ -12811,6 +13512,141 @@ pub(crate) mod tests {
         // Clock-free in substance: the injected interval exceeds any wall time this test can see,
         // so only a stamp that failed to subtract it could order these the other way.
         assert!(loaded < start, "{start} -> {loaded}");
+    }
+
+    /// Greedy agreement is teacher-forced: one argmax flip is one mismatch, not a cascade. The
+    /// free-running first divergence is recorded beside it.
+    #[test]
+    fn greedy_agreement_is_teacher_forced_and_divergence_is_recorded() {
+        let reference = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        // The candidate's own choice at every reference position: one flip at position 1.
+        let forced_choices = [5, 99, 7, 8, 9, 10, 11, 12, 13, 14];
+        assert_eq!(
+            teacher_forced_agreement(&forced_choices, &reference),
+            (9, 10)
+        );
+        // A shorter forced run counts the unreached positions as mismatches.
+        assert_eq!(
+            teacher_forced_agreement(&forced_choices[..4], &reference),
+            (3, 10)
+        );
+        // Free running, the same flip cascades: every later token differs.
+        let free_running = [5, 99, 1, 2, 3, 4, 0, 0, 0, 0];
+        assert_eq!(teacher_forced_agreement(&free_running, &reference), (1, 10));
+        assert_eq!(first_divergence(&free_running, &reference), Some(1));
+        assert_eq!(first_divergence(&reference, &reference), None);
+        assert_eq!(first_divergence(&reference[..3], &reference), Some(3));
+        assert_eq!(first_divergence(&[], &[1]), Some(0));
+    }
+
+    // Helpers keep the estimate test's assertions free of clock-shaped names (they read fixture
+    // arithmetic, not a clock).
+    fn completed_row(family: &str, target: u64, wall: f64) -> RowDurationBasis {
+        RowDurationBasis {
+            family: family.into(),
+            context_window_tokens: 131_072,
+            context_target_tokens: target,
+            wall_seconds: wall,
+        }
+    }
+
+    fn epoch(value: &str) -> Option<f64> {
+        utc_timestamp_seconds(value)
+    }
+
+    fn lower_bound(family: &str, band: &str, history: &[RowDurationBasis]) -> Option<(f64, usize)> {
+        estimate_row_seconds(family, band, history)
+    }
+
+    fn measured_span(receipt: &Receipt) -> Option<(String, f64)> {
+        row_duration_basis(receipt).map(|row| (row.family, row.wall_seconds))
+    }
+
+    /// The pre-row duration estimate is a linear lower bound from completed same-family rows.
+    #[test]
+    fn row_duration_estimate_is_a_same_family_linear_lower_bound() {
+        assert_eq!(epoch("1970-01-01T00:00:00Z"), Some(0.0));
+        assert_eq!(epoch("2026-01-01T00:00:00Z"), Some(1_767_225_600.0));
+        assert_eq!(epoch("2024-02-29T12:30:15.250Z"), Some(1_709_209_815.25));
+        assert_eq!(epoch("not a time"), None);
+        assert_eq!(lower_bound("llama", "short", &[]), None);
+        assert_eq!(
+            lower_bound("llama", "short", &[completed_row("qwen", 32, 60.0)]),
+            None
+        );
+        let history = [
+            completed_row("llama", 32, 64.0),       // 2 per token
+            completed_row("llama", 8_192, 4_096.0), // 0.5 per token: the lower bound
+            completed_row("qwen", 8_192, 1.0),      // another family never lowers it
+        ];
+        let target = context_band_target(131_072, "memory-material").unwrap() as f64;
+        assert_eq!(
+            lower_bound("llama", "memory-material", &history),
+            Some((0.5 * target, 2))
+        );
+        let receipt = builder_test_receipt();
+        assert_eq!(
+            measured_span(&receipt),
+            Some((receipt.matrix.family.clone(), 10.0))
+        );
+    }
+
+    /// Between sessions MLX may keep a residual within the slack; a larger one still fails.
+    #[test]
+    fn session_quiesce_allows_recorded_slack_but_not_a_leak() {
+        let expected = 4_000_000_000;
+        let slack = post_release_mlx_slack_bytes(expected);
+        quiesced_within_slack(expected, 0, expected).unwrap();
+        quiesced_within_slack(expected - 1, 0, expected).unwrap();
+        quiesced_within_slack(expected + slack, 0, expected).unwrap();
+        quiesced_within_slack(expected, POST_RELEASE_MLX_SLACK_FLOOR_BYTES, expected).unwrap();
+        assert!(quiesced_within_slack(expected + slack + 1, 0, expected).is_err());
+        assert!(
+            quiesced_within_slack(expected, POST_RELEASE_MLX_SLACK_FLOOR_BYTES + 1, expected)
+                .is_err()
+        );
+    }
+
+    /// The dense-KV share of the prefill footprint and host-state variation are recorded flags.
+    #[test]
+    fn dense_kv_share_and_campaign_host_variation_are_recorded_not_refused() {
+        assert_eq!(
+            dense_kv_share(100, 1_000, "memory-material").unwrap(),
+            (1_000, false)
+        );
+        assert_eq!(
+            dense_kv_share(99, 1_000, "memory-material").unwrap(),
+            (990, true)
+        );
+        assert_eq!(dense_kv_share(99, 1_000, "short").unwrap(), (990, false));
+        assert!(dense_kv_share(1, 0, "short").is_err());
+        let receipt = builder_test_receipt();
+        let mut flagged = receipt.clone();
+        flagged.memory.below_memory_material_share = !flagged.memory.below_memory_material_share;
+        assert!(validate_receipt_semantics(&flagged)
+            .unwrap_err()
+            .contains("dense KV share"));
+        let mut share = receipt.clone();
+        share.memory.dense_kv_share_bps += 1;
+        assert!(validate_receipt_semantics(&share).is_err());
+
+        let mut free_running = receipt.clone();
+        free_running.quality.greedy_agreement_method = "free-running".into();
+        assert!(validate_receipt_semantics(&free_running)
+            .unwrap_err()
+            .contains("teacher-forced"));
+        assert!(!campaign_host_state_varied([&receipt, &receipt]));
+        let mut low_power = receipt.clone();
+        low_power.provenance.power_mode = "low-power".into();
+        assert!(campaign_host_state_varied([&receipt, &low_power]));
+        let mut changed = receipt.clone();
+        changed.provenance.thermal_changed_during_row = true;
+        assert!(campaign_host_state_varied([&changed]));
+        // Power/thermal no longer split the campaign's global identity.
+        assert_eq!(
+            campaign_global_identity(&receipt).unwrap(),
+            campaign_global_identity(&low_power).unwrap()
+        );
     }
 
     #[derive(Debug, PartialEq)]

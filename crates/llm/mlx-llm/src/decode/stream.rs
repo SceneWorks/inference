@@ -533,6 +533,38 @@ pub fn generate_from_prefill(
     )
 }
 
+/// [`generate_from_prefill`] with a campaign observer attached to the decode loop (used for
+/// teacher-forced greedy agreement; product generation never attaches one here).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_from_prefill_observed(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    first_logits: Array,
+    history: Vec<i32>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    observer: &mut dyn crate::campaign::Observer,
+) -> Result<GenerationOutput> {
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
+    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
+    decode_loop(
+        decoder,
+        cache,
+        first_logits,
+        rng,
+        history,
+        config,
+        cancel,
+        on_event,
+        None,
+        None,
+        &mut Some(observer),
+    )
+}
+
 /// Synchronized variant of [`generate_from_prefill`] for a prefill whose conditioning began at
 /// `prefill_started`. Qwen-VL starts this clock before image/video encoding and fusion.
 #[allow(clippy::too_many_arguments)]
@@ -608,6 +640,20 @@ pub(crate) fn decode_loop(
             break;
         }
 
+        // Campaign teacher forcing (never set in product use): the forced stream decides what is
+        // fed back, and its end stops generation before another position is sampled.
+        let forced = match observer
+            .as_deref_mut()
+            .map(|o| o.teacher_forced_token(step))
+        {
+            Some(crate::campaign::TeacherForcing::Token(token)) => Some(token),
+            Some(crate::campaign::TeacherForcing::Exhausted) => {
+                finish = FinishReason::Stopped;
+                break;
+            }
+            Some(crate::campaign::TeacherForcing::Off) | None => None,
+        };
+
         // Apply the constraint mask (if any) for this step, then sample. The mask borrow is scoped
         // so the constraint is free to be advanced again below.
         let next = {
@@ -615,9 +661,11 @@ pub(crate) fn decode_loop(
             sample(&logits, &history, &config.sampling, &mut rng, mask)?
         };
 
+        // The model's own choice is what the observer records, forced or not.
         if let Some(observer) = observer.as_deref_mut() {
             observer.token_probability("decode", next, selected_token_probability(&logits, next)?);
         }
+        let next = forced.unwrap_or(next);
 
         if config.stop_tokens.contains(&next) {
             finish = FinishReason::StopToken;
@@ -901,6 +949,63 @@ mod tests {
             observer.phases,
             vec!["prefill-peak", "first-token", "decode-steady"]
         );
+    }
+
+    /// Teacher forcing feeds the forced stream, records the model's own greedy choice at every
+    /// position, and stops when the forced stream ends (before sampling another position).
+    #[test]
+    fn teacher_forced_generation_feeds_the_stream_and_records_own_choices() {
+        struct Forcing {
+            forced: Vec<i32>,
+            choices: Vec<i32>,
+        }
+        impl crate::campaign::Observer for Forcing {
+            fn phase(&mut self, _name: &'static str) {}
+            fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+            fn teacher_forced_token(&mut self, step: usize) -> crate::campaign::TeacherForcing {
+                self.forced
+                    .get(step)
+                    .map_or(crate::campaign::TeacherForcing::Exhausted, |token| {
+                        crate::campaign::TeacherForcing::Token(*token)
+                    })
+            }
+            fn token_probability(&mut self, _stage: &'static str, token: i32, _probability: f64) {
+                self.choices.push(token);
+            }
+        }
+        let run = |forced: Vec<i32>, stop_tokens: Vec<i32>| {
+            let mut observer = Forcing {
+                forced,
+                choices: Vec::new(),
+            };
+            let output = generate_with_observer(
+                &FixedDecoder,
+                &[7],
+                &GenerationConfig {
+                    max_new_tokens: 10,
+                    seed: Some(0),
+                    stop_tokens,
+                    ..Default::default()
+                },
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                Some(&mut observer),
+            )
+            .unwrap();
+            (output, observer.choices)
+        };
+        // FixedDecoder's greedy choice is always token 1.
+        let (output, choices) = run(vec![2, 0, 2], Vec::new());
+        assert_eq!(output.tokens, vec![2, 0, 2]);
+        assert_eq!(choices, vec![1, 1, 1]);
+        assert_eq!(output.finish_reason, FinishReason::Stopped);
+        // A forced stop token ends generation exactly as the reference stream did.
+        let (output, choices) = run(vec![2, 0, 2], vec![0]);
+        assert_eq!(output.tokens, vec![2]);
+        assert_eq!(choices, vec![1, 1]);
+        assert_eq!(output.finish_reason, FinishReason::StopToken);
     }
 
     /// Returns lazy logits (an unevaluated multiply) and keeps a handle to every array it returned,
