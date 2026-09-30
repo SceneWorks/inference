@@ -256,9 +256,15 @@ fn breakdown(name: &str, model: &CausalLm) {
 // Prefill throughput: before vs after the sc-7455 chunked-SDPA mitigation (story 7469).
 // ============================================================================================
 //
+// sc-24442 REMOVED that mitigation: sc-7430's "wrong numerics" were a stride-blind `as_slice`
+// readback of the fused full kernel's permuted output, not a kernel bug, so [`sdpa`] now issues the
+// same single fused call at head dims 64/80/128 and the `chunked` column below should read ≈ the
+// `fused` one (≈1.0×). The sweep stays as the regression harness for `sdpa`'s remaining tiling
+// (vector-kernel tiles at head dims 96/256, 2048-row blocks past one prefill block). History:
+//
 // sc-7455 made [`sdpa`] split a `q_len > 8` prefill (multi-head × pow2 head_dim) into `ceil(q_len/8)`
 // fused calls. This measured the throughput cost (correctness is gated in `attention.rs`) and drove
-// the sc-7469 fixes now in `sdpa_chunked_prefill`: the original per-chunk `eval` was ~95% of prefill
+// the sc-7469 fixes now in `sdpa_tiled`: the original per-chunk `eval` was ~95% of prefill
 // (a GPU sync per chunk × layer), and the causal K/V `take_axis` gathers eagerly copied the growing
 // prefix — both gone (lazy chunks + strided slice views), recovering ~8.5–9× at S=512.
 //
@@ -294,8 +300,8 @@ const PREFILL_WARMUP: usize = 2;
 const PREFILL_ITERS: usize = 4;
 
 /// One fused causal SDPA per layer over `q/k/v` (decode/prefill attention shape), evaluated — the
-/// **pre-sc-7455** path. Calls the raw kernel directly: for `q_len > 8 × multi-head × pow2 head_dim`
-/// this is the miscompiling kernel (sc-7430), timed only to recover the pre-mitigation throughput.
+/// **pre-sc-7455** path. Calls the raw kernel directly (numerically correct — sc-7430's "miscompile"
+/// was a readback artifact, see sc-24442).
 fn fused_sdpa_sweep(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize) {
     let mut outs = Vec::with_capacity(layers);
     for _ in 0..layers {
@@ -314,9 +320,8 @@ fn fused_sdpa_sweep(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize) 
     eval(outs.iter()).unwrap();
 }
 
-/// One [`sdpa`] (the shipping, chunked-on-the-broken-envelope wrapper) per layer — the **post-sc-7455**
-/// path. The chunked branch `eval`s each ≤8-row chunk internally, so this faithfully carries the
-/// per-chunk serialization the model pays; the trailing `eval` is then near-free.
+/// One [`sdpa`] (the shipping wrapper) per layer — since sc-24442 one fused call at these head dims;
+/// any tiling it still does is carried here exactly as the model pays it.
 fn chunked_sdpa_sweep(q: &Array, k: &Array, v: &Array, scale: f32, layers: usize) {
     let mut outs = Vec::with_capacity(layers);
     for _ in 0..layers {

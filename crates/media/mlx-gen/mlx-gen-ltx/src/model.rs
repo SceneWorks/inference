@@ -2929,7 +2929,10 @@ fn validate_request_for(
 pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
     let sh = frames.shape(); // (F, H, W, 3)
     let (f, h, w) = (sh[0] as usize, sh[1] as u32, sh[2] as u32);
-    let data = frames.as_slice::<u8>();
+    // `as_slice` reads the physical buffer: force logical row-major order rather than rely on
+    // `pipeline::to_uint8_frames` ending in a `contiguous` copy.
+    let owned = mlx_gen::array::contiguous(frames)?;
+    let data = owned.as_slice::<u8>();
     let per = (h as usize) * (w as usize) * 3;
     Ok((0..f)
         .map(|i| Image {
@@ -4508,5 +4511,19 @@ mod tests {
         assert_eq!((imgs[0].width, imgs[0].height), (2, 1));
         assert_eq!(imgs[0].pixels, vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(imgs[1].pixels, vec![6, 7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn frames_to_images_reads_a_strided_view_logically() {
+        // Physical (3, F=2, H=1, W=2) planes → logical (F, H, W, 3) through a transpose view; a raw
+        // `as_slice` would return the planes in physical order.
+        let planes: Vec<u8> = (0..12).collect();
+        let frames = Array::from_slice(&planes, &[3, 2, 1, 2])
+            .transpose_axes(&[1, 2, 3, 0])
+            .unwrap();
+        frames.eval().unwrap();
+        let imgs = frames_to_images(&frames).unwrap();
+        assert_eq!(imgs[0].pixels, vec![0, 4, 8, 1, 5, 9]);
+        assert_eq!(imgs[1].pixels, vec![2, 6, 10, 3, 7, 11]);
     }
 }
