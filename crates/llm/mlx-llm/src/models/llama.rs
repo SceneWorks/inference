@@ -1987,6 +1987,92 @@ impl LayerPlan {
 mod tests {
     use super::*;
 
+    /// sc-24442 AC2: every `CausalLm` fixture emits the same greedy tokens under the new `sdpa`
+    /// routing as under the pre-sc-24442 one (8-row tiles for multi-head power-of-2 head dims, one
+    /// call otherwise), compared in-process — Llama and Qwen3 (q/k-norm) wiring × every head dim
+    /// class (vector-only 96/256, full-kernel 64/80/128, unserved 8/32/72/512) × MHA / GQA 4 / GQA 8
+    /// × prompts inside one vector tile, across tiles, and across many tiles.
+    #[test]
+    fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
+        use crate::primitives::attention::route_override::{
+            assert_greedy_matches_pre_sc24442, GreedyComparison,
+        };
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        const HIDDEN: i32 = 32;
+        const VOCAB: i32 = 48;
+        const INTER: i32 = 64;
+        let mut seen = GreedyComparison::default();
+        for (family, qk_norm) in [("llama", false), ("qwen3", true)] {
+            for hd in [8, 32, 64, 72, 80, 96, 128, 256, 512] {
+                for (nh, nkv) in [(4, 4), (4, 1), (8, 1)] {
+                    let mut rng = SplitMix64::new(0x2444_2000 + (hd * 16 + nh + nkv) as u64);
+                    let mut randn = |shape: &[i32]| {
+                        let n: i32 = shape.iter().product();
+                        let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+                        Array::from_slice(&data, shape)
+                    };
+                    let ones = |d: i32| Array::ones::<f32>(&[d]).unwrap();
+                    let mut m = HashMap::new();
+                    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN]));
+                    m.insert("model.norm.weight".into(), ones(HIDDEN));
+                    m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN]));
+                    for i in 0..2 {
+                        let p = |s: &str| format!("model.layers.{i}.{s}");
+                        m.insert(p("input_layernorm.weight"), ones(HIDDEN));
+                        m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
+                        m.insert(p("self_attn.q_proj.weight"), randn(&[nh * hd, HIDDEN]));
+                        m.insert(p("self_attn.k_proj.weight"), randn(&[nkv * hd, HIDDEN]));
+                        m.insert(p("self_attn.v_proj.weight"), randn(&[nkv * hd, HIDDEN]));
+                        m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, nh * hd]));
+                        if qk_norm {
+                            m.insert(p("self_attn.q_norm.weight"), randn(&[hd]));
+                            m.insert(p("self_attn.k_norm.weight"), randn(&[hd]));
+                        }
+                        m.insert(p("mlp.gate_proj.weight"), randn(&[INTER, HIDDEN]));
+                        m.insert(p("mlp.up_proj.weight"), randn(&[INTER, HIDDEN]));
+                        m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, INTER]));
+                    }
+                    let arch = if qk_norm {
+                        "Qwen3ForCausalLM"
+                    } else {
+                        "LlamaForCausalLM"
+                    };
+                    let cfg = ModelConfig::from_json(&json!({
+                        "architectures": [arch], "model_type": family,
+                        "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": 2,
+                        "num_attention_heads": nh, "num_key_value_heads": nkv, "head_dim": hd,
+                        "vocab_size": VOCAB, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                        "tie_word_embeddings": false
+                    }))
+                    .unwrap();
+                    let model = CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap();
+                    for prompt_len in [5, 20, 70] {
+                        let prompt: Vec<i32> =
+                            (0..prompt_len).map(|i| (i * 7 + 3) % VOCAB).collect();
+                        seen += assert_greedy_matches_pre_sc24442(
+                            &format!("{family} hd {hd} {nh}/{nkv} prompt {prompt_len}"),
+                            &prompt,
+                            6,
+                            || model.new_cache(),
+                            |ids, cache, offset| model.decode_logits(ids, cache, offset).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.differing_calls > 0,
+            "no fixture exercised a routing change"
+        );
+        assert!(
+            seen.compared_steps > seen.tie_steps,
+            "most greedy steps must be decisive enough to compare: {seen:?}"
+        );
+    }
+
     #[test]
     fn join_handles_empty_prefix() {
         assert_eq!(join("", "model.norm.weight"), "model.norm.weight");
