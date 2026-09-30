@@ -118,6 +118,137 @@ pub const QUALITY_CONTRACT_HASH: &str =
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
 pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
+/// Frozen compressed perplexity-delta maximum (contract v3 `thresholds.perplexityDelta`).
+pub const COMPRESSED_PERPLEXITY_DELTA_MAX: f64 = 0.01;
+
+/// Direction of a frozen quality threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityGateComparison {
+    /// The measured value must be at least the threshold.
+    Minimum,
+    /// The measured value must be at most the threshold.
+    Maximum,
+}
+
+impl QualityGateComparison {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimum => "minimum",
+            Self::Maximum => "maximum",
+        }
+    }
+
+    fn misses(self, value: f64, threshold: f64) -> bool {
+        match self {
+            Self::Minimum => value < threshold,
+            Self::Maximum => value > threshold,
+        }
+    }
+}
+
+/// One gated quality metric: its fixture, frozen threshold, and direction.
+pub struct QualityGateMetric {
+    pub metric: &'static str,
+    pub fixture: &'static str,
+    pub threshold: f64,
+    pub comparison: QualityGateComparison,
+    read: fn(&QualityMetrics) -> f64,
+}
+
+/// The measured-quality gate of a compressed row: each contract v3 threshold, evaluated for every
+/// measured repeat against the same-weights dense-KV run. A miss is recorded evidence for the
+/// SC-20678 Go/No-Go decision, never a refused row. Kernel parity (`parityMaxError`) is
+/// deliberately absent: it compares the fused reader with its independent host-fp32
+/// dequantize-then-attend reference over the exact stored codes, a kernel-correctness check that
+/// still refuses the row.
+pub const QUALITY_GATE_METRICS: [QualityGateMetric; 5] = [
+    QualityGateMetric {
+        metric: "greedyTokenAgreement",
+        fixture: "kernel-fp32-reference",
+        threshold: COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.greedy_token_agreement,
+    },
+    QualityGateMetric {
+        metric: "perplexityDelta",
+        fixture: "kernel-fp32-reference",
+        threshold: COMPRESSED_PERPLEXITY_DELTA_MAX,
+        comparison: QualityGateComparison::Maximum,
+        read: |metrics| metrics.perplexity_delta,
+    },
+    QualityGateMetric {
+        metric: "structuredToolAgreement",
+        fixture: "structured-tool-call",
+        threshold: 1.0,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.structured_tool_agreement,
+    },
+    QualityGateMetric {
+        metric: "needleRetrieval",
+        fixture: "long-context-needle",
+        threshold: 1.0,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.needle_retrieval,
+    },
+    QualityGateMetric {
+        metric: "multiTurnPromptCache",
+        fixture: "multi-turn-prompt-cache",
+        threshold: 1.0,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.multi_turn_prompt_cache,
+    },
+];
+
+/// Evaluate the compressed quality gate over every measured repeat's metrics, in repeat order.
+pub fn quality_gate_from_repeats(repeats: &[QualityMetrics]) -> ReceiptQualityGate {
+    let failures = repeats
+        .iter()
+        .enumerate()
+        .flat_map(|(repeat, metrics)| {
+            QUALITY_GATE_METRICS.iter().filter_map(move |spec| {
+                let value = (spec.read)(metrics);
+                spec.comparison
+                    .misses(value, spec.threshold)
+                    .then(|| ReceiptQualityGateFailure {
+                        metric: spec.metric.into(),
+                        fixture: spec.fixture.into(),
+                        repeat: repeat as u64,
+                        value,
+                        threshold: spec.threshold,
+                        comparison: spec.comparison.as_str().into(),
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
+    ReceiptQualityGate {
+        passed: failures.is_empty(),
+        failures,
+    }
+}
+
+/// Human-readable outcome of a quality gate, for diagnostics and the human receipt.
+pub fn quality_gate_summary(gate: &ReceiptQualityGate) -> String {
+    if gate.passed {
+        return "passed".into();
+    }
+    let failures = gate
+        .failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "{} repeat {} = {} ({} {}, fixture {})",
+                failure.metric,
+                failure.repeat,
+                failure.value,
+                failure.comparison,
+                failure.threshold,
+                failure.fixture
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("FAILED: {failures}")
+}
 /// Greedy agreement under quality contract v3 is teacher-forced (decided before any compressed
 /// result existed): the candidate's greedy choice at each position of the reference stream.
 pub const GREEDY_AGREEMENT_METHOD: &str = "teacher-forced";
@@ -481,6 +612,13 @@ pub fn context_band_target(context_window: u64, context_band: &str) -> Result<u6
     }
 }
 
+/// Live tokens of a compressed row's forced continuation: the kernel prompt plus its continuation,
+/// which a fit-boundary row shortens to the native window.
+fn forced_continuation_live_tokens(kernel_prompt_tokens: u64, native_context_tokens: u64) -> u64 {
+    kernel_prompt_tokens
+        + FORCED_CONTINUATION_TOKENS.min(native_context_tokens.saturating_sub(kernel_prompt_tokens))
+}
+
 /// Compute a conservative total-live-token bound using only the pinned tokenizer and source
 /// fixture construction. Product chat rendering is separately capped by the native window; the
 /// prefix/batch paths bypass that renderer, so their exact raw prompt lengths are checked here.
@@ -491,6 +629,7 @@ fn preflight_total_live_tokens(
     spec: &BenchmarkModelSpec,
     coordinate: &Coordinate,
     prompt: &str,
+    compressed: bool,
 ) -> Result<(u64, u64), String> {
     let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json"))
         .map_err(|e| format!("load pinned tokenizer for safety preflight: {e}"))?;
@@ -601,7 +740,17 @@ fn preflight_total_live_tokens(
     } else {
         max_request
     };
-    Ok((total.max(steady_decode), max_request))
+    // A compressed row's forced continuation holds the kernel context plus its continuation (at
+    // most the native window) in its own request-scoped cache.
+    let forced_continuation = if compressed {
+        forced_continuation_live_tokens(prompt_tokens[0], spec.native_context_tokens)
+    } else {
+        0
+    };
+    Ok((
+        total.max(steady_decode).max(forced_continuation),
+        max_request,
+    ))
 }
 
 /// The dtype every campaign role's dense K/V is cached in: the causal loader's compute dtype. The
@@ -843,13 +992,24 @@ fn static_row_requirements(
     reference_snapshot: &Path,
     prompt: &str,
     policy: &CampaignSafetyPolicy,
+    compressed: bool,
 ) -> Result<(u64, u64, u64), String> {
     let candidate = benchmark_model(coordinate.family, false)?;
     let reference = benchmark_model(coordinate.family, true)?;
-    let candidate_tokens =
-        preflight_total_live_tokens(candidate_snapshot, candidate, coordinate, prompt)?;
-    let reference_tokens =
-        preflight_total_live_tokens(reference_snapshot, reference, coordinate, prompt)?;
+    let candidate_tokens = preflight_total_live_tokens(
+        candidate_snapshot,
+        candidate,
+        coordinate,
+        prompt,
+        compressed,
+    )?;
+    let reference_tokens = preflight_total_live_tokens(
+        reference_snapshot,
+        reference,
+        coordinate,
+        prompt,
+        compressed,
+    )?;
     let total = candidate_tokens.0.max(reference_tokens.0);
     let max_request = candidate_tokens.1.max(reference_tokens.1);
     if max_request > policy.max_request_tokens {
@@ -1652,6 +1812,162 @@ pub struct ReceiptQuality {
     pub statistics: ReceiptQualityStatistics,
     #[serde(rename = "fixtureEvidence")]
     pub fixture_evidence: std::collections::BTreeMap<String, ReceiptFixture>,
+    /// Compressed rows only: the frozen-threshold outcome of every measured repeat. A failed gate
+    /// is a measured result for the Go/No-Go decision, never a relabelled pass or a refused row.
+    /// Dense rows are characterization and carry none.
+    #[serde(
+        rename = "qualityGate",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub quality_gate: Option<ReceiptQualityGate>,
+    /// Compressed rows only: the forced-continuation measurement behind `greedyTokenAgreement`.
+    #[serde(
+        rename = "forcedContinuation",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub forced_continuation: Option<ReceiptForcedContinuation>,
+}
+/// One frozen-threshold miss of one measured repeat.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptQualityGateFailure {
+    pub metric: String,
+    pub fixture: String,
+    pub repeat: u64,
+    pub value: f64,
+    pub threshold: f64,
+    pub comparison: String,
+}
+/// The measured quality-gate outcome of a compressed receipt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptQualityGate {
+    pub passed: bool,
+    pub failures: Vec<ReceiptQualityGateFailure>,
+}
+
+/// Length of a compressed row's forced continuation. Teacher-forced agreement over the short
+/// natural fixture streams (~7-21 tokens) turned the frozen 0.999 minimum into "zero flips"; over
+/// this many positions it resolves one flip.
+pub const FORCED_CONTINUATION_TOKENS: u64 = 1024;
+/// Only a fit-boundary row may shorten its continuation (to the context window left after the
+/// kernel prompt), never below the steady-decode reserve.
+pub const FORCED_CONTINUATION_MIN_TOKENS: u64 = STEADY_DECODE_TOKENS;
+/// How many flip positions a receipt records (the first ones, in order).
+pub const FORCED_CONTINUATION_RECORDED_FLIPS: usize = 32;
+pub const FORCED_CONTINUATION_METHOD: &str =
+    "dense-kv-same-weights-greedy-continuation-eos-ignored-teacher-forced";
+
+/// A compressed row's greedy agreement (quality contract v3 `greedyTokenAgreement`): the
+/// same-weights dense-KV session greedily continues the kernel fixture prompt through every stop
+/// token for `tokens` positions, and the compressed session, teacher-forced on that stream in one
+/// pass, is compared by argmax at every position. The stream is deterministic, so it is measured
+/// once per row and shared by every repeat.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptForcedContinuation {
+    pub method: String,
+    pub tokens: u64,
+    pub matches: u64,
+    pub agreement: f64,
+    pub flip_count: u64,
+    /// The first [`FORCED_CONTINUATION_RECORDED_FLIPS`] disagreeing positions, ascending.
+    pub first_flip_positions: Vec<u64>,
+    pub reference_stream_sha256: String,
+    pub candidate_choices_sha256: String,
+}
+
+fn token_stream_sha256(tokens: &[i32]) -> String {
+    seal_bytes(&serde_json::to_vec(tokens).unwrap_or_default())
+}
+
+/// Per-position argmax agreement of a teacher-forced pass with the stream it was forced on.
+pub fn forced_continuation_evidence(
+    reference: &[i32],
+    choices: &[i32],
+) -> Result<ReceiptForcedContinuation, String> {
+    if reference.is_empty() || reference.len() != choices.len() {
+        return Err(format!(
+            "forced continuation has {} reference positions but {} teacher-forced choices",
+            reference.len(),
+            choices.len()
+        ));
+    }
+    let flips = reference
+        .iter()
+        .zip(choices)
+        .enumerate()
+        .filter(|(_, (reference, choice))| reference != choice)
+        .map(|(position, _)| position as u64)
+        .collect::<Vec<_>>();
+    let tokens = reference.len() as u64;
+    let matches = tokens - flips.len() as u64;
+    Ok(ReceiptForcedContinuation {
+        method: FORCED_CONTINUATION_METHOD.into(),
+        tokens,
+        matches,
+        agreement: matches as f64 / tokens as f64,
+        flip_count: flips.len() as u64,
+        first_flip_positions: flips
+            .into_iter()
+            .take(FORCED_CONTINUATION_RECORDED_FLIPS)
+            .collect(),
+        reference_stream_sha256: token_stream_sha256(reference),
+        candidate_choices_sha256: token_stream_sha256(choices),
+    })
+}
+
+/// Internal consistency of a recorded forced continuation for a row of `context_band`.
+fn validate_forced_continuation(
+    continuation: &ReceiptForcedContinuation,
+    context_band: &str,
+) -> Result<(), String> {
+    let digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let length_valid = continuation.tokens == FORCED_CONTINUATION_TOKENS
+        || (context_band == "fit-boundary"
+            && (FORCED_CONTINUATION_MIN_TOKENS..FORCED_CONTINUATION_TOKENS)
+                .contains(&continuation.tokens));
+    let recorded = usize::try_from(continuation.flip_count)
+        .unwrap_or(usize::MAX)
+        .min(FORCED_CONTINUATION_RECORDED_FLIPS);
+    if continuation.method != FORCED_CONTINUATION_METHOD
+        || !length_valid
+        || continuation.matches > continuation.tokens
+        || continuation.flip_count != continuation.tokens - continuation.matches
+        || continuation.agreement.to_bits()
+            != (continuation.matches as f64 / continuation.tokens as f64).to_bits()
+        || continuation.first_flip_positions.len() != recorded
+        || continuation
+            .first_flip_positions
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || continuation
+            .first_flip_positions
+            .last()
+            .is_some_and(|last| *last >= continuation.tokens)
+        || !digest(&continuation.reference_stream_sha256)
+        || !digest(&continuation.candidate_choices_sha256)
+    {
+        return Err(format!(
+            "forced continuation evidence is inconsistent: method={}, tokens={} (band {context_band}), matches={}, agreement={}, flipCount={}, recordedFlips={}",
+            continuation.method,
+            continuation.tokens,
+            continuation.matches,
+            continuation.agreement,
+            continuation.flip_count,
+            continuation.first_flip_positions.len()
+        ));
+    }
+    Ok(())
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2083,6 +2399,24 @@ impl ReceiptBuilder {
         self.template.quality.needle_discriminating = self.quality.needle_discriminating;
         self.template.quality.tool_discriminating = self.quality.tool_discriminating;
         self.template.quality.multi_turn_prompt_cache = metrics.multi_turn_prompt_cache;
+        // A compressed row's quality is gated per measured repeat; the outcome, pass or fail, is
+        // recorded with the row (dense rows are characterization and carry no gate).
+        (
+            self.template.quality.quality_gate,
+            self.template.quality.forced_continuation,
+        ) = if self.template.mode == "compressed" {
+            if self.quality.repeat_metrics.len() != 5 {
+                return Err(
+                    "a compressed quality gate evaluates exactly the five measured repeats".into(),
+                );
+            }
+            (
+                Some(quality_gate_from_repeats(&self.quality.repeat_metrics)),
+                self.quality.forced_continuation.clone(),
+            )
+        } else {
+            (None, None)
+        };
         if self.template.memory.persistent_kv_bytes == 0
             || self.template.memory.model_weights_bytes == 0
         {
@@ -2359,6 +2693,126 @@ fn validate_host_states(receipt: &Receipt) -> Result<(), String> {
         || !utc_timestamp_before(&last.timestamp, &end.captured_at)
     {
         return invalid("does not bracket the row's measured phases");
+    }
+    Ok(())
+}
+
+/// A compressed receipt's measured quality gate must be exactly the frozen-threshold evaluation
+/// of the values the receipt records: every miss named with its value, threshold, repeat, and
+/// fixture, and `passed` only when nothing missed. Dense receipts are characterization and carry
+/// neither a gate nor a forced continuation. Values of repeats 1-4 other than greedy agreement
+/// live in the sealed fixture artifacts and are bound by the artifact-bundle validator.
+fn validate_quality_gate(receipt: &Receipt) -> Result<(), String> {
+    let quality = &receipt.quality;
+    if receipt.mode != "compressed" {
+        if quality.quality_gate.is_some() || quality.forced_continuation.is_some() {
+            return Err(
+                "a quality gate and forced continuation are recorded only on compressed receipts"
+                    .into(),
+            );
+        }
+        return Ok(());
+    }
+    let continuation = quality
+        .forced_continuation
+        .as_ref()
+        .ok_or("compressed receipt has no forced-continuation greedy agreement")?;
+    validate_forced_continuation(continuation, &receipt.matrix.context_band)?;
+    if quality
+        .greedy_token_agreement_by_repeat
+        .iter()
+        .chain(std::iter::once(&quality.greedy_token_agreement))
+        .any(|value| value.to_bits() != continuation.agreement.to_bits())
+    {
+        return Err(format!(
+            "greedyTokenAgreement {} (by repeat {:?}) is not the row's forced-continuation agreement {}",
+            quality.greedy_token_agreement,
+            quality.greedy_token_agreement_by_repeat,
+            continuation.agreement
+        ));
+    }
+    let gate = quality
+        .quality_gate
+        .as_ref()
+        .ok_or("compressed receipt has no measured quality-gate record")?;
+    let mut previous: Option<(u64, usize)> = None;
+    for failure in &gate.failures {
+        let index = QUALITY_GATE_METRICS
+            .iter()
+            .position(|spec| spec.metric == failure.metric)
+            .ok_or_else(|| format!("quality gate names unknown metric {}", failure.metric))?;
+        let spec = &QUALITY_GATE_METRICS[index];
+        if failure.fixture != spec.fixture
+            || failure.threshold.to_bits() != spec.threshold.to_bits()
+            || failure.comparison != spec.comparison.as_str()
+            || failure.repeat >= 5
+            || !failure.value.is_finite()
+            || !spec.comparison.misses(failure.value, spec.threshold)
+            || previous.is_some_and(|previous| previous >= (failure.repeat, index))
+        {
+            return Err(format!(
+                "quality gate failure is not an ordered frozen-threshold miss: metric={} value={} threshold={} comparison={} repeat={} fixture={}",
+                failure.metric,
+                failure.value,
+                failure.threshold,
+                failure.comparison,
+                failure.repeat,
+                failure.fixture
+            ));
+        }
+        previous = Some((failure.repeat, index));
+    }
+    if gate.passed != gate.failures.is_empty() {
+        return Err(format!(
+            "quality gate claims passed={} with {} recorded failure(s): {}",
+            gate.passed,
+            gate.failures.len(),
+            quality_gate_summary(&ReceiptQualityGate {
+                passed: false,
+                failures: gate.failures.clone(),
+            })
+        ));
+    }
+    // Every value the receipt itself records must appear in the gate exactly when it misses.
+    let recorded = |metric: &str, repeat: u64| {
+        gate.failures
+            .iter()
+            .find(|failure| failure.metric == metric && failure.repeat == repeat)
+            .map(|failure| failure.value.to_bits())
+    };
+    let visible = quality
+        .greedy_token_agreement_by_repeat
+        .iter()
+        .enumerate()
+        .map(|(repeat, value)| ("greedyTokenAgreement", repeat as u64, *value))
+        .chain([
+            ("perplexityDelta", 0, quality.perplexity_delta),
+            (
+                "structuredToolAgreement",
+                0,
+                quality.structured_tool_agreement,
+            ),
+            ("needleRetrieval", 0, quality.needle_retrieval),
+            ("multiTurnPromptCache", 0, quality.multi_turn_prompt_cache),
+        ]);
+    for (metric, repeat, value) in visible {
+        let spec = QUALITY_GATE_METRICS
+            .iter()
+            .find(|spec| spec.metric == metric)
+            .ok_or("quality gate metric table is incomplete")?;
+        let expected = spec
+            .comparison
+            .misses(value, spec.threshold)
+            .then_some(value.to_bits());
+        if recorded(metric, repeat) != expected {
+            return Err(format!(
+                "quality gate does not record {metric} repeat {repeat} = {value} against the frozen {} {} (fixture {}): passed={}",
+                spec.comparison.as_str(),
+                spec.threshold,
+                spec.fixture,
+                gate.passed
+            ));
+        }
     }
     Ok(())
 }
@@ -2995,50 +3449,59 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("quality evidence contains invalid numeric values".into());
     }
+    // Kernel parity compares the fused reader with its independent host-fp32
+    // dequantize-then-attend reference over the exact stored codes: a correctness check of the
+    // kernel, not a quality-versus-dense metric, so a miss still refuses the row.
     if receipt.mode == "compressed"
-        && (receipt.quality.parity_max_error > COMPRESSED_PARITY_MAX_ERROR
-            || receipt.quality.perplexity_delta > 0.01)
+        && receipt.quality.parity_max_error > COMPRESSED_PARITY_MAX_ERROR
     {
         return Err(format!(
-            "quality thresholds failed: parityMaxError={}, perplexityDelta={}, greedyTokenAgreement={}, structuredToolAgreement={}, needleRetrieval={}, multiTurnPromptCache={}",
+            "kernel parity failed: metric=parityMaxError value={} threshold={COMPRESSED_PARITY_MAX_ERROR} comparison=maximum fixture=kernel-fp32-reference repeat=all (one fused-reader probe against the host-fp32 dequantize-then-attend reference)",
             receipt.quality.parity_max_error,
-            receipt.quality.perplexity_delta,
-            receipt.quality.greedy_token_agreement,
-            receipt.quality.structured_tool_agreement,
-            receipt.quality.needle_retrieval,
-            receipt.quality.multi_turn_prompt_cache,
         ));
     }
     if receipt.quality.fixture_evidence.len() != 4
         || receipt.quality.statistics.repeats != 5
         || receipt.quality.statistics.warmups != 2
     {
-        return Err("quality contract evidence incomplete".into());
+        return Err(format!(
+            "quality contract evidence incomplete: fixtures={}, repeats={}, warmups={}",
+            receipt.quality.fixture_evidence.len(),
+            receipt.quality.statistics.repeats,
+            receipt.quality.statistics.warmups
+        ));
     }
-    if (receipt.mode == "compressed"
-        && (receipt.quality.greedy_token_agreement < COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN
-            || receipt.quality.structured_tool_agreement < 1.0
-            || receipt.quality.needle_retrieval < 1.0
-            || receipt.quality.multi_turn_prompt_cache < 1.0))
-        || REQUIRED_FIXTURES.iter().any(|name| {
-            receipt.quality.fixture_evidence.get(*name).is_none_or(|f| {
-                !f.passed
-                    || f.artifact_name != format!("fixtures/{name}.json")
-                    || f.artifact_sha256.len() != 64
-                    || !f
-                        .artifact_sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    || f.independent_reference.is_empty()
-                    || f.artifact_sidecar_sha256.len() != 64
-                    || !f
-                        .artifact_sidecar_sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-        })
-    {
-        return Err("quality threshold or fixture evidence failed".into());
+    let lowercase_digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    for name in REQUIRED_FIXTURES {
+        let fixture = receipt
+            .quality
+            .fixture_evidence
+            .get(name)
+            .ok_or_else(|| format!("fixture evidence failed: fixture={name} is missing"))?;
+        let problem = if !fixture.passed {
+            Some("passed=false".to_string())
+        } else if fixture.artifact_name != format!("fixtures/{name}.json") {
+            Some(format!("artifactName={}", fixture.artifact_name))
+        } else if !lowercase_digest(&fixture.artifact_sha256) {
+            Some(format!("artifactSha256={}", fixture.artifact_sha256))
+        } else if fixture.independent_reference.is_empty() {
+            Some("independentReference is empty".into())
+        } else if !lowercase_digest(&fixture.artifact_sidecar_sha256) {
+            Some(format!(
+                "artifactSidecarSha256={}",
+                fixture.artifact_sidecar_sha256
+            ))
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(format!("fixture evidence failed: fixture={name} {problem}"));
+        }
     }
     // Contract v3: a compressed receipt's quality denominator is the dense-KV run on the same
     // weights, never the bf16 model; dense fixtures are bf16 characterization and must not claim
@@ -3153,7 +3616,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             )
         }
     }
-    Ok(())
+    // Last: every integrity, identity, safety, and fixture check above refuses first; the gate
+    // record is then checked against the measured values.
+    validate_quality_gate(receipt)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3219,8 +3684,15 @@ fn assemble_artifacts_with_fixtures_named(
         .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    // Compressed rows state their measured quality-gate outcome; dense bytes are unchanged.
+    let quality_gate = receipt
+        .quality
+        .quality_gate
+        .as_ref()
+        .map(|gate| format!("- Quality gate: {}\n", quality_gate_summary(gate)))
+        .unwrap_or_default();
     let human = format!(
-        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Compile attribution: {} / {} / {}\n- Compile probes: {} ms\n- First dispatch excess: {} ms\n- Compile cost: {}\n- Steady dispatch: {} ms\n- Receipt hash: {}\n",
+        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Compile attribution: {} / {} / {}\n- Compile probes: {} ms\n- First dispatch excess: {} ms\n- Compile cost: {}\n- Steady dispatch: {} ms\n{quality_gate}- Receipt hash: {}\n",
         if receipt.mode == "dense" {
             "Dense"
         } else {
@@ -3426,6 +3898,10 @@ pub fn validate_artifact_bundle_named(
             repeat_artifacts.push((fixture, artifact.bytes.as_slice()));
         }
     }
+    if typed.mode == "compressed" {
+        let repeats = sealed_repeat_quality_metrics(&typed, &repeat_artifacts)?;
+        validate_sealed_quality_gate(&typed, &repeats)?;
+    }
     validate_repeat_discrimination(&typed, repeat_artifacts)?;
     let mut core = value.clone();
     core.as_object_mut()
@@ -3438,6 +3914,183 @@ pub fn validate_artifact_bundle_named(
     let human = std::str::from_utf8(&bundle.human).map_err(|_| "human receipt is not UTF-8")?;
     if !human.contains(&format!("- Receipt hash: {expected}\n")) {
         return Err("human receipt is not bound to the sealed JSON receipt".into());
+    }
+    Ok(())
+}
+
+/// Re-derive each measured repeat's quality metrics from the raw evidence of its sealed fixture
+/// artifacts (`artifacts` is repeat-major, [`REQUIRED_FIXTURES`] order within a repeat). A
+/// compressed repeat's kernel evidence carries the row's forced continuation, which must be the
+/// receipt's.
+fn sealed_repeat_quality_metrics(
+    receipt: &Receipt,
+    artifacts: &[(&str, &[u8])],
+) -> Result<Vec<QualityMetrics>, String> {
+    if artifacts.len() != 5 * REQUIRED_FIXTURES.len() {
+        return Err("sealed quality evidence requires every fixture of every repeat".into());
+    }
+    artifacts
+        .chunks(REQUIRED_FIXTURES.len())
+        .enumerate()
+        .map(|(repeat, fixtures)| {
+            let mut metrics = QualityMetrics {
+                parity_max_error: 0.0,
+                perplexity_delta: 0.0,
+                greedy_token_agreement: 0.0,
+                structured_tool_agreement: 0.0,
+                needle_retrieval: 0.0,
+                multi_turn_prompt_cache: 0.0,
+            };
+            for ((name, bytes), expected) in fixtures.iter().zip(REQUIRED_FIXTURES) {
+                if *name != expected {
+                    return Err(format!("repeat {repeat} fixture order differs at {name}"));
+                }
+                let value: serde_json::Value = serde_json::from_slice(bytes)
+                    .map_err(|e| format!("fixture {name} repeat {repeat} JSON: {e}"))?;
+                let evidence = value
+                    .get("evidence")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| format!("fixture {name} repeat {repeat} lacks evidence"))?;
+                let number = |key: &str| {
+                    evidence
+                        .get(key)
+                        .and_then(serde_json::Value::as_f64)
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| {
+                            format!("fixture {name} repeat {repeat} lacks finite evidence {key}")
+                        })
+                };
+                let ratio = |matches: &str, total: &str| -> Result<f64, String> {
+                    let (matches, total) = (number(matches)?, number(total)?);
+                    if total < 1.0 || matches < 0.0 || matches > total {
+                        return Err(format!(
+                            "fixture {name} repeat {repeat} evidence has {matches} of {total} matches"
+                        ));
+                    }
+                    Ok(matches / total)
+                };
+                match *name {
+                    "kernel-fp32-reference" => {
+                        let forced = evidence
+                            .get("forcedContinuation")
+                            .map(|value| {
+                                serde_json::from_value::<ReceiptForcedContinuation>(value.clone())
+                            })
+                            .transpose()
+                            .map_err(|e| format!("repeat {repeat} forced continuation: {e}"))?;
+                        if forced.as_ref() != receipt.quality.forced_continuation.as_ref() {
+                            return Err(format!(
+                                "repeat {repeat} kernel fixture forced continuation is not the receipt's"
+                            ));
+                        }
+                        if forced.as_ref().is_some_and(|forced| {
+                            number("greedyMatches").ok() != Some(forced.matches as f64)
+                                || number("greedyTotal").ok() != Some(forced.tokens as f64)
+                        }) {
+                            return Err(format!(
+                                "repeat {repeat} kernel greedy counts are not its forced continuation's"
+                            ));
+                        }
+                        metrics.greedy_token_agreement = ratio("greedyMatches", "greedyTotal")?;
+                        metrics.perplexity_delta =
+                            number("candidatePerplexity")? - number("referencePerplexity")?;
+                        metrics.parity_max_error = evidence
+                            .get("parityErrors")
+                            .and_then(serde_json::Value::as_array)
+                            .filter(|errors| !errors.is_empty())
+                            .ok_or_else(|| format!("repeat {repeat} kernel fixture lacks parity errors"))?
+                            .iter()
+                            .map(|error| {
+                                error.as_f64().filter(|e| e.is_finite() && *e >= 0.0).ok_or_else(|| {
+                                    format!("repeat {repeat} kernel parity error is not finite")
+                                })
+                            })
+                            .try_fold(0.0_f64, |maximum, error| Ok::<_, String>(maximum.max(error?)))?;
+                    }
+                    "structured-tool-call" => {
+                        metrics.structured_tool_agreement = ratio("matches", "total")?
+                    }
+                    "long-context-needle" => metrics.needle_retrieval = ratio("matches", "total")?,
+                    _ => metrics.multi_turn_prompt_cache = ratio("matches", "total")?,
+                }
+            }
+            Ok(metrics)
+        })
+        .collect()
+}
+
+/// A compressed receipt's recorded quality must be its sealed repeats': per-repeat greedy
+/// agreement, the primary repeat's receipt-level values, and a quality gate exactly equal to the
+/// frozen-threshold evaluation of every repeat (so a failing value can never be recorded as a pass).
+/// Kernel parity is refused here as in [`validate_receipt_semantics`].
+fn validate_sealed_quality_gate(
+    receipt: &Receipt,
+    repeats: &[QualityMetrics],
+) -> Result<(), String> {
+    let quality = &receipt.quality;
+    for (repeat, metrics) in repeats.iter().enumerate() {
+        if metrics.parity_max_error > COMPRESSED_PARITY_MAX_ERROR {
+            return Err(format!(
+                "kernel parity failed: metric=parityMaxError value={} threshold={COMPRESSED_PARITY_MAX_ERROR} comparison=maximum fixture=kernel-fp32-reference repeat={repeat}",
+                metrics.parity_max_error
+            ));
+        }
+        if quality
+            .greedy_token_agreement_by_repeat
+            .get(repeat)
+            .map(|value| value.to_bits())
+            != Some(metrics.greedy_token_agreement.to_bits())
+        {
+            return Err(format!(
+                "greedyTokenAgreement repeat {repeat} is not its sealed agreement {}",
+                metrics.greedy_token_agreement
+            ));
+        }
+    }
+    let primary = repeats.first().ok_or("no sealed repeats")?;
+    for (metric, recorded, sealed) in [
+        (
+            "parityMaxError",
+            quality.parity_max_error,
+            primary.parity_max_error,
+        ),
+        (
+            "perplexityDelta",
+            quality.perplexity_delta,
+            primary.perplexity_delta,
+        ),
+        (
+            "structuredToolAgreement",
+            quality.structured_tool_agreement,
+            primary.structured_tool_agreement,
+        ),
+        (
+            "needleRetrieval",
+            quality.needle_retrieval,
+            primary.needle_retrieval,
+        ),
+        (
+            "multiTurnPromptCache",
+            quality.multi_turn_prompt_cache,
+            primary.multi_turn_prompt_cache,
+        ),
+    ] {
+        if recorded.to_bits() != sealed.to_bits() {
+            return Err(format!(
+                "receipt {metric} {recorded} is not the primary repeat's sealed value {sealed}"
+            ));
+        }
+    }
+    let expected = quality_gate_from_repeats(repeats);
+    if quality.quality_gate.as_ref() != Some(&expected) {
+        return Err(format!(
+            "receipt quality gate ({}) is not the gate of its sealed repeats ({})",
+            quality
+                .quality_gate
+                .as_ref()
+                .map_or_else(|| "absent".into(), quality_gate_summary),
+            quality_gate_summary(&expected)
+        ));
     }
     Ok(())
 }
@@ -3465,7 +4118,7 @@ fn validate_repeat_discrimination<'a>(
 }
 
 /// Re-derive a structured-tool or needle artifact's metric and discrimination flag from the raw
-/// outcomes it records, and return the per-repeat flag. Compressed rows must pass every repeat.
+/// outcomes it records, and return the per-repeat flag.
 fn fixture_discrimination(
     receipt: &Receipt,
     name: &str,
@@ -3516,10 +4169,11 @@ fn fixture_discrimination(
         )
     };
     let (matches, total) = (count("matches")?, count("total")?);
+    // A compressed repeat that validly measured a miss is gate evidence (see
+    // `validate_sealed_quality_gate`), not a malformed artifact.
     if total != 1
         || discriminating != expected_discriminating
         || matches != u64::from(expected_match)
-        || (compressed && matches != total)
     {
         return Err(format!(
             "fixture {name} outcome evidence does not derive its metric and discrimination"
@@ -4089,15 +4743,20 @@ pub fn publish_complete_campaign(
             for fixture in &item.bundle.fixtures {
                 files.push(serde_json::json!({"name": fixture.name, "sha256": seal_bytes(&fixture.bytes), "sidecarSha256": seal_bytes(fixture.sidecar.as_bytes())}));
             }
-            manifest_rows.push(serde_json::json!({
+            let mut row = serde_json::json!({
                 "coordinate": slug,
                 "receiptSha256": receipt.receipt_sha256,
                 "workerPid": receipt.memory.phase_samples[0].pid,
                 "files": files,
-            }));
+            });
+            // Compressed rows publish their measured gate outcome; dense rows carry none.
+            if let Some(gate) = &receipt.quality.quality_gate {
+                row["qualityGatePassed"] = serde_json::json!(gate.passed);
+            }
+            manifest_rows.push(row);
             receipts.push(receipt);
         }
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "schemaVersion": 2,
             "kind": SC20671_CAMPAIGN_KIND,
             "scheduleVersion": SC20671_SCHEDULE_VERSION,
@@ -4106,6 +4765,9 @@ pub fn publish_complete_campaign(
             "hostStateVaried": campaign_host_state_varied(&receipts),
             "coordinates": manifest_rows,
         });
+        if let Some(passed) = campaign_quality_gate_passed(&receipts)? {
+            manifest["qualityGatePassed"] = serde_json::json!(passed);
+        }
         let (identity_bytes, identity_sha) = seal_json(resume_identity)?;
         let (policy_bytes, _) =
             seal_json(&serde_json::to_value(policy).map_err(|e| e.to_string())?)?;
@@ -4131,6 +4793,49 @@ pub fn publish_complete_campaign(
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+/// A compressed campaign's measured quality-gate outcome: passed only when every row's gate
+/// passed. `None` for a dense campaign (characterization, never gated).
+pub fn campaign_quality_gate_passed(receipts: &[Receipt]) -> Result<Option<bool>, String> {
+    let gates = receipts
+        .iter()
+        .map(|receipt| receipt.quality.quality_gate.as_ref())
+        .collect::<Vec<_>>();
+    if gates.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    gates
+        .iter()
+        .try_fold(true, |passed, gate| {
+            gate.map(|gate| passed && gate.passed)
+                .ok_or("campaign mixes gated and ungated rows")
+        })
+        .map(Some)
+        .map_err(Into::into)
+}
+
+/// One stderr line per row plus the campaign verdict: the measured quality-gate outcomes a
+/// Go/No-Go decision reads.
+fn report_campaign_quality_gates(receipts: &[Receipt]) -> Result<(), String> {
+    let Some(passed) = campaign_quality_gate_passed(receipts)? else {
+        return Ok(());
+    };
+    for receipt in receipts {
+        if let Some(gate) = &receipt.quality.quality_gate {
+            eprintln!(
+                "sc20671-kv-baseline: quality gate {}-{}-{}-{}-{}: {}",
+                receipt.matrix.family,
+                receipt.matrix.context_band,
+                receipt.matrix.request_mode,
+                receipt.matrix.prefill_mode,
+                receipt.matrix.process_temperature,
+                quality_gate_summary(gate)
+            );
+        }
+    }
+    eprintln!("sc20671-kv-baseline: compressed campaign qualityGatePassed={passed}");
+    Ok(())
 }
 
 /// The one SC-20671 coordinate SC-20676 may bind for a family. It is deliberately the frozen
@@ -4329,6 +5034,18 @@ pub fn load_validated_complete_campaign(
         {
             return Err("SC-20671 manifest/receipt coordinate, PID, or seal mismatch".into());
         }
+        if row.get("qualityGatePassed")
+            != receipt
+                .quality
+                .quality_gate
+                .as_ref()
+                .map(|gate| serde_json::json!(gate.passed))
+                .as_ref()
+        {
+            return Err(format!(
+                "SC-20671 manifest row {slug} qualityGatePassed does not recompute from its receipt"
+            ));
+        }
         let listed = row
             .get("files")
             .and_then(serde_json::Value::as_array)
@@ -4392,6 +5109,13 @@ pub fn load_validated_complete_campaign(
             != Some(campaign_host_state_varied(&host_state_receipts))
     {
         return Err("SC-20671 manifest host-state variation flag does not recompute".into());
+    }
+    if value.get("qualityGatePassed")
+        != campaign_quality_gate_passed(&host_state_receipts)?
+            .map(serde_json::Value::Bool)
+            .as_ref()
+    {
+        return Err("SC-20671 manifest qualityGatePassed does not recompute from its rows".into());
     }
     validate_schedule_outcomes(&schedule, &outcomes)?;
     Ok(prepared)
@@ -4869,14 +5593,21 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
             (&launch.qwen_snapshot, &launch.qwen_fp32_reference_snapshot)
         };
         let coordinate = coordinate_slug(&row.coordinate);
-        match static_row_requirements(&row.coordinate, candidate, reference, &prompt, &policy)
-            .and_then(|(total, request, footprint)| {
-                Ok((
-                    total,
-                    request,
-                    runtime_guarded_admission(&policy, footprint)?,
-                ))
-            }) {
+        match static_row_requirements(
+            &row.coordinate,
+            candidate,
+            reference,
+            &prompt,
+            &policy,
+            launch.compressed.is_some(),
+        )
+        .and_then(|(total, request, footprint)| {
+            Ok((
+                total,
+                request,
+                runtime_guarded_admission(&policy, footprint)?,
+            ))
+        }) {
             Ok((total, request, admission)) => row_admission.push(serde_json::json!({
                 "coordinate": coordinate, "staticPreflightPassed": true,
                 "totalLiveTokenBound": total, "requestTokenBound": request,
@@ -5110,6 +5841,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 reference_snapshot,
                 &prompt,
                 &policy,
+                launch.compressed.is_some(),
             )?;
             let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
             let mut command = Command::new(&launch.executable);
@@ -5261,6 +5993,12 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
             let item = load_prepared_coordinate_receipt(&child_dir, row.coordinate.clone())?;
             let receipt: Receipt =
                 serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+            if let Some(gate) = &receipt.quality.quality_gate {
+                eprintln!(
+                    "sc20671-kv-baseline: coordinate {slug} accepted as measured; quality gate {}",
+                    quality_gate_summary(gate)
+                );
+            }
             let binding = seal_json(&row_binding(
                 &identity_sha256,
                 &receipt,
@@ -5291,6 +6029,13 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
         return Ok(CampaignOutcome::IncompleteWithRefusals(stopped.refused));
     }
     publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?;
+    report_campaign_quality_gates(
+        &prepared
+            .iter()
+            .map(|item| serde_json::from_slice::<Receipt>(&item.bundle.receipt))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?,
+    )?;
     Ok(CampaignOutcome::Completed)
 }
 
@@ -5506,6 +6251,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 &reference_snapshot,
                 &prompt,
                 &policy,
+                compressed.is_some(),
             )?;
             let admission = supervised_admission(&policy, static_footprint_floor)?;
             // Observed before any model loads: a throttled host refuses the row before it runs.
@@ -5661,6 +6407,26 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 );
                 reference_repeats.push(half);
             }
+            // Compressed rows: the same-weights dense-KV session greedily continues the kernel
+            // fixture prompt through every stop token, once per row (the stream is deterministic).
+            let forced_reference = compressed
+                .map(|_| {
+                    let kernel_prompt =
+                        kernel_fixture_prompt(&reference_session, &prompt, &row.coordinate)?;
+                    reference_session.provider.campaign_forced_continuation(
+                        &kernel_prompt,
+                        FORCED_CONTINUATION_TOKENS as usize,
+                        None,
+                        None,
+                    )
+                })
+                .transpose()
+                .map_err(|e| {
+                    format!(
+                        "dense forced continuation for {}: {e}",
+                        coordinate_slug(&row.coordinate)
+                    )
+                })?;
             drop(reference_session);
             quiesce_campaign_active_memory(reference_baseline).map_err(|e| {
                 format!(
@@ -5678,30 +6444,73 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             }
             .map_err(|e| format!("load teacher-forcing candidate session: {e}"))?;
             let forcing_baseline = forcing_session.load_start_sample.mlx_active_bytes;
-            // One forced pass per distinct reference stream (greedy reference repeats are usually
-            // identical, and each pass is a full-context prefill).
-            let stop_tokens = forcing_session.provider.campaign_stop_tokens().to_vec();
-            let streams = reference_repeats
-                .iter()
-                .map(|reference| {
-                    stream_tokens(&reference.kernel.quality_observation.token_probabilities)
-                })
-                .collect::<Vec<_>>();
-            let teacher_forced = force_distinct_streams(&streams, |stream| {
-                teacher_forced_kernel_choices(&forcing_session, &prompt, &row.coordinate, stream)
-                    .map_err(|e| {
-                        format!(
-                            "teacher-forced pass for {}: {e}",
-                            coordinate_slug(&row.coordinate)
+            // A compressed row is teacher-forced once on its dense forced continuation (every
+            // position compared by argmax); a dense row keeps one forced pass per distinct natural
+            // reference stream (greedy reference repeats are usually identical, and each pass is
+            // a full-context prefill).
+            let (teacher_forced, forced_continuation) = match &forced_reference {
+                Some(reference_stream) => {
+                    let choices = kernel_fixture_prompt(&forcing_session, &prompt, &row.coordinate)
+                        .and_then(|kernel_prompt| {
+                            forcing_session.provider.campaign_forced_continuation(
+                                &kernel_prompt,
+                                reference_stream.len(),
+                                forcing_session.compressed(),
+                                Some(reference_stream),
+                            )
+                        })
+                        .map_err(|e| {
+                            format!(
+                                "teacher-forced continuation for {}: {e}",
+                                coordinate_slug(&row.coordinate)
+                            )
+                        })?;
+                    let continuation = forced_continuation_evidence(reference_stream, &choices)?;
+                    eprintln!(
+                        "sc20671-kv-baseline: coordinate {} forced continuation agreement {} ({}/{}; first flips {:?})",
+                        coordinate_slug(&row.coordinate),
+                        continuation.agreement,
+                        continuation.matches,
+                        continuation.tokens,
+                        continuation.first_flip_positions
+                    );
+                    (vec![None; reference_repeats.len()], Some(continuation))
+                }
+                None => {
+                    let stop_tokens = forcing_session.provider.campaign_stop_tokens().to_vec();
+                    let streams = reference_repeats
+                        .iter()
+                        .map(|reference| {
+                            stream_tokens(
+                                &reference.kernel.quality_observation.token_probabilities,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let forced = force_distinct_streams(&streams, |stream| {
+                        teacher_forced_kernel_choices(
+                            &forcing_session,
+                            &prompt,
+                            &row.coordinate,
+                            stream,
                         )
+                        .map_err(|e| {
+                            format!(
+                                "teacher-forced pass for {}: {e}",
+                                coordinate_slug(&row.coordinate)
+                            )
+                        })
+                    })?
+                    .into_iter()
+                    .map(|choices| {
+                        Some(TeacherForcedChoices {
+                            choices,
+                            stop_tokens: stop_tokens.clone(),
+                        })
                     })
-            })?
-            .into_iter()
-            .map(|choices| TeacherForcedChoices {
-                choices,
-                stop_tokens: stop_tokens.clone(),
-            })
-            .collect::<Vec<_>>();
+                    .collect::<Vec<_>>();
+                    (forced, None)
+                }
+            };
             drop(forcing_session);
             quiesce_campaign_active_memory(forcing_baseline).map_err(|e| {
                 format!(
@@ -5737,7 +6546,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     let mut suite =
                         pair_product_fixture_halves(candidate, reference, reference_kind)?;
                     suite.kernel_parity_errors = compressed_parity.clone();
-                    suite.teacher_forced_candidate = Some(forced);
+                    suite.teacher_forced_candidate = forced;
+                    suite.forced_continuation = forced_continuation.clone();
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product fixture repeat {repeat} quality for {}: {e}",
@@ -6322,6 +7132,11 @@ pub struct QualityObservation {
     pub free_running_first_divergence: Option<u64>,
     /// Teacher-forced greedy agreement of every measured repeat, in order (empty for one suite).
     pub greedy_agreement_by_repeat: Vec<f64>,
+    /// Every measured repeat's quality metrics, in order (empty for one suite). A compressed
+    /// receipt's quality gate evaluates each.
+    pub repeat_metrics: Vec<QualityMetrics>,
+    /// Compressed rows: the forced continuation whose agreement is the greedy agreement.
+    pub forced_continuation: Option<ReceiptForcedContinuation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6423,6 +7238,11 @@ fn product_fixture_artifact(
         ),
         _ => return Err(format!("unknown fixture {name}")),
     };
+    let mut evidence = evidence;
+    if let (Some(continuation), "kernel-fp32-reference") = (&quality.forced_continuation, name) {
+        evidence["forcedContinuation"] =
+            serde_json::to_value(continuation).map_err(|e| e.to_string())?;
+    }
     let metrics = compute_quality(&quality)?;
     let value = serde_json::json!({
         "fixture": name,
@@ -8152,6 +8972,7 @@ pub fn quality_from_product_fixtures(
     reference: QualityReference,
     kernel_parity_errors: Option<&[f64]>,
     teacher_forced_candidate: Option<&TeacherForcedChoices>,
+    forced_continuation: Option<&ReceiptForcedContinuation>,
 ) -> Result<QualityObservation, String> {
     if reference == QualityReference::DenseKvSameWeights
         && [
@@ -8175,11 +8996,12 @@ pub fn quality_from_product_fixtures(
     let reference_stream = stream_tokens(&kernel_reference.quality_observation.token_probabilities);
     // Greedy agreement is teacher-forced: the candidate's own greedy choice at every position of
     // the reference stream. A free-running cascade after one argmax flip is recorded separately.
-    let (greedy_matches, greedy_total) = match teacher_forced_candidate {
-        Some(forced) => {
+    let (greedy_matches, greedy_total) = match (forced_continuation, teacher_forced_candidate) {
+        (Some(continuation), _) => (continuation.matches, continuation.tokens),
+        (None, Some(forced)) => {
             teacher_forced_agreement(&forced.choices, &reference_stream, &forced.stop_tokens)
         }
-        None => token_agreement(
+        (None, None) => token_agreement(
             &kernel_candidate.quality_observation.token_probabilities,
             &kernel_reference.quality_observation.token_probabilities,
         ),
@@ -8230,6 +9052,8 @@ pub fn quality_from_product_fixtures(
         tool_discriminating,
         free_running_first_divergence: first_divergence(&candidate_stream, &reference_stream),
         greedy_agreement_by_repeat: Vec::new(),
+        repeat_metrics: Vec::new(),
+        forced_continuation: forced_continuation.cloned(),
     })
 }
 
@@ -8337,8 +9161,11 @@ pub struct ProductFixtureSuite {
     /// timed).
     pub steady_decode: Option<SteadyDecodeMeasurement>,
     /// The candidate's greedy choice at every position of this repeat's reference kernel stream
-    /// (teacher-forced). Required for measured repeats; warmups do not carry it.
+    /// (teacher-forced). Required for a dense row's measured repeats; warmups do not carry it.
     pub teacher_forced_candidate: Option<TeacherForcedChoices>,
+    /// Compressed rows' measured repeats: the row's forced continuation, which replaces the
+    /// natural-stream teacher-forced agreement.
+    pub forced_continuation: Option<ReceiptForcedContinuation>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -8751,6 +9578,7 @@ fn pair_product_fixture_halves(
         kernel_parity_errors: None,
         steady_decode: candidate.steady_decode,
         teacher_forced_candidate: None,
+        forced_continuation: None,
     })
 }
 
@@ -8769,6 +9597,7 @@ impl ProductFixtureSuite {
             self.reference,
             self.kernel_parity_errors.as_deref(),
             self.teacher_forced_candidate.as_ref(),
+            self.forced_continuation.as_ref(),
         )
     }
 }
@@ -9548,16 +10377,23 @@ fn process_thermal_state() -> Result<i64, String> {
 fn receipt_quality_over_repeats(
     suites: &[ProductFixtureSuite],
 ) -> Result<QualityObservation, String> {
-    if suites
-        .iter()
-        .any(|suite| suite.teacher_forced_candidate.is_none())
-    {
+    if suites.iter().any(|suite| {
+        suite.teacher_forced_candidate.is_none() && suite.forced_continuation.is_none()
+    }) {
         return Err("every measured repeat requires its teacher-forced greedy agreement".into());
     }
     let (primary, repeats) = suites
         .split_first()
         .ok_or("product receipt requires its fixture repeats")?;
+    // A row's forced continuation is one deterministic measurement shared by every repeat.
+    if repeats
+        .iter()
+        .any(|suite| suite.forced_continuation != primary.forced_continuation)
+    {
+        return Err("every measured repeat must share the row's one forced continuation".into());
+    }
     let mut quality = primary.quality()?;
+    quality.repeat_metrics = vec![compute_quality(&quality)?];
     let ratio = |q: &QualityObservation| {
         if q.greedy_total == 0 {
             Err("teacher-forced greedy agreement has zero positions".to_string())
@@ -9573,6 +10409,7 @@ fn receipt_quality_over_repeats(
     );
     for repeat in repeats {
         let repeat = repeat.quality()?;
+        quality.repeat_metrics.push(compute_quality(&repeat)?);
         quality.needle_discriminating &= repeat.needle_discriminating;
         quality.tool_discriminating &= repeat.tool_discriminating;
         let agreement = ratio(&repeat)?;
@@ -10018,7 +10855,7 @@ fn product_receipt(
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: release_evidence(weights_loaded, release), admission, dense_kv_share_bps: 0, below_memory_material_share: false },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:None,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,greedy_token_agreement_by_repeat:Vec::new(),structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,greedy_token_agreement_by_repeat:Vec::new(),structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence,quality_gate:None,forced_continuation:None}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -10089,99 +10926,103 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A synthetic product fixture result whose output text is `text`.
+    fn test_fixture_result(text: &str) -> ProductFixtureResult {
+        let observation = || ProductObservations {
+            snapshot: SnapshotInventory {
+                root: PathBuf::new(),
+                files: Vec::new(),
+                bytes: 1,
+                sha256: "b".repeat(64),
+            },
+            geometry: ProductGeometry {
+                query_heads: 24,
+                kv_heads: 8,
+                head_dimension: 8,
+                layers: 28,
+                element_bytes: 2,
+            },
+            phases: vec![
+                ReceiptPhase {
+                    phase: "prefill-peak".into(),
+                    pid: 42,
+                    source: PHYS_FOOTPRINT_SOURCE.into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    phys_footprint_bytes: 123,
+                    phys_footprint_peak_bytes: 456,
+                    mlx: ReceiptMlx {
+                        source: "mlx_rs::memory".into(),
+                        active_bytes: 12,
+                        cache_bytes: 34,
+                        peak_bytes: 56,
+                    },
+                };
+                8
+            ],
+            phase_elapsed_ms: Vec::new(),
+            allocations: Vec::new(),
+            prefill_logits: Vec::new(),
+            token_probabilities: vec![(7, 0.5), (9, 0.25)],
+            session_id: "session".into(),
+            cache_state_version: 1,
+            operations: Vec::new(),
+            load_elapsed_ms: 1.0,
+            prefill_peak_window: ReceiptPeakWindow {
+                started_at: "2026-01-01T00:00:00Z".into(),
+                baseline_active_bytes: 1,
+                reset_peak_bytes: 0,
+            },
+            cache_live_tokens: 32,
+            cache_capacity_tokens: 256,
+            packed_evidence: Vec::new(),
+            dense_fallbacks: Vec::new(),
+            coordinate_scope: None,
+        };
+        ProductFixtureResult {
+            observation: observation(),
+            quality_observation: observation(),
+            output: TextLlmOutput {
+                text: text.into(),
+                ..Default::default()
+            },
+            coordinate_operation: "chunked-prefix-reuse".into(),
+            coordinate_generated_tokens: 1,
+            coordinate_prompt_tokens: 32,
+            coordinate_output_sha256: "c".repeat(64),
+            compile_setup_ms: 0.0,
+            compile_dispatch_ms: 1.0,
+            secondary_coordinate_operation: None,
+        }
+    }
+
+    /// A synthetic fixture half: valid tool call, `needle_text` as the needle answer.
+    fn test_fixture_half(needle_text: &str) -> ProductFixtureHalf {
+        let mut tool = test_fixture_result("");
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "fact".into(),
+            serde_json::json!("SC20671 structured fixture"),
+        );
+        tool.output.tool_calls = vec![core_llm::ToolCall::new("record_baseline_fact", arguments)];
+        ProductFixtureHalf {
+            kernel: test_fixture_result("kernel"),
+            tool,
+            needle_result: test_fixture_result(needle_text),
+            cache: test_fixture_result("cache"),
+            needle: "SC20671-NUMERIC-NEEDLE-9b7a2e".into(),
+            context_window_tokens: 4096,
+            context_target_tokens: 32,
+            context_payload_tokens: 32,
+            context_payload_sha256: "d".repeat(64),
+            fixture_prompt_tokens: [32; 4],
+            fixture_prompt_sha256: std::array::from_fn(|_| "e".repeat(64)),
+            steady_decode: None,
+        }
+    }
+
     #[test]
     fn needle_miss_is_a_recorded_observation_with_role_diagnostics() {
-        let result = |text: &str| {
-            let observation = || ProductObservations {
-                snapshot: SnapshotInventory {
-                    root: PathBuf::new(),
-                    files: Vec::new(),
-                    bytes: 1,
-                    sha256: "b".repeat(64),
-                },
-                geometry: ProductGeometry {
-                    query_heads: 24,
-                    kv_heads: 8,
-                    head_dimension: 8,
-                    layers: 28,
-                    element_bytes: 2,
-                },
-                phases: vec![
-                    ReceiptPhase {
-                        phase: "prefill-peak".into(),
-                        pid: 42,
-                        source: PHYS_FOOTPRINT_SOURCE.into(),
-                        timestamp: "2026-01-01T00:00:00Z".into(),
-                        phys_footprint_bytes: 123,
-                        phys_footprint_peak_bytes: 456,
-                        mlx: ReceiptMlx {
-                            source: "mlx_rs::memory".into(),
-                            active_bytes: 12,
-                            cache_bytes: 34,
-                            peak_bytes: 56,
-                        },
-                    };
-                    8
-                ],
-                phase_elapsed_ms: Vec::new(),
-                allocations: Vec::new(),
-                prefill_logits: Vec::new(),
-                token_probabilities: vec![(7, 0.5), (9, 0.25)],
-                session_id: "session".into(),
-                cache_state_version: 1,
-                operations: Vec::new(),
-                load_elapsed_ms: 1.0,
-                prefill_peak_window: ReceiptPeakWindow {
-                    started_at: "2026-01-01T00:00:00Z".into(),
-                    baseline_active_bytes: 1,
-                    reset_peak_bytes: 0,
-                },
-                cache_live_tokens: 32,
-                cache_capacity_tokens: 256,
-                packed_evidence: Vec::new(),
-                dense_fallbacks: Vec::new(),
-                coordinate_scope: None,
-            };
-            ProductFixtureResult {
-                observation: observation(),
-                quality_observation: observation(),
-                output: TextLlmOutput {
-                    text: text.into(),
-                    ..Default::default()
-                },
-                coordinate_operation: "chunked-prefix-reuse".into(),
-                coordinate_generated_tokens: 1,
-                coordinate_prompt_tokens: 32,
-                coordinate_output_sha256: "c".repeat(64),
-                compile_setup_ms: 0.0,
-                compile_dispatch_ms: 1.0,
-                secondary_coordinate_operation: None,
-            }
-        };
-        let half = |needle_text: &str| {
-            let mut tool = result("");
-            let mut arguments = serde_json::Map::new();
-            arguments.insert(
-                "fact".into(),
-                serde_json::json!("SC20671 structured fixture"),
-            );
-            tool.output.tool_calls =
-                vec![core_llm::ToolCall::new("record_baseline_fact", arguments)];
-            ProductFixtureHalf {
-                kernel: result("kernel"),
-                tool,
-                needle_result: result(needle_text),
-                cache: result("cache"),
-                needle: "SC20671-NUMERIC-NEEDLE-9b7a2e".into(),
-                context_window_tokens: 4096,
-                context_target_tokens: 32,
-                context_payload_tokens: 32,
-                context_payload_sha256: "d".repeat(64),
-                fixture_prompt_tokens: [32; 4],
-                fixture_prompt_sha256: std::array::from_fn(|_| "e".repeat(64)),
-                steady_decode: None,
-            }
-        };
+        let half = test_fixture_half;
         let coordinate = required_coordinates()[0].clone();
         let candidate = half("wrong\nanswer");
         let reference = half("SC20671-NUMERIC-NEEDLE-9b7a2e");
@@ -10989,6 +11830,7 @@ pub(crate) mod tests {
                 Path::new("/nonexistent-reference"),
                 "prompt",
                 &policy,
+                false,
             )
             .unwrap_err();
             assert!(
@@ -11454,6 +12296,8 @@ pub(crate) mod tests {
             tool_discriminating: true,
             free_running_first_divergence: None,
             greedy_agreement_by_repeat: vec![1.0; 5],
+            repeat_metrics: Vec::new(),
+            forced_continuation: None,
         };
         let metrics = compute_quality(&raw).unwrap();
         assert_eq!(metrics.parity_max_error, 0.0002);
@@ -11576,6 +12420,13 @@ pub(crate) mod tests {
 
     /// A complete, valid dense receipt assembled by the real builder from minimal evidence.
     fn builder_test_receipt() -> Receipt {
+        test_receipt_builder()
+            .finish()
+            .expect("builder must produce a complete v4 receipt")
+    }
+
+    /// The dense builder behind [`builder_test_receipt`], before `finish`.
+    fn test_receipt_builder() -> ReceiptBuilder {
         let mut template = Receipt {
             schema_version: RECEIPT_SCHEMA_VERSION,
             harness_version: RECEIPT_HARNESS_VERSION.into(),
@@ -11749,6 +12600,8 @@ pub(crate) mod tests {
                     max_coefficient_of_variation: 0.05,
                 },
                 fixture_evidence: std::collections::BTreeMap::new(),
+                quality_gate: None,
+                forced_continuation: None,
             },
             lifecycle: ReceiptLifecycle {
                 append: true,
@@ -11909,6 +12762,8 @@ pub(crate) mod tests {
             tool_discriminating: true,
             free_running_first_divergence: None,
             greedy_agreement_by_repeat: vec![1.0; 5],
+            repeat_metrics: Vec::new(),
+            forced_continuation: None,
         };
         ReceiptBuilder {
             template,
@@ -11918,8 +12773,41 @@ pub(crate) mod tests {
             compile_attribution,
             quality,
         }
-        .finish()
-        .expect("builder must produce a complete v4 receipt")
+    }
+
+    /// The same builder row measured in compressed mode (as [`compress_test_receipt`] turns a
+    /// finished receipt), with `quality` as its measured repeats.
+    fn compressed_test_builder(quality: QualityObservation) -> ReceiptBuilder {
+        let mut builder = test_receipt_builder();
+        let template = &mut builder.template;
+        template.mode = "compressed".into();
+        template.provenance.command = template
+            .provenance
+            .command_template
+            .replace("{mode}", "compressed");
+        for name in REQUIRED_FIXTURES {
+            template
+                .quality
+                .fixture_evidence
+                .get_mut(name)
+                .unwrap()
+                .independent_reference = fixture_independent_reference(
+                name,
+                QualityReference::DenseKvSameWeights,
+                &template.provenance.model_file_sha256,
+            );
+        }
+        template.lifecycle = receipt_lifecycle(true);
+        template.compression = Some(test_compression_block());
+        let compressed_kv = template.memory.persistent_kv_bytes / 2;
+        template.memory.persistent_kv_bytes = compressed_kv;
+        for event in &mut builder.allocations {
+            if event.role == "cache" && event.lifetime != "transient" {
+                event.bytes = compressed_kv;
+            }
+        }
+        builder.quality = quality;
+        builder
     }
 
     fn test_packed_evidence(fused: usize) -> crate::primitives::PackedCacheEvidence {
@@ -12054,6 +12942,42 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A forced continuation over the full length with `matches` agreeing positions (the flips
+    /// are the last positions).
+    fn test_forced_continuation(matches: u64) -> ReceiptForcedContinuation {
+        let reference = (0..FORCED_CONTINUATION_TOKENS as i32).collect::<Vec<_>>();
+        let choices = reference
+            .iter()
+            .enumerate()
+            .map(|(position, token)| {
+                if (position as u64) < matches {
+                    *token
+                } else {
+                    -1
+                }
+            })
+            .collect::<Vec<_>>();
+        forced_continuation_evidence(&reference, &choices).unwrap()
+    }
+
+    /// Record `continuation` as the receipt's greedy agreement and its gate as the frozen
+    /// evaluation of the receipt-level values for every repeat.
+    fn set_test_compressed_quality(receipt: &mut Receipt, continuation: ReceiptForcedContinuation) {
+        let quality = &mut receipt.quality;
+        quality.greedy_token_agreement = continuation.agreement;
+        quality.greedy_token_agreement_by_repeat = vec![continuation.agreement; 5];
+        let metrics = QualityMetrics {
+            parity_max_error: quality.parity_max_error,
+            perplexity_delta: quality.perplexity_delta,
+            greedy_token_agreement: continuation.agreement,
+            structured_tool_agreement: quality.structured_tool_agreement,
+            needle_retrieval: quality.needle_retrieval,
+            multi_turn_prompt_cache: quality.multi_turn_prompt_cache,
+        };
+        quality.forced_continuation = Some(continuation);
+        quality.quality_gate = Some(quality_gate_from_repeats(&[metrics; 5]));
+    }
+
     /// Turn the builder's dense receipt into the same row measured in compressed mode: same-weights
     /// fixtures, compressed lifecycle, a persistent KV below the dense geometry, and the block.
     fn compress_test_receipt(receipt: &mut Receipt, compression: ReceiptCompression) {
@@ -12075,6 +12999,10 @@ pub(crate) mod tests {
             );
         }
         receipt.lifecycle = receipt_lifecycle(true);
+        set_test_compressed_quality(
+            receipt,
+            test_forced_continuation(FORCED_CONTINUATION_TOKENS),
+        );
         let compressed_kv = receipt.memory.persistent_kv_bytes / 2;
         for event in &mut receipt.memory.allocation_events {
             if event.role == "cache" && event.lifetime != "transient" {
@@ -12352,6 +13280,385 @@ pub(crate) mod tests {
         assert!(validate_receipt_semantics(&dense_with_block)
             .unwrap_err()
             .contains("present exactly on compressed"));
+    }
+
+    const TEST_NEEDLE: &str = "SC20671-NUMERIC-NEEDLE-9b7a2e";
+
+    /// Five compressed repeats sharing `continuation`; `needle_miss` repeats lose the needle the
+    /// same-weights dense run recovered.
+    fn compressed_test_suites(
+        continuation: &ReceiptForcedContinuation,
+        needle_miss: &[usize],
+    ) -> Vec<ProductFixtureSuite> {
+        (0..5)
+            .map(|repeat| {
+                let candidate = test_fixture_half(if needle_miss.contains(&repeat) {
+                    "wrong"
+                } else {
+                    TEST_NEEDLE
+                });
+                let mut suite = pair_product_fixture_halves(
+                    candidate,
+                    test_fixture_half(TEST_NEEDLE),
+                    QualityReference::DenseKvSameWeights,
+                )
+                .unwrap();
+                suite.kernel_parity_errors = Some(vec![0.00005]);
+                suite.forced_continuation = Some(continuation.clone());
+                suite
+            })
+            .collect()
+    }
+
+    /// The sealed repeat-major artifacts of `suites`, as the bundle validator reads them.
+    fn sealed_test_repeats(suites: &[ProductFixtureSuite]) -> Vec<SealedFixtureArtifact> {
+        sealed_product_fixture_artifacts(suites, &required_coordinates()[0]).unwrap()
+    }
+
+    fn repeat_pairs(fixtures: &[SealedFixtureArtifact]) -> Vec<(&'static str, &[u8])> {
+        (0..5)
+            .flat_map(|repeat| {
+                REQUIRED_FIXTURES.map(|fixture| {
+                    let name = fixture_artifact_name(fixture, repeat);
+                    (
+                        fixture,
+                        fixtures
+                            .iter()
+                            .find(|artifact| artifact.name == name)
+                            .unwrap()
+                            .bytes
+                            .as_slice(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forced_continuation_is_admitted_up_to_the_native_window() {
+        assert_eq!(forced_continuation_live_tokens(60, 131_072), 60 + 1024);
+        assert_eq!(forced_continuation_live_tokens(130_600, 131_072), 131_072);
+    }
+
+    #[test]
+    fn forced_continuation_records_every_position_and_the_first_flips() {
+        let evidence = forced_continuation_evidence(&[1, 2, 3, 4], &[1, 0, 3, 0]).unwrap();
+        assert_eq!(
+            (evidence.tokens, evidence.matches, evidence.flip_count),
+            (4, 2, 2)
+        );
+        assert_eq!(evidence.agreement, 0.5);
+        assert_eq!(evidence.first_flip_positions, vec![1, 3]);
+        assert!(forced_continuation_evidence(&[1, 2], &[1]).is_err());
+        assert!(forced_continuation_evidence(&[], &[]).is_err());
+        // One flip in 1024 positions clears the frozen 0.999; two do not.
+        let one = test_forced_continuation(FORCED_CONTINUATION_TOKENS - 1);
+        let two = test_forced_continuation(FORCED_CONTINUATION_TOKENS - 2);
+        assert!(one.agreement >= COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN);
+        assert!(two.agreement < COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN);
+        let many = test_forced_continuation(100);
+        assert_eq!(many.flip_count, FORCED_CONTINUATION_TOKENS - 100);
+        assert_eq!(
+            many.first_flip_positions,
+            (100..100 + FORCED_CONTINUATION_RECORDED_FLIPS as u64).collect::<Vec<_>>()
+        );
+        validate_forced_continuation(&many, "short").unwrap();
+        // Only a fit-boundary row may run a shorter continuation, never below the reserve.
+        let short = forced_continuation_evidence(&[1; 300], &[1; 300]).unwrap();
+        assert!(validate_forced_continuation(&short, "short").is_err());
+        validate_forced_continuation(&short, "fit-boundary").unwrap();
+        let tiny = forced_continuation_evidence(&[1; 8], &[1; 8]).unwrap();
+        assert!(validate_forced_continuation(&tiny, "fit-boundary").is_err());
+        for edit in [
+            (|c: &mut ReceiptForcedContinuation| c.matches -= 1) as fn(&mut _),
+            |c| c.agreement = 1.0,
+            |c| c.flip_count += 1,
+            |c| c.first_flip_positions.reverse(),
+            |c| c.first_flip_positions.pop().map(drop).unwrap_or(()),
+            |c| c.method = "natural-stream".into(),
+            |c| c.reference_stream_sha256 = "x".into(),
+        ] {
+            let mut forged = many.clone();
+            edit(&mut forged);
+            assert!(validate_forced_continuation(&forged, "short").is_err());
+        }
+    }
+
+    #[test]
+    fn compressed_quality_miss_is_accepted_as_a_measured_gate_failure() {
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS - 2);
+        let suites = compressed_test_suites(&continuation, &[3]);
+        let quality = receipt_quality_over_repeats(&suites).unwrap();
+        let receipt = compressed_test_builder(quality)
+            .finish()
+            .expect("a validly measured quality miss is an accepted, measured row");
+        let agreement = 1022.0 / 1024.0;
+        let failure = |metric: &str, fixture: &str, repeat: u64, value: f64, threshold: f64| {
+            ReceiptQualityGateFailure {
+                metric: metric.into(),
+                fixture: fixture.into(),
+                repeat,
+                value,
+                threshold,
+                comparison: "minimum".into(),
+            }
+        };
+        let mut expected = Vec::new();
+        for repeat in 0..5 {
+            expected.push(failure(
+                "greedyTokenAgreement",
+                "kernel-fp32-reference",
+                repeat,
+                agreement,
+                0.999,
+            ));
+            if repeat == 3 {
+                expected.push(failure(
+                    "needleRetrieval",
+                    "long-context-needle",
+                    3,
+                    0.0,
+                    1.0,
+                ));
+            }
+        }
+        assert_eq!(
+            receipt.quality.quality_gate,
+            Some(ReceiptQualityGate {
+                passed: false,
+                failures: expected
+            })
+        );
+        assert_eq!(receipt.quality.greedy_token_agreement, agreement);
+        assert_eq!(
+            receipt.quality.greedy_token_agreement_by_repeat,
+            vec![agreement; 5]
+        );
+        // The primary repeat recovered the needle; its receipt-level value is recorded as measured.
+        assert_eq!(receipt.quality.needle_retrieval, 1.0);
+        assert_eq!(
+            receipt.quality.forced_continuation,
+            Some(continuation.clone())
+        );
+        let sealed = receipt_semantic_seal(&receipt)
+            .map(|seal| Receipt {
+                receipt_sha256: seal,
+                ..receipt.clone()
+            })
+            .unwrap();
+        validate_sealed_receipt(&sealed).unwrap();
+        let parsed: Receipt = serde_json::from_slice(&sealed.bytes().unwrap()).unwrap();
+        assert_eq!(parsed.quality.quality_gate, receipt.quality.quality_gate);
+        validate_sealed_receipt(&parsed).unwrap();
+
+        // The gate is exactly the evaluation of the sealed repeat artifacts.
+        let fixtures = sealed_test_repeats(&suites);
+        let repeats = sealed_repeat_quality_metrics(&receipt, &repeat_pairs(&fixtures)).unwrap();
+        assert_eq!(repeats[3].needle_retrieval, 0.0);
+        validate_sealed_quality_gate(&receipt, &repeats).unwrap();
+        let bundle = assemble_artifacts_with_fixtures(receipt.clone(), fixtures).unwrap();
+        let human = String::from_utf8(bundle.human).unwrap();
+        assert!(human.contains(
+            "- Quality gate: FAILED: greedyTokenAgreement repeat 0 = 0.998046875 (minimum 0.999, fixture kernel-fp32-reference);"
+        ), "{human}");
+        assert!(
+            human.contains("needleRetrieval repeat 3 = 0 (minimum 1, fixture long-context-needle)")
+        );
+
+        // A pass can never be claimed over a failing value.
+        let rejects = |edit: &dyn Fn(&mut ReceiptQualityGate), expected: &str| {
+            let mut forged = receipt.clone();
+            edit(forged.quality.quality_gate.as_mut().unwrap());
+            let error = validate_receipt_semantics(&forged).unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        rejects(
+            &|gate| *gate = ReceiptQualityGate { passed: true, failures: Vec::new() },
+            "does not record greedyTokenAgreement repeat 0 = 0.998046875 against the frozen minimum 0.999",
+        );
+        rejects(
+            &|gate| gate.passed = true,
+            "claims passed=true with 6 recorded failure(s)",
+        );
+        rejects(
+            &|gate| gate.failures[0].value = 0.5,
+            "does not record greedyTokenAgreement repeat 0",
+        );
+        rejects(
+            &|gate| gate.failures[0].threshold = 0.9,
+            "not an ordered frozen-threshold miss",
+        );
+        rejects(
+            &|gate| gate.failures.swap(0, 1),
+            "not an ordered frozen-threshold miss",
+        );
+        rejects(
+            &|gate| gate.failures[4].fixture = "kernel-fp32-reference".into(),
+            "not an ordered frozen-threshold miss",
+        );
+        // Repeat 3's needle is invisible in the receipt; only its sealed artifact exposes the miss.
+        let mut hidden = receipt.clone();
+        hidden
+            .quality
+            .quality_gate
+            .as_mut()
+            .unwrap()
+            .failures
+            .retain(|failure| failure.metric != "needleRetrieval");
+        validate_receipt_semantics(&hidden).expect("the receipt alone cannot see repeat 3");
+        assert!(validate_sealed_quality_gate(&hidden, &repeats)
+            .unwrap_err()
+            .contains("is not the gate of its sealed repeats"));
+
+        // A row that meets every threshold records passed with no failures.
+        let clean = compressed_test_suites(
+            &test_forced_continuation(FORCED_CONTINUATION_TOKENS - 1),
+            &[],
+        );
+        let passed = compressed_test_builder(receipt_quality_over_repeats(&clean).unwrap())
+            .finish()
+            .unwrap();
+        assert_eq!(
+            passed.quality.quality_gate,
+            Some(ReceiptQualityGate {
+                passed: true,
+                failures: Vec::new()
+            })
+        );
+        let clean_fixtures = sealed_test_repeats(&clean);
+        validate_sealed_quality_gate(
+            &passed,
+            &sealed_repeat_quality_metrics(&passed, &repeat_pairs(&clean_fixtures)).unwrap(),
+        )
+        .unwrap();
+        // The campaign is gate-failed when any row failed; dense campaigns carry no verdict.
+        assert_eq!(
+            campaign_quality_gate_passed(&[passed.clone(), passed.clone()]),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            campaign_quality_gate_passed(&[passed.clone(), receipt.clone()]),
+            Ok(Some(false))
+        );
+        let dense = builder_test_receipt();
+        assert_eq!(
+            campaign_quality_gate_passed(&[dense.clone(), dense.clone()]),
+            Ok(None)
+        );
+        assert!(campaign_quality_gate_passed(&[dense, passed]).is_err());
+    }
+
+    #[test]
+    fn compressed_integrity_failures_still_refuse_the_row() {
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS);
+        let quality =
+            || receipt_quality_over_repeats(&compressed_test_suites(&continuation, &[])).unwrap();
+        // Kernel parity against the host-fp32 dequantize-then-attend reference is correctness.
+        let mut broken_kernel = quality();
+        broken_kernel.parity_errors = vec![0.5];
+        let error = compressed_test_builder(broken_kernel).finish().unwrap_err();
+        assert!(
+            error
+                .contains("kernel parity failed: metric=parityMaxError value=0.5 threshold=0.0001"),
+            "{error}"
+        );
+        // No forced continuation: the greedy agreement was never measured.
+        let mut unmeasured = quality();
+        unmeasured.forced_continuation = None;
+        let error = compressed_test_builder(unmeasured).finish().unwrap_err();
+        assert!(
+            error.contains("no forced-continuation greedy agreement"),
+            "{error}"
+        );
+        // Too few measured repeats to gate.
+        let mut partial = quality();
+        partial.repeat_metrics.pop();
+        assert!(compressed_test_builder(partial)
+            .finish()
+            .unwrap_err()
+            .contains("five measured repeats"));
+        // Repeats that disagree on the row's one forced continuation.
+        let mut suites = compressed_test_suites(&continuation, &[]);
+        suites[2].forced_continuation = Some(test_forced_continuation(1000));
+        assert!(receipt_quality_over_repeats(&suites)
+            .unwrap_err()
+            .contains("one forced continuation"));
+        let receipt = compressed_test_builder(quality()).finish().unwrap();
+        let refuses = |edit: &dyn Fn(&mut Receipt), expected: &str| {
+            let mut forged = receipt.clone();
+            edit(&mut forged);
+            let error = validate_receipt_semantics(&forged).unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        // Fixture evidence is integrity, named by fixture.
+        refuses(
+            &|r| {
+                r.quality
+                    .fixture_evidence
+                    .get_mut("long-context-needle")
+                    .unwrap()
+                    .passed = false
+            },
+            "fixture evidence failed: fixture=long-context-needle passed=false",
+        );
+        refuses(
+            &|r| {
+                r.quality
+                    .fixture_evidence
+                    .get_mut("structured-tool-call")
+                    .unwrap()
+                    .artifact_sha256 = "A".repeat(64)
+            },
+            "fixture evidence failed: fixture=structured-tool-call artifactSha256=",
+        );
+        refuses(
+            &|r| r.quality.quality_gate = None,
+            "no measured quality-gate record",
+        );
+        refuses(
+            &|r| r.quality.forced_continuation.as_mut().unwrap().matches -= 1,
+            "forced continuation evidence is inconsistent",
+        );
+        refuses(
+            &|r| r.quality.greedy_token_agreement_by_repeat[4] = 0.5,
+            "greedy agreement is not the minimum",
+        );
+        // A dense row is characterization: it can carry neither a gate nor a continuation.
+        let mut dense = builder_test_receipt();
+        dense.quality.quality_gate = receipt.quality.quality_gate.clone();
+        assert!(validate_receipt_semantics(&dense)
+            .unwrap_err()
+            .contains("only on compressed receipts"));
+        // Sealed artifacts must carry the receipt's forced continuation and its counts.
+        let suites = compressed_test_suites(&continuation, &[]);
+        let fixtures = sealed_test_repeats(&suites);
+        let mut pairs = repeat_pairs(&fixtures);
+        let mut forged: serde_json::Value = serde_json::from_slice(pairs[4].1).unwrap();
+        forged["evidence"]["forcedContinuation"]["matches"] = serde_json::json!(1000);
+        let forged = serde_json::to_vec(&forged).unwrap();
+        pairs[4].1 = &forged;
+        assert!(sealed_repeat_quality_metrics(&receipt, &pairs)
+            .unwrap_err()
+            .contains("repeat 1 kernel fixture forced continuation"));
+        let mut miscounted: serde_json::Value =
+            serde_json::from_slice(repeat_pairs(&fixtures)[0].1).unwrap();
+        miscounted["evidence"]["greedyMatches"] = serde_json::json!(1000);
+        let miscounted = serde_json::to_vec(&miscounted).unwrap();
+        let mut pairs = repeat_pairs(&fixtures);
+        pairs[0].1 = &miscounted;
+        assert!(sealed_repeat_quality_metrics(&receipt, &pairs)
+            .unwrap_err()
+            .contains("greedy counts"));
+        let mut parity: serde_json::Value =
+            serde_json::from_slice(repeat_pairs(&fixtures)[8].1).unwrap();
+        parity["evidence"]["parityErrors"] = serde_json::json!([0.5]);
+        let parity = serde_json::to_vec(&parity).unwrap();
+        let mut pairs = repeat_pairs(&fixtures);
+        pairs[8].1 = &parity;
+        let repeats = sealed_repeat_quality_metrics(&receipt, &pairs).unwrap();
+        assert!(validate_sealed_quality_gate(&receipt, &repeats)
+            .unwrap_err()
+            .contains("kernel parity failed: metric=parityMaxError value=0.5 threshold=0.0001 comparison=maximum fixture=kernel-fp32-reference repeat=2"));
     }
 
     #[test]
@@ -12967,7 +14274,7 @@ pub(crate) mod tests {
         quality_tampered.quality.parity_max_error = 0.1;
         assert!(validate_receipt_semantics(&quality_tampered)
             .unwrap_err()
-            .contains("parityMaxError=0.1"));
+            .contains("kernel parity failed: metric=parityMaxError value=0.1 threshold=0.0001"));
         // Contract v3: compressed quality is gated only against the same-weights dense-KV run.
         let same_weights = |receipt: &mut Receipt| {
             for name in REQUIRED_FIXTURES {
@@ -13170,8 +14477,21 @@ pub(crate) mod tests {
             repeats(&[&hit, &shared_miss], &[&valid_tool, &shared_invalid_tool]),
         )
         .unwrap();
-        // Per-artifact derivation: flag must follow the same-weights dense run, a non-discriminating
-        // compressed repeat must match the dense output, and compressed repeats must all pass.
+        // A validly measured compressed miss (dense recovered / emitted the call, compressed did
+        // not) is gate evidence, not a malformed artifact: its derivation is accepted here and the
+        // miss is recorded by the quality gate.
+        for (fixture, measured_miss) in [
+            ("long-context-needle", needle(false, true, false, 0, true)),
+            ("structured-tool-call", tool(true, true, false, true)),
+        ] {
+            validate_repeat_discrimination(
+                &all_discriminating,
+                [(fixture, measured_miss.as_slice())],
+            )
+            .unwrap_or_else(|error| panic!("{fixture} measured miss refused: {error}"));
+        }
+        // Per-artifact derivation: flag must follow the same-weights dense run and a
+        // non-discriminating compressed repeat must match the dense output.
         for (fixture, forged, flag) in [
             // Shared miss whose outputs differ from dense, counted as a match.
             (
@@ -13185,16 +14505,14 @@ pub(crate) mod tests {
                 needle(true, true, true, 1, false),
                 false,
             ),
-            // Discriminating compressed repeat that lost the needle.
+            // Discriminating compressed repeat that lost the needle, counted as a match.
             (
                 "long-context-needle",
-                needle(false, true, false, 0, true),
+                needle(false, true, false, 1, true),
                 true,
             ),
             // Dense tool call invalid, yet flagged discriminating.
             ("structured-tool-call", tool(true, false, true, true), true),
-            // Compressed tool call diverged from dense.
-            ("structured-tool-call", tool(true, true, false, true), true),
         ] {
             // The receipt carries the artifact's own flag, so only the derivation can fail.
             let mut claimed = compressed.clone();

@@ -195,6 +195,29 @@ fn campaign_steady_decode_on(
     stop_tokens: &[i32],
     compressed: Option<&crate::campaign::CompressedKvArm>,
 ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
+    let measured =
+        campaign_forced_decode_on(model, prompt_ids, tokens, stop_tokens, compressed, None)?;
+    Ok(crate::campaign::SteadyDecodeMeasurement {
+        prompt_tokens: prompt_ids.len() as u64,
+        generated_tokens: measured.tokens.len() as u64,
+        timed_tokens: measured.timed_tokens,
+        decode_ms: measured.decode_ms,
+        forced_stop_tokens: measured.forced_stop_tokens,
+    })
+}
+
+/// One fixed-length greedy decode through every stop token on a fresh cache of the session's
+/// representation, optionally teacher-forced on `teacher_forced` (see
+/// [`crate::decode::forced_greedy_decode`]). A compressed arm must run wholly on its fused
+/// compressed reader or the call fails closed.
+fn campaign_forced_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    tokens: usize,
+    stop_tokens: &[i32],
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+    teacher_forced: Option<&[i32]>,
+) -> CoreResult<crate::decode::ForcedDecode> {
     let packed = match (compressed, model) {
         (None, _) => None,
         (Some(arm), Decoder::Causal(causal)) => Some(PackedCampaignDecoder {
@@ -219,6 +242,7 @@ fn campaign_steady_decode_on(
         prompt_ids,
         tokens,
         stop_tokens,
+        teacher_forced,
         &mut |_| {},
     );
     let evidence = cache.packed_evidence();
@@ -235,17 +259,11 @@ fn campaign_steady_decode_on(
             });
         if !fused {
             return Err(CoreError::Load(
-                "compressed steady decode did not run wholly on the fused compressed reader".into(),
+                "compressed forced decode did not run wholly on the fused compressed reader".into(),
             ));
         }
     }
-    Ok(crate::campaign::SteadyDecodeMeasurement {
-        prompt_tokens: prompt_ids.len() as u64,
-        generated_tokens: measured.tokens.len() as u64,
-        timed_tokens: measured.timed_tokens,
-        decode_ms: measured.decode_ms,
-        forced_stop_tokens: measured.forced_stop_tokens,
-    })
+    Ok(measured)
 }
 
 /// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
@@ -1254,6 +1272,49 @@ impl LlamaProvider {
             campaign_steady_decode_on(&self.model, &ids, tokens, &self.stop_tokens, compressed);
         mlx_rs::memory::clear_cache();
         measured
+    }
+
+    /// SC-20671 forced continuation (compressed rows): on the session's representation, prefill the
+    /// raw `prompt` and greedily decode `min(tokens, context window - prompt)` ids through every
+    /// stop token. With `teacher_forced`, the decode is forced on that stream instead and the
+    /// session's argmax at each position is returned (its length is the stream's). Runs outside
+    /// every coordinate's memory attribution on a request-scoped cache.
+    pub(crate) fn campaign_forced_continuation(
+        &self,
+        prompt: &str,
+        tokens: usize,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
+        teacher_forced: Option<&[i32]>,
+    ) -> CoreResult<Vec<i32>> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let window = usize::try_from(self.campaign_context_window()?)
+            .map_err(|_| CoreError::Load("context window overflows usize".into()))?;
+        let length = match teacher_forced {
+            Some(forced) => forced.len(),
+            None => tokens.min(window.saturating_sub(ids.len())),
+        };
+        let budget = u32::try_from(length)
+            .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured = campaign_forced_decode_on(
+            &self.model,
+            &ids,
+            length,
+            &self.stop_tokens,
+            compressed,
+            teacher_forced,
+        );
+        mlx_rs::memory::clear_cache();
+        Ok(measured?.tokens)
     }
 
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
@@ -4732,6 +4793,61 @@ mod tests {
             )),
         );
         let error = campaign_steady_decode_on(&model, &prompt, 8, &every_id, Some(&refused))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fused compressed reader"), "{error}");
+    }
+
+    /// SC-20671 forced continuation on a tiny model: the dense arm continues greedily through
+    /// every stop token; teacher-forcing the dense arm on its own continuation reproduces it at
+    /// every position; the compressed arm is teacher-forced on the dense stream wholly on its fused
+    /// reader; a position forced off the compressed arm's choice is a recorded flip; and a refused
+    /// compressed reader fails closed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn campaign_forced_continuation_teacher_forces_the_compressed_arm_on_the_dense_stream() {
+        let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let every_id = (0..32).collect::<Vec<i32>>();
+        let prompt = [1, 2, 3, 4, 5];
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        let forced = |compressed, stream: Option<&[i32]>| {
+            campaign_forced_decode_on(&model, &prompt, 64, &every_id, compressed, stream)
+                .map(|decode| decode.tokens)
+        };
+        let reference = forced(None, None).unwrap();
+        assert_eq!(reference.len(), 64, "every stop token is decoded through");
+        assert_eq!(forced(None, Some(&reference)).unwrap(), reference);
+        let choices = forced(Some(&arm), Some(&reference)).unwrap();
+        let evidence = crate::campaign::forced_continuation_evidence(&reference, &choices).unwrap();
+        assert_eq!(evidence.tokens, 64);
+        assert_eq!(evidence.matches + evidence.flip_count, 64);
+        // Force position 10 off the compressed arm's own choice there: a guaranteed flip.
+        let mut off = reference.clone();
+        off[10] = (choices[10] + 1) % 32;
+        let off_choices = forced(Some(&arm), Some(&off)).unwrap();
+        assert_eq!(
+            off_choices[..10],
+            choices[..10],
+            "the prefix before 10 is unchanged"
+        );
+        let miss = crate::campaign::forced_continuation_evidence(&off, &off_choices).unwrap();
+        assert!(miss.first_flip_positions.contains(&10), "{miss:?}");
+        assert!(miss.agreement < 1.0);
+        assert!(forced(Some(&arm), Some(&reference[..63])).is_err());
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20671-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let error = forced(Some(&refused), Some(&reference))
             .unwrap_err()
             .to_string();
         assert!(error.contains("fused compressed reader"), "{error}");

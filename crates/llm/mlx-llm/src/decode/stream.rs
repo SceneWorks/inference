@@ -775,17 +775,28 @@ pub(crate) struct ForcedDecode {
 /// timed window opens at the first token's stamp, so prefill and time-to-first-token are excluded.
 /// The loop body mirrors [`decode_loop`] (product sampler, KV feed, buffer-release cadence), minus
 /// stop handling, constraints, and the stream callback.
+///
+/// With `teacher_forced`, each step feeds the forced stream's previous token instead of the
+/// decoder's own choice (`tokens` must equal the stream length), so the returned ids are the
+/// decoder's greedy argmax at every position of that stream (SC-20671 forced-continuation
+/// agreement).
 pub(crate) fn forced_greedy_decode(
     decoder: &dyn Decode,
     cache: &mut dyn KvCache,
     prompt_ids: &[i32],
     tokens: usize,
     stop_tokens: &[i32],
+    teacher_forced: Option<&[i32]>,
     boundary: &mut dyn FnMut(&Array),
 ) -> Result<ForcedDecode> {
     if prompt_ids.is_empty() || tokens < 2 {
         return Err(Error::Msg(
             "forced steady decode needs a prompt and at least two tokens".into(),
+        ));
+    }
+    if teacher_forced.is_some_and(|forced| forced.len() != tokens) {
+        return Err(Error::Msg(
+            "teacher-forced decode length differs from its forced stream".into(),
         ));
     }
     let greedy = SamplingParams::default();
@@ -798,7 +809,7 @@ pub(crate) fn forced_greedy_decode(
     let mut closed: Option<Instant> = None;
     for step in 0..tokens {
         if step > 0 {
-            let previous = generated[step - 1];
+            let previous = teacher_forced.map_or(generated[step - 1], |forced| forced[step - 1]);
             let offset = cache.offset();
             logits = decoder.step(&input_ids(&[previous]), cache, offset)?;
             release.advance(1);
@@ -812,7 +823,7 @@ pub(crate) fn forced_greedy_decode(
             closed = Some(stamped);
         }
         generated.push(next);
-        history.push(next);
+        history.push(teacher_forced.map_or(next, |forced| forced[step]));
     }
     let (Some(opened), Some(closed)) = (opened, closed) else {
         return Err(Error::Msg(
@@ -1133,16 +1144,83 @@ mod tests {
     fn forced_steady_decode_ignores_stop_tokens_and_produces_exactly_n() {
         let mut cache = FixedDecoder.make_cache();
         // FixedDecoder's greedy token is 1; declare it the stop token.
-        let measured =
-            forced_greedy_decode(&FixedDecoder, cache.as_mut(), &[7, 8], 6, &[1], &mut |_| {})
-                .unwrap();
+        let measured = forced_greedy_decode(
+            &FixedDecoder,
+            cache.as_mut(),
+            &[7, 8],
+            6,
+            &[1],
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(measured.tokens, vec![1; 6]);
         assert_eq!(measured.timed_tokens, 5, "the first token is not timed");
         assert_eq!(measured.forced_stop_tokens, 6);
         assert!(
-            forced_greedy_decode(&FixedDecoder, cache.as_mut(), &[7], 1, &[], &mut |_| {}).is_err(),
+            forced_greedy_decode(
+                &FixedDecoder,
+                cache.as_mut(),
+                &[7],
+                1,
+                &[],
+                None,
+                &mut |_| {}
+            )
+            .is_err(),
             "one token has no steady window"
         );
+    }
+
+    /// Teacher forcing feeds the forced stream, not the decoder's own choice, and returns the
+    /// decoder's argmax at every forced position.
+    #[test]
+    fn forced_greedy_decode_teacher_forces_the_given_stream() {
+        struct EchoDecoder(std::cell::RefCell<Vec<i32>>);
+        impl Decode for EchoDecoder {
+            fn make_cache(&self) -> Box<dyn KvCache> {
+                Box::new(ContiguousKvCache::new(0))
+            }
+            fn step(
+                &self,
+                input_ids: &Array,
+                _cache: &mut dyn KvCache,
+                _offset: i32,
+            ) -> Result<Array> {
+                let fed = input_ids.as_slice::<i32>().to_vec();
+                let last = *fed.last().unwrap();
+                self.0.borrow_mut().extend(fed);
+                // Argmax is the fed token plus one (mod 4).
+                let mut logits = vec![0.0_f32; 4];
+                logits[((last + 1) % 4) as usize] = 1.0;
+                Ok(Array::from_slice(&logits, &[1, 4]))
+            }
+        }
+        let decoder = EchoDecoder(Default::default());
+        let mut cache = decoder.make_cache();
+        let forced = [3, 3, 0, 2];
+        let measured = forced_greedy_decode(
+            &decoder,
+            cache.as_mut(),
+            &[1],
+            4,
+            &[],
+            Some(&forced),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(*decoder.0.borrow(), vec![1, 3, 3, 0]);
+        assert_eq!(measured.tokens, vec![2, 0, 0, 1]);
+        assert!(forced_greedy_decode(
+            &decoder,
+            cache.as_mut(),
+            &[1],
+            3,
+            &[],
+            Some(&forced),
+            &mut |_| {}
+        )
+        .is_err());
     }
 
     /// Every steady-decode stamp is taken after the logits it closes over reached GPU completion,
@@ -1155,15 +1233,22 @@ mod tests {
         };
         let mut cache = decoder.make_cache();
         let mut boundaries = Vec::new();
-        let measured =
-            forced_greedy_decode(&decoder, cache.as_mut(), &[7], 4, &[], &mut |logits| {
+        let measured = forced_greedy_decode(
+            &decoder,
+            cache.as_mut(),
+            &[7],
+            4,
+            &[],
+            None,
+            &mut |logits| {
                 let produced = produced.borrow();
                 boundaries.push((
                     produced.len(),
                     mlx_array_is_available(logits) && produced.iter().all(mlx_array_is_available),
                 ));
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(measured.tokens.len(), 4);
         assert_eq!(boundaries, vec![(1, true), (2, true), (3, true), (4, true)]);
     }
