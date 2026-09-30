@@ -20,6 +20,11 @@ pub struct LlmMemoryGeometry {
 }
 
 /// Conservative checked estimate for request-owned native memory.
+///
+/// With `mtp_width > 0` the recurrent-state term is charged three times — the live state plus the
+/// copies a clone/replay MTP loop holds while it verifies and restores. A backend whose
+/// `geometry.recurrent_bytes` already prices every rollback copy its cache holds uses
+/// [`estimate_request_bytes_with_recurrent_copies`] instead.
 pub fn estimate_request_bytes(
     prompt_tokens: usize,
     max_new_tokens: u32,
@@ -27,6 +32,32 @@ pub fn estimate_request_bytes(
     vision_workspace_bytes: u64,
     mtp_width: u32,
 ) -> Option<u64> {
+    estimate_request_bytes_with_recurrent_copies(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        if mtp_width > 0 { 3 } else { 1 },
+    )
+}
+
+/// [`estimate_request_bytes`] with the recurrent-state multiplier chosen by the caller:
+/// `geometry.recurrent_bytes` is charged exactly `recurrent_copies` times, whatever `mtp_width`
+/// is. Every other term is identical. The eager counterpart of
+/// [`estimate_chunked_request_bytes_with_recurrent_copies`], with the same contract:
+/// `recurrent_copies == 0` is refused (`None`).
+pub fn estimate_request_bytes_with_recurrent_copies(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    recurrent_copies: u64,
+) -> Option<u64> {
+    if recurrent_copies == 0 {
+        return None;
+    }
     let prompt = u64::try_from(prompt_tokens).ok()?;
     let total = prompt.checked_add(u64::from(max_new_tokens))?;
     // Eager prefill materializes scores, the additive mask, and softmax weights.
@@ -67,11 +98,7 @@ pub fn estimate_request_bytes(
         .checked_add(mtp)?
         .checked_add(vision_workspace_bytes)?
         .checked_add(activations)?
-        .checked_add(
-            geometry
-                .recurrent_bytes
-                .checked_mul(if mtp_width > 0 { 3 } else { 1 })?,
-        )
+        .checked_add(geometry.recurrent_bytes.checked_mul(recurrent_copies)?)
 }
 
 /// Conservative checked estimate for a request whose attention implementation bounds the number
@@ -465,6 +492,25 @@ mod tests {
         // Zero copies would drop the recurrent state from admission: refused.
         assert_eq!(with(5, 0), None);
         assert_eq!(with(5, u64::MAX / 2), None, "the multiplication is checked");
+
+        // The eager estimate takes the same multiplier.
+        let eager = |mtp_width, copies| {
+            estimate_request_bytes_with_recurrent_copies(1_000, 64, geometry, 0, mtp_width, copies)
+        };
+        let once = eager(5, 1).unwrap();
+        assert_eq!(eager(5, 3).unwrap() - once, 2 * recurrent);
+        assert_eq!(
+            estimate_request_bytes(1_000, 64, geometry, 0, 5),
+            eager(5, 3)
+        );
+        assert_eq!(
+            estimate_request_bytes(1_000, 64, geometry, 0, 0),
+            eager(0, 1)
+        );
+        let mtp_terms = estimate_request_bytes(1_000, 64, no_recurrent, 0, 5).unwrap()
+            - estimate_request_bytes(1_000, 64, no_recurrent, 0, 0).unwrap();
+        assert_eq!(once - eager(0, 1).unwrap(), mtp_terms);
+        assert_eq!(eager(5, 0), None);
     }
 
     #[test]

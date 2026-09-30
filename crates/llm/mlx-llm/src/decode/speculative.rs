@@ -129,7 +129,7 @@ pub fn generate_draft_speculative(
     }
     let run = generate_speculative(
         target,
-        &mut DraftModelProposer::new(draft),
+        &mut DraftModelProposer::new(draft, spec.num_draft),
         SpeculativePrompt::Tokens(prompt_ids),
         config,
         spec.num_draft,

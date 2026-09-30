@@ -216,8 +216,17 @@ impl XcodecDecoder {
 
     /// Upstream `SoundStream.get_embed`: the RVQ-dequantized embedding `[1, dim, frames]` (the
     /// Vocos upsampler's input). The grid must pass [`check_grid`].
+    ///
+    /// A zero-frame grid yields an empty `[1, dim, 0]` **host** tensor without touching the
+    /// decoder's device: CUDA cannot allocate a zero-byte buffer (`cuMemAlloc(0)` is
+    /// `CUDA_ERROR_INVALID_VALUE`), so the degenerate case must never reach it. The Vocos
+    /// upsampler accepts that empty embedding on any device (it returns no samples).
     pub fn get_embed(&self, frames: &CodecFrames) -> Result<Tensor, AudioError> {
         check_grid(frames)?;
+        if frames.frames() == 0 {
+            let (_, dim) = self.codebooks[0].dims2()?;
+            return Ok(Tensor::zeros((1, dim, 0), DType::F32, &Device::Cpu)?);
+        }
         Ok(rvq_dequantize(
             &self.codebooks,
             &frames.codebooks,
@@ -495,21 +504,33 @@ mod tests {
     fn decode_refuses_malformed_grids_and_honors_cancel() {
         let snap = tiny_snapshot();
         let codec = load(&assets(snap.path())).unwrap();
+        // Malformed grids are refused by the host-side grid check before any device op, so the
+        // refusal is the same typed message on every backend (never a device/driver error).
+        let refused = |g: &CodecFrames| match codec.decode(g, &CancelFlag::new()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("malformed grid decoded"),
+        };
         let mut bad = grid(2);
         bad.codebooks[3][1] = CODEBOOK_SIZE;
-        assert!(codec.decode(&bad, &CancelFlag::new()).is_err());
+        assert!(refused(&bad).contains("is outside 0..1024"));
         let mut short = grid(2);
         short.codebooks.pop();
-        assert!(codec.decode(&short, &CancelFlag::new()).is_err());
+        assert!(refused(&short).contains("expected 8 codebooks"));
+        let mut ragged = grid(2);
+        ragged.codebooks[5].pop();
+        assert!(refused(&ragged).contains("same number of frames"));
         let cancel = CancelFlag::new();
         cancel.cancel();
         assert!(matches!(
             codec.decode(&grid(2), &cancel),
             Err(gen_core::Error::Canceled)
         ));
+        // A zero-frame grid decodes to nothing without a device allocation (CUDA refuses a
+        // zero-byte buffer), so the empty embedding is a host tensor on every backend.
         let empty = codec.decode(&grid(0), &CancelFlag::new()).unwrap();
         assert!(empty.wave.is_empty());
         assert_eq!(empty.embedding.dims(), [1, E, 0]);
+        assert!(empty.embedding.device().is_cpu());
     }
 
     /// max |got − want| / max |want|.

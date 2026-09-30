@@ -2713,6 +2713,12 @@ impl ProviderRegistry {
                 spec.yue2_ar_mode
             )));
         }
+        if spec.yue2_compute_policy != crate::Yue2ComputePolicy::Legacy && id != "yue2" {
+            return Err(Error::Unsupported(format!(
+                "the YuE2 compute policy {:?} cannot be used by provider '{id}'",
+                spec.yue2_compute_policy
+            )));
+        }
         let Some(quant) = spec.quantize else {
             return Ok(());
         };
@@ -4521,11 +4527,21 @@ mod tests {
         let base = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         assert_eq!(base.yue2_ar_mode, crate::Yue2ArMode::Native);
         assert!(registry.load("dummy_test_model", &base).is_ok());
-        let fp8 = base.with_yue2_ar_mode(crate::Yue2ArMode::ExperimentalFp8);
+        let fp8 = base
+            .clone()
+            .with_yue2_ar_mode(crate::Yue2ArMode::ExperimentalFp8);
         let err = registry.load("dummy_test_model", &fp8).err().unwrap();
         assert!(
             matches!(&err, Error::Unsupported(message)
             if message.contains("YuE2 AR mode") && message.contains("dummy_test_model")),
+            "{err}"
+        );
+        assert_eq!(base.yue2_compute_policy, crate::Yue2ComputePolicy::Legacy);
+        let strict = base.with_yue2_compute_policy(crate::Yue2ComputePolicy::Bf16);
+        let err = registry.load("dummy_test_model", &strict).err().unwrap();
+        assert!(
+            matches!(&err, Error::Unsupported(message)
+            if message.contains("YuE2 compute policy") && message.contains("dummy_test_model")),
             "{err}"
         );
     }

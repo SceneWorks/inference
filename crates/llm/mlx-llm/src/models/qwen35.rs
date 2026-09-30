@@ -20,13 +20,14 @@
 use std::cell::Cell;
 
 use mlx_rs::ops::{add, concatenate_axis, multiply, rsqrt, sigmoid, split_sections, sum_axis};
+use mlx_rs::transforms::async_eval;
 use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
 use crate::models::deepstack::{self, deepstack_fused_decoder_layers};
 use crate::primitives::attention::{sdpa_capped, AttnMask};
 use crate::primitives::gated_delta::{
-    causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
+    causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -330,7 +331,8 @@ impl GatedDeltaNet {
             Some(cs) => cs.clone(),
             None => zeros3(b, self.conv_kernel - 1, self.conv_dim, dt)?,
         };
-        let (conv_out, new_conv) = causal_depthwise_conv(&mixed, &self.conv_weight, &conv_state)?;
+        let (conv_out, conv_trace) =
+            causal_depthwise_conv_traced(&mixed, &self.conv_weight, &conv_state)?;
         let cp = split_sections(&conv_out, &[self.key_dim, 2 * self.key_dim], 2)?;
         let qc = cp[0].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
         let kc = cp[1].reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
@@ -343,25 +345,24 @@ impl GatedDeltaNet {
 
         // The gated delta recurrence, accumulated in f32 (matching the reference kernel). GQA
         // (q/k from Hk key heads → Hv value heads) is handled inside the recurrence primitive.
+        // The cache advances itself: an armed (speculative verify) forward also keeps every
+        // token's state for the checkpoint ring (sc-24435).
         let beta = sigmoid(&b_in)?;
         let g = compute_g(&a_in, &self.a_log, &self.dt_bias)?;
         let f32 = Dtype::Float32;
-        let (y, new_ssm) = gated_delta_recurrence(
+        let y = cache.advance(
+            conv_trace,
             &qn.as_dtype(f32)?,
             &kn.as_dtype(f32)?,
             &vc.as_dtype(f32)?,
             &g.as_dtype(f32)?,
             &beta.as_dtype(f32)?,
-            cache.ssm_state.as_ref(),
         )?;
 
         // Gated RMS-norm with z (back in the layer dtype), then the output projection.
         let out = rms_norm_gated(&y.as_dtype(dt)?, &self.norm_weight, &z, self.eps)?;
-        let result = self
-            .out_proj
-            .forward(&out.reshape(&[b, s, self.value_dim])?)?;
-        cache.update(new_conv, new_ssm, s);
-        Ok(result)
+        self.out_proj
+            .forward(&out.reshape(&[b, s, self.value_dim])?)
     }
 }
 
@@ -500,9 +501,10 @@ impl DecoderLayer {
 /// 16 of these layers; the per-token concat cost ~370 MB of unreusable buffers per token at 5.6k
 /// context).
 ///
-/// `Clone` is a buffer-sharing snapshot — the MTP loop's rollback (`target_cache.clone()` /
-/// `mtp_cache.clone()`) stays correct because the in-place write copies rather than donates while
-/// a snapshot holds the buffer.
+/// `Clone` is a buffer-sharing snapshot — a snapshot rollback (the MTP predictor's `MtpCache`, the
+/// engine's generic `SnapshotRollback`) stays correct because the in-place write copies rather
+/// than donates while a snapshot holds the buffer. The hybrid target itself rolls back through
+/// [`Qwen35Cache::truncate`] and never takes one.
 #[derive(Clone, Debug)]
 pub struct AttnKv {
     kv: ContiguousKvCache,
@@ -542,6 +544,12 @@ impl AttnKv {
     fn reset(&mut self) {
         self.kv.reset();
     }
+
+    /// Keep positions `0..len` — bookkeeping only: the rolled-back positions stay in the block
+    /// buffer as padding and the next update overwrites them in place.
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        self.kv.truncate(len)
+    }
 }
 
 /// The per-layer cache slot — a recurrent [`DeltaNetCache`] for linear layers, growing KV for
@@ -553,9 +561,41 @@ pub enum Qwen35LayerCache {
 }
 
 /// The hybrid decoder's cache: one slot per decoder layer.
-#[derive(Clone, Debug)]
+///
+/// It rolls back without a forward: [`arm_checkpoints`](Self::arm_checkpoints) opens a checkpoint
+/// window in every DeltaNet layer (the ring, sc-24435) — the state there and after every token of
+/// each forward until the window closes stays restorable — after which
+/// [`truncate`](Self::truncate) to any position of the window selects the kept states and
+/// truncates the attention KV by offset: the speculative engine's direct rollback. `Clone` is a
+/// buffer-sharing snapshot (a clone held across a forward makes the attention KV's in-place write
+/// copy its block); the engine never takes one.
+#[derive(Debug)]
 pub struct Qwen35Cache {
     layers: Vec<Qwen35LayerCache>,
+}
+
+impl Clone for Qwen35Cache {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        CACHE_CLONES.with(|c| c.set(c.get() + 1));
+        Self {
+            layers: self.layers.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only count of [`Qwen35Cache`] clones on this thread.
+    static CACHE_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f`, returning how many times a [`Qwen35Cache`] was cloned on this thread meanwhile.
+#[cfg(test)]
+pub(crate) fn counting_cache_clones<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    let before = CACHE_CLONES.with(|c| c.get());
+    let out = f();
+    (out, CACHE_CLONES.with(|c| c.get()) - before)
 }
 
 impl Qwen35Cache {
@@ -579,6 +619,156 @@ impl Qwen35Cache {
                 Qwen35LayerCache::Attn(a) => a.reset(),
             }
         }
+    }
+
+    /// Open a checkpoint window at the current position in every DeltaNet layer: the state here
+    /// and after every token of each forward until the window closes stays restorable, so
+    /// [`truncate`](Self::truncate) can return to any of those positions without a forward. The
+    /// speculative engine opens one per verify step (a draft model's proposal spans several
+    /// forwards in one window); prefill and plain decode never do, so they keep the
+    /// final-state-only recurrence. The window records at most `max_tokens` tokens — the
+    /// `width + 1` of a speculative width, what [`Qwen35Model::checkpoint_ring_bytes`] prices: a
+    /// forward past that is [`Error::CheckpointWindowFull`], refused by the first DeltaNet layer
+    /// (layer 0 of every hybrid schedule) before any layer's cache is written.
+    pub fn arm_checkpoints(&mut self, max_tokens: i32) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.arm_checkpoints(max_tokens);
+            }
+        }
+    }
+
+    /// Tokens the DeltaNet layers' checkpoint windows hold, summed over the layers (`0` when no
+    /// layer records).
+    #[cfg(test)]
+    pub(crate) fn checkpointed_tokens(&self) -> i32 {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                Qwen35LayerCache::Delta(c) => c.checkpointed_tokens(),
+                Qwen35LayerCache::Attn(_) => 0,
+            })
+            .sum()
+    }
+
+    /// Every DeltaNet layer's live `(conv_state, ssm_state)` on the host, in layer order.
+    #[cfg(test)]
+    pub(crate) fn delta_states(&self) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let host = |a: &Array| {
+            a.as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec()
+        };
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => {
+                    c.live_state().map(|(conv, ssm)| (host(conv), host(ssm)))
+                }
+                Qwen35LayerCache::Attn(_) => None,
+            })
+            .collect()
+    }
+
+    /// Close the checkpoint window: later forwards stop recording (and drop it).
+    pub fn close_checkpoints(&mut self) {
+        for l in &mut self.layers {
+            if let Qwen35LayerCache::Delta(c) = l {
+                c.close_checkpoints();
+            }
+        }
+    }
+
+    /// The positions [`truncate`](Self::truncate) can return to besides `0` and the current one:
+    /// the checkpoint window's (the ring's depth).
+    pub fn restorable(&self) -> std::ops::Range<i32> {
+        let offset = self.offset();
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Delta(c) => Some(c.restorable()),
+                Qwen35LayerCache::Attn(_) => None,
+            })
+            .reduce(|a, b| a.start.max(b.start)..a.end.min(b.end))
+            .unwrap_or(0..offset)
+    }
+
+    /// Keep positions `0..len` and close the checkpoint window: `len == offset()` only closes it
+    /// and `0` is a reset; otherwise every DeltaNet layer restores the state it kept at `len` and
+    /// the attention KV drops the positions past it by offset (its buffer is kept and written in
+    /// place by the next forward). A `len` outside the checkpoint window
+    /// ([`restorable`](Self::restorable)) is [`Error::Unsupported`] and leaves the cache
+    /// untouched. The restored states are scheduled for evaluation (asynchronously) so the
+    /// checkpoints they were read from free as soon as the next forward drops the window.
+    pub fn truncate(&mut self, len: i32) -> Result<()> {
+        let offset = self.offset();
+        if len < 0 || len > offset {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: cannot truncate to {len} with {offset} positions cached"
+            )));
+        }
+        if len == offset {
+            self.close_checkpoints();
+            return Ok(());
+        }
+        if len == 0 {
+            self.reset();
+            return Ok(());
+        }
+        if let Some(Qwen35LayerCache::Delta(c)) = self
+            .layers
+            .iter()
+            .find(|l| matches!(l, Qwen35LayerCache::Delta(c) if !c.can_rollback_to(len)))
+        {
+            let held = c.restorable();
+            return Err(Error::Unsupported(format!(
+                "Qwen35Cache: cannot truncate {offset} positions to {len}: the DeltaNet \
+                 checkpoint window holds positions {}..{}",
+                held.start, held.end
+            )));
+        }
+        let mut restored = Vec::new();
+        for l in &mut self.layers {
+            match l {
+                Qwen35LayerCache::Delta(c) => {
+                    c.rollback_to(len)?;
+                    if let Some((conv, ssm)) = c.live_state() {
+                        restored.extend([conv.clone(), ssm.clone()]);
+                    }
+                }
+                Qwen35LayerCache::Attn(a) => a.truncate(len)?,
+            }
+        }
+        async_eval(&restored)?;
+        Ok(())
+    }
+
+    /// Bytes of recurrent state the DeltaNet layers hold: every live state plus the checkpoint
+    /// ring (the attention KV is excluded) — what admission prices as the request's recurrent
+    /// footprint.
+    pub fn recurrent_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                Qwen35LayerCache::Delta(c) => c.resident_bytes(),
+                Qwen35LayerCache::Attn(_) => 0,
+            })
+            .sum()
+    }
+
+    /// The attention layers' K and V block-buffer addresses, in layer order — equal across steps
+    /// exactly when the forwards wrote them in place.
+    #[cfg(test)]
+    pub(crate) fn attn_buffer_addresses(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .filter_map(|l| match l {
+                Qwen35LayerCache::Attn(a) => Some(a.kv.buffer_addresses()),
+                Qwen35LayerCache::Delta(_) => None,
+            })
+            .flatten()
+            .collect()
     }
 }
 
@@ -659,6 +849,32 @@ impl Qwen35Model {
             layers: (0..mtp.layers.len()).map(|_| AttnKv::default()).collect(),
             steps: 0,
         })
+    }
+
+    /// The bytes a speculative run of `width` drafts per step adds to the recurrent footprint
+    /// through the DeltaNet checkpoint ring (sc-24435), over the live state: per linear layer,
+    /// `width + 2` slots of one recurrent state (`Hv·Dv·Dk`) plus `K` conv rows (`conv_dim`), all
+    /// at 4 bytes per element. That covers the most a checkpoint window holds for a verify step of
+    /// `width + 1` tokens — the state at the window start, the `width + 1` per-token states, and
+    /// the conv tails (`K - 1` rows) plus the forward's conv input (`width + K` rows) — whatever
+    /// the conv dtype. `None` on overflow (the caller fails closed).
+    pub fn checkpoint_ring_bytes(&self, width: usize) -> Option<u64> {
+        let c = &self.cfg;
+        let n = |v: i32| u64::try_from(v).ok();
+        let linear = (0..c.num_layers).filter(|&i| c.is_linear(i)).count() as u64;
+        let state = n(c.linear_num_value_heads)?
+            .checked_mul(n(c.linear_value_head_dim)?)?
+            .checked_mul(n(c.linear_key_head_dim)?)?;
+        let conv_dim = n(c.linear_num_key_heads)?
+            .checked_mul(n(c.linear_key_head_dim)?)?
+            .checked_mul(2)?
+            .checked_add(n(c.linear_num_value_heads)?.checked_mul(n(c.linear_value_head_dim)?)?)?;
+        let conv = conv_dim.checked_mul(n(c.linear_conv_kernel_dim)?)?;
+        let slots = u64::try_from(width).ok()?.checked_add(2)?;
+        linear
+            .checked_mul(slots)?
+            .checked_mul(state.checked_add(conv)?)?
+            .checked_mul(4)
     }
 
     /// A fresh per-layer cache (linear vs full-attn slot per the schedule).
@@ -1517,8 +1733,8 @@ impl KvCache for Qwen35Cache {
         ))
     }
 
-    fn truncate(&mut self, _len: i32) -> Result<()> {
-        Err(Error::Msg("Qwen35Cache: truncate not yet supported".into()))
+    fn truncate(&mut self, len: i32) -> Result<()> {
+        Qwen35Cache::truncate(self, len)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -1706,10 +1922,11 @@ pub(crate) mod tests {
     #[test]
     fn attn_kv_clone_snapshot_survives_in_place_updates_and_rolls_back() {
         let _cpu = CpuStream::enter();
-        // The MTP loop rolls back by restoring a `clone()` taken before the trial (there is no
-        // truncate on the hybrid cache). While the trial writes in place, the snapshot must stay
-        // exactly what it was, and continuing from it must match a reference that never saw the
-        // trial — across a block boundary, so the trial both overwrites padding and grows.
+        // A snapshot rollback (the MTP predictor cache, the engine's generic `SnapshotRollback`)
+        // restores a `clone()` taken before the trial. While the trial writes in place, the
+        // snapshot must stay exactly what it was, and continuing from it must match a reference
+        // that never saw the trial — across a block boundary, so the trial both overwrites padding
+        // and grows.
         let block = 4;
         let mut slot = AttnKv::with_block_tokens(block);
         let mut reference = ConcatReference::new();
@@ -3859,5 +4076,215 @@ pub(crate) mod tests {
             .as_slice::<f32>()
             .iter()
             .all(|x| x.is_finite()));
+    }
+
+    // ---- The DeltaNet checkpoint ring at the model level (sc-24435). ----
+
+    /// Feed `tokens` one forward each, returning the last forward's logits on the host.
+    fn step_each(model: &Qwen35Model, cache: &mut Qwen35Cache, tokens: &[i32]) -> Vec<f32> {
+        let mut last = Vec::new();
+        for &t in tokens {
+            let offset = cache.offset();
+            let logits = model
+                .decode_logits(&crate::primitives::input_ids(&[t]), cache, offset)
+                .unwrap();
+            last = host(&logits);
+        }
+        last
+    }
+
+    fn prefilled(model: &Qwen35Model, prompt: &[i32]) -> Qwen35Cache {
+        let mut cache = model.new_cache();
+        let logits = model
+            .decode_logits(&crate::primitives::input_ids(prompt), &mut cache, 0)
+            .unwrap();
+        logits.eval().unwrap();
+        cache
+    }
+
+    const RING_PROMPT: [i32; 6] = [3, 9, 4, 11, 3, 9];
+
+    /// The draft-model shape of the ring seam: one checkpoint window opened at the step start
+    /// spans several single-token forwards (and a multi-token one), and the hybrid cache truncates
+    /// to **each** position of it — the DeltaNet layers restore their kept state, the attention KV
+    /// drops the rest by offset — after which the next forward's logits are exactly those of a
+    /// cache that never saw the dropped tokens.
+    #[test]
+    fn a_checkpoint_window_over_several_forwards_truncates_to_each_position() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        let p = RING_PROMPT.len() as i32;
+        let drafts = [4, 11, 7, 20];
+        let next = 13;
+        for j in 0..=drafts.len() {
+            let mut cache = prefilled(&model, &RING_PROMPT);
+            cache.arm_checkpoints(drafts.len() as i32);
+            step_each(&model, &mut cache, &drafts);
+            assert_eq!(cache.restorable(), p..p + drafts.len() as i32);
+            cache.truncate(p + j as i32).unwrap();
+            assert_eq!(cache.offset(), p + j as i32);
+            let got = step_each(&model, &mut cache, &[next]);
+            let mut reference = prefilled(&model, &RING_PROMPT);
+            step_each(&model, &mut reference, &drafts[..j]);
+            let want = step_each(&model, &mut reference, &[next]);
+            assert_eq!(got, want, "truncated to {j} kept drafts");
+        }
+
+        // A multi-token forward inside the window (the verify shape) followed by a single token.
+        let mut cache = prefilled(&model, &RING_PROMPT);
+        cache.arm_checkpoints(4);
+        let offset = cache.offset();
+        model
+            .decode_logits(
+                &crate::primitives::input_ids(&drafts[..3]),
+                &mut cache,
+                offset,
+            )
+            .unwrap()
+            .eval()
+            .unwrap();
+        step_each(&model, &mut cache, &drafts[3..]);
+        assert_eq!(cache.restorable(), p..p + 4);
+        cache.truncate(p + 2).unwrap();
+        let got = step_each(&model, &mut cache, &[next]);
+        // The reference never saw the third token.
+        let mut reference = prefilled(&model, &RING_PROMPT);
+        step_each(&model, &mut reference, &drafts[..2]);
+        let want = step_each(&model, &mut reference, &[next]);
+        let max = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // The kept states came out of a 3-token forward, the reference's out of single-token
+        // ones: equal up to the multi-row projection's bf16 rounding.
+        assert!(max < 5e-2, "restored-from-verify logits differ by {max}");
+    }
+
+    /// `truncate` is refused (typed, cache untouched) outside the checkpoint window — with no
+    /// window at all, and before the window's start — and a truncation closes the window: the
+    /// next forward records nothing and drops it. `0` is a reset and the current length a no-op,
+    /// through the [`KvCache`] trait too.
+    #[test]
+    fn truncate_outside_the_checkpoint_window_is_refused_and_closes_it() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        let p = RING_PROMPT.len() as i32;
+        let mut cache = prefilled(&model, &RING_PROMPT);
+        step_each(&model, &mut cache, &[4, 11]);
+        let err = cache.truncate(p + 1).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "no window: {err}");
+        assert_eq!(cache.offset(), p + 2);
+
+        cache.arm_checkpoints(2);
+        step_each(&model, &mut cache, &[7, 20]);
+        let err = cache.truncate(p + 1).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "before the window: {err}"
+        );
+        assert_eq!(
+            cache.offset(),
+            p + 4,
+            "a refused truncate leaves the cache untouched"
+        );
+        assert!(cache.truncate(p + 5).is_err(), "past the end");
+
+        KvCache::truncate(&mut cache, p + 3).unwrap();
+        assert_eq!(cache.offset(), p + 3);
+        step_each(&model, &mut cache, &[5]);
+        assert!(
+            cache.restorable().is_empty(),
+            "the truncation closed the window"
+        );
+        assert!(cache.truncate(p + 3).is_err());
+
+        let offset = cache.offset();
+        KvCache::truncate(&mut cache, offset).unwrap();
+        assert_eq!(cache.offset(), p + 4);
+        KvCache::truncate(&mut cache, 0).unwrap();
+        assert_eq!(cache.offset(), 0);
+    }
+
+    /// sc-24435: a checkpoint window armed for `2` tokens refuses a 3-token forward (typed)
+    /// before any layer runs — the offset, every DeltaNet state and the attention KV are as they
+    /// were, so the next forward's logits are a never-refused cache's.
+    #[test]
+    fn a_forward_past_the_armed_window_is_refused_untouched() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        let p = RING_PROMPT.len() as i32;
+        let mut cache = prefilled(&model, &RING_PROMPT);
+        cache.arm_checkpoints(2);
+        let before = cache.delta_states();
+        let err = model
+            .decode_logits(&crate::primitives::input_ids(&[4, 11, 7]), &mut cache, p)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::CheckpointWindowFull {
+                    recorded: 0,
+                    requested: 3,
+                    max_tokens: 2
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(cache.offset(), p);
+        assert_eq!(cache.delta_states(), before);
+        assert_eq!(cache.checkpointed_tokens(), 0);
+        let got = step_each(&model, &mut cache, &[4, 11]);
+        let want = step_each(&model, &mut prefilled(&model, &RING_PROMPT), &[4, 11]);
+        assert_eq!(got, want);
+    }
+
+    /// E7 (sc-24435): the checkpoint ring's resident memory — the window's start state plus every
+    /// kept per-token state and conv input, measured on the cache — never exceeds what
+    /// [`Qwen35Model::checkpoint_ring_bytes`] prices for the speculative width, for a verify step
+    /// (`width + 1` tokens in one forward, the cap the window is armed with) and for a draft
+    /// model's window (`width` single-token forwards). Keeping every position — a full acceptance,
+    /// `truncate(offset())` — closes the window, so the next forward records nothing and releases
+    /// the ring.
+    #[test]
+    fn the_checkpoint_ring_footprint_is_what_admission_prices() {
+        let model = crate::decode::engine::tests::qwen35(false);
+        for width in [1usize, 4, 8] {
+            let priced = model.checkpoint_ring_bytes(width).unwrap() as usize;
+            let cap = width as i32 + 1;
+            let tokens: Vec<i32> = (0..cap).map(|i| 4 + i).collect();
+            let released = |cache: &mut Qwen35Cache, live: usize, label: &str| {
+                let offset = cache.offset();
+                cache.truncate(offset).unwrap();
+                step_each(&model, cache, &[5]);
+                assert!(cache.restorable().is_empty(), "{label}: the window closed");
+                assert_eq!(cache.checkpointed_tokens(), 0, "{label}: nothing recorded");
+                assert_eq!(cache.recurrent_bytes(), live, "{label}: the ring released");
+            };
+
+            let mut cache = prefilled(&model, &RING_PROMPT);
+            let live = cache.recurrent_bytes();
+            cache.arm_checkpoints(cap);
+            step_each(&model, &mut cache, &tokens[..width]);
+            let ring = cache.recurrent_bytes() - live;
+            assert!(
+                ring > 0 && ring <= priced,
+                "draft {width}: ring {ring} B, priced {priced} B"
+            );
+            released(&mut cache, live, &format!("draft {width}"));
+
+            let mut cache = prefilled(&model, &RING_PROMPT);
+            cache.arm_checkpoints(cap);
+            let offset = cache.offset();
+            model
+                .decode_logits(&crate::primitives::input_ids(&tokens), &mut cache, offset)
+                .unwrap()
+                .eval()
+                .unwrap();
+            let ring = cache.recurrent_bytes() - live;
+            assert!(
+                ring > 0 && ring <= priced,
+                "verify {width}: ring {ring} B, priced {priced} B"
+            );
+            released(&mut cache, live, &format!("verify {width}"));
+        }
+        assert!(model.checkpoint_ring_bytes(8) > model.checkpoint_ring_bytes(4));
     }
 }

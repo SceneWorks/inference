@@ -23,10 +23,10 @@ pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
-    generate_speculative, CacheRollback, DraftSampler, EngineOptions, LogitsScope, MlxSampler,
-    NoProposer, Proposal, ProposeContext, Proposer, RewindableConstraintMask, Rollback,
-    SampledToken, SnapshotRollback, SpeculativePrompt, SpeculativeRun, SpeculativeTarget,
-    StepTarget, TargetOutput, TokenSampler, TruncateRollback,
+    generate_speculative, CacheRollback, CheckpointRingRollback, DraftSampler, EngineOptions,
+    LogitsScope, MlxSampler, NoProposer, Proposal, ProposeContext, Proposer,
+    RewindableConstraintMask, Rollback, SampledToken, SnapshotRollback, SpeculativePrompt,
+    SpeculativeRun, SpeculativeTarget, StepTarget, TargetOutput, TokenSampler, TruncateRollback,
 };
 pub use prefix::{generate_cached, generate_cached_with, PrefixCache, PrefixStats};
 pub use proposers::{
