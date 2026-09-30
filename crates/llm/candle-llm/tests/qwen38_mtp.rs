@@ -166,7 +166,8 @@ fn write_snapshot(tokenizer_path: &std::path::Path, stop_first: bool) -> tempfil
 }
 
 /// [`write_snapshot`] with or without the MTP head (`with_mtp`): a checkpoint without one
-/// advertises no MTP capability, so `MtpMode::Auto` must decode normally and say `proposer=none`.
+/// advertises no MTP capability, so `MtpMode::Auto` (the legacy alias of `Speculative::Auto`)
+/// resolves to prompt lookup and says `proposer=prompt_lookup` (sc-24433).
 fn write_snapshot_with(
     tokenizer_path: &std::path::Path,
     stop_first: bool,
@@ -363,8 +364,8 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert_eq!(
         capabilities.mtp,
         Some(core_llm::MtpCapabilities {
-            max_draft_tokens: u32::MAX,
-            recommended_draft_tokens: 3,
+            max_draft_tokens: candle_llm::provider::MTP_MAX_DEPTH,
+            recommended_draft_tokens: candle_llm::provider::MTP_RECOMMENDED_DEPTH,
         })
     );
 
@@ -466,11 +467,11 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert!(auto_output.mtp.is_none());
     assert_eq!(auto_output.usage.generated_tokens, 3);
     let auto_record = plain_provider.last_decode_record().unwrap();
-    assert_eq!(auto_record.path, DecodePath::StepModel);
+    assert_eq!(auto_record.path, DecodePath::PromptLookup);
     assert_eq!(auto_record.kv_cache, KvCacheKind::Static);
-    assert_eq!(auto_record.proposer, ProposerKind::None);
-    assert_eq!(auto_record.proposer.label(), "none");
-    assert_eq!(auto_record.proposed_tokens, 0);
+    assert_eq!(auto_record.proposer, ProposerKind::PromptLookup);
+    assert_eq!(auto_record.proposer.label(), "prompt_lookup");
+    assert!(auto_output.decode.unwrap().fallbacks.is_empty());
     let mut enabled_request = request("enabled without a head", 3);
     enabled_request.mtp = MtpMode::Enabled { draft_tokens: 3 };
     assert!(matches!(

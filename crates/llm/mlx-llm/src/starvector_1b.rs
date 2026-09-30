@@ -12,17 +12,17 @@ use mlx_rs::Array;
 use serde_json::Value;
 
 use core_llm::{
-    Channel, Content, DecoderArchitecture, Error as CoreError, FinishReason, ImagePreprocessing,
-    LoadSpec, ProjectionMetadata, Result as CoreResult, StarVectorBoundedStream,
-    StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput, StarVectorProvider,
-    StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus, StarVectorTier, StreamEvent,
-    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer,
-    Usage, VisionEncoderArchitecture,
+    Channel, Content, DecodeReport, DecoderArchitecture, Error as CoreError, FinishReason,
+    ImagePreprocessing, LoadSpec, ProjectionMetadata, Result as CoreResult,
+    StarVectorBoundedStream, StarVectorDescriptor, StarVectorFinishReason, StarVectorOutput,
+    StarVectorProvider, StarVectorRequest, StarVectorStreamEvent, StarVectorStreamStatus,
+    StarVectorTier, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, Tokenizer, Usage, VisionEncoderArchitecture,
 };
 
 use crate::decode::{
-    generate_from_prefill, FinishReason as DecodeFinish, GenerationConfig,
-    StreamEvent as DecodeEvent,
+    generate_speculative, EngineOptions, FinishReason as DecodeFinish, GenerationConfig,
+    NoProposer, SpeculativePrompt, StepTarget, StreamEvent as DecodeEvent,
 };
 use crate::error::{Error, Result};
 use crate::image::resize_bicubic_u8;
@@ -148,11 +148,13 @@ impl StarVector1bProvider {
         image_from_request(request)
     }
 
+    /// The SVG run and, when the decoder ran, the engine's measured decode report (`None` only
+    /// when the stream stopped at the static `<svg` prefix, before any decode).
     fn generate_svg_inner(
         &self,
         request: &StarVectorRequest,
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
-    ) -> CoreResult<StarVectorOutput> {
+    ) -> CoreResult<(StarVectorOutput, Option<DecodeReport>)> {
         self.validate_svg(request)?;
         if request.text_request.cancel.is_cancelled() {
             return Err(CoreError::Canceled);
@@ -178,7 +180,7 @@ impl StarVector1bProvider {
                     generated_tokens: output.generated_tokens,
                     generated_bytes: output.generated_bytes,
                 });
-                return Ok(output);
+                return Ok((output, None));
             }
         }
         let (first_logits, mut cache) = self.model.prefill(image, &prompt).map_err(to_core)?;
@@ -233,18 +235,29 @@ impl StarVector1bProvider {
                 stopped.set(!matches!(status, StarVectorStreamStatus::Continue));
             }
         };
-        let generated = generate_from_prefill(
-            &self.model.decoder,
-            cache.as_mut(),
-            first_logits,
-            prompt,
+        // The decode is the speculative engine's token-at-a-time loop over the step-only decoder,
+        // so the SVG run carries a measured `DecodeReport` (epic sc-24432).
+        let run = generate_speculative(
+            &StepTarget(&self.model.decoder),
+            &mut NoProposer,
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits: first_logits,
+                hidden: None,
+                history: &prompt,
+                position_delta: 0,
+            },
             &config,
+            0,
             &request.text_request.cancel,
             &mut decode_event,
-            None,
-            Some(&|| stopped.get()),
+            EngineOptions {
+                should_stop: Some(&|| stopped.get()),
+                ..EngineOptions::default()
+            },
         )
         .map_err(to_core)?;
+        let generated = run.output;
         if let Some(error) = stream_error.into_inner() {
             return Err(error);
         }
@@ -284,7 +297,7 @@ impl StarVector1bProvider {
             generated_tokens: output.generated_tokens,
             generated_bytes: output.generated_bytes,
         });
-        Ok(output)
+        Ok((output, Some(run.report)))
     }
 }
 
@@ -339,7 +352,7 @@ impl TextLlm for StarVector1bProvider {
     ) -> CoreResult<TextLlmOutput> {
         let svg_request =
             StarVectorRequest::new(request.clone(), 2 * 1024 * 1024, Duration::from_secs(120));
-        let output = self.generate_svg_inner(&svg_request, &mut |event| match event {
+        let (output, report) = self.generate_svg_inner(&svg_request, &mut |event| match event {
             StarVectorStreamEvent::Source { text, index } => {
                 on_event(StreamEvent::Token {
                     id: index,
@@ -373,7 +386,18 @@ impl TextLlm for StarVector1bProvider {
                 generated_tokens: output.generated_tokens,
             },
             mtp: None,
-            decode: None,
+            // StarVector advertises no proposer: the resolution's fallback (an `auto` or proposer
+            // request it cannot run) joins the measured report, never a silent downgrade (E2).
+            decode: report.map(|mut report| {
+                report.fallbacks = core_llm::resolve_speculative(
+                    request.speculative_mode(),
+                    &self.descriptor.capabilities,
+                )
+                .fallback
+                .into_iter()
+                .collect();
+                report
+            }),
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
@@ -388,7 +412,7 @@ impl StarVectorProvider for StarVector1bProvider {
         request: &StarVectorRequest,
         on_event: &mut dyn FnMut(StarVectorStreamEvent),
     ) -> CoreResult<StarVectorOutput> {
-        self.generate_svg_inner(request, on_event)
+        Ok(self.generate_svg_inner(request, on_event)?.0)
     }
 }
 
@@ -412,6 +436,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_preserve_thinking: false,
             supports_tools: false,
             mtp: None,
+            speculative: Vec::new(),
             supported_constraints: Vec::new(),
         },
     }
@@ -687,5 +712,216 @@ mod tests {
             || Box::new(StarVector1bProvider::load(&spec).unwrap()),
             &profile,
         );
+    }
+
+    // ---- The engine decode (epic sc-24432, story sc-24434) on a shape-valid synthetic model. ----
+
+    use crate::decode::{
+        generate_speculative, EngineOptions, NoProposer, SpeculativePrompt, StepTarget,
+    };
+    use crate::synthetic::{word_tokenizer, Synth};
+
+    const VOCAB: i32 = 40;
+
+    /// A shape-valid StarVector-1B: a one-block CLIP tower at the published width and 224 px /
+    /// 257-row geometry, the BatchNorm adapter, and a tiny random GPTBigCode whose tied head
+    /// scores EOS exactly zero (so greedy decoding runs to the budget).
+    fn tiny_provider() -> StarVector1bProvider {
+        let (width, inner, hidden) = (1024, 16, 16);
+        let mut w = Synth::new(0x57A2_001B);
+        let v = "model.image_encoder.visual_encoder";
+        let b = format!("{v}.transformer.resblocks.0");
+        w.randn(format!("{v}.conv1.weight"), &[width, 3, 14, 14])
+            .randn(format!("{v}.class_embedding"), &[width])
+            .randn(format!("{v}.positional_embedding"), &[IMAGE_TOKENS, width])
+            .layer_norm(&format!("{v}.ln_pre"), width)
+            .layer_norm(&format!("{b}.ln_1"), width)
+            .randn(format!("{b}.attn.in_proj_weight"), &[3 * width, width])
+            .randn(format!("{b}.attn.in_proj_bias"), &[3 * width])
+            .linear(&format!("{b}.attn.out_proj"), width, width)
+            .layer_norm(&format!("{b}.ln_2"), width)
+            .linear(&format!("{b}.mlp.c_fc"), inner, width)
+            .linear(&format!("{b}.mlp.c_proj"), width, inner)
+            .layer_norm("model.image_encoder.ln_vision", width);
+        let a = "model.image_projection";
+        w.linear(&format!("{a}.c_fc"), inner, width)
+            .linear(&format!("{a}.c_proj"), hidden, inner)
+            .fill(format!("{a}.norm.weight"), &[IMAGE_TOKENS], 1.0)
+            .fill(format!("{a}.norm.bias"), &[IMAGE_TOKENS], 0.0)
+            .fill(format!("{a}.norm.running_mean"), &[IMAGE_TOKENS], 0.0)
+            .fill(format!("{a}.norm.running_var"), &[IMAGE_TOKENS], 1.0);
+        let d = "model.svg_transformer.transformer";
+        let l = format!("{d}.transformer.h.0");
+        let wte = format!("{d}.transformer.wte.weight");
+        w.randn(wte.clone(), &[VOCAB, hidden])
+            .zero_row(&wte, EOS_TOKEN_ID)
+            .randn(format!("{d}.transformer.wpe.weight"), &[512, hidden])
+            .layer_norm(&format!("{d}.transformer.ln_f"), hidden)
+            .layer_norm(&format!("{l}.ln_1"), hidden)
+            .linear(
+                &format!("{l}.attn.c_attn"),
+                hidden + 2 * (hidden / 2),
+                hidden,
+            )
+            .linear(&format!("{l}.attn.c_proj"), hidden, hidden)
+            .layer_norm(&format!("{l}.ln_2"), hidden)
+            .linear(&format!("{l}.mlp.c_fc"), 32, hidden)
+            .linear(&format!("{l}.mlp.c_proj"), hidden, 32);
+        let weights = w.weights();
+        StarVector1bProvider {
+            descriptor: descriptor(),
+            starvector: starvector_descriptor(),
+            model: StarVector1bModel {
+                vision: StarVectorClipVision::from_weights_with_layers(
+                    &weights,
+                    "model.image_encoder",
+                    1,
+                )
+                .unwrap(),
+                adapter: StarVectorAdapter::from_weights(&weights, a).unwrap(),
+                decoder: GptBigCode::from_weights(
+                    &weights,
+                    d,
+                    GptBigCodeConfig {
+                        vocab_size: VOCAB,
+                        hidden_size: hidden,
+                        layers: 1,
+                        heads: 2,
+                        positions: 512,
+                    },
+                )
+                .unwrap(),
+            },
+            tokenizer: word_tokenizer(VOCAB as usize, &[]),
+        }
+    }
+
+    fn image_request(speculative: Option<core_llm::Speculative>) -> TextLlmRequest {
+        TextLlmRequest {
+            messages: vec![core_llm::Message {
+                role: core_llm::Role::User,
+                content: vec![Content::Image(
+                    core_llm::ImageRef::new(
+                        8,
+                        8,
+                        (0..8 * 8 * 3).map(|i| (i * 37 % 256) as u8).collect(),
+                    )
+                    .unwrap(),
+                )],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 8,
+            seed: Some(3),
+            speculative,
+            ..Default::default()
+        }
+    }
+
+    /// The engine port emits exactly the pre-engine `generate_from_prefill` loop's tokens on the
+    /// synthetic model's image-conditioned prefill — greedy, and seeded stochastic (whose draws
+    /// are sensitive to small logit differences a greedy argmax can absorb).
+    #[test]
+    fn the_engine_decode_is_the_pre_engine_loop() {
+        let provider = tiny_provider();
+        let request = image_request(None);
+        let image = image_from_request(&request).unwrap();
+        let prompt: Vec<i32> = provider
+            .tokenizer
+            .encode(SVG_PROMPT, false)
+            .unwrap()
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+        let stochastic = SamplingParams {
+            temperature: 1.5,
+            ..SamplingParams::default()
+        };
+        for (name, params) in [
+            ("greedy", sampling(&request.sampling)),
+            ("stochastic", stochastic),
+        ] {
+            let config = GenerationConfig {
+                max_new_tokens: 8,
+                sampling: params,
+                seed: request.seed,
+                stop_tokens: vec![EOS_TOKEN_ID],
+            };
+            let (logits, mut cache) = provider.model.prefill(image, &prompt).unwrap();
+            let expected = crate::decode::generate_from_prefill(
+                &provider.model.decoder,
+                cache.as_mut(),
+                logits,
+                prompt.clone(),
+                &config,
+                &core_llm::CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                expected.tokens.len() > 1,
+                "{name}: the fixture steps the decoder"
+            );
+            let (logits, mut cache) = provider.model.prefill(image, &prompt).unwrap();
+            let run = generate_speculative(
+                &StepTarget(&provider.model.decoder),
+                &mut NoProposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &prompt,
+                    position_delta: 0,
+                },
+                &config,
+                0,
+                &core_llm::CancelFlag::new(),
+                &mut |_| {},
+                EngineOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(run.output.tokens, expected.tokens, "{name}");
+            assert_eq!(run.output.finish_reason, expected.finish_reason, "{name}");
+        }
+    }
+
+    /// AC2 end to end: an SVG generation carries `decode`, naming the token-at-a-time path, no
+    /// proposer, the measured sampler, and the fallback an `auto` request resolves to on a
+    /// provider that advertises no proposer.
+    #[test]
+    fn the_provider_reports_its_decode_and_the_auto_fallback() {
+        let provider = tiny_provider();
+        let out = provider
+            .generate(
+                &image_request(Some(core_llm::Speculative::Auto)),
+                &mut |_| {},
+            )
+            .unwrap();
+        let report = out.decode.expect("an SVG run reports its decode path");
+        assert_eq!(report.path, "step_model");
+        assert_eq!(report.proposer, core_llm::ProposerKind::None);
+        assert_eq!(report.draft_tokens, None);
+        assert_eq!(report.sampler, "device");
+        assert_eq!(out.usage.generated_tokens, 8);
+        assert_eq!(
+            report.verify_steps + 1,
+            u64::from(out.usage.generated_tokens)
+        );
+        assert_eq!(
+            report.fallbacks,
+            vec![
+                "speculative: auto found no proposer this model can run (no MTP head, no prompt \
+                 lookup on this backend)"
+                    .to_string()
+            ]
+        );
+        let off = provider
+            .generate(&image_request(None), &mut |_| {})
+            .unwrap();
+        assert_eq!(off.text, out.text, "the fallback decodes plainly");
+        assert!(off.decode.unwrap().fallbacks.is_empty());
     }
 }

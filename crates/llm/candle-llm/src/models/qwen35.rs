@@ -14,9 +14,9 @@
 //!   `sigmoid(gate)` before the output projection).
 //!
 //! Each decoder layer is `input_layernorm → mixer → residual → post_attention_layernorm → MLP →
-//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank (`MoeFfn`, the
-//! 35B-A3B). The KV cache (full-attn layers) and the recurrent [`DeltaNetCache`] (linear
-//! layers) live side by side in a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next
+//! residual`. The MLP is a dense SwiGLU (the 27B) or a sparse Mixture-of-Experts bank (the shared
+//! [`SparseMoe`] block, the 35B-A3B). The KV cache (full-attn layers) and the recurrent
+//! [`DeltaNetCache`] (linear layers) live side by side in a per-layer [`Qwen35Cache`]. RMSNorm weights follow the Qwen3-Next
 //! `(1 + weight)` convention; the recurrence accumulates in f32 (matching the reference GPU kernel)
 //! while the rest of the decoder runs in the device compute dtype (bf16 on GPU, f32 on CPU).
 
@@ -35,6 +35,7 @@ use crate::primitives::gated_delta::{
     causal_depthwise_conv_traced, compute_g, rms_norm_gated, DeltaNetCache, RingSpec,
 };
 use crate::primitives::kv_cache::{KvCacheKind, StaticKvCache};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu};
 use crate::primitives::nn::{embed, rms_norm, rms_norm_residual, swiglu};
 use crate::primitives::projection::{Projection, ProjectionFormat, QuantSpec, WeightCensus};
 use crate::primitives::quant::is_ggml_block_tensor;
@@ -44,7 +45,7 @@ use crate::primitives::{KvCache, PrismRegistry, Weights};
 /// Whether a dense [`Qwen35Model`] / [`Qwen35Mtp`] load stores the checkpoint tensor `key` in a
 /// requested projection format rather than dense: in every decoder (and MTP) layer the Gated
 /// DeltaNet in/out projections (`in_proj_qkv`, `in_proj_z`, `out_proj`), the attention q/k/v/o,
-/// the dense MLP, the stacked MoE experts and the shared expert; and the MTP `fc`. The per-head
+/// the dense MLP, the MoE experts (stacked, or per expert) and the shared expert; and the MTP `fc`. The per-head
 /// `in_proj_a` / `in_proj_b`, the conv, `A_log` / `dt_bias`, the norms, the MoE router and
 /// shared-expert gate, and the embeddings stay dense. The LM head is quantized under every
 /// format — a tied head from a copy of the embedding — and is not a keyed rule here.
@@ -70,8 +71,24 @@ pub(crate) fn quantizes_tensor(key: &str) -> bool {
         "mlp.shared_expert.down_proj.weight",
     ];
     key == "mtp.fc.weight"
-        || super::split_layer_key(key)
-            .is_some_and(|(_, _, suffix)| LAYER_PROJECTIONS.contains(&suffix))
+        || super::split_layer_key(key).is_some_and(|(_, _, suffix)| {
+            LAYER_PROJECTIONS.contains(&suffix) || is_per_expert_projection(suffix)
+        })
+}
+
+/// A layer-relative key of one routed expert's projection in the per-expert layout (the bf16
+/// Qwen3.5 release): `mlp.experts.{e}.{gate,up,down}_proj.weight`.
+fn is_per_expert_projection(suffix: &str) -> bool {
+    suffix
+        .strip_prefix("mlp.experts.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(e, part)| {
+            e.parse::<usize>().is_ok()
+                && matches!(
+                    part,
+                    "gate_proj.weight" | "up_proj.weight" | "down_proj.weight"
+                )
+        })
 }
 
 /// Whether a [`Qwen35Model`] / [`Qwen35Mtp`] load of a snapshot with this config stores the
@@ -158,7 +175,7 @@ impl QwenEmbedding {
 pub type MropePositions = (Vec<i32>, Vec<i32>, Vec<i32>, i32);
 
 /// Mixture-of-Experts FFN parameters (`qwen3_5_moe`, the 35B-A3B): the routed-expert count / top-k
-/// and the per-expert + shared-expert FFN widths that drive the un-fused `MoeFfn`.
+/// and the per-expert + shared-expert FFN widths that drive the MoE block.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeParams {
     pub num_experts: i32,
@@ -600,86 +617,14 @@ impl Mlp {
     }
 }
 
-/// Sparse Mixture-of-Experts FFN (`Qwen3_5MoeSparseMoeBlock`, the 35B-A3B): a softmax router over
-/// `experts` (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
-/// **sigmoid-gated** shared expert. Each expert runs only on its routed tokens (gathered, then
-/// scatter-added back), so active compute scales with `experts_per_tok` (~3B of 35B). The fused
-/// checkpoint tensors (`experts.gate_up_proj` / `experts.down_proj`) are un-fused into per-expert
-/// [`Mlp`]s at load. Routing mirrors the generic [`MoeMlp`](super::llama) bank's CPU path.
-struct MoeFfn {
-    router: Tensor, // [num_experts, hidden]
-    experts: Vec<Mlp>,
-    shared: Mlp,
-    shared_gate: Tensor, // [1, hidden] sigmoid gate
-    experts_per_tok: usize,
-}
-
-impl MoeFfn {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, s, h) = x.dims3()?;
-        let t = b * s;
-        let dtype = x.dtype();
-        let device = x.device();
-        let xf = x.reshape((t, h))?;
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Router probabilities (f32 softmax for a stable top-k), pulled to host.
-        let logits = xf.matmul(&self.router.t()?)?; // [t, E]
-        crate::primitives::host_sync::note_host_sync();
-        let probs =
-            candle_nn::ops::softmax_last_dim(&logits.to_dtype(DType::F32)?)?.to_vec2::<f32>()?;
-
-        // Invert the per-token top-k into per-expert (token, weight) lists, renormalized to sum 1.
-        let mut routed: Vec<Vec<(u32, f32)>> = vec![Vec::new(); num_experts];
-        for (ti, row) in probs.iter().enumerate() {
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
-            let top = &idx[..k];
-            let denom = top
-                .iter()
-                .map(|&e| row[e])
-                .sum::<f32>()
-                .max(f32::MIN_POSITIVE);
-            for &e in top {
-                routed[e].push((ti as u32, row[e] / denom));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = Tensor::zeros((t, h), dtype, device)?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len();
-            let idx = Tensor::from_vec(
-                toks.iter().map(|&(ti, _)| ti).collect::<Vec<u32>>(),
-                (n,),
-                device,
-            )?;
-            let wts = Tensor::from_vec(
-                toks.iter().map(|&(_, w)| w).collect::<Vec<f32>>(),
-                (n, 1),
-                device,
-            )?
-            .to_dtype(dtype)?;
-            let xe = xf.index_select(&idx, 0)?; // [n, h]
-            let ye = self.experts[e].forward(&xe)?.broadcast_mul(&wts)?; // [n, h]
-            out = out.index_add(&idx, &ye, 0)?;
-        }
-
-        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
-        let shared = self.shared.forward(&xf)?;
-        let sg = sigmoid(&xf.matmul(&self.shared_gate.t()?)?)?; // [t, 1]
-        Ok((out + shared.broadcast_mul(&sg)?)?.reshape((b, s, h))?)
-    }
-}
-
 /// The per-layer FFN: a dense SwiGLU (27B) or a sparse MoE block (35B-A3B).
+///
+/// The MoE block is the crate's shared [`SparseMoe`] (sc-24440): a softmax router over the experts
+/// (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
+/// **sigmoid-gated** shared expert, routed on the device.
 enum Ffn {
     Dense(Mlp),
-    Moe(MoeFfn),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -720,14 +665,7 @@ impl DecoderLayer {
         }
         match &self.ffn {
             Ffn::Dense(m) => m.record(census),
-            Ffn::Moe(moe) => {
-                census.record_tensor(&moe.router);
-                census.record_tensor(&moe.shared_gate);
-                moe.shared.record(census);
-                for e in &moe.experts {
-                    e.record(census);
-                }
-            }
+            Ffn::Moe(moe) => moe.record(census),
         }
     }
 }
@@ -1402,6 +1340,95 @@ pub struct Qwen35Model {
     device_positions: bool,
 }
 
+/// The FFN of the decoder or MTP predictor layer whose tensors live under `lp` (the layer prefix
+/// with its trailing dot: `model.language_model.layers.3.`, `mtp.layers.0.`): a dense SwiGLU (27B)
+/// or the crate's shared sparse-MoE block (35B-A3B). The body and the MTP head share it, so a
+/// predictor layer takes exactly the body's FFN choice and expert layout (sc-24438). `proj_q` is
+/// the loader's keyed projection reader (Prism, stored GGML blocks, or dense in `format`).
+///
+/// MoE experts come in two checkpoint layouts. The fused one (Qwen3.6) stacks them:
+/// `experts.gate_up_proj` `[E, 2·moe_inter, hidden]` (gate rows ‖ up rows, matching the reference
+/// `linear(x, gate_up_proj[e]).chunk(2, -1)`) and `experts.down_proj` `[E, hidden, moe_inter]`,
+/// un-fused here into per-expert SwiGLUs. The per-expert one (the bf16 Qwen3.5 release) stores
+/// each expert's `experts.{e}.{gate,up,down}_proj.weight`, read as keyed projections.
+fn build_ffn(
+    w: &Weights,
+    lp: &str,
+    cfg: &Qwen35Config,
+    format: Option<&ProjectionFormat>,
+    dtype: DType,
+    device: &Device,
+    proj_q: &dyn Fn(String) -> Result<Projection>,
+) -> Result<Ffn> {
+    let lp = |s: &str| format!("{lp}{s}");
+    let req = |key: String| -> Result<Tensor> { dense_weight(w, &key, dtype) };
+    let Some(moe) = &cfg.moe else {
+        return Ok(Ffn::Dense(Mlp {
+            gate: proj_q(lp("mlp.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.up_proj.weight"))?,
+            down: proj_q(lp("mlp.down_proj.weight"))?,
+        }));
+    };
+    let mut experts = Vec::with_capacity(moe.num_experts as usize);
+    if w.contains(&lp("mlp.experts.0.gate_proj.weight")) {
+        for e in 0..moe.num_experts as usize {
+            let part = |p: &str| proj_q(lp(&format!("mlp.experts.{e}.{p}_proj.weight")));
+            experts.push(SwiGlu {
+                gate: part("gate")?,
+                up: part("up")?,
+                down: part("down")?,
+            });
+        }
+    } else {
+        let mi = moe.moe_intermediate_size as usize;
+        debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
+        debug_assert_priced(&lp("mlp.experts.down_proj"), format);
+        // A prepared tier stores each stacked tensor as GGML blocks
+        // `[E, rows, blocks, block_bytes]` (sc-19375); an expert's rows are whole blocks, so it is
+        // sliced out exactly like the dense `[E, rows, cols]`.
+        let stacked = |key: String| -> Result<(Tensor, bool)> {
+            let t = w.require(&key)?;
+            match is_ggml_block_tensor(t) {
+                true => Ok((t.clone(), true)),
+                false => Ok((req(key)?, false)),
+            }
+        };
+        let (gate_up_key, down_key) = (lp("mlp.experts.gate_up_proj"), lp("mlp.experts.down_proj"));
+        let (gate_up, gate_up_stored) = stacked(gate_up_key.clone())?;
+        let (down, down_stored) = stacked(down_key.clone())?;
+        let expert = |key: &str, slice: Tensor, stored: bool| -> Result<Projection> {
+            match stored {
+                true => Projection::load_stored_blocks(key, &slice, None, format, device),
+                false => Projection::load_as(slice.contiguous()?, None, format),
+            }
+        };
+        for e in 0..moe.num_experts as usize {
+            let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?; // [2·mi, hidden]
+            let dn = down.narrow(0, e, 1)?.squeeze(0)?; // [hidden, mi]
+            experts.push(SwiGlu {
+                gate: expert(&gate_up_key, gu.narrow(0, 0, mi)?, gate_up_stored)?,
+                up: expert(&gate_up_key, gu.narrow(0, mi, mi)?, gate_up_stored)?,
+                down: expert(&down_key, dn, down_stored)?,
+            });
+        }
+    }
+    Ok(Ffn::Moe(SparseMoe::new(
+        req(lp("mlp.gate.weight"))?,
+        experts,
+        SwiGlu {
+            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
+            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
+        },
+        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        MoeRouting {
+            experts_per_tok: moe.experts_per_tok,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+        },
+    )?))
+}
+
 /// The checkpoint-native Qwen3.8 multi-token predictor.
 ///
 /// This is an auxiliary draft model only: the target decoder never consults it during ordinary
@@ -1444,9 +1471,13 @@ impl Qwen35MtpCache {
 }
 
 impl Qwen35Mtp {
-    /// All tensors required by the frozen Qwen3.8 MTP layout. A checkpoint is advertised as MTP
-    /// capable only when every key is present; a partial auxiliary head is never used.
-    pub fn required_keys(num_layers: usize) -> Vec<String> {
+    /// All tensors the configured MTP head requires: the frozen Qwen3.8 layout, whose predictor
+    /// layer FFN is the body's — the dense MLP, or for a sparse-MoE config (35B-A3B) the router,
+    /// shared expert and routed experts in the snapshot's layout (fused `gate_up_proj` /
+    /// `down_proj`, or per-expert `experts.{e}.*` when `per_expert`). A checkpoint is advertised as
+    /// MTP capable only when every key is present; a partial auxiliary head is never used.
+    pub fn required_keys(cfg: &Qwen35Config, per_expert: bool) -> Vec<String> {
+        let num_layers = cfg.mtp_num_hidden_layers;
         let mut keys = vec![
             "mtp.fc.weight".to_string(),
             "mtp.norm.weight".to_string(),
@@ -1463,21 +1494,52 @@ impl Qwen35Mtp {
                 "self_attn.o_proj.weight",
                 "self_attn.q_norm.weight",
                 "self_attn.k_norm.weight",
-                "mlp.gate_proj.weight",
-                "mlp.up_proj.weight",
-                "mlp.down_proj.weight",
             ] {
                 keys.push(format!("mtp.layers.{i}.{suffix}"));
             }
+            let mut ffn: Vec<String> = match &cfg.moe {
+                None => ["gate_proj", "up_proj", "down_proj"]
+                    .map(|p| format!("mlp.{p}.weight"))
+                    .into(),
+                Some(moe) => {
+                    let mut ffn: Vec<String> = [
+                        "mlp.gate.weight",
+                        "mlp.shared_expert.gate_proj.weight",
+                        "mlp.shared_expert.up_proj.weight",
+                        "mlp.shared_expert.down_proj.weight",
+                        "mlp.shared_expert_gate.weight",
+                    ]
+                    .map(String::from)
+                    .into();
+                    if per_expert {
+                        for e in 0..moe.num_experts {
+                            for p in ["gate_proj", "up_proj", "down_proj"] {
+                                ffn.push(format!("mlp.experts.{e}.{p}.weight"));
+                            }
+                        }
+                    } else {
+                        ffn.push("mlp.experts.gate_up_proj".into());
+                        ffn.push("mlp.experts.down_proj".into());
+                    }
+                    ffn
+                }
+            };
+            keys.extend(ffn.drain(..).map(|k| format!("mtp.layers.{i}.{k}")));
         }
         keys
+    }
+
+    /// Whether the snapshot `w` stores the MTP predictor layer's routed experts per expert
+    /// (`experts.{e}.*`, the bf16 Qwen3.5 release) rather than fused.
+    fn per_expert_in(w: &Weights) -> bool {
+        w.contains("mtp.layers.0.mlp.experts.0.gate_proj.weight")
     }
 
     /// Whether the complete configured MTP tensor set is present.
     pub fn complete_in(w: &Weights, cfg: &Qwen35Config) -> bool {
         cfg.mtp_num_hidden_layers == 1
             && !cfg.mtp_use_dedicated_embeddings
-            && Self::required_keys(cfg.mtp_num_hidden_layers)
+            && Self::required_keys(cfg, Self::per_expert_in(w))
                 .iter()
                 .all(|key| w.contains(key))
     }
@@ -1530,7 +1592,7 @@ impl Qwen35Mtp {
                     .into(),
             ));
         }
-        let missing: Vec<String> = Self::required_keys(cfg.mtp_num_hidden_layers)
+        let missing: Vec<String> = Self::required_keys(cfg, Self::per_expert_in(w))
             .into_iter()
             .filter(|key| !w.contains(key))
             .collect();
@@ -1539,11 +1601,6 @@ impl Qwen35Mtp {
                 "qwen3_5 MTP tensor set is incomplete; missing {}",
                 missing.join(", ")
             )));
-        }
-        if cfg.moe.is_some() {
-            return Err(Error::Config(
-                "qwen3_5 MoE MTP loading requires the checkpoint's sparse MTP FFN layout".into(),
-            ));
         }
 
         let dtype = target.dtype;
@@ -1576,11 +1633,17 @@ impl Qwen35Mtp {
                     scale: (cfg.head_dim as f32).powf(-0.5),
                     eps,
                 }),
-                ffn: Ffn::Dense(Mlp {
-                    gate: proj_q(&lp("mlp.gate_proj.weight"))?,
-                    up: proj_q(&lp("mlp.up_proj.weight"))?,
-                    down: proj_q(&lp("mlp.down_proj.weight"))?,
-                }),
+                // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
+                // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`).
+                ffn: build_ffn(
+                    w,
+                    &lp(""),
+                    cfg,
+                    format,
+                    dtype,
+                    &target.device,
+                    &|key: String| proj_q(&key),
+                )?,
                 eps,
             });
         }
@@ -2684,66 +2747,15 @@ impl Qwen35Model {
                     eps,
                 })
             };
-            let ffn = match &cfg.moe {
-                // Dense SwiGLU (27B).
-                None => Ffn::Dense(Mlp {
-                    gate: proj_q(lp("mlp.gate_proj.weight"))?,
-                    up: proj_q(lp("mlp.up_proj.weight"))?,
-                    down: proj_q(lp("mlp.down_proj.weight"))?,
-                }),
-                // Sparse MoE (35B-A3B): un-fuse the stacked expert tensors into per-expert SwiGLUs.
-                // `experts.gate_up_proj` is [E, 2·moe_inter, hidden] (gate rows ‖ up rows, matching the
-                // reference `linear(x, gate_up_proj[e]).chunk(2, -1)`); `experts.down_proj` is
-                // [E, hidden, moe_inter].
-                Some(moe) => {
-                    let mi = moe.moe_intermediate_size as usize;
-                    debug_assert_priced(&lp("mlp.experts.gate_up_proj"), format);
-                    debug_assert_priced(&lp("mlp.experts.down_proj"), format);
-                    // A prepared tier stores each stacked tensor as GGML blocks
-                    // `[E, rows, blocks, block_bytes]` (sc-19375); an expert's rows are whole
-                    // blocks, so it is sliced out exactly like the dense `[E, rows, cols]`.
-                    let stacked = |key: String| -> Result<(Tensor, bool)> {
-                        let t = w.require(&key)?;
-                        match is_ggml_block_tensor(t) {
-                            true => Ok((t.clone(), true)),
-                            false => Ok((req(key)?, false)),
-                        }
-                    };
-                    let (gate_up_key, down_key) =
-                        (lp("mlp.experts.gate_up_proj"), lp("mlp.experts.down_proj"));
-                    let (gate_up, gate_up_stored) = stacked(gate_up_key.clone())?;
-                    let (down, down_stored) = stacked(down_key.clone())?;
-                    let expert = |key: &str, slice: Tensor, stored: bool| -> Result<Projection> {
-                        match stored {
-                            true => {
-                                Projection::load_stored_blocks(key, &slice, None, format, &device)
-                            }
-                            false => Projection::load_as(slice.contiguous()?, None, format),
-                        }
-                    };
-                    let mut experts = Vec::with_capacity(moe.num_experts as usize);
-                    for e in 0..moe.num_experts as usize {
-                        let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?; // [2·mi, hidden]
-                        let dn = down.narrow(0, e, 1)?.squeeze(0)?; // [hidden, mi]
-                        experts.push(Mlp {
-                            gate: expert(&gate_up_key, gu.narrow(0, 0, mi)?, gate_up_stored)?,
-                            up: expert(&gate_up_key, gu.narrow(0, mi, mi)?, gate_up_stored)?,
-                            down: expert(&down_key, dn, down_stored)?,
-                        });
-                    }
-                    Ffn::Moe(MoeFfn {
-                        router: req(lp("mlp.gate.weight"))?,
-                        experts,
-                        shared: Mlp {
-                            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
-                            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
-                            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
-                        },
-                        shared_gate: req(lp("mlp.shared_expert_gate.weight"))?,
-                        experts_per_tok: moe.experts_per_tok,
-                    })
-                }
-            };
+            let ffn = build_ffn(
+                w,
+                &join(&format!("layers.{i}.")),
+                &cfg,
+                format,
+                dtype,
+                &device,
+                &proj_q,
+            )?;
             layers.push(DecoderLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
@@ -2866,16 +2878,20 @@ impl StepModel for Qwen35Model {
     }
 
     /// Replayable as a CUDA graph (stories sc-24134, sc-24441) when every per-step position is
-    /// device data: with device positions on (the CUDA default) a dense step reads its RoPE
-    /// positions, KV write index, attention length and DeltaNet ring slots from the cache's
-    /// staged buffers. Still declared uncapturable, so the runner refuses before any capture: the
-    /// MoE block (35B-A3B) pulls its router probabilities to the host every step
-    /// (`moe_router_host_read`); with device positions off the positions are Rust-side scalars
+    /// device data: with device positions on (the CUDA default) a step reads its RoPE positions,
+    /// KV write index, attention length and DeltaNet ring slots from the cache's staged buffers.
+    /// Still declared uncapturable, so the runner refuses before any capture: an MoE block
+    /// (35B-A3B) whose experts Candle cannot index by a device id (quantized) dispatches them from
+    /// host-read routes (`moe_expert_host_dispatch`; the router itself runs on the device since
+    /// sc-24440); with device positions off the positions are Rust-side scalars
     /// (`positions_host_scalar`); and a model the device path does not serve says why
     /// ([`Qwen35Model::device_positions_support`]).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
-        if self.cfg.moe.is_some() {
-            return Err("moe_router_host_read");
+        if let Some(reason) = self.layers.iter().find_map(|l| match &l.ffn {
+            Ffn::Moe(m) => m.graph_refusal(),
+            Ffn::Dense(_) => None,
+        }) {
+            return Err(reason);
         }
         if !self.device_positions {
             return Err("positions_host_scalar");
@@ -2998,6 +3014,7 @@ impl crate::models::VlmDecode for Qwen35Model {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -3089,7 +3106,12 @@ pub(crate) mod tests {
         )))
         .unwrap();
         let cfg = Qwen35Config::from_json(&value).unwrap();
-        let mut keys = Qwen35Mtp::required_keys(cfg.mtp_num_hidden_layers);
+        let mut keys = Qwen35Mtp::required_keys(&cfg, false);
+        assert_eq!(
+            Qwen35Mtp::required_keys(&cfg, true),
+            keys,
+            "dense: no experts"
+        );
         keys.sort();
         let expected = [
             "mtp.fc.weight",
@@ -3127,6 +3149,52 @@ pub(crate) mod tests {
             Device::Cpu,
         );
         assert!(!Qwen35Mtp::complete_in(&incomplete, &cfg));
+    }
+
+    /// sc-24438: a sparse-MoE config's MTP inventory is its predictor layer's MoE block in the
+    /// snapshot's expert layout — the 35B-A3B's router, shared expert and either the fused
+    /// (Qwen3.6) `gate_up_proj` / `down_proj` or the 256 per-expert (Qwen3.5) triples — never the
+    /// dense MLP; `complete_in` reads the layout off the snapshot.
+    #[test]
+    fn a_moe_mtp_inventory_follows_the_expert_layout() {
+        let mut value: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docs/reference/qwen38/config.json"
+        )))
+        .unwrap();
+        let text = value["text_config"].as_object_mut().unwrap();
+        text.insert("model_type".into(), serde_json::json!("qwen3_5_moe_text"));
+        text.insert("num_experts".into(), serde_json::json!(256));
+        text.insert("num_experts_per_tok".into(), serde_json::json!(8));
+        text.insert("moe_intermediate_size".into(), serde_json::json!(512));
+        text.insert(
+            "shared_expert_intermediate_size".into(),
+            serde_json::json!(512),
+        );
+        let cfg = Qwen35Config::from_json(&value).unwrap();
+        let (fused, split) = (
+            Qwen35Mtp::required_keys(&cfg, false),
+            Qwen35Mtp::required_keys(&cfg, true),
+        );
+        let mlp = |keys: &[String]| {
+            keys.iter()
+                .filter(|k| k.starts_with("mtp.layers.0.mlp."))
+                .count()
+        };
+        for keys in [&fused, &split] {
+            assert!(!keys.contains(&"mtp.layers.0.mlp.gate_proj.weight".to_string()));
+            for k in [
+                "mtp.layers.0.mlp.gate.weight",
+                "mtp.layers.0.mlp.shared_expert_gate.weight",
+                "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+            ] {
+                assert!(keys.contains(&k.to_string()), "{k}");
+            }
+        }
+        assert!(fused.contains(&"mtp.layers.0.mlp.experts.gate_up_proj".to_string()));
+        assert_eq!(mlp(&fused), 5 + 2);
+        assert!(split.contains(&"mtp.layers.0.mlp.experts.255.down_proj.weight".to_string()));
+        assert_eq!(mlp(&split), 5 + 256 * 3);
     }
 
     /// A deterministic small tensor of shape `dims` (finite, non-degenerate), on CPU.
@@ -3373,6 +3441,82 @@ pub(crate) mod tests {
         );
     }
 
+    /// AC (sc-24443): chunkwise prefill leaves Qwen35 greedy decoding unchanged against the
+    /// per-token reference recurrence — a short and a multi-chunk prompt, a speculative-verify-width
+    /// forward and the decode steps after it, on a plain cache and on a checkpointing (ringed) one.
+    #[test]
+    fn greedy_tokens_match_the_per_token_reference_recurrence() {
+        let (_cfg, model) = text_model();
+        let argmax_rows = |logits: &Tensor| -> Vec<u32> {
+            let v = *logits.dims().last().unwrap();
+            host(logits)
+                .chunks(v)
+                .map(|r| {
+                    r.iter()
+                        .enumerate()
+                        .fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                        .0 as u32
+                })
+                .collect()
+        };
+        let run = |prompt: &[u32], ringed: bool| -> (Vec<u32>, Vec<f32>) {
+            let mut cache = if ringed {
+                model.new_cache_with_checkpoints(3)
+            } else {
+                model.new_cache()
+            };
+            let n = prompt.len() as i32;
+            let mut logits = Vec::new();
+            let pre = model.decode_logits(&ids(prompt), &mut cache, 0).unwrap();
+            let mut next = argmax_rows(&pre)[0];
+            logits.extend(host(&pre));
+            let verify = model
+                .forward(
+                    &ids(&[next, (next + 1) % 50, (next + 2) % 50]),
+                    &mut cache,
+                    n,
+                )
+                .unwrap();
+            let mut out = argmax_rows(&verify);
+            logits.extend(host(&verify));
+            next = out[2];
+            for i in 0..6 {
+                let step = model
+                    .decode_logits(&ids(&[next]), &mut cache, n + 3 + i)
+                    .unwrap();
+                next = argmax_rows(&step)[0];
+                out.push(next);
+                logits.extend(host(&step));
+            }
+            (out, logits)
+        };
+        let long: Vec<u32> = (0..90).map(|i| (i * 7 + 3) % 50).collect();
+        for prompt in [&[1u32, 7, 3, 42, 9, 2][..], &long[..]] {
+            for ringed in [false, true] {
+                let (tokens, logits) = run(prompt, ringed);
+                let (ref_tokens, ref_logits) =
+                    crate::primitives::gated_delta::with_per_token_reference(|| {
+                        run(prompt, ringed)
+                    });
+                let md = logits
+                    .iter()
+                    .zip(&ref_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "prompt len {} ringed={ringed}: max logit diff vs per-token {md:.2e}",
+                    prompt.len()
+                );
+                assert_eq!(tokens, ref_tokens, "prompt len {}", prompt.len());
+                assert!(
+                    md < 1e-4,
+                    "prompt len {}: max logit diff {md}",
+                    prompt.len()
+                );
+            }
+        }
+    }
+
     /// The whole Gated DeltaNet layer, validated against the numeric oracle from the exact
     /// `Qwen3_5GatedDeltaNet.forward` reference (4-way in-projection → short conv → contiguous q|k|v
     /// split → L2-norm + q-scale → GQA delta recurrence → gated RMS-norm(z) → out-proj). The same
@@ -3495,23 +3639,28 @@ pub(crate) mod tests {
                 .unwrap()
                 .contiguous()
                 .unwrap();
-            experts.push(Mlp {
+            experts.push(SwiGlu {
                 gate: proj(gate_w),
                 up: proj(up_w),
                 down: proj(dn),
             });
         }
-        let moe = MoeFfn {
-            router: mk("router", &[e, h]),
+        let moe = SparseMoe::new(
+            mk("router", &[e, h]),
             experts,
-            shared: Mlp {
+            SwiGlu {
                 gate: proj(mk("sh_gate", &[mi, h])),
                 up: proj(mk("sh_up", &[mi, h])),
                 down: proj(mk("sh_down", &[h, mi])),
             },
-            shared_gate: mk("sh_gatew", &[1, h]),
-            experts_per_tok: k,
-        };
+            Some(mk("sh_gatew", &[1, h])),
+            MoeRouting {
+                experts_per_tok: k,
+                norm_topk_prob: true,
+                routed_scaling_factor: 1.0,
+            },
+        )
+        .unwrap();
 
         let out = moe.forward(&mk("x", &[1, 1, h])).unwrap();
         assert_eq!(out.dims(), &[1, 1, h]);
@@ -3526,6 +3675,210 @@ pub(crate) mod tests {
             md < 2e-4,
             "moe ffn vs reference: max abs diff {md}\n got {got:?}\n exp {exp:?}"
         );
+    }
+
+    /// [`cfg_json_moe`] with a configured MTP head — the 35B-A3B checkpoint's layout (sc-24438).
+    pub(crate) fn cfg_json_moe_mtp() -> Value {
+        let mut v = cfg_json_moe();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("mtp_num_hidden_layers".into(), json!(1));
+        tc.insert("mtp_use_dedicated_embeddings".into(), json!(false));
+        v
+    }
+
+    /// The synthetic tensors of a sparse-MoE `cfg` with an MTP head whose predictor layer carries
+    /// a sparse-MoE FFN (router, experts, shared expert) instead of the dense MLP — as the 35B-A3B
+    /// checkpoint ships it (sc-24438) — with every MoE tensor (body and head) seeded **non-zero
+    /// random**. `fused` stores the experts as the Qwen3.6 release does (`experts.gate_up_proj` /
+    /// `experts.down_proj`); otherwise each under its own keys, as the bf16 Qwen3.5 release does
+    /// (`experts.{e}.{gate,up,down}_proj.weight`) — the same values either way.
+    pub(crate) fn seeded_moe_mtp_tensors(
+        cfg: &Qwen35Config,
+        fused: bool,
+    ) -> HashMap<String, Tensor> {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let moe = cfg.moe.as_ref().expect("a MoE config");
+        assert_eq!(cfg.mtp_num_hidden_layers, 1);
+        let h = cfg.hidden_size as usize;
+        let (e, mi, si) = (
+            moe.num_experts as usize,
+            moe.moe_intermediate_size as usize,
+            moe.shared_expert_intermediate_size as usize,
+        );
+        let weights = synthetic_weights(cfg);
+        let mut m: HashMap<String, Tensor> = weights
+            .keys()
+            .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
+            .collect();
+        for dense in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(m
+                .remove(&format!("mtp.layers.0.mlp.{dense}.weight"))
+                .is_some());
+        }
+        let mut rng = SplitMix64::new(0x5EED_24438);
+        let mut layers: Vec<String> = (0..cfg.num_layers)
+            .map(|i| format!("model.language_model.layers.{i}."))
+            .collect();
+        layers.push("mtp.layers.0.".into());
+        for lp in layers {
+            let mut rand = |key: &str, dims: &[usize]| {
+                let n: usize = dims.iter().product();
+                let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.8).collect();
+                let t = Tensor::from_vec(data.clone(), dims.to_vec(), &Device::Cpu).unwrap();
+                m.insert(format!("{lp}{key}"), t);
+                data
+            };
+            let gate_up = rand("mlp.experts.gate_up_proj", &[e, 2 * mi, h]);
+            let down = rand("mlp.experts.down_proj", &[e, h, mi]);
+            rand("mlp.gate.weight", &[e, h]);
+            rand("mlp.shared_expert.gate_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.up_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.down_proj.weight", &[h, si]);
+            rand("mlp.shared_expert_gate.weight", &[1, h]);
+            if !fused {
+                m.remove(&format!("{lp}mlp.experts.gate_up_proj"));
+                m.remove(&format!("{lp}mlp.experts.down_proj"));
+                let rows = mi * h;
+                let put = |m: &mut HashMap<String, Tensor>, key: String, d: &[f32], dims| {
+                    m.insert(
+                        key,
+                        Tensor::from_vec(d.to_vec(), dims, &Device::Cpu).unwrap(),
+                    );
+                };
+                for x in 0..e {
+                    let key = |p: &str| format!("{lp}mlp.experts.{x}.{p}_proj.weight");
+                    let gu = &gate_up[x * 2 * rows..(x + 1) * 2 * rows];
+                    put(&mut m, key("gate"), &gu[..rows], (mi, h));
+                    put(&mut m, key("up"), &gu[rows..], (mi, h));
+                    put(
+                        &mut m,
+                        key("down"),
+                        &down[x * rows..(x + 1) * rows],
+                        (h, mi),
+                    );
+                }
+            }
+        }
+        m
+    }
+
+    fn load_moe_mtp(
+        cfg: &Qwen35Config,
+        tensors: HashMap<String, Tensor>,
+    ) -> (Qwen35Model, Qwen35Mtp) {
+        let w = Weights::from_map(tensors, Device::Cpu);
+        assert!(
+            Qwen35Mtp::complete_in(&w, cfg),
+            "the MoE MTP head is complete"
+        );
+        let model = Qwen35Model::from_weights(&w, "model.language_model", cfg.clone()).unwrap();
+        let mtp = Qwen35Mtp::from_weights_with(&w, &model, None)
+            .expect("a MoE checkpoint's MTP head loads");
+        (model, mtp)
+    }
+
+    /// sc-24438 AC2 (a): a sparse-MoE checkpoint's MTP head loads — its predictor layer the body's
+    /// sparse-MoE block — and the fused (Qwen3.6) and per-expert (Qwen3.5) expert layouts of the
+    /// same seeded non-zero weights give identical target hidden states and identical MTP
+    /// logits / hidden state.
+    #[test]
+    fn a_moe_mtp_head_runs_identically_in_both_expert_layouts() {
+        let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
+        let run = |fused: bool| {
+            let (model, mtp) = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, fused));
+            let Ffn::Moe(_) = &mtp.layers[0].ffn else {
+                panic!("the predictor layer is the sparse-MoE block");
+            };
+            let hidden = model
+                .hidden(&ids(&[1, 7, 3, 42]), &mut model.new_cache(), 0)
+                .unwrap();
+            let (logits, mtp_hidden) = mtp
+                .forward_sequence(&[7, 3, 42, 9], &hidden, 0, &mut mtp.new_cache())
+                .unwrap();
+            (host(&hidden), host(&mtp_hidden), host(&logits))
+        };
+        let (a, b) = (run(true), run(false));
+        assert!(
+            a.2.iter().any(|x| x.abs() > 1e-3),
+            "non-degenerate MTP logits"
+        );
+        assert_eq!(a.0, b.0, "target hidden");
+        assert_eq!(a.1, b.1, "MTP hidden");
+        assert_eq!(a.2, b.2, "MTP logits");
+    }
+
+    /// sc-24438 AC2 (b): the MTP predictor layer's FFN, built by the loader under the
+    /// `mtp.layers.0.` prefix from the `Qwen3_5MoeSparseMoeBlock.forward` oracle's weights (the
+    /// fused layout and the per-expert split of it), reproduces the oracle's output — the check
+    /// [`moe_ffn_matches_qwen3_5_moe_reference`] holds the block itself to.
+    #[test]
+    fn the_mtp_layer_ffn_matches_the_moe_reference() {
+        let json: Value =
+            serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
+        let arr = |k: &str| -> Vec<f32> {
+            json[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let (h, e, mi) = (8usize, 6usize, 4usize);
+        let mut v = cfg_json_moe_mtp();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("hidden_size".into(), json!(h));
+        tc.insert("moe_intermediate_size".into(), json!(mi));
+        tc.insert("shared_expert_intermediate_size".into(), json!(mi));
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        for fused in [true, false] {
+            let mut m = seeded_moe_mtp_tensors(&cfg, fused);
+            let lp = |s: &str| format!("mtp.layers.0.mlp.{s}");
+            let mut put = |key: String, data: &[f32], dims: &[usize]| {
+                let t = Tensor::from_vec(data.to_vec(), dims.to_vec(), &Device::Cpu).unwrap();
+                m.insert(key, t);
+            };
+            let (gate_up, down) = (arr("gate_up"), arr("down"));
+            if fused {
+                put(lp("experts.gate_up_proj"), &gate_up, &[e, 2 * mi, h]);
+                put(lp("experts.down_proj"), &down, &[e, h, mi]);
+            } else {
+                let rows = mi * h;
+                for x in 0..e {
+                    let gu = &gate_up[x * 2 * rows..(x + 1) * 2 * rows];
+                    let key = |p: &str| lp(&format!("experts.{x}.{p}_proj.weight"));
+                    put(key("gate"), &gu[..rows], &[mi, h]);
+                    put(key("up"), &gu[rows..], &[mi, h]);
+                    put(key("down"), &down[x * rows..(x + 1) * rows], &[h, mi]);
+                }
+            }
+            put(lp("gate.weight"), &arr("router"), &[e, h]);
+            put(
+                lp("shared_expert.gate_proj.weight"),
+                &arr("sh_gate"),
+                &[mi, h],
+            );
+            put(lp("shared_expert.up_proj.weight"), &arr("sh_up"), &[mi, h]);
+            put(
+                lp("shared_expert.down_proj.weight"),
+                &arr("sh_down"),
+                &[h, mi],
+            );
+            put(lp("shared_expert_gate.weight"), &arr("sh_gatew"), &[1, h]);
+            let (_, mtp) = load_moe_mtp(&cfg, m);
+            let x = Tensor::from_vec(arr("x"), (1, 1, h), &Device::Cpu).unwrap();
+            let got = host(&mtp.layers[0].ffn.forward(&x).unwrap());
+            let exp = arr("expected_output");
+            let md = got
+                .iter()
+                .zip(&exp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                md < 2e-4,
+                "fused {fused}: MTP-layer ffn vs reference: max abs diff {md}\n got {got:?}\n \
+                 exp {exp:?}"
+            );
+        }
     }
 
     /// sc-24140 review: the qwen3_5 loader quantizes every MoE expert from a view narrowed out of
@@ -3574,15 +3927,21 @@ pub(crate) mod tests {
             let (Ffn::Moe(d), Ffn::Moe(q)) = (&d.ffn, &q.ffn) else {
                 panic!("an MoE layer")
             };
-            for (e, (de, qe)) in d.experts.iter().zip(&q.experts).enumerate() {
-                assert_eq!(qe.gate.kind(), crate::primitives::ProjectionKind::Ggml);
-                let hidden = de.gate.forward(&x).unwrap();
-                for (name, dp, qp, input) in [
-                    ("gate", &de.gate, &qe.gate, &x),
-                    ("up", &de.up, &qe.up, &x),
-                    ("down", &de.down, &qe.down, &hidden),
+            for e in 0..d.num_experts() {
+                assert_eq!(
+                    q.expert_kind(e, ExpertPart::Gate),
+                    crate::primitives::ProjectionKind::Ggml
+                );
+                let hidden = d.expert_projection(e, ExpertPart::Gate, &x).unwrap();
+                for (name, part, input) in [
+                    ("gate", ExpertPart::Gate, &x),
+                    ("up", ExpertPart::Up, &x),
+                    ("down", ExpertPart::Down, &hidden),
                 ] {
-                    let err = rel(&qp.forward(input).unwrap(), &dp.forward(input).unwrap());
+                    let err = rel(
+                        &q.expert_projection(e, part, input).unwrap(),
+                        &d.expert_projection(e, part, input).unwrap(),
+                    );
                     assert!(err < 0.02, "expert {e} {name}: relative error {err}");
                 }
                 experts += 1;

@@ -5,8 +5,8 @@
 //! these raw records together with model inventories, runtime identity and external memory samples.
 
 use core_llm::{
-    Channel, Content, ImageRef, Message, MtpMode, Role, Sampling, StreamEvent, TextLlm,
-    TextLlmRequest, ThinkingMode, VideoRef,
+    Channel, Content, ImageRef, Message, MtpMode, Role, Sampling, Speculative, SpeculativeProposer,
+    StreamEvent, TextLlm, TextLlmRequest, ThinkingMode, VideoRef,
 };
 use serde_json::{json, Value};
 use std::io::Write;
@@ -108,6 +108,7 @@ pub fn request_evidence(request: &TextLlmRequest) -> Value {
         "thinking":format!("{:?}",request.thinking),
         "reasoning_effort":request.reasoning_effort.map(|effort|effort.as_str()),
         "preserve_thinking":request.preserve_thinking,"mtp":mtp,
+        "speculative":request.speculative,
         "constraint":request.constraint.as_ref().map(|value|format!("{value:?}")),
         "stop":request.stop,
         "tools":request.tools.iter().map(|tool|tool.to_template_json()).collect::<Vec<_>>()})
@@ -258,10 +259,15 @@ fn measure_case_inner(
                     .thinking
                     .as_deref()
                     .is_some_and(|text| !text.trim().is_empty());
-            let mtp_observed = !matches!(case.request.mtp, MtpMode::Enabled { .. })
-                || output
-                    .mtp
-                    .is_some_and(|stats| stats.proposed_tokens > 0 && stats.target_forwards > 0);
+            let mtp_observed = !matches!(
+                case.request.speculative_mode(),
+                Speculative::Proposer {
+                    proposer: SpeculativeProposer::Mtp,
+                    ..
+                }
+            ) || output
+                .mtp
+                .is_some_and(|stats| stats.proposed_tokens > 0 && stats.target_forwards > 0);
             record["functional_acceptance_passed"] =
                 json!(quality_passed && stream_ok && reasoning_observed && mtp_observed);
             record["stream_contract_passed"] = json!(stream_ok);

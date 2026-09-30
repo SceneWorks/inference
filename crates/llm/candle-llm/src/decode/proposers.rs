@@ -212,7 +212,7 @@ impl Default for NgramProposer {
 
 impl Proposer for NgramProposer {
     fn kind(&self) -> ProposerKind {
-        ProposerKind::Ngram
+        ProposerKind::PromptLookup
     }
 
     fn warm(&mut self, _: &[i32], _: Option<&Tensor>) -> Result<()> {
@@ -248,12 +248,19 @@ impl Proposer for NgramProposer {
 /// start plus a replay when its cache only checkpoints step starts (it asks the cache to retain
 /// `K + 2` checkpoints so that start survives the draft steps; a hybrid draft therefore holds
 /// `K + 3` recurrent states, which whoever admits a draft-model request must price).
+///
+/// A draft padded differently from its target ([`with_vocab`](Self::with_vocab)) proposes only
+/// its tokenizer's ids, over logits the target's width.
 pub struct DraftModelProposer<'a, D: StepModel> {
     draft: &'a D,
     cache: Option<D::Cache>,
     budget: usize,
     max_drafts: usize,
     base: i32,
+    /// Leading draft ids a draft may be drawn from (the tokenizer's tokens the draft scores).
+    proposable: usize,
+    /// The target's logits width, which the draft's logits are shaped to.
+    width: usize,
     /// Draft-model forwards issued (its own cost, separate from the target's).
     pub draft_forwards: u64,
 }
@@ -269,8 +276,37 @@ impl<'a, D: StepModel> DraftModelProposer<'a, D> {
             budget: capacity,
             max_drafts,
             base: 0,
+            proposable: draft.vocab_size(),
+            width: draft.vocab_size(),
             draft_forwards: 0,
         }
+    }
+
+    /// Draw drafts only from the first `proposable` draft ids, over logits `width` wide — the
+    /// target's — with every other id at `-inf`: a draft whose padding rows differ from its
+    /// target's ([`core_llm::draft_compatibility`]) never proposes a padding id, and its `q`
+    /// covers the target's id space.
+    pub fn with_vocab(mut self, proposable: usize, width: usize) -> Self {
+        self.proposable = proposable.min(self.draft.vocab_size()).min(width);
+        self.width = width;
+        self
+    }
+
+    /// The draft's `[1, vocab]` logits over the target's ids.
+    pub(crate) fn shaped(&self, logits: Tensor) -> Result<Tensor> {
+        if self.proposable == self.width && self.width == self.draft.vocab_size() {
+            return Ok(logits);
+        }
+        let last = logits.rank() - 1;
+        let kept = logits.narrow(last, 0, self.proposable)?;
+        if self.width == self.proposable {
+            return Ok(kept);
+        }
+        let mut pad = logits.dims().to_vec();
+        pad[last] = self.width - self.proposable;
+        let pad =
+            Tensor::full(f32::NEG_INFINITY, pad, logits.device())?.to_dtype(logits.dtype())?;
+        Ok(Tensor::cat(&[&kept, &pad], last)?)
     }
 
     fn take_cache(&mut self) -> Result<D::Cache> {
@@ -282,11 +318,11 @@ impl<'a, D: StepModel> DraftModelProposer<'a, D> {
 
 impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
     fn kind(&self) -> ProposerKind {
-        ProposerKind::Draft
+        ProposerKind::DraftModel
     }
 
     fn vocab_size(&self) -> Option<usize> {
-        Some(self.draft.vocab_size())
+        Some(self.width)
     }
 
     fn warm(&mut self, prompt: &[i32], _: Option<&Tensor>) -> Result<()> {
@@ -318,7 +354,10 @@ impl<D: StepModel> Proposer for DraftModelProposer<'_, D> {
     fn commit(&mut self, cur: i32, accepted: &[i32], _: Option<&Tensor>, _: i32) -> Result<()> {
         let base = self.base;
         let mut cache = self.take_cache()?;
-        let target = base + 1 + accepted.len() as i32;
+        // A host-sampled run stops drafting at a stop token without feeding it, so an accepted
+        // stop leaves the cache one short of `base + 1 + accepted`: keep what was fed (the run
+        // ends at that stop).
+        let target = (base + 1 + accepted.len() as i32).min(cache.len());
         let result = match cache.rollback_to(target) {
             Ok(()) => Ok(()),
             Err(Error::RollbackUnavailable { .. }) => cache.rollback_to(base).and_then(|()| {
@@ -356,7 +395,7 @@ impl<D: StepModel> DraftModelProposer<'_, D> {
                     .logits;
                 self.draft_forwards += 1;
                 if step < k {
-                    feed = argmax_rows_tensor(&logits)?.reshape((1, 1))?;
+                    feed = argmax_rows_tensor(&self.shaped(logits)?)?.reshape((1, 1))?;
                     drafts.push(feed.clone());
                 }
             }
@@ -379,7 +418,7 @@ impl<D: StepModel> DraftModelProposer<'_, D> {
                 .logits;
             self.draft_forwards += 1;
             if step < k {
-                let (d, dist) = sampler.sample_draft(&logits, &draft_history)?;
+                let (d, dist) = sampler.sample_draft(&self.shaped(logits)?, &draft_history)?;
                 if let Some(dist) = dist {
                     dists.push(dist);
                 }

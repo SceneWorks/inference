@@ -45,9 +45,7 @@
 //! Attention is scaled by a literal `1.0` (not `head_dim^-0.5`) — the learned q/k norms absorb it —
 //! and the norms multiply by the stored weight directly, *not* Gemma-2's `(1 + weight)` fold.
 
-use mlx_rs::ops::{
-    add, broadcast_to, concatenate_axis, multiply, sigmoid, split_sections, zeros_dtype,
-};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split_sections};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, ModelConfig};
@@ -55,8 +53,9 @@ use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
 use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
 use crate::primitives::kv_cache::KvCache;
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
 use crate::primitives::nn::{
-    embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
+    embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap,
 };
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
 use crate::primitives::quant::QuantizedLinear;
@@ -1502,11 +1501,12 @@ fn row_axis0(a: &Array, i: i32) -> Result<Array> {
     Ok(a.take_axis(&idx, 0)?)
 }
 
-/// A layer's feed-forward network: a dense gated MLP, or a sparse Mixture-of-Experts bank.
+/// A layer's feed-forward network: a dense gated MLP, or a sparse Mixture-of-Experts bank (the shared
+/// [`SparseMoe`] block — Qwen2-MoE, DeepSeek-V2).
 #[derive(Debug)]
 enum Ffn {
     Dense(LlamaMlp),
-    Moe(MoeMlp),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -1533,100 +1533,6 @@ impl LlamaMlp {
         let g = if self.gelu { gelu_tanh(&g)? } else { silu(&g)? };
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&g, &up)?)
-    }
-}
-
-/// A sparse Mixture-of-Experts feed-forward (Qwen2-MoE, DeepSeek-V2): a softmax router over `experts`
-/// (top-k per token) plus an always-on `shared` expert. Correctness-first — each expert runs only on
-/// its routed tokens (gathered, then scatter-added back), so active compute scales with
-/// `experts_per_tok`. Top-k selection is done on the host. `n_group`/`topk_group` group-limited
-/// routing (DeepSeek-V2-236B / V3) is not modelled — V2-Lite uses plain greedy top-k.
-#[derive(Debug)]
-struct MoeMlp {
-    /// Router weight `[num_experts, hidden]`.
-    router: Array,
-    experts: Vec<LlamaMlp>,
-    shared: LlamaMlp,
-    /// Shared-expert sigmoid gate `[1, hidden]` (Qwen2-MoE); `None` ⇒ added ungated (DeepSeek-V2).
-    shared_gate: Option<Array>,
-    experts_per_tok: usize,
-    norm_topk_prob: bool,
-    /// Multiplier on the (un-normalized) routed weights — DeepSeek's `routed_scaling_factor`; `1.0`
-    /// for Qwen2-MoE. Ignored when `norm_topk_prob` (the weights are renormalized instead).
-    routed_scaling_factor: f32,
-}
-
-impl MoeMlp {
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s, h) = (sh[0], sh[1], sh[2]);
-        let t = b * s;
-        let dtype = x.dtype();
-        let xf = x.reshape(&[t, h])?;
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Router probabilities (f32 softmax on the host, for a stable top-k).
-        let logits = linear(&xf, &self.router, None)?; // [t, num_experts]
-        let logits = to_f32_host(&logits)?; // row-major [t * num_experts]
-
-        // Invert the per-token top-k into per-expert (token, weight) lists.
-        let mut routed: Vec<Vec<(i32, f32)>> = vec![Vec::new(); num_experts];
-        for ti in 0..t as usize {
-            let row = &logits[ti * num_experts..(ti + 1) * num_experts];
-            let m = row.iter().copied().fold(f32::MIN, f32::max);
-            let exps: Vec<f32> = row.iter().map(|&x| (x - m).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-            let top = &idx[..k];
-            // Renormalize the top-k weights to sum to 1, or apply the routed scaling factor.
-            let (denom, post_scale) = if self.norm_topk_prob {
-                (
-                    top.iter()
-                        .map(|&e| probs[e])
-                        .sum::<f32>()
-                        .max(f32::MIN_POSITIVE),
-                    1.0,
-                )
-            } else {
-                (1.0, self.routed_scaling_factor)
-            };
-            for &e in top {
-                routed[e].push((ti as i32, probs[e] / denom * post_scale));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = zeros_dtype(&[t, h], dtype)?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len() as i32;
-            let idx_i: Vec<i32> = toks.iter().map(|&(ti, _)| ti).collect();
-            let idx_u: Vec<u32> = toks.iter().map(|&(ti, _)| ti as u32).collect();
-            let wts: Vec<f32> = toks.iter().map(|&(_, w)| w).collect();
-            let idx = Array::from_slice(&idx_i, &[n]);
-            let idx_u = Array::from_slice(&idx_u, &[n]);
-            let wts = Array::from_slice(&wts, &[n, 1]).as_dtype(dtype)?;
-            let xe = xf.take_axis(&idx, 0)?; // [n, h]
-            let ye = multiply(&self.experts[e].forward(&xe)?, &wts)?.reshape(&[n, 1, h])?;
-            out = mlx_rs::ops::indexing::scatter_add_single(&out, &idx_u, &ye, 0)?;
-        }
-
-        // Always-on shared expert: Qwen2 gates it by sigmoid(x · shared_gateᵀ); DeepSeek adds it
-        // ungated.
-        let shared = self.shared.forward(&xf)?;
-        let shared = match &self.shared_gate {
-            Some(g) => {
-                let sg = sigmoid(&linear(&xf, g, None)?)?; // [t, 1]
-                multiply(&shared, &sg)?
-            }
-            None => shared,
-        };
-        Ok(add(&out, &shared)?.reshape(&[b, s, h])?)
     }
 }
 
@@ -1873,15 +1779,14 @@ impl LayerPlan {
         // `first_k_dense_replace` layers dense even though the model is MoE. Gemma uses GeGLU.
         let moe_layer = cfg.moe.filter(|m| i >= m.first_k_dense_replace);
         let ffn = if let Some(moe) = moe_layer {
-            let mut experts = Vec::with_capacity(moe.num_experts);
+            // The routed experts are stored per expert; stack each projection across the bank so
+            // the shared block dispatches them with a gathered matmul.
+            let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
             for e in 0..moe.num_experts {
                 let ep = |s: &str| lp(&format!("mlp.experts.{e}.{s}"));
-                experts.push(LlamaMlp {
-                    gate: proj(ep("gate_proj.weight"))?,
-                    up: proj(ep("up_proj.weight"))?,
-                    down: proj(ep("down_proj.weight"))?,
-                    gelu: false,
-                });
+                gate.push(proj(ep("gate_proj.weight"))?);
+                up.push(proj(ep("up_proj.weight"))?);
+                down.push(proj(ep("down_proj.weight"))?);
             }
             // Shared-expert key stem: DeepSeek packs `n_shared_experts` into `mlp.shared_experts`
             // (plural, ungated); Qwen2-MoE has a single `mlp.shared_expert` gated by a sigmoid.
@@ -1891,24 +1796,27 @@ impl LayerPlan {
                 "mlp.shared_expert"
             };
             let shared_gate_key = lp("mlp.shared_expert_gate.weight");
-            Ffn::Moe(MoeMlp {
-                router: req_bf16(lp("mlp.gate.weight"))?, // [num_experts, hidden]
-                experts,
-                shared: LlamaMlp {
+            Ffn::Moe(SparseMoe::new(
+                req_bf16(lp("mlp.gate.weight"))?, // [num_experts, hidden]
+                SwitchLinear::stack(gate)?,
+                SwitchLinear::stack(up)?,
+                SwitchLinear::stack(down)?,
+                SwiGlu {
                     gate: proj(lp(&format!("{shared_stem}.gate_proj.weight")))?,
                     up: proj(lp(&format!("{shared_stem}.up_proj.weight")))?,
                     down: proj(lp(&format!("{shared_stem}.down_proj.weight")))?,
-                    gelu: false,
                 },
-                shared_gate: if w.contains(&shared_gate_key) {
+                if w.contains(&shared_gate_key) {
                     Some(req_bf16(shared_gate_key)?) // [1, hidden]
                 } else {
                     None
                 },
-                experts_per_tok: moe.num_experts_per_tok,
-                norm_topk_prob: moe.norm_topk_prob,
-                routed_scaling_factor: moe.routed_scaling_factor,
-            })
+                MoeRouting {
+                    experts_per_tok: moe.num_experts_per_tok,
+                    norm_topk_prob: moe.norm_topk_prob,
+                    routed_scaling_factor: moe.routed_scaling_factor,
+                },
+            )?)
         } else {
             // Dense MLP; Phi-3 fuses gate‖up into one weight, split along axis 0.
             let (gate, up) = {
@@ -1986,6 +1894,92 @@ impl LayerPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-24442 AC2: every `CausalLm` fixture emits the same greedy tokens under the new `sdpa`
+    /// routing as under the pre-sc-24442 one (8-row tiles for multi-head power-of-2 head dims, one
+    /// call otherwise), compared in-process — Llama and Qwen3 (q/k-norm) wiring × every head dim
+    /// class (vector-only 96/256, full-kernel 64/80/128, unserved 8/32/72/512) × MHA / GQA 4 / GQA 8
+    /// × prompts inside one vector tile, across tiles, and across many tiles.
+    #[test]
+    fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
+        use crate::primitives::attention::route_override::{
+            assert_greedy_matches_pre_sc24442, GreedyComparison,
+        };
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        const HIDDEN: i32 = 32;
+        const VOCAB: i32 = 48;
+        const INTER: i32 = 64;
+        let mut seen = GreedyComparison::default();
+        for (family, qk_norm) in [("llama", false), ("qwen3", true)] {
+            for hd in [8, 32, 64, 72, 80, 96, 128, 256, 512] {
+                for (nh, nkv) in [(4, 4), (4, 1), (8, 1)] {
+                    let mut rng = SplitMix64::new(0x2444_2000 + (hd * 16 + nh + nkv) as u64);
+                    let mut randn = |shape: &[i32]| {
+                        let n: i32 = shape.iter().product();
+                        let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+                        Array::from_slice(&data, shape)
+                    };
+                    let ones = |d: i32| Array::ones::<f32>(&[d]).unwrap();
+                    let mut m = HashMap::new();
+                    m.insert("model.embed_tokens.weight".into(), randn(&[VOCAB, HIDDEN]));
+                    m.insert("model.norm.weight".into(), ones(HIDDEN));
+                    m.insert("lm_head.weight".into(), randn(&[VOCAB, HIDDEN]));
+                    for i in 0..2 {
+                        let p = |s: &str| format!("model.layers.{i}.{s}");
+                        m.insert(p("input_layernorm.weight"), ones(HIDDEN));
+                        m.insert(p("post_attention_layernorm.weight"), ones(HIDDEN));
+                        m.insert(p("self_attn.q_proj.weight"), randn(&[nh * hd, HIDDEN]));
+                        m.insert(p("self_attn.k_proj.weight"), randn(&[nkv * hd, HIDDEN]));
+                        m.insert(p("self_attn.v_proj.weight"), randn(&[nkv * hd, HIDDEN]));
+                        m.insert(p("self_attn.o_proj.weight"), randn(&[HIDDEN, nh * hd]));
+                        if qk_norm {
+                            m.insert(p("self_attn.q_norm.weight"), randn(&[hd]));
+                            m.insert(p("self_attn.k_norm.weight"), randn(&[hd]));
+                        }
+                        m.insert(p("mlp.gate_proj.weight"), randn(&[INTER, HIDDEN]));
+                        m.insert(p("mlp.up_proj.weight"), randn(&[INTER, HIDDEN]));
+                        m.insert(p("mlp.down_proj.weight"), randn(&[HIDDEN, INTER]));
+                    }
+                    let arch = if qk_norm {
+                        "Qwen3ForCausalLM"
+                    } else {
+                        "LlamaForCausalLM"
+                    };
+                    let cfg = ModelConfig::from_json(&json!({
+                        "architectures": [arch], "model_type": family,
+                        "hidden_size": HIDDEN, "intermediate_size": INTER, "num_hidden_layers": 2,
+                        "num_attention_heads": nh, "num_key_value_heads": nkv, "head_dim": hd,
+                        "vocab_size": VOCAB, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+                        "tie_word_embeddings": false
+                    }))
+                    .unwrap();
+                    let model = CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap();
+                    for prompt_len in [5, 20, 70] {
+                        let prompt: Vec<i32> =
+                            (0..prompt_len).map(|i| (i * 7 + 3) % VOCAB).collect();
+                        seen += assert_greedy_matches_pre_sc24442(
+                            &format!("{family} hd {hd} {nh}/{nkv} prompt {prompt_len}"),
+                            &prompt,
+                            6,
+                            || model.new_cache(),
+                            |ids, cache, offset| model.decode_logits(ids, cache, offset).unwrap(),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.differing_calls > 0,
+            "no fixture exercised a routing change"
+        );
+        assert!(
+            seen.compared_steps > seen.tie_steps,
+            "most greedy steps must be decisive enough to compare: {seen:?}"
+        );
+    }
 
     #[test]
     fn join_handles_empty_prefix() {

@@ -22,19 +22,22 @@ use mlx_rs::{Array, Dtype};
 use serde_json::Value;
 
 use core_llm::{
-    Channel, Content, Error as CoreError, FinishReason as CoreFinish, IncrementalDetok, LoadSpec,
-    Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
+    Channel, Content, DecodeReport, Error as CoreError, FinishReason as CoreFinish,
+    IncrementalDetok, LoadSpec, Result as CoreResult, Sampling, StreamEvent as CoreEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, Tokenizer, Usage,
 };
 
 use crate::config::ModelConfig;
-use crate::decode::{CancelFlag, FinishReason};
+use crate::decode::{
+    generate_speculative, CancelFlag, EngineOptions, FinishReason, GenerationConfig, NoProposer,
+    SpeculativePrompt, StreamEvent as DecodeEvent,
+};
 use crate::error::{Error, Result};
 use crate::image::SiglipImageProcessor;
 use crate::models::siglip::{select_vision_feature, SiglipVisionConfig, SiglipVisionTower};
 use crate::models::CausalLm;
 use crate::primitives::nn::{gelu, gelu_tanh, linear};
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::SamplingParams;
 use crate::primitives::{input_ids, Weights};
 
 /// The registry id of the JoyCaption provider.
@@ -234,6 +237,8 @@ pub struct JoyGeneration {
     pub tokens: Vec<i32>,
     /// Why generation stopped.
     pub finish_reason: FinishReason,
+    /// The measured decode report of the engine run (the provider adds the request's fallbacks).
+    pub report: DecodeReport,
 }
 
 /// The loaded JoyCaption VLM: vision tower, projector, language decoder, and image preprocessor.
@@ -290,7 +295,9 @@ impl JoyCaptionModel {
     }
 
     /// Generate a caption from a tokenized prompt (containing a single [`IMAGE_TOKEN_ID`]) and the
-    /// projected image features. Emits each token through `on_token(id, step)`.
+    /// projected image features. Emits each token through `on_token(id, step)`. The spliced prompt
+    /// is prefilled here; the decode is the speculative engine's token-at-a-time loop
+    /// ([`NoProposer`]), so the caption carries a measured [`DecodeReport`] (epic sc-24432).
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -318,40 +325,39 @@ impl JoyCaptionModel {
         let spliced = splice_image_features(&embeds, &expanded, &feat_bf16)?;
 
         let mut cache = self.language.new_cache();
-        let mut rng = SplitMix64::new(seed.unwrap_or_else(crate::decode::stream::default_seed));
-        let mut history = expanded.clone();
-        let mut generated: Vec<i32> = Vec::new();
-        let prompt_len = expanded.len() as i32;
-        let mut logits = self
+        let logits = self
             .language
             .decode_logits_from_embeds(&spliced, &mut cache, 0)?;
-        let mut finish = FinishReason::MaxTokens;
-
-        for step in 0..max_new_tokens {
-            if cancel.is_cancelled() {
-                finish = FinishReason::Cancelled;
-                break;
-            }
-            let next = sample(&logits, &history, params, &mut rng, None)?;
-            if stop_tokens.contains(&next) {
-                finish = FinishReason::StopToken;
-                break;
-            }
-            on_token(next, step);
-            generated.push(next);
-            history.push(next);
-            if step + 1 == max_new_tokens {
-                break;
-            }
-            let tok = input_ids(&[next]);
-            logits = self
-                .language
-                .decode_logits(&tok, &mut cache, prompt_len + step as i32)?;
-        }
-
+        let config = GenerationConfig {
+            max_new_tokens,
+            sampling: *params,
+            seed,
+            stop_tokens: stop_tokens.to_vec(),
+        };
+        let run = generate_speculative(
+            &self.language,
+            &mut NoProposer,
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits,
+                hidden: None,
+                history: &expanded,
+                position_delta: 0,
+            },
+            &config,
+            0,
+            cancel,
+            &mut |event| {
+                if let DecodeEvent::Token { id, step } = event {
+                    on_token(id, step);
+                }
+            },
+            EngineOptions::default(),
+        )?;
         Ok(JoyGeneration {
-            tokens: generated,
-            finish_reason: finish,
+            tokens: run.output.tokens,
+            finish_reason: run.output.finish_reason,
+            report: run.report,
         })
     }
 }
@@ -502,6 +508,14 @@ impl TextLlm for JoyCaptionProvider {
             prompt_tokens: prompt_len,
             generated_tokens: gen.tokens.len() as u32,
         };
+        // A captioner advertises no proposer: the resolution's fallback (an `auto` or proposer
+        // request it cannot run) joins the measured report, never a silent downgrade (E2).
+        let mut report = gen.report;
+        report.fallbacks =
+            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities)
+                .fallback
+                .into_iter()
+                .collect();
         on_event(CoreEvent::Done {
             finish_reason: finish,
             usage,
@@ -513,7 +527,7 @@ impl TextLlm for JoyCaptionProvider {
             tool_calls: Vec::new(),
             usage,
             mtp: None,
-            decode: None,
+            decode: Some(report),
             finish_reason: Some(finish),
         })
     }
@@ -540,6 +554,7 @@ pub fn descriptor() -> TextLlmDescriptor {
             supports_preserve_thinking: false,
             supports_tools: false,
             mtp: None,
+            speculative: Vec::new(),
             supported_constraints: Vec::new(),
         },
     }
@@ -789,5 +804,220 @@ mod tests {
                 Err(Error::Config(_))
             ));
         }
+    }
+
+    // ---- The engine decode (epic sc-24432, story sc-24434) on a shape-valid synthetic VLM. ----
+
+    use crate::decode::engine::tests::tiny_llama;
+    use crate::synthetic::{word_tokenizer, Synth};
+
+    /// Llama-3's vocabulary width, so the image placeholder id is a real embedding row.
+    const VOCAB: i32 = 128_256;
+
+    /// A shape-valid JoyCaption: a one-layer, 8-wide SigLIP tower at the real 384 px / 729-row
+    /// geometry, the LLaVA projector and a tiny random Llama over the full Llama-3 vocabulary.
+    fn tiny_model() -> JoyCaptionModel {
+        let vision_cfg = SiglipVisionConfig {
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            ..SiglipVisionConfig::default()
+        };
+        let (h, i) = (vision_cfg.hidden_size, vision_cfg.intermediate_size);
+        let text_hidden = 16;
+        let mut w = Synth::new(0x10C_A710);
+        let v = "vision_tower.vision_model";
+        w.randn(
+            format!("{v}.embeddings.patch_embedding.weight"),
+            &[h, 3, 14, 14],
+        )
+        .randn(format!("{v}.embeddings.patch_embedding.bias"), &[h])
+        .randn(
+            format!("{v}.embeddings.position_embedding.weight"),
+            &[729, h],
+        )
+        .layer_norm(&format!("{v}.encoder.layers.0.layer_norm1"), h)
+        .layer_norm(&format!("{v}.encoder.layers.0.layer_norm2"), h)
+        .layer_norm(&format!("{v}.post_layernorm"), h);
+        for proj in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+            w.linear(&format!("{v}.encoder.layers.0.self_attn.{proj}"), h, h);
+        }
+        w.linear(&format!("{v}.encoder.layers.0.mlp.fc1"), i, h)
+            .linear(&format!("{v}.encoder.layers.0.mlp.fc2"), h, i)
+            .linear("multi_modal_projector.linear_1", text_hidden, h)
+            .linear("multi_modal_projector.linear_2", text_hidden, text_hidden);
+        let weights = w.weights();
+        JoyCaptionModel {
+            vision: SiglipVisionTower::from_weights(&weights, v, vision_cfg).unwrap(),
+            projector: LlavaProjector::from_weights(
+                &weights,
+                "multi_modal_projector",
+                ProjectorActivation::GeluErf,
+            )
+            .unwrap(),
+            language: tiny_llama(VOCAB),
+            processor: SiglipImageProcessor::default(),
+        }
+    }
+
+    fn gray(width: u32, height: u32) -> core_llm::ImageRef {
+        core_llm::ImageRef::new(width, height, vec![0x80; (width * height * 3) as usize]).unwrap()
+    }
+
+    /// The pre-engine JoyCaption loop, verbatim — the reference the engine port is held to.
+    #[allow(clippy::too_many_arguments)]
+    fn pre_engine_loop(
+        model: &JoyCaptionModel,
+        prompt_ids: &[i32],
+        image_features: &Array,
+        params: &SamplingParams,
+        max_new_tokens: usize,
+        seed: Option<u64>,
+        stop_tokens: &[i32],
+    ) -> (Vec<i32>, FinishReason) {
+        use crate::primitives::sampler::{sample, SplitMix64};
+        let expanded = expand_image_tokens(prompt_ids);
+        let embeds = model.language.embed(&input_ids(&expanded)).unwrap();
+        let feat_bf16 = image_features.as_dtype(Dtype::Bfloat16).unwrap();
+        let spliced = splice_image_features(&embeds, &expanded, &feat_bf16).unwrap();
+        let mut cache = model.language.new_cache();
+        let mut rng = SplitMix64::new(seed.unwrap_or_else(crate::decode::stream::default_seed));
+        let mut history = expanded.clone();
+        let mut generated = Vec::new();
+        let prompt_len = expanded.len() as i32;
+        let mut logits = model
+            .language
+            .decode_logits_from_embeds(&spliced, &mut cache, 0)
+            .unwrap();
+        let mut finish = FinishReason::MaxTokens;
+        for step in 0..max_new_tokens {
+            let next = sample(&logits, &history, params, &mut rng, None).unwrap();
+            if stop_tokens.contains(&next) {
+                finish = FinishReason::StopToken;
+                break;
+            }
+            generated.push(next);
+            history.push(next);
+            if step + 1 == max_new_tokens {
+                break;
+            }
+            logits = model
+                .language
+                .decode_logits(&input_ids(&[next]), &mut cache, prompt_len + step as i32)
+                .unwrap();
+        }
+        (generated, finish)
+    }
+
+    /// The engine port emits the pre-engine loop's tokens — greedy, penalized and seeded
+    /// stochastic — and names its decode path.
+    #[test]
+    fn the_engine_decode_is_the_pre_engine_loop() {
+        let model = tiny_model();
+        let image = gray(8, 8);
+        let features = model
+            .image_features(&image.pixels, image.width as usize, image.height as usize)
+            .unwrap();
+        let prompt = [5, 6, IMAGE_TOKEN_ID, 7, 8];
+        let greedy = SamplingParams::default();
+        let penalized = SamplingParams {
+            repetition_penalty: 1.3,
+            repetition_context: 16,
+            presence_penalty: 0.2,
+            ..greedy
+        };
+        let stochastic = SamplingParams {
+            temperature: 0.8,
+            top_p: 0.9,
+            top_k: 6,
+            ..greedy
+        };
+        for (name, params, sampler) in [
+            ("greedy", greedy, "device"),
+            ("penalized", penalized, "host:penalty"),
+            ("stochastic", stochastic, "host:device_unavailable"),
+        ] {
+            let (expected, finish) = pre_engine_loop(
+                &model,
+                &prompt,
+                &features,
+                &params,
+                12,
+                Some(9),
+                STOP_TOKENS,
+            );
+            assert!(expected.len() > 1, "{name}: the fixture steps the decoder");
+            let mut streamed = Vec::new();
+            let gen = model
+                .generate(
+                    &prompt,
+                    &features,
+                    &params,
+                    12,
+                    Some(9),
+                    STOP_TOKENS,
+                    &CancelFlag::new(),
+                    &mut |id, step| streamed.push((id, step)),
+                )
+                .unwrap();
+            assert_eq!(gen.tokens, expected, "{name}");
+            assert_eq!(gen.finish_reason, finish, "{name}");
+            assert_eq!(
+                streamed,
+                expected.iter().copied().zip(0..).collect::<Vec<_>>(),
+                "{name}: streamed ids and steps"
+            );
+            assert_eq!(gen.report.path, "step_model", "{name}");
+            assert_eq!(gen.report.sampler, sampler, "{name}");
+        }
+    }
+
+    /// AC2 end to end: a JoyCaption generation carries `decode`, naming the token-at-a-time path,
+    /// no proposer, the measured sampler, and the fallback an `auto` request resolves to on a
+    /// captioner that advertises no proposer.
+    #[test]
+    fn the_provider_reports_its_decode_and_the_auto_fallback() {
+        let provider = JoyCaptionProvider {
+            descriptor: descriptor(),
+            model: tiny_model(),
+            tokenizer: word_tokenizer(50, &[("reserved_special_token_69", IMAGE_TOKEN_ID as u32)]),
+        };
+        let request = |speculative| TextLlmRequest {
+            messages: vec![core_llm::Message {
+                role: core_llm::Role::User,
+                content: vec![Content::Text("t3 t9 t4".into()), Content::Image(gray(8, 8))],
+                thinking: None,
+                tool_calls: Vec::new(),
+            }],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 6,
+            seed: Some(3),
+            speculative,
+            ..Default::default()
+        };
+        let out = provider
+            .generate(&request(Some(core_llm::Speculative::Auto)), &mut |_| {})
+            .unwrap();
+        let report = out.decode.expect("a caption reports its decode path");
+        assert_eq!(report.path, "step_model");
+        assert_eq!(report.proposer, core_llm::ProposerKind::None);
+        assert_eq!(report.draft_tokens, None);
+        assert_eq!(report.sampler, "device");
+        assert_eq!(
+            report.verify_steps + 1,
+            u64::from(out.usage.generated_tokens)
+        );
+        assert_eq!(
+            report.fallbacks,
+            vec![
+                "speculative: auto found no proposer this model can run (no MTP head, no prompt \
+                 lookup on this backend)"
+                    .to_string()
+            ]
+        );
+        let off = provider.generate(&request(None), &mut |_| {}).unwrap();
+        assert_eq!(off.text, out.text, "the fallback decodes plainly");
+        assert!(off.decode.unwrap().fallbacks.is_empty());
     }
 }

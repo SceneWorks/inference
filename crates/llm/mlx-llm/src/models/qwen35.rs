@@ -29,7 +29,8 @@ use crate::primitives::gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
 use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
-use crate::primitives::nn::{embed, linear, rms_norm, silu};
+use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
+use crate::primitives::nn::{embed, rms_norm, silu};
 use crate::primitives::prism::PrismEmbedding;
 use crate::primitives::projection::{Projection, QuantSpec};
 use crate::primitives::rope::{apply_rope, Rope};
@@ -438,86 +439,15 @@ impl Mlp {
     }
 }
 
-/// Sparse Mixture-of-Experts FFN (`Qwen3_5MoeSparseMoeBlock`, the 35B-A3B): a softmax router over
-/// `experts` (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
-/// **sigmoid-gated** shared expert. Each expert runs only on its routed tokens (gathered, then
-/// scatter-added back), so active compute scales with `experts_per_tok` (≈3B of 35B). The fused
-/// checkpoint tensors (`experts.gate_up_proj` / `experts.down_proj`) are un-fused into per-expert
-/// [`Mlp`]s at load.
-#[derive(Debug)]
-struct MoeFfn {
-    router: Array, // [num_experts, hidden]
-    experts: Vec<Mlp>,
-    shared: Mlp,
-    shared_gate: Array, // [1, hidden] sigmoid gate
-    experts_per_tok: usize,
-}
-
-impl MoeFfn {
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let (b, s, h) = (sh[0], sh[1], sh[2]);
-        let t = b * s;
-        let dtype = x.dtype();
-        let xf = x.reshape(&[t, h])?;
-        let num_experts = self.experts.len();
-        let k = self.experts_per_tok.min(num_experts).max(1);
-
-        // Router probabilities (f32 softmax on the host, for a stable top-k), then invert the
-        // per-token top-k into per-expert (token, weight) lists with the weights renormalized to 1.
-        let logits = linear(&xf, &self.router, None)?; // [t, num_experts]
-        let logits = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let mut routed: Vec<Vec<(i32, f32)>> = vec![Vec::new(); num_experts];
-        for ti in 0..t as usize {
-            let row = &logits[ti * num_experts..(ti + 1) * num_experts];
-            let m = row.iter().copied().fold(f32::MIN, f32::max);
-            let exps: Vec<f32> = row.iter().map(|&x| (x - m).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
-            let mut idx: Vec<usize> = (0..num_experts).collect();
-            idx.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-            let top = &idx[..k];
-            let denom = top
-                .iter()
-                .map(|&e| probs[e])
-                .sum::<f32>()
-                .max(f32::MIN_POSITIVE);
-            for &e in top {
-                routed[e].push((ti as i32, probs[e] / denom));
-            }
-        }
-
-        // Each expert runs on just its tokens; scatter the weighted outputs back.
-        let mut out = zeros3(t, 1, h, dtype)?.reshape(&[t, h])?;
-        for (e, toks) in routed.iter().enumerate() {
-            if toks.is_empty() {
-                continue;
-            }
-            let n = toks.len() as i32;
-            let idx_i: Vec<i32> = toks.iter().map(|&(ti, _)| ti).collect();
-            let idx_u: Vec<u32> = toks.iter().map(|&(ti, _)| ti as u32).collect();
-            let wts: Vec<f32> = toks.iter().map(|&(_, w)| w).collect();
-            let idx = Array::from_slice(&idx_i, &[n]);
-            let idx_u = Array::from_slice(&idx_u, &[n]);
-            let wts = Array::from_slice(&wts, &[n, 1]).as_dtype(dtype)?;
-            let xe = xf.take_axis(&idx, 0)?; // [n, h]
-            let ye = multiply(&self.experts[e].forward(&xe)?, &wts)?.reshape(&[n, 1, h])?;
-            out = mlx_rs::ops::indexing::scatter_add_single(&out, &idx_u, &ye, 0)?;
-        }
-
-        // Always-on shared expert, gated by sigmoid(x · shared_gateᵀ).
-        let shared = self.shared.forward(&xf)?;
-        let sg = sigmoid(&linear(&xf, &self.shared_gate, None)?)?; // [t, 1]
-        let shared = multiply(&shared, &sg)?;
-        Ok(add(&out, &shared)?.reshape(&[b, s, h])?)
-    }
-}
-
 /// The per-layer FFN: a dense SwiGLU (27B) or a sparse MoE block (35B-A3B).
+///
+/// The MoE block is the crate's shared [`SparseMoe`] (sc-24440): a softmax router over the stacked
+/// experts (top-`experts_per_tok` per token, weights renormalized to sum to 1) plus an always-on
+/// **sigmoid-gated** shared expert, routed and dispatched on the device.
 #[derive(Debug)]
 enum Ffn {
     Dense(Mlp),
-    Moe(MoeFfn),
+    Moe(SparseMoe),
 }
 
 impl Ffn {
@@ -1387,61 +1317,7 @@ impl Qwen35Model {
                     eps,
                 })
             };
-            let ffn = match &cfg.moe {
-                // Dense SwiGLU (27B).
-                None => Ffn::Dense(Mlp {
-                    gate: proj_q(lp("mlp.gate_proj.weight"))?,
-                    up: proj_q(lp("mlp.up_proj.weight"))?,
-                    down: proj_q(lp("mlp.down_proj.weight"))?,
-                }),
-                // Sparse MoE (35B-A3B): un-fuse the stacked expert tensors into per-expert SwiGLUs.
-                // `experts.gate_up_proj` is [E, 2·moe_inter, hidden] (gate rows ‖ up rows, matching
-                // the reference `linear(x, gate_up_proj[e]).chunk(2, -1)`); `experts.down_proj` is
-                // [E, hidden, moe_inter].
-                Some(moe) => {
-                    let h = cfg.hidden_size;
-                    let mi = moe.moe_intermediate_size;
-                    let mut experts = Vec::with_capacity(moe.num_experts as usize);
-                    let expert0 = lp("mlp.experts.0.gate_proj");
-                    let split_stored = ["scales", "biases"]
-                        .iter()
-                        .any(|part| w.contains(&format!("{expert0}.{part}")));
-                    if stored_quant.is_some() || split_stored {
-                        for e in 0..moe.num_experts {
-                            experts.push(Mlp {
-                                gate: proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?,
-                                up: proj_q(lp(&format!("mlp.experts.{e}.up_proj.weight")))?,
-                                down: proj_q(lp(&format!("mlp.experts.{e}.down_proj.weight")))?,
-                            });
-                        }
-                    } else {
-                        let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
-                        let down = req(lp("mlp.experts.down_proj"))?;
-                        for e in 0..moe.num_experts {
-                            let sel = Array::from_slice(&[e], &[1]);
-                            let gu = gate_up.take_axis(&sel, 0)?.reshape(&[2 * mi, h])?;
-                            let parts = split_sections(&gu, &[mi], 0)?; // [gate_w, up_w]
-                            let dn = down.take_axis(&sel, 0)?.reshape(&[h, mi])?;
-                            experts.push(Mlp {
-                                gate: Projection::load(parts[0].clone(), quant)?,
-                                up: Projection::load(parts[1].clone(), quant)?,
-                                down: Projection::load(dn, quant)?,
-                            });
-                        }
-                    }
-                    Ffn::Moe(MoeFfn {
-                        router: req(lp("mlp.gate.weight"))?,
-                        experts,
-                        shared: Mlp {
-                            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
-                            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
-                            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
-                        },
-                        shared_gate: req(lp("mlp.shared_expert_gate.weight"))?,
-                        experts_per_tok: moe.experts_per_tok,
-                    })
-                }
-            };
+            let ffn = build_ffn(w, &dp(&format!("layers.{i}.")), &cfg, quant, &proj_q)?;
             layers.push(DecoderLayer {
                 input_ln: norm_w(lp("input_layernorm.weight"))?,
                 post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
@@ -1467,12 +1343,6 @@ impl Qwen35Model {
                             .into(),
                     ));
                 }
-                if cfg.moe.is_some() {
-                    return Err(Error::Config(
-                        "qwen3_5 MTP with a MoE predictor is not supported by this architecture"
-                            .into(),
-                    ));
-                }
                 let lp = |s: &str| format!("mtp.layers.0.{s}");
                 let layer = DecoderLayer {
                     input_ln: norm_w(lp("input_layernorm.weight"))?,
@@ -1490,11 +1360,10 @@ impl Qwen35Model {
                         scale: (cfg.head_dim as f32).powf(-0.5),
                         eps,
                     }),
-                    ffn: Ffn::Dense(Mlp {
-                        gate: proj_q(lp("mlp.gate_proj.weight"))?,
-                        up: proj_q(lp("mlp.up_proj.weight"))?,
-                        down: proj_q(lp("mlp.down_proj.weight"))?,
-                    }),
+                    // The predictor layer carries the body's FFN choice: the dense MLP (27B) or
+                    // the sparse-MoE block (35B-A3B), in either expert layout (vLLM
+                    // `qwen3_5_mtp.py`, sc-24438).
+                    ffn: build_ffn(w, "mtp.layers.0.", &cfg, quant, &proj_q)?,
                     eps,
                 };
                 Some(MtpPredictor {
@@ -1528,6 +1397,86 @@ impl Qwen35Model {
         w.verify_accessed_gpu_view()?;
         Ok(model)
     }
+}
+
+/// The FFN of the decoder or MTP predictor layer whose tensors live under `lp` (the layer prefix
+/// with its trailing dot: `model.language_model.layers.3.`, `mtp.layers.0.`): a dense SwiGLU (27B)
+/// or the sparse-MoE block (35B-A3B). The body and the MTP head share it, so a predictor layer
+/// takes exactly the body's FFN choice and expert layout (sc-24438). `proj_q` is the loader's
+/// projection reader (stored-quantized, load-time-quantized, Prism or dense).
+///
+/// MoE experts stay stacked for the gathered matmul. The fused layout (Qwen3.6) stores
+/// `experts.gate_up_proj` `[E, 2·moe_inter, hidden]` (gate rows ‖ up rows, matching the reference
+/// `linear(x, gate_up_proj[e]).chunk(2, -1)`) and `experts.down_proj` `[E, hidden, moe_inter]`.
+/// A snapshot that stores each expert under its own key — the bf16 Qwen3.5 release
+/// (`experts.{e}.{gate,up,down}_proj.weight`) or a quantized conversion (their `.scales` /
+/// `.biases` parts) — is stacked from its per-expert projections instead.
+fn build_ffn(
+    w: &Weights,
+    lp: &str,
+    cfg: &Qwen35Config,
+    quant: Option<QuantSpec>,
+    proj_q: &dyn Fn(String) -> Result<Projection>,
+) -> Result<Ffn> {
+    let lp = |s: &str| format!("{lp}{s}");
+    let req = |key: String| -> Result<Array> { Ok(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?) };
+    let Some(moe) = &cfg.moe else {
+        return Ok(Ffn::Dense(Mlp {
+            gate: proj_q(lp("mlp.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.up_proj.weight"))?,
+            down: proj_q(lp("mlp.down_proj.weight"))?,
+        }));
+    };
+    let h = cfg.hidden_size;
+    let mi = moe.moe_intermediate_size;
+    let expert0 = lp("mlp.experts.0.gate_proj");
+    let per_expert = ["weight", "scales", "biases"]
+        .iter()
+        .any(|part| w.contains(&format!("{expert0}.{part}")));
+    let (gate, up, down) = if cfg.quantization.is_some() || per_expert {
+        let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
+        for e in 0..moe.num_experts {
+            gate.push(proj_q(lp(&format!("mlp.experts.{e}.gate_proj.weight")))?);
+            up.push(proj_q(lp(&format!("mlp.experts.{e}.up_proj.weight")))?);
+            down.push(proj_q(lp(&format!("mlp.experts.{e}.down_proj.weight")))?);
+        }
+        (
+            SwitchLinear::stack(gate)?,
+            SwitchLinear::stack(up)?,
+            SwitchLinear::stack(down)?,
+        )
+    } else {
+        let e = moe.num_experts;
+        // [E, 2, mi, h]: `take` along the gate/up axis yields each half contiguous.
+        let gate_up = req(lp("mlp.experts.gate_up_proj"))?.reshape(&[e, 2, mi, h])?;
+        let half = |i: i32| -> Result<Array> {
+            Ok(gate_up
+                .take_axis(Array::from_slice(&[i], &[1]), 1)?
+                .reshape(&[e, mi, h])?)
+        };
+        (
+            SwitchLinear::load(half(0)?, quant)?,
+            SwitchLinear::load(half(1)?, quant)?,
+            SwitchLinear::load(req(lp("mlp.experts.down_proj"))?, quant)?,
+        )
+    };
+    Ok(Ffn::Moe(SparseMoe::new(
+        req(lp("mlp.gate.weight"))?,
+        gate,
+        up,
+        down,
+        SwiGlu {
+            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
+            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
+            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
+        },
+        Some(req(lp("mlp.shared_expert_gate.weight"))?),
+        MoeRouting {
+            experts_per_tok: moe.experts_per_tok,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+        },
+    )?))
 }
 
 impl KvCache for Qwen35Cache {
@@ -1708,7 +1657,7 @@ pub fn vision_merged_token_count(grid_thw: [i32; 3], spatial_merge_size: i32) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::primitives::kv_cache::testing::{host, tok, ConcatReference, CpuStream};
     use serde_json::json;
@@ -1824,7 +1773,7 @@ mod tests {
         assert!((dense.item::<f32>() - source[0]).abs() < 1e-6);
     }
 
-    fn cfg_json() -> serde_json::Value {
+    pub(crate) fn cfg_json() -> serde_json::Value {
         // 4 layers → schedule (interval 4): layers 0,1,2 linear, layer 3 full attention.
         json!({
             "text_config": {
@@ -1874,6 +1823,10 @@ mod tests {
     }
 
     fn synthetic_weights_with_prefix(cfg: &Qwen35Config, pfx: &str) -> Weights {
+        Weights::from_map(synthetic_tensors_with_prefix(cfg, pfx))
+    }
+
+    fn synthetic_tensors_with_prefix(cfg: &Qwen35Config, pfx: &str) -> HashMap<String, Array> {
         let h = cfg.hidden_size;
         let key_dim = cfg.linear_key_head_dim * cfg.linear_num_key_heads;
         let value_dim = cfg.linear_value_head_dim * cfg.linear_num_value_heads;
@@ -2040,14 +1993,14 @@ mod tests {
                 &[h, cfg.intermediate_size],
             );
         }
-        Weights::from_map(m)
+        m
     }
 
-    fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
+    pub(crate) fn synthetic_weights(cfg: &Qwen35Config) -> Weights {
         synthetic_weights_with_prefix(cfg, "model.language_model")
     }
 
-    fn cfg_json_mtp() -> serde_json::Value {
+    pub(crate) fn cfg_json_mtp() -> serde_json::Value {
         let mut v = cfg_json();
         let tc = v["text_config"].as_object_mut().unwrap();
         tc.insert("mtp_num_hidden_layers".into(), json!(1));
@@ -2292,8 +2245,9 @@ mod tests {
     #[test]
     fn mtp_generation_covers_verification_rollback_stop_and_cancel() {
         use crate::decode::{
-            generate, generate_qwen35_mtp, generate_qwen35_mtp_with_timings, CancelFlag,
-            ConstraintMask, FinishReason, GenerationConfig, RewindableConstraintMask,
+            generate, generate_qwen35_mtp, generate_speculative, CancelFlag, ConstraintMask,
+            EngineOptions, FinishReason, GenerationConfig, MtpProposer, RewindableConstraintMask,
+            SpeculativePrompt,
         };
         use crate::primitives::sampler::SamplingParams;
 
@@ -2344,19 +2298,25 @@ mod tests {
         };
         let target_only =
             generate(&model, &[1, 2, 3], &greedy, &CancelFlag::new(), &mut |_| {}).unwrap();
-        let (timed, stats) = generate_qwen35_mtp_with_timings(
+        let mut timed = generate_speculative(
             &model,
-            &[1, 2, 3],
+            &mut MtpProposer::new(),
+            SpeculativePrompt::Tokens(&[1, 2, 3]),
             &greedy,
             2,
             &CancelFlag::new(),
             &mut |_| {},
-            None,
-            None,
+            EngineOptions {
+                prefill_clock: Some(std::time::Instant::now()),
+                ..EngineOptions::default()
+            },
         )
         .unwrap();
-        let speculative = timed.output;
-        let _timings = timed.timer.finish();
+        let _timings = timed
+            .take_timer()
+            .expect("a timed run keeps its timer")
+            .finish();
+        let (speculative, stats) = (timed.output, timed.stats);
         assert_eq!(
             speculative.tokens, target_only.tokens,
             "adversarial MTP drafts must not change greedy target output"
@@ -2482,8 +2442,8 @@ mod tests {
         use std::time::Instant;
 
         use crate::decode::{
-            generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
-            CancelFlag, GenerationConfig, Qwen35MtpMultimodalPrompt,
+            generate_speculative, CancelFlag, EngineOptions, GenerationConfig, MtpProposer,
+            Qwen35MtpMultimodalPrompt, SpeculativePrompt,
         };
         use crate::primitives::sampler::SamplingParams;
 
@@ -2517,33 +2477,54 @@ mod tests {
             seed: Some(17),
             stop_tokens: Vec::new(),
         };
-        let (text, text_stats) = generate_qwen35_mtp_with_timings(
+        let clock = || EngineOptions {
+            prefill_clock: Some(Instant::now()),
+            ..EngineOptions::default()
+        };
+        let mut text = generate_speculative(
             &model,
-            &ids,
+            &mut MtpProposer::new(),
+            SpeculativePrompt::Tokens(&ids),
             &config,
             2,
             &CancelFlag::new(),
             &mut |_| {},
-            None,
-            None,
+            clock(),
         )
         .unwrap();
-        let (visual, visual_stats) = generate_qwen35_mtp_multimodal_with_timings(
+        // The multimodal route: the caller prefills the fused embeddings under explicit M-RoPE
+        // positions and the proposer seeds from those same embeddings.
+        let mut visual_cache = model.new_cache();
+        let (visual_hidden, visual_logits) = model
+            .prefill_hidden_and_last_logits_from_embeds_with_deepstack(
+                prompt.embeddings,
+                prompt.positions,
+                &mut visual_cache,
+                prompt.visual_pos_mask,
+                prompt.deepstack,
+            )
+            .unwrap();
+        let mut visual = generate_speculative(
             &model,
-            &prompt,
+            &mut MtpProposer::multimodal(&prompt),
+            SpeculativePrompt::Prefilled {
+                cache: &mut visual_cache,
+                logits: visual_logits,
+                hidden: Some(visual_hidden),
+                history: prompt.input_ids,
+                position_delta: prompt.continuation_delta,
+            },
             &config,
             2,
             &CancelFlag::new(),
             &mut |_| {},
-            None,
-            None,
-            Instant::now(),
+            clock(),
         )
         .unwrap();
         assert_eq!(visual.output.tokens, text.output.tokens);
-        assert_eq!(visual_stats, text_stats);
-        let _ = text.timer.finish();
-        let _ = visual.timer.finish();
+        assert_eq!(visual.stats, text.stats);
+        let _ = text.take_timer().unwrap().finish();
+        let _ = visual.take_timer().unwrap().finish();
 
         // Alter the middle row as an encoded visual feature. Both the target prefill and shifted
         // MTP seed must consume that fused row rather than re-embedding placeholder token id 2.
@@ -2776,9 +2757,110 @@ mod tests {
         );
     }
 
+    /// AC (sc-24443): the Gated DeltaNet dispatch (fused Metal kernel for prefill, decode and
+    /// verify) leaves Qwen35 greedy decoding unchanged against the op-by-op reference recurrence —
+    /// for a short and a multi-chunk prompt, a speculative-verify-width forward, and the decode
+    /// steps after it — on the production bf16 path, with every logit within one bf16 ULP of the
+    /// reference's. Runs on a GPU stream (the kernel's route) whatever the process default device.
+    #[test]
+    fn greedy_tokens_match_the_ops_reference_recurrence() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), greedy_tokens_match_on_the_gpu);
+    }
+
+    fn greedy_tokens_match_on_the_gpu() {
+        use crate::primitives::gated_delta::{recording_routes, with_ops_reference, Route};
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let model =
+            Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg)
+                .unwrap();
+        let argmax_rows = |logits: &Array| -> Vec<i32> {
+            let rows = logits.as_dtype(Dtype::Float32).unwrap();
+            let v = *rows.shape().last().unwrap() as usize;
+            host(&rows)
+                .chunks(v)
+                .map(|r| {
+                    r.iter()
+                        .enumerate()
+                        .fold((0, f32::MIN), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                        .0 as i32
+                })
+                .collect()
+        };
+        // Prefill, a 3-token verify block, then 6 greedy decode steps; every row's argmax.
+        let run = |prompt: &[i32]| -> (Vec<i32>, Vec<f32>) {
+            let mut cache = model.new_cache();
+            let n = prompt.len() as i32;
+            let mut out = Vec::new();
+            let mut logits = Vec::new();
+            let pre = model
+                .decode_logits(&Array::from_slice(prompt, &[1, n]), &mut cache, 0)
+                .unwrap();
+            let mut next = argmax_rows(&pre)[0];
+            logits.extend(host(&pre.as_dtype(Dtype::Float32).unwrap()));
+            let block = [next, (next + 1) % 50, (next + 2) % 50];
+            let verify = model
+                .forward(&Array::from_slice(&block, &[1, 3]), &mut cache, n)
+                .unwrap();
+            let rows = argmax_rows(&verify);
+            out.extend(&rows);
+            logits.extend(host(&verify.as_dtype(Dtype::Float32).unwrap()));
+            next = rows[2];
+            for i in 0..6 {
+                let step = model
+                    .decode_logits(&Array::from_slice(&[next], &[1, 1]), &mut cache, n + 3 + i)
+                    .unwrap();
+                next = argmax_rows(&step)[0];
+                out.push(next);
+                logits.extend(host(&step.as_dtype(Dtype::Float32).unwrap()));
+            }
+            (out, logits)
+        };
+        let long: Vec<i32> = (0..90).map(|i| (i * 7 + 3) % 50).collect();
+        for prompt in [&[1i32, 7, 3, 42, 9, 2][..], &long[..]] {
+            let ((tokens, logits), routes) = recording_routes(|| run(prompt));
+            let ((ref_tokens, ref_logits), ref_routes) =
+                recording_routes(|| with_ops_reference(|| run(prompt)));
+            // The production run took the fused kernel for every recurrence call and the reference
+            // run the op loop — so the comparison is kernel against ops, not a path against itself.
+            assert!(
+                !routes.is_empty() && routes.iter().all(|r| *r == Route::Kernel),
+                "production routes {routes:?}"
+            );
+            assert!(
+                !ref_routes.is_empty() && ref_routes.iter().all(|r| *r == Route::Ops),
+                "reference routes {ref_routes:?}"
+            );
+            let md = logits
+                .iter()
+                .zip(&ref_logits)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // The logits are bf16: one ULP at the largest reference logit's binade (8 significand
+            // bits, so the spacing in [2^e, 2^(e+1)) is 2^(e-7)) bounds a last-bit rounding flip.
+            let scale = ref_logits.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let ulp = 2f32.powi(scale.log2().floor() as i32 - 7);
+            eprintln!(
+                "prompt len {}: max logit diff vs ops reference {md:.2e} (bf16 ulp {ulp:.2e} at \
+                 |logit| {scale:.2e})",
+                prompt.len()
+            );
+            assert_eq!(
+                tokens,
+                ref_tokens,
+                "prompt len {}: greedy tokens diverged (max logit diff {md})",
+                prompt.len()
+            );
+            assert!(
+                md <= ulp,
+                "prompt len {}: max logit diff {md} exceeds one bf16 ulp {ulp}",
+                prompt.len()
+            );
+        }
+    }
+
     /// A MoE config (`qwen3_5_moe`, the 35B-A3B shape, scaled down): 6 experts, top-2, with a shared
     /// expert. Same 4-layer 3:1 mixer schedule as [`cfg_json`].
-    fn cfg_json_moe() -> serde_json::Value {
+    pub(crate) fn cfg_json_moe() -> serde_json::Value {
         let mut v = cfg_json();
         let tc = v["text_config"].as_object_mut().unwrap();
         tc.insert("model_type".into(), json!("qwen3_5_moe_text"));
@@ -2789,10 +2871,218 @@ mod tests {
         v
     }
 
+    /// [`cfg_json_moe`] with a configured MTP head — the 35B-A3B checkpoint's layout (sc-24438).
+    pub(crate) fn cfg_json_moe_mtp() -> serde_json::Value {
+        let mut v = cfg_json_moe();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("mtp_num_hidden_layers".into(), json!(1));
+        tc.insert("mtp_use_dedicated_embeddings".into(), json!(false));
+        v
+    }
+
+    /// Synthetic tensors for a sparse-MoE `cfg` with an MTP head whose predictor layer carries a
+    /// sparse-MoE FFN (router, experts, shared expert) instead of the dense MLP — as the 35B-A3B
+    /// checkpoint ships it (sc-24438) — with every MoE tensor (body and head) seeded **non-zero
+    /// random**. `fused` stores the experts as the Qwen3.6 release does (`experts.gate_up_proj` /
+    /// `experts.down_proj`); otherwise each expert under its own keys, as the bf16 Qwen3.5 release
+    /// does (`experts.{e}.{gate,up,down}_proj.weight`) — the same values either way.
+    pub(crate) fn seeded_moe_mtp_tensors(
+        cfg: &Qwen35Config,
+        fused: bool,
+    ) -> HashMap<String, Array> {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let moe = cfg.moe.as_ref().expect("a MoE config");
+        let h = cfg.hidden_size;
+        let (e, mi, si) = (
+            moe.num_experts,
+            moe.moe_intermediate_size,
+            moe.shared_expert_intermediate_size,
+        );
+        let mut m = synthetic_tensors_with_prefix(cfg, "model.language_model");
+        for dense in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(m
+                .remove(&format!("mtp.layers.0.mlp.{dense}.weight"))
+                .is_some());
+        }
+        let mut rng = SplitMix64::new(0x5EED_24438);
+        let mut layers: Vec<String> = (0..cfg.num_layers)
+            .map(|i| format!("model.language_model.layers.{i}."))
+            .collect();
+        layers.push("mtp.layers.0.".into());
+        for lp in layers {
+            let mut rand = |key: &str, shape: &[i32]| {
+                let n: i32 = shape.iter().product();
+                let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.8).collect();
+                m.insert(format!("{lp}{key}"), Array::from_slice(&data, shape));
+                data
+            };
+            let gate_up = rand("mlp.experts.gate_up_proj", &[e, 2 * mi, h]);
+            let down = rand("mlp.experts.down_proj", &[e, h, mi]);
+            rand("mlp.gate.weight", &[e, h]);
+            rand("mlp.shared_expert.gate_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.up_proj.weight", &[si, h]);
+            rand("mlp.shared_expert.down_proj.weight", &[h, si]);
+            rand("mlp.shared_expert_gate.weight", &[1, h]);
+            if !fused {
+                m.remove(&format!("{lp}mlp.experts.gate_up_proj"));
+                m.remove(&format!("{lp}mlp.experts.down_proj"));
+                let (rows, bank) = ((mi * h) as usize, (2 * mi * h) as usize);
+                for x in 0..e as usize {
+                    let key = |p: &str| format!("{lp}mlp.experts.{x}.{p}_proj.weight");
+                    let gu = &gate_up[x * bank..(x + 1) * bank];
+                    m.insert(key("gate"), Array::from_slice(&gu[..rows], &[mi, h]));
+                    m.insert(key("up"), Array::from_slice(&gu[rows..], &[mi, h]));
+                    let dn = &down[x * rows..(x + 1) * rows];
+                    m.insert(key("down"), Array::from_slice(dn, &[h, mi]));
+                }
+            }
+        }
+        m
+    }
+
+    fn load_moe_mtp(cfg: &Qwen35Config, tensors: HashMap<String, Array>) -> Qwen35Model {
+        Qwen35Model::from_weights(
+            &Weights::from_map(tensors),
+            "model.language_model",
+            cfg.clone(),
+        )
+        .expect("a MoE checkpoint with an MTP head loads")
+    }
+
+    fn host_f32(a: &Array) -> Vec<f32> {
+        a.as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec()
+    }
+
+    /// sc-24438 AC2 (a): a sparse-MoE checkpoint carrying an MTP head loads the head — its
+    /// predictor layer the body's sparse-MoE block — and the fused (Qwen3.6) and per-expert
+    /// (Qwen3.5) expert layouts of the same seeded non-zero weights give identical target logits
+    /// and identical `mtp_step` logits / hidden state.
+    #[test]
+    fn a_moe_mtp_head_runs_identically_in_both_expert_layouts() {
+        let cfg = Qwen35Config::from_json(&cfg_json_moe_mtp()).unwrap();
+        let fused = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, true));
+        let split = load_moe_mtp(&cfg, seeded_moe_mtp_tensors(&cfg, false));
+        for model in [&fused, &split] {
+            assert!(model.has_mtp());
+            let Ffn::Moe(_) = &model.mtp.as_ref().unwrap().layers[0].ffn else {
+                panic!("the predictor layer is the sparse-MoE block");
+            };
+        }
+        let ids = Array::from_slice(&[1i32, 7, 3, 42], &[1, 4]);
+        let run = |model: &Qwen35Model| {
+            let hidden = model.hidden(&ids, &mut model.new_cache(), 0).unwrap();
+            let mut cache = model.new_mtp_cache().unwrap();
+            let shifted = Array::from_slice(&[7i32, 3, 42, 9], &[1, 4]);
+            let (mtp_hidden, mtp_logits) =
+                model.mtp_step(&shifted, &hidden, &mut cache, 0).unwrap();
+            (
+                host_f32(&hidden),
+                host_f32(&mtp_hidden),
+                host_f32(&mtp_logits),
+            )
+        };
+        let (a, b) = (run(&fused), run(&split));
+        assert!(
+            a.2.iter().any(|x| x.abs() > 1e-3),
+            "non-degenerate MTP logits"
+        );
+        assert_eq!(a.0, b.0, "target hidden");
+        assert_eq!(a.1, b.1, "MTP hidden");
+        assert_eq!(a.2, b.2, "MTP logits");
+    }
+
+    /// sc-24438 AC2 (b): the MTP predictor layer's FFN, built by the loader under the
+    /// `mtp.layers.0.` prefix from the `Qwen3_5MoeSparseMoeBlock.forward` oracle's weights (the
+    /// fused layout and the per-expert split of it), reproduces the oracle's output — the check
+    /// [`moe_ffn_matches_qwen3_5_moe_reference`] holds the block itself to, at bf16 tolerance.
+    #[test]
+    fn the_mtp_layer_ffn_matches_the_moe_reference() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/qwen35_moe_oracle.json")).unwrap();
+        let arr = |k: &str| -> Vec<f32> {
+            json[k]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let (h, e, mi) = (8i32, 6i32, 4i32);
+        let mut v = cfg_json_moe_mtp();
+        let tc = v["text_config"].as_object_mut().unwrap();
+        tc.insert("hidden_size".into(), json!(h));
+        tc.insert("moe_intermediate_size".into(), json!(mi));
+        tc.insert("shared_expert_intermediate_size".into(), json!(mi));
+        let cfg = Qwen35Config::from_json(&v).unwrap();
+        assert_eq!(
+            (
+                cfg.moe.unwrap().num_experts,
+                cfg.moe.unwrap().experts_per_tok
+            ),
+            (e, 2)
+        );
+        for fused in [true, false] {
+            let mut m = seeded_moe_mtp_tensors(&cfg, fused);
+            let lp = |s: &str| format!("mtp.layers.0.mlp.{s}");
+            let mut put = |key: String, data: &[f32], shape: &[i32]| {
+                m.insert(key, Array::from_slice(data, shape));
+            };
+            let (gate_up, down) = (arr("gate_up"), arr("down"));
+            if fused {
+                put(lp("experts.gate_up_proj"), &gate_up, &[e, 2 * mi, h]);
+                put(lp("experts.down_proj"), &down, &[e, h, mi]);
+            } else {
+                let rows = (mi * h) as usize;
+                for x in 0..e as usize {
+                    let gu = &gate_up[x * 2 * rows..(x + 1) * 2 * rows];
+                    let key = |p: &str| lp(&format!("experts.{x}.{p}_proj.weight"));
+                    put(key("gate"), &gu[..rows], &[mi, h]);
+                    put(key("up"), &gu[rows..], &[mi, h]);
+                    put(key("down"), &down[x * rows..(x + 1) * rows], &[h, mi]);
+                }
+            }
+            put(lp("gate.weight"), &arr("router"), &[e, h]);
+            put(
+                lp("shared_expert.gate_proj.weight"),
+                &arr("sh_gate"),
+                &[mi, h],
+            );
+            put(lp("shared_expert.up_proj.weight"), &arr("sh_up"), &[mi, h]);
+            put(
+                lp("shared_expert.down_proj.weight"),
+                &arr("sh_down"),
+                &[h, mi],
+            );
+            put(lp("shared_expert_gate.weight"), &arr("sh_gatew"), &[1, h]);
+            let model = load_moe_mtp(&cfg, m);
+            let ffn = &model.mtp.as_ref().unwrap().layers[0].ffn;
+            let got = host_f32(
+                &ffn.forward(&Array::from_slice(&arr("x"), &[1, 1, h]))
+                    .unwrap(),
+            );
+            let exp = arr("expected_output");
+            let md = got
+                .iter()
+                .zip(&exp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // The loader stores weights in bf16 (the block test above runs f32): bf16's 2^-8
+            // relative step on outputs of magnitude ~0.5, far below a wrong route or expert.
+            assert!(
+                md < 5e-3,
+                "fused {fused}: MTP-layer ffn vs reference: max abs diff {md}\n got {got:?}\n \
+                 exp {exp:?}"
+            );
+        }
+    }
+
     /// The MoE FFN block, validated against a numeric oracle from the exact
     /// `Qwen3_5MoeSparseMoeBlock.forward` reference: softmax router → top-k → renormalize → per-expert
-    /// SwiGLU (gathered/scattered) → sigmoid-gated shared expert. Builds the block via the same
-    /// un-fuse path as the loader (`experts.gate_up_proj` → per-expert gate/up). Single token (S=1) so
+    /// SwiGLU → sigmoid-gated shared expert. Builds the shared [`SparseMoe`] block via the same split
+    /// as the loader (`experts.gate_up_proj` → stacked gate / up banks). Single token (S=1) so
     /// MLX runs the exact GEMV path and the match is tight; regenerate with `/tmp/gen_moe.py`.
     #[test]
     fn moe_ffn_matches_qwen3_5_moe_reference() {
@@ -2810,36 +3100,36 @@ mod tests {
         let mk = |key: &str, shape: &[i32]| Array::from_slice(&arr(key), shape);
         let proj = |a: Array| Projection::load(a, None).unwrap();
 
-        // Un-fuse experts.gate_up_proj / down_proj into per-expert SwiGLUs (mirrors the loader).
-        let gate_up = mk("gate_up", &[e, 2 * mi, h]);
-        let down = mk("down", &[e, h, mi]);
-        let mut experts = Vec::new();
-        for ei in 0..e {
-            let sel = Array::from_slice(&[ei], &[1]);
-            let gu = gate_up
-                .take_axis(&sel, 0)
+        // Split experts.gate_up_proj into the stacked gate / up banks (mirrors the loader).
+        let gate_up = mk("gate_up", &[e, 2 * mi, h])
+            .reshape(&[e, 2, mi, h])
+            .unwrap();
+        let half = |i: i32| {
+            gate_up
+                .take_axis(Array::from_slice(&[i], &[1]), 1)
                 .unwrap()
-                .reshape(&[2 * mi, h])
-                .unwrap();
-            let parts = split_sections(&gu, &[mi], 0).unwrap();
-            let dn = down.take_axis(&sel, 0).unwrap().reshape(&[h, mi]).unwrap();
-            experts.push(Mlp {
-                gate: proj(parts[0].clone()),
-                up: proj(parts[1].clone()),
-                down: proj(dn),
-            });
-        }
-        let moe = MoeFfn {
-            router: mk("router", &[e, h]),
-            experts,
-            shared: Mlp {
+                .reshape(&[e, mi, h])
+                .unwrap()
+        };
+        let bank = |a: Array| SwitchLinear::load(a, None).unwrap();
+        let moe = SparseMoe::new(
+            mk("router", &[e, h]),
+            bank(half(0)),
+            bank(half(1)),
+            bank(mk("down", &[e, h, mi])),
+            SwiGlu {
                 gate: proj(mk("sh_gate", &[mi, h])),
                 up: proj(mk("sh_up", &[mi, h])),
                 down: proj(mk("sh_down", &[h, mi])),
             },
-            shared_gate: mk("sh_gatew", &[1, h]),
-            experts_per_tok: k,
-        };
+            Some(mk("sh_gatew", &[1, h])),
+            MoeRouting {
+                experts_per_tok: k,
+                norm_topk_prob: true,
+                routed_scaling_factor: 1.0,
+            },
+        )
+        .unwrap();
 
         let out = moe.forward(&mk("x", &[1, 1, h])).unwrap();
         assert_eq!(out.shape(), &[1, 1, h]);
@@ -2923,6 +3213,72 @@ mod tests {
         assert!(
             md < 5e-2,
             "MoE prefill vs stepwise diverged: max abs diff {md}"
+        );
+    }
+
+    /// sc-24442 AC2: the Qwen35 hybrid decoder (gated full attention with partial M-RoPE
+    /// interleaved with linear-attention layers) emits the same greedy tokens under the new `sdpa` routing as under
+    /// the pre-sc-24442 one, compared in-process — head dims 8 (unserved), 64 (full kernel) and 256
+    /// (vector-only) × GQA 2 / GQA 8 × prompts inside one tile, across tiles, and across many.
+    #[test]
+    fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
+        use crate::primitives::attention::route_override::{
+            assert_greedy_matches_pre_sc24442, GreedyComparison,
+        };
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+
+        let mut seen = GreedyComparison::default();
+        for hd in [8, 64, 256] {
+            for (nh, nkv) in [(4, 2), (8, 1)] {
+                let mut v = cfg_json();
+                let tc = v["text_config"].as_object_mut().unwrap();
+                tc.insert("head_dim".into(), json!(hd));
+                tc.insert("num_attention_heads".into(), json!(nh));
+                tc.insert("num_key_value_heads".into(), json!(nkv));
+                // Full attention at layers 1 and 3: an earlier full-attention layer's every row
+                // feeds the last-position logits (the last layer's only reaches them via its
+                // final row, which no masking or tiling choice changes).
+                tc.insert("full_attention_interval".into(), json!(2));
+                let cfg = Qwen35Config::from_json(&v).unwrap();
+                assert!(!cfg.is_linear(1) && !cfg.is_linear(3));
+                // Random (not periodic) values so greedy steps are rarely near-ties.
+                let mut rng = SplitMix64::new(0x2444_2350 + (hd * 16 + nh + nkv) as u64);
+                let weights: HashMap<String, Array> = synthetic_weights(&cfg)
+                    .into_map()
+                    .into_iter()
+                    .map(|(key, a)| {
+                        let n = a.size();
+                        let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+                        (key, Array::from_slice(&data, a.shape()))
+                    })
+                    .collect();
+                let model = Qwen35Model::from_weights(
+                    &Weights::from_map(weights),
+                    "model.language_model",
+                    cfg.clone(),
+                )
+                .unwrap();
+                for prompt_len in [5, 20, 70] {
+                    let prompt: Vec<i32> = (0..prompt_len)
+                        .map(|i| (i * 7 + 3) % cfg.vocab_size)
+                        .collect();
+                    seen += assert_greedy_matches_pre_sc24442(
+                        &format!("qwen35 hd {hd} {nh}/{nkv} prompt {prompt_len}"),
+                        &prompt,
+                        6,
+                        || model.new_cache(),
+                        |ids, cache, offset| model.decode_logits(ids, cache, offset).unwrap(),
+                    );
+                }
+            }
+        }
+        assert!(
+            seen.differing_calls > 0,
+            "no fixture exercised a routing change"
+        );
+        assert!(
+            seen.compared_steps > seen.tie_steps,
+            "most greedy steps must be decisive enough to compare: {seen:?}"
         );
     }
 

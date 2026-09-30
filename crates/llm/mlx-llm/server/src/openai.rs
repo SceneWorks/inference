@@ -5,7 +5,10 @@
 //! These are pure data transforms (no model, no I/O), so they're unit-tested directly. The server
 //! ([`crate::main`]) wires them to a TCP socket + a loaded `core_llm::TextLlm` provider.
 
-use mlx_llm::core_llm::{Constraint, Content, Message, Role, Sampling, TextLlmRequest};
+use mlx_llm::core_llm::{
+    Constraint, Content, DecodeReport, Message, MtpMode, Role, Sampling, Speculative,
+    TextLlmRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -40,6 +43,14 @@ pub struct ChatRequest {
     pub stop: Option<StringOrVec>,
     /// `{"type":"json_object"}` ⇒ constrain output to valid JSON.
     pub response_format: Option<ResponseFormat>,
+    /// Speculative decoding (non-OpenAI extension, epic sc-24432 E4): `"off"`, `"auto"` or
+    /// `{"proposer": "mtp" | "prompt_lookup" | "draft_model", "depth": N}`, mapped onto the
+    /// contract's `speculative` option. The legacy `mtp` field (`{"mode": "off" | "auto"}`,
+    /// `{"mode": "enabled", "draft_tokens": N}`) is read into the same option; sending both is a
+    /// duplicate field, and an unknown value in either is refused by the contract's parser — a
+    /// 400, never silently decoded as `off`. Omitted ⇒ `off`.
+    #[serde(default, alias = "mtp")]
+    pub speculative: Option<Speculative>,
 }
 
 /// One chat turn. `content` is a string or an array of typed parts (the vision wire form); this
@@ -167,7 +178,10 @@ impl ChatRequest {
             thinking: Default::default(),
             reasoning_effort: None,
             preserve_thinking: None,
-            mtp: Default::default(),
+            // The request's speculative option (or its legacy `mtp` spelling) as sent; the
+            // provider validates it against what the loaded model advertises (sc-24438).
+            speculative: self.speculative,
+            mtp: MtpMode::Off,
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
@@ -201,12 +215,39 @@ pub fn content_chunk(id: &str, model: &str, created: u64, delta: &str) -> String
     chunk(id, model, created, json!({ "content": delta }), Value::Null)
 }
 
-/// The terminal SSE chunk: an empty delta plus the finish reason.
-pub fn final_chunk(id: &str, model: &str, created: u64, finish: &str) -> String {
-    chunk(id, model, created, json!({}), json!(finish))
+/// The terminal SSE chunk: an empty delta plus the finish reason, and the request's decode
+/// report as [`x_decode`] (sc-24438).
+pub fn final_chunk(
+    id: &str,
+    model: &str,
+    created: u64,
+    finish: &str,
+    decode: Option<&DecodeReport>,
+) -> String {
+    let mut v = chunk_value(id, model, created, json!({}), json!(finish));
+    if let Some(report) = decode {
+        v["x_decode"] = x_decode(report);
+    }
+    v.to_string()
+}
+
+/// The decode report an OpenAI client can see (sc-24438, epic sc-24432 E2): which proposer ran,
+/// its depth, and every fallback — a clamped depth, an unavailable proposer — by name, so no
+/// downgrade is silent over HTTP. Carried as the `x_decode` extension member of the non-streaming
+/// body and of the final SSE chunk before `[DONE]`.
+pub fn x_decode(report: &DecodeReport) -> Value {
+    json!({
+        "proposer": report.proposer.label(),
+        "draft_tokens": report.draft_tokens,
+        "fallbacks": report.fallbacks,
+    })
 }
 
 fn chunk(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value) -> String {
+    chunk_value(id, model, created, delta, finish_reason).to_string()
+}
+
+fn chunk_value(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value) -> Value {
     json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -214,20 +255,32 @@ fn chunk(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value
         "model": model,
         "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
     })
-    .to_string()
 }
 
-/// A non-streaming `chat.completion` response body.
+/// The token counts a completion reports.
+pub struct CompletionUsage {
+    /// Prompt tokens.
+    pub prompt_tokens: u32,
+    /// Generated tokens.
+    pub completion_tokens: u32,
+}
+
+/// A non-streaming `chat.completion` response body, with the request's decode report as
+/// [`x_decode`] (sc-24438).
 pub fn completion(
     id: &str,
     model: &str,
     created: u64,
     text: &str,
     finish: &str,
-    prompt_tokens: u32,
-    completion_tokens: u32,
+    usage: CompletionUsage,
+    decode: Option<&DecodeReport>,
 ) -> String {
-    json!({
+    let CompletionUsage {
+        prompt_tokens,
+        completion_tokens,
+    } = usage;
+    let mut v = json!({
         "id": id,
         "object": "chat.completion",
         "created": created,
@@ -242,8 +295,11 @@ pub fn completion(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
-    })
-    .to_string()
+    });
+    if let Some(report) = decode {
+        v["x_decode"] = x_decode(report);
+    }
+    v.to_string()
 }
 
 /// The `GET /v1/models` body listing the single hosted model.
@@ -328,6 +384,69 @@ mod tests {
         assert_eq!(r2.stop, vec!["a".to_string(), "b".to_string()]);
     }
 
+    /// sc-24438 AC3: the new `speculative` option and the legacy `mtp` shape both reach the
+    /// contract as sent (never forced to off), and an omitted option is `off`.
+    #[test]
+    fn speculative_and_the_legacy_mtp_field_map_onto_the_contract() {
+        use mlx_llm::core_llm::SpeculativeProposer;
+        let spec = |extra: &str| {
+            parse(&format!(
+                r#"{{"messages":[{{"role":"user","content":"x"}}]{extra}}}"#
+            ))
+            .into_text_llm_request()
+            .unwrap()
+        };
+        let r = spec("");
+        assert_eq!(r.speculative, None);
+        assert_eq!(r.speculative_mode(), Speculative::Off);
+        for (extra, want) in [
+            (r#","speculative":"auto""#, Speculative::Auto),
+            (r#","speculative":"off""#, Speculative::Off),
+            (
+                r#","speculative":{"proposer":"prompt_lookup","depth":4}"#,
+                Speculative::proposer(SpeculativeProposer::PromptLookup, 4),
+            ),
+            (
+                r#","speculative":{"proposer":"mtp","depth":12}"#,
+                Speculative::proposer(SpeculativeProposer::Mtp, 12),
+            ),
+            (r#","mtp":{"mode":"auto"}"#, Speculative::Auto),
+            (r#","mtp":{"mode":"off"}"#, Speculative::Off),
+            (
+                r#","mtp":{"mode":"enabled","draft_tokens":3}"#,
+                Speculative::proposer(SpeculativeProposer::Mtp, 3),
+            ),
+        ] {
+            let r = spec(extra);
+            assert_eq!(r.speculative, Some(want), "{extra}");
+            assert_eq!(r.speculative_mode(), want, "{extra}");
+            assert_eq!(r.mtp, MtpMode::Off, "{extra}");
+        }
+    }
+
+    /// sc-24438 AC3: an unknown speculative value — in either field — or both fields at once is
+    /// a parse error (the server's 400), never ignored.
+    #[test]
+    fn unknown_speculative_values_are_refused_not_ignored() {
+        for extra in [
+            r#","speculative":"fast""#,
+            r#","speculative":true"#,
+            r#","speculative":{"proposer":"ngram","depth":2}"#,
+            r#","speculative":{"proposer":"mtp","depth":-1}"#,
+            r#","speculative":{"proposer":"mtp"}"#,
+            r#","speculative":{"proposer":"mtp","depth":2,"width":3}"#,
+            r#","mtp":{"mode":"always"}"#,
+            r#","mtp":{"mode":"enabled"}"#,
+            r#","mtp":"sometimes""#,
+            r#","speculative":"auto","mtp":{"mode":"auto"}"#,
+        ] {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":"x"}}]{extra}}}"#);
+            let err = serde_json::from_str::<ChatRequest>(&body)
+                .expect_err(&format!("{extra} must be refused"));
+            assert!(!err.to_string().is_empty(), "{extra}");
+        }
+    }
+
     #[test]
     fn empty_messages_rejected() {
         assert!(parse(r#"{"messages":[]}"#).into_text_llm_request().is_err());
@@ -344,15 +463,23 @@ mod tests {
             serde_json::from_str::<Value>(&content_chunk("id1", "m", 100, "hello")).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "hello");
 
-        let fin = serde_json::from_str::<Value>(&final_chunk("id1", "m", 100, "length")).unwrap();
+        let fin =
+            serde_json::from_str::<Value>(&final_chunk("id1", "m", 100, "length", None)).unwrap();
         assert_eq!(fin["choices"][0]["finish_reason"], "length");
         assert_eq!(fin["choices"][0]["delta"], json!({}));
+        assert!(fin.get("x_decode").is_none(), "no report, no member");
     }
 
     #[test]
     fn completion_body_carries_usage_and_message() {
-        let v = serde_json::from_str::<Value>(&completion("id", "m", 1, "hi there", "stop", 3, 2))
-            .unwrap();
+        let usage = CompletionUsage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+        };
+        let v = serde_json::from_str::<Value>(&completion(
+            "id", "m", 1, "hi there", "stop", usage, None,
+        ))
+        .unwrap();
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["content"], "hi there");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");

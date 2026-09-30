@@ -1271,6 +1271,7 @@ version = "0.0.0"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
@@ -1283,6 +1284,7 @@ version = "0.0.0"
 dependencies = [
  "core-llm",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2826,6 +2828,7 @@ dependencies = [
  "half",
  "memmap2",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

@@ -38,6 +38,9 @@ mod continuous;
 #[path = "contract_roundtrip.rs"]
 mod contract_roundtrip;
 
+#[path = "draft_model.rs"]
+mod draft_model;
+
 #[path = "gemma4_decoder.rs"]
 mod gemma4_decoder;
 
@@ -61,6 +64,9 @@ mod joycaption;
 
 #[path = "ltx_2_5_te_tier_quality.rs"]
 mod ltx_2_5_te_tier_quality;
+
+#[path = "moe_routing.rs"]
+mod moe_routing;
 
 #[path = "native_composition.rs"]
 mod native_composition;

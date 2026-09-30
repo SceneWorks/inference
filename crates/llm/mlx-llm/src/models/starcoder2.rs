@@ -57,6 +57,8 @@ pub struct StarCoder2 {
     layers: Vec<StarCoder2Layer>,
     final_norm_weight: Array,
     final_norm_bias: Array,
+    /// Standard RoPE over the full head, built once at load (device-resident schedule).
+    rope: Rope,
     cfg: StarCoder2Config,
 }
 
@@ -89,6 +91,7 @@ impl StarCoder2 {
             layers,
             final_norm_weight: w.require(&key("model.norm.weight"))?.clone(),
             final_norm_bias: w.require(&key("model.norm.bias"))?.clone(),
+            rope: Rope::standard(cfg.head_dim(), cfg.rope_theta),
             cfg,
         };
         w.verify_accessed_gpu_view()?;
@@ -108,8 +111,7 @@ impl StarCoder2 {
         offset: i32,
     ) -> Result<Array> {
         let sequence = embeds.shape()[1];
-        let rope = Rope::standard(self.cfg.head_dim(), self.cfg.rope_theta);
-        let (cos, sin) = rope.cos_sin(sequence, offset, embeds.dtype())?;
+        let (cos, sin) = self.rope.cos_sin(sequence, offset, embeds.dtype())?;
         let mut hidden = embeds.clone();
         for (index, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, &cos, &sin, cache, index)?;
