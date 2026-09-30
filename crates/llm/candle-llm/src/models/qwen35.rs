@@ -1116,7 +1116,13 @@ impl Qwen35Cache {
     pub fn prefix_snapshot(&self) -> Result<Qwen35PrefixState> {
         let len = self.offset().max(0) as usize;
         let copy_kv = |k: &Tensor, v: &Tensor| -> Result<(Tensor, Tensor)> {
-            Ok((k.narrow(2, 0, len)?.copy()?, v.narrow(2, 0, len)?.copy()?))
+            // Compact copies of exactly `len` positions: `Tensor::copy` would keep the view's
+            // layout over a clone of the whole static buffer — the cache's full capacity, pinned
+            // by an entry charged for `len` positions.
+            Ok((
+                k.narrow(2, 0, len)?.force_contiguous()?,
+                v.narrow(2, 0, len)?.force_contiguous()?,
+            ))
         };
         let layers = self
             .layers
@@ -1125,7 +1131,11 @@ impl Qwen35Cache {
                 Ok(match l {
                     Qwen35LayerCache::Delta(c) => {
                         Qwen35PrefixLayer::Delta(match (c.conv_state(), c.ssm_state()) {
-                            (Some(conv), Some(ssm)) => Some((conv.copy()?, ssm.copy()?)),
+                            // Compact copies: the live state may be a slot view of the
+                            // checkpoint ring, which `copy` would clone whole.
+                            (Some(conv), Some(ssm)) => {
+                                Some((conv.force_contiguous()?, ssm.force_contiguous()?))
+                            }
                             _ => None,
                         })
                     }
@@ -2776,6 +2786,44 @@ pub(crate) mod tests {
     use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// sc-24437: a prefix snapshot owns compact copies of exactly the positions it holds — never a
+    /// view into the live cache's static KV buffer, which would pin that whole buffer beyond the
+    /// bytes the entry is charged for.
+    #[test]
+    fn a_prefix_snapshot_holds_compact_copies_of_its_positions() {
+        use crate::decode::{StepModel, StepRequest};
+        let (_, model) = text_model();
+        let mut cache = model.new_cache_for(32, 3).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[3, 9, 4, 11, 3, 9, 4, 11]))
+            .unwrap();
+        let state = cache.prefix_snapshot().unwrap();
+        let pinned = crate::primitives::decode_cache::pinned_f32_elems;
+        for layer in &state.layers {
+            if let Qwen35PrefixLayer::Delta(Some((conv, ssm))) = layer {
+                for t in [conv, ssm] {
+                    assert_eq!(pinned(t), t.elem_count(), "{:?}", t.layout());
+                }
+            }
+        }
+        let mut attention = 0;
+        for layer in &state.layers {
+            if let Qwen35PrefixLayer::Attn(Some((k, v))) = layer {
+                for t in [k, v] {
+                    assert_eq!(t.dim(2).unwrap(), 8);
+                    assert_eq!(
+                        pinned(t),
+                        t.elem_count(),
+                        "the entry pins more than it holds: {:?}",
+                        t.layout()
+                    );
+                }
+                attention += 1;
+            }
+        }
+        assert!(attention > 0, "the fixture has full-attention layers");
+    }
 
     #[test]
     fn published_prism_norm_multiplier_matches_independent_rms_oracle() {

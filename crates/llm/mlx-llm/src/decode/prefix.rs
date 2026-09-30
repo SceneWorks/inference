@@ -323,10 +323,14 @@ pub struct PrefixPrefill<C> {
     pub logits: Array,
     /// The target's hidden rows for the prefilled positions `reused..prompt.len()` (when asked).
     pub hidden: Option<Array>,
-    /// Leading prompt positions restored instead of prefilled (the report's `prefix_hit_tokens`).
+    /// Leading prompt positions the lookup restored (the prefill starts past them).
     pub reused: usize,
     /// Target forwards the prefill ran (two when it split at the boundary).
     pub forwards: usize,
+    /// Prompt tokens the prefill fed through the target — `prompt.len() - reused` when the
+    /// restored cache was really prefilled on top of; the provider reports
+    /// `prefix_hit_tokens = prompt.len() - fed_tokens`, so the report measures the prefill it ran.
+    pub fed_tokens: usize,
     /// The MTP head's state at `reused`, for
     /// [`MtpProposer::resume_from`](super::MtpProposer::resume_from).
     pub mtp: Option<MtpBoundary>,
@@ -401,13 +405,14 @@ where
     let mut logits = None;
     let mut snapshot = None;
     let forwards = segments.len();
+    let fed_tokens = segments.iter().map(ExactSizeIterator::len).sum();
     for segment in segments {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
         let out = target.forward(
             &mut cache,
-            &prompt[segment.clone()],
+            &input_ids(&prompt[segment.clone()]),
             segment.start as i32,
             LogitsScope::Last,
             want_hidden,
@@ -435,6 +440,7 @@ where
         hidden,
         reused,
         forwards,
+        fed_tokens,
         mtp,
         boundary: snapshot,
     })
@@ -642,12 +648,12 @@ mod engine_tests {
         fn forward(
             &self,
             cache: &mut T::Cache,
-            ids: &[i32],
+            ids: &Array,
             rope_offset: i32,
             scope: LogitsScope,
             want_hidden: bool,
         ) -> Result<TargetOutput> {
-            self.fed.set(self.fed.get() + ids.len());
+            self.fed.set(self.fed.get() + ids.shape()[1] as usize);
             if let Some(cancel) = self.cancel_in_forward {
                 cancel.cancel();
             }
@@ -800,6 +806,59 @@ mod engine_tests {
         other.extend_from_slice(&[1, 2]);
         let restored = pc.restore::<Qwen35Cache>(&other, false).unwrap();
         assert!(restored.is_none());
+    }
+
+    /// The boundary snapshot is independent of the live cache it was taken from (MLX arrays are
+    /// copy-on-write): that cache goes on to decode — prompt lookup verifying and rolling back on
+    /// top of it — and a restore of the stored entry answers exactly as it did before.
+    #[test]
+    fn a_boundary_snapshot_is_not_written_by_the_decode_that_continues_past_it() {
+        let model = qwen35(false);
+        let mut prompt = vec![3, 9, 4, 11, 3, 9, 4, 11];
+        prompt.extend_from_slice(&[40, 41]);
+        let PrefixPrefill {
+            mut cache,
+            logits,
+            boundary,
+            ..
+        } = prefill_restored(&model, None, &prompt, Some(8), false, &CancelFlag::new()).unwrap();
+        let entry = boundary
+            .expect("a snapshot at the boundary")
+            .cache
+            .into_entry(None);
+        let probe = |entry: &PrefixEntry| -> Vec<f32> {
+            let mut restored = <Qwen35Cache as PrefixSnapshot>::restore(entry, 8).unwrap();
+            let out = SpeculativeTarget::forward(
+                &model,
+                &mut restored,
+                &input_ids(&[20, 21]),
+                8,
+                LogitsScope::Last,
+                false,
+            )
+            .unwrap();
+            let logits = out.logits.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            logits.as_slice::<f32>().to_vec()
+        };
+        let before = probe(&entry);
+        generate_speculative(
+            &model,
+            &mut crate::decode::NgramProposer::default(),
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits,
+                hidden: None,
+                history: &prompt,
+                position_delta: 0,
+            },
+            &greedy(20),
+            3,
+            &CancelFlag::new(),
+            &mut |_| {},
+            EngineOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(probe(&entry), before);
     }
 
     /// Speculative decoding on top of a hit: the MTP head resumes from the state stored at the

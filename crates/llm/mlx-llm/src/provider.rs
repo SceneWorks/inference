@@ -570,6 +570,10 @@ pub struct LlamaProvider {
     /// The cross-turn prefix cache (sc-24437): one per loaded model, every decoder family, under
     /// the byte budget [`load`](Self::load) admitted.
     prefix: RefCell<PrefixCache>,
+    /// What [`load`](Self::load) settled, for [`TextLlm::load_report`]: the requested weight
+    /// format and the prefix cache's admitted budget. `None` for a provider assembled without a
+    /// load.
+    load_report: Option<core_llm::LoadReport>,
 }
 
 /// The same Qwen3.5/3.8 decoder appears under `model.language_model` in VLM snapshots and
@@ -631,7 +635,7 @@ impl LlamaProvider {
 
         let dir = Path::new(&spec.source);
         if dir.extension().and_then(|v| v.to_str()) == Some("gguf") {
-            return Self::load_prism_gguf(spec, dir).map(|p| p.with_prefix_budget(prefix_budget));
+            return Self::load_prism_gguf(spec, dir).map(|p| p.settled(spec, prefix_budget));
         }
         // Read config.json once to dispatch the architecture: the hybrid Qwen3.6 (`qwen3_5`) decoder
         // has its own config/weights path (and `ModelConfig` deliberately rejects it).
@@ -786,8 +790,10 @@ impl LlamaProvider {
             vision,
             gemma4,
             _prism_vision_weights: prism_vision_weights,
-            prefix: RefCell::new(PrefixCache::with_budget(prefix_budget)),
-        })
+            prefix: RefCell::new(PrefixCache::with_budget(0)),
+            load_report: None,
+        }
+        .settled(spec, prefix_budget))
     }
 
     fn load_prism_gguf(spec: &LoadSpec, path: &Path) -> CoreResult<Self> {
@@ -848,6 +854,7 @@ impl LlamaProvider {
             prefix: RefCell::new(PrefixCache::with_budget(
                 core_llm::DEFAULT_PREFIX_CACHE_BYTES,
             )),
+            load_report: None,
         })
     }
 
@@ -871,9 +878,15 @@ impl LlamaProvider {
         self.prefix.borrow().stats()
     }
 
-    /// Replace the prefix cache with an empty one of `budget` bytes.
-    fn with_prefix_budget(self, budget: u64) -> Self {
-        self.prefix.replace(PrefixCache::with_budget(budget));
+    /// Settle what the load of `spec` admitted: an empty prefix cache of `prefix_budget` bytes,
+    /// and the load report naming it.
+    fn settled(mut self, spec: &LoadSpec, prefix_budget: u64) -> Self {
+        self.prefix.replace(PrefixCache::with_budget(prefix_budget));
+        self.load_report = Some(core_llm::LoadReport {
+            requested: spec.quantize,
+            prefix_cache_bytes: Some(prefix_budget),
+            ..core_llm::LoadReport::default()
+        });
         self
     }
 
@@ -898,6 +911,7 @@ impl LlamaProvider {
             prefix: RefCell::new(PrefixCache::with_budget(
                 core_llm::DEFAULT_PREFIX_CACHE_BYTES,
             )),
+            load_report: None,
         }
     }
 
@@ -1426,6 +1440,10 @@ impl TextLlm for LlamaProvider {
             .validate_request(&self.descriptor.id, req)
     }
 
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        self.load_report.clone()
+    }
+
     fn generate(
         &self,
         req: &TextLlmRequest,
@@ -1537,22 +1555,16 @@ impl TextLlm for LlamaProvider {
         // (or clips) behind the same placeholder ids apart — a multimodal prompt neither reads nor
         // feeds it, and the report says so. The hybrid decoder snapshots at the end of the
         // rendered conversation, the prefix the next chat turn extends.
-        let prefix_on = self.prefix.borrow().budget_bytes() > 0;
-        let (mut prefix_path, mut prefix_reason) = if !prefix_on {
-            ("off", None)
-        } else if multimodal || gemma4_mm_request {
-            (
-                "bypassed",
-                Some(
-                    "a multimodal prompt is never cached — its image / video / audio rows are \
-                     not in the token key",
-                ),
-            )
-        } else {
-            ("miss", None)
-        };
+        let (mut prefix_path, mut prefix_reason) = prefix_path_for(
+            self.prefix.borrow().budget_bytes() > 0,
+            multimodal,
+            gemma4_mm_request,
+        );
+        // Only a request the cache serves reads (restores) or feeds (stores) it — `off` and
+        // `bypassed` never touch it.
+        let prefix_route = prefix_path == "miss";
         let prefix_boundary = match &self.model {
-            Decoder::Qwen35(_) if prefix_on && !multimodal && !gemma4_mm_request => {
+            Decoder::Qwen35(_) if prefix_route => {
                 self.conversation_boundary(messages, req, &prompt_ids)
             }
             _ => None,
@@ -1571,7 +1583,7 @@ impl TextLlm for LlamaProvider {
         // not fit evicts them least-recently-used first, and the snapshot it would leave behind
         // is admitted with it — or not taken, so caching never makes a request fail and never
         // takes memory admission did not grant.
-        let prefix_admission = if prefix_on && !multimodal && !gemma4_mm_request {
+        let prefix_admission = if prefix_route {
             self.prefix
                 .borrow_mut()
                 .admit(required, snapshot_bytes, available)
@@ -1582,7 +1594,7 @@ impl TextLlm for LlamaProvider {
             }
         };
         let keep_prefix = prefix_admission.snapshot;
-        if prefix_on && !multimodal && !gemma4_mm_request && !keep_prefix {
+        if prefix_route && !keep_prefix {
             prefix_reason =
                 Some("not kept: admission could not hold this request's snapshot beside it");
         }
@@ -1932,16 +1944,19 @@ impl TextLlm for LlamaProvider {
                     };
                     match &self.model {
                         Decoder::Causal(model) => {
-                            let restored = self
-                                .prefix
-                                .borrow_mut()
-                                .restore::<ContiguousKvCache>(&prompt_ids, false)
-                                .map_err(to_core)?;
+                            let restored = if prefix_route {
+                                self.prefix
+                                    .borrow_mut()
+                                    .restore::<ContiguousKvCache>(&prompt_ids, false)
+                                    .map_err(to_core)?
+                            } else {
+                                None
+                            };
                             let PrefixPrefill {
                                 mut cache,
                                 logits,
-                                reused,
                                 forwards,
+                                fed_tokens,
                                 ..
                             } = prefill_restored(
                                 model,
@@ -1952,8 +1967,10 @@ impl TextLlm for LlamaProvider {
                                 &req.cancel,
                             )
                             .map_err(to_core)?;
-                            (prefix_hit, prefill_forwards) = (reused, forwards);
-                            if reused > 0 {
+                            // Measured, not looked up: the positions the prefill did not feed.
+                            prefix_hit = prompt_ids.len() - fed_tokens;
+                            prefill_forwards = forwards;
+                            if prefix_hit > 0 {
                                 prefix_path = "hit";
                             }
                             let run = generate_speculative(
@@ -1985,19 +2002,23 @@ impl TextLlm for LlamaProvider {
                         }
                         Decoder::Qwen35(model) => {
                             let mtp = route.is_mtp();
-                            let restored = self
-                                .prefix
-                                .borrow_mut()
-                                .restore::<Qwen35Cache>(&prompt_ids, mtp)
-                                .map_err(to_core)?;
+                            let restored = if prefix_route {
+                                self.prefix
+                                    .borrow_mut()
+                                    .restore::<Qwen35Cache>(&prompt_ids, mtp)
+                                    .map_err(to_core)?
+                            } else {
+                                None
+                            };
                             let PrefixPrefill {
                                 mut cache,
                                 logits,
                                 hidden,
-                                reused,
                                 forwards,
+                                fed_tokens,
                                 mtp: resume,
                                 boundary,
+                                ..
                             } = prefill_restored(
                                 model,
                                 restored,
@@ -2007,8 +2028,10 @@ impl TextLlm for LlamaProvider {
                                 &req.cancel,
                             )
                             .map_err(to_core)?;
-                            (prefix_hit, prefill_forwards) = (reused, forwards);
-                            if reused > 0 {
+                            // Measured, not looked up: the positions the prefill did not feed.
+                            prefix_hit = prompt_ids.len() - fed_tokens;
+                            prefill_forwards = forwards;
+                            if prefix_hit > 0 {
                                 prefix_path = "hit";
                             }
                             let mut head = mtp.then(|| {
@@ -2037,7 +2060,7 @@ impl TextLlm for LlamaProvider {
                                 &mut sink,
                                 options,
                             );
-                            if run.is_ok() {
+                            if run.is_ok() && keep_prefix {
                                 let captured = head.as_mut().and_then(MtpProposer::take_captured);
                                 self.prefix.borrow_mut().store(
                                     &prompt_ids,
@@ -2069,6 +2092,7 @@ impl TextLlm for LlamaProvider {
         };
         let extra_prefill = prefill_forwards.saturating_sub(1);
         report.target_forwards += extra_prefill as u64;
+        report.prefill_forwards += extra_prefill as u64;
 
         // End-of-generation tails, in pipeline order. First the thinking segmenter's held-back
         // partial marker (it turned out not to begin a marker) as current-channel text — reasoning
@@ -2173,6 +2197,29 @@ impl TextLlm for LlamaProvider {
             decode: Some(report),
             finish_reason: Some(finish),
         })
+    }
+}
+
+/// Why a multimodal request never reads or feeds the cross-turn prefix cache (sc-24437).
+const PREFIX_MULTIMODAL_BYPASS: &str =
+    "a multimodal prompt is never cached — its image / video / audio rows are not in the token key";
+
+/// The cross-turn prefix cache's part in a request before any lookup (sc-24437): `off` when the
+/// load settled a zero budget, `bypassed` (with the reason) for a multimodal prompt — Qwen-VL
+/// (`multimodal`) or Gemma 4 (`gemma4_mm`) — whose token ids cannot tell two images or clips apart,
+/// else `miss` (the lookup may still turn it into a `hit`). Only a `miss` request reads or feeds
+/// the cache.
+fn prefix_path_for(
+    prefix_on: bool,
+    multimodal: bool,
+    gemma4_mm: bool,
+) -> (&'static str, Option<&'static str>) {
+    if !prefix_on {
+        ("off", None)
+    } else if multimodal || gemma4_mm {
+        ("bypassed", Some(PREFIX_MULTIMODAL_BYPASS))
+    } else {
+        ("miss", None)
     }
 }
 
@@ -3742,6 +3789,7 @@ mod tests {
             prefix: RefCell::new(PrefixCache::with_budget(
                 core_llm::DEFAULT_PREFIX_CACHE_BYTES,
             )),
+            load_report: None,
         }
     }
 
@@ -3822,16 +3870,21 @@ mod tests {
         use core_llm::Speculative;
         // The absolute accounting of a budget-bound run without stop tokens: the first token
         // comes from the prefill and each verify step commits its accepted drafts plus one; every
-        // forward is the prefill, a verify step or a recovery replay.
+        // forward is a prefill forward (two when the hybrid's prefill split at the prefix cache's
+        // conversation boundary, sc-24437), a verify step or a recovery replay.
         let accounting = |label: &str, ids: &[u32], report: &core_llm::DecodeReport| {
             assert_eq!(
                 ids.len() as u64,
                 1 + report.verify_steps + report.accepted_tokens,
                 "{label}: {report:?}"
             );
+            assert!(
+                matches!(report.prefill_forwards, 1 | 2),
+                "{label}: {report:?}"
+            );
             assert_eq!(
                 report.target_forwards,
-                1 + report.verify_steps + report.replay_forwards,
+                report.prefill_forwards + report.verify_steps + report.replay_forwards,
                 "{label}: {report:?}"
             );
         };
@@ -4350,6 +4403,11 @@ mod tests {
             let _budget = MemoryOverride::set(required + headroom);
             let provider = LlamaProvider::load(&spec).unwrap();
             assert_eq!(provider.prefix_cache_budget(), headroom);
+            assert_eq!(
+                provider.load_report().unwrap().prefix_cache_bytes,
+                Some(headroom),
+                "the report names the settled budget"
+            );
             spec.prefix_cache_bytes = Some(100);
             assert_eq!(
                 LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
@@ -4363,12 +4421,51 @@ mod tests {
         }
         spec.prefix_cache_bytes = Some(u64::MAX);
         {
+            // At the boundary the budget settles down to nothing rather than refusing.
             let _budget = MemoryOverride::set(required);
-            assert_eq!(LlamaProvider::load(&spec).unwrap().prefix_cache_budget(), 0);
+            let provider = LlamaProvider::load(&spec).unwrap();
+            assert_eq!(provider.prefix_cache_budget(), 0);
+            assert_eq!(provider.load_report().unwrap().prefix_cache_bytes, Some(0));
         }
         {
             let _budget = MemoryOverride::set(required - 1);
             assert!(LlamaProvider::load(&spec).is_err(), "past admission");
+        }
+    }
+
+    /// The cache's part before any lookup: off with a zero budget, bypassed (named) for either
+    /// multimodal route, else a miss — the only request that reads or feeds it.
+    #[test]
+    fn the_prefix_route_is_off_bypassed_or_a_miss() {
+        assert_eq!(prefix_path_for(false, false, false), ("off", None));
+        assert_eq!(prefix_path_for(false, true, true), ("off", None));
+        for (multimodal, gemma4_mm) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                prefix_path_for(true, multimodal, gemma4_mm),
+                ("bypassed", Some(PREFIX_MULTIMODAL_BYPASS)),
+                "multimodal {multimodal}, gemma4 {gemma4_mm}"
+            );
+        }
+        assert_eq!(prefix_path_for(true, false, false), ("miss", None));
+    }
+
+    /// A load that settled a zero budget never reads or feeds the cache: no lookup, no store,
+    /// and every turn reports `off`.
+    #[test]
+    fn an_off_cache_is_never_read_or_fed() {
+        use core_llm::Speculative;
+        for provider in [causal_provider(), qwen35_mtp_provider()] {
+            let provider = provider.settled(&LoadSpec::dense(""), 0);
+            let user = Message::user("t3 t9 t4 t11");
+            let (out1, _) = run(&provider, &chat(vec![user.clone()], Speculative::Off));
+            let turn2 = chat(
+                vec![user, Message::assistant(out1.text), Message::user("t5 t7")],
+                Speculative::Off,
+            );
+            let report = run(&provider, &turn2).0.decode.unwrap();
+            assert_eq!(report.prefix_cache.path, "off");
+            assert_eq!(report.prefix_hit_tokens, 0);
+            assert_eq!(provider.prefix_cache_stats(), PrefixStats::default());
         }
     }
 

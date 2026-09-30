@@ -140,6 +140,12 @@ pub struct DecodeReport {
     pub fused_primitives: PathReport,
     /// Target-model forward passes, including the prompt prefill.
     pub target_forwards: u64,
+    /// The target forwards the prompt prefill took, counted in
+    /// [`target_forwards`](Self::target_forwards): one for a prompt prefilled in one pass, two
+    /// when a hybrid decoder's prefill split at the cross-turn prefix cache's snapshot boundary
+    /// (story sc-24437), `0` on a path that does not report it. On the speculative engine
+    /// `target_forwards == prefill_forwards + verify_steps + replay_forwards`.
+    pub prefill_forwards: u64,
     /// Draft tokens proposed.
     pub proposed_tokens: u64,
     /// Draft tokens accepted by target verification.
@@ -153,7 +159,7 @@ pub struct DecodeReport {
     /// Leading prompt tokens whose cache state came from the cross-turn prefix cache instead of a
     /// prefill forward (story sc-24437): the prefill ran only the prompt past them. `0` on a miss,
     /// when the cache is off, and on a request it refuses (a multimodal prompt — its reason is in
-    /// [`fallbacks`](Self::fallbacks)).
+    /// [`prefix_cache`](Self::prefix_cache)'s `reason`).
     pub prefix_hit_tokens: u64,
     /// The cross-turn prefix cache's part in this request (story sc-24437): `hit` (a stored
     /// prefix was restored — [`prefix_hit_tokens`](Self::prefix_hit_tokens) of it), `miss`
@@ -212,6 +218,13 @@ pub struct LoadReport {
     /// load. `None` where the switch does not apply — a provider that never routes decode steps
     /// through a CUDA-graph runner — so a product shows the settled value, not the request.
     pub cuda_graphs: Option<bool>,
+    /// The cross-turn prefix cache's byte budget the load settled (story sc-24437): the requested
+    /// budget ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes), else
+    /// [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES)) clamped to the headroom
+    /// the load's admission left — memory the loaded model may hold beyond its weights. `Some(0)`
+    /// when the cache is off or no headroom was left; `None` where the provider has no prefix
+    /// cache or was assembled without a load.
+    pub prefix_cache_bytes: Option<u64>,
 }
 
 #[cfg(test)]

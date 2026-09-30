@@ -106,6 +106,16 @@ pub const MODEL_25_ID: &str = "ltx_2_5";
 /// The stock, locally staged Gemma-4 instruction snapshot used only for opt-in LTX-2.5 prompt
 /// enhancement.  It lives below the single LTX rehost rather than in a job-time HF cache.
 const LTX25_ENHANCER_COMPONENT: &str = "enhancer";
+
+/// Byte budget of the LTX-2.5 Gemma-4 enhancer's cross-request prefix cache (the system-prompt
+/// KV reused between text-to-video enhancements; sc-24437 made the cache byte-budgeted). It lives
+/// on the provider for as long as the load, so the 2.5 memory contract charges it beside the
+/// enhancer weights whenever the enhancer snapshot is staged
+/// ([`crate::memory_strategy_2_5`]), and this constant is the one figure both read. 1 GiB holds
+/// one enhancement's prompt plus rewrite at bf16 on the 12B enhancer with room to spare; an entry
+/// larger than the budget is simply not kept — the enhancement itself is unaffected, only the
+/// next request's reuse is lost.
+pub(crate) const LTX25_ENHANCER_PREFIX_CACHE_BYTES: u64 = 1 << 30;
 /// Rehost-owned inventory that must accompany the exact stock enhancer snapshot.
 const LTX25_ENHANCER_MANIFEST_FILE: &str = "sceneworks_asset_manifest.json";
 /// Canonical SC-18780 publication manifest. Its semantic inventory digest binds the source repo,
@@ -908,7 +918,9 @@ pub fn load_25(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         variant,
         memory_strategy,
         memory_tier,
-        enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
+        enhancer_cache: Rc::new(RefCell::new(PrefixCache::with_budget(
+            LTX25_ENHANCER_PREFIX_CACHE_BYTES,
+        ))),
     }))
 }
 
@@ -3167,7 +3179,9 @@ mod tests {
             memory_tier: crate::memory_strategy_2_5::resolved_numeric_tier(&spec).unwrap(),
             spec,
             variant,
-            enhancer_cache: Rc::new(RefCell::new(PrefixCache::new(4))),
+            enhancer_cache: Rc::new(RefCell::new(PrefixCache::with_budget(
+                LTX25_ENHANCER_PREFIX_CACHE_BYTES,
+            ))),
         }
     }
 

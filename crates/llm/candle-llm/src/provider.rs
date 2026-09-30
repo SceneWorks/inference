@@ -60,6 +60,19 @@ const PREFIX_NOT_ADMITTED: &str =
     "not kept: admission could not hold this request's snapshot beside it";
 /// Why a request's own prefix-cache snapshot was dropped.
 const PREFIX_COPY_FAILED: &str = "not kept: the snapshot copy failed";
+/// Why a request on a paged KV cache keeps no snapshot: its blocks are shared through the pool's
+/// own copy-on-write, and the prefix cache does not copy them out.
+const PREFIX_PAGED_NOT_SNAPSHOTTED: &str = "not kept: paged KV backing is not snapshotted";
+
+/// The prefix-cache reason for a failed [`PrefixCache::store`]: the paged backing's typed refusal
+/// (`Unsupported` — the only one a snapshot raises) is named as such; anything else is a failed
+/// copy.
+fn prefix_store_reason(error: &crate::Error) -> &'static str {
+    match error {
+        crate::Error::Unsupported(_) => PREFIX_PAGED_NOT_SNAPSHOTTED,
+        _ => PREFIX_COPY_FAILED,
+    }
+}
 
 /// The loaded decoder behind the provider: the generic Llama-family [`CausalLm`] or the Qwen3.6
 /// hybrid [`Qwen35Model`] (DeltaNet linear attention + gated full attention), both driven through the
@@ -842,6 +855,10 @@ pub struct LoadRecord {
     /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
     /// follows the process switch.
     pub cuda_graphs: Option<bool>,
+    /// The cross-turn prefix cache's byte budget the load settled (sc-24437): the requested
+    /// budget clamped to the headroom admission left. `None` for a provider assembled without a
+    /// load.
+    pub prefix_cache_bytes: Option<u64>,
 }
 
 impl LoadRecord {
@@ -875,6 +892,7 @@ impl LoadRecord {
             requested: self.requested,
             projections,
             cuda_graphs: self.cuda_graphs,
+            prefix_cache_bytes: self.prefix_cache_bytes,
         }
     }
 }
@@ -1480,6 +1498,7 @@ impl LlamaProvider {
         };
         provider.load_record.requested = spec.quantize;
         provider.load_record.cuda_graphs = Some(cuda_graphs);
+        provider.load_record.prefix_cache_bytes = Some(prefix_budget);
         provider.prefix = Mutex::new(PrefixCache::with_budget(prefix_budget));
         Ok(provider)
     }
@@ -1553,6 +1572,7 @@ impl LlamaProvider {
             payload_bytes: payload,
             host_required_bytes: host_required,
             device_required_bytes: device_required,
+            prefix_cache_bytes: core_llm::requested_prefix_cache_bytes(spec.prefix_cache_bytes),
             source_bytes: on_device(working.source),
             cast_copy_bytes: on_device(working.cast),
             quantized_copy_bytes: on_device(working.copy),
@@ -1789,6 +1809,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                prefix_cache_bytes: None,
             },
         })
     }
@@ -1989,6 +2010,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                prefix_cache_bytes: None,
             },
         })
     }
@@ -2401,6 +2423,13 @@ pub struct LoadMemoryEstimate {
     /// headroom over it, `cast_copy_bytes`, `quantized_copy_bytes` and any external projector's
     /// bound.
     pub device_required_bytes: Option<u64>,
+    /// The cross-turn prefix cache's budget the load asks for (sc-24437):
+    /// [`LoadSpec::prefix_cache_bytes`], else [`core_llm::DEFAULT_PREFIX_CACHE_BYTES`]. Memory
+    /// the loaded model may hold **beside** the required bytes, in the domain the cache lives in
+    /// (the device's on CUDA, the host's otherwise). It is not part of either required figure:
+    /// `load` clamps it to the headroom its admission leaves, so it never refuses a load by
+    /// itself, and reports the settled budget in [`core_llm::LoadReport::prefix_cache_bytes`].
+    pub prefix_cache_bytes: u64,
     /// The source the load holds resident on the device while it builds the decoder: the
     /// payload of a safetensors or Prism checkpoint, the dense f32 map a llama-family GGUF is
     /// dequantized into (`0` off CUDA).
@@ -3885,7 +3914,9 @@ impl TextLlm for LlamaProvider {
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
-                        (prefix_hit, prefill_forwards) = (prefilled.reused, prefilled.forwards);
+                        // Measured, not looked up: the positions the prefill did not feed.
+                        prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
+                        prefill_forwards = prefilled.forwards;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
@@ -3939,12 +3970,11 @@ impl TextLlm for LlamaProvider {
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
                         let captured = mtp_proposer.as_mut().and_then(MtpProposer::take_captured);
-                        if self
-                            .prefix_cache()
-                            .store(&prompt_ids, &[], &cache, snapshot, captured)
-                            .is_err()
+                        if let Err(e) =
+                            self.prefix_cache()
+                                .store(&prompt_ids, &[], &cache, snapshot, captured)
                         {
-                            prefix_reason = Some(PREFIX_COPY_FAILED);
+                            prefix_reason = Some(prefix_store_reason(&e));
                         }
                         run
                     }
@@ -4091,7 +4121,9 @@ impl TextLlm for LlamaProvider {
                             &req.cancel,
                         )
                         .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
-                        (prefix_hit, prefill_forwards) = (prefilled.reused, prefilled.forwards);
+                        // Measured, not looked up: the positions the prefill did not feed.
+                        prefix_hit = prompt_ids.len() - prefilled.fed_tokens;
+                        prefill_forwards = prefilled.forwards;
                         if prefix_hit > 0 {
                             prefix_path = "hit";
                         }
@@ -4130,13 +4162,16 @@ impl TextLlm for LlamaProvider {
                         phase_prefill = prefill.unwrap_or_else(|| generation_started.elapsed());
                         phase_decode_started =
                             decode_started.unwrap_or_else(std::time::Instant::now);
-                        if keep_prefix
-                            && self
-                                .prefix_cache()
-                                .store(&prompt_ids, &run.output.tokens, &cache, None, None)
-                                .is_err()
-                        {
-                            prefix_reason = Some(PREFIX_COPY_FAILED);
+                        if keep_prefix {
+                            if let Err(e) = self.prefix_cache().store(
+                                &prompt_ids,
+                                &run.output.tokens,
+                                &cache,
+                                None,
+                                None,
+                            ) {
+                                prefix_reason = Some(prefix_store_reason(&e));
+                            }
                         }
                         run
                     }
@@ -8674,12 +8709,30 @@ mod tests {
                 .unwrap()
                 .host_required_bytes;
             let headroom = 4096;
+            // The estimate names what the load asks for, beside what it requires.
+            let asked = |spec: &LoadSpec| {
+                LlamaProvider::load_memory_estimate(spec, false)
+                    .unwrap()
+                    .prefix_cache_bytes
+            };
+            assert_eq!(asked(&spec), core_llm::DEFAULT_PREFIX_CACHE_BYTES);
             spec.prefix_cache_bytes = Some(u64::MAX);
+            assert_eq!(asked(&spec), u64::MAX);
+            assert_eq!(
+                LlamaProvider::load_memory_estimate(&spec, false)
+                    .unwrap()
+                    .host_required_bytes,
+                required,
+                "the budget is never part of what the load requires"
+            );
             {
                 let _budget = MemoryOverride::set(required + headroom);
+                let provider = LlamaProvider::load(&spec).unwrap();
+                assert_eq!(provider.prefix_cache_budget(), headroom);
                 assert_eq!(
-                    LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
-                    headroom
+                    provider.load_report().unwrap().prefix_cache_bytes,
+                    Some(headroom),
+                    "the report names the settled budget"
                 );
                 spec.prefix_cache_bytes = Some(100);
                 assert_eq!(
@@ -8694,13 +8747,38 @@ mod tests {
             }
             spec.prefix_cache_bytes = Some(u64::MAX);
             {
+                // At the boundary the budget settles down to nothing rather than refusing.
                 let _budget = MemoryOverride::set(required);
-                assert_eq!(LlamaProvider::load(&spec).unwrap().prefix_cache_budget(), 0);
+                let provider = LlamaProvider::load(&spec).unwrap();
+                assert_eq!(provider.prefix_cache_budget(), 0);
+                assert_eq!(provider.load_report().unwrap().prefix_cache_bytes, Some(0));
             }
             {
                 let _budget = MemoryOverride::set(required - 1);
                 assert!(LlamaProvider::load(&spec).is_err(), "past admission");
             }
+        }
+
+        /// A paged KV cache keeps no snapshot and the report says why — not as a failed copy.
+        #[test]
+        fn a_paged_cache_names_why_it_keeps_no_snapshot() {
+            let model = tiny_causal_from(tiny_llama_parts().0, tiny_llama_parts().1);
+            let mut cache = model.new_paged_step_cache(4);
+            let prompt = [3, 9, 4, 11, 5];
+            StepModel::forward_step(
+                &model,
+                &mut cache,
+                crate::decode::StepRequest::last(&prompt),
+            )
+            .unwrap();
+            let err = PrefixCache::with_budget(1 << 30)
+                .store(&prompt, &[], &cache, None, None)
+                .unwrap_err();
+            assert_eq!(prefix_store_reason(&err), PREFIX_PAGED_NOT_SNAPSHOTTED);
+            assert_eq!(
+                prefix_store_reason(&crate::Error::Msg("copy".into())),
+                PREFIX_COPY_FAILED
+            );
         }
 
         fn required_bytes(provider: &LlamaProvider, req: &TextLlmRequest) -> u64 {

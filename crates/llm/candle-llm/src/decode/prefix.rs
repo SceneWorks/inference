@@ -115,11 +115,14 @@ pub trait PrefixSnapshot {
     fn positions(&self) -> usize;
 }
 
-/// Copy `(k, v)` narrowed to `len` positions.
+/// Copy `(k, v)` narrowed to `len` positions into compact storage of exactly that size: never a
+/// view of the live buffer (a later write would reach it), and never a clone of the whole buffer
+/// (`Tensor::copy` keeps the view's layout over a copy of all of its storage, so an entry would
+/// hold the cache's full capacity while charged for `len` positions).
 fn copy_kv(k: &Tensor, v: &Tensor, len: usize) -> Result<(Tensor, Tensor)> {
     Ok((
-        k.narrow(SEQ_AXIS, 0, len)?.copy()?,
-        v.narrow(SEQ_AXIS, 0, len)?.copy()?,
+        k.narrow(SEQ_AXIS, 0, len)?.force_contiguous()?,
+        v.narrow(SEQ_AXIS, 0, len)?.force_contiguous()?,
     ))
 }
 
@@ -405,10 +408,14 @@ pub struct PrefixPrefill {
     pub logits: Tensor,
     /// The target's hidden rows for the prefilled positions `reused..prompt.len()` (when asked).
     pub hidden: Option<Tensor>,
-    /// Leading prompt positions restored instead of prefilled (the report's `prefix_hit_tokens`).
+    /// Leading prompt positions the lookup restored (the prefill starts past them).
     pub reused: usize,
     /// Target forwards the prefill ran (two when it split at the boundary).
     pub forwards: usize,
+    /// Prompt tokens the prefill fed through the model — `prompt.len() - reused` when the
+    /// restored cache was really prefilled on top of; the provider reports
+    /// `prefix_hit_tokens = prompt.len() - fed_tokens`, so the report measures the prefill it ran.
+    pub fed_tokens: usize,
     /// The MTP head's state at `reused`, for
     /// [`MtpProposer::resume_from`](super::MtpProposer::resume_from).
     pub mtp: Option<MtpBoundary>,
@@ -457,6 +464,7 @@ where
     }
     segments.push(from..prompt.len());
     let forwards = segments.len();
+    let fed_tokens = segments.iter().map(ExactSizeIterator::len).sum();
     let mut hidden_rows = Vec::new();
     let mut logits = None;
     let mut snapshot = None;
@@ -487,6 +495,7 @@ where
         hidden,
         reused,
         forwards,
+        fed_tokens,
         mtp,
         boundary: snapshot,
     })
@@ -909,6 +918,91 @@ mod engine_tests {
             .unwrap()
             .is_none());
         assert_eq!(cache.offset(), 0, "a miss leaves the cache untouched");
+    }
+
+    /// A softmax entry holds exactly the positions it is charged for: a copy of the static step
+    /// cache's first `len` positions, not the whole preallocated buffer behind them.
+    #[test]
+    fn a_softmax_entry_pins_only_the_positions_it_is_charged_for() {
+        use crate::primitives::decode_cache::pinned_f32_elems;
+        let model = tiny_llama();
+        let prompt = [3, 9, 4, 11, 3];
+        let mut cache = model.new_cache_for(prompt.len() + 16, 2).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&prompt))
+            .unwrap();
+        let entry = PrefixSnapshot::snapshot(&cache, prompt.len()).unwrap();
+        let PrefixEntry::Kv(layers) = &entry else {
+            panic!("a softmax entry");
+        };
+        let mut charged = 0;
+        for (k, v) in layers.iter().flatten() {
+            for t in [k, v] {
+                assert_eq!(t.dims()[SEQ_AXIS], prompt.len());
+                assert_eq!(pinned_f32_elems(t), t.elem_count(), "{:?}", t.layout());
+                charged += tensor_bytes(t);
+            }
+        }
+        assert!(charged > 0);
+        assert_eq!(entry.bytes(), charged as u64);
+    }
+
+    /// The boundary snapshot is a copy, not a view: the live cache it was taken from goes on to
+    /// decode (prompt lookup verifying and rolling back through the DeltaNet checkpoint ring,
+    /// whose slots are written in place), and a restore of the snapshot answers exactly as it
+    /// did before that decode.
+    #[test]
+    fn a_boundary_snapshot_is_not_written_by_the_decode_that_continues_past_it() {
+        use candle_core::DType;
+        let (_, model) = text_model();
+        let mut prompt = vec![3, 9, 4, 11, 3, 9, 4, 11];
+        prompt.extend_from_slice(&[40, 41]);
+        let mut cache = model.new_cache_for(prompt.len() + 24, 3).unwrap();
+        let pre = prefill_restored(
+            &model,
+            &mut cache,
+            None,
+            &prompt,
+            Some(8),
+            false,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        let boundary = pre.boundary.expect("a snapshot at the boundary");
+        let probe = |entry: &PrefixEntry| -> Vec<f32> {
+            let mut fresh = model.new_cache_for(16, 3).unwrap();
+            PrefixSnapshot::restore(&mut fresh, entry, 8).unwrap();
+            model
+                .forward_step(&mut fresh, StepRequest::last(&[20, 21]))
+                .unwrap()
+                .logits
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap()
+        };
+        let before = probe(&boundary.entry);
+        generate_speculative(
+            &model,
+            &mut crate::decode::NgramProposer::default(),
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits: pre.logits,
+                hidden: None,
+                history: &prompt,
+                position_delta: 0,
+                warm_proposer: true,
+            },
+            &greedy(20),
+            3,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        assert_eq!(probe(&boundary.entry), before);
     }
 
     /// Speculative decoding on top of a hit: the MTP head resumes its warm-up from the state

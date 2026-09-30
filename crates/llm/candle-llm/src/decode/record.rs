@@ -404,6 +404,7 @@ impl DecodeRecord {
                 reason: self.fused_primitives.reference_reason.map(str::to_string),
             },
             target_forwards: self.target_forwards,
+            prefill_forwards: self.prefill_forwards,
             proposed_tokens: self.proposed_tokens,
             accepted_tokens: self.accepted_tokens,
             verify_steps: self.verify_steps,
