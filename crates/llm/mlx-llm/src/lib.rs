@@ -70,6 +70,10 @@ pub mod starvector_8b;
 #[path = "../tests/common/mod.rs"]
 mod test_fixture;
 
+// Seeded synthetic checkpoints and a word tokenizer, so unit suites drive providers end to end.
+#[cfg(test)]
+mod synthetic;
+
 // Re-export the contract crate so consumers can reach it as `mlx_llm::core_llm::…`.
 pub use core_llm;
 
