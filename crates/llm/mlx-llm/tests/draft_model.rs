@@ -5,7 +5,8 @@
 
 use core_llm::{LoadSpec, TextLlm};
 use core_llm_testkit::{
-    check_draft_model_refused, check_draft_model_resident, write_draft_model_fixture,
+    check_draft_model_refused, check_draft_model_resident, check_draft_model_short_context,
+    check_draft_model_stop_token, write_draft_model_fixture,
 };
 use mlx_llm::LlamaProvider;
 
@@ -34,4 +35,28 @@ fn a_mismatched_tokenizer_draft_is_refused_and_the_target_still_loads() {
     check_draft_model_refused(&provider, &alone, &fixture.foreign_draft.to_string_lossy())
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(alone.load_report().unwrap().draft.is_none());
+}
+
+fn load(spec: &LoadSpec) -> Result<Box<dyn TextLlm>, String> {
+    LlamaProvider::load(spec)
+        .map(|p| Box::new(p) as Box<dyn TextLlm>)
+        .map_err(|e| e.to_string())
+}
+
+/// A real stop token the drafts propose and the target accepts ends every `draft_model` run —
+/// the host-sampled paths (a penalty, a near-zero temperature) included — where `off` stops.
+#[test]
+fn a_draft_proposed_stop_token_ends_the_run_where_off_does() {
+    let root = Fixture::new("mlx-llm-draft-model-", None);
+    let fixture = write_draft_model_fixture(&root).unwrap();
+    check_draft_model_stop_token(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// E2: a request past the draft's own context window runs `auto` by name instead of driving the
+/// draft past it; within the window the draft runs.
+#[test]
+fn a_request_past_the_draft_context_falls_back_by_name() {
+    let root = Fixture::new("mlx-llm-draft-model-", None);
+    let fixture = write_draft_model_fixture(&root).unwrap();
+    check_draft_model_short_context(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
 }

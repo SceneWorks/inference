@@ -213,11 +213,13 @@ proposer (`decode::MtpProposer` / `decode::NgramProposer`) for both decoder fami
 that cannot run on the request's path (a Qwen3-VL multimodal request decodes on the reference loop)
 falls back with its reason in `DecodeReport::fallbacks`. A load names a draft model with
 `LoadSpec::with_draft` (sc-24436): it loads beside the target on the same device at the same tier,
-admitted with it (a draft without room, an unreadable one, or one whose tokenizer vocabulary or
-logits width is not the target's is refused by name in `LoadReport::draft` and the target loads
-alone), and only a resident draft advertises `draft_model` (depth 1..=8, recommended 4) — which
-the engine then runs with `decode::DraftModelProposer`, pricing the draft's own prefill and cache
-in request admission. The greedy parity suite and the
+admitted with it (a draft without room, an unreadable one, one whose tokenizer vocabulary is not
+the target's, or one scoring more ids than the target is refused by name in `LoadReport::draft`
+and the target loads alone; a draft padded less than its target proposes only its tokenizer's
+ids), and only a resident draft advertises `draft_model` (the model's prompt-lookup depth bound,
+recommended 4) — which the engine then runs with `decode::DraftModelProposer`, pricing the
+draft's own prefill and cache in request admission. A request whose reach outruns the draft's own
+context window runs `auto` instead, the reason named in `DecodeReport::fallbacks`. The greedy parity suite and the
 benchmark harness are core-llm-testkit's `check_speculative_greedy_parity` /
 `run_speculative_bench`; `tests/speculative_bench.rs` drives the harness on real weights.
 

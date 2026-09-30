@@ -213,9 +213,9 @@ pub struct LoadReport {
 pub struct DraftReport {
     /// The draft source the load named.
     pub source: String,
-    /// Why the draft was not loaded (a tokenizer vocabulary that is not the target's, a
-    /// different logits width, an unreadable source, no room beside the target), or `None` when
-    /// it is resident.
+    /// Why the draft was not loaded (a tokenizer vocabulary that is not the target's, logits over
+    /// more ids than the target's, an unreadable source, no room beside the target), or `None`
+    /// when it is resident.
     pub refusal: Option<String>,
 }
 

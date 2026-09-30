@@ -571,10 +571,24 @@ pub struct LlamaProvider {
     /// The resident draft model for `draft_model` speculation (sc-24436), present iff the load
     /// named a compatible one ([`LoadSpec::draft_source`]); `draft_model` is advertised exactly
     /// then. A second decoder with its own cache per request, driven as a proposer by the engine.
-    draft: Option<Decoder>,
+    draft: Option<ResidentDraft>,
     /// What the load settled: the requested weight format and what became of a named draft
     /// (resident, or refused with the reason). Read through [`TextLlm::load_report`].
     load_report: core_llm::LoadReport,
+}
+
+/// A draft model resident beside its target (sc-24436).
+struct ResidentDraft {
+    /// The draft decoder.
+    model: Decoder,
+    /// Leading draft ids it may propose — its tokenizer's tokens
+    /// ([`core_llm::draft_compatibility`]); a padding row never becomes a draft.
+    proposable: usize,
+    /// The target's logits width, which the draft's logits are shaped to.
+    width: usize,
+    /// The draft's own context window (`0`: unbounded): a request reaching past it runs `auto`
+    /// instead ([`core_llm::fit_draft_context`], E2).
+    context: usize,
 }
 
 /// What a load does with its named draft model (sc-24436), decided before any weight is read.
@@ -718,7 +732,12 @@ impl LlamaProvider {
                         &draft.tokenizer,
                         draft.model.memory_geometry().vocab_size as usize,
                     )
-                    .map(|()| draft.model),
+                    .map(|proposable| ResidentDraft {
+                        proposable,
+                        width: target_logits,
+                        context: draft.descriptor.capabilities.max_context_tokens,
+                        model: draft.model,
+                    }),
                 },
             },
         };
@@ -728,7 +747,7 @@ impl LlamaProvider {
                 self.descriptor
                     .capabilities
                     .speculative
-                    .push(core_llm::draft_model_capabilities());
+                    .push(core_llm::draft_model_capabilities(PROMPT_LOOKUP_MAX_DEPTH));
                 DraftReport::resident(source)
             }
             Err(why) => DraftReport::refused(source, why),
@@ -1624,6 +1643,15 @@ impl TextLlm for LlamaProvider {
             core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities);
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
+        // A `draft_model` request reaching past the draft's own context window runs `auto`
+        // instead, by name (sc-24436, E2).
+        let route = self.fit_draft_route(
+            route,
+            admitted_prompt,
+            req.max_new_tokens,
+            gemma4_mm_request,
+            &mut fallbacks,
+        );
         let required = self
             .speculative_request_bytes(route, admitted_prompt, req.max_new_tokens, vision_workspace)
             .ok_or_else(|| CoreError::InvalidRequest("request memory estimate overflow".into()))?;
@@ -1662,6 +1690,16 @@ impl TextLlm for LlamaProvider {
             prompt_len,
             req.max_new_tokens,
         )?;
+        // A Gemma 4 prompt's soft-token expansion is known only now: a `draft_model` route checks
+        // the draft's context window again against the effective prompt (E2). Nothing has been
+        // allocated for the route yet; the priced draft is only an over-estimate.
+        let route = self.fit_draft_route(
+            route,
+            prompt_len,
+            req.max_new_tokens,
+            gemma4_mm_request,
+            &mut fallbacks,
+        );
 
         let config = GenerationConfig {
             max_new_tokens: req.max_new_tokens as usize,
@@ -2159,15 +2197,20 @@ impl SpeculativeRoute {
     /// needs the Qwen35 target.)
     fn plain_proposer<'a, T: SpeculativeTarget + 'a>(
         self,
-        draft: Option<&'a Decoder>,
+        draft: Option<&'a ResidentDraft>,
     ) -> Box<dyn Proposer<T> + 'a> {
         match (self, draft) {
             (SpeculativeRoute::PromptLookup { .. }, _) => Box::new(NgramProposer::default()),
-            (SpeculativeRoute::DraftModel { .. }, Some(Decoder::Causal(draft))) => {
-                Box::new(DraftModelProposer::new(draft))
-            }
-            (SpeculativeRoute::DraftModel { .. }, Some(Decoder::Qwen35(draft))) => {
-                Box::new(DraftModelProposer::new(draft))
+            (SpeculativeRoute::DraftModel { .. }, Some(resident)) => {
+                let (proposable, width) = (resident.proposable, resident.width);
+                match &resident.model {
+                    Decoder::Causal(draft) => {
+                        Box::new(DraftModelProposer::new(draft).with_vocab(proposable, width))
+                    }
+                    Decoder::Qwen35(draft) => {
+                        Box::new(DraftModelProposer::new(draft).with_vocab(proposable, width))
+                    }
+                }
             }
             // `speculative_route` routes `draft_model` only with a resident draft.
             (SpeculativeRoute::DraftModel { .. }, None)
@@ -2223,7 +2266,7 @@ impl LlamaProvider {
         // The draft model's own request (E7, sc-24436): its prefill of the same prompt and a
         // cache that grows over the whole run plus the provisional drafts a step writes past the
         // committed tokens — a step-start snapshot too when the draft is the hybrid.
-        let draft = match (route, self.draft.as_ref()) {
+        let draft = match (route, self.draft.as_ref().map(|d| &d.model)) {
             (SpeculativeRoute::DraftModel { width }, Some(draft)) => {
                 let snapshot = match draft {
                     Decoder::Causal(_) => 0,
@@ -2241,6 +2284,48 @@ impl LlamaProvider {
             _ => 0,
         };
         target.checked_add(draft)
+    }
+
+    /// The resident draft's context window (`0`: no draft, or an unbounded one).
+    fn draft_context(&self) -> usize {
+        self.draft.as_ref().map_or(0, |draft| draft.context)
+    }
+
+    /// A `draft_model` route whose request — `prompt_tokens` + `max_new_tokens` and a step's
+    /// overshoot — outruns the resident draft's context window runs what `auto` resolves to
+    /// instead, the reason named in `fallbacks` ([`core_llm::fit_draft_context`], sc-24436 E2).
+    /// Any other route is returned unchanged.
+    fn fit_draft_route(
+        &self,
+        route: SpeculativeRoute,
+        prompt_tokens: usize,
+        max_new_tokens: u32,
+        gemma4_mm_request: bool,
+        fallbacks: &mut Vec<String>,
+    ) -> SpeculativeRoute {
+        let SpeculativeRoute::DraftModel { width } = route else {
+            return route;
+        };
+        let fit = core_llm::fit_draft_context(
+            core_llm::SpeculativeResolution {
+                plan: SpeculativePlan::Run {
+                    proposer: SpeculativeProposer::DraftModel,
+                    depth: width as u32,
+                },
+                fallback: None,
+            },
+            &self.descriptor.capabilities,
+            self.draft_context(),
+            prompt_tokens,
+            max_new_tokens,
+        );
+        match fit.fallback {
+            None => route,
+            Some(why) => {
+                fallbacks.push(why);
+                self.speculative_route(fit.plan, gemma4_mm_request, fallbacks)
+            }
+        }
     }
 
     /// Route a resolved speculative plan onto what this request can run, naming every downgrade
@@ -3933,14 +4018,17 @@ mod tests {
     /// The causal fixture with its own first layer resident as the draft model (sc-24436).
     fn causal_provider_with_draft() -> LlamaProvider {
         let mut provider = causal_provider();
-        provider.draft = Some(Decoder::Causal(crate::decode::engine::tests::causal_model(
-            24, 1,
-        )));
+        provider.draft = Some(ResidentDraft {
+            model: Decoder::Causal(crate::decode::engine::tests::causal_model(24, 1)),
+            proposable: 24,
+            width: 24,
+            context: 0,
+        });
         provider
             .descriptor
             .capabilities
             .speculative
-            .push(core_llm::draft_model_capabilities());
+            .push(core_llm::draft_model_capabilities(PROMPT_LOOKUP_MAX_DEPTH));
         provider
     }
 
@@ -3982,7 +4070,7 @@ mod tests {
         };
         let lookup = price(SpeculativeRoute::PromptLookup { width: 4 });
         let with_draft = price(SpeculativeRoute::DraftModel { width: 4 });
-        let draft_model = provider.draft.as_ref().unwrap();
+        let draft_model = &provider.draft.as_ref().unwrap().model;
         let draft_request = estimate_mlx_request_bytes(
             64,
             32 + 4,
@@ -4007,6 +4095,49 @@ mod tests {
                 0
             ),
             Some(lookup)
+        );
+    }
+
+    /// sc-24436 E2: a `draft_model` route whose request outruns the draft's context window — the
+    /// prompt (the Gemma 4 expansion included, at its second check), the budget and a step's
+    /// `K + 1` positions — runs `auto` (prompt lookup on this target) by name; within it the
+    /// route stands, and an unbounded draft never falls back.
+    #[test]
+    fn a_draft_route_past_the_draft_context_runs_auto_by_name() {
+        let mut provider = causal_provider_with_draft();
+        provider.draft.as_mut().unwrap().context = 20;
+        let draft = SpeculativeRoute::DraftModel { width: 3 };
+        for gemma4 in [false, true] {
+            let mut why = Vec::new();
+            assert_eq!(
+                provider.fit_draft_route(draft, 10, 6, gemma4, &mut why),
+                draft
+            );
+            assert!(why.is_empty(), "{why:?}");
+            let fallen = provider.fit_draft_route(draft, 10, 7, gemma4, &mut why);
+            assert_eq!(
+                fallen,
+                SpeculativeRoute::PromptLookup {
+                    width: PROMPT_LOOKUP_RECOMMENDED_DEPTH as usize
+                }
+            );
+            assert_eq!(why.len(), 1);
+            assert!(
+                why[0].contains("exceeds the draft model's context window 20"),
+                "{why:?}"
+            );
+            // Other routes are untouched.
+            let lookup = SpeculativeRoute::PromptLookup { width: 3 };
+            assert_eq!(
+                provider.fit_draft_route(lookup, 10, 700, gemma4, &mut why),
+                lookup
+            );
+        }
+        provider.draft.as_mut().unwrap().context = 0;
+        let mut why = Vec::new();
+        assert_eq!(
+            provider.fit_draft_route(draft, 10, 7000, false, &mut why),
+            draft
         );
     }
 

@@ -117,9 +117,9 @@ pub use resource::{
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{
-    accept_greedy_run, accept_token, draft_compatibility, draft_model_capabilities, greedy_commit,
-    ngram_propose, resolve_speculative, Acceptance, ProposerKind, SpeculativePlan,
-    SpeculativeResolution, DRAFT_MODEL_MAX_DEPTH, DRAFT_MODEL_RECOMMENDED_DEPTH,
+    accept_greedy_run, accept_token, draft_compatibility, draft_model_capabilities,
+    fit_draft_context, greedy_commit, ngram_propose, resolve_speculative, Acceptance, ProposerKind,
+    SpeculativePlan, SpeculativeResolution, DRAFT_MODEL_RECOMMENDED_DEPTH,
 };
 pub use starvector::{
     generated_token_budget, validate_advertised_generated_token_cap,

@@ -4,6 +4,8 @@
 //! target and any draft decoder). Each implements [`Proposer`]; the loop that verifies, accepts
 //! and rolls back is the one [`engine`](super::engine).
 
+use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
@@ -76,10 +78,16 @@ impl<T: SpeculativeTarget + ?Sized> Proposer<T> for NgramProposer {
 /// commit keeps the accepted drafts already fed — by truncation, or by restoring the step start
 /// on a cache that cannot truncate (the Qwen35 hybrid) — and queues the rest of the accepted run
 /// for the next proposal's first forward, so no step pays an extra draft forward to catch up.
+///
+/// A draft padded differently from its target ([`with_vocab`](Self::with_vocab)) proposes only
+/// its tokenizer's ids, over logits the target's width.
 pub struct DraftModelProposer<'d, D: SpeculativeTarget + ?Sized> {
     draft: &'d D,
     cache: Option<D::Cache>,
     rollback: D::Rollback,
+    /// `(proposable, width)`: draw only the first `proposable` draft ids, over logits `width`
+    /// (the target's) wide. `None`: the draft's logits as they are.
+    vocab: Option<(i32, i32)>,
     /// Committed tokens not yet in the draft cache, fed ahead of `cur` by the next proposal.
     pending: Vec<i32>,
     /// Drafts the last proposal wrote into the cache past the step start (`None`: no proposal
@@ -96,10 +104,43 @@ impl<'d, D: SpeculativeTarget + ?Sized> DraftModelProposer<'d, D> {
             draft,
             cache: None,
             rollback: draft.rollback(),
+            vocab: None,
             pending: Vec::new(),
             fed: None,
             draft_forwards: 0,
         }
+    }
+
+    /// Draw drafts only from the first `proposable` draft ids, over logits `width` wide — the
+    /// target's — with every other id at `-inf`: a draft whose padding rows differ from its
+    /// target's ([`core_llm::draft_compatibility`]) never proposes a padding id, and its `q`
+    /// covers the target's id space.
+    pub fn with_vocab(mut self, proposable: usize, width: usize) -> Self {
+        self.vocab = Some((proposable.min(width) as i32, width as i32));
+        self
+    }
+
+    /// The draft's `[1, vocab]` logits over the target's ids.
+    pub(crate) fn shaped(&self, logits: Array) -> Result<Array> {
+        let Some((proposable, width)) = self.vocab else {
+            return Ok(logits);
+        };
+        let own = *logits.shape().last().unwrap_or(&0);
+        if own == proposable && proposable == width {
+            return Ok(logits);
+        }
+        let rows = logits.reshape(&[-1, own])?;
+        let kept = rows.try_index((.., ..proposable.min(own)))?;
+        let kept_width = proposable.min(own);
+        if kept_width == width {
+            return Ok(kept);
+        }
+        let pad = mlx_rs::ops::full::<f32>(
+            &[rows.shape()[0], width - kept_width],
+            Array::from_f32(f32::NEG_INFINITY),
+        )?
+        .as_dtype(logits.dtype())?;
+        Ok(concatenate_axis(&[&kept, &pad], 1)?)
     }
 
     fn cache(&mut self) -> Result<&mut D::Cache> {
@@ -108,14 +149,24 @@ impl<'d, D: SpeculativeTarget + ?Sized> DraftModelProposer<'d, D> {
             .ok_or_else(|| Error::Msg("DraftModelProposer: propose before warm".into()))
     }
 
-    /// Run `ids` through the draft at the end of its cache, returning the last row's logits.
+    /// Run `ids` through the draft at the end of its cache, returning the last row's logits over
+    /// the target's ids ([`shaped`](Self::shaped)).
     fn feed(&mut self, ids: &[i32]) -> Result<Array> {
         let draft = self.draft;
         let cache = self.cache()?;
         let offset = draft.cache_len(cache);
         let out = draft.forward(cache, &input_ids(ids), offset, LogitsScope::Last, false)?;
         self.draft_forwards += 1;
-        Ok(out.logits)
+        self.shaped(out.logits)
+    }
+}
+
+#[cfg(test)]
+impl<D: SpeculativeTarget + ?Sized> DraftModelProposer<'_, D> {
+    /// The draft cache, the committed tokens it has not been fed yet, and the drafts the last
+    /// proposal fed past its step start (`None` once committed).
+    pub(crate) fn state(&self) -> (Option<&D::Cache>, &[i32], Option<usize>) {
+        (self.cache.as_ref(), &self.pending, self.fed)
     }
 }
 

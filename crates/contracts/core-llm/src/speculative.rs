@@ -181,22 +181,20 @@ pub fn resolve_speculative(
     }
 }
 
-/// The deepest draft-model proposal a provider runs (sc-24436): drafts per verify step, so the
-/// verify forward carries at most `1 + 8` positions — the same bound as prompt lookup. Every draft
-/// is one draft-model forward, so past this depth a rejected tail costs more draft forwards than
-/// an accepted run saves target forwards.
-pub const DRAFT_MODEL_MAX_DEPTH: u32 = 8;
-
-/// The draft-model depth advertised as recommended (sc-24436): four drafts per verify step.
+/// The draft-model depth advertised as recommended (sc-24436): four drafts per verify step, or
+/// the provider's bound when that is shallower.
 pub const DRAFT_MODEL_RECOMMENDED_DEPTH: u32 = 4;
 
 /// The `draft_model` advertisement a provider carries while a compatible draft is resident
-/// (sc-24436). Both backends advertise exactly this, so the depth bound is one policy.
-pub fn draft_model_capabilities() -> crate::ProposerCapabilities {
+/// (sc-24436): `1..=max_depth` drafts per verify step, recommended
+/// [`DRAFT_MODEL_RECOMMENDED_DEPTH`] (or `max_depth` when shallower). `max_depth` is the same
+/// per-model verify bound the provider advertises for its other proposers — every draft is one
+/// more verify row, whichever proposer drew it — so a provider passes that one value here.
+pub fn draft_model_capabilities(max_depth: u32) -> crate::ProposerCapabilities {
     crate::ProposerCapabilities {
         proposer: crate::SpeculativeProposer::DraftModel,
-        max_depth: DRAFT_MODEL_MAX_DEPTH,
-        recommended_depth: DRAFT_MODEL_RECOMMENDED_DEPTH,
+        max_depth,
+        recommended_depth: DRAFT_MODEL_RECOMMENDED_DEPTH.min(max_depth),
     }
 }
 
@@ -204,25 +202,77 @@ pub fn draft_model_capabilities() -> crate::ProposerCapabilities {
 /// The target verifies each draft id as its own token and the acceptance rule compares the two
 /// models' distributions row for row, so the draft must share the target's tokenizer vocabulary
 /// token for token ([`Tokenizer::vocabulary_mismatch`](crate::Tokenizer::vocabulary_mismatch))
-/// and produce logits over the same number of ids (`*_logits` — the models' `vocab_size`, which
-/// may exceed the tokenizer's by padding rows). The reason leads with `draft model:`.
+/// and score no ids the target does not (`*_logits` — the models' `vocab_size`, which may exceed
+/// the tokenizer's by padding rows). A draft padded less than its target is compatible: it
+/// scores every real token. `Ok` carries how many leading draft ids a proposer may draw — the
+/// tokenizer's tokens the draft scores — so a padding row is never proposed. The reason leads
+/// with `draft model:`.
 pub fn draft_compatibility(
     target: &crate::Tokenizer,
     target_logits: usize,
     draft: &crate::Tokenizer,
     draft_logits: usize,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     if let Some(why) = target.vocabulary_mismatch(draft) {
         return Err(format!(
             "draft model: its tokenizer vocabulary is not the target's ({why})"
         ));
     }
-    if target_logits != draft_logits {
+    if draft_logits > target_logits {
         return Err(format!(
-            "draft model: it scores {draft_logits} token ids, the target {target_logits}"
+            "draft model: it scores {draft_logits} token ids, more than the target's {target_logits}"
         ));
     }
-    Ok(())
+    Ok(draft_logits.min(draft.vocab_size()))
+}
+
+/// A `draft_model` plan the resident draft cannot cover (sc-24436, E2): when the positions its
+/// cache must hold — the request's `prompt_tokens + max_new_tokens` plus the `depth + 1` a
+/// draft step writes past the committed tokens — outrun the draft's own context window
+/// (`draft_context`; `0` is unbounded), the request runs what
+/// [`Speculative::Auto`](crate::Speculative::Auto) resolves to on these `capabilities` instead —
+/// MTP or prompt lookup, else plain decoding — with the reason named, rather than driving the
+/// draft past the positions it was built for. Any other resolution is returned unchanged.
+pub fn fit_draft_context(
+    resolution: SpeculativeResolution,
+    capabilities: &crate::TextLlmCapabilities,
+    draft_context: usize,
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+) -> SpeculativeResolution {
+    let SpeculativePlan::Run {
+        proposer: crate::SpeculativeProposer::DraftModel,
+        depth,
+    } = resolution.plan
+    else {
+        return resolution;
+    };
+    let reach = prompt_tokens
+        .saturating_add(max_new_tokens as usize)
+        .saturating_add(depth as usize)
+        .saturating_add(1);
+    if draft_context == 0 || reach <= draft_context {
+        return resolution;
+    }
+    let auto = resolve_speculative(crate::Speculative::Auto, capabilities);
+    let runs = match auto.plan {
+        SpeculativePlan::Run { proposer, depth } => format!("`{proposer}` at depth {depth}"),
+        SpeculativePlan::Off => "without a proposer".into(),
+    };
+    let why = format!(
+        "speculative: `draft_model` cannot cover this request: prompt ({prompt_tokens} tokens) + \
+         requested generation ({max_new_tokens}) + a depth-{depth} draft step's {} positions \
+         exceeds the draft model's context window {draft_context}; decoded as `auto` would, \
+         {runs}",
+        depth + 1
+    );
+    SpeculativeResolution {
+        plan: auto.plan,
+        fallback: Some(match auto.fallback {
+            Some(more) => format!("{why}; {more}"),
+            None => why,
+        }),
+    }
 }
 
 /// The greedy verify decision in one call: the committed run (accepted drafts + the bonus token)
@@ -518,7 +568,7 @@ mod tests {
         let target = word_tokenizer("t", 8);
         assert_eq!(
             draft_compatibility(&target, 8, &word_tokenizer("t", 8), 8),
-            Ok(())
+            Ok(8)
         );
         // A tokenizer of the same size over different tokens is refused by name.
         let why = draft_compatibility(&target, 8, &word_tokenizer("w", 8), 8).unwrap_err();
@@ -526,17 +576,29 @@ mod tests {
             why.starts_with("draft model: its tokenizer vocabulary is not the target's"),
             "{why}"
         );
-        // A shared tokenizer with a different logits width (padding rows) is refused too.
-        let why = draft_compatibility(&target, 8, &word_tokenizer("t", 8), 16).unwrap_err();
-        assert!(why.contains("scores 16 token ids, the target 8"), "{why}");
-
-        let caps = draft_model_capabilities();
-        assert_eq!(caps.proposer, SpeculativeProposer::DraftModel);
+        // A draft padded less than its target (Qwen2.5-0.5B's 151936 rows beside 7B's 152064) is
+        // compatible; one padded past its tokenizer proposes only the tokenizer's ids.
         assert_eq!(
-            (caps.max_depth, caps.recommended_depth),
-            (DRAFT_MODEL_MAX_DEPTH, DRAFT_MODEL_RECOMMENDED_DEPTH)
+            draft_compatibility(&target, 16, &word_tokenizer("t", 8), 12),
+            Ok(8)
         );
-        assert!(caps.recommended_depth <= caps.max_depth);
+        assert_eq!(
+            draft_compatibility(&target, 16, &word_tokenizer("t", 8), 8),
+            Ok(8)
+        );
+        // A draft scoring more ids than its target is refused.
+        let why = draft_compatibility(&target, 8, &word_tokenizer("t", 8), 16).unwrap_err();
+        assert!(
+            why.contains("scores 16 token ids, more than the target's 8"),
+            "{why}"
+        );
+
+        let caps = draft_model_capabilities(8);
+        assert_eq!(caps.proposer, SpeculativeProposer::DraftModel);
+        assert_eq!((caps.max_depth, caps.recommended_depth), (8, 4));
+        // The provider's bound is the advertisement's; the recommendation never exceeds it.
+        let shallow = draft_model_capabilities(3);
+        assert_eq!((shallow.max_depth, shallow.recommended_depth), (3, 3));
         // Advertised, `{proposer: draft_model}` runs at the requested depth.
         let resident = crate::TextLlmCapabilities {
             speculative: vec![caps],
@@ -554,6 +616,64 @@ mod tests {
                 },
                 fallback: None
             }
+        );
+    }
+
+    /// sc-24436 E2: a `draft_model` request past the draft's context window runs what `auto`
+    /// resolves to, by name; within it (or with an unbounded draft) the plan is unchanged.
+    #[test]
+    fn a_request_past_the_draft_context_runs_auto_by_name() {
+        use crate::{ProposerCapabilities, Speculative, SpeculativeProposer};
+        let lookup = ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 8,
+            recommended_depth: 4,
+        };
+        let caps = crate::TextLlmCapabilities {
+            speculative: vec![lookup, draft_model_capabilities(8)],
+            ..Default::default()
+        };
+        let asked = resolve_speculative(
+            Speculative::proposer(SpeculativeProposer::DraftModel, 3),
+            &caps,
+        );
+        // Depth 3: the draft cache holds the prompt, the budget and a step's 3 + 1 positions.
+        assert_eq!(fit_draft_context(asked.clone(), &caps, 64, 40, 20), asked);
+        assert_eq!(fit_draft_context(asked.clone(), &caps, 0, 4000, 24), asked);
+        let fit = fit_draft_context(asked.clone(), &caps, 64, 40, 21);
+        assert_eq!(
+            fit.plan,
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::PromptLookup,
+                depth: 4
+            }
+        );
+        let why = fit.fallback.unwrap();
+        assert!(
+            why.contains("exceeds the draft model's context window 64")
+                && why.contains("`prompt_lookup` at depth 4"),
+            "{why}"
+        );
+        // No proposer for `auto` either: plain decoding, both reasons named.
+        let only_draft = crate::TextLlmCapabilities {
+            speculative: vec![draft_model_capabilities(8)],
+            ..Default::default()
+        };
+        let fit = fit_draft_context(asked, &only_draft, 64, 40, 21);
+        assert_eq!(fit.plan, SpeculativePlan::Off);
+        let why = fit.fallback.unwrap();
+        assert!(
+            why.contains("without a proposer") && why.contains("auto found no proposer"),
+            "{why}"
+        );
+        // Any other plan is untouched.
+        let lookup_plan = resolve_speculative(
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 3),
+            &caps,
+        );
+        assert_eq!(
+            fit_draft_context(lookup_plan.clone(), &caps, 64, 40, 25),
+            lookup_plan
         );
     }
 

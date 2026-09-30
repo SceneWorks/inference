@@ -783,8 +783,8 @@ pub struct LoadSpec {
     /// in request admission. `None` (the default) loads no draft, exactly as before.
     ///
     /// A draft never fails the load: one the provider cannot use — a tokenizer vocabulary that is
-    /// not the target's, a different logits width, an unreadable source, or no room beside the
-    /// target — is refused with the reason named in
+    /// not the target's, logits over more ids than the target's, an unreadable source, or no room
+    /// beside the target — is refused with the reason named in
     /// [`LoadReport::draft`](crate::LoadReport::draft), the target loads alone, and `draft_model`
     /// is not advertised. `draft_model` is advertised in
     /// [`TextLlmCapabilities::speculative`](crate::TextLlmCapabilities::speculative) only while a
