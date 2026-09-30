@@ -28,7 +28,7 @@ use mlx_rs::fast::MetalKernel;
 use mlx_rs::nn::{silu, softplus};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, exp, multiply, subtract, sum_axis};
 use mlx_rs::transforms::eval;
-use mlx_rs::{Array, Dtype};
+use mlx_rs::{Array, Dtype, Stream};
 
 use crate::error::Result;
 
@@ -89,8 +89,11 @@ pub fn gated_delta_recurrence(
         return gated_delta_recurrence_ops(q, k, v, g, beta, state);
     }
     let t = q.shape()[1];
-    let (y, next) = if default_stream_is_gpu() {
-        kernel_segmented(q, k, v, g, beta, state)?
+    // Resolve the stream once: the device check and the kernel dispatch must see the same one
+    // (the task-local stream when set, which need not be on the process default device).
+    let stream = Stream::task_local_or_default();
+    let (y, next) = if stream_is_gpu(&stream) {
+        kernel_segmented(q, k, v, g, beta, state, &stream)?
     } else if t >= CHUNKED_PREFILL_MIN_TOKENS {
         gated_delta_chunked(q, k, v, g, beta, state)?
     } else {
@@ -113,10 +116,11 @@ fn kernel_segmented(
     g: &Array,
     beta: &Array,
     state: Option<&Array>,
+    stream: &Stream,
 ) -> Result<(Array, Array)> {
     let t = q.shape()[1];
     if t <= KERNEL_MAX_STEPS {
-        return gated_delta_kernel(q, k, v, g, beta, state);
+        return kernel_on(q, k, v, g, beta, state, stream);
     }
     let mut state = state.cloned();
     let mut ys = Vec::new();
@@ -124,13 +128,14 @@ fn kernel_segmented(
     while start < t {
         let end = (start + KERNEL_MAX_STEPS).min(t);
         let part = |x: &Array| slice_axis(x, 1, start, end);
-        let (y, next) = gated_delta_kernel(
+        let (y, next) = kernel_on(
             &part(q)?,
             &part(k)?,
             &part(v)?,
             &part(g)?,
             &part(beta)?,
             state.as_ref(),
+            stream,
         )?;
         ys.push(y);
         state = Some(next);
@@ -175,10 +180,44 @@ pub(crate) fn with_ops_reference<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Whether ops issued now land on a GPU stream (the task-local default stream if one is set,
-/// else the default device's) — the only place a custom Metal kernel can run.
-fn default_stream_is_gpu() -> bool {
-    let stream = mlx_rs::Stream::task_local_or_default();
+/// Which recurrence implementation ran — recorded (test builds only) at each implementation's
+/// entry, so a test can assert the route [`gated_delta_recurrence`] took, not just its numbers.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// One fused Metal kernel dispatch (a long run records one per segment).
+    Kernel,
+    /// One call of the chunkwise-parallel form.
+    Chunked,
+    /// One call of the op-by-op reference.
+    Ops,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROUTES: std::cell::RefCell<Option<Vec<Route>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record(route: Route) {
+    ROUTES.with(|r| {
+        if let Some(routes) = r.borrow_mut().as_mut() {
+            routes.push(route);
+        }
+    });
+}
+
+/// Run `f`, returning every [`Route`] a recurrence implementation recorded on this thread.
+#[cfg(test)]
+pub(crate) fn recording_routes<R>(f: impl FnOnce() -> R) -> (R, Vec<Route>) {
+    let previous = ROUTES.with(|r| r.replace(Some(Vec::new())));
+    let out = f();
+    let routes = ROUTES.with(|r| r.replace(previous)).unwrap_or_default();
+    (out, routes)
+}
+
+/// Whether `stream` is a GPU stream — the only place a custom Metal kernel can run.
+fn stream_is_gpu(stream: &Stream) -> bool {
     // SAFETY: `dev` is created and freed here; `stream` outlives both calls.
     unsafe {
         let mut dev = mlx_sys::mlx_device_new();
@@ -271,7 +310,8 @@ const GDN_KERNEL_SOURCE: &str = r#"
 /// The gated delta recurrence as one fused Metal kernel (decode `T = 1`, verify `T = M`, or any
 /// `T`): the whole `T`-step loop runs on the GPU with the state in registers. Shapes as
 /// [`gated_delta_recurrence`]; inputs may be f32/bf16/f16 and are accumulated in f32; returns
-/// `(y [B,T,Hv,Dv], state [B,Hv,Dv,Dk])`, **both f32**. GPU only.
+/// `(y [B,T,Hv,Dv], state [B,Hv,Dv,Dk])`, **both f32**. Dispatches on the task-local default
+/// stream (else the default device's), which must be a GPU stream.
 pub fn gated_delta_kernel(
     q: &Array,
     k: &Array,
@@ -280,6 +320,21 @@ pub fn gated_delta_kernel(
     beta: &Array,
     state: Option<&Array>,
 ) -> Result<(Array, Array)> {
+    kernel_on(q, k, v, g, beta, state, &Stream::task_local_or_default())
+}
+
+/// [`gated_delta_kernel`] dispatched on `stream` (a GPU stream).
+fn kernel_on(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: Option<&Array>,
+    stream: &Stream,
+) -> Result<(Array, Array)> {
+    #[cfg(test)]
+    record(Route::Kernel);
     let qs = q.shape();
     let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
     let vs = v.shape();
@@ -314,7 +369,7 @@ pub fn gated_delta_kernel(
         .template_arg("Hv", hv)
         .grid(32, dv, b * hv)
         .thread_group(32, rows, 1)
-        .run()?;
+        .run_device(stream)?;
     let next = out.pop().expect("two kernel outputs");
     let y = out.pop().expect("two kernel outputs");
     Ok((y, next))
@@ -348,6 +403,8 @@ pub fn gated_delta_chunked(
     beta: &Array,
     state: Option<&Array>,
 ) -> Result<(Array, Array)> {
+    #[cfg(test)]
+    record(Route::Chunked);
     let f32 = Dtype::Float32;
     let c = GDN_CHUNK;
     let qs = q.shape();
@@ -531,6 +588,8 @@ pub fn gated_delta_recurrence_ops(
     beta: &Array,
     state: Option<&Array>,
 ) -> Result<(Array, Array)> {
+    #[cfg(test)]
+    record(Route::Ops);
     let qs = q.shape();
     let (b, t, hk, dk) = (qs[0], qs[1], qs[2], qs[3]);
     let vs = v.shape();
@@ -1076,20 +1135,22 @@ mod tests {
     /// on f32, bf16 and f16 inputs (accumulated in f32), from a zero and from a carried state.
     #[test]
     fn metal_kernel_matches_ops_reference() {
-        assert_matches_reference(
-            gated_delta_kernel,
-            "kernel",
-            &[
-                ("decode", [1, 1, 2, 4, 128, 128]),
-                ("verify", [1, 4, 2, 4, 128, 128]),
-                ("prefill", [1, 512, 2, 4, 128, 128]),
-                ("prefill", [1, 2048, 2, 4, 128, 128]),
-                ("batch2", [2, 5, 1, 2, 64, 32]),
-                ("tiny-dims", [1, 7, 2, 4, 4, 6]),
-            ],
-            1e-5,
-            1e-5,
-        );
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            assert_matches_reference(
+                gated_delta_kernel,
+                "kernel",
+                &[
+                    ("decode", [1, 1, 2, 4, 128, 128]),
+                    ("verify", [1, 4, 2, 4, 128, 128]),
+                    ("prefill", [1, 512, 2, 4, 128, 128]),
+                    ("prefill", [1, 2048, 2, 4, 128, 128]),
+                    ("batch2", [2, 5, 1, 2, 64, 32]),
+                    ("tiny-dims", [1, 7, 2, 4, 4, 6]),
+                ],
+                1e-5,
+                1e-5,
+            )
+        });
     }
 
     /// AC (sc-24443): the chunkwise prefill matches the per-token reference's outputs and final
@@ -1117,40 +1178,71 @@ mod tests {
     /// The dispatcher's contract: every route agrees with the reference — the GPU kernel at any
     /// length (split into dispatches past [`KERNEL_MAX_STEPS`]), and on a CPU stream (where a Metal
     /// kernel cannot run) the chunked form from [`CHUNKED_PREFILL_MIN_TOKENS`] and the op loop
-    /// below it — and output dtypes follow the inputs (y in `q`'s dtype, state in the carried
-    /// state's).
+    /// below it — each length takes exactly that route, and output dtypes follow the inputs (y in
+    /// `q`'s dtype, state in the carried state's).
     #[test]
     fn dispatch_routes_by_device_and_length_and_keeps_dtypes() {
-        let check = |t: i32, dims: [i32; 4]| {
+        let check = |t: i32, dims: [i32; 4], route: &[Route]| {
             let [hk, hv, dk, dv] = dims;
             let x = inputs([1, t, hk, hv, dk, dv], Dtype::Float32, t as u64);
-            let (y, s) =
-                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+            let ((y, s), routes) = recording_routes(|| {
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap()
+            });
+            assert_eq!(routes, route, "t={t}");
             let (y_ref, s_ref) = reference(&x, true);
             let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
             assert!(ey.0 < 2e-5 && es.0 < 2e-5, "t={t}: y {ey:?} state {es:?}");
         };
-        for t in [1, 4, 200] {
-            check(t, [2, 4, 32, 16]);
-        }
-        check(KERNEL_MAX_STEPS + 37, [1, 2, 32, 8]);
-        mlx_rs::with_new_default_stream(mlx_rs::Stream::cpu(), || {
-            for t in [
-                3,
-                CHUNKED_PREFILL_MIN_TOKENS - 1,
-                CHUNKED_PREFILL_MIN_TOKENS,
-                150,
-            ] {
-                check(t, [2, 4, 32, 16]);
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            for t in [1, 4, 200] {
+                check(t, [2, 4, 32, 16], &[Route::Kernel]);
+            }
+            check(
+                KERNEL_MAX_STEPS + 37,
+                [1, 2, 32, 8],
+                &[Route::Kernel, Route::Kernel],
+            );
+        });
+        mlx_rs::with_new_default_stream(Stream::cpu(), || {
+            for t in [3, CHUNKED_PREFILL_MIN_TOKENS - 1] {
+                check(t, [2, 4, 32, 16], &[Route::Ops]);
+            }
+            for t in [CHUNKED_PREFILL_MIN_TOKENS, 150] {
+                check(t, [2, 4, 32, 16], &[Route::Chunked]);
             }
         });
 
-        let x = inputs([1, 3, 2, 4, 32, 16], Dtype::Bfloat16, 9);
-        let (y, s) = gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, None).unwrap();
-        assert_eq!((y.dtype(), s.dtype()), (Dtype::Bfloat16, Dtype::Bfloat16));
-        let (_, s) =
-            gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
-        assert_eq!(s.dtype(), Dtype::Float32);
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let x = inputs([1, 3, 2, 4, 32, 16], Dtype::Bfloat16, 9);
+            let (y, s) = gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, None).unwrap();
+            assert_eq!((y.dtype(), s.dtype()), (Dtype::Bfloat16, Dtype::Bfloat16));
+            let (_, s) =
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+            assert_eq!(s.dtype(), Dtype::Float32);
+        });
+    }
+
+    /// The route follows the stream ops are issued on: a task-local GPU stream runs the kernel on
+    /// that stream even when the process default device is the CPU (another test may have set it —
+    /// the default device is process-global).
+    #[test]
+    fn kernel_runs_on_the_task_local_gpu_stream_under_a_cpu_default_device() {
+        let _cpu_default = crate::primitives::kv_cache::testing::CpuStream::enter();
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let x = inputs([1, 4, 2, 4, 32, 16], Dtype::Float32, 21);
+            let ((y, s), routes) = recording_routes(|| {
+                gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap()
+            });
+            assert_eq!(routes, [Route::Kernel]);
+            let (y_ref, s_ref) = reference(&x, true);
+            let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+            assert!(ey.0 < 1e-5 && es.0 < 1e-5, "y {ey:?} state {es:?}");
+            // The public kernel entry point dispatches on the same task-local stream.
+            let (y, s) =
+                gated_delta_kernel(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
+            let (ey, es) = (errors(&y, &y_ref), errors(&s, &s_ref));
+            assert!(ey.0 < 1e-5 && es.0 < 1e-5, "kernel y {ey:?} state {es:?}");
+        });
     }
 
     /// A long prefill must not exhaust the Metal allocator. The op-by-op path builds the whole

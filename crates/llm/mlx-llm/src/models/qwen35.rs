@@ -2779,9 +2779,15 @@ mod tests {
     /// AC (sc-24443): the Gated DeltaNet dispatch (fused Metal kernel for prefill, decode and
     /// verify) leaves Qwen35 greedy decoding unchanged against the op-by-op reference recurrence —
     /// for a short and a multi-chunk prompt, a speculative-verify-width forward, and the decode
-    /// steps after it — on the production bf16 path.
+    /// steps after it — on the production bf16 path, with every logit within one bf16 ULP of the
+    /// reference's. Runs on a GPU stream (the kernel's route) whatever the process default device.
     #[test]
     fn greedy_tokens_match_the_ops_reference_recurrence() {
+        mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), greedy_tokens_match_on_the_gpu);
+    }
+
+    fn greedy_tokens_match_on_the_gpu() {
+        use crate::primitives::gated_delta::{recording_routes, with_ops_reference, Route};
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let model =
             Qwen35Model::from_weights(&synthetic_weights(&cfg), "model.language_model", cfg)
@@ -2830,22 +2836,42 @@ mod tests {
         };
         let long: Vec<i32> = (0..90).map(|i| (i * 7 + 3) % 50).collect();
         for prompt in [&[1i32, 7, 3, 42, 9, 2][..], &long[..]] {
-            let (tokens, logits) = run(prompt);
-            let (ref_tokens, ref_logits) =
-                crate::primitives::gated_delta::with_ops_reference(|| run(prompt));
+            let ((tokens, logits), routes) = recording_routes(|| run(prompt));
+            let ((ref_tokens, ref_logits), ref_routes) =
+                recording_routes(|| with_ops_reference(|| run(prompt)));
+            // The production run took the fused kernel for every recurrence call and the reference
+            // run the op loop — so the comparison is kernel against ops, not a path against itself.
+            assert!(
+                !routes.is_empty() && routes.iter().all(|r| *r == Route::Kernel),
+                "production routes {routes:?}"
+            );
+            assert!(
+                !ref_routes.is_empty() && ref_routes.iter().all(|r| *r == Route::Ops),
+                "reference routes {ref_routes:?}"
+            );
             let md = logits
                 .iter()
                 .zip(&ref_logits)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
+            // The logits are bf16: one ULP at the largest reference logit's binade (8 significand
+            // bits, so the spacing in [2^e, 2^(e+1)) is 2^(e-7)) bounds a last-bit rounding flip.
+            let scale = ref_logits.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let ulp = 2f32.powi(scale.log2().floor() as i32 - 7);
             eprintln!(
-                "prompt len {}: max logit diff vs ops reference {md:.2e}",
+                "prompt len {}: max logit diff vs ops reference {md:.2e} (bf16 ulp {ulp:.2e} at \
+                 |logit| {scale:.2e})",
                 prompt.len()
             );
             assert_eq!(
                 tokens,
                 ref_tokens,
                 "prompt len {}: greedy tokens diverged (max logit diff {md})",
+                prompt.len()
+            );
+            assert!(
+                md <= ulp,
+                "prompt len {}: max logit diff {md} exceeds one bf16 ulp {ulp}",
                 prompt.len()
             );
         }

@@ -268,12 +268,6 @@ pub fn gated_delta_chunked(
     let (b, t, hk, dk) = q.dims4()?;
     let (_, _, hv, dv) = v.dims4()?;
     let dev = q.device();
-    let (q, k) = if hv != hk {
-        let r = hv / hk;
-        (repeat_heads(q, r)?, repeat_heads(k, r)?)
-    } else {
-        (q.clone(), k.clone())
-    };
 
     // Pad T to whole chunks with inert steps (g = 1, β = 0, k = q = v = 0 leave the state as is),
     // then lay every tensor out per head and chunk: [N = B·Hv, nC, C, ·].
@@ -302,8 +296,17 @@ pub fn gated_delta_chunked(
             }
         })
     };
-    let q = heads_first(&q, 0.0)?;
-    let k = heads_first(&k, 0.0)?;
+    // GQA-expand q/k as statement temporaries, so each prompt-sized expansion frees as soon as
+    // it is laid out.
+    let expand = |x: &Tensor| -> Result<Tensor> {
+        if hv != hk {
+            repeat_heads(x, hv / hk)
+        } else {
+            Ok(x.clone())
+        }
+    };
+    let q = heads_first(&expand(q)?, 0.0)?;
+    let k = heads_first(&expand(k)?, 0.0)?;
     let v = heads_first(v, 0.0)?;
     let g = heads_first(g, 1.0)?;
     let beta = heads_first(beta, 0.0)?;
@@ -381,10 +384,13 @@ pub fn gated_delta_chunked(
         }
         seg_start += m;
     }
-    let refs: Vec<&Tensor> = ys.iter().collect();
-    let y = Tensor::cat(&refs, 1)? // [N, Tp, Dv]
-        .narrow(1, 0, t)?
-        .reshape((b, hv, t, dv))?
+    // One copy out: the per-chunk outputs free once concatenated, and the padded [N, Tp, Dv]
+    // result reshapes as a view so the narrow + transpose materialize in a single `contiguous`.
+    let y = Tensor::cat(&ys.iter().collect::<Vec<_>>(), 1)?; // [N, Tp, Dv]
+    drop(ys);
+    let y = y
+        .reshape((b, hv, n_chunks * c, dv))?
+        .narrow(2, 0, t)?
         .transpose(1, 2)?
         .contiguous()?; // [B, T, Hv, Dv]
     Ok((y, state.reshape((b, hv, dv, dk))?))
@@ -1429,15 +1435,28 @@ mod tests {
             .collect()
     }
 
-    /// Model-shaped recurrence inputs `(q, k, v, g, β, carried state)`: L2-normalized q (scaled by
-    /// `1/√Dk`) and k, gates from [`compute_g`], `β = sigmoid(b)` — all rounded through `dtype` so
-    /// the f32 reference sees exactly the values the path under test reads.
+    /// The device the chunked-parity tests run on: the build's GPU backend when one is compiled
+    /// in and present (so the CUDA and Metal lanes execute the chunked form on the GPU), else CPU.
+    fn test_device() -> Device {
+        #[cfg(feature = "cuda")]
+        let device = Device::cuda_if_available(0).unwrap();
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let device = Device::metal_if_available(0).unwrap();
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let device = Device::Cpu;
+        device
+    }
+
+    /// Model-shaped recurrence inputs `(q, k, v, g, β, carried state)` on [`test_device`]:
+    /// L2-normalized q (scaled by `1/√Dk`) and k, gates from [`compute_g`], `β = sigmoid(b)` — all
+    /// rounded through `dtype` so the f32 reference sees exactly the values the path under test
+    /// reads.
     fn model_inputs(dims: [usize; 6], dtype: DType, seed: u64) -> [Tensor; 6] {
         let [b, t, hk, hv, dk, dv] = dims;
-        let cpu = &Device::Cpu;
+        let dev = &test_device();
         let arr = |shape: &[usize], s: u64| {
             let n = shape.iter().product();
-            Tensor::from_vec(lcg(n, seed ^ s), shape, cpu).unwrap()
+            Tensor::from_vec(lcg(n, seed ^ s), shape, dev).unwrap()
         };
         let l2 = |x: Tensor| {
             let norm = x
@@ -1598,8 +1617,9 @@ mod tests {
     /// ringed position to the state a token-at-a-time decode reaches.
     #[test]
     fn ring_prefill_with_a_chunked_head_restores_the_per_token_states() {
-        let fixture = ring_inputs(150, 2);
-        let mut cache = DeltaNetCache::with_ring(ring_spec(4)).unwrap();
+        let device = test_device();
+        let fixture = ring_inputs_on(150, 2, &device);
+        let mut cache = DeltaNetCache::with_ring(ring_spec_on(4, device)).unwrap();
         feed(&mut cache, &fixture, 0, 150);
         assert_eq!(cache.restorable(), vec![147, 148, 149]);
         for n in [150, 149, 148, 147] {
@@ -1877,40 +1897,48 @@ mod tests {
     type Fixture = (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor);
 
     fn ring_spec(slots: usize) -> RingSpec {
+        ring_spec_on(slots, Device::Cpu)
+    }
+
+    fn ring_spec_on(slots: usize, device: Device) -> RingSpec {
         RingSpec {
             slots,
             conv_dims: (RB, RK - 1, RC),
             conv_dtype: DType::F32,
             ssm_dims: (RB, RHV, RDV, RDK),
             ssm_dtype: DType::F32,
-            device: Device::Cpu,
+            device,
         }
     }
 
     /// Seeded recurrence inputs for `t` tokens plus the conv input `x [B, t, C]`.
     fn ring_inputs(t: usize, salt: usize) -> Fixture {
+        ring_inputs_on(t, salt, &Device::Cpu)
+    }
+
+    /// [`ring_inputs`] on `dev`.
+    fn ring_inputs_on(t: usize, salt: usize, dev: &Device) -> Fixture {
         let sample = |len: usize, s: usize, scale: f32| -> Vec<f32> {
             (0..len)
                 .map(|i| ((i * 31 + s * 7) % 41) as f32 * scale - 20.0 * scale)
                 .collect()
         };
-        let cpu = &Device::Cpu;
         let q = Tensor::from_vec(
             sample(t * RHK * RDK, salt + 1, 0.05),
             (RB, t, RHK, RDK),
-            cpu,
+            dev,
         )
         .unwrap();
         let k = Tensor::from_vec(
             sample(t * RHK * RDK, salt + 2, 0.04),
             (RB, t, RHK, RDK),
-            cpu,
+            dev,
         )
         .unwrap();
         let v = Tensor::from_vec(
             sample(t * RHV * RDV, salt + 3, 0.06),
             (RB, t, RHV, RDV),
-            cpu,
+            dev,
         )
         .unwrap();
         let g = Tensor::from_vec(
@@ -1919,7 +1947,7 @@ mod tests {
                 .map(|x| 0.95 + x)
                 .collect(),
             (RB, t, RHV),
-            cpu,
+            dev,
         )
         .unwrap();
         let beta = Tensor::from_vec(
@@ -1928,10 +1956,10 @@ mod tests {
                 .map(|x| 0.5 + x)
                 .collect(),
             (RB, t, RHV),
-            cpu,
+            dev,
         )
         .unwrap();
-        let x = Tensor::from_vec(sample(t * RC, salt + 6, 0.1), (RB, t, RC), cpu).unwrap();
+        let x = Tensor::from_vec(sample(t * RC, salt + 6, 0.1), (RB, t, RC), dev).unwrap();
         (q, k, v, g, beta, x)
     }
 
@@ -1942,10 +1970,10 @@ mod tests {
     /// Feed tokens `start..start+len` of the fixture through `cache` (one `advance`).
     fn feed(cache: &mut DeltaNetCache, fixture: &Fixture, start: usize, len: usize) -> Tensor {
         let (q, k, v, g, beta, x) = fixture;
-        let weight = Tensor::from_slice(CW, (RC, RK), &Device::Cpu).unwrap();
+        let weight = Tensor::from_slice(CW, (RC, RK), x.device()).unwrap();
         let conv_state = match cache.conv_state() {
             Some(c) => c.clone(),
-            None => Tensor::zeros((RB, RK - 1, RC), DType::F32, &Device::Cpu).unwrap(),
+            None => Tensor::zeros((RB, RK - 1, RC), DType::F32, x.device()).unwrap(),
         };
         let (_out, trace) =
             causal_depthwise_conv_traced(&narrow_t(x, start, len), &weight, &conv_state).unwrap();
