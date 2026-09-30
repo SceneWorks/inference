@@ -2954,6 +2954,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// sc-24442 AC2: the Qwen35 hybrid decoder (gated full attention with partial M-RoPE
+    /// interleaved with linear-attention layers) emits the same greedy tokens under the new `sdpa` routing as under
+    /// the pre-sc-24442 one, compared in-process — head dims 8 (unserved), 64 (full kernel) and 256
+    /// (vector-only) × GQA 2 / GQA 8 × prompts inside one tile, across tiles, and across many.
+    #[test]
+    fn greedy_tokens_match_pre_sc24442_sdpa_routing() {
+        use crate::primitives::attention::route_override::{
+            assert_greedy_matches_pre_sc24442, GreedyComparison,
+        };
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+
+        let mut seen = GreedyComparison::default();
+        for hd in [8, 64, 256] {
+            for (nh, nkv) in [(4, 2), (8, 1)] {
+                let mut v = cfg_json();
+                let tc = v["text_config"].as_object_mut().unwrap();
+                tc.insert("head_dim".into(), json!(hd));
+                tc.insert("num_attention_heads".into(), json!(nh));
+                tc.insert("num_key_value_heads".into(), json!(nkv));
+                // Full attention at layers 1 and 3: an earlier full-attention layer's every row
+                // feeds the last-position logits (the last layer's only reaches them via its
+                // final row, which no masking or tiling choice changes).
+                tc.insert("full_attention_interval".into(), json!(2));
+                let cfg = Qwen35Config::from_json(&v).unwrap();
+                assert!(!cfg.is_linear(1) && !cfg.is_linear(3));
+                // Random (not periodic) values so greedy steps are rarely near-ties.
+                let mut rng = SplitMix64::new(0x2444_2350 + (hd * 16 + nh + nkv) as u64);
+                let weights: HashMap<String, Array> = synthetic_weights(&cfg)
+                    .into_map()
+                    .into_iter()
+                    .map(|(key, a)| {
+                        let n = a.size();
+                        let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+                        (key, Array::from_slice(&data, a.shape()))
+                    })
+                    .collect();
+                let model = Qwen35Model::from_weights(
+                    &Weights::from_map(weights),
+                    "model.language_model",
+                    cfg.clone(),
+                )
+                .unwrap();
+                for prompt_len in [5, 20, 70] {
+                    let prompt: Vec<i32> = (0..prompt_len)
+                        .map(|i| (i * 7 + 3) % cfg.vocab_size)
+                        .collect();
+                    seen += assert_greedy_matches_pre_sc24442(
+                        &format!("qwen35 hd {hd} {nh}/{nkv} prompt {prompt_len}"),
+                        &prompt,
+                        6,
+                        || model.new_cache(),
+                        |ids, cache, offset| model.decode_logits(ids, cache, offset).unwrap(),
+                    );
+                }
+            }
+        }
+        assert!(
+            seen.differing_calls > 0,
+            "no fixture exercised a routing change"
+        );
+        assert!(
+            seen.compared_steps > seen.tie_steps,
+            "most greedy steps must be decisive enough to compare: {seen:?}"
+        );
+    }
+
     fn synthetic_model() -> (Qwen35Config, Qwen35Model) {
         let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let w = synthetic_weights(&cfg);
