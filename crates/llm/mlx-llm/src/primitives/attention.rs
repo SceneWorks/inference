@@ -29,7 +29,7 @@ const MASK_NEG: f32 = -1e30;
 /// view over `[B, L, H, D]` storage, and the tripwire read it with mlx-rs `as_slice`, which ignores
 /// strides. Production consumers transpose/reshape (stride-aware) and never saw wrong numbers. The
 /// kernel matches an f64 host reference (`sc7430_fused_sdpa_matches_host_at_long_qlen`).
-const MLX_SDPA_VECTOR_MAX_QLEN: i32 = 8;
+pub(crate) const MLX_SDPA_VECTOR_MAX_QLEN: i32 = 8;
 
 /// Largest `q_len × gqa_factor` MLX's vector kernel serves (`(query_sequence_length * gqa_factor)
 /// <= 32`); a wider GQA group falls back even at `q_len <= 8`.
@@ -167,10 +167,7 @@ enum SdpaRoute {
 fn sdpa_route(queries: &Array, keys: &Array, values: &Array, mask: AttnMask<'_>) -> SdpaRoute {
     let (hq, q_len, qd) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);
     let (hkv, k_len, vd) = (keys.shape()[1], keys.shape()[2], values.shape()[3]);
-    let gqa = (hq / hkv.max(1)).max(1);
     let full_head_dim = qd == vd && matches!(qd, 64 | 80 | 128);
-    let vector_head_dim =
-        (qd == vd && matches!(qd, 64 | 96 | 128 | 256)) || (qd == 192 && vd == 128);
     if q_len > MLX_SDPA_VECTOR_MAX_QLEN && full_head_dim {
         return if q_len > SDPA_PREFILL_BLOCK_QLEN {
             SdpaRoute::Tiled {
@@ -181,7 +178,7 @@ fn sdpa_route(queries: &Array, keys: &Array, values: &Array, mask: AttnMask<'_>)
             SdpaRoute::Fused
         };
     }
-    if !vector_head_dim || gqa > MLX_SDPA_VECTOR_MAX_ROWS {
+    if !vector_kernel_serves(hq, hkv, qd, vd) {
         let masked = !matches!(mask, AttnMask::None);
         return if masked && q_len > SDPA_SCORE_TILE_QLEN {
             SdpaRoute::Tiled {
@@ -192,7 +189,7 @@ fn sdpa_route(queries: &Array, keys: &Array, values: &Array, mask: AttnMask<'_>)
             SdpaRoute::Fused
         };
     }
-    let rows = MLX_SDPA_VECTOR_MAX_QLEN.min(MLX_SDPA_VECTOR_MAX_ROWS / gqa);
+    let rows = vector_verify_rows(hq, hkv, qd, vd);
     if q_len <= rows && q_len <= k_len {
         SdpaRoute::Fused
     } else {
@@ -200,6 +197,37 @@ fn sdpa_route(queries: &Array, keys: &Array, values: &Array, mask: AttnMask<'_>)
             rows,
             eval_tiles: false,
         }
+    }
+}
+
+/// `gqa_factor = q_heads / kv_heads` as MLX derives it.
+fn gqa_factor(hq: i32, hkv: i32) -> i32 {
+    (hq / hkv.max(1)).max(1)
+}
+
+/// Whether MLX 0.32's single-pass **vector** SDPA kernel serves this head geometry at some
+/// `q_len <= 8`: `qd == vd ∈ {64, 96, 128, 256}` (or MLA's 192/128) and a GQA group of at most 32.
+fn vector_kernel_serves(hq: i32, hkv: i32, qd: i32, vd: i32) -> bool {
+    let vector_head_dim =
+        (qd == vd && matches!(qd, 64 | 96 | 128 | 256)) || (qd == 192 && vd == 128);
+    vector_head_dim && gqa_factor(hq, hkv) <= MLX_SDPA_VECTOR_MAX_ROWS
+}
+
+/// The most query rows [`sdpa`] hands MLX as **one** decode-kernel call for a `[b, hq, q_len, qd]`
+/// × `[b, hkv, k_len, qd]` × `[…, vd]` attention with `q_len <= k_len` — the widest speculative
+/// verify (`1 + depth` rows) that costs one fused call per attention layer, like the plain
+/// `q_len = 1` step it must agree with (sc-24438).
+///
+/// Where the vector kernel serves the head geometry it is `min(8, 32 / gqa)` — the rows
+/// `sdpa_route` tiles a wider call into, so a GQA group wider than 4 narrows it (gqa 6 → 5, gqa 8
+/// → 4, gqa 16 → 2). Where it does not (a head dim only the full kernel or MLX's fallback serves,
+/// or a GQA group wider than 32), a masked call of up to [`SDPA_SCORE_TILE_QLEN`] (8) rows is one
+/// call, so the bound is 8. Always `>= 1`.
+pub(crate) fn vector_verify_rows(hq: i32, hkv: i32, qd: i32, vd: i32) -> i32 {
+    if vector_kernel_serves(hq, hkv, qd, vd) {
+        MLX_SDPA_VECTOR_MAX_QLEN.min(MLX_SDPA_VECTOR_MAX_ROWS / gqa_factor(hq, hkv))
+    } else {
+        SDPA_SCORE_TILE_QLEN
     }
 }
 
@@ -970,6 +998,48 @@ mod tests {
         }
         assert_eq!(route(64, 1, 4, 64, 128, 128), SdpaRoute::Fused); // gqa 64, q 4: one call
         assert_eq!(route(64, 1, 40, 40, 128, 128), SdpaRoute::Fused); // full kernel takes any gqa
+    }
+
+    /// sc-24438: [`vector_verify_rows`] is the widest query `sdpa_route` keeps as one fused call —
+    /// a verify of `rows` query rows over a longer cache is one call, `rows + 1` is split — for the
+    /// shipped Qwen3.8-27B (24q/4kv/hd 256, gqa 6 → 5), Qwen3.5/3.6-35B-A3B (16q/2kv/hd 256, gqa 8
+    /// → 4), a gqa-4 hd-128 Llama (8), a gqa-8 hd-128 one (4), and shapes the vector kernel does
+    /// not serve (8: the masked one-call bound).
+    #[test]
+    fn vector_verify_rows_is_the_widest_single_fused_verify() {
+        let route = |hq: i32, hkv: i32, ql: i32, hd: i32| {
+            sdpa_route(
+                &Array::zeros::<f32>(&[1, hq, ql, hd]).unwrap(),
+                &Array::zeros::<f32>(&[1, hkv, 64, hd]).unwrap(),
+                &Array::zeros::<f32>(&[1, hkv, 64, hd]).unwrap(),
+                AttnMask::Causal,
+            )
+        };
+        for (hq, hkv, hd, rows) in [
+            (24, 4, 256, 5),
+            (16, 2, 256, 4),
+            (32, 8, 128, 8),
+            (32, 4, 128, 4),
+            (8, 4, 72, 8),
+            (64, 1, 256, 8),
+        ] {
+            assert_eq!(vector_verify_rows(hq, hkv, hd, hd), rows, "{hq}/{hkv}/{hd}");
+            assert_eq!(
+                route(hq, hkv, rows, hd),
+                SdpaRoute::Fused,
+                "{hq}/{hkv}/{hd}"
+            );
+            if vector_kernel_serves(hq, hkv, hd, hd) && rows < MLX_SDPA_VECTOR_MAX_QLEN {
+                assert_eq!(
+                    route(hq, hkv, rows + 1, hd),
+                    SdpaRoute::Tiled {
+                        rows,
+                        eval_tiles: false
+                    },
+                    "{hq}/{hkv}/{hd}: one row wider is split"
+                );
+            }
+        }
     }
 
     /// Where [`sdpa`] tiles, the result still matches the host reference: vector-kernel tiles for
