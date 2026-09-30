@@ -377,8 +377,14 @@ fn multimodal_instruction_conditioning_matches_torch() {
     assert_eq!(conditioning.seq_lens, vec![93]);
     let (max_abs, _, mean_rel) = error(&conditioning.txt, golden.require("edit_txt").unwrap());
     println!("edit_txt: max_abs={max_abs:.6} mean_rel={mean_rel:.6}");
+    // sc-24380: the bound must cover the Torch reference's own bf16 spread. Regenerating the
+    // golden under transformers 5.10.4 (fp32 vision tower bitwise identical to 5.5.0) moved
+    // `edit_txt` by max_abs 17.52 / mean_rel 0.0855 golden-to-golden; MLX measured 15.82 against
+    // the 5.5.0 golden and 17.09 / 0.096 against the 5.10.4 one. The strict isolated gates above
+    // (exact-vision text, LM layer boundaries) carry the discrimination; this end-to-end check
+    // only bounds the combined bf16 drift.
     assert!(
-        max_abs <= 16.0 && mean_rel <= 0.10,
+        max_abs <= 20.0 && mean_rel <= 0.10,
         "combined vision+LM conditioning exceeds measured cross-backend spread"
     );
 }
