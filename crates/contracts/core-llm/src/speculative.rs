@@ -121,11 +121,12 @@ pub struct SpeculativeResolution {
 /// * `off` never speculates;
 /// * `auto` runs MTP at its recommended depth where the model has a head, else prompt lookup at
 ///   its recommended depth, else decodes plainly with the reason named;
-/// * `{proposer, depth}` runs exactly that. Its admissibility (advertised, `1 ..= max_depth`) is
+/// * `{proposer, depth}` runs that proposer. Its admissibility (advertised, `depth >= 1`) is
 ///   checked by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
 ///   first, so an un-advertised proposer here is the caller's contract violation: it resolves to
-///   `off` with the reason named rather than inventing a proposer, and a depth outside the
-///   advertised range is clamped into it, also named.
+///   `off` with the reason named rather than inventing a proposer. A depth above the advertised
+///   `max_depth` — the backend-true bound — is clamped to it and the clamp named in the fallback
+///   (sc-24438), never refused and never run past the bound.
 pub fn resolve_speculative(
     mode: crate::Speculative,
     capabilities: &crate::TextLlmCapabilities,
@@ -452,6 +453,30 @@ mod tests {
             ProposerKind::from(SpeculativeProposer::DraftModel),
             ProposerKind::DraftModel
         );
+    }
+
+    /// sc-24438 AC1: a request above the advertised max depth — new option or legacy `mtp` —
+    /// runs at the max, and the clamp is named; a request within it is untouched.
+    #[test]
+    fn a_too_deep_request_is_clamped_to_the_advertised_max_and_named() {
+        use crate::{MtpMode, Speculative, SpeculativeProposer, TextLlmCapabilities};
+        let mut caps = TextLlmCapabilities::default();
+        caps.advertise_mtp(7, 3);
+        let legacy = resolve_speculative(MtpMode::Enabled { draft_tokens: 40 }.into(), &caps);
+        assert_eq!(
+            legacy.plan,
+            SpeculativePlan::Run {
+                proposer: SpeculativeProposer::Mtp,
+                depth: 7
+            }
+        );
+        assert_eq!(
+            legacy.fallback.as_deref(),
+            Some("speculative: `mtp` depth 40 clamped to 7 (advertised 1..=7)")
+        );
+        let within = resolve_speculative(Speculative::proposer(SpeculativeProposer::Mtp, 7), &caps);
+        assert_eq!(within.plan.depth(), Some(7));
+        assert_eq!(within.fallback, None);
     }
 
     fn auto_plan(caps: &crate::TextLlmCapabilities) -> SpeculativePlan {
