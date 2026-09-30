@@ -34,8 +34,10 @@ use crate::{Error, ModelConfig, Result};
 /// v4 (sc-20671 audit): the parity gate is kernel parity on the same stored codes, model-level
 /// logit error and the dense/packed throughput comparison are recorded observations, greedy
 /// agreement is teacher-forced, and release allows the recorded MLX allocator slack.
-pub const SC20676_SCHEMA_VERSION: u32 = 4;
-pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v4";
+/// v5: the baseline binding records its SC-20671 source closure, so a dense campaign produced at
+/// an ancestor inference revision is reusable only when that closure is byte-identical.
+pub const SC20676_SCHEMA_VERSION: u32 = 5;
+pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v5";
 /// The SC-20671 frozen contract is the policy identity; SC-20676 only narrows it with the
 /// compressed-domain parity requirements below and never introduces a tunable caller threshold.
 pub const SC20676_CONTRACT_HASH: &str = campaign::QUALITY_CONTRACT_HASH;
@@ -83,6 +85,47 @@ pub struct Sc20676BaselineBinding {
     pub context_band: String,
     pub context_payload_tokens: u64,
     pub head_dimension: u64,
+    /// The SC-20671 source closure the baseline and this harness share.
+    pub closure: Sc20676BaselineClosure,
+}
+
+/// Every path whose content decides an SC-20671 dense row: the mlx-llm library and bins (minus
+/// this SC-20676 harness, its bin and the SC-20677 candidate codecs, none of which the dense
+/// worker calls), its manifests, the backend contract it implements, the lockfile and toolchain,
+/// the frozen build recipe and prebuilt-MLX fetch, and the campaign policies and prompt.
+/// Git pathspecs, evaluated from the inference root.
+pub const SC20676_BASELINE_CLOSURE_PATHSPECS: &[&str] = &[
+    "Cargo.lock",
+    "Cargo.toml",
+    "rust-toolchain.toml",
+    ".cargo",
+    "crates/llm/mlx-llm/Cargo.toml",
+    "crates/llm/mlx-llm/src",
+    ":(exclude)crates/llm/mlx-llm/src/sc20676_evidence.rs",
+    ":(exclude)crates/llm/mlx-llm/src/bin/sc20676_packed_evidence.rs",
+    ":(exclude)crates/llm/mlx-llm/src/primitives/kv_candidates",
+    "crates/contracts/core-llm",
+    ".github/kv-poc/build.sh",
+    "scripts/fetch-prebuilt-mlx.sh",
+    ".github/kv-poc/policies",
+    ".github/kv-poc/inputs",
+    ".github/kv-poc/inputs.sha256",
+];
+
+/// Why a baseline produced at `baseline_revision` may stand for a harness at `harness_revision`:
+/// the baseline is an ancestor and `git diff --quiet baseline harness -- <closure>` is empty.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Sc20676BaselineClosure {
+    pub baseline_revision: String,
+    pub harness_revision: String,
+    pub baseline_is_ancestor: bool,
+    pub closure_diff_empty: bool,
+    pub closure_pathspecs_sha256: String,
+}
+
+pub fn sc20676_closure_pathspecs_sha256() -> String {
+    campaign::seal_bytes(SC20676_BASELINE_CLOSURE_PATHSPECS.join("\n").as_bytes())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -910,6 +953,11 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
         || !is_digest(&receipt.baseline.campaign_session_id)
         || !is_digest(&receipt.baseline.campaign_global_identity_sha256)
         || receipt.baseline.context_band != campaign::SC20676_BASELINE_CONTEXT_BAND
+        || receipt.baseline.closure.baseline_revision != receipt.baseline.inference_revision
+        || !is_revision(&receipt.baseline.closure.harness_revision)
+        || !receipt.baseline.closure.baseline_is_ancestor
+        || !receipt.baseline.closure.closure_diff_empty
+        || receipt.baseline.closure.closure_pathspecs_sha256 != sc20676_closure_pathspecs_sha256()
         || receipt.baseline.context_payload_tokens < SC20676_MIN_LONG_CONTEXT_TOKENS as u64
         || ![64, 128, 256].contains(&receipt.baseline.head_dimension)
         || receipt.thresholds.max_kernel_parity_error != SC20676_MAX_KERNEL_PARITY_ERROR
@@ -971,7 +1019,7 @@ fn validate_sc20676_receipt_core(receipt: &Sc20676Receipt) -> std::result::Resul
     if host_independent(&receipt.dense.provenance) != host_independent(&receipt.packed.provenance)
         || !is_revision(&receipt.dense.provenance.inference_revision)
         || !is_revision(&receipt.dense.provenance.scene_works_revision)
-        || receipt.dense.provenance.inference_revision != receipt.baseline.inference_revision
+        || receipt.dense.provenance.inference_revision != receipt.baseline.closure.harness_revision
         || receipt.dense.provenance.scene_works_revision != receipt.baseline.scene_works_revision
         || !is_digest(&receipt.dense.provenance.dependency_lock_sha256)
         || [
@@ -1076,10 +1124,15 @@ pub fn validate_sc20676_receipt(receipt: &Sc20676Receipt) -> std::result::Result
 /// Bind the frozen long-context row from a complete SC-20671 campaign to the exact immutable
 /// candidate snapshot being tested.  A standalone receipt, a different coordinate, or a model
 /// inventory substituted after baseline publication fails closed.
+///
+/// The campaign's inference revision must be `harness_revision` or, per
+/// [`sc20676_baseline_closure`], an ancestor whose SC-20671 dense closure is unchanged.
 pub fn bind_sc20671_baseline(
     campaign_directory: impl AsRef<Path>,
     snapshot: &Path,
     family: &str,
+    inference_root: &Path,
+    harness_revision: &str,
 ) -> std::result::Result<Sc20676BaselineBinding, String> {
     let campaign_directory = campaign_directory.as_ref();
     let baseline = campaign::select_sc20676_baseline_row(campaign_directory, family)?;
@@ -1111,6 +1164,11 @@ pub fn bind_sc20671_baseline(
                 .into(),
         );
     }
+    let closure = sc20676_baseline_closure(
+        inference_root,
+        &receipt.provenance.inference_revision,
+        harness_revision,
+    )?;
     Ok(Sc20676BaselineBinding {
         receipt_sha256: receipt.receipt_sha256,
         campaign_manifest_sha256: campaign::seal_bytes(&manifest_bytes),
@@ -1127,6 +1185,106 @@ pub fn bind_sc20671_baseline(
         context_band: baseline.coordinate.context_band.into(),
         context_payload_tokens: receipt.geometry.context_payload_tokens,
         head_dimension: receipt.geometry.head_dimension,
+        closure,
+    })
+}
+
+/// `Ok(true)` for exit 0, `Ok(false)` for exit 1, and an error for anything else (a git failure is
+/// never read as a negative answer).
+fn git_predicate(root: &Path, args: &[&str]) -> std::result::Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "git {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
+/// A dense SC-20671 campaign produced at `baseline_revision` may be the baseline of a harness at
+/// `harness_revision` only when the baseline is that revision or an ancestor of it AND
+/// `git diff --quiet <baseline> <harness> -- <SC20676_BASELINE_CLOSURE_PATHSPECS>` is empty, i.e.
+/// the change between them is harness-only. Anything else refuses with the reason.
+pub fn sc20676_baseline_closure(
+    inference_root: &Path,
+    baseline_revision: &str,
+    harness_revision: &str,
+) -> std::result::Result<Sc20676BaselineClosure, String> {
+    if !is_revision(baseline_revision) || !is_revision(harness_revision) {
+        return Err(format!(
+            "SC-20676 baseline closure needs full commit ids, got baseline {baseline_revision:?} and harness {harness_revision:?}"
+        ));
+    }
+    for revision in [baseline_revision, harness_revision] {
+        if !git_predicate(
+            inference_root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{revision}^{{commit}}"),
+            ],
+        )? {
+            return Err(format!(
+                "SC-20676 cannot check baseline reuse: inference revision {revision} is not in {}; fetch the history from {harness_revision} back to {baseline_revision}",
+                inference_root.display()
+            ));
+        }
+    }
+    if !git_predicate(
+        inference_root,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            baseline_revision,
+            harness_revision,
+        ],
+    )? {
+        return Err(format!(
+            "SC-20676 refuses the SC-20671 baseline from inference {baseline_revision}: it is not an ancestor of the harness revision {harness_revision} (or the checkout's shallow history stops before it)"
+        ));
+    }
+    let mut diff = vec!["diff", "--quiet", baseline_revision, harness_revision, "--"];
+    diff.extend_from_slice(SC20676_BASELINE_CLOSURE_PATHSPECS);
+    if !git_predicate(inference_root, &diff)? {
+        let mut names = vec![
+            "diff",
+            "--name-only",
+            baseline_revision,
+            harness_revision,
+            "--",
+        ];
+        names.extend_from_slice(SC20676_BASELINE_CLOSURE_PATHSPECS);
+        let changed = Command::new("git")
+            .arg("-C")
+            .arg(inference_root)
+            .args(&names)
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .replace('\n', ", ")
+            })
+            .unwrap_or_default();
+        return Err(format!(
+            "SC-20676 refuses the SC-20671 baseline from inference {baseline_revision}: the dense campaign closure changed before {harness_revision} ({changed}); rerun the dense campaign at {harness_revision}"
+        ));
+    }
+    Ok(Sc20676BaselineClosure {
+        baseline_revision: baseline_revision.into(),
+        harness_revision: harness_revision.into(),
+        baseline_is_ancestor: true,
+        closure_diff_empty: true,
+        closure_pathspecs_sha256: sc20676_closure_pathspecs_sha256(),
     })
 }
 
@@ -1172,11 +1330,16 @@ fn checked_clean_revision(root: &Path, label: &str) -> std::result::Result<Strin
     Ok(revision)
 }
 
-fn worker_provenance() -> std::result::Result<Sc20676Provenance, String> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+/// The inference checkout this binary was compiled from (the frozen campaign keeps it in place).
+fn inference_root() -> std::result::Result<&'static Path, String> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
-        .ok_or("inference root")?;
+        .ok_or_else(|| "inference root".into())
+}
+
+fn worker_provenance() -> std::result::Result<Sc20676Provenance, String> {
+    let root = inference_root()?;
     let scene_works_root = PathBuf::from(
         std::env::var("SCENEWORKS_ROOT")
             .map_err(|_| "SCENEWORKS_ROOT is required for SC-20676 provenance")?,
@@ -2504,6 +2667,70 @@ fn host_independent(provenance: &Sc20676Provenance) -> Sc20676Provenance {
     }
 }
 
+/// Each differing provenance field as `field: captured=<value> worker=<value>`.
+fn provenance_differences(
+    captured: &Sc20676Provenance,
+    worker: &Sc20676Provenance,
+) -> std::result::Result<Vec<String>, String> {
+    let captured = serde_json::to_value(captured).map_err(|e| e.to_string())?;
+    let worker = serde_json::to_value(worker).map_err(|e| e.to_string())?;
+    let (Some(captured), Some(worker)) = (captured.as_object(), worker.as_object()) else {
+        return Err("SC-20676 provenance is not an object".into());
+    };
+    let shown = |value: Option<&serde_json::Value>| {
+        let text = value.map_or_else(|| "<absent>".to_owned(), ToString::to_string);
+        match text.char_indices().nth(160) {
+            Some((end, _)) => format!("{}...", &text[..end]),
+            None => text,
+        }
+    };
+    Ok(captured
+        .keys()
+        .chain(worker.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| captured.get(*key) != worker.get(*key))
+        .map(|key| {
+            format!(
+                "{key}: captured={} worker={}",
+                shown(captured.get(key)),
+                shown(worker.get(key))
+            )
+        })
+        .collect())
+}
+
+/// The worker half of the resume round trip. The parent captured `provenance` WITHOUT host
+/// power/thermal state ([`host_independent`]) and with the run's source revisions; the worker
+/// compares its own live environment on that same basis, then records its live host state (the
+/// arm-start observation) under the captured revisions.
+fn worker_arm_provenance(
+    identity: &serde_json::Value,
+    live: Sc20676Provenance,
+) -> std::result::Result<Sc20676Provenance, String> {
+    let captured: Sc20676Provenance = serde_json::from_value(
+        identity
+            .get("provenance")
+            .cloned()
+            .ok_or("SC-20676 resume provenance missing")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let arm = Sc20676Provenance {
+        scene_works_revision: captured.scene_works_revision.clone(),
+        inference_revision: captured.inference_revision.clone(),
+        ..live
+    };
+    let differences =
+        provenance_differences(&host_independent(&captured), &host_independent(&arm))?;
+    if !differences.is_empty() {
+        return Err(format!(
+            "SC-20676 worker environment differs from captured resume provenance: {}",
+            differences.join("; ")
+        ));
+    }
+    Ok(arm)
+}
+
 fn arm_resume_identity(
     inputs: &[ArmFamilyInput],
     executable_sha256: &str,
@@ -2684,25 +2911,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
                 "SC-20676 worker policy, executable, or nonce differs from resume identity".into(),
             );
         }
-        let captured: Sc20676Provenance = serde_json::from_value(
-            identity
-                .get("provenance")
-                .cloned()
-                .ok_or("SC-20676 resume provenance missing")?,
-        )
-        .map_err(|e| e.to_string())?;
-        let mut current = worker_provenance()?;
-        current
-            .scene_works_revision
-            .clone_from(&captured.scene_works_revision);
-        current
-            .inference_revision
-            .clone_from(&captured.inference_revision);
-        if current != captured {
-            return Err(
-                "SC-20676 worker environment differs from captured resume provenance".into(),
-            );
-        }
+        let arm_provenance = worker_arm_provenance(&identity, worker_provenance()?)?;
         let arm = run_sc20676_worker(
             Path::new(&required_flag(args, "--snapshot")?),
             &required_flag(args, "--family")?,
@@ -2711,7 +2920,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             &required_flag(args, "--executable-sha256")?,
             requested_tokens,
             &policy,
-            &captured,
+            &arm_provenance,
         )?;
         validate_arm(&arm)?;
         let output = PathBuf::from(required_flag(args, "--out")?);
@@ -2761,7 +2970,20 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             args,
             &format!("--{family}-baseline-campaign"),
         )?);
-        let baseline = bind_sc20671_baseline(&baseline_campaign, &snapshot, family)?;
+        let baseline = bind_sc20671_baseline(
+            &baseline_campaign,
+            &snapshot,
+            family,
+            inference_root()?,
+            &current_provenance.inference_revision,
+        )?;
+        // The receipt binds the baseline's SceneWorks revision; refuse now, not after every arm.
+        if baseline.scene_works_revision != current_provenance.scene_works_revision {
+            return Err(format!(
+                "SC-20676 {family} baseline ran at SceneWorks {} but SCENEWORKS_ROOT is at {}; use the baseline's SceneWorks revision",
+                baseline.scene_works_revision, current_provenance.scene_works_revision
+            ));
+        }
         let inventory = campaign::validate_sc20676_candidate_snapshot(family, &snapshot)?;
         let native = campaign::benchmark_model(family, false)?.native_context_tokens;
         if baseline
@@ -3325,6 +3547,13 @@ mod tests {
                 context_band: campaign::SC20676_BASELINE_CONTEXT_BAND.into(),
                 context_payload_tokens: 1024,
                 head_dimension: 64,
+                closure: Sc20676BaselineClosure {
+                    baseline_revision: "b".repeat(40),
+                    harness_revision: "b".repeat(40),
+                    baseline_is_ancestor: true,
+                    closure_diff_empty: true,
+                    closure_pathspecs_sha256: sc20676_closure_pathspecs_sha256(),
+                },
             },
             thresholds: Sc20676Thresholds::default(),
             throughput_comparison: sc20676_throughput_comparison(&arm("dense"), &arm("packed"))
@@ -4053,5 +4282,177 @@ mod tests {
         let mut whitespace_tampered = bytes;
         whitespace_tampered.push(b' ');
         assert!(parse_staged_receipt_bytes(&whitespace_tampered, &seal).is_err());
+    }
+
+    /// The run-36658509441 failure: the parent seals `identity.json` with host power/thermal
+    /// blanked, and the worker compared its LIVE host state against that, so every worker failed.
+    /// Round trip through the real parent capture (identity file on disk) and worker compare.
+    #[test]
+    fn worker_resume_round_trip_ignores_host_state_and_names_a_real_difference() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("resume");
+        let input = ArmFamilyInput {
+            family: "llama",
+            snapshot: PathBuf::new(),
+            baseline: receipt().baseline,
+            snapshot_bytes: 100,
+            baseline_manifest_sha256: digest(),
+        };
+        let parent = provenance();
+        let dense = arm("dense");
+        let mut identity = arm_resume_identity(
+            &[input],
+            &dense.executable_sha256,
+            &digest(),
+            &parent,
+            &dense.run_nonce,
+        )
+        .unwrap();
+        let (_, nonce, expected) = prepare_arm_resume(&root, &mut identity).unwrap();
+        let sealed: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("identity.json")).unwrap()).unwrap();
+        assert_eq!(sealed["provenance"]["thermalState"], "");
+
+        // The worker's arm start sees a different (unthrottled) host state: not an identity change.
+        let live = Sc20676Provenance {
+            power_mode: "lowpowermode 1".into(),
+            thermal_state: "fair".into(),
+            ..parent.clone()
+        };
+        let recorded = worker_arm_provenance(&sealed, live).expect("host state is not identity");
+        assert_eq!(recorded.thermal_state, "fair");
+        assert_eq!(recorded.power_mode, "lowpowermode 1");
+        let mut worker_arm = dense.clone();
+        worker_arm.provenance = recorded;
+        reseal_arm(&mut worker_arm);
+        validate_worker_binding(
+            &worker_arm,
+            "llama",
+            "dense",
+            &nonce,
+            &dense.executable_sha256,
+            &expected,
+            &mut std::collections::BTreeSet::new(),
+        )
+        .expect("the parent accepts the worker's recorded provenance");
+
+        // A genuinely different environment still refuses, naming the field and both values.
+        let other_xcode = Sc20676Provenance {
+            xcode: "Xcode 99.0".into(),
+            ..parent
+        };
+        let error = worker_arm_provenance(&sealed, other_xcode).unwrap_err();
+        assert!(
+            error.contains(r#"xcode: captured="Xcode" worker="Xcode 99.0""#),
+            "{error}"
+        );
+        assert!(!error.contains("thermalState"), "{error}");
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+    fn commit_file(root: &Path, path: &str, contents: &str) -> String {
+        let file = root.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, contents).unwrap();
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "--quiet", "--no-verify", "-m", path]);
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn baseline_reuse_requires_an_ancestor_with_an_unchanged_dense_closure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "--quiet"]);
+        commit_file(root, "Cargo.lock", "lock");
+        let baseline = commit_file(root, "crates/llm/mlx-llm/src/campaign.rs", "dense");
+        assert_eq!(
+            sc20676_baseline_closure(root, &baseline, &baseline).unwrap(),
+            Sc20676BaselineClosure {
+                baseline_revision: baseline.clone(),
+                harness_revision: baseline.clone(),
+                baseline_is_ancestor: true,
+                closure_diff_empty: true,
+                closure_pathspecs_sha256: sc20676_closure_pathspecs_sha256(),
+            }
+        );
+        // Harness-only changes: this module, its bin, the SC-20677 codecs, the workflow.
+        commit_file(root, "crates/llm/mlx-llm/src/sc20676_evidence.rs", "fix");
+        commit_file(
+            root,
+            "crates/llm/mlx-llm/src/bin/sc20676_packed_evidence.rs",
+            "b",
+        );
+        commit_file(
+            root,
+            "crates/llm/mlx-llm/src/primitives/kv_candidates/rvq.rs",
+            "c",
+        );
+        let harness = commit_file(root, ".github/kv-poc/phase.sh", "a3");
+        let reuse = sc20676_baseline_closure(root, &baseline, &harness).unwrap();
+        assert_eq!(reuse.baseline_revision, baseline);
+        assert_eq!(reuse.harness_revision, harness);
+        let error = sc20676_baseline_closure(root, &harness, &baseline).unwrap_err();
+        assert!(error.contains("not an ancestor"), "{error}");
+        let missing = "0".repeat(40);
+        let error = sc20676_baseline_closure(root, &missing, &harness).unwrap_err();
+        assert!(error.contains("is not in"), "{error}");
+        for path in [
+            "crates/llm/mlx-llm/src/campaign.rs",
+            "crates/llm/mlx-llm/src/primitives/other.rs",
+            "crates/contracts/core-llm/src/lib.rs",
+            "Cargo.lock",
+            ".github/kv-poc/policies/llm.json",
+        ] {
+            let changed = commit_file(root, path, "changed");
+            let error = sc20676_baseline_closure(root, &baseline, &changed).unwrap_err();
+            assert!(error.contains(path), "{path}: {error}");
+            assert!(sc20676_baseline_closure(root, &harness, &changed).is_err());
+        }
+    }
+
+    #[test]
+    fn cross_revision_baseline_receipt_requires_the_recorded_closure() {
+        let mut reused = receipt();
+        reused.baseline.inference_revision = "c".repeat(40);
+        reused.baseline.closure.baseline_revision = "c".repeat(40);
+        reused
+            .clone()
+            .finish()
+            .expect("an ancestor baseline with an empty closure diff");
+        let mut unrecorded = reused.clone();
+        unrecorded.baseline.closure.baseline_revision = "b".repeat(40);
+        assert!(unrecorded.finish().is_err());
+        let mut changed = reused.clone();
+        changed.baseline.closure.closure_diff_empty = false;
+        assert!(changed.finish().is_err());
+        let mut not_ancestor = reused.clone();
+        not_ancestor.baseline.closure.baseline_is_ancestor = false;
+        assert!(not_ancestor.finish().is_err());
+        let mut other_paths = reused.clone();
+        other_paths.baseline.closure.closure_pathspecs_sha256 = digest();
+        assert!(other_paths.finish().is_err());
+        let mut other_harness = reused;
+        other_harness.baseline.closure.harness_revision = "d".repeat(40);
+        assert!(other_harness.finish().is_err());
     }
 }

@@ -17,10 +17,11 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #
 # TRIGGERS
 #   * push to `kv-poc-run/**`: parameters come from `.github/kv-poc-run.json` on the pushed commit
-#     ({mode, inference_ref, sceneworks_ref, runner_label, phases}). This is how the campaign runs
-#     before this file reaches `main` (a workflow_dispatch workflow must exist on the default
-#     branch to be dispatched). Start W1 by flipping "mode" to "w1" in that file and pushing; start
-#     W2 with "mode": "w2" and an inference_ref that carries the W2 sources (SC-20686 product_load /
+#     ({mode, inference_ref, sceneworks_ref, runner_label, phases}, plus an optional
+#     baseline_evidence_ref: the inference SHA whose A1 evidence A3 binds, default inference_ref).
+#     This is how the campaign runs before this file reaches `main` (a workflow_dispatch workflow
+#     must exist on the default branch to be dispatched). Start W1 by flipping "mode" to "w1" in
+#     that file and pushing; start W2 with "mode": "w2" and an inference_ref that carries the W2 sources (SC-20686 product_load /
 #     VACE-Fun Q4, >= a3cde51d5), on a new kv-poc-run/w2-* branch.
 #   * workflow_dispatch (once this file is on `main`):
 #       gh workflow run kv-poc-campaign.yml -R SceneWorks/inference --ref main -f mode=w1
@@ -84,6 +85,10 @@ on:
         description: "Empty = all of the mode's phases. w1: subset of a1,a3,a2,b; w2: subset of c,d,d-control, or none (assets + build only). Run order is fixed."
         type: string
         default: ""
+      baseline_evidence_ref:
+        description: "Inference SHA whose completed A1 evidence ($HOME/kv-poc/<sha>-runs/evidence/sc20671-dense) A3 binds. Empty = inference_ref. sc20676 refuses it unless it is an ancestor of inference_ref with an unchanged SC-20671 dense closure."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -108,6 +113,7 @@ jobs:
       mode: ${{ steps.resolve.outputs.mode }}
       inference_sha: ${{ steps.resolve.outputs.inference_sha }}
       sceneworks_sha: ${{ steps.resolve.outputs.sceneworks_sha }}
+      baseline_evidence_sha: ${{ steps.resolve.outputs.baseline_evidence_sha }}
       runner_label: ${{ steps.resolve.outputs.runner_label }}
       phases: ${{ steps.resolve.outputs.phases }}
       runs_on: ${{ steps.resolve.outputs.runs_on }}
@@ -126,6 +132,7 @@ jobs:
           DISPATCH_SCENEWORKS_REF: ${{ inputs.sceneworks_ref }}
           DISPATCH_RUNNER_LABEL: ${{ inputs.runner_label }}
           DISPATCH_PHASES: ${{ inputs.phases }}
+          DISPATCH_BASELINE_EVIDENCE_REF: ${{ inputs.baseline_evidence_ref }}
         run: bash .github/kv-poc/config.sh
 
   probe:
@@ -217,6 +224,7 @@ jobs:
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      BASELINE_EVIDENCE_SHA: ${{ needs.config.outputs.baseline_evidence_sha }}
       KV_SOFT_BUDGET_MIN: "60"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

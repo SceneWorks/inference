@@ -27,6 +27,10 @@ phase="${2:?usage: phase.sh run|collect <phase>}"
 
 RESUME=""
 OUT=""
+# A3's SC-20671 dense baseline: this run's A1, or the A1 of an ancestor inference revision
+# (BASELINE_EVIDENCE_SHA) that sc20676 accepts only with an unchanged dense closure.
+BASELINE_SHA="${BASELINE_EVIDENCE_SHA:-$INFERENCE_SHA}"
+DENSE_BASELINE="$KV_ROOT/$BASELINE_SHA-runs/evidence/sc20671-dense"
 case "$phase" in
   a1) RESUME="$R/sc20671-dense-resume"; OUT="$R/evidence/sc20671-dense" ;;
   a3) RESUME="$R/sc20676-resume"; OUT="$R/evidence/sc20676-packed" ;;
@@ -133,8 +137,8 @@ else
   python3.12 "$KV_DIR/models.py" --check-only --hub "$KV_HF_HUB" --pins "$KV_DIR/models.tsv" \
     || problems="$problems; pinned snapshots are missing or wrong"
 fi
-if [ "$phase" = a3 ] && [ ! -d "$R/evidence/sc20671-dense" ]; then
-  problems="$problems; A3 needs the completed A1 evidence $R/evidence/sc20671-dense"
+if [ "$phase" = a3 ] && [ ! -d "$DENSE_BASELINE" ]; then
+  problems="$problems; A3 needs the completed A1 evidence $DENSE_BASELINE"
 fi
 if [ -n "$problems" ]; then
   echo "::error title=precheck NO-GO ($phase)::${problems#; }"
@@ -226,8 +230,17 @@ case "$phase" in
       --resume-dir "$RESUME" --out "$OUT" || rc=$?
     ;;
   a3)
+    if [ "$BASELINE_SHA" != "$INFERENCE_SHA" ]; then
+      # The shallow clone has only $INFERENCE_SHA; sc20676 walks the history back to the baseline
+      # (ancestry + closure diff), so deepen until it is reachable. sc20676 refuses if it is not.
+      for depth in 16 256 4096; do
+        git -C "$INF" merge-base --is-ancestor "$BASELINE_SHA" "$INFERENCE_SHA" 2>/dev/null && break
+        git -C "$INF" fetch --quiet --no-tags --depth "$depth" origin "$INFERENCE_SHA" \
+          || echo "::warning title=history fetch failed::depth $depth of $INFERENCE_SHA"
+      done
+    fi
     run_cmd "$F/sc20676_packed_evidence" parent --llama-snapshot "$LQ" --qwen-snapshot "$QQ" \
-      --llama-baseline-campaign "$R/evidence/sc20671-dense" --qwen-baseline-campaign "$R/evidence/sc20671-dense" \
+      --llama-baseline-campaign "$DENSE_BASELINE" --qwen-baseline-campaign "$DENSE_BASELINE" \
       --safety-policy "$F/policies/llm.json" --resume-dir "$RESUME" --out "$OUT" || rc=$?
     ;;
   a2)
