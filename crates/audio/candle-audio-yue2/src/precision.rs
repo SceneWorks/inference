@@ -539,10 +539,11 @@ pub const OWNER_DECISIONS: &[OwnerDecision] = &[
     OwnerDecision {
         id: "metal_bf16_parity",
         status: DecisionStatus::Recorded,
-        summary: "Metal BF16 fidelity passed against a fresh CPU F32 reference on nax-macos-2 \
-                  at M2 (runtime 36559069894, artifact-only recovery 36560050786): 98.3333% \
+        summary: "Historical Metal MoT BF16 / FP32 VAE fidelity passed against a fresh CPU F32 \
+                  reference on nax-macos-2 at M2 (runtime 36559069894, artifact-only recovery 36560050786): 98.3333% \
                   aggregate top-1, mean KL 0.00029809, minimum latent SNR 37.03 dB. \
-                  Previously characterized bounds remain labeled as such; this is not listening.",
+                  Previously characterized bounds remain labeled as such. This is neither strict BF16 \
+                  VAE proof nor listening acceptance.",
     },
 ];
 
