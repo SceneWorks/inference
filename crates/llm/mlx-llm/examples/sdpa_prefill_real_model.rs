@@ -12,6 +12,10 @@
 //! prefill changing the greedy continuation on some >8-token prompts) was confirmed with a temporary
 //! fused-vs-eager toggle in `sdpa` (see sc-7430); generations here look fine because the corruption
 //! stays fluent and the last-position argmax is usually robust.
+//!
+//! **sc-24442:** the kernel was never broken — sc-7430's evidence was a stride-blind `as_slice`
+//! readback of the full kernel's permuted output (see `examples/sdpa_f32_repro.rs`). `sdpa` now
+//! runs this prefill as one fused call; this demo remains a real-model fluency smoke.
 
 use core_llm::Tokenizer;
 use mlx_llm::config::ModelConfig;

@@ -35,7 +35,7 @@ use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
-use crate::primitives::attention::SDPA_MAX_FUSED_QLEN;
+use crate::primitives::attention::SDPA_SCORE_TILE_QLEN;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
@@ -2220,7 +2220,7 @@ fn estimate_qwen35_workspace_extra_bytes(
     // buffers for the rest of its evaluator window, so price those additional tiles here.
     let attention_window = checked_product([
         prompt,
-        prompt.min(SDPA_MAX_FUSED_QLEN as u64),
+        prompt.min(SDPA_SCORE_TILE_QLEN as u64),
         query_heads,
         3,
         MLX_EVAL_BUFFER_WINDOW.checked_sub(1)?,
@@ -2282,7 +2282,7 @@ fn estimate_mlx_request_bytes(
             geometry,
             vision_workspace_bytes,
             mtp_width,
-            SDPA_MAX_FUSED_QLEN as usize,
+            SDPA_SCORE_TILE_QLEN as usize,
         ),
         MlxWorkspaceContract::Qwen35 { config, prism } => {
             let base = core_llm::estimate_chunked_request_bytes(
@@ -2291,7 +2291,7 @@ fn estimate_mlx_request_bytes(
                 geometry,
                 vision_workspace_bytes,
                 mtp_width,
-                SDPA_MAX_FUSED_QLEN as usize,
+                SDPA_SCORE_TILE_QLEN as usize,
             )?;
             base.checked_add(estimate_qwen35_workspace_extra_bytes(
                 prompt_tokens,
