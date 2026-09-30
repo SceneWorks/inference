@@ -11,6 +11,7 @@ from scripts.bump_pins import (
     parse_ls_remote,
     read_group_rev,
     rewrite,
+    vendored_refusal,
 )
 
 
@@ -122,6 +123,27 @@ class DriftGuardTests(unittest.TestCase):
             for dep, package in zip(group.manifest_deps, group.lock_packages):
                 gate_package, _revision = gate.PINNED_WORKSPACE_DEPENDENCIES[dep]
                 self.assertEqual(gate_package, package, dep)
+
+
+class VendoredGroupTests(unittest.TestCase):
+    """A backend with an in-tree vendored crate is never bumped mechanically (sc-24441)."""
+
+    def test_candle_is_refused_and_names_every_vendored_copy(self) -> None:
+        refusal = vendored_refusal(PIN_GROUPS["candle"])
+        self.assertIsNotNone(refusal)
+        for path in PIN_GROUPS["candle"].vendored:
+            self.assertIn(f"{path}/VENDORED.md", refusal)
+        self.assertIsNone(vendored_refusal(PIN_GROUPS["mlx"]))
+
+    def test_the_gate_and_the_tool_agree_on_the_vendored_copies(self) -> None:
+        gate = load_gate_module()
+        tool = {path for group in PIN_GROUPS.values() for path in group.vendored}
+        self.assertEqual(tool, {v["path"] for v in gate.VENDORED_PACKAGES.values()})
+        for name, vendored in gate.VENDORED_PACKAGES.items():
+            path, revision = vendored["path"], vendored["upstream_rev"]
+            _package, pinned = gate.PINNED_WORKSPACE_DEPENDENCIES[name]
+            self.assertEqual(revision, pinned, name)
+            self.assertIn(revision, (ROOT / path / "VENDORED.md").read_text(encoding="utf-8"))
 
 
 class LiveRepositoryTests(unittest.TestCase):
