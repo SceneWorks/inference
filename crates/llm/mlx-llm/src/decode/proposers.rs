@@ -113,7 +113,7 @@ impl<'d, D: SpeculativeTarget + ?Sized> DraftModelProposer<'d, D> {
         let draft = self.draft;
         let cache = self.cache()?;
         let offset = draft.cache_len(cache);
-        let out = draft.forward(cache, ids, offset, LogitsScope::Last, false)?;
+        let out = draft.forward(cache, &input_ids(ids), offset, LogitsScope::Last, false)?;
         self.draft_forwards += 1;
         Ok(out.logits)
     }
