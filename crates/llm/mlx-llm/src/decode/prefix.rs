@@ -138,26 +138,38 @@ impl PrefixCache {
         }
     }
 
-    /// Store `tokens`' full per-layer KV (from the just-finished `cache`) for future reuse, freeing
-    /// any LRU entries the insertion evicts. A no-op if the cache has no exportable state.
+    /// Store `tokens`' full per-layer KV (from the just-finished `cache`, which the caller resets
+    /// next) for future reuse, freeing any LRU entries the insertion evicts or replaces. A no-op if
+    /// the cache has no exportable state.
+    ///
+    /// The entry takes the finished cache's buffers rather than a copy of them
+    /// ([`ContiguousKvCache::share_live`]): a copy held a second full KV next to the finished cache
+    /// and, once that cache was reset, left its block buffers in MLX's freed-buffer cache. The
+    /// shared views are evaluated here, so the entry is materialized now and keeps its buffers for
+    /// as long as it lives — nothing it references is released mid-way through a later request.
+    ///
+    /// An entry this insert retires is released to the system at once. MLX's allocator reuses a
+    /// freed buffer only for a request of (nearly) the same size and returns its cache to the
+    /// system only near the device working-set limit, so a retired full-context KV would otherwise
+    /// stay resident beside the live entry and the next request's cache (sc-20671: a 130k-token
+    /// prefix reuse held ~5× its KV in process footprint).
     fn store(&mut self, tokens: Vec<i32>, cache: &ContiguousKvCache) -> Result<()> {
-        let Some(layers) = cache.export()? else {
+        let Some(layers) = cache.share_live()? else {
             return Ok(());
         };
         let out = self.index.insert(tokens);
+        let mut retired = false;
         for evicted in &out.evicted {
-            self.kv.remove(evicted);
+            retired |= self.kv.remove(evicted).is_some();
         }
         // `contains` guards the degenerate `capacity == 0` case, where the insert immediately evicts
         // its own entry (so we must not leave an orphan in `kv`).
         if self.index.contains(out.id) {
-            // `export` builds lazy copies: until they are evaluated each one still references the
-            // finished cache's whole padded block buffer, so the entry would pin every layer's
-            // full block capacity (not its live length) until whatever request next evaluates it
-            // frees it mid-prefill. Evaluate here so the entry owns only its live positions and the
-            // block buffers are released with the finished cache (sc-20671).
-            mlx_rs::transforms::eval(layers.iter().flat_map(|(k, v)| [k, v]))?;
-            self.kv.insert(out.id, layers);
+            // Re-storing an identical sequence replaces its entry.
+            retired |= self.kv.insert(out.id, layers).is_some();
+        }
+        if retired {
+            mlx_rs::memory::clear_cache();
         }
         Ok(())
     }
@@ -391,25 +403,32 @@ fn stored_seq_len(stored: &[(Array, Array)]) -> usize {
 }
 
 /// Slice each layer's `(keys, values)` to the first `len` sequence positions (axis [`SEQ_AXIS`]).
-/// When `len` already equals the stored length the tensors are cloned as-is (no gather). `len`
-/// beyond a stored tensor's sequence length is a typed error — MLX's `take_axis` gather is **not**
-/// bounds-checked (out-of-range indices silently clamp), so without this guard a misaligned index
-/// entry would seed silently-corrupt KV. [`PrefixCache::seed_for`] clamps before calling, so
-/// hitting this error means the index/KV alignment invariant broke.
+/// The result is a view of the stored buffers, never a copy: the seeded cache's first update grows
+/// out of it into a buffer of its own ([`ContiguousKvCache::seeded`]), so a gathered copy was one
+/// more full prefix KV allocated per hit and then left in MLX's freed-buffer cache (sc-20671).
+/// When `len` already equals the stored length the tensors are cloned as-is. `len` beyond a stored
+/// tensor's sequence length is a typed error, so a misaligned index entry can never seed
+/// silently-corrupt KV. [`PrefixCache::seed_for`] clamps before calling, so hitting this error
+/// means the index/KV alignment invariant broke.
 fn slice_layers(stored: &[(Array, Array)], len: usize) -> Result<Vec<(Array, Array)>> {
+    use mlx_rs::ops::indexing::TryIndexOp;
     let mut out = Vec::with_capacity(stored.len());
-    let idx = Array::from_slice(&(0..len as i32).collect::<Vec<_>>(), &[len as i32]);
+    let len_i32 = i32::try_from(len)
+        .map_err(|_| Error::Msg(format!("prefix cache: {len} positions overflow i32")))?;
     for (k, v) in stored {
         let stored_len = k.shape()[SEQ_AXIS as usize];
-        if stored_len < len as i32 {
+        if stored_len < len_i32 {
             return Err(Error::Msg(format!(
                 "prefix cache: requested {len} positions but the stored KV holds only {stored_len}"
             )));
         }
-        if stored_len == len as i32 {
+        if stored_len == len_i32 {
             out.push((k.clone(), v.clone()));
         } else {
-            out.push((k.take_axis(&idx, SEQ_AXIS)?, v.take_axis(&idx, SEQ_AXIS)?));
+            out.push((
+                k.try_index((.., .., ..len_i32, ..))?,
+                v.try_index((.., .., ..len_i32, ..))?,
+            ));
         }
     }
     Ok(out)
@@ -437,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_layers_gathers_and_clones() {
+    fn slice_layers_views_and_clones() {
         let sliced = slice_layers(&kv(4), 3).unwrap();
         assert_eq!(sliced[0].0.shape()[SEQ_AXIS as usize], 3);
         let cloned = slice_layers(&kv(4), 4).unwrap();
@@ -457,15 +476,27 @@ mod tests {
     /// Tiny synthetic Llama (4 KV heads × head dim 64, 2 layers) for the store-ownership test.
     #[cfg(target_os = "macos")]
     fn tiny_model() -> CausalLm {
+        synthetic_llama(256, 128, 2, 4, 64)
+    }
+
+    /// A random-weight Llama of the given geometry (`heads` query and KV heads, vocabulary 64).
+    #[cfg(target_os = "macos")]
+    fn synthetic_llama(
+        hidden_size: i32,
+        intermediate_size: i32,
+        num_layers: usize,
+        heads: i32,
+        head_dim: i32,
+    ) -> CausalLm {
         use crate::primitives::sampler::{SplitMix64, TokenRng};
         use crate::primitives::Weights;
         let cfg = crate::config::ModelConfig {
-            hidden_size: 256,
-            intermediate_size: 128,
-            num_layers: 2,
-            num_heads: 4,
-            num_kv_heads: 4,
-            head_dim: 64,
+            hidden_size,
+            intermediate_size,
+            num_layers,
+            num_heads: heads,
+            num_kv_heads: heads,
+            head_dim,
             vocab_size: 64,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
@@ -515,11 +546,12 @@ mod tests {
         CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap()
     }
 
-    /// sc-20671: a stored prefix entry is materialized at store time and owns only its live
-    /// positions. A lazy export keeps a reference to the finished cache's whole padded block
-    /// buffer, so a campaign's prefill-window baseline (sampled after seeding the store) counted
-    /// the full block capacity and the hit's first evaluation released it mid-prefill — the
-    /// phase-local floor then exceeded the measured active bytes.
+    /// sc-20671: a stored prefix entry is materialized at store time, over its live positions. A
+    /// lazy entry kept an unevaluated reference to the finished cache's padded block buffer, so a
+    /// campaign's prefill-window baseline (sampled after seeding the store) counted that buffer
+    /// and the hit's first evaluation released it mid-prefill — the phase-local floor then
+    /// exceeded the measured active bytes. The entry now holds the finished cache's buffers
+    /// themselves (evaluated views), which it keeps until it is itself retired.
     #[cfg(target_os = "macos")]
     #[test]
     fn stored_prefix_entries_are_materialized_at_their_live_length() {
@@ -552,9 +584,80 @@ mod tests {
             assert_eq!(values.shape()[SEQ_AXIS as usize], 40);
             assert!(
                 is_available(keys) && is_available(values),
-                "a stored prefix entry must not be a lazy view of the finished cache's block buffer"
+                "a stored prefix entry must be materialized, not a lazy graph over the finished cache"
             );
         }
+    }
+
+    /// sc-20671: prefix reuse at long context holds at most one stored entry plus one request
+    /// cache — the "prefix + request" live KV the campaign preflight budgets — and leaves no retired
+    /// full-context KV resident. The fit-boundary row (130k tokens, ~14 GiB of KV per copy) was
+    /// killed at 68 GiB because the seed-and-hit sequence held ~3 KV copies at once (stored entry,
+    /// gathered seed, grown cache, export copy) and left ~4 more in MLX's freed-buffer cache, whose
+    /// mismatched sizes are never reused and which is only trimmed near the device working-set
+    /// limit.
+    ///
+    /// The model is KV-dominant (24 layers, 8 × 64 KV heads, 64-wide residual), so one layer's
+    /// prefill activations stay a small fraction of the KV, and the 5000-token prompt crosses the
+    /// 2048-row prefill blocks and the per-layer checkpoint, as the production path does. Everything
+    /// is measured in units of one full-prompt KV: `peak` is MLX's active high-water during one
+    /// call, `footprint` the active plus freed-buffer bytes after it (what `phys_footprint` sees).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prefix_reuse_holds_one_entry_and_one_request_cache() {
+        use mlx_rs::memory;
+        let (layers, heads, head_dim) = (24, 8, 64);
+        let model = synthetic_llama(64, 64, layers, heads, head_dim);
+        let tokens = 5000;
+        // K and V, every layer, BF16.
+        let kv = (tokens * layers * 2 * (heads * head_dim) as usize * 2) as f64;
+        let prompt = (0..tokens)
+            .map(|i| (i % 63 + 1) as i32)
+            .collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let mut store = PrefixCache::new(2);
+        let cancel = CancelFlag::new();
+        // Weights are materialized by the first forward; take the baseline after one tiny call on
+        // a separate store so only the long prompt's buffers count.
+        generate_cached(
+            &model,
+            &prompt[..4],
+            &config,
+            &cancel,
+            &mut |_| {},
+            &mut PrefixCache::new(1),
+        )
+        .unwrap();
+        memory::clear_cache();
+        let active_base = memory::get_active_memory() as f64;
+        for call in ["cold seed", "hit", "second hit", "third hit"] {
+            memory::reset_peak_memory();
+            generate_cached(&model, &prompt, &config, &cancel, &mut |_| {}, &mut store).unwrap();
+            let peak = (memory::get_peak_memory() as f64 - active_base) / kv;
+            let footprint = (memory::get_active_memory() as f64
+                + memory::get_cache_memory() as f64
+                - active_base)
+                / kv;
+            // A hit holds the stored entry and the request cache grown out of it (2 KV); the cold
+            // seed holds one cache plus one layer's prefill activations.
+            assert!(
+                peak <= 2.25,
+                "{call}: active peak {peak:.2} KV; at most the entry plus the request cache fit"
+            );
+            // Afterwards only the stored entry (one KV plus under a block of padding) and the
+            // prefill's reusable activation buffers remain.
+            assert!(
+                footprint <= 1.5,
+                "{call}: {footprint:.2} KV stays resident after the call; only the stored entry \
+                 may (a copy or a retired entry is a full KV more)"
+            );
+        }
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.stats().hits, 3);
     }
 
     /// Defence in depth (sc-12455): if an index entry ever over-states its KV again (the pre-fix

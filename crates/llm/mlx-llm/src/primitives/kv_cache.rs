@@ -285,6 +285,10 @@ struct LayerSlot {
     values: Array,
     /// Live positions (`<= capacity`).
     offset: i32,
+    /// Whether the buffers belong to someone else — a [`ContiguousKvCache::seeded`] slot holds the
+    /// prefix store's entry by reference. Growing such a slot retires nothing this cache owns: the
+    /// store keeps the old buffers alive, so no transient release is recorded for them.
+    borrowed: bool,
 }
 
 impl LayerSlot {
@@ -462,6 +466,7 @@ impl ContiguousKvCache {
                         keys,
                         values,
                         offset,
+                        borrowed: true,
                     };
                     debug_assert_eq!(
                         slot.offset,
@@ -475,6 +480,31 @@ impl ContiguousKvCache {
             block: KV_BLOCK_TOKENS,
             events: Vec::new(),
         }
+    }
+
+    /// Hand every layer's live `(keys, values)` to a caller that outlives this cache — the prefix
+    /// store taking a finished request's KV — without copying: the result is a `[.., ..offset]` view
+    /// of each block buffer, evaluated (so it is a materialized view, not a lazy graph), or `None`
+    /// if any layer is still empty.
+    ///
+    /// The views share the buffers, so the caller must be the last writer: reset (or drop) this
+    /// cache next and never update it again, or the next in-place write would copy the block
+    /// instead of donating it. Each view pins its block's padding (fewer than one block of
+    /// positions: every growth sizes the buffer to the live length plus whole blocks), a small
+    /// fraction of a long entry. The alternative, [`export`](Self::export), holds a second full
+    /// copy of the KV next to this cache until it is reset — at long context the dominant
+    /// transient of a prefix-store insert (sc-20671).
+    pub fn share_live(&self) -> Result<Option<Vec<(Array, Array)>>> {
+        let Some(layers) = self
+            .layers
+            .iter()
+            .map(|slot| slot.as_ref().map(LayerSlot::live).transpose())
+            .collect::<Result<Option<Vec<_>>>>()?
+        else {
+            return Ok(None);
+        };
+        mlx_rs::transforms::eval(layers.iter().flat_map(|(k, v)| [k, v]))?;
+        Ok(Some(layers))
     }
 
     /// Snapshot every layer's cached `(keys, values)` over the live positions, or `None` if any
@@ -525,6 +555,7 @@ impl ContiguousKvCache {
         let zv = self.zero_block(&live_v, extra)?;
         slot.keys = concatenate_axis(&[&live_k, &zk], SEQ_AXIS)?;
         slot.values = concatenate_axis(&[&live_v, &zv], SEQ_AXIS)?;
+        slot.borrowed = false;
         Ok(())
     }
 
@@ -537,8 +568,11 @@ impl ContiguousKvCache {
 impl KvCache for ContiguousKvCache {
     fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)> {
         let n = keys.shape()[SEQ_AXIS as usize];
+        // A borrowed (seeded) slot's buffers stay owned by the prefix store, so growing out of
+        // them retires nothing: only an owned buffer becomes a transient.
         let prior_bytes = self.layers[layer]
             .as_ref()
+            .filter(|slot| !slot.borrowed)
             .map(|slot| {
                 array_bytes(&slot.keys)?
                     .checked_add(array_bytes(&slot.values)?)
@@ -551,6 +585,7 @@ impl KvCache for ContiguousKvCache {
                 keys: self.zero_block(keys, self.blocks_for(n))?,
                 values: self.zero_block(values, self.blocks_for(n))?,
                 offset: 0,
+                borrowed: false,
             },
         };
         let grew = slot.offset + n > slot.capacity();
@@ -567,6 +602,9 @@ impl KvCache for ContiguousKvCache {
             slot.values
                 .try_index_mut((.., .., slot.offset..end, ..), values)?;
             slot.offset = end;
+            // The write's output is this cache's own buffer (a borrowed one is copied, never
+            // written through).
+            slot.borrowed = false;
         }
         let retained_bytes = array_bytes(&slot.keys)?
             .checked_add(array_bytes(&slot.values)?)
@@ -625,6 +663,7 @@ impl KvCache for ContiguousKvCache {
         for slot in self.layers.iter_mut().flatten() {
             slot.keys = slot.keys.take_axis(&idx, 0)?;
             slot.values = slot.values.take_axis(&idx, 0)?;
+            slot.borrowed = false;
         }
         Ok(())
     }
@@ -987,6 +1026,20 @@ mod tests {
         let expected: Vec<f32> = host(&prefix).into_iter().chain(host(&suffix)).collect();
         assert_eq!(host(&k), expected);
         assert_eq!(cache.offset(), 6);
+        // The seeded buffer is the prefix store's, which keeps it: growing out of it retires
+        // nothing (a recorded transient would raise the campaign's phase-local peak floor by a
+        // whole prefix KV that is never allocated).
+        assert!(!cache
+            .events()
+            .iter()
+            .any(|event| event.operation == "dense_block_growth_retired_buffer"));
+        // Once grown, the buffer is the cache's own: the next growth retires it.
+        let more = arange4(1, 1, 300, 2);
+        cache.update(0, &more, &more).unwrap();
+        assert!(cache
+            .events()
+            .iter()
+            .any(|event| event.operation == "dense_block_growth_retired_buffer"));
     }
 
     #[test]
@@ -1187,6 +1240,37 @@ mod tests {
             cache_growth <= retired + block_pair + slack,
             "freed-buffer cache grew {cache_growth} B; retired pre-growth buffers total {retired} B"
         );
+    }
+
+    #[test]
+    fn share_live_hands_over_the_buffers_without_a_copy() {
+        let _cpu = CpuStream::enter();
+        // The prefix store takes a finished request's KV through `share_live`: the entry must be
+        // the cache's own buffers (a copy is a second full KV at the store's high-water) and
+        // already materialized, over exactly the live positions.
+        let mut cache = ContiguousKvCache::with_block_tokens(1, MEM_BLOCK);
+        let inputs: Vec<(Array, Array)> = (0..5)
+            .map(|i| (mem_tok(i as f32), mem_tok(50.0 + i as f32)))
+            .collect();
+        let mut expected = (Vec::new(), Vec::new());
+        for (k, v) in &inputs {
+            let (ck, cv) = cache.update(0, k, v).unwrap();
+            mlx_rs::transforms::eval([&ck, &cv]).unwrap();
+            expected = (host(&ck), host(&cv));
+        }
+        let active_base = memory::get_active_memory();
+        let shared = cache.share_live().unwrap().unwrap();
+        let (sk, sv) = &shared[0];
+        let growth = memory::get_active_memory().saturating_sub(active_base);
+        let live_pair = 2 * 5 * MEM_BYTES_PER_POS;
+        assert!(
+            growth < live_pair / 2,
+            "share_live allocated {growth} B (a copy of the live K/V is {live_pair} B)"
+        );
+        assert_eq!(sk.shape(), &[1, MEM_HEADS, 5, MEM_HEAD_DIM]);
+        cache.reset().unwrap();
+        assert_eq!((host(sk), host(sv)), expected);
+        assert!(ContiguousKvCache::new(1).share_live().unwrap().is_none());
     }
 
     #[test]

@@ -721,10 +721,16 @@ fn dense_kv_width_refusal(observed: u64) -> String {
 
 /// A deliberately conservative planning floor, not a proven process peak. The two-times
 /// checkpoint load reservation matches this model type's load admission; the pinned projection
-/// metadata supplies role-specific dense KV width. The actual lazy graph may retain more,
-/// especially at long context, so the floor is only a pre-spawn refusal (a row whose floor already
-/// exceeds the child cap cannot fit) and the estimate recorded in the receipt. Admission itself is
-/// runtime-guarded: see [`runtime_guarded_admission`].
+/// metadata supplies role-specific dense KV width. The live KV is the total-live bound's (a stored
+/// prefix alongside one full request, which is all the prefix path holds since sc-20671). The
+/// request's prefill activations — one decoder layer's projections, MLP tensors and residuals
+/// across the whole request, priced exactly as the product's tiled request admission prices them
+/// ([`core_llm::tiled_prefill_activation_bytes`]) — scale with the request like the KV does and
+/// were missing before sc-20671 (~12 GiB for the 3B bf16 reference at the fit boundary). The
+/// actual lazy graph may retain more, especially at long context, so the floor is only a
+/// pre-spawn refusal (a row whose floor already exceeds the child cap cannot fit) and the
+/// estimate recorded in the receipt. Admission itself is runtime-guarded: see
+/// [`runtime_guarded_admission`].
 pub(crate) fn static_role_footprint_budget(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
@@ -761,6 +767,9 @@ pub(crate) fn static_role_footprint_budget(
     let kv_heads = positive("num_key_value_heads")?;
     let head_dim = positive("head_dim")?;
     let query_heads = positive("num_attention_heads")?;
+    let hidden_size = positive("hidden_size")?;
+    let intermediate_size = positive("intermediate_size")?;
+    let vocab_size = positive("vocab_size")?;
     let element_bytes = pinned_dense_kv_element_bytes(spec, snapshot, layers)?;
     let kv = dense_kv_bytes(
         1,
@@ -774,10 +783,27 @@ pub(crate) fn static_role_footprint_budget(
         .into_iter()
         .try_fold(1_u64, |value, factor| value.checked_mul(factor))
         .ok_or("fused prefill tile footprint overflows")?;
+    let activations = core_llm::tiled_prefill_activation_bytes(
+        request_tokens,
+        core_llm::LlmMemoryGeometry {
+            query_heads,
+            kv_heads,
+            head_dim,
+            layers,
+            element_bytes,
+            score_element_bytes: 4,
+            hidden_size,
+            intermediate_size,
+            vocab_size,
+            recurrent_bytes: 0,
+        },
+    )
+    .ok_or("prefill activation footprint overflows")?;
     payload
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(kv))
         .and_then(|bytes| bytes.checked_add(tile))
+        .and_then(|bytes| bytes.checked_add(activations))
         .ok_or("static model-load plus KV/working budget overflows".into())
 }
 
@@ -11181,7 +11207,7 @@ pub(crate) mod tests {
         fs::create_dir_all(root).unwrap();
         fs::write(
             root.join("config.json"),
-            br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":24}"#,
+            br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":24,"hidden_size":3072,"intermediate_size":8192,"vocab_size":128256}"#,
         )
         .unwrap();
         let mut header = serde_json::Map::new();
@@ -11257,6 +11283,35 @@ pub(crate) mod tests {
         let budget =
             static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy).unwrap();
         assert!(budget > 12_000_000_000); // BF16 reference dominates the sequential roles.
+    }
+
+    /// sc-20671: the static floor prices the request's prefill activations beside the load
+    /// reservation, the total-live KV and the attention tile. Without them the fit-boundary row's
+    /// floor (40.2 GiB for the bf16 reference) sat ~12 GiB under what a 130k-token prefill
+    /// alongside a stored prefix actually holds.
+    #[test]
+    fn static_floor_prices_request_prefill_activations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let reference = temporary.path().join("reference");
+        write_stub_dtype_snapshot(&reference, &LLAMA_REFERENCE, "BF16");
+        let payload: u64 = LLAMA_REFERENCE
+            .required_files
+            .iter()
+            .filter(|file| file.path.ends_with(".safetensors"))
+            .map(|file| file.bytes)
+            .sum();
+        // The fit-boundary row's preflight: a ~130.7k-token prefix beside a full request.
+        let (total, request) = (261_483_u64, 130_741_u64);
+        let floor =
+            static_role_footprint_budget(&LLAMA_REFERENCE, &reference, total, request).unwrap();
+        // 28 layers x K/V x 8 heads x 128 x BF16.
+        let kv = total * 28 * 2 * 8 * 128 * 2;
+        let tile = 3 * 8 * request * 24 * 4;
+        // One layer's projections/MLP/residuals per request token (3 x 8192 + 8 x 3072 BF16
+        // elements) plus one logits row.
+        let activations = request * (3 * 8_192 + 8 * 3_072) * 2 + 128_256 * 2;
+        assert_eq!(floor, 2 * payload + kv + tile + activations);
+        assert!(activations > 11 << 30, "{activations}");
     }
 
     /// sc-20671: the pinned dense KV width is the BF16 compute dtype's for every role, whatever

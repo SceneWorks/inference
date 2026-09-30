@@ -186,9 +186,25 @@ pub fn estimate_tiled_request_bytes_with_recurrent_copies(
     } else {
         0
     };
-    // One decoder layer's live projections, MLP tensors, and residuals. The vocabulary projection
-    // is one row because the backend narrows the final hidden state before applying lm_head.
-    let activations = prompt
+    let activations = tiled_prefill_activation_bytes(prompt, geometry)?;
+    attention
+        .checked_add(kv)?
+        .checked_add(mtp)?
+        .checked_add(vision_workspace_bytes)?
+        .checked_add(activations)?
+        .checked_add(geometry.recurrent_bytes.checked_mul(recurrent_copies)?)
+}
+
+/// Decoder activations a tiled prefill of `prompt_tokens` holds at once: one decoder layer's live
+/// projections, MLP tensors, and residuals across the whole prompt, plus one row of vocabulary
+/// logits (the backend narrows the final hidden state before applying lm_head). This is the
+/// activation term of [`estimate_tiled_request_bytes_with_recurrent_copies`], exposed so a caller
+/// pricing a prompt's prefill outside a request admission prices it identically.
+pub fn tiled_prefill_activation_bytes(
+    prompt_tokens: u64,
+    geometry: LlmMemoryGeometry,
+) -> Option<u64> {
+    prompt_tokens
         .checked_mul(
             geometry
                 .intermediate_size
@@ -196,13 +212,7 @@ pub fn estimate_tiled_request_bytes_with_recurrent_copies(
                 .checked_add(geometry.hidden_size.checked_mul(8)?)?,
         )?
         .checked_mul(geometry.element_bytes)?
-        .checked_add(geometry.vocab_size.checked_mul(geometry.element_bytes)?)?;
-    attention
-        .checked_add(kv)?
-        .checked_add(mtp)?
-        .checked_add(vision_workspace_bytes)?
-        .checked_add(activations)?
-        .checked_add(geometry.recurrent_bytes.checked_mul(recurrent_copies)?)
+        .checked_add(geometry.vocab_size.checked_mul(geometry.element_bytes)?)
 }
 
 /// Reject an estimated request before native tensor allocation.
