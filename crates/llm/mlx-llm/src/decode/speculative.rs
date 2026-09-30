@@ -8,7 +8,9 @@
 //!
 //! Each step runs the target once over `[cur, draft₁ … draftₖ]` (all-position logits), then the
 //! backend-neutral acceptance sampler ([`core_llm::speculative`]) accepts the longest agreeing prefix
-//! plus one bonus token. Rejected drafts are rolled back via [`KvCache::truncate`]. The committed
+//! plus one bonus token. Rejected drafts are rolled back via [`KvCache::truncate`]. Prompt lookup
+//! runs on the model-agnostic [engine](crate::decode::engine) (sc-24434); the draft-model loop
+//! below is still its own. The committed
 //! tokens are distributed exactly as the **verify forward's** distribution — the acceptance is exact
 //! (proven in `core_llm::speculative`), so this changes throughput, not the sampled distribution.
 //!
@@ -25,11 +27,11 @@
 
 use mlx_rs::Array;
 
-use core_llm::speculative::{
-    accept_greedy_run, accept_token, ngram_propose, sample_weighted, Acceptance,
-};
+use core_llm::speculative::{accept_greedy_run, accept_token, sample_weighted, Acceptance};
 
 use crate::decode::cancel::CancelFlag;
+use crate::decode::engine::{generate_speculative, EngineOptions, SpeculativePrompt};
+use crate::decode::proposers::NgramProposer;
 use crate::decode::stream::{
     default_seed, FinishReason, GenerationConfig, GenerationOutput, StreamEvent,
 };
@@ -61,18 +63,27 @@ impl Default for SpeculativeConfig {
 /// Measured speculation efficiency for a run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpeculativeStats {
-    /// Target forward passes (the prefill + one per verify step). Fewer than `generated` ⇒ speedup.
+    /// Target forward passes (the prefill, one per verify step, and any recovery replays). Fewer
+    /// than `generated` ⇒ speedup.
     pub forwards: usize,
     /// Draft tokens proposed across all steps.
     pub proposed: usize,
     /// Draft tokens accepted across all steps.
     pub accepted: usize,
+    /// Target verification passes (every decode step after the first token is one).
+    pub verify_steps: usize,
+    /// Verify steps recovered by restoring the step start and replaying the kept prefix.
+    pub replays: usize,
+    /// Partially accepted verify steps recovered by a direct cache rollback (no forward).
+    pub direct_rollbacks: usize,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and
-/// [`SpeculativeStats`]. The output is the **same** as [`generate`](crate::decode::generate) for the
-/// same prompt+config — token-for-token identical under greedy; distribution-preserving under
-/// sampling.
+/// [`SpeculativeStats`] — the [engine](crate::decode::engine) with an
+/// [`NgramProposer`] (epic sc-24432, story sc-24434). The
+/// output is the **same** as [`generate`](crate::decode::generate) for the same prompt+config —
+/// token-for-token identical under greedy (modulo the verify-kernel caveat above);
+/// distribution-preserving under sampling.
 ///
 /// Returns [`Error::Canceled`] if `cancel` is already set before any inference.
 pub fn generate_prompt_lookup(
@@ -83,139 +94,19 @@ pub fn generate_prompt_lookup(
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Result<(GenerationOutput, SpeculativeStats)> {
-    if cancel.is_cancelled() {
-        return Err(Error::Canceled); // typed pre-inference cancel
-    }
-    if prompt_ids.is_empty() {
-        return Err(Error::Msg("generate_prompt_lookup: empty prompt".into()));
-    }
-
-    let mut stats = SpeculativeStats::default();
-    let mut generated: Vec<i32> = Vec::new();
-    let mut finish = FinishReason::MaxTokens;
-
-    if config.max_new_tokens == 0 {
-        on_event(StreamEvent::Done {
-            reason: finish,
-            generated: 0,
-        });
-        return Ok((
-            GenerationOutput {
-                tokens: generated,
-                finish_reason: finish,
-            },
-            stats,
-        ));
-    }
-
-    let mut rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let mut cache = model.new_cache();
-    let greedy = config.sampling.temperature <= 0.0;
-
-    // ---- Prefill: logits for the last prompt position; the first token is sampled as usual. ----
-    let logits_last = model.decode_logits(&input_ids(prompt_ids), &mut cache, 0)?;
-    stats.forwards += 1;
-    let mut history: Vec<i32> = prompt_ids.to_vec();
-
-    let first = sample(&logits_last, &history, &config.sampling, &mut rng, None)?;
-    // That sample evaluated the (lazy) prefill graph. `logits_last` would otherwise live to the
-    // end of the function, so retire it explicitly; the release is taken on the loop's first
-    // `advance`, once step 0 has also retired its own transients.
-    drop(logits_last);
-    let mut release = BufferRelease::new();
-    if config.stop_tokens.contains(&first) {
-        finish = FinishReason::StopToken;
-        on_event(StreamEvent::Done {
-            reason: finish,
-            generated: 0,
-        });
-        return Ok((
-            GenerationOutput {
-                tokens: generated,
-                finish_reason: finish,
-            },
-            stats,
-        ));
-    }
-    on_event(StreamEvent::Token { id: first, step: 0 });
-    generated.push(first);
-    history.push(first);
-    let mut cur = first; // last committed token, not yet in the cache (cache holds the prompt)
-
-    // ---- Speculative steps: propose after `cur`, verify in one pass, accept a prefix + bonus. ----
-    'outer: while generated.len() < config.max_new_tokens {
-        if cancel.is_cancelled() {
-            finish = FinishReason::Cancelled;
-            break;
-        }
-
-        // Propose drafts; cap so the commit (≤ accepted + 1) cannot overrun the budget.
-        let remaining = config.max_new_tokens - generated.len();
-        let k_cap = spec.num_draft.min(remaining.saturating_sub(1));
-        let drafts = if k_cap == 0 {
-            Vec::new()
-        } else {
-            ngram_propose(&history, spec.max_ngram, k_cap)
-        };
-        stats.proposed += drafts.len();
-
-        // One target forward over [cur, drafts…]; logits_all[i] predicts the token after verify[i].
-        let mut verify = Vec::with_capacity(1 + drafts.len());
-        verify.push(cur);
-        verify.extend_from_slice(&drafts);
-        let base_offset = cache.offset();
-        let logits_all = model.decode_logits_all(&input_ids(&verify), &mut cache, base_offset)?;
-        stats.forwards += 1;
-
-        let (committed, accepted) = if greedy {
-            decide_greedy(&logits_all, &drafts, &history, config, &mut rng)?
-        } else {
-            decide_stochastic(
-                &logits_all,
-                &drafts,
-                &point_mass_dists(&drafts),
-                &history,
-                config,
-                &mut rng,
-            )?
-        };
-        stats.accepted += accepted;
-
-        // Roll the cache back to keep only `cur` + the accepted drafts; rejected-draft KV is dropped.
-        cache.truncate(base_offset + 1 + accepted as i32)?;
-        release.advance(committed.len());
-
-        // Commit, honoring stop tokens and the budget; `cur` advances to the last committed token.
-        for &t in &committed {
-            if config.stop_tokens.contains(&t) {
-                finish = FinishReason::StopToken;
-                break 'outer;
-            }
-            on_event(StreamEvent::Token {
-                id: t,
-                step: generated.len(),
-            });
-            generated.push(t);
-            history.push(t);
-            cur = t;
-            if generated.len() >= config.max_new_tokens {
-                finish = FinishReason::MaxTokens;
-                break 'outer;
-            }
-        }
-    }
-
-    on_event(StreamEvent::Done {
-        reason: finish,
-        generated: generated.len(),
-    });
-    Ok((
-        GenerationOutput {
-            tokens: generated,
-            finish_reason: finish,
+    let run = generate_speculative(
+        model,
+        &mut NgramProposer {
+            max_ngram: spec.max_ngram,
         },
-        stats,
-    ))
+        SpeculativePrompt::Tokens(prompt_ids),
+        config,
+        spec.num_draft,
+        cancel,
+        on_event,
+        EngineOptions::default(),
+    )?;
+    Ok((run.output, run.stats))
 }
 
 /// Generate from `prompt_ids` with **draft-model** speculative decoding: the small `draft` model
@@ -402,7 +293,7 @@ pub fn generate_draft_speculative(
 /// Greedy acceptance: the target's argmax at each verify position (penalty-aware, via the sampler),
 /// accept the longest matching draft prefix, bonus = the argmax at the divergence point. Returns
 /// `(committed tokens, accepted draft count)`.
-pub(crate) fn decide_greedy(
+fn decide_greedy(
     logits_all: &Array,
     drafts: &[i32],
     history: &[i32],
@@ -430,7 +321,7 @@ pub(crate) fn decide_greedy(
 /// distribution-preserving. `draft_dists[i]` is the proposal distribution `q` the draft sampled
 /// `drafts[i]` from — a point mass `[(drafts[i], 1.0)]` for prompt-lookup, the draft model's shaped
 /// distribution for draft-model speculation. Returns `(committed tokens, accepted draft count)`.
-pub(crate) fn decide_stochastic(
+fn decide_stochastic(
     logits_all: &Array,
     drafts: &[i32],
     draft_dists: &[Vec<(i32, f32)>],
@@ -469,14 +360,8 @@ pub(crate) fn decide_stochastic(
     Ok((committed, accepted))
 }
 
-/// Point-mass proposal distributions for prompt-lookup drafts (each draft was "sampled" with
-/// probability 1).
-fn point_mass_dists(drafts: &[i32]) -> Vec<Vec<(i32, f32)>> {
-    drafts.iter().map(|&d| vec![(d, 1.0)]).collect()
-}
-
 /// Extract position `i`'s logits row `[batch, vocab]` from an all-positions `[batch, seq, vocab]`.
-pub(crate) fn logits_row(all: &Array, i: i32) -> Result<Array> {
+fn logits_row(all: &Array, i: i32) -> Result<Array> {
     let idx = Array::from_slice(&[i], &[1]);
     let sh = all.shape();
     Ok(all.take_axis(&idx, 1)?.reshape(&[sh[0], sh[2]])?)

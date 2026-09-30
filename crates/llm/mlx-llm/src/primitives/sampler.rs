@@ -19,7 +19,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use mlx_rs::ops::indexing::argmax;
+use mlx_rs::ops::indexing::{argmax, argmax_axis};
 use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
@@ -96,7 +96,7 @@ impl Default for SamplingParams {
 impl SamplingParams {
     /// True when this configuration is pure greedy with no penalty and (caller-checked) no
     /// constraint mask — eligible for the on-device argmax fast path.
-    fn is_plain_greedy(&self) -> bool {
+    pub fn is_plain_greedy(&self) -> bool {
         self.temperature <= 0.0 && self.presence_penalty == 0.0 && self.repetition_penalty == 1.0
     }
 }
@@ -256,6 +256,37 @@ pub fn argmax_device(logits: &Array) -> Result<i32> {
     let flat = logits.reshape(&[-1])?;
     let idx = argmax(&flat, None)?;
     Ok(idx.item::<u32>() as i32)
+}
+
+/// On-device argmax of **every** row of a `[.., n, vocab]` logits block, brought to the host in one
+/// transfer — the speculative verify step's greedy decision (epic sc-24432, story sc-24434), where
+/// the per-row [`argmax_device`] would pay `n` transfers. Ties break to the lowest index, exactly as
+/// [`argmax_device`] does per row, so the chosen ids are identical.
+pub fn argmax_rows_device(logits: &Array) -> Result<Vec<i32>> {
+    let vocab = logits.shape().last().copied().unwrap_or(0);
+    let rows = logits.reshape(&[-1, vocab])?;
+    let idx = argmax_axis(&rows, -1, None)?;
+    Ok(idx.as_slice::<u32>().iter().map(|&t| t as i32).collect())
+}
+
+/// The target distribution a speculative acceptance test ([`core_llm::speculative::accept_token`])
+/// checks a draft against: [`shaped_candidates`], or — when nothing survives the shaping (every
+/// logit masked, a NaN or `+inf` maximum) — the point mass on the penalized row's argmax, which is
+/// the token [`sample`] itself commits for such a row. Never empty, so a degenerate row can never
+/// accept a draft (or commit a fallback id) the row did not choose.
+pub fn acceptance_target(
+    logits: &Array,
+    history: &[i32],
+    params: &SamplingParams,
+    allowed: Option<&[bool]>,
+) -> Result<Vec<(i32, f32)>> {
+    let v = penalized_logits(logits, history, params, allowed)?;
+    let weights = nucleus_weights(&v, params);
+    let total: f32 = weights.iter().map(|x| x.1).sum();
+    if weights.is_empty() || total <= 0.0 || !total.is_finite() {
+        return Ok(vec![(argmax_host(&v), 1.0)]);
+    }
+    Ok(weights.into_iter().map(|(i, w)| (i as i32, w)).collect())
 }
 
 /// Host-side argmax over an f32 slice; first maximum wins (ties → lowest index).

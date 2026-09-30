@@ -102,14 +102,6 @@ pub struct GenerationOutput {
     pub finish_reason: FinishReason,
 }
 
-/// A generation result whose synchronized phase timer remains live until provider-side stream
-/// processing has completed. The provider finishes the timer after detokenization, stop handling,
-/// and the terminal callback so `decode` includes the complete stream-dispatch path.
-pub(crate) struct TimedGenerationOutput {
-    pub(crate) output: GenerationOutput,
-    pub(crate) timer: GenerationTimer,
-}
-
 /// Two-phase timer with an explicit accelerator synchronization boundary between prefill and
 /// decode. Keeping this stateful prevents a caller from accidentally measuring lazy MLX graph
 /// submission as completed prefill work.
@@ -120,7 +112,8 @@ pub(crate) struct GenerationTimer {
 }
 
 impl GenerationTimer {
-    pub(crate) fn start() -> Self {
+    #[cfg(test)]
+    fn start() -> Self {
         Self::start_at(Instant::now())
     }
 
@@ -233,47 +226,6 @@ pub fn generate_with(
     )
 }
 
-/// Synchronized two-phase variant of [`generate_with`]. Tokenization and template rendering happen
-/// before this function; the returned timer deliberately remains live for provider-side stream
-/// processing.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_with_timings(
-    decoder: &dyn Decode,
-    prompt_ids: &[i32],
-    config: &GenerationConfig,
-    cancel: &CancelFlag,
-    on_event: &mut dyn FnMut(StreamEvent),
-    constraint: Option<&mut dyn ConstraintMask>,
-    should_stop: Option<&dyn Fn() -> bool>,
-) -> Result<TimedGenerationOutput> {
-    if cancel.is_cancelled() {
-        return Err(Error::Canceled);
-    }
-    if prompt_ids.is_empty() {
-        return Err(Error::Msg("generate_with_timings: empty prompt".into()));
-    }
-
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let mut cache = decoder.make_cache();
-    let prompt = input_ids(prompt_ids);
-    let mut timer = GenerationTimer::start();
-    let logits = decoder.step(&prompt, cache.as_mut(), 0)?;
-    timer.finish_prefill([&logits])?;
-    let output = decode_loop(
-        decoder,
-        cache.as_mut(),
-        logits,
-        rng,
-        prompt_ids.to_vec(),
-        config,
-        cancel,
-        on_event,
-        constraint,
-        should_stop,
-    )?;
-    Ok(TimedGenerationOutput { output, timer })
-}
-
 /// Like [`generate`], but driving a **caller-provided** KV cache that may already hold a prefix
 /// (e.g. a [`PagedKvCache`](crate::primitives::PagedKvCache) seeded with shared blocks). Prefills
 /// only `prompt_ids[cache.offset()..]` at that offset, then decodes. The cache is borrowed (not
@@ -359,42 +311,6 @@ pub fn generate_from_prefill(
         constraint,
         should_stop,
     )
-}
-
-/// Synchronized variant of [`generate_from_prefill`] for a prefill whose conditioning began at
-/// `prefill_started`. Qwen-VL starts this clock before image/video encoding and fusion.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_from_prefill_with_timings(
-    decoder: &dyn Decode,
-    cache: &mut dyn KvCache,
-    first_logits: Array,
-    history: Vec<i32>,
-    config: &GenerationConfig,
-    cancel: &CancelFlag,
-    on_event: &mut dyn FnMut(StreamEvent),
-    constraint: Option<&mut dyn ConstraintMask>,
-    should_stop: Option<&dyn Fn() -> bool>,
-    prefill_started: Instant,
-) -> Result<TimedGenerationOutput> {
-    if cancel.is_cancelled() {
-        return Err(Error::Canceled);
-    }
-    let mut timer = GenerationTimer::start_at(prefill_started);
-    timer.finish_prefill([&first_logits])?;
-    let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
-    let output = decode_loop(
-        decoder,
-        cache,
-        first_logits,
-        rng,
-        history,
-        config,
-        cancel,
-        on_event,
-        constraint,
-        should_stop,
-    )?;
-    Ok(TimedGenerationOutput { output, timer })
 }
 
 /// The token-by-token decode loop shared by [`generate_with`] and the prefix-cached path
