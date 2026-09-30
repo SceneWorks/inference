@@ -364,8 +364,8 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
     assert_eq!(
         capabilities.mtp,
         Some(core_llm::MtpCapabilities {
-            max_draft_tokens: u32::MAX,
-            recommended_draft_tokens: 3,
+            max_draft_tokens: candle_llm::provider::MTP_MAX_DEPTH,
+            recommended_draft_tokens: candle_llm::provider::MTP_RECOMMENDED_DEPTH,
         })
     );
 

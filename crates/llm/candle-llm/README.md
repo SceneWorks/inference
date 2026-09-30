@@ -207,7 +207,9 @@ oracle, selectable with `LlamaProvider::set_decode_path(DecodePath::Reference)`.
 Speculation is chosen per request through core-llm's one proposer-agnostic option (sc-24433,
 `TextLlmRequest::speculative`: `off | auto | {proposer: mtp|prompt_lookup|draft_model, depth}`; the
 legacy `mtp` field maps onto it). Every decoder this provider loads advertises prompt lookup
-(`PROMPT_LOOKUP_MAX_DEPTH` = 8, recommended 4) and a qwen3_5 checkpoint with a head also MTP; `auto`
+(`PROMPT_LOOKUP_MAX_DEPTH` = 7, recommended 4) and a qwen3_5 checkpoint with a head — dense or
+sparse-MoE predictor layer, fused or per-expert experts — also MTP at the same depth (sc-24438: a
+deeper request runs at 7, the clamp named in `DecodeReport::fallbacks`); `auto`
 resolves to MTP where the head exists, else prompt lookup, and the engine runs the resolved
 proposer (`decode::MtpProposer` / `decode::NgramProposer`) for both decoder families. A proposer
 that cannot run on the request's path (a Qwen3-VL multimodal request decodes on the reference loop)
