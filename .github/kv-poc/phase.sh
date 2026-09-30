@@ -9,6 +9,15 @@
 # Exit 0 = phase complete (or already complete); exit 0 with output stopped=true = the parent
 # honoured a stop request and exited 75 after its in-flight row; anything else = failure.
 #
+# LISTS. a3 runs once per $KV_A3_BITS value (`--kv-bits <b>`, default "2") and a2 once per
+# $KV_A2_METHODS value (`--kv-method <m>`, default "group-affine"), sequentially in list order,
+# each invocation with its own resume + evidence dirs (sc20676-b<b>-resume, evidence/
+# sc20676-packed-b<b>; sc20671-compressed-<m>-resume, evidence/sc20671-compressed-<m>). A finished
+# invocation (its --out exists) is skipped. A3's recorded QUALITY GATE FAILED is evidence (exit 0)
+# and never skips the next value; a stop request ends the list (exit 75 -> stopped=true, a
+# re-dispatch resumes); a hard failure ends the list and fails the job. The soft budget is PER
+# INVOCATION (it restarts when each value starts); config.sh caps each list at 2 values.
+#
 # SAFE STOP. A background watcher polls every 60 s for `refs/heads/kv-poc-stop/<run_id>` on the
 # inference remote, and also enforces this job's soft budget ($KV_SOFT_BUDGET_MIN). Either one
 # touches <resume-dir>/STOP, and the campaign parent exits 75 after the row it is running; it never
@@ -27,20 +36,37 @@ phase="${2:?usage: phase.sh run|collect <phase>}"
 
 RESUME=""
 OUT=""
+LABEL="$phase"
 # A3's SC-20671 dense baseline: this run's A1, or the A1 of an ancestor inference revision
 # (BASELINE_EVIDENCE_SHA) that sc20676 accepts only with an unchanged dense closure.
 BASELINE_SHA="${BASELINE_EVIDENCE_SHA:-$INFERENCE_SHA}"
 DENSE_BASELINE="$KV_ROOT/$BASELINE_SHA-runs/evidence/sc20671-dense"
+# One invocation per list value (a3, a2); every other phase has a single invocation, value "-".
 case "$phase" in
-  a1) RESUME="$R/sc20671-dense-resume"; OUT="$R/evidence/sc20671-dense" ;;
-  a3) RESUME="$R/sc20676-resume"; OUT="$R/evidence/sc20676-packed" ;;
-  a2) RESUME="$R/sc20671-compressed-resume"; OUT="$R/evidence/sc20671-compressed" ;;
-  b) ;;
-  c) RESUME="$R/sc20684-resume"; OUT="$R/evidence/sc20684-krea" ;;
-  d) RESUME="$R/sc20686-mlx-resume"; OUT="$R/evidence/sc20686-mlx" ;;
-  d-control) RESUME="$R/sc20686-mlx-control-resume"; OUT="$R/evidence/sc20686-mlx-control" ;;
+  a3) values="${KV_A3_BITS:-2}" ;;
+  a2) values="${KV_A2_METHODS:-group-affine}" ;;
+  a1|b|c|d|d-control) values="-" ;;
   *) echo "unknown phase $phase" >&2; exit 2 ;;
 esac
+values="${values//,/ }"
+for v in $values; do
+  # The values name directories; config.sh admits only the known bits/methods.
+  case "$v" in ''|*[!a-z0-9-]*) echo "bad $phase list value '$v' (KV_A3_BITS / KV_A2_METHODS)" >&2; exit 2 ;; esac
+done
+[ -n "${values// /}" ] || { echo "empty $phase list (KV_A3_BITS / KV_A2_METHODS)" >&2; exit 2; }
+
+select_value() { # <value>: RESUME, OUT and LABEL of that invocation
+  V="$1"
+  case "$phase" in
+    a1) RESUME="$R/sc20671-dense-resume"; OUT="$R/evidence/sc20671-dense" ;;
+    a3) RESUME="$R/sc20676-b$V-resume"; OUT="$R/evidence/sc20676-packed-b$V"; LABEL="a3 --kv-bits $V" ;;
+    a2) RESUME="$R/sc20671-compressed-$V-resume"; OUT="$R/evidence/sc20671-compressed-$V"; LABEL="a2 --kv-method $V" ;;
+    b) RESUME=""; OUT="" ;;
+    c) RESUME="$R/sc20684-resume"; OUT="$R/evidence/sc20684-krea" ;;
+    d) RESUME="$R/sc20686-mlx-resume"; OUT="$R/evidence/sc20686-mlx" ;;
+    d-control) RESUME="$R/sc20686-mlx-control-resume"; OUT="$R/evidence/sc20686-mlx-control" ;;
+  esac
+}
 W2=0
 case "$phase" in c|d|d-control) W2=1 ;; esac
 LOG_DIR="$R/logs"
@@ -50,20 +76,24 @@ ART="${RUNNER_TEMP:-/tmp}/kv-poc-artifact/$phase"
 
 collect() {
   mkdir -p "$ART"
-  local src sources="$LOG_DIR"
+  local src v sources="$LOG_DIR"
   if [ "$phase" = b ]; then
     for n in llama qwen; do
       sources="$sources $R/evidence/sc20677-kv-$n $R/evidence/sc20677-kv-$n.partial $R/evidence/sc20677-comparison-$n.json"
     done
   else
-    sources="$sources $RESUME $OUT"
+    for v in $values; do select_value "$v"; sources="$sources $RESUME $OUT"; done
   fi
   for src in $sources; do
     [ -e "$src" ] || continue
     python3.12 "$KV_DIR/summarize.py" copy --src "$src" --dest "$ART/$(basename "$src")" --max-bytes 1073741824
   done
-  python3.12 "$KV_DIR/summarize.py" report --phase "$phase" --root "$R" \
-    ${RESUME:+--dir "$RESUME"} ${OUT:+--dir "$OUT"} >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}" || true
+  # One report per invocation (each list value has its own resume + evidence dirs).
+  for v in $values; do
+    select_value "$v"
+    python3.12 "$KV_DIR/summarize.py" report --phase "$LABEL" --root "$R" \
+      ${RESUME:+--dir "$RESUME"} ${OUT:+--dir "$OUT"} >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}" || true
+  done
 }
 
 if [ "$action" = collect ]; then collect; exit 0; fi
@@ -88,9 +118,17 @@ if stop_branch_present; then
 fi
 
 # 1. Already complete? A campaign --out appears only after every row is accepted, and the parent
-#    refuses an existing --out, so rerunning a finished phase is a skip, not an error.
-if [ -n "$OUT" ] && [ -e "$OUT" ]; then
-  finish 0 false "already complete ($OUT exists); skipped"
+#    refuses an existing --out, so rerunning a finished phase is a skip, not an error. A listed
+#    phase is complete when every value's --out exists; finished values are skipped in the loop.
+pending=""
+for v in $values; do
+  select_value "$v"
+  if [ -z "$OUT" ] || [ ! -e "$OUT" ]; then pending="$pending $v"; fi
+done
+if [ -z "$pending" ]; then
+  done_outs=""
+  for v in $values; do select_value "$v"; done_outs="${done_outs:+$done_outs, }$OUT"; done
+  finish 0 false "already complete ($done_outs exists); skipped"
   exit 0
 fi
 if [ "$phase" = b ] && [ -e "$R/evidence/sc20677-comparison-llama.json" ] && [ -e "$R/evidence/sc20677-comparison-qwen.json" ]; then
@@ -154,25 +192,27 @@ else
   export SCENEWORKS_ROOT="$SW"
 fi
 
-# 3. Stop plumbing.
-if [ -n "$RESUME" ] && [ -e "$RESUME/STOP" ]; then
-  echo "removing the stale stop file $RESUME/STOP left by an earlier run (this dispatch resumes)"
-  rm -f "$RESUME/STOP"
-fi
+# 3. Stop plumbing. The watcher reads the running invocation's resume dir and start time from
+#    $CTL (a listed phase moves on to the next value's dirs, and each value gets its own budget).
+rm -f "$CTL/current-resume" "$CTL/current-label"
+date +%s > "$CTL/invocation-started"
 request_stop() {
+  local resume
   [ -f "$CTL/stop-requested" ] || { echo "$1" > "$CTL/stop-requested"; echo "::warning title=stop requested::$1; the parent exits 75 after its in-flight row"; }
-  if [ -n "$RESUME" ] && [ -d "$RESUME" ] && [ ! -e "$RESUME/STOP" ]; then touch "$RESUME/STOP"; echo "touched $RESUME/STOP"; fi
+  resume="$(cat "$CTL/current-resume" 2>/dev/null)"
+  if [ -n "$resume" ] && [ -d "$resume" ] && [ ! -e "$resume/STOP" ]; then touch "$resume/STOP"; echo "touched $resume/STOP"; fi
 }
-started="$(date +%s)"
 budget="${KV_SOFT_BUDGET_MIN:-0}"
 (
   while :; do
     sleep 60
     if [ ! -f "$CTL/stop-requested" ]; then
+      started="$(cat "$CTL/invocation-started" 2>/dev/null)"
+      case "$started" in ''|*[!0-9]*) started="$(date +%s)" ;; esac # mid-rewrite
       if stop_branch_present; then
         request_stop "stop branch $(stop_ref) present"
       elif [ "$budget" -gt 0 ] && [ $(( ($(date +%s) - started) / 60 )) -ge "$budget" ]; then
-        request_stop "soft budget of ${budget} min reached"
+        request_stop "soft budget of ${budget} min reached ($(cat "$CTL/current-label" 2>/dev/null || echo "$phase"))"
       fi
     else
       request_stop "$(cat "$CTL/stop-requested")" # the resume dir may appear after the request
@@ -223,91 +263,126 @@ LLM_ARGS_TEXT="--llama-snapshot $LQ --qwen-snapshot $QQ --llama-fp32-reference-s
 # shellcheck disable=SC2206  # every element is a space-free absolute path or flag
 LLM_ARGS=($LLM_ARGS_TEXT)
 
+# 4. One invocation per list value, in list order (a single one for every other phase).
+results=""
 rc=0
-case "$phase" in
-  a1)
-    run_cmd "$F/sc20671_kv_baseline" parent "${LLM_ARGS[@]}" \
-      --resume-dir "$RESUME" --out "$OUT" || rc=$?
-    ;;
-  a3)
-    if [ "$BASELINE_SHA" != "$INFERENCE_SHA" ]; then
-      # The shallow clone has only $INFERENCE_SHA; sc20676 walks the history back to the baseline
-      # (ancestry + closure diff), so deepen until it is reachable. sc20676 refuses if it is not.
-      for depth in 16 256 4096; do
-        git -C "$INF" merge-base --is-ancestor "$BASELINE_SHA" "$INFERENCE_SHA" 2>/dev/null && break
-        git -C "$INF" fetch --quiet --no-tags --depth "$depth" origin "$INFERENCE_SHA" \
-          || echo "::warning title=history fetch failed::depth $depth of $INFERENCE_SHA"
-      done
-    fi
-    run_cmd "$F/sc20676_packed_evidence" parent --llama-snapshot "$LQ" --qwen-snapshot "$QQ" \
-      --llama-baseline-campaign "$DENSE_BASELINE" --qwen-baseline-campaign "$DENSE_BASELINE" \
-      --safety-policy "$F/policies/llm.json" --resume-dir "$RESUME" --out "$OUT" || rc=$?
-    ;;
-  a2)
-    run_cmd "$F/sc20671_kv_baseline" parent --mode compressed --kv-method group-affine "${LLM_ARGS[@]}" \
-      --resume-dir "$RESUME" --out "$OUT" || rc=$?
-    ;;
-  b)
-    for fam in "llama:$LQ" "qwen:$QQ"; do
-      n="${fam%%:*}"
-      kvdir="$R/evidence/sc20677-kv-$n"
-      cmp="$R/evidence/sc20677-comparison-$n.json"
-      if [ -e "$cmp" ]; then echo "$n: comparison exists; skipped"; continue; fi
-      if stop_requested; then rc=75; break; fi
-      if [ -e "$kvdir.partial" ]; then
-        echo "::error title=partial capture::$kvdir.partial exists from an earlier failed capture; inspect it and remove it by hand, then re-dispatch"
-        rc=1; break
-      fi
-      if [ ! -e "$kvdir" ]; then
-        run_cmd "$F/sc20677_capture_kv" parent --snapshot "${fam#*:}" --prompt-file "$F/inputs/prompt.txt" --tokens 8192 \
-          --layers 0,mid,last --safety-policy "$F/policies/capture.json" --out "$kvdir" || { rc=$?; break; }
-      fi
-      if stop_requested; then rc=75; break; fi
-      kv=""
-      for f in "$kvdir"/*.safetensors; do [ -e "$f" ] && kv="$kv --kv $f"; done
-      [ -n "$kv" ] || { echo "::error title=empty capture::$kvdir holds no .safetensors"; rc=1; break; }
-      # shellcheck disable=SC2086  # deliberate word splitting of the space-free --kv list
-      run_cmd "$F/sc20677_kv_candidates" $kv --out "$cmp" || { rc=$?; break; }
-    done
-    ;;
-  c)
-    # The launcher shlex-splits --product-command: $F2 must stay free of spaces (it is under $HOME).
-    run_cmd python3.12 "$INF/scripts/sc20684_krea_realtime_campaign.py" --snapshot "$W2_KREA" --output "$OUT" \
-      --safety-policy "$F2/policies/$W2_POLICY" --resume-dir "$RESUME" --stop-file "$CTL/stop-requested" \
-      --product-command "$F2/krea-integration --exact --ignored --nocapture $W2_KREA_OBSERVER" || rc=$?
-    ;;
-  d)
-    run_cmd python3.12 "$INF/scripts/sc20686_campaign_adapter.py" "${D_ARGS[@]}" \
-      --resume-dir "$RESUME" --matrix-output "$OUT" || rc=$?
-    ;;
-  d-control)
-    run_cmd python3.12 "$INF/scripts/sc20686_campaign_adapter.py" "${D_ARGS[@]}" --schedule-control \
-      --resume-dir "$RESUME" --matrix-output "$OUT" || rc=$?
-    ;;
-esac
-
-# A3 publishes a measured quality-gate miss as evidence; it is never reported as a pass.
-gate_note=""
-if [ "$rc" = 0 ] && [ "$phase" = a3 ] && [ -f "$OUT/complete-matrix.json" ]; then
-  # Families whose gate did not pass (empty = every gate passed); an unreadable matrix never passes.
-  failed="$(python3.12 -c 'import json, sys; m = json.load(open(sys.argv[1])); print(",".join(r["family"] for r in m["receipts"] if r.get("qualityGatePassed") is not True) or ("" if m.get("qualityGatePassed") is True else "matrix"))' "$OUT/complete-matrix.json")" \
-    || failed="an unreadable complete-matrix.json"
-  if [ -n "$failed" ]; then
-    echo "::warning title=A3 quality gate FAILED::packed quality gate failed for ${failed}; the receipts record each failed metric (qualityGate.failures). Evidence, NOT a pass."
-    gate_note=" -- QUALITY GATE FAILED for ${failed} (evidence recorded, NOT a pass)"
-  else
-    gate_note=" -- quality gate passed"
+for v in $values; do
+  select_value "$v"
+  if [ -n "$OUT" ] && [ -e "$OUT" ]; then
+    echo "$LABEL: already complete ($OUT exists); skipped"
+    results="$results; $LABEL: already complete, skipped"
+    continue
   fi
+  printf '%s\n' "$RESUME" > "$CTL/current-resume"
+  printf '%s\n' "$LABEL" > "$CTL/current-label"
+  rc=0
+  if stop_requested; then rc=75; break; fi
+  if [ -n "$RESUME" ] && [ -e "$RESUME/STOP" ]; then
+    echo "removing the stale stop file $RESUME/STOP left by an earlier run (this dispatch resumes)"
+    rm -f "$RESUME/STOP"
+  fi
+  date +%s > "$CTL/invocation-started"
+  [ "$V" = - ] || LOG="$LOG_DIR/$phase-$V-run${GITHUB_RUN_ID:-local}-attempt${GITHUB_RUN_ATTEMPT:-1}.log"
+  case "$phase" in
+    a1)
+      run_cmd "$F/sc20671_kv_baseline" parent "${LLM_ARGS[@]}" \
+        --resume-dir "$RESUME" --out "$OUT" || rc=$?
+      ;;
+    a3)
+      if [ "$BASELINE_SHA" != "$INFERENCE_SHA" ]; then
+        # The shallow clone has only $INFERENCE_SHA; sc20676 walks the history back to the baseline
+        # (ancestry + closure diff), so deepen until it is reachable. sc20676 refuses if it is not.
+        for depth in 16 256 4096; do
+          git -C "$INF" merge-base --is-ancestor "$BASELINE_SHA" "$INFERENCE_SHA" 2>/dev/null && break
+          git -C "$INF" fetch --quiet --no-tags --depth "$depth" origin "$INFERENCE_SHA" \
+            || echo "::warning title=history fetch failed::depth $depth of $INFERENCE_SHA"
+        done
+      fi
+      run_cmd "$F/sc20676_packed_evidence" parent --llama-snapshot "$LQ" --qwen-snapshot "$QQ" \
+        --llama-baseline-campaign "$DENSE_BASELINE" --qwen-baseline-campaign "$DENSE_BASELINE" \
+        --safety-policy "$F/policies/llm.json" --kv-bits "$V" --resume-dir "$RESUME" --out "$OUT" || rc=$?
+      ;;
+    a2)
+      run_cmd "$F/sc20671_kv_baseline" parent --mode compressed --kv-method "$V" "${LLM_ARGS[@]}" \
+        --resume-dir "$RESUME" --out "$OUT" || rc=$?
+      ;;
+    b)
+      for fam in "llama:$LQ" "qwen:$QQ"; do
+        n="${fam%%:*}"
+        kvdir="$R/evidence/sc20677-kv-$n"
+        cmp="$R/evidence/sc20677-comparison-$n.json"
+        if [ -e "$cmp" ]; then echo "$n: comparison exists; skipped"; continue; fi
+        if stop_requested; then rc=75; break; fi
+        if [ -e "$kvdir.partial" ]; then
+          echo "::error title=partial capture::$kvdir.partial exists from an earlier failed capture; inspect it and remove it by hand, then re-dispatch"
+          rc=1; break
+        fi
+        if [ ! -e "$kvdir" ]; then
+          run_cmd "$F/sc20677_capture_kv" parent --snapshot "${fam#*:}" --prompt-file "$F/inputs/prompt.txt" --tokens 8192 \
+            --layers 0,mid,last --safety-policy "$F/policies/capture.json" --out "$kvdir" || { rc=$?; break; }
+        fi
+        if stop_requested; then rc=75; break; fi
+        kv=""
+        for f in "$kvdir"/*.safetensors; do [ -e "$f" ] && kv="$kv --kv $f"; done
+        [ -n "$kv" ] || { echo "::error title=empty capture::$kvdir holds no .safetensors"; rc=1; break; }
+        # shellcheck disable=SC2086  # deliberate word splitting of the space-free --kv list
+        run_cmd "$F/sc20677_kv_candidates" $kv --out "$cmp" || { rc=$?; break; }
+      done
+      ;;
+    c)
+      # The launcher shlex-splits --product-command: $F2 must stay free of spaces (it is under $HOME).
+      run_cmd python3.12 "$INF/scripts/sc20684_krea_realtime_campaign.py" --snapshot "$W2_KREA" --output "$OUT" \
+        --safety-policy "$F2/policies/$W2_POLICY" --resume-dir "$RESUME" --stop-file "$CTL/stop-requested" \
+        --product-command "$F2/krea-integration --exact --ignored --nocapture $W2_KREA_OBSERVER" || rc=$?
+      ;;
+    d)
+      run_cmd python3.12 "$INF/scripts/sc20686_campaign_adapter.py" "${D_ARGS[@]}" \
+        --resume-dir "$RESUME" --matrix-output "$OUT" || rc=$?
+      ;;
+    d-control)
+      run_cmd python3.12 "$INF/scripts/sc20686_campaign_adapter.py" "${D_ARGS[@]}" --schedule-control \
+        --resume-dir "$RESUME" --matrix-output "$OUT" || rc=$?
+      ;;
+  esac
+
+  # A3 publishes a measured quality-gate miss as evidence; it is never reported as a pass.
+  gate_note=""
+  if [ "$rc" = 0 ] && [ "$phase" = a3 ] && [ -f "$OUT/complete-matrix.json" ]; then
+    # Families whose gate did not pass (empty = every gate passed); an unreadable matrix never passes.
+    failed="$(python3.12 -c 'import json, sys; m = json.load(open(sys.argv[1])); print(",".join(r["family"] for r in m["receipts"] if r.get("qualityGatePassed") is not True) or ("" if m.get("qualityGatePassed") is True else "matrix"))' "$OUT/complete-matrix.json")" \
+      || failed="an unreadable complete-matrix.json"
+    if [ -n "$failed" ]; then
+      echo "::warning title=A3 quality gate FAILED::packed quality gate failed for ${failed}; the receipts record each failed metric (qualityGate.failures). Evidence, NOT a pass."
+      gate_note=" -- QUALITY GATE FAILED for ${failed} (evidence recorded, NOT a pass)"
+    else
+      gate_note=" -- quality gate passed"
+    fi
+  fi
+
+  # A stop request or a hard failure ends the list; a recorded quality-gate miss (exit 0) does not.
+  case "$rc" in
+    0) outcome="completed${gate_note}" ;;
+    75) outcome="stopped" ;;
+    *) outcome="FAILED (exit $rc)" ;;
+  esac
+  echo "$LABEL: $outcome (exit $rc)"
+  results="$results; $LABEL: $outcome"
+  [ "$rc" = 0 ] || break
+done
+results="${results#; }"
+if [ "$values" = - ]; then
+  # A single-invocation phase keeps its one-line message ("completed" / "stopped ..." / "FAILED").
+  if [ "$rc" = 0 ]; then results="${results#"$phase: "}"; else results=""; fi
 fi
 
 case "$rc" in
-  0) finish 0 false "completed${gate_note}" ;;
+  0) finish 0 false "$results" ;;
   75)
     reason="$(cat "$CTL/stop-requested" 2>/dev/null || echo "stop file present")"
     echo "::notice title=phase $phase stopped::$reason; re-dispatch the same parameters to resume"
-    finish 75 true "stopped by operator request ($reason); later phases skip; re-dispatch to resume"
+    finish 75 true "stopped by operator request ($reason); later values and phases skip; re-dispatch to resume${results:+ [$results]}"
     rc=0
     ;;
-  *) finish "$rc" false "FAILED" ;;
+  *) finish "$rc" false "FAILED${results:+ [$results]}" ;;
 esac
 exit "$rc"
