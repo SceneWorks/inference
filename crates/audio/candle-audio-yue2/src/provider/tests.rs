@@ -14,7 +14,9 @@ use candle_audio::gen_core::{
 use serde_json::Value;
 
 use super::*;
-use crate::run::{verify_run, AUDIO_WAV, CONFIG_JSON, REQUEST_JSON, RESULT_JSON};
+use crate::run::{
+    verify_run, AUDIO_WAV, CONFIG_JSON, REQUEST_JSON, RESULT_JSON, SOURCE_GENERATION_JSON,
+};
 
 /// A SheetSage2 transcription of a public-domain recording (the committed sc-23003 oracle, also
 /// used by the cover module's tests): a full score with chord symbols, and its melody-only form.
@@ -46,6 +48,34 @@ fn spec_with(root: &Path, standard: bool, legacy: bool) -> LoadSpec {
 
 fn spec(root: &Path, legacy: bool) -> LoadSpec {
     spec_with(root, true, legacy)
+}
+
+#[test]
+fn stage_policy_is_explicit_and_cpu_bf16_refuses_before_weights() {
+    let base = LoadSpec::new(WeightsSource::Dir("/not-loaded".into()));
+    let cpu = Device::Cpu;
+    assert_eq!(stage_dtypes(&base, &cpu).unwrap(), (DType::F32, DType::F32));
+    let auto = base
+        .clone()
+        .with_yue2_compute_policy(Yue2ComputePolicy::Auto);
+    assert_eq!(stage_dtypes(&auto, &cpu).unwrap(), (DType::F32, DType::F32));
+    let f32 = base
+        .clone()
+        .with_yue2_compute_policy(Yue2ComputePolicy::Fp32);
+    assert_eq!(stage_dtypes(&f32, &cpu).unwrap(), (DType::F32, DType::F32));
+    let bf16 = base.with_yue2_compute_policy(Yue2ComputePolicy::Bf16);
+    let err = stage_dtypes(&bf16, &cpu).unwrap_err();
+    assert!(
+        matches!(err, gen_core::Error::Unsupported(ref reason) if reason.contains("requires an accelerator"))
+    );
+    for quant in [None, Some(Quant::Q8), Some(Quant::Q4)] {
+        let mut selected = f32.clone();
+        selected.quantize = quant;
+        assert_eq!(
+            stage_dtypes(&selected, &cpu).unwrap(),
+            (DType::F32, DType::F32)
+        );
+    }
 }
 
 /// Load `yue2` through the explicit registry with the synthetic engine.
@@ -412,6 +442,89 @@ fn the_load_gate_refuses_what_it_cannot_honour() {
     let file = LoadSpec::new(WeightsSource::File(tmp.path().join("model.safetensors")))
         .with_component(VAE_COMPONENT_ID, WeightsSource::Dir(tmp.path().into()));
     assert!(load_synthetic(&file).is_err());
+}
+
+/// The registered load option is distinct from a weight tier and fails before touching weights
+/// when the required accelerator, BF16 compute or original tier is unavailable.
+#[test]
+fn registered_fp8_mode_refuses_unsupported_loads_before_weights() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = spec(tmp.path(), false);
+    assert_eq!(base.yue2_ar_mode, Yue2ArMode::Native);
+    assert!(load_synthetic(&base).is_ok());
+
+    let fp8 = base.with_yue2_ar_mode(Yue2ArMode::ExperimentalFp8);
+    let err = load_synthetic(&fp8).err().unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("experimental FP8 AR") && message.contains("BF16 compute dtype")),
+        "{err}"
+    );
+
+    let err = load_synthetic(&fp8.clone().with_quant(Quant::Q8))
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("original BF16 AR weights")),
+        "{err}"
+    );
+
+    let mut f32 = fp8.clone();
+    f32.precision = gen_core::Precision::Fp32;
+    let err = load_synthetic(&f32).err().unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("BF16 compute dtype")),
+        "{err}"
+    );
+
+    // A derived snapshot must not be treated as the original when quantize is omitted.
+    std::fs::write(
+        tmp.path().join("YuE2-3B").join(crate::tier::TIER_MANIFEST),
+        b"{}",
+    )
+    .unwrap();
+    let err = load_synthetic(&fp8).err().unwrap();
+    assert!(
+        matches!(&err, gen_core::Error::Unsupported(message)
+        if message.contains("not a derived tier snapshot")),
+        "{err}"
+    );
+}
+
+/// A targeted CUDA acceptance test: the registry, not a direct `Yue2Engine` call, must select
+/// experimental FP8 and bind it into the published run identity/configuration. Requires pinned
+/// real snapshots and a CUDA sm_89+ runner; ordinary CPU tests never touch the GPU.
+#[test]
+#[ignore = "requires pinned YuE2 snapshots in YUE2_HF_HUB and CUDA sm_89+"]
+fn registered_fp8_load_publishes_a_mode_bound_run() {
+    let hub = std::path::PathBuf::from(std::env::var("YUE2_HF_HUB").expect("YUE2_HF_HUB"));
+    let snapshot = |component: ComponentId| {
+        let repo = component.component().repo;
+        hub.join(format!("models--{}", repo.id.replace('/', "--")))
+            .join("snapshots")
+            .join(repo.revision)
+    };
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot(ComponentId::Lm)))
+        .with_component(
+            VAE_COMPONENT_ID,
+            WeightsSource::Dir(snapshot(ComponentId::VaeStandard)),
+        )
+        .with_yue2_ar_mode(Yue2ArMode::ExperimentalFp8);
+    let registry = crate::provider_registry().unwrap();
+    let generator = registry.load(PROVIDER_ID, &spec).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let run = tmp.path().join("fp8-run");
+    let (report, _) = reported(generator.as_ref(), &song_request(Some(&run)));
+    assert!(report.output.is_some());
+    let config = read_json(&run.join(CONFIG_JSON));
+    assert_eq!(config["quantization"], "fp8");
+    assert_eq!(config["weight_tier"], "bf16");
+    assert_eq!(
+        verify_run(&run, None).unwrap()["identity"],
+        report.artifacts.unwrap().identity
+    );
 }
 
 /// The advertised tiers are exactly the accepted ones: every `Quant` the descriptor lists passes
@@ -1187,6 +1300,58 @@ fn a_cached_decode_resumes_under_other_decode_tiling() {
         audio_of(again.output.unwrap()).samples,
         audio_of(first.output.unwrap()).samples
     );
+}
+
+/// A verified latent can be a source for a fresh target-policy decode. Its published waveform
+/// remains tied to the target policy; the original source config is immutable provenance.
+#[test]
+fn a_new_policy_redecodes_verified_latents_with_its_own_identity_and_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = load_synthetic(&spec(tmp.path(), true)).unwrap();
+    let source = tmp.path().join("song");
+    old.generate(&song_request(Some(&source)), &mut |_| {})
+        .unwrap();
+    let source_result = verify_run(&source, None).unwrap();
+    let source_config = read_json(&source.join(CONFIG_JSON));
+    assert!(source_config.get("compute_policy").is_none());
+
+    let auto =
+        load_synthetic(&spec(tmp.path(), true).with_yue2_compute_policy(Yue2ComputePolicy::Auto))
+            .unwrap();
+    let target = tmp.path().join("redecoded");
+    let request = |resume: bool| GenerationRequest {
+        audio: Some(AudioParams {
+            song: Some(SongParams {
+                cached_latents: Some(source.clone()),
+                decoder: Some(SongDecoder::Legacy),
+                ..Default::default()
+            }),
+            artifacts: Some(AudioArtifacts {
+                dir: target.clone(),
+                resume,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    auto.generate(&request(false), &mut |_| {}).unwrap();
+    let output = verify_run(&target, None).unwrap();
+    let config = read_json(&target.join(CONFIG_JSON));
+    let provenance = read_json(&target.join(SOURCE_GENERATION_JSON));
+    assert_eq!(config["compute_policy"], "auto");
+    assert_eq!(config["vae_dtype"], "float32");
+    assert_eq!(provenance["config"], source_config);
+    assert_eq!(provenance["identity"], source_result["identity"]);
+    assert_eq!(output["latent"], source_result["latent"]);
+    assert_ne!(output["identity"], source_result["identity"]);
+
+    let before = std::fs::read(target.join(RESULT_JSON)).unwrap();
+    let err = match old.generate(&request(true), &mut |_| {}) {
+        Ok(_) => panic!("a different target policy must not reuse the waveform"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("identity"), "{err}");
+    assert_eq!(std::fs::read(target.join(RESULT_JSON)).unwrap(), before);
 }
 
 /// What does change a result is still bound: resuming a completed run with another seed, other

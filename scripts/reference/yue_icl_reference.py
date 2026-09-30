@@ -70,6 +70,7 @@ import hashlib
 import json
 import math
 import os
+import pickle
 import sys
 from pathlib import Path
 
@@ -79,6 +80,15 @@ DEFAULT_OUTPUT = REPO_ROOT / "crates/audio/candle-audio-yue/tests/fixtures/yue_i
 YUE_COMMIT = "6d4f0b1f8ce6a55fb2392e959394c46e07ee334d"
 XCODEC_REVISION = "fe781a67815ab47b4a3a5fce1e8d0a692da7e4e5"
 INFER_SHA256 = "9e2fa795b1556d73e9a8c7a1c6c32bcb8b053d70ba7cf67b2c5ca9a4f510d47f"
+
+
+def load_codec_state(path="./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth"):
+    import torch
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)["codec_model"]
+    except pickle.UnpicklingError as exc:
+        raise ValueError(f"{path}: xcodec checkpoint requires a tensor-only PyTorch export") from exc
 
 GENRES = "inspiring female uplifting pop airy vocal electronic bright vocal"
 LYRICS = "[verse]\nStaring at the sunset, colors paint the sky\n\n[chorus]\nDon't let this moment fade\n"
@@ -236,8 +246,7 @@ def main() -> None:
     device = torch.device("cpu")
     cfg = OmegaConf.load("./xcodec_mini_infer/final_ckpt/config.yaml")
     codec_model = SoundStream(**cfg.generator.config)
-    state = torch.load("./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth",
-                       map_location="cpu", weights_only=False)["codec_model"]
+    state = load_codec_state()
     codec_model.load_state_dict(state)
     codec_model.eval()
     mmtokenizer = _MMSentencePieceTokenizer("./mm_tokenizer_v0.2_hf/tokenizer.model")

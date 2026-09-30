@@ -53,9 +53,6 @@ impl DitBlockStream {
             self.cfg.head_dim,
             self.dtype,
         )?;
-        // Read this block's bytes on the CPU stream now, before its quantize/forward is encoded; left
-        // lazy, the window's `eval` makes Metal command buffers wait on the disk read (sc-24245).
-        view.materialize_accessed()?;
         if let Some(quant) = self.quant {
             block.quantize(quant.bits())?;
         }
