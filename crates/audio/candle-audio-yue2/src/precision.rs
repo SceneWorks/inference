@@ -24,7 +24,7 @@
 //! | [`TensorClass::LatentPositions`] | `latent_pos_embed.pe` | BF16 | BF16 | BF16 |
 //! | [`TensorClass::Norm`] | every RMSNorm weight (`*_layernorm`, `q_norm`, `k_norm`, `model.norm`) | BF16 | BF16 | BF16 |
 //! | [`TensorClass::Bias`] | the NAR heads' biases | BF16 | BF16 | BF16 |
-//! | VAE (both decoders) | every tensor | FP32 | FP32 | FP32 |
+//! | VAE (both decoders) | every tensor | selected stage compute dtype | selected stage compute dtype | selected stage compute dtype |
 //!
 //! ## Explicit V2 choices (owner-visible)
 //!
@@ -32,16 +32,22 @@
 //! approved xcodec / Vocos fp16 carve-out (epic sc-19373) does not carry over to YuE2**: YuE2 has
 //! no xcodec or Vocos, and nothing here runs a component in FP16.
 //!
-//! * **VAE at FP32 at every tier.** Upstream's reference decode is FP32 (`vae_dtype: float32` in
-//!   its effective configuration; epic E8), and the pinned Candle has no quantized convolution, so
-//!   no `q8` / `q4` VAE target exists to measure. The decoders therefore run above a `q8` / `q4`
-//!   tier — an exception to the whole-render tier contract that an owner must approve (or replace
-//!   with a quantized-VAE requirement). It is [`OWNER_DECISIONS`]' `vae_fp32_at_every_tier`.
-//! * **Lookup tables and vectors stay BF16.** The token embedding and the latent position table are
-//!   gathered, not multiplied, and the workspace's GGML tier convention (`candle_llm::prepare`)
-//!   stores embeddings and norms exactly as read; Candle has no quantized gather. Norms and biases
-//!   are vectors below one GGML block. Together they are 0.86 GB of the 7.26 GB checkpoint.
-//!   Recorded as `embedding_tables_bf16`.
+//! * **VAE stage dtype follows the selected compute policy.** Explicit BF16 or FP32 runs both
+//!   decoders in that dtype. Explicit Auto allows BF16 MoT + FP32 VAE on an accelerator. Legacy
+//!   loads preserve their historical FP32 VAE. Source VAE tensors remain FP32 and are folded in
+//!   FP32 before the resident parameters are cast. Q8/Q4 specify MoT weight storage, not VAE
+//!   integer arithmetic; Candle has no quantized VAE convolution.
+//! * **Lookup table storage stays BF16 at q8/q4.** Embeddings, position tables, norms and biases
+//!   are stored as released, then loaded into the selected floating compute dtype. GGML has no
+//!   quantized gather, and these tensors are not whole-matrix projection weights.
+//! * **Numerical internals are disclosed separately from stage dtype.** At q8/q4,
+//!   [`crate::weights::Proj::forward`] converts each selected-dtype activation temporarily to F32
+//!   for Candle's GGML `QMatMul`, then casts its result back to the stage dtype before the next
+//!   layer; the GGML blocks stay resident. RMSNorm reductions, NAR sinusoid construction,
+//!   logits/sampling, VAE posterior softplus and source-checkpoint weight-norm/Snake preparation
+//!   also use F32 numerical work. Durable latents and WAV output are serialized as F32. Explicit
+//!   BF16 means BF16 resident floating weights and inter-layer activations at every model stage,
+//!   not that every kernel accumulator or transient operand is BF16.
 //!
 //! ## Shared AR / NAR weights
 //!
@@ -73,6 +79,9 @@
 //! frames × 32 midpoint steps (`multi_chunk_32`'s codes; one chunk at the full context) and 24
 //! frames × 5 steps — then the standard decoder (FP32). One seed per case: these are engineering
 //! fidelity numbers against the original, not a listening benchmark.
+//! The recorded GPU BF16 rows used the historical mixed path (BF16 MoT, FP32 VAE). They are
+//! evidence for `Auto`/`Legacy` stage selection, not for explicit BF16 VAE execution; the latter
+//! requires its separate real-weight decoder/encoder proof.
 //!
 //! | config | backend | top-1 | top-8 overlap | KL mean / max | latents SNR (100 / 24 fr) | audio SNR (100 / 24 fr) | weights resident |
 //! |---|---|---|---|---|---|---|---|
@@ -387,9 +396,6 @@ pub fn plan<'a>(
     Ok(out)
 }
 
-/// The VAE precision at every tier.
-pub const VAE_DTYPE: &str = "float32";
-
 /// The backend a residency is priced for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -488,19 +494,18 @@ pub struct OwnerDecision {
 pub const OWNER_DECISIONS: &[OwnerDecision] = &[
     OwnerDecision {
         id: "vae_fp32_at_every_tier",
-        status: DecisionStatus::Unresolved,
-        summary: "Both VAE decoders run FP32 at bf16, q8 and q4 (upstream's reference decode is \
-                  FP32; the pinned Candle has no quantized convolution, so no q8/q4 VAE target \
-                  exists). This is an exception to the whole-render tier contract; the owner \
-                  approves it or requires a quantized-VAE target.",
+        status: DecisionStatus::Recorded,
+        summary: "The owner rejected FP32 VAE as a blanket exception. Explicit BF16/FP32 runs \
+                  both VAE variants in the selected floating dtype; Auto alone opts into BF16 \
+                  MoT with FP32 VAE on an accelerator. Legacy loads retain their former behavior. \
+                  Q8/Q4 name quantized MoT weights, not integer VAE convolution.",
     },
     OwnerDecision {
         id: "embedding_tables_bf16",
-        status: DecisionStatus::Unresolved,
-        summary: "model.embed_tokens and latent_pos_embed.pe (0.86 GB) stay BF16 at q8/q4, per \
-                  the workspace GGML-tier convention (embeddings are gathered, not multiplied; \
-                  Candle has no quantized gather). Norms and biases (vectors) stay BF16 too. The \
-                  owner approves this or requires quantized tables.",
+        status: DecisionStatus::Recorded,
+        summary: "At q8/q4, model.embed_tokens, latent_pos_embed.pe, norms and biases retain \
+                  BF16 checkpoint storage; the loader converts them to the selected floating \
+                  compute dtype. Quantized projection storage is distinct from stage arithmetic.",
     },
     OwnerDecision {
         id: "v1_fp16_exception_not_carried",
@@ -715,6 +720,6 @@ mod tests {
         assert_eq!(ids.len(), OWNER_DECISIONS.len());
         assert!(OWNER_DECISIONS
             .iter()
-            .any(|d| d.id == "vae_fp32_at_every_tier" && d.status == DecisionStatus::Unresolved));
+            .any(|d| d.id == "vae_fp32_at_every_tier" && d.status == DecisionStatus::Recorded));
     }
 }
