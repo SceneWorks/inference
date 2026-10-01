@@ -1,0 +1,103 @@
+{
+  "baseline": {
+    "completedUtc": "2026-10-01T10:41:06.0723492Z",
+    "counters": {
+      "adapterDedicated": 23834624,
+      "engine": {
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_0_engtype_3d": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_10_engtype_videoencode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_11_engtype_videoencode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_12_engtype_ofa_0": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_13_engtype_jpeg_decode_0": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_14_engtype_jpeg_decode_1": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_15_engtype_jpeg_decode_2": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_16_engtype_jpeg_decode_3": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_17_engtype_vr": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_18_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_19_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_1_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_20_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_21_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_2_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_3_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_4_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_5_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_6_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_7_engtype_security": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_8_engtype_videoencode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_9_engtype_videoencode": 0
+      },
+      "processCommitted": 29732864,
+      "processDedicated": 19341312,
+      "processShared": 10391552
+    },
+    "gpu": {
+      "freeMiB": null,
+      "pci": ":21:00.0",
+      "totalMiB": 97887,
+      "usedMiB": 19,
+      "uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+    },
+    "identity": [
+      38212,
+      "desktop.exe",
+      "C:\\Redacted\\desktop.exe",
+      "2026-09-25T07:02:03Z"
+    ],
+    "luid": "luid_0x00000000_0x00020d46",
+    "pci": ":21:00.0",
+    "uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+  },
+  "fresh": {
+    "completedUtc": "2026-10-01T10:41:06.0723492Z",
+    "counters": {
+      "adapterCommitted": 34226176,
+      "adapterDedicated": 23834624,
+      "adapterShared": 10391552,
+      "engine": {
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_0_engtype_3d": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_10_engtype_videoencode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_11_engtype_videoencode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_12_engtype_ofa_0": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_13_engtype_jpeg_decode_0": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_14_engtype_jpeg_decode_1": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_15_engtype_jpeg_decode_2": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_16_engtype_jpeg_decode_3": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_17_engtype_vr": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_18_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_19_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_1_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_20_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_21_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_2_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_3_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_4_engtype_videodecode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_5_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_6_engtype_copy": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_7_engtype_security": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_8_engtype_videoencode": 0,
+        "pid_38212_luid_0x00000000_0x00020d46_phys_0_eng_9_engtype_videoencode": 0
+      },
+      "processCommitted": 29732864,
+      "processDedicated": 19341312,
+      "processShared": 10391552
+    },
+    "gpu": {
+      "freeMiB": 97868,
+      "pci": ":21:00.0",
+      "totalMiB": 97887,
+      "usedMiB": 19,
+      "uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+    },
+    "identity": [
+      38212,
+      "desktop.exe",
+      "C:\\Redacted\\desktop.exe",
+      "2026-09-25T07:02:03Z"
+    ],
+    "luid": "luid_0x00000000_0x00020d46",
+    "pci": ":21:00.0",
+    "uuid": "GPU-b1a31911-c7b4-2901-3d8b-9a62e228bfc0"
+  },
+  "provenance": "redacted values from CUDA diagnostic run 36850466402; PID/path replaced, selected GPU0 counters retained"
+}

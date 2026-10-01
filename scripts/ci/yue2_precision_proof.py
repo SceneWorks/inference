@@ -79,8 +79,8 @@ def verify_reference(args: argparse.Namespace) -> None:
     print(f"pinned external reference verified: {digest}, {source.stat().st_size} bytes")
 
 
-def compute_capable_rows(output: str) -> list[str]:
-    rows = []
+def typed_compute_rows(output: str) -> list[tuple[str, int, str]]:
+    rows: list[tuple[str, int, str]] = []
     columns: dict[str, int] = {}
     for line in output.splitlines():
         if not line.strip():
@@ -105,9 +105,13 @@ def compute_capable_rows(output: str) -> list[str]:
         kind = fields[type_index]
         require(kind in {"C", "C+G", "G"}, f"unrecognized nvidia-smi pmon process type: {line}")
         if kind in {"C", "C+G"}:
-            rows.append(line)
+            rows.append((line, int(fields[pid_index]), kind))
     require(columns, "nvidia-smi pmon output lacks typed process columns")
     return rows
+
+
+def compute_capable_rows(output: str) -> list[str]:
+    return [line for line, _, _ in typed_compute_rows(output)]
 
 
 def query_compute_apps_rows(output: str) -> list[str]:
@@ -127,7 +131,21 @@ def cuda_census() -> tuple[str, list[str]]:
     command = ["nvidia-smi", "pmon", "-i", "0", "-c", "1", "-s", "um"]
     result = subprocess.run(command, capture_output=True, text=True, timeout=20, encoding="utf-8")
     if result.returncode == 0:
-        return result.stdout, compute_capable_rows(result.stdout)
+        typed = typed_compute_rows(result.stdout)
+        busy = [line for line, _, _ in typed]
+        # The normal typed guard still refuses every compute context. The only
+        # exception is a currently reverified, receipt-bound WDDM C+G context;
+        # pure C, multiple mixed rows, missing evidence, and faults stay busy.
+        if len(typed) == 1 and typed[0][2] == "C+G" and os.environ.get("YUE2_IDLE_CONTEXT_RUN_ID"):
+            try:
+                from yue2_cuda_idle_context import census_mixed_context  # type: ignore[import-not-found]
+                raw, verified = census_mixed_context(typed[0][1], result.stdout)
+                if verified:
+                    return raw, []
+                return raw, busy
+            except Exception as error:
+                return f"{result.stdout}\nreviewed C+G guard refused: {error}", busy
+        return result.stdout, busy
     # Some Windows drivers do not expose pmon. The supported apps query has no
     # C/G type, so conservatively refuse every process it reports.
     fallback = subprocess.run(

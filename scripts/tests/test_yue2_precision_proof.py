@@ -2,11 +2,16 @@
 import importlib.util
 import json
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+import copy
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts/ci"))
+import yue2_cuda_idle_context as IDLE
 SPEC = importlib.util.spec_from_file_location("yue2_precision_proof", ROOT / "scripts/ci/yue2_precision_proof.py")
 CONTROL = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CONTROL)
@@ -53,6 +58,155 @@ class PrecisionControlTests(unittest.TestCase):
         with patch.object(CONTROL.subprocess, "run", side_effect=[failed, query_failed]):
             with self.assertRaisesRegex(RuntimeError, "CUDA census unavailable"):
                 CONTROL.cuda_census()
+
+    def test_reviewed_idle_context_is_exact_and_expiring(self):
+        fixture = json.loads((ROOT / "scripts/tests/fixtures/yue2-idle-context-redacted.json").read_text(encoding="utf-8"))
+        baseline, fresh = fixture["baseline"], fixture["fresh"]
+        self.assertEqual(len(baseline["counters"]["engine"]), 22)
+        self.assertEqual(baseline["counters"]["processDedicated"], 19_341_312)
+        self.assertEqual(baseline["gpu"]["usedMiB"], 19)
+        IDLE.validate_current(fresh, baseline)
+        mutations = (
+            ("identity", lambda row: row["identity"].__setitem__(3, "different start")),
+            ("pci", lambda row: row.__setitem__("pci", ":c1:00.0")),
+            ("engine set", lambda row: row["counters"]["engine"].pop(next(iter(row["counters"]["engine"])))),
+            ("activity", lambda row: row["counters"]["engine"].__setitem__(next(iter(row["counters"]["engine"])), 0.1)),
+            ("process residency", lambda row: row["counters"].__setitem__("processDedicated", 19_341_313)),
+            ("adapter residency", lambda row: row["counters"].__setitem__("adapterDedicated", 23_834_625)),
+            ("NVML residency", lambda row: row["gpu"].__setitem__("usedMiB", 20)),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                changed = copy.deepcopy(fresh)
+                mutate(changed)
+                with self.assertRaises(RuntimeError):
+                    IDLE.validate_current(changed, baseline)
+        completed = datetime.fromisoformat(baseline["completedUtc"].replace("Z", "+00:00"))
+        IDLE.check_window(baseline["completedUtc"], completed + timedelta(hours=11))
+        for bad in (completed - timedelta(seconds=1), completed + timedelta(hours=12, seconds=1)):
+            with self.assertRaisesRegex(RuntimeError, "owner window"):
+                IDLE.check_window(baseline["completedUtc"], bad)
+        IDLE.check_dispatch(IDLE.RUN_ID, IDLE.ENGINE_SHA, "a" * 40, "a" * 40)
+        for run_id, engine, control, github in (
+            ("other", IDLE.ENGINE_SHA, "a" * 40, "a" * 40),
+            (IDLE.RUN_ID, "b" * 40, "a" * 40, "a" * 40),
+            (IDLE.RUN_ID, IDLE.ENGINE_SHA, "a" * 40, "b" * 40),
+        ):
+            with self.assertRaises(RuntimeError):
+                IDLE.check_dispatch(run_id, engine, control, github)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text('{"reviewed":true}', encoding="utf-8")
+            with patch.object(IDLE, "BASELINE_DIGEST", IDLE.artifact_digest(Path(directory))):
+                IDLE.verify_artifact(Path(directory))
+                path.write_text('{"reviewed":false}', encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+                    IDLE.verify_artifact(Path(directory))
+
+    def test_shared_census_requires_live_receipt_only_for_mixed_context(self):
+        def result(output):
+            return type("Result", (), {"returncode": 0, "stdout": output, "stderr": ""})()
+        header = "# gpu pid type fb sm\n"
+        with patch.dict("os.environ", {"YUE2_IDLE_CONTEXT_RUN_ID": IDLE.RUN_ID}):
+            with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 - - - -\n")), \
+                 patch.object(IDLE, "census_mixed_context") as attestation:
+                self.assertEqual(CONTROL.cuda_census()[1], [])
+                attestation.assert_not_called()
+            with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 38212 C+G 0 -\n")), \
+                 patch.object(IDLE, "census_mixed_context", return_value=("reviewed raw receipt", True)):
+                self.assertEqual(CONTROL.cuda_census(), ("reviewed raw receipt", []))
+            reordered = "# pid gpu type fb sm\n38212 0 C+G 0 -\n"
+            with patch.object(CONTROL.subprocess, "run", return_value=result(reordered)), \
+                 patch.object(IDLE, "census_mixed_context", return_value=("reviewed reordered", True)) as attestation:
+                self.assertEqual(CONTROL.cuda_census(), ("reviewed reordered", []))
+                self.assertEqual(attestation.call_args.args[0], 38212)
+            with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 38212 C+G 0 -\n")), \
+                 patch.object(IDLE, "census_mixed_context", side_effect=RuntimeError("expired")):
+                raw, busy = CONTROL.cuda_census()
+                self.assertIn("expired", raw)
+                self.assertEqual(len(busy), 1)
+            with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 38212 C+G 0 -\n")), \
+                 patch.object(IDLE, "census_mixed_context", return_value=("raw active counters", False)):
+                self.assertEqual(CONTROL.cuda_census(), ("raw active counters", ["0 38212 C+G 0 -"]))
+            with patch.object(CONTROL.subprocess, "run", return_value=result(header + "0 38212 C 0 0\n")), \
+                 patch.object(IDLE, "census_mixed_context") as attestation:
+                self.assertEqual(len(CONTROL.cuda_census()[1]), 1)
+                attestation.assert_not_called()
+
+    def test_counter_status_and_missing_fields_refuse_instead_of_becoming_zero(self):
+        luid = "luid_0x00000000_0x00020d46"
+        pid = 38212
+        def row(path, instance, value=0, status="0"):
+            return {"counter": path, "samples": [{"instance": instance, "cookedValue": value, "status": status}]}
+        rows = [
+            row(r"\GPU Engine(*)\Utilization Percentage", f"pid_{pid}_{luid}_phys_0_eng_0_engtype_3d"),
+            row(r"\GPU Process Memory(*)\Dedicated Usage", f"pid_{pid}_{luid}_phys_0", 19_341_312),
+            row(r"\GPU Process Memory(*)\Shared Usage", f"pid_{pid}_{luid}_phys_0", 10_391_552),
+            row(r"\GPU Process Memory(*)\Total Committed", f"pid_{pid}_{luid}_phys_0", 29_732_864),
+            row(r"\GPU Adapter Memory(*)\Dedicated Usage", f"{luid}_phys_0", 23_834_624),
+            row(r"\GPU Adapter Memory(*)\Shared Usage", f"{luid}_phys_0", 10_391_552),
+            row(r"\GPU Adapter Memory(*)\Total Committed", f"{luid}_phys_0", 34_226_176),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "windows-counters-0.json"
+            def check(value):
+                path.write_text(json.dumps({"targetPid": pid, "counters": value}), encoding="utf-8")
+                return IDLE._counters(Path(directory), 0, pid, luid, baseline=False)
+            self.assertEqual(check(rows)["processDedicated"], 19_341_312)
+            for index in range(len(rows)):
+                for invalid in (float("inf"), float("-inf"), float("nan"), True):
+                    changed = copy.deepcopy(rows)
+                    changed[index]["samples"][0]["cookedValue"] = invalid
+                    with self.subTest(counter=index, invalid=invalid), self.assertRaises(RuntimeError):
+                        check(changed)
+            for mutation in (
+                lambda x: x[0]["samples"][0].__setitem__("status", "1"),
+                lambda x: x[0]["samples"][0].__setitem__("cookedValue", 0.1),
+                lambda x: x[1].__setitem__("error", "unsupported"),
+                lambda x: x.pop(),
+            ):
+                changed = copy.deepcopy(rows)
+                mutation(changed)
+                with self.assertRaises(RuntimeError):
+                    check(changed)
+
+    def test_fresh_probe_refuses_new_or_disappearing_mixed_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pmon = root / "pmon-0-0.json"
+            apps = root / "compute-apps-0-0.json"
+            def check(rows, app_rows):
+                pmon.write_text(json.dumps({"exitCode": 0, "output": ["# gpu pid type fb sm mem enc dec jpg ofa", *rows]}), encoding="utf-8")
+                apps.write_text(json.dumps({"exitCode": 0, "output": app_rows}), encoding="utf-8")
+                IDLE._pmon(root, "pmon-0-0", 38212)
+                IDLE._compute_apps(root, "compute-apps-0-0", 38212)
+            check(["0 38212 C+G 0 - - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"])
+            for rows, app_rows in (
+                ([], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 - - - - - -", "0 999 C+G 0 - - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 - - - - - -", "0 999 C 0 2 - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 - - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]", "999, C:\\Other.exe, [N/A]"]),
+            ):
+                with self.subTest(rows=rows, app_rows=app_rows), self.assertRaises(RuntimeError):
+                    check(rows, app_rows)
+
+    def test_pmon_positive_utilization_refuses_even_with_idle_windows_samples(self):
+        header = "# gpu pid type sm mem enc dec jpg ofa fb ccpm command"
+        values = ["0", "38212", "C+G", "-", "-", "-", "-", "-", "-", "19", "0", "desktop.exe"]
+        IDLE._pmon_output([header, " ".join(values)], "initial pmon", 38212)
+        for missing in range(3, 9):
+            columns = header.split()[1:]
+            fields = values.copy()
+            columns.pop(missing)
+            fields.pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                IDLE._pmon_output(["# " + " ".join(columns), " ".join(fields)], "initial pmon", 38212)
+        for index in range(3, 9):
+            for invalid in ("50", "0.1", "NaN", "Infinity", "bad"):
+                changed = values.copy()
+                changed[index] = invalid
+                with self.subTest(metric=index, value=invalid), self.assertRaises(RuntimeError):
+                    IDLE._pmon_output([header, " ".join(changed)], "initial pmon", 38212)
 
     def test_metal_census_refuses_foreign_workers_by_executable_only(self):
         rows = "\n".join((
@@ -149,7 +303,7 @@ class PrecisionControlTests(unittest.TestCase):
         source = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", source)
         self.assertNotIn("schedule:", source)
-        self.assertIn("options: [fixture, cuda, metal]", source)
+        self.assertIn("options: [fixture, cuda, metal, cuda-diagnostic]", source)
         self.assertIn("if: inputs.stage == 'fixture'", source)
         self.assertIn("if: inputs.stage == 'cuda'", source)
         self.assertIn("if: inputs.stage == 'metal'", source)
@@ -171,6 +325,36 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertNotIn("tier_quality_against_the_f32_reference", source)
         self.assertNotIn("registered_loader_generates_a_song_with_every_artifact", source)
         self.assertNotIn("SIGKILL", source)
+        app_source = (ROOT / ".github/workflows/yue2-app-precision-profile.yml").read_text(encoding="utf-8")
+        for workflow in (source, app_source):
+            self.assertIn("idle_cuda_context_run_id:", workflow)
+            self.assertIn("yue2-reviewed-idle-context", workflow)
+            self.assertIn("if: inputs.idle_cuda_context_run_id != ''", workflow)
+            self.assertIn(f"{IDLE.ENGINE_SHA}-control-{IDLE.BASELINE_CONTROL_SHA}-{IDLE.RUN_ID}-1", workflow)
+            self.assertIn("run-id: ${{ inputs.idle_cuda_context_run_id }}", workflow)
+
+    def test_cuda_diagnostic_is_provenance_guarded_and_cannot_launch_proof(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        job = workflow.split("  cuda_diagnostic:\n", 1)[1].split("  reference:\n", 1)[0]
+        probe = (ROOT / "scripts/ci/yue2_cuda_context_diagnostic.ps1").read_text(encoding="utf-8")
+        self.assertIn("if: inputs.stage == 'cuda-diagnostic'", job)
+        self.assertIn("group: inference-real-weights-physical-host", workflow)
+        self.assertIn("$env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA", job)
+        self.assertIn("(git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA", job)
+        self.assertIn("diagnostic_pid must be a positive decimal PID", job)
+        self.assertIn("if: always()", job)
+        self.assertNotIn("cargo ", job)
+        self.assertNotIn("download-artifact", job)
+        self.assertNotIn("yue2_precision_proof.py run", job)
+        for required in ("cuDeviceGetLuid", "cuDeviceGetPCIBusId", "Get-Counter",
+                         "Get-AuthenticodeSignature", "process-before", "process-after",
+                         "compute-apps-$gpu-$i", "pmon-$gpu-$i", "driverInitializationOnly",
+                         "-ListSet $name", "windows-counter-catalog.json",
+                         "GPU Process Memory(*)\\Dedicated Usage", "GPU Process Memory(*)\\Shared Usage"):
+            self.assertIn(required, probe)
+        for forbidden in ("extern int cuCtxCreate", "extern int cuDevicePrimaryCtxRetain",
+                          "extern int cudaMalloc", "Start-Process", "Stop-Process"):
+            self.assertNotIn(forbidden, probe)
 
 
 if __name__ == "__main__":
