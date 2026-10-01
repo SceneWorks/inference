@@ -33,6 +33,22 @@ pub struct Weights {
     /// Keys read through [`Weights::require`] / [`Weights::get`] since the last
     /// [`Weights::remove_accessed`]. See the module docs.
     accessed: RefCell<HashSet<String>>,
+    /// Keys whose handle [`Weights::materialize_groups`] dropped once the model's own arrays had
+    /// consumed them (sc-24446). Still [`contained`](Weights::contains) — layout probes keep
+    /// answering — but no longer readable.
+    released: HashSet<String>,
+}
+
+/// What [`Weights::materialize_groups`] did, for the load's tests and probes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Materialized {
+    /// Output groups evaluated (empty groups are skipped).
+    pub groups: usize,
+    /// Source tensors read, verified and released group by group.
+    pub released: usize,
+    /// Accessed sources no output group consumed: read, verified and kept, exactly as
+    /// [`Weights::verify_accessed_gpu_view`] would have. A complete model enumeration leaves none.
+    pub leftover: usize,
 }
 
 impl Weights {
@@ -41,6 +57,7 @@ impl Weights {
         Self {
             tensors,
             accessed: RefCell::new(HashSet::new()),
+            released: HashSet::new(),
         }
     }
 
@@ -77,6 +94,9 @@ impl Weights {
 
     /// Fetch a tensor by key, erroring if absent. Records the key in the access set.
     pub fn require(&self, key: &str) -> Result<&Array> {
+        if self.released.contains(key) {
+            return Err(released(key));
+        }
         let value = self
             .tensors
             .get(key)
@@ -85,31 +105,35 @@ impl Weights {
         Ok(value)
     }
 
-    /// Fetch a tensor by key if present. Records the key in the access set.
+    /// Fetch a tensor by key if present. Records the key in the access set. A released key reads
+    /// as absent: its bytes now live only in the model that consumed them.
     pub fn get(&self, key: &str) -> Option<&Array> {
         let value = self.tensors.get(key)?;
         self.accessed.borrow_mut().insert(key.to_owned());
         Some(value)
     }
 
-    /// Whether a key is present.
+    /// Whether a key is present (a released key still is: the checkpoint carries it).
     pub fn contains(&self, key: &str) -> bool {
-        self.tensors.contains_key(key)
+        self.tensors.contains_key(key) || self.released.contains(key)
     }
 
-    /// Number of loaded tensors.
+    /// Number of loaded tensors, released ones included.
     pub fn len(&self) -> usize {
-        self.tensors.len()
+        self.tensors.len() + self.released.len()
     }
 
     /// Whether no tensors are loaded.
     pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
+        self.len() == 0
     }
 
-    /// All loaded tensor keys.
+    /// All loaded tensor keys, released ones included.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.tensors.keys().map(|s| s.as_str())
+        self.tensors
+            .keys()
+            .chain(self.released.iter())
+            .map(|s| s.as_str())
     }
 
     /// Evaluate only the tensors read since the last [`Weights::remove_accessed`].
@@ -170,6 +194,84 @@ impl Weights {
         crate::primitives::coherence::verify_gpu_view(batch.iter().copied())
     }
 
+    /// Materialize a freshly built model **group by group**, releasing each group's consumed
+    /// sources as it goes (sc-24446) — the load order MLX load admission prices.
+    ///
+    /// `groups` are the model's own arrays (dense weights, casts, quantized triples, stacked
+    /// expert banks, norm results) in build order, one group per decoder layer plus the arrays
+    /// outside the layer stack ([`crate::models::CausalLm::param_groups`],
+    /// [`crate::models::Qwen35Model::param_groups`]). For each group:
+    ///
+    /// 1. its pending safetensors `Load`s are read on the CPU stream
+    ///    ([`mlx_rs::transforms::eval_pending_loads`]) — so no GPU op below ever waits on the disk
+    ///    (sc-24245);
+    /// 2. every source that read made resident is checked for a coherent GPU view
+    ///    ([`coherence::verify_gpu_view`](crate::primitives::coherence::verify_gpu_view), sc-22414);
+    /// 3. the group is evaluated (quantize, cast, split, stack — all GPU work over resident
+    ///    inputs);
+    /// 4. this map's handles on those sources are dropped and MLX's buffer cache is cleared, so a
+    ///    source consumed into a different array (a quantized projection, a BF16 cast, a stacked
+    ///    bank) is returned to the system before the next group reads its own.
+    ///
+    /// Peak resident memory is therefore the arrays already built plus **one group's** sources and
+    /// conversions — never the whole payload beside the whole derived set, which is what verifying
+    /// every source up front and deriving lazily on the first request held.
+    ///
+    /// Every accessed source is still evaluated and verified before this returns, so the load
+    /// boundary guarantee of [`Weights::verify_accessed_gpu_view`] holds: a source no group consumed
+    /// (an enumeration gap) is read, verified and kept, and counted in
+    /// [`Materialized::leftover`]. Sources that were already resident when this was called (an
+    /// in-memory map) are verified and kept. Released keys stay [`contained`](Weights::contains).
+    pub fn materialize_groups(&mut self, groups: &[Vec<Array>]) -> Result<Materialized> {
+        let mut accessed: Vec<String> = self.accessed.borrow().iter().cloned().collect();
+        accessed.sort_unstable();
+        let (resident, mut pending): (Vec<String>, Vec<String>) = accessed
+            .into_iter()
+            .filter(|key| self.tensors.contains_key(key))
+            .partition(|key| is_available(&self.tensors[key]));
+        crate::primitives::coherence::verify_gpu_view(
+            resident
+                .iter()
+                .map(|key| (key.as_str(), &self.tensors[key])),
+        )?;
+        let mut report = Materialized::default();
+        for group in groups.iter().filter(|g| !g.is_empty()) {
+            mlx_rs::transforms::eval_pending_loads(group.iter())?;
+            let (read, rest): (Vec<String>, Vec<String>) = pending
+                .into_iter()
+                .partition(|key| is_available(&self.tensors[key]));
+            pending = rest;
+            crate::primitives::coherence::verify_gpu_view(
+                read.iter().map(|key| (key.as_str(), &self.tensors[key])),
+            )?;
+            mlx_rs::transforms::eval(group.iter())?;
+            for key in read {
+                self.tensors.remove(&key);
+                self.released.insert(key);
+                report.released += 1;
+            }
+            mlx_rs::memory::clear_cache();
+            report.groups += 1;
+        }
+        report.leftover = pending.len();
+        let mut batch: Vec<(&str, &Array)> = Vec::new();
+        let mut bytes = 0usize;
+        for key in &pending {
+            let array = &self.tensors[key];
+            bytes = bytes.saturating_add(array.nbytes());
+            batch.push((key, array));
+            if bytes >= Self::VERIFY_BATCH_BYTES {
+                Self::verify_batch(&batch)?;
+                batch.clear();
+                bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            Self::verify_batch(&batch)?;
+        }
+        Ok(report)
+    }
+
     /// Drop every tensor read through [`Weights::require`] / [`Weights::get`] since the previous
     /// call, and reset the access set.
     ///
@@ -202,6 +304,38 @@ impl Weights {
     pub fn into_map(self) -> HashMap<String, Array> {
         self.tensors
     }
+}
+
+/// The error a read of a [released](Weights::materialize_groups) key returns.
+fn released(key: &str) -> Error {
+    Error::Msg(format!(
+        "tensor `{key}` was released once the model's load materialized it; read it before \
+         materializing, or from a fresh `Weights`"
+    ))
+}
+
+/// Whether `a` holds its data (evaluated, or built from host memory) — MLX's `is_available`,
+/// which mlx-rs does not expose.
+pub(crate) fn is_available(a: &Array) -> bool {
+    let mut available = false;
+    // SAFETY: `a.as_ptr()` is a live `mlx_array` for the duration of the call, and the out
+    // pointer is a valid `bool`.
+    let status = unsafe { mlx_sys::_mlx_array_is_available(&mut available, a.as_ptr()) };
+    status == 0 && available
+}
+
+/// Evaluate a model's own arrays group by group, clearing MLX's buffer cache after each, once its
+/// constructor has verified every source ([`Weights::verify_accessed_gpu_view`]). The
+/// non-releasing twin of [`Weights::materialize_groups`] for a caller-owned map: every derived
+/// array (quantized projection, cast, split, stacked bank) exists before the constructor returns,
+/// so a forward never builds one — and never reads a source — inside its command stream
+/// (sc-24446, sc-24245).
+pub(crate) fn eval_groups(groups: &[Vec<Array>]) -> Result<()> {
+    for group in groups.iter().filter(|g| !g.is_empty()) {
+        mlx_rs::transforms::eval(group.iter())?;
+        mlx_rs::memory::clear_cache();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -246,6 +380,99 @@ mod tests {
     #[test]
     fn weights_fixture_is_self_removing() {
         assert_fixture_is_self_removing(Fixture::new("mlx-llm-weights-test-", None));
+    }
+
+    /// Four f32 `[256, 1024]` "layers" (1 MiB each, consumed into a 0.5 MiB BF16 cast) and one
+    /// BF16 matrix kept as stored, saved to a file and lazily reopened.
+    fn materialize_fixture(dir: &Fixture) -> Weights {
+        let path = dir.join("model.safetensors");
+        let layer = |i: usize| {
+            let data: Vec<f32> = (0..256 * 1024)
+                .map(|j| ((i * 7 + j) % 97) as f32 * 0.01)
+                .collect();
+            Array::from_slice(&data, &[256, 1024])
+        };
+        let mut tensors: Vec<(String, Array)> =
+            (0..4).map(|i| (format!("l{i}.w"), layer(i))).collect();
+        tensors.push((
+            "keep".into(),
+            layer(9).as_dtype(mlx_rs::Dtype::Bfloat16).unwrap(),
+        ));
+        Array::save_safetensors(tensors.iter().map(|(k, v)| (k.as_str(), v)), None, &path).unwrap();
+        Weights::from_file(&path).unwrap()
+    }
+
+    /// sc-24446: [`Weights::materialize_groups`] reads, verifies, converts and **releases** one
+    /// group at a time, so its peak holds the arrays already built plus one group's sources —
+    /// never every source beside every conversion — and nothing stays lazy.
+    ///
+    /// MUTATION: keep the map's handle (`self.tensors.remove(&key)` skipped) and the active-memory
+    /// and peak assertions go RED; skip the group `eval` and the availability assertion does.
+    #[test]
+    fn materialize_groups_releases_each_groups_consumed_sources() {
+        const MIB: usize = 1024 * 1024;
+        let dir = Fixture::new("mlx-llm-materialize-", None);
+        let mut w = materialize_fixture(&dir);
+        let mut groups: Vec<Vec<Array>> = (0..4)
+            .map(|i| {
+                vec![w
+                    .require(&format!("l{i}.w"))
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Bfloat16)
+                    .unwrap()]
+            })
+            .collect();
+        groups.push(vec![w.require("keep").unwrap().clone()]);
+        mlx_rs::memory::clear_cache();
+        let base = mlx_rs::memory::get_active_memory();
+        mlx_rs::memory::reset_peak_memory();
+        let report = w.materialize_groups(&groups).unwrap();
+        let peak = mlx_rs::memory::get_peak_memory().saturating_sub(base);
+        let after = mlx_rs::memory::get_active_memory().saturating_sub(base);
+        assert_eq!(
+            report,
+            Materialized {
+                groups: 5,
+                released: 5,
+                leftover: 0
+            }
+        );
+        assert!(
+            groups.iter().flatten().all(is_available),
+            "a lazy array left"
+        );
+        // Resident afterwards: four 0.5 MiB casts and the 0.5 MiB kept matrix — no f32 source.
+        assert!(after <= 5 * MIB / 2 + MIB / 4, "resident after: {after}");
+        // Holding every source beside every cast would be 4 + 2.5 MiB; one group at a time
+        // peaks at the casts built so far plus one source and its cast (≤ 3.5 MiB).
+        assert!(
+            peak < 4 * MIB,
+            "peak {peak} held more than one group's source"
+        );
+        assert!(peak >= 5 * MIB / 2, "peak {peak} below the resident set");
+        // A released key is still in the checkpoint, but no longer readable.
+        assert!(w.contains("l0.w") && w.keys().any(|k| k == "l0.w"));
+        assert!(w.require("l0.w").is_err());
+        assert!(w.get("l0.w").is_none());
+    }
+
+    /// A source no group consumed is still read and verified before the load returns (the
+    /// sc-24245 load boundary), kept in the map, and counted as a leftover.
+    #[test]
+    fn a_source_no_group_consumes_is_read_verified_and_kept() {
+        let dir = Fixture::new("mlx-llm-materialize-", None);
+        let mut w = materialize_fixture(&dir);
+        let consumed = w
+            .require("l0.w")
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+        let orphan = w.require("l1.w").unwrap().clone();
+        assert!(!is_available(&orphan));
+        let report = w.materialize_groups(&[vec![consumed]]).unwrap();
+        assert_eq!((report.released, report.leftover), (1, 1));
+        assert!(is_available(w.require("l1.w").unwrap()));
+        assert!(is_available(&orphan));
     }
 
     /// The view-drain primitive the sequential decoder stack is built on (sc-18798).

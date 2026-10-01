@@ -336,6 +336,9 @@ impl Qwen35VisionModel {
             cfg,
         };
         w.verify_accessed_gpu_view()?;
+        // The patch kernel is the tower's one derived array (a channels-last kernel is
+        // transposed into a contiguous copy); it exists before a request needs it (sc-24446).
+        model.patch_embed.weight.eval()?;
         Ok(model)
     }
 

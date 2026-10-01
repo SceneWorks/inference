@@ -12,6 +12,10 @@
 //! The routed experts are held **stacked** (`[experts, out, in]` per projection, dense or
 //! group-wise quantized) and dispatched with `gather_mm` / `gather_qmm`: each (token, slot) pair
 //! multiplies against the expert its index names, so only the routed experts' weights are read.
+//! A checkpoint that stores gate‖up as one fused bank (Qwen3.6's `experts.gate_up_proj`,
+//! `[experts, 2·inter, in]`) keeps it fused: one gathered matmul produces both halves and the
+//! per-token **activations** are split, instead of splitting the bank into two weight copies at
+//! load (sc-24446) — which held a second copy of ~44 GB of Qwen3.6-35B-A3B expert weights.
 //! Prefill-sized batches sort the pairs by expert first (the `sorted_indices` fast path) and
 //! unsort afterwards, exactly as mlx-lm's `SwitchGLU` does.
 
@@ -164,6 +168,66 @@ impl SwitchLinear {
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. })
     }
+
+    /// Output rows per expert (`out` of `[experts, out, in]`).
+    fn out_features(&self) -> i32 {
+        let (Self::Dense { weight } | Self::Quantized { weight, .. }) = self;
+        weight.shape().get(1).copied().unwrap_or(0)
+    }
+
+    /// The arrays the bank holds, for load-time materialization (sc-24446).
+    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+        match self {
+            Self::Dense { weight } => out.push(weight.clone()),
+            Self::Quantized {
+                weight,
+                scales,
+                biases,
+                ..
+            } => out.extend([weight.clone(), scales.clone(), biases.clone()]),
+        }
+    }
+}
+
+/// The routed experts' gate and up projections.
+#[derive(Debug)]
+pub enum GateUp {
+    /// One bank over gate‖up rows (`[experts, 2·inter, in]`, gate rows first) — the layout
+    /// Qwen3.6 ships as `experts.gate_up_proj`. One gathered matmul yields `[.., 2·inter]`, split
+    /// into gate and up per token.
+    Fused(SwitchLinear),
+    /// Separate gate and up banks (per-expert checkpoints, stacked at load).
+    Split {
+        /// The gate bank `[experts, inter, in]`.
+        gate: SwitchLinear,
+        /// The up bank `[experts, inter, in]`.
+        up: SwitchLinear,
+    },
+}
+
+impl GateUp {
+    /// `(gate, up)` activations for `x` routed through `idx`.
+    fn forward(&self, x: &Array, idx: &Array, sorted: bool) -> Result<(Array, Array)> {
+        match self {
+            Self::Fused(bank) => {
+                let gu = bank.forward(x, idx, sorted)?;
+                let mut halves = split_sections(&gu, &[bank.out_features() / 2], -1)?;
+                let up = halves.pop().expect("two halves");
+                let gate = halves.pop().expect("two halves");
+                Ok((gate, up))
+            }
+            Self::Split { gate, up } => {
+                Ok((gate.forward(x, idx, sorted)?, up.forward(x, idx, sorted)?))
+            }
+        }
+    }
+
+    fn banks(&self) -> Vec<(&'static str, &SwitchLinear)> {
+        match self {
+            Self::Fused(bank) => vec![("gate_up", bank)],
+            Self::Split { gate, up } => vec![("gate", gate), ("up", up)],
+        }
+    }
 }
 
 fn mixed_bank() -> Error {
@@ -191,6 +255,13 @@ impl SwiGlu {
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&g, &up)?)
     }
+
+    /// The arrays the three projections hold, for load-time materialization (sc-24446).
+    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+        for p in [&self.gate, &self.up, &self.down] {
+            p.push_arrays(out);
+        }
+    }
 }
 
 /// How the router turns probabilities into expert weights.
@@ -214,8 +285,7 @@ pub struct MoeRouting {
 pub struct SparseMoe {
     /// Router weight `[experts, hidden]`.
     router: Array,
-    gate: SwitchLinear,
-    up: SwitchLinear,
+    gate_up: GateUp,
     down: SwitchLinear,
     num_experts: usize,
     shared: SwiGlu,
@@ -238,13 +308,60 @@ impl SparseMoe {
         shared_gate: Option<Array>,
         routing: MoeRouting,
     ) -> Result<Self> {
+        Self::with_gate_up(
+            router,
+            GateUp::Split { gate, up },
+            down,
+            shared,
+            shared_gate,
+            routing,
+        )
+    }
+
+    /// Assemble the block over a **fused** gate‖up bank `[experts, 2·inter, hidden]` (gate rows
+    /// first — Qwen3.6's `experts.gate_up_proj`), dispatched as one gathered matmul whose output
+    /// is split per token. A bank with an odd row count has no gate/up split and is refused.
+    pub fn fused(
+        router: Array,
+        gate_up: SwitchLinear,
+        down: SwitchLinear,
+        shared: SwiGlu,
+        shared_gate: Option<Array>,
+        routing: MoeRouting,
+    ) -> Result<Self> {
+        if gate_up.out_features() % 2 != 0 || gate_up.out_features() == 0 {
+            return Err(Error::Config(format!(
+                "a fused MoE gate_up bank needs an even, non-zero row count (gate ‖ up), got {}",
+                gate_up.out_features()
+            )));
+        }
+        Self::with_gate_up(
+            router,
+            GateUp::Fused(gate_up),
+            down,
+            shared,
+            shared_gate,
+            routing,
+        )
+    }
+
+    fn with_gate_up(
+        router: Array,
+        gate_up: GateUp,
+        down: SwitchLinear,
+        shared: SwiGlu,
+        shared_gate: Option<Array>,
+        routing: MoeRouting,
+    ) -> Result<Self> {
         let num_experts = router.shape().first().copied().unwrap_or(0) as usize;
         if num_experts == 0 {
             return Err(Error::Config(
                 "an MoE router needs at least one expert".into(),
             ));
         }
-        for (name, bank) in [("gate", &gate), ("up", &up), ("down", &down)] {
+        let mut banks = gate_up.banks();
+        banks.push(("down", &down));
+        for (name, bank) in banks {
             if bank.num_experts() != num_experts {
                 return Err(Error::Config(format!(
                     "an MoE router over {num_experts} experts needs as many {name} experts, got {}",
@@ -254,8 +371,7 @@ impl SparseMoe {
         }
         Ok(Self {
             router,
-            gate,
-            up,
+            gate_up,
             down,
             num_experts,
             shared,
@@ -271,7 +387,30 @@ impl SparseMoe {
 
     /// Whether the routed experts are quantized.
     pub fn is_quantized(&self) -> bool {
-        self.gate.is_quantized()
+        self.down.is_quantized()
+    }
+
+    /// Whether gate and up are dispatched as one fused bank.
+    pub fn is_fused(&self) -> bool {
+        matches!(self.gate_up, GateUp::Fused(_))
+    }
+
+    /// The always-on shared expert's projections.
+    pub(crate) fn for_each_shared_projection(&self, f: &mut dyn FnMut(&Projection)) {
+        for p in [&self.shared.gate, &self.shared.up, &self.shared.down] {
+            f(p);
+        }
+    }
+
+    /// Every array the block holds, for load-time materialization (sc-24446).
+    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+        out.push(self.router.clone());
+        for (_, bank) in self.gate_up.banks() {
+            bank.push_arrays(out);
+        }
+        self.down.push_arrays(out);
+        self.shared.push_arrays(out);
+        out.extend(self.shared_gate.iter().cloned());
     }
 
     /// Route every token on the device: the top-k expert indices `[t, k]` (uint32) and their
@@ -305,9 +444,8 @@ impl SparseMoe {
         let (t, k) = (sh[0], sh[1]);
         let h = xf.shape()[1];
         let swiglu = |x: &Array, idx: &Array, sorted: bool| -> Result<Array> {
-            let g = silu(&self.gate.forward(x, idx, sorted)?)?;
-            let up = self.up.forward(x, idx, sorted)?;
-            self.down.forward(&multiply(&g, &up)?, idx, sorted)
+            let (g, up) = self.gate_up.forward(x, idx, sorted)?;
+            self.down.forward(&multiply(&silu(&g)?, &up)?, idx, sorted)
         };
         if t * k >= SORT_THRESHOLD {
             // Sort the (token, slot) pairs by expert so each expert's rows are contiguous, run
@@ -584,6 +722,94 @@ mod tests {
             let d = max_diff(&got, &want);
             assert!(d < 1e-4, "t={t}: max abs diff {d}");
         }
+    }
+
+    /// sc-24446: a fused gate‖up bank (Qwen3.6's `experts.gate_up_proj`) dispatched as ONE
+    /// gathered matmul whose output is split per token is bit-identical to the gate and up banks
+    /// the loader used to cut out of it — dense f32 and bf16, Q8 and Q4, on the unsorted decode
+    /// shape (t = 1) and the sorted prefill shape (t·k ≥ 64).
+    ///
+    /// MUTATION: swap the halves in `GateUp::forward` (gate ↔ up), and every case goes RED.
+    #[test]
+    fn a_fused_gate_up_bank_matches_the_split_banks_exactly() {
+        let (e, h, inter) = (8, 64, 64);
+        let routing = MoeRouting {
+            experts_per_tok: 2,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+        };
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            for quant in [None, Some(QuantSpec::q8()), Some(QuantSpec::q4())] {
+                let mut rng = SplitMix64::new(0x2444_6100);
+                let cast = |a: Array| a.as_dtype(dtype).unwrap();
+                let router = cast(randn(&[e, h], &mut rng));
+                let gate_up = cast(randn(&[e, 2 * inter, h], &mut rng));
+                let down = cast(randn(&[e, h, inter], &mut rng));
+                let shared: [Array; 3] = [
+                    cast(randn(&[inter, h], &mut rng)),
+                    cast(randn(&[inter, h], &mut rng)),
+                    cast(randn(&[h, inter], &mut rng)),
+                ];
+                let shared_gate = cast(randn(&[1, h], &mut rng));
+                let swiglu = || SwiGlu {
+                    gate: Projection::load(shared[0].clone(), None).unwrap(),
+                    up: Projection::load(shared[1].clone(), None).unwrap(),
+                    down: Projection::load(shared[2].clone(), None).unwrap(),
+                };
+                let fused = SparseMoe::fused(
+                    router.clone(),
+                    SwitchLinear::load(gate_up.clone(), quant).unwrap(),
+                    SwitchLinear::load(down.clone(), quant).unwrap(),
+                    swiglu(),
+                    Some(shared_gate.clone()),
+                    routing,
+                )
+                .unwrap();
+                let halves = split_sections(&gate_up, &[inter], 1).unwrap();
+                let split = SparseMoe::new(
+                    router,
+                    SwitchLinear::load(halves[0].clone(), quant).unwrap(),
+                    SwitchLinear::load(halves[1].clone(), quant).unwrap(),
+                    SwitchLinear::load(down, quant).unwrap(),
+                    swiglu(),
+                    Some(shared_gate),
+                    routing,
+                )
+                .unwrap();
+                assert!(fused.is_fused() && !split.is_fused());
+                for t in [1, 40] {
+                    let mut rng = SplitMix64::new(0x2444_6200 + t as u64);
+                    let x = cast(randn(&[1, t, h], &mut rng));
+                    let (a, b) = (
+                        host(&fused.forward(&x).unwrap()),
+                        host(&split.forward(&x).unwrap()),
+                    );
+                    assert!(a.iter().any(|v| v.abs() > 1e-3), "non-degenerate output");
+                    assert_eq!(a, b, "{dtype:?} {quant:?} t={t}: fused != split");
+                }
+            }
+        }
+    }
+
+    /// A fused bank with no even gate/up split is refused at load.
+    #[test]
+    fn a_fused_bank_with_an_odd_row_count_is_refused() {
+        let mut rng = SplitMix64::new(7);
+        let (e, h) = (4, 64);
+        let shared = || SwiGlu {
+            gate: Projection::load(randn(&[64, h], &mut SplitMix64::new(3)), None).unwrap(),
+            up: Projection::load(randn(&[64, h], &mut SplitMix64::new(4)), None).unwrap(),
+            down: Projection::load(randn(&[h, 64], &mut SplitMix64::new(5)), None).unwrap(),
+        };
+        let odd = SparseMoe::fused(
+            randn(&[e, h], &mut rng),
+            SwitchLinear::load(randn(&[e, 63, h], &mut rng), None).unwrap(),
+            SwitchLinear::load(randn(&[e, h, 31], &mut rng), None).unwrap(),
+            shared(),
+            None,
+            NORM,
+        );
+        assert!(matches!(odd, Err(Error::Config(_))));
     }
 
     /// Mixed and Prism banks are refused at load, never dispatched on a wrong kernel.

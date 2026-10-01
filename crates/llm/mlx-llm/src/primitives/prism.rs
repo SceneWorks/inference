@@ -406,6 +406,17 @@ pub struct PrismLinear {
 }
 
 impl PrismLinear {
+    /// The arrays this matrix holds, for load-time materialization (sc-24446).
+    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+        out.extend([
+            self.weight.clone(),
+            self.scales.clone(),
+            self.biases.clone(),
+            self.signs.clone(),
+            self.scale.clone(),
+        ]);
+    }
+
     /// Validate and retain a packed `[out, in]` matrix without dequantizing it.
     pub fn new(
         label: &str,
@@ -455,6 +466,17 @@ pub struct PrismEmbedding {
 }
 
 impl PrismEmbedding {
+    /// The arrays this matrix holds, for load-time materialization (sc-24446).
+    pub(crate) fn push_arrays(&self, out: &mut Vec<Array>) {
+        out.extend([
+            self.weight.clone(),
+            self.scales.clone(),
+            self.biases.clone(),
+            self.signs.clone(),
+            self.scale.clone(),
+        ]);
+    }
+
     /// Validate and retain a packed `[vocab, hidden]` embedding table.
     pub fn new(
         label: &str,

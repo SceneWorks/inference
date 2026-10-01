@@ -197,7 +197,65 @@ impl CausalLm {
         cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        let model = Self::build(w, prefix, cfg, quant, None)?;
+        // The caller-owned-map load boundary: every source verified resident (sc-22414), then
+        // every derived array evaluated (sc-24446), so no forward reads a weight or builds one
+        // inside its command stream (sc-24245).
+        w.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
+    }
+
+    /// [`CausalLm::from_weights_with`] without evaluating anything: every array is a lazy graph
+    /// over `w`'s sources, for the provider to materialize group by group with
+    /// [`Weights::materialize_groups`], releasing each group's consumed sources (sc-24446).
+    pub fn build_lazy(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
         Self::build(w, prefix, cfg, quant, None)
+    }
+
+    /// Whether a forward's activations are wider than its weights. Every Gemma generation's GeGLU
+    /// runs `mlx_rs::nn::gelu_approximate`, whose constants are `f32` arrays: a BF16 input
+    /// comes back `f32`, and the residual stream, every later projection's input and the final
+    /// hidden state stay `f32` (sc-24446). The SwiGLU decoders keep BF16 throughout.
+    pub fn activations_promote(&self) -> bool {
+        self.cfg.architecture.is_gemma()
+    }
+
+    /// When [`CausalLm::activations_promote`]: the LM head's elements, and the most elements any
+    /// one decoder projection promotes ([`Projection::promoted_elements`]) — what a forward
+    /// materializes as `f32` copies of BF16 weights, priced by request admission. `None`
+    /// otherwise.
+    pub fn promoted_weight_elements(&self) -> Option<(u64, u64)> {
+        if !self.activations_promote() {
+            return None;
+        }
+        let mut largest = 0u64;
+        if let Stack::Resident(layers) = &self.stack {
+            for layer in layers {
+                layer.for_each_projection(&mut |p| largest = largest.max(p.promoted_elements()));
+            }
+        }
+        Some((self.lm_head.size() as u64, largest))
+    }
+
+    /// The model's resident arrays in build order, grouped as load admission prices them
+    /// (sc-24446): the arrays outside the layer stack, then one group per resident layer (a
+    /// streamed stack holds none).
+    pub fn param_groups(&self) -> Vec<Vec<Array>> {
+        let mut groups = vec![vec![
+            self.embed_tokens.clone(),
+            self.norm.clone(),
+            self.lm_head.clone(),
+        ]];
+        if let Stack::Resident(layers) = &self.stack {
+            groups.extend(layers.iter().map(LlamaLayer::arrays));
+        }
+        groups
     }
 
     /// The one constructor. `stream_source` selects the layer stack's shape: `None` builds every
@@ -311,13 +369,13 @@ impl CausalLm {
             ),
             None => (cfg.build_rope(), None),
         };
-        // Every tensor this constructor read is a freshly loaded buffer whose GPU view can lag the
-        // CPU's (sc-22414): force them resident in bounded batches and hold until the GPU reads the
-        // same bytes, *before* any forward builds a graph over them. Under `Stack::Resident` that is
-        // the whole checkpoint; under `Stack::Sequential` it is the resident set (embeddings, final
-        // norm, LM head) — the streamed layers are verified per pass in
+        // Nothing is evaluated here. Every tensor this constructor read is a freshly loaded buffer
+        // whose GPU view can lag the CPU's (sc-22414); the callers force them resident and verified
+        // *before* any forward builds a graph over them — `from_weights_with` /
+        // `from_file_sequential` up front, the provider group by group
+        // (`Weights::materialize_groups`). Under `Stack::Sequential` that is the resident set
+        // (embeddings, final norm, LM head) — the streamed layers are verified per pass in
         // `crate::residency::SequentialStack::run_layer`.
-        w.verify_accessed_gpu_view()?;
         let quantized = quant.is_some() || cfg.quantization.is_some();
         Ok(Self {
             embed_tokens,
@@ -354,7 +412,10 @@ impl CausalLm {
         // This view supplies only the non-layer weights (embeddings, final norm, LM head). It is
         // dropped on return; every layer read happens later, against a view the stream reopens.
         let w = Weights::from_file(path)?;
-        Self::build(&w, prefix, cfg, quant, Some(path.to_path_buf()))
+        let model = Self::build(&w, prefix, cfg, quant, Some(path.to_path_buf()))?;
+        w.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
     }
 
     /// The resident layer stack, or a typed refusal when this model streams its layers.
@@ -1026,6 +1087,76 @@ pub(crate) struct LlamaLayer {
 }
 
 impl LlamaLayer {
+    /// Every projection of the layer (attention and FFN; a sparse-MoE block's shared expert).
+    fn for_each_projection(&self, f: &mut dyn FnMut(&Projection)) {
+        match &self.attn {
+            Attention::Gqa(a) => {
+                f(&a.q);
+                if let Some(kv) = &a.kv {
+                    f(kv.key());
+                    if let Some(v) = kv.value() {
+                        f(v);
+                    }
+                }
+                f(&a.o);
+            }
+            Attention::Mla(a) => {
+                for p in [&a.q_proj, &a.q_a_proj, &a.q_b_proj].into_iter().flatten() {
+                    f(p);
+                }
+                for p in [&a.kv_a_proj, &a.kv_b_proj, &a.o_proj] {
+                    f(p);
+                }
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => {
+                for p in [&m.gate, &m.up, &m.down] {
+                    f(p);
+                }
+            }
+            Ffn::Moe(m) => m.for_each_shared_projection(f),
+        }
+    }
+
+    /// Every array the layer holds, for load-time materialization (sc-24446).
+    pub(crate) fn arrays(&self) -> Vec<Array> {
+        let mut out = vec![self.input_ln.clone(), self.post_ln.clone()];
+        out.extend(self.pre_ff_ln.iter().cloned());
+        out.extend(self.post_ff_ln.iter().cloned());
+        out.extend(self.layer_scalar.iter().cloned());
+        match &self.attn {
+            Attention::Gqa(a) => {
+                a.q.push_arrays(&mut out);
+                if let Some(kv) = &a.kv {
+                    kv.push_arrays(&mut out);
+                }
+                a.o.push_arrays(&mut out);
+                out.extend(a.q_norm.iter().cloned());
+                out.extend(a.k_norm.iter().cloned());
+            }
+            Attention::Mla(a) => {
+                for p in [&a.q_proj, &a.q_a_proj, &a.q_b_proj].into_iter().flatten() {
+                    p.push_arrays(&mut out);
+                }
+                out.extend(a.q_a_layernorm.iter().cloned());
+                for p in [&a.kv_a_proj, &a.kv_b_proj, &a.o_proj] {
+                    p.push_arrays(&mut out);
+                }
+                out.push(a.kv_a_layernorm.clone());
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => {
+                for p in [&m.gate, &m.up, &m.down] {
+                    p.push_arrays(&mut out);
+                }
+            }
+            Ffn::Moe(m) => m.push_arrays(&mut out),
+        }
+        out
+    }
+
     pub(crate) fn forward(
         &self,
         x: &Array,

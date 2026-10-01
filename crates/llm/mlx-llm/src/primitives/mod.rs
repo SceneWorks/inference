@@ -36,7 +36,7 @@ pub use gated_delta::{
     CHUNKED_PREFILL_MIN_TOKENS, KERNEL_MAX_STEPS,
 };
 pub use kv_cache::{ContiguousKvCache, KvCache};
-pub use moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
+pub use moe::{GateUp, MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
 pub use nn::{
     conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
     soft_cap,
@@ -46,7 +46,7 @@ pub use projection::{KvProjection, Projection, QuantSpec};
 pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
-pub use weights::Weights;
+pub use weights::{Materialized, Weights};
 
 /// Whether `stream` is a GPU stream — the only place a custom Metal kernel can run. Every fused
 /// kernel resolves [`Stream::task_local_or_default`](mlx_rs::Stream::task_local_or_default) once,

@@ -129,6 +129,19 @@ impl Decoder {
         }
     }
 
+    /// Bytes a forward's promoted weight copies hold at once ([`promoted_weight_bytes`]), when
+    /// the decoder's activations are wider than its weights ([`CausalLm::activations_promote`]);
+    /// `Some(0)` otherwise.
+    fn promoted_request_bytes(&self) -> Option<u64> {
+        match self {
+            Decoder::Causal(m) => match m.promoted_weight_elements() {
+                Some((head, largest)) => promoted_weight_bytes(head, largest),
+                None => Some(0),
+            },
+            Decoder::Qwen35(_) => Some(0),
+        }
+    }
+
     /// Select the request-memory contract matching the complete decoder implementation.
     fn workspace_contract(&self) -> MlxWorkspaceContract<'_> {
         match self {
@@ -807,7 +820,7 @@ impl LlamaProvider {
         // has its own config/weights path (and `ModelConfig` deliberately rejects it).
         let cfg_value = read_config_value(dir)?;
         let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
-        let weights = Weights::from_dir(dir).map_err(to_core)?;
+        let mut weights = Weights::from_dir(dir).map_err(to_core)?;
         let is_prism =
             cfg_value.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35");
         if is_prism && quant.is_some() {
@@ -827,7 +840,10 @@ impl LlamaProvider {
                 let pack = PrismMlxPack::from_dir(dir, &cfg_value, &weights).map_err(to_core)?;
                 descriptor.family = "prism_hadamard_qwen35".into();
                 let model =
-                    Qwen35Model::from_prism_weights(&weights, qcfg, &pack).map_err(to_core)?;
+                    Qwen35Model::build_prism_lazy(&weights, qcfg, &pack).map_err(to_core)?;
+                weights
+                    .materialize_groups(&model.param_groups())
+                    .map_err(to_core)?;
                 if pack.has_vision_tower {
                     let keys = weights
                         .keys()
@@ -844,7 +860,14 @@ impl LlamaProvider {
             } else {
                 // The text decoder nests under `model.language_model` in the VLM-wrapped checkpoint.
                 let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
-                Qwen35Model::from_weights_with(&weights, prefix, qcfg, quant).map_err(to_core)?
+                let model =
+                    Qwen35Model::build_lazy(&weights, prefix, qcfg, quant).map_err(to_core)?;
+                // Group by group: read, verify, convert, release (sc-24446) — the order
+                // `load_memory::required_bytes` prices.
+                weights
+                    .materialize_groups(&model.param_groups())
+                    .map_err(to_core)?;
+                model
             };
             // A configured head that was not built is named and not advertised: the loaded
             // config (its MTP layers cleared) settles the advertisement.
@@ -856,7 +879,10 @@ impl LlamaProvider {
         } else {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
-            let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
+            let m = CausalLm::build_lazy(&weights, "", cfg, quant).map_err(to_core)?;
+            weights
+                .materialize_groups(&m.param_groups())
+                .map_err(to_core)?;
             (Decoder::Causal(m), descriptor)
         };
 
@@ -2686,7 +2712,8 @@ impl LlamaProvider {
             priced_width,
             self.model.workspace_contract(),
         )?
-        .checked_add(overshoot)?;
+        .checked_add(overshoot)?
+        .checked_add(self.model.promoted_request_bytes()?)?;
         // The draft model's own request (E7, sc-24436): its prefill of the same prompt and a
         // cache that grows over the whole run plus the provisional drafts a step writes past the
         // committed tokens — and, when the draft is the hybrid, the checkpoint ring its proposal
@@ -2707,6 +2734,7 @@ impl LlamaProvider {
                     0,
                     draft.workspace_contract(),
                 )?
+                .checked_add(draft.promoted_request_bytes()?)?
             }
             _ => 0,
         };
@@ -3012,6 +3040,36 @@ enum MlxWorkspaceContract<'a> {
 /// MLX permits ten completed command buffers to remain in flight and can be building the next
 /// buffer before applying backpressure. Price that current buffer plus the in-flight set.
 const MLX_EVAL_BUFFER_WINDOW: u64 = 11;
+/// The largest command buffer MLX 0.32 encodes before committing it, in bytes of its ops'
+/// inputs and outputs (`max_mb_per_buffer`: 40 MB on base / Pro / phone GPUs, 50 MB on Max and
+/// Ultra; `MLX_MAX_MB_PER_BUFFER` is never set by this runtime). A buffer may exceed it by the one
+/// op that crosses it.
+const MLX_MAX_BUFFER_BYTES: u64 = 50 * 1024 * 1024;
+
+/// The most ops MLX 0.32 encodes into one command buffer before committing it
+/// (`max_ops_per_buffer`: 20–50 by GPU family; `MLX_MAX_OPS_PER_BUFFER` is never set here).
+const MLX_MAX_OPS_PER_BUFFER: u64 = 50;
+
+/// What a forward's promoted weight copies can hold at once when the decoder's activations are
+/// `f32` against BF16 weights (Gemma's GeGLU, [`CausalLm::activations_promote`]; sc-24446).
+///
+/// Each dense matmul materializes an `f32` copy of its weight (a quantized matmul, of its scales
+/// and biases), held until the command buffer that consumes it completes. The LM head's copy —
+/// the vocabulary-wide one, 2.4 GB on Gemma 2 and 4.0 GB on the 262K-token Gemma 4 — is priced
+/// whole; the decoder's copies are bounded by MLX's evaluation window: at most
+/// [`MLX_EVAL_BUFFER_WINDOW`] command buffers are alive (ten committed plus the one encoding),
+/// each holding at most [`MLX_MAX_BUFFER_BYTES`] plus the one op that crosses it — at most the
+/// largest promoted projection, `largest_elements`.
+fn promoted_weight_bytes(head_elements: u64, largest_elements: u64) -> Option<u64> {
+    const F32: u64 = 4;
+    let per_buffer = largest_elements
+        .checked_mul(F32)?
+        .checked_add(MLX_MAX_BUFFER_BYTES)?;
+    head_elements
+        .checked_mul(F32)?
+        .checked_add(per_buffer.checked_mul(MLX_EVAL_BUFFER_WINDOW)?)
+}
+
 /// Apple-Silicon Metal allocations are rounded to 16-KiB VM pages. Gated DeltaNet retains one
 /// independently allocated output row per prompt token until its final concatenate.
 const MLX_ALLOCATION_PAGE_BYTES: u64 = 16 * 1024;
@@ -3176,6 +3234,86 @@ fn estimate_qwen35_workspace_extra_bytes(
 /// the shared tiled estimate. Dense Qwen3.5 adds its F32 recurrence, packed-Hadamard, allocator, and
 /// lazy-evaluator lifetimes; eager/otherwise-unbounded implementations retain the quadratic model.
 fn estimate_mlx_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    contract: MlxWorkspaceContract<'_>,
+) -> Option<u64> {
+    let decoder = estimate_mlx_decoder_bytes(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        contract,
+    )?;
+    match contract {
+        // The hybrid's contract already prices MLX's evaluation window and allocator rounding
+        // from its own frozen probes.
+        MlxWorkspaceContract::Qwen35 { .. } => Some(decoder),
+        MlxWorkspaceContract::Eager | MlxWorkspaceContract::Chunked => decoder.checked_add(
+            mlx_runtime_request_bytes(prompt_tokens, max_new_tokens, geometry)?,
+        ),
+    }
+}
+
+/// What MLX's runtime holds for a request beyond the decoder's own tensors (sc-24446), which
+/// the shared estimates do not see — measured on the one-token requests of the sc-24446 probes
+/// (35–87 MB on Llama 3.2 1B, Qwen3-1.7B and Qwen3-8B, against 6–9 MB estimated before):
+///
+/// * **KV block padding.** [`ContiguousKvCache`] allocates whole
+///   [`KV_BLOCK_TOKENS`](crate::primitives::kv_cache::KV_BLOCK_TOKENS)-position blocks, so a
+///   request holds its K/V rounded up to a block, not `prompt + max_new_tokens` positions.
+/// * **In-flight layer temporaries.** MLX keeps every op's inputs until the command buffer that
+///   ran it completes, and runs ahead by up to [`MLX_EVAL_BUFFER_WINDOW`] buffers of at most
+///   [`MLX_MAX_BUFFER_BYTES`] and [`MLX_MAX_OPS_PER_BUFFER`] ops each — so a short forward
+///   holds more than the one layer of activations the shared estimate prices: every other
+///   layer's, capped by that window, plus a page of rounding per op output in it.
+fn mlx_runtime_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+) -> Option<u64> {
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let total = prompt.checked_add(u64::from(max_new_tokens))?;
+    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+    let kv_position = checked_product([
+        geometry.layers,
+        geometry.kv_heads,
+        geometry.head_dim,
+        geometry.element_bytes,
+        2,
+    ])?;
+    let kv_padding = round_up(total, block)?
+        .checked_sub(total)?
+        .checked_mul(kv_position)?;
+    let per_layer = checked_product([
+        prompt,
+        checked_sum([
+            geometry.intermediate_size.checked_mul(3)?,
+            geometry.hidden_size.checked_mul(8)?,
+        ])?,
+        geometry.element_bytes,
+    ])?;
+    let in_flight = geometry
+        .layers
+        .saturating_sub(1)
+        .checked_mul(per_layer)?
+        .min(MLX_EVAL_BUFFER_WINDOW.checked_mul(MLX_MAX_BUFFER_BYTES)?);
+    // Each in-flight buffer's op outputs are page-rounded allocations, however small.
+    let rounding = checked_product([
+        MLX_EVAL_BUFFER_WINDOW,
+        MLX_MAX_OPS_PER_BUFFER,
+        MLX_ALLOCATION_PAGE_BYTES,
+    ])?;
+    checked_sum([kv_padding, in_flight, rounding])
+}
+
+/// The decoder's own request tensors under its workspace contract (the shared estimates, plus
+/// the Qwen3.5 hybrid's recurrence workspace).
+fn estimate_mlx_decoder_bytes(
     prompt_tokens: usize,
     max_new_tokens: u32,
     geometry: LlmMemoryGeometry,
@@ -3524,8 +3662,9 @@ mod tests {
         assert!(eager > 400_000_000_000, "quadratic eager peak: {eager}");
         assert_eq!(
             eager,
-            core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap(),
-            "non-fused paths retain the shared fail-closed estimate"
+            core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap()
+                + mlx_runtime_request_bytes(29_600, 128, geometry).unwrap(),
+            "non-fused paths retain the shared fail-closed estimate, plus MLX's runtime terms"
         );
     }
 
@@ -6008,6 +6147,272 @@ mod tests {
             assert_eq!(report.prefix_hit_tokens, 0);
             assert_eq!(provider.prefix_cache_stats(), PrefixStats::default());
         }
+    }
+
+    /// A tied-embedding decoder snapshot at `vocab × h` (h = 256: every projection a whole number
+    /// of Q4/Q8 groups), Gemma 2's soft caps and sandwich norms when `gemma`, with a word-level
+    /// tokenizer over the whole vocabulary.
+    fn promotion_snapshot(dir: &Path, model_type: &str, arch: &str, vocab: i32, gemma: bool) {
+        let (h, softcap) = (256, gemma);
+        let (inter, layers, heads, kv, hd) = (512, 2, 2, 1, 128);
+        let mut cfg = json!({
+            "architectures": [arch], "model_type": model_type, "hidden_size": h,
+            "intermediate_size": inter, "num_hidden_layers": layers, "num_attention_heads": heads,
+            "num_key_value_heads": kv, "head_dim": hd, "vocab_size": vocab, "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0, "tie_word_embeddings": true, "max_position_embeddings": 8192,
+        });
+        if softcap {
+            cfg["attn_logit_softcapping"] = json!(50.0);
+            cfg["final_logit_softcapping"] = json!(30.0);
+            cfg["query_pre_attn_scalar"] = json!(hd);
+            cfg["sliding_window"] = json!(4096);
+        }
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+        std::fs::write(
+            dir.join("tokenizer.json"),
+            format!(
+                r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+                "decoder": null,
+                "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+                entries.join(", ")
+            ),
+        )
+        .unwrap();
+        let mut seed = 1u64;
+        let mut r = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let v: Vec<f32> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.1
+                })
+                .collect();
+            Array::from_slice(&v, shape)
+                .as_dtype(mlx_rs::Dtype::Bfloat16)
+                .unwrap()
+        };
+        let mut t: Vec<(String, Array)> = vec![
+            ("model.embed_tokens.weight".into(), r(&[vocab, h])),
+            ("model.norm.weight".into(), r(&[h])),
+        ];
+        for i in 0..layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            for n in ["input_layernorm", "post_attention_layernorm"] {
+                t.push((p(&format!("{n}.weight")), r(&[h])));
+            }
+            if softcap {
+                for n in ["pre_feedforward_layernorm", "post_feedforward_layernorm"] {
+                    t.push((p(&format!("{n}.weight")), r(&[h])));
+                }
+            }
+            t.push((p("self_attn.q_proj.weight"), r(&[heads * hd, h])));
+            t.push((p("self_attn.k_proj.weight"), r(&[kv * hd, h])));
+            t.push((p("self_attn.v_proj.weight"), r(&[kv * hd, h])));
+            t.push((p("self_attn.o_proj.weight"), r(&[h, heads * hd])));
+            t.push((p("mlp.gate_proj.weight"), r(&[inter, h])));
+            t.push((p("mlp.up_proj.weight"), r(&[inter, h])));
+            t.push((p("mlp.down_proj.weight"), r(&[h, inter])));
+        }
+        Array::save_safetensors(
+            t.iter().map(|(k, v)| (k.as_str(), v)),
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
+    /// sc-24446 (d): a one-token request's MLX working set is priced, including what a Gemma
+    /// forward promotes. Gemma's GeGLU leaves its activations `f32` against BF16 weights, so a
+    /// forward materializes an `f32` copy of the LM head (vocabulary × hidden × 4 bytes — 2.4 GB
+    /// on Gemma 2, 4.0 GB on Gemma 4) and of every dense projection it runs; request admission
+    /// prices that ([`promoted_weight_bytes`]) on top of the decoder's own workspace. On a tied
+    /// 65,536-token fixture, dense and at load-time Q4, the measured second-request peak (the
+    /// model already materialized) stays within the request estimate — and exceeds the estimate
+    /// without the promotion term, so the term is load-bearing. A SwiGLU decoder promotes
+    /// nothing.
+    ///
+    /// MUTATION: return `Some(0)` from `Decoder::promoted_request_bytes` and the Gemma cases go
+    /// RED.
+    #[test]
+    fn a_one_token_request_working_set_is_priced_including_gemma_weight_promotion() {
+        for (model_type, arch, gemma) in [
+            ("llama", "LlamaForCausalLM", false),
+            ("gemma2", "Gemma2ForCausalLM", true),
+        ] {
+            for quantize in [None, Some(Quantize::Q4)] {
+                let dir = tempfile::tempdir().unwrap();
+                promotion_snapshot(dir.path(), model_type, arch, 65_536, gemma);
+                let mut spec = LoadSpec::dense(dir.path().display().to_string());
+                spec.quantize = quantize;
+                spec.prefix_cache_bytes = Some(0);
+                let provider = LlamaProvider::load(&spec).unwrap();
+                let req = TextLlmRequest {
+                    messages: vec![Message::user("t3 t9 t4 t11")],
+                    sampling: Sampling::greedy(),
+                    max_new_tokens: 1,
+                    seed: Some(0),
+                    speculative: Some(core_llm::Speculative::Off),
+                    ..Default::default()
+                };
+                let prompt = rendered_ids(&provider, &req, true);
+                let estimate = provider
+                    .speculative_request_bytes(SpeculativeRoute::Plain, prompt.len(), 1, 0)
+                    .unwrap();
+                let promoted = provider.model.promoted_request_bytes().unwrap();
+                let Decoder::Causal(m) = &provider.model else {
+                    unreachable!("a causal fixture")
+                };
+                // What the pricing keys on is what the forward does: the final hidden state is
+                // `f32` exactly when the model reports promoting activations.
+                let hidden = m
+                    .hidden_states(&input_ids(&[3, 9, 4]), &mut m.new_cache(), 0)
+                    .unwrap();
+                assert_eq!(
+                    hidden.last().unwrap().dtype() == mlx_rs::Dtype::Float32,
+                    m.activations_promote(),
+                    "{model_type}: activation dtype {:?}",
+                    hidden.last().unwrap().dtype()
+                );
+                provider.generate(&req, &mut |_| {}).unwrap();
+                mlx_rs::memory::clear_cache();
+                let before = mlx_rs::memory::get_active_memory();
+                mlx_rs::memory::reset_peak_memory();
+                provider.generate(&req, &mut |_| {}).unwrap();
+                let working_set = (mlx_rs::memory::get_peak_memory() - before) as u64;
+                let label = format!("{model_type} {quantize:?}");
+                assert!(
+                    working_set <= estimate,
+                    "{label}: working set {working_set} exceeds the estimate {estimate}"
+                );
+                if gemma {
+                    assert!(m.activations_promote(), "{label}");
+                    assert!(
+                        working_set > estimate - promoted,
+                        "{label}: the promotion term is not load-bearing ({working_set} <= {})",
+                        estimate - promoted
+                    );
+                } else {
+                    assert_eq!(promoted, 0, "{label}");
+                }
+            }
+        }
+    }
+
+    /// The request estimate covers every one-token request MLX working set the sc-24446 guarded
+    /// probes recorded on real weights (`native-memory-admission.md`: a second identical
+    /// one-token "Hi" request on the materialized model, MLX peak active growth), computed from
+    /// each model's geometry, its rendered prompt length and — for Gemma — the promoted LM head
+    /// and largest promoted projection (a dense MLP matrix at BF16; its scales and biases at Q4).
+    /// Recorded evidence, not a machine golden: the relation is pinned. Before sc-24446 the
+    /// estimate was 6–9 MB for the Llama / Qwen3 cases (measured 35–87 MB) and 14–31 MB for the
+    /// Gemma cases (measured 2.4–5.4 GB).
+    #[test]
+    fn the_request_estimate_covers_the_recorded_one_token_working_sets() {
+        let geometry = |q, kv, hd, layers, hidden, inter, vocab, recurrent| LlmMemoryGeometry {
+            query_heads: q,
+            kv_heads: kv,
+            head_dim: hd,
+            layers,
+            element_bytes: 4,
+            hidden_size: hidden,
+            intermediate_size: inter,
+            vocab_size: vocab,
+            recurrent_bytes: recurrent,
+        };
+        let llama = geometry(32, 8, 64, 16, 2048, 8192, 128_256, 0);
+        let qwen3_small = geometry(16, 8, 128, 28, 2048, 6144, 151_936, 0);
+        let qwen3_8b = geometry(32, 8, 128, 36, 4096, 12_288, 151_936, 0);
+        let gemma2 = geometry(8, 4, 256, 26, 2304, 9216, 256_000, 0);
+        let gemma4 = geometry(16, 8, 256, 48, 3840, 15_360, 262_144, 0);
+        let qwen38 = frozen_dense_qwen35_config();
+        let qwen38_geometry = geometry(
+            24,
+            4,
+            256,
+            64,
+            5120,
+            17_408,
+            248_320,
+            64 * 48 * 128 * (128 + 4) * 4,
+        );
+        let qwen35 = MlxWorkspaceContract::Qwen35 {
+            config: &qwen38,
+            prism: false,
+        };
+        let (g2_head, g2_mlp) = (256_000 * 2304, 9216 * 2304);
+        let (g4_head, g4_mlp) = (262_144 * 3840, 15_360 * 3840);
+        let promoted = |head, largest| promoted_weight_bytes(head, largest).unwrap();
+        // (config, geometry, contract, rendered prompt tokens, promoted bytes, measured bytes)
+        let cases = [
+            (
+                "Llama 3.2 1B",
+                llama,
+                MlxWorkspaceContract::Chunked,
+                36,
+                0,
+                41_000_000u64,
+            ),
+            (
+                "Qwen3-1.7B",
+                qwen3_small,
+                MlxWorkspaceContract::Chunked,
+                13,
+                0,
+                46_000_000,
+            ),
+            (
+                "Qwen3-8B",
+                qwen3_8b,
+                MlxWorkspaceContract::Chunked,
+                13,
+                0,
+                87_000_000,
+            ),
+            ("Qwen3.8-27B", qwen38_geometry, qwen35, 13, 0, 236_000_000),
+            (
+                "Gemma 2 2B-it BF16",
+                gemma2,
+                MlxWorkspaceContract::Eager,
+                10,
+                promoted(g2_head, g2_mlp),
+                3_528_000_000,
+            ),
+            (
+                "Gemma 2 2B-it Q4",
+                gemma2,
+                MlxWorkspaceContract::Eager,
+                10,
+                promoted(g2_head, g2_mlp / 64 * 2),
+                2_426_000_000,
+            ),
+            (
+                "Gemma 4 enhancer BF16",
+                gemma4,
+                MlxWorkspaceContract::Eager,
+                14,
+                promoted(g4_head, g4_mlp),
+                5_416_000_000,
+            ),
+            (
+                "Gemma 4 enhancer Q4",
+                gemma4,
+                MlxWorkspaceContract::Eager,
+                14,
+                promoted(g4_head, g4_mlp / 64 * 2),
+                4_466_000_000,
+            ),
+        ];
+        for (config, geometry, contract, prompt, promoted, measured) in cases {
+            let estimate =
+                estimate_mlx_request_bytes(prompt, 1, geometry, 0, 0, contract).unwrap() + promoted;
+            assert!(
+                estimate >= measured,
+                "{config}: estimate {estimate} < measured {measured}"
+            );
+        }
+        assert!(promoted_weight_bytes(u64::MAX, 1).is_none());
     }
 
     /// E7 per request: held entries are reclaimable. A request short by exactly what the cache

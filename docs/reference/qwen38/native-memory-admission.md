@@ -37,35 +37,77 @@ not need separate full host and GPU copies.
 
 ### MLX safetensors allocation order (sc-24446)
 
-Read from `mlx-llm` (`Weights::from_dir`, `CausalLm::build` / `LayerPlan::load`,
-`Qwen35Model::from_weights_layout`, `build_ffn`, `Gemma4Mm::from_weights`, `Projection::load`,
-`SwitchLinear::{load,stack}`) and MLX 0.32.0 (`affine_quantize`, `fast::Quantize::eval_gpu`, the
-Metal allocator and its buffer cache):
+Read from `mlx-llm` (`Weights::from_dir`, `Weights::materialize_groups`, `CausalLm::build_lazy` /
+`LayerPlan::load`, `Qwen35Model::build_lazy` / `build_ffn`, `Gemma4Mm::from_weights`,
+`Projection::load`, `SwitchLinear::{load,stack}`) and MLX 0.32.0 (`affine_quantize`,
+`fast::Quantize::eval_gpu`, the Metal allocator and its buffer cache):
 
 1. Construction is lazy. Every projection, cast, split and quantization is an unevaluated graph
    node over the loaded source arrays; nothing is allocated yet.
-2. Each constructor ends with `Weights::verify_accessed_gpu_view` (sc-22414), which evaluates every
-   accessed **source** tensor in 512 MiB batches and checks the GPU view. After it, the whole
-   accessed payload is resident, and the `Weights` map keeps it so until `load_admitted` returns.
-3. Derived arrays — load-time quantized projections, BF16 casts, `1 + w` norms, gathered splits,
-   stacked expert banks — are evaluated by the **first forward** (the first request's prefill),
-   not at load. Load-time quantization is therefore *not* tensor-by-tensor: the full source payload
-   is resident when quantization starts. MLX affine `quantize` on the GPU stream is one kernel per
-   tensor that writes the packed `uint32` words plus scales and biases in the input dtype (BF16);
-   it has no float intermediates. After a node is evaluated MLX detaches its inputs, so each
-   consumed source returns its buffer to MLX's freed-buffer cache.
-4. That cache is reused only for an allocation of (page-rounded) equal size, and is released only by
-   `clear_cache` — which the decode loop calls after the first step — or when active + cached +
-   request crosses MLX's GC limit (0.95 × the device's recommended working set). A consumed
-   transient therefore still occupies memory through the first forward.
+2. The provider then **materializes the decoder group by group** (`Weights::materialize_groups`;
+   one group per decoder or MTP layer, plus the arrays outside the layer stack —
+   `CausalLm::param_groups` / `Qwen35Model::param_groups`). For each group it reads the group's
+   pending safetensors loads on the CPU stream (`eval_pending_loads`, so no GPU op waits on the
+   disk — sc-24245), checks every source it read for a coherent GPU view (sc-22414), evaluates the
+   group's conversions on the GPU, drops the `Weights` map's handles on those sources and clears
+   MLX's buffer cache. A source consumed into a different array (a quantized projection, a BF16
+   cast, a `1 + w` norm, a stacked expert bank) is returned to the system before the next group
+   reads its own; a source the model keeps as stored (a BF16 matrix) stays as the model's array.
+   Every accessed source is still read and verified before the load returns — one no group
+   consumed is verified and kept (`Materialized::leftover`, zero for every decoder's
+   enumeration, pinned by the tests) — and no array is left lazy, so the first request neither
+   reads a weight nor derives one inside its command stream.
+3. Vision towers and Gemma 4's media embedders keep the earlier order: their constructors verify
+   every source up front and keep it beside their (lazily derived) arrays.
+4. A caller that keeps its own `Weights` map (`CausalLm::from_weights_with`,
+   `Qwen35Model::from_weights_with`, the text encoders in `mlx-gen`) verifies every source up front
+   and then evaluates every derived array group by group before the constructor returns — the
+   same derived arrays, materialized at load rather than by the first forward; the map it owns
+   keeps the sources until it drops them.
 
-So the honest upper bound is additive: the payload once, plus every derived allocation, each
-rounded to a 16 KiB page. It is not "final payload + the largest single transient".
+Greedy outputs are unchanged: the order only moves when each array is computed (the
+`materializing_group_by_group_consumes_every_source_and_decodes_identically` suite decodes every
+MoE family and layout, dense and at load-time Q8 / Q4, bit-identically to the caller-owned-map
+constructor).
 
-### The bound (`mlx-llm/src/load_memory.rs`)
+#### The fused Qwen3.6 expert bank (sc-24446)
 
-`required = payload + derived`, where `derived` sums, per stored tensor of `n` elements (header
-only; "language" = not under `model.visual.` / `vision_tower.`):
+Qwen3.6-35B-A3B ships each layer's routed experts as one fused `experts.gate_up_proj`
+`[experts, 2·moe_inter, hidden]` (gate rows ‖ up rows). The loader used to cut it into gate and
+up banks with a gathered `take` — a second copy of ~44 GB of BF16 expert weights. The MoE block
+(`primitives::moe::SparseMoe::fused`) now keeps it fused: one `gather_mm` / `gather_qmm` over the
+fused bank, its `[.., 2·moe_inter]` output split per token into gate and up. Quantizing the fused
+bank produces exactly the quantized rows of the two halves (groups run along `hidden`), and the
+gathered matmul over the fused bank is bit-identical to the two over the halves — pinned dense
+(f32 and BF16) and at Q8 / Q4 on the unsorted decode and sorted prefill shapes, and at model level
+against the per-expert layout of the same weights (which stacks exactly the old split banks),
+MTP-on-MoE included. Per-expert checkpoints (the BF16 Qwen3.5 release, prepared quantized
+snapshots, Qwen2-MoE, DeepSeek-V2) keep the separate gate and up banks.
+
+### The bounds (`mlx-llm/src/load_memory.rs`)
+
+**Materialize-at-load bound** (`materialized_bound`): `resident + max(window)` plus the host
+heap. While group `g` converts, memory holds the arrays already built, `g`'s sources and
+transients and `g`'s outputs — at most every resident array plus `g`'s window:
+
+| Term | Charge | Why |
+| --- | --- | --- |
+| resident, quantized at load | `n·bits/8 + 4·n/group` + three pages | packed words + BF16 scales + biases (the source is released) |
+| resident, per-expert | the stacked copy in its loaded form + a page | `SwitchLinear::stack` |
+| resident, vector | `max(stored, 2n)` + a page | `1 + w` norms, `exp(A_log)` |
+| resident, wider float | `2n` + a page | BF16 cast (the source is released) |
+| resident, otherwise | stored + a page | BF16 matrices and stored quantized parts are the model's arrays |
+| resident, media | stored + a page + every derived term below | vision / audio constructors keep their sources |
+| window of a group | its consumed sources; a BF16 cast ahead of a quantize; each expert's loaded form ahead of its stack; `4n` norm intermediates; checksum widening | what group `g` reads and converts |
+
+A decoder tensor's group is its `…layers.{i}.` prefix (decoder and MTP layers alike), or the
+non-layer group. Load-time quantization never touches embeddings, the LM head, stored quantized
+parts, or the matrices the decoders keep dense (MoE routers, the shared-expert gate, Qwen3.5's
+`in_proj_a/b`).
+
+**Earlier bound** (`derived_bytes`): `payload + derived`, the verify-everything-then-derive
+order's peak — the stored payload once, plus per stored tensor of `n` elements (header only;
+"language" = not under `model.visual.` / `vision_tower.`):
 
 | Term | Charge | Why |
 | --- | --- | --- |
@@ -74,9 +116,14 @@ only; "language" = not under `model.visual.` / `vision_tower.`):
 | vector intermediates | `4n` for a language tensor of rank ≤ 1 | `1 + w` norms, `exp(A_log)`, signs |
 | vision patch transpose | `4n` for `*patch_embed.proj.weight` | contiguous channels-last copy |
 | checksum widening | `4·bytes` when `bytes % 4 ≠ 0` | the load-boundary checksum widens a byte view to `u32` |
-| gathered split | `2n` for `*.mlp.experts.gate_up_proj` and a rank-3 `*.pos_embedding` | `take_axis` copies (Qwen3.6 gate/up halves, Gemma 4 row/column tables) |
+| gathered split | `2n` for a rank-3 `*.pos_embedding` | `take_axis` copies (Gemma 4 row/column tables) |
 | load-time Q4/Q8 | `n·bits/8 + 4·n/group` for every language float matrix whose input width divides the group, except embeddings and the LM head | packed words + BF16 scales + biases |
 | expert stacking | one more copy of each `*experts.{e}.*` tensor in its loaded form (quantized, BF16, or the stored packed part) | `SwitchLinear::stack` (sc-24440) concatenates the bank |
+
+The materialize-at-load order never holds more than the earlier bound (each group's sources are a
+slice of the payload, its outputs and transients a slice of the derived set — pinned against MLX's
+measured peak on a fixture, `the_materialized_bound_covers_the_provider_load_order_on_a_fixture`),
+so the earlier bound stays an upper bound for every cell its probes verified.
 
 Beside the arrays, a load builds host heap MLX does not see: the parsed tokenizer (measured at
 12–17× the `tokenizer.json` bytes for Llama 3.2, Qwen3 and Gemma 2), the chat template, the lazy
@@ -84,15 +131,16 @@ graph's nodes and the Metal pipeline states its checksum and first forward compi
 safetensors load is charged `24 × tokenizer.json bytes + 64 MiB` for it. The Metal device and MLX's
 kernel library (~170 MB) are process-wide one-time costs and are not charged per load.
 
-The quantized term over-charges a few small dense matrices the decoders keep dense (a router, a
-one-row gate, `in_proj_a/b`); it never misses one the decoders quantize. Load-time quantization
-keeps the BF16 payload resident (step 2), so a Q4 load holds ≈ `1.28×` and a Q8 load ≈ `1.53×`
-the BF16 payload of the quantized matrices, not `2×` the checkpoint.
+**What a load is charged**, by the probe evidence behind it:
 
-A verified (architecture × conversion) is charged exactly `required` plus the host heap. Anything
-unverified keeps the two-copy bound **raised to `required` when that is larger**, plus the host
-heap — the derived total of a Qwen3.6 fused expert bank quantized to Q8 is `2.12×` its payload,
-which the old flat `2×` under-charged.
+1. a cell in `MATERIALIZED_VERIFIED` (architecture × MoE × conversion, each backed by a guarded
+   real-weight probe of the materialize-at-load order): `materialized_bound` + host heap;
+2. a cell the earlier probes verified (`verified_load`): the earlier bound + host heap;
+3. anything else: the two-copy bound **raised to the earlier bound when that is larger**, plus
+   the host heap.
+
+`MATERIALIZED_VERIFIED` is empty until the materialize-at-load probes run (below); until then
+every load keeps the bound its earlier probes backed.
 
 | Architecture (loader dispatch) | Unquantized (dense / stored) | Load-time Q4 / Q8 |
 | --- | --- | --- |
@@ -106,11 +154,22 @@ which the old flat `2×` under-charged.
 | stored-quantized snapshot outside Qwen3.5 | unverified → `max(2×, required)` | — |
 | Phi-3, GLM-4, DeepSeek-V2 (MLA), plain Gemma 4 | unverified → `max(2×, required)` | unverified → `max(2×, required)` |
 
-MoE stays unverified: its derived bound is dominated by the gathered `gate_up` split copies
-(Qwen3.6) or the expert-stacking copies, which MLX's equal-size cache reuse may absorb in practice
-but nothing here proves, and the derived totals for Qwen3.6-35B-A3B (BF16 ≈ 116 GB, Q4 ≈ 135 GB,
-Q8 152.6 GB) exceed both a 128 GiB host and the 80 GiB probe cap, so no guarded probe can verify
-them. Phi-3's packed `qkv_proj`/`gate_up_proj` splits are row slices (views) but unmeasured.
+Header-only bounds for the materialize-at-load probe targets (arrays only, host heap excluded;
+GB):
+
+| Snapshot | Payload | BF16: earlier / materialized | Q4: earlier / materialized | Q8: earlier / materialized |
+| --- | --- | --- | --- | --- |
+| Qwen3.6-35B-A3B (`995ad96e`) | 71.90 | 71.93 / 71.93 | 91.34 / 24.09 | 108.58 / 41.32 |
+| Qwen3.6-35B-A3B prepared Q4 (stored) | 22.38 | 44.08 / 24.44 | — | — |
+| Qwen3.8-27B (`1d4bf0f2`) | 55.56 | 55.60 / 55.60 | 69.54 / 20.79 | 81.93 / 33.17 |
+| Gemma 4 unified enhancer (`791ef617`) | 23.92 | 23.96 / 23.95 | 30.12 / 8.77 | 35.60 / 14.22 |
+| Qwen3-8B (`b968826d`) | 16.38 | 16.39 / 16.39 | 20.30 / 6.80 | 23.78 / 10.27 |
+
+The Qwen3.6 earlier bounds already exclude the gate/up split copies the fused bank removed (they
+were ≈ 116 / 135 / 153 GB with them). The two-copy floor still applies to MoE until its probes
+run, so Qwen3.6-35B-A3B is charged ≈ 144.2 GB at BF16, Q4 and Q8 alike today (twice the payload,
+host heap included) — refused on a 128 GiB host — and ≈ 72.3 / 24.5 / 41.7 GB once its
+materialize-at-load cells are probe-verified.
 
 For GGUF it counts the source mapping, retained affine words and both intermediate/final scales,
 dense conversion arrays, and the largest per-tensor host conversion/reordering buffers. Projectors
@@ -171,11 +230,36 @@ On a 128 GiB host (~105 GB available when idle) this admits Qwen3.8-27B at load-
 (69.9 GB, previously 111.1 GB → refused) and Q8 (82.3 GB), the Gemma 4 enhancer at BF16 (24.8 GB,
 previously 47.8 GB) and Q4 (31.0 GB), and Qwen3-8B Q4 with a Qwen3-1.7B Q4 draft
 (20.6 + 4.6 GB, previously 32.8 + 6.9 GB). Qwen3.6-35B-A3B (MoE) stays refused: ≈ 144.2 GB at
-BF16/Q4 (the retained two-copy floor) and ≈ 153 GB at Q8 (its derived bound), host heap included.
+BF16, Q4 and Q8 (the retained two-copy floor), host heap included.
 
-Observed in passing, outside load admission: a one-token request on Gemma 2 and on the Gemma 4
-enhancer has an MLX working set of 2.4–3.5 GB and 4.5–5.4 GB respectively (vocabulary-wide
-buffers at 256K/262K tokens); whether request admission prices that is a request-side question.
+These probes ran under the earlier verify-everything-then-derive order and back the earlier bound;
+the materialize-at-load order needs its own (pending, below the table of header-only bounds).
+
+### One-token request working set (sc-24446)
+
+The second-request MLX working sets above were not priced by request admission: its estimate for
+those one-token "Hi" requests was 6–9 MB on Llama 3.2 1B / Qwen3-1.7B / Qwen3-8B (measured
+35–87 MB) and 14–31 MB on Gemma 2 / the Gemma 4 enhancer (measured 2.4–5.4 GB). Two causes, both
+now priced on top of the decoder's own workspace (`provider.rs`), with the recorded probes pinned
+(`the_request_estimate_covers_the_recorded_one_token_working_sets`) and a fixture measurement
+(`a_one_token_request_working_set_is_priced_including_gemma_weight_promotion`):
+
+- **Gemma promotes its weights every forward.** Gemma's GeGLU runs `mlx_rs::nn::gelu_approximate`,
+  whose constants are `f32` arrays, so a BF16 input comes back `f32` and the residual stream, every
+  later projection's input and the final hidden state stay `f32` (`CausalLm::activations_promote`;
+  a SwiGLU decoder stays BF16). Each dense matmul then materializes an `f32` copy of its BF16
+  weight — the LM head's alone is vocabulary × hidden × 4 bytes: 2.36 GB on Gemma 2, 4.03 GB on the
+  262K-token Gemma 4 — and each quantized matmul an `f32` copy of its scales and biases. Priced as
+  the LM head's copy plus MLX's evaluation window (ten committed command buffers and the one
+  encoding) × (the 50 MB per-buffer cap + the largest promoted projection).
+- **MLX runtime terms the shared estimates do not see** (generic decoders; the Qwen3.5 hybrid's
+  contract already prices its own): K/V held in whole 256-position blocks, every layer's
+  temporaries in flight across that window (capped at window × 50 MB), and a page of rounding per
+  op output in it.
+
+The Gemma promotion is a dtype leak, not an inherent cost — computing GeGLU in the activation's
+dtype would remove both the copies and their traffic — but it changes Gemma's (and every
+`gelu_tanh` model's) numerics, so it is priced here rather than changed.
 
 Request bounds include expanded visual tokens, eager attention scores/mask/softmax, full-length
 K/V storage, recurrent state, projection/MLP/logit buffers, MTP cache/rollback and draft-width
