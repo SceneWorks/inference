@@ -248,7 +248,7 @@ class SupervisorTests(unittest.TestCase):
         class PersistedProbe(Probe):
             def tree_footprint(self, pgid):
                 self_status = json.loads(status_path.read_text(encoding="utf-8"))
-                case.assertEqual(self_status["pgid"], pgid)
+                case.assertEqual(self_status["pgid"], pgid.pgid)
                 return super().tree_footprint(pgid)
 
         result = self.run_child("import time; time.sleep(.15)", probe=PersistedProbe(),
@@ -354,16 +354,81 @@ class SupervisorTests(unittest.TestCase):
             self.run_child(script)
         self.assertFalse(safety._group_pids(int((self.root / "pid").read_text(encoding="ascii"))))
 
-    def test_observed_child_that_escapes_process_group_is_reaped(self):
+    class MembersProbe(Probe):
+        """Records every (ppid, pgid) row each owned member showed on any tick."""
+        def __init__(self):
+            super().__init__()
+            self.rows = {}
+        def tree_footprint(self, owner):
+            table = safety._process_table()
+            for pid in owner.members():
+                if pid in table:
+                    self.rows.setdefault(pid, set()).add(table[pid])
+            return super().tree_footprint(owner)
+
+    def test_descendant_in_its_own_group_is_owned_measured_and_reaped(self):
         script = (
             "import os,subprocess,sys,time; "
             "p=subprocess.Popen([sys.executable,'-c',"
             "'import os,time;time.sleep(.1);os.setsid();time.sleep(5)']); "
             "open('escaped-pid','w').write(str(p.pid));time.sleep(5)"
         )
-        with self.assertRaisesRegex(safety.SupervisionError, "process-escape"):
-            self.run_child(script)
-        self.assertNotIn(int((self.root / "escaped-pid").read_text(encoding="ascii")), safety._process_table())
+        probe = self.MembersProbe()
+        with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
+            self.run_child(script, probe=probe)
+        escaped = int((self.root / "escaped-pid").read_text(encoding="ascii"))
+        self.assertIn(escaped, {group for _parent, group in probe.rows[escaped]})  # measured after leaving
+        self.assertNotIn(escaped, safety._process_table())
+
+    def test_row_waits_for_a_reparented_descendant_in_its_own_group(self):
+        # The root exits first; its setsid'd descendant is reparented to launchd/init and
+        # the row only finishes once that descendant has exited too.
+        script = (
+            "import subprocess,sys,time; "
+            "p=subprocess.Popen([sys.executable,'-c',"
+            "'import os,time;os.setsid();time.sleep(.6)']); "
+            "open('escaped-pid','w').write(str(p.pid));time.sleep(.2)"
+        )
+        probe = self.MembersProbe()
+        result = self.run_child(script, probe=probe)
+        escaped = int((self.root / "escaped-pid").read_text(encoding="ascii"))
+        self.assertEqual(result.returncode, 0)
+        self.assertGreaterEqual(result.elapsed_seconds, .5)
+        self.assertIn(escaped, probe.rows)
+        self.assertNotIn(escaped, safety._process_table())
+
+    @unittest.skipUnless(sys.platform == "darwin", "system_profiler is macOS-only")
+    def test_system_profiler_collector_group_is_not_a_refusal(self):
+        # SC-20684 W2 run 36808330752: the product's toolchain probe runs system_profiler,
+        # whose `-nospawn` collector child starts its own process group.
+        script = ("import subprocess; subprocess.run(['/usr/sbin/system_profiler', "
+                  "'SPDisplaysDataType'], stdout=subprocess.DEVNULL, check=True)")
+        probe = self.MembersProbe()
+        result = self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        own_group = [pid for pid, rows in probe.rows.items() if any(group != result.pid for _p, group in rows)]
+        self.assertTrue(own_group, probe.rows)
+
+    def test_system_probe_measures_every_owned_member(self):
+        owner = safety.PosixTree(1, set())
+        with patch.object(safety.platform, "system", return_value="Darwin"), \
+             patch.object(safety.PosixTree, "members", return_value={21, 22, 23}), \
+             patch.object(safety, "darwin_phys_footprint", side_effect=lambda pid: pid):
+            self.assertEqual(safety.SystemProbe(self.policy).tree_footprint(owner), 66)
+
+    def test_ancestry_survives_reparenting_and_forgets_exited_pids(self):
+        known = {10}
+        # 11 is a child of 10; 12 a grandchild that moved to its own group.
+        self.assertEqual(safety._expand_owned({10: (1, 10), 11: (10, 10), 12: (11, 12), 50: (1, 50)}, known),
+                         {10, 11, 12})
+        # The root and 11 exit: 12 is reparented to launchd and stays owned; 13 is its child.
+        self.assertEqual(safety._expand_owned({12: (1, 12), 13: (12, 12), 50: (1, 50)}, known), {12, 13})
+        # Exit race: 13 vanished between listing and read (ESRCH) -- simply absent, not owned.
+        self.assertEqual(safety._expand_owned({12: (1, 12), 50: (1, 50)}, known), {12})
+        # PID reuse: unrelated processes now hold 10, 11 and 13; none is a descendant.
+        self.assertEqual(safety._expand_owned(
+            {10: (1, 10), 11: (50, 50), 12: (1, 12), 13: (1, 13), 50: (1, 50)}, known), {12})
+        self.assertEqual(known, {12})
 
     def test_live_reserve_counts_reclaimable_file_cache(self):
         class FileCacheProbe(Probe):
@@ -864,11 +929,11 @@ class SupervisorTests(unittest.TestCase):
                 return f"123, 256, {gpu}\n456, 128, {gpu}\n"
             raise AssertionError(argv)
         with patch.object(safety.platform, "system", return_value="Linux"), \
-             patch.object(safety, "_bounded_output", side_effect=output), \
-             patch.object(safety, "_group_pids", return_value={123}):
+             patch.object(safety, "_bounded_output", side_effect=output):
             probe = safety.SystemProbe(policy)
             self.assertEqual(probe.gpu_free(), 8192 * 1024**2)
-            self.assertEqual(probe.gpu_free_and_tree_bytes(999), (8192 * 1024**2, 256 * 1024**2))
+            owner = type("Owner", (), {"members": lambda self: {123}})()
+            self.assertEqual(probe.gpu_free_and_tree_bytes(owner), (8192 * 1024**2, 256 * 1024**2))
 
     def test_windows_policy_and_unknown_gpu_memory_refuse(self):
         data = json.loads(self.policy.canonical_bytes)
