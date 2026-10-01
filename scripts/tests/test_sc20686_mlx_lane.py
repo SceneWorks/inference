@@ -122,17 +122,30 @@ class MetalLaneTests(unittest.TestCase):
                 "reused_requests": 4, "minimum_cache_reads": 2,
             }
         else:
-            for _forward in range(2):
-                for _layer in range(geometry["layers"]):
+            # Wan-VACE as the product runs it: each CFG branch over its own unpadded context (the
+            # cond branch shorter here) and mixed per-block dtypes (F32 main, BF16 VACE blocks).
+            vace = variant in ("wan_vace", "wan2_2_vace_fun_14b")
+            dense = 0
+            for forward in range(2):
+                tokens = geometry["skv"] // 2 if vace and forward == 0 else geometry["skv"]
+                for layer in range(geometry["layers"]):
+                    dtype = "F32" if vace and layer % 3 else geometry["dtype"]
+                    slice_shape = f"[1,{geometry['heads']},{tokens},{geometry['head_dimension']}]"
+                    slice_dense = (
+                        2 * geometry["heads"] * tokens * geometry["head_dimension"]
+                        * self.reducer.DTYPE_BYTES[dtype]
+                    )
+                    dense = max(dense, slice_dense)
                     events.append({
                         "phase": "cross-kv-created", "operation": operations["create"],
-                        "cache_id": 0, "persistent_bytes": 0, "transient_bytes": dense,
-                        "kv_batch": 1, **base,
+                        "cache_id": 0, "persistent_bytes": 0, "transient_bytes": slice_dense,
+                        "kv_batch": 1, "tensor_shape": f"k={slice_shape};v={slice_shape}",
+                        "kv_dtype": dtype, **base,
                     })
                     events.append({
                         "phase": "cross-kv-read", "operation": operations["read"],
-                        "cache_id": 0, "transient_bytes": dense, "reused": 1,
-                        **alloc(GIB, GIB + dense), **base,
+                        "cache_id": 0, "transient_bytes": slice_dense, "reused": 1,
+                        **alloc(GIB, GIB + slice_dense), **base,
                     })
             events.append(window("denoise-step", 1))
             metrics = {
@@ -375,6 +388,52 @@ class MetalLaneTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, message):
                 check(route, name, arguments)
+
+    def test_wan_vace_recomputed_slices_are_exact_per_projection(self):
+        """The SC-20686 W2 `wan_vace/normal` evidence (run 36893401358, 768x512x33, 4 steps): each
+        forward recomputes 45 text K/V slices (15 VACE blocks in BF16, then 30 main blocks in F32 —
+        the Wan2.1-VACE-1.3B checkpoint is mixed), the cond branch over its own 13 tokens and the
+        uncond branch over 126, at 12 heads x 128. Recorded bytes: 79,872 / 159,744 (cond) and
+        774,144 / 1,548,288 (uncond). The old single-slice formula could not account for any of
+        them (the observer bound skv=1536, the model width, giving 9,437,184 bytes)."""
+        check = self.reducer.exact_metal_recomputed_slices
+        geometry = {"heads": 12, "head_dimension": 128, "skv": 126, "batch": 1, "dtype": "BF16"}
+
+        def projection(tokens, dtype):
+            shape = f"[1,12,{tokens},128]"
+            dense = 2 * 12 * tokens * 128 * self.reducer.DTYPE_BYTES[dtype]
+            return (
+                {"tensor_shape": f"k={shape};v={shape}", "kv_dtype": dtype, "transient_bytes": dense},
+                {"transient_bytes": dense},
+            )
+
+        pairs = [
+            projection(tokens, dtype)
+            for _step in range(4)
+            for tokens in (13, 126)
+            for dtype in ["BF16"] * 15 + ["F32"] * 30
+        ]
+        created, reads = [p[0] for p in pairs], [p[1] for p in pairs]
+        recorded = sorted({event["transient_bytes"] for event in created})
+        self.assertEqual(recorded, [79_872, 159_744, 774_144, 1_548_288])
+        self.assertEqual(check(created, reads, geometry, 1), 1_548_288)
+        # The pre-fix observer's evidence is still refused: no per-projection dtype, or skv bound
+        # to the model width, or a slice whose bytes do not match its own shape and dtype.
+        for mutate, broken_geometry in (
+            (lambda c, r: c[0].pop("kv_dtype"), geometry),
+            (lambda c, r: None, {**geometry, "skv": 1536}),
+            (lambda c, r: c[17].update(kv_dtype="BF16"), geometry),
+            (lambda c, r: r[3].update(transient_bytes=159_744), geometry),
+            (lambda c, r: c[5].update(tensor_shape="k=[1,12,13,64];v=[1,12,13,64]"), geometry),
+            (lambda c, r: r.pop(), geometry),
+        ):
+            mutated = [dict(event) for event in created]
+            mutated_reads = [dict(event) for event in reads]
+            mutate(mutated, mutated_reads)
+            with self.assertRaises(ValueError):
+                check(mutated, mutated_reads, broken_geometry, 1)
+        with self.assertRaises(ValueError):
+            check(created, reads, geometry, 2)
 
     def _flux_inputs(self, root, stem):
         entrypoint = root / stem

@@ -180,8 +180,9 @@ fn wan_cross_kv_hooks_are_inert_off_and_bit_identical_on() {
     );
 }
 
-#[test]
-fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
+/// The tiny golden VACE transformer (4 main + 2 VACE blocks, f32) with its latent, control and
+/// `[1, L, text_dim]` text context.
+fn tiny_vace() -> (crate::vace::WanVaceTransformer, Array, Array, Array) {
     let mut weights = mlx_gen::weights::Weights::from_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/wanvace_transformer_golden.safetensors"
@@ -217,6 +218,12 @@ fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
         .reshape(&[96, 4, 8, 8])
         .unwrap();
     let context = weights.require("in.encoder_hidden_states").unwrap().clone();
+    (transformer, init, control, context)
+}
+
+#[test]
+fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
+    let (transformer, init, control, context) = tiny_vace();
     let run = || {
         crate::vace::denoise_vace(
             &transformer,
@@ -271,6 +278,63 @@ fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
         2 * 4 * skv * 16 * 4,
         "2·B·H·Skv·D·f32 for the recomputed text K/V"
     );
+}
+
+/// SC-20686 W2: the product feeds Wan-VACE each CFG branch's own unpadded `[L, text_dim]` context,
+/// so the cond and uncond branches recompute slices of different lengths. The bound `skv` is the
+/// longest branch's token count (not the context width, which the 2-D product shape used to yield),
+/// and every projection records its own live dtype for the slice-by-slice exactness check.
+#[test]
+fn vace_branches_of_different_lengths_bind_the_longest_and_record_each_slice() {
+    let (transformer, init, control, context) = tiny_vace();
+    let text_dim = context.shape()[2];
+    // The product's 2-D `[L, text_dim]` shape; like the live run, the cond prompt is the shorter
+    // branch (13 vs 126 tokens there; 5 vs 12 here).
+    let uncond = context.reshape(&[-1, text_dim]).unwrap();
+    let cond = mlx_rs::ops::indexing::IndexOp::index(&uncond, ..5);
+    let (root, snapshot) = snapshot();
+    let (scope, events) = activate(root.path(), &snapshot, "wan_vace");
+    crate::vace::denoise_vace(
+        &transformer,
+        &control,
+        &[1.0, 0.5],
+        crate::scheduler::SolverKind::UniPC,
+        1000,
+        2,
+        1.0,
+        3.0,
+        &cond,
+        Some(&uncond),
+        &init,
+        &CancelFlag::new(),
+        &mut |_| {},
+    )
+    .unwrap();
+    obs::observe_generation_end();
+    drop(scope);
+
+    let events = events.borrow();
+    let metadata = of(&events, "metadata").pop().unwrap();
+    assert_eq!(
+        metadata["geometry"]["skv"], 12,
+        "the longest branch, not the model width"
+    );
+    let created = of(&events, "cross-kv-created");
+    let mut lengths = std::collections::BTreeSet::new();
+    for event in &created {
+        assert_eq!(event["kv_dtype"], "F32");
+        let shape = event["tensor_shape"].as_str().unwrap();
+        let tokens: u64 = shape
+            .split(',')
+            .nth(2)
+            .and_then(|tokens| tokens.parse().ok())
+            .unwrap();
+        lengths.insert(tokens);
+        assert_eq!(event["transient_bytes"], 2 * 4 * tokens * 16 * 4, "{shape}");
+    }
+    assert_eq!(lengths.into_iter().collect::<Vec<_>>(), [5, 12]);
+    let metrics = of(&events, "metrics").pop().unwrap();
+    assert_eq!(metrics["current_read_transient_bytes"], 2 * 4 * 12 * 16 * 4);
 }
 
 #[test]

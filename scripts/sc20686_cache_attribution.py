@@ -127,6 +127,47 @@ def active_allocator_measurement(event, label):
     return values
 
 
+KV_SLICE_SHAPE = re.compile(r"k=\[(\d+),(\d+),(\d+),(\d+)\];v=\[(\d+),(\d+),(\d+),(\d+)\]")
+
+
+def exact_metal_recomputed_slices(created, reads, geometry, exact_batch):
+    """Account for every Metal-lane recomputed K/V projection exactly, slice by slice.
+
+    One route may recompute slices of different live lengths and dtypes: MLX Wan-VACE projects each
+    CFG branch over its own unpadded context, and the Wan2.1-VACE-1.3B checkpoint ships its main
+    blocks F32 beside BF16 VACE blocks. So each projection's bytes must equal exactly its own live
+    `[B,H,S,D]` slice at its own recorded dtype, with the route's heads/head dimension and exact CFG
+    batch; its read must spend exactly that slice; no slice may exceed the bound context length, and
+    the longest one must be it. Returns the largest live slice (the dense read workspace).
+    """
+    if not created or len(created) != len(reads):
+        fail("recomputed K/V reads do not pair one-to-one with their projections")
+    longest = largest = 0
+    for projection, read in zip(created, reads):
+        match = KV_SLICE_SHAPE.fullmatch(str(projection.get("tensor_shape") or ""))
+        dtype_bytes = DTYPE_BYTES.get(str(projection.get("kv_dtype") or "").upper())
+        if match is None or dtype_bytes is None:
+            fail("recomputed K/V slice lacks its exact live shape and dtype")
+        values = [int(value) for value in match.groups()]
+        batch, heads, tokens, head_dimension = values[:4]
+        dense = 2 * batch * heads * tokens * head_dimension * dtype_bytes
+        if (
+            values[:4] != values[4:]
+            or batch != exact_batch
+            or heads != geometry["heads"]
+            or head_dimension != geometry["head_dimension"]
+            or not 0 < tokens <= geometry["skv"]
+            or projection.get("transient_bytes") != dense
+            or read.get("transient_bytes") != dense
+        ):
+            fail("recomputed K/V slice differs from exact live geometry/dtype")
+        longest = max(longest, tokens)
+        largest = max(largest, dense)
+    if longest != geometry["skv"]:
+        fail("recomputed K/V slice differs from exact live geometry/dtype")
+    return largest
+
+
 def dense_reference_kv_bytes(geometry, kv_batch=None):
     dtype_bytes = DTYPE_BYTES.get(geometry["dtype"].upper())
     if dtype_bytes is None:
@@ -519,14 +560,20 @@ def validate(row, expected_source_map_hash, source_map=None):
             ):
                 fail("cache read transient differs from active allocator high-water")
     else:
-        exact_dense = dense_reference_kv_bytes(geometry)
+        if row["backend"] == "mlx-metal":
+            exact_dense = exact_metal_recomputed_slices(created, reads, geometry, exact_batch)
+            uniform = True
+        else:
+            exact_dense = dense_reference_kv_bytes(geometry)
+            uniform = all(
+                event.get("transient_bytes") == exact_dense for event in (*created, *reads)
+            )
         if row["candidate_persistent_bytes"] != expected_candidate * geometry["layers"]:
             fail("recomputed candidate bytes differ from exact per-layer SC-20675 group32 projection")
         if (
             row["current_persistent_bytes"] != 0
             or any(event.get("persistent_bytes", 0) != 0 for event in created)
-            or any(event.get("transient_bytes") != exact_dense for event in created)
-            or any(event.get("transient_bytes") != exact_dense for event in reads)
+            or not uniform
             or row["current_read_transient_bytes"] != exact_dense
             or row["candidate_read_transient_bytes"] != exact_dense
         ):
