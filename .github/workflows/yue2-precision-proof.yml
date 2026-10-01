@@ -34,6 +34,11 @@ on:
         required: false
         default: ""
         description: "Exact Windows PID to inspect on cuda-diagnostic only; no other process metadata is queried"
+      idle_cuda_context_run_id:
+        type: string
+        required: false
+        default: ""
+        description: "Reviewed owner-window diagnostic run; empty keeps the CUDA mixed-context refusal"
 
 permissions:
   contents: read
@@ -168,6 +173,9 @@ jobs:
       run:
         working-directory: engine
     env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
       YUE2_HF_HUB: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CUDA_VISIBLE_DEVICES: "0"
       CUDA_COMPUTE_CAP: "80"
@@ -183,6 +191,15 @@ jobs:
           ref: ${{ inputs.expected_engine_sha }}
           path: engine
           persist-credentials: false
+      - name: Download exact reviewed desktop-context receipt when requested
+        if: inputs.idle_cuda_context_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-88b257d1d2e0ef3c153fb3b1bf96bce66edc5f97-36850466402-1
+          run-id: ${{ inputs.idle_cuda_context_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-reviewed-idle-context
       - name: Verify exact engine source and fixture run selector
         shell: powershell
         env:

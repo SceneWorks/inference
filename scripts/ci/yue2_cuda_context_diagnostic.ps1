@@ -46,7 +46,8 @@ function Save-Counters($Name) {
     $patterns = @('\GPU Engine(*)\Utilization Percentage',
                   '\GPU Process Memory(*)\Dedicated Usage', '\GPU Process Memory(*)\Shared Usage',
                   '\GPU Process Memory(*)\Local Usage', '\GPU Process Memory(*)\Non Local Usage',
-                  '\GPU Process Memory(*)\Total Committed', '\GPU Adapter Memory(*)\Dedicated Usage')
+                  '\GPU Process Memory(*)\Total Committed', '\GPU Adapter Memory(*)\Dedicated Usage',
+                  '\GPU Adapter Memory(*)\Shared Usage', '\GPU Adapter Memory(*)\Total Committed')
     $results = @()
     foreach ($pattern in $patterns) {
         try {
@@ -124,7 +125,7 @@ Save-Json 'manifest.json' @{ schemaVersion = 1; purpose = 'diagnostic only, no i
 Save-ProcessIdentity 'process-before'
 Save-CounterCatalog
 for ($i = 0; $i -lt 3; $i++) {
-    Invoke-Smi "gpu-sample-$i" @('--query-gpu=index,uuid,pci.bus_id,name,driver_version,memory.total,memory.used,utilization.gpu,utilization.memory', '--format=csv,noheader,nounits')
+    Invoke-Smi "gpu-sample-$i" @('--query-gpu=index,uuid,pci.bus_id,name,driver_version,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory', '--format=csv,noheader,nounits')
     Invoke-Smi "driver-mode-$i" @('--query-gpu=index,uuid,driver_model.current,display_active', '--format=csv,noheader')
     foreach ($gpu in @(0, 1)) {
         Invoke-Smi "pmon-$gpu-$i" @('pmon', '-i', [string]$gpu, '-c', '1', '-s', 'um')
@@ -136,5 +137,6 @@ for ($i = 0; $i -lt 3; $i++) {
 Invoke-Smi 'gpu-before-cuda-properties' @('--query-gpu=index,uuid,pci.bus_id,memory.used,utilization.gpu', '--format=csv,noheader,nounits')
 Save-CudaAdapterMap
 Invoke-Smi 'gpu-after-cuda-properties' @('--query-gpu=index,uuid,pci.bus_id,memory.used,utilization.gpu', '--format=csv,noheader,nounits')
+Invoke-Smi 'pmon-0-final' @('pmon', '-i', '0', '-c', '1', '-s', 'um')
 Save-ProcessIdentity 'process-after'
 Save-Json 'manifest.json' @{ schemaVersion = 1; purpose = 'diagnostic only, no idle verdict'; engineSha = $EngineSha; controlSha = $ControlSha; runner = $env:RUNNER_NAME; targetPid = $TargetPid; startedUtc = $started; completedUtc = (Get-Date).ToUniversalTime().ToString('o'); completed = $true }

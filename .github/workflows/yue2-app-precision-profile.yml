@@ -26,9 +26,15 @@ on:
         required: false
         default: false
         description: Operator confirms a fresh nax-macos-2 resource window was approved
+      idle_cuda_context_run_id:
+        type: string
+        required: false
+        default: ""
+        description: Reviewed owner-window diagnostic run; empty keeps the CUDA mixed-context refusal
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ inputs.backend == 'cuda' && 'inference-real-weights-physical-host' || 'yue2-app-precision-nax-macos-2' }}
@@ -40,6 +46,9 @@ jobs:
     runs-on: [self-hosted, Windows, X64, cuda, real-weights]
     timeout-minutes: 480
     env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
       CUDA_VISIBLE_DEVICES: "0"
       CUDA_COMPUTE_CAP: "120"
       APP_RUN_ROOT: 'E:\sceneworks-terminal\sc-23002-yue2-precision\${{ github.run_id }}-${{ github.run_attempt }}'
@@ -76,6 +85,15 @@ jobs:
           ref: ${{ inputs.expected_engine_sha }}
           path: engine
           persist-credentials: false
+      - name: Download exact reviewed desktop-context receipt when requested
+        if: inputs.idle_cuda_context_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-88b257d1d2e0ef3c153fb3b1bf96bce66edc5f97-36850466402-1
+          run-id: ${{ inputs.idle_cuda_context_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-reviewed-idle-context
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: "0.12.3"
