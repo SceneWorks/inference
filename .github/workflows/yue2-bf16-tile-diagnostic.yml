@@ -125,6 +125,8 @@ jobs:
           set "RUSTC_WRAPPER="
           call "%VCVARS%" || exit /b 1
           "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" || exit /b 1
+          cargo fetch --locked --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --target x86_64-pc-windows-msvc > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\fetch.log" 2>&1
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\fetch.log"& exit /b 1)
           cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
           if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"& exit /b 1)
           "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" || exit /b 1

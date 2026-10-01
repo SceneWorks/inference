@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 CI = Path(__file__).resolve().parents[1] / "ci"
+WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/yue2-bf16-tile-diagnostic.yml"
 sys.path.insert(0, str(CI))
 spec = importlib.util.spec_from_file_location("yue2_bf16_tile_diagnostic", CI / "yue2_bf16_tile_diagnostic.py")
 diag = importlib.util.module_from_spec(spec)
@@ -17,6 +18,48 @@ spec.loader.exec_module(diag)
 
 
 class DiagnosticGuards(unittest.TestCase):
+    @staticmethod
+    def assert_locked_fetch_before_offline_build(workflow: str) -> None:
+        step = workflow.split("      - name: Build the external M3 VAE diagnostic harness\n", 1)[1].split(
+            "      - name: Run only the bounded same-input VAE diagnostic\n", 1)[0]
+        lines = [line.strip() for line in step.splitlines()]
+        prepare = next(i for i, line in enumerate(lines) if "prepare-harness" in line)
+        fetch = next(i for i, line in enumerate(lines) if line.startswith("cargo fetch "))
+        build = next(i for i, line in enumerate(lines) if line.startswith("cargo build "))
+        assert prepare < fetch < build
+        assert lines[fetch] == (
+            'cargo fetch --locked --manifest-path "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\harness\\Cargo.toml" '
+            '--target x86_64-pc-windows-msvc > "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\fetch.log" 2>&1')
+        assert lines[fetch + 1] == (
+            'if errorlevel 1 (type "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\fetch.log"& exit /b 1)')
+        assert lines[build] == (
+            'cargo build --locked --offline --release --manifest-path '
+            '"%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\harness\\Cargo.toml" --features cuda '
+            '--message-format=json > "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.jsonl" '
+            '2> "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\build.log"')
+        assert 'path: ${{ runner.temp }}/yue2-bf16-tile-diagnostic' in workflow
+
+    def test_locked_target_fetch_stages_before_unchanged_offline_build(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assert_locked_fetch_before_offline_build(workflow)
+        mutations = {
+            "missing fetch": ('          cargo fetch --locked', '          cargo missing --locked'),
+            "unlocked fetch": ('cargo fetch --locked', 'cargo fetch'),
+            "wrong target": ('--target x86_64-pc-windows-msvc', '--target x86_64-unknown-linux-gnu'),
+            "ignored fetch error": ('if errorlevel 1 (type "%RUNNER_TEMP%\\yue2-bf16-tile-diagnostic\\fetch.log"& exit /b 1)', 'rem ignored fetch error'),
+            "online build": ('cargo build --locked --offline', 'cargo build --locked'),
+        }
+        for name, (old, new) in mutations.items():
+            with self.subTest(name=name):
+                self.assertIn(old, workflow)
+                with self.assertRaises((AssertionError, StopIteration)):
+                    self.assert_locked_fetch_before_offline_build(workflow.replace(old, new, 1))
+        fetch_line = next(line for line in workflow.splitlines() if "cargo fetch --locked" in line)
+        build_line = next(line for line in workflow.splitlines() if "cargo build --locked --offline" in line)
+        moved = workflow.replace(fetch_line + "\n", "", 1).replace(build_line, build_line + "\n" + fetch_line, 1)
+        with self.assertRaises(AssertionError):
+            self.assert_locked_fetch_before_offline_build(moved)
+
     def test_foreign_context_never_launches_a_diagnostic(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
