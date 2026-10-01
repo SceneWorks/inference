@@ -66,6 +66,13 @@ pub struct SpeculativeStats {
     pub replays: usize,
     /// Partially accepted verify steps recovered by a direct cache rollback (no forward).
     pub direct_rollbacks: usize,
+    /// Decode steps the pipelined loop enqueued before the previous token was read back (story
+    /// sc-24439); `0` for a run that was not pipelined.
+    pub pipelined: usize,
+    /// Pipelined look-ahead forwards discarded unread because the token before them ended the run
+    /// (at most one per run). `forwards` counts them: forwards = prefill + verify steps + replays +
+    /// discarded.
+    pub discarded: usize,
 }
 
 /// Generate from `prompt_ids` with prompt-lookup speculative decoding, returning the output and
@@ -138,4 +145,53 @@ pub fn generate_draft_speculative(
         EngineOptions::default(),
     )?;
     Ok((run.output, run.stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::engine::tests::causal;
+    use crate::decode::generate;
+
+    /// Draft-model speculation draws by the shared rule every MLX decode loop uses: with no
+    /// drafts (`num_draft = 0`, the exactness gate) a seeded temperature-0.8 / top-p-0.9 run is the
+    /// plain loop's, first token and all. (Top-p is what separates the rules: the heap-order
+    /// reference walks the nucleus heaviest-first, the shared sampler in vocabulary order.)
+    #[test]
+    fn draft_speculation_draws_by_the_shared_sampler() {
+        let (target, draft) = (causal(), causal());
+        let prompt = [3, 9, 4, 11, 3, 9, 4, 11];
+        for seed in [7, 8, 9] {
+            let config = GenerationConfig {
+                max_new_tokens: 12,
+                sampling: crate::primitives::sampler::SamplingParams {
+                    temperature: 0.8,
+                    top_p: 0.9,
+                    ..Default::default()
+                },
+                seed: Some(seed),
+                stop_tokens: Vec::new(),
+            };
+            let expected =
+                generate(&target, &prompt, &config, &CancelFlag::new(), &mut |_| {}).unwrap();
+            let (out, _) = generate_draft_speculative(
+                &target,
+                &draft,
+                &prompt,
+                &config,
+                &SpeculativeConfig {
+                    max_ngram: 3,
+                    num_draft: 0,
+                },
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_eq!(
+                out.tokens[0], expected.tokens[0],
+                "seed {seed}: first token"
+            );
+            assert_eq!(out.tokens, expected.tokens, "seed {seed}");
+        }
+    }
 }

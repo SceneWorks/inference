@@ -59,6 +59,7 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaption> {
                 projector_source: None,
                 quantize: None,
                 cuda_graphs: None,
+                prefix_cache_bytes: None,
                 draft_source: None,
             },
             &ModelRequirements::default().with_vision(),

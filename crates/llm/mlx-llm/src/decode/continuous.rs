@@ -43,7 +43,7 @@ use crate::error::{Error, Result};
 use crate::models::CausalLm;
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::nn::input_ids;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::{draw_token, SamplingParams, SplitMix64};
 use crate::primitives::{BlockPool, PagedKvCache};
 
 /// Numerical mode for [`generate_continuous`]'s decode forward — a throughput/exactness tradeoff
@@ -188,7 +188,7 @@ pub fn generate_continuous(
 
         let mut survivors: Vec<Lane> = Vec::with_capacity(lanes.len());
         for (mut lane, logits) in std::mem::take(&mut lanes).into_iter().zip(per_lane) {
-            let tok = sample(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
+            let tok = draw_token(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
             if let LaneStep::Continue = record_token(&mut sched, &mut lane, tok, on_event) {
                 survivors.push(lane);
             }
@@ -296,7 +296,7 @@ fn admit_lane(
         history: r.prompt_ids.clone(),
         next_token: 0,
     };
-    let tok = sample(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
+    let tok = draw_token(&logits, &lane.history, &lane.params, &mut lane.rng, None)?;
     Ok(match record_token(sched, &mut lane, tok, on_event) {
         LaneStep::Continue => Some(lane),
         LaneStep::Done => None,

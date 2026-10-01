@@ -148,6 +148,12 @@ pub struct DecodeReport {
     pub fused_primitives: PathReport,
     /// Target-model forward passes, including the prompt prefill.
     pub target_forwards: u64,
+    /// The target forwards the prompt prefill took, counted in
+    /// [`target_forwards`](Self::target_forwards): one for a prompt prefilled in one pass, two
+    /// when a hybrid decoder's prefill split at the cross-turn prefix cache's snapshot boundary
+    /// (story sc-24437), `0` on a path that does not report it. On the speculative engine
+    /// `target_forwards == prefill_forwards + verify_steps + replay_forwards`.
+    pub prefill_forwards: u64,
     /// Draft tokens proposed.
     pub proposed_tokens: u64,
     /// Draft tokens accepted by target verification.
@@ -158,6 +164,18 @@ pub struct DecodeReport {
     pub verify_steps: u64,
     /// Verify steps recovered by a step-start rollback plus a replay forward.
     pub replay_forwards: u64,
+    /// Leading prompt tokens whose cache state came from the cross-turn prefix cache instead of a
+    /// prefill forward (story sc-24437): the prefill ran only the prompt past them. `0` on a miss,
+    /// when the cache is off, and on a request it refuses (a multimodal prompt — its reason is in
+    /// [`prefix_cache`](Self::prefix_cache)'s `reason`).
+    pub prefix_hit_tokens: u64,
+    /// The cross-turn prefix cache's part in this request (story sc-24437): `hit` (a stored
+    /// prefix was restored — [`prefix_hit_tokens`](Self::prefix_hit_tokens) of it), `miss`
+    /// (looked up, nothing reusable), `off` (the load settled a zero budget), `bypassed` (the
+    /// request never reads or feeds the cache — the reason names why, e.g. a multimodal prompt
+    /// whose image / video / audio rows are not in the token key), or `none` (a decode path the
+    /// cache is not wired to). The reason also names why a request's own state was not kept.
+    pub prefix_cache: PathReport,
     /// Every fallback this request took that no sub-report above already names (epic sc-24432
     /// E2/E3): the speculative option resolving to less than it asked for, or a proposer that
     /// could not run on the path this request decoded on. Each entry leads with the feature
@@ -208,6 +226,13 @@ pub struct LoadReport {
     /// load. `None` where the switch does not apply — a provider that never routes decode steps
     /// through a CUDA-graph runner — so a product shows the settled value, not the request.
     pub cuda_graphs: Option<bool>,
+    /// The cross-turn prefix cache's byte budget the load settled (story sc-24437): the requested
+    /// budget ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes), else
+    /// [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES)) clamped to the headroom
+    /// the load's admission left — memory the loaded model may hold beyond its weights. `Some(0)`
+    /// when the cache is off or no headroom was left; `None` where the provider has no prefix
+    /// cache or was assembled without a load.
+    pub prefix_cache_bytes: Option<u64>,
     /// The draft model the load named ([`LoadSpec::draft_source`](crate::LoadSpec::draft_source),
     /// epic sc-24432 story sc-24436): resident, or refused with the reason named. `None` when no
     /// draft was named.

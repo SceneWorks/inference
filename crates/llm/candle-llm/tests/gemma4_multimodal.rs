@@ -564,6 +564,7 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
             projector_source: None,
             quantize,
             cuda_graphs: None,
+            prefix_cache_bytes: None,
             draft_source: None,
         };
         let p = LlamaProvider::load(&spec)
@@ -645,6 +646,43 @@ fn audio_conditioning_changes_the_provider_output() {
         clip(rising),
         "generation is deterministic"
     );
+}
+
+/// sc-24437: the cross-turn prefix cache keys on token ids, and two clips (or images) sit behind
+/// the same placeholder ids — so a multimodal prompt neither reads nor feeds the cache, and the
+/// report names why. A second clip on the same provider therefore decodes exactly what it decodes
+/// on a fresh one, however much of its prompt the first clip's matched token for token.
+#[test]
+fn a_multimodal_prompt_never_reuses_another_clips_prefix() {
+    let fx = write_snapshot(true, true);
+    let p = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    let req = |v: Vec<f32>| {
+        request(vec![
+            Content::Audio(AudioRef::new(AUDIO_RATE, v).unwrap()),
+            Content::text("t1"),
+        ])
+    };
+    let rising = req((0..8).map(|i| i as f32 / 8.0).collect());
+    let falling = req((0..8).map(|i| 1.0 - i as f32 / 8.0).collect());
+    let report = |p: &LlamaProvider, r: &TextLlmRequest| {
+        p.generate(r, &mut |_| {})
+            .expect("generate")
+            .decode
+            .expect("a decode report")
+    };
+    for r in [&rising, &falling] {
+        let rep = report(&p, r);
+        assert_eq!(rep.prefix_hit_tokens, 0);
+        assert_eq!(rep.prefix_cache.path, "bypassed");
+        let reason = rep.prefix_cache.reason.unwrap();
+        assert!(
+            reason.starts_with("a multimodal prompt is never cached"),
+            "{reason}"
+        );
+    }
+    let fresh = LlamaProvider::load(&spec_of(&fx)).expect("load");
+    assert_eq!(generate(&p, &falling), generate(&fresh, &falling));
+    assert_ne!(generate(&p, &rising), generate(&p, &falling));
 }
 
 /// sc-24138: a Gemma 4 request — the soft-token splice and plain text alike — decodes through

@@ -263,6 +263,25 @@ impl StepKvCache {
         }
     }
 
+    /// `layer`'s cached `(keys, values)` over the live positions `[1, heads, len, dim]` — views of
+    /// the cache's own storage (copy them to keep them past the next write) — or `None` for a
+    /// layer that caches nothing (or has not been written). What the cross-turn prefix cache
+    /// snapshots (sc-24437); a paged backing is [`Error::Unsupported`] (its blocks are shared
+    /// through the pool's own copy-on-write, not snapshotted).
+    pub fn layer_kv(&self, layer: usize) -> Result<Option<(Tensor, Tensor)>> {
+        match &self.backing {
+            Backing::Static(layers) => layers
+                .get(layer)
+                .and_then(Option::as_ref)
+                .map(|l| l.views(0))
+                .transpose(),
+            Backing::Growing(c) => Ok(c.peek(layer).cloned()),
+            Backing::Paged(_) => Err(Error::Unsupported(
+                "StepKvCache: a paged backing is not snapshotted by the prefix cache".into(),
+            )),
+        }
+    }
+
     fn first_static(layers: &[Option<StaticKvCache>]) -> Option<&StaticKvCache> {
         layers.iter().flatten().next()
     }
