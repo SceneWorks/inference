@@ -113,11 +113,14 @@ pub const REQUIRED_PHASES: [&str; 8] = [
 /// a throttled row start refuses), the dense-KV share of the prefill footprint, post-release MLX
 /// residuals within a defined slack, teacher-forced greedy agreement with the free-running
 /// divergence, and compile cost against a noise band.
-pub const RECEIPT_SCHEMA_VERSION: u32 = 6;
-pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v6";
-/// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v3).
+/// v7 (quality contract v4): the multi-turn prompt-cache fixture is a real two-turn conversation
+/// whose turn 2 is served by a prompt-cache hit, its agreement is teacher-forced (compressed rows on
+/// a turn-2 forced continuation), and each arm's per-turn cache record is sealed.
+pub const RECEIPT_SCHEMA_VERSION: u32 = 7;
+pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v7";
+/// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v4).
 pub const QUALITY_CONTRACT_HASH: &str =
-    "58eaa007c35084c8acac2b35b5a2a1dff5af55832a7533557741d43a05944b49";
+    "daf6fabf19ed3fbd584209df4bb0f22b5f2f3aac08a785618912eca82d315e03";
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
 pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
@@ -196,7 +199,7 @@ pub const QUALITY_GATE_METRICS: [QualityGateMetric; 5] = [
     QualityGateMetric {
         metric: "multiTurnPromptCache",
         fixture: "multi-turn-prompt-cache",
-        threshold: 1.0,
+        threshold: COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN,
         comparison: QualityGateComparison::Minimum,
         read: |metrics| metrics.multi_turn_prompt_cache,
     },
@@ -715,6 +718,51 @@ fn preflight_total_live_tokens(
         .into_iter()
         .max()
         .ok_or("no rendered requests")?;
+    // The multi-turn fixture (contract v4) holds turn 1's stored prompt and answer beside turn
+    // 2's request cache: turn 2 renders turn 1's conversation, an answer of at most
+    // `FIXTURE_MAX_NEW_TOKENS` tokens (bounded here by a placeholder answer of that many words plus
+    // a re-tokenization margin), and the follow-up, then decodes its natural answer or, on a
+    // compressed row, its forced continuation.
+    let turn1_rendered = crate::provider::campaign_preflight_request_tokens(
+        snapshot,
+        &fixture_request(prompts[3].clone(), Vec::new()),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut turn2_request = fixture_request(prompts[3].clone(), Vec::new());
+    turn2_request.messages.push(Message::text(
+        Role::Assistant,
+        " context".repeat(FIXTURE_MAX_NEW_TOKENS as usize),
+    ));
+    turn2_request
+        .messages
+        .push(Message::text(Role::User, MULTI_TURN_FIXTURE_FOLLOW_UP));
+    let turn2_rendered =
+        crate::provider::campaign_preflight_request_tokens(snapshot, &turn2_request)
+            .map_err(|e| e.to_string())?
+            .checked_add(MULTI_TURN_ANSWER_RETOKENIZATION_MARGIN)
+            .ok_or("multi-turn live context overflows u64")?;
+    if turn2_rendered + u64::from(FIXTURE_MAX_NEW_TOKENS) > spec.native_context_tokens {
+        return Err(format!(
+            "{} multi-turn fixture turn 2 exceeds native context before model load",
+            coordinate_slug(coordinate)
+        ));
+    }
+    let turn2_decode = if compressed {
+        FORCED_CONTINUATION_TOKENS
+            .min(spec.native_context_tokens.saturating_sub(turn2_rendered))
+            .max(u64::from(FIXTURE_MAX_NEW_TOKENS))
+    } else {
+        u64::from(FIXTURE_MAX_NEW_TOKENS)
+    };
+    let multi_turn = [
+        turn1_rendered,
+        u64::from(FIXTURE_MAX_NEW_TOKENS),
+        turn2_rendered,
+        turn2_decode,
+    ]
+    .into_iter()
+    .try_fold(0_u64, u64::checked_add)
+    .ok_or("multi-turn live context overflows u64")?;
     let cancellation = crate::provider::campaign_preflight_cancellation_tokens(snapshot)
         .map_err(|e| e.to_string())?;
     if rendered > spec.native_context_tokens || cancellation > spec.native_context_tokens {
@@ -751,8 +799,11 @@ fn preflight_total_live_tokens(
         0
     };
     Ok((
-        total.max(steady_decode).max(forced_continuation),
-        max_request,
+        total
+            .max(steady_decode)
+            .max(forced_continuation)
+            .max(multi_turn),
+        max_request.max(turn2_rendered),
     ))
 }
 
@@ -1840,6 +1891,26 @@ pub struct ReceiptQuality {
     pub tool_discriminating: bool,
     #[serde(rename = "multiTurnPromptCache")]
     pub multi_turn_prompt_cache: f64,
+    /// Always [`MULTI_TURN_PROMPT_CACHE_METHOD`] (quality contract v4).
+    #[serde(rename = "multiTurnPromptCacheMethod")]
+    pub multi_turn_prompt_cache_method: String,
+    /// Observation only: the earliest position, over the measured repeats, at which the
+    /// free-running candidate and reference turn-2 streams differ (`null` when identical).
+    #[serde(rename = "multiTurnFreeRunningFirstDivergence")]
+    pub multi_turn_free_running_first_divergence: Option<u64>,
+    /// Observation only: the fewest leading turn-2 positions on which those streams agree.
+    #[serde(rename = "multiTurnMatchedPrefixTokens")]
+    pub multi_turn_matched_prefix_tokens: u64,
+    /// The primary repeat's per-turn prompt-cache records of both arms.
+    #[serde(rename = "multiTurnCache")]
+    pub multi_turn_cache: ReceiptMultiTurnCache,
+    /// Compressed rows only: the turn-2 forced continuation behind `multiTurnPromptCache`.
+    #[serde(
+        rename = "multiTurnForcedContinuation",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub multi_turn_forced_continuation: Option<ReceiptForcedContinuation>,
     pub statistics: ReceiptQualityStatistics,
     #[serde(rename = "fixtureEvidence")]
     pub fixture_evidence: std::collections::BTreeMap<String, ReceiptFixture>,
@@ -1859,6 +1930,13 @@ pub struct ReceiptQuality {
         skip_serializing_if = "Option::is_none"
     )]
     pub forced_continuation: Option<ReceiptForcedContinuation>,
+}
+/// Both arms' prompt-cache records of the multi-turn fixture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptMultiTurnCache {
+    pub candidate: MultiTurnPromptCacheTurns,
+    pub reference: MultiTurnPromptCacheTurns,
 }
 /// One frozen-threshold miss of one measured repeat.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1921,6 +1999,22 @@ pub fn forced_continuation_evidence(
     reference: &[i32],
     choices: &[i32],
 ) -> Result<ReceiptForcedContinuation, String> {
+    forced_continuation_evidence_with(reference, choices, FORCED_CONTINUATION_METHOD)
+}
+
+/// [`forced_continuation_evidence`] of the multi-turn fixture's turn-2 continuation (contract v4).
+pub fn multi_turn_forced_continuation_evidence(
+    reference: &[i32],
+    choices: &[i32],
+) -> Result<ReceiptForcedContinuation, String> {
+    forced_continuation_evidence_with(reference, choices, MULTI_TURN_FORCED_CONTINUATION_METHOD)
+}
+
+fn forced_continuation_evidence_with(
+    reference: &[i32],
+    choices: &[i32],
+    method: &str,
+) -> Result<ReceiptForcedContinuation, String> {
     if reference.is_empty() || reference.len() != choices.len() {
         return Err(format!(
             "forced continuation has {} reference positions but {} teacher-forced choices",
@@ -1938,7 +2032,7 @@ pub fn forced_continuation_evidence(
     let tokens = reference.len() as u64;
     let matches = tokens - flips.len() as u64;
     Ok(ReceiptForcedContinuation {
-        method: FORCED_CONTINUATION_METHOD.into(),
+        method: method.into(),
         tokens,
         matches,
         agreement: matches as f64 / tokens as f64,
@@ -1957,6 +2051,14 @@ fn validate_forced_continuation(
     continuation: &ReceiptForcedContinuation,
     context_band: &str,
 ) -> Result<(), String> {
+    validate_forced_continuation_with(continuation, context_band, FORCED_CONTINUATION_METHOD)
+}
+
+fn validate_forced_continuation_with(
+    continuation: &ReceiptForcedContinuation,
+    context_band: &str,
+    method: &str,
+) -> Result<(), String> {
     let digest = |value: &str| {
         value.len() == 64
             && value
@@ -1970,7 +2072,7 @@ fn validate_forced_continuation(
     let recorded = usize::try_from(continuation.flip_count)
         .unwrap_or(usize::MAX)
         .min(FORCED_CONTINUATION_RECORDED_FLIPS);
-    if continuation.method != FORCED_CONTINUATION_METHOD
+    if continuation.method != method
         || !length_valid
         || continuation.matches > continuation.tokens
         || continuation.flip_count != continuation.tokens - continuation.matches
@@ -1999,6 +2101,75 @@ fn validate_forced_continuation(
         ));
     }
     Ok(())
+}
+
+/// Re-tokenization slack of turn 1's decoded answer when turn 2 renders it (preflight bound).
+const MULTI_TURN_ANSWER_RETOKENIZATION_MARGIN: u64 = 32;
+/// Quality contract v4 multi-turn prompt-cache fixture: turn 2's user message. Turn 1 is the
+/// frozen cache prompt; turn 2 is turn 1's conversation, its answer, and this follow-up.
+pub const MULTI_TURN_FIXTURE_FOLLOW_UP: &str =
+    "Now repeat that same stable baseline fact once more, in one short sentence.";
+/// Contract v4 `multiTurnPromptCache`: teacher-forced per-position argmax agreement of turn 2,
+/// served by a prompt-cache hit over turn 1, with the reference's turn-2 stream.
+pub const MULTI_TURN_PROMPT_CACHE_METHOD: &str = "teacher-forced-turn-2-after-prompt-cache-hit";
+/// The compressed rows' turn-2 forced continuation (the denominator of `multiTurnPromptCache`).
+pub const MULTI_TURN_FORCED_CONTINUATION_METHOD: &str =
+    "dense-kv-same-weights-turn-2-prompt-cache-hit-greedy-continuation-eos-ignored-teacher-forced";
+/// Frozen compressed `multiTurnPromptCache` minimum (contract v4 `thresholds.multiTurnPromptCache`,
+/// aligned with greedy agreement).
+pub const COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN: f64 = 0.999;
+
+/// One turn of the multi-turn prompt-cache fixture as the product prompt cache served it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PromptCacheTurn {
+    /// Rendered prompt tokens of the turn.
+    pub prompt_tokens: u64,
+    /// Whether the turn's prompt-cache lookup hit.
+    pub cache_hit: bool,
+    /// Prompt tokens whose K/V the hit reused (zero on a miss).
+    pub reused_prefix_tokens: u64,
+}
+
+/// Both turns of one multi-turn prompt-cache fixture run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct MultiTurnPromptCacheTurns {
+    pub turn1: PromptCacheTurn,
+    pub turn2: PromptCacheTurn,
+}
+
+impl MultiTurnPromptCacheTurns {
+    /// Turn 1 misses its fresh store; turn 2 is served by a hit that reuses part of its prompt
+    /// (at most turn 1's stored prompt and answer). Anything else measured a cold turn 2.
+    pub fn validate(&self, arm: &str) -> Result<(), String> {
+        let (one, two) = (self.turn1, self.turn2);
+        if one.cache_hit
+            || one.reused_prefix_tokens != 0
+            || one.prompt_tokens == 0
+            || !two.cache_hit
+            || two.reused_prefix_tokens == 0
+            || two.reused_prefix_tokens >= two.prompt_tokens
+            || two.prompt_tokens <= one.prompt_tokens
+            || two.reused_prefix_tokens > one.prompt_tokens + u64::from(FIXTURE_MAX_NEW_TOKENS)
+        {
+            return Err(format!(
+                "{arm} multi-turn prompt cache did not serve turn 2 from turn 1's prefix: {self:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Leading positions on which two free-running streams agree.
+fn matched_prefix_tokens(candidate: &[i32], reference: &[i32]) -> u64 {
+    candidate
+        .iter()
+        .zip(reference)
+        .take_while(|(candidate, reference)| candidate == reference)
+        .count() as u64
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2430,11 +2601,24 @@ impl ReceiptBuilder {
         self.template.quality.needle_discriminating = self.quality.needle_discriminating;
         self.template.quality.tool_discriminating = self.quality.tool_discriminating;
         self.template.quality.multi_turn_prompt_cache = metrics.multi_turn_prompt_cache;
+        self.template.quality.multi_turn_prompt_cache_method =
+            MULTI_TURN_PROMPT_CACHE_METHOD.into();
+        self.template
+            .quality
+            .multi_turn_free_running_first_divergence =
+            self.quality.cache_free_running_first_divergence;
+        self.template.quality.multi_turn_matched_prefix_tokens =
+            self.quality.cache_matched_prefix_tokens;
+        self.template.quality.multi_turn_cache = ReceiptMultiTurnCache {
+            candidate: self.quality.cache_candidate_turns,
+            reference: self.quality.cache_reference_turns,
+        };
         // A compressed row's quality is gated per measured repeat; the outcome, pass or fail, is
         // recorded with the row (dense rows are characterization and carry no gate).
         (
             self.template.quality.quality_gate,
             self.template.quality.forced_continuation,
+            self.template.quality.multi_turn_forced_continuation,
         ) = if self.template.mode == "compressed" {
             if self.quality.repeat_metrics.len() != 5 {
                 return Err(
@@ -2444,9 +2628,10 @@ impl ReceiptBuilder {
             (
                 Some(quality_gate_from_repeats(&self.quality.repeat_metrics)),
                 self.quality.forced_continuation.clone(),
+                self.quality.multi_turn_forced_continuation.clone(),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         if self.template.memory.persistent_kv_bytes == 0
             || self.template.memory.model_weights_bytes == 0
@@ -2768,13 +2953,31 @@ fn validate_host_states(receipt: &Receipt) -> Result<(), String> {
 fn validate_quality_gate(receipt: &Receipt) -> Result<(), String> {
     let quality = &receipt.quality;
     if receipt.mode != "compressed" {
-        if quality.quality_gate.is_some() || quality.forced_continuation.is_some() {
+        if quality.quality_gate.is_some()
+            || quality.forced_continuation.is_some()
+            || quality.multi_turn_forced_continuation.is_some()
+        {
             return Err(
                 "a quality gate and forced continuation are recorded only on compressed receipts"
                     .into(),
             );
         }
         return Ok(());
+    }
+    let multi_turn = quality
+        .multi_turn_forced_continuation
+        .as_ref()
+        .ok_or("compressed receipt has no turn-2 forced continuation for multiTurnPromptCache")?;
+    validate_forced_continuation_with(
+        multi_turn,
+        &receipt.matrix.context_band,
+        MULTI_TURN_FORCED_CONTINUATION_METHOD,
+    )?;
+    if quality.multi_turn_prompt_cache.to_bits() != multi_turn.agreement.to_bits() {
+        return Err(format!(
+            "multiTurnPromptCache {} is not the row's turn-2 forced-continuation agreement {}",
+            quality.multi_turn_prompt_cache, multi_turn.agreement
+        ));
     }
     let continuation = quality
         .forced_continuation
@@ -3486,6 +3689,30 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     if receipt.quality.greedy_agreement_method != GREEDY_AGREEMENT_METHOD {
         return Err("greedy agreement is not teacher-forced".into());
     }
+    if receipt.quality.multi_turn_prompt_cache_method != MULTI_TURN_PROMPT_CACHE_METHOD {
+        return Err(
+            "multi-turn prompt-cache agreement is not teacher-forced on a cache-hit turn 2".into(),
+        );
+    }
+    receipt
+        .quality
+        .multi_turn_cache
+        .candidate
+        .validate("candidate")?;
+    receipt
+        .quality
+        .multi_turn_cache
+        .reference
+        .validate("reference")?;
+    if receipt
+        .quality
+        .multi_turn_free_running_first_divergence
+        .is_some_and(|divergence| receipt.quality.multi_turn_matched_prefix_tokens > divergence)
+    {
+        return Err(
+            "multi-turn matched prefix extends past its first free-running divergence".into(),
+        );
+    }
     let by_repeat = &receipt.quality.greedy_token_agreement_by_repeat;
     if by_repeat.len() != 5
         || by_repeat.iter().any(|value| !(0.0..=1.0).contains(value))
@@ -4074,7 +4301,50 @@ fn sealed_repeat_quality_metrics(
                         metrics.structured_tool_agreement = ratio("matches", "total")?
                     }
                     "long-context-needle" => metrics.needle_retrieval = ratio("matches", "total")?,
-                    _ => metrics.multi_turn_prompt_cache = ratio("matches", "total")?,
+                    _ => {
+                        let forced = evidence
+                            .get("forcedContinuation")
+                            .map(|value| {
+                                serde_json::from_value::<ReceiptForcedContinuation>(value.clone())
+                            })
+                            .transpose()
+                            .map_err(|e| format!("repeat {repeat} turn-2 forced continuation: {e}"))?;
+                        if forced.as_ref()
+                            != receipt.quality.multi_turn_forced_continuation.as_ref()
+                        {
+                            return Err(format!(
+                                "repeat {repeat} multi-turn fixture forced continuation is not the receipt's"
+                            ));
+                        }
+                        if forced.as_ref().is_some_and(|forced| {
+                            number("matches").ok() != Some(forced.matches as f64)
+                                || number("total").ok() != Some(forced.tokens as f64)
+                        }) {
+                            return Err(format!(
+                                "repeat {repeat} multi-turn counts are not its turn-2 forced continuation's"
+                            ));
+                        }
+                        if evidence.get("method").and_then(serde_json::Value::as_str)
+                            != Some(MULTI_TURN_PROMPT_CACHE_METHOD)
+                        {
+                            return Err(format!(
+                                "repeat {repeat} multi-turn fixture is not teacher-forced on a cache-hit turn 2"
+                            ));
+                        }
+                        for arm in ["candidate", "reference"] {
+                            evidence
+                                .get("turns")
+                                .and_then(|turns| turns.get(arm))
+                                .cloned()
+                                .ok_or_else(|| format!("repeat {repeat} {arm} has no turn records"))
+                                .and_then(|turns| {
+                                    serde_json::from_value::<MultiTurnPromptCacheTurns>(turns)
+                                        .map_err(|e| format!("repeat {repeat} {arm} turns: {e}"))
+                                })?
+                                .validate(arm)?;
+                        }
+                        metrics.multi_turn_prompt_cache = ratio("matches", "total")?
+                    }
                 }
             }
             Ok(metrics)
@@ -6605,6 +6875,31 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                         coordinate_slug(&row.coordinate)
                     )
                 })?;
+            // Contract v4: compressed rows' multi-turn prompt-cache agreement is measured on the
+            // same-weights dense-KV session's turn-2 forced continuation, after its own turn-2
+            // prompt-cache hit, once per row.
+            let multi_turn_reference = compressed
+                .map(|_| {
+                    let cache_prompt =
+                        cache_fixture_prompt(&reference_session, &prompt, &row.coordinate)?;
+                    reference_session
+                        .provider
+                        .campaign_multi_turn_forced_continuation(
+                            &fixture_request(cache_prompt, Vec::new()),
+                            MULTI_TURN_FIXTURE_FOLLOW_UP,
+                            FORCED_CONTINUATION_TOKENS as usize,
+                            None,
+                            None,
+                        )
+                        .map(|(stream, _)| stream)
+                })
+                .transpose()
+                .map_err(|e| {
+                    format!(
+                        "dense turn-2 forced continuation for {}: {e}",
+                        coordinate_slug(&row.coordinate)
+                    )
+                })?;
             drop(reference_session);
             quiesce_campaign_active_memory(reference_baseline).map_err(|e| {
                 format!(
@@ -6689,6 +6984,75 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     (forced, None)
                 }
             };
+            // Multi-turn prompt-cache agreement (contract v4) is teacher-forced the same way, on
+            // turn 2 after the candidate's own turn-2 prompt-cache hit: the row's turn-2 forced
+            // continuation (compressed) or each reference repeat's natural turn-2 stream (dense).
+            let (teacher_forced_cache, multi_turn_continuation) = match &multi_turn_reference {
+                Some(reference_stream) => {
+                    let choices = cache_fixture_prompt(&forcing_session, &prompt, &row.coordinate)
+                        .and_then(|cache_prompt| {
+                            forcing_session
+                                .provider
+                                .campaign_multi_turn_forced_continuation(
+                                    &fixture_request(cache_prompt, Vec::new()),
+                                    MULTI_TURN_FIXTURE_FOLLOW_UP,
+                                    reference_stream.len(),
+                                    forcing_session.compressed(),
+                                    Some(reference_stream),
+                                )
+                        })
+                        .map_err(|e| {
+                            format!(
+                                "teacher-forced turn-2 continuation for {}: {e}",
+                                coordinate_slug(&row.coordinate)
+                            )
+                        })?
+                        .0;
+                    let continuation =
+                        multi_turn_forced_continuation_evidence(reference_stream, &choices)?;
+                    eprintln!(
+                        "sc20671-kv-baseline: coordinate {} multi-turn turn-2 forced continuation agreement {} ({}/{}; first flips {:?})",
+                        coordinate_slug(&row.coordinate),
+                        continuation.agreement,
+                        continuation.matches,
+                        continuation.tokens,
+                        continuation.first_flip_positions
+                    );
+                    (vec![None; reference_repeats.len()], Some(continuation))
+                }
+                None => {
+                    let stop_tokens = forcing_session.provider.campaign_stop_tokens().to_vec();
+                    let streams = reference_repeats
+                        .iter()
+                        .map(|reference| {
+                            stream_tokens(&reference.cache.quality_observation.token_probabilities)
+                        })
+                        .collect::<Vec<_>>();
+                    let forced = force_distinct_streams(&streams, |stream| {
+                        teacher_forced_multi_turn_choices(
+                            &forcing_session,
+                            &prompt,
+                            &row.coordinate,
+                            stream,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "teacher-forced turn-2 pass for {}: {e}",
+                                coordinate_slug(&row.coordinate)
+                            )
+                        })
+                    })?
+                    .into_iter()
+                    .map(|choices| {
+                        Some(TeacherForcedChoices {
+                            choices,
+                            stop_tokens: stop_tokens.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                    (forced, None)
+                }
+            };
             drop(forcing_session);
             quiesce_campaign_active_memory(forcing_baseline).map_err(|e| {
                 format!(
@@ -6719,13 +7083,16 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 .into_iter()
                 .zip(reference_repeats)
                 .zip(teacher_forced)
+                .zip(teacher_forced_cache)
                 .enumerate()
-                .map(|(repeat, ((candidate, reference), forced))| {
+                .map(|(repeat, (((candidate, reference), forced), forced_cache))| {
                     let mut suite =
                         pair_product_fixture_halves(candidate, reference, reference_kind)?;
                     suite.kernel_parity_errors = compressed_parity.clone();
                     suite.teacher_forced_candidate = forced;
                     suite.forced_continuation = forced_continuation.clone();
+                    suite.teacher_forced_cache = forced_cache;
+                    suite.multi_turn_forced_continuation = multi_turn_continuation.clone();
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product fixture repeat {repeat} quality for {}: {e}",
@@ -7316,6 +7683,16 @@ pub struct QualityObservation {
     pub repeat_metrics: Vec<QualityMetrics>,
     /// Compressed rows: the forced continuation whose agreement is the greedy agreement.
     pub forced_continuation: Option<ReceiptForcedContinuation>,
+    /// Observation only: the first position at which the free-running candidate and reference
+    /// turn-2 streams of the multi-turn fixture differ (`None` when identical).
+    pub cache_free_running_first_divergence: Option<u64>,
+    /// Observation only: leading turn-2 positions on which those free-running streams agree.
+    pub cache_matched_prefix_tokens: u64,
+    /// Both arms' prompt-cache records of the multi-turn fixture (turn 2 must hit in each).
+    pub cache_candidate_turns: MultiTurnPromptCacheTurns,
+    pub cache_reference_turns: MultiTurnPromptCacheTurns,
+    /// Compressed rows: the turn-2 forced continuation whose agreement is `multiTurnPromptCache`.
+    pub multi_turn_forced_continuation: Option<ReceiptForcedContinuation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7411,7 +7788,17 @@ fn product_fixture_artifact(
             &suite.needle_reference,
         ),
         "multi-turn-prompt-cache" => (
-            serde_json::json!({ "matches": quality.cache_matches, "total": quality.cache_total }),
+            serde_json::json!({
+                "matches": quality.cache_matches,
+                "total": quality.cache_total,
+                "method": MULTI_TURN_PROMPT_CACHE_METHOD,
+                "freeRunningFirstDivergence": quality.cache_free_running_first_divergence,
+                "matchedPrefixTokens": quality.cache_matched_prefix_tokens,
+                "turns": {
+                    "candidate": quality.cache_candidate_turns,
+                    "reference": quality.cache_reference_turns,
+                },
+            }),
             &suite.cache_candidate,
             &suite.cache_reference,
         ),
@@ -7419,6 +7806,12 @@ fn product_fixture_artifact(
     };
     let mut evidence = evidence;
     if let (Some(continuation), "kernel-fp32-reference") = (&quality.forced_continuation, name) {
+        evidence["forcedContinuation"] =
+            serde_json::to_value(continuation).map_err(|e| e.to_string())?;
+    }
+    if let (Some(continuation), "multi-turn-prompt-cache") =
+        (&quality.multi_turn_forced_continuation, name)
+    {
         evidence["forcedContinuation"] =
             serde_json::to_value(continuation).map_err(|e| e.to_string())?;
     }
@@ -8569,6 +8962,22 @@ pub fn run_dense_lifecycle_request_on_session(
     coordinate: Option<&Coordinate>,
     observer: &mut dyn Observer,
 ) -> core_llm::Result<TextLlmOutput> {
+    run_lifecycle_request_on_session(session, prefix_prompt, request, None, coordinate, observer)
+        .map(|(output, _)| output)
+}
+
+/// [`run_dense_lifecycle_request_on_session`], optionally as the multi-turn prompt-cache fixture:
+/// with `follow_up`, the observed generation is turn 2 of a two-turn conversation served by the
+/// product prompt cache ([`crate::provider::LlamaProvider::campaign_multi_turn_observed`]), and
+/// both turns' cache records are returned.
+fn run_lifecycle_request_on_session(
+    session: &CampaignSession,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+    follow_up: Option<&str>,
+    coordinate: Option<&Coordinate>,
+    observer: &mut dyn Observer,
+) -> core_llm::Result<(TextLlmOutput, Option<MultiTurnPromptCacheTurns>)> {
     if let Some(coordinate) = coordinate {
         session.validate_coordinate_family(coordinate)?;
     }
@@ -8605,12 +9014,27 @@ pub fn run_dense_lifecycle_request_on_session(
         observer.phase("weights-loaded");
         observer.allocation("weights", "persistent", session.model_weights_bytes());
         let mut saw_token = false;
-        let output = provider.generate_observed(
-            &request,
-            &mut |event| saw_token |= matches!(event, StreamEvent::Token { .. }),
-            observer,
-            session.compressed(),
-        )?;
+        let mut on_event = |event| saw_token |= matches!(event, StreamEvent::Token { .. });
+        let (output, turns) = match follow_up {
+            Some(follow_up) => provider
+                .campaign_multi_turn_observed(
+                    &request,
+                    follow_up,
+                    &mut on_event,
+                    observer,
+                    session.compressed(),
+                )
+                .map(|(output, turns)| (output, Some(turns)))?,
+            None => (
+                provider.generate_observed(
+                    &request,
+                    &mut on_event,
+                    observer,
+                    session.compressed(),
+                )?,
+                None,
+            ),
+        };
         if !output_has_observed_generation(&output, saw_token) {
             return Err(core_llm::Error::InvalidRequest(
                 "dense campaign produced neither a streamed token nor a parsed tool call".into(),
@@ -8625,7 +9049,7 @@ pub fn run_dense_lifecycle_request_on_session(
         observer.cache_state(session.advance_cache_state());
         observer.phase("prompt-cache-reuse");
         provider.campaign_cancel_after_first_token(observer, session.compressed())?;
-        output
+        (output, turns)
     };
     provider.campaign_release_cache_state();
     mlx_rs::memory::clear_cache();
@@ -8644,6 +9068,9 @@ pub struct ProductFixtureResult {
     /// It is sealed alongside the coordinate observation and is never used as coordinate telemetry.
     pub quality_observation: ProductObservations,
     pub output: TextLlmOutput,
+    /// The multi-turn prompt-cache fixture only: both turns' prompt-cache records (the quality
+    /// output is turn 2's). `None` for every single-turn fixture.
+    pub multi_turn: Option<MultiTurnPromptCacheTurns>,
     pub coordinate_operation: String,
     pub coordinate_generated_tokens: u64,
     pub coordinate_prompt_tokens: u64,
@@ -8785,6 +9212,18 @@ pub fn run_product_fixture_on_session(
     request: TextLlmRequest,
     coordinate: &Coordinate,
 ) -> core_llm::Result<ProductFixtureResult> {
+    run_fixture_on_session(session, prefix_prompt, request, None, coordinate)
+}
+
+/// One product fixture: the coordinate operation on `prefix_prompt`, then the quality request —
+/// with `follow_up`, as turn 2 of the multi-turn prompt-cache fixture (contract v4).
+fn run_fixture_on_session(
+    session: &CampaignSession,
+    prefix_prompt: &str,
+    request: TextLlmRequest,
+    follow_up: Option<&str>,
+    coordinate: &Coordinate,
+) -> core_llm::Result<ProductFixtureResult> {
     session.validate_coordinate_family(coordinate)?;
     let primary_operation = if coordinate.request_mode == "supported-batch" {
         "supported-batch"
@@ -8811,10 +9250,11 @@ pub fn run_product_fixture_on_session(
             None
         };
     let mut observer = ProductObserver::new();
-    let output = run_dense_lifecycle_request_on_session(
+    let (output, multi_turn) = run_lifecycle_request_on_session(
         session,
         prefix_prompt,
         request,
+        follow_up,
         None,
         &mut observer,
     )?;
@@ -8823,6 +9263,7 @@ pub fn run_product_fixture_on_session(
         observation: primary.observation,
         quality_observation,
         output,
+        multi_turn,
         coordinate_operation: primary.operation,
         coordinate_generated_tokens: primary.generated_tokens,
         coordinate_prompt_tokens: primary.prompt_tokens,
@@ -9166,6 +9607,8 @@ pub fn quality_from_product_fixtures(
     kernel_parity_errors: Option<&[f64]>,
     teacher_forced_candidate: Option<&TeacherForcedChoices>,
     forced_continuation: Option<&ReceiptForcedContinuation>,
+    teacher_forced_cache: Option<&TeacherForcedChoices>,
+    multi_turn_forced_continuation: Option<&ReceiptForcedContinuation>,
 ) -> Result<QualityObservation, String> {
     if reference == QualityReference::DenseKvSameWeights
         && [
@@ -9199,10 +9642,37 @@ pub fn quality_from_product_fixtures(
             &kernel_reference.quality_observation.token_probabilities,
         ),
     };
-    let (cache_matches, cache_total) = token_agreement(
-        &cache_candidate.quality_observation.token_probabilities,
-        &cache_reference.quality_observation.token_probabilities,
-    );
+    // Contract v4: the multi-turn fixture's quality output is turn 2, served in both arms by a
+    // prompt-cache hit over turn 1 (fail closed otherwise), and its agreement is teacher-forced
+    // like greedy agreement: on the row's turn-2 forced continuation (compressed rows) or on the
+    // reference's natural turn-2 stream (dense rows). Free-running agreement is only observed.
+    let turns = |result: &ProductFixtureResult, arm: &str| {
+        let turns = result.multi_turn.ok_or_else(|| {
+            format!("{arm} multi-turn prompt-cache fixture has no per-turn cache record")
+        })?;
+        turns.validate(arm)?;
+        Ok::<_, String>(turns)
+    };
+    let cache_candidate_turns = turns(cache_candidate, "candidate")?;
+    let cache_reference_turns = turns(cache_reference, "reference")?;
+    let cache_candidate_stream =
+        stream_tokens(&cache_candidate.quality_observation.token_probabilities);
+    let cache_reference_stream =
+        stream_tokens(&cache_reference.quality_observation.token_probabilities);
+    let (cache_matches, cache_total) = match (multi_turn_forced_continuation, teacher_forced_cache)
+    {
+        (Some(continuation), _) => (continuation.matches, continuation.tokens),
+        (None, Some(forced)) => teacher_forced_agreement(
+            &forced.choices,
+            &cache_reference_stream,
+            &forced.stop_tokens,
+        ),
+        // Warmups only: every measured repeat requires its teacher-forced turn-2 pass.
+        (None, None) => token_agreement(
+            &cache_candidate.quality_observation.token_probabilities,
+            &cache_reference.quality_observation.token_probabilities,
+        ),
+    };
     let outcomes = FixtureOutcomes {
         candidate_tool_valid: structured_fixture_tool_valid(&tool_candidate.output),
         reference_tool_valid: structured_fixture_tool_valid(&tool_reference.output),
@@ -9247,6 +9717,17 @@ pub fn quality_from_product_fixtures(
         greedy_agreement_by_repeat: Vec::new(),
         repeat_metrics: Vec::new(),
         forced_continuation: forced_continuation.cloned(),
+        cache_free_running_first_divergence: first_divergence(
+            &cache_candidate_stream,
+            &cache_reference_stream,
+        ),
+        cache_matched_prefix_tokens: matched_prefix_tokens(
+            &cache_candidate_stream,
+            &cache_reference_stream,
+        ),
+        cache_candidate_turns,
+        cache_reference_turns,
+        multi_turn_forced_continuation: multi_turn_forced_continuation.cloned(),
     })
 }
 
@@ -9359,6 +9840,11 @@ pub struct ProductFixtureSuite {
     /// Compressed rows' measured repeats: the row's forced continuation, which replaces the
     /// natural-stream teacher-forced agreement.
     pub forced_continuation: Option<ReceiptForcedContinuation>,
+    /// Dense rows' measured repeats: the candidate's greedy choice at every position of this
+    /// repeat's reference turn-2 stream, after its own turn-2 prompt-cache hit.
+    pub teacher_forced_cache: Option<TeacherForcedChoices>,
+    /// Compressed rows' measured repeats: the row's turn-2 forced continuation (contract v4).
+    pub multi_turn_forced_continuation: Option<ReceiptForcedContinuation>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -9505,6 +9991,7 @@ fn fixture_half_attempt_diagnostic(
                     },
                     "coordinateOperation": result.coordinate_operation,
                     "coordinateOutputSha256": result.coordinate_output_sha256,
+                    "multiTurn": result.multi_turn,
                     "coordinateObservation": observation(&result.observation),
                     "qualityObservation": observation(&result.quality_observation),
                 }),
@@ -9559,6 +10046,49 @@ fn kernel_fixture_prompt(
     Ok(format!(
         "{prompt}\n{band_payload}\nReturn a concise deterministic answer."
     ))
+}
+
+/// The multi-turn fixture's turn-1 prompt of `coordinate`'s context band, exactly as the fixture
+/// half builds it.
+fn cache_fixture_prompt(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+) -> core_llm::Result<String> {
+    let (band_payload, ..) = session
+        .provider
+        .campaign_context_band_measurement(coordinate.context_band)?;
+    Ok(format!(
+        "{prompt}\n{band_payload}\nRepeat the stable baseline fact."
+    ))
+}
+
+/// Teacher-forced multi-turn fixture (dense rows): the candidate session runs both turns on the
+/// product prompt cache and decodes turn 2 forced on `forced` (the reference's natural turn-2
+/// stream); its greedy choice at every position is returned.
+fn teacher_forced_multi_turn_choices(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+    forced: &[i32],
+) -> core_llm::Result<Vec<i32>> {
+    let cache_prompt = cache_fixture_prompt(session, prompt, coordinate)?;
+    if forced.is_empty() {
+        return Err(core_llm::Error::InvalidRequest(
+            "reference turn-2 stream is empty; nothing to teacher-force".into(),
+        ));
+    }
+    let mut observer = ProductObserver::teacher_forced(forced.to_vec());
+    run_lifecycle_request_on_session(
+        session,
+        &cache_prompt,
+        fixture_request(cache_prompt.clone(), Vec::new()),
+        Some(MULTI_TURN_FIXTURE_FOLLOW_UP),
+        None,
+        &mut observer,
+    )?;
+    let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
+    Ok(stream_tokens(&observation.token_probabilities))
 }
 
 /// Teacher-forced kernel fixture: the candidate session decodes `reference`'s own kernel token
@@ -9662,7 +10192,7 @@ fn run_product_fixture_half_on_session_bounded(
         "{prompt}\n{band_payload}\nCall record_baseline_fact with fact exactly `SC20671 structured fixture`."
     );
     let needle_prompt = needle_fixture_prompt(prompt, &band_payload, &needle);
-    let cache_prompt = format!("{prompt}\n{band_payload}\nRepeat the stable baseline fact.");
+    let cache_prompt = cache_fixture_prompt(session, prompt, coordinate)?;
     let fixture_prompt_tokens = [
         session.provider.campaign_prompt_tokens(&kernel_prompt)?,
         session.provider.campaign_prompt_tokens(&tool_prompt)?,
@@ -9705,10 +10235,11 @@ fn run_product_fixture_half_on_session_bounded(
         fixture_request(needle_prompt.clone(), Vec::new()),
         coordinate,
     )?;
-    let cache = run_product_fixture_on_session(
+    let cache = run_fixture_on_session(
         session,
         &cache_prompt,
         fixture_request(cache_prompt.clone(), Vec::new()),
+        Some(MULTI_TURN_FIXTURE_FOLLOW_UP),
         coordinate,
     )?;
     // Batch rows are timed as one sequence too: the compressed arm has no batch route, so a
@@ -9772,6 +10303,8 @@ fn pair_product_fixture_halves(
         steady_decode: candidate.steady_decode,
         teacher_forced_candidate: None,
         forced_continuation: None,
+        teacher_forced_cache: None,
+        multi_turn_forced_continuation: None,
     })
 }
 
@@ -9791,6 +10324,8 @@ impl ProductFixtureSuite {
             self.kernel_parity_errors.as_deref(),
             self.teacher_forced_candidate.as_ref(),
             self.forced_continuation.as_ref(),
+            self.teacher_forced_cache.as_ref(),
+            self.multi_turn_forced_continuation.as_ref(),
         )
     }
 }
@@ -10575,6 +11110,14 @@ fn receipt_quality_over_repeats(
     }) {
         return Err("every measured repeat requires its teacher-forced greedy agreement".into());
     }
+    if suites.iter().any(|suite| {
+        suite.teacher_forced_cache.is_none() && suite.multi_turn_forced_continuation.is_none()
+    }) {
+        return Err(
+            "every measured repeat requires its teacher-forced multi-turn prompt-cache agreement"
+                .into(),
+        );
+    }
     let (primary, repeats) = suites
         .split_first()
         .ok_or("product receipt requires its fixture repeats")?;
@@ -10584,6 +11127,14 @@ fn receipt_quality_over_repeats(
         .any(|suite| suite.forced_continuation != primary.forced_continuation)
     {
         return Err("every measured repeat must share the row's one forced continuation".into());
+    }
+    if repeats
+        .iter()
+        .any(|suite| suite.multi_turn_forced_continuation != primary.multi_turn_forced_continuation)
+    {
+        return Err(
+            "every measured repeat must share the row's one turn-2 forced continuation".into(),
+        );
     }
     let mut quality = primary.quality()?;
     quality.repeat_metrics = vec![compute_quality(&quality)?];
@@ -10617,6 +11168,16 @@ fn receipt_quality_over_repeats(
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, right) => left.or(right),
         };
+        quality.cache_free_running_first_divergence = match (
+            quality.cache_free_running_first_divergence,
+            repeat.cache_free_running_first_divergence,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        quality.cache_matched_prefix_tokens = quality
+            .cache_matched_prefix_tokens
+            .min(repeat.cache_matched_prefix_tokens);
     }
     // The gate is the weakest repeat's agreement; every repeat's value is recorded.
     (quality.greedy_matches, quality.greedy_total) = (weakest.1, weakest.2);
@@ -11062,7 +11623,7 @@ fn product_receipt(
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
         memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: release_evidence(weights_loaded, release), admission, dense_kv_share_bps: 0, below_memory_material_share: false },
         timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:None,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,greedy_token_agreement_by_repeat:Vec::new(),structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence,quality_gate:None,forced_continuation:None}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,greedy_token_agreement_by_repeat:Vec::new(),structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,multi_turn_prompt_cache_method:String::new(),multi_turn_free_running_first_divergence:None,multi_turn_matched_prefix_tokens:0,multi_turn_cache:ReceiptMultiTurnCache::default(),multi_turn_forced_continuation:None,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence,quality_gate:None,forced_continuation:None}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -11199,6 +11760,23 @@ pub(crate) mod tests {
             compile_setup_ms: 0.0,
             compile_dispatch_ms: 1.0,
             secondary_coordinate_operation: None,
+            multi_turn: Some(test_multi_turn()),
+        }
+    }
+
+    /// A multi-turn fixture's valid per-turn records: turn 1 misses, turn 2 reuses 40 tokens.
+    fn test_multi_turn() -> MultiTurnPromptCacheTurns {
+        MultiTurnPromptCacheTurns {
+            turn1: PromptCacheTurn {
+                prompt_tokens: 32,
+                cache_hit: false,
+                reused_prefix_tokens: 0,
+            },
+            turn2: PromptCacheTurn {
+                prompt_tokens: 60,
+                cache_hit: true,
+                reused_prefix_tokens: 40,
+            },
         }
     }
 
@@ -11381,6 +11959,15 @@ pub(crate) mod tests {
                 ),
                 stop_tokens: Vec::new(),
             });
+            suite.teacher_forced_cache = Some(TeacherForcedChoices {
+                choices: stream_tokens(
+                    &suite
+                        .cache_reference
+                        .quality_observation
+                        .token_probabilities,
+                ),
+                stop_tokens: Vec::new(),
+            });
             suite
         };
         let mut invalid_dense_tool = half("I cannot help with that.");
@@ -11472,7 +12059,20 @@ pub(crate) mod tests {
         let bytes = include_bytes!("../testdata/kv-baseline-quality-contract.json");
         assert_eq!(seal_bytes(bytes), QUALITY_CONTRACT_HASH);
         let contract: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(contract["version"], 3);
+        assert_eq!(contract["version"], 4);
+        assert_eq!(
+            contract["thresholds"]["multiTurnPromptCache"],
+            COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN
+        );
+        assert_eq!(
+            contract["multiTurnFixture"]["followUp"],
+            MULTI_TURN_FIXTURE_FOLLOW_UP
+        );
+        for field in ["turns", "metric", "observations"] {
+            assert!(contract["multiTurnFixture"][field]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()));
+        }
         assert_eq!(
             contract["gate"]["compressedReference"],
             COMPRESSED_QUALITY_REFERENCE
@@ -12763,6 +13363,11 @@ pub(crate) mod tests {
             greedy_agreement_by_repeat: vec![1.0; 5],
             repeat_metrics: Vec::new(),
             forced_continuation: None,
+            cache_free_running_first_divergence: None,
+            cache_matched_prefix_tokens: 1,
+            cache_candidate_turns: test_multi_turn(),
+            cache_reference_turns: test_multi_turn(),
+            multi_turn_forced_continuation: None,
         };
         let metrics = compute_quality(&raw).unwrap();
         assert_eq!(metrics.parity_max_error, 0.0002);
@@ -13056,6 +13661,14 @@ pub(crate) mod tests {
                 needle_discriminating: true,
                 tool_discriminating: true,
                 multi_turn_prompt_cache: 1.0,
+                multi_turn_prompt_cache_method: MULTI_TURN_PROMPT_CACHE_METHOD.into(),
+                multi_turn_free_running_first_divergence: None,
+                multi_turn_matched_prefix_tokens: 1,
+                multi_turn_cache: ReceiptMultiTurnCache {
+                    candidate: test_multi_turn(),
+                    reference: test_multi_turn(),
+                },
+                multi_turn_forced_continuation: None,
                 statistics: ReceiptQualityStatistics {
                     repeats: 5,
                     warmups: 2,
@@ -13229,6 +13842,11 @@ pub(crate) mod tests {
             greedy_agreement_by_repeat: vec![1.0; 5],
             repeat_metrics: Vec::new(),
             forced_continuation: None,
+            cache_free_running_first_divergence: None,
+            cache_matched_prefix_tokens: 1,
+            cache_candidate_turns: test_multi_turn(),
+            cache_reference_turns: test_multi_turn(),
+            multi_turn_forced_continuation: None,
         };
         ReceiptBuilder {
             template,
@@ -13425,10 +14043,21 @@ pub(crate) mod tests {
         forced_continuation_evidence(&reference, &choices).unwrap()
     }
 
+    /// [`test_forced_continuation`] of the multi-turn fixture's turn 2.
+    fn test_multi_turn_forced_continuation(matches: u64) -> ReceiptForcedContinuation {
+        ReceiptForcedContinuation {
+            method: MULTI_TURN_FORCED_CONTINUATION_METHOD.into(),
+            ..test_forced_continuation(matches)
+        }
+    }
+
     /// Record `continuation` as the receipt's greedy agreement and its gate as the frozen
     /// evaluation of the receipt-level values for every repeat.
     fn set_test_compressed_quality(receipt: &mut Receipt, continuation: ReceiptForcedContinuation) {
         let quality = &mut receipt.quality;
+        let multi_turn = test_multi_turn_forced_continuation(FORCED_CONTINUATION_TOKENS);
+        quality.multi_turn_prompt_cache = multi_turn.agreement;
+        quality.multi_turn_forced_continuation = Some(multi_turn);
         quality.greedy_token_agreement = continuation.agreement;
         quality.greedy_token_agreement_by_repeat = vec![continuation.agreement; 5];
         let metrics = QualityMetrics {
@@ -13770,6 +14399,9 @@ pub(crate) mod tests {
                 .unwrap();
                 suite.kernel_parity_errors = Some(vec![0.00005]);
                 suite.forced_continuation = Some(continuation.clone());
+                suite.multi_turn_forced_continuation = Some(test_multi_turn_forced_continuation(
+                    FORCED_CONTINUATION_TOKENS,
+                ));
                 suite
             })
             .collect()
@@ -13847,6 +14479,218 @@ pub(crate) mod tests {
             edit(&mut forged);
             assert!(validate_forced_continuation(&forged, "short").is_err());
         }
+    }
+
+    /// Quality contract v4: `multiTurnPromptCache` is teacher-forced on turn 2 after its
+    /// prompt-cache hit (a compressed row's turn-2 forced continuation, a dense row's natural
+    /// reference stream), every measured repeat needs that pass, turn 2 must have hit the cache
+    /// in both arms, and the gate's minimum is 0.999 like greedy agreement. Free-running turn-2
+    /// agreement is an observation only.
+    #[test]
+    fn multi_turn_prompt_cache_is_teacher_forced_on_a_cache_hit_turn_two() {
+        let pair = || {
+            pair_product_fixture_halves(
+                test_fixture_half(TEST_NEEDLE),
+                test_fixture_half(TEST_NEEDLE),
+                QualityReference::DenseKvSameWeights,
+            )
+            .unwrap()
+        };
+        // Dense rows: teacher-forced on the reference turn-2 stream. A free-running candidate
+        // that diverged at position 0 does not lower it when every forced position agrees.
+        let mut suite = pair();
+        let reference_stream = stream_tokens(
+            &suite
+                .cache_reference
+                .quality_observation
+                .token_probabilities,
+        );
+        suite
+            .cache_candidate
+            .quality_observation
+            .token_probabilities
+            .iter_mut()
+            .for_each(|(token, _)| *token += 1000);
+        assert_eq!(
+            suite.quality().unwrap().cache_matches,
+            0,
+            "free-running warmup scoring"
+        );
+        suite.teacher_forced_cache = Some(TeacherForcedChoices {
+            choices: reference_stream.clone(),
+            stop_tokens: Vec::new(),
+        });
+        let forced = suite.quality().unwrap();
+        assert_eq!(
+            (forced.cache_matches, forced.cache_total),
+            (reference_stream.len() as u64, reference_stream.len() as u64)
+        );
+        assert_eq!(forced.cache_free_running_first_divergence, Some(0));
+        assert_eq!(forced.cache_matched_prefix_tokens, 0);
+        // Compressed rows: the turn-2 forced continuation supplies the counts.
+        suite.multi_turn_forced_continuation = Some(test_multi_turn_forced_continuation(1022));
+        let compressed = suite.quality().unwrap();
+        assert_eq!(
+            (compressed.cache_matches, compressed.cache_total),
+            (1022, 1024)
+        );
+        // A turn 2 the cache did not serve, or a fixture with no per-turn record, fails closed.
+        for arm in ["candidate", "reference"] {
+            let mut missed = pair();
+            let result = if arm == "candidate" {
+                &mut missed.cache_candidate
+            } else {
+                &mut missed.cache_reference
+            };
+            let mut turns = test_multi_turn();
+            turns.turn2.cache_hit = false;
+            turns.turn2.reused_prefix_tokens = 0;
+            result.multi_turn = Some(turns);
+            let error = missed.quality().unwrap_err();
+            assert!(
+                error.contains(&format!("{arm} multi-turn prompt cache")),
+                "{error}"
+            );
+            let mut unrecorded = pair();
+            unrecorded.cache_reference.multi_turn = None;
+            assert!(unrecorded
+                .quality()
+                .unwrap_err()
+                .contains("per-turn cache record"));
+        }
+        // Every measured repeat requires its teacher-forced turn-2 pass.
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS);
+        let mut suites = compressed_test_suites(&continuation, &[]);
+        suites[1].multi_turn_forced_continuation = None;
+        assert!(receipt_quality_over_repeats(&suites)
+            .unwrap_err()
+            .contains("teacher-forced multi-turn prompt-cache agreement"));
+        suites[1].multi_turn_forced_continuation = Some(test_multi_turn_forced_continuation(1000));
+        assert!(receipt_quality_over_repeats(&suites)
+            .unwrap_err()
+            .contains("one turn-2 forced continuation"));
+        // One flip in 1024 meets the 0.999 minimum; two do not.
+        for (matches, passes) in [(1023, true), (1022, false)] {
+            let suites = compressed_test_suites(&continuation, &[])
+                .into_iter()
+                .map(|mut suite| {
+                    suite.multi_turn_forced_continuation =
+                        Some(test_multi_turn_forced_continuation(matches));
+                    suite
+                })
+                .collect::<Vec<_>>();
+            let receipt = compressed_test_builder(receipt_quality_over_repeats(&suites).unwrap())
+                .finish()
+                .unwrap();
+            let gate = receipt.quality.quality_gate.as_ref().unwrap();
+            assert_eq!(
+                gate.failures
+                    .iter()
+                    .filter(|failure| failure.metric == "multiTurnPromptCache")
+                    .count(),
+                if passes { 0 } else { 5 },
+                "{gate:?}"
+            );
+            assert_eq!(
+                receipt.quality.multi_turn_prompt_cache,
+                matches as f64 / 1024.0
+            );
+            assert_eq!(
+                receipt.quality.multi_turn_prompt_cache_method,
+                MULTI_TURN_PROMPT_CACHE_METHOD
+            );
+        }
+        // The receipt validators bind the value, method, records and contract identity.
+        let receipt = compressed_test_builder(
+            receipt_quality_over_repeats(&compressed_test_suites(&continuation, &[])).unwrap(),
+        )
+        .finish()
+        .unwrap();
+        let refuses = |edit: &dyn Fn(&mut Receipt), expected: &str| {
+            let mut forged = receipt.clone();
+            edit(&mut forged);
+            let error = validate_receipt_semantics(&forged).unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        refuses(
+            &|r| r.quality.multi_turn_prompt_cache = 0.5625,
+            "not the row's turn-2 forced-continuation agreement",
+        );
+        refuses(
+            &|r| r.quality.multi_turn_forced_continuation = None,
+            "no turn-2 forced continuation",
+        );
+        refuses(
+            &|r| {
+                r.quality
+                    .multi_turn_forced_continuation
+                    .as_mut()
+                    .unwrap()
+                    .method = FORCED_CONTINUATION_METHOD.into()
+            },
+            "forced continuation evidence is inconsistent",
+        );
+        refuses(
+            &|r| r.quality.multi_turn_prompt_cache_method = "free-running".into(),
+            "not teacher-forced on a cache-hit turn 2",
+        );
+        refuses(
+            &|r| r.quality.multi_turn_cache.reference.turn2.cache_hit = false,
+            "reference multi-turn prompt cache did not serve turn 2",
+        );
+        // A contract v3 receipt is refused outright.
+        refuses(
+            &|r| {
+                r.contract_hash =
+                    "58eaa007c35084c8acac2b35b5a2a1dff5af55832a7533557741d43a05944b49".into()
+            },
+            "receipt constants mismatch",
+        );
+        // Sealed repeat artifacts carry the turn-2 continuation, method and turn records.
+        let suites = compressed_test_suites(&continuation, &[]);
+        let artifacts = sealed_test_repeats(&suites);
+        let pairs = repeat_pairs(&artifacts);
+        let metrics = sealed_repeat_quality_metrics(&receipt, &pairs).unwrap();
+        assert!(metrics
+            .iter()
+            .all(|metrics| metrics.multi_turn_prompt_cache == 1.0));
+        let cache_index = REQUIRED_FIXTURES
+            .iter()
+            .position(|name| *name == "multi-turn-prompt-cache")
+            .unwrap();
+        let tamper = |edit: &dyn Fn(&mut serde_json::Value), expected: &str| {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(pairs[cache_index].1).unwrap();
+            edit(&mut value);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let mut forged = pairs.clone();
+            forged[cache_index].1 = &bytes;
+            let error = sealed_repeat_quality_metrics(&receipt, &forged).unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        tamper(
+            &|v| v["evidence"]["matches"] = serde_json::json!(36),
+            "not its turn-2 forced continuation's",
+        );
+        tamper(
+            &|v| v["evidence"]["method"] = serde_json::json!("free-running"),
+            "not teacher-forced on a cache-hit turn 2",
+        );
+        tamper(
+            &|v| {
+                v["evidence"]["turns"]["candidate"]["turn2"]["cacheHit"] = serde_json::json!(false)
+            },
+            "candidate multi-turn prompt cache",
+        );
+        tamper(
+            &|v| {
+                v["evidence"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("forcedContinuation");
+            },
+            "forced continuation is not the receipt's",
+        );
     }
 
     #[test]

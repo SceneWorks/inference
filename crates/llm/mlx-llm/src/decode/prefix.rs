@@ -269,14 +269,8 @@ pub(crate) fn generate_cached_with_observer(
     let rng = SplitMix64::new(config.seed.unwrap_or_else(default_seed));
 
     // Reuse the longest cached prefix (or start cold), then prefill only the uncached suffix.
-    let seed = prefix_cache.seed_for(prompt_ids)?;
-    let matched_len = seed.as_ref().map_or(0, |(_, len)| *len);
-    let mut cache: Box<dyn KvCache> = match (seed, compressed) {
-        (Some((seed, _)), Some(arm)) => import_compressed_prefix(model, arm, seed, &mut observer)?,
-        (None, Some(arm)) => compressed_cache(model, arm, &mut observer).0,
-        (Some((seed, _)), None) => Box::new(seed),
-        (None, None) => Box::new(model.new_cache()),
-    };
+    let (mut cache, matched_len) =
+        request_cache(model, prompt_ids, prefix_cache, compressed, &mut observer)?;
     let mut observed_cache = ObservedCache::default();
     let suffix = input_ids(&prompt_ids[matched_len..]);
     let logits = model.decode_logits(&suffix, cache.as_mut(), matched_len as i32)?;
@@ -330,6 +324,87 @@ pub(crate) fn generate_cached_with_observer(
     observe_cache_events(cache.as_mut(), &mut observed_cache, &mut observer)?;
 
     Ok(out)
+}
+
+/// The request cache of one prompt-cache lookup and the prompt length it already holds: the
+/// longest stored prefix seeded densely (or, with a `compressed` arm, imported into that arm's
+/// compressed cache by quantize-on-append), else a cold cache of the request's representation.
+fn request_cache(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    prefix_cache: &mut PrefixCache,
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+    observer: &mut Option<&mut dyn crate::campaign::Observer>,
+) -> Result<(Box<dyn KvCache>, usize)> {
+    let seed = prefix_cache.seed_for(prompt_ids)?;
+    let matched_len = seed.as_ref().map_or(0, |(_, len)| *len);
+    let cache: Box<dyn KvCache> = match (seed, compressed) {
+        (Some((seed, _)), Some(arm)) => import_compressed_prefix(model, arm, seed, observer)?,
+        (None, Some(arm)) => compressed_cache(model, arm, observer).0,
+        (Some((seed, _)), None) => Box::new(seed),
+        (None, None) => Box::new(model.new_cache()),
+    };
+    Ok((cache, matched_len))
+}
+
+/// The outcome of [`forced_cached_decode`]: the decode, the request cache's packed evidence, and
+/// every reasoned fallback its lookup recorded (the reuse itself is in the store's stats).
+pub(crate) struct ForcedCachedDecode {
+    pub(crate) decode: crate::decode::ForcedDecode,
+    pub(crate) packed_evidence: Option<crate::primitives::PackedCacheEvidence>,
+    pub(crate) fallbacks: Vec<(String, String)>,
+}
+
+/// A fixed-length forced greedy decode served through the prompt cache (SC-20671 multi-turn
+/// fixture): `prompt_ids` is looked up and its cache built exactly as
+/// [`generate_cached_with_observer`] builds it (dense seed, or a `compressed` import), only the
+/// uncached suffix is prefilled, and `tokens` ids are decoded through every stop token
+/// ([`crate::decode::forced_greedy_decode`]), teacher-forced on `teacher_forced` when given. The
+/// request cache is never stored back.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_cached_decode(
+    model: &CausalLm,
+    prompt_ids: &[i32],
+    prefix_cache: &mut PrefixCache,
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+    tokens: usize,
+    stop_tokens: &[i32],
+    teacher_forced: Option<&[i32]>,
+) -> Result<ForcedCachedDecode> {
+    let mut fallbacks = FallbackCapture::default();
+    let (mut cache, reused_prefix_tokens) = {
+        let mut observer: Option<&mut dyn crate::campaign::Observer> = Some(&mut fallbacks);
+        request_cache(model, prompt_ids, prefix_cache, compressed, &mut observer)?
+    };
+    let measured = crate::decode::forced_greedy_decode_from(
+        model,
+        cache.as_mut(),
+        prompt_ids,
+        reused_prefix_tokens,
+        tokens,
+        stop_tokens,
+        teacher_forced,
+        &mut |_| {},
+    );
+    let packed_evidence = cache.packed_evidence();
+    cache.reset()?;
+    Ok(ForcedCachedDecode {
+        decode: measured?,
+        packed_evidence,
+        fallbacks: fallbacks.0,
+    })
+}
+
+/// Reasoned fallbacks a forced cached decode's lookup recorded.
+#[derive(Default)]
+struct FallbackCapture(Vec<(String, String)>);
+
+impl crate::campaign::Observer for FallbackCapture {
+    fn phase(&mut self, _name: &'static str) {}
+    fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+    fn dense_fallback(&mut self, operation: &str, reason: &str) {
+        self.0.push((operation.into(), reason.into()));
+    }
 }
 
 /// Operation name of a reasoned fallback on the compressed prefix-import path.
