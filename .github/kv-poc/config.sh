@@ -45,8 +45,20 @@ case "$mode" in probe|w1|w2) ;; *) fail "mode must be probe, w1 or w2, got '$mod
 [[ "$sceneworks_sha" =~ ^[0-9a-f]{40}$ ]] || fail "sceneworks_ref must be a full 40-hex commit id, got '$sceneworks_sha'"
 [ -n "$baseline_sha" ] || baseline_sha="$inference_sha"
 [[ "$baseline_sha" =~ ^[0-9a-f]{40}$ ]] || fail "baseline_evidence_ref must be empty or a full 40-hex commit id, got '$baseline_sha'"
-# A closed set: rw-krea is nax-macos-2 (the second Mac); nax is Michael's dev Mac.
-case "$label" in rw-krea|nax) ;; *) fail "runner_label must be rw-krea or nax, got '$label'" ;; esac
+# A closed set naming a HOST, each mapped to the runner it must land on and to a label set only
+# that runner carries. Every campaign job reuses state the previous job left under that host's
+# $HOME/kv-poc, so all of a run's macOS jobs must land on the SAME Mac. The `nax` label is
+# registered on BOTH Macs (run 36816509385: its probe + w2-assets ran on nax-macos-2, which
+# cloned /Users/MTrefry/kv-poc/<sha>, and its w2-build on nax-macos, where /Users/michael/kv-poc/<sha>
+# never existed), so it cannot select the dev Mac by itself; `rw-starvector` is the label only
+# nax-macos carries (every rw-starvector job since 2026-08-31 ran there), as `rw-krea` is
+# nax-macos-2's. Labels are operator-movable, so each job also asserts its runner name
+# (common.sh KV_EXPECTED_RUNNER) and fails before touching state if the pool ever drifts.
+case "$label" in
+  rw-krea) host_labels=rw-krea; runner_name=nax-macos-2 ;;
+  nax) host_labels="nax rw-starvector"; runner_name=nax-macos ;;
+  *) fail "runner_label must be rw-krea or nax, got '$label'" ;;
+esac
 
 # Each mode owns a fixed phase order; an empty list means all of that mode's phases. W2 also takes
 # `none`: run the asset prep and the build only (e.g. to see a host's disk shortfall first).
@@ -91,7 +103,7 @@ value_list() { # <key> <list> <allowed values...>; sets $listed to the canonical
 value_list a3_bits "$a3_bits" 2 4; a3_bits="$listed"
 value_list a2_methods "$a2_methods" group-affine group-affine-4; a2_methods="$listed"
 
-runs_on="$(jq -cn --arg l "$label" '["self-hosted","macOS","ARM64",$l]')"
+runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l | split(" "))')"
 {
   echo "mode=$mode"
   echo "inference_sha=$inference_sha"
@@ -103,6 +115,7 @@ runs_on="$(jq -cn --arg l "$label" '["self-hosted","macOS","ARM64",$l]')"
   echo "a3_bits=$a3_bits"
   echo "a2_methods=$a2_methods"
   echo "runs_on=$runs_on"
+  echo "runner_name=$runner_name"
 } >> "$GITHUB_OUTPUT"
 
 {
@@ -115,7 +128,7 @@ runs_on="$(jq -cn --arg l "$label" '["self-hosted","macOS","ARM64",$l]')"
   echo "| inference | \`$inference_sha\` |"
   echo "| SceneWorks | \`$sceneworks_sha\` |"
   echo "| A3 dense baseline evidence | \`$baseline_sha\` |"
-  echo "| runner label | \`$label\` |"
+  echo "| runner label | \`$label\` (runs-on \`$host_labels\`, must land on \`$runner_name\`) |"
   echo "| phases | \`${canonical#,}\` |"
   echo "| A3 --kv-bits | \`$a3_bits\` |"
   echo "| A2 --kv-method | \`$a2_methods\` |"
