@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
+import re
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -16,6 +19,8 @@ from yue2_precision_proof import (REFERENCE_SHA256, cuda_census, require, sample
                                  DECODER_SHA256, sha256, verify_reference, verify_revisions, write_json)
 
 ENGINE_SHA = "4127a675fc8575555e029e01b7f6867488880a8f"
+LATENT_SHA256 = "f89f02851d08128baa12a3f50cc3e73c80fbb5578797b7c166888dd815dc70c9"
+DIAGNOSTICS = ("waveform", "first_conv")
 
 
 def verify_diagnostic_data(data: Path) -> None:
@@ -50,6 +55,135 @@ def verify_diagnostic_data(data: Path) -> None:
                             "diagnostic residual array hash mismatch")
                     artifacts.append(path.resolve())
     require(len(set(artifacts)) == 12, "diagnostic arrays collided")
+
+
+def first_conv_array(data: Path, row: dict, dtype: str, shape: list[int]) -> tuple[list[float], list[int]]:
+    require(row.get("dtype") == dtype and row.get("shape") == shape and
+            row.get("layout") == "bct_f32le", "first Conv7 tensor dtype, shape, or layout changed")
+    path = data / row["file"]
+    require(path.resolve().parent == data.resolve() and path.is_file(), "first Conv7 array escaped evidence")
+    raw = path.read_bytes()
+    require(len(raw) == row.get("bytes") == math.prod(shape) * 4 and
+            row.get("sha256") == sha256(path), "first Conv7 array size/hash mismatch")
+    bits = [entry[0] for entry in struct.iter_unpack("<I", raw)]
+    floats = [entry[0] for entry in struct.iter_unpack("<f", raw)]
+    require(all(math.isfinite(value) for value in floats), "first Conv7 array is non-finite")
+    if dtype == "BF16":
+        require(all(value & 0xffff == 0 for value in bits), "BF16 first Conv7 array lost its dtype")
+    return floats, bits
+
+
+def first_conv_comparison(full: tuple[list[float], list[int]], tile: tuple[list[float], list[int]],
+                          channels: int, frames: int, tile_frames: int, start: int, left: int,
+                          core_len: int) -> dict:
+    maximum = 0.0
+    different = 0
+    first = None
+    for channel in range(channels):
+        for offset in range(core_len):
+            full_at = channel * frames + start + offset
+            tile_at = channel * tile_frames + start - left + offset
+            a, b = full[0][full_at], tile[0][tile_at]
+            error = struct.unpack("<f", struct.pack("<f", abs(a - b)))[0]
+            maximum = max(maximum, error)
+            if full[1][full_at] != tile[1][tile_at]:
+                different += 1
+                if first is None:
+                    first = {"channel": channel, "globalLatentFrame": start + offset,
+                             "fullValue": a, "tileValue": b, "absError": error}
+    return {"maxAbs": maximum, "differentValues": different, "firstDifferent": first,
+            "comparedValues": channels * core_len}
+
+
+def same_first_conv_comparison(observed: dict, expected: dict) -> bool:
+    """Compare reported f32 scalars by bits after JSON's decimal round trip."""
+    if not isinstance(observed, dict) or set(observed) != set(expected):
+        return False
+    if any(observed[key] != expected[key] for key in ("differentValues", "comparedValues")):
+        return False
+    def bits(value: float) -> bytes:
+        return struct.pack("<f", value)
+    if bits(observed["maxAbs"]) != bits(expected["maxAbs"]):
+        return False
+    a, b = observed["firstDifferent"], expected["firstDifferent"]
+    if a is None or b is None:
+        return a is b
+    if not isinstance(a, dict) or set(a) != set(b):
+        return False
+    if any(a[key] != b[key] for key in ("channel", "globalLatentFrame")):
+        return False
+    return all(bits(a[key]) == bits(b[key]) for key in ("fullValue", "tileValue", "absError"))
+
+
+def verify_first_conv_data(data: Path, meta: dict) -> None:
+    report = json.loads((data / "report.json").read_text(encoding="utf-8"))
+    require(report.get("schemaVersion") == 2 and report.get("selector") == "first_conv" and
+            report.get("purpose") == "diagnostic_only_no_gate_change", "first Conv7 schema/selector changed")
+    require(report.get("engineSha") == ENGINE_SHA and report.get("referenceSha256") == REFERENCE_SHA256 and
+            report.get("referenceMetadataSha256") == sha256(Path("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json")),
+            "first Conv7 source/reference identity changed")
+    latent = report.get("latentIdentity", {})
+    require(latent.get("sha256") == LATENT_SHA256 and latent.get("shape") == [75, 64] and
+            latent.get("source", {}).get("stage_identity") == "precision_reference:long_latent",
+            "first Conv7 latent identity changed")
+    decoder = report.get("decoderIdentity", {})
+    require(decoder.get("weights_sha256") == DECODER_SHA256["standard"] and
+            decoder.get("config_sha256") == meta["decoders"]["standard"]["config_sha256"] and
+            decoder.get("repo") == meta["decoders"]["standard"]["repo"] and
+            decoder.get("revision") == meta["decoders"]["standard"]["revision"],
+            "first Conv7 decoder identity changed")
+    require(report.get("backend") == "cuda" and report.get("deviceOrdinal") == 0 and
+            (report.get("frames"), report.get("coreFrames"), report.get("haloFrames")) == (75, 16, 16) and
+            report.get("operator") == {"name": "decoder.layers.0.Conv1d", "kernel": 7,
+                                       "padding": 3, "stride": 1, "dilation": 1, "groups": 1},
+            "first Conv7 geometry changed")
+    observation = report.get("originalWaveformObservation", {})
+    require(observation.get("runId") == "36884387320" and observation.get("clampedMaxAbs") == 0.03125 and
+            observation.get("originalBound") == 1 / 64 and
+            observation.get("interpretation") == "prior_failed_waveform_proof_not_a_first_conv_gate",
+            "original failed waveform observation was regraded")
+    runs = report.get("runs", {})
+    require(set(runs) == {"bf16", "f32"}, "first Conv7 precision controls incomplete")
+    artifacts = []
+    for name, dtype in (("bf16", "BF16"), ("f32", "F32")):
+        row = runs[name]
+        resident = row.get("resident", {})
+        weight_shape = resident.get("weightShape")
+        require(isinstance(weight_shape, list) and len(weight_shape) == 3 and
+                isinstance(weight_shape[0], int) and 1 <= weight_shape[0] <= 4096 and
+                weight_shape[1:] == [64, 7] and resident.get("biasShape") == [weight_shape[0]] and
+                resident.get("sourceDtype") == resident.get("foldDtype") == "F32" and
+                resident.get("residentDtype") == dtype and
+                all(re.fullmatch(r"[0-9a-f]{64}", resident.get(key, "")) for key in
+                    ("weightF32LeSha256", "biasF32LeSha256")),
+                "first Conv7 resident weight identity changed")
+        channels = weight_shape[0]
+        full = {}
+        for stage, stage_channels in (("input", 64), ("preBias", channels), ("postBias", channels)):
+            capture = row["full"][stage]
+            full[stage] = first_conv_array(data, capture, dtype, [1, stage_channels, 75])
+            artifacts.append(capture["file"])
+        windows = row.get("windows", [])
+        require(len(windows) == 5, "first Conv7 must compare all five windows")
+        for index, window in enumerate(windows):
+            start = index * 16
+            end = min(start + 16, 75)
+            left = max(0, start - 16)
+            right = min(75, end + 16)
+            require((window.get("start"), window.get("end"), window.get("left"), window.get("right"),
+                     window.get("coreLength")) == (start, end, left, right, end - start),
+                    "first Conv7 window geometry changed")
+            for stage, stage_channels in (("input", 64), ("preBias", channels), ("postBias", channels)):
+                capture = window["captures"][stage]
+                tile = first_conv_array(data, capture, dtype, [1, stage_channels, right - left])
+                artifacts.append(capture["file"])
+                expected = first_conv_comparison(full[stage], tile, stage_channels, 75,
+                                                 right - left, start, left, end - start)
+                require(same_first_conv_comparison(window["alignedCore"][stage], expected),
+                        "first Conv7 aligned residual does not match saved arrays")
+            require(window["alignedCore"]["input"]["differentValues"] == 0,
+                    "first Conv7 same-input core is not byte-identical")
+    require(len(artifacts) == len(set(artifacts)) == 36, "first Conv7 raw arrays collided")
 
 
 def prepare_harness(args: argparse.Namespace) -> None:
@@ -118,6 +252,8 @@ def resolve_binary(build_json: Path, output: Path) -> None:
 
 def execute(args: argparse.Namespace) -> None:
     require(args.engine_sha == ENGINE_SHA, "diagnostic requires the exact failed M3 source")
+    selector = getattr(args, "diagnostic", "waveform")
+    require(selector in DIAGNOSTICS, "unknown diagnostic selector")
     verify_revisions(args.engine_sha, args.control_sha)
     require(os.environ.get("RUNNER_NAME") in {"cuda-windows", "cuda-windows-2"},
             "diagnostic requires an eligible shared CUDA listener")
@@ -141,7 +277,8 @@ def execute(args: argparse.Namespace) -> None:
     env = os.environ.copy()
     env["YUE2_ENGINE_ROOT"] = str(Path.cwd().resolve())
     with (args.evidence / "diagnostic.log").open("w", encoding="utf-8") as log:
-        child = subprocess.Popen([str(args.binary), "--reference-dir", str(args.reference),
+        child = subprocess.Popen([str(args.binary), "--diagnostic", selector,
+                                  "--reference-dir", str(args.reference),
                                   "--output-dir", str(data)], stdout=log, stderr=subprocess.STDOUT, env=env)
         def sample_loop() -> None:
             while not stop.is_set() and child.poll() is None:
@@ -173,6 +310,7 @@ def execute(args: argparse.Namespace) -> None:
     files = [{"path": str(p.relative_to(args.evidence)), "bytes": p.stat().st_size,
               "sha256": sha256(p)} for p in sorted(data.rglob("*")) if p.is_file()]
     report = {"schema": "yue2-bf16-tile-diagnostic-control-v1", "diagnostic_only": True,
+              "selector": selector,
               "engine_sha": args.engine_sha, "control_sha": args.control_sha,
               "reference_sha256": REFERENCE_SHA256, "binary_sha256": sha256(args.binary),
               "runner_name": os.environ["RUNNER_NAME"], "owned_pid": child.pid,
@@ -187,7 +325,11 @@ def execute(args: argparse.Namespace) -> None:
     require(child.poll() is not None and not after_busy and after_error is None,
             "diagnostic accelerator release unverified")
     require((data / "report.json").is_file(), "diagnostic residual report absent")
-    verify_diagnostic_data(data)
+    if selector == "first_conv":
+        meta = json.loads(Path("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json").read_text(encoding="utf-8"))
+        verify_first_conv_data(data, meta)
+    else:
+        verify_diagnostic_data(data)
 
 
 def main() -> None:
@@ -202,6 +344,7 @@ def main() -> None:
     resolve.add_argument("--build-json", type=Path, required=True)
     resolve.add_argument("--output", type=Path, required=True)
     run = commands.add_parser("run")
+    run.add_argument("--diagnostic", choices=DIAGNOSTICS, default="waveform")
     for name in ("binary", "reference", "evidence"):
         run.add_argument(f"--{name}", type=Path, required=True)
     for name in ("engine-sha", "control-sha"):

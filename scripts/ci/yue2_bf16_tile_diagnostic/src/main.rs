@@ -1,4 +1,4 @@
-//! Same-input numerical diagnostic for the frozen M3 YuE2 standard VAE.
+//! Same-input waveform or first-Conv7 numerical diagnostic for the frozen M3 YuE2 standard VAE.
 //! This reports the original 1/64 bound; it does not change a production gate.
 
 use std::collections::BTreeMap;
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use candle_audio::candle_core::{self, DType, Device, Tensor};
+use candle_audio::neural_codec::fold_weight_norm;
 use candle_audio_yue2::inventory::{ComponentId, YUE2_VAE_REPO};
 use candle_audio_yue2::latent::{AcousticLatents, LatentSource};
 use candle_audio_yue2::snapshot::resolve_component;
@@ -21,6 +22,23 @@ const ENGINE_SHA: &str = "4127a675fc8575555e029e01b7f6867488880a8f";
 const ORIGINAL_BOUND: f32 = 1.0 / 64.0;
 const RATIO: usize = 1920;
 const SEAM_RADIUS: usize = 128;
+const FIRST_CONV_KERNEL: usize = 7;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Diagnostic {
+    Waveform,
+    FirstConv,
+}
+
+impl Diagnostic {
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        match value {
+            "waveform" => Ok(Self::Waveform),
+            "first_conv" => Ok(Self::FirstConv),
+            _ => Err(format!("unsupported diagnostic {value:?}").into()),
+        }
+    }
+}
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -61,12 +79,17 @@ fn required_env(name: &str) -> Result<PathBuf, Box<dyn Error>> {
     ))
 }
 
-fn arguments() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+fn arguments() -> Result<(Diagnostic, PathBuf, PathBuf), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
-    let (mut reference, mut output) = (None, None);
+    let (mut diagnostic, mut reference, mut output) = (None, None, None);
     while let Some(key) = args.next() {
         let value = PathBuf::from(args.next().ok_or("option requires a path")?);
         match key.to_str() {
+            Some("--diagnostic") if diagnostic.is_none() => {
+                diagnostic = Some(Diagnostic::parse(
+                    value.to_str().ok_or("diagnostic is not UTF-8")?,
+                )?)
+            }
             Some("--reference-dir") if reference.is_none() => reference = Some(value),
             Some("--output-dir") if output.is_none() => output = Some(value),
             _ => return Err(format!("unknown or duplicate option {key:?}").into()),
@@ -77,7 +100,11 @@ fn arguments() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
     if !reference.is_absolute() || !output.is_absolute() || output.exists() {
         return Err("reference and fresh output directories must be absolute".into());
     }
-    Ok((reference, output))
+    Ok((
+        diagnostic.unwrap_or(Diagnostic::Waveform),
+        reference,
+        output,
+    ))
 }
 
 fn write_samples(dir: &Path, name: &str, values: &[f32]) -> Result<Value, Box<dyn Error>> {
@@ -256,12 +283,245 @@ fn pair(a: &Value, b: &Value, seams: &[usize]) -> Value {
     })
 }
 
+struct FirstTensor {
+    record: Value,
+    values: Vec<f32>,
+    channels: usize,
+    length: usize,
+}
+
+fn first_tensor(
+    tensor: &Tensor,
+    dtype: DType,
+    out: &Path,
+    name: &str,
+) -> Result<FirstTensor, Box<dyn Error>> {
+    let [1, channels, length] = tensor.dims() else {
+        return Err(format!("{name} has unexpected shape {:?}", tensor.dims()).into());
+    };
+    if tensor.dtype() != dtype || *channels == 0 || *length == 0 {
+        return Err(format!(
+            "{name} has unexpected dtype/shape {:?}/{:?}",
+            tensor.dtype(),
+            tensor.dims()
+        )
+        .into());
+    }
+    // BF16 to F32 is lossless; F32LE retains every original BF16 value for independent analysis.
+    let values = tensor
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{name} contains non-finite values").into());
+    }
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in &values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let file = format!("{name}.f32le");
+    let mut handle = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out.join(&file))?;
+    handle.write_all(&bytes)?;
+    Ok(FirstTensor {
+        record: json!({"file":file,"sha256":sha256(&bytes),"bytes":bytes.len(),
+            "layout":"bct_f32le","shape":[1,channels,length],"dtype":format!("{dtype:?}")}),
+        values,
+        channels: *channels,
+        length: *length,
+    })
+}
+
+fn first_conv_capture(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    dtype: DType,
+    out: &Path,
+    stem: &str,
+) -> Result<[FirstTensor; 3], Box<dyn Error>> {
+    if input.dtype() != dtype || weight.dtype() != dtype || bias.dtype() != dtype {
+        return Err("first Conv7 operand dtype mismatch".into());
+    }
+    let input_record = first_tensor(input, dtype, out, &format!("{stem}-input"))?;
+    // Exactly M3 Conv::forward: k7/p3/s1/d1/groups1, then BF16/F32 bias addition.
+    let pre = input.conv1d(weight, 3, 1, 1, 1)?;
+    let pre_record = first_tensor(&pre, dtype, out, &format!("{stem}-pre-bias"))?;
+    let post = pre.broadcast_add(&bias.reshape((1, (), 1))?)?;
+    let post_record = first_tensor(&post, dtype, out, &format!("{stem}-post-bias"))?;
+    Ok([input_record, pre_record, post_record])
+}
+
+fn compare_first_core(
+    full: &FirstTensor,
+    tile: &FirstTensor,
+    start: usize,
+    left: usize,
+    core_len: usize,
+) -> Value {
+    assert_eq!(full.channels, tile.channels);
+    assert!(start + core_len <= full.length);
+    assert!(start >= left && start - left + core_len <= tile.length);
+    let mut maximum = 0f32;
+    let mut different = 0usize;
+    let mut first = Value::Null;
+    for channel in 0..full.channels {
+        for offset in 0..core_len {
+            let full_value = full.values[channel * full.length + start + offset];
+            let tile_value = tile.values[channel * tile.length + start - left + offset];
+            let error = (full_value - tile_value).abs();
+            maximum = maximum.max(error);
+            if full_value.to_bits() != tile_value.to_bits() {
+                different += 1;
+                if first.is_null() {
+                    first = json!({"channel":channel,"globalLatentFrame":start+offset,
+                        "fullValue":full_value,"tileValue":tile_value,"absError":error});
+                }
+            }
+        }
+    }
+    json!({"maxAbs":maximum,"differentValues":different,"firstDifferent":first,
+        "comparedValues":full.channels*core_len})
+}
+
+fn first_conv_weights(
+    verified: &candle_audio_yue2::snapshot::VerifiedComponent,
+    device: &Device,
+    dtype: DType,
+) -> Result<(Tensor, Tensor, Value), Box<dyn Error>> {
+    let path = verified
+        .weights_path()
+        .ok_or("verified standard VAE weights absent")?;
+    // The source is integrity-checked immediately above; use the same mapped loader as M3.
+    let source = unsafe { candle_core::safetensors::MmapedSafetensors::new(path) }?;
+    let prefix = "decoder.layers.0";
+    let v = source.load(&format!("{prefix}.weight_v"), device)?;
+    let g = source.load(&format!("{prefix}.weight_g"), device)?;
+    let b = source.load(&format!("{prefix}.bias"), device)?;
+    let [channels, 64, FIRST_CONV_KERNEL] = v.dims() else {
+        return Err(format!("first Conv7 weight_v shape {:?}", v.dims()).into());
+    };
+    if v.dtype() != DType::F32
+        || g.dtype() != DType::F32
+        || b.dtype() != DType::F32
+        || g.dims() != [*channels, 1, 1]
+        || b.dims() != [*channels]
+    {
+        return Err("first Conv7 source tensor dtype/shape mismatch".into());
+    }
+    let weight = fold_weight_norm(&v, &g)?.contiguous()?.to_dtype(dtype)?;
+    let bias = b.to_dtype(dtype)?;
+    let tensor_hash = |tensor: &Tensor| -> Result<String, Box<dyn Error>> {
+        let values = tensor
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok(samples_sha256(&values))
+    };
+    let identity = json!({"sourceDtype":"F32","foldDtype":"F32",
+        "residentDtype":format!("{dtype:?}"),"weightShape":weight.dims(),
+        "biasShape":bias.dims(),"weightF32LeSha256":tensor_hash(&weight)?,
+        "biasF32LeSha256":tensor_hash(&bias)?});
+    Ok((weight, bias, identity))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_first_conv(
+    engine: &Path,
+    out: &Path,
+    source: &AcousticLatents,
+    verified: &candle_audio_yue2::snapshot::VerifiedComponent,
+    device: &Device,
+    meta: &Value,
+    reference_hash: &str,
+    frames: usize,
+    core: usize,
+    halo: usize,
+) -> Result<(), Box<dyn Error>> {
+    let standard = &meta["decoders"]["standard"];
+    let component = verified.component();
+    if component.repo.id != standard["repo"]
+        || component.repo.revision != standard["revision"]
+        || component.weights().map(|file| file.sha256) != standard["weights_sha256"].as_str()
+        || component.file("config.json").map(|file| file.sha256)
+            != standard["config_sha256"].as_str()
+    {
+        return Err("first Conv7 component differs from pinned standard VAE reference".into());
+    }
+    let mut runs = BTreeMap::new();
+    for (label, dtype) in [("bf16", DType::BF16), ("f32", DType::F32)] {
+        let (weight, bias, resident) = first_conv_weights(verified, device, dtype)?;
+        let z = source.to_decoder_input(device)?.to_dtype(dtype)?;
+        let full = first_conv_capture(&z, &weight, &bias, dtype, out, &format!("{label}-full"))?;
+        let mut windows = Vec::new();
+        for start in (0..frames).step_by(core) {
+            let end = frames.min(start + core);
+            let left = start.saturating_sub(halo);
+            let right = frames.min(end + halo);
+            let tile_input = z.narrow(2, left, right - left)?;
+            let tile = first_conv_capture(
+                &tile_input,
+                &weight,
+                &bias,
+                dtype,
+                out,
+                &format!("{label}-tile-{}", start / core),
+            )?;
+            let input = compare_first_core(&full[0], &tile[0], start, left, end - start);
+            if input["differentValues"] != 0 {
+                return Err(format!("{label} aligned input core differs at start {start}").into());
+            }
+            windows.push(json!({"start":start,"end":end,"left":left,"right":right,
+                "coreLength":end-start,"captures":{
+                    "input":tile[0].record,"preBias":tile[1].record,"postBias":tile[2].record},
+                "alignedCore":{
+                    "input":input,
+                    "preBias":compare_first_core(&full[1],&tile[1],start,left,end-start),
+                    "postBias":compare_first_core(&full[2],&tile[2],start,left,end-start)}}));
+        }
+        runs.insert(
+            label,
+            json!({"resident":resident,"full":{
+            "input":full[0].record,"preBias":full[1].record,"postBias":full[2].record},
+            "windows":windows}),
+        );
+    }
+    let metadata =
+        engine.join("crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json");
+    let report = json!({"schemaVersion":2,"selector":"first_conv",
+        "purpose":"diagnostic_only_no_gate_change","engineSha":ENGINE_SHA,
+        "referenceSha256":reference_hash,"referenceMetadataSha256":sha256(&fs::read(metadata)?),
+        "latentIdentity":source.identity().to_json(),"backend":"cuda","deviceOrdinal":0,
+        "decoderIdentity":{"repo":YUE2_VAE_REPO.id,"revision":YUE2_VAE_REPO.revision,
+            "weights_sha256":meta["decoders"]["standard"]["weights_sha256"],
+            "config_sha256":meta["decoders"]["standard"]["config_sha256"]},
+        "frames":frames,"coreFrames":core,"haloFrames":halo,
+        "operator":{"name":"decoder.layers.0.Conv1d","kernel":FIRST_CONV_KERNEL,
+            "padding":3,"stride":1,"dilation":1,"groups":1},
+        "originalWaveformObservation":{"runId":"36884387320","clampedMaxAbs":0.03125,
+            "originalBound":ORIGINAL_BOUND,"interpretation":"prior_failed_waveform_proof_not_a_first_conv_gate"},
+        "runs":runs});
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out.join("report.json"))?;
+    file.write_all(serde_json::to_string_pretty(&report)?.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let engine = verified_engine()?;
     if std::env::var("CUDA_VISIBLE_DEVICES").ok().as_deref() != Some("0") {
         return Err("CUDA_VISIBLE_DEVICES must be exactly 0".into());
     }
-    let (fixture_root, out) = arguments()?;
+    let (diagnostic, fixture_root, out) = arguments()?;
     let hub_root = required_env("YUE2_HF_HUB")?;
     let output_parent = out
         .parent()
@@ -312,6 +572,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     let verified = resolve_component(ComponentId::VaeStandard, &snapshots)?;
     fs::create_dir(&out)?;
     let device = Device::new_cuda(0)?;
+    if diagnostic == Diagnostic::FirstConv {
+        return run_first_conv(
+            &engine,
+            &out,
+            &source,
+            &verified,
+            &device,
+            &meta,
+            &reference_hash,
+            frames,
+            core,
+            halo,
+        );
+    }
     let seams: Vec<usize> = (core..frames).step_by(core).map(|f| f * RATIO).collect();
     let pinned_reference = json!({
         "raw": interleaved(reference.get("standard.long_full_raw").ok_or("missing standard.long_full_raw")?, false)?,
@@ -404,6 +678,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_is_typed_and_waveform_stays_default() {
+        assert_eq!(Diagnostic::parse("waveform").unwrap(), Diagnostic::Waveform);
+        assert_eq!(
+            Diagnostic::parse("first_conv").unwrap(),
+            Diagnostic::FirstConv
+        );
+        assert!(Diagnostic::parse("full_vae").is_err());
+    }
+
+    #[test]
+    fn aligned_core_comparison_identifies_first_channel_and_global_frame() {
+        let full = FirstTensor {
+            record: Value::Null,
+            values: vec![
+                0., 1., 2., 3., 4., 5., 6., 7., 10., 11., 12., 13., 14., 15., 16., 17.,
+            ],
+            channels: 2,
+            length: 8,
+        };
+        // Window starts at global frame 2. Core covers global frames 3 and 4.
+        let mut tile = FirstTensor {
+            record: Value::Null,
+            values: vec![2., 3., 4., 5., 6., 12., 13., 14., 15., 16.],
+            channels: 2,
+            length: 5,
+        };
+        let same = compare_first_core(&full, &tile, 3, 2, 2);
+        assert_eq!(same["differentValues"], 0);
+        tile.values[tile.length + 2] += 0.03125;
+        let changed = compare_first_core(&full, &tile, 3, 2, 2);
+        assert_eq!(changed["differentValues"], 1);
+        assert_eq!(changed["firstDifferent"]["channel"], 1);
+        assert_eq!(changed["firstDifferent"]["globalLatentFrame"], 4);
+        assert_eq!(changed["maxAbs"], 0.03125);
+    }
 
     #[test]
     fn seam_window_matches_failed_proofs_half_open_bounds() {

@@ -1,6 +1,6 @@
 name: YuE2 bounded BF16 tile diagnosis
 
-# CUDA-only diagnostic for failed M3 full/tiled comparison; no acceptance, model
+# CUDA-only waveform or first-Conv7 diagnostic for failed M3 full/tiled comparison; no acceptance, model
 # generation, app profile, quality sweep, or Metal dispatch. Numerical gates unchanged.
 on:
   workflow_dispatch:
@@ -13,6 +13,12 @@ on:
         type: string
         required: true
         description: Exact reviewed diagnostic workflow and harness SHA
+      diagnostic:
+        type: choice
+        required: true
+        default: waveform
+        options: [waveform, first_conv]
+        description: One bounded diagnostic, with waveform preserving the existing default
       reference_run_id:
         type: string
         required: true
@@ -44,6 +50,7 @@ jobs:
     env:
       EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
       EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      YUE2_DIAGNOSTIC_SELECTOR: ${{ inputs.diagnostic }}
       YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
       YUE2_HF_HUB: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
       CUDA_VISIBLE_DEVICES: "0"
@@ -137,7 +144,7 @@ jobs:
           EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
         run: |
           $binary = (Get-Content "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\binary.txt" -Raw).Trim()
-          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA"
+          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR" --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload immutable diagnostic output and failures
         if: always()
