@@ -353,6 +353,37 @@ def minimax_h3_vram_policy_errors(workflow: str, manifest: str) -> list[str]:
     return errors
 
 
+GIT_BASH_BIN = "C:\\Program Files\\Git\\bin"
+
+
+def windows_bash_selection_errors(name: str, job: dict) -> list[str]:
+    """On a self-hosted Windows runner a bare `bash` resolves to WSL's
+    `C:\\Windows\\System32\\bash.exe`, which has no distribution there and fails every step
+    (sc-24446: `execvpe(/bin/bash) failed`). Every step that runs bash — `shell: bash`, or
+    `dtolnay/rust-toolchain`, whose steps are `shell: bash` — must come after the step that checks
+    for Git Bash and puts it first on `GITHUB_PATH`."""
+    if "self-hosted" not in job.get("runs-on", []) or "windows" not in [
+        str(label).lower() for label in job.get("runs-on", [])
+    ]:
+        return []
+    selected = False
+    errors = []
+    for step in job.get("steps", []):
+        run = str(step.get("run", ""))
+        if f'"{GIT_BASH_BIN}\\bash.exe"' in run and f'{GIT_BASH_BIN}>>"%GITHUB_PATH%"' in run:
+            selected = True
+            continue
+        runs_bash = step.get("shell") == "bash" or str(step.get("uses", "")).startswith(
+            "dtolnay/rust-toolchain@"
+        )
+        if runs_bash and not selected:
+            errors.append(
+                f"{name}: `{step.get('name') or step.get('uses')}` runs bash before Git Bash is "
+                "selected (a bare `bash` is WSL's on the Windows runners)"
+            )
+    return errors
+
+
 def privileged_real_weight_jobs(workflow: str) -> list[str]:
     """Find ordinary-CI jobs whose job-level runner declaration names the privileged label."""
     privileged: list[str] = []
@@ -4216,6 +4247,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         ):
             if fragment not in run:
                 errors.append(f"the run step lacks {fragment!r}")
+        errors += windows_bash_selection_errors("candle-decode-speedups-bench", job)
         upload = named.get("Keep the decode-speedups benchmark documents", {})
         if upload.get("if") != "${{ !cancelled() }}":
             errors.append("the documents upload must survive a failed row")
@@ -4242,6 +4274,26 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         def interpolate(job: dict) -> None:
             job["steps"][-2]["run"] += ' & echo "${{ inputs.decode_bench_matrix }}"'
 
+        def git_bash_index(job: dict) -> int:
+            return next(i for i, s in enumerate(job["steps"]) if s.get("name") == "Select Git Bash")
+
+        def drop_git_bash(job: dict) -> None:
+            job["steps"].pop(git_bash_index(job))
+
+        def select_git_bash_after_the_toolchain(job: dict) -> None:
+            step = job["steps"].pop(git_bash_index(job))
+            job["steps"].insert(git_bash_index_after_toolchain(job), step)
+
+        def git_bash_index_after_toolchain(job: dict) -> int:
+            return 1 + next(
+                i
+                for i, s in enumerate(job["steps"])
+                if str(s.get("uses", "")).startswith("dtolnay/rust-toolchain@")
+            )
+
+        def bare_bash_step_first(job: dict) -> None:
+            job["steps"].insert(2, {"name": "probe", "shell": "bash", "run": "true"})
+
         for mutate in (
             lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench'"}),
             lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "0"}),
@@ -4250,11 +4302,32 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             lambda job: job["steps"][1]["with"].update({"ref": "main"}),
             lambda job: job["steps"][-1].pop("if"),
             interpolate,
+            drop_git_bash,
+            select_git_bash_after_the_toolchain,
+            bare_bash_step_first,
         ):
             mutated = copy.deepcopy(workflow)
             mutate(mutated["jobs"]["candle-decode-speedups-bench"])
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.decode_speedups_bench_errors(mutated))
+
+
+class WindowsBashSelectionTests(unittest.TestCase):
+    def test_every_self_hosted_windows_job_selects_git_bash_before_running_bash(self) -> None:
+        """sc-24446: the decode-speedups lane's `dtolnay/rust-toolchain` ran WSL's bash. Every
+        self-hosted Windows job in every workflow selects Git Bash before any bash step."""
+        checked = 0
+        for path in sorted(WORKFLOW.parent.glob("*.y*ml")):
+            text = (
+                real_weights_inline_text()
+                if path == REAL_WEIGHTS_WORKFLOW
+                else path.read_text(encoding="utf-8")
+            )
+            for name, job in (yaml.safe_load(text).get("jobs") or {}).items():
+                with self.subTest(workflow=path.name, job=name):
+                    self.assertEqual(windows_bash_selection_errors(name, job), [])
+                checked += "windows" in str(job.get("runs-on", "")).lower()
+        self.assertGreater(checked, 0)
 
 
 class WorkflowFileSizeTests(unittest.TestCase):

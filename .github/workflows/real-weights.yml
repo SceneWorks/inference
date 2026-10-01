@@ -4956,6 +4956,13 @@ jobs:
       - name: Validate the matrix and initialize the run-scoped evidence directory
         shell: cmd
         run: call scripts\ci\real-weights\candle-decode-speedups-bench\validate-the-matrix-and-initialize-the-run-scoped-evidence.cmd
+      # `dtolnay/rust-toolchain` runs its steps with `shell: bash`; on this runner a bare `bash` is
+      # WSL's `C:\Windows\System32\bash.exe`, which has no distribution (sc-24446).
+      - name: Select Git Bash
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
         with:
           toolchain: 1.96.0
