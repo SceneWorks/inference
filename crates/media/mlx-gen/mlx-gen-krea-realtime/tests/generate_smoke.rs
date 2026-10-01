@@ -788,6 +788,66 @@ enum Sc20684Mode {
 }
 
 const SC20684_V2V_STRENGTH: f32 = 0.6;
+
+/// An `f32` request knob as the decimal the request declared, for the launcher's identity check.
+/// `serde_json` widens an `f32` to `f64` exactly, so `0.6f32` would serialize as
+/// `0.6000000238418579` and fail the launcher's `v2vStrength == 0.6` (W2 run 36854186685). The
+/// shortest decimal that round-trips the `f32` is the requested value; the generation itself still
+/// consumes the `f32`.
+fn sc20684_identity_decimal(value: f32) -> f64 {
+    value
+        .to_string()
+        .parse()
+        .expect("an f32's shortest decimal is a valid f64")
+}
+
+/// The V2V conditioning's input identity, exactly as the launcher validates it.
+fn sc20684_v2v_input_identity(
+    source_sha256: &str,
+    frames: usize,
+    width: usize,
+    height: usize,
+    strength: f32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "deterministic-smooth-motion-clip", "sha256": source_sha256,
+        "frameCount": frames, "width": width, "height": height,
+        "vaeEncoding": "WanVae.encode-sample",
+        "v2vStrength": sc20684_identity_decimal(strength),
+    })
+}
+
+#[test]
+fn sc20684_v2v_strength_identity_is_the_requested_decimal() {
+    let emitted = serde_json::to_string(&sc20684_v2v_input_identity(
+        &"0".repeat(64),
+        25,
+        832,
+        480,
+        SC20684_V2V_STRENGTH,
+    ))
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();
+    assert_eq!(
+        parsed["v2vStrength"].as_f64(),
+        Some(0.6),
+        "the launcher expects the requested V2V strength, 0.6: {emitted}"
+    );
+    assert!(emitted.contains(r#""v2vStrength":0.6}"#) || emitted.contains(r#""v2vStrength":0.6,"#));
+    let identity = |strength: serde_json::Value| {
+        serde_json::to_string(&serde_json::json!({ "v2vStrength": strength })).unwrap()
+    };
+    // The defect this guards: the raw f32 widens on serialization.
+    assert_ne!(
+        identity(SC20684_V2V_STRENGTH.into()),
+        r#"{"v2vStrength":0.6}"#
+    );
+    // Still the same f32 the generation consumes.
+    assert_eq!(
+        sc20684_identity_decimal(SC20684_V2V_STRENGTH) as f32,
+        SC20684_V2V_STRENGTH
+    );
+}
 const SC20684_Q8_PARITY_MAX_ABS_ERROR: f32 = 0.25;
 const SC20684_Q4_PARITY_MAX_ABS_ERROR: f32 = 0.75;
 const SC20684_Q8_MAX_ABS_RGB_U8: u8 = 32;
@@ -847,13 +907,41 @@ fn sc20684_decode_plan_prices_the_full_raw_frame_count() {
     assert_eq!(estimate, Some(12_643_205_120));
 }
 
+/// Every recorded allocator-sampler gap, with the phase and release windows it spanned.
+fn sc20684_sampler_gaps(
+    allocator: &mlx_gen::memory_probe::AllocatorProbeReport,
+) -> Vec<serde_json::Value> {
+    allocator
+        .gaps
+        .iter()
+        .map(|gap| {
+            serde_json::json!({
+                "startMicros": gap.start_micros,
+                "durationMicros": gap.duration_micros,
+                "uncoveredMicros": gap.uncovered_micros,
+                "releaseMicros": gap.release_micros,
+                "releaseWindows": gap.release_windows,
+                "phaseAtStart": gap.phase_at_start,
+                "phaseAtEnd": gap.phase_at_end,
+            })
+        })
+        .collect()
+}
+
+/// One phase-boundary memory reading. It is also printed as it is taken, so a role the launcher's
+/// footprint watchdog aborts mid-run still leaves which phases completed, and with what MLX active
+/// versus cached bytes, in its bounded stdout transcript.
 fn sc20684_phase_memory(name: &str) -> serde_json::Value {
-    serde_json::json!({
+    // The allocator probe attributes each sampler gap to the last phase reached.
+    mlx_gen::memory_probe::set_phase(name);
+    let value = serde_json::json!({
         "phase": name,
         "process": sc20684_process_memory(),
         "mlxActiveBytes": mlx_rs::memory::get_active_memory() as u64,
         "mlxCacheBytes": mlx_rs::memory::get_cache_memory() as u64,
-    })
+    });
+    println!("SC20684_KREA_PHASE {value}");
+    value
 }
 
 fn sc20684_source_budget(
@@ -1346,11 +1434,13 @@ fn sc20684_conditioning(
                     context_latents: None,
                     source: Some((latents, strength)),
                 },
-                serde_json::json!({
-                    "kind": "deterministic-smooth-motion-clip", "sha256": sc20684_hash_media(&source),
-                    "frameCount": frames, "width": width, "height": height,
-                    "vaeEncoding": "WanVae.encode-sample", "v2vStrength": strength,
-                }),
+                sc20684_v2v_input_identity(
+                    &sc20684_hash_media(&source),
+                    frames,
+                    width,
+                    height,
+                    strength,
+                ),
             )
         }
     }
@@ -1490,6 +1580,7 @@ fn sc20684_packed_campaign_observer() {
     let campaign_started = Instant::now();
     let process_start = sc20684_process_memory();
     mlx_rs::memory::reset_peak_memory();
+    mlx_gen::memory_probe::set_phase("process-start");
     let allocator_probe = mlx_gen::memory_probe::AllocatorProbe::start_default();
     let mode = Sc20684Mode::parse();
     let tier = sc20684_cache_tier();
@@ -1525,10 +1616,11 @@ fn sc20684_packed_campaign_observer() {
     let load_started = Instant::now();
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), config.wan.text_len)
         .expect("load product tokenizer");
-    let mut text_weights =
-        mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors"))
-            .expect("open product text encoder");
-    let context = {
+    // The product's own UMT5 release (`encode_prompt`): the encoder and its weight map live only
+    // inside the phase, its context is materialized, then MLX's cache of their buffers is returned.
+    let context = mlx_gen_krea_realtime::materialize_and_release_phase(|| {
+        let mut text_weights =
+            mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors"))?;
         let encoder = Umt5Encoder::from_weights_quantized(
             &mut text_weights,
             &config.wan,
@@ -1536,18 +1628,13 @@ fn sc20684_packed_campaign_observer() {
                 bits: 8,
                 group_size: 64,
             },
+        )?;
+        encoder.encode(
+            &tokenizer,
+            "a red fox trotting through a snowy pine forest at sunrise",
         )
-        .expect("load product text encoder");
-        let value = encoder
-            .encode(
-                &tokenizer,
-                "a red fox trotting through a snowy pine forest at sunrise",
-            )
-            .expect("encode product prompt");
-        mlx_rs::transforms::eval([&value]).expect("materialize product prompt context");
-        value
-    };
-    drop(text_weights);
+    })
+    .expect("encode product prompt and release the text encoder");
     drop(tokenizer);
     let dit_weights = mlx_gen::weights::Weights::from_file(root.join("dit.safetensors"))
         .expect("open product DiT");
@@ -1659,7 +1746,7 @@ fn sc20684_packed_campaign_observer() {
         drop(dense_cache);
         drop(dense_latents);
         drop(conditioning);
-        mlx_rs::memory::clear_cache();
+        mlx_gen::memory_probe::clear_cache();
         phase_memory.push(sc20684_phase_memory("release"));
         let release_process = sc20684_process_memory();
         let release_active = mlx_rs::memory::get_active_memory() as u64;
@@ -1741,6 +1828,11 @@ fn sc20684_packed_campaign_observer() {
                     "samplingSpanMicros": allocator.sampling_span_micros,
                     "intervalMicros": allocator.interval_micros,
                     "maxGapMicros": allocator.max_gap_micros,
+                    "maxUncoveredGapMicros": allocator.max_uncovered_gap_micros,
+                    "gaps": sc20684_sampler_gaps(&allocator),
+                    "gapsNotRecorded": allocator.gaps_not_recorded,
+                    "releaseWindowCount": allocator.release_window_count,
+                    "realtimeSampler": allocator.realtime_sampler,
                     "releaseActiveBytes": release_active,
                     "releaseCacheBytes": release_cache,
                 },
@@ -1794,6 +1886,24 @@ fn sc20684_packed_campaign_observer() {
     drop(packed_media);
     let allocator = allocator_probe.finish();
     let candidate_wall_ms = campaign_started.elapsed().as_secs_f64() * 1000.0;
+    // The candidate's measurements are taken. Return the packed decode's cached working set before
+    // the dense parity generation: its buffers fit no DiT shape, so MLX would otherwise hold them
+    // beside the dense run until its ~0.95 x working-set trim, far above the child cap.
+    mlx_gen::memory_probe::clear_cache();
+    // Printed like every phase reading, but kept out of `phaseMemory`, whose labels the launcher
+    // validates in a fixed order. Without the clear this reads the packed decode's ~12 GiB working
+    // set; the 1 GiB bound tolerates a Metal completion handler recycling a late temporary between
+    // the clear and the read (nothing else allocates here: the allocator probe has finished and
+    // only reads counters).
+    let dense_parity_entry = sc20684_phase_memory("dense-parity-entry");
+    let dense_parity_entry_cache = dense_parity_entry["mlxCacheBytes"]
+        .as_u64()
+        .expect("SC-20684 dense-parity-entry cache bytes");
+    assert!(
+        dense_parity_entry_cache < 1 << 30,
+        "SC-20684 dense parity must start with the packed decode's cache returned: \
+         {dense_parity_entry_cache} cached bytes"
+    );
 
     let (dense_latents, _, dense_elapsed, _) = sc20684_generate_latents(
         &transformer,
@@ -1951,7 +2061,7 @@ fn sc20684_packed_campaign_observer() {
             == mlx_gen_krea_realtime::compressed_kv::PACKED_METAL_THREADGROUP_SCRATCH_BYTES;
     drop(cancelled_cache);
     drop(cancellation_conditioning);
-    mlx_rs::memory::clear_cache();
+    mlx_gen::memory_probe::clear_cache();
     let cancellation_active_after_release = mlx_rs::memory::get_active_memory() as u64;
     let cancellation_cache_after_release = mlx_rs::memory::get_cache_memory() as u64;
     let cancellation_scratch_released = cancellation_active_after_release
@@ -1987,7 +2097,7 @@ fn sc20684_packed_campaign_observer() {
     let verification_terminal = sc20684_process_memory();
     let verification_terminal_active = mlx_rs::memory::get_active_memory() as u64;
     let verification_terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
-    mlx_rs::memory::clear_cache();
+    mlx_gen::memory_probe::clear_cache();
     phase_memory.push(sc20684_phase_memory("release"));
     let release_process = sc20684_process_memory();
     let release_active = mlx_rs::memory::get_active_memory() as u64;
@@ -2081,6 +2191,11 @@ fn sc20684_packed_campaign_observer() {
                 "samplingSpanMicros": allocator.sampling_span_micros,
                 "intervalMicros": allocator.interval_micros,
                 "maxGapMicros": allocator.max_gap_micros,
+                "maxUncoveredGapMicros": allocator.max_uncovered_gap_micros,
+                "gaps": sc20684_sampler_gaps(&allocator),
+                "gapsNotRecorded": allocator.gaps_not_recorded,
+                "releaseWindowCount": allocator.release_window_count,
+                "realtimeSampler": allocator.realtime_sampler,
                 "releaseActiveBytes": release_active,
                 "releaseCacheBytes": release_cache,
             },

@@ -18,6 +18,9 @@ use crate::campaign_supervisor::{self, RunRequest, SafetyPolicy, SystemProbe};
 
 pub const SC20671_SCHEDULE_VERSION: u64 = 2;
 pub const SC20671_CAMPAIGN_KIND: &str = "sc-20671-complete-covering-set";
+/// Manifest kind of an `--only-coordinate` run: one scheduled row, never a campaign. Every
+/// complete-campaign loader (here and in SceneWorks) refuses it by kind.
+pub const SC20671_PARTIAL_RUN_KIND: &str = "sc-20671-partial-coordinate-run";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -103,12 +106,155 @@ pub const REQUIRED_PHASES: [&str; 8] = [
     "cancellation-cleanup",
     "post-run-release",
 ];
+/// Receipt schema. v5 (sc-20671): per-repeat decode throughput is a dedicated fixed-length steady
+/// decode recorded beside each sample, and provenance records the host's power mode and thermal
+/// state at row start and end. v6 (sc-20671 hardware audit): real-hardware observations are
+/// recorded instead of refused: host state per timing sample and thermal/power change flags (only
+/// a throttled row start refuses), the dense-KV share of the prefill footprint, post-release MLX
+/// residuals within a defined slack, teacher-forced greedy agreement with the free-running
+/// divergence, and compile cost against a noise band.
+pub const RECEIPT_SCHEMA_VERSION: u32 = 6;
+pub const RECEIPT_HARNESS_VERSION: &str = "sc-20671-kv-baseline-v6";
 /// Exact-byte SHA-256 of SceneWorks `config/kv-baseline-quality-contract.json` (contract v3).
 pub const QUALITY_CONTRACT_HASH: &str =
     "58eaa007c35084c8acac2b35b5a2a1dff5af55832a7533557741d43a05944b49";
 /// Frozen compressed-domain parity contract, shared by SC-20671 and the SC-20676 product proof.
 pub const COMPRESSED_PARITY_MAX_ERROR: f64 = 0.0001;
 pub const COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN: f64 = 0.999;
+/// Frozen compressed perplexity-delta maximum (contract v3 `thresholds.perplexityDelta`).
+pub const COMPRESSED_PERPLEXITY_DELTA_MAX: f64 = 0.01;
+
+/// Direction of a frozen quality threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityGateComparison {
+    /// The measured value must be at least the threshold.
+    Minimum,
+    /// The measured value must be at most the threshold.
+    Maximum,
+}
+
+impl QualityGateComparison {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimum => "minimum",
+            Self::Maximum => "maximum",
+        }
+    }
+
+    fn misses(self, value: f64, threshold: f64) -> bool {
+        match self {
+            Self::Minimum => value < threshold,
+            Self::Maximum => value > threshold,
+        }
+    }
+}
+
+/// One gated quality metric: its fixture, frozen threshold, and direction.
+pub struct QualityGateMetric {
+    pub metric: &'static str,
+    pub fixture: &'static str,
+    pub threshold: f64,
+    pub comparison: QualityGateComparison,
+    read: fn(&QualityMetrics) -> f64,
+}
+
+/// The measured-quality gate of a compressed row: each contract v3 threshold, evaluated for every
+/// measured repeat against the same-weights dense-KV run. A miss is recorded evidence for the
+/// SC-20678 Go/No-Go decision, never a refused row. Kernel parity (`parityMaxError`) is
+/// deliberately absent: it compares the fused reader with its independent host-fp32
+/// dequantize-then-attend reference over the exact stored codes, a kernel-correctness check that
+/// still refuses the row.
+pub const QUALITY_GATE_METRICS: [QualityGateMetric; 5] = [
+    QualityGateMetric {
+        metric: "greedyTokenAgreement",
+        fixture: "kernel-fp32-reference",
+        threshold: COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.greedy_token_agreement,
+    },
+    QualityGateMetric {
+        metric: "perplexityDelta",
+        fixture: "kernel-fp32-reference",
+        threshold: COMPRESSED_PERPLEXITY_DELTA_MAX,
+        comparison: QualityGateComparison::Maximum,
+        read: |metrics| metrics.perplexity_delta,
+    },
+    QualityGateMetric {
+        metric: "structuredToolAgreement",
+        fixture: "structured-tool-call",
+        threshold: 1.0,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.structured_tool_agreement,
+    },
+    QualityGateMetric {
+        metric: "needleRetrieval",
+        fixture: "long-context-needle",
+        threshold: 1.0,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.needle_retrieval,
+    },
+    QualityGateMetric {
+        metric: "multiTurnPromptCache",
+        fixture: "multi-turn-prompt-cache",
+        threshold: 1.0,
+        comparison: QualityGateComparison::Minimum,
+        read: |metrics| metrics.multi_turn_prompt_cache,
+    },
+];
+
+/// Evaluate the compressed quality gate over every measured repeat's metrics, in repeat order.
+pub fn quality_gate_from_repeats(repeats: &[QualityMetrics]) -> ReceiptQualityGate {
+    let failures = repeats
+        .iter()
+        .enumerate()
+        .flat_map(|(repeat, metrics)| {
+            QUALITY_GATE_METRICS.iter().filter_map(move |spec| {
+                let value = (spec.read)(metrics);
+                spec.comparison
+                    .misses(value, spec.threshold)
+                    .then(|| ReceiptQualityGateFailure {
+                        metric: spec.metric.into(),
+                        fixture: spec.fixture.into(),
+                        repeat: repeat as u64,
+                        value,
+                        threshold: spec.threshold,
+                        comparison: spec.comparison.as_str().into(),
+                    })
+            })
+        })
+        .collect::<Vec<_>>();
+    ReceiptQualityGate {
+        passed: failures.is_empty(),
+        failures,
+    }
+}
+
+/// Human-readable outcome of a quality gate, for diagnostics and the human receipt.
+pub fn quality_gate_summary(gate: &ReceiptQualityGate) -> String {
+    if gate.passed {
+        return "passed".into();
+    }
+    let failures = gate
+        .failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "{} repeat {} = {} ({} {}, fixture {})",
+                failure.metric,
+                failure.repeat,
+                failure.value,
+                failure.comparison,
+                failure.threshold,
+                failure.fixture
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("FAILED: {failures}")
+}
+/// Greedy agreement under quality contract v3 is teacher-forced (decided before any compressed
+/// result existed): the candidate's greedy choice at each position of the reference stream.
+pub const GREEDY_AGREEMENT_METHOD: &str = "teacher-forced";
 /// Quality contract v3: the only denominator of a compressed receipt's quality gate is the
 /// dense-KV run on the same weights. The bf16 model remains weight-quantization characterization.
 pub const COMPRESSED_QUALITY_REFERENCE: &str = "dense-kv-same-weights";
@@ -134,9 +280,17 @@ pub const CONTEXT_BANDS: [&str; 4] = ["short", "medium", "memory-material", "fit
 pub const MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS: u64 = 1_000;
 pub const FIT_BOUNDARY_MIN_CONTEXT_BPS: u64 = 9_000;
 /// Fixed allowance for process-resident Metal/JIT runtime pages after MLX live tensors and its
-/// allocator cache have returned exactly to the loaded-model boundary. This is deliberately not a
-/// tensor or cache tolerance: both MLX release tolerances remain zero.
+/// allocator cache have returned to the loaded-model boundary.
 pub const POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES: u64 = 512 * 1024 * 1024;
+/// Floor of the post-release MLX allocator slack: real hardware leaves a few small allocator blocks
+/// (scalars, RNG state, compiled-kernel constants) that are not a leak.
+pub const POST_RELEASE_MLX_SLACK_FLOOR_BYTES: u64 = 1024 * 1024;
+
+/// Post-release MLX active/cache slack over a loaded-model `baseline`: `max(1 MiB, 0.1% of
+/// baseline)`, rounded up. A residual above it is a material leak and still fails.
+pub fn post_release_mlx_slack_bytes(baseline: u64) -> u64 {
+    POST_RELEASE_MLX_SLACK_FLOOR_BYTES.max(baseline.div_ceil(1_000))
+}
 pub const SCENEWORKS_REPOSITORY: &str = "github.com/SceneWorks/SceneWorks";
 pub const INFERENCE_REPOSITORY: &str = "github.com/SceneWorks/inference";
 pub const PMETAL_MLX_REPOSITORY: &str = "https://github.com/michaeltrefry/mlx-rs";
@@ -193,6 +347,31 @@ pub(crate) fn valid_utc_timestamp(value: &str) -> bool {
         && hour < 24
         && minute < 60
         && second < 60
+}
+
+/// Seconds since the Unix epoch of a validated UTC timestamp (fraction included).
+pub(crate) fn utc_timestamp_seconds(value: &str) -> Option<f64> {
+    if !valid_utc_timestamp(value) {
+        return None;
+    }
+    let parse = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (parse(0..4)?, parse(5..7)?, parse(8..10)?);
+    let (hour, minute, second) = (parse(11..13)?, parse(14..16)?, parse(17..19)?);
+    // Days from civil (proleptic Gregorian), the inverse of `timestamp_now`'s conversion.
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = if shifted >= 0 { shifted } else { shifted - 399 } / 400;
+    let year_of_era = shifted - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let fraction = if value.len() > 20 {
+        format!("0.{}", &value[20..value.len() - 1])
+            .parse::<f64>()
+            .ok()?
+    } else {
+        0.0
+    };
+    Some((days * 86_400 + hour * 3_600 + minute * 60 + second) as f64 + fraction)
 }
 
 pub(crate) fn compare_utc_timestamps(left: &str, right: &str) -> Option<std::cmp::Ordering> {
@@ -436,6 +615,13 @@ pub fn context_band_target(context_window: u64, context_band: &str) -> Result<u6
     }
 }
 
+/// Live tokens of a compressed row's forced continuation: the kernel prompt plus its continuation,
+/// which a fit-boundary row shortens to the native window.
+fn forced_continuation_live_tokens(kernel_prompt_tokens: u64, native_context_tokens: u64) -> u64 {
+    kernel_prompt_tokens
+        + FORCED_CONTINUATION_TOKENS.min(native_context_tokens.saturating_sub(kernel_prompt_tokens))
+}
+
 /// Compute a conservative total-live-token bound using only the pinned tokenizer and source
 /// fixture construction. Product chat rendering is separately capped by the native window; the
 /// prefix/batch paths bypass that renderer, so their exact raw prompt lengths are checked here.
@@ -446,6 +632,7 @@ fn preflight_total_live_tokens(
     spec: &BenchmarkModelSpec,
     coordinate: &Coordinate,
     prompt: &str,
+    compressed: bool,
 ) -> Result<(u64, u64), String> {
     let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json"))
         .map_err(|e| format!("load pinned tokenizer for safety preflight: {e}"))?;
@@ -479,13 +666,20 @@ fn preflight_total_live_tokens(
         needle_fixture_prompt(prompt, &payload, needle),
         format!("{prompt}\n{payload}\nRepeat the stable baseline fact."),
     ];
-    let max_prefix = prompts
+    let prompt_tokens = prompts
         .iter()
         .map(|text| token_count(text))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let max_prefix = prompt_tokens
+        .iter()
+        .copied()
         .max()
         .ok_or("no fixture prompts")?;
+    // Each candidate repeat's steady decode holds the kernel fixture's raw context plus the fixed
+    // decode length in its own cache, alone (every fixture cache has been released).
+    let steady_decode = prompt_tokens[0]
+        .checked_add(STEADY_DECODE_TOKENS)
+        .ok_or("steady-decode live context overflows u64")?;
     let direct_request = max_prefix
         .checked_add(2)
         .ok_or("direct request token count overflows")?;
@@ -549,7 +743,17 @@ fn preflight_total_live_tokens(
     } else {
         max_request
     };
-    Ok((total, max_request))
+    // A compressed row's forced continuation holds the kernel context plus its continuation (at
+    // most the native window) in its own request-scoped cache.
+    let forced_continuation = if compressed {
+        forced_continuation_live_tokens(prompt_tokens[0], spec.native_context_tokens)
+    } else {
+        0
+    };
+    Ok((
+        total.max(steady_decode).max(forced_continuation),
+        max_request,
+    ))
 }
 
 /// The dtype every campaign role's dense K/V is cached in: the causal loader's compute dtype. The
@@ -669,10 +873,16 @@ fn dense_kv_width_refusal(observed: u64) -> String {
 
 /// A deliberately conservative planning floor, not a proven process peak. The two-times
 /// checkpoint load reservation matches this model type's load admission; the pinned projection
-/// metadata supplies role-specific dense KV width. The actual lazy graph may retain more,
-/// especially at long context, so the floor is only a pre-spawn refusal (a row whose floor already
-/// exceeds the child cap cannot fit) and the estimate recorded in the receipt. Admission itself is
-/// runtime-guarded: see [`runtime_guarded_admission`].
+/// metadata supplies role-specific dense KV width. The live KV is the total-live bound's (a stored
+/// prefix alongside one full request, which is all the prefix path holds since sc-20671). The
+/// request's prefill activations — one decoder layer's projections, MLP tensors and residuals
+/// across the whole request, priced exactly as the product's tiled request admission prices them
+/// ([`core_llm::tiled_prefill_activation_bytes`]) — scale with the request like the KV does and
+/// were missing before sc-20671 (~12 GiB for the 3B bf16 reference at the fit boundary). The
+/// actual lazy graph may retain more, especially at long context, so the floor is only a
+/// pre-spawn refusal (a row whose floor already exceeds the child cap cannot fit) and the
+/// estimate recorded in the receipt. Admission itself is runtime-guarded: see
+/// [`runtime_guarded_admission`].
 pub(crate) fn static_role_footprint_budget(
     spec: &BenchmarkModelSpec,
     snapshot: &Path,
@@ -709,6 +919,9 @@ pub(crate) fn static_role_footprint_budget(
     let kv_heads = positive("num_key_value_heads")?;
     let head_dim = positive("head_dim")?;
     let query_heads = positive("num_attention_heads")?;
+    let hidden_size = positive("hidden_size")?;
+    let intermediate_size = positive("intermediate_size")?;
+    let vocab_size = positive("vocab_size")?;
     let element_bytes = pinned_dense_kv_element_bytes(spec, snapshot, layers)?;
     let kv = dense_kv_bytes(
         1,
@@ -722,10 +935,27 @@ pub(crate) fn static_role_footprint_budget(
         .into_iter()
         .try_fold(1_u64, |value, factor| value.checked_mul(factor))
         .ok_or("fused prefill tile footprint overflows")?;
+    let activations = core_llm::tiled_prefill_activation_bytes(
+        request_tokens,
+        core_llm::LlmMemoryGeometry {
+            query_heads,
+            kv_heads,
+            head_dim,
+            layers,
+            element_bytes,
+            score_element_bytes: 4,
+            hidden_size,
+            intermediate_size,
+            vocab_size,
+            recurrent_bytes: 0,
+        },
+    )
+    .ok_or("prefill activation footprint overflows")?;
     payload
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(kv))
         .and_then(|bytes| bytes.checked_add(tile))
+        .and_then(|bytes| bytes.checked_add(activations))
         .ok_or("static model-load plus KV/working budget overflows".into())
 }
 
@@ -765,13 +995,24 @@ fn static_row_requirements(
     reference_snapshot: &Path,
     prompt: &str,
     policy: &CampaignSafetyPolicy,
+    compressed: bool,
 ) -> Result<(u64, u64, u64), String> {
     let candidate = benchmark_model(coordinate.family, false)?;
     let reference = benchmark_model(coordinate.family, true)?;
-    let candidate_tokens =
-        preflight_total_live_tokens(candidate_snapshot, candidate, coordinate, prompt)?;
-    let reference_tokens =
-        preflight_total_live_tokens(reference_snapshot, reference, coordinate, prompt)?;
+    let candidate_tokens = preflight_total_live_tokens(
+        candidate_snapshot,
+        candidate,
+        coordinate,
+        prompt,
+        compressed,
+    )?;
+    let reference_tokens = preflight_total_live_tokens(
+        reference_snapshot,
+        reference,
+        coordinate,
+        prompt,
+        compressed,
+    )?;
     let total = candidate_tokens.0.max(reference_tokens.0);
     let max_request = candidate_tokens.1.max(reference_tokens.1);
     if max_request > policy.max_request_tokens {
@@ -807,12 +1048,17 @@ pub struct ReceiptAdmission {
     pub child_footprint_cap_bytes: u64,
     pub host_free_reserve_bytes: u64,
     pub static_footprint_floor_bytes: u64,
+    /// Every vm_stat component of the pre-spawn host measurement the row was admitted (or
+    /// refused) on. Absent only from a parent-side static admission computed before any
+    /// measurement; a receipt requires it (see [`Self::validate_admitted`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_memory_components: Option<campaign_supervisor::HostMemory>,
 }
 
 impl ReceiptAdmission {
     /// The recorded cap and reserve must be the captured campaign policy's, not caller values.
     pub fn validate_against(&self, policy: &CampaignSafetyPolicy) -> Result<(), String> {
-        self.validate()?;
+        self.validate_admitted()?;
         if self.child_footprint_cap_bytes != policy.child_footprint_cap_bytes
             || self.host_free_reserve_bytes != policy.host_free_reserve_bytes
         {
@@ -834,7 +1080,28 @@ impl ReceiptAdmission {
         {
             return Err("row admission is not a runtime-guarded cap with its estimate".into());
         }
+        if let Some(host) = &self.host_memory_components {
+            host.validate()?;
+        }
         Ok(())
+    }
+
+    /// A receipt's admission: the row ran, so its recorded host measurement must exist,
+    /// recompute, and cover cap plus reserve.
+    pub fn validate_admitted(&self) -> Result<(), String> {
+        self.validate()?;
+        self.host_memory_components
+            .as_ref()
+            .ok_or("row admission lacks its host memory components")?
+            .validate_admits(self.host_free_reserve_bytes, self.child_footprint_cap_bytes)
+    }
+
+    /// The same admission with the supervisor's pre-spawn measurement (for unaccepted records).
+    pub fn with_host_memory(&self, host: Option<campaign_supervisor::HostMemory>) -> Self {
+        Self {
+            host_memory_components: host,
+            ..self.clone()
+        }
     }
 }
 
@@ -842,8 +1109,9 @@ impl ReceiptAdmission {
 /// unobtainable for lazy long-context graphs. The row is admitted only when the mandatory policy
 /// configures every supervisor guard (deadline, sampling, termination grace, host RAM reserve,
 /// child `phys_footprint` watchdog cap) and the conservative static floor still fits under the
-/// cap. The supervisor then refuses before spawn unless host free RAM covers cap plus reserve, and
-/// terminates the child if the watchdog trips; neither outcome is ever an accepted row.
+/// cap. The supervisor then refuses before spawn unless host available RAM
+/// ([`campaign_supervisor::HostMemory`]) covers cap plus reserve, and terminates the child if the
+/// watchdog trips; neither outcome is ever an accepted row.
 pub(crate) fn runtime_guarded_admission(
     policy: &CampaignSafetyPolicy,
     static_footprint_floor_bytes: u64,
@@ -854,8 +1122,25 @@ pub(crate) fn runtime_guarded_admission(
         child_footprint_cap_bytes: policy.child_footprint_cap_bytes,
         host_free_reserve_bytes: policy.host_free_reserve_bytes,
         static_footprint_floor_bytes,
+        host_memory_components: None,
     };
     admission.validate()?;
+    Ok(admission)
+}
+
+/// Worker side: the runtime-guarded admission plus the host measurement its supervisor admitted
+/// it on (handed over in [`campaign_supervisor::HOST_MEMORY_ADMISSION_ENV`]), so the worker's own
+/// receipt records every component of the decision.
+pub(crate) fn supervised_admission(
+    policy: &CampaignSafetyPolicy,
+    static_footprint_floor_bytes: u64,
+) -> Result<ReceiptAdmission, String> {
+    let admission = runtime_guarded_admission(policy, static_footprint_floor_bytes)?
+        .with_host_memory(Some(campaign_supervisor::admitted_host_memory(
+            policy.host_free_reserve_bytes,
+            policy.child_footprint_cap_bytes,
+        )?));
+    admission.validate_admitted()?;
     Ok(admission)
 }
 
@@ -871,6 +1156,15 @@ pub(crate) fn unused_attempt_prefix(logs: &Path, slug: &str) -> Option<String> {
         })
 }
 
+/// Why a row stopped: reason, detail, the owned child PID (after spawn), and the live host sample
+/// that tripped the host-reserve watchdog, when one did.
+pub(crate) type UnacceptedStop<'a> = (
+    &'a str,
+    &'a str,
+    Option<u32>,
+    Option<&'a campaign_supervisor::HostMemory>,
+);
+
 /// Record an unaccepted row and return the row's own failure. A record-write failure is appended
 /// to, never substituted for, the original refusal/abort/exit reason.
 pub(crate) fn unaccepted_row_error(
@@ -878,7 +1172,7 @@ pub(crate) fn unaccepted_row_error(
     kind: &str,
     slug: &str,
     admission: &ReceiptAdmission,
-    stop: (&str, &str, Option<u32>),
+    stop: UnacceptedStop<'_>,
     failure: String,
 ) -> String {
     match write_unaccepted_row_record(path, kind, slug, admission, stop) {
@@ -897,10 +1191,10 @@ pub(crate) fn write_unaccepted_row_record(
     kind: &str,
     slug: &str,
     admission: &ReceiptAdmission,
-    stop: (&str, &str, Option<u32>),
+    stop: UnacceptedStop<'_>,
 ) -> Result<(), String> {
-    let (reason, detail, pid) = stop;
-    let record = serde_json::json!({
+    let (reason, detail, pid, watchdog_host_memory) = stop;
+    let mut record = serde_json::json!({
         "schemaVersion": 1,
         "kind": kind,
         "coordinate": slug,
@@ -915,6 +1209,9 @@ pub(crate) fn write_unaccepted_row_record(
         "pid": pid,
         "admission": admission,
     });
+    if let Some(sample) = watchdog_host_memory {
+        record["watchdogHostMemory"] = serde_json::to_value(sample).map_err(|e| e.to_string())?;
+    }
     let bytes = seal_json(&record)?.0;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -965,8 +1262,17 @@ pub struct ReceiptProvenance {
     pub reference_model_id: String,
     pub reference_model_sha256: String,
     pub reference_model_bytes: u64,
+    /// The row-start energy mode (one of [`POWER_MODES`]).
     pub power_mode: String,
+    /// The row-start thermal state: never throttled, because a throttled start refuses the row.
     pub thermal_state: String,
+    /// Power mode and thermal state observed at [`HOST_STATE_BOUNDARIES`], in order.
+    pub host_states: Vec<ReceiptHostState>,
+    /// Recorded, never refused: after row start the thermal state changed or throttled (row end
+    /// or any timing sample).
+    pub thermal_changed_during_row: bool,
+    /// Recorded, never refused: after row start the power mode changed.
+    pub power_mode_changed_during_row: bool,
     pub command_template: String,
     pub command: String,
     pub campaign_session_id: String,
@@ -1017,18 +1323,39 @@ pub struct ProductGeometry {
 /// SC-20677 RVQ/RaBitQ caches) is one variant here plus its cache selection and kernel parity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressedKvMethod {
-    /// SC-20675 packed 2-bit group-affine cache read by the SC-20676 fused Metal kernel.
+    /// SC-20675 packed 2-bit group-affine cache read by the SC-20676 fused Metal kernel. Its
+    /// identifier stays `group-affine` so earlier receipts and resume identities keep binding.
     GroupAffine,
+    /// The same cache and reader with 4-bit (KIVI-style) codes, group 32.
+    GroupAffine4,
+    /// The same cache and reader with 8-bit codes, group 32.
+    GroupAffine8,
 }
 
 impl CompressedKvMethod {
-    pub const ALL: [Self; 1] = [Self::GroupAffine];
+    pub const ALL: [Self; 3] = [Self::GroupAffine, Self::GroupAffine4, Self::GroupAffine8];
 
     /// Stable receipt/CLI identifier.
     pub fn id(self) -> &'static str {
         match self {
             Self::GroupAffine => "group-affine",
+            Self::GroupAffine4 => "group-affine-4",
+            Self::GroupAffine8 => "group-affine-8",
         }
+    }
+
+    /// Code width of this method's packed cache.
+    pub fn code_bits(self) -> crate::primitives::PackedCodeBits {
+        match self {
+            Self::GroupAffine => crate::primitives::PackedCodeBits::Two,
+            Self::GroupAffine4 => crate::primitives::PackedCodeBits::Four,
+            Self::GroupAffine8 => crate::primitives::PackedCodeBits::Eight,
+        }
+    }
+
+    /// Representation identity this method's cache and reader carry (recorded on receipts).
+    pub fn representation_identity(self) -> &'static str {
+        crate::primitives::packed_metal_identity(self.code_bits())
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {
@@ -1049,17 +1376,20 @@ impl CompressedKvMethod {
     /// any device this arm can dispatch on qualifies for the recent-family profile.
     pub fn kernel_gpu_family(self) -> crate::primitives::PackedMetalGpuFamily {
         match self {
-            Self::GroupAffine => crate::primitives::PackedMetalGpuFamily::Apple7OrNewer,
+            Self::GroupAffine | Self::GroupAffine4 | Self::GroupAffine8 => {
+                crate::primitives::PackedMetalGpuFamily::Apple7OrNewer
+            }
         }
     }
 
     /// Build this method's retained fused reader once per campaign session.
     pub fn arm(self) -> Result<CompressedKvArm, String> {
         let reader = match self {
-            Self::GroupAffine => {
-                let kernel = crate::primitives::PackedMetalKernel::for_identity_and_family(
-                    crate::primitives::PACKED_METAL_DEFAULT_IDENTITY,
+            Self::GroupAffine | Self::GroupAffine4 | Self::GroupAffine8 => {
+                let kernel = crate::primitives::PackedMetalKernel::for_identity_family_and_bits(
+                    self.representation_identity(),
                     self.kernel_gpu_family(),
+                    self.code_bits(),
                 )
                 .map_err(|e| e.to_string())?;
                 // The single-threaded campaign worker owns this non-Send Metal object through the
@@ -1103,7 +1433,9 @@ impl CompressedKvArm {
         model: &crate::models::CausalLm,
     ) -> crate::primitives::DecoderCacheSelection {
         match self.method {
-            CompressedKvMethod::GroupAffine => {
+            CompressedKvMethod::GroupAffine
+            | CompressedKvMethod::GroupAffine4
+            | CompressedKvMethod::GroupAffine8 => {
                 model.select_cache_with_packed_reader(self.reader.clone(), 1, 1, false)
             }
         }
@@ -1113,7 +1445,9 @@ impl CompressedKvArm {
     /// dequantize-then-attend reference over the exact stored codes.
     pub fn kernel_parity_errors(&self) -> Result<Vec<f64>, String> {
         match self.method {
-            CompressedKvMethod::GroupAffine => {
+            CompressedKvMethod::GroupAffine
+            | CompressedKvMethod::GroupAffine4
+            | CompressedKvMethod::GroupAffine8 => {
                 crate::primitives::group_affine_kernel_fp32_parity_errors(&self.reader)
             }
         }
@@ -1286,8 +1620,14 @@ pub struct ReceiptReconciliation {
 pub struct ReceiptRelease {
     pub verified: bool,
     pub phys_footprint_tolerance_bytes: u64,
+    /// [`post_release_mlx_slack_bytes`] of the weights-loaded MLX active bytes.
     pub mlx_active_tolerance_bytes: u64,
+    /// [`post_release_mlx_slack_bytes`] of the weights-loaded MLX cache bytes.
     pub mlx_cache_tolerance_bytes: u64,
+    /// Post-release MLX active bytes above the weights-loaded boundary (0 when at or below it).
+    pub mlx_active_residual_bytes: u64,
+    /// Post-release MLX cache bytes above the weights-loaded boundary (0 when at or below it).
+    pub mlx_cache_residual_bytes: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1311,6 +1651,12 @@ pub struct ReceiptMemory {
     pub reconciliation: ReceiptReconciliation,
     pub release: ReceiptRelease,
     pub admission: ReceiptAdmission,
+    /// Dense KV bytes as a share of the prefill-peak process footprint, in basis points (floor).
+    pub dense_kv_share_bps: u64,
+    /// A memory-material row whose dense KV share is below
+    /// [`MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS`]. The band is defined by geometry, so this is a
+    /// recorded flag, never a refusal.
+    pub below_memory_material_share: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1320,7 +1666,44 @@ pub struct ReceiptTimingSample {
     pub prefill_ms: f64,
     pub ttft_ms: f64,
     pub first_token_ms: f64,
+    /// `steady_decode_timed_tokens * 1000 / steady_decode_ms` of this repeat's dedicated
+    /// fixed-length steady decode ([`STEADY_DECODE_TOKENS`]).
     pub decode_tokens_per_second: f64,
+    pub steady_decode_prompt_tokens: u64,
+    pub steady_decode_generated_tokens: u64,
+    pub steady_decode_timed_tokens: u64,
+    pub steady_decode_ms: f64,
+    pub steady_decode_forced_stop_tokens: u64,
+    /// Host power/thermal state right after this repeat, so throughput drift is attributable.
+    pub host_state: ReceiptHostState,
+}
+
+impl ReceiptTimingSample {
+    fn steady_decode(&self) -> SteadyDecodeMeasurement {
+        SteadyDecodeMeasurement {
+            prompt_tokens: self.steady_decode_prompt_tokens,
+            generated_tokens: self.steady_decode_generated_tokens,
+            timed_tokens: self.steady_decode_timed_tokens,
+            decode_ms: self.steady_decode_ms,
+            forced_stop_tokens: self.steady_decode_forced_stop_tokens,
+        }
+    }
+
+    /// The sample's throughput is exactly its recorded fixed-length steady decode, and that decode
+    /// fit the loaded native context.
+    fn validate_steady_decode(&self, context_window_tokens: u64) -> Result<(), String> {
+        let steady = self.steady_decode();
+        let derived = steady.tokens_per_second()?;
+        if (self.decode_tokens_per_second - derived).abs() > derived * 1e-9
+            || steady.prompt_tokens.saturating_add(steady.generated_tokens) > context_window_tokens
+        {
+            return Err(
+                "timing sample throughput does not derive from its fixed-length steady decode"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1345,8 +1728,35 @@ pub struct ReceiptCompileAttribution {
     pub probe_evidence: Vec<ReceiptCompileProbeEvidence>,
     pub first_dispatch_ms: f64,
     pub steady_dispatch_ms: f64,
+    /// `first - steady`; any finite sign under [`COMPILE_ATTRIBUTION_METHOD`].
     pub first_dispatch_excess_ms: f64,
+    /// Steady-state dispatch durations the noise band is read from: the four post-first measured
+    /// repeats of a cold row, or the five measured repeats that follow a warm row's warmups.
+    /// Required, like the band and resolution below (`Option` only for construction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_samples_ms: Option<Vec<f64>>,
+    /// `max - min` of [`Self::noise_samples_ms`]: run-to-run spread of the same dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_band_ms: Option<f64>,
+    /// Whether the first-dispatch excess clears the noise band. At large geometries compute
+    /// dominates and compile cost is below run-to-run noise, so this is recorded, never required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cost_resolved: Option<bool>,
+    /// The excess, present exactly when it is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cost_ms: Option<f64>,
+    /// [`COMPILE_COST_NOT_SLOWER`] or [`COMPILE_COST_WITHIN_NOISE`], present exactly when the
+    /// excess is unresolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compile_cost_unresolved_reason: Option<String>,
 }
+
+/// Compile attribution that records the first-dispatch excess against a measured noise band.
+pub const COMPILE_ATTRIBUTION_METHOD: &str = "first-dispatch-minus-steady-v2";
+/// Unresolved: the first dispatch was not slower than steady state.
+pub const COMPILE_COST_NOT_SLOWER: &str = "first-dispatch-not-slower-than-steady";
+/// Unresolved: the positive excess does not exceed the steady noise band.
+pub const COMPILE_COST_WITHIN_NOISE: &str = "excess-within-steady-noise-band";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -1367,7 +1777,8 @@ pub struct ReceiptTimings {
     pub ttft_ms: f64,
     pub first_token_ms: f64,
     pub decode_tokens_per_second: f64,
-    pub cold_compile_ms: f64,
+    /// The resolved compile cost; `null` when it is below the steady noise band.
+    pub cold_compile_ms: Option<f64>,
     pub warm_compile_ms: f64,
     pub compile_attribution: ReceiptCompileAttribution,
     pub samples: Vec<ReceiptTimingSample>,
@@ -1404,6 +1815,17 @@ pub struct ReceiptQuality {
     pub perplexity_delta: f64,
     #[serde(rename = "greedyTokenAgreement")]
     pub greedy_token_agreement: f64,
+    /// Always [`GREEDY_AGREEMENT_METHOD`].
+    #[serde(rename = "greedyAgreementMethod")]
+    pub greedy_agreement_method: String,
+    /// Observation only: the first position at which the free-running candidate and reference
+    /// kernel streams of the primary repeat differ (`null` when identical).
+    #[serde(rename = "freeRunningFirstDivergence")]
+    pub free_running_first_divergence: Option<u64>,
+    /// Teacher-forced greedy agreement of each measured repeat; `greedyTokenAgreement` is their
+    /// minimum.
+    #[serde(rename = "greedyTokenAgreementByRepeat")]
+    pub greedy_token_agreement_by_repeat: Vec<f64>,
     #[serde(rename = "structuredToolAgreement")]
     pub structured_tool_agreement: f64,
     #[serde(rename = "needleRetrieval")]
@@ -1421,6 +1843,162 @@ pub struct ReceiptQuality {
     pub statistics: ReceiptQualityStatistics,
     #[serde(rename = "fixtureEvidence")]
     pub fixture_evidence: std::collections::BTreeMap<String, ReceiptFixture>,
+    /// Compressed rows only: the frozen-threshold outcome of every measured repeat. A failed gate
+    /// is a measured result for the Go/No-Go decision, never a relabelled pass or a refused row.
+    /// Dense rows are characterization and carry none.
+    #[serde(
+        rename = "qualityGate",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub quality_gate: Option<ReceiptQualityGate>,
+    /// Compressed rows only: the forced-continuation measurement behind `greedyTokenAgreement`.
+    #[serde(
+        rename = "forcedContinuation",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub forced_continuation: Option<ReceiptForcedContinuation>,
+}
+/// One frozen-threshold miss of one measured repeat.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptQualityGateFailure {
+    pub metric: String,
+    pub fixture: String,
+    pub repeat: u64,
+    pub value: f64,
+    pub threshold: f64,
+    pub comparison: String,
+}
+/// The measured quality-gate outcome of a compressed receipt.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptQualityGate {
+    pub passed: bool,
+    pub failures: Vec<ReceiptQualityGateFailure>,
+}
+
+/// Length of a compressed row's forced continuation. Teacher-forced agreement over the short
+/// natural fixture streams (~7-21 tokens) turned the frozen 0.999 minimum into "zero flips"; over
+/// this many positions it resolves one flip.
+pub const FORCED_CONTINUATION_TOKENS: u64 = 1024;
+/// Only a fit-boundary row may shorten its continuation (to the context window left after the
+/// kernel prompt), never below the steady-decode reserve.
+pub const FORCED_CONTINUATION_MIN_TOKENS: u64 = STEADY_DECODE_TOKENS;
+/// How many flip positions a receipt records (the first ones, in order).
+pub const FORCED_CONTINUATION_RECORDED_FLIPS: usize = 32;
+pub const FORCED_CONTINUATION_METHOD: &str =
+    "dense-kv-same-weights-greedy-continuation-eos-ignored-teacher-forced";
+
+/// A compressed row's greedy agreement (quality contract v3 `greedyTokenAgreement`): the
+/// same-weights dense-KV session greedily continues the kernel fixture prompt through every stop
+/// token for `tokens` positions, and the compressed session, teacher-forced on that stream in one
+/// pass, is compared by argmax at every position. The stream is deterministic, so it is measured
+/// once per row and shared by every repeat.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptForcedContinuation {
+    pub method: String,
+    pub tokens: u64,
+    pub matches: u64,
+    pub agreement: f64,
+    pub flip_count: u64,
+    /// The first [`FORCED_CONTINUATION_RECORDED_FLIPS`] disagreeing positions, ascending.
+    pub first_flip_positions: Vec<u64>,
+    pub reference_stream_sha256: String,
+    pub candidate_choices_sha256: String,
+}
+
+fn token_stream_sha256(tokens: &[i32]) -> String {
+    seal_bytes(&serde_json::to_vec(tokens).unwrap_or_default())
+}
+
+/// Per-position argmax agreement of a teacher-forced pass with the stream it was forced on.
+pub fn forced_continuation_evidence(
+    reference: &[i32],
+    choices: &[i32],
+) -> Result<ReceiptForcedContinuation, String> {
+    if reference.is_empty() || reference.len() != choices.len() {
+        return Err(format!(
+            "forced continuation has {} reference positions but {} teacher-forced choices",
+            reference.len(),
+            choices.len()
+        ));
+    }
+    let flips = reference
+        .iter()
+        .zip(choices)
+        .enumerate()
+        .filter(|(_, (reference, choice))| reference != choice)
+        .map(|(position, _)| position as u64)
+        .collect::<Vec<_>>();
+    let tokens = reference.len() as u64;
+    let matches = tokens - flips.len() as u64;
+    Ok(ReceiptForcedContinuation {
+        method: FORCED_CONTINUATION_METHOD.into(),
+        tokens,
+        matches,
+        agreement: matches as f64 / tokens as f64,
+        flip_count: flips.len() as u64,
+        first_flip_positions: flips
+            .into_iter()
+            .take(FORCED_CONTINUATION_RECORDED_FLIPS)
+            .collect(),
+        reference_stream_sha256: token_stream_sha256(reference),
+        candidate_choices_sha256: token_stream_sha256(choices),
+    })
+}
+
+/// Internal consistency of a recorded forced continuation for a row of `context_band`.
+fn validate_forced_continuation(
+    continuation: &ReceiptForcedContinuation,
+    context_band: &str,
+) -> Result<(), String> {
+    let digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let length_valid = continuation.tokens == FORCED_CONTINUATION_TOKENS
+        || (context_band == "fit-boundary"
+            && (FORCED_CONTINUATION_MIN_TOKENS..FORCED_CONTINUATION_TOKENS)
+                .contains(&continuation.tokens));
+    let recorded = usize::try_from(continuation.flip_count)
+        .unwrap_or(usize::MAX)
+        .min(FORCED_CONTINUATION_RECORDED_FLIPS);
+    if continuation.method != FORCED_CONTINUATION_METHOD
+        || !length_valid
+        || continuation.matches > continuation.tokens
+        || continuation.flip_count != continuation.tokens - continuation.matches
+        || continuation.agreement.to_bits()
+            != (continuation.matches as f64 / continuation.tokens as f64).to_bits()
+        || continuation.first_flip_positions.len() != recorded
+        || continuation
+            .first_flip_positions
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        || continuation
+            .first_flip_positions
+            .last()
+            .is_some_and(|last| *last >= continuation.tokens)
+        || !digest(&continuation.reference_stream_sha256)
+        || !digest(&continuation.candidate_choices_sha256)
+    {
+        return Err(format!(
+            "forced continuation evidence is inconsistent: method={}, tokens={} (band {context_band}), matches={}, agreement={}, flipCount={}, recordedFlips={}",
+            continuation.method,
+            continuation.tokens,
+            continuation.matches,
+            continuation.agreement,
+            continuation.flip_count,
+            continuation.first_flip_positions.len()
+        ));
+    }
+    Ok(())
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1566,13 +2144,64 @@ pub struct Receipt {
     pub compression: Option<ReceiptCompression>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RawTiming {
     pub load_ms: f64,
     pub prefill_ms: f64,
     pub ttft_ms: f64,
     pub first_token_ms: f64,
     pub decode_tokens_per_second: f64,
+    pub steady_decode: SteadyDecodeMeasurement,
+    /// The host state captured right after this repeat's steady decode (the worker fills it).
+    pub host_state: Option<ReceiptHostState>,
+}
+
+/// Fixed decode length of every SC-20671 steady-decode sample. Steady throughput is a dedicated
+/// measurement per repeat — the row's context prefilled into a fresh cache of the row's KV
+/// representation, then exactly this many greedy tokens decoded through any stop token — never
+/// the coordinate's own (EOS- or budget-terminated, footprint-sampled) generation. 256 is the
+/// longest fixed length every frozen context band admits: the fit-boundary fixture prompt is
+/// refused above `native context - 256`, so `prompt + 256` always fits the native window. The
+/// 255 timed tokens span roughly 1-2 s at short context on the pinned 1.7B-3B 4-bit candidates
+/// (about 130-250 tok/s) and several seconds at the longer bands.
+pub const STEADY_DECODE_TOKENS: u64 = 256;
+
+/// One steady-decode sample, measured by the product decoder at a synchronized per-token boundary
+/// (the crate-private `decode::forced_greedy_decode`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SteadyDecodeMeasurement {
+    /// Raw tokens of the row context prefilled before decoding.
+    pub prompt_tokens: u64,
+    /// Every decoded token, including the untimed first one; always [`STEADY_DECODE_TOKENS`].
+    pub generated_tokens: u64,
+    /// Tokens inside the timed window: every decoded token after the first.
+    pub timed_tokens: u64,
+    /// Milliseconds from the first token's GPU completion to the last token's.
+    pub decode_ms: f64,
+    /// Decoded stop tokens that were forced through instead of ending the sample.
+    pub forced_stop_tokens: u64,
+}
+
+impl SteadyDecodeMeasurement {
+    /// The frozen fixed-length shape and its derived throughput.
+    pub fn tokens_per_second(&self) -> Result<f64, String> {
+        if self.generated_tokens != STEADY_DECODE_TOKENS
+            || self.timed_tokens + 1 != self.generated_tokens
+            || self.prompt_tokens == 0
+            || self.forced_stop_tokens > self.generated_tokens
+            || !self.decode_ms.is_finite()
+            || self.decode_ms <= 0.0
+        {
+            return Err(format!(
+                "steady decode is not a {STEADY_DECODE_TOKENS}-token fixed-length sample in positive time: {self:?}"
+            ));
+        }
+        let throughput = self.timed_tokens as f64 * 1_000.0 / self.decode_ms;
+        if !throughput.is_finite() || throughput <= 0.0 {
+            return Err("invalid steady decode throughput".into());
+        }
+        Ok(throughput)
+    }
 }
 
 pub struct ProductTimingMeasurements {
@@ -1591,8 +2220,8 @@ pub struct ReceiptBuilder {
 
 impl ReceiptBuilder {
     pub fn finish(mut self) -> Result<Receipt, String> {
-        self.template.schema_version = 4;
-        self.template.harness_version = "sc-20671-kv-baseline-v4".into();
+        self.template.schema_version = RECEIPT_SCHEMA_VERSION;
+        self.template.harness_version = RECEIPT_HARNESS_VERSION.into();
         let digest = |v: &str| {
             v.len() == 64
                 && v.bytes()
@@ -1620,7 +2249,7 @@ impl ReceiptBuilder {
         {
             return Err("receipt repository identity is not paired SceneWorks".into());
         }
-        if self.template.provenance.thermal_state != "nominal"
+        if !THERMAL_STATES.contains(&self.template.provenance.thermal_state.as_str())
             || !self.template.provenance.command_template.contains("{mode}")
             || self.template.provenance.command
                 != self
@@ -1677,7 +2306,7 @@ impl ReceiptBuilder {
         for (phase, expected) in self.phases.iter().zip(REQUIRED_PHASES) {
             if phase.phase != expected
                 || phase.pid == 0
-                || phase.source != "footprint -p"
+                || !valid_phys_footprint_source(&phase.source)
                 || phase.mlx.source != "mlx_rs::memory"
             {
                 return Err("invalid phase evidence".into());
@@ -1739,6 +2368,15 @@ impl ReceiptBuilder {
             confidence_interval_low: sorted[0],
             confidence_interval_high: sorted[4],
         };
+        self.template.memory.release = release_evidence(&self.phases[1], &self.phases[7]);
+        (
+            self.template.memory.dense_kv_share_bps,
+            self.template.memory.below_memory_material_share,
+        ) = dense_kv_share(
+            dense,
+            self.phases[2].phys_footprint_bytes,
+            &self.template.matrix.context_band,
+        )?;
         self.template.memory.phase_samples = self.phases;
         self.template.memory.allocation_events = self.allocations;
         self.template.memory.dense_theoretical_kv_bytes = dense;
@@ -1753,30 +2391,63 @@ impl ReceiptBuilder {
             ttft_ms: mean(|t| t.ttft_ms),
             first_token_ms: mean(|t| t.first_token_ms),
             decode_tokens_per_second: decode_mean,
-            cold_compile_ms: self.compile_attribution.first_dispatch_excess_ms,
+            cold_compile_ms: cold_compile_alias(&self.compile_attribution),
             warm_compile_ms: self.compile_attribution.steady_dispatch_ms,
             compile_attribution: self.compile_attribution,
             samples: self
                 .timings
                 .into_iter()
-                .map(|t| ReceiptTimingSample {
-                    load_ms: t.load_ms,
-                    prefill_ms: t.prefill_ms,
-                    ttft_ms: t.ttft_ms,
-                    first_token_ms: t.first_token_ms,
-                    decode_tokens_per_second: t.decode_tokens_per_second,
+                .map(|t| {
+                    Ok(ReceiptTimingSample {
+                        load_ms: t.load_ms,
+                        prefill_ms: t.prefill_ms,
+                        ttft_ms: t.ttft_ms,
+                        first_token_ms: t.first_token_ms,
+                        decode_tokens_per_second: t.decode_tokens_per_second,
+                        steady_decode_prompt_tokens: t.steady_decode.prompt_tokens,
+                        steady_decode_generated_tokens: t.steady_decode.generated_tokens,
+                        steady_decode_timed_tokens: t.steady_decode.timed_tokens,
+                        steady_decode_ms: t.steady_decode.decode_ms,
+                        steady_decode_forced_stop_tokens: t.steady_decode.forced_stop_tokens,
+                        host_state: t
+                            .host_state
+                            .ok_or("timing sample has no recorded host state")?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, String>>()?,
             summary,
         };
         self.template.quality.parity_max_error = metrics.parity_max_error;
         self.template.quality.perplexity_delta = metrics.perplexity_delta;
         self.template.quality.greedy_token_agreement = metrics.greedy_token_agreement;
+        self.template.quality.greedy_agreement_method = GREEDY_AGREEMENT_METHOD.into();
+        self.template.quality.free_running_first_divergence =
+            self.quality.free_running_first_divergence;
+        self.template.quality.greedy_token_agreement_by_repeat =
+            self.quality.greedy_agreement_by_repeat.clone();
         self.template.quality.structured_tool_agreement = metrics.structured_tool_agreement;
         self.template.quality.needle_retrieval = metrics.needle_retrieval;
         self.template.quality.needle_discriminating = self.quality.needle_discriminating;
         self.template.quality.tool_discriminating = self.quality.tool_discriminating;
         self.template.quality.multi_turn_prompt_cache = metrics.multi_turn_prompt_cache;
+        // A compressed row's quality is gated per measured repeat; the outcome, pass or fail, is
+        // recorded with the row (dense rows are characterization and carry no gate).
+        (
+            self.template.quality.quality_gate,
+            self.template.quality.forced_continuation,
+        ) = if self.template.mode == "compressed" {
+            if self.quality.repeat_metrics.len() != 5 {
+                return Err(
+                    "a compressed quality gate evaluates exactly the five measured repeats".into(),
+                );
+            }
+            (
+                Some(quality_gate_from_repeats(&self.quality.repeat_metrics)),
+                self.quality.forced_continuation.clone(),
+            )
+        } else {
+            (None, None)
+        };
         if self.template.memory.persistent_kv_bytes == 0
             || self.template.memory.model_weights_bytes == 0
         {
@@ -1905,6 +2576,20 @@ fn validate_receipt_compression(
     {
         return Err("compressed representation identity is incomplete".into());
     }
+    // Each method names exactly one representation: its code width and reader identity.
+    let method = CompressedKvMethod::parse(&compression.method)?;
+    if compression.bits != u64::from(method.code_bits().bits())
+        || compression.representation_identity != method.representation_identity()
+    {
+        return Err(format!(
+            "compressed method {} is {}-bit {} but the receipt records {}-bit {}",
+            method.id(),
+            method.code_bits().bits(),
+            method.representation_identity(),
+            compression.bits,
+            compression.representation_identity
+        ));
+    }
     let device_bytes = compression
         .device_code_bytes
         .checked_add(compression.device_metadata_bytes);
@@ -1970,15 +2655,13 @@ fn validate_receipt_compression(
         // device arrays, it describes the receipt's KV length, and the whole physical
         // representation (device + host copy + staged tail) is below the dense geometry.
         COMPRESSED_PERSISTENT_KV => {
-            if compression.device_code_bytes == 0
-                || device_bytes != Some(receipt.memory.persistent_kv_bytes)
-                || compression.storage_tokens != receipt.geometry.kv_length
-            {
-                return Err(
-                    "compressed persistent KV does not reconcile with the coordinate's measured storage"
-                        .into(),
-                );
-            }
+            coordinate_storage_reconciles(
+                compression.device_code_bytes,
+                device_bytes,
+                compression.storage_tokens,
+                receipt.memory.persistent_kv_bytes,
+                receipt.geometry.kv_length,
+            )?;
             if compression.physical_kv_bytes >= receipt.memory.dense_theoretical_kv_bytes {
                 return Err(
                     "compressed persistent KV representation disagrees with its evidence".into(),
@@ -2002,6 +2685,201 @@ fn validate_receipt_compression(
     Ok(())
 }
 
+/// A compressed coordinate's measured storage must be its persistent KV exactly: the MLX-resident
+/// device share equals `memory.persistentKvBytes` and the storage describes `geometry.kvLength`.
+pub(crate) fn coordinate_storage_reconciles(
+    device_code_bytes: u64,
+    device_bytes: Option<u64>,
+    storage_tokens: u64,
+    persistent_kv_bytes: u64,
+    kv_length: u64,
+) -> Result<(), String> {
+    if device_code_bytes == 0
+        || device_bytes != Some(persistent_kv_bytes)
+        || storage_tokens != kv_length
+    {
+        return Err(format!(
+            "compressed persistent KV does not reconcile with the coordinate's measured storage: device bytes {device_bytes:?} (codes {device_code_bytes}) vs persistentKvBytes {persistent_kv_bytes}; storageTokens {storage_tokens} vs kvLength {kv_length}"
+        ));
+    }
+    Ok(())
+}
+
+/// The row's recorded power mode and thermal state: one observation per boundary, in order, each
+/// nominal and in the row's single power mode, bracketing every measured phase sample.
+fn validate_host_states(receipt: &Receipt) -> Result<(), String> {
+    let p = &receipt.provenance;
+    let invalid = |detail: &str| Err(format!("host power/thermal provenance {detail}"));
+    let [start, end] = p.host_states.as_slice() else {
+        return invalid("does not record exactly the row-start and row-end states");
+    };
+    start.validate(HOST_STATE_BOUNDARIES[0])?;
+    end.validate(HOST_STATE_BOUNDARIES[1])?;
+    refuse_throttled_row_start(start)
+        .map_err(|error| format!("host power/thermal provenance: {error}"))?;
+    if p.power_mode != start.power_mode || p.thermal_state != start.thermal_state {
+        return invalid("is not the row-start state");
+    }
+    let samples = receipt
+        .timings
+        .samples
+        .iter()
+        .map(|sample| &sample.host_state)
+        .collect::<Vec<_>>();
+    for state in &samples {
+        state.validate(TIMING_SAMPLE_HOST_BOUNDARY)?;
+    }
+    let order = std::iter::once(start)
+        .chain(samples.iter().copied())
+        .chain(std::iter::once(end))
+        .collect::<Vec<_>>();
+    if order
+        .windows(2)
+        .any(|pair| !utc_timestamp_before(&pair[0].captured_at, &pair[1].captured_at))
+    {
+        return invalid("is not ordered row start, timing samples, row end");
+    }
+    if (
+        p.thermal_changed_during_row,
+        p.power_mode_changed_during_row,
+    ) != host_state_changes(start, samples.iter().copied().chain(std::iter::once(end)))
+    {
+        return invalid("change flags do not recompute");
+    }
+    let (Some(first), Some(last)) = (
+        receipt.memory.phase_samples.first(),
+        receipt.memory.phase_samples.last(),
+    ) else {
+        return invalid("has no phase samples to bracket");
+    };
+    if !utc_timestamp_before(&start.captured_at, &first.timestamp)
+        || !utc_timestamp_before(&last.timestamp, &end.captured_at)
+    {
+        return invalid("does not bracket the row's measured phases");
+    }
+    Ok(())
+}
+
+/// A compressed receipt's measured quality gate must be exactly the frozen-threshold evaluation
+/// of the values the receipt records: every miss named with its value, threshold, repeat, and
+/// fixture, and `passed` only when nothing missed. Dense receipts are characterization and carry
+/// neither a gate nor a forced continuation. Values of repeats 1-4 other than greedy agreement
+/// live in the sealed fixture artifacts and are bound by the artifact-bundle validator.
+fn validate_quality_gate(receipt: &Receipt) -> Result<(), String> {
+    let quality = &receipt.quality;
+    if receipt.mode != "compressed" {
+        if quality.quality_gate.is_some() || quality.forced_continuation.is_some() {
+            return Err(
+                "a quality gate and forced continuation are recorded only on compressed receipts"
+                    .into(),
+            );
+        }
+        return Ok(());
+    }
+    let continuation = quality
+        .forced_continuation
+        .as_ref()
+        .ok_or("compressed receipt has no forced-continuation greedy agreement")?;
+    validate_forced_continuation(continuation, &receipt.matrix.context_band)?;
+    if quality
+        .greedy_token_agreement_by_repeat
+        .iter()
+        .chain(std::iter::once(&quality.greedy_token_agreement))
+        .any(|value| value.to_bits() != continuation.agreement.to_bits())
+    {
+        return Err(format!(
+            "greedyTokenAgreement {} (by repeat {:?}) is not the row's forced-continuation agreement {}",
+            quality.greedy_token_agreement,
+            quality.greedy_token_agreement_by_repeat,
+            continuation.agreement
+        ));
+    }
+    let gate = quality
+        .quality_gate
+        .as_ref()
+        .ok_or("compressed receipt has no measured quality-gate record")?;
+    let mut previous: Option<(u64, usize)> = None;
+    for failure in &gate.failures {
+        let index = QUALITY_GATE_METRICS
+            .iter()
+            .position(|spec| spec.metric == failure.metric)
+            .ok_or_else(|| format!("quality gate names unknown metric {}", failure.metric))?;
+        let spec = &QUALITY_GATE_METRICS[index];
+        if failure.fixture != spec.fixture
+            || failure.threshold.to_bits() != spec.threshold.to_bits()
+            || failure.comparison != spec.comparison.as_str()
+            || failure.repeat >= 5
+            || !failure.value.is_finite()
+            || !spec.comparison.misses(failure.value, spec.threshold)
+            || previous.is_some_and(|previous| previous >= (failure.repeat, index))
+        {
+            return Err(format!(
+                "quality gate failure is not an ordered frozen-threshold miss: metric={} value={} threshold={} comparison={} repeat={} fixture={}",
+                failure.metric,
+                failure.value,
+                failure.threshold,
+                failure.comparison,
+                failure.repeat,
+                failure.fixture
+            ));
+        }
+        previous = Some((failure.repeat, index));
+    }
+    if gate.passed != gate.failures.is_empty() {
+        return Err(format!(
+            "quality gate claims passed={} with {} recorded failure(s): {}",
+            gate.passed,
+            gate.failures.len(),
+            quality_gate_summary(&ReceiptQualityGate {
+                passed: false,
+                failures: gate.failures.clone(),
+            })
+        ));
+    }
+    // Every value the receipt itself records must appear in the gate exactly when it misses.
+    let recorded = |metric: &str, repeat: u64| {
+        gate.failures
+            .iter()
+            .find(|failure| failure.metric == metric && failure.repeat == repeat)
+            .map(|failure| failure.value.to_bits())
+    };
+    let visible = quality
+        .greedy_token_agreement_by_repeat
+        .iter()
+        .enumerate()
+        .map(|(repeat, value)| ("greedyTokenAgreement", repeat as u64, *value))
+        .chain([
+            ("perplexityDelta", 0, quality.perplexity_delta),
+            (
+                "structuredToolAgreement",
+                0,
+                quality.structured_tool_agreement,
+            ),
+            ("needleRetrieval", 0, quality.needle_retrieval),
+            ("multiTurnPromptCache", 0, quality.multi_turn_prompt_cache),
+        ]);
+    for (metric, repeat, value) in visible {
+        let spec = QUALITY_GATE_METRICS
+            .iter()
+            .find(|spec| spec.metric == metric)
+            .ok_or("quality gate metric table is incomplete")?;
+        let expected = spec
+            .comparison
+            .misses(value, spec.threshold)
+            .then_some(value.to_bits());
+        if recorded(metric, repeat) != expected {
+            return Err(format!(
+                "quality gate does not record {metric} repeat {repeat} = {value} against the frozen {} {} (fixture {}): passed={}",
+                spec.comparison.as_str(),
+                spec.threshold,
+                spec.fixture,
+                gate.passed
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     let lowercase_hex = |v: &str, len: usize| {
         v.len() == len
@@ -2013,8 +2891,8 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             && v.bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     };
-    if receipt.schema_version != 4
-        || receipt.harness_version != "sc-20671-kv-baseline-v4"
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION
+        || receipt.harness_version != RECEIPT_HARNESS_VERSION
         || receipt.status != "complete"
         || receipt.contract_hash != QUALITY_CONTRACT_HASH
     {
@@ -2060,12 +2938,13 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         || !lowercase_hex(&p.campaign_session_id, 64)
         || !lowercase_hex(&p.coordinate_operation_sha256, 64)
         || p.campaign_cache_state_version == 0
-        || p.thermal_state != "nominal"
+        || !THERMAL_STATES.contains(&p.thermal_state.as_str())
         || !p.command_template.contains("{mode}")
         || p.command_template.replace("{mode}", &receipt.mode) != p.command
     {
         return Err("provenance is incomplete".into());
     }
+    validate_host_states(receipt)?;
     let g = &receipt.geometry;
     if [
         g.batch,
@@ -2121,7 +3000,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             .zip(REQUIRED_PHASES)
             .any(|(p, expected)| {
                 p.phase != expected
-                    || p.source != "footprint -p"
+                    || !valid_phys_footprint_source(&p.source)
                     || p.mlx.source != "mlx_rs::memory"
                     || p.phys_footprint_peak_bytes < p.phys_footprint_bytes
                     || !valid_utc_timestamp(&p.timestamp)
@@ -2272,12 +3151,12 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         .find(|sample| sample.phase == "prefill-peak")
         .ok_or("missing prefill-peak materiality evidence")?
         .phys_footprint_bytes;
-    if receipt.matrix.context_band == "memory-material"
-        && u128::from(dense).saturating_mul(10_000)
-            < u128::from(prefill_footprint)
-                .saturating_mul(u128::from(MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS))
+    if (
+        receipt.memory.dense_kv_share_bps,
+        receipt.memory.below_memory_material_share,
+    ) != dense_kv_share(dense, prefill_footprint, &receipt.matrix.context_band)?
     {
-        return Err("memory-material dense KV is below the frozen process-footprint share".into());
+        return Err("dense KV share of the prefill footprint does not recompute".into());
     }
     if receipt.matrix.context_band == "fit-boundary"
         && (receipt.geometry.kv_length > receipt.geometry.context_window_tokens
@@ -2314,7 +3193,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("explicit full-cache temporary detected".into());
     }
-    receipt.memory.admission.validate()?;
+    receipt.memory.admission.validate_admitted()?;
     let weights = receipt.memory.model_weights_bytes;
     let kv = receipt.memory.persistent_kv_bytes;
     let sample_for = |phase: &str| {
@@ -2429,14 +3308,26 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             receipt.memory.reconciliation.tolerance_bytes,
         ));
     }
+    let end = receipt.memory.phase_samples.last().unwrap();
     if receipt.memory.release.phys_footprint_tolerance_bytes
         != POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES
-        || receipt.memory.release.mlx_active_tolerance_bytes != 0
-        || receipt.memory.release.mlx_cache_tolerance_bytes != 0
+        || receipt.memory.release.mlx_active_tolerance_bytes
+            != post_release_mlx_slack_bytes(weights_loaded.mlx.active_bytes)
+        || receipt.memory.release.mlx_cache_tolerance_bytes
+            != post_release_mlx_slack_bytes(weights_loaded.mlx.cache_bytes)
+        || receipt.memory.release.mlx_active_residual_bytes
+            != end
+                .mlx
+                .active_bytes
+                .saturating_sub(weights_loaded.mlx.active_bytes)
+        || receipt.memory.release.mlx_cache_residual_bytes
+            != end
+                .mlx
+                .cache_bytes
+                .saturating_sub(weights_loaded.mlx.cache_bytes)
     {
-        return Err("release tolerances differ from the frozen platform contract".into());
+        return Err("release tolerances or residuals differ from the platform contract".into());
     }
-    let end = receipt.memory.phase_samples.last().unwrap();
     if end.phys_footprint_bytes
         > weights_loaded
             .phys_footprint_bytes
@@ -2465,6 +3356,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             receipt.memory.release.mlx_cache_tolerance_bytes,
         ));
     }
+    for sample in &receipt.timings.samples {
+        sample.validate_steady_decode(receipt.geometry.context_window_tokens)?;
+    }
     if receipt.timings.samples.len() != 5
         || !receipt.timings.samples.iter().all(|s| {
             [
@@ -2483,7 +3377,6 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             receipt.timings.ttft_ms,
             receipt.timings.first_token_ms,
             receipt.timings.decode_tokens_per_second,
-            receipt.timings.cold_compile_ms,
             receipt.timings.warm_compile_ms,
             receipt.timings.summary.decode_tokens_per_second_mean,
             receipt.timings.summary.decode_tokens_per_second_p95,
@@ -2527,10 +3420,7 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
         ));
     }
     validate_compile_attribution(&receipt.timings.compile_attribution, &receipt.matrix)?;
-    if (receipt.timings.cold_compile_ms
-        - receipt.timings.compile_attribution.first_dispatch_excess_ms)
-        .abs()
-        > 1e-9
+    if receipt.timings.cold_compile_ms != cold_compile_alias(&receipt.timings.compile_attribution)
         || (receipt.timings.warm_compile_ms
             - receipt.timings.compile_attribution.steady_dispatch_ms)
             .abs()
@@ -2593,6 +3483,21 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("timing summary derivation failed".into());
     }
+    if receipt.quality.greedy_agreement_method != GREEDY_AGREEMENT_METHOD {
+        return Err("greedy agreement is not teacher-forced".into());
+    }
+    let by_repeat = &receipt.quality.greedy_token_agreement_by_repeat;
+    if by_repeat.len() != 5
+        || by_repeat.iter().any(|value| !(0.0..=1.0).contains(value))
+        || by_repeat
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+            .to_bits()
+            != receipt.quality.greedy_token_agreement.to_bits()
+    {
+        return Err("greedy agreement is not the minimum over the five recorded repeats".into());
+    }
     if !receipt.quality.parity_max_error.is_finite()
         || !receipt.quality.perplexity_delta.is_finite()
         || receipt.quality.parity_max_error < 0.0
@@ -2607,50 +3512,59 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
     {
         return Err("quality evidence contains invalid numeric values".into());
     }
+    // Kernel parity compares the fused reader with its independent host-fp32
+    // dequantize-then-attend reference over the exact stored codes: a correctness check of the
+    // kernel, not a quality-versus-dense metric, so a miss still refuses the row.
     if receipt.mode == "compressed"
-        && (receipt.quality.parity_max_error > COMPRESSED_PARITY_MAX_ERROR
-            || receipt.quality.perplexity_delta > 0.01)
+        && receipt.quality.parity_max_error > COMPRESSED_PARITY_MAX_ERROR
     {
         return Err(format!(
-            "quality thresholds failed: parityMaxError={}, perplexityDelta={}, greedyTokenAgreement={}, structuredToolAgreement={}, needleRetrieval={}, multiTurnPromptCache={}",
+            "kernel parity failed: metric=parityMaxError value={} threshold={COMPRESSED_PARITY_MAX_ERROR} comparison=maximum fixture=kernel-fp32-reference repeat=all (one fused-reader probe against the host-fp32 dequantize-then-attend reference)",
             receipt.quality.parity_max_error,
-            receipt.quality.perplexity_delta,
-            receipt.quality.greedy_token_agreement,
-            receipt.quality.structured_tool_agreement,
-            receipt.quality.needle_retrieval,
-            receipt.quality.multi_turn_prompt_cache,
         ));
     }
     if receipt.quality.fixture_evidence.len() != 4
         || receipt.quality.statistics.repeats != 5
         || receipt.quality.statistics.warmups != 2
     {
-        return Err("quality contract evidence incomplete".into());
+        return Err(format!(
+            "quality contract evidence incomplete: fixtures={}, repeats={}, warmups={}",
+            receipt.quality.fixture_evidence.len(),
+            receipt.quality.statistics.repeats,
+            receipt.quality.statistics.warmups
+        ));
     }
-    if (receipt.mode == "compressed"
-        && (receipt.quality.greedy_token_agreement < COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN
-            || receipt.quality.structured_tool_agreement < 1.0
-            || receipt.quality.needle_retrieval < 1.0
-            || receipt.quality.multi_turn_prompt_cache < 1.0))
-        || REQUIRED_FIXTURES.iter().any(|name| {
-            receipt.quality.fixture_evidence.get(*name).is_none_or(|f| {
-                !f.passed
-                    || f.artifact_name != format!("fixtures/{name}.json")
-                    || f.artifact_sha256.len() != 64
-                    || !f
-                        .artifact_sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    || f.independent_reference.is_empty()
-                    || f.artifact_sidecar_sha256.len() != 64
-                    || !f
-                        .artifact_sidecar_sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-        })
-    {
-        return Err("quality threshold or fixture evidence failed".into());
+    let lowercase_digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    for name in REQUIRED_FIXTURES {
+        let fixture = receipt
+            .quality
+            .fixture_evidence
+            .get(name)
+            .ok_or_else(|| format!("fixture evidence failed: fixture={name} is missing"))?;
+        let problem = if !fixture.passed {
+            Some("passed=false".to_string())
+        } else if fixture.artifact_name != format!("fixtures/{name}.json") {
+            Some(format!("artifactName={}", fixture.artifact_name))
+        } else if !lowercase_digest(&fixture.artifact_sha256) {
+            Some(format!("artifactSha256={}", fixture.artifact_sha256))
+        } else if fixture.independent_reference.is_empty() {
+            Some("independentReference is empty".into())
+        } else if !lowercase_digest(&fixture.artifact_sidecar_sha256) {
+            Some(format!(
+                "artifactSidecarSha256={}",
+                fixture.artifact_sidecar_sha256
+            ))
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(format!("fixture evidence failed: fixture={name} {problem}"));
+        }
     }
     // Contract v3: a compressed receipt's quality denominator is the dense-KV run on the same
     // weights, never the bf16 model; dense fixtures are bf16 characterization and must not claim
@@ -2765,7 +3679,9 @@ pub fn validate_receipt_semantics(receipt: &Receipt) -> Result<(), String> {
             )
         }
     }
-    Ok(())
+    // Last: every integrity, identity, safety, and fixture check above refuses first; the gate
+    // record is then checked against the measured values.
+    validate_quality_gate(receipt)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2831,8 +3747,15 @@ fn assemble_artifacts_with_fixtures_named(
         .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    // Compressed rows state their measured quality-gate outcome; dense bytes are unchanged.
+    let quality_gate = receipt
+        .quality
+        .quality_gate
+        .as_ref()
+        .map(|gate| format!("- Quality gate: {}\n", quality_gate_summary(gate)))
+        .unwrap_or_default();
     let human = format!(
-        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Compile attribution: {} / {} / {}\n- Compile probes: {} ms\n- First dispatch excess: {} ms\n- Steady dispatch: {} ms\n- Receipt hash: {}\n",
+        "# {} KV receipt\n\n- Run: {}\n- Mode: {}\n- Released cache ownership bytes: {}\n- Compile attribution: {} / {} / {}\n- Compile probes: {} ms\n- First dispatch excess: {} ms\n- Compile cost: {}\n- Steady dispatch: {} ms\n{quality_gate}- Receipt hash: {}\n",
         if receipt.mode == "dense" {
             "Dense"
         } else {
@@ -2845,7 +3768,8 @@ fn assemble_artifacts_with_fixtures_named(
         receipt.timings.compile_attribution.operation,
         receipt.timings.compile_attribution.source,
         compile_probes,
-        receipt.timings.cold_compile_ms,
+        receipt.timings.compile_attribution.first_dispatch_excess_ms,
+        compile_cost_summary(&receipt.timings.compile_attribution),
         receipt.timings.warm_compile_ms,
         receipt.receipt_sha256
     )
@@ -3037,6 +3961,10 @@ pub fn validate_artifact_bundle_named(
             repeat_artifacts.push((fixture, artifact.bytes.as_slice()));
         }
     }
+    if typed.mode == "compressed" {
+        let repeats = sealed_repeat_quality_metrics(&typed, &repeat_artifacts)?;
+        validate_sealed_quality_gate(&typed, &repeats)?;
+    }
     validate_repeat_discrimination(&typed, repeat_artifacts)?;
     let mut core = value.clone();
     core.as_object_mut()
@@ -3049,6 +3977,183 @@ pub fn validate_artifact_bundle_named(
     let human = std::str::from_utf8(&bundle.human).map_err(|_| "human receipt is not UTF-8")?;
     if !human.contains(&format!("- Receipt hash: {expected}\n")) {
         return Err("human receipt is not bound to the sealed JSON receipt".into());
+    }
+    Ok(())
+}
+
+/// Re-derive each measured repeat's quality metrics from the raw evidence of its sealed fixture
+/// artifacts (`artifacts` is repeat-major, [`REQUIRED_FIXTURES`] order within a repeat). A
+/// compressed repeat's kernel evidence carries the row's forced continuation, which must be the
+/// receipt's.
+fn sealed_repeat_quality_metrics(
+    receipt: &Receipt,
+    artifacts: &[(&str, &[u8])],
+) -> Result<Vec<QualityMetrics>, String> {
+    if artifacts.len() != 5 * REQUIRED_FIXTURES.len() {
+        return Err("sealed quality evidence requires every fixture of every repeat".into());
+    }
+    artifacts
+        .chunks(REQUIRED_FIXTURES.len())
+        .enumerate()
+        .map(|(repeat, fixtures)| {
+            let mut metrics = QualityMetrics {
+                parity_max_error: 0.0,
+                perplexity_delta: 0.0,
+                greedy_token_agreement: 0.0,
+                structured_tool_agreement: 0.0,
+                needle_retrieval: 0.0,
+                multi_turn_prompt_cache: 0.0,
+            };
+            for ((name, bytes), expected) in fixtures.iter().zip(REQUIRED_FIXTURES) {
+                if *name != expected {
+                    return Err(format!("repeat {repeat} fixture order differs at {name}"));
+                }
+                let value: serde_json::Value = serde_json::from_slice(bytes)
+                    .map_err(|e| format!("fixture {name} repeat {repeat} JSON: {e}"))?;
+                let evidence = value
+                    .get("evidence")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| format!("fixture {name} repeat {repeat} lacks evidence"))?;
+                let number = |key: &str| {
+                    evidence
+                        .get(key)
+                        .and_then(serde_json::Value::as_f64)
+                        .filter(|value| value.is_finite())
+                        .ok_or_else(|| {
+                            format!("fixture {name} repeat {repeat} lacks finite evidence {key}")
+                        })
+                };
+                let ratio = |matches: &str, total: &str| -> Result<f64, String> {
+                    let (matches, total) = (number(matches)?, number(total)?);
+                    if total < 1.0 || matches < 0.0 || matches > total {
+                        return Err(format!(
+                            "fixture {name} repeat {repeat} evidence has {matches} of {total} matches"
+                        ));
+                    }
+                    Ok(matches / total)
+                };
+                match *name {
+                    "kernel-fp32-reference" => {
+                        let forced = evidence
+                            .get("forcedContinuation")
+                            .map(|value| {
+                                serde_json::from_value::<ReceiptForcedContinuation>(value.clone())
+                            })
+                            .transpose()
+                            .map_err(|e| format!("repeat {repeat} forced continuation: {e}"))?;
+                        if forced.as_ref() != receipt.quality.forced_continuation.as_ref() {
+                            return Err(format!(
+                                "repeat {repeat} kernel fixture forced continuation is not the receipt's"
+                            ));
+                        }
+                        if forced.as_ref().is_some_and(|forced| {
+                            number("greedyMatches").ok() != Some(forced.matches as f64)
+                                || number("greedyTotal").ok() != Some(forced.tokens as f64)
+                        }) {
+                            return Err(format!(
+                                "repeat {repeat} kernel greedy counts are not its forced continuation's"
+                            ));
+                        }
+                        metrics.greedy_token_agreement = ratio("greedyMatches", "greedyTotal")?;
+                        metrics.perplexity_delta =
+                            number("candidatePerplexity")? - number("referencePerplexity")?;
+                        metrics.parity_max_error = evidence
+                            .get("parityErrors")
+                            .and_then(serde_json::Value::as_array)
+                            .filter(|errors| !errors.is_empty())
+                            .ok_or_else(|| format!("repeat {repeat} kernel fixture lacks parity errors"))?
+                            .iter()
+                            .map(|error| {
+                                error.as_f64().filter(|e| e.is_finite() && *e >= 0.0).ok_or_else(|| {
+                                    format!("repeat {repeat} kernel parity error is not finite")
+                                })
+                            })
+                            .try_fold(0.0_f64, |maximum, error| Ok::<_, String>(maximum.max(error?)))?;
+                    }
+                    "structured-tool-call" => {
+                        metrics.structured_tool_agreement = ratio("matches", "total")?
+                    }
+                    "long-context-needle" => metrics.needle_retrieval = ratio("matches", "total")?,
+                    _ => metrics.multi_turn_prompt_cache = ratio("matches", "total")?,
+                }
+            }
+            Ok(metrics)
+        })
+        .collect()
+}
+
+/// A compressed receipt's recorded quality must be its sealed repeats': per-repeat greedy
+/// agreement, the primary repeat's receipt-level values, and a quality gate exactly equal to the
+/// frozen-threshold evaluation of every repeat (so a failing value can never be recorded as a pass).
+/// Kernel parity is refused here as in [`validate_receipt_semantics`].
+fn validate_sealed_quality_gate(
+    receipt: &Receipt,
+    repeats: &[QualityMetrics],
+) -> Result<(), String> {
+    let quality = &receipt.quality;
+    for (repeat, metrics) in repeats.iter().enumerate() {
+        if metrics.parity_max_error > COMPRESSED_PARITY_MAX_ERROR {
+            return Err(format!(
+                "kernel parity failed: metric=parityMaxError value={} threshold={COMPRESSED_PARITY_MAX_ERROR} comparison=maximum fixture=kernel-fp32-reference repeat={repeat}",
+                metrics.parity_max_error
+            ));
+        }
+        if quality
+            .greedy_token_agreement_by_repeat
+            .get(repeat)
+            .map(|value| value.to_bits())
+            != Some(metrics.greedy_token_agreement.to_bits())
+        {
+            return Err(format!(
+                "greedyTokenAgreement repeat {repeat} is not its sealed agreement {}",
+                metrics.greedy_token_agreement
+            ));
+        }
+    }
+    let primary = repeats.first().ok_or("no sealed repeats")?;
+    for (metric, recorded, sealed) in [
+        (
+            "parityMaxError",
+            quality.parity_max_error,
+            primary.parity_max_error,
+        ),
+        (
+            "perplexityDelta",
+            quality.perplexity_delta,
+            primary.perplexity_delta,
+        ),
+        (
+            "structuredToolAgreement",
+            quality.structured_tool_agreement,
+            primary.structured_tool_agreement,
+        ),
+        (
+            "needleRetrieval",
+            quality.needle_retrieval,
+            primary.needle_retrieval,
+        ),
+        (
+            "multiTurnPromptCache",
+            quality.multi_turn_prompt_cache,
+            primary.multi_turn_prompt_cache,
+        ),
+    ] {
+        if recorded.to_bits() != sealed.to_bits() {
+            return Err(format!(
+                "receipt {metric} {recorded} is not the primary repeat's sealed value {sealed}"
+            ));
+        }
+    }
+    let expected = quality_gate_from_repeats(repeats);
+    if quality.quality_gate.as_ref() != Some(&expected) {
+        return Err(format!(
+            "receipt quality gate ({}) is not the gate of its sealed repeats ({})",
+            quality
+                .quality_gate
+                .as_ref()
+                .map_or_else(|| "absent".into(), quality_gate_summary),
+            quality_gate_summary(&expected)
+        ));
     }
     Ok(())
 }
@@ -3076,7 +4181,7 @@ fn validate_repeat_discrimination<'a>(
 }
 
 /// Re-derive a structured-tool or needle artifact's metric and discrimination flag from the raw
-/// outcomes it records, and return the per-repeat flag. Compressed rows must pass every repeat.
+/// outcomes it records, and return the per-repeat flag.
 fn fixture_discrimination(
     receipt: &Receipt,
     name: &str,
@@ -3127,10 +4232,11 @@ fn fixture_discrimination(
         )
     };
     let (matches, total) = (count("matches")?, count("total")?);
+    // A compressed repeat that validly measured a miss is gate evidence (see
+    // `validate_sealed_quality_gate`), not a malformed artifact.
     if total != 1
         || discriminating != expected_discriminating
         || matches != u64::from(expected_match)
-        || (compressed && matches != total)
     {
         return Err(format!(
             "fixture {name} outcome evidence does not derive its metric and discrimination"
@@ -3320,6 +4426,17 @@ fn validate_fixture_binding(
             return Err("cold compile probe evidence is not bound to its repeat fixture".into());
         }
     }
+    if name == "kernel-fp32-reference" && receipt.matrix.process_temperature == "warm" {
+        if let Some(samples) = &receipt.timings.compile_attribution.noise_samples_ms {
+            let dispatch_ms = candidate
+                .get("compileDispatchMs")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or("warm kernel fixture lacks compileDispatchMs")?;
+            if samples.get(expected_repeat) != Some(&dispatch_ms) {
+                return Err("warm compile noise sample is not bound to its repeat fixture".into());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3358,11 +4475,22 @@ pub fn campaign_global_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
         "os": provenance.os,
         "xcode": provenance.xcode,
         "hardware": provenance.hardware,
-        "powerMode": provenance.power_mode,
-        "thermalState": provenance.thermal_state,
         "commandTemplate": provenance.command_template,
     }))
     .map_err(|error| error.to_string())
+}
+
+/// Recorded in the campaign manifest, never refused: rows started in more than one power mode or
+/// thermal state, or some row's host state changed during the row.
+pub fn campaign_host_state_varied<'a>(receipts: impl IntoIterator<Item = &'a Receipt>) -> bool {
+    let mut starts = std::collections::BTreeSet::new();
+    let mut changed = false;
+    for receipt in receipts {
+        let p = &receipt.provenance;
+        starts.insert((p.power_mode.clone(), p.thermal_state.clone()));
+        changed |= p.thermal_changed_during_row || p.power_mode_changed_during_row;
+    }
+    changed || starts.len() > 1
 }
 
 pub fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
@@ -3386,6 +4514,161 @@ pub fn campaign_family_identity(receipt: &Receipt) -> Result<Vec<u8>, String> {
     .map_err(|error| error.to_string())
 }
 
+/// A refused estimate must exceed the row deadline by this factor, so estimation error alone
+/// never refuses a row that would have finished.
+pub const DURATION_REFUSAL_MARGIN: f64 = 1.25;
+/// Assumed bits per parameter of the 4-bit candidate's MLX weights (4-bit codes plus group
+/// scales/biases). It converts weight bytes into a parameter count for the attention crossover.
+const CANDIDATE_BITS_PER_PARAMETER: f64 = 4.5;
+
+/// Row shape as it drives work: how many fixture halves run and how many full-context prefills
+/// the row issues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowWork {
+    /// Candidate and reference fixture halves: `2 * (warmups + 5 repeats)`.
+    pub halves: u64,
+    /// Full-context prefills: every half runs 4 fixtures, each a quality request plus the
+    /// coordinate operation (2 sequences for supported-batch, plus the secondary chunked operation
+    /// on a batch+chunked row), then 5 steady decodes and one teacher-forced kernel pass.
+    pub prefills: u64,
+}
+
+pub fn row_work(process_temperature: &str, request_mode: &str, prefill_mode: &str) -> RowWork {
+    let warmups = if process_temperature == "warm" { 2 } else { 0 };
+    let halves = 2 * (warmups + 5);
+    let operation_units = match (request_mode, prefill_mode) {
+        ("supported-batch", "chunked") => 3,
+        ("supported-batch", _) => 2,
+        _ => 1,
+    };
+    RowWork {
+        halves,
+        prefills: halves * 4 * (1 + operation_units) + 5 + 1,
+    }
+}
+
+/// Prefill cost of a `tokens`-long context, up to a constant: linear (projections and MLP) plus
+/// quadratic attention, equal at `crossover` tokens. This sets the effective exponent between 1
+/// and 2 from the model itself.
+pub fn prefill_scale(tokens: f64, crossover: f64) -> f64 {
+    tokens * (1.0 + tokens / crossover)
+}
+
+/// A completed row's measurements that the pre-row estimate scales from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowDurationBasis {
+    pub coordinate: String,
+    pub family: String,
+    pub context_window_tokens: u64,
+    pub context_target_tokens: u64,
+    /// Row-start to row-end host-state span.
+    pub wall_seconds: f64,
+    /// One sequence's full-context prefill: the measured coordinate prefill over its batch.
+    pub prefill_seconds: f64,
+    pub work: RowWork,
+    /// Context length at which attention matches the linear per-token cost:
+    /// `parameters / (2 * layers * query_heads * head_dimension)`.
+    pub attention_crossover_tokens: f64,
+}
+
+/// The basis a completed receipt provides. A chunked row's measured prefill is the short suffix
+/// after a prefix hit, not a full-context prefill, so it provides none.
+pub fn row_duration_basis(receipt: &Receipt) -> Option<RowDurationBasis> {
+    let [start, end] = receipt.provenance.host_states.as_slice() else {
+        return None;
+    };
+    if receipt.matrix.prefill_mode == "chunked" {
+        return None;
+    }
+    let wall_seconds =
+        utc_timestamp_seconds(&end.captured_at)? - utc_timestamp_seconds(&start.captured_at)?;
+    let geometry = &receipt.geometry;
+    let prefill_seconds = receipt.timings.prefill_ms / 1_000.0 / geometry.batch.max(1) as f64;
+    let parameters = receipt.memory.model_weights_bytes as f64 * 8.0 / CANDIDATE_BITS_PER_PARAMETER;
+    let attention_width = 2 * geometry.layers * geometry.query_heads * geometry.head_dimension;
+    let valid = wall_seconds.is_finite()
+        && wall_seconds > 0.0
+        && prefill_seconds.is_finite()
+        && prefill_seconds > 0.0
+        && geometry.context_target_tokens > 0
+        && attention_width > 0
+        && parameters > 0.0;
+    valid.then(|| RowDurationBasis {
+        coordinate: format!(
+            "{}-{}-{}-{}-{}",
+            receipt.matrix.family,
+            receipt.matrix.context_band,
+            receipt.matrix.request_mode,
+            receipt.matrix.prefill_mode,
+            receipt.matrix.process_temperature
+        ),
+        family: receipt.matrix.family.clone(),
+        context_window_tokens: geometry.context_window_tokens,
+        context_target_tokens: geometry.context_target_tokens,
+        wall_seconds,
+        prefill_seconds,
+        work: row_work(
+            &receipt.matrix.process_temperature,
+            &receipt.matrix.request_mode,
+            &receipt.matrix.prefill_mode,
+        ),
+        attention_crossover_tokens: parameters / attention_width as f64,
+    })
+}
+
+/// A pre-row duration estimate and its parts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowDurationEstimate {
+    pub seconds: f64,
+    /// Measured context-independent time (loads, fixtures' decode, steady decode, overhead),
+    /// scaled only by the fixture-half count.
+    pub fixed_seconds: f64,
+    /// Full-context prefills, scaled by [`prefill_scale`].
+    pub prefill_seconds: f64,
+    pub basis_coordinate: String,
+}
+
+/// Estimate a row from the largest-context completed row of the same family.
+///
+/// The basis row's wall time is split into its measured prefill part
+/// (`prefills x per-sequence prefill`) and the fixed remainder. The fixed part is scaled only by
+/// the fixture-half ratio; the prefill part is scaled by the target row's prefill count and
+/// `prefill_scale(target) / prefill_scale(basis)`. The reference arm is assumed to prefill at
+/// the candidate's rate. `None` when no same-family row with a full-context prefill has completed.
+pub fn estimate_row_seconds(
+    family: &str,
+    context_band: &str,
+    target: RowWork,
+    basis: &[RowDurationBasis],
+) -> Option<RowDurationEstimate> {
+    let row = basis
+        .iter()
+        .filter(|row| row.family == family)
+        .max_by_key(|row| row.context_target_tokens)?;
+    let target_tokens = context_band_target(row.context_window_tokens, context_band).ok()? as f64;
+    let basis_prefill = row.work.prefills as f64 * row.prefill_seconds;
+    let basis_fixed = (row.wall_seconds - basis_prefill).max(0.0);
+    let fixed_seconds = basis_fixed * target.halves as f64 / row.work.halves as f64;
+    let prefill_seconds = target.prefills as f64
+        * row.prefill_seconds
+        * prefill_scale(target_tokens, row.attention_crossover_tokens)
+        / prefill_scale(
+            row.context_target_tokens as f64,
+            row.attention_crossover_tokens,
+        );
+    Some(RowDurationEstimate {
+        seconds: fixed_seconds + prefill_seconds,
+        fixed_seconds,
+        prefill_seconds,
+        basis_coordinate: row.coordinate.clone(),
+    })
+}
+
+/// Whether an estimate refuses a row: it must exceed the deadline by [`DURATION_REFUSAL_MARGIN`].
+pub fn duration_estimate_refuses(estimate: &RowDurationEstimate, deadline_seconds: u64) -> bool {
+    estimate.seconds > deadline_seconds as f64 * DURATION_REFUSAL_MARGIN
+}
+
 /// Atomically publish the whole eight-coordinate receipt collection. Individual worker output is
 /// intentionally not a campaign result; only this function creates `destination`, and it does so
 /// after every receipt, sidecar, coordinate, and product-owned worker PID has been validated.
@@ -3395,13 +4678,43 @@ pub fn publish_complete_campaign(
     resume_identity: &serde_json::Value,
     policy: &CampaignSafetyPolicy,
 ) -> Result<(), String> {
+    publish_campaign(destination, prepared, resume_identity, policy, None)
+}
+
+/// Publish a complete campaign, or (`only_coordinate`) the single row of a partial run under a
+/// manifest marked partial and non-publishable that no campaign loader accepts.
+fn publish_campaign(
+    destination: &Path,
+    prepared: &[PreparedCoordinateReceipt],
+    resume_identity: &serde_json::Value,
+    policy: &CampaignSafetyPolicy,
+    only_coordinate: Option<&str>,
+) -> Result<(), String> {
     let policy_sha256 = policy.seal()?;
     if destination.exists() {
         return Err("campaign destination must be absent for atomic publication".into());
     }
-    let schedule = required_schedule();
+    if resume_identity
+        .get("onlyCoordinate")
+        .and_then(serde_json::Value::as_str)
+        != only_coordinate
+    {
+        return Err(
+            "publication scope differs from the resume identity's coordinate filter".into(),
+        );
+    }
+    let full_schedule = required_schedule();
+    let schedule = selected_schedule_indices(only_coordinate)?
+        .into_iter()
+        .map(|index| full_schedule[index].clone())
+        .collect::<Vec<_>>();
     if prepared.len() != schedule.len() {
-        return Err("complete campaign requires exactly eight prepared receipts".into());
+        return Err(match only_coordinate {
+            None => "complete campaign requires exactly eight prepared receipts".into(),
+            Some(slug) => {
+                format!("partial run of {slug} requires exactly its one prepared receipt")
+            }
+        });
     }
     let mut outcomes = Vec::with_capacity(prepared.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -3504,6 +4817,7 @@ pub fn publish_complete_campaign(
     fs::create_dir(&staging).map_err(|e| e.to_string())?;
     let result = (|| -> Result<(), String> {
         let mut manifest_rows = Vec::with_capacity(prepared.len());
+        let mut receipts = Vec::with_capacity(prepared.len());
         for item in prepared {
             let slug = coordinate_slug(&item.coordinate);
             write_artifacts(
@@ -3522,21 +4836,36 @@ pub fn publish_complete_campaign(
             for fixture in &item.bundle.fixtures {
                 files.push(serde_json::json!({"name": fixture.name, "sha256": seal_bytes(&fixture.bytes), "sidecarSha256": seal_bytes(fixture.sidecar.as_bytes())}));
             }
-            manifest_rows.push(serde_json::json!({
+            let mut row = serde_json::json!({
                 "coordinate": slug,
                 "receiptSha256": receipt.receipt_sha256,
                 "workerPid": receipt.memory.phase_samples[0].pid,
                 "files": files,
-            }));
+            });
+            // Compressed rows publish their measured gate outcome; dense rows carry none.
+            if let Some(gate) = &receipt.quality.quality_gate {
+                row["qualityGatePassed"] = serde_json::json!(gate.passed);
+            }
+            manifest_rows.push(row);
+            receipts.push(receipt);
         }
-        let manifest = serde_json::json!({
+        let mut manifest = serde_json::json!({
             "schemaVersion": 2,
-            "kind": SC20671_CAMPAIGN_KIND,
+            "kind": if only_coordinate.is_some() { SC20671_PARTIAL_RUN_KIND } else { SC20671_CAMPAIGN_KIND },
             "scheduleVersion": SC20671_SCHEDULE_VERSION,
             "policySha256": policy_sha256,
             "resumeIdentitySha256": seal_bytes(&canonical_json_bytes(resume_identity).map_err(|e| e.to_string())?),
+            "hostStateVaried": campaign_host_state_varied(&receipts),
             "coordinates": manifest_rows,
         });
+        if let Some(passed) = campaign_quality_gate_passed(&receipts)? {
+            manifest["qualityGatePassed"] = serde_json::json!(passed);
+        }
+        if let Some(slug) = only_coordinate {
+            manifest["partial"] = serde_json::json!(true);
+            manifest["publishable"] = serde_json::json!(false);
+            manifest["onlyCoordinate"] = serde_json::json!(slug);
+        }
         let (identity_bytes, identity_sha) = seal_json(resume_identity)?;
         let (policy_bytes, _) =
             seal_json(&serde_json::to_value(policy).map_err(|e| e.to_string())?)?;
@@ -3562,6 +4891,49 @@ pub fn publish_complete_campaign(
         let _ = fs::remove_dir_all(&staging);
     }
     result
+}
+
+/// A compressed campaign's measured quality-gate outcome: passed only when every row's gate
+/// passed. `None` for a dense campaign (characterization, never gated).
+pub fn campaign_quality_gate_passed(receipts: &[Receipt]) -> Result<Option<bool>, String> {
+    let gates = receipts
+        .iter()
+        .map(|receipt| receipt.quality.quality_gate.as_ref())
+        .collect::<Vec<_>>();
+    if gates.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    gates
+        .iter()
+        .try_fold(true, |passed, gate| {
+            gate.map(|gate| passed && gate.passed)
+                .ok_or("campaign mixes gated and ungated rows")
+        })
+        .map(Some)
+        .map_err(Into::into)
+}
+
+/// One stderr line per row plus the campaign verdict: the measured quality-gate outcomes a
+/// Go/No-Go decision reads.
+fn report_campaign_quality_gates(receipts: &[Receipt]) -> Result<(), String> {
+    let Some(passed) = campaign_quality_gate_passed(receipts)? else {
+        return Ok(());
+    };
+    for receipt in receipts {
+        if let Some(gate) = &receipt.quality.quality_gate {
+            eprintln!(
+                "sc20671-kv-baseline: quality gate {}-{}-{}-{}-{}: {}",
+                receipt.matrix.family,
+                receipt.matrix.context_band,
+                receipt.matrix.request_mode,
+                receipt.matrix.prefill_mode,
+                receipt.matrix.process_temperature,
+                quality_gate_summary(gate)
+            );
+        }
+    }
+    eprintln!("sc20671-kv-baseline: compressed campaign qualityGatePassed={passed}");
+    Ok(())
 }
 
 /// The one SC-20671 coordinate SC-20676 may bind for a family. It is deliberately the frozen
@@ -3710,6 +5082,7 @@ pub fn load_validated_complete_campaign(
     let mut global_identity = None;
     let mut family_identities = std::collections::BTreeMap::new();
     let mut outcomes = Vec::with_capacity(schedule.len());
+    let mut host_state_receipts = Vec::with_capacity(schedule.len());
     for row in rows {
         let slug = row
             .get("coordinate")
@@ -3758,6 +5131,18 @@ pub fn load_validated_complete_campaign(
                 != Some(u64::from(worker_pid))
         {
             return Err("SC-20671 manifest/receipt coordinate, PID, or seal mismatch".into());
+        }
+        if row.get("qualityGatePassed")
+            != receipt
+                .quality
+                .quality_gate
+                .as_ref()
+                .map(|gate| serde_json::json!(gate.passed))
+                .as_ref()
+        {
+            return Err(format!(
+                "SC-20671 manifest row {slug} qualityGatePassed does not recompute from its receipt"
+            ));
         }
         let listed = row
             .get("files")
@@ -3809,10 +5194,26 @@ pub fn load_validated_complete_campaign(
         } else {
             family_identities.insert(coordinate.family, family_identity);
         }
+        host_state_receipts.push(receipt);
         prepared.push(item);
     }
     if seen.len() != schedule.len() || family_identities.len() != 2 {
         return Err("SC-20671 campaign omits a scheduled coordinate or family identity".into());
+    }
+    if resume_identity.is_some()
+        && value
+            .get("hostStateVaried")
+            .and_then(serde_json::Value::as_bool)
+            != Some(campaign_host_state_varied(&host_state_receipts))
+    {
+        return Err("SC-20671 manifest host-state variation flag does not recompute".into());
+    }
+    if value.get("qualityGatePassed")
+        != campaign_quality_gate_passed(&host_state_receipts)?
+            .map(serde_json::Value::Bool)
+            .as_ref()
+    {
+        return Err("SC-20671 manifest qualityGatePassed does not recompute from its rows".into());
     }
     validate_schedule_outcomes(&schedule, &outcomes)?;
     Ok(prepared)
@@ -3930,6 +5331,8 @@ pub struct OperatorStop {
 pub enum CampaignOutcome {
     Completed,
     StoppedByOperator(OperatorStop),
+    /// Every row was attempted but these were refused before spawn; nothing is published.
+    IncompleteWithRefusals(Vec<String>),
 }
 
 impl CampaignOutcome {
@@ -3937,6 +5340,7 @@ impl CampaignOutcome {
         match self {
             Self::Completed => 0,
             Self::StoppedByOperator(_) => OPERATOR_STOP_EXIT_CODE,
+            Self::IncompleteWithRefusals(_) => 1,
         }
     }
 }
@@ -4066,7 +5470,8 @@ pub(crate) fn operator_stop_before_row(
 pub(crate) enum RowStep {
     /// Accept the row from the resume directory; `Ok(false)` means it must run.
     Resume,
-    /// Spawn, supervise, and accept the row's worker.
+    /// Spawn, supervise, and accept the row's worker; `Ok(false)` records a pre-spawn refusal
+    /// and the loop continues with the next row.
     Run,
 }
 
@@ -4078,7 +5483,8 @@ pub(crate) fn drive_rows(
     logs: &Path,
     kind: &str,
     mut row: impl FnMut(usize, RowStep) -> Result<bool, String>,
-) -> Result<Option<OperatorStop>, String> {
+) -> Result<DriveOutcome, String> {
+    let mut refused = Vec::new();
     for (index, slug) in slugs.iter().enumerate() {
         if row(index, RowStep::Resume)? {
             eprintln!("coordinate {}/{} resumed: {slug}", index + 1, slugs.len());
@@ -4087,12 +5493,34 @@ pub(crate) fn drive_rows(
         if let Some(stop) =
             operator_stop_before_row(stop_files, logs, kind, index, slug, slugs.len())?
         {
-            return Ok(Some(stop));
+            return Ok(DriveOutcome {
+                stop: Some(stop),
+                refused,
+            });
         }
-        row(index, RowStep::Run)?;
-        eprintln!("coordinate {}/{} accepted: {slug}", index + 1, slugs.len());
+        if row(index, RowStep::Run)? {
+            eprintln!("coordinate {}/{} accepted: {slug}", index + 1, slugs.len());
+        } else {
+            eprintln!(
+                "coordinate {}/{} refused before spawn: {slug}",
+                index + 1,
+                slugs.len()
+            );
+            refused.push(slug.clone());
+        }
     }
-    Ok(None)
+    Ok(DriveOutcome {
+        stop: None,
+        refused,
+    })
+}
+
+/// How the parent's row loop ended: an operator stop, and the rows refused before spawn (whose
+/// unaccepted records are in the logs).
+#[derive(Debug)]
+pub(crate) struct DriveOutcome {
+    pub(crate) stop: Option<OperatorStop>,
+    pub(crate) refused: Vec<String>,
 }
 
 /// Immutable parent inputs.  The only model-related choices are snapshot paths; model identity,
@@ -4114,6 +5542,28 @@ pub struct CampaignLaunch {
     /// `Some` launches every scheduled row in `compressed` mode with this KV method; `None` is the
     /// dense baseline campaign.
     pub compressed: Option<CompressedKvMethod>,
+    /// `--only-coordinate <slug>`: run just this scheduled row. The run publishes a partial,
+    /// non-publishable manifest ([`SC20671_PARTIAL_RUN_KIND`]), never a campaign.
+    pub only_coordinate: Option<String>,
+}
+
+/// Indices into [`required_schedule`] a launch runs: all of them, or the one `--only-coordinate`
+/// names (an unscheduled name is refused, listing the schedule).
+fn selected_schedule_indices(only_coordinate: Option<&str>) -> Result<Vec<usize>, String> {
+    let slugs = required_coordinates()
+        .iter()
+        .map(coordinate_slug)
+        .collect::<Vec<_>>();
+    match only_coordinate {
+        None => Ok((0..slugs.len()).collect()),
+        Some(slug) => slugs
+            .iter()
+            .position(|candidate| candidate == slug)
+            .map(|index| vec![index])
+            .ok_or_else(|| {
+                format!("--only-coordinate {slug:?} is not a scheduled coordinate; expected one of {slugs:?}")
+            }),
+    }
 }
 
 pub(crate) fn file_seal(path: &Path) -> Result<String, String> {
@@ -4164,6 +5614,10 @@ fn resume_identity(
         "qwenReference": inventory_value(3),
     });
     bind_resume_mode(&mut identity, launch.compressed);
+    if let Some(slug) = &launch.only_coordinate {
+        // A single-row run never shares a resume directory with a full campaign.
+        identity["onlyCoordinate"] = slug.as_str().into();
+    }
     Ok(identity)
 }
 
@@ -4253,7 +5707,11 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
         return Err("campaign prompt must not be empty".into());
     }
     let mut row_admission = Vec::new();
-    for row in required_schedule() {
+    let schedule = required_schedule();
+    for row in selected_schedule_indices(launch.only_coordinate.as_deref())?
+        .into_iter()
+        .map(|index| schedule[index].clone())
+    {
         let (candidate, reference) = if row.coordinate.family == "llama" {
             (
                 &launch.llama_snapshot,
@@ -4263,14 +5721,21 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
             (&launch.qwen_snapshot, &launch.qwen_fp32_reference_snapshot)
         };
         let coordinate = coordinate_slug(&row.coordinate);
-        match static_row_requirements(&row.coordinate, candidate, reference, &prompt, &policy)
-            .and_then(|(total, request, footprint)| {
-                Ok((
-                    total,
-                    request,
-                    runtime_guarded_admission(&policy, footprint)?,
-                ))
-            }) {
+        match static_row_requirements(
+            &row.coordinate,
+            candidate,
+            reference,
+            &prompt,
+            &policy,
+            launch.compressed.is_some(),
+        )
+        .and_then(|(total, request, footprint)| {
+            Ok((
+                total,
+                request,
+                runtime_guarded_admission(&policy, footprint)?,
+            ))
+        }) {
             Ok((total, request, admission)) => row_admission.push(serde_json::json!({
                 "coordinate": coordinate, "staticPreflightPassed": true,
                 "totalLiveTokenBound": total, "requestTokenBound": request,
@@ -4449,15 +5914,16 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
         validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?,
     ];
     let schedule = required_schedule();
+    let selected = selected_schedule_indices(launch.only_coordinate.as_deref())?;
     let prompt = fs::read_to_string(&launch.prompt_file).map_err(|e| e.to_string())?;
     if prompt.trim().is_empty() {
         return Err("campaign prompt must not be empty".into());
     }
     let mut identity = resume_identity(launch, &policy_sha256, &inventories)?;
     let identity_sha256 = prepare_resume_root(&launch.resume_dir, &mut identity)?;
-    let slugs = schedule
+    let slugs = selected
         .iter()
-        .map(|row| coordinate_slug(&row.coordinate))
+        .map(|index| coordinate_slug(&schedule[*index].coordinate))
         .collect::<Vec<_>>();
     validate_resume_entries(&launch.resume_dir, &launch.stop_files, &slugs)?;
     let mut prepared = Vec::with_capacity(schedule.len());
@@ -4467,7 +5933,8 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
         &launch.resume_dir.join("logs"),
         "sc-20671-operator-stop",
         |index, step| {
-            let row = &schedule[index];
+            let schedule_index = selected[index];
+            let row = &schedule[schedule_index];
             let slug = coordinate_slug(&row.coordinate);
             let child_dir = launch.resume_dir.join(&slug);
             let binding_path = row_binding_path(&launch.resume_dir, &slug);
@@ -4504,13 +5971,14 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 reference_snapshot,
                 &prompt,
                 &policy,
+                launch.compressed.is_some(),
             )?;
             let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
             let mut command = Command::new(&launch.executable);
             command
                 .arg("worker")
                 .arg("--coordinate-index")
-                .arg(index.to_string())
+                .arg(schedule_index.to_string())
                 .arg("--snapshot")
                 .arg(snapshot)
                 .arg("--prompt-file")
@@ -4544,6 +6012,72 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                 stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
             };
             let unaccepted = logs.join(format!("{log_prefix}.unaccepted.json"));
+            // Pre-row duration estimate from completed same-family rows. A row whose estimate
+            // exceeds the deadline by the margin is refused before it spawns; the campaign then
+            // continues with the next row and ends incomplete-with-refusals.
+            let basis = prepared
+                .iter()
+                .filter_map(|item| serde_json::from_slice::<Receipt>(&item.bundle.receipt).ok())
+                .filter_map(|receipt| row_duration_basis(&receipt))
+                .collect::<Vec<_>>();
+            let estimate = estimate_row_seconds(
+                row.coordinate.family,
+                row.coordinate.context_band,
+                row_work(
+                    row.coordinate.process_temperature,
+                    row.coordinate.request_mode,
+                    row.coordinate.prefill_mode,
+                ),
+                &basis,
+            );
+            let deadline_seconds = policy.row_deadline_seconds;
+            let estimate_record = serde_json::json!({
+                "schemaVersion": 2,
+                "kind": "sc-20671-row-duration-estimate",
+                "coordinate": slug,
+                "estimatedSeconds": estimate.as_ref().map(|e| e.seconds),
+                "fixedSeconds": estimate.as_ref().map(|e| e.fixed_seconds),
+                "prefillSeconds": estimate.as_ref().map(|e| e.prefill_seconds),
+                "basisCoordinate": estimate.as_ref().map(|e| e.basis_coordinate.clone()),
+                "rowDeadlineSeconds": deadline_seconds,
+                "refusalMargin": DURATION_REFUSAL_MARGIN,
+                "method": "basis wall time split into measured full-context prefills and a fixed remainder; fixed scaled by fixture halves, prefill by count x T(1+T/Tattn) ratio",
+            });
+            fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
+            fs::write(
+                logs.join(format!("{log_prefix}.estimate.json")),
+                seal_json(&estimate_record)?.0,
+            )
+            .map_err(|e| e.to_string())?;
+            match &estimate {
+                Some(estimate) => eprintln!(
+                    "sc20671-kv-baseline: coordinate {slug} estimated at {:.0}s (fixed {:.0}s + prefill {:.0}s, from {}); row deadline {deadline_seconds}s",
+                    estimate.seconds, estimate.fixed_seconds, estimate.prefill_seconds, estimate.basis_coordinate
+                ),
+                None => eprintln!(
+                    "sc20671-kv-baseline: coordinate {slug} has no completed full-prefill {} row to estimate from; row deadline {deadline_seconds}s",
+                    row.coordinate.family
+                ),
+            }
+            if let Some(estimate) = estimate
+                .as_ref()
+                .filter(|estimate| duration_estimate_refuses(estimate, deadline_seconds))
+            {
+                let detail = format!(
+                    "estimated duration {:.0}s (from {}) exceeds the {deadline_seconds}s row deadline by more than {DURATION_REFUSAL_MARGIN}x",
+                    estimate.seconds, estimate.basis_coordinate
+                );
+                let message = unaccepted_row_error(
+                    &unaccepted,
+                    "sc-20671-unaccepted-row",
+                    &slug,
+                    &admission,
+                    ("DurationEstimate", &detail, None, None),
+                    format!("coordinate {slug} refused before spawn: {detail}"),
+                );
+                eprintln!("sc20671-kv-baseline: {message}; continuing with the next row");
+                return Ok(false);
+            }
             let status = match campaign_supervisor::run_guarded(
                 &mut command,
                 &request,
@@ -4557,8 +6091,13 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                         &unaccepted,
                         "sc-20671-unaccepted-row",
                         &slug,
-                        &admission,
-                        (&reason, &failure.detail, failure.pid),
+                        &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
+                        (
+                &reason,
+                &failure.detail,
+                failure.pid,
+                failure.watchdog_host_memory.as_deref(),
+            ),
                         format!(
                             "coordinate {slug} stopped ({reason}): {}; child {:?} reaped; valid earlier rows remain in {}",
                             failure.detail, failure.pid, launch.resume_dir.display(),
@@ -4572,7 +6111,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
                     "sc-20671-unaccepted-row",
                     &slug,
                     &admission,
-                    ("ChildExit", &status.to_string(), None),
+                    ("ChildExit", &status.to_string(), None, None),
                     format!(
                         "coordinate {slug} failed with {status}; stderr: {}; valid earlier rows remain in {}",
                         request.stderr_path.display(), launch.resume_dir.display(),
@@ -4584,6 +6123,12 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
             let item = load_prepared_coordinate_receipt(&child_dir, row.coordinate.clone())?;
             let receipt: Receipt =
                 serde_json::from_slice(&item.bundle.receipt).map_err(|e| e.to_string())?;
+            if let Some(gate) = &receipt.quality.quality_gate {
+                eprintln!(
+                    "sc20671-kv-baseline: coordinate {slug} accepted as measured; quality gate {}",
+                    quality_gate_summary(gate)
+                );
+            }
             let binding = seal_json(&row_binding(
                 &identity_sha256,
                 &receipt,
@@ -4600,10 +6145,42 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
             Ok(true)
         },
     )?;
-    if let Some(stop) = stopped {
+    if let Some(stop) = stopped.stop {
         return Ok(CampaignOutcome::StoppedByOperator(stop));
     }
-    publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?;
+    if !stopped.refused.is_empty() {
+        // Every other row ran; the campaign is not complete and is never published.
+        eprintln!(
+            "sc20671-kv-baseline: campaign incomplete: {} row(s) refused before spawn ({}); accepted rows remain in {}",
+            stopped.refused.len(),
+            stopped.refused.join(", "),
+            launch.resume_dir.display()
+        );
+        return Ok(CampaignOutcome::IncompleteWithRefusals(stopped.refused));
+    }
+    match &launch.only_coordinate {
+        Some(slug) => {
+            publish_campaign(
+                &launch.destination,
+                &prepared,
+                &identity,
+                &policy,
+                Some(slug),
+            )?;
+            eprintln!(
+                "sc20671-kv-baseline: PARTIAL run of {slug} only, published as a non-publishable {SC20671_PARTIAL_RUN_KIND} at {}; it is not a campaign",
+                launch.destination.display()
+            );
+        }
+        None => publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?,
+    }
+    report_campaign_quality_gates(
+        &prepared
+            .iter()
+            .map(|item| serde_json::from_slice::<Receipt>(&item.bundle.receipt))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?,
+    )?;
     Ok(CampaignOutcome::Completed)
 }
 
@@ -4628,6 +6205,19 @@ fn validate_resume_entries(
         }
     }
     Ok(())
+}
+
+/// `name <value>` when present (a flag without a value is refused).
+fn optional_flag(args: &[String], name: &str) -> Result<Option<String>, String> {
+    match args.iter().position(|arg| arg == name) {
+        None => Ok(None),
+        Some(index) => args
+            .get(index + 1)
+            .filter(|value| !value.starts_with("--"))
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("{name} requires a value")),
+    }
 }
 
 fn required_flag(args: &[String], name: &str) -> Result<String, String> {
@@ -4660,7 +6250,10 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 ///
 /// `--mode compressed --kv-method <method>` (parent, preflight, and worker) runs every scheduled
 /// row with its KV held in that method's compressed cache and fused decode attention, gated
-/// against a dense-KV reference arm on the same candidate weights (SC-20676). The GPU-window
+/// against a dense-KV reference arm on the same candidate weights (SC-20676). Methods:
+/// `group-affine` (2-bit codes), `group-affine-4` (4-bit) and `group-affine-8` (8-bit), all group
+/// 32. `--only-coordinate <coordinate>` runs one scheduled row and publishes a partial,
+/// non-publishable `sc-20671-partial-coordinate-run` manifest (never a campaign). The GPU-window
 /// launch of the compressed campaign is one command from the inference checkout:
 ///
 /// ```text
@@ -4704,6 +6297,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 resume_dir,
                 safety_policy: PathBuf::from(required_flag(args, "--safety-policy")?),
                 compressed: compressed_mode_flags(args)?,
+                only_coordinate: optional_flag(args, "--only-coordinate")?,
             };
             if mode == "preflight" {
                 let value = preflight_complete_campaign(&launch)?;
@@ -4769,6 +6363,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 .get(index)
                 .cloned()
                 .ok_or("--coordinate-index is outside the frozen eight-coordinate schedule")?;
+            if let Some(only) = identity.get("onlyCoordinate") {
+                if only.as_str() != Some(coordinate_slug(&row.coordinate).as_str()) {
+                    return Err(
+                        "worker coordinate differs from the resume identity's coordinate filter"
+                            .into(),
+                    );
+                }
+            }
             let snapshot = PathBuf::from(required_flag(args, "--snapshot")?);
             let reference_snapshot =
                 PathBuf::from(required_flag(args, "--fp32-reference-snapshot")?);
@@ -4819,8 +6421,12 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 &reference_snapshot,
                 &prompt,
                 &policy,
+                compressed.is_some(),
             )?;
-            let admission = runtime_guarded_admission(&policy, static_footprint_floor)?;
+            let admission = supervised_admission(&policy, static_footprint_floor)?;
+            // Observed before any model loads: a throttled host refuses the row before it runs.
+            let row_start = capture_host_state("row-start")?;
+            refuse_throttled_row_start(&row_start)?;
             // Compressed rows: the measured arm holds KV in the method's compressed cache, and its
             // quality denominator is the dense-KV run on the SAME candidate weights.
             let candidate_session = match compressed {
@@ -4839,6 +6445,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                         &prompt,
                         &row.coordinate,
                         policy.max_request_tokens,
+                        true,
                     )
                     .map_err(|e| {
                         format!(
@@ -4863,12 +6470,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let warmup_cache_state_version =
                 (!candidate_warmups.is_empty()).then(|| candidate_session.cache_state_version());
             let mut candidate_repeats = Vec::with_capacity(5);
+            let mut repeat_host_states = Vec::with_capacity(5);
             for repeat in 0..5 {
                 let half = run_product_fixture_half_on_session_bounded(
                     &candidate_session,
                     &prompt,
                     &row.coordinate,
                     policy.max_request_tokens,
+                    true,
                 )
                 .map_err(|e| {
                     format!(
@@ -4888,6 +6497,8 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     )
                 );
                 candidate_repeats.push(half);
+                // Outside every timed window: recorded so throughput drift is attributable.
+                repeat_host_states.push(capture_host_state(TIMING_SAMPLE_HOST_BOUNDARY)?);
             }
             let compressed_parity = candidate_session
                 .compressed()
@@ -4917,6 +6528,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     &prompt,
                     &row.coordinate,
                     policy.max_request_tokens,
+                    false,
                 )
                 .map_err(|e| {
                     format!(
@@ -4944,6 +6556,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                     &prompt,
                     &row.coordinate,
                     policy.max_request_tokens,
+                    false,
                 )
                 .map_err(|e| {
                     format!(
@@ -4964,10 +6577,114 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 );
                 reference_repeats.push(half);
             }
+            // Compressed rows: the same-weights dense-KV session greedily continues the kernel
+            // fixture prompt through every stop token, once per row (the stream is deterministic).
+            let forced_reference = compressed
+                .map(|_| {
+                    let kernel_prompt =
+                        kernel_fixture_prompt(&reference_session, &prompt, &row.coordinate)?;
+                    reference_session.provider.campaign_forced_continuation(
+                        &kernel_prompt,
+                        FORCED_CONTINUATION_TOKENS as usize,
+                        None,
+                        None,
+                    )
+                })
+                .transpose()
+                .map_err(|e| {
+                    format!(
+                        "dense forced continuation for {}: {e}",
+                        coordinate_slug(&row.coordinate)
+                    )
+                })?;
             drop(reference_session);
             quiesce_campaign_active_memory(reference_baseline).map_err(|e| {
                 format!(
                     "reference session release for {}: {e}",
+                    coordinate_slug(&row.coordinate)
+                )
+            })?;
+
+            // Greedy agreement (quality contract v3) is teacher-forced: the candidate, reloaded in
+            // its own representation, is evaluated on each reference repeat's kernel stream. This
+            // runs after every timed dispatch, so it never touches timing or compile attribution.
+            let forcing_session = match compressed {
+                Some(method) => CampaignSession::load_compressed(&snapshot, method),
+                None => CampaignSession::load(&snapshot),
+            }
+            .map_err(|e| format!("load teacher-forcing candidate session: {e}"))?;
+            let forcing_baseline = forcing_session.load_start_sample.mlx_active_bytes;
+            // A compressed row is teacher-forced once on its dense forced continuation (every
+            // position compared by argmax); a dense row keeps one forced pass per distinct natural
+            // reference stream (greedy reference repeats are usually identical, and each pass is
+            // a full-context prefill).
+            let (teacher_forced, forced_continuation) = match &forced_reference {
+                Some(reference_stream) => {
+                    let choices = kernel_fixture_prompt(&forcing_session, &prompt, &row.coordinate)
+                        .and_then(|kernel_prompt| {
+                            forcing_session.provider.campaign_forced_continuation(
+                                &kernel_prompt,
+                                reference_stream.len(),
+                                forcing_session.compressed(),
+                                Some(reference_stream),
+                            )
+                        })
+                        .map_err(|e| {
+                            format!(
+                                "teacher-forced continuation for {}: {e}",
+                                coordinate_slug(&row.coordinate)
+                            )
+                        })?;
+                    let continuation = forced_continuation_evidence(reference_stream, &choices)?;
+                    eprintln!(
+                        "sc20671-kv-baseline: coordinate {} forced continuation agreement {} ({}/{}; first flips {:?})",
+                        coordinate_slug(&row.coordinate),
+                        continuation.agreement,
+                        continuation.matches,
+                        continuation.tokens,
+                        continuation.first_flip_positions
+                    );
+                    (vec![None; reference_repeats.len()], Some(continuation))
+                }
+                None => {
+                    let stop_tokens = forcing_session.provider.campaign_stop_tokens().to_vec();
+                    let streams = reference_repeats
+                        .iter()
+                        .map(|reference| {
+                            stream_tokens(
+                                &reference.kernel.quality_observation.token_probabilities,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let forced = force_distinct_streams(&streams, |stream| {
+                        teacher_forced_kernel_choices(
+                            &forcing_session,
+                            &prompt,
+                            &row.coordinate,
+                            stream,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "teacher-forced pass for {}: {e}",
+                                coordinate_slug(&row.coordinate)
+                            )
+                        })
+                    })?
+                    .into_iter()
+                    .map(|choices| {
+                        Some(TeacherForcedChoices {
+                            choices,
+                            stop_tokens: stop_tokens.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                    (forced, None)
+                }
+            };
+            drop(forcing_session);
+            quiesce_campaign_active_memory(forcing_baseline).map_err(|e| {
+                format!(
+                    "teacher-forcing session release for {}: {e}",
                     coordinate_slug(&row.coordinate)
                 )
             })?;
@@ -4993,11 +6710,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             let suites = candidate_repeats
                 .into_iter()
                 .zip(reference_repeats)
+                .zip(teacher_forced)
                 .enumerate()
-                .map(|(repeat, (candidate, reference))| {
+                .map(|(repeat, ((candidate, reference), forced))| {
                     let mut suite =
                         pair_product_fixture_halves(candidate, reference, reference_kind)?;
                     suite.kernel_parity_errors = compressed_parity.clone();
+                    suite.teacher_forced_candidate = forced;
+                    suite.forced_continuation = forced_continuation.clone();
                     suite.quality().map_err(|e| {
                         core_llm::Error::InvalidRequest(format!(
                             "product fixture repeat {repeat} quality for {}: {e}",
@@ -5016,12 +6736,25 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 .iter()
                 .map(|suite| &suite.kernel_candidate)
                 .collect::<Vec<_>>();
-            let timings = timing_samples_from_product_repeats(
+            let steady_decodes = suites
+                .iter()
+                .map(|suite| {
+                    suite
+                        .steady_decode
+                        .as_ref()
+                        .ok_or("candidate repeat has no steady-decode measurement")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut timings = timing_samples_from_product_repeats(
                 &kernel_runs,
+                &steady_decodes,
                 &row.coordinate,
                 row.coordinate.process_temperature,
                 &warmup_runs,
             )?;
+            for (sample, state) in timings.samples.iter_mut().zip(repeat_host_states) {
+                sample.host_state = Some(state);
+            }
             let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             let fixtures = sealed_product_fixture_artifacts(&suites, &row.coordinate)?;
             let receipt = product_receipt(
@@ -5035,6 +6768,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 admission,
                 compressed.map(|method| (method, warmup_suites.as_slice())),
                 &reference_inventory,
+                row_start,
             )?;
             let bundle = assemble_artifacts_with_fixtures(receipt, fixtures)?;
             write_artifacts(
@@ -5046,7 +6780,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             .map_err(|e| e.to_string())?;
             Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--stop-file <path>] [options]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options]".into()),
     }
 }
 
@@ -5136,7 +6870,8 @@ pub struct ScheduledCoordinate {
 }
 
 /// The parent executable consumes exactly this schedule.  It never accepts a caller-supplied row
-/// list, which prevents a selectively successful campaign from being published as the baseline.
+/// list, which prevents a selectively successful campaign from being published as the baseline;
+/// `--only-coordinate` runs one of these rows and publishes it only as a partial run.
 pub fn required_schedule() -> Vec<ScheduledCoordinate> {
     required_coordinates()
         .into_iter()
@@ -5563,6 +7298,16 @@ pub struct QualityObservation {
     /// Whether tool agreement can detect KV-induced tool-call loss: the same-weights dense-KV run
     /// emitted the valid structured call.
     pub tool_discriminating: bool,
+    /// Observation only: the first position at which the free-running candidate and reference
+    /// kernel streams differ (`None` when identical).
+    pub free_running_first_divergence: Option<u64>,
+    /// Teacher-forced greedy agreement of every measured repeat, in order (empty for one suite).
+    pub greedy_agreement_by_repeat: Vec<f64>,
+    /// Every measured repeat's quality metrics, in order (empty for one suite). A compressed
+    /// receipt's quality gate evaluates each.
+    pub repeat_metrics: Vec<QualityMetrics>,
+    /// Compressed rows: the forced continuation whose agreement is the greedy agreement.
+    pub forced_continuation: Option<ReceiptForcedContinuation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5628,6 +7373,7 @@ fn product_fixture_artifact(
                 "parityErrors": quality.parity_errors,
                 "greedyMatches": quality.greedy_matches,
                 "greedyTotal": quality.greedy_total,
+                "freeRunningFirstDivergence": quality.free_running_first_divergence,
             }),
             &suite.kernel_candidate,
             &suite.kernel_reference,
@@ -5663,6 +7409,11 @@ fn product_fixture_artifact(
         ),
         _ => return Err(format!("unknown fixture {name}")),
     };
+    let mut evidence = evidence;
+    if let (Some(continuation), "kernel-fp32-reference") = (&quality.forced_continuation, name) {
+        evidence["forcedContinuation"] =
+            serde_json::to_value(continuation).map_err(|e| e.to_string())?;
+    }
     let metrics = compute_quality(&quality)?;
     let value = serde_json::json!({
         "fixture": name,
@@ -5810,8 +7561,26 @@ pub fn sequence_marker() -> u64 {
 
 /// The narrow observation seam used by a real campaign runner.  The runner owns platform probes
 /// (`footprint` and `mlx_rs::memory`); the product path owns the phase boundaries and generation.
+/// Teacher forcing for the campaign's greedy-agreement measurement: the decode loop feeds the
+/// forced token at each step instead of its own choice, which it still reports through
+/// [`Observer::token_probability`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeacherForcing {
+    /// Ordinary generation.
+    Off,
+    /// Feed this token at the current step.
+    Token(i32),
+    /// The forced stream is exhausted: stop before sampling another position.
+    Exhausted,
+}
+
 pub trait Observer {
     fn phase(&mut self, name: &'static str);
+    /// Teacher forcing for decode `step` of the observed generation; off unless a campaign quality
+    /// observer supplies a forced stream.
+    fn teacher_forced_token(&mut self, _step: usize) -> TeacherForcing {
+        TeacherForcing::Off
+    }
     fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64);
     fn allocation_event(
         &mut self,
@@ -5900,6 +7669,11 @@ pub struct ProductObserver {
     /// opened; set once by [`ProductObserver::begin_coordinate_operation`].
     coordinate_start: Option<(usize, usize)>,
     coordinate_scope: Option<CoordinateCompressionScope>,
+    /// The reference token stream fed back at each decode step (teacher forcing), if any.
+    forced_tokens: Option<Vec<i32>>,
+    /// Teacher forcing covers only the first observed generation; a second step 0 ends it.
+    forcing_started: bool,
+    forcing_done: bool,
 }
 
 /// Compressed-arm evidence of one coordinate operation's measured dispatch only (opened by
@@ -5941,6 +7715,18 @@ impl ProductObserver {
             compressed_storage_peak: None,
             coordinate_start: None,
             coordinate_scope: None,
+            forced_tokens: None,
+            forcing_started: false,
+            forcing_done: false,
+        }
+    }
+
+    /// An observer whose first observed generation is teacher-forced on `tokens`: at every
+    /// position the model's own greedy choice is recorded and the forced token is fed back.
+    pub fn teacher_forced(tokens: Vec<i32>) -> Self {
+        Self {
+            forced_tokens: Some(tokens),
+            ..Self::new()
         }
     }
 
@@ -5954,6 +7740,16 @@ impl ProductObserver {
         }
         self.coordinate_start = Some((self.packed_evidence.len(), self.dense_fallbacks.len()));
         self.compressed_storage_peak = None;
+    }
+
+    /// The coordinate operation's storage at its persistent-KV peak (test inspection).
+    #[cfg(test)]
+    pub(crate) fn coordinate_storage_peak(
+        &self,
+    ) -> Option<crate::primitives::CompressedCacheStorage> {
+        self.coordinate_scope
+            .as_ref()
+            .and_then(|scope| scope.storage_peak)
     }
 
     /// Close the coordinate operation: compressed evidence recorded so far describes the measured
@@ -5989,6 +7785,13 @@ impl ProductObserver {
 
     fn sampling_elapsed_ms(&self) -> f64 {
         self.sampling_elapsed_ms
+    }
+
+    /// The observer's product clock: wall time since creation minus every synchronous memory
+    /// sample the observer itself took. Phase timings are deltas of this clock, so a memory sample
+    /// at a phase boundary is never relabeled as prefill, first-token, or decode time.
+    fn product_elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1_000.0 - self.sampling_elapsed_ms
     }
 
     pub fn finish(self) -> Result<ProductObservations, String> {
@@ -6130,7 +7933,10 @@ impl Observer for ProductObserver {
             return;
         }
         mlx_rs::memory::reset_peak_memory();
-        match sample_memory(self.pid) {
+        let sampling_started = std::time::Instant::now();
+        let sampled = sample_memory(self.pid);
+        self.sampling_elapsed_ms += sampling_started.elapsed().as_secs_f64() * 1_000.0;
+        match sampled {
             Ok(sample) if sample.mlx_active_bytes > 0 && sample.mlx_peak_bytes == 0 => {
                 self.prefill_peak_window = Some(ReceiptPeakWindow {
                     started_at: sample.captured_at,
@@ -6212,7 +8018,7 @@ impl Observer for ProductObserver {
                 self.phases.push(ReceiptPhase {
                     phase: name.into(),
                     pid: sample.pid,
-                    source: "footprint -p".into(),
+                    source: PHYS_FOOTPRINT_SOURCE.into(),
                     timestamp: sample.captured_at,
                     phys_footprint_bytes: sample.current_bytes,
                     phys_footprint_peak_bytes: sample.peak_bytes,
@@ -6223,8 +8029,7 @@ impl Observer for ProductObserver {
                         peak_bytes: sample.mlx_peak_bytes,
                     },
                 });
-                self.phase_elapsed_ms
-                    .push(self.started.elapsed().as_secs_f64() * 1_000.0);
+                self.phase_elapsed_ms.push(self.product_elapsed_ms());
             }
             Err(error) => self.error = Some(format!("product memory sample at {name}: {error}")),
         }
@@ -6289,6 +8094,24 @@ impl Observer for ProductObserver {
         self.prefill_logits = Some(values.to_vec());
     }
 
+    fn teacher_forced_token(&mut self, step: usize) -> TeacherForcing {
+        let Some(forced) = &self.forced_tokens else {
+            return TeacherForcing::Off;
+        };
+        if step == 0 {
+            if self.forcing_started {
+                self.forcing_done = true;
+            }
+            self.forcing_started = true;
+        }
+        if self.forcing_done {
+            return TeacherForcing::Off;
+        }
+        forced.get(step).map_or(TeacherForcing::Exhausted, |token| {
+            TeacherForcing::Token(*token)
+        })
+    }
+
     fn token_probability(&mut self, stage: &'static str, token: i32, probability: f64) {
         if stage != "decode"
             || token < 0
@@ -6323,11 +8146,15 @@ impl Observer for ProductObserver {
     /// Keep the storage at the persistent-KV peak: the largest device share (which is what
     /// `cache_snapshot` reports as persistent KV), then the largest whole physical footprint, so
     /// the receipt's physical bytes describe the same instant as `memory.persistentKvBytes`.
+    /// Device arrays grow only by whole blocks and the dense residual is a fixed group, so the
+    /// peak is a plateau across every append inside the last block: the latest (most live tokens)
+    /// instant of it is the one whose length is the receipt's `kvLength`.
     fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
         let key = |s: &crate::primitives::CompressedCacheStorage| {
             (
                 s.device_bytes(),
                 s.device_bytes().saturating_add(s.host_payload_bytes),
+                s.tokens,
             )
         };
         if self
@@ -6392,14 +8219,79 @@ fn measured_model_weight_bytes(
         })
 }
 
+/// Dense KV as a share of the prefill-peak footprint (basis points, floor) and whether a
+/// memory-material row falls below [`MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS`]: recorded, not refused.
+fn dense_kv_share(dense: u64, prefill_footprint: u64, band: &str) -> Result<(u64, bool), String> {
+    if prefill_footprint == 0 {
+        return Err("prefill-peak footprint is zero".into());
+    }
+    let bps = u128::from(dense).saturating_mul(10_000) / u128::from(prefill_footprint);
+    let bps = u64::try_from(bps).map_err(|_| "dense KV share overflows u64".to_string())?;
+    Ok((
+        bps,
+        band == "memory-material"
+            && u128::from(dense).saturating_mul(10_000)
+                < u128::from(prefill_footprint)
+                    .saturating_mul(u128::from(MEMORY_MATERIAL_MIN_DENSE_SHARE_BPS)),
+    ))
+}
+
+/// Release evidence from the weights-loaded and post-run-release phase samples: the frozen
+/// footprint allowance, the MLX slack over each weights-loaded counter, and the recorded residuals.
+fn release_evidence(weights_loaded: &ReceiptPhase, release: &ReceiptPhase) -> ReceiptRelease {
+    let active_tolerance = post_release_mlx_slack_bytes(weights_loaded.mlx.active_bytes);
+    let cache_tolerance = post_release_mlx_slack_bytes(weights_loaded.mlx.cache_bytes);
+    ReceiptRelease {
+        verified: release.phys_footprint_bytes
+            <= weights_loaded
+                .phys_footprint_bytes
+                .saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES)
+            && release.mlx.active_bytes
+                <= weights_loaded
+                    .mlx
+                    .active_bytes
+                    .saturating_add(active_tolerance)
+            && release.mlx.cache_bytes
+                <= weights_loaded
+                    .mlx
+                    .cache_bytes
+                    .saturating_add(cache_tolerance),
+        phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES,
+        mlx_active_tolerance_bytes: active_tolerance,
+        mlx_cache_tolerance_bytes: cache_tolerance,
+        mlx_active_residual_bytes: release
+            .mlx
+            .active_bytes
+            .saturating_sub(weights_loaded.mlx.active_bytes),
+        mlx_cache_residual_bytes: release
+            .mlx
+            .cache_bytes
+            .saturating_sub(weights_loaded.mlx.cache_bytes),
+    }
+}
+
+/// Between sessions: MLX active memory returns to `expected_active_bytes` and the cache empties,
+/// each within [`post_release_mlx_slack_bytes`]. A residual inside the slack is logged, not fatal.
 fn quiesce_campaign_active_memory(expected_active_bytes: u64) -> core_llm::Result<()> {
     mlx_rs::memory::clear_cache();
     let active = mlx_rs::memory::get_active_memory() as u64;
     let cache = mlx_rs::memory::get_cache_memory() as u64;
-    if active != expected_active_bytes || cache != 0 {
-        return Err(core_llm::Error::Load(format!(
-            "campaign session did not quiesce before the next model load: active={active}, expected={expected_active_bytes}, cache={cache}"
-        )));
+    quiesced_within_slack(active, cache, expected_active_bytes).map_err(core_llm::Error::Load)
+}
+
+fn quiesced_within_slack(active: u64, cache: u64, expected_active: u64) -> Result<(), String> {
+    let active_residual = active.saturating_sub(expected_active);
+    if active_residual > post_release_mlx_slack_bytes(expected_active)
+        || cache > post_release_mlx_slack_bytes(0)
+    {
+        return Err(format!(
+            "campaign session did not quiesce before the next model load: active={active}, expected={expected_active}, cache={cache}"
+        ));
+    }
+    if active_residual > 0 || cache > 0 {
+        eprintln!(
+            "sc20671-kv-baseline: session quiesced with a recorded residual within slack: active residual={active_residual} bytes, cache={cache} bytes"
+        );
     }
     Ok(())
 }
@@ -6480,7 +8372,7 @@ impl<S: CampaignSampler> PhaseRecorder<S> {
         self.samples.push(ReceiptPhase {
             phase: phase.into(),
             pid: sample.pid,
-            source: "footprint -p".into(),
+            source: PHYS_FOOTPRINT_SOURCE.into(),
             timestamp: sample.captured_at,
             phys_footprint_bytes: sample.current_bytes,
             phys_footprint_peak_bytes: sample.peak_bytes,
@@ -6532,50 +8424,27 @@ where
     recorder.finish()
 }
 
-/// Parse Darwin footprint fields while accepting the units emitted by different macOS releases.
-pub fn parse_footprint_value(value: &str) -> Option<u64> {
-    let mut parts = value.split_whitespace();
-    let number: f64 = parts.next()?.parse().ok()?;
-    let unit = parts.next().unwrap_or("B").to_ascii_uppercase();
-    let multiplier = match unit.as_str() {
-        "B" => 1.0,
-        "KB" => 1024.0,
-        "MB" => 1024.0 * 1024.0,
-        "GB" => 1024.0 * 1024.0 * 1024.0,
-        _ => return None,
-    };
-    if !number.is_finite() || number < 0.0 {
-        return None;
-    }
-    let bytes = (number * multiplier).round();
-    if !bytes.is_finite() || !(0.0..=(u64::MAX as f64)).contains(&bytes) {
-        return None;
-    }
-    Some(bytes as u64)
+/// Provenance recorded on every phase sample: one `proc_pid_rusage(RUSAGE_INFO_V4)` read of the
+/// Darwin `phys_footprint` ledger (`ri_phys_footprint`, `ri_lifetime_max_phys_footprint`).
+pub const PHYS_FOOTPRINT_SOURCE: &str = "proc_pid_rusage";
+/// Receipts written before sc-20671 moved sampling off the `/usr/bin/footprint` subprocess. The
+/// tool prints the same ledger, so those receipts stay valid.
+const LEGACY_PHYS_FOOTPRINT_SOURCE: &str = "footprint -p";
+
+fn valid_phys_footprint_source(source: &str) -> bool {
+    source == PHYS_FOOTPRINT_SOURCE || source == LEGACY_PHYS_FOOTPRINT_SOURCE
 }
 
 #[cfg(target_os = "macos")]
 pub fn sample_memory(pid: u32) -> std::io::Result<MemorySample> {
-    use std::process::Command;
-    let output = Command::new("/usr/bin/footprint")
-        .args(["--pid", &pid.to_string(), "--noCategories", "--wired"])
-        .output()?;
-    if !output.status.success() {
-        return Err(std::io::Error::other("footprint failed"));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let field = |name: &str| {
-        text.lines()
-            .find_map(|line| line.trim().strip_prefix(name))
-            .and_then(parse_footprint_value)
-    };
+    // Settled: freed Metal memory leaves `phys_footprint` asynchronously (see
+    // `settled_phys_footprint`), and the release check compares against the weights-loaded read.
+    let footprint = crate::campaign_supervisor::settled_phys_footprint(pid)?;
     Ok(MemorySample {
         captured_at: timestamp_now(),
         pid,
-        current_bytes: field("phys_footprint:")
-            .ok_or_else(|| std::io::Error::other("missing phys_footprint"))?,
-        peak_bytes: field("phys_footprint_peak:")
-            .ok_or_else(|| std::io::Error::other("missing phys_footprint_peak"))?,
+        current_bytes: footprint.current_bytes,
+        peak_bytes: footprint.lifetime_peak_bytes,
         mlx_active_bytes: mlx_rs::memory::get_active_memory() as u64,
         mlx_cache_bytes: mlx_rs::memory::get_cache_memory() as u64,
         mlx_peak_bytes: mlx_rs::memory::get_peak_memory() as u64,
@@ -6958,7 +8827,7 @@ pub fn run_product_fixture_on_session(
 
 /// Time one product dispatch while removing only the synchronous memory-sampling work performed
 /// by the campaign observer. The provider remains responsible for invoking the observer at its
-/// real phase boundaries; this wrapper prevents `/usr/bin/footprint` latency from being relabeled
+/// real phase boundaries; this wrapper prevents memory-sampling latency from being relabeled
 /// as model compilation or execution time.
 fn measure_product_dispatch<T>(
     observer: &mut ProductObserver,
@@ -7287,6 +9156,8 @@ pub fn quality_from_product_fixtures(
     expected_needle: &str,
     reference: QualityReference,
     kernel_parity_errors: Option<&[f64]>,
+    teacher_forced_candidate: Option<&TeacherForcedChoices>,
+    forced_continuation: Option<&ReceiptForcedContinuation>,
 ) -> Result<QualityObservation, String> {
     if reference == QualityReference::DenseKvSameWeights
         && [
@@ -7306,10 +9177,20 @@ pub fn quality_from_product_fixtures(
                 .into(),
         );
     }
-    let (greedy_matches, greedy_total) = token_agreement(
-        &kernel_candidate.quality_observation.token_probabilities,
-        &kernel_reference.quality_observation.token_probabilities,
-    );
+    let candidate_stream = stream_tokens(&kernel_candidate.quality_observation.token_probabilities);
+    let reference_stream = stream_tokens(&kernel_reference.quality_observation.token_probabilities);
+    // Greedy agreement is teacher-forced: the candidate's own greedy choice at every position of
+    // the reference stream. A free-running cascade after one argmax flip is recorded separately.
+    let (greedy_matches, greedy_total) = match (forced_continuation, teacher_forced_candidate) {
+        (Some(continuation), _) => (continuation.matches, continuation.tokens),
+        (None, Some(forced)) => {
+            teacher_forced_agreement(&forced.choices, &reference_stream, &forced.stop_tokens)
+        }
+        (None, None) => token_agreement(
+            &kernel_candidate.quality_observation.token_probabilities,
+            &kernel_reference.quality_observation.token_probabilities,
+        ),
+    };
     let (cache_matches, cache_total) = token_agreement(
         &cache_candidate.quality_observation.token_probabilities,
         &cache_reference.quality_observation.token_probabilities,
@@ -7354,7 +9235,46 @@ pub fn quality_from_product_fixtures(
         outcomes,
         needle_discriminating,
         tool_discriminating,
+        free_running_first_divergence: first_divergence(&candidate_stream, &reference_stream),
+        greedy_agreement_by_repeat: Vec::new(),
+        repeat_metrics: Vec::new(),
+        forced_continuation: forced_continuation.cloned(),
     })
+}
+
+fn stream_tokens(probabilities: &[(i32, f64)]) -> Vec<i32> {
+    probabilities.iter().map(|(token, _)| *token).collect()
+}
+
+/// Teacher-forced agreement: at each position of the `reference` stream, whether the candidate's
+/// greedy choice (given the reference prefix) is the reference token. The reference stream keeps
+/// its stop token, so its stop position counts: there the candidate agrees when it also chooses a
+/// stop token. A position the candidate never reached counts as a mismatch; the denominator is
+/// always the reference length.
+pub fn teacher_forced_agreement(
+    candidate_choices: &[i32],
+    reference: &[i32],
+    stop_tokens: &[i32],
+) -> (u64, u64) {
+    let matches = candidate_choices
+        .iter()
+        .zip(reference)
+        .filter(|(candidate, reference)| {
+            candidate == reference
+                || (stop_tokens.contains(reference) && stop_tokens.contains(candidate))
+        })
+        .count() as u64;
+    (matches, reference.len() as u64)
+}
+
+/// First position at which two free-running streams differ; a strict prefix diverges at its end.
+pub fn first_divergence(candidate: &[i32], reference: &[i32]) -> Option<u64> {
+    candidate
+        .iter()
+        .zip(reference)
+        .position(|(candidate, reference)| candidate != reference)
+        .or((candidate.len() != reference.len()).then(|| candidate.len().min(reference.len())))
+        .map(|position| position as u64)
 }
 
 /// Needle outcome and whether it can discriminate KV-induced retrieval loss.
@@ -7422,6 +9342,15 @@ pub struct ProductFixtureSuite {
     /// Compressed rows: the fused reader's parity against its host-fp32 dequantize-then-attend
     /// reference. `None` measures the dense kernel.
     pub kernel_parity_errors: Option<Vec<f64>>,
+    /// The candidate half's dedicated fixed-length steady decode (the reference arm is never
+    /// timed).
+    pub steady_decode: Option<SteadyDecodeMeasurement>,
+    /// The candidate's greedy choice at every position of this repeat's reference kernel stream
+    /// (teacher-forced). Required for a dense row's measured repeats; warmups do not carry it.
+    pub teacher_forced_candidate: Option<TeacherForcedChoices>,
+    /// Compressed rows' measured repeats: the row's forced continuation, which replaces the
+    /// natural-stream teacher-forced agreement.
+    pub forced_continuation: Option<ReceiptForcedContinuation>,
 }
 
 const FIXTURE_MAX_NEW_TOKENS: u32 = 64;
@@ -7461,13 +9390,14 @@ pub fn run_product_fixture_suite(
 ) -> core_llm::Result<ProductFixtureSuite> {
     let candidate = CampaignSession::load(candidate_snapshot)?;
     let candidate_baseline = candidate.load_start_sample.mlx_active_bytes;
-    let candidate_half = run_product_fixture_half_on_session(&candidate, prompt, coordinate)?;
+    let candidate_half = run_product_fixture_half_on_session(&candidate, prompt, coordinate, true)?;
     drop(candidate);
     quiesce_campaign_active_memory(candidate_baseline)?;
 
     let reference = CampaignSession::load(reference_snapshot)?;
     let reference_baseline = reference.load_start_sample.mlx_active_bytes;
-    let reference_half = run_product_fixture_half_on_session(&reference, prompt, coordinate)?;
+    let reference_half =
+        run_product_fixture_half_on_session(&reference, prompt, coordinate, false)?;
     drop(reference);
     quiesce_campaign_active_memory(reference_baseline)?;
     pair_product_fixture_halves(
@@ -7489,6 +9419,7 @@ struct ProductFixtureHalf {
     context_payload_sha256: String,
     fixture_prompt_tokens: [u64; 4],
     fixture_prompt_sha256: [String; 4],
+    steady_decode: Option<SteadyDecodeMeasurement>,
 }
 
 /// A bounded, explicitly unaccepted worker-log record. It survives quality rejection but is never
@@ -7591,8 +9522,118 @@ fn run_product_fixture_half_on_session(
     session: &CampaignSession,
     prompt: &str,
     coordinate: &Coordinate,
+    measure_steady_decode: bool,
 ) -> core_llm::Result<ProductFixtureHalf> {
-    run_product_fixture_half_on_session_bounded(session, prompt, coordinate, u64::MAX)
+    run_product_fixture_half_on_session_bounded(
+        session,
+        prompt,
+        coordinate,
+        u64::MAX,
+        measure_steady_decode,
+    )
+}
+
+/// One fixture half: the four frozen fixtures, each with its coordinate operation, then — when
+/// `measure_steady_decode` (the timed candidate arm) — one fixed-length steady decode of the row
+/// context. The steady decode runs after every observer of the half has closed, on its own
+/// request-scoped cache that is released before the next half, so no coordinate's memory
+/// attribution sees it; its `prompt + STEADY_DECODE_TOKENS` live tokens are admitted up front by
+/// the preflight live-token bound.
+/// The kernel fixture prompt of `coordinate`'s context band, exactly as the fixture half builds it.
+fn kernel_fixture_prompt(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+) -> core_llm::Result<String> {
+    let (band_payload, ..) = session
+        .provider
+        .campaign_context_band_measurement(coordinate.context_band)?;
+    Ok(format!(
+        "{prompt}\n{band_payload}\nReturn a concise deterministic answer."
+    ))
+}
+
+/// Teacher-forced kernel fixture: the candidate session decodes `reference`'s own kernel token
+/// stream, and at every position the candidate's greedy choice is returned.
+fn teacher_forced_kernel_choices(
+    session: &CampaignSession,
+    prompt: &str,
+    coordinate: &Coordinate,
+    forced: &[i32],
+) -> core_llm::Result<Vec<i32>> {
+    let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
+    if forced.is_empty() {
+        return Err(core_llm::Error::InvalidRequest(
+            "reference kernel stream is empty; nothing to teacher-force".into(),
+        ));
+    }
+    let mut observer = ProductObserver::teacher_forced(forced.to_vec());
+    run_dense_lifecycle_request_on_session(
+        session,
+        &kernel_prompt,
+        fixture_request(kernel_prompt.clone(), Vec::new()),
+        None,
+        &mut observer,
+    )?;
+    let observation = observer.finish().map_err(core_llm::Error::InvalidRequest)?;
+    if session.compressed().is_some() {
+        forced_pass_stayed_compressed(&observation.packed_evidence, &observation.dense_fallbacks)
+            .map_err(core_llm::Error::Load)?;
+    }
+    Ok(stream_tokens(&observation.token_probabilities))
+}
+
+/// Run `force` once per distinct stream and return its result for every stream, in order.
+pub fn force_distinct_streams<E>(
+    streams: &[Vec<i32>],
+    mut force: impl FnMut(&[i32]) -> Result<Vec<i32>, E>,
+) -> Result<Vec<Vec<i32>>, E> {
+    let mut forced = std::collections::BTreeMap::<&[i32], Vec<i32>>::new();
+    streams
+        .iter()
+        .map(|stream| {
+            if let Some(choices) = forced.get(stream.as_slice()) {
+                return Ok(choices.clone());
+            }
+            let choices = force(stream)?;
+            forced.insert(stream, choices.clone());
+            Ok(choices)
+        })
+        .collect()
+}
+
+/// A compressed row's teacher-forced pass must decode wholly on the fused compressed reader, like
+/// its steady decode: a pass that fell back to dense would measure dense agreement under a
+/// compressed label. Refused (fail closed) otherwise.
+pub fn forced_pass_stayed_compressed(
+    evidence: &[crate::primitives::PackedCacheEvidence],
+    dense_fallbacks: &[(String, String)],
+) -> Result<(), String> {
+    let fused = evidence
+        .first()
+        .is_some_and(|first| first.accepted_direct_calls > 0)
+        && evidence.iter().all(|cache| {
+            cache.fallback_reasons.is_empty()
+                && !cache.dense_active
+                && cache.full_cache_dequantizations == 0
+                && cache.failed_dispatches == 0
+        })
+        && dense_fallbacks.is_empty();
+    if !fused {
+        return Err(
+            "teacher-forced pass did not decode wholly on the fused compressed reader; the row is refused"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// The candidate's greedy choice at every position of a reference stream, and the stop tokens the
+/// generation ends on (any stop token agrees with a reference stop token).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeacherForcedChoices {
+    pub choices: Vec<i32>,
+    pub stop_tokens: Vec<i32>,
 }
 
 fn run_product_fixture_half_on_session_bounded(
@@ -7600,6 +9641,7 @@ fn run_product_fixture_half_on_session_bounded(
     prompt: &str,
     coordinate: &Coordinate,
     max_request_tokens: u64,
+    measure_steady_decode: bool,
 ) -> core_llm::Result<ProductFixtureHalf> {
     session.validate_coordinate_family(coordinate)?;
     let context_window_tokens = session.provider.campaign_context_window()?;
@@ -7607,7 +9649,7 @@ fn run_product_fixture_half_on_session_bounded(
         .provider
         .campaign_context_band_measurement(coordinate.context_band)?;
     let needle = "SC20671-NUMERIC-NEEDLE-9b7a2e".to_string();
-    let kernel_prompt = format!("{prompt}\n{band_payload}\nReturn a concise deterministic answer.");
+    let kernel_prompt = kernel_fixture_prompt(session, prompt, coordinate)?;
     let tool_prompt = format!(
         "{prompt}\n{band_payload}\nCall record_baseline_fact with fact exactly `SC20671 structured fixture`."
     );
@@ -7661,6 +9703,17 @@ fn run_product_fixture_half_on_session_bounded(
         fixture_request(cache_prompt.clone(), Vec::new()),
         coordinate,
     )?;
+    // Batch rows are timed as one sequence too: the compressed arm has no batch route, so a
+    // batched steady decode could not compare the two representations at the same boundary.
+    let steady_decode = measure_steady_decode
+        .then(|| {
+            session.provider.campaign_steady_decode(
+                &kernel_prompt,
+                STEADY_DECODE_TOKENS as usize,
+                session.compressed(),
+            )
+        })
+        .transpose()?;
     Ok(ProductFixtureHalf {
         kernel,
         tool,
@@ -7673,6 +9726,7 @@ fn run_product_fixture_half_on_session_bounded(
         context_payload_sha256: seal_bytes(band_payload.as_bytes()),
         fixture_prompt_tokens,
         fixture_prompt_sha256,
+        steady_decode,
     })
 }
 
@@ -7707,6 +9761,9 @@ fn pair_product_fixture_halves(
         context_payload_tokens: candidate.context_payload_tokens,
         reference: reference_kind,
         kernel_parity_errors: None,
+        steady_decode: candidate.steady_decode,
+        teacher_forced_candidate: None,
+        forced_continuation: None,
     })
 }
 
@@ -7724,20 +9781,25 @@ impl ProductFixtureSuite {
             &self.needle,
             self.reference,
             self.kernel_parity_errors.as_deref(),
+            self.teacher_forced_candidate.as_ref(),
+            self.forced_continuation.as_ref(),
         )
     }
 }
 
 /// Derive one timing sample from product phase boundaries plus the wall-clock snapshot/provider
-/// load that created this session. Compile attribution is finalized across the cold dispatch or
-/// two real warmups by [`timing_samples_from_product_repeats`].
+/// load that created this session, and the repeat's dedicated fixed-length steady decode. Decode
+/// throughput is never a phase delta: the coordinate operation's own generation is EOS- or
+/// budget-terminated (a chunked coordinate decodes a single token), so its `first-token` →
+/// `decode-steady` interval is a few tokens or none at all. Compile attribution is finalized
+/// across the cold dispatch or two real warmups by [`timing_samples_from_product_repeats`].
 pub fn timing_from_product_observation(
     observation: &ProductObservations,
-    generated_tokens: usize,
+    steady_decode: &SteadyDecodeMeasurement,
     process_temperature: &str,
 ) -> Result<RawTiming, String> {
-    if observation.phase_elapsed_ms.len() != REQUIRED_PHASES.len() || generated_tokens == 0 {
-        return Err("timing requires eight product phases and generated tokens".into());
+    if observation.phase_elapsed_ms.len() != REQUIRED_PHASES.len() {
+        return Err("timing requires eight product phases".into());
     }
     let elapsed = &observation.phase_elapsed_ms;
     if elapsed.windows(2).any(|window| window[1] <= window[0]) {
@@ -7756,11 +9818,7 @@ pub fn timing_from_product_observation(
     let prefill_ms = positive_delta(2, 1)?;
     let ttft_ms = positive_delta(3, 2)?;
     let first_token_ms = positive_delta(3, 0)?;
-    let decode_ms = positive_delta(4, 3)?;
-    let throughput = generated_tokens as f64 * 1_000.0 / decode_ms;
-    if !throughput.is_finite() || throughput <= 0.0 {
-        return Err("invalid product decode throughput".into());
-    }
+    let throughput = steady_decode.tokens_per_second()?;
     if !matches!(process_temperature, "cold" | "warm") {
         return Err("unknown process temperature".into());
     }
@@ -7770,6 +9828,8 @@ pub fn timing_from_product_observation(
         ttft_ms,
         first_token_ms,
         decode_tokens_per_second: throughput,
+        steady_decode: *steady_decode,
+        host_state: None,
     })
 }
 
@@ -7813,7 +9873,7 @@ fn validate_compile_attribution(
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
-    if attribution.method != "first-dispatch-minus-steady-v1"
+    if attribution.method != COMPILE_ATTRIBUTION_METHOD
         || attribution.operation != expected_coordinate_operation(matrix)?
         || attribution.source != expected_source
         || attribution.probe_durations_ms.len() != expected_len
@@ -7850,23 +9910,86 @@ fn validate_compile_attribution(
         attribution.probe_durations_ms[1]
     };
     let excess = first - steady;
-    if excess <= 0.0
-        || !excess.is_finite()
+    if !excess.is_finite()
         || (attribution.first_dispatch_ms - first).abs() > 1e-9
         || (attribution.steady_dispatch_ms - steady).abs() > 1e-9
         || (attribution.first_dispatch_excess_ms - excess).abs() > 1e-9
     {
         return Err(format!(
-            "compile attribution does not prove a positive first-dispatch excess: first={first:.6}ms steady={steady:.6}ms excess={excess:.6}ms"
+            "compile attribution does not recompute: first={first:.6}ms steady={steady:.6}ms excess={excess:.6}ms"
+        ));
+    }
+    let samples = attribution
+        .noise_samples_ms
+        .as_deref()
+        .ok_or("compile attribution lacks its steady noise samples")?;
+    let samples_valid = if expected_source == "measured-repeats" {
+        samples == &attribution.probe_durations_ms[1..]
+    } else {
+        samples.len() == 5
+    };
+    if !samples_valid
+        || samples
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err("compile attribution steady noise samples are invalid".into());
+    }
+    let band = noise_band(samples);
+    let resolved = excess > band;
+    let expected_reason = if resolved {
+        None
+    } else if excess <= 0.0 {
+        Some(COMPILE_COST_NOT_SLOWER)
+    } else {
+        Some(COMPILE_COST_WITHIN_NOISE)
+    };
+    if attribution
+        .noise_band_ms
+        .is_none_or(|value| (value - band).abs() > 1e-9)
+        || attribution.compile_cost_resolved != Some(resolved)
+        || attribution.compile_cost_ms.is_some() != resolved
+        || attribution
+            .compile_cost_ms
+            .is_some_and(|value| (value - excess).abs() > 1e-9)
+        || attribution.compile_cost_unresolved_reason.as_deref() != expected_reason
+    {
+        return Err(format!(
+            "compile cost does not recompute from its noise band: excess={excess:.6}ms band={band:.6}ms"
         ));
     }
     Ok(())
+}
+
+/// Run-to-run spread (`max - min`) of steady-state dispatches of the same operation.
+fn noise_band(samples: &[f64]) -> f64 {
+    let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    max - min
+}
+
+/// `timings.coldCompileMs`: the resolved compile cost (`None` below the noise band).
+fn cold_compile_alias(attribution: &ReceiptCompileAttribution) -> Option<f64> {
+    attribution.compile_cost_ms
+}
+
+fn compile_cost_summary(attribution: &ReceiptCompileAttribution) -> String {
+    match (
+        attribution.compile_cost_ms,
+        attribution.compile_cost_unresolved_reason.as_deref(),
+        attribution.noise_band_ms,
+    ) {
+        (Some(cost), _, Some(band)) => format!("{cost} ms (noise band {band} ms)"),
+        (None, Some(reason), Some(band)) => format!("unresolved: {reason} (noise band {band} ms)"),
+        _ => "invalid compile attribution".into(),
+    }
 }
 
 fn compile_attribution_from_probes(
     operation: &str,
     matrix: &ReceiptMatrix,
     probes: Vec<(f64, f64, String)>,
+    measured_dispatch_ms: &[f64],
 ) -> Result<ReceiptCompileAttribution, String> {
     let source = match matrix.process_temperature.as_str() {
         "cold" => "measured-repeats",
@@ -7899,7 +10022,7 @@ fn compile_attribution_from_probes(
         )
         .collect::<Vec<_>>();
     let mut attribution = ReceiptCompileAttribution {
-        method: "first-dispatch-minus-steady-v1".into(),
+        method: COMPILE_ATTRIBUTION_METHOD.into(),
         operation: operation.into(),
         source: source.into(),
         probe_durations_ms: probe_evidence
@@ -7910,6 +10033,11 @@ fn compile_attribution_from_probes(
         first_dispatch_ms: 0.0,
         steady_dispatch_ms: 0.0,
         first_dispatch_excess_ms: 0.0,
+        noise_samples_ms: None,
+        noise_band_ms: None,
+        compile_cost_resolved: None,
+        compile_cost_ms: None,
+        compile_cost_unresolved_reason: None,
     };
     if attribution.probe_durations_ms.is_empty() {
         return Err("compile attribution has no raw probes".into());
@@ -7928,8 +10056,28 @@ fn compile_attribution_from_probes(
         }
         attribution.probe_durations_ms[1]
     };
-    attribution.first_dispatch_excess_ms =
-        attribution.first_dispatch_ms - attribution.steady_dispatch_ms;
+    let excess = attribution.first_dispatch_ms - attribution.steady_dispatch_ms;
+    attribution.first_dispatch_excess_ms = excess;
+    // A cold row's steady samples are its post-first repeats; a warm row's are the measured
+    // repeats that follow its two warmups.
+    let samples = if matrix.process_temperature == "cold" {
+        attribution.probe_durations_ms[1..].to_vec()
+    } else {
+        measured_dispatch_ms.to_vec()
+    };
+    let band = noise_band(&samples);
+    let resolved = excess > band;
+    attribution.noise_samples_ms = Some(samples);
+    attribution.noise_band_ms = Some(band);
+    attribution.compile_cost_resolved = Some(resolved);
+    attribution.compile_cost_ms = resolved.then_some(excess);
+    attribution.compile_cost_unresolved_reason = (!resolved).then(|| {
+        if excess <= 0.0 {
+            COMPILE_COST_NOT_SLOWER.to_string()
+        } else {
+            COMPILE_COST_WITHIN_NOISE.to_string()
+        }
+    });
     validate_compile_attribution(&attribution, matrix)?;
     Ok(attribution)
 }
@@ -7949,25 +10097,25 @@ fn warmup_probe_suite_sha256(
 
 /// Freeze cold-versus-steady compilation attribution before receipt assembly. A cold worker uses
 /// five complete product-call probes and compares the first with the median of the next four. A
-/// warm worker uses its two real pre-measurement warmups. Prefix-reuse probes add only the seed and
+/// warm worker uses its two real pre-measurement warmups. The excess is resolved as compile cost
+/// only when it exceeds the spread of the steady dispatches (the four later cold probes, or the
+/// five measured warm repeats); otherwise it is recorded as unresolved, never refused. Prefix-reuse probes add only the seed and
 /// observed-hit product calls, excluding allocator reset and footprint instrumentation.
 pub fn timing_samples_from_product_repeats(
     runs: &[&ProductFixtureResult],
+    steady_decodes: &[&SteadyDecodeMeasurement],
     coordinate: &Coordinate,
     process_temperature: &str,
     warmups: &[&ProductFixtureResult],
 ) -> Result<ProductTimingMeasurements, String> {
-    if runs.len() != 5 {
-        return Err("receipt requires exactly five product repeats".into());
+    if runs.len() != 5 || steady_decodes.len() != runs.len() {
+        return Err("receipt requires exactly five product repeats and steady decodes".into());
     }
     let samples = runs
         .iter()
-        .map(|run| {
-            timing_from_product_observation(
-                &run.observation,
-                run.coordinate_generated_tokens as usize,
-                process_temperature,
-            )
+        .zip(steady_decodes)
+        .map(|(run, steady)| {
+            timing_from_product_observation(&run.observation, steady, process_temperature)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let operation = runs[0].coordinate_operation.as_str();
@@ -8002,7 +10150,12 @@ pub fn timing_samples_from_product_repeats(
         prefill_mode: coordinate.prefill_mode.into(),
         process_temperature: coordinate.process_temperature.into(),
     };
-    let compile_attribution = compile_attribution_from_probes(operation, &matrix, probes)?;
+    let measured_dispatch_ms = runs
+        .iter()
+        .map(|run| run.compile_dispatch_ms)
+        .collect::<Vec<_>>();
+    let compile_attribution =
+        compile_attribution_from_probes(operation, &matrix, probes, &measured_dispatch_ms)?;
     Ok(ProductTimingMeasurements {
         samples,
         compile_attribution,
@@ -8153,55 +10306,255 @@ fn probed_command(program: &str, args: &[&str], label: &str) -> Result<String, S
     Ok(value)
 }
 
-/// `pmset -g therm` is verbose diagnostic text, never a receipt state.  Accept only an explicit
-/// no-throttling/no-pressure observation and normalize it to the schema's semantic `nominal`.
-pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
-    let normalized = value.to_ascii_lowercase();
-    if normalized.contains("not nominal")
-        || normalized.contains("throttl")
-        || normalized.contains("critical")
-    {
-        return Err("pmset thermal probe reports throttling or a contradictory state".into());
-    }
-    let lines = normalized
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let nominal_no_history = [
-        "note: no thermal warning level has been recorded",
-        "note: no performance warning level has been recorded",
-        "note: no cpu power status has been recorded",
-    ];
-    if lines.len() == nominal_no_history.len()
-        && nominal_no_history
-            .iter()
-            .all(|expected| lines.contains(expected))
-    {
-        return Ok("nominal".into());
-    }
-    let mut saw_zero = false;
-    for line in lines {
-        let Some((name, raw_value)) = line.split_once(':') else {
+/// `CPU_Speed_Limit` from `pmset -g therm` when it reports CPU power status (`None` when it
+/// prints only its no-history notes). The rest of the text is recorded verbatim, never parsed, so
+/// unknown note lines are tolerated; only a malformed or contradictory limit is refused.
+pub fn pmset_cpu_speed_limit(value: &str) -> Result<Option<u64>, String> {
+    let mut limit = None;
+    for line in value.lines() {
+        let Some((name, raw)) = line.split_once('=') else {
             continue;
         };
-        if !matches!(name.trim(), "thermal pressure" | "thermal level") {
+        if !name.trim().eq_ignore_ascii_case("CPU_Speed_Limit") {
             continue;
         }
-        let value = raw_value.trim();
-        let digits = value
-            .chars()
-            .take_while(|character| character.is_ascii_digit())
-            .collect::<String>();
-        if digits.is_empty() || digits != "0" {
-            return Err("pmset thermal probe reports nonzero thermal pressure".into());
+        let parsed = raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("pmset CPU_Speed_Limit is not a number: {:?}", raw.trim()))?;
+        if limit.is_some_and(|prior| prior != parsed) {
+            return Err("pmset reports contradictory CPU_Speed_Limit values".into());
         }
-        saw_zero = true;
+        limit = Some(parsed);
     }
-    if saw_zero {
-        return Ok("nominal".into());
+    Ok(limit)
+}
+
+/// Row boundaries at which the host's power mode and thermal state are observed, in order.
+pub const HOST_STATE_BOUNDARIES: [&str; 2] = ["row-start", "row-end"];
+/// The host state recorded beside each measured timing sample, so throughput drift is attributable.
+pub const TIMING_SAMPLE_HOST_BOUNDARY: &str = "timing-sample";
+/// Normalized macOS energy modes (`pmset` `powermode` 0/1/2, or the older `lowpowermode`).
+pub const POWER_MODES: [&str; 3] = ["automatic", "low-power", "high-power"];
+/// `NSProcessInfo.thermalState` 0..=3.
+pub const THERMAL_STATES: [&str; 4] = ["nominal", "fair", "serious", "critical"];
+
+/// A real throttle signal: `NSProcessInfo.thermalState` serious or critical, or a `pmset`
+/// `CPU_Speed_Limit` below 100%.
+pub fn host_state_throttled(thermal_state: &str, cpu_speed_limit: Option<u64>) -> bool {
+    matches!(thermal_state, "serious" | "critical")
+        || cpu_speed_limit.is_some_and(|limit| limit < 100)
+}
+
+/// The host's power mode and thermal state at one boundary. Only a throttled row start refuses
+/// the row; later states are recorded and flagged on the provenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptHostState {
+    pub boundary: String,
+    pub captured_at: String,
+    pub power_mode: String,
+    /// `NSProcessInfo.thermalState`, one of [`THERMAL_STATES`].
+    pub thermal_state: String,
+    /// `pmset -g therm` `CPU_Speed_Limit` (percent), when reported.
+    pub cpu_speed_limit: Option<u64>,
+    /// The raw `pmset -g therm` text, recorded verbatim.
+    pub pmset_thermal_raw: String,
+    /// [`host_state_throttled`] of this state.
+    pub throttled: bool,
+}
+
+impl ReceiptHostState {
+    fn validate(&self, boundary: &str) -> Result<(), String> {
+        if self.boundary != boundary
+            || !valid_utc_timestamp(&self.captured_at)
+            || !POWER_MODES.contains(&self.power_mode.as_str())
+            || !THERMAL_STATES.contains(&self.thermal_state.as_str())
+            || self.pmset_thermal_raw.trim().is_empty()
+            || pmset_cpu_speed_limit(&self.pmset_thermal_raw)? != self.cpu_speed_limit
+            || self.throttled != host_state_throttled(&self.thermal_state, self.cpu_speed_limit)
+        {
+            return Err(format!(
+                "host power/thermal provenance: {boundary} state is malformed or does not recompute"
+            ));
+        }
+        Ok(())
     }
-    Err("pmset thermal probe did not prove nominal thermal state".into())
+}
+
+/// Whether the thermal state or the power mode changed from `start` across `later` observations.
+/// A throttled later observation counts as a thermal change.
+pub fn host_state_changes<'a>(
+    start: &ReceiptHostState,
+    later: impl IntoIterator<Item = &'a ReceiptHostState>,
+) -> (bool, bool) {
+    later
+        .into_iter()
+        .fold((false, false), |(thermal, power), state| {
+            (
+                thermal || state.thermal_state != start.thermal_state || state.throttled,
+                power || state.power_mode != start.power_mode,
+            )
+        })
+}
+
+/// Refuse a row whose start is thermally throttled; every other state is recorded.
+pub fn refuse_throttled_row_start(state: &ReceiptHostState) -> Result<(), String> {
+    if state.throttled {
+        return Err(format!(
+            "row-start host is thermally throttled (thermalState={}, CPU_Speed_Limit={:?}); the row is refused before it runs",
+            state.thermal_state, state.cpu_speed_limit
+        ));
+    }
+    Ok(())
+}
+
+/// Normalize the active energy mode from `pmset -g` (its "Currently in use" settings): `powermode`
+/// 0/1/2 is Automatic/Low Power/High Power; hosts without it report `lowpowermode` (and, on some
+/// releases, `highpowermode`) 0/1. A missing, unknown, or contradictory setting is refused.
+pub fn normalize_pmset_power_mode(value: &str) -> Result<String, String> {
+    let mut in_use = false;
+    let mut settings = std::collections::BTreeMap::new();
+    for line in value.lines() {
+        let line = line.trim();
+        if line.eq_ignore_ascii_case("currently in use:") {
+            in_use = true;
+            continue;
+        }
+        if !in_use {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        if let (Some(key @ ("powermode" | "lowpowermode" | "highpowermode")), Some(setting)) =
+            (fields.next(), fields.next())
+        {
+            if settings.insert(key, setting).is_some() {
+                return Err(format!("pmset reports {key} twice"));
+            }
+        }
+    }
+    let flag = |key: &str| match settings.get(key).copied() {
+        None => Ok(None),
+        Some("0") => Ok(Some(false)),
+        Some("1") => Ok(Some(true)),
+        Some(other) => Err(format!("pmset reports unknown {key} {other}")),
+    };
+    let (low, high) = (flag("lowpowermode")?, flag("highpowermode")?);
+    let mode = match settings.get("powermode").copied() {
+        Some("0") => "automatic",
+        Some("1") => "low-power",
+        Some("2") => "high-power",
+        Some(other) => return Err(format!("pmset reports unknown powermode {other}")),
+        None => match (low, high) {
+            (Some(true), Some(true)) => {
+                return Err("pmset reports both low and high power mode".into())
+            }
+            (Some(true), _) => "low-power",
+            (_, Some(true)) => "high-power",
+            (Some(false), _) | (_, Some(false)) => "automatic",
+            (None, None) => {
+                return Err("pmset does not report the active power mode".into());
+            }
+        },
+    };
+    if (low == Some(true) && mode != "low-power") || (high == Some(true) && mode != "high-power") {
+        return Err("pmset power mode settings contradict each other".into());
+    }
+    Ok(mode.into())
+}
+
+/// `NSProcessInfo.thermalState` (0 nominal, 1 fair, 2 serious, 3 critical) as its name.
+pub fn normalize_process_thermal_state(state: i64) -> Result<String, String> {
+    usize::try_from(state)
+        .ok()
+        .and_then(|index| THERMAL_STATES.get(index))
+        .map(|name| (*name).to_string())
+        .ok_or_else(|| format!("unknown process thermal state {state}"))
+}
+
+/// One boundary's host state from its raw probes: `pmset -g`, `pmset -g therm`, and
+/// `NSProcessInfo.thermalState`. Throttling is recorded here, never refused.
+pub fn host_state_from_probes(
+    boundary: &str,
+    captured_at: String,
+    pmset: &str,
+    pmset_thermal: &str,
+    process_thermal_state: i64,
+) -> Result<ReceiptHostState, String> {
+    if !HOST_STATE_BOUNDARIES.contains(&boundary) && boundary != TIMING_SAMPLE_HOST_BOUNDARY {
+        return Err(format!("unknown host-state boundary {boundary}"));
+    }
+    let power_mode = normalize_pmset_power_mode(pmset)?;
+    let thermal_state = normalize_process_thermal_state(process_thermal_state)?;
+    let cpu_speed_limit = pmset_cpu_speed_limit(pmset_thermal)?;
+    Ok(ReceiptHostState {
+        boundary: boundary.into(),
+        captured_at,
+        power_mode,
+        throttled: host_state_throttled(&thermal_state, cpu_speed_limit),
+        thermal_state,
+        cpu_speed_limit,
+        pmset_thermal_raw: pmset_thermal.into(),
+    })
+}
+
+/// Probe this host's power mode and thermal state at `boundary`.
+pub fn capture_host_state(boundary: &str) -> Result<ReceiptHostState, String> {
+    let pmset = probed_command("pmset", &["-g"], "power mode")?;
+    let pmset_thermal = probed_command("pmset", &["-g", "therm"], "thermal state")?;
+    let process_thermal = process_thermal_state()?;
+    host_state_from_probes(
+        boundary,
+        timestamp_now(),
+        &pmset,
+        &pmset_thermal,
+        process_thermal,
+    )
+    .map_err(|e| format!("{boundary} host state: {e}"))
+}
+
+/// `[[NSProcessInfo processInfo] thermalState]` through the Objective-C runtime.
+#[cfg(target_os = "macos")]
+fn process_thermal_state() -> Result<i64, String> {
+    use std::ffi::{c_char, c_void};
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+    #[link(name = "Foundation", kind = "framework")]
+    extern "C" {}
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+    // SAFETY: the class and selector names are C string literals; `objc_msgSend` is called
+    // through the exact signatures of `+[NSProcessInfo processInfo]` (returns an object) and
+    // `-[NSProcessInfo thermalState]` (returns an `NSInteger`), as the arm64/x86_64 ABIs require.
+    unsafe {
+        let class = objc_getClass(c"NSProcessInfo".as_ptr());
+        if class.is_null() {
+            return Err("NSProcessInfo is unavailable".into());
+        }
+        let send_object = std::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "C" fn(Id, Sel) -> Id,
+        >(objc_msgSend);
+        let info = send_object(class, sel_registerName(c"processInfo".as_ptr()));
+        if info.is_null() {
+            return Err("NSProcessInfo returned no process info".into());
+        }
+        let send_integer = std::mem::transmute::<
+            unsafe extern "C" fn(),
+            unsafe extern "C" fn(Id, Sel) -> isize,
+        >(objc_msgSend);
+        Ok(send_integer(info, sel_registerName(c"thermalState".as_ptr())) as i64)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_thermal_state() -> Result<i64, String> {
+    Err("the process thermal state probe requires macOS".into())
 }
 
 /// The primary repeat supplies the receipt metrics; discrimination is the AND over every sealed
@@ -8209,15 +10562,56 @@ pub fn normalize_pmset_thermal(value: &str) -> Result<String, String> {
 fn receipt_quality_over_repeats(
     suites: &[ProductFixtureSuite],
 ) -> Result<QualityObservation, String> {
+    if suites.iter().any(|suite| {
+        suite.teacher_forced_candidate.is_none() && suite.forced_continuation.is_none()
+    }) {
+        return Err("every measured repeat requires its teacher-forced greedy agreement".into());
+    }
     let (primary, repeats) = suites
         .split_first()
         .ok_or("product receipt requires its fixture repeats")?;
+    // A row's forced continuation is one deterministic measurement shared by every repeat.
+    if repeats
+        .iter()
+        .any(|suite| suite.forced_continuation != primary.forced_continuation)
+    {
+        return Err("every measured repeat must share the row's one forced continuation".into());
+    }
     let mut quality = primary.quality()?;
+    quality.repeat_metrics = vec![compute_quality(&quality)?];
+    let ratio = |q: &QualityObservation| {
+        if q.greedy_total == 0 {
+            Err("teacher-forced greedy agreement has zero positions".to_string())
+        } else {
+            Ok(q.greedy_matches as f64 / q.greedy_total as f64)
+        }
+    };
+    quality.greedy_agreement_by_repeat = vec![ratio(&quality)?];
+    let mut weakest = (
+        ratio(&quality)?,
+        quality.greedy_matches,
+        quality.greedy_total,
+    );
     for repeat in repeats {
         let repeat = repeat.quality()?;
+        quality.repeat_metrics.push(compute_quality(&repeat)?);
         quality.needle_discriminating &= repeat.needle_discriminating;
         quality.tool_discriminating &= repeat.tool_discriminating;
+        let agreement = ratio(&repeat)?;
+        quality.greedy_agreement_by_repeat.push(agreement);
+        if agreement < weakest.0 {
+            weakest = (agreement, repeat.greedy_matches, repeat.greedy_total);
+        }
+        quality.free_running_first_divergence = match (
+            quality.free_running_first_divergence,
+            repeat.free_running_first_divergence,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
     }
+    // The gate is the weakest repeat's agreement; every repeat's value is recorded.
+    (quality.greedy_matches, quality.greedy_total) = (weakest.1, weakest.2);
     Ok(quality)
 }
 
@@ -8319,6 +10713,20 @@ pub fn compressed_receipt_block(
     let first = evidence
         .first()
         .ok_or("compressed arm produced no compressed cache evidence")?;
+    if first.bits != method.code_bits().bits() {
+        return Err(format!(
+            "compressed arm for {} produced {}-bit evidence",
+            method.id(),
+            first.bits
+        ));
+    }
+    if first.representation_identity != method.representation_identity() {
+        return Err(format!(
+            "compressed arm for {} produced {} evidence",
+            method.id(),
+            first.representation_identity
+        ));
+    }
     let mut fallbacks = std::collections::BTreeMap::<(String, String), u64>::new();
     let mut kernel_paths =
         std::collections::BTreeMap::<(String, String, String), (String, u64)>::new();
@@ -8456,6 +10864,7 @@ fn product_receipt(
     admission: ReceiptAdmission,
     compressed: Option<(CompressedKvMethod, &[ProductFixtureSuite])>,
     reference_model: &SnapshotInventory,
+    row_start: ReceiptHostState,
 ) -> Result<Receipt, String> {
     let suite = suites
         .first()
@@ -8532,9 +10941,24 @@ fn product_receipt(
     let inference_revision = captured_source.1.clone();
     let hardware = probed_command("sysctl", &["-n", "hw.model"], "hardware")?;
     let xcode = probed_command("xcodebuild", &["-version"], "xcode")?;
-    let power_mode = probed_command("pmset", &["-g", "custom"], "power mode")?;
-    let thermal_state = probed_command("pmset", &["-g", "therm"], "thermal state")?;
-    let normalized_thermal_state = normalize_pmset_thermal(&thermal_state)?;
+    // Only a throttled row start refuses a row. Later changes are recorded and flagged.
+    let row_end = capture_host_state("row-end")?;
+    let (thermal_changed_during_row, power_mode_changed_during_row) = host_state_changes(
+        &row_start,
+        timing_samples
+            .iter()
+            .filter_map(|sample| sample.host_state.as_ref())
+            .chain(std::iter::once(&row_end)),
+    );
+    if thermal_changed_during_row || power_mode_changed_during_row {
+        eprintln!(
+            "sc20671-kv-baseline: host state changed during the row (thermal {} -> {}, power {} -> {}); recorded, not refused",
+            row_start.thermal_state, row_end.thermal_state, row_start.power_mode, row_end.power_mode
+        );
+    }
+    let power_mode = row_start.power_mode.clone();
+    let normalized_thermal_state = row_start.thermal_state.clone();
+    let host_states = vec![row_start, row_end];
     let mlx = locked_mlx_identity(include_bytes!("../../../../Cargo.lock"))?;
     let transcript = format!(
         "{}\n{}\n{}\n{}",
@@ -8624,13 +11048,13 @@ fn product_receipt(
         );
     }
     let template = Receipt {
-        schema_version: 4, harness_version: "sc-20671-kv-baseline-v4".into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: mode.into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
-        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
+        schema_version: RECEIPT_SCHEMA_VERSION, harness_version: RECEIPT_HARNESS_VERSION.into(), run_id: seal_bytes(format!("{}:{}:{}", coordinate_slug(coordinate), model.sha256, seal_bytes(transcript.as_bytes())).as_bytes()), captured_at: release.timestamp.clone(), mode: mode.into(), status: "complete".into(), contract_hash: QUALITY_CONTRACT_HASH.into(), receipt_sha256: String::new(),
+        provenance: ReceiptProvenance { scene_works_repository, inference_repository, scene_works_revision, inference_revision, mlx_version: mlx.version, mlx_source: mlx.source, mlx_revision: mlx.revision, dependency_lock_sha256: seal_bytes(include_bytes!("../../../../Cargo.lock")), os: std::env::consts::OS.into(), xcode, hardware, model_id: format!("{}@{};architecture={};inventory={}", candidate_contract.repository, candidate_contract.revision, candidate_contract.architecture, model.sha256), model_file_sha256: model.sha256.clone(), model_file_bytes: model.bytes, reference_model_id: format!("{}@{};architecture={};inventory={}", reference_contract.repository, reference_contract.revision, reference_contract.architecture, reference.sha256), reference_model_sha256: reference.sha256.clone(), reference_model_bytes: reference.bytes, power_mode, thermal_state: normalized_thermal_state, host_states, thermal_changed_during_row, power_mode_changed_during_row, command_template: "sc20671-kv-baseline --mode {mode}".into(), command: format!("sc20671-kv-baseline --mode {mode}"), campaign_session_id: observation.session_id.clone(), campaign_cache_state_version: observation.cache_state_version, coordinate_operation_sha256: coordinate_operation_digest(&suite.kernel_candidate) },
         matrix: ReceiptMatrix { family: coordinate.family.into(), context_band: coordinate.context_band.into(), request_mode: coordinate.request_mode.into(), prefill_mode: coordinate.prefill_mode.into(), process_temperature: coordinate.process_temperature.into() },
         geometry: ReceiptGeometry { batch: if coordinate.request_mode == "single" {1} else {2}, query_heads: observation.geometry.query_heads, kv_heads: observation.geometry.kv_heads, head_dimension: observation.geometry.head_dimension, query_length: suite.kernel_candidate.coordinate_prompt_tokens, kv_length: observation.cache_live_tokens, layers: observation.geometry.layers, element_bytes: observation.geometry.element_bytes, capacity: observation.cache_capacity_tokens, context_window_tokens: suite.context_window_tokens, context_target_tokens: suite.context_target_tokens, context_payload_tokens: suite.context_payload_tokens },
-        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: ReceiptRelease { verified: release.phys_footprint_bytes <= weights_loaded.phys_footprint_bytes.saturating_add(POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES) && release.mlx.active_bytes <= weights_loaded.mlx.active_bytes && release.mlx.cache_bytes <= weights_loaded.mlx.cache_bytes, phys_footprint_tolerance_bytes: POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES, mlx_active_tolerance_bytes: 0, mlx_cache_tolerance_bytes: 0 }, admission },
-        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:0.0,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
-        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
+        memory: ReceiptMemory { model_weights_bytes, persistent_kv_bytes: cache_bytes, transient_workspace_bytes: workspace, dense_theoretical_kv_bytes: 0, prefill_peak_window: observation.prefill_peak_window.clone(), phase_samples: vec![], allocation_events: vec![], reconciliation: ReceiptReconciliation { expected_dense_kv_bytes: 0, observed_persistent_kv_bytes: 0, tolerance_bytes: 0 }, release: release_evidence(weights_loaded, release), admission, dense_kv_share_bps: 0, below_memory_material_share: false },
+        timings: ReceiptTimings { load_ms: 0.0,prefill_ms:0.0,ttft_ms:0.0,first_token_ms:0.0,decode_tokens_per_second:0.0,cold_compile_ms:None,warm_compile_ms:0.0,compile_attribution:compile_attribution.clone(),samples:vec![],summary:ReceiptTimingSummary{decode_tokens_per_second_mean:0.0,decode_tokens_per_second_p95:0.0,decode_tokens_per_second_variance:0.0,decode_tokens_per_second_coefficient_of_variation:0.0,confidence_interval_low:0.0,confidence_interval_high:0.0}},
+        quality: ReceiptQuality { parity_max_error:0.0,perplexity_delta:0.0,greedy_token_agreement:0.0,greedy_agreement_method:String::new(),free_running_first_divergence:None,greedy_token_agreement_by_repeat:Vec::new(),structured_tool_agreement:0.0,needle_retrieval:0.0,needle_discriminating:false,tool_discriminating:false,multi_turn_prompt_cache:0.0,statistics:ReceiptQualityStatistics{repeats:5,warmups:2,confidence_interval:"95% bootstrap".into(),outlier_policy:"report all samples; no silent deletion".into(),variance_policy:"all raw repeats retained; decode throughput coefficient of variation must stay within the frozen maximum".into(),max_coefficient_of_variation:0.05},fixture_evidence,quality_gate:None,forced_continuation:None}, lifecycle, cancellation: ReceiptCancellation{cleanup_verified:true}, warmup: ReceiptWarmup { required: coordinate.process_temperature == "warm", completed: warmup_cache_state_version.is_some(), worker_pid: std::process::id(), suite_sha256: warmup_suite_sha256, session_id: if coordinate.process_temperature == "warm" { observation.session_id.clone() } else { String::new() }, cache_state_version: warmup_cache_state_version.unwrap_or_default() }, compression };
     ReceiptBuilder {
         template,
         phases: observation.phases.clone(),
@@ -8701,98 +11125,103 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A synthetic product fixture result whose output text is `text`.
+    fn test_fixture_result(text: &str) -> ProductFixtureResult {
+        let observation = || ProductObservations {
+            snapshot: SnapshotInventory {
+                root: PathBuf::new(),
+                files: Vec::new(),
+                bytes: 1,
+                sha256: "b".repeat(64),
+            },
+            geometry: ProductGeometry {
+                query_heads: 24,
+                kv_heads: 8,
+                head_dimension: 8,
+                layers: 28,
+                element_bytes: 2,
+            },
+            phases: vec![
+                ReceiptPhase {
+                    phase: "prefill-peak".into(),
+                    pid: 42,
+                    source: PHYS_FOOTPRINT_SOURCE.into(),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                    phys_footprint_bytes: 123,
+                    phys_footprint_peak_bytes: 456,
+                    mlx: ReceiptMlx {
+                        source: "mlx_rs::memory".into(),
+                        active_bytes: 12,
+                        cache_bytes: 34,
+                        peak_bytes: 56,
+                    },
+                };
+                8
+            ],
+            phase_elapsed_ms: Vec::new(),
+            allocations: Vec::new(),
+            prefill_logits: Vec::new(),
+            token_probabilities: vec![(7, 0.5), (9, 0.25)],
+            session_id: "session".into(),
+            cache_state_version: 1,
+            operations: Vec::new(),
+            load_elapsed_ms: 1.0,
+            prefill_peak_window: ReceiptPeakWindow {
+                started_at: "2026-01-01T00:00:00Z".into(),
+                baseline_active_bytes: 1,
+                reset_peak_bytes: 0,
+            },
+            cache_live_tokens: 32,
+            cache_capacity_tokens: 256,
+            packed_evidence: Vec::new(),
+            dense_fallbacks: Vec::new(),
+            coordinate_scope: None,
+        };
+        ProductFixtureResult {
+            observation: observation(),
+            quality_observation: observation(),
+            output: TextLlmOutput {
+                text: text.into(),
+                ..Default::default()
+            },
+            coordinate_operation: "chunked-prefix-reuse".into(),
+            coordinate_generated_tokens: 1,
+            coordinate_prompt_tokens: 32,
+            coordinate_output_sha256: "c".repeat(64),
+            compile_setup_ms: 0.0,
+            compile_dispatch_ms: 1.0,
+            secondary_coordinate_operation: None,
+        }
+    }
+
+    /// A synthetic fixture half: valid tool call, `needle_text` as the needle answer.
+    fn test_fixture_half(needle_text: &str) -> ProductFixtureHalf {
+        let mut tool = test_fixture_result("");
+        let mut arguments = serde_json::Map::new();
+        arguments.insert(
+            "fact".into(),
+            serde_json::json!("SC20671 structured fixture"),
+        );
+        tool.output.tool_calls = vec![core_llm::ToolCall::new("record_baseline_fact", arguments)];
+        ProductFixtureHalf {
+            kernel: test_fixture_result("kernel"),
+            tool,
+            needle_result: test_fixture_result(needle_text),
+            cache: test_fixture_result("cache"),
+            needle: "SC20671-NUMERIC-NEEDLE-9b7a2e".into(),
+            context_window_tokens: 4096,
+            context_target_tokens: 32,
+            context_payload_tokens: 32,
+            context_payload_sha256: "d".repeat(64),
+            fixture_prompt_tokens: [32; 4],
+            fixture_prompt_sha256: std::array::from_fn(|_| "e".repeat(64)),
+            steady_decode: None,
+        }
+    }
+
     #[test]
     fn needle_miss_is_a_recorded_observation_with_role_diagnostics() {
-        let result = |text: &str| {
-            let observation = || ProductObservations {
-                snapshot: SnapshotInventory {
-                    root: PathBuf::new(),
-                    files: Vec::new(),
-                    bytes: 1,
-                    sha256: "b".repeat(64),
-                },
-                geometry: ProductGeometry {
-                    query_heads: 24,
-                    kv_heads: 8,
-                    head_dimension: 8,
-                    layers: 28,
-                    element_bytes: 2,
-                },
-                phases: vec![
-                    ReceiptPhase {
-                        phase: "prefill-peak".into(),
-                        pid: 42,
-                        source: "footprint -p".into(),
-                        timestamp: "2026-01-01T00:00:00Z".into(),
-                        phys_footprint_bytes: 123,
-                        phys_footprint_peak_bytes: 456,
-                        mlx: ReceiptMlx {
-                            source: "mlx_rs::memory".into(),
-                            active_bytes: 12,
-                            cache_bytes: 34,
-                            peak_bytes: 56,
-                        },
-                    };
-                    8
-                ],
-                phase_elapsed_ms: Vec::new(),
-                allocations: Vec::new(),
-                prefill_logits: Vec::new(),
-                token_probabilities: vec![(7, 0.5), (9, 0.25)],
-                session_id: "session".into(),
-                cache_state_version: 1,
-                operations: Vec::new(),
-                load_elapsed_ms: 1.0,
-                prefill_peak_window: ReceiptPeakWindow {
-                    started_at: "2026-01-01T00:00:00Z".into(),
-                    baseline_active_bytes: 1,
-                    reset_peak_bytes: 0,
-                },
-                cache_live_tokens: 32,
-                cache_capacity_tokens: 256,
-                packed_evidence: Vec::new(),
-                dense_fallbacks: Vec::new(),
-                coordinate_scope: None,
-            };
-            ProductFixtureResult {
-                observation: observation(),
-                quality_observation: observation(),
-                output: TextLlmOutput {
-                    text: text.into(),
-                    ..Default::default()
-                },
-                coordinate_operation: "chunked-prefix-reuse".into(),
-                coordinate_generated_tokens: 1,
-                coordinate_prompt_tokens: 32,
-                coordinate_output_sha256: "c".repeat(64),
-                compile_setup_ms: 0.0,
-                compile_dispatch_ms: 1.0,
-                secondary_coordinate_operation: None,
-            }
-        };
-        let half = |needle_text: &str| {
-            let mut tool = result("");
-            let mut arguments = serde_json::Map::new();
-            arguments.insert(
-                "fact".into(),
-                serde_json::json!("SC20671 structured fixture"),
-            );
-            tool.output.tool_calls =
-                vec![core_llm::ToolCall::new("record_baseline_fact", arguments)];
-            ProductFixtureHalf {
-                kernel: result("kernel"),
-                tool,
-                needle_result: result(needle_text),
-                cache: result("cache"),
-                needle: "SC20671-NUMERIC-NEEDLE-9b7a2e".into(),
-                context_window_tokens: 4096,
-                context_target_tokens: 32,
-                context_payload_tokens: 32,
-                context_payload_sha256: "d".repeat(64),
-                fixture_prompt_tokens: [32; 4],
-                fixture_prompt_sha256: std::array::from_fn(|_| "e".repeat(64)),
-            }
-        };
+        let half = test_fixture_half;
         let coordinate = required_coordinates()[0].clone();
         let candidate = half("wrong\nanswer");
         let reference = half("SC20671-NUMERIC-NEEDLE-9b7a2e");
@@ -8929,14 +11358,28 @@ pub(crate) mod tests {
         assert!(!divergent_miss.needle_discriminating);
         // Receipt discrimination is the AND over repeats, not the primary repeat alone.
         let pair = |compressed: ProductFixtureHalf, dense: ProductFixtureHalf| {
-            pair_product_fixture_halves(compressed, dense, QualityReference::DenseKvSameWeights)
-                .unwrap()
+            let mut suite = pair_product_fixture_halves(
+                compressed,
+                dense,
+                QualityReference::DenseKvSameWeights,
+            )
+            .unwrap();
+            suite.teacher_forced_candidate = Some(TeacherForcedChoices {
+                choices: stream_tokens(
+                    &suite
+                        .kernel_reference
+                        .quality_observation
+                        .token_probabilities,
+                ),
+                stop_tokens: Vec::new(),
+            });
+            suite
         };
         let mut invalid_dense_tool = half("I cannot help with that.");
         invalid_dense_tool.tool.output.tool_calls.clear();
         let mut invalid_compressed_tool = half("I cannot help with that.");
         invalid_compressed_tool.tool.output.tool_calls.clear();
-        let repeats = [
+        let mut repeats = [
             pair(
                 half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
                 half("SC20671-NUMERIC-NEEDLE-9b7a2e"),
@@ -8944,6 +11387,46 @@ pub(crate) mod tests {
             pair(invalid_compressed_tool, invalid_dense_tool),
         ];
         assert!(repeats[0].quality().unwrap().needle_discriminating);
+        // The suite's greedy agreement is the teacher-forced one: a diverged free-running
+        // candidate stream does not lower it when every forced position agrees.
+        let reference_stream = stream_tokens(
+            &repeats[0]
+                .kernel_reference
+                .quality_observation
+                .token_probabilities,
+        );
+        repeats[0]
+            .kernel_candidate
+            .quality_observation
+            .token_probabilities
+            .iter_mut()
+            .for_each(|(token, _)| *token += 1000);
+        let forced_quality = repeats[0].quality().unwrap();
+        assert_eq!(
+            (forced_quality.greedy_matches, forced_quality.greedy_total),
+            (reference_stream.len() as u64, reference_stream.len() as u64)
+        );
+        assert_eq!(forced_quality.free_running_first_divergence, Some(0));
+        let forced = repeats[1].teacher_forced_candidate.take();
+        assert!(receipt_quality_over_repeats(&repeats).is_err());
+        repeats[1].teacher_forced_candidate = forced;
+        // The receipt's greedy agreement is the weakest repeat's; each repeat is recorded.
+        let flipped = repeats[1]
+            .teacher_forced_candidate
+            .clone()
+            .map(|mut forced| {
+                forced.choices[0] += 1000;
+                forced
+            });
+        let original = std::mem::replace(&mut repeats[1].teacher_forced_candidate, flipped);
+        let weakest = receipt_quality_over_repeats(&repeats).unwrap();
+        let total = weakest.greedy_total;
+        assert_eq!(weakest.greedy_matches, total - 1);
+        assert_eq!(
+            weakest.greedy_agreement_by_repeat,
+            vec![1.0, (total - 1) as f64 / total as f64]
+        );
+        repeats[1].teacher_forced_candidate = original;
         let anded = receipt_quality_over_repeats(&repeats).unwrap();
         assert!(!anded.needle_discriminating);
         assert!(!anded.tool_discriminating);
@@ -9245,11 +11728,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn footprint_units_are_deterministic() {
-        assert_eq!(parse_footprint_value("1664 KB"), Some(1_703_936));
-        assert_eq!(parse_footprint_value("2 MB"), Some(2 * 1024 * 1024));
-        assert!(parse_footprint_value("nan B").is_none());
-        assert!(parse_footprint_value("4 TB").is_none());
+    fn phase_samples_name_the_syscall_and_legacy_footprint_receipts_stay_valid() {
+        assert_eq!(PHYS_FOOTPRINT_SOURCE, "proc_pid_rusage");
+        assert!(valid_phys_footprint_source(PHYS_FOOTPRINT_SOURCE));
+        assert!(valid_phys_footprint_source("footprint -p"));
+        for other in ["", "footprint", "mlx_rs::memory", "proc_pid_rusage "] {
+            assert!(!valid_phys_footprint_source(other), "{other:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn worker_samples_its_own_footprint_without_a_subprocess() {
+        let pid = std::process::id();
+        let sample = sample_memory(pid).unwrap();
+        assert_eq!(sample.pid, pid);
+        std::num::NonZeroU64::new(sample.current_bytes).expect("own phys_footprint is zero");
+        assert!(sample.peak_bytes >= sample.current_bytes);
     }
 
     #[test]
@@ -9474,6 +11969,97 @@ pub(crate) mod tests {
         }
     }
 
+    /// `--only-coordinate` selects exactly one scheduled row (an unscheduled name is refused), its
+    /// publication must match the resume identity's filter and hold exactly that row, and a
+    /// partial-run manifest is never loadable as a complete campaign.
+    #[test]
+    fn only_coordinate_runs_one_row_and_never_publishes_a_campaign() {
+        const SLUG: &str = "llama-memory-material-single-single-shot-warm";
+        assert_eq!(
+            selected_schedule_indices(None).unwrap(),
+            (0..8).collect::<Vec<_>>()
+        );
+        let selected = selected_schedule_indices(Some(SLUG)).unwrap();
+        assert_eq!(selected, vec![2]);
+        assert_eq!(coordinate_slug(&required_schedule()[2].coordinate), SLUG);
+        assert!(selected_schedule_indices(Some("llama-32k"))
+            .unwrap_err()
+            .contains("not a scheduled coordinate"));
+        let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            optional_flag(&args(&["parent"]), "--only-coordinate").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_flag(
+                &args(&["parent", "--only-coordinate", SLUG]),
+                "--only-coordinate"
+            )
+            .unwrap()
+            .as_deref(),
+            Some(SLUG)
+        );
+        for bad in [&["--only-coordinate"][..], &["--only-coordinate", "--out"]] {
+            assert!(
+                optional_flag(&args(bad), "--only-coordinate").is_err(),
+                "{bad:?}"
+            );
+        }
+
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1024,
+            child_footprint_cap_bytes: 2048,
+            max_context_tokens: 4096,
+            max_request_tokens: 4096,
+            stdout_cap_bytes: 4096,
+            stderr_cap_bytes: 4096,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("partial");
+        let full = serde_json::json!({ "kind": "sc-20671-resume-identity" });
+        let mut partial = full.clone();
+        partial["onlyCoordinate"] = SLUG.into();
+        // The publication scope must be the identity's: neither can stand in for the other.
+        for (identity, only) in [(&full, Some(SLUG)), (&partial, None)] {
+            assert_eq!(
+                publish_campaign(&destination, &[], identity, &policy, only).unwrap_err(),
+                "publication scope differs from the resume identity's coordinate filter"
+            );
+        }
+        assert_eq!(
+            publish_campaign(&destination, &[], &partial, &policy, Some(SLUG)).unwrap_err(),
+            format!("partial run of {SLUG} requires exactly its one prepared receipt")
+        );
+        assert!(!destination.exists());
+
+        // A partial manifest (correctly sealed) is refused by the complete-campaign loader.
+        fs::create_dir(&destination).unwrap();
+        let manifest = canonical_json_bytes(&serde_json::json!({
+            "schemaVersion": 2,
+            "kind": SC20671_PARTIAL_RUN_KIND,
+            "scheduleVersion": SC20671_SCHEDULE_VERSION,
+            "partial": true,
+            "publishable": false,
+            "onlyCoordinate": SLUG,
+            "coordinates": [],
+        }))
+        .unwrap();
+        fs::write(destination.join("campaign.json"), &manifest).unwrap();
+        fs::write(
+            destination.join("campaign.json.sha256"),
+            format!("{}  campaign.json\n", seal_bytes(&manifest)),
+        )
+        .unwrap();
+        assert_eq!(
+            load_validated_complete_campaign(&destination).unwrap_err(),
+            "SC-20671 campaign manifest identity is invalid"
+        );
+    }
+
     #[test]
     fn safety_policy_and_resume_identity_hashes_match_cross_language_fixture() {
         let policy = CampaignSafetyPolicy {
@@ -9534,6 +12120,7 @@ pub(crate) mod tests {
                 Path::new("/nonexistent-reference"),
                 "prompt",
                 &policy,
+                false,
             )
             .unwrap_err();
             assert!(
@@ -9551,6 +12138,7 @@ pub(crate) mod tests {
                 child_footprint_cap_bytes: 2_048,
                 host_free_reserve_bytes: 1_024,
                 static_footprint_floor_bytes: 1_000,
+                host_memory_components: None,
             }
         );
         // Refused without guards, or when the conservative floor already exceeds the cap.
@@ -9581,8 +12169,18 @@ pub(crate) mod tests {
             child: u64,
         }
         impl campaign_supervisor::MemoryProbe for Host {
-            fn host_free_bytes(&mut self, _: std::time::Instant) -> std::io::Result<u64> {
-                Ok(self.free)
+            fn host_memory(
+                &mut self,
+                _: std::time::Instant,
+            ) -> std::io::Result<campaign_supervisor::HostMemory> {
+                Ok(campaign_supervisor::HostMemory::from_pages(
+                    1,
+                    campaign_supervisor::VmStatPages {
+                        free: self.free,
+                        ..Default::default()
+                    },
+                )
+                .unwrap())
             }
             fn child_footprint_bytes(
                 &mut self,
@@ -9605,11 +12203,12 @@ pub(crate) mod tests {
                 &path,
                 "sc-20671-unaccepted-row",
                 name,
-                &admission,
+                &admission.with_host_memory(failure.host_memory.as_deref().cloned()),
                 (
                     &format!("{:?}", failure.reason),
                     &failure.detail,
                     failure.pid,
+                    failure.watchdog_host_memory.as_deref(),
                 ),
             )
             .unwrap();
@@ -9635,6 +12234,11 @@ pub(crate) mod tests {
         assert_eq!(refused["outcome"], "refused");
         assert_eq!(refused["admission"]["childFootprintCapBytes"], 2_048);
         assert_eq!(refused["admission"]["staticFootprintFloorBytes"], 1_000);
+        // The refusal records the measurement it was refused on.
+        assert_eq!(
+            refused["admission"]["hostMemoryComponents"]["availableBytes"],
+            2_048 + 1_024 - 1
+        );
         // A watchdog trip after spawn is an aborted row, never an accepted one.
         let aborted = campaign_supervisor::run_guarded(
             Command::new("/bin/sleep").arg("5"),
@@ -9667,7 +12271,7 @@ pub(crate) mod tests {
             unused_attempt_prefix(&logs, "row").unwrap(),
             "row.attempt-1"
         );
-        let stop = ("PreflightMemory", "host free 1 bytes", None);
+        let stop = ("PreflightMemory", "host free 1 bytes", None, None);
         let collided = unaccepted_row_error(
             &logs.join("row.attempt-0.unaccepted.json"),
             "sc-20671-unaccepted-row",
@@ -9687,6 +12291,31 @@ pub(crate) mod tests {
             "coordinate row stopped (PreflightMemory)".into(),
         );
         assert!(recorded.contains("; not accepted ("), "{recorded}");
+        // A host-reserve watchdog abort records the live sample that tripped it.
+        let sample = campaign_supervisor::HostMemory::from_pages(
+            16_384,
+            campaign_supervisor::VmStatPages {
+                free: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tripped = logs.join("row.attempt-2.unaccepted.json");
+        write_unaccepted_row_record(
+            &tripped,
+            "sc-20671-unaccepted-row",
+            "row",
+            &admission,
+            ("HostMemory", "host available", Some(9), Some(&sample)),
+        )
+        .unwrap();
+        let tripped: serde_json::Value =
+            serde_json::from_slice(&fs::read(tripped).unwrap()).unwrap();
+        assert_eq!(tripped["outcome"], "aborted");
+        assert_eq!(
+            tripped["watchdogHostMemory"],
+            serde_json::to_value(&sample).unwrap()
+        );
         assert!(logs.join("row.attempt-1.unaccepted.json").exists());
         // Enough host RAM and a child under the cap: admitted and supervised to completion.
         assert!(campaign_supervisor::run_guarded(
@@ -9710,7 +12339,7 @@ pub(crate) mod tests {
         fs::create_dir_all(root).unwrap();
         fs::write(
             root.join("config.json"),
-            br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":24}"#,
+            br#"{"torch_dtype":"bfloat16","num_hidden_layers":28,"num_key_value_heads":8,"head_dim":128,"num_attention_heads":24,"hidden_size":3072,"intermediate_size":8192,"vocab_size":128256}"#,
         )
         .unwrap();
         let mut header = serde_json::Map::new();
@@ -9786,6 +12415,35 @@ pub(crate) mod tests {
         let budget =
             static_row_footprint_budget(row, &candidate, &reference, 425, 318, &policy).unwrap();
         assert!(budget > 12_000_000_000); // BF16 reference dominates the sequential roles.
+    }
+
+    /// sc-20671: the static floor prices the request's prefill activations beside the load
+    /// reservation, the total-live KV and the attention tile. Without them the fit-boundary row's
+    /// floor (40.2 GiB for the bf16 reference) sat ~12 GiB under what a 130k-token prefill
+    /// alongside a stored prefix actually holds.
+    #[test]
+    fn static_floor_prices_request_prefill_activations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let reference = temporary.path().join("reference");
+        write_stub_dtype_snapshot(&reference, &LLAMA_REFERENCE, "BF16");
+        let payload: u64 = LLAMA_REFERENCE
+            .required_files
+            .iter()
+            .filter(|file| file.path.ends_with(".safetensors"))
+            .map(|file| file.bytes)
+            .sum();
+        // The fit-boundary row's preflight: a ~130.7k-token prefix beside a full request.
+        let (total, request) = (261_483_u64, 130_741_u64);
+        let floor =
+            static_role_footprint_budget(&LLAMA_REFERENCE, &reference, total, request).unwrap();
+        // 28 layers x K/V x 8 heads x 128 x BF16.
+        let kv = total * 28 * 2 * 8 * 128 * 2;
+        let tile = 3 * 8 * request * 24 * 4;
+        // One layer's projections/MLP/residuals per request token (3 x 8192 + 8 x 3072 BF16
+        // elements) plus one logits row.
+        let activations = request * (3 * 8_192 + 8 * 3_072) * 2 + 128_256 * 2;
+        assert_eq!(floor, 2 * payload + kv + tile + activations);
+        assert!(activations > 11 << 30, "{activations}");
     }
 
     /// sc-20671: the pinned dense KV width is the BF16 compute dtype's for every role, whatever
@@ -9926,6 +12584,10 @@ pub(crate) mod tests {
             outcomes: FixtureOutcomes::default(),
             needle_discriminating: true,
             tool_discriminating: true,
+            free_running_first_divergence: None,
+            greedy_agreement_by_repeat: vec![1.0; 5],
+            repeat_metrics: Vec::new(),
+            forced_continuation: None,
         };
         let metrics = compute_quality(&raw).unwrap();
         assert_eq!(metrics.parity_max_error, 0.0002);
@@ -10022,11 +12684,42 @@ pub(crate) mod tests {
         assert!(validate_fixture_evidence(&evidence[..3]).is_err());
     }
 
-    /// A complete, valid dense v4 receipt assembled by the real builder from minimal evidence.
+    /// A fixed-length steady decode of a 32-token context whose 255 timed tokens took `decode_ms`.
+    /// A nominal, unthrottled host state observed at `boundary`.
+    fn test_host_state(boundary: &str, captured_at: &str) -> ReceiptHostState {
+        ReceiptHostState {
+            boundary: boundary.into(),
+            captured_at: captured_at.into(),
+            power_mode: "automatic".into(),
+            thermal_state: "nominal".into(),
+            cpu_speed_limit: None,
+            pmset_thermal_raw: PMSET_NOMINAL_THERMAL.into(),
+            throttled: false,
+        }
+    }
+
+    fn test_steady_decode(decode_ms: f64) -> SteadyDecodeMeasurement {
+        SteadyDecodeMeasurement {
+            prompt_tokens: 32,
+            generated_tokens: STEADY_DECODE_TOKENS,
+            timed_tokens: STEADY_DECODE_TOKENS - 1,
+            decode_ms,
+            forced_stop_tokens: 3,
+        }
+    }
+
+    /// A complete, valid dense receipt assembled by the real builder from minimal evidence.
     fn builder_test_receipt() -> Receipt {
+        test_receipt_builder()
+            .finish()
+            .expect("builder must produce a complete v4 receipt")
+    }
+
+    /// The dense builder behind [`builder_test_receipt`], before `finish`.
+    fn test_receipt_builder() -> ReceiptBuilder {
         let mut template = Receipt {
-            schema_version: 4,
-            harness_version: "sc-20671-kv-baseline-v4".into(),
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            harness_version: RECEIPT_HARNESS_VERSION.into(),
             run_id: "run".into(),
             captured_at: "2026-01-01T00:00:00Z".into(),
             mode: "dense".into(),
@@ -10055,8 +12748,14 @@ pub(crate) mod tests {
                 reference_model_id: "reference-model".into(),
                 reference_model_sha256: "9".repeat(64),
                 reference_model_bytes: 1,
-                power_mode: "nominal".into(),
+                power_mode: "automatic".into(),
                 thermal_state: "nominal".into(),
+                host_states: vec![
+                    test_host_state("row-start", "2025-12-31T23:59:59.000Z"),
+                    test_host_state("row-end", "2026-01-01T00:00:09.000Z"),
+                ],
+                thermal_changed_during_row: false,
+                power_mode_changed_during_row: false,
                 command_template: "run --mode {mode}".into(),
                 command: "run --mode dense".into(),
                 campaign_session_id: "e".repeat(64),
@@ -10107,13 +12806,30 @@ pub(crate) mod tests {
                         POST_RELEASE_PHYS_FOOTPRINT_TOLERANCE_BYTES,
                     mlx_active_tolerance_bytes: 0,
                     mlx_cache_tolerance_bytes: 0,
+                    mlx_active_residual_bytes: 0,
+                    mlx_cache_residual_bytes: 0,
                 },
                 admission: ReceiptAdmission {
                     mode: RUNTIME_GUARDED_ADMISSION.into(),
                     child_footprint_cap_bytes: 1 << 30,
                     host_free_reserve_bytes: 1 << 30,
                     static_footprint_floor_bytes: 1 << 20,
+                    host_memory_components: campaign_supervisor::HostMemory::from_pages(
+                        16_384,
+                        campaign_supervisor::VmStatPages {
+                            free: 200_000,
+                            speculative: 4_000,
+                            purgeable: 100,
+                            inactive: 90_000,
+                            file_backed: 60_000,
+                            anonymous: 40_000,
+                            throttled: 0,
+                            active: 0,
+                        },
+                    ),
                 },
+                dense_kv_share_bps: 0,
+                below_memory_material_share: false,
             },
             timings: ReceiptTimings {
                 load_ms: 1.0,
@@ -10121,10 +12837,10 @@ pub(crate) mod tests {
                 ttft_ms: 1.0,
                 first_token_ms: 1.0,
                 decode_tokens_per_second: 1.0,
-                cold_compile_ms: 1.0,
+                cold_compile_ms: Some(1.0),
                 warm_compile_ms: 1.0,
                 compile_attribution: ReceiptCompileAttribution {
-                    method: "first-dispatch-minus-steady-v1".into(),
+                    method: COMPILE_ATTRIBUTION_METHOD.into(),
                     operation: "single-shot-generation".into(),
                     source: "measured-repeats".into(),
                     probe_durations_ms: vec![3.0, 1.0, 1.0, 1.0, 1.0],
@@ -10137,6 +12853,11 @@ pub(crate) mod tests {
                     first_dispatch_ms: 3.0,
                     steady_dispatch_ms: 1.0,
                     first_dispatch_excess_ms: 2.0,
+                    noise_samples_ms: Some(vec![1.0; 4]),
+                    noise_band_ms: Some(0.0),
+                    compile_cost_resolved: Some(true),
+                    compile_cost_ms: Some(2.0),
+                    compile_cost_unresolved_reason: None,
                 },
                 samples: vec![],
                 summary: ReceiptTimingSummary {
@@ -10152,6 +12873,9 @@ pub(crate) mod tests {
                 parity_max_error: 0.0,
                 perplexity_delta: 0.0,
                 greedy_token_agreement: 1.0,
+                greedy_agreement_method: GREEDY_AGREEMENT_METHOD.into(),
+                free_running_first_divergence: None,
+                greedy_token_agreement_by_repeat: vec![1.0; 5],
                 structured_tool_agreement: 1.0,
                 needle_retrieval: 1.0,
                 needle_discriminating: true,
@@ -10166,6 +12890,8 @@ pub(crate) mod tests {
                     max_coefficient_of_variation: 0.05,
                 },
                 fixture_evidence: std::collections::BTreeMap::new(),
+                quality_gate: None,
+                forced_continuation: None,
             },
             lifecycle: ReceiptLifecycle {
                 append: true,
@@ -10221,7 +12947,7 @@ pub(crate) mod tests {
             .map(|(index, phase)| ReceiptPhase {
                 phase: (*phase).into(),
                 pid: 7,
-                source: "footprint -p".into(),
+                source: PHYS_FOOTPRINT_SOURCE.into(),
                 timestamp: format!("2026-01-01T00:00:0{index}.000Z"),
                 phys_footprint_bytes: 100,
                 phys_footprint_peak_bytes: 100,
@@ -10276,16 +13002,21 @@ pub(crate) mod tests {
             },
         ];
         let timings = (0..5)
-            .map(|_| RawTiming {
+            .map(|repeat| RawTiming {
                 load_ms: 1.0,
                 prefill_ms: 1.0,
                 ttft_ms: 1.0,
                 first_token_ms: 1.0,
                 decode_tokens_per_second: 1.0,
+                steady_decode: test_steady_decode(255_000.0),
+                host_state: Some(test_host_state(
+                    TIMING_SAMPLE_HOST_BOUNDARY,
+                    &format!("2026-01-01T00:00:08.{:03}Z", 100 + repeat * 10),
+                )),
             })
             .collect();
         let compile_attribution = ReceiptCompileAttribution {
-            method: "first-dispatch-minus-steady-v1".into(),
+            method: COMPILE_ATTRIBUTION_METHOD.into(),
             operation: "single-shot-generation".into(),
             source: "measured-repeats".into(),
             probe_durations_ms: vec![3.0, 1.0, 1.0, 1.0, 1.0],
@@ -10298,6 +13029,11 @@ pub(crate) mod tests {
             first_dispatch_ms: 3.0,
             steady_dispatch_ms: 1.0,
             first_dispatch_excess_ms: 2.0,
+            noise_samples_ms: Some(vec![1.0; 4]),
+            noise_band_ms: Some(0.0),
+            compile_cost_resolved: Some(true),
+            compile_cost_ms: Some(2.0),
+            compile_cost_unresolved_reason: None,
         };
         let quality = QualityObservation {
             parity_errors: vec![0.0],
@@ -10314,6 +13050,10 @@ pub(crate) mod tests {
             outcomes: FixtureOutcomes::default(),
             needle_discriminating: true,
             tool_discriminating: true,
+            free_running_first_divergence: None,
+            greedy_agreement_by_repeat: vec![1.0; 5],
+            repeat_metrics: Vec::new(),
+            forced_continuation: None,
         };
         ReceiptBuilder {
             template,
@@ -10323,8 +13063,41 @@ pub(crate) mod tests {
             compile_attribution,
             quality,
         }
-        .finish()
-        .expect("builder must produce a complete v4 receipt")
+    }
+
+    /// The same builder row measured in compressed mode (as [`compress_test_receipt`] turns a
+    /// finished receipt), with `quality` as its measured repeats.
+    fn compressed_test_builder(quality: QualityObservation) -> ReceiptBuilder {
+        let mut builder = test_receipt_builder();
+        let template = &mut builder.template;
+        template.mode = "compressed".into();
+        template.provenance.command = template
+            .provenance
+            .command_template
+            .replace("{mode}", "compressed");
+        for name in REQUIRED_FIXTURES {
+            template
+                .quality
+                .fixture_evidence
+                .get_mut(name)
+                .unwrap()
+                .independent_reference = fixture_independent_reference(
+                name,
+                QualityReference::DenseKvSameWeights,
+                &template.provenance.model_file_sha256,
+            );
+        }
+        template.lifecycle = receipt_lifecycle(true);
+        template.compression = Some(test_compression_block());
+        let compressed_kv = template.memory.persistent_kv_bytes / 2;
+        template.memory.persistent_kv_bytes = compressed_kv;
+        for event in &mut builder.allocations {
+            if event.role == "cache" && event.lifetime != "transient" {
+                event.bytes = compressed_kv;
+            }
+        }
+        builder.quality = quality;
+        builder
     }
 
     fn test_packed_evidence(fused: usize) -> crate::primitives::PackedCacheEvidence {
@@ -10459,6 +13232,42 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A forced continuation over the full length with `matches` agreeing positions (the flips
+    /// are the last positions).
+    fn test_forced_continuation(matches: u64) -> ReceiptForcedContinuation {
+        let reference = (0..FORCED_CONTINUATION_TOKENS as i32).collect::<Vec<_>>();
+        let choices = reference
+            .iter()
+            .enumerate()
+            .map(|(position, token)| {
+                if (position as u64) < matches {
+                    *token
+                } else {
+                    -1
+                }
+            })
+            .collect::<Vec<_>>();
+        forced_continuation_evidence(&reference, &choices).unwrap()
+    }
+
+    /// Record `continuation` as the receipt's greedy agreement and its gate as the frozen
+    /// evaluation of the receipt-level values for every repeat.
+    fn set_test_compressed_quality(receipt: &mut Receipt, continuation: ReceiptForcedContinuation) {
+        let quality = &mut receipt.quality;
+        quality.greedy_token_agreement = continuation.agreement;
+        quality.greedy_token_agreement_by_repeat = vec![continuation.agreement; 5];
+        let metrics = QualityMetrics {
+            parity_max_error: quality.parity_max_error,
+            perplexity_delta: quality.perplexity_delta,
+            greedy_token_agreement: continuation.agreement,
+            structured_tool_agreement: quality.structured_tool_agreement,
+            needle_retrieval: quality.needle_retrieval,
+            multi_turn_prompt_cache: quality.multi_turn_prompt_cache,
+        };
+        quality.forced_continuation = Some(continuation);
+        quality.quality_gate = Some(quality_gate_from_repeats(&[metrics; 5]));
+    }
+
     /// Turn the builder's dense receipt into the same row measured in compressed mode: same-weights
     /// fixtures, compressed lifecycle, a persistent KV below the dense geometry, and the block.
     fn compress_test_receipt(receipt: &mut Receipt, compression: ReceiptCompression) {
@@ -10480,6 +13289,10 @@ pub(crate) mod tests {
             );
         }
         receipt.lifecycle = receipt_lifecycle(true);
+        set_test_compressed_quality(
+            receipt,
+            test_forced_continuation(FORCED_CONTINUATION_TOKENS),
+        );
         let compressed_kv = receipt.memory.persistent_kv_bytes / 2;
         for event in &mut receipt.memory.allocation_events {
             if event.role == "cache" && event.lifetime != "transient" {
@@ -10757,6 +13570,385 @@ pub(crate) mod tests {
         assert!(validate_receipt_semantics(&dense_with_block)
             .unwrap_err()
             .contains("present exactly on compressed"));
+    }
+
+    const TEST_NEEDLE: &str = "SC20671-NUMERIC-NEEDLE-9b7a2e";
+
+    /// Five compressed repeats sharing `continuation`; `needle_miss` repeats lose the needle the
+    /// same-weights dense run recovered.
+    fn compressed_test_suites(
+        continuation: &ReceiptForcedContinuation,
+        needle_miss: &[usize],
+    ) -> Vec<ProductFixtureSuite> {
+        (0..5)
+            .map(|repeat| {
+                let candidate = test_fixture_half(if needle_miss.contains(&repeat) {
+                    "wrong"
+                } else {
+                    TEST_NEEDLE
+                });
+                let mut suite = pair_product_fixture_halves(
+                    candidate,
+                    test_fixture_half(TEST_NEEDLE),
+                    QualityReference::DenseKvSameWeights,
+                )
+                .unwrap();
+                suite.kernel_parity_errors = Some(vec![0.00005]);
+                suite.forced_continuation = Some(continuation.clone());
+                suite
+            })
+            .collect()
+    }
+
+    /// The sealed repeat-major artifacts of `suites`, as the bundle validator reads them.
+    fn sealed_test_repeats(suites: &[ProductFixtureSuite]) -> Vec<SealedFixtureArtifact> {
+        sealed_product_fixture_artifacts(suites, &required_coordinates()[0]).unwrap()
+    }
+
+    fn repeat_pairs(fixtures: &[SealedFixtureArtifact]) -> Vec<(&'static str, &[u8])> {
+        (0..5)
+            .flat_map(|repeat| {
+                REQUIRED_FIXTURES.map(|fixture| {
+                    let name = fixture_artifact_name(fixture, repeat);
+                    (
+                        fixture,
+                        fixtures
+                            .iter()
+                            .find(|artifact| artifact.name == name)
+                            .unwrap()
+                            .bytes
+                            .as_slice(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forced_continuation_is_admitted_up_to_the_native_window() {
+        assert_eq!(forced_continuation_live_tokens(60, 131_072), 60 + 1024);
+        assert_eq!(forced_continuation_live_tokens(130_600, 131_072), 131_072);
+    }
+
+    #[test]
+    fn forced_continuation_records_every_position_and_the_first_flips() {
+        let evidence = forced_continuation_evidence(&[1, 2, 3, 4], &[1, 0, 3, 0]).unwrap();
+        assert_eq!(
+            (evidence.tokens, evidence.matches, evidence.flip_count),
+            (4, 2, 2)
+        );
+        assert_eq!(evidence.agreement, 0.5);
+        assert_eq!(evidence.first_flip_positions, vec![1, 3]);
+        assert!(forced_continuation_evidence(&[1, 2], &[1]).is_err());
+        assert!(forced_continuation_evidence(&[], &[]).is_err());
+        // One flip in 1024 positions clears the frozen 0.999; two do not.
+        let one = test_forced_continuation(FORCED_CONTINUATION_TOKENS - 1);
+        let two = test_forced_continuation(FORCED_CONTINUATION_TOKENS - 2);
+        assert!(one.agreement >= COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN);
+        assert!(two.agreement < COMPRESSED_GREEDY_TOKEN_AGREEMENT_MIN);
+        let many = test_forced_continuation(100);
+        assert_eq!(many.flip_count, FORCED_CONTINUATION_TOKENS - 100);
+        assert_eq!(
+            many.first_flip_positions,
+            (100..100 + FORCED_CONTINUATION_RECORDED_FLIPS as u64).collect::<Vec<_>>()
+        );
+        validate_forced_continuation(&many, "short").unwrap();
+        // Only a fit-boundary row may run a shorter continuation, never below the reserve.
+        let short = forced_continuation_evidence(&[1; 300], &[1; 300]).unwrap();
+        assert!(validate_forced_continuation(&short, "short").is_err());
+        validate_forced_continuation(&short, "fit-boundary").unwrap();
+        let tiny = forced_continuation_evidence(&[1; 8], &[1; 8]).unwrap();
+        assert!(validate_forced_continuation(&tiny, "fit-boundary").is_err());
+        for edit in [
+            (|c: &mut ReceiptForcedContinuation| c.matches -= 1) as fn(&mut _),
+            |c| c.agreement = 1.0,
+            |c| c.flip_count += 1,
+            |c| c.first_flip_positions.reverse(),
+            |c| c.first_flip_positions.pop().map(drop).unwrap_or(()),
+            |c| c.method = "natural-stream".into(),
+            |c| c.reference_stream_sha256 = "x".into(),
+        ] {
+            let mut forged = many.clone();
+            edit(&mut forged);
+            assert!(validate_forced_continuation(&forged, "short").is_err());
+        }
+    }
+
+    #[test]
+    fn compressed_quality_miss_is_accepted_as_a_measured_gate_failure() {
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS - 2);
+        let suites = compressed_test_suites(&continuation, &[3]);
+        let quality = receipt_quality_over_repeats(&suites).unwrap();
+        let receipt = compressed_test_builder(quality)
+            .finish()
+            .expect("a validly measured quality miss is an accepted, measured row");
+        let agreement = 1022.0 / 1024.0;
+        let failure = |metric: &str, fixture: &str, repeat: u64, value: f64, threshold: f64| {
+            ReceiptQualityGateFailure {
+                metric: metric.into(),
+                fixture: fixture.into(),
+                repeat,
+                value,
+                threshold,
+                comparison: "minimum".into(),
+            }
+        };
+        let mut expected = Vec::new();
+        for repeat in 0..5 {
+            expected.push(failure(
+                "greedyTokenAgreement",
+                "kernel-fp32-reference",
+                repeat,
+                agreement,
+                0.999,
+            ));
+            if repeat == 3 {
+                expected.push(failure(
+                    "needleRetrieval",
+                    "long-context-needle",
+                    3,
+                    0.0,
+                    1.0,
+                ));
+            }
+        }
+        assert_eq!(
+            receipt.quality.quality_gate,
+            Some(ReceiptQualityGate {
+                passed: false,
+                failures: expected
+            })
+        );
+        assert_eq!(receipt.quality.greedy_token_agreement, agreement);
+        assert_eq!(
+            receipt.quality.greedy_token_agreement_by_repeat,
+            vec![agreement; 5]
+        );
+        // The primary repeat recovered the needle; its receipt-level value is recorded as measured.
+        assert_eq!(receipt.quality.needle_retrieval, 1.0);
+        assert_eq!(
+            receipt.quality.forced_continuation,
+            Some(continuation.clone())
+        );
+        let sealed = receipt_semantic_seal(&receipt)
+            .map(|seal| Receipt {
+                receipt_sha256: seal,
+                ..receipt.clone()
+            })
+            .unwrap();
+        validate_sealed_receipt(&sealed).unwrap();
+        let parsed: Receipt = serde_json::from_slice(&sealed.bytes().unwrap()).unwrap();
+        assert_eq!(parsed.quality.quality_gate, receipt.quality.quality_gate);
+        validate_sealed_receipt(&parsed).unwrap();
+
+        // The gate is exactly the evaluation of the sealed repeat artifacts.
+        let fixtures = sealed_test_repeats(&suites);
+        let repeats = sealed_repeat_quality_metrics(&receipt, &repeat_pairs(&fixtures)).unwrap();
+        assert_eq!(repeats[3].needle_retrieval, 0.0);
+        validate_sealed_quality_gate(&receipt, &repeats).unwrap();
+        let bundle = assemble_artifacts_with_fixtures(receipt.clone(), fixtures).unwrap();
+        let human = String::from_utf8(bundle.human).unwrap();
+        assert!(human.contains(
+            "- Quality gate: FAILED: greedyTokenAgreement repeat 0 = 0.998046875 (minimum 0.999, fixture kernel-fp32-reference);"
+        ), "{human}");
+        assert!(
+            human.contains("needleRetrieval repeat 3 = 0 (minimum 1, fixture long-context-needle)")
+        );
+
+        // A pass can never be claimed over a failing value.
+        let rejects = |edit: &dyn Fn(&mut ReceiptQualityGate), expected: &str| {
+            let mut forged = receipt.clone();
+            edit(forged.quality.quality_gate.as_mut().unwrap());
+            let error = validate_receipt_semantics(&forged).unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        rejects(
+            &|gate| *gate = ReceiptQualityGate { passed: true, failures: Vec::new() },
+            "does not record greedyTokenAgreement repeat 0 = 0.998046875 against the frozen minimum 0.999",
+        );
+        rejects(
+            &|gate| gate.passed = true,
+            "claims passed=true with 6 recorded failure(s)",
+        );
+        rejects(
+            &|gate| gate.failures[0].value = 0.5,
+            "does not record greedyTokenAgreement repeat 0",
+        );
+        rejects(
+            &|gate| gate.failures[0].threshold = 0.9,
+            "not an ordered frozen-threshold miss",
+        );
+        rejects(
+            &|gate| gate.failures.swap(0, 1),
+            "not an ordered frozen-threshold miss",
+        );
+        rejects(
+            &|gate| gate.failures[4].fixture = "kernel-fp32-reference".into(),
+            "not an ordered frozen-threshold miss",
+        );
+        // Repeat 3's needle is invisible in the receipt; only its sealed artifact exposes the miss.
+        let mut hidden = receipt.clone();
+        hidden
+            .quality
+            .quality_gate
+            .as_mut()
+            .unwrap()
+            .failures
+            .retain(|failure| failure.metric != "needleRetrieval");
+        validate_receipt_semantics(&hidden).expect("the receipt alone cannot see repeat 3");
+        assert!(validate_sealed_quality_gate(&hidden, &repeats)
+            .unwrap_err()
+            .contains("is not the gate of its sealed repeats"));
+
+        // A row that meets every threshold records passed with no failures.
+        let clean = compressed_test_suites(
+            &test_forced_continuation(FORCED_CONTINUATION_TOKENS - 1),
+            &[],
+        );
+        let passed = compressed_test_builder(receipt_quality_over_repeats(&clean).unwrap())
+            .finish()
+            .unwrap();
+        assert_eq!(
+            passed.quality.quality_gate,
+            Some(ReceiptQualityGate {
+                passed: true,
+                failures: Vec::new()
+            })
+        );
+        let clean_fixtures = sealed_test_repeats(&clean);
+        validate_sealed_quality_gate(
+            &passed,
+            &sealed_repeat_quality_metrics(&passed, &repeat_pairs(&clean_fixtures)).unwrap(),
+        )
+        .unwrap();
+        // The campaign is gate-failed when any row failed; dense campaigns carry no verdict.
+        assert_eq!(
+            campaign_quality_gate_passed(&[passed.clone(), passed.clone()]),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            campaign_quality_gate_passed(&[passed.clone(), receipt.clone()]),
+            Ok(Some(false))
+        );
+        let dense = builder_test_receipt();
+        assert_eq!(
+            campaign_quality_gate_passed(&[dense.clone(), dense.clone()]),
+            Ok(None)
+        );
+        assert!(campaign_quality_gate_passed(&[dense, passed]).is_err());
+    }
+
+    #[test]
+    fn compressed_integrity_failures_still_refuse_the_row() {
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS);
+        let quality =
+            || receipt_quality_over_repeats(&compressed_test_suites(&continuation, &[])).unwrap();
+        // Kernel parity against the host-fp32 dequantize-then-attend reference is correctness.
+        let mut broken_kernel = quality();
+        broken_kernel.parity_errors = vec![0.5];
+        let error = compressed_test_builder(broken_kernel).finish().unwrap_err();
+        assert!(
+            error
+                .contains("kernel parity failed: metric=parityMaxError value=0.5 threshold=0.0001"),
+            "{error}"
+        );
+        // No forced continuation: the greedy agreement was never measured.
+        let mut unmeasured = quality();
+        unmeasured.forced_continuation = None;
+        let error = compressed_test_builder(unmeasured).finish().unwrap_err();
+        assert!(
+            error.contains("no forced-continuation greedy agreement"),
+            "{error}"
+        );
+        // Too few measured repeats to gate.
+        let mut partial = quality();
+        partial.repeat_metrics.pop();
+        assert!(compressed_test_builder(partial)
+            .finish()
+            .unwrap_err()
+            .contains("five measured repeats"));
+        // Repeats that disagree on the row's one forced continuation.
+        let mut suites = compressed_test_suites(&continuation, &[]);
+        suites[2].forced_continuation = Some(test_forced_continuation(1000));
+        assert!(receipt_quality_over_repeats(&suites)
+            .unwrap_err()
+            .contains("one forced continuation"));
+        let receipt = compressed_test_builder(quality()).finish().unwrap();
+        let refuses = |edit: &dyn Fn(&mut Receipt), expected: &str| {
+            let mut forged = receipt.clone();
+            edit(&mut forged);
+            let error = validate_receipt_semantics(&forged).unwrap_err();
+            assert!(error.contains(expected), "{expected}: {error}");
+        };
+        // Fixture evidence is integrity, named by fixture.
+        refuses(
+            &|r| {
+                r.quality
+                    .fixture_evidence
+                    .get_mut("long-context-needle")
+                    .unwrap()
+                    .passed = false
+            },
+            "fixture evidence failed: fixture=long-context-needle passed=false",
+        );
+        refuses(
+            &|r| {
+                r.quality
+                    .fixture_evidence
+                    .get_mut("structured-tool-call")
+                    .unwrap()
+                    .artifact_sha256 = "A".repeat(64)
+            },
+            "fixture evidence failed: fixture=structured-tool-call artifactSha256=",
+        );
+        refuses(
+            &|r| r.quality.quality_gate = None,
+            "no measured quality-gate record",
+        );
+        refuses(
+            &|r| r.quality.forced_continuation.as_mut().unwrap().matches -= 1,
+            "forced continuation evidence is inconsistent",
+        );
+        refuses(
+            &|r| r.quality.greedy_token_agreement_by_repeat[4] = 0.5,
+            "greedy agreement is not the minimum",
+        );
+        // A dense row is characterization: it can carry neither a gate nor a continuation.
+        let mut dense = builder_test_receipt();
+        dense.quality.quality_gate = receipt.quality.quality_gate.clone();
+        assert!(validate_receipt_semantics(&dense)
+            .unwrap_err()
+            .contains("only on compressed receipts"));
+        // Sealed artifacts must carry the receipt's forced continuation and its counts.
+        let suites = compressed_test_suites(&continuation, &[]);
+        let fixtures = sealed_test_repeats(&suites);
+        let mut pairs = repeat_pairs(&fixtures);
+        let mut forged: serde_json::Value = serde_json::from_slice(pairs[4].1).unwrap();
+        forged["evidence"]["forcedContinuation"]["matches"] = serde_json::json!(1000);
+        let forged = serde_json::to_vec(&forged).unwrap();
+        pairs[4].1 = &forged;
+        assert!(sealed_repeat_quality_metrics(&receipt, &pairs)
+            .unwrap_err()
+            .contains("repeat 1 kernel fixture forced continuation"));
+        let mut miscounted: serde_json::Value =
+            serde_json::from_slice(repeat_pairs(&fixtures)[0].1).unwrap();
+        miscounted["evidence"]["greedyMatches"] = serde_json::json!(1000);
+        let miscounted = serde_json::to_vec(&miscounted).unwrap();
+        let mut pairs = repeat_pairs(&fixtures);
+        pairs[0].1 = &miscounted;
+        assert!(sealed_repeat_quality_metrics(&receipt, &pairs)
+            .unwrap_err()
+            .contains("greedy counts"));
+        let mut parity: serde_json::Value =
+            serde_json::from_slice(repeat_pairs(&fixtures)[8].1).unwrap();
+        parity["evidence"]["parityErrors"] = serde_json::json!([0.5]);
+        let parity = serde_json::to_vec(&parity).unwrap();
+        let mut pairs = repeat_pairs(&fixtures);
+        pairs[8].1 = &parity;
+        let repeats = sealed_repeat_quality_metrics(&receipt, &pairs).unwrap();
+        assert!(validate_sealed_quality_gate(&receipt, &repeats)
+            .unwrap_err()
+            .contains("kernel parity failed: metric=parityMaxError value=0.5 threshold=0.0001 comparison=maximum fixture=kernel-fp32-reference repeat=2"));
     }
 
     #[test]
@@ -11097,6 +14289,25 @@ pub(crate) mod tests {
         compress_test_receipt(&mut receipt, block);
         validate_sealed_receipt(&receipt).expect("a reasoned dense coordinate is a valid row");
 
+        // A method is bound to its code width: 2-bit evidence cannot become a 4-bit receipt.
+        assert_eq!(
+            compressed_receipt_block(CompressedKvMethod::GroupAffine4, &primary, &[&primary])
+                .unwrap_err(),
+            "compressed arm for group-affine-4 produced 2-bit evidence"
+        );
+        // ...and to its reader identity: 4-bit evidence under the 2-bit identity is refused.
+        for item in &mut primary.packed_evidence {
+            item.bits = 4;
+        }
+        assert_eq!(
+            compressed_receipt_block(CompressedKvMethod::GroupAffine4, &primary, &[&primary])
+                .unwrap_err(),
+            "compressed arm for group-affine-4 produced sc-20676-packed-group-affine-v1 evidence"
+        );
+        for item in &mut primary.packed_evidence {
+            item.bits = 2;
+        }
+
         // A primary that never closed its coordinate scope cannot be classified.
         primary.coordinate_scope = None;
         assert!(
@@ -11104,6 +14315,51 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("no coordinate-operation scope")
         );
+    }
+
+    #[test]
+    fn compressed_receipt_method_is_bound_to_its_width_and_identity() {
+        let validate = |edit: &dyn Fn(&mut ReceiptCompression)| {
+            let mut block = test_compression_block();
+            edit(&mut block);
+            let mut receipt = builder_test_receipt();
+            compress_test_receipt(&mut receipt, block);
+            validate_sealed_receipt(&receipt)
+        };
+        let set = |method: &'static str, bits: u64, identity: &'static str| {
+            move |block: &mut ReceiptCompression| {
+                block.method = method.into();
+                block.bits = bits;
+                block.representation_identity = identity.into();
+            }
+        };
+        const B2: &str = "sc-20676-packed-group-affine-v1";
+        const B4: &str = "sc-20676-packed-group-affine-b4-v1";
+        const B8: &str = "sc-20676-packed-group-affine-b8-v1";
+        let table = [
+            ("group-affine", 2, B2),
+            ("group-affine-4", 4, B4),
+            ("group-affine-8", 8, B8),
+        ];
+        // Every (method, bits, identity) combination: only the method's own pair validates.
+        for (method, own_bits, own_identity) in table {
+            for (_, bits, _) in table {
+                for (_, _, identity) in table {
+                    let result = validate(&set(method, bits, identity));
+                    if bits == own_bits && identity == own_identity {
+                        result.unwrap();
+                    } else {
+                        let error = result.unwrap_err();
+                        assert!(
+                            error.contains(&format!("compressed method {method} is")),
+                            "{method}/{bits}/{identity}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        let error = validate(&set("rvq-unwired", 2, B2)).unwrap_err();
+        assert!(error.contains("unknown compressed KV method"), "{error}");
     }
 
     #[test]
@@ -11125,6 +14381,43 @@ pub(crate) mod tests {
             .unwrap(),
             Some(CompressedKvMethod::GroupAffine)
         );
+        assert_eq!(
+            compressed_mode_flags(&args(&[
+                "parent",
+                "--mode",
+                "compressed",
+                "--kv-method",
+                "group-affine-4"
+            ]))
+            .unwrap(),
+            Some(CompressedKvMethod::GroupAffine4)
+        );
+        for method in CompressedKvMethod::ALL {
+            assert_eq!(CompressedKvMethod::parse(method.id()), Ok(method));
+        }
+        assert_eq!(
+            CompressedKvMethod::GroupAffine.representation_identity(),
+            "sc-20676-packed-group-affine-v1"
+        );
+        assert_eq!(
+            CompressedKvMethod::GroupAffine4.representation_identity(),
+            "sc-20676-packed-group-affine-b4-v1"
+        );
+        assert_eq!(
+            CompressedKvMethod::GroupAffine8.representation_identity(),
+            "sc-20676-packed-group-affine-b8-v1"
+        );
+        assert_eq!(
+            compressed_mode_flags(&args(&[
+                "parent",
+                "--mode",
+                "compressed",
+                "--kv-method",
+                "group-affine-8"
+            ]))
+            .unwrap(),
+            Some(CompressedKvMethod::GroupAffine8)
+        );
         for bad in [
             &["--mode", "compressed"][..],
             &["--kv-method", "group-affine"],
@@ -11143,6 +14436,13 @@ pub(crate) mod tests {
             resume_identity_mode(&identity).unwrap(),
             Some(CompressedKvMethod::GroupAffine)
         );
+        let two_bit = canonical_json_bytes(&identity).unwrap();
+        bind_resume_mode(&mut identity, Some(CompressedKvMethod::GroupAffine4));
+        assert_eq!(
+            resume_identity_mode(&identity).unwrap(),
+            Some(CompressedKvMethod::GroupAffine4)
+        );
+        assert_ne!(canonical_json_bytes(&identity).unwrap(), two_bit);
         identity["kvMethod"] = serde_json::Value::Null;
         assert!(resume_identity_mode(&identity).is_err());
     }
@@ -11150,18 +14450,17 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn group_affine_fused_reader_parity_is_within_the_frozen_contract() {
-        let errors = CompressedKvMethod::GroupAffine
-            .arm()
-            .unwrap()
-            .kernel_parity_errors()
-            .unwrap();
-        // Decode (S_q = 1), causal prefill chunk (S_q = 5), and split-KV decode (S_q = 1) cases.
-        assert_eq!(errors.len(), 4 * 128 * (1 + 5 + 1));
-        let max = errors.iter().copied().fold(0.0, f64::max);
-        assert!(
-            max <= COMPRESSED_PARITY_MAX_ERROR,
-            "fused reader parity {max}"
-        );
+        for method in CompressedKvMethod::ALL {
+            let errors = method.arm().unwrap().kernel_parity_errors().unwrap();
+            // Decode (S_q = 1), causal prefill chunk (S_q = 5), and split-KV decode (S_q = 1).
+            assert_eq!(errors.len(), 4 * 128 * (1 + 5 + 1));
+            let max = errors.iter().copied().fold(0.0, f64::max);
+            assert!(
+                max <= COMPRESSED_PARITY_MAX_ERROR,
+                "{}: fused reader parity {max}",
+                method.id()
+            );
+        }
     }
 
     #[test]
@@ -11188,6 +14487,15 @@ pub(crate) mod tests {
             sample.mlx.peak_bytes = 1028;
             sample.phys_footprint_peak_bytes = 2000;
         }
+        (
+            padded.memory.dense_kv_share_bps,
+            padded.memory.below_memory_material_share,
+        ) = dense_kv_share(
+            1024,
+            padded.memory.phase_samples[2].phys_footprint_bytes,
+            &padded.matrix.context_band,
+        )
+        .unwrap();
         padded.receipt_sha256 = receipt_semantic_seal(&padded).unwrap();
         validate_receipt_semantics(&padded).expect("physical block capacity reconciles exactly");
         let mut loosened_release = receipt.clone();
@@ -11197,20 +14505,42 @@ pub(crate) mod tests {
             .phys_footprint_tolerance_bytes += 1;
         assert_eq!(
             validate_receipt_semantics(&loosened_release).unwrap_err(),
-            "release tolerances differ from the frozen platform contract"
+            "release tolerances or residuals differ from the platform contract"
         );
-        let mut unreleased_active = receipt.clone();
-        unreleased_active
-            .memory
-            .phase_samples
-            .last_mut()
-            .unwrap()
-            .mlx
-            .active_bytes = 4;
-        let release_error = validate_receipt_semantics(&unreleased_active).unwrap_err();
+        // A small allocator residual is recorded and accepted; a material leak still fails.
+        let released_with = |active: u64, cache: u64| {
+            let mut released = receipt.clone();
+            let end = released.memory.phase_samples.last_mut().unwrap();
+            end.mlx.active_bytes = active;
+            end.mlx.cache_bytes = cache;
+            end.mlx.peak_bytes = end.mlx.peak_bytes.max(active);
+            end.phys_footprint_bytes = end.phys_footprint_bytes.max(active + cache);
+            end.phys_footprint_peak_bytes = end.phys_footprint_peak_bytes.max(active + cache);
+            released.memory.release = release_evidence(
+                &released.memory.phase_samples[1],
+                released.memory.phase_samples.last().unwrap(),
+            );
+            released
+        };
+        let slack = post_release_mlx_slack_bytes(3);
+        assert_eq!(slack, POST_RELEASE_MLX_SLACK_FLOOR_BYTES);
+        let residual = released_with(3 + slack, 0);
+        assert_eq!(residual.memory.release.mlx_active_residual_bytes, slack);
+        validate_receipt_semantics(&residual).expect("a residual within slack is recorded");
+        let mut unrecorded = residual.clone();
+        unrecorded.memory.release.mlx_active_residual_bytes = 0;
+        assert!(validate_receipt_semantics(&unrecorded).is_err());
+        let leak = released_with(3 + slack + 1, 0);
+        assert!(!leak.memory.release.verified);
+        let release_error = validate_receipt_semantics(&leak).unwrap_err();
         assert!(
-            release_error.contains("endMlxActive=4, weightsLoadedMlxActive=3, activeTolerance=0")
+            release_error.contains("release did not return within tolerance"),
+            "{release_error}"
         );
+        let cache_leak = released_with(3, slack + 1);
+        assert!(validate_receipt_semantics(&cache_leak).is_err());
+        assert_eq!(post_release_mlx_slack_bytes(4_000_000_000), 4_000_000);
+        assert_eq!(post_release_mlx_slack_bytes(4_000_000_001), 4_000_001);
         let mut reference_only_memory = receipt.clone();
         reference_only_memory.memory.phase_samples[0]
             .mlx
@@ -11246,6 +14576,87 @@ pub(crate) mod tests {
         let mut timing_tampered = receipt.clone();
         timing_tampered.timings.decode_tokens_per_second += 1.0;
         assert!(validate_receipt_semantics(&timing_tampered).is_err());
+        // Each sample's throughput is exactly its recorded fixed-length steady decode.
+        let steady_error = |edit: &dyn Fn(&mut ReceiptTimingSample)| {
+            let mut tampered = receipt.clone();
+            edit(&mut tampered.timings.samples[2]);
+            validate_receipt_semantics(&tampered).unwrap_err()
+        };
+        for edit in [
+            &(|s: &mut ReceiptTimingSample| s.steady_decode_ms *= 2.0) as &dyn Fn(&mut _),
+            &|s: &mut ReceiptTimingSample| {
+                // A short EOS-terminated generation, internally consistent, is still refused.
+                s.steady_decode_generated_tokens = 24;
+                s.steady_decode_timed_tokens = 23;
+                s.decode_tokens_per_second = 23.0 * 1_000.0 / s.steady_decode_ms;
+            },
+            &|s: &mut ReceiptTimingSample| s.steady_decode_timed_tokens = STEADY_DECODE_TOKENS,
+            &|s: &mut ReceiptTimingSample| s.steady_decode_prompt_tokens = 4_000,
+            &|s: &mut ReceiptTimingSample| s.steady_decode_forced_stop_tokens = 257,
+        ] {
+            let error = steady_error(edit);
+            assert!(error.contains("steady decode"), "{error}");
+        }
+        // Power mode and thermal state are recorded at row start, each timing sample, and row
+        // end. Only a throttled row start is refused; later changes are recorded and flagged.
+        let host_error = |edit: &dyn Fn(&mut ReceiptProvenance)| {
+            let mut tampered = receipt.clone();
+            edit(&mut tampered.provenance);
+            validate_receipt_semantics(&tampered).unwrap_err()
+        };
+        let mut warmed = receipt.clone();
+        warmed.provenance.host_states[1].thermal_state = "serious".into();
+        warmed.provenance.host_states[1].throttled = true;
+        warmed.provenance.host_states[1].power_mode = "low-power".into();
+        warmed.provenance.thermal_changed_during_row = true;
+        warmed.provenance.power_mode_changed_during_row = true;
+        validate_receipt_semantics(&warmed).expect("a row-end change is recorded, not refused");
+        let mut sample_change = receipt.clone();
+        sample_change.timings.samples[2].host_state.thermal_state = "fair".into();
+        assert!(validate_receipt_semantics(&sample_change)
+            .unwrap_err()
+            .contains("change flags do not recompute"));
+        sample_change.provenance.thermal_changed_during_row = true;
+        validate_receipt_semantics(&sample_change).expect("a timing-sample change is recorded");
+        let mut sample_order = receipt.clone();
+        sample_order.timings.samples.swap(0, 4);
+        assert!(validate_receipt_semantics(&sample_order).is_err());
+        for edit in [
+            &(|p: &mut ReceiptProvenance| p.host_states[1].thermal_state = "fair".into())
+                as &dyn Fn(&mut _),
+            &|p: &mut ReceiptProvenance| p.host_states[1].power_mode = "low-power".into(),
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[0].thermal_state = "critical".into();
+                p.host_states[0].throttled = true;
+                p.thermal_state = "critical".into();
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[0].pmset_thermal_raw = "CPU_Speed_Limit = 50\n".into();
+                p.host_states[0].cpu_speed_limit = Some(50);
+                p.host_states[0].throttled = true;
+            },
+            &|p: &mut ReceiptProvenance| p.host_states[1].throttled = true,
+            &|p: &mut ReceiptProvenance| p.thermal_state = "fair".into(),
+            &|p: &mut ReceiptProvenance| p.host_states.reverse(),
+            &|p: &mut ReceiptProvenance| {
+                p.host_states.pop();
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[0].captured_at = "2026-01-01T00:00:03.000Z".into()
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.host_states[1].captured_at = "2026-01-01T00:00:05.000Z".into()
+            },
+            &|p: &mut ReceiptProvenance| {
+                p.power_mode = "nominal".into();
+                for state in &mut p.host_states {
+                    state.power_mode = "nominal".into();
+                }
+            },
+        ] {
+            let error = host_error(edit);
+            assert!(error.contains("host power/thermal"), "{error}");
+        }
         let mut unstable_timing = receipt.clone();
         unstable_timing
             .timings
@@ -11260,7 +14671,7 @@ pub(crate) mod tests {
         quality_tampered.quality.parity_max_error = 0.1;
         assert!(validate_receipt_semantics(&quality_tampered)
             .unwrap_err()
-            .contains("parityMaxError=0.1"));
+            .contains("kernel parity failed: metric=parityMaxError value=0.1 threshold=0.0001"));
         // Contract v3: compressed quality is gated only against the same-weights dense-KV run.
         let same_weights = |receipt: &mut Receipt| {
             for name in REQUIRED_FIXTURES {
@@ -11321,6 +14732,35 @@ pub(crate) mod tests {
             .static_footprint_floor_bytes =
             over_cap_estimate.memory.admission.child_footprint_cap_bytes + 1;
         assert!(validate_receipt_semantics(&over_cap_estimate).is_err());
+        // A receipt must carry a host measurement that recomputes and covers cap plus reserve.
+        let mut unmeasured = receipt.clone();
+        unmeasured.memory.admission.host_memory_components = None;
+        assert!(validate_receipt_semantics(&unmeasured)
+            .unwrap_err()
+            .contains("host memory components"));
+        let mut tampered_host = receipt.clone();
+        tampered_host
+            .memory
+            .admission
+            .host_memory_components
+            .as_mut()
+            .unwrap()
+            .reclaimable_file_pages = 90_000;
+        assert!(validate_receipt_semantics(&tampered_host)
+            .unwrap_err()
+            .contains("recompute"));
+        let mut short_host = receipt.clone();
+        short_host.memory.admission.host_memory_components =
+            campaign_supervisor::HostMemory::from_pages(
+                16_384,
+                campaign_supervisor::VmStatPages {
+                    free: 100_000,
+                    ..Default::default()
+                },
+            );
+        assert!(validate_receipt_semantics(&short_host)
+            .unwrap_err()
+            .contains("below reserve plus child cap"));
         // Artifacts: the compressed denominator is bound to the candidate's own inventory.
         let binding = |receipt: &Receipt, reference_inventory: &str| {
             let arm = |inventory: &str, session: &str| {
@@ -11434,8 +14874,21 @@ pub(crate) mod tests {
             repeats(&[&hit, &shared_miss], &[&valid_tool, &shared_invalid_tool]),
         )
         .unwrap();
-        // Per-artifact derivation: flag must follow the same-weights dense run, a non-discriminating
-        // compressed repeat must match the dense output, and compressed repeats must all pass.
+        // A validly measured compressed miss (dense recovered / emitted the call, compressed did
+        // not) is gate evidence, not a malformed artifact: its derivation is accepted here and the
+        // miss is recorded by the quality gate.
+        for (fixture, measured_miss) in [
+            ("long-context-needle", needle(false, true, false, 0, true)),
+            ("structured-tool-call", tool(true, true, false, true)),
+        ] {
+            validate_repeat_discrimination(
+                &all_discriminating,
+                [(fixture, measured_miss.as_slice())],
+            )
+            .unwrap_or_else(|error| panic!("{fixture} measured miss refused: {error}"));
+        }
+        // Per-artifact derivation: flag must follow the same-weights dense run and a
+        // non-discriminating compressed repeat must match the dense output.
         for (fixture, forged, flag) in [
             // Shared miss whose outputs differ from dense, counted as a match.
             (
@@ -11449,16 +14902,14 @@ pub(crate) mod tests {
                 needle(true, true, true, 1, false),
                 false,
             ),
-            // Discriminating compressed repeat that lost the needle.
+            // Discriminating compressed repeat that lost the needle, counted as a match.
             (
                 "long-context-needle",
-                needle(false, true, false, 0, true),
+                needle(false, true, false, 1, true),
                 true,
             ),
             // Dense tool call invalid, yet flagged discriminating.
             ("structured-tool-call", tool(true, false, true, true), true),
-            // Compressed tool call diverged from dense.
-            ("structured-tool-call", tool(true, true, false, true), true),
         ] {
             // The receipt carries the artifact's own flag, so only the derivation can fail.
             let mut claimed = compressed.clone();
@@ -11630,6 +15081,31 @@ pub(crate) mod tests {
         non_material.geometry.context_payload_tokens =
             non_material.geometry.context_target_tokens / 2;
         assert!(validate_receipt_semantics(&non_material).is_err());
+        // With its share recorded, the same memory-material row validates: a low dense-KV share
+        // of the prefill footprint is flagged, never refused.
+        let mut recorded = non_material.clone();
+        (
+            recorded.memory.dense_kv_share_bps,
+            recorded.memory.below_memory_material_share,
+        ) = dense_kv_share(
+            recorded.memory.dense_theoretical_kv_bytes,
+            recorded.memory.phase_samples[2].phys_footprint_bytes,
+            "memory-material",
+        )
+        .unwrap();
+        assert!(recorded.memory.below_memory_material_share);
+        let coordinate = format!(
+            "{}-{}-{}-{}-{}",
+            recorded.matrix.family,
+            recorded.matrix.context_band,
+            recorded.matrix.request_mode,
+            recorded.matrix.prefill_mode,
+            recorded.matrix.process_temperature
+        );
+        for evidence in &mut recorded.timings.compile_attribution.probe_evidence {
+            evidence.matrix_coordinate = coordinate.clone();
+        }
+        validate_receipt_semantics(&recorded).expect("a low share is recorded, not refused");
         let mut not_near_fit = receipt.clone();
         not_near_fit.matrix.context_band = "fit-boundary".into();
         not_near_fit.geometry.context_target_tokens =
@@ -11866,31 +15342,545 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn thermal_probe_requires_an_explicit_nominal_record() {
+    fn pmset_thermal_text_is_recorded_and_only_the_speed_limit_is_read() {
+        assert_eq!(pmset_cpu_speed_limit(PMSET_NOMINAL_THERMAL).unwrap(), None);
+        // Unknown note lines (a new macOS release) are tolerated and kept verbatim.
         assert_eq!(
-            normalize_pmset_thermal("Thermal Pressure: 0\n").unwrap(),
-            "nominal"
-        );
-        assert_eq!(
-            normalize_pmset_thermal(
-                "Note: No thermal warning level has been recorded\n\
-                 Note: No performance warning level has been recorded\n\
-                 Note: No CPU power status has been recorded\n"
+            pmset_cpu_speed_limit(
+                "Note: No thermal warning level has been recorded\nNote: something new\n"
             )
             .unwrap(),
-            "nominal"
+            None
+        );
+        assert_eq!(
+            pmset_cpu_speed_limit(
+                "CPU_Scheduler_Limit \t= 100\nCPU_Available_CPUs \t= 12\nCPU_Speed_Limit \t= 70\n"
+            )
+            .unwrap(),
+            Some(70)
         );
         for invalid in [
-            "Thermal Pressure: 1\n",
-            "Thermal Level: 0\nnot nominal\n",
-            "nominal\n",
-            "Thermal Pressure: 0\nthrottling active\n",
-            "Note: No thermal warning level has been recorded\n",
+            "CPU_Speed_Limit = fast\n",
+            "CPU_Speed_Limit = 100\nCPU_Speed_Limit = 90\n",
+        ] {
+            assert!(pmset_cpu_speed_limit(invalid).is_err(), "{invalid:?}");
+        }
+        assert!(!host_state_throttled("fair", Some(100)));
+        assert!(host_state_throttled("nominal", Some(99)));
+        assert!(host_state_throttled("serious", None));
+        assert!(host_state_throttled("critical", Some(100)));
+    }
+
+    const PMSET_NOMINAL_THERMAL: &str = "Note: No thermal warning level has been recorded\n\
+         Note: No performance warning level has been recorded\n\
+         Note: No CPU power status has been recorded\n";
+
+    fn pmset_in_use(settings: &str) -> String {
+        format!(
+            "System-wide power settings:\nCurrently in use:\n standby              1\n{settings} womp                 1\n"
+        )
+    }
+
+    /// The recorded power mode is the ACTIVE energy mode, not the per-source profile dump.
+    #[test]
+    fn power_mode_is_the_active_pmset_setting() {
+        for (settings, expected) in [
+            (" powermode            0\n", "automatic"),
+            (" powermode            1\n", "low-power"),
+            (" powermode            2\n", "high-power"),
+            (" lowpowermode         0\n", "automatic"),
+            (" lowpowermode         1\n", "low-power"),
+            (" highpowermode        1\n lowpowermode 0\n", "high-power"),
+        ] {
+            assert_eq!(
+                normalize_pmset_power_mode(&pmset_in_use(settings)).unwrap(),
+                expected,
+                "{settings:?}"
+            );
+        }
+        for invalid in [
+            pmset_in_use(""),
+            pmset_in_use(" powermode            3\n"),
+            pmset_in_use(" powermode            0\n lowpowermode 1\n"),
+            pmset_in_use(" lowpowermode 1\n highpowermode 1\n"),
+            pmset_in_use(" powermode 0\n powermode 2\n"),
+            // `pmset -g custom` lists every power source's profile, not the active mode.
+            "Battery Power:\n powermode            1\nAC Power:\n powermode            0\n".into(),
         ] {
             assert!(
-                normalize_pmset_thermal(invalid).is_err(),
-                "invalid thermal probe unexpectedly accepted: {invalid:?}"
+                normalize_pmset_power_mode(&invalid).is_err(),
+                "{invalid:?} was accepted"
             );
+        }
+    }
+
+    /// A throttled row START refuses the row; every later state is recorded and flagged.
+    #[test]
+    fn only_a_throttled_row_start_refuses_the_row() {
+        let pmset = pmset_in_use(" powermode            0\n");
+        let state = |boundary: &str, therm: &str, process: i64| {
+            host_state_from_probes(
+                boundary,
+                "2026-01-01T00:00:00Z".into(),
+                &pmset,
+                therm,
+                process,
+            )
+        };
+        let nominal = state("row-start", PMSET_NOMINAL_THERMAL, 0).unwrap();
+        assert_eq!(
+            (
+                nominal.power_mode.as_str(),
+                nominal.thermal_state.as_str(),
+                nominal.throttled
+            ),
+            ("automatic", "nominal", false)
+        );
+        assert_eq!(nominal.pmset_thermal_raw, PMSET_NOMINAL_THERMAL);
+        refuse_throttled_row_start(&nominal).unwrap();
+        let fair = state("row-start", PMSET_NOMINAL_THERMAL, 1).unwrap();
+        refuse_throttled_row_start(&fair).expect("fair is not a throttle signal");
+        for (therm, process) in [
+            (PMSET_NOMINAL_THERMAL, 2),
+            (PMSET_NOMINAL_THERMAL, 3),
+            ("CPU_Speed_Limit \t= 80\n", 0),
+        ] {
+            let throttled = state("row-start", therm, process).unwrap();
+            assert!(throttled.throttled);
+            let error = refuse_throttled_row_start(&throttled).unwrap_err();
+            assert!(error.contains("refused before it runs"), "{error}");
+            // At row end the same observation is recorded, not refused.
+            let end = state("row-end", therm, process).unwrap();
+            assert_eq!(host_state_changes(&nominal, [&end]), (true, false));
+        }
+        let low_power = host_state_from_probes(
+            "row-end",
+            "t".into(),
+            &pmset_in_use(" powermode            1\n"),
+            PMSET_NOMINAL_THERMAL,
+            0,
+        )
+        .unwrap();
+        assert_eq!(host_state_changes(&nominal, [&low_power]), (false, true));
+        assert_eq!(host_state_changes(&nominal, [&nominal]), (false, false));
+        for (therm, process, boundary) in [
+            (PMSET_NOMINAL_THERMAL, 4, "row-start"),
+            (PMSET_NOMINAL_THERMAL, 0, "mid-row"),
+            ("CPU_Speed_Limit = x\n", 0, "row-start"),
+        ] {
+            assert!(
+                state(boundary, therm, process).is_err(),
+                "{therm:?}/{process}/{boundary} was accepted"
+            );
+        }
+    }
+
+    /// Decode throughput is the repeat's fixed-length steady decode, whatever the coordinate's
+    /// own phase deltas are; a short, EOS-terminated generation is not a steady-decode sample.
+    #[test]
+    fn decode_throughput_is_the_fixed_length_steady_decode_not_a_phase_delta() {
+        let observation = ProductObservations {
+            snapshot: SnapshotInventory {
+                root: PathBuf::new(),
+                files: Vec::new(),
+                bytes: 1,
+                sha256: "b".repeat(64),
+            },
+            geometry: ProductGeometry {
+                query_heads: 2,
+                kv_heads: 1,
+                head_dimension: 64,
+                layers: 1,
+                element_bytes: 2,
+            },
+            phases: Vec::new(),
+            // A chunked coordinate: `first-token` -> `decode-steady` is one token, 0.02 ms apart.
+            phase_elapsed_ms: vec![0.0, 1.0, 3.0, 4.0, 4.02, 6.0, 7.0, 8.0],
+            allocations: Vec::new(),
+            prefill_logits: Vec::new(),
+            token_probabilities: Vec::new(),
+            session_id: "session".into(),
+            cache_state_version: 1,
+            operations: Vec::new(),
+            load_elapsed_ms: 10.0,
+            prefill_peak_window: ReceiptPeakWindow {
+                started_at: "2026-01-01T00:00:00Z".into(),
+                baseline_active_bytes: 1,
+                reset_peak_bytes: 0,
+            },
+            cache_live_tokens: 32,
+            cache_capacity_tokens: 256,
+            packed_evidence: Vec::new(),
+            dense_fallbacks: Vec::new(),
+            coordinate_scope: None,
+        };
+        let timing =
+            timing_from_product_observation(&observation, &test_steady_decode(1_000.0), "cold")
+                .unwrap();
+        // 255 timed tokens in 1000 ms; the phase deltas still supply prefill/TTFT/first token.
+        let expected = RawTiming {
+            load_ms: 10.0,
+            prefill_ms: 2.0,
+            ttft_ms: 1.0,
+            first_token_ms: 4.0,
+            decode_tokens_per_second: 255.0,
+            steady_decode: test_steady_decode(1_000.0),
+            host_state: None,
+        };
+        assert_eq!(timing, expected);
+        let eos_terminated = SteadyDecodeMeasurement {
+            generated_tokens: 24,
+            timed_tokens: 23,
+            ..test_steady_decode(100.0)
+        };
+        assert!(timing_from_product_observation(&observation, &eos_terminated, "cold").is_err());
+    }
+
+    /// A phase stamp is the observer's product clock: synchronous memory sampling (the
+    /// `proc_pid_rusage` read) is subtracted, so it can never be charged to a phase delta.
+    #[test]
+    fn phase_clock_excludes_the_observers_own_memory_sampling() {
+        let pid = std::process::id();
+        let sample = |bytes| MemorySample {
+            captured_at: timestamp_now(),
+            pid,
+            current_bytes: bytes,
+            peak_bytes: bytes,
+            mlx_active_bytes: bytes,
+            mlx_cache_bytes: 0,
+            mlx_peak_bytes: bytes,
+        };
+        let mut observer = ProductObserver::new();
+        observer.load_boundary = Some((sample(1), sample(2)));
+        Observer::phase(&mut observer, "process-start");
+        // A sampling interval no test run can reach: charged to a phase, it would dominate.
+        observer.sampling_elapsed_ms += 1.0e12;
+        Observer::phase(&mut observer, "weights-loaded");
+        let [start, loaded] = observer.phase_elapsed_ms[..] else {
+            panic!("two phases were stamped");
+        };
+        // Clock-free in substance: the injected interval exceeds any wall time this test can see,
+        // so only a stamp that failed to subtract it could order these the other way.
+        assert!(loaded < start, "{start} -> {loaded}");
+    }
+
+    /// Greedy agreement is teacher-forced: one argmax flip is one mismatch, not a cascade. The
+    /// free-running first divergence is recorded beside it.
+    #[test]
+    fn greedy_agreement_is_teacher_forced_and_divergence_is_recorded() {
+        let reference = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+        // The candidate's own choice at every reference position: one flip at position 1.
+        let forced_choices = [5, 99, 7, 8, 9, 10, 11, 12, 13, 14];
+        assert_eq!(
+            teacher_forced_agreement(&forced_choices, &reference, &[]),
+            (9, 10)
+        );
+        // A shorter forced run counts the unreached positions as mismatches.
+        assert_eq!(
+            teacher_forced_agreement(&forced_choices[..4], &reference, &[]),
+            (3, 10)
+        );
+        // Free running, the same flip cascades: every later token differs.
+        let free_running = [5, 99, 1, 2, 3, 4, 0, 0, 0, 0];
+        assert_eq!(
+            teacher_forced_agreement(&free_running, &reference, &[]),
+            (1, 10)
+        );
+        // The reference stream keeps its stop token: at that position the candidate agrees when
+        // it also stops (with any stop token), and disagrees when it keeps generating.
+        let stopped = [5, 6, 2];
+        assert_eq!(
+            teacher_forced_agreement(&[5, 6, 3], &stopped, &[2, 3]),
+            (3, 3)
+        );
+        assert_eq!(
+            teacher_forced_agreement(&[5, 6, 7], &stopped, &[2, 3]),
+            (2, 3)
+        );
+        assert_eq!(teacher_forced_agreement(&[5, 6], &stopped, &[2, 3]), (2, 3));
+        assert_eq!(first_divergence(&free_running, &reference), Some(1));
+        assert_eq!(first_divergence(&reference, &reference), None);
+        assert_eq!(first_divergence(&reference[..3], &reference), Some(3));
+        assert_eq!(first_divergence(&[], &[1]), Some(0));
+    }
+
+    /// The forced pass runs once per distinct reference stream; its compressed arm must stay on
+    /// the fused reader.
+    #[test]
+    fn forced_passes_are_deduplicated_and_must_stay_compressed() {
+        let streams = vec![vec![1, 2], vec![1, 2], vec![3], vec![1, 2], vec![3]];
+        let mut passes = Vec::new();
+        let forced = force_distinct_streams::<String>(&streams, |stream| {
+            passes.push(stream.to_vec());
+            Ok(stream.iter().map(|token| token + 10).collect())
+        })
+        .unwrap();
+        assert_eq!(passes, vec![vec![1, 2], vec![3]]);
+        assert_eq!(
+            forced,
+            vec![vec![11, 12], vec![11, 12], vec![13], vec![11, 12], vec![13]]
+        );
+        let fused = crate::primitives::PackedCacheEvidence {
+            accepted_direct_calls: 3,
+            ..Default::default()
+        };
+        forced_pass_stayed_compressed(std::slice::from_ref(&fused), &[]).unwrap();
+        let edits: [fn(&mut crate::primitives::PackedCacheEvidence); 5] = [
+            |e| e.accepted_direct_calls = 0,
+            |e| e.dense_active = true,
+            |e| e.full_cache_dequantizations = 1,
+            |e| e.failed_dispatches = 1,
+            |e| {
+                e.fallback_reasons
+                    .push(("decode".into(), "additive mask".into()))
+            },
+        ];
+        for edit in edits {
+            let mut evidence = fused.clone();
+            edit(&mut evidence);
+            assert!(forced_pass_stayed_compressed(&[evidence], &[]).is_err());
+        }
+        assert!(forced_pass_stayed_compressed(&[], &[]).is_err());
+        assert!(forced_pass_stayed_compressed(
+            std::slice::from_ref(&fused),
+            &[("chunked-prefix-seed".into(), "dense store".into())]
+        )
+        .is_err());
+    }
+
+    /// The receipt's greedy agreement is the minimum over the repeats; each is recorded.
+    #[test]
+    fn greedy_agreement_gates_on_the_weakest_repeat() {
+        let mut receipt = builder_test_receipt();
+        receipt.quality.greedy_token_agreement_by_repeat = vec![1.0, 0.9, 1.0, 1.0, 0.95];
+        receipt.quality.greedy_token_agreement = 0.9;
+        validate_receipt_semantics(&receipt).expect("minimum recorded");
+        let mut not_min = receipt.clone();
+        not_min.quality.greedy_token_agreement = 1.0;
+        assert!(validate_receipt_semantics(&not_min)
+            .unwrap_err()
+            .contains("minimum over the five"));
+        let mut short = receipt.clone();
+        short.quality.greedy_token_agreement_by_repeat.pop();
+        assert!(validate_receipt_semantics(&short).is_err());
+    }
+
+    // Helpers keep the estimate test's assertions free of clock-shaped names (they read fixture
+    // arithmetic, not a clock).
+    fn epoch(value: &str) -> Option<f64> {
+        utc_timestamp_seconds(value)
+    }
+
+    /// A synthetic completed Llama-3.2-3B-shaped row: `wall` total, `prefill` per sequence.
+    fn completed_row(
+        band: &str,
+        request_mode: &str,
+        prefill_mode: &str,
+        temperature: &str,
+        target: u64,
+        wall: f64,
+        prefill: f64,
+    ) -> RowDurationBasis {
+        RowDurationBasis {
+            coordinate: format!("llama-{band}-{request_mode}-{prefill_mode}-{temperature}"),
+            family: "llama".into(),
+            context_window_tokens: 131_072,
+            context_target_tokens: target,
+            wall_seconds: wall,
+            prefill_seconds: prefill,
+            work: row_work(temperature, request_mode, prefill_mode),
+            // 1.8 GB of 4.5-bit weights over 2 x 28 layers x 24 heads x 128.
+            attention_crossover_tokens: 1.8e9 * 8.0 / 4.5 / (2.0 * 28.0 * 24.0 * 128.0),
+        }
+    }
+
+    fn predicted(band: &str, history: &[RowDurationBasis]) -> Option<(u64, u64, u64, String)> {
+        estimate_row_seconds(
+            "llama",
+            band,
+            row_work("warm", "single", "single-shot"),
+            history,
+        )
+        .map(|e| {
+            (
+                e.seconds.round() as u64,
+                e.fixed_seconds.round() as u64,
+                e.prefill_seconds.round() as u64,
+                e.basis_coordinate,
+            )
+        })
+    }
+
+    /// The estimate scales only the measured full-context prefills of the nearest completed
+    /// same-family row; fixed costs are not scaled by context. The 32 -> 1024 -> 32768 -> 130560
+    /// progression.
+    #[test]
+    fn row_duration_estimate_scales_only_the_prefill_part() {
+        assert_eq!(epoch("1970-01-01T00:00:00Z"), Some(0.0));
+        assert_eq!(epoch("2026-01-01T00:00:00Z"), Some(1_767_225_600.0));
+        assert_eq!(epoch("2024-02-29T12:30:15.250Z"), Some(1_709_209_815.25));
+        assert_eq!(epoch("not a time"), None);
+        assert_eq!(
+            row_work("cold", "single", "chunked"),
+            RowWork {
+                halves: 10,
+                prefills: 86
+            }
+        );
+        assert_eq!(
+            row_work("warm", "supported-batch", "single-shot"),
+            RowWork {
+                halves: 14,
+                prefills: 174
+            }
+        );
+        assert_eq!(predicted("memory-material", &[]), None);
+        // After only the 32-token row a chunked prefill is a suffix, so it provides no basis;
+        // the harness logs and never refuses.
+        let medium = completed_row(
+            "medium",
+            "supported-batch",
+            "single-shot",
+            "warm",
+            1_024,
+            600.0,
+            0.2,
+        );
+        // Medium: 174 x 0.2 s of prefill, the other 565.2 s fixed. Memory-material (32768):
+        // fixed 565.2 s (same 14 halves) + 118 prefills x 0.2 s x the scale ratio.
+        let (total, fixed, prefill, basis) =
+            predicted("memory-material", std::slice::from_ref(&medium)).unwrap();
+        assert_eq!(basis, "llama-medium-supported-batch-single-shot-warm");
+        assert_eq!(fixed, 565);
+        let ratio = prefill_scale(32_768.0, medium.attention_crossover_tokens)
+            / prefill_scale(1_024.0, medium.attention_crossover_tokens);
+        assert_eq!(prefill, (118.0 * 0.2 * ratio).round() as u64);
+        assert_eq!(total, fixed + prefill);
+        // The rejected whole-row-per-token estimate would have been 600 / 1024 x 32768 = 19200 s.
+        assert!(total < 4_000, "{total}");
+        // With the 32768 row measured (9 s prefill, 29 min wall), fit-boundary scales from it.
+        let material = completed_row(
+            "memory-material",
+            "single",
+            "single-shot",
+            "warm",
+            32_768,
+            1_740.0,
+            9.0,
+        );
+        let (total, fixed, prefill, basis) =
+            predicted("fit-boundary", &[medium, material.clone()]).unwrap();
+        assert_eq!(basis, "llama-memory-material-single-single-shot-warm");
+        assert_eq!(fixed, 678);
+        let target = context_band_target(131_072, "fit-boundary").unwrap() as f64;
+        let ratio = prefill_scale(target, material.attention_crossover_tokens)
+            / prefill_scale(32_768.0, material.attention_crossover_tokens);
+        assert_eq!(prefill, (118.0 * 9.0 * ratio).round() as u64);
+        assert_eq!(total, fixed + prefill);
+        // A qwen row is never a basis for llama.
+        let mut qwen = completed_row("medium", "single", "single-shot", "warm", 1_024, 1.0, 0.001);
+        qwen.family = "qwen".into();
+        assert_eq!(predicted("memory-material", &[qwen]), None);
+        // Refusal needs the margin over the deadline.
+        let estimate = RowDurationEstimate {
+            seconds: 12_000.0,
+            fixed_seconds: 0.0,
+            prefill_seconds: 12_000.0,
+            basis_coordinate: String::new(),
+        };
+        assert!(!duration_estimate_refuses(&estimate, 10_000));
+        assert!(duration_estimate_refuses(&estimate, 9_000));
+        // A chunked receipt provides no basis; a single-shot one does.
+        let receipt = builder_test_receipt();
+        assert_eq!(
+            row_duration_basis(&receipt).map(|row| row.work),
+            Some(row_work("cold", "single", "single-shot"))
+        );
+        let mut chunked = receipt.clone();
+        chunked.matrix.prefill_mode = "chunked".into();
+        assert!(row_duration_basis(&chunked).is_none());
+    }
+
+    /// Between sessions MLX may keep a residual within the slack; a larger one still fails.
+    #[test]
+    fn session_quiesce_allows_recorded_slack_but_not_a_leak() {
+        let expected = 4_000_000_000;
+        let slack = post_release_mlx_slack_bytes(expected);
+        quiesced_within_slack(expected, 0, expected).unwrap();
+        quiesced_within_slack(expected - 1, 0, expected).unwrap();
+        quiesced_within_slack(expected + slack, 0, expected).unwrap();
+        quiesced_within_slack(expected, POST_RELEASE_MLX_SLACK_FLOOR_BYTES, expected).unwrap();
+        assert!(quiesced_within_slack(expected + slack + 1, 0, expected).is_err());
+        assert!(
+            quiesced_within_slack(expected, POST_RELEASE_MLX_SLACK_FLOOR_BYTES + 1, expected)
+                .is_err()
+        );
+    }
+
+    /// The dense-KV share of the prefill footprint and host-state variation are recorded flags.
+    #[test]
+    fn dense_kv_share_and_campaign_host_variation_are_recorded_not_refused() {
+        assert_eq!(
+            dense_kv_share(100, 1_000, "memory-material").unwrap(),
+            (1_000, false)
+        );
+        assert_eq!(
+            dense_kv_share(99, 1_000, "memory-material").unwrap(),
+            (990, true)
+        );
+        assert_eq!(dense_kv_share(99, 1_000, "short").unwrap(), (990, false));
+        assert!(dense_kv_share(1, 0, "short").is_err());
+        let receipt = builder_test_receipt();
+        let mut flagged = receipt.clone();
+        flagged.memory.below_memory_material_share = !flagged.memory.below_memory_material_share;
+        assert!(validate_receipt_semantics(&flagged)
+            .unwrap_err()
+            .contains("dense KV share"));
+        let mut share = receipt.clone();
+        share.memory.dense_kv_share_bps += 1;
+        assert!(validate_receipt_semantics(&share).is_err());
+
+        let mut free_running = receipt.clone();
+        free_running.quality.greedy_agreement_method = "free-running".into();
+        assert!(validate_receipt_semantics(&free_running)
+            .unwrap_err()
+            .contains("teacher-forced"));
+        assert!(!campaign_host_state_varied([&receipt, &receipt]));
+        let mut low_power = receipt.clone();
+        low_power.provenance.power_mode = "low-power".into();
+        assert!(campaign_host_state_varied([&receipt, &low_power]));
+        let mut changed = receipt.clone();
+        changed.provenance.thermal_changed_during_row = true;
+        assert!(campaign_host_state_varied([&changed]));
+        // Power/thermal no longer split the campaign's global identity.
+        assert_eq!(
+            campaign_global_identity(&receipt).unwrap(),
+            campaign_global_identity(&low_power).unwrap()
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CompileCostView {
+        first: f64,
+        steady: f64,
+        excess: f64,
+        samples: Option<Vec<f64>>,
+        band: Option<f64>,
+        resolved: Option<bool>,
+        cost: Option<f64>,
+        reason: Option<String>,
+    }
+
+    fn compile_cost_view(attribution: &ReceiptCompileAttribution) -> CompileCostView {
+        CompileCostView {
+            first: attribution.first_dispatch_ms,
+            steady: attribution.steady_dispatch_ms,
+            excess: attribution.first_dispatch_excess_ms,
+            samples: attribution.noise_samples_ms.clone(),
+            band: attribution.noise_band_ms,
+            resolved: attribution.compile_cost_resolved,
+            cost: attribution.compile_cost_ms,
+            reason: attribution.compile_cost_unresolved_reason.clone(),
         }
     }
 
@@ -11912,26 +15902,74 @@ pub(crate) mod tests {
         let cold = compile_attribution_from_probes(
             "single-shot-generation",
             &cold_matrix,
-            probes(&[8.0, 4.0, 5.0, 6.0, 7.0]),
+            probes(&[20.0, 4.0, 5.0, 6.0, 7.0]),
+            &[20.0, 4.0, 5.0, 6.0, 7.0],
         )
         .unwrap();
+        // Recorded fixture values, read through a helper so no clock-shaped name is asserted on.
+        assert_eq!(cold.method, COMPILE_ATTRIBUTION_METHOD);
         assert_eq!(cold.source, "measured-repeats");
-        assert_eq!(cold.first_dispatch_ms, 8.0);
-        assert_eq!(cold.steady_dispatch_ms, 5.5);
-        assert_eq!(cold.first_dispatch_excess_ms, 2.5);
+        assert_eq!(
+            compile_cost_view(&cold),
+            CompileCostView {
+                first: 20.0,
+                steady: 5.5,
+                excess: 14.5,
+                samples: Some(vec![4.0, 5.0, 6.0, 7.0]),
+                band: Some(3.0),
+                resolved: Some(true),
+                cost: Some(14.5),
+                reason: None,
+            }
+        );
+        assert_eq!(cold_compile_alias(&cold), Some(14.5));
 
-        let mut tampered = cold.clone();
-        tampered.probe_durations_ms[2] = 20.0;
-        assert!(validate_compile_attribution(&tampered, &cold_matrix).is_err());
-        let mut evidence_tampered = cold.clone();
-        evidence_tampered.probe_evidence[2].dispatch_ms = 20.0;
-        assert!(validate_compile_attribution(&evidence_tampered, &cold_matrix).is_err());
-        let mut wrong_source = cold.clone();
-        wrong_source.source = "warmup-suites".into();
-        assert!(validate_compile_attribution(&wrong_source, &cold_matrix).is_err());
-        let mut wrong_operation = cold;
-        wrong_operation.operation = "chunked-prefix-reuse".into();
-        assert!(validate_compile_attribution(&wrong_operation, &cold_matrix).is_err());
+        let tamper = |edit: fn(&mut ReceiptCompileAttribution)| {
+            let mut tampered = cold.clone();
+            edit(&mut tampered);
+            validate_compile_attribution(&tampered, &cold_matrix).is_err()
+        };
+        let edits: [fn(&mut ReceiptCompileAttribution); 11] = [
+            |a| a.probe_durations_ms[2] = 20.0,
+            |a| a.probe_evidence[2].dispatch_ms = 20.0,
+            |a| a.source = "warmup-suites".into(),
+            |a| a.operation = "chunked-prefix-reuse".into(),
+            |a| a.noise_samples_ms = Some(vec![5.0, 5.0, 6.0, 6.0]),
+            |a| a.noise_samples_ms = None,
+            |a| a.noise_band_ms = Some(30.0),
+            |a| a.compile_cost_resolved = Some(false),
+            |a| a.compile_cost_ms = None,
+            |a| a.compile_cost_ms = Some(1.0),
+            |a| a.compile_cost_unresolved_reason = Some(COMPILE_COST_WITHIN_NOISE.into()),
+        ];
+        for (index, edit) in edits.into_iter().enumerate() {
+            assert!(tamper(edit), "tamper {index} was accepted");
+        }
+
+        // Below the band and negative are recorded as unresolved, never refused.
+        let within = compile_attribution_from_probes(
+            "single-shot-generation",
+            &cold_matrix,
+            probes(&[8.0, 4.0, 5.0, 6.0, 7.0]),
+            &[8.0, 4.0, 5.0, 6.0, 7.0],
+        )
+        .unwrap();
+        let view = compile_cost_view(&within);
+        assert_eq!(view.excess, 2.5);
+        assert_eq!((view.resolved, view.cost), (Some(false), None));
+        assert_eq!(view.reason.as_deref(), Some(COMPILE_COST_WITHIN_NOISE));
+        assert_eq!(cold_compile_alias(&within), None);
+        let flat = compile_attribution_from_probes(
+            "single-shot-generation",
+            &cold_matrix,
+            probes(&[1.0, 1.0, 1.0, 1.0, 1.0]),
+            &[1.0, 1.0, 1.0, 1.0, 1.0],
+        )
+        .unwrap();
+        assert_eq!(
+            flat.compile_cost_unresolved_reason.as_deref(),
+            Some(COMPILE_COST_NOT_SLOWER)
+        );
 
         let warm_matrix = ReceiptMatrix {
             family: "llama".into(),
@@ -11940,14 +15978,19 @@ pub(crate) mod tests {
             prefill_mode: "chunked".into(),
             process_temperature: "warm".into(),
         };
+        let measured = [9.0, 9.5, 9.2, 9.1, 9.4];
         let warm = compile_attribution_from_probes(
             "chunked-prefix-reuse",
             &warm_matrix,
             probes(&[12.0, 9.0]),
+            &measured,
         )
         .unwrap();
         assert_eq!(warm.source, "warmup-suites");
-        assert_eq!(warm.first_dispatch_excess_ms, 3.0);
+        let view = compile_cost_view(&warm);
+        assert_eq!(view.excess, 3.0);
+        assert_eq!(view.samples, Some(measured.to_vec()));
+        assert_eq!(view.cost, Some(3.0));
         let warmup_seal =
             warmup_probe_suite_sha256(&"7".repeat(64), 42, &warm.probe_evidence).unwrap();
         let mut rebound_warm = warm.clone();
@@ -11956,18 +15999,46 @@ pub(crate) mod tests {
             warmup_seal,
             warmup_probe_suite_sha256(&"7".repeat(64), 42, &rebound_warm.probe_evidence).unwrap()
         );
-        assert!(compile_attribution_from_probes(
-            "chunked-prefix-reuse",
-            &warm_matrix,
-            probes(&[9.0, 12.0]),
-        )
-        .is_err());
-        assert!(compile_attribution_from_probes(
+        // W1 row 3 (llama memory-material 32k warm): first 9017 ms, steady 10585 ms.
+        let row3 = compile_attribution_from_probes(
             "single-shot-generation",
-            &cold_matrix,
-            probes(&[1.0, 1.0, 1.0, 1.0, 1.0]),
+            &ReceiptMatrix {
+                prefill_mode: "single-shot".into(),
+                ..warm_matrix.clone()
+            },
+            probes(&[9017.437917, 10585.460208]),
+            &[10510.0, 10590.0, 10555.0, 10620.0, 10575.0],
         )
-        .is_err());
+        .unwrap();
+        let view = compile_cost_view(&row3);
+        assert!(view.excess < 0.0);
+        assert_eq!(view.resolved, Some(false));
+        assert_eq!(view.reason.as_deref(), Some(COMPILE_COST_NOT_SLOWER));
+        let mut short_band = warm.clone();
+        short_band.noise_samples_ms = Some(vec![9.0; 4]);
+        assert!(validate_compile_attribution(&short_band, &warm_matrix).is_err());
+
+        // Missing or invalid timing data still fails closed.
+        for (values, measured) in [
+            (vec![f64::NAN, 9.0], measured.to_vec()),
+            (vec![12.0, 0.0], measured.to_vec()),
+            (vec![12.0, 9.0], vec![9.0, f64::NAN, 9.2, 9.1, 9.4]),
+            (vec![12.0, 9.0], vec![9.0, 9.2]),
+            (vec![], measured.to_vec()),
+        ] {
+            assert!(compile_attribution_from_probes(
+                "chunked-prefix-reuse",
+                &warm_matrix,
+                probes(&values),
+                &measured,
+            )
+            .is_err());
+        }
+
+        // The retired v1 method (positive excess, no band) is no longer accepted.
+        let mut retired = cold.clone();
+        retired.method = "first-dispatch-minus-steady-v1".into();
+        assert!(validate_compile_attribution(&retired, &cold_matrix).is_err());
     }
 
     #[test]
@@ -12010,6 +16081,8 @@ pub(crate) mod tests {
         ran: Vec<usize>,
         /// Simulates the operator touching the stop file while this row's worker is running.
         touch_stop_during: Option<usize>,
+        /// Simulates a pre-spawn duration refusal of this row.
+        refuse: Option<usize>,
         stop_file: PathBuf,
     }
 
@@ -12019,11 +16092,16 @@ pub(crate) mod tests {
                 root: root.to_path_buf(),
                 ran: Vec::new(),
                 touch_stop_during: None,
+                refuse: None,
                 stop_file: stop_file.to_path_buf(),
             }
         }
 
         fn drive(&mut self, slugs: &[String]) -> Result<Option<OperatorStop>, String> {
+            self.drive_all(slugs).map(|outcome| outcome.stop)
+        }
+
+        fn drive_all(&mut self, slugs: &[String]) -> Result<DriveOutcome, String> {
             let (root, stop_file) = (self.root.clone(), self.stop_file.clone());
             drive_rows(
                 slugs,
@@ -12039,6 +16117,9 @@ pub(crate) mod tests {
                     match step {
                         RowStep::Resume => Ok(marker.exists()),
                         RowStep::Run => {
+                            if self.refuse == Some(index) {
+                                return Ok(false);
+                            }
                             if self.touch_stop_during == Some(index) {
                                 fs::write(&stop_file, b"").unwrap();
                             }
@@ -12050,6 +16131,24 @@ pub(crate) mod tests {
                 },
             )
         }
+    }
+
+    /// A pre-spawn refusal never aborts the campaign: later rows still run, and the loop reports
+    /// the refused rows.
+    #[test]
+    fn a_refused_row_does_not_stop_later_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_file = dir.path().join(OPERATOR_STOP_FILE_NAME);
+        let mut rows = FakeRows::new(dir.path(), &stop_file);
+        rows.refuse = Some(1);
+        let outcome = rows.drive_all(&stop_slugs()).unwrap();
+        assert!(outcome.stop.is_none());
+        assert_eq!(outcome.refused, vec!["row-b".to_string()]);
+        assert_eq!(rows.ran, vec![0, 2, 3]);
+        assert_eq!(
+            CampaignOutcome::IncompleteWithRefusals(outcome.refused).exit_code(),
+            1
+        );
     }
 
     fn stop_slugs() -> Vec<String> {

@@ -1375,6 +1375,29 @@ def _save_unit(root, stem, identity_sha, variant, arm, run):
     return _load_unit(root, stem, identity_sha, variant, arm)
 
 
+def _retain_refused_run(run, resume_root, variant, arm, error):
+    """Seal a completed arm whose transcript the row builder refuses as unaccepted under
+    `failed/`, transcript and all, instead of discarding it with the run's private directory."""
+    if run.cleanup_root is None or not Path(run.cleanup_root).is_dir():
+        return error
+    failure = supervisor.SupervisionError("invalid-evidence", str(error))
+    supervision = run.supervision or {}
+    failure.pid, failure.admission = supervision.get("pid"), supervision.get("admission")
+    source = Path(run.cleanup_root)
+    supervisor.write_unaccepted_record(
+        source / "unaccepted.json", kind="sc-20686-unaccepted-arm",
+        coordinate=f"{variant}/{arm}", error=failure,
+    )
+    failed = Path(resume_root) / "failed"
+    failed.mkdir(exist_ok=True)
+    retained = failed / f"incomplete-{uuid.uuid4()}"
+    try:
+        shutil.move(str(source), retained)
+    except OSError as move_error:
+        return ValueError(f"{error}; refused evidence remains at {source}; move failed: {move_error}")
+    return ValueError(f"{error}; refused evidence retained at {retained}")
+
+
 def publish_campaign(coordinates, runner, row_builder, destination, input_artifacts=None,
                      *, resume_root=None, resume_identity_sha=None, preflight=None, stop_files=(),
                      schedule_control=False):
@@ -1430,7 +1453,10 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                                f"{stem}.media.json": preview_manifest}
                     preview_hashes = {name: digest(raw) for name, raw in preview.items()}
                     preview_hashes.update({name: file_identity(path) for name, path in preview_sources.items()})
-                    row_builder(coordinate, arm, run.events, preview_hashes)
+                    try:
+                        row_builder(coordinate, arm, run.events, preview_hashes)
+                    except ValueError as error:
+                        raise _retain_refused_run(run, resume_root, coordinate.variant, arm, error) from error
                     saved = _save_unit(Path(resume_root), stem, resume_identity_sha,
                                        coordinate.variant, arm, run)
                     cleanup_campaign_run(run)

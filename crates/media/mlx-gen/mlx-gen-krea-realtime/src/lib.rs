@@ -145,6 +145,26 @@ pub fn conservative_video_decode_memory_profile(
     mlx_gen_wan::conservative_video_decode_memory_profile_for_vae(VAE_TILING, width, height, frames)
 }
 
+/// The provider-owned conservative VAE **encode** working set (sc-20686, epic E8), or `None` when
+/// the request encodes nothing. Krea Realtime: the reference still for i2v, the source clip for v2v. The encode and decode phases never overlap.
+pub fn conservative_video_encode_memory_profile(
+    provider_id: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    reference_count: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    vae_tiling(provider_id)?;
+    let encode_frames = mlx_gen_wan::conditioning_encode_frames(mode, frames, reference_count)?;
+    mlx_gen_wan::conservative_video_encode_memory_profile_for_vae(
+        VAE_TILING,
+        width,
+        height,
+        encode_frames,
+    )
+}
+
 pub use causal::{
     block_causal_mask, build_block_causal_mask, CausalKreaTransformer, CausalKvCache,
     PackedMetalRouteReceipt,
@@ -180,7 +200,7 @@ pub use scheduler::{euler_x0, renoise_step, FewStepSchedule, NUM_TRAIN_TIMESTEPS
 pub use t2v::{
     decode_latents_to_video, decode_tiling, generate_i2v, generate_i2v_from_components,
     generate_t2v, generate_t2v_from_components, generate_v2v, generate_v2v_from_components,
-    mac_ar_config, KreaRealtimeJob,
+    mac_ar_config, materialize_and_release_phase, KreaRealtimeJob,
 };
 
 // Re-export the reused Wan config types so callers can name the DiT dimensions — and a snapshot's
@@ -275,5 +295,46 @@ mod explicit_registry_tests {
             [super::MODEL_ID]
         );
         assert!(registry.memory_contract_surfaces().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod encode_profile_tests {
+    /// sc-20686 E8: Krea prices the i2v still and the v2v source clip it encodes, and nothing for t2v.
+    #[test]
+    fn krea_prices_its_conditioning_encode() {
+        let bytes = |mode, frames, references| {
+            super::conservative_video_encode_memory_profile(
+                super::MODEL_ID,
+                mode,
+                832,
+                480,
+                frames,
+                references,
+            )
+            .map(|profile| profile.working_set_bytes())
+        };
+        let encode = |frames| {
+            mlx_gen_wan::pipeline::video_encode_peak_bytes_for_vae(
+                super::VAE_TILING,
+                832,
+                480,
+                frames,
+            )
+        };
+        assert_eq!(bytes("text_to_video", 81, 0), None);
+        assert_eq!(bytes("image_to_video", 81, 1), encode(1));
+        assert_eq!(bytes("video_to_video", 81, 1), encode(81));
+        assert_eq!(
+            super::conservative_video_encode_memory_profile(
+                "wan_vace",
+                "video_to_video",
+                832,
+                480,
+                81,
+                1
+            ),
+            None
+        );
     }
 }

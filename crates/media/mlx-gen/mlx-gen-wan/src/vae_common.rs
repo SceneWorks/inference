@@ -46,6 +46,67 @@ pub(crate) fn eval(x: &Array) -> Result<()> {
     Ok(())
 }
 
+/// What a decoder's up-sampling tail does with the buffers each finished block frees (sc-20686).
+///
+/// The Wan decoders' calibrated cost models (`pipeline.rs`) are fit to `get_peak_memory`, i.e. live
+/// arrays only. MLX, however, keeps every freed buffer in its allocator cache until its own GC
+/// limit (~0.95 x the device working set), and that cache counts toward the process footprint. In a
+/// single-pass decode each up-stage runs at a larger extent than the one before, so a freed buffer
+/// rarely serves a later block: on the production-width z48 decoder (bf16, synthetic weights) live
+/// peaked at 3.0-3.2 kB per output voxel but live + cache at 8.1-10.1 kB, so a single-pass
+/// 768x512x33 decode priced at 41.6 GiB carried a footprint far past 64 GiB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeadStageBuffers {
+    /// Single-pass decode: every block boundary materializes its output and returns all freed
+    /// buffers to the OS, so the cache stays near zero and the live-only cost model holds.
+    Release,
+    /// Tiled decode: the next tile runs the same blocks at the same extents and reuses the cached
+    /// buffers, so they stay pooled.
+    Keep,
+}
+
+impl DeadStageBuffers {
+    /// Whether this pass releases at block boundaries.
+    pub(crate) fn releases(self) -> bool {
+        self == Self::Release
+    }
+
+    /// Materialize `x`, then (on [`Self::Release`]) return every freed buffer to the OS. The
+    /// evaluation and the release are one operation so a release can never run ahead of the graph
+    /// whose buffers it is meant to free.
+    pub(crate) fn materialize(self, x: &Array) -> Result<()> {
+        eval(x)?;
+        self.release();
+        Ok(())
+    }
+
+    /// [`Self::materialize`] for a chunked encoder: `x` is evaluated together with every carried
+    /// conv-cache slot, so a lazy slot (a slice of a block's full output) can never keep that
+    /// output alive past the release.
+    pub(crate) fn materialize_with_cache(self, x: &Array, cache: &FeatCache) -> Result<()> {
+        let mut arrays: Vec<&Array> = cache.slots.iter().flatten().collect();
+        arrays.push(x);
+        mlx_rs::transforms::eval(arrays)?;
+        self.release();
+        Ok(())
+    }
+
+    fn release(self) {
+        if self.releases() {
+            #[cfg(test)]
+            BLOCK_RELEASES.with(|count| count.set(count.get() + 1));
+            mlx_gen::memory_probe::clear_cache();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of [`DeadStageBuffers::Release`] releases, so a test pins every release
+    /// site without reading the process-global MLX counters.
+    pub(crate) static BLOCK_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Per-conv last-frames cache threaded through the chunked encode. `idx` resets to 0 each chunk and
 /// advances once per cache-bearing conv (in the fixed traversal order), so slots stay aligned.
 pub(crate) struct FeatCache {

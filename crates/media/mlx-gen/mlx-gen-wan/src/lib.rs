@@ -54,6 +54,8 @@ pub mod block_stream;
 pub mod chunk;
 pub mod config;
 pub mod convert;
+#[cfg(test)]
+mod encode_footprint_harness;
 pub mod feature_cache;
 pub mod i2v_memory_strategy;
 pub mod memory_strategy;
@@ -456,6 +458,66 @@ pub fn selected_video_decode_memory_profile(
     )
 }
 
+/// What a request VAE-encodes before denoise (sc-20686, epic E8), for a provider that conditions
+/// generically on its request mode: `None` (nothing), `Some(1)` (a still per reference, encoded one
+/// at a time) or `Some(frames)` (a conditioning clip at the output length). `mode` is the request's
+/// video mode (`GenerationRequest::video_mode`, the admission calibration mode). An unknown mode
+/// that carries references is priced as a clip, so an unrecognized conditioning surface is never
+/// admitted without its encode.
+pub fn conditioning_encode_frames(mode: &str, frames: u32, reference_count: u32) -> Option<u32> {
+    match mode {
+        "text_to_video" if reference_count == 0 => None,
+        "text_to_video" | "image_to_video" | "first_last_frame" | "keyframe"
+        | "reference_to_video" => Some(1),
+        _ if reference_count == 0 => None,
+        _ => Some(frames),
+    }
+}
+
+/// Build the conservative encode working-set profile for `encode_frames` frames at the output
+/// geometry through one concrete Wan VAE (sc-20686, epic E8). The VAE weights are already part of
+/// the contract's resident bytes, so none are included here.
+pub fn conservative_video_encode_memory_profile_for_vae(
+    vae: mlx_gen::tiling::VaeTiling,
+    width: u32,
+    height: u32,
+    encode_frames: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    mlx_gen::VideoDecodeMemoryProfile::new(
+        pipeline::video_encode_peak_bytes_for_vae(vae, width, height, encode_frames)?,
+        0,
+    )
+}
+
+/// The provider-owned conservative VAE **encode** working set for a Wan generator id (sc-20686,
+/// epic E8), or `None` when the request encodes nothing. Admission composes it like the decode
+/// profile — the encode (conditioning) and decode phases never overlap, so the peak is their max.
+///
+/// | Route | Encodes |
+/// | --- | --- |
+/// | `wan2_2_ti2v_5b` | the conditioning still (z48, one frame) when the request is image-conditioned |
+/// | `wan2_2_i2v_14b` | the full `frames`-long `[image, zeros…]` conditioning video (z16) |
+/// | `wan2_2_t2v_14b` | nothing |
+/// | `wan_vace` / `wan2_2_vace_fun_14b` | the `frames`-long control clip (z16; its inactive and reactive halves and the reference stills encode one after another) |
+pub fn conservative_video_encode_memory_profile(
+    provider_id: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    reference_count: u32,
+) -> Option<mlx_gen::VideoDecodeMemoryProfile> {
+    let vae = vae_tiling(provider_id)?;
+    let encode_frames = match provider_id {
+        model::MODEL_ID => conditioning_encode_frames(mode, frames, reference_count).map(|_| 1),
+        model::MODEL_ID_I2V_14B | model_vace::MODEL_ID_VACE | model_vace::MODEL_ID_VACE_FUN => {
+            Some(frames)
+        }
+        _ => None,
+    }?;
+    conservative_video_encode_memory_profile_for_vae(vae, width, height, encode_frames)
+}
+
 /// Resolve the concrete MLX Wan VAE geometry used by a registered generator id.
 pub fn vae_tiling(provider_id: &str) -> Option<mlx_gen::tiling::VaeTiling> {
     model::ti2v_vae_tiling(provider_id)
@@ -503,6 +565,69 @@ pub fn conservative_video_decode_memory_profile(
         height,
         frames,
     )
+}
+
+#[cfg(test)]
+mod encode_profile_tests {
+    use super::*;
+
+    fn bytes(provider: &str, mode: &str, frames: u32, references: u32) -> Option<u64> {
+        conservative_video_encode_memory_profile(provider, mode, 832, 480, frames, references)
+            .map(|profile| profile.working_set_bytes())
+    }
+
+    /// sc-20686 E8: each Wan route prices exactly what it VAE-encodes before denoise.
+    #[test]
+    fn each_route_prices_its_conditioning_encode() {
+        let z16 = |frames| {
+            pipeline::video_encode_peak_bytes_for_vae(
+                model::A14bProviderVae::VAE_TILING,
+                832,
+                480,
+                frames,
+            )
+        };
+        let z48_still = pipeline::video_encode_peak_bytes_for_vae(
+            model::ti2v_vae_tiling(model::MODEL_ID).unwrap(),
+            832,
+            480,
+            1,
+        );
+        assert_eq!(bytes(model::MODEL_ID, "text_to_video", 81, 0), None);
+        assert_eq!(bytes(model::MODEL_ID, "image_to_video", 81, 1), z48_still);
+        assert_eq!(bytes(model::MODEL_ID_T2V_14B, "text_to_video", 81, 0), None);
+        // I2V-A14B encodes the full [image, zeros...] video, not one frame.
+        assert_eq!(
+            bytes(model::MODEL_ID_I2V_14B, "image_to_video", 81, 1),
+            z16(81)
+        );
+        for vace in [model_vace::MODEL_ID_VACE, model_vace::MODEL_ID_VACE_FUN] {
+            assert_eq!(bytes(vace, "replace_person", 81, 1), z16(81), "{vace}");
+        }
+        assert!(z16(81).unwrap() > z16(1).unwrap());
+        assert_eq!(bytes("ltx_2_3", "image_to_video", 81, 1), None);
+    }
+
+    #[test]
+    fn generic_conditioning_classifies_stills_and_clips() {
+        assert_eq!(conditioning_encode_frames("text_to_video", 81, 0), None);
+        assert_eq!(conditioning_encode_frames("image_to_video", 81, 1), Some(1));
+        assert_eq!(
+            conditioning_encode_frames("reference_to_video", 81, 3),
+            Some(1)
+        );
+        assert_eq!(
+            conditioning_encode_frames("video_to_video", 81, 1),
+            Some(81)
+        );
+        assert_eq!(
+            conditioning_encode_frames("multi_video_to_video", 81, 4),
+            Some(81)
+        );
+        // An unrecognized conditioned mode is priced as a clip, never as nothing.
+        assert_eq!(conditioning_encode_frames("future_mode", 81, 1), Some(81));
+        assert_eq!(conditioning_encode_frames("future_mode", 81, 0), None);
+    }
 }
 
 #[cfg(test)]

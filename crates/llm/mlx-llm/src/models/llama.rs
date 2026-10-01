@@ -1066,6 +1066,7 @@ impl CausalLm {
                 kv_heads: self.cfg.num_kv_heads as usize,
                 head_dimension: self.cfg.head_dim as usize,
                 group_size: PACKED_METAL_QUANT_GROUP_SIZE,
+                bits: handle.code_bits(),
                 query_length,
                 has_mask,
             },

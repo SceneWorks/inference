@@ -44,18 +44,20 @@ pub use nn::{
     rms_norm, rms_norm_unscaled, soft_cap,
 };
 pub use packed_group_affine_kv::{
-    group_affine_kernel_fp32_parity_errors, select_decoder_cache, select_decoder_cache_with_reader,
-    CompiledKernelHandle, DecoderCacheSelection, DenseFallbackEvent,
-    DenseFallbackPackedDecoderCache, OpaqueCompiledKernel, PackedCacheRequest,
-    PackedDispatchTelemetry, PackedGroupAffineKvCache, RepresentationMetadata,
-    RetainedPackedKernel, PACKED_CODES_PER_BYTE, PACKED_METAL_QUANT_GROUP_SIZE,
+    group_affine_kernel_fp32_parity_errors, group_affine_kernel_fp32_parity_errors_at,
+    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
+    DecoderCacheSelection, DenseFallbackEvent, DenseFallbackPackedDecoderCache,
+    OpaqueCompiledKernel, PackedCacheRequest, PackedCodeBits, PackedDispatchTelemetry,
+    PackedGroupAffineKvCache, RepresentationMetadata, RetainedPackedKernel,
+    PACKED_METAL_QUANT_GROUP_SIZE,
 };
 pub use packed_metal::{
-    mlx_nax_available, packed_kernel_path_valid, packed_kv_split_count,
+    mlx_nax_available, packed_kernel_path_valid, packed_kv_split_count, packed_metal_identity,
     packed_nax_head_dimension_supported, packed_query_dtype_name, packed_tiled_min_query_tokens,
     packed_tiled_split_count, PackedAttentionArgs, PackedKernelDescriptor, PackedKernelPath,
     PackedKernelSelection, PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
-    PackedMetalTuningProfile, PackedNaxSelection, PACKED_METAL_DEFAULT_IDENTITY, PACKED_NAX_KERNEL,
+    PackedMetalTuningProfile, PackedNaxSelection, PACKED_METAL_B4_IDENTITY,
+    PACKED_METAL_B8_IDENTITY, PACKED_METAL_DEFAULT_IDENTITY, PACKED_NAX_KERNEL,
     PACKED_PER_ROW_KERNEL, PACKED_SELECTION_BELOW_MULTI_ROW, PACKED_SELECTION_CONSERVATIVE,
     PACKED_SELECTION_F32_QUERY, PACKED_SELECTION_HEAD_DIMENSION, PACKED_SELECTION_NAX,
     PACKED_SELECTION_NAX_UNAVAILABLE, PACKED_TILED_KERNEL,

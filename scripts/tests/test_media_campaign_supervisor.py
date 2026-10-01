@@ -22,6 +22,13 @@ class Probe:
     def host_free(self):
         return self.free
 
+    def host_admission(self):
+        free = self.host_free()
+        return free, safety.darwin_host_memory(4096, {
+            "freePages": free // 4096, "speculativePages": 0, "purgeablePages": 0,
+            "inactivePages": 0, "fileBackedPages": 0,
+            "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
+
     def tree_footprint(self, _pgid):
         return self.footprint
 
@@ -194,6 +201,13 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((record["accepted"], record["outcome"], record["pid"]),
                          (False, "aborted", caught.exception.pid))
         safety.validate_admission(record["admission"], policy_sha256=self.policy.sha256)
+        # The breaching sample is sealed with the abort, so a cap overrun names its size and time.
+        breach = record["watchdogChildFootprint"]
+        self.assertEqual((breach["footprintBytes"], breach["capBytes"], breach["sampleCount"]),
+                         (10**7, self.policy.child_footprint_cap_bytes, 1))
+        self.assertEqual(breach["trajectory"], [{"elapsedMillis": breach["elapsedMillis"],
+                                                 "footprintBytes": 10**7}])
+        self.assertNotIn("processes", breach)  # the fixture probe exposes no per-process split
         (self.root / "stdout").unlink()
         (self.root / "stderr").unlink()
         with self.assertRaisesRegex(safety.SupervisionError, "child-exit") as caught:
@@ -204,11 +218,9 @@ class SupervisorTests(unittest.TestCase):
 
     def test_policy_parsing_and_preflight_refuse_before_spawn(self):
         self.assertEqual(self.policy.sha256, safety.digest(self.policy.canonical_bytes))
-        self.assertEqual(safety.darwin_free_bytes("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 2.\nPages speculative: 3.\n"), 5 * 16384)
-        self.assertEqual(safety.darwin_footprint_bytes("    phys_footprint: 32768 B\n"), 32768)
-        self.assertEqual(safety.linux_free_bytes("MemAvailable: 2048 kB\n"), 2048 * 1024)
         with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
-            safety.darwin_footprint_bytes("phys_footprint: unavailable")
+            safety.darwin_available("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free: 2.\nPages speculative: 3.\n")
+        self.assertEqual(safety.linux_free_bytes("MemAvailable: 2048 kB\n"), 2048 * 1024)
         with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
             self.run_child("open('spawned','w').close()", probe=Probe(free=10))
         self.assertFalse((self.root / "spawned").exists())
@@ -243,7 +255,7 @@ class SupervisorTests(unittest.TestCase):
         class PersistedProbe(Probe):
             def tree_footprint(self, pgid):
                 self_status = json.loads(status_path.read_text(encoding="utf-8"))
-                case.assertEqual(self_status["pgid"], pgid)
+                case.assertEqual(self_status["pgid"], pgid.pgid)
                 return super().tree_footprint(pgid)
 
         result = self.run_child("import time; time.sleep(.15)", probe=PersistedProbe(),
@@ -349,16 +361,112 @@ class SupervisorTests(unittest.TestCase):
             self.run_child(script)
         self.assertFalse(safety._group_pids(int((self.root / "pid").read_text(encoding="ascii"))))
 
-    def test_observed_child_that_escapes_process_group_is_reaped(self):
+    class MembersProbe(Probe):
+        """Records every (ppid, pgid) row each owned member showed on any tick."""
+        def __init__(self):
+            super().__init__()
+            self.rows = {}
+        def tree_footprint(self, owner):
+            table = safety._process_table()
+            for pid in owner.members():
+                if pid in table:
+                    self.rows.setdefault(pid, set()).add(table[pid])
+            return super().tree_footprint(owner)
+
+    def test_descendant_in_its_own_group_is_owned_measured_and_reaped(self):
         script = (
             "import os,subprocess,sys,time; "
             "p=subprocess.Popen([sys.executable,'-c',"
             "'import os,time;time.sleep(.1);os.setsid();time.sleep(5)']); "
             "open('escaped-pid','w').write(str(p.pid));time.sleep(5)"
         )
-        with self.assertRaisesRegex(safety.SupervisionError, "process-escape"):
-            self.run_child(script)
-        self.assertNotIn(int((self.root / "escaped-pid").read_text(encoding="ascii")), safety._process_table())
+        probe = self.MembersProbe()
+        with self.assertRaisesRegex(safety.SupervisionError, "deadline"):
+            self.run_child(script, probe=probe)
+        escaped = int((self.root / "escaped-pid").read_text(encoding="ascii"))
+        self.assertIn(escaped, {group for _parent, group in probe.rows[escaped]})  # measured after leaving
+        self.assertNotIn(escaped, safety._process_table())
+
+    def test_row_waits_for_a_reparented_descendant_in_its_own_group(self):
+        # The root exits first; its setsid'd descendant is reparented to launchd/init and
+        # the row only finishes once that descendant has exited too.
+        script = (
+            "import subprocess,sys,time; "
+            "p=subprocess.Popen([sys.executable,'-c',"
+            "'import os,time;os.setsid();time.sleep(.6)']); "
+            "open('escaped-pid','w').write(str(p.pid));time.sleep(.2)"
+        )
+        probe = self.MembersProbe()
+        result = self.run_child(script, probe=probe)
+        escaped = int((self.root / "escaped-pid").read_text(encoding="ascii"))
+        self.assertEqual(result.returncode, 0)
+        self.assertGreaterEqual(result.elapsed_seconds, .5)
+        self.assertIn(escaped, probe.rows)
+        self.assertNotIn(escaped, safety._process_table())
+
+    @unittest.skipUnless(sys.platform == "darwin", "system_profiler is macOS-only")
+    def test_system_profiler_collector_group_is_not_a_refusal(self):
+        # SC-20684 W2 run 36808330752: the product's toolchain probe runs system_profiler,
+        # whose `-nospawn` collector child starts its own process group.
+        script = ("import subprocess; subprocess.run(['/usr/sbin/system_profiler', "
+                  "'SPDisplaysDataType'], stdout=subprocess.DEVNULL, check=True)")
+        probe = self.MembersProbe()
+        result = self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        own_group = [pid for pid, rows in probe.rows.items() if any(group != result.pid for _p, group in rows)]
+        self.assertTrue(own_group, probe.rows)
+
+    def test_system_probe_measures_every_owned_member(self):
+        owner = safety.PosixTree(1, set())
+        with patch.object(safety.platform, "system", return_value="Darwin"), \
+             patch.object(safety.PosixTree, "members", return_value={21, 22, 23}), \
+             patch.object(safety, "darwin_phys_footprint", side_effect=lambda pid: pid):
+            self.assertEqual(safety.SystemProbe(self.policy).tree_footprint(owner), 66)
+
+    def test_ancestry_survives_reparenting_and_forgets_exited_pids(self):
+        known = {10}
+        # 11 is a child of 10; 12 a grandchild that moved to its own group.
+        self.assertEqual(safety._expand_owned({10: (1, 10), 11: (10, 10), 12: (11, 12), 50: (1, 50)}, known),
+                         {10, 11, 12})
+        # The root and 11 exit: 12 is reparented to launchd and stays owned; 13 is its child.
+        self.assertEqual(safety._expand_owned({12: (1, 12), 13: (12, 12), 50: (1, 50)}, known), {12, 13})
+        # Exit race: 13 vanished between listing and read (ESRCH) -- simply absent, not owned.
+        self.assertEqual(safety._expand_owned({12: (1, 12), 50: (1, 50)}, known), {12})
+        # PID reuse: unrelated processes now hold 10, 11 and 13; none is a descendant.
+        self.assertEqual(safety._expand_owned(
+            {10: (1, 10), 11: (50, 50), 12: (1, 12), 13: (1, 13), 50: (1, 50)}, known), {12})
+        self.assertEqual(known, {12})
+
+    def test_live_reserve_counts_reclaimable_file_cache(self):
+        class FileCacheProbe(Probe):
+            """Free plus speculative is under the 100-byte reserve on every sample; inactive
+            clean file cache keeps the available measure above reserve plus cap until told."""
+            def __init__(self, cache_pages):
+                super().__init__()
+                self.cache_pages = list(cache_pages)
+            def host_free(self):
+                return 0
+            def host_admission(self):
+                pages = self.cache_pages.pop(0) if len(self.cache_pages) > 1 else self.cache_pages[0]
+                host = safety.darwin_host_memory(4096, {
+                    "freePages": 0, "speculativePages": 0, "purgeablePages": 0,
+                    "inactivePages": pages, "fileBackedPages": pages, "anonymousPages": 0,
+                    "throttledPages": 0, "activePages": 0})
+                return host["availableBytes"], host
+        result = self.run_child("import time; time.sleep(.1)", probe=FileCacheProbe([1000]))
+        self.assertEqual(result.returncode, 0)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+        with self.assertRaisesRegex(safety.SupervisionError,
+                                    r"host-memory: host available 0 bytes \(darwin-vm-stat-available-v3\)") as caught:
+            self.run_child("import time; time.sleep(5)", probe=FileCacheProbe([1000, 0]))
+        self.assertIsNotNone(caught.exception.pid)
+        self.assertEqual(caught.exception.admission["hostMemoryComponents"]["inactivePages"], 1000)
+        # The abort record carries the tripping sample itself, next to the admission's.
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual((record["outcome"], record["reason"]), ("aborted", "host-memory"))
+        self.assertEqual(record["watchdogHostMemory"]["inactivePages"], 0)
+        self.assertEqual(record["watchdogHostMemory"]["metric"], "darwin-vm-stat-available-v3")
 
     def test_live_reserve_and_footprint_abort(self):
         class DecliningProbe(Probe):
@@ -384,6 +492,368 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(safety.SupervisionError, "probe-failure"):
             self.run_child("import time; time.sleep(5)", probe=FailedProbe())
 
+    def patient_policy(self):
+        # A deadline no tick-counting test reaches: each is bounded by probe calls.
+        return dataclasses.replace(self.policy, deadline_seconds=30)
+
+    def stop_when_present_script(self):
+        stop = self.root / "stop"
+        return stop, (f"import os, time\nwhile not os.path.exists({str(stop)!r}):\n"
+                      "    time.sleep(.01)\n")
+
+    class HostScriptProbe(Probe):
+        """host_admission answers from a script: an exception instance raises, else passes."""
+        def __init__(self, script, after=None):
+            super().__init__()
+            self.script = list(script)
+            self.after = after
+            self.host_reads = 0
+        def host_admission(self):
+            self.host_reads += 1
+            if self.script:
+                step = self.script.pop(0)
+            else:
+                step = self.after() if self.after else None
+            if isinstance(step, BaseException):
+                raise step
+            return super().host_admission()
+
+    @staticmethod
+    def vm_stat_fault():
+        return safety.SupervisionError("probe-failure", "/usr/bin/vm_stat: exit status 1")
+
+    def test_host_preflight_retries_then_refuses_with_the_error(self):
+        probe = self.HostScriptProbe([self.vm_stat_fault()] * 3)
+        self.assertEqual(self.run_child("pass", probe=probe).returncode, 0)
+        self.assertGreaterEqual(probe.host_reads, 4)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        probe = self.HostScriptProbe([], after=self.vm_stat_fault)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child("open('spawned','w').close()", probe=probe)
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("preflight host probe failed 4 reads; last error /usr/bin/vm_stat: exit status 1",
+                      caught.exception.detail)
+        self.assertEqual(probe.host_reads, 4)
+        self.assertFalse((self.root / "spawned").exists())
+
+    def test_transient_host_failures_never_stop_a_row(self):
+        stop, script = self.stop_when_present_script()
+        fault = self.vm_stat_fault()
+        # Admission, four failed ticks, a good tick, four failed ticks: never five in a row.
+        probe = self.HostScriptProbe([None] + [fault] * 16 + [None] + [fault] * 16,
+                                     after=lambda: stop.touch())
+        result = self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(probe.host_reads, 34)
+
+    def test_sustained_host_failure_stops_with_detail_and_count(self):
+        _stop, script = self.stop_when_present_script()
+        probe = self.HostScriptProbe([None], after=self.vm_stat_fault)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("live host probe failed on 5 consecutive ticks; last error host probe "
+                      "failed 4 reads; last error /usr/bin/vm_stat: exit status 1",
+                      caught.exception.detail)
+        self.assertEqual(probe.host_reads, 1 + 5 * safety.HOST_READS_PER_TICK)
+
+    def test_footprint_read_retries_within_a_tick_and_a_gone_pid_is_none(self):
+        def reads(outcomes):
+            calls = []
+            def read(pid):
+                calls.append(pid)
+                outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome, outcome
+            return read, calls
+
+        eperm = OSError(1, os.strerror(1))
+        read, calls = reads([eperm, eperm, eperm, 7])
+        self.assertEqual(safety.darwin_phys_footprint(5, read=read), 7)
+        self.assertEqual(len(calls), 4)
+        read, calls = reads([eperm])
+        with self.assertRaises(safety.SupervisionError) as caught:
+            safety.darwin_phys_footprint(5, read=read)
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("failed 4 reads: errno 1: Operation not permitted", caught.exception.detail)
+        self.assertEqual(len(calls), 4)
+        read, calls = reads([OSError(3, os.strerror(3))])  # ESRCH
+        self.assertIsNone(safety.darwin_phys_footprint(5, read=read))
+        self.assertEqual(len(calls), 1)
+
+    def test_transient_footprint_failures_never_stop_a_row(self):
+        stop, script = self.stop_when_present_script()
+
+        class FlakyProbe(Probe):
+            # Four failed ticks, one good read, four more failed ticks: never five in a row.
+            ticks = 0
+            def tree_footprint(self, pgid):
+                self.ticks += 1
+                if self.ticks in (5, 10):
+                    return 1024
+                if self.ticks < 10:
+                    raise safety.SupervisionError("probe-failure", "synthetic transient fault")
+                stop.touch()
+                return super().tree_footprint(pgid)
+
+        probe = FlakyProbe()
+        result = self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(probe.ticks, 10)
+
+    def test_gone_owned_tree_is_left_to_exit_handling(self):
+        stop, script = self.stop_when_present_script()
+
+        class GoneProbe(Probe):
+            ticks = 0
+            def tree_footprint(self, _pgid):
+                self.ticks += 1
+                if self.ticks == 3 * safety.FOOTPRINT_FAILED_TICK_LIMIT:
+                    stop.touch()
+                return None
+
+        probe = GoneProbe()
+        result = self.run_child(script, probe=probe, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertGreaterEqual(probe.ticks, 3 * safety.FOOTPRINT_FAILED_TICK_LIMIT)
+
+    def test_sustained_footprint_failure_stops_with_errno_and_count(self):
+        _stop, script = self.stop_when_present_script()
+        reads = []
+
+        def eperm(pid):
+            reads.append(pid)
+            raise OSError(1, os.strerror(1))
+
+        class FailingProbe(Probe):
+            def tree_footprint(self, _pgid):
+                return safety.darwin_phys_footprint(4321, read=eperm)
+
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child(script, probe=FailingProbe(), policy=self.patient_policy())
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("failed on 5 consecutive ticks", caught.exception.detail)
+        self.assertIn("errno 1: Operation not permitted", caught.exception.detail)
+        self.assertEqual(len(reads), 5 * safety.FOOTPRINT_READS_PER_TICK)
+
+    @staticmethod
+    def ps_timeout():
+        return safety.SupervisionError(
+            "probe-failure", "/bin/ps: Command '['/bin/ps', '-axo', 'pid=,ppid=,pgid=,stat=']' "
+            "timed out after 2.0 seconds")
+
+    def scripted_table(self, failing):
+        """_read_process_table that raises the SC-20684 ps timeout on the read indexes failing()
+        selects and otherwise reads the real table."""
+        real = safety._read_process_table
+        reads = []
+        def read():
+            reads.append(None)
+            if failing(len(reads)):
+                raise self.ps_timeout()
+            return real()
+        return read, reads
+
+    def test_process_table_retries_within_a_tick(self):
+        read, reads = self.scripted_table(lambda n: n <= 3)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            self.assertIn(os.getpid(), safety._process_table())
+        self.assertEqual(len(reads), 4)
+        read, reads = self.scripted_table(lambda n: True)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            with self.assertRaises(safety.SupervisionError) as caught:
+                safety._process_table()
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("process table probe failed 4 reads; last error /bin/ps:", caught.exception.detail)
+        self.assertIn("timed out after 2.0 seconds", caught.exception.detail)
+        self.assertEqual(len(reads), safety.PROCESS_TABLE_READS_PER_TICK)
+
+    def test_transient_process_tree_failures_never_stop_a_row(self):
+        stop, script = self.stop_when_present_script()
+        per_tick = safety.PROCESS_TABLE_READS_PER_TICK
+        # Four failed ticks, a good tick, four more failed ticks: never five in a row.
+        def failing(n):
+            if n > 1 + 8 * per_tick:
+                stop.touch()
+                return False
+            return n != 1 + 4 * per_tick
+        read, reads = self.scripted_table(failing)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            result = self.run_child(script, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(len(reads), 1 + 8 * per_tick)
+
+    def test_sustained_process_tree_failure_stops_with_detail_and_count(self):
+        _stop, script = self.stop_when_present_script()
+        limit = safety.FOOTPRINT_FAILED_TICK_LIMIT * safety.PROCESS_TABLE_READS_PER_TICK
+        # Every watchdog read fails; the reaper's later reads see the real table.
+        read, reads = self.scripted_table(lambda n: n <= limit)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            with self.assertRaises(safety.SupervisionError) as caught:
+                self.run_child(script, policy=self.patient_policy())
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("process-tree probe failed on 5 consecutive ticks; last error process table "
+                      "probe failed 4 reads; last error /bin/ps:", caught.exception.detail)
+        self.assertIn("timed out after 2.0 seconds", caught.exception.detail)
+        self.assertGreaterEqual(len(reads), limit)
+
+    def cuda_policy(self):
+        return dataclasses.replace(
+            self.patient_policy(), backend="linux-cuda",
+            cuda_device_uuid="GPU-12345678-1234-1234-1234-123456789abc",
+            gpu_free_reserve_bytes=100, child_gpu_cap_bytes=10**6)
+
+    class GpuScriptProbe(Probe):
+        """gpu_free_and_tree_bytes fails on the calls failing() selects."""
+        def __init__(self, failing, *, preflight=()):
+            super().__init__()
+            self.failing = failing
+            self.preflight = list(preflight)
+            self.reads = 0
+            self.preflight_reads = 0
+        def gpu_free(self):
+            self.preflight_reads += 1
+            if self.preflight:
+                step = self.preflight.pop(0)
+                if step is not None:
+                    raise step
+            return super().gpu_free()
+        def gpu_free_and_tree_bytes(self, owner):
+            self.reads += 1
+            if self.failing(self.reads):
+                raise safety.SupervisionError("probe-failure", "nvidia-smi: timed out after 2.0 seconds")
+            return super().gpu_free_and_tree_bytes(owner)
+
+    def test_transient_cuda_failures_never_stop_a_row(self):
+        stop, script = self.stop_when_present_script()
+        per_tick = safety.GPU_READS_PER_TICK
+        fault = safety.SupervisionError("probe-failure", "nvidia-smi: timed out after 2.0 seconds")
+        def failing(n):
+            if n > 1 + 8 * per_tick:
+                stop.touch()
+                return False
+            return n != 1 + 4 * per_tick
+        probe = self.GpuScriptProbe(failing, preflight=[fault] * 3)
+        result = self.run_child(script, probe=probe, policy=self.cuda_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(probe.preflight_reads, 4)
+        self.assertGreater(probe.reads, 1 + 8 * per_tick)
+
+    def test_sustained_cuda_failure_stops_with_detail_and_count(self):
+        _stop, script = self.stop_when_present_script()
+        probe = self.GpuScriptProbe(lambda n: True)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child(script, probe=probe, policy=self.cuda_policy())
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("CUDA probe failed on 5 consecutive ticks; last error CUDA probe failed 4 reads; "
+                      "last error nvidia-smi: timed out after 2.0 seconds", caught.exception.detail)
+        self.assertEqual(probe.reads, 5 * safety.GPU_READS_PER_TICK)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        fault = safety.SupervisionError("probe-failure", "nvidia-smi: timed out after 2.0 seconds")
+        probe = self.GpuScriptProbe(lambda n: False, preflight=[fault] * 4)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child("open('spawned','w').close()", probe=probe, policy=self.cuda_policy())
+        self.assertIn("preflight CUDA probe failed 4 reads; last error nvidia-smi", caught.exception.detail)
+        self.assertFalse((self.root / "spawned").exists())
+
+    def test_ps_fallback_runs_only_without_libproc_and_with_the_long_timeout(self):
+        calls = []
+        def output(argv, *, timeout):
+            calls.append((argv, timeout))
+            return f"{os.getpid()} 1 {os.getpgrp()} S\n77 1 77 Z\n"
+        with patch.object(safety, "_load_libproc", return_value=None), \
+             patch.object(safety, "_bounded_output", side_effect=output):
+            self.assertEqual(safety._process_table(), {os.getpid(): (1, os.getpgrp())})
+        self.assertEqual(calls, [(["/bin/ps", "-axo", "pid=,ppid=,pgid=,stat="], 10.0)])
+        if sys.platform == "darwin":
+            with patch.object(safety, "_bounded_output", side_effect=AssertionError("ps spawned")):
+                self.assertIn(os.getpid(), safety._process_table())
+
+    @unittest.skipUnless(sys.platform == "darwin", "libproc is Darwin-only")
+    def test_libproc_tree_matches_ps_on_a_live_child_tree(self):
+        import subprocess
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import subprocess, sys, time\n"
+             "kids = [subprocess.Popen(['sleep', '30']) for _ in range(2)]\n"
+             "grand = subprocess.Popen([sys.executable, '-c', "
+             "'import subprocess, time; subprocess.Popen([\"sleep\", \"30\"]); time.sleep(30)'])\n"
+             "zombie = subprocess.Popen(['true']); time.sleep(.5)\n"
+             "print('ready', flush=True); time.sleep(30)"],
+            stdout=subprocess.PIPE, encoding="utf-8", start_new_session=True)
+        try:
+            self.addCleanup(child.stdout.close)
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            group = lambda table: {pid: row for pid, row in table.items() if row[1] == child.pid}
+            libproc = group(safety.libproc_process_table(safety._load_libproc()))
+            ps = group(safety.ps_process_table())
+            self.assertEqual(libproc, ps)
+            # Root, two sleeps, the Python grandchild and its sleep; the reaped-later zombie is excluded.
+            self.assertEqual(len(libproc), 5)
+            self.assertEqual(safety._expand_owned(safety._process_table(), {child.pid}), set(libproc))
+        finally:
+            os.killpg(child.pid, 9)
+            child.wait()
+
+    @unittest.skipUnless(sys.platform == "darwin", "proc_pid_rusage is Darwin-only")
+    def test_proc_pid_rusage_reads_a_child_allocation_like_footprint(self):
+        import re
+        import subprocess
+        block = 64 << 20
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             f"b = bytearray({block})\nfor i in range(0, len(b), 4096): b[i] = 1\n"
+             "print('ready', flush=True)\nimport time; time.sleep(30)"],
+            stdout=subprocess.PIPE, encoding="utf-8")
+        try:
+            self.assertEqual(child.stdout.readline(), "ready\n")
+            current, peak = safety.proc_pid_rusage_footprint(child.pid)
+            tool = subprocess.run(["/usr/bin/footprint", "-p", str(child.pid), "-f", "bytes"],
+                                  stdout=subprocess.PIPE, encoding="utf-8", check=True).stdout
+            self.assertEqual(safety.darwin_phys_footprint(child.pid), current)
+        finally:
+            child.kill()
+            child.wait()
+            child.stdout.close()
+        self.assertGreaterEqual(current, block)
+        self.assertLess(current, 4 * block)
+        self.assertGreaterEqual(peak, current)
+        field = lambda name: int(re.search(rf"^\s*{name}:\s*(\d+) B\s*$", tool, re.MULTILINE).group(1))
+        self.assertEqual((field("phys_footprint"), field("phys_footprint_peak")), (current, peak))
+        with self.assertRaises(ProcessLookupError):
+            safety.proc_pid_rusage_footprint(child.pid)
+        self.assertIsNone(safety.darwin_phys_footprint(child.pid))
+
+    @unittest.skipUnless(sys.platform == "darwin", "proc_pid_rusage is Darwin-only")
+    def test_system_probe_caps_a_real_child_through_proc_pid_rusage(self):
+        # A Python interpreter's footprint is well above the 1 MB fixture cap.
+        with self.assertRaisesRegex(safety.SupervisionError, "child-footprint") as caught:
+            self.run_child("import time; time.sleep(5)", probe=safety.SystemProbe(self.policy))
+        breach = caught.exception.watchdog_child_footprint
+        # The per-process split is the same sample as the breaching total, keyed by owned PID.
+        self.assertEqual([item["pid"] for item in breach["processes"]], [caught.exception.pid])
+        self.assertEqual(sum(item["footprintBytes"] for item in breach["processes"]),
+                         breach["footprintBytes"])
+        self.assertGreater(breach["footprintBytes"], breach["capBytes"])
+
+    def test_child_footprint_trajectory_is_evenly_thinned_and_ends_at_the_breach(self):
+        trajectory = [(index * 250, 1000 + index) for index in range(1000)]
+        breach = safety.child_footprint_breach(1999, 1500, trajectory, {7: 1500, 3: 499})
+        points = breach["trajectory"]
+        self.assertEqual(len(points), safety.CHILD_FOOTPRINT_TRAJECTORY_POINTS)
+        self.assertEqual(points[0], {"elapsedMillis": 0, "footprintBytes": 1000})
+        self.assertEqual(points[-1], {"elapsedMillis": 999 * 250, "footprintBytes": 1999})
+        self.assertEqual([point["elapsedMillis"] for point in points],
+                         sorted({point["elapsedMillis"] for point in points}))
+        self.assertEqual((breach["elapsedMillis"], breach["sampleCount"]), (999 * 250, 1000))
+        self.assertEqual(breach["processes"], [{"pid": 3, "footprintBytes": 499},
+                                               {"pid": 7, "footprintBytes": 1500}])
+
     def test_footprint_exit_race_requires_terminal_root_and_empty_owned_tree(self):
         class FailedProbe(Probe):
             def __init__(self, after_snapshot=None):
@@ -397,18 +867,22 @@ class SupervisorTests(unittest.TestCase):
         class Child:
             pid = 43210
             def __init__(self, second_status):
-                self.statuses = iter((None, second_status))
+                self.polls = 0
+                self.second_status = second_status
                 self.waited = False
             def poll(self):
-                return next(self.statuses)
+                # Live on the first poll; every later poll sees the same status.
+                self.polls += 1
+                return None if self.polls == 1 else self.second_status
             def wait(self, **_kwargs):
                 self.waited = True
                 return 0
 
         def invoke(child, second_table, *, after_snapshot=None, event_path=None):
-            tables = ({child.pid: (1, child.pid)}, second_table)
+            tables = iter(({child.pid: (1, child.pid)},))
             with patch.object(safety.subprocess, "Popen", return_value=child), \
-                 patch.object(safety, "_process_table", side_effect=tables), \
+                 patch.object(safety, "_process_table",
+                              side_effect=lambda: next(tables, second_table)), \
                  patch.object(safety, "_stop_tree") as stop:
                 try:
                     result = self.run_child("unused", probe=FailedProbe(after_snapshot), event_path=event_path)
@@ -429,6 +903,7 @@ class SupervisorTests(unittest.TestCase):
         result, stopped = invoke(live, {live.pid: (1, live.pid)})
         self.assertIsInstance(result, safety.SupervisionError)
         self.assertEqual(result.reason, "probe-failure")
+        self.assertIn("failed on 5 consecutive ticks", result.detail)
         self.assertTrue(stopped)
         (self.root / "stdout").unlink()
         (self.root / "stderr").unlink()
@@ -480,11 +955,11 @@ class SupervisorTests(unittest.TestCase):
                 return f"123, 256, {gpu}\n456, 128, {gpu}\n"
             raise AssertionError(argv)
         with patch.object(safety.platform, "system", return_value="Linux"), \
-             patch.object(safety, "_bounded_output", side_effect=output), \
-             patch.object(safety, "_group_pids", return_value={123}):
+             patch.object(safety, "_bounded_output", side_effect=output):
             probe = safety.SystemProbe(policy)
             self.assertEqual(probe.gpu_free(), 8192 * 1024**2)
-            self.assertEqual(probe.gpu_free_and_tree_bytes(999), (8192 * 1024**2, 256 * 1024**2))
+            owner = type("Owner", (), {"members": lambda self: {123}})()
+            self.assertEqual(probe.gpu_free_and_tree_bytes(owner), (8192 * 1024**2, 256 * 1024**2))
 
     def test_windows_policy_and_unknown_gpu_memory_refuse(self):
         data = json.loads(self.policy.canonical_bytes)
@@ -593,6 +1068,8 @@ class WindowsSupervisorTests(unittest.TestCase):
         class Probe:
             def host_free(self):
                 return 10**12
+            def host_admission(self):
+                return self.host_free(), None
             def gpu_free(self):
                 return 10**12
             def tree_footprint(self, owner):

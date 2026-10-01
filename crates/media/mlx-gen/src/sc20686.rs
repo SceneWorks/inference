@@ -100,37 +100,37 @@ struct DarwinFootprint;
 
 impl FootprintProbe for DarwinFootprint {
     fn sample(&self) -> Option<(u64, u64)> {
-        let output = std::process::Command::new("/usr/bin/footprint")
-            .args([
-                "-p",
-                &std::process::id().to_string(),
-                "-f",
-                "bytes",
-                "--noCategories",
-            ])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        parse_footprint(&String::from_utf8_lossy(&output.stdout))
+        own_phys_footprint()
     }
 }
 
-/// Parse `footprint -f bytes` output. A missing or non-byte field fails closed (`None`).
-pub fn parse_footprint(text: &str) -> Option<(u64, u64)> {
-    let field = |name: &str| {
-        let mut matches = text.lines().filter_map(|line| {
-            line.trim()
-                .strip_prefix(name)
-                .and_then(|rest| rest.trim().strip_suffix(" B"))
-                .and_then(|value| value.trim().parse::<u64>().ok())
-        });
-        let value = matches.next()?;
-        matches.next().is_none().then_some(value)
+/// Own `(phys_footprint, lifetime peak)` via `proc_pid_rusage`, not a footprint subprocess.
+#[cfg(target_os = "macos")]
+fn own_phys_footprint() -> Option<(u64, u64)> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: the RUSAGE_INFO_V4 flavor writes at most one `rusage_info_v4` into the zeroed buffer.
+    let status = unsafe {
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
     };
-    let current = field("phys_footprint:")?;
-    let peak = field("phys_footprint_peak:")?;
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: the successful call initialized the buffer (and it was zeroed before).
+    let info = unsafe { info.assume_init() };
+    footprint_pair(info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn own_phys_footprint() -> Option<(u64, u64)> {
+    None
+}
+
+/// A footprint sample is usable only when it is positive and its peak covers it.
+pub fn footprint_pair(current: u64, peak: u64) -> Option<(u64, u64)> {
     (current > 0 && peak >= current).then_some((current, peak))
 }
 
@@ -205,7 +205,7 @@ struct Context {
     dtype: String,
     mask: String,
     rope: String,
-    real_weights: bool,
+    real_weights: Option<bool>, // None until a product projection confirms it; gates metadata.
 }
 
 impl Context {
@@ -481,7 +481,7 @@ fn model_snapshot_revision(root: &Path) -> io::Result<String> {
     ))
 }
 
-/// Components injected by tests; production uses the Metal allocator, `/usr/bin/footprint` and a
+/// Components injected by tests; production uses the Metal allocator, `proc_pid_rusage` and a
 /// JSONL file.
 pub struct Instruments {
     pub sink: Box<dyn EventSink>,
@@ -543,7 +543,7 @@ fn activate_pending(
         dtype: String::new(),
         mask: "none".into(),
         rope: "none".into(),
-        real_weights: false,
+        real_weights: None,
     };
     let run_high = instruments
         .counters
@@ -915,7 +915,7 @@ fn emit(state: &mut State, phase: &'static str, operation: &str, fields: EventFi
                 BACKEND, context.source_ref, context.variant
             ));
         }
-        value["real_weights"] = json!(context.real_weights);
+        value["real_weights"] = json!(context.real_weights == Some(true));
         value["full_generation"] = json!(!state.cancellation_armed);
         value["schedule_control"] = json!(state.schedule_control);
         value["attention_kind"] = json!("cross");
@@ -990,7 +990,10 @@ fn emit_metrics(state: &mut State) {
             ),
             ("reused_requests", json!(reused)),
             ("minimum_cache_reads", json!(minimum)),
-            ("real_weights", json!(state.context.real_weights)),
+            (
+                "real_weights",
+                json!(state.context.real_weights == Some(true)),
+            ),
             ("full_generation", json!(!state.cancellation_armed)),
             ("attention_kind", json!("cross")),
         ],
@@ -1037,13 +1040,16 @@ pub fn bind_geometry(geometry: KvGeometry, dtype: Option<Dtype>, mask: &str, rop
 /// crate can never produce a promotable (`real_weights: true`) transcript.
 pub fn confirm_real_weights() {
     with_state(|state| {
-        state.context.real_weights = !cfg!(test);
+        state.context.real_weights = Some(!cfg!(test));
         try_emit_metadata(state);
     });
 }
 
 fn try_emit_metadata(state: &mut State) {
-    if state.metadata_emitted || !state.context.geometry_ready() {
+    if state.metadata_emitted
+        || state.context.real_weights.is_none()
+        || !state.context.geometry_ready()
+    {
         return;
     }
     state.metadata_emitted = true;
@@ -1151,7 +1157,7 @@ pub fn register_cache(
         if state.context.dtype.is_empty() {
             state.context.dtype = dtype_name(key_array.dtype()).into();
         }
-        state.context.real_weights = !cfg!(test);
+        state.context.real_weights = Some(!cfg!(test));
         try_emit_metadata(state);
         let id = state.next_cache_id;
         state.next_cache_id += 1;
@@ -1330,7 +1336,7 @@ pub fn record_recomputed_kv(
         if state.context.dtype.is_empty() {
             state.context.dtype = dtype_name(key_array.dtype()).into();
         }
-        state.context.real_weights = !cfg!(test);
+        state.context.real_weights = Some(!cfg!(test));
         try_emit_metadata(state);
         state.recomputed_projections += 1;
         state.recomputed_dense = state.recomputed_dense.max(dense);

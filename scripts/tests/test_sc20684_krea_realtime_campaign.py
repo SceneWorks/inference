@@ -48,6 +48,16 @@ MODEL = {
 }
 
 
+def measured_admission(supervisor, policy) -> dict:
+    """A darwin admission as run_guarded records it: with its vm_stat components."""
+    admission = supervisor.runtime_guarded_admission(policy)
+    admission["hostMemoryComponents"] = supervisor.darwin_host_memory(16384, {
+        "freePages": 10**9 // 16384, "speculativePages": 0, "purgeablePages": 0,
+        "inactivePages": 0, "fileBackedPages": 0,
+            "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
+    return admission
+
+
 def source_budget(mode: str, tier: str) -> dict:
     per_token = 435_200 if tier == "q8" else 230_400
     previous = 0
@@ -234,6 +244,11 @@ def observation(mode: str, tier: str, run_id: str) -> dict:
                 "samplingSpanMicros": 1000,
                 "intervalMicros": 100,
                 "maxGapMicros": 100,
+                "maxUncoveredGapMicros": 100,
+                "gaps": [],
+                "gapsNotRecorded": 0,
+                "releaseWindowCount": 0,
+                "realtimeSampler": True,
                 "releaseActiveBytes": 5 * GIB,
                 "releaseCacheBytes": GIB // 2,
             },
@@ -343,6 +358,11 @@ def baseline_observation(mode: str, tier: str, run_id: str, candidate: dict) -> 
                 "samplingSpanMicros": 1000,
                 "intervalMicros": 100,
                 "maxGapMicros": 100,
+                "maxUncoveredGapMicros": 100,
+                "gaps": [],
+                "gapsNotRecorded": 0,
+                "releaseWindowCount": 0,
+                "realtimeSampler": True,
                 "releaseActiveBytes": 5 * GIB,
                 "releaseCacheBytes": GIB // 2,
             },
@@ -378,6 +398,20 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 row, expected_mode="t2v", expected_tier="q4", run_id="run",
                 expected_source=SOURCE, expected_snapshot=MODEL,
             )
+
+    def test_v2v_strength_identity_is_the_requested_decimal_not_a_widened_f32(self) -> None:
+        # W2 run 36854186685: the observer emitted f32 0.6 widened to f64. The launcher keeps the
+        # exact requested decimal; a widened or different strength is still refused.
+        self.validate("v2v")
+        for strength in (0.6000000238418579, 0.5, None):
+            row = observation("v2v", "q8", "run")
+            row["input"]["v2vStrength"] = strength
+            with self.subTest(strength=strength), self.assertRaisesRegex(
+                    campaign.CampaignError, "input identity does not match"):
+                campaign._validate_observation(
+                    row, expected_mode="v2v", expected_tier="q8", run_id="run",
+                    expected_source=SOURCE, expected_snapshot=MODEL,
+                )
 
     def validate(self, mode: str = "t2v", tier: str = "q8", run_id: str = "run") -> dict:
         return campaign._validate_observation(
@@ -863,7 +897,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 campaign._load_resumed_role(resume, "i2v-q8.dense-baseline", identity)
             record["supervision"] = campaign._supervision_record(campaign.supervisor.RunResult(
                 123, 0, 1024, None, 10**9, None, 1.0, (),
-                campaign.supervisor.runtime_guarded_admission(policy),
+                measured_admission(campaign.supervisor, policy),
             ))
             foreign = copy.deepcopy(record)
             foreign["supervision"]["admission"]["policySha256"] = "0" * 64
@@ -922,7 +956,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                     artifacts.mkdir(parents=True, exist_ok=True)
                     (artifacts / "frame.bin").write_bytes(name.encode())
                 return supervisor.RunResult(1000 + len(spawned), 0, 1024, None, 10**9, None, 1.0, (),
-                                            supervisor.runtime_guarded_admission(policy))
+                                            measured_admission(supervisor, policy))
 
             def run() -> list[dict]:
                 return campaign.run_matrix(
@@ -1007,6 +1041,12 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             def host_free(self) -> int:
                 return self.free
 
+            def host_admission(self) -> tuple[int, dict[str, object]]:
+                return self.free, campaign.supervisor.darwin_host_memory(4096, {
+                    "freePages": self.free // 4096, "speculativePages": 0, "purgeablePages": 0,
+                    "inactivePages": 0, "fileBackedPages": 0,
+            "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
+
             def tree_footprint(self, _owner: object) -> int:
                 return self.footprint
 
@@ -1069,6 +1109,61 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["pid"]), (False, "aborted", error.pid))
             self.assertIsNone(sealed["admission"]["wholeProcessPeakBoundBytes"])
             self.assertFalse((aborted / "roles").exists())
+
+    def test_sampler_gap_rule_reads_the_uncovered_gap_and_names_it(self) -> None:
+        # W2 run 36821253163: 5271 ticks over 810.4 s at a 50 ms interval, one 678 ms gap.
+        def gap(duration: int, uncovered: int, windows: int, release: int) -> dict:
+            return {"startMicros": 412_000_000, "durationMicros": duration, "uncoveredMicros": uncovered,
+                    "releaseMicros": release, "releaseWindows": windows,
+                    "phaseAtStart": "packed-generation-complete", "phaseAtEnd": "packed-generation-complete"}
+
+        def sampled(row: dict, raw: int, uncovered: int, gaps: list[dict]) -> dict:
+            row["memory"]["mlx"].update({
+                "intervalMicros": 50_000, "sampleCount": 5271, "samplingSpanMicros": 810_445_773,
+                "maxGapMicros": raw, "maxUncoveredGapMicros": uncovered, "gaps": gaps,
+                "releaseWindowCount": sum(item["releaseWindows"] for item in gaps)})
+            return row
+
+        # At the limit, and a long gap the clear_cache windows cover, are recorded, not refused.
+        self.validate_from(sampled(observation("t2v", "q8", "run"), 500_000, 500_000,
+                                   [gap(500_000, 500_000, 0, 0)]))
+        accepted = self.validate_from(sampled(observation("t2v", "q8", "run"), 678_127, 120_000,
+                                              [gap(678_127, 120_000, 3, 558_127)]))
+        self.assertEqual(accepted["memory"]["mlx"]["gaps"][0]["durationMicros"], 678_127)
+
+        # The same gap with nothing covering it is refused, naming where it was.
+        with self.assertRaises(campaign.CampaignError) as caught:
+            self.validate_from(sampled(observation("t2v", "q8", "run"), 678_127, 678_127,
+                                       [gap(678_127, 678_127, 0, 0)]))
+        self.assertEqual(
+            str(caught.exception),
+            "memory sampler coverage has an excessive gap: uncovered gap 678127 us exceeds 500000 us "
+            "(10 x 50000 us interval); raw max gap 678127 us; 5271 samples over 810445773 us, mean "
+            "spacing 153784 us; worst recorded gap at 412000000 us lasted 678127 us (678127 us "
+            "uncovered, 0 clear_cache windows) from phase packed-generation-complete to "
+            "packed-generation-complete")
+
+        candidate = self.validate()
+        def baseline(raw: int, uncovered: int, gaps: list[dict]) -> dict:
+            return campaign._validate_baseline_observation(
+                sampled(baseline_observation("t2v", "q8", "baseline", candidate), raw, uncovered, gaps),
+                expected_mode="t2v", expected_tier="q8", run_id="baseline",
+                candidate=candidate)
+        baseline(678_127, 120_000, [gap(678_127, 120_000, 1, 558_127)])
+        with self.assertRaisesRegex(campaign.CampaignError,
+                                    "dense baseline memory sampler coverage has an excessive gap: "
+                                    "uncovered gap 678127 us exceeds 500000 us"):
+            baseline(678_127, 678_127, [gap(678_127, 678_127, 0, 0)])
+
+        # A receipt that contradicts itself is refused before the rule is read.
+        for raw, uncovered, gaps in (
+            (100_000, 200_000, []),                            # uncovered above raw
+            (678_127, 120_000, [gap(678_127, 120_000, 0, 558_127)]),  # release time without a window
+            (678_127, 100_000, [gap(678_127, 120_000, 1, 558_127)]),  # record above the receipt
+            (600_000, 120_000, [gap(678_127, 120_000, 1, 558_127)]),  # record above the raw max
+        ):
+            with self.assertRaisesRegex(campaign.CampaignError, "uncovered gap exceeds|inconsistent"):
+                self.validate_from(sampled(observation("t2v", "q8", "run"), raw, uncovered, gaps))
 
     def validate_from(self, row: dict, mode: str = "t2v", tier: str = "q8") -> dict:
         return campaign._validate_observation(

@@ -741,6 +741,67 @@ pub fn conservative_video_decode_peak_bytes_for_vae(
     video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, None)
 }
 
+// --- sc-20686 (epic E8): Wan VAE encode working set -------------------------------------------
+//
+// Both Wan encoders are chunked causal encoders (a 1-frame first chunk, then 4-frame chunks) that
+// release their dead buffers at every block, so the live encode peak is one chunk's working set plus
+// a small per-input-frame term (the input clip and the growing latent), and MLX's cache stays empty
+// (live + cache == live). There is no tiled encode: the chunking already bounds time, and space is
+// priced whole. Fit from `encode_footprint_harness` (production-width synthetic weights, f32 — the
+// dtype production encodes in for both VAEs) at 64x128 and 128x128, T = 1/5/9/13; every coefficient
+// is rounded up so each measured point is covered:
+//   z16: T=1 6,284/6,246 B/px; T>=5 (peak - 700*T*HW) / 4HW <= 4,518.
+//   z48: T=1 2,843/2,828 B/px; T>=5 (peak - 50*T*HW) / 4HW <= 2,330.
+/// z16 encode: bytes per input pixel of a single-frame encode.
+const VAE16_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL: u64 = 6_300;
+/// z16 encode: bytes per pixel of one 4-frame chunk.
+const VAE16_ENCODE_CHUNK_BYTES_PER_VOXEL: u64 = 4_600;
+/// z16 encode: bytes per input voxel of the whole clip (input + accumulated latent).
+const VAE16_ENCODE_CLIP_BYTES_PER_VOXEL: u64 = 700;
+/// z48 encode: bytes per input pixel of a single-frame encode.
+const VAE22_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL: u64 = 2_900;
+/// z48 encode: bytes per voxel of one 4-frame chunk.
+const VAE22_ENCODE_CHUNK_BYTES_PER_VOXEL: u64 = 2_400;
+/// z48 encode: bytes per input voxel of the whole clip.
+const VAE22_ENCODE_CLIP_BYTES_PER_VOXEL: u64 = 50;
+/// Frames in every chunk after the first (the encoders' temporal stride).
+const VAE_ENCODE_CHUNK_FRAMES: u64 = 4;
+
+/// Conservative live working set (bytes) of one Wan VAE encode of a `frames x height x width` clip
+/// (`frames = 1` for a still). Excludes the VAE weights. `None` for a non-Wan VAE or overflow.
+pub fn video_encode_peak_bytes_for_vae(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+) -> Option<u64> {
+    let (single, chunk, clip) = if vae == WanVae::VAE_TILING {
+        (
+            VAE16_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL,
+            VAE16_ENCODE_CHUNK_BYTES_PER_VOXEL,
+            VAE16_ENCODE_CLIP_BYTES_PER_VOXEL,
+        )
+    } else if vae == Wan22Vae::VAE_TILING {
+        (
+            VAE22_ENCODE_SINGLE_FRAME_BYTES_PER_PIXEL,
+            VAE22_ENCODE_CHUNK_BYTES_PER_VOXEL,
+            VAE22_ENCODE_CLIP_BYTES_PER_VOXEL,
+        )
+    } else {
+        return None;
+    };
+    let pixels = u64::from(width).checked_mul(u64::from(height))?;
+    match frames {
+        0 => None,
+        1 => single.checked_mul(pixels),
+        frames => chunk
+            .checked_mul(VAE_ENCODE_CHUNK_FRAMES)?
+            .checked_mul(pixels)?
+            .max(single.checked_mul(pixels)?)
+            .checked_add(clip.checked_mul(u64::from(frames))?.checked_mul(pixels)?),
+    }
+}
+
 /// **Memory-budgeted** tiling for the z16 Wan 2.1 VAE decode (sc-6894 F-009): the z16 analogue of
 /// [`auto_tiling_budgeted`], routing the shared [`budgeted_plan`] selector through the z16 cost model.
 /// Replaces the unbudgeted [`TilingConfig::auto`] on the 14B T2V/I2V + VACE decode paths. Uses the same
@@ -3215,5 +3276,38 @@ mod tests {
         let out = ti2v_blend_init(&z_img, &mask, &noise).unwrap();
         // frame0 = z_img (9), frame1 = noise (7).
         assert_eq!(out.as_slice::<f32>(), &[9.0, 7.0]);
+    }
+
+    /// sc-20686 E8: the encode working-set model covers every point `encode_footprint_harness`
+    /// measured (production-width synthetic weights, f32, post-release live == live + cache) and
+    /// stays within 30 % above it.
+    #[test]
+    fn encode_peak_model_covers_the_measured_encodes() {
+        // (vae, frames, height, width, measured live bytes)
+        let measured = [
+            (WanVae::VAE_TILING, 1, 64, 128, 51_478_544_u64),
+            (WanVae::VAE_TILING, 5, 64, 128, 176_734_228),
+            (WanVae::VAE_TILING, 9, 64, 128, 199_360_532),
+            (WanVae::VAE_TILING, 1, 128, 128, 102_334_480),
+            (WanVae::VAE_TILING, 5, 128, 128, 352_256_020),
+            (WanVae::VAE_TILING, 13, 128, 128, 397_541_396),
+            (Wan22Vae::VAE_TILING, 1, 64, 128, 23_289_876),
+            (Wan22Vae::VAE_TILING, 5, 64, 128, 78_393_368),
+            (Wan22Vae::VAE_TILING, 9, 64, 128, 78_786_584),
+            (Wan22Vae::VAE_TILING, 1, 128, 128, 46_333_972),
+            (Wan22Vae::VAE_TILING, 5, 128, 128, 156_287_000),
+            (Wan22Vae::VAE_TILING, 13, 128, 128, 157_859_864),
+        ];
+        for (vae, frames, height, width, live) in measured {
+            let modelled = video_encode_peak_bytes_for_vae(vae, width, height, frames).unwrap();
+            assert!(
+                modelled >= live && (modelled as f64) <= live as f64 * 1.3,
+                "{vae:?} {frames}x{height}x{width}: modelled {modelled} vs measured {live}"
+            );
+        }
+        assert_eq!(
+            video_encode_peak_bytes_for_vae(WanVae::VAE_TILING, 64, 64, 0),
+            None
+        );
     }
 }

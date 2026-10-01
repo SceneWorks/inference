@@ -185,6 +185,87 @@ impl Decode for PackedCampaignDecoder<'_> {
     }
 }
 
+/// [`LlamaProvider::campaign_steady_decode`] over an already-tokenized context. A compressed arm's
+/// measurement must run wholly on its fused compressed reader (selected cache, no fallback, no
+/// dense reconstruction): a timing that silently decoded dense would carry a compressed label.
+fn campaign_steady_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    tokens: usize,
+    stop_tokens: &[i32],
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
+    let measured =
+        campaign_forced_decode_on(model, prompt_ids, tokens, stop_tokens, compressed, None)?;
+    Ok(crate::campaign::SteadyDecodeMeasurement {
+        prompt_tokens: prompt_ids.len() as u64,
+        generated_tokens: measured.tokens.len() as u64,
+        timed_tokens: measured.timed_tokens,
+        decode_ms: measured.decode_ms,
+        forced_stop_tokens: measured.forced_stop_tokens,
+    })
+}
+
+/// One fixed-length greedy decode through every stop token on a fresh cache of the session's
+/// representation, optionally teacher-forced on `teacher_forced` (see
+/// [`crate::decode::forced_greedy_decode`]). A compressed arm must run wholly on its fused
+/// compressed reader or the call fails closed.
+fn campaign_forced_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    tokens: usize,
+    stop_tokens: &[i32],
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+    teacher_forced: Option<&[i32]>,
+) -> CoreResult<crate::decode::ForcedDecode> {
+    let packed = match (compressed, model) {
+        (None, _) => None,
+        (Some(arm), Decoder::Causal(causal)) => Some(PackedCampaignDecoder {
+            model: causal,
+            arm,
+            selection_fallbacks: RefCell::new(Vec::new()),
+        }),
+        (Some(_), Decoder::Qwen35(_)) => {
+            return Err(CoreError::Unsupported(
+                "compressed campaign steady decode requires the causal decoder".into(),
+            ))
+        }
+    };
+    let decoder: &dyn Decode = match &packed {
+        Some(packed) => packed,
+        None => model,
+    };
+    let mut cache = decoder.make_cache();
+    let measured = crate::decode::forced_greedy_decode(
+        decoder,
+        cache.as_mut(),
+        prompt_ids,
+        tokens,
+        stop_tokens,
+        teacher_forced,
+        &mut |_| {},
+    );
+    let evidence = cache.packed_evidence();
+    cache.reset().map_err(to_core)?;
+    let measured = measured.map_err(to_core)?;
+    if let Some(packed) = &packed {
+        let fused = packed.selection_fallbacks.borrow().is_empty()
+            && evidence.is_some_and(|evidence| {
+                evidence.accepted_direct_calls > 0
+                    && evidence.fallback_reasons.is_empty()
+                    && !evidence.dense_active
+                    && evidence.full_cache_dequantizations == 0
+                    && evidence.failed_dispatches == 0
+            });
+        if !fused {
+            return Err(CoreError::Load(
+                "compressed forced decode did not run wholly on the fused compressed reader".into(),
+            ));
+        }
+    }
+    Ok(measured)
+}
+
 /// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
 /// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
 /// implement [`Decode`], so the generation loop is identical.
@@ -1028,6 +1109,11 @@ impl LlamaProvider {
     /// Drop campaign-only shared-prefix ownership before a post-request release sample. Ordinary
     /// serving has no access to this cache; campaign workers must not let it retain MLX arrays and
     /// then claim that request-scoped cache memory was released.
+    /// The stop tokens every product generation of this provider ends on.
+    pub(crate) fn campaign_stop_tokens(&self) -> &[i32] {
+        &self.stop_tokens
+    }
+
     pub(crate) fn campaign_release_cache_state(&self) {
         self.campaign_prefix_cache.borrow_mut().take();
     }
@@ -1156,6 +1242,79 @@ impl LlamaProvider {
         observer.phase("cancellation-cleanup");
         captured.replay(observer);
         Ok(())
+    }
+
+    /// SC-20671 steady-decode timing: prefill the raw `prompt` (the row's context) into a fresh
+    /// cache of the session's representation and greedily decode exactly `tokens` ids through any
+    /// stop token (see [`crate::decode::forced_greedy_decode`]). No observer is attached: this runs
+    /// outside every coordinate's memory attribution, and its request-scoped cache is reset and
+    /// MLX's buffer cache released before it returns.
+    pub(crate) fn campaign_steady_decode(
+        &self,
+        prompt: &str,
+        tokens: usize,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let budget = u32::try_from(tokens)
+            .map_err(|_| CoreError::InvalidRequest("steady-decode length overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured =
+            campaign_steady_decode_on(&self.model, &ids, tokens, &self.stop_tokens, compressed);
+        mlx_rs::memory::clear_cache();
+        measured
+    }
+
+    /// SC-20671 forced continuation (compressed rows): on the session's representation, prefill the
+    /// raw `prompt` and greedily decode `min(tokens, context window - prompt)` ids through every
+    /// stop token. With `teacher_forced`, the decode is forced on that stream instead and the
+    /// session's argmax at each position is returned (its length is the stream's). Runs outside
+    /// every coordinate's memory attribution on a request-scoped cache.
+    pub(crate) fn campaign_forced_continuation(
+        &self,
+        prompt: &str,
+        tokens: usize,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
+        teacher_forced: Option<&[i32]>,
+    ) -> CoreResult<Vec<i32>> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let window = usize::try_from(self.campaign_context_window()?)
+            .map_err(|_| CoreError::Load("context window overflows usize".into()))?;
+        let length = match teacher_forced {
+            Some(forced) => forced.len(),
+            None => tokens.min(window.saturating_sub(ids.len())),
+        };
+        let budget = u32::try_from(length)
+            .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured = campaign_forced_decode_on(
+            &self.model,
+            &ids,
+            length,
+            &self.stop_tokens,
+            compressed,
+            teacher_forced,
+        );
+        mlx_rs::memory::clear_cache();
+        Ok(measured?.tokens)
     }
 
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
@@ -4597,5 +4756,287 @@ mod tests {
         assert_eq!(capture.reconstructions, 0);
         assert!(!capture.snapshots.is_empty());
         assert_eq!(capture.releases, vec![*capture.snapshots.last().unwrap()]);
+    }
+
+    /// SC-20671 prefill attribution through the real decode loop, at 2- and 4-bit. An empty
+    /// cache's first multi-row step attends on dense SDPA, so no output reads the packed store;
+    /// the cache must still materialize the store it reports at the step's commit. Left lazy, the
+    /// prefill-peak sample holds the step's dense K/V instead of the store, and the campaign's
+    /// `baseline + persistent KV` floor fails whenever that dense K/V is smaller than the
+    /// block-allocated store (Mac2 A2 qwen-short 4-bit: 80 prompt tokens, active growth
+    /// 9,504,184 B for a 12,845,056 B store; 2-bit passed only because its 9,175,040 B store
+    /// equals the 80-token dense K/V).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_prefill_sample_holds_the_reported_packed_store() {
+        #[derive(Default)]
+        struct PrefillCapture {
+            phase: Option<&'static str>,
+            prefill_active: Option<u64>,
+            prefill_kv: u64,
+            element_bytes: u64,
+        }
+        impl crate::campaign::Observer for PrefillCapture {
+            fn phase(&mut self, name: &'static str) {
+                self.phase = Some(name);
+                if name == "prefill-peak" {
+                    self.prefill_active = Some(mlx_rs::memory::get_active_memory() as u64);
+                }
+            }
+            fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+            fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, element: u64) {
+                if self.phase == Some("prefill-peak") {
+                    self.prefill_kv = self.prefill_kv.max(bytes);
+                    self.element_bytes = element;
+                }
+            }
+        }
+        let model = tiny_packed_capable_model();
+        // 40 tokens: past the fused-SDPA row limit (the dense first step), one flushed 32-token
+        // group and an 8-token residual.
+        let prompt = (0..40).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 2,
+            seed: Some(0),
+            ..Default::default()
+        };
+        for method in crate::campaign::CompressedKvMethod::ALL {
+            let arm = method.arm().unwrap();
+            let decoder = PackedCampaignDecoder {
+                model: &model,
+                arm: &arm,
+                selection_fallbacks: RefCell::new(Vec::new()),
+            };
+            let run = |observer: Option<&mut dyn crate::campaign::Observer>| {
+                crate::decode::generate_with_observer(
+                    &decoder,
+                    &prompt,
+                    &config,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                    None,
+                    None,
+                    observer,
+                )
+                .unwrap();
+            };
+            // Warm the reader and the lazily created weights so the baseline is steady. Tests run
+            // one at a time (`.cargo/config.toml`), so the process-global counter is ours.
+            run(None);
+            let baseline = mlx_rs::memory::get_active_memory() as u64;
+            let mut capture = PrefillCapture::default();
+            run(Some(&mut capture));
+            assert!(
+                decoder.selection_fallbacks.borrow().is_empty(),
+                "{method:?} selected the packed cache"
+            );
+            // The failing scenario: the prompt's dense K + V (2 layers, 1 KV head, D64, at the
+            // cache's element width) is smaller than the reported store.
+            let dense_prompt_kv = 2 * 2 * 40 * 64 * capture.element_bytes;
+            assert!(
+                dense_prompt_kv < capture.prefill_kv,
+                "{method:?}: dense {dense_prompt_kv} B vs store {} B",
+                capture.prefill_kv
+            );
+            let growth = capture.prefill_active.unwrap().saturating_sub(baseline);
+            assert!(
+                growth >= capture.prefill_kv,
+                "{method:?}: prefill-peak active growth {growth} B does not hold the reported \
+                 packed store {} B",
+                capture.prefill_kv
+            );
+        }
+    }
+
+    /// SC-20671 storage reconciliation through the real decode loop, at 2- and 4-bit: a prompt
+    /// that crosses a 256-token block boundary leaves a pending residual, and the decode that
+    /// follows (including a group flush) stays inside the last block, so the device share is a
+    /// plateau. The coordinate storage the campaign observer keeps must be the plateau's latest
+    /// instant: its device share is the largest persistent snapshot and its length the largest
+    /// live length (the Mac2 32k single-shot row recorded the prefill instant, 32836 tokens,
+    /// against a kvLength of 32843).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_coordinate_storage_reconciles_across_a_block_plateau() {
+        #[derive(Default)]
+        struct StorageCapture {
+            snapshots: Vec<(u64, u64)>,
+            storage: Vec<crate::primitives::CompressedCacheStorage>,
+        }
+        impl crate::campaign::Observer for StorageCapture {
+            fn phase(&mut self, _name: &'static str) {}
+            fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+            fn cache_snapshot(&mut self, bytes: u64, tokens: u64, _capacity: u64, _element: u64) {
+                self.snapshots.push((bytes, tokens));
+            }
+            fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+                self.storage.push(*storage);
+            }
+        }
+        let model = tiny_packed_capable_model();
+        // 300 prompt tokens: one full block plus 44 (a 12-token residual after 32-token groups).
+        let prompt = (0..300).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
+        for method in crate::campaign::CompressedKvMethod::ALL {
+            let arm = method.arm().unwrap();
+            let decoder = PackedCampaignDecoder {
+                model: &model,
+                arm: &arm,
+                selection_fallbacks: RefCell::new(Vec::new()),
+            };
+            let mut capture = StorageCapture::default();
+            let config = GenerationConfig {
+                max_new_tokens: 30,
+                seed: Some(0),
+                ..Default::default()
+            };
+            crate::decode::generate_with_observer(
+                &decoder,
+                &prompt,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                Some(&mut capture),
+            )
+            .unwrap();
+            let mut observer = crate::campaign::ProductObserver::new();
+            observer.begin_coordinate_operation();
+            for storage in &capture.storage {
+                crate::campaign::Observer::compressed_storage(&mut observer, storage);
+            }
+            observer.end_coordinate_operation();
+            let peak = observer.coordinate_storage_peak().unwrap();
+            let persistent = capture
+                .snapshots
+                .iter()
+                .map(|(bytes, _)| *bytes)
+                .max()
+                .unwrap();
+            let kv_length = capture
+                .snapshots
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .max()
+                .unwrap();
+            // The scenario is the failing one: several instants share the peak device share.
+            let plateau = capture
+                .storage
+                .iter()
+                .filter(|storage| storage.device_bytes() == persistent)
+                .map(|storage| storage.tokens)
+                .collect::<Vec<_>>();
+            assert!(
+                plateau.len() > 1 && plateau[0] < kv_length,
+                "{method:?} {plateau:?}"
+            );
+            assert!(
+                kv_length > 300 && kv_length < 512,
+                "{method:?} decode stays in block two"
+            );
+            crate::campaign::coordinate_storage_reconciles(
+                peak.device_code_bytes,
+                Some(peak.device_bytes()),
+                peak.tokens,
+                persistent,
+                kv_length,
+            )
+            .unwrap_or_else(|error| panic!("{method:?}: {error}"));
+        }
+    }
+
+    /// SC-20671 steady decode on a tiny model: both arms decode exactly the fixed length through
+    /// stop tokens (every vocabulary id is declared one), and a compressed arm whose reader is
+    /// refused fails closed instead of timing a dense decode under the compressed label.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn campaign_steady_decode_is_fixed_length_on_both_arms_and_refuses_a_dense_compressed_arm() {
+        let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let every_id = (0..32).collect::<Vec<i32>>();
+        let prompt = [1, 2, 3, 4, 5];
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        for compressed in [None, Some(&arm)] {
+            let measured =
+                campaign_steady_decode_on(&model, &prompt, 8, &every_id, compressed).unwrap();
+            assert_eq!(measured.prompt_tokens, 5);
+            assert_eq!(measured.generated_tokens, 8);
+            assert_eq!(measured.timed_tokens, 7);
+            assert_eq!(
+                measured.forced_stop_tokens, 8,
+                "every token was a forced stop"
+            );
+        }
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20671-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let error = campaign_steady_decode_on(&model, &prompt, 8, &every_id, Some(&refused))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fused compressed reader"), "{error}");
+    }
+
+    /// SC-20671 forced continuation on a tiny model: the dense arm continues greedily through
+    /// every stop token; teacher-forcing the dense arm on its own continuation reproduces it at
+    /// every position; the compressed arm is teacher-forced on the dense stream wholly on its fused
+    /// reader; a position forced off the compressed arm's choice is a recorded flip; and a refused
+    /// compressed reader fails closed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn campaign_forced_continuation_teacher_forces_the_compressed_arm_on_the_dense_stream() {
+        let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let every_id = (0..32).collect::<Vec<i32>>();
+        let prompt = [1, 2, 3, 4, 5];
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        let forced = |compressed, stream: Option<&[i32]>| {
+            campaign_forced_decode_on(&model, &prompt, 64, &every_id, compressed, stream)
+                .map(|decode| decode.tokens)
+        };
+        let reference = forced(None, None).unwrap();
+        assert_eq!(reference.len(), 64, "every stop token is decoded through");
+        assert_eq!(forced(None, Some(&reference)).unwrap(), reference);
+        let choices = forced(Some(&arm), Some(&reference)).unwrap();
+        let evidence = crate::campaign::forced_continuation_evidence(&reference, &choices).unwrap();
+        assert_eq!(evidence.tokens, 64);
+        assert_eq!(evidence.matches + evidence.flip_count, 64);
+        // Force position 10 off the compressed arm's own choice there: a guaranteed flip.
+        let mut off = reference.clone();
+        off[10] = (choices[10] + 1) % 32;
+        let off_choices = forced(Some(&arm), Some(&off)).unwrap();
+        assert_eq!(
+            off_choices[..10],
+            choices[..10],
+            "the prefix before 10 is unchanged"
+        );
+        let miss = crate::campaign::forced_continuation_evidence(&off, &off_choices).unwrap();
+        assert!(miss.first_flip_positions.contains(&10), "{miss:?}");
+        assert!(miss.agreement < 1.0);
+        assert!(forced(Some(&arm), Some(&reference[..63])).is_err());
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20671-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let error = forced(Some(&refused), Some(&reference))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fused compressed reader"), "{error}");
     }
 }

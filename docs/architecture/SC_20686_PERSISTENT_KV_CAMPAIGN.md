@@ -218,9 +218,11 @@ Candle observers plus `"backend": "mlx-metal"` on every event and a `kv_batch` o
 * **Per-phase attribution** is emitted as `phase-window` events (`encode`, `load`, `prepare-cache`,
   `denoise-step` with its step index, `post-denoise`, `decode`) driven by the provider's own progress
   stream and cache-build hooks. Each window carries its allocator before/after/high/reserved and the
-  process `phys_footprint`/`phys_footprint_peak` from `/usr/bin/footprint`. The supervisor adds its
-  own sampled `phys_footprint` of the owned process tree and admits each arm by `vm_stat` free memory
-  (runtime-guarded admission, no static peak bound).
+  process `phys_footprint`/`phys_footprint_peak` from `proc_pid_rusage` (the ledger
+  `/usr/bin/footprint` prints, read without a subprocess). The supervisor adds its
+  own sampled `phys_footprint` of the owned process tree and admits each arm by `vm_stat` available
+  memory -- free, speculative, purgeable, and file-backed (cached-file) pages, each component recorded in
+  `admission.hostMemoryComponents` (runtime-guarded admission, no static peak bound).
 * **Reuse/invalidation** events are exact: every read names its cache id, a rebuild releases the old
   id before the new creation, and the reducer's per-cache minimum reuse counts caches that were never
   read. A cached FLUX read window opens on the query and the fresh K/V, so the splice of the stored

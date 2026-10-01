@@ -25,7 +25,7 @@ the ``Executable`` path that command prints. The executable must be built and se
 invoking this launcher. No static
 whole-process peak bound exists for these cells; each role is admitted by the
 supervisor's runtime guards (watchdog cap, host reserve, deadline, sampling) when
-pre-spawn host free RAM covers cap plus reserve. The admission, with the unknown
+pre-spawn host available RAM covers cap plus reserve. The admission, with the unknown
 peak recorded as null plus reason, is sealed with every role. A pre-spawn refusal,
 watchdog abort or failed child is written as a sealed unaccepted log record and
 leaves the campaign incomplete; it is never an accepted role.
@@ -635,16 +635,15 @@ def _validate_observation(
         "sampledCachePeakBytes", "sampledFootprintPeakBytes", "footprintPeakActiveBytes",
         "footprintPeakCacheBytes", "sampleCount", "periodicSampleCount", "samplingSpanMicros",
         "intervalMicros", "maxGapMicros", "releaseActiveBytes", "releaseCacheBytes",
-    }
+    } | SAMPLER_RECEIPT_FIELDS
     mlx = _object(memory["mlx"], "memory.mlx", mlx_fields)
-    for key in mlx_fields:
+    for key in mlx_fields - SAMPLER_RECEIPT_FIELDS:
         _integer(mlx[key], f"memory.mlx.{key}", minimum=1 if key in {"exactActivePeakBytes", "sampledActivePeakBytes", "sampledFootprintPeakBytes", "sampleCount", "periodicSampleCount", "samplingSpanMicros", "intervalMicros"} else 0)
     if mlx["sampledFootprintPeakBytes"] != mlx["footprintPeakActiveBytes"] + mlx["footprintPeakCacheBytes"]:
         raise CampaignError("memory sampler paired footprint peak is internally inconsistent")
     if mlx["exactActivePeakBytes"] < mlx["sampledActivePeakBytes"]:
         raise CampaignError("exact MLX active peak cannot be below a sampled active value")
-    if mlx["maxGapMicros"] > mlx["intervalMicros"] * 10:
-        raise CampaignError("memory sampler coverage has an excessive gap")
+    _require_sampler_coverage(mlx, "memory sampler")
     if type(memory["releaseVerified"]) is not bool:
         raise CampaignError("memory.releaseVerified must be a boolean")
     loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024
@@ -812,6 +811,64 @@ def _validate_observation(
     return row
 
 
+# The longest allowed stretch with no allocator sample bounding MLX active+cache, in sampler
+# intervals. The sampled active+cache peak is a decision domain (decision_policy
+# materialMemory.requiredDomains) and nothing else bounds MLX's cache between samples -- MLX keeps
+# an exact high-water mark for active bytes only, and the Darwin lifetime phys_footprint also
+# counts non-MLX memory -- so a longer stretch leaves an unbounded hole in that evidence and the
+# row is refused. A clear_cache window is not such a stretch: it is bracketed by samples and
+# active+cache cannot rise inside it (mlx_gen::memory_probe::clear_cache), so the rule reads
+# maxUncoveredGapMicros; maxGapMicros and every long gap stay on record.
+SAMPLER_MAX_GAP_INTERVALS = 10
+# Coverage receipt fields beyond the integer counters, validated by _require_sampler_coverage.
+SAMPLER_RECEIPT_FIELDS = {
+    "maxUncoveredGapMicros", "gaps", "gapsNotRecorded", "releaseWindowCount", "realtimeSampler",
+}
+SAMPLER_GAP_FIELDS = {
+    "startMicros", "durationMicros", "uncoveredMicros", "releaseMicros", "releaseWindows",
+    "phaseAtStart", "phaseAtEnd",
+}
+SAMPLER_MAX_GAP_RECORDS = 256
+
+
+def _require_sampler_coverage(mlx: dict[str, Any], label: str) -> None:
+    """Validate the allocator sampler's coverage receipt; refuse an uncovered gap over the limit."""
+    for key in ("maxUncoveredGapMicros", "gapsNotRecorded", "releaseWindowCount"):
+        _integer(mlx[key], f"{label} {key}")
+    if type(mlx["realtimeSampler"]) is not bool:
+        raise CampaignError(f"{label} realtimeSampler must be a boolean")
+    if mlx["maxUncoveredGapMicros"] > mlx["maxGapMicros"]:
+        raise CampaignError(f"{label} uncovered gap exceeds its raw gap")
+    gaps = mlx["gaps"]
+    if not isinstance(gaps, list) or len(gaps) > SAMPLER_MAX_GAP_RECORDS:
+        raise CampaignError(f"{label} gaps must be a list of at most {SAMPLER_MAX_GAP_RECORDS} records")
+    for index, gap in enumerate(gaps):
+        gap = _object(gap, f"{label} gaps[{index}]", SAMPLER_GAP_FIELDS)
+        for key in SAMPLER_GAP_FIELDS - {"phaseAtStart", "phaseAtEnd"}:
+            _integer(gap[key], f"{label} gaps[{index}].{key}")
+        for key in ("phaseAtStart", "phaseAtEnd"):
+            if gap[key] is not None and not isinstance(gap[key], str):
+                raise CampaignError(f"{label} gaps[{index}].{key} must be a string or null")
+        if (gap["uncoveredMicros"] > gap["durationMicros"] or gap["releaseMicros"] > gap["durationMicros"]
+                or gap["durationMicros"] > mlx["maxGapMicros"]
+                or gap["uncoveredMicros"] > mlx["maxUncoveredGapMicros"]
+                or (gap["releaseWindows"] == 0) != (gap["releaseMicros"] == 0)):
+            raise CampaignError(f"{label} gaps[{index}] is inconsistent with its coverage receipt")
+    limit = mlx["intervalMicros"] * SAMPLER_MAX_GAP_INTERVALS
+    if mlx["maxUncoveredGapMicros"] > limit:
+        worst = max(gaps, key=lambda gap: gap["uncoveredMicros"], default=None)
+        where = ("" if worst is None else
+                 f"; worst recorded gap at {worst['startMicros']} us lasted {worst['durationMicros']} us "
+                 f"({worst['uncoveredMicros']} us uncovered, {worst['releaseWindows']} clear_cache "
+                 f"windows) from phase {worst['phaseAtStart']} to {worst['phaseAtEnd']}")
+        raise CampaignError(
+            f"{label} coverage has an excessive gap: uncovered gap {mlx['maxUncoveredGapMicros']} us "
+            f"exceeds {limit} us ({SAMPLER_MAX_GAP_INTERVALS} x {mlx['intervalMicros']} us interval); "
+            f"raw max gap {mlx['maxGapMicros']} us; {mlx['sampleCount']} samples over "
+            f"{mlx['samplingSpanMicros']} us, mean spacing "
+            f"{mlx['samplingSpanMicros'] // max(mlx['sampleCount'] - 1, 1)} us{where}")
+
+
 def _validate_baseline_observation(
     observation: object,
     *,
@@ -898,14 +955,15 @@ def _validate_baseline_observation(
         "sampledCachePeakBytes", "sampledFootprintPeakBytes", "footprintPeakActiveBytes",
         "footprintPeakCacheBytes", "sampleCount", "periodicSampleCount", "samplingSpanMicros",
         "intervalMicros", "maxGapMicros", "releaseActiveBytes", "releaseCacheBytes",
-    }
+    } | SAMPLER_RECEIPT_FIELDS
     mlx = _object(memory["mlx"], "dense baseline memory.mlx", mlx_fields)
-    for key in mlx_fields:
+    for key in mlx_fields - SAMPLER_RECEIPT_FIELDS:
         _integer(mlx[key], f"dense baseline memory.mlx.{key}", minimum=1 if key in {"exactActivePeakBytes", "sampledActivePeakBytes", "sampledFootprintPeakBytes", "sampleCount", "periodicSampleCount", "samplingSpanMicros", "intervalMicros"} else 0)
     if mlx["sampledFootprintPeakBytes"] != mlx["footprintPeakActiveBytes"] + mlx["footprintPeakCacheBytes"]:
         raise CampaignError("dense baseline paired allocator peak is inconsistent")
-    if mlx["exactActivePeakBytes"] < mlx["sampledActivePeakBytes"] or mlx["maxGapMicros"] > mlx["intervalMicros"] * 10:
+    if mlx["exactActivePeakBytes"] < mlx["sampledActivePeakBytes"]:
         raise CampaignError("dense baseline allocator coverage is inconsistent")
+    _require_sampler_coverage(mlx, "dense baseline memory sampler")
     if type(memory["releaseVerified"]) is not bool:
         raise CampaignError("dense baseline memory.releaseVerified must be a boolean")
     loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024

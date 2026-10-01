@@ -1,16 +1,18 @@
 //! Retained MLX Metal reader for SC-20675's packed K/V layout.
 //!
-//! K codes are token-group packed (`[B,H,groups,G·D/4]`, one f16 scale/zero per group and channel)
-//! and V codes are channel-group packed (`[B,H,tokens,D/4]`, one f16 scale/zero per token and
-//! channel group). The not-yet-quantized residual of each (at most one quantization group of the
+//! K codes are token-group packed (`[B,H,groups,G·D·b/8]`, one f16 scale/zero per group and
+//! channel) and V codes are channel-group packed (`[B,H,tokens,D·b/8]`, one f16 scale/zero per token
+//! and channel group), for a code width `b` of 2, 4, or 8 ([`PackedCodeBits`]). Every kernel takes `b`
+//! as the compile-time template argument `BITS`, so each width is its own pipeline specialization
+//! and the decode loops carry no width branch. The not-yet-quantized residual of each (at most one quantization group of the
 //! most recent tokens) is a separate dense `[B,H,residual_capacity,D]` input, so the reader never
 //! receives, and never builds, a concatenation of history and residual. Buffers may be
 //! block-preallocated: the live extents are kernel parameters, not buffer shapes.
 //!
 //! Kernel design. Each threadgroup owns one query row (batch, query head, query position) and one
 //! block-aligned slice of the visible KV range. Its SIMD groups stride over 32-token blocks; inside a
-//! SIMD group every lane owns `D/32` contiguous channels, so one lane reads one packed byte per
-//! token for K and for V, a score is one `simd_sum`, and the online-softmax state (running max,
+//! SIMD group every lane owns `D/32` contiguous channels, so one lane reads `D·b/256` packed bytes
+//! per token for K and for V, a score is one `simd_sum`, and the online-softmax state (running max,
 //! normalizer, `D/32` accumulators) lives in registers with no barrier per token. SIMD groups merge
 //! once through threadgroup memory at the end. A long history is split across several threadgroups
 //! per row (split-KV); their partial `(max, sum, acc)` are merged by a second one-SIMD-group pass.
@@ -34,7 +36,7 @@
 //! [`PackedMetalKernel::nax_selection`] and [`PackedMetalKernel::kernel_descriptor`].
 use crate::error::{Error, Result};
 use crate::primitives::packed_group_affine_kv::{
-    packed_metal_head_dimension_supported, PACKED_CODES_PER_BYTE, PACKED_METAL_QUANT_GROUP_SIZE,
+    packed_metal_head_dimension_supported, PackedCodeBits, PACKED_METAL_QUANT_GROUP_SIZE,
 };
 use mlx_rs::fast::{MetalKernel, OutputArg};
 use mlx_rs::{Array, Dtype};
@@ -408,21 +410,39 @@ using namespace metal;
 template <typename T> struct sc20676_device_element;
 template <typename T> struct sc20676_device_element<device T*> { using type = T; };
 
-// Four 2-bit codes per byte; `index` is the code index of the lane's first channel, a multiple of
-// the lane's channel count.
-template <int EPL>
+// `8 / BITS` codes per byte, low bits first. Every branch below is on template constants, so each
+// (EPL, BITS) specialization compiles to straight-line shifts and masks.
+// `EPL` codes starting at code `index` (a multiple of `EPL`): the lane's contiguous channels.
+template <int EPL, int BITS>
 inline void sc20676_unpack(const device uint8_t* base, uint index, thread uint* codes) {
-    if (EPL == 2) {
-        const uint byte = base[index >> 2];
-        const uint shift = (index & 3u) * 2u;
-        codes[0] = (byte >> shift) & 3u;
-        codes[1] = (byte >> (shift + 2u)) & 3u;
+    static_assert(BITS == 2 || BITS == 4 || BITS == 8, "packed codes are 2, 4, or 8 bits wide");
+    constexpr uint PER_BYTE = 8u / uint(BITS);
+    constexpr uint MASK = (1u << uint(BITS)) - 1u;
+    if (uint(EPL) < PER_BYTE) {
+        const uint byte = base[index / PER_BYTE];
+        const uint shift = (index % PER_BYTE) * uint(BITS);
+        for (uint k = 0; k < uint(EPL); ++k) codes[k] = (byte >> (shift + uint(BITS) * k)) & MASK;
     } else {
-        for (uint word = 0; word < uint(EPL) / 4u; ++word) {
-            const uint byte = base[(index >> 2) + word];
-            for (uint k = 0; k < 4u; ++k) codes[word * 4u + k] = (byte >> (2u * k)) & 3u;
+        for (uint word = 0; word < uint(EPL) / PER_BYTE; ++word) {
+            const uint byte = base[index / PER_BYTE + word];
+            for (uint k = 0; k < PER_BYTE; ++k) {
+                codes[word * PER_BYTE + k] = (byte >> (uint(BITS) * k)) & MASK;
+            }
         }
     }
+}
+
+// Four codes starting at code `index` (a multiple of four) as floats: one byte at 2 bits, two at 4,
+// four at 8.
+template <int BITS>
+inline float4 sc20676_codes4(const device uint8_t* base, uint index) {
+    static_assert(BITS == 2 || BITS == 4 || BITS == 8, "packed codes are 2, 4, or 8 bits wide");
+    constexpr uint PER_BYTE = 8u / uint(BITS);
+    constexpr uint MASK = (1u << uint(BITS)) - 1u;
+    uint word = 0;
+    for (uint b = 0; b < 4u / PER_BYTE; ++b) word |= uint(base[index / PER_BYTE + b]) << (8u * b);
+    return float4(float(word & MASK), float((word >> uint(BITS)) & MASK),
+                  float((word >> (2u * uint(BITS))) & MASK), float((word >> (3u * uint(BITS))) & MASK));
 }
 
 // Fused packed attention for one threadgroup: one row of `QG` query heads sharing a KV head, one
@@ -431,7 +451,8 @@ inline void sc20676_unpack(const device uint8_t* base, uint index, thread uint* 
 // the log2 domain (`q` pre-scaled by log2(e)/sqrt(D)), so `exp2` is the softmax exponential. SIMD
 // group 0 returns true holding the merged (unnormalized) accumulators, maxima, and sums for the
 // row's heads; `qrow0` is the output row of the first head (head `g` is `qrow0 + g * SQ`).
-template <int D, int QG, int BN, int MASK_MODE, int WINDOW, typename QT, typename KT, typename VT>
+template <int D, int QG, int BN, int MASK_MODE, int WINDOW, int BITS, typename QT, typename KT,
+          typename VT>
 inline bool sc20676_attend(
     const device QT* q, const device uint8_t* k_codes, const device half* k_scale,
     const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
@@ -442,8 +463,8 @@ inline bool sc20676_attend(
     thread float* merged, thread float* out_max, thread float* out_sum, thread uint& qrow0) {
     constexpr int EPL = D / 32;
     constexpr int G = 32;
-    constexpr int KW = G * D / 4;
-    constexpr int VW = D / 4;
+    constexpr int KW = G * D * BITS / 8;
+    constexpr int VW = D * BITS / 8;
     constexpr int VG = D / G;
     const uint head_blocks = HQ / QG;
     const uint qi = row % SQ;
@@ -503,7 +524,7 @@ inline bool sc20676_attend(
         for (uint t = t_begin; t < t_end; ++t) {
             float score[QG];
             if (k_quantized) {
-                sc20676_unpack<EPL>(kc, (t - blk * G) * D + ch, codes);
+                sc20676_unpack<EPL, BITS>(kc, (t - blk * G) * D + ch, codes);
                 float kf[EPL];
                 for (uint j = 0; j < EPL; ++j) kf[j] = float(codes[j]);
                 for (uint g = 0; g < QG; ++g) {
@@ -526,7 +547,7 @@ inline bool sc20676_attend(
                 const uint meta = vrow * VG + ch / G;
                 const float vs = float(v_scale[meta]);
                 const float vz = float(v_zero[meta]);
-                sc20676_unpack<EPL>(v_codes + vrow * VW, ch, codes);
+                sc20676_unpack<EPL, BITS>(v_codes + vrow * VW, ch, codes);
                 for (uint j = 0; j < EPL; ++j) vval[j] = vz + vs * float(codes[j]);
             } else {
                 const uint base = (kv_row * VT_CAP + (t - v_packed)) * D + ch;
@@ -590,7 +611,7 @@ const ATTEND_BODY: &str = r#"
     uint qrow0;
     const uint splits = threadgroups_per_grid.x;
     const uint split = threadgroup_position_in_grid.x;
-    const bool writer = sc20676_attend<D, QG, BN, MASK_MODE, WINDOW>(
+    const bool writer = sc20676_attend<D, QG, BN, MASK_MODE, WINDOW, BITS>(
         q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
         uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]), uint(k_codes_shape[2]),
         uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]), tg_max, tg_sum,
@@ -683,12 +704,8 @@ inline float4 sc20676_load4(const device T* src) {
     return float4(float(src[0]), float(src[1]), float(src[2]), float(src[3]));
 }
 
-inline float4 sc20676_codes4(uint byte) {
-    return float4(float(byte & 3u), float((byte >> 2) & 3u), float((byte >> 4) & 3u),
-                  float((byte >> 6) & 3u));
-}
-
-template <int D, int BK, int WM, int MASK_MODE, int WINDOW, typename QT, typename KT, typename VT>
+template <int D, int BK, int WM, int MASK_MODE, int WINDOW, int BITS, typename QT, typename KT,
+          typename VT>
 inline void sc20676_tiled(
     const device QT* q, const device uint8_t* k_codes, const device half* k_scale,
     const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
@@ -699,8 +716,8 @@ inline void sc20676_tiled(
     thread float* o, thread float& row_max, thread float& row_sum, thread uint& out_row,
     thread bool& valid) {
     constexpr uint G = 32;
-    constexpr uint KW = G * D / 4;
-    constexpr uint VW = D / 4;
+    constexpr uint KW = G * D * BITS / 8;
+    constexpr uint VW = D * BITS / 8;
     constexpr uint VG = D / G;
     constexpr uint LD = D + 4;
     constexpr int DT = D / 8;
@@ -759,7 +776,7 @@ inline void sc20676_tiled(
             if (t < kv_len) {
                 if (t < k_packed) {
                     const uint grp = kv_row * KG_CAP + t / G;
-                    const float4 codes = sc20676_codes4(k_codes[grp * KW + ((t % G) * D + c0) / 4]);
+                    const float4 codes = sc20676_codes4<BITS>(k_codes + grp * KW, (t % G) * D + c0);
                     kv = sc20676_load4(k_zero + grp * D + c0)
                         + sc20676_load4(k_scale + grp * D + c0) * codes;
                 } else {
@@ -769,7 +786,7 @@ inline void sc20676_tiled(
                     const uint vrow = kv_row * V_CAP + t;
                     const uint meta = vrow * VG + c0 / G;
                     vv = float(v_zero[meta])
-                        + float(v_scale[meta]) * sc20676_codes4(v_codes[vrow * VW + c0 / 4]);
+                        + float(v_scale[meta]) * sc20676_codes4<BITS>(v_codes + vrow * VW, c0);
                 } else {
                     vv = sc20676_load4(v_tail + (kv_row * VT_CAP + (t - v_packed)) * D + c0);
                 }
@@ -859,7 +876,7 @@ const TILED_BODY: &str = r#"
     bool valid;
     const uint split = threadgroup_position_in_grid.z;
     const uint splits = threadgroups_per_grid.z;
-    sc20676_tiled<D, BK, WM, MASK_MODE, WINDOW>(
+    sc20676_tiled<D, BK, WM, MASK_MODE, WINDOW, BITS>(
         q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
         uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]),
         uint(k_codes_shape[2]), uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]),
@@ -957,7 +974,8 @@ inline __attribute__((always_inline)) vec<T, 8> sc20676_nax_tile_frag(const thre
     return vec<T, 8>(lo, hi);
 }
 
-template <int D, int BK, int WM, int MASK_MODE, int WINDOW, typename T, typename KT, typename VT>
+template <int D, int BK, int WM, int MASK_MODE, int WINDOW, int BITS, typename T, typename KT,
+          typename VT>
 inline __attribute__((always_inline)) void sc20676_nax(
     const device T* q, const device uint8_t* k_codes, const device half* k_scale,
     const device half* k_zero, const device KT* k_tail, const device uint8_t* v_codes,
@@ -968,8 +986,8 @@ inline __attribute__((always_inline)) void sc20676_nax(
     thread vec<float, 8>* o, thread float* row_max, thread float* row_sum,
     thread uint* out_row, thread bool* valid) {
     constexpr uint G = 32;
-    constexpr uint KW = G * D / 4;
-    constexpr uint VW = D / 4;
+    constexpr uint KW = G * D * BITS / 8;
+    constexpr uint VW = D * BITS / 8;
     constexpr uint VG = D / G;
     constexpr int LD = D + 8;
     constexpr int DT = D / 16;
@@ -1031,16 +1049,16 @@ inline __attribute__((always_inline)) void sc20676_nax(
             const uint grp = kv_row * KG_CAP + blk;
             const float4 ks = sc20676_load4(k_scale + grp * D + c_quad);
             const float4 kz = sc20676_load4(k_zero + grp * D + c_quad);
-            const device uint8_t* kc = k_codes + grp * KW + c_quad / 4;
+            const device uint8_t* kc = k_codes + grp * KW;
 #pragma clang loop unroll(full)
             for (uint r = 0; r < BK / TSTEP; ++r) {
                 const uint tt = t_row + r * TSTEP;
-                const float4 kv = kz + ks * sc20676_codes4(kc[tt * (D / 4)]);
+                const float4 kv = kz + ks * sc20676_codes4<BITS>(kc, tt * D + c_quad);
                 *(threadgroup vec<T, 4>*)(k_tile + tt * LD + c_quad) = vec<T, 4>(kv);
                 const uint vrow = kv_row * V_CAP + t0 + tt;
                 const uint meta = vrow * VG + c_quad / G;
                 const float4 vv = float(v_zero[meta])
-                    + float(v_scale[meta]) * sc20676_codes4(v_codes[vrow * VW + c_quad / 4]);
+                    + float(v_scale[meta]) * sc20676_codes4<BITS>(v_codes + vrow * VW, c_quad);
                 *(threadgroup vec<T, 4>*)(v_tile + tt * LD + c_quad) = vec<T, 4>(vv);
             }
         } else {
@@ -1054,7 +1072,7 @@ inline __attribute__((always_inline)) void sc20676_nax(
                     if (t < k_packed) {
                         const uint grp = kv_row * KG_CAP + t / G;
                         const float4 codes =
-                            sc20676_codes4(k_codes[grp * KW + ((t % G) * D + c_quad) / 4]);
+                            sc20676_codes4<BITS>(k_codes + grp * KW, (t % G) * D + c_quad);
                         kv = sc20676_load4(k_zero + grp * D + c_quad)
                             + sc20676_load4(k_scale + grp * D + c_quad) * codes;
                     } else {
@@ -1064,7 +1082,7 @@ inline __attribute__((always_inline)) void sc20676_nax(
                         const uint vrow = kv_row * V_CAP + t;
                         const uint meta = vrow * VG + c_quad / G;
                         vv = float(v_zero[meta])
-                            + float(v_scale[meta]) * sc20676_codes4(v_codes[vrow * VW + c_quad / 4]);
+                            + float(v_scale[meta]) * sc20676_codes4<BITS>(v_codes + vrow * VW, c_quad);
                     } else {
                         vv = sc20676_load4(v_tail + (kv_row * VT_CAP + (t - v_packed)) * D + c_quad);
                     }
@@ -1168,7 +1186,7 @@ const NAX_BODY: &str = r#"
     bool valid[2];
     const uint split = threadgroup_position_in_grid.z;
     const uint splits = threadgroups_per_grid.z;
-    sc20676_nax<D, BK, WM, MASK_MODE, WINDOW>(
+    sc20676_nax<D, BK, WM, MASK_MODE, WINDOW, BITS>(
         q, k_codes, k_scale, k_zero, k_tail, v_codes, v_scale, v_zero, v_tail, uint(params[0]),
         uint(params[1]), uint(params[2]), uint(q_shape[1]), uint(q_shape[2]), uint(v_codes_shape[1]),
         uint(k_codes_shape[2]), uint(k_tail_shape[2]), uint(v_codes_shape[2]), uint(v_tail_shape[2]),
@@ -1220,7 +1238,7 @@ const ATTEND_INPUTS: [&str; 10] = [
 pub struct PackedAttentionArgs<'a> {
     /// `[B, Hq, Sq, D]`, f16/bf16/f32. Queries are the last `Sq` positions of the KV range.
     pub query: &'a Array,
-    /// `[B, Hkv, key_group_capacity, G·D/4]` Uint8.
+    /// `[B, Hkv, key_group_capacity, G·D·b/8]` Uint8.
     pub key_codes: &'a Array,
     /// `[B, Hkv, key_group_capacity, D]` Float16 scales.
     pub key_scales: &'a Array,
@@ -1228,7 +1246,7 @@ pub struct PackedAttentionArgs<'a> {
     pub key_zeros: &'a Array,
     /// `[B, Hkv, key_residual_capacity, D]` dense residual keys, any float dtype.
     pub key_tail: &'a Array,
-    /// `[B, Hkv, value_capacity, D/4]` Uint8.
+    /// `[B, Hkv, value_capacity, D·b/8]` Uint8.
     pub value_codes: &'a Array,
     /// `[B, Hkv, value_capacity, D/G]` Float16 scales.
     pub value_scales: &'a Array,
@@ -1242,6 +1260,8 @@ pub struct PackedAttentionArgs<'a> {
     pub value_packed_tokens: usize,
     /// Live KV tokens.
     pub kv_tokens: usize,
+    /// Code width `b` of `key_codes` and `value_codes`; the reader must have been built for it.
+    pub code_bits: PackedCodeBits,
     pub mask: PackedMask,
 }
 
@@ -1257,6 +1277,8 @@ pub struct PackedMetalKernel {
     nax_partial: MetalKernel,
     identity: String,
     gpu_family: PackedMetalGpuFamily,
+    /// Code width this reader reads; a dispatch of another width is refused before encoding.
+    code_bits: PackedCodeBits,
     /// [`mlx_nax_available`], probed once at construction on the qualified family only.
     nax_available: bool,
 }
@@ -1281,12 +1303,17 @@ impl crate::primitives::packed_group_affine_kv::RetainedPackedKernel for PackedM
     fn kernel_selection(&self, args: &PackedAttentionArgs<'_>) -> Option<PackedKernelSelection> {
         PackedMetalKernel::kernel_selection(self, args).ok()
     }
+
+    fn code_bits(&self) -> PackedCodeBits {
+        self.code_bits
+    }
 }
 
 impl std::fmt::Debug for PackedMetalKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PackedMetalKernel")
             .field("gpu_family", &self.gpu_family)
+            .field("code_bits", &self.code_bits.bits())
             .field("nax_available", &self.nax_available)
             .finish_non_exhaustive()
     }
@@ -1308,6 +1335,8 @@ struct ValidatedDispatch {
     visible_tokens: usize,
     mask_mode: i32,
     window: i32,
+    /// `BITS` template argument.
+    bits: i32,
 }
 
 fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch> {
@@ -1324,8 +1353,8 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
     let vt = checked_shape(args.value_tail.shape(), "value residual")?;
     let kv_heads = kc[1];
     let float = |dtype: Dtype| matches!(dtype, Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32);
-    let key_words = group * head_dimension / PACKED_CODES_PER_BYTE;
-    let value_words = head_dimension / PACKED_CODES_PER_BYTE;
+    let key_words = args.code_bits.code_bytes(group * head_dimension);
+    let value_words = args.code_bits.code_bytes(head_dimension);
     let value_groups = head_dimension / group;
     let kv = args.kv_tokens;
     let valid = batch != 0
@@ -1410,11 +1439,26 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
         visible_tokens,
         mask_mode,
         window,
+        bits: i32::from(args.code_bits.bits()),
     })
 }
 
-/// Cache identity of the default SC-20676 packed group-affine reader.
+/// Cache identity of the default SC-20676 packed group-affine reader (2-bit codes).
 pub const PACKED_METAL_DEFAULT_IDENTITY: &str = "sc-20676-packed-group-affine-v1";
+/// Cache identity of the 4-bit SC-20676 packed group-affine reader.
+pub const PACKED_METAL_B4_IDENTITY: &str = "sc-20676-packed-group-affine-b4-v1";
+/// Cache identity of the 8-bit SC-20676 packed group-affine reader.
+pub const PACKED_METAL_B8_IDENTITY: &str = "sc-20676-packed-group-affine-b8-v1";
+
+/// Cache identity of the SC-20676 packed group-affine reader for `bits`-wide codes. The 2-bit
+/// identity predates the 4-bit representation and is kept for receipt continuity.
+pub const fn packed_metal_identity(bits: PackedCodeBits) -> &'static str {
+    match bits {
+        PackedCodeBits::Two => PACKED_METAL_DEFAULT_IDENTITY,
+        PackedCodeBits::Four => PACKED_METAL_B4_IDENTITY,
+        PackedCodeBits::Eight => PACKED_METAL_B8_IDENTITY,
+    }
+}
 
 impl PackedMetalKernel {
     pub fn new() -> Result<Self> {
@@ -1434,6 +1478,16 @@ impl PackedMetalKernel {
     pub fn for_identity_and_family(
         identity: impl Into<String>,
         gpu_family: PackedMetalGpuFamily,
+    ) -> Result<Self> {
+        Self::for_identity_family_and_bits(identity, gpu_family, PackedCodeBits::Two)
+    }
+
+    /// [`Self::for_identity_and_family`] for a cache whose codes are `code_bits` wide. Every
+    /// kernel runs its `BITS = code_bits` specialization.
+    pub fn for_identity_family_and_bits(
+        identity: impl Into<String>,
+        gpu_family: PackedMetalGpuFamily,
+        code_bits: PackedCodeBits,
     ) -> Result<Self> {
         let single = ATTEND_BODY.replace("SC20676_EPILOGUE", SINGLE_EPILOGUE);
         let partial = ATTEND_BODY.replace("SC20676_EPILOGUE", PARTIAL_EPILOGUE);
@@ -1511,6 +1565,7 @@ impl PackedMetalKernel {
             )?,
             identity: identity.into(),
             gpu_family,
+            code_bits,
             nax_available: gpu_family == PackedMetalGpuFamily::Apple7OrNewer
                 && mlx_nax_available()?,
         })
@@ -1556,6 +1611,23 @@ impl PackedMetalKernel {
 
     pub fn gpu_family(&self) -> PackedMetalGpuFamily {
         self.gpu_family
+    }
+
+    /// Code width this reader reads.
+    pub fn code_bits(&self) -> PackedCodeBits {
+        self.code_bits
+    }
+
+    /// Refuse a dispatch whose codes are not this reader's width, before anything is encoded.
+    fn validate_width(&self, args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch> {
+        if args.code_bits != self.code_bits {
+            return Err(Error::Unsupported(format!(
+                "SC-20676 reader for {}-bit codes cannot read {}-bit codes",
+                self.code_bits.bits(),
+                args.code_bits.bits()
+            )));
+        }
+        validate_dispatch(args)
     }
 
     pub fn tuning_profile(&self, head_dimension: usize) -> Option<PackedMetalTuningProfile> {
@@ -1652,7 +1724,7 @@ impl PackedMetalKernel {
         &self,
         args: &PackedAttentionArgs<'_>,
     ) -> Result<PackedKernelSelection> {
-        let validated = validate_dispatch(args)?;
+        let validated = self.validate_width(args)?;
         let dtype = args.query.dtype();
         let query_dtype = packed_query_dtype_name(dtype)
             .ok_or_else(|| Error::Unsupported("SC-20676 query dtype".into()))?;
@@ -1677,7 +1749,7 @@ impl PackedMetalKernel {
 
     /// Kernel and KV split count [`Self::dispatch`] selects (see [`Self::selects_tiled`]).
     pub fn planned_path(&self, args: &PackedAttentionArgs<'_>) -> Result<PackedKernelPath> {
-        let validated = validate_dispatch(args)?;
+        let validated = self.validate_width(args)?;
         if self.selects_tiled(validated.query_tokens, validated.head_dimension) {
             if self
                 .nax_selection(validated.head_dimension, args.query.dtype())
@@ -1717,7 +1789,7 @@ impl PackedMetalKernel {
         args: &PackedAttentionArgs<'_>,
         splits: Option<usize>,
     ) -> Result<Array> {
-        let validated = validate_dispatch(args)?;
+        let validated = self.validate_width(args)?;
         let selection = self.nax_selection(validated.head_dimension, args.query.dtype());
         if !selection.selected {
             return Err(Error::Unsupported(format!(
@@ -1754,7 +1826,7 @@ impl PackedMetalKernel {
                 "SC-20676 tiled kernel requires the qualified Apple7OrNewer profile".into(),
             ));
         }
-        let validated = validate_dispatch(args)?;
+        let validated = self.validate_width(args)?;
         let splits = splits
             .unwrap_or_else(|| tiled_splits(&validated))
             .clamp(1, MAX_KV_SPLITS);
@@ -1814,7 +1886,8 @@ impl PackedMetalKernel {
             .template_arg("BK", block)
             .template_arg("WM", wm)
             .template_arg("MASK_MODE", validated.mask_mode)
-            .template_arg("WINDOW", validated.window);
+            .template_arg("WINDOW", validated.window)
+            .template_arg("BITS", validated.bits);
         let query_shape = args.query.shape().to_vec();
         if splits == 1 {
             return attend
@@ -1897,7 +1970,7 @@ impl PackedMetalKernel {
         args: &PackedAttentionArgs<'_>,
         splits: Option<usize>,
     ) -> Result<Array> {
-        let validated = validate_dispatch(args)?;
+        let validated = self.validate_width(args)?;
         let tuning = self.required_tuning(validated.head_dimension)?;
         let splits = splits
             .unwrap_or_else(|| {
@@ -1938,7 +2011,8 @@ impl PackedMetalKernel {
             .template_arg("QG", heads_per_row)
             .template_arg("BN", bn)
             .template_arg("MASK_MODE", validated.mask_mode)
-            .template_arg("WINDOW", validated.window);
+            .template_arg("WINDOW", validated.window)
+            .template_arg("BITS", validated.bits);
         let query_shape = args.query.shape().to_vec();
         if splits == 1 {
             return attend
@@ -2024,12 +2098,15 @@ fn tile_splits(validated: &ValidatedDispatch, rows_per_tile: usize) -> usize {
 }
 
 /// Quantize completed K token groups per channel exactly as the CPU reference
-/// (`TokenGroupKeyTensor::flush_pending_group`): f32 min/max, `scale = max((max−min)/3, ε)`, codes
-/// `clamp(round((x−min)/scale), 0, 3)` with IEEE division and round-half-away-from-zero, and f16
-/// scale/zero. The source is the virtual sequence `residual[0..p] ++ fresh`.
+/// (`TokenGroupKeyTensor::flush_pending_group`): f32 min/max, `scale = max((max−min)/L, ε)` with
+/// `L = 2^BITS − 1`, codes `clamp(round((x−min)/scale), 0, L)` with IEEE division and
+/// round-half-away-from-zero, and f16 scale/zero. The source is the virtual sequence
+/// `residual[0..p] ++ fresh`. One thread owns a quad of channels of one group: per token its four
+/// codes are `BITS / 2` whole bytes.
 const QUANTIZE_KEYS_BODY: &str = r#"
     constexpr int G = 32;
-    constexpr int KW = G * D / 4;
+    constexpr int KW = G * D * BITS / 8;
+    constexpr float LEVELS = float((1 << BITS) - 1);
     const uint gid = thread_position_in_grid.x;
     const uint quads = uint(D) / 4u;
     const uint p = uint(params[0]);
@@ -2059,29 +2136,32 @@ const QUANTIZE_KEYS_BODY: &str = r#"
         }
     }
     for (uint k = 0; k < 4u; ++k) {
-        sc[k] = fmax(precise::divide(hi[k] - lo[k], 3.0f), FLT_EPSILON);
+        sc[k] = fmax(precise::divide(hi[k] - lo[k], LEVELS), FLT_EPSILON);
         scales[(bh * groups + g) * D + c0 + k] = half(sc[k]);
         zeros[(bh * groups + g) * D + c0 + k] = half(lo[k]);
     }
     for (uint t = 0; t < uint(G); ++t) {
         const uint vt = g * uint(G) + t;
-        uint byte = 0;
+        uint word = 0;
         for (uint k = 0; k < 4u; ++k) {
             const float x = vt < p ? float(tail[(bh * TCAP + vt) * D + c0 + k])
                                    : float(fresh[(bh * STEP + vt - p) * D + c0 + k]);
-            const uint code = uint(clamp(round(precise::divide(x - lo[k], sc[k])), 0.0f, 3.0f));
-            byte |= code << (2u * k);
+            const uint code = uint(clamp(round(precise::divide(x - lo[k], sc[k])), 0.0f, LEVELS));
+            word |= code << (uint(BITS) * k);
         }
-        codes[(bh * groups + g) * KW + (t * uint(D) + c0) / 4u] = uint8_t(byte);
+        const uint first = (bh * groups + g) * KW + (t * uint(D) + c0) * uint(BITS) / 8u;
+        for (uint b = 0; b < uint(BITS) / 2u; ++b) codes[first + b] = uint8_t(word >> (8u * b));
     }
 "#;
 
 /// Quantize V rows per token over 32-channel groups exactly as the CPU reference
-/// (`PackedTensor::append`). The source is the virtual sequence `residual[0..p] ++ fresh`.
+/// (`PackedTensor::append`), with the key quantizer's `BITS` levels and rounding. The source is the
+/// virtual sequence `residual[0..p] ++ fresh`.
 const QUANTIZE_VALUES_BODY: &str = r#"
     constexpr int G = 32;
-    constexpr int VW = D / 4;
+    constexpr int VW = D * BITS / 8;
     constexpr int VG = D / G;
+    constexpr float LEVELS = float((1 << BITS) - 1);
     const uint gid = thread_position_in_grid.x;
     const uint p = uint(params[0]);
     const uint rows = uint(params[1]);
@@ -2101,19 +2181,20 @@ const QUANTIZE_VALUES_BODY: &str = r#"
         lo = fmin(lo, x);
         hi = fmax(hi, x);
     }
-    const float sc = fmax(precise::divide(hi - lo, 3.0f), FLT_EPSILON);
+    const float sc = fmax(precise::divide(hi - lo, LEVELS), FLT_EPSILON);
     scales[(bh * rows + r) * VG + grp] = half(sc);
     zeros[(bh * rows + r) * VG + grp] = half(lo);
-    for (uint word = 0; word < uint(G) / 4u; ++word) {
-        uint byte = 0;
+    for (uint quad = 0; quad < uint(G) / 4u; ++quad) {
+        uint word = 0;
         for (uint k = 0; k < 4u; ++k) {
-            const uint c = c0 + word * 4u + k;
+            const uint c = c0 + quad * 4u + k;
             const float x = r < p ? float(tail[(bh * TCAP + r) * D + c])
                                   : float(fresh[(bh * STEP + r - p) * D + c]);
-            const uint code = uint(clamp(round(precise::divide(x - lo, sc)), 0.0f, 3.0f));
-            byte |= code << (2u * k);
+            const uint code = uint(clamp(round(precise::divide(x - lo, sc)), 0.0f, LEVELS));
+            word |= code << (uint(BITS) * k);
         }
-        codes[(bh * rows + r) * VW + c0 / 4u + word] = uint8_t(byte);
+        const uint first = (bh * rows + r) * VW + (c0 + quad * 4u) * uint(BITS) / 8u;
+        for (uint b = 0; b < uint(BITS) / 2u; ++b) codes[first + b] = uint8_t(word >> (8u * b));
     }
 "#;
 
@@ -2153,9 +2234,9 @@ fn with_quantizers<T>(f: impl FnOnce(&MetalKernel, &MetalKernel) -> Result<T>) -
 }
 
 /// Packed group-affine quantization of the first `groups · G` tokens of the virtual sequence
-/// `residual[.., .., 0..residual_rows, ..] ++ fresh`, on the GPU and lazily. Returns
-/// `[key_codes [B,H,groups,G·D/4], key_scales, key_zeros [B,H,groups,D],
-///   value_codes [B,H,groups·G,D/4], value_scales, value_zeros [B,H,groups·G,D/G]]`.
+/// `residual[.., .., 0..residual_rows, ..] ++ fresh` into `bits`-wide codes, on the GPU and
+/// lazily. Returns `[key_codes [B,H,groups,G·D·b/8], key_scales, key_zeros [B,H,groups,D],
+///   value_codes [B,H,groups·G,D·b/8], value_scales, value_zeros [B,H,groups·G,D/G]]`.
 pub(crate) fn quantize_group_affine_flush(
     key_residual: &Array,
     value_residual: &Array,
@@ -2163,6 +2244,7 @@ pub(crate) fn quantize_group_affine_flush(
     fresh_keys: &Array,
     fresh_values: &Array,
     groups: usize,
+    bits: PackedCodeBits,
 ) -> Result<[Array; 6]> {
     let [batch, heads, _, head_dimension] = checked_shape(fresh_keys.shape(), "fresh keys")?;
     if groups == 0 || !packed_metal_head_dimension_supported(head_dimension) {
@@ -2182,11 +2264,13 @@ pub(crate) fn quantize_group_affine_flush(
         checked_msl_i32(head_dimension, "head dimension")?,
         checked_msl_i32(rows, "flushed rows")?,
     );
-    let key_words = checked_msl_i32(group * head_dimension / PACKED_CODES_PER_BYTE, "key words")?;
-    let value_words = checked_msl_i32(head_dimension / PACKED_CODES_PER_BYTE, "value words")?;
+    let key_words = checked_msl_i32(bits.code_bytes(group * head_dimension), "key words")?;
+    let value_words = checked_msl_i32(bits.code_bytes(head_dimension), "value words")?;
     let value_groups = checked_msl_i32(head_dimension / group, "value groups")?;
+    let code_bits = i32::from(bits.bits());
+    // One key-quantizer thread per channel quad of each group.
     let key_threads = checked_msl_i32(
-        batch * heads * groups * (head_dimension / PACKED_CODES_PER_BYTE),
+        batch * heads * groups * (head_dimension / 4),
         "key quantizer grid",
     )?;
     let value_threads = checked_msl_i32(
@@ -2222,6 +2306,7 @@ pub(crate) fn quantize_group_affine_flush(
             .grid(key_threads, 1, 1)
             .thread_group(key_threads.min(256), 1, 1)
             .template_arg("D", d)
+            .template_arg("BITS", code_bits)
             .run()?;
         let [vc, vs, vz] = triple(vec![b, h, r, value_words], vec![b, h, r, value_groups]);
         let value_out = values
@@ -2235,6 +2320,7 @@ pub(crate) fn quantize_group_affine_flush(
             .grid(value_threads, 1, 1)
             .thread_group(value_threads.min(256), 1, 1)
             .template_arg("D", d)
+            .template_arg("BITS", code_bits)
             .run()?;
         let mut all = key_out.into_iter().chain(value_out);
         let mut next = || {
@@ -2457,6 +2543,7 @@ mod tests {
                 key_packed_tokens: 0,
                 value_packed_tokens: 1,
                 kv_tokens: 1,
+                code_bits: PackedCodeBits::Two,
                 mask: PackedMask::SlidingWindow(usize::MAX),
             })
             .unwrap_err();
@@ -2474,6 +2561,7 @@ mod tests {
         value_scales: Array,
         value_zeros: Array,
         value_tail: Array,
+        bits: PackedCodeBits,
     }
 
     const BENCH_QUERY_HEADS: i32 = 24;
@@ -2481,7 +2569,16 @@ mod tests {
     const BENCH_DIM: i32 = 128;
 
     fn synthetic_packed_layer(total: i32, d: i32) -> SyntheticPackedLayer {
+        synthetic_packed_layer_bits(total, d, PackedCodeBits::Two)
+    }
+
+    fn synthetic_packed_layer_bits(
+        total: i32,
+        d: i32,
+        bits: PackedCodeBits,
+    ) -> SyntheticPackedLayer {
         use mlx_rs::random::{normal, randint};
+        let per_byte = bits.codes_per_byte() as i32;
         let h = BENCH_KV_HEADS;
         let groups = total / 32;
         let codes = |shape: &[i32]| {
@@ -2505,14 +2602,15 @@ mod tests {
                 .unwrap()
         };
         let layer = SyntheticPackedLayer {
-            key_codes: codes(&[1, h, groups, 32 * d / 4]),
+            key_codes: codes(&[1, h, groups, 32 * d / per_byte]),
             key_scales: metadata(&[1, h, groups, d], 0.3),
             key_zeros: metadata(&[1, h, groups, d], 0.5),
             key_tail: tail(),
-            value_codes: codes(&[1, h, total, d / 4]),
+            value_codes: codes(&[1, h, total, d / per_byte]),
             value_scales: metadata(&[1, h, total, d / 32], 0.3),
             value_zeros: metadata(&[1, h, total, d / 32], 0.5),
             value_tail: tail(),
+            bits,
         };
         for array in [
             &layer.key_codes,
@@ -2544,6 +2642,7 @@ mod tests {
                 key_packed_tokens: kv,
                 value_packed_tokens: kv,
                 kv_tokens: kv,
+                code_bits: self.bits,
                 mask: PackedMask::Causal,
             }
         }
@@ -2738,5 +2837,81 @@ mod tests {
     #[ignore = "GPU micro-benchmark; run explicitly with --ignored --nocapture"]
     fn tiled_chunked_prefill_benchmark_32k() {
         chunked_prefill_benchmark(32_768);
+    }
+
+    /// Code-width comparison (synthetic, one layer, bf16, Hq = 24, Hkv = 8, D = 128, qualified
+    /// family): dense MLX SDPA vs the packed reader at 2-bit and 4-bit codes, for one decode row
+    /// over 8k and 32k histories and the last 2048-row causal prefill chunk over 32k (the path
+    /// `dispatch` selects: split-KV per-row for decode, NAX or fp32 tiled for the chunk). Median
+    /// of five evaluated calls after one warm call. Resident inputs stay under 0.4 GiB.
+    #[test]
+    #[ignore = "GPU micro-benchmark; run explicitly with --ignored --nocapture"]
+    fn group_affine_code_width_benchmark() {
+        use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
+        use mlx_rs::ops::indexing::TryIndexOp;
+        const TOTAL: i32 = 32_768;
+        let median = |run: &dyn Fn() -> Array| {
+            run().eval().unwrap();
+            let mut samples = (0..5).map(|_| timed(run)).collect::<Vec<_>>();
+            samples.sort_by(f64::total_cmp);
+            samples[2]
+        };
+        let dense = || {
+            let array = mlx_rs::random::normal::<f32>(
+                &[1, BENCH_KV_HEADS, TOTAL, BENCH_DIM],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+            array.eval().unwrap();
+            array
+        };
+        let (dense_keys, dense_values) = (dense(), dense());
+        let layers = PackedCodeBits::ALL.map(|bits| {
+            let kernel = PackedMetalKernel::for_identity_family_and_bits(
+                packed_metal_identity(bits),
+                PackedMetalGpuFamily::Apple7OrNewer,
+                bits,
+            )
+            .unwrap();
+            (
+                bits,
+                kernel,
+                synthetic_packed_layer_bits(TOTAL, BENCH_DIM, bits),
+            )
+        });
+        let scale = (BENCH_DIM as f32).powf(-0.5);
+        eprintln!("step	kv	path	ms");
+        for (label, rows, kv) in [
+            ("decode", 1, 8192usize),
+            ("decode", 1, 32_768),
+            ("prefill-chunk-2048", 2048, 32_768),
+        ] {
+            let query = bench_query(rows, BENCH_DIM);
+            let end = kv as i32;
+            let keys = dense_keys.try_index((.., .., 0..end, ..)).unwrap();
+            let values = dense_values.try_index((.., .., 0..end, ..)).unwrap();
+            let dense_ms = median(&|| {
+                scaled_dot_product_attention(
+                    &query,
+                    &keys,
+                    &values,
+                    scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None,
+                )
+                .unwrap()
+            });
+            eprintln!("{label}	{kv}	dense-sdpa-bf16	{dense_ms:.3}");
+            for (bits, kernel, layer) in &layers {
+                let args = layer.args(&query, kv);
+                let path = kernel.planned_path(&args).unwrap();
+                let ms = median(&|| kernel.dispatch(&args).unwrap());
+                eprintln!("{label}	{kv}	packed-b{} {path:?}	{ms:.3}", bits.bits());
+            }
+        }
     }
 }
