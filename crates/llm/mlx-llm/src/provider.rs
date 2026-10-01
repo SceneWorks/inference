@@ -271,7 +271,7 @@ fn campaign_forced_decode_on(
 fn prompt_cache_turn(
     before: crate::decode::PrefixStats,
     store: &crate::decode::PrefixCache,
-    prompt_tokens: usize,
+    prompt_ids: &[i32],
 ) -> CoreResult<crate::campaign::PromptCacheTurn> {
     let after = store.stats();
     if after.lookups != before.lookups + 1 {
@@ -282,7 +282,8 @@ fn prompt_cache_turn(
     let cache_hit = after.hits > before.hits;
     let reused = after.reused_prefix_tokens - before.reused_prefix_tokens;
     Ok(crate::campaign::PromptCacheTurn {
-        prompt_tokens: prompt_tokens as u64,
+        prompt_tokens: prompt_ids.len() as u64,
+        prompt_sha256: crate::campaign::token_stream_sha256(prompt_ids),
         cache_hit,
         reused_prefix_tokens: reused as u64,
     })
@@ -905,6 +906,30 @@ impl LlamaProvider {
         let context_window = self.campaign_context_window()?;
         let target = crate::campaign::context_band_target(context_window, context_band)
             .map_err(CoreError::Load)?;
+        self.campaign_band_payload(context_band, target)
+    }
+
+    /// The multi-turn prompt-cache fixture's payload (contract v4): the band payload capped by
+    /// [`crate::campaign::multi_turn_payload_target`], so turn 2 plus the full turn-2 forced
+    /// continuation fits the native window. The row's coordinate operations keep the full band.
+    pub(crate) fn campaign_multi_turn_payload(
+        &self,
+        context_band: &str,
+    ) -> CoreResult<(String, u64, u64)> {
+        let context_window = self.campaign_context_window()?;
+        let band = crate::campaign::context_band_target(context_window, context_band)
+            .map_err(CoreError::Load)?;
+        let target = crate::campaign::multi_turn_payload_target(context_window, band)
+            .map_err(CoreError::Load)?;
+        self.campaign_band_payload(context_band, target)
+    }
+
+    /// The largest `context_band` payload of at most `target` tokens.
+    fn campaign_band_payload(
+        &self,
+        context_band: &str,
+        target: u64,
+    ) -> CoreResult<(String, u64, u64)> {
         let header = format!("SC20671-CONTEXT-BAND-{context_band}");
         let mut lower = 0usize;
         let mut upper = usize::try_from(target)
@@ -2354,7 +2379,7 @@ impl LlamaProvider {
             None,
             Some(&mut *store),
         )?;
-        let turn = prompt_cache_turn(before, store, ids.len())?;
+        let turn = prompt_cache_turn(before, store, &ids)?;
         if turn.cache_hit || store.len() != 1 {
             return Err(CoreError::Load(
                 "multi-turn prompt cache: turn 1 must miss a fresh store and store its K/V".into(),
@@ -2420,7 +2445,7 @@ impl LlamaProvider {
         let before = store.stats();
         let output =
             self.generate_inner(&turn2, on_event, Some(observer), packed, Some(&mut store))?;
-        let turn2_cache = prompt_cache_turn(before, &store, turn2_ids.len())?;
+        let turn2_cache = prompt_cache_turn(before, &store, &turn2_ids)?;
         Self::require_turn_two_hit(&turn2_cache, &turn1_ids, &turn2_ids)?;
         drop(store);
         mlx_rs::memory::clear_cache();
@@ -2459,10 +2484,15 @@ impl LlamaProvider {
         let (_, turn2_ids) = self.render_prompt(&turn2, &turn2.messages)?;
         let window = usize::try_from(self.campaign_context_window()?)
             .map_err(|_| CoreError::Load("context window overflows usize".into()))?;
-        let length = match teacher_forced {
-            Some(forced) => forced.len(),
-            None => tokens.min(window.saturating_sub(turn2_ids.len())),
-        };
+        // The fixture is sized so turn 2 leaves the full continuation; never shorten it.
+        if teacher_forced.is_none() && window.saturating_sub(turn2_ids.len()) < tokens {
+            return Err(CoreError::InvalidRequest(format!(
+                "multi-turn turn 2 ({} tokens) leaves fewer than the {tokens}-token forced \
+                 continuation in the {window}-token window",
+                turn2_ids.len()
+            )));
+        }
+        let length = teacher_forced.map_or(tokens, <[i32]>::len);
         let budget = u32::try_from(length)
             .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
         validate_context_window(
@@ -2480,7 +2510,7 @@ impl LlamaProvider {
             &self.stop_tokens,
             teacher_forced,
         );
-        let turn2_cache = prompt_cache_turn(before, &store, turn2_ids.len());
+        let turn2_cache = prompt_cache_turn(before, &store, &turn2_ids);
         drop(store);
         mlx_rs::memory::clear_cache();
         let measured = measured.map_err(to_core)?;
@@ -5207,6 +5237,27 @@ mod tests {
         );
         assert!(!dense_text.is_empty() && !compressed_text.is_empty());
 
+        // The 2048-token window cannot hold turn 2 of a ~1100-token turn 1 plus the 1024-token
+        // continuation: refused before decoding, never shortened.
+        let long_turn1 = TextLlmRequest {
+            messages: vec![Message::text(
+                Role::User,
+                (0..1_100)
+                    .map(|i| format!("w{}", (i * 5) % 26 + 6))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )],
+            ..turn1.clone()
+        };
+        let error = provider
+            .campaign_multi_turn_forced_continuation(&long_turn1, follow_up, 1024, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("fewer than the 1024-token forced continuation"),
+            "{error}"
+        );
+
         // A turn 2 the cache did not serve is refused.
         let mut store = crate::decode::PrefixCache::new(2);
         let (answer, _, turn1_ids) = provider.campaign_turn_one(&turn1, &mut store).unwrap();
@@ -5214,6 +5265,7 @@ mod tests {
         let (_, turn2_ids) = provider.render_prompt(&turn2, &turn2.messages).unwrap();
         let missed = crate::campaign::PromptCacheTurn {
             prompt_tokens: turn2_ids.len() as u64,
+            prompt_sha256: crate::campaign::token_stream_sha256(&turn2_ids),
             cache_hit: false,
             reused_prefix_tokens: 0,
         };
