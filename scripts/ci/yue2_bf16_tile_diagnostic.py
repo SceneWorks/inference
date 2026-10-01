@@ -221,6 +221,16 @@ def first_conv_math_gate(windows: list[dict]) -> str:
     return "no_positive_pre_bias_residual"
 
 
+def verify_first_conv_math_file_set(data: Path, arrays: list[str], expected_count: int) -> None:
+    require(len(arrays) == len(set(arrays)) == expected_count, "first Conv7 math arrays collided")
+    expected = {"report.json", "math-mode-events.jsonl", *arrays}
+    entries = list(data.iterdir())
+    require(all(entry.is_file() and not entry.is_symlink() for entry in entries),
+            "first Conv7 math data contains a non-regular entry")
+    require(len(entries) == len(expected) and {entry.name for entry in entries} == expected,
+            "first Conv7 math data file set differs from report")
+
+
 def verify_first_conv_math_data(data: Path, meta: dict) -> None:
     report = json.loads((data / "report.json").read_text(encoding="utf-8"))
     verify_first_conv_data(data, meta, report, 3, "first_conv_math",
@@ -241,9 +251,14 @@ def verify_first_conv_math_data(data: Path, meta: dict) -> None:
     require(len(events) == len(actions) and all(
         row == {"action": action, "status": "CUBLAS_STATUS_SUCCESS", "rawMode": mode}
         for row, action, mode in zip(events, actions, modes)), "math-mode call/readback sequence incomplete")
+    files = [capture["file"] for run in report["runs"].values()
+             for capture in run["full"].values()]
+    files += [capture["file"] for run in report["runs"].values()
+              for window in run["windows"] for capture in window["captures"].values()]
     if reason != "positive_pre_bias_residual":
         require(controlled.get("status") == "not_applicable" and controlled.get("flagged") is None and
                 controlled.get("crossArm") is None, "inapplicable first Conv7 math arm ran")
+        verify_first_conv_math_file_set(data, files, 36)
         return
     require(controlled.get("status") == "collected", "applicable first Conv7 math arm absent")
     flagged = controlled.get("flagged", {})
@@ -263,10 +278,6 @@ def verify_first_conv_math_data(data: Path, meta: dict) -> None:
     windows = flagged.get("windows", [])
     require(len(windows) == len(baseline["windows"]) == len(controlled["crossArm"]["windows"]) == 5,
             "flagged first Conv7 window coverage incomplete")
-    files = [capture["file"] for capture in baseline["full"].values()]
-    files += [capture["file"] for row in baseline["windows"] for capture in row["captures"].values()]
-    files += [capture["file"] for capture in report["runs"]["f32"]["full"].values()]
-    files += [capture["file"] for row in report["runs"]["f32"]["windows"] for capture in row["captures"].values()]
     files += [capture["file"] for capture in flagged["full"].values()]
     for index, window in enumerate(windows):
         original = baseline["windows"][index]
@@ -289,7 +300,7 @@ def verify_first_conv_math_data(data: Path, meta: dict) -> None:
                                             left, window["coreLength"])
             require(same_first_conv_comparison(window["alignedCore"][stage], aligned),
                     "flagged aligned residual differs from saved arrays")
-    require(len(files) == len(set(files)) == 54, "first Conv7 math arrays collided")
+    verify_first_conv_math_file_set(data, files, 54)
 
 
 def prepare_harness(args: argparse.Namespace) -> None:

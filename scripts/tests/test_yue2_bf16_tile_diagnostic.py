@@ -152,6 +152,53 @@ class DiagnosticGuards(unittest.TestCase):
                 finally:
                     os.chdir(old)
 
+    def test_first_conv_math_requires_exact_data_files_in_both_outcomes(self):
+        for applicable in (False, True):
+            with self.subTest(applicable=applicable), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                data, meta, report = synthetic_math_report(root, applicable)
+                old = Path.cwd()
+                try:
+                    os.chdir(root)
+                    diag.verify_first_conv_math_data(data, meta)
+
+                    extra = data / "unreferenced-flagged.f32le"
+                    extra.write_bytes(b"unreferenced")
+                    with self.assertRaisesRegex(RuntimeError, "file set differs"):
+                        diag.verify_first_conv_math_data(data, meta)
+                    extra.unlink()
+
+                    unexpected_dir = data / "unreferenced-directory"
+                    unexpected_dir.mkdir()
+                    with self.assertRaisesRegex(RuntimeError, "non-regular entry"):
+                        diag.verify_first_conv_math_data(data, meta)
+                    unexpected_dir.rmdir()
+
+                    array = data / report["runs"]["bf16"]["full"]["input"]["file"]
+                    original_array = array.read_bytes()
+                    array.unlink()
+                    with self.assertRaisesRegex(RuntimeError, "array escaped evidence"):
+                        diag.verify_first_conv_math_data(data, meta)
+                    array.write_bytes(original_array)
+
+                    events = data / "math-mode-events.jsonl"
+                    original_events = events.read_bytes()
+                    events.unlink()
+                    with self.assertRaisesRegex(RuntimeError, "event hash mismatch"):
+                        diag.verify_first_conv_math_data(data, meta)
+                    events.write_bytes(original_events)
+
+                    if os.name != "nt":
+                        link = data / "unreferenced-symlink"
+                        link.symlink_to(array)
+                        with self.assertRaisesRegex(RuntimeError, "non-regular entry"):
+                            diag.verify_first_conv_math_data(data, meta)
+                        link.unlink()
+
+                    diag.verify_first_conv_math_data(data, meta)
+                finally:
+                    os.chdir(old)
+
     def test_math_gate_signed_zero_and_input_mismatch_do_not_enable_flag(self):
         windows = [{"alignedCore": {"input": {"differentValues": 0},
                                     "preBias": {"differentValues": 1, "maxAbs": 0.0}}}]
