@@ -1799,6 +1799,20 @@ fn sc20684_packed_campaign_observer() {
     // the dense parity generation: its buffers fit no DiT shape, so MLX would otherwise hold them
     // beside the dense run until its ~0.95 x working-set trim, far above the child cap.
     mlx_rs::memory::clear_cache();
+    // Printed like every phase reading, but kept out of `phaseMemory`, whose labels the launcher
+    // validates in a fixed order. Without the clear this reads the packed decode's ~12 GiB working
+    // set; the 1 GiB bound tolerates a Metal completion handler recycling a late temporary between
+    // the clear and the read (nothing else allocates here: the allocator probe has finished and
+    // only reads counters).
+    let dense_parity_entry = sc20684_phase_memory("dense-parity-entry");
+    let dense_parity_entry_cache = dense_parity_entry["mlxCacheBytes"]
+        .as_u64()
+        .expect("SC-20684 dense-parity-entry cache bytes");
+    assert!(
+        dense_parity_entry_cache < 1 << 30,
+        "SC-20684 dense parity must start with the packed decode's cache returned: \
+         {dense_parity_entry_cache} cached bytes"
+    );
 
     let (dense_latents, _, dense_elapsed, _) = sc20684_generate_latents(
         &transformer,
