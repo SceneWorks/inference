@@ -6,6 +6,7 @@
 //! GLM-4, and DeepSeek-V2 (MLA) behind the same single generic decoder. Mirrors candle-llm's
 //! `config.rs` (the cross-backend blueprint) so the two backends dispatch identically.
 
+use crate::primitives::activation::ActivationRole;
 use std::path::Path;
 
 use serde_json::Value;
@@ -716,6 +717,10 @@ pub struct ModelConfig {
     /// inlining it inflated the provider's decoder enum enough to trip `clippy::large_enum_variant`.
     /// One pointer keeps the common config exactly as cheap as it was.
     pub gemma4: Option<Box<Gemma4Config>>,
+    /// What this decoder's activations feed — the key of the activation-dtype policy
+    /// ([`crate::primitives::activation`]): [`ActivationRole::LlmDecode`] for every parsed config;
+    /// the LTX-2.5 text encoder sets [`ActivationRole::LtxTextEncoder`] (sc-24446).
+    pub activation_role: ActivationRole,
 }
 
 impl ModelConfig {
@@ -934,6 +939,7 @@ impl ModelConfig {
             yarn,
             mrope_section,
             gemma4,
+            activation_role: ActivationRole::LlmDecode,
         })
     }
 

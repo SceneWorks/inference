@@ -120,7 +120,10 @@ impl ProjectorActivation {
     fn apply(self, x: &Array) -> Result<Array> {
         match self {
             Self::GeluErf => gelu(x),
-            Self::GeluTanh => gelu_tanh(x),
+            Self::GeluTanh => gelu_tanh(
+                x,
+                crate::primitives::activation::ActivationRole::VisionEncoder,
+            ),
         }
     }
 }

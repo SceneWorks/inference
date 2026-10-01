@@ -353,6 +353,24 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    fn push_arrays(&self, out: &mut Vec<Array>) {
+        for p in [
+            &self.in_proj_qkv,
+            &self.in_proj_z,
+            &self.in_proj_a,
+            &self.in_proj_b,
+        ] {
+            p.push_arrays(out);
+        }
+        out.extend([
+            self.conv_weight.clone(),
+            self.a_log.clone(),
+            self.dt_bias.clone(),
+            self.norm_weight.clone(),
+        ]);
+        self.out_proj.push_arrays(out);
+    }
+
     fn forward(&self, x: &Array, cache: &mut DeltaNetCache) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -425,6 +443,13 @@ struct Qwen35Attention {
 }
 
 impl Qwen35Attention {
+    fn push_arrays(&self, out: &mut Vec<Array>) {
+        for p in [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj] {
+            p.push_arrays(out);
+        }
+        out.extend([self.q_norm.clone(), self.k_norm.clone()]);
+    }
+
     fn forward(&self, x: &Array, cos: &Array, sin: &Array, cache: &mut AttnKv) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
@@ -475,6 +500,12 @@ struct Mlp {
 }
 
 impl Mlp {
+    fn push_arrays(&self, out: &mut Vec<Array>) {
+        for p in [&self.gate, &self.up, &self.down] {
+            p.push_arrays(out);
+        }
+    }
+
     fn forward(&self, x: &Array) -> Result<Array> {
         let gate = silu(&self.gate.forward(x)?)?;
         let up = self.up.forward(x)?;
@@ -494,6 +525,13 @@ enum Ffn {
 }
 
 impl Ffn {
+    fn push_arrays(&self, out: &mut Vec<Array>) {
+        match self {
+            Ffn::Dense(m) => m.push_arrays(out),
+            Ffn::Moe(m) => m.push_arrays(out),
+        }
+    }
+
     fn forward(&self, x: &Array) -> Result<Array> {
         match self {
             Ffn::Dense(m) => m.forward(x),
@@ -518,6 +556,17 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    /// Every array the layer holds, for load-time materialization (sc-24446).
+    fn arrays(&self) -> Vec<Array> {
+        let mut out = vec![self.input_ln.clone(), self.post_ln.clone()];
+        match &self.mixer {
+            Mixer::Delta(d) => d.push_arrays(&mut out),
+            Mixer::Attn(a) => a.push_arrays(&mut out),
+        }
+        self.ffn.push_arrays(&mut out);
+        out
+    }
+
     fn forward(
         &self,
         x: &Array,
@@ -866,6 +915,13 @@ enum TokenEmbedding {
 }
 
 impl TokenEmbedding {
+    fn push_arrays(&self, out: &mut Vec<Array>) {
+        match self {
+            Self::Dense(weight) => out.push(weight.clone()),
+            Self::Prism(embedding) => embedding.push_arrays(out),
+        }
+    }
+
     fn forward(&self, input_ids: &Array) -> Result<Array> {
         match self {
             Self::Dense(weight) => embed(weight, input_ids),
@@ -900,7 +956,40 @@ struct MtpPredictor {
     norm: Array,
 }
 
+impl MtpPredictor {
+    /// The predictor's own non-layer arrays, then one group per predictor layer (sc-24446).
+    fn param_groups(&self) -> Vec<Vec<Array>> {
+        let mut head = Vec::new();
+        self.fc.push_arrays(&mut head);
+        head.extend([
+            self.pre_fc_norm_embedding.clone(),
+            self.pre_fc_norm_hidden.clone(),
+            self.norm.clone(),
+        ]);
+        let mut groups = vec![head];
+        groups.extend(self.layers.iter().map(DecoderLayer::arrays));
+        groups
+    }
+}
+
 impl Qwen35Model {
+    /// The model's arrays in build order, grouped as load admission prices them (sc-24446): the
+    /// arrays outside the layer stack, then one group per decoder layer, then the MTP predictor's
+    /// own non-layer arrays and one group per predictor layer. [`Weights::materialize_groups`]
+    /// evaluates and releases one group at a time.
+    pub fn param_groups(&self) -> Vec<Vec<Array>> {
+        let mut top = Vec::new();
+        self.embed_tokens.push_arrays(&mut top);
+        top.push(self.norm.clone());
+        self.lm_head.push_arrays(&mut top);
+        let mut groups = vec![top];
+        groups.extend(self.layers.iter().map(DecoderLayer::arrays));
+        if let Some(mtp) = &self.mtp {
+            groups.extend(mtp.param_groups());
+        }
+        groups
+    }
+
     /// The parsed config.
     pub fn config(&self) -> &Qwen35Config {
         &self.cfg
@@ -1430,12 +1519,44 @@ impl Qwen35Model {
         cfg: Qwen35Config,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
-        Self::from_weights_layout(w, prefix, cfg, quant, None)
+        Self::materialized(w, Self::build_lazy(w, prefix, cfg, quant)?)
     }
 
     /// Build the Qwen3.5 decoder directly over a validated Prism MLX 2-bit pack.
     pub fn from_prism_weights(w: &Weights, cfg: Qwen35Config, pack: &PrismMlxPack) -> Result<Self> {
+        Self::materialized(w, Self::build_prism_lazy(w, cfg, pack)?)
+    }
+
+    /// [`Qwen35Model::from_weights_with`] without evaluating anything: every array is a lazy graph
+    /// over `w`'s sources. The provider materializes it group by group with
+    /// [`Weights::materialize_groups`], releasing each group's consumed sources (sc-24446); a
+    /// caller that keeps the map uses [`Qwen35Model::from_weights_with`] instead.
+    pub fn build_lazy(
+        w: &Weights,
+        prefix: &str,
+        cfg: Qwen35Config,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
+        Self::from_weights_layout(w, prefix, cfg, quant, None)
+    }
+
+    /// [`Qwen35Model::from_prism_weights`] without evaluating anything (see
+    /// [`Qwen35Model::build_lazy`]).
+    pub(crate) fn build_prism_lazy(
+        w: &Weights,
+        cfg: Qwen35Config,
+        pack: &PrismMlxPack,
+    ) -> Result<Self> {
         Self::from_weights_layout(w, "language_model.model", cfg, None, Some(pack))
+    }
+
+    /// The caller-owned-map load boundary: every source this constructor read is verified
+    /// resident (sc-22414) and every derived array evaluated (sc-24446) before the model is
+    /// returned, so no forward reads a weight or builds one inside its command stream (sc-24245).
+    fn materialized(w: &Weights, model: Self) -> Result<Self> {
+        w.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
     }
 
     fn from_weights_layout(
@@ -1605,7 +1726,6 @@ impl Qwen35Model {
             quantized: prism.is_some() || quant.is_some() || saw_stored.get(),
             prism: prism.is_some(),
         };
-        w.verify_accessed_gpu_view()?;
         Ok(model)
     }
 }
@@ -1658,36 +1778,57 @@ fn build_ffn(
         )
     } else {
         let e = moe.num_experts;
-        // [E, 2, mi, h]: `take` along the gate/up axis yields each half contiguous.
-        let gate_up = req(lp("mlp.experts.gate_up_proj"))?.reshape(&[e, 2, mi, h])?;
-        let half = |i: i32| -> Result<Array> {
-            Ok(gate_up
-                .take_axis(Array::from_slice(&[i], &[1]), 1)?
-                .reshape(&[e, mi, h])?)
-        };
-        (
-            SwitchLinear::load(half(0)?, quant)?,
-            SwitchLinear::load(half(1)?, quant)?,
+        // The fused bank stays fused (sc-24446): one gathered matmul over gate‖up rows, its
+        // output split per token. Splitting the weights here held a second, gathered copy of
+        // the whole bank (~44 GB on Qwen3.6-35B-A3B).
+        let gate_up = req(lp("mlp.experts.gate_up_proj"))?;
+        if gate_up.shape() != [e, 2 * mi, h] {
+            return Err(Error::Config(format!(
+                "qwen3_5_moe: `{}` is {:?}; expected [{e}, {}, {h}] from config",
+                lp("mlp.experts.gate_up_proj"),
+                gate_up.shape(),
+                2 * mi
+            )));
+        }
+        return Ok(Ffn::Moe(SparseMoe::fused(
+            req(lp("mlp.gate.weight"))?,
+            SwitchLinear::load(gate_up, quant)?,
             SwitchLinear::load(req(lp("mlp.experts.down_proj"))?, quant)?,
-        )
+            shared_expert(&proj_q, &lp)?,
+            Some(req(lp("mlp.shared_expert_gate.weight"))?),
+            routing(moe),
+        )?));
     };
     Ok(Ffn::Moe(SparseMoe::new(
         req(lp("mlp.gate.weight"))?,
         gate,
         up,
         down,
-        SwiGlu {
-            gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
-            up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
-            down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
-        },
+        shared_expert(&proj_q, &lp)?,
         Some(req(lp("mlp.shared_expert_gate.weight"))?),
-        MoeRouting {
-            experts_per_tok: moe.experts_per_tok,
-            norm_topk_prob: true,
-            routed_scaling_factor: 1.0,
-        },
+        routing(moe),
     )?))
+}
+
+/// The always-on shared expert of the MoE layer under `lp`.
+fn shared_expert(
+    proj_q: &dyn Fn(String) -> Result<Projection>,
+    lp: &dyn Fn(&str) -> String,
+) -> Result<SwiGlu> {
+    Ok(SwiGlu {
+        gate: proj_q(lp("mlp.shared_expert.gate_proj.weight"))?,
+        up: proj_q(lp("mlp.shared_expert.up_proj.weight"))?,
+        down: proj_q(lp("mlp.shared_expert.down_proj.weight"))?,
+    })
+}
+
+/// Qwen3.6-MoE routing: top-k renormalized to sum to 1.
+fn routing(moe: &MoeParams) -> MoeRouting {
+    MoeRouting {
+        experts_per_tok: moe.experts_per_tok,
+        norm_topk_prob: true,
+        routed_scaling_factor: 1.0,
+    }
 }
 
 /// Load one `[out, in]` projection that is either a stored MLX affine-quantized triple
@@ -1912,6 +2053,8 @@ impl Qwen35Model {
         core_llm::check_companion_unused(w.unused_keys().into_iter().map(Into::into).collect())
             .map_err(Error::Config)?;
         w.verify_accessed_gpu_view()?;
+        // Its `1 + w` norms and any cast exist before the first draft step needs them (sc-24446).
+        crate::primitives::weights::eval_groups(&predictor.param_groups())?;
         self.mtp = Some(predictor);
         // The target now carries one predictor layer: what its config prices the head's state by
         // (the prefix-cache snapshot's head KV, sc-24437).

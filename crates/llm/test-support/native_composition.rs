@@ -342,7 +342,9 @@ fn native_resource_rejects_within_window_before_allocating() {
             .unwrap()
             .to_string();
         assert!(
-            error.contains("bytes of native workspace but only 1 bytes are available"),
+            error.contains("load admission:")
+                && error.contains("bytes are available")
+                && error.contains("only 1 bytes"),
             "{error}"
         );
         std::env::set_var(core_llm::AVAILABLE_MEMORY_OVERRIDE, "invalid-budget");

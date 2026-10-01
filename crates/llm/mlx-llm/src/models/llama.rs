@@ -51,6 +51,7 @@ use mlx_rs::{Array, Dtype};
 use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, ModelConfig};
 use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
+use crate::primitives::activation::{gelu_precision, ActivationRole, GeluPrecision};
 use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -197,7 +198,66 @@ impl CausalLm {
         cfg: ModelConfig,
         quant: Option<QuantSpec>,
     ) -> Result<Self> {
+        let model = Self::build(w, prefix, cfg, quant, None)?;
+        // The caller-owned-map load boundary: every source verified resident (sc-22414), then
+        // every derived array evaluated (sc-24446), so no forward reads a weight or builds one
+        // inside its command stream (sc-24245).
+        w.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
+    }
+
+    /// [`CausalLm::from_weights_with`] without evaluating anything: every array is a lazy graph
+    /// over `w`'s sources, for the provider to materialize group by group with
+    /// [`Weights::materialize_groups`], releasing each group's consumed sources (sc-24446).
+    pub fn build_lazy(
+        w: &Weights,
+        prefix: &str,
+        cfg: ModelConfig,
+        quant: Option<QuantSpec>,
+    ) -> Result<Self> {
         Self::build(w, prefix, cfg, quant, None)
+    }
+
+    /// Whether a forward's activations are wider than its weights: a Gemma GeGLU whose role the
+    /// activation-dtype policy keeps on the `f32` path ([`crate::primitives::activation`]) — its
+    /// residual stream, every later projection's input and the final hidden state are `f32`
+    /// (sc-24446). An LLM decoder's GeGLU and every SwiGLU decoder keep BF16 throughout.
+    pub fn activations_promote(&self) -> bool {
+        self.cfg.architecture.is_gemma()
+            && gelu_precision(self.cfg.activation_role) == GeluPrecision::F32
+    }
+
+    /// When [`CausalLm::activations_promote`]: the LM head's elements, and the most elements any
+    /// one decoder projection promotes ([`Projection::promoted_elements`]) — what a forward
+    /// materializes as `f32` copies of BF16 weights, priced by request admission. `None`
+    /// otherwise.
+    pub fn promoted_weight_elements(&self) -> Option<(u64, u64)> {
+        if !self.activations_promote() {
+            return None;
+        }
+        let mut largest = 0u64;
+        if let Stack::Resident(layers) = &self.stack {
+            for layer in layers {
+                layer.for_each_projection(&mut |p| largest = largest.max(p.promoted_elements()));
+            }
+        }
+        Some((self.lm_head.size() as u64, largest))
+    }
+
+    /// The model's resident arrays in build order, grouped as load admission prices them
+    /// (sc-24446): the arrays outside the layer stack, then one group per resident layer (a
+    /// streamed stack holds none).
+    pub fn param_groups(&self) -> Vec<Vec<Array>> {
+        let mut groups = vec![vec![
+            self.embed_tokens.clone(),
+            self.norm.clone(),
+            self.lm_head.clone(),
+        ]];
+        if let Stack::Resident(layers) = &self.stack {
+            groups.extend(layers.iter().map(LlamaLayer::arrays));
+        }
+        groups
     }
 
     /// The one constructor. `stream_source` selects the layer stack's shape: `None` builds every
@@ -311,13 +371,13 @@ impl CausalLm {
             ),
             None => (cfg.build_rope(), None),
         };
-        // Every tensor this constructor read is a freshly loaded buffer whose GPU view can lag the
-        // CPU's (sc-22414): force them resident in bounded batches and hold until the GPU reads the
-        // same bytes, *before* any forward builds a graph over them. Under `Stack::Resident` that is
-        // the whole checkpoint; under `Stack::Sequential` it is the resident set (embeddings, final
-        // norm, LM head) — the streamed layers are verified per pass in
+        // Nothing is evaluated here. Every tensor this constructor read is a freshly loaded buffer
+        // whose GPU view can lag the CPU's (sc-22414); the callers force them resident and verified
+        // *before* any forward builds a graph over them — `from_weights_with` /
+        // `from_file_sequential` up front, the provider group by group
+        // (`Weights::materialize_groups`). Under `Stack::Sequential` that is the resident set
+        // (embeddings, final norm, LM head) — the streamed layers are verified per pass in
         // `crate::residency::SequentialStack::run_layer`.
-        w.verify_accessed_gpu_view()?;
         let quantized = quant.is_some() || cfg.quantization.is_some();
         Ok(Self {
             embed_tokens,
@@ -354,7 +414,10 @@ impl CausalLm {
         // This view supplies only the non-layer weights (embeddings, final norm, LM head). It is
         // dropped on return; every layer read happens later, against a view the stream reopens.
         let w = Weights::from_file(path)?;
-        Self::build(&w, prefix, cfg, quant, Some(path.to_path_buf()))
+        let model = Self::build(&w, prefix, cfg, quant, Some(path.to_path_buf()))?;
+        w.verify_accessed_gpu_view()?;
+        crate::primitives::weights::eval_groups(&model.param_groups())?;
+        Ok(model)
     }
 
     /// The resident layer stack, or a typed refusal when this model streams its layers.
@@ -1026,6 +1089,76 @@ pub(crate) struct LlamaLayer {
 }
 
 impl LlamaLayer {
+    /// Every projection of the layer (attention and FFN; a sparse-MoE block's shared expert).
+    fn for_each_projection(&self, f: &mut dyn FnMut(&Projection)) {
+        match &self.attn {
+            Attention::Gqa(a) => {
+                f(&a.q);
+                if let Some(kv) = &a.kv {
+                    f(kv.key());
+                    if let Some(v) = kv.value() {
+                        f(v);
+                    }
+                }
+                f(&a.o);
+            }
+            Attention::Mla(a) => {
+                for p in [&a.q_proj, &a.q_a_proj, &a.q_b_proj].into_iter().flatten() {
+                    f(p);
+                }
+                for p in [&a.kv_a_proj, &a.kv_b_proj, &a.o_proj] {
+                    f(p);
+                }
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => {
+                for p in [&m.gate, &m.up, &m.down] {
+                    f(p);
+                }
+            }
+            Ffn::Moe(m) => m.for_each_shared_projection(f),
+        }
+    }
+
+    /// Every array the layer holds, for load-time materialization (sc-24446).
+    pub(crate) fn arrays(&self) -> Vec<Array> {
+        let mut out = vec![self.input_ln.clone(), self.post_ln.clone()];
+        out.extend(self.pre_ff_ln.iter().cloned());
+        out.extend(self.post_ff_ln.iter().cloned());
+        out.extend(self.layer_scalar.iter().cloned());
+        match &self.attn {
+            Attention::Gqa(a) => {
+                a.q.push_arrays(&mut out);
+                if let Some(kv) = &a.kv {
+                    kv.push_arrays(&mut out);
+                }
+                a.o.push_arrays(&mut out);
+                out.extend(a.q_norm.iter().cloned());
+                out.extend(a.k_norm.iter().cloned());
+            }
+            Attention::Mla(a) => {
+                for p in [&a.q_proj, &a.q_a_proj, &a.q_b_proj].into_iter().flatten() {
+                    p.push_arrays(&mut out);
+                }
+                out.extend(a.q_a_layernorm.iter().cloned());
+                for p in [&a.kv_a_proj, &a.kv_b_proj, &a.o_proj] {
+                    p.push_arrays(&mut out);
+                }
+                out.push(a.kv_a_layernorm.clone());
+            }
+        }
+        match &self.ffn {
+            Ffn::Dense(m) => {
+                for p in [&m.gate, &m.up, &m.down] {
+                    p.push_arrays(&mut out);
+                }
+            }
+            Ffn::Moe(m) => m.push_arrays(&mut out),
+        }
+        out
+    }
+
     pub(crate) fn forward(
         &self,
         x: &Array,
@@ -1524,13 +1657,17 @@ struct LlamaMlp {
     gate: Projection,
     up: Projection,
     down: Projection,
-    gelu: bool,
+    /// GeGLU (Gemma) for this role — the activation-dtype policy's key; `None` ⇒ SwiGLU.
+    gelu: Option<ActivationRole>,
 }
 
 impl LlamaMlp {
     fn forward(&self, x: &Array) -> Result<Array> {
         let g = self.gate.forward(x)?;
-        let g = if self.gelu { gelu_tanh(&g)? } else { silu(&g)? };
+        let g = match self.gelu {
+            Some(role) => gelu_tanh(&g, role)?,
+            None => silu(&g)?,
+        };
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&g, &up)?)
     }
@@ -1839,7 +1976,7 @@ impl LayerPlan {
                 gate,
                 up,
                 down: proj(lp("mlp.down_proj.weight"))?,
-                gelu: gemma,
+                gelu: gemma.then_some(cfg.activation_role),
             })
         };
 
@@ -1979,6 +2116,85 @@ mod tests {
             seen.compared_steps > seen.tie_steps,
             "most greedy steps must be decisive enough to compare: {seen:?}"
         );
+    }
+
+    /// sc-24446 parity gate for the Gemma decoders' GeGLU in the activation dtype: Gemma 2 on a
+    /// random BF16 fixture (soft-capped attention and logits, sandwich norms, `1 + w`) and Gemma 4
+    /// on the decoder-golden fixture (sliding / full alternation, layer scalars, k = v), each held
+    /// to the gate's logit budget and greedy-margin rule against its own `f32` path
+    /// ([`crate::primitives::activation::parity`]).
+    #[test]
+    fn gemma_geglu_activation_dtype_parity() {
+        use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
+        use serde_json::json;
+        // Gemma 2.
+        let (v, h, inter, layers, heads, kv, hd) = (64, 64, 128, 2, 4, 2, 16);
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("model.embed_tokens.weight".into(), vec![v, h]),
+            ("model.norm.weight".into(), vec![h]),
+        ];
+        for i in 0..layers {
+            let l = |s: &str| format!("model.layers.{i}.{s}");
+            for (key, shape) in [
+                ("input_layernorm.weight", vec![h]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("pre_feedforward_layernorm.weight", vec![h]),
+                ("post_feedforward_layernorm.weight", vec![h]),
+                ("self_attn.q_proj.weight", vec![heads * hd, h]),
+                ("self_attn.k_proj.weight", vec![kv * hd, h]),
+                ("self_attn.v_proj.weight", vec![kv * hd, h]),
+                ("self_attn.o_proj.weight", vec![h, heads * hd]),
+                ("mlp.gate_proj.weight", vec![inter, h]),
+                ("mlp.up_proj.weight", vec![inter, h]),
+                ("mlp.down_proj.weight", vec![h, inter]),
+            ] {
+                shapes.push((l(key), shape));
+            }
+        }
+        let cfg = ModelConfig::from_json(&json!({
+            "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2",
+            "hidden_size": h, "intermediate_size": inter, "num_hidden_layers": layers,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+            "vocab_size": v, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": hd, "sliding_window": 4096,
+            "max_position_embeddings": 8192
+        }))
+        .unwrap();
+        let gemma2 = CausalLm::from_weights(
+            &Weights::from_map(random_bf16(&shapes, 0x2444_6603)),
+            "",
+            cfg,
+        )
+        .unwrap();
+        let report = assert_geglu_parity("gemma2", &gemma2, &[3, 17, 5, 40, 9], 16);
+        eprintln!("gemma2 GeGLU parity: {report:?}");
+
+        // Gemma 4, on the decoder-golden fixture.
+        let g: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../testdata/gemma4/gemma4_decoder_goldens.json"
+        ))
+        .unwrap();
+        let floats = |v: &serde_json::Value| -> Vec<f32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let mut map = std::collections::HashMap::new();
+        for (key, entry) in g["weights"].as_object().unwrap() {
+            let shape: Vec<i32> = floats(&entry["shape"]).iter().map(|&x| x as i32).collect();
+            map.insert(
+                key.clone(),
+                Array::from_slice(&floats(&entry["data"]), &shape),
+            );
+        }
+        let cfg = ModelConfig::from_json(&g["config"]).unwrap();
+        let gemma4 = CausalLm::from_weights(&Weights::from_map(map), "", cfg).unwrap();
+        let prompt: Vec<i32> = floats(&g["prompt"]).iter().map(|&x| x as i32).collect();
+        let report = assert_geglu_parity("gemma4", &gemma4, &prompt, 16);
+        eprintln!("gemma4 GeGLU parity: {report:?}");
     }
 
     #[test]
