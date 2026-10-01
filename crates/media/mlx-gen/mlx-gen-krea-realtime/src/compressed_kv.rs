@@ -217,6 +217,11 @@ impl RetainedKernelHandle for KreaPackedMetalKernel {
     }
 }
 
+// UNTILED REFERENCE KERNEL. This is a correctness reference for the SC-20684 POC, not a tuned
+// kernel: one simdgroup computes each 8x8 score tile while the other seven wait at barriers, and the
+// softmax/value passes run per lane over 8-key blocks. The POC decision is No-Go on memory grounds, so
+// its throughput is deliberately not optimized; do not read its timings as a fused-kernel ceiling.
+//
 // MLX synthesizes the argument list from `MetalKernel::with_options`.  Each threadgroup owns a
 // 8-row query tile; packed history is decoded from Krea's actual uint32/bf16 D-axis rows.  The
 // simdgroup fragments are register/tile-local, while max/sum/value are streamed over keys: no
@@ -279,7 +284,10 @@ const KREA_PACKED_ONLINE_SOFTMAX_MSL: &str = r#"
             simdgroup_matrix<float, 8, 8> a, bmat, c(0.0f);
             for (uint d0 = 0; d0 < HEAD_DIM; d0 += 8) {
                 simdgroup_load(a, &q_tile[0][d0], HEAD_DIM);
-                simdgroup_load(bmat, &k_tile[0][d0], HEAD_DIM, true);
+                // MSL signature: (dst, src, elements_per_row, ulong2 matrix_origin, transpose).
+                // The origin must be spelled out: a bare `true` in the 4th slot converts to
+                // origin (1,1) and leaves transpose false (Q·shifted-untransposed-K).
+                simdgroup_load(bmat, &k_tile[0][d0], HEAD_DIM, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(c, a, bmat, c);
             }
             simdgroup_store(c, &scores[0][0], K_TILE);
@@ -1307,6 +1315,195 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Device parity with non-zero, random Q/K/V against an independent fp32 (f64-accumulated)
+    /// dequantize-then-attend reference. The uniform-value oracle above uses `q = k = 0`, so every
+    /// score is zero and a kernel that multiplies Q by the wrong K fragment still passes it; this
+    /// test makes the softmax peaky enough that any score-tile defect (origin, transpose, row
+    /// offset) moves the output by O(1). S_q covers 1, a full 8-row tile, and non-multiples of 8
+    /// (tail tiles), with history and current key counts that leave partial 8-key tiles. There is
+    /// no GQA axis: Krea/Wan 14B is MHA (40 Q heads = 40 KV heads) and the kernel indexes K/V by
+    /// the query head.
+    #[test]
+    fn real_metal_kernel_matches_fp32_reference_with_random_qkv_for_tiles_tails_and_masks() {
+        const HEADS: usize = 40;
+        const DIM: usize = 128;
+        const GROUP: usize = 64;
+
+        struct Rng(u64);
+        impl Rng {
+            fn uniform(&mut self, amplitude: f32) -> f32 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                // 24 random mantissa bits mapped to [-amplitude, amplitude); rounded to bf16 so the
+                // reference attends exactly the values the kernel receives.
+                let unit = (self.0 >> 40) as f32 / (1u64 << 24) as f32;
+                bf16_to_f32(f32_to_bf16((unit * 2.0 - 1.0) * amplitude))
+            }
+            fn tensor(&mut self, tokens: usize, amplitude: f32) -> Vec<f32> {
+                (0..HEADS * tokens * DIM)
+                    .map(|_| self.uniform(amplitude))
+                    .collect()
+            }
+        }
+        let bf16 = |values: &[f32], tokens: usize| {
+            Array::from_slice(values, &[1, HEADS as i32, tokens as i32, DIM as i32])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap()
+        };
+        let host_f32 = |array: &Array| {
+            let array = array.as_dtype(Dtype::Float32).unwrap();
+            array.eval().unwrap();
+            array.as_slice::<f32>().to_vec()
+        };
+        // Independent host decode of the exact packed rows handed to the kernel: LSB-first codes
+        // within each uint32 word, one bf16 scale/bias per 64-channel group along D.
+        let decode = |packed: &(Array, Array, Array), tokens: usize, bits: usize| {
+            let (w, scales, biases) = packed;
+            w.eval().unwrap();
+            let words = w.as_slice::<u32>();
+            let (scales, biases) = (host_f32(scales), host_f32(biases));
+            let words_per_row = DIM * bits / 32;
+            let mut dense = vec![0.0f32; HEADS * tokens * DIM];
+            for row in 0..HEADS * tokens {
+                for d in 0..DIM {
+                    let word = words[row * words_per_row + d * bits / 32];
+                    let code = (word >> ((d * bits) % 32)) & ((1u32 << bits) - 1);
+                    let meta = row * (DIM / GROUP) + d / GROUP;
+                    dense[row * DIM + d] = scales[meta] * code as f32 + biases[meta];
+                }
+            }
+            dense
+        };
+
+        let mut rng = Rng(0x5c20_684d_eadb_eef1);
+        // (S_q, packed history tokens, block size). Block size 1024 disables the block mask.
+        let cases = [
+            (1usize, 7usize, 3usize),
+            (5, 16, 4),
+            (8, 8, 8),
+            (13, 21, 5),
+            (17, 3, 1024),
+        ];
+        for (tier, bits) in [(CompressedTier::Q8, 8usize), (CompressedTier::Q4, 4)] {
+            let kernel = KreaPackedMetalKernel::new(tier).unwrap();
+            for &(sq, history, block_size) in &cases {
+                let keys_total = history + sq;
+                let q = rng.tensor(sq, 3.0);
+                let history_k = rng.tensor(history, 3.0);
+                let history_v = rng.tensor(history, 3.0);
+                let current_k = rng.tensor(sq, 3.0);
+                let current_v = rng.tensor(sq, 3.0);
+                let packed_k =
+                    mlx_rs::ops::quantize(bf16(&history_k, history), GROUP as i32, bits as i32)
+                        .unwrap();
+                let packed_v =
+                    mlx_rs::ops::quantize(bf16(&history_v, history), GROUP as i32, bits as i32)
+                        .unwrap();
+                let decoded_k = decode(&packed_k, history, bits);
+                let decoded_v = decode(&packed_v, history, bits);
+                // The host decode must be the representation, not a reinterpretation of it: every
+                // decoded channel lies within one quantization step of its source value (MLX's affine
+                // quantize snaps one group edge exactly, so the far edge may clip past half a step;
+                // a misread code layout instead lands O(range) away).
+                let levels = ((1usize << bits) - 1) as f32;
+                for (source, decoded) in [(&history_k, &decoded_k), (&history_v, &decoded_v)] {
+                    for (&x, &y) in source.iter().zip(decoded.iter()) {
+                        assert!(
+                            (x - y).abs() <= 6.0 / levels + 0.05,
+                            "host decode disagrees with MLX packing: {x} vs {y}"
+                        );
+                    }
+                }
+
+                let query_positions = Array::from_slice(
+                    &(history as i64..keys_total as i64).collect::<Vec<_>>(),
+                    &[sq as i32],
+                );
+                let key_positions = Array::from_slice(
+                    &(0..keys_total as i64).collect::<Vec<_>>(),
+                    &[keys_total as i32],
+                );
+                let output = kernel
+                    .dispatch(
+                        &bf16(&q, sq),
+                        &packed_k.0,
+                        &packed_k.1,
+                        &packed_k.2,
+                        &packed_v.0,
+                        &packed_v.1,
+                        &packed_v.2,
+                        &bf16(&current_k, sq),
+                        &bf16(&current_v, sq),
+                        &query_positions,
+                        &key_positions,
+                        block_size,
+                    )
+                    .unwrap();
+                let actual = host_f32(&output);
+
+                let key = |h: usize, kk: usize, d: usize| {
+                    if kk < history {
+                        decoded_k[(h * history + kk) * DIM + d]
+                    } else {
+                        current_k[(h * sq + kk - history) * DIM + d]
+                    }
+                };
+                let value = |h: usize, kk: usize, d: usize| {
+                    if kk < history {
+                        decoded_v[(h * history + kk) * DIM + d]
+                    } else {
+                        current_v[(h * sq + kk - history) * DIM + d]
+                    }
+                };
+                let mut worst = 0.0f64;
+                for h in 0..HEADS {
+                    for qi in 0..sq {
+                        let q_position = history + qi;
+                        let allowed: Vec<usize> = (0..keys_total)
+                            .filter(|&kk| kk / block_size <= q_position / block_size)
+                            .collect();
+                        let scores: Vec<f64> = allowed
+                            .iter()
+                            .map(|&kk| {
+                                (0..DIM)
+                                    .map(|d| {
+                                        f64::from(q[(h * sq + qi) * DIM + d])
+                                            * f64::from(key(h, kk, d))
+                                    })
+                                    .sum::<f64>()
+                                    / (DIM as f64).sqrt()
+                            })
+                            .collect();
+                        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                        let sum: f64 = weights.iter().sum();
+                        for d in 0..DIM {
+                            let expected = allowed
+                                .iter()
+                                .zip(&weights)
+                                .map(|(&kk, w)| w * f64::from(value(h, kk, d)))
+                                .sum::<f64>()
+                                / sum;
+                            let got = f64::from(actual[(h * sq + qi) * DIM + d]);
+                            let error = (got - expected).abs();
+                            worst = worst.max(error);
+                            // bf16 output rounding (2^-8 relative) plus fp32 score accumulation.
+                            assert!(
+                                error <= 1e-2 + 8e-3 * expected.abs(),
+                                "tier={tier:?} sq={sq} history={history} block={block_size} \
+                                 h={h} qi={qi} d={d}: kernel {got} != fp32 reference {expected}"
+                            );
+                        }
+                    }
+                }
+                eprintln!(
+                    "tier={tier:?} sq={sq} history={history} block={block_size}: max |err| {worst:.3e}"
+                );
             }
         }
     }

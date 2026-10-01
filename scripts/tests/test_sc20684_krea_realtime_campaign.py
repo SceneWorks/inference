@@ -659,7 +659,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
 
     def test_release_must_return_to_loaded_model_and_terminal_boundaries(self) -> None:
         row = observation("t2v", "q8", "run")
-        row["memory"]["mlx"]["releaseActiveBytes"] = 5 * GIB + 1
+        row["memory"]["mlx"]["releaseActiveBytes"] = 5 * GIB + campaign.RELEASE_ACTIVE_RESIDUAL_BYTES + 1
         row["memory"]["releaseVerified"] = False
         validated = self.validate_from(row)
         self.assertFalse(validated["memory"]["releaseVerified"])
@@ -669,7 +669,7 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
 
         candidate = self.validate()
         baseline = baseline_observation("t2v", "q8", "baseline", candidate)
-        baseline["memory"]["mlx"]["releaseActiveBytes"] = 5 * GIB + 1
+        baseline["memory"]["mlx"]["releaseActiveBytes"] = 5 * GIB + campaign.RELEASE_ACTIVE_RESIDUAL_BYTES + 1
         baseline["memory"]["releaseVerified"] = True
         with self.assertRaisesRegex(campaign.CampaignError, "resource boundaries"):
             campaign._validate_baseline_observation(
@@ -679,6 +679,42 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 run_id="baseline",
                 candidate=candidate,
             )
+
+    def test_recorded_lazy_cast_residual_is_a_verified_release_in_both_roles(self) -> None:
+        # SC-20684 campaign numbers, identical in the dense-baseline and paired roles: release sits
+        # 4,456,444 bytes above weights-loaded because the Wan DiT's lazily cast f32 modulation/norm3
+        # tables materialize on the first forward and stay with the loaded model.
+        loaded, release = 8_887_095_376, 8_891_551_820
+        self.assertEqual(campaign.LAZY_DENSE_CAST_BYTES, 4_440_064)
+        self.assertLessEqual(release - loaded, campaign.RELEASE_ACTIVE_RESIDUAL_BYTES)
+
+        def recorded(row: dict) -> dict:
+            mlx = row["memory"]["mlx"]
+            for key in ("candidateTerminalActiveBytes", "verificationTerminalActiveBytes", "generationTerminalActiveBytes"):
+                if key in mlx:
+                    mlx[key] = 9 * GIB
+            mlx["weightsLoadedActiveBytes"] = loaded
+            mlx["releaseActiveBytes"] = release
+            row["memory"]["releaseVerified"] = True
+            return row
+
+        validated = self.validate_from(recorded(observation("t2v", "q8", "run")))
+        self.assertTrue(validated["memory"]["releaseVerified"])
+        candidate = self.validate()
+        baseline = recorded(baseline_observation("t2v", "q8", "baseline", candidate))
+        checked = campaign._validate_baseline_observation(
+            baseline,
+            expected_mode="t2v",
+            expected_tier="q8",
+            run_id="baseline",
+            candidate=candidate,
+        )
+        self.assertTrue(checked["memory"]["releaseVerified"])
+
+        # Zero tolerance (the pre-fix rule) calls this recorded release a leak and contradicts it.
+        with patch.object(campaign, "RELEASE_ACTIVE_RESIDUAL_BYTES", 0):
+            with self.assertRaisesRegex(campaign.CampaignError, "contradicts"):
+                self.validate_from(recorded(observation("t2v", "q8", "run")))
 
     def test_cancellation_must_be_in_flight_allocated_and_cleaned(self) -> None:
         row = observation("t2v", "q8", "run")

@@ -83,6 +83,20 @@ QUALITY_THRESHOLDS_BY_TIER = {
         "temporalDeltaDrift": 12.0,
     },
 }
+# MLX active bytes the loaded Krea 14B legitimately gains on its FIRST forward and then keeps for the
+# model's lifetime, so "release" may exceed "weights loaded" by exactly this much. mlx-gen-wan keeps every
+# block's `modulation` [1,6,5120] and `norm3` weight/bias [5120], and `head.modulation` [1,2,5120], as
+# lazy f32 casts of the bf16 checkpoint tensors (`Block::load`, `from_weights_without_blocks`);
+# `Weights::materialize_accessed` evaluates the bf16 sources at load but not the casts. The first forward
+# allocates the f32 tables (16 KiB-page-rounded: 131072 + 2*32768 per block, 49152 head) and frees their
+# bf16 sources (65536 + 2*10240 per block, 32768 head). That is one-time model state, not a per-request
+# leak: the identical tiny-config pipeline gains exactly its own lazy-cast sum on request 1 and nothing on
+# requests 2 and 3. Campaign rows recorded +4,456,444 bytes in BOTH the dense-baseline and paired roles;
+# the remaining 16,380 bytes (< one Metal page) are first-use MLX allocations, bounded here by one page.
+# Mirrors `SC20684_RELEASE_ACTIVE_RESIDUAL_BYTES` in tests/generate_smoke.rs (contract checker pins both).
+LAZY_DENSE_CAST_BYTES = 40 * (131_072 + 2 * 32_768 - 65_536 - 2 * 10_240) + (49_152 - 32_768)
+RELEASE_ACTIVE_RESIDUAL_BYTES = 4_456_448
+assert RELEASE_ACTIVE_RESIDUAL_BYTES == LAZY_DENSE_CAST_BYTES + 16_384
 PACKED_GEOMETRY_IDENTITY = {
     "queryTile": 8,
     "keyTile": 8,
@@ -649,7 +663,7 @@ def _validate_observation(
     loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024
     terminal_release_limit = memory["verificationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
     resources_released = not (
-        mlx["releaseActiveBytes"] > mlx["weightsLoadedActiveBytes"]
+        mlx["releaseActiveBytes"] > mlx["weightsLoadedActiveBytes"] + RELEASE_ACTIVE_RESIDUAL_BYTES
         or mlx["releaseActiveBytes"] > mlx["verificationTerminalActiveBytes"]
         or mlx["releaseCacheBytes"] > mlx["weightsLoadedCacheBytes"]
         or mlx["releaseCacheBytes"] > mlx["verificationTerminalCacheBytes"]
@@ -969,7 +983,7 @@ def _validate_baseline_observation(
     loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024
     terminal_release_limit = memory["generationTerminal"]["physFootprintBytes"] + 512 * 1024 * 1024
     resources_released = not (
-        mlx["releaseActiveBytes"] > mlx["weightsLoadedActiveBytes"]
+        mlx["releaseActiveBytes"] > mlx["weightsLoadedActiveBytes"] + RELEASE_ACTIVE_RESIDUAL_BYTES
         or mlx["releaseActiveBytes"] > mlx["generationTerminalActiveBytes"]
         or mlx["releaseCacheBytes"] > mlx["weightsLoadedCacheBytes"]
         or mlx["releaseCacheBytes"] > mlx["generationTerminalCacheBytes"]

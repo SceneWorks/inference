@@ -259,7 +259,8 @@ if [ "$W2" = 1 ]; then
     SC20686_WAN_T2V_LIGHTNING_HIGH="$W2_LIGHTNING/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/high_noise_model.safetensors" \
     SC20686_WAN_T2V_LIGHTNING_LOW="$W2_LIGHTNING/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/low_noise_model.safetensors" \
     SC20686_WAN_I2V_LIGHTNING_HIGH="$W2_LIGHTNING/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors" \
-    SC20686_WAN_I2V_LIGHTNING_LOW="$W2_LIGHTNING/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors"
+    SC20686_WAN_I2V_LIGHTNING_LOW="$W2_LIGHTNING/Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors" \
+    SC20686_HF_HUB="$KV_HF_HUB"
 fi
 D_ARGS=(--campaign --matrix --inference-revision "$INFERENCE_SHA" --safety-policy "$F2/policies/$W2_POLICY"
   --stop-file "$CTL/stop-requested" --wan-manifest "$INF/scripts/sc20686_mlx_wan_campaign_manifest.example.json"

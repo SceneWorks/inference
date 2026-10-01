@@ -1336,6 +1336,182 @@ fn sc20684_process_memory() -> serde_json::Value {
     }
 }
 
+/// MLX active bytes the loaded Krea 14B legitimately gains on its FIRST forward and then keeps for the
+/// model's lifetime, so the release boundary may exceed the weights-loaded boundary by this much.
+///
+/// mlx-gen-wan keeps every block's `modulation` `[1,6,5120]` and `norm3` weight/bias `[5120]`, and
+/// `head.modulation` `[1,2,5120]`, as lazy f32 casts of the bf16 checkpoint tensors (`Block::load`,
+/// `WanTransformer::from_weights_without_blocks`); `Weights::materialize_accessed` evaluates the bf16
+/// sources at load but not the casts. The first forward allocates the f32 tables (16 KiB-page-rounded:
+/// 131072 + 2×32768 per block, 49152 for the head) and frees their bf16 sources (65536 + 2×10240 per
+/// block, 32768 for the head): [`SC20684_LAZY_DENSE_CAST_BYTES`] = 4,440,064 bytes. It is one-time model
+/// state, not a per-request leak — the same pipeline on the tiny random-weight config gains exactly its
+/// own lazy-cast sum on request 1 and nothing on requests 2 and 3. The SC-20684 campaign recorded
+/// +4,456,444 bytes in BOTH the dense-baseline and paired roles; the remaining 16,380 bytes (under one
+/// Metal page) are first-use MLX allocations, bounded here by one 16 KiB page. Mirrors
+/// `RELEASE_ACTIVE_RESIDUAL_BYTES` in `scripts/sc20684_krea_realtime_campaign.py`.
+const SC20684_LAZY_DENSE_CAST_BYTES: u64 =
+    40 * (131_072 + 2 * 32_768 - 65_536 - 2 * 10_240) + (49_152 - 32_768);
+const SC20684_RELEASE_ACTIVE_RESIDUAL_BYTES: u64 = 4_456_448;
+/// Darwin phys-footprint slack between the release boundary and the loaded/terminal boundaries.
+const SC20684_RELEASE_FOOTPRINT_SLACK_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The release rule shared by the dense-baseline and paired roles (and re-derived independently by
+/// the campaign validator): MLX active memory returns to the loaded model plus its documented one-time
+/// residual and to the terminal boundary, the allocator cache is empty of anything the run added, and
+/// the settled Darwin footprint is within slack of both boundaries.
+#[allow(clippy::too_many_arguments)]
+fn sc20684_release_verified(
+    release_active: u64,
+    weights_loaded_active: u64,
+    terminal_active: u64,
+    release_cache: u64,
+    weights_loaded_cache: u64,
+    terminal_cache: u64,
+    release_footprint: u64,
+    weights_loaded_footprint: u64,
+    terminal_footprint: u64,
+) -> bool {
+    release_active <= weights_loaded_active.saturating_add(SC20684_RELEASE_ACTIVE_RESIDUAL_BYTES)
+        && release_active <= terminal_active
+        && release_cache <= weights_loaded_cache
+        && release_cache <= terminal_cache
+        && release_footprint
+            <= weights_loaded_footprint.saturating_add(SC20684_RELEASE_FOOTPRINT_SLACK_BYTES)
+        && release_footprint
+            <= terminal_footprint.saturating_add(SC20684_RELEASE_FOOTPRINT_SLACK_BYTES)
+}
+
+#[test]
+fn sc20684_release_rule_admits_the_recorded_lazy_cast_residual_and_nothing_more() {
+    assert_eq!(SC20684_LAZY_DENSE_CAST_BYTES, 4_440_064);
+    assert_eq!(
+        SC20684_RELEASE_ACTIVE_RESIDUAL_BYTES,
+        SC20684_LAZY_DENSE_CAST_BYTES + 16_384
+    );
+    // Recorded SC-20684 campaign numbers: identical in the dense-baseline and paired roles.
+    let (loaded, release) = (8_887_095_376u64, 8_891_551_820u64);
+    let terminal = release + 4 * 1024 * 1024 * 1024;
+    let footprint = 20 * 1024 * 1024 * 1024u64;
+    let verified = |release_active: u64, release_footprint: u64| {
+        sc20684_release_verified(
+            release_active,
+            loaded,
+            terminal,
+            0,
+            0,
+            1024,
+            release_footprint,
+            footprint,
+            footprint + 1024 * 1024 * 1024,
+        )
+    };
+    assert!(verified(release, footprint));
+    assert!(verified(
+        loaded + SC20684_RELEASE_ACTIVE_RESIDUAL_BYTES,
+        footprint
+    ));
+    // One byte past the documented residual is a leak, and so is anything past the footprint slack.
+    assert!(!verified(
+        loaded + SC20684_RELEASE_ACTIVE_RESIDUAL_BYTES + 1,
+        footprint
+    ));
+    assert!(!verified(
+        release,
+        footprint + SC20684_RELEASE_FOOTPRINT_SLACK_BYTES + 1
+    ));
+}
+
+/// Poll interval, stable-read count, read bound, and unchanged tolerance of a settled footprint read —
+/// the same policy as mlx-llm's `campaign_supervisor::settled_phys_footprint`.
+const SC20684_FOOTPRINT_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+const SC20684_FOOTPRINT_SETTLE_STABLE_READS: u32 = 25;
+const SC20684_FOOTPRINT_SETTLE_MAX_READS: u32 = 300;
+const SC20684_FOOTPRINT_SETTLE_TOLERANCE_BYTES: u64 = 1024 * 1024;
+
+/// Darwin returns Metal buffers MLX just freed to the process footprint asynchronously: a read taken
+/// right after `clear_cache` reports the pre-free footprint for tens of milliseconds and then falls in
+/// steps. Poll until `physFootprintBytes` is unchanged (within tolerance) for `stable_reads`
+/// consecutive reads, bounded by `max_reads` (then the latest read is returned).
+fn sc20684_settle_process_memory(
+    mut read: impl FnMut() -> serde_json::Value,
+    mut wait: impl FnMut(),
+    stable_reads: u32,
+    max_reads: u32,
+) -> serde_json::Value {
+    let current = |value: &serde_json::Value| {
+        value["physFootprintBytes"]
+            .as_u64()
+            .expect("SC-20684 footprint read carries physFootprintBytes")
+    };
+    let mut latest = read();
+    let mut anchor = current(&latest);
+    let mut stable = 0;
+    for _ in 1..max_reads {
+        wait();
+        latest = read();
+        if current(&latest).abs_diff(anchor) <= SC20684_FOOTPRINT_SETTLE_TOLERANCE_BYTES {
+            stable += 1;
+            if stable >= stable_reads {
+                break;
+            }
+        } else {
+            anchor = current(&latest);
+            stable = 0;
+        }
+    }
+    latest
+}
+
+/// [`sc20684_process_memory`] once the footprint has stopped changing; every boundary the release rule
+/// compares is read this way so a lagging pre-free footprint is never trusted.
+fn sc20684_settled_process_memory() -> serde_json::Value {
+    sc20684_settle_process_memory(
+        sc20684_process_memory,
+        || std::thread::sleep(SC20684_FOOTPRINT_SETTLE_POLL),
+        SC20684_FOOTPRINT_SETTLE_STABLE_READS,
+        SC20684_FOOTPRINT_SETTLE_MAX_READS,
+    )
+}
+
+#[test]
+fn sc20684_settled_footprint_waits_out_an_asynchronous_release() {
+    let gib = 1024 * 1024 * 1024u64;
+    let row = |current: u64| serde_json::json!({"physFootprintBytes": current, "physFootprintPeakBytes": 30 * gib});
+    // Pre-free value held for three reads, then two falling steps, then flat.
+    let trace = [20 * gib, 20 * gib, 20 * gib, 15 * gib, 12 * gib];
+    let mut reads = 0usize;
+    let settled = sc20684_settle_process_memory(
+        || {
+            reads += 1;
+            row(trace.get(reads - 1).copied().unwrap_or(12 * gib))
+        },
+        || {},
+        4,
+        100,
+    );
+    assert_eq!(settled["physFootprintBytes"].as_u64(), Some(12 * gib));
+    // Settles on the last step plus four unchanged reads, never on the lagging pre-free plateau.
+    assert_eq!(reads, trace.len() + 4);
+
+    // A footprint that never stops moving is bounded: the latest read is returned.
+    let mut reads = 0u64;
+    let unsettled = sc20684_settle_process_memory(
+        || {
+            reads += 1;
+            row(reads * 2 * 1024 * 1024)
+        },
+        || {},
+        4,
+        10,
+    );
+    assert_eq!(reads, 10);
+    assert_eq!(
+        unsettled["physFootprintBytes"].as_u64(),
+        Some(20 * 1024 * 1024)
+    );
+}
+
 fn sc20684_conditioning(
     mode: Sc20684Mode,
     vae: &mlx_gen_wan::WanVae,
@@ -1656,7 +1832,7 @@ fn sc20684_packed_campaign_observer() {
     let vae = WanVae::from_weights(&vae_weights).expect("load product VAE");
     drop(vae_weights);
     let load_elapsed = load_started.elapsed();
-    let weights_loaded = sc20684_process_memory();
+    let weights_loaded = sc20684_settled_process_memory();
     let weights_loaded_active = mlx_rs::memory::get_active_memory() as u64;
     let weights_loaded_cache = mlx_rs::memory::get_cache_memory() as u64;
     let mut phase_memory = vec![sc20684_phase_memory("weights-loaded")];
@@ -1737,7 +1913,7 @@ fn sc20684_packed_campaign_observer() {
         let (output_sha256, dense_frames) = sc20684_hash_video(&dense_media);
         let output_frame_count = dense_frames.len();
         let key_tokens = dense_cache.stored_tokens();
-        let terminal_process = sc20684_process_memory();
+        let terminal_process = sc20684_settled_process_memory();
         let terminal_active = mlx_rs::memory::get_active_memory() as u64;
         let terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
         let exact_active_peak = mlx_rs::memory::get_peak_memory() as u64;
@@ -1748,7 +1924,7 @@ fn sc20684_packed_campaign_observer() {
         drop(conditioning);
         mlx_gen::memory_probe::clear_cache();
         phase_memory.push(sc20684_phase_memory("release"));
-        let release_process = sc20684_process_memory();
+        let release_process = sc20684_settled_process_memory();
         let release_active = mlx_rs::memory::get_active_memory() as u64;
         let release_cache = mlx_rs::memory::get_cache_memory() as u64;
         let allocator = allocator_probe.finish();
@@ -1761,12 +1937,17 @@ fn sc20684_packed_campaign_observer() {
         let release_footprint = release_process["physFootprintBytes"]
             .as_u64()
             .expect("SC-20684 dense release footprint");
-        let release_verified = release_active <= weights_loaded_active
-            && release_active <= terminal_active
-            && release_cache <= weights_loaded_cache
-            && release_cache <= terminal_cache
-            && release_footprint <= weights_loaded_footprint.saturating_add(512 * 1024 * 1024)
-            && release_footprint <= terminal_footprint.saturating_add(512 * 1024 * 1024);
+        let release_verified = sc20684_release_verified(
+            release_active,
+            weights_loaded_active,
+            terminal_active,
+            release_cache,
+            weights_loaded_cache,
+            terminal_cache,
+            release_footprint,
+            weights_loaded_footprint,
+            terminal_footprint,
+        );
         let request_first_frame_ms =
             (conditioning_elapsed + generation_elapsed + decode_elapsed).as_secs_f64() * 1000.0;
         let mean_output_frame_ms = (generation_elapsed + decode_elapsed).as_secs_f64() * 1000.0
@@ -2094,12 +2275,12 @@ fn sc20684_packed_campaign_observer() {
     let mean_output_frame_ms =
         (packed_elapsed + packed_decode_elapsed).as_secs_f64() * 1000.0 / packed_frame_count as f64;
 
-    let verification_terminal = sc20684_process_memory();
+    let verification_terminal = sc20684_settled_process_memory();
     let verification_terminal_active = mlx_rs::memory::get_active_memory() as u64;
     let verification_terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
     mlx_gen::memory_probe::clear_cache();
     phase_memory.push(sc20684_phase_memory("release"));
-    let release_process = sc20684_process_memory();
+    let release_process = sc20684_settled_process_memory();
     let release_active = mlx_rs::memory::get_active_memory() as u64;
     let release_cache = mlx_rs::memory::get_cache_memory() as u64;
     let weights_loaded_footprint = weights_loaded["physFootprintBytes"]
@@ -2112,12 +2293,17 @@ fn sc20684_packed_campaign_observer() {
         .as_u64()
         .expect("SC-20684 release footprint");
     let release_verified = cancellation_clean
-        && release_active <= weights_loaded_active
-        && release_active <= verification_terminal_active
-        && release_cache <= weights_loaded_cache
-        && release_cache <= verification_terminal_cache
-        && release_footprint <= weights_loaded_footprint.saturating_add(512 * 1024 * 1024)
-        && release_footprint <= verification_terminal_footprint.saturating_add(512 * 1024 * 1024);
+        && sc20684_release_verified(
+            release_active,
+            weights_loaded_active,
+            verification_terminal_active,
+            release_cache,
+            weights_loaded_cache,
+            verification_terminal_cache,
+            release_footprint,
+            weights_loaded_footprint,
+            verification_terminal_footprint,
+        );
 
     let repository = sc20684_repository_root();
     let tool = |program: &str, args: &[&str]| sc20684_command(program, args);

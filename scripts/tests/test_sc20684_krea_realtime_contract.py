@@ -102,6 +102,9 @@ class KreaRealtimeContractTests(unittest.TestCase):
         ):
             self.assertIn(needle, source)
         self.assertNotIn("q_tile[thread_index_in_threadgroup.x][d]", source)
+        # MSL's 4th simdgroup_load parameter is `ulong2 matrix_origin`: a bare `true` there means
+        # origin (1,1) with no transpose, so the K fragment must spell the origin out.
+        self.assertIn("simdgroup_load(bmat, &k_tile[0][d0], HEAD_DIM, ulong2(0, 0), true)", source)
 
 
 if __name__ == "__main__":

@@ -4677,6 +4677,141 @@ mod tests {
         );
     }
 
+    /// Prefill logits, packed evidence and fallbacks of one observed generation.
+    #[derive(Default)]
+    struct PrefillLogitsCapture {
+        prefill: Vec<f32>,
+        evidence: Vec<crate::primitives::PackedCacheEvidence>,
+        fallbacks: Vec<(String, String)>,
+    }
+
+    impl crate::campaign::Observer for PrefillLogitsCapture {
+        fn phase(&mut self, _name: &'static str) {}
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+        fn logits(&mut self, stage: &'static str, values: &[f32]) {
+            if stage == "prefill" {
+                self.prefill = values.to_vec();
+            }
+        }
+        fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+            self.evidence.push(evidence.clone());
+        }
+        fn dense_fallback(&mut self, operation: &str, reason: &str) {
+            self.fallbacks.push((operation.into(), reason.into()));
+        }
+    }
+
+    /// Multi-turn prompt-cache reuse on the 8-bit compressed arm agrees with dense (SC-20671
+    /// `multiTurnPromptCache` diagnosis). Turn 2 extends turn 1's prompt and answer; the dense
+    /// store holds turn 1. The dense hit, the compressed hit (prefix imported by quantize-on-append
+    /// at the reused offset) and a cold compressed turn 2 must choose the same tokens, with turn-2
+    /// prefill logits within 8-bit rounding of the dense hit. A misplaced, dropped or re-quantized
+    /// imported prefix moves the compressed logits by far more than that.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_8bit_multi_turn_prompt_cache_reuse_agrees_with_dense() {
+        let model = tiny_packed_capable_model();
+        let vocab = model.config().vocab_size;
+        // Turn 1 spans two 32-token groups plus a residual; ids stay inside the vocabulary.
+        let turn1 = (0..70).map(|i| (i * 7) % 31 + 1).collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 6,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = CancelFlag::new();
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine8
+            .arm()
+            .unwrap();
+        let turn1_store = || {
+            let mut store = crate::decode::PrefixCache::new(2);
+            let out = crate::decode::generate_cached(
+                &model,
+                &turn1,
+                &config,
+                &cancel,
+                &mut |_| {},
+                &mut store,
+            )
+            .unwrap();
+            (store, out.tokens)
+        };
+        let (_, answer) = turn1_store();
+        let mut turn2 = turn1.clone();
+        turn2.extend_from_slice(&answer);
+        turn2.extend((0..9).map(|i| (i * 5) % 31 + 1));
+        assert!(turn2.iter().all(|id| (0..vocab).contains(id)));
+
+        let turn2_run =
+            |store: &mut crate::decode::PrefixCache,
+             compressed: Option<&crate::campaign::CompressedKvArm>| {
+                let mut capture = PrefillLogitsCapture::default();
+                let out = crate::decode::prefix::generate_cached_with_observer(
+                    &model,
+                    &turn2,
+                    &config,
+                    &cancel,
+                    &mut |_| {},
+                    store,
+                    None,
+                    None,
+                    Some(&mut capture),
+                    compressed,
+                )
+                .unwrap();
+                (out.tokens, capture)
+            };
+        let (mut dense_store, _) = turn1_store();
+        let (dense_tokens, dense) = turn2_run(&mut dense_store, None);
+        let (mut hit_store, _) = turn1_store();
+        let (hit_tokens, hit) = turn2_run(&mut hit_store, Some(&arm));
+        let mut cold_store = crate::decode::PrefixCache::new(2);
+        let (cold_tokens, cold) = turn2_run(&mut cold_store, Some(&arm));
+
+        assert_eq!(dense_store.stats().hits, 1);
+        assert_eq!(
+            hit_store.stats().hits,
+            1,
+            "turn 2 must reuse turn 1's prefix"
+        );
+        assert_eq!(cold_store.stats().hits, 0);
+        for (label, capture) in [("hit", &hit), ("cold", &cold)] {
+            assert!(
+                capture.fallbacks.is_empty(),
+                "{label}: {:?}",
+                capture.fallbacks
+            );
+            assert!(
+                !capture.evidence.is_empty()
+                    && capture
+                        .evidence
+                        .iter()
+                        .all(|e| e.accepted_direct_calls > 0 && !e.dense_active),
+                "{label} must decode on the fused reader"
+            );
+        }
+        let max_abs = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let scale = dense.prefill.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(scale > 0.0);
+        let hit_error = max_abs(&hit.prefill, &dense.prefill) / scale;
+        let cold_error = max_abs(&cold.prefill, &dense.prefill) / scale;
+        eprintln!(
+            "mtpc: 8-bit turn-2 prefill relative max error hit {hit_error} cold {cold_error}"
+        );
+        assert!(
+            hit_error < 0.02 && cold_error < 0.02,
+            "8-bit turn-2 prefill logits drifted from dense: hit {hit_error}, cold {cold_error}"
+        );
+        assert_eq!(hit_tokens, dense_tokens, "compressed reuse vs dense turn 2");
+        assert_eq!(cold_tokens, dense_tokens, "compressed cold vs dense turn 2");
+    }
+
     /// A packed cache whose retained reader fails to bind still records the selection's own
     /// reason rather than only the later generic dense-attention fallback.
     #[cfg(target_os = "macos")]
