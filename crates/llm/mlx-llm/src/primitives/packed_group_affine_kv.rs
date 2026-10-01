@@ -469,12 +469,17 @@ struct PendingPackedStep {
     accepted_dispatch: AcceptedDispatchSnapshot,
     /// Bytes this step wrote into device storage; accepted only when the step commits.
     written_bytes: u64,
+    /// A layer of this step attended its fresh K/V through dense SDPA (an empty cache's first
+    /// multi-row step), so no output reads that layer's store: the commit evaluates the store.
+    store_unread: bool,
 }
 
 /// Decoder-facing owner for the device-resident packed store and the retained fused reader. A model
 /// step is a whole-step transaction across layers: each layer appends lazily into the device store
 /// and dispatches the reader lazily (only a cold dispatch is evaluated, to surface a JIT fault
-/// inside the transaction); a failure rolls every layer back to its marked extents. Unsupported
+/// inside the transaction); a failure rolls every layer back to its marked extents. A step whose
+/// attention ran on dense SDPA has no output that reads the store, so its commit evaluates the
+/// store: left lazy, it would keep the step's dense K/V alive until the first packed read. Unsupported
 /// semantics transition the exact evaluated history to dense before the caller's ordinary update.
 #[derive(Debug)]
 pub struct DenseFallbackPackedDecoderCache {
@@ -893,6 +898,7 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                     marks: self.staged.device_marks(),
                     accepted_dispatch: self.staged.accepted_dispatch_snapshot(),
                     written_bytes: 0,
+                    store_unread: false,
                 });
             }
             let (written, replaced) = self.staged.append_device_replacing(layer, keys, values)?;
@@ -907,6 +913,9 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                 .compiled_handle()
                 .is_some_and(CompiledKernelHandle::is_warmed);
             let output = if let Some(dense_mask) = first_step_dense_mask {
+                if let Some(pending) = self.pending_step.as_mut() {
+                    pending.store_unread = true;
+                }
                 crate::primitives::attention::sdpa(query, keys, values, scale, dense_mask)?
             } else {
                 let snapshot_overhead = self.pending_device_snapshot_overhead();
@@ -945,6 +954,19 @@ impl KvCache for DenseFallbackPackedDecoderCache {
                     return Err(Error::Msg(
                         "packed whole-step transaction did not commit".into(),
                     ));
+                }
+                // The dense-SDPA output does not depend on the store, so evaluating the caller's
+                // logits leaves the store a lazy graph over this step's dense K/V: the dense K/V
+                // stay resident and the packed bytes the cache reports are not, until the first
+                // packed read (SC-20671 4-bit prefill attribution floor; the first decode step's
+                // peak then held both). Evaluate inside the transaction, so a quantizer fault
+                // rolls the step back instead of surfacing at a later unrelated evaluation.
+                if self
+                    .pending_step
+                    .as_ref()
+                    .is_some_and(|pending| pending.store_unread)
+                {
+                    self.staged.evaluate_device_store()?;
                 }
                 if let Some(pending) = self.pending_step.take() {
                     self.staged.telemetry.accepted_uploaded_packed_bytes = self
@@ -2958,6 +2980,24 @@ impl PackedGroupAffineKvCache {
                     .map(DevicePackedLayer::mark)
             })
             .collect()
+    }
+
+    /// Evaluate every resident device layer's store (packed extents, metadata, and residuals), so
+    /// the arrays the cache accounts are materialized and no lazy append retains its dense input.
+    fn evaluate_device_store(&self) -> Result<()> {
+        mlx_rs::transforms::eval(self.device_layers.iter().flatten().flat_map(|device| {
+            [
+                &device.key_codes,
+                &device.key_scales,
+                &device.key_zeros,
+                &device.key_tail,
+                &device.value_codes,
+                &device.value_scales,
+                &device.value_zeros,
+                &device.value_tail,
+            ]
+        }))?;
+        Ok(())
     }
 
     /// Return every device-resident layer to `marks` and the logical length to `len`. Packed arrays

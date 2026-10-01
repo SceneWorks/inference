@@ -4758,6 +4758,94 @@ mod tests {
         assert_eq!(capture.releases, vec![*capture.snapshots.last().unwrap()]);
     }
 
+    /// SC-20671 prefill attribution through the real decode loop, at 2- and 4-bit. An empty
+    /// cache's first multi-row step attends on dense SDPA, so no output reads the packed store;
+    /// the cache must still materialize the store it reports at the step's commit. Left lazy, the
+    /// prefill-peak sample holds the step's dense K/V instead of the store, and the campaign's
+    /// `baseline + persistent KV` floor fails whenever that dense K/V is smaller than the
+    /// block-allocated store (Mac2 A2 qwen-short 4-bit: 80 prompt tokens, active growth
+    /// 9,504,184 B for a 12,845,056 B store; 2-bit passed only because its 9,175,040 B store
+    /// equals the 80-token dense K/V).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_prefill_sample_holds_the_reported_packed_store() {
+        #[derive(Default)]
+        struct PrefillCapture {
+            phase: Option<&'static str>,
+            prefill_active: Option<u64>,
+            prefill_kv: u64,
+        }
+        impl crate::campaign::Observer for PrefillCapture {
+            fn phase(&mut self, name: &'static str) {
+                self.phase = Some(name);
+                if name == "prefill-peak" {
+                    self.prefill_active = Some(mlx_rs::memory::get_active_memory() as u64);
+                }
+            }
+            fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+            fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, _element: u64) {
+                if self.phase == Some("prefill-peak") {
+                    self.prefill_kv = self.prefill_kv.max(bytes);
+                }
+            }
+        }
+        let model = tiny_packed_capable_model();
+        // 40 tokens: past the fused-SDPA row limit (the dense first step), one flushed 32-token
+        // group and an 8-token residual.
+        let prompt = (0..40).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
+        // Dense f32 K + V of the prompt for the tiny model (2 layers, 1 KV head, D64).
+        let dense_prompt_kv = 2 * 2 * 40 * 64 * 4;
+        let config = GenerationConfig {
+            max_new_tokens: 2,
+            seed: Some(0),
+            ..Default::default()
+        };
+        for method in crate::campaign::CompressedKvMethod::ALL {
+            let arm = method.arm().unwrap();
+            let decoder = PackedCampaignDecoder {
+                model: &model,
+                arm: &arm,
+                selection_fallbacks: RefCell::new(Vec::new()),
+            };
+            let run = |observer: Option<&mut dyn crate::campaign::Observer>| {
+                crate::decode::generate_with_observer(
+                    &decoder,
+                    &prompt,
+                    &config,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                    None,
+                    None,
+                    observer,
+                )
+                .unwrap();
+            };
+            // Warm the reader and the lazily created weights so the baseline is steady. Tests run
+            // one at a time (`.cargo/config.toml`), so the process-global counter is ours.
+            run(None);
+            let baseline = mlx_rs::memory::get_active_memory() as u64;
+            let mut capture = PrefillCapture::default();
+            run(Some(&mut capture));
+            assert!(
+                decoder.selection_fallbacks.borrow().is_empty(),
+                "{method:?} selected the packed cache"
+            );
+            // The failing scenario: the prompt's dense K/V is smaller than the reported store.
+            assert!(
+                dense_prompt_kv < capture.prefill_kv,
+                "{method:?}: dense {dense_prompt_kv} B vs store {} B",
+                capture.prefill_kv
+            );
+            let growth = capture.prefill_active.unwrap().saturating_sub(baseline);
+            assert!(
+                growth >= capture.prefill_kv,
+                "{method:?}: prefill-peak active growth {growth} B does not hold the reported \
+                 packed store {} B",
+                capture.prefill_kv
+            );
+        }
+    }
+
     /// SC-20671 storage reconciliation through the real decode loop, at 2- and 4-bit: a prompt
     /// that crosses a 256-token block boundary leaves a pending residual, and the decode that
     /// follows (including a group flush) stays inside the last block, so the device share is a
