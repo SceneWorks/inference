@@ -162,8 +162,16 @@ decoder matrix is stored in (`LoadCell`):
 
 | Cell | Charged |
 | --- | --- |
-| `llama`, `qwen3`, `gemma2`, `gemma4_unified`, `qwen3_5`, `qwen3_5_moe` × dense / load-time Q4 / load-time Q8, BF16-stored | `materialized_bound` + host (exact-peak probes, 2026-10-01, all covered) |
-| every other cell — stored-quantized snapshots (incl. a prepared Qwen3.6 Q4: probed at 22.72 GB but its 9.4 MB manifest is not committed), Prism, Qwen3-VL, `qwen3_5_text`, Mistral, dense Qwen2, F16/F32 checkpoints, a config without `model_type` | `max(2×, earlier)` + host |
+| `llama`, `qwen3`, `gemma2`, `gemma4_unified`, `qwen3_5_moe` × dense / load-time Q4 / load-time Q8, BF16-stored; `qwen3_5` × load-time Q4 / Q8 | `materialized_bound` + host (exact-peak probes, 2026-10-01, all covered) |
+| `qwen3_5`, `qwen3_5_text`, `qwen3_vl`, `prism_hadamard_qwen35` unquantized (dense or stored-quantized, any stored dtype) — the cells `main` verified | exactly `main`'s charge (`payload + casts`) + host; the lower of that and the materialized bound where the exact probes cover the cell (`qwen3_5` dense BF16) |
+| every other cell — stored-quantized snapshots of other families (incl. a prepared Qwen3.6 Q4: probed at 22.72 GB but its 9.4 MB manifest is not committed), Mistral, dense Qwen2, F16/F32 checkpoints of a probed family, a config without `model_type` | `max(2×, earlier)` + host |
+
+The host term (`24 × tokenizer.json + 64 MiB + 256 MiB` driver wake) is an allocation `main` did not
+price; the exact probes measured it (Qwen3.8-27B BF16 peaked 0.35 GB above `main`'s whole charge),
+so a `main`-verified cell is never charged more than `main` charged for its arrays, and never
+refused where `main` admitted it except inside that host term
+(`main_verified_cells_are_never_charged_more_than_main_charged_them`, on the committed Qwen3.8
+manifest and synthetic Qwen3-VL-32B / `qwen3_5_text` / stored-quantized / Prism headers).
 
 On this 128 GiB host (~97 GB available idle) every probed cell is admitted — charges in the
 measured-probes table below; the largest, Qwen3.6-35B-A3B BF16, at 72.7 GB.
@@ -269,15 +277,15 @@ footprint growth of a second one-token request (driver wake, cache and host heap
 | Gemma 4 unified enhancer | BF16 | 25.191 | 24.570 | 0.497 | 0.248 | 47.839 |
 | Gemma 4 unified enhancer | Q4 | 10.500 | 9.086 | 1.368 | 0.295 | 47.839 |
 | Gemma 4 unified enhancer | Q8 | 15.950 | 14.415 | 1.463 | 0.287 | 47.839 |
-| Qwen3.8-27B | BF16 | 56.373 | 55.920 | 0.173 | 0.359 | 55.573 |
+| Qwen3.8-27B | BF16 | 56.216 | 55.920 | 0.016 | 0.359 | 55.573 |
 | Qwen3.8-27B | Q4 | 22.337 | 20.304 | 1.931 | 0.382 | 111.126 (refused) |
 | Qwen3.8-27B | Q8 | 34.712 | 32.868 | 1.680 | 0.378 | 111.126 (refused) |
 | Qwen3.6-35B-A3B | BF16 | 72.711 | 72.265 | 0.085 | 0.241 | 143.808 (refused) |
 | Qwen3.6-35B-A3B | Q4 | 26.552 | 23.362 | 3.073 | 0.251 | 143.808 (refused) |
 | Qwen3.6-35B-A3B | Q8 | 43.783 | 40.662 | 2.918 | 0.245 | 143.808 (refused) |
 
-The tightest are the two large BF16 loads (Qwen3.6 by 85 MB, Qwen3.8 by 173 MB beyond the 0.5 %
-margin): BF16 keeps every source as the model's own array, so the bound is the payload plus a few
+The tightest are the two large BF16 loads (Qwen3.8 — charged `main`'s charge plus the host heap,
+the lower bound — by 16 MB, Qwen3.6 by 85 MB beyond the 0.5 % margin): BF16 keeps every source as the model's own array, so the bound is the payload plus a few
 hundred MB and a sub-percent run-to-run variation is all the headroom there is to need.
 
 ### One-token request working set (sc-24446)

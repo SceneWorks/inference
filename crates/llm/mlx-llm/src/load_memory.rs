@@ -76,8 +76,12 @@ impl SnapshotFacts {
     /// The bound a load at `quant` is charged ([`required_bytes`]).
     pub(crate) fn required(&self, quant: Option<QuantSpec>) -> Result<u64> {
         let cell = LoadCell::of(&self.config, &self.headers, quant);
+        let main = self.main_verified_arrays(&cell)?;
         let arrays = if cell.is_in(MATERIALIZED_VERIFIED) {
-            materialized_bound(&self.headers, quant)?
+            let materialized = materialized_bound(&self.headers, quant)?;
+            main.map_or(materialized, |main| main.min(materialized))
+        } else if let Some(main) = main {
+            main
         } else {
             let derived = self.earlier_arrays(quant)?;
             if cell.is_in(EARLIER_VERIFIED) {
@@ -87,6 +91,37 @@ impl SnapshotFacts {
             }
         };
         arrays.checked_add(self.host()?).ok_or_else(overflow)
+    }
+
+    /// The arrays a cell `main` verified is charged exactly as `main` charged them
+    /// ([`MAIN_VERIFIED_MODEL_TYPES`]): the payload once plus the BF16 casts, vector
+    /// intermediates and vision patch transpose `main`'s `safetensors_extra` priced. `None` for
+    /// every other cell.
+    fn main_verified_arrays(&self, cell: &LoadCell) -> Result<Option<u64>> {
+        if !cell.is_main_verified() {
+            return Ok(None);
+        }
+        let mut extra = 0u64;
+        for header in &self.headers {
+            for t in header_tensors(header)? {
+                let vision =
+                    t.name.starts_with("model.visual.") || t.name.starts_with("vision_tower.");
+                let mut add = |bytes: u64| -> Result<()> {
+                    extra = extra.checked_add(bytes).ok_or_else(overflow)?;
+                    Ok(())
+                };
+                if !vision && matches!(t.dtype, "F32" | "F16" | "F64") {
+                    add(t.elements.checked_mul(2).ok_or_else(overflow)?)?;
+                }
+                if !vision && t.shape.len() <= 1 {
+                    add(t.elements.checked_mul(4).ok_or_else(overflow)?)?;
+                }
+                if vision && t.name.ends_with("patch_embed.proj.weight") {
+                    add(t.elements.checked_mul(4).ok_or_else(overflow)?)?;
+                }
+            }
+        }
+        Ok(Some(self.payload.checked_add(extra).ok_or_else(overflow)?))
     }
 
     /// The earlier order's peak: the payload once plus every derived allocation.
@@ -177,6 +212,17 @@ impl LoadCell {
         }
     }
 
+    /// Whether `main` verified this cell's bound (before sc-24446): a [`MAIN_VERIFIED_MODEL_TYPES`]
+    /// snapshot loaded without load-time quantization, dense or stored-quantized, any stored
+    /// dtype.
+    pub(crate) fn is_main_verified(&self) -> bool {
+        MAIN_VERIFIED_MODEL_TYPES.contains(&self.model_type.as_str())
+            && matches!(
+                self.conversion,
+                Some(Conversion::Dense) | Some(Conversion::Stored)
+            )
+    }
+
     pub(crate) fn is_in(&self, table: &[Cell]) -> bool {
         table.iter().any(|c| {
             Some(c.conversion) == self.conversion
@@ -185,6 +231,20 @@ impl LoadCell {
         })
     }
 }
+
+/// The families whose unquantized loads `main` had verified (bbddc165b and the earlier Qwen3.8
+/// admission work) and charged at `payload + casts` (its `safetensors_extra`). Carried at exactly
+/// that charge plus the load's host heap ([`host_bytes`]) — an allocation `main` did not price,
+/// which the 2026-10-01 exact probes show is real (Qwen3.8-27B BF16 peaked 0.35 GB above `main`'s
+/// whole charge) — so this branch never charges their arrays more than `main` did, and never
+/// refuses one of them that `main` admitted unless it sits inside that host term. A cell the
+/// materialize-at-load probes cover is charged the lower of the two.
+pub(crate) const MAIN_VERIFIED_MODEL_TYPES: [&str; 4] = [
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_vl",
+    "prism_hadamard_qwen35",
+];
 
 /// Cells whose earlier-order bound ([`SnapshotFacts::earlier_arrays`]) a guarded real-weight
 /// probe covers with margin — each backed by a `MEASURED` row the tests recompute from the
@@ -213,8 +273,9 @@ pub(crate) const EARLIER_VERIFIED: &[Cell] = &[
 
 /// Cells whose [`materialized_bound`] an exact-peak (kernel `phys_footprint` maximum) probe of
 /// the provider's materialize-at-load order covers with margin — the 2026-10-01 re-probe session
-/// (21 probes, every one covered; the tightest, Qwen3.6-35B-A3B BF16, by 85 MB beyond its 0.5 %
-/// margin). A stored-quantized Qwen3.6 snapshot was probed too but has no committed manifest, so
+/// (21 probes, every one covered by what its cell is charged; the tightest are Qwen3.8-27B BF16,
+/// charged `main`'s charge plus the host heap, by 16 MB, and Qwen3.6-35B-A3B BF16 by 85 MB beyond
+/// the 0.5 % margin). A stored-quantized Qwen3.6 snapshot was probed too but has no committed manifest, so
 /// its cell is not listed.
 pub(crate) const MATERIALIZED_VERIFIED: &[Cell] = &[
     Cell {
@@ -863,10 +924,10 @@ mod tests {
     }
 
     /// The probed cells are charged their materialize-at-load bound (the exact-peak re-probes
-    /// cover every listed cell); every other cell keeps the two-copy floor, including a family
-    /// the loader dispatches alike (Mistral, dense Qwen2 — the Llama decoder), a different stored
-    /// dtype of a probed family (F16, F32), a config without `model_type`, and the unprobed
-    /// families (Qwen3.5 text-only, Qwen3-VL, Prism).
+    /// cover every listed cell); every other cell outside `main`'s verified families keeps the
+    /// two-copy floor, including a family the loader dispatches alike (Mistral, dense Qwen2 — the
+    /// Llama decoder), a different stored dtype of a probed family (F16, F32), and a config
+    /// without `model_type`.
     ///
     /// MUTATION: drop the dtype or the `model_type` from `LoadCell::is_in`'s match and this goes
     /// RED.
@@ -876,7 +937,6 @@ mod tests {
             ("llama", "model"),
             ("qwen3", "model"),
             ("gemma2", "model"),
-            ("qwen3_5", "model.language_model"),
             ("gemma4_unified", "model.language_model"),
         ] {
             let (dir, _) = snapshot(json!({ "model_type": model_type }), &refs(&dense(prefix)));
@@ -891,9 +951,6 @@ mod tests {
             (json!({"model_type": "mistral"}), "model"),
             (json!({"model_type": "qwen2"}), "model"),
             (json!({}), "model"),
-            (json!({"model_type": "qwen3_5_text"}), "model"),
-            (json!({"model_type": "qwen3_vl"}), "model.language_model"),
-            (json!({"model_type": "prism_hadamard_qwen35"}), "model"),
         ] {
             let (dir, payload) = snapshot(config.clone(), &refs(&dense(prefix)));
             assert_eq!(required(&dir, None), 2 * payload + H, "{config}");
@@ -906,6 +963,183 @@ mod tests {
             let (dir, payload) = snapshot(json!({"model_type": "llama"}), &refs(&tensors));
             assert!(required(&dir, None) >= 2 * payload + H, "llama {dtype}");
         }
+    }
+
+    /// `main`'s charge for a verified (tight-path) load — an independent transcription of its
+    /// `required_bytes` / `safetensors_extra` (origin/main before sc-24446): the payload plus BF16
+    /// casts of wider language floats, four bytes per language vector element and a vision patch
+    /// transpose. `None` where `main` charged two copies.
+    fn main_charge(facts: &SnapshotFacts, quant: Option<QuantSpec>) -> Option<u64> {
+        let model_type = facts.config["model_type"].as_str()?;
+        if quant.is_some()
+            || !matches!(
+                model_type,
+                "qwen3_5" | "qwen3_5_text" | "qwen3_vl" | "prism_hadamard_qwen35"
+            )
+        {
+            return None;
+        }
+        let mut extra = 0u64;
+        for header in &facts.headers {
+            for (name, info) in header.as_object().unwrap() {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let shape = info["shape"].as_array().unwrap();
+                let n: u64 = shape.iter().map(|v| v.as_u64().unwrap()).product();
+                let dtype = info["dtype"].as_str().unwrap();
+                let vision = name.starts_with("model.visual.") || name.starts_with("vision_tower.");
+                if !vision && matches!(dtype, "F32" | "F16" | "F64") {
+                    extra += 2 * n;
+                }
+                if !vision && shape.len() <= 1 {
+                    extra += 4 * n;
+                }
+                if vision && name.ends_with("patch_embed.proj.weight") {
+                    extra += 4 * n;
+                }
+            }
+        }
+        Some(facts.payload + extra)
+    }
+
+    /// Header-only facts of a synthetic snapshot: `tensors` (name, dtype, shape) under `config`.
+    fn synthetic_facts(config: Value, tensors: &[(String, &str, Vec<u64>)]) -> SnapshotFacts {
+        let mut header = serde_json::Map::new();
+        let mut payload = 0u64;
+        for (name, dtype, shape) in tensors {
+            let width = match *dtype {
+                "F32" | "U32" => 4,
+                _ => 2,
+            };
+            payload += width * shape.iter().product::<u64>();
+            header.insert(name.clone(), json!({"dtype": dtype, "shape": shape}));
+        }
+        SnapshotFacts {
+            config,
+            headers: vec![Value::Object(header)],
+            payload,
+            tokenizer_bytes: 11_000_000,
+        }
+    }
+
+    /// A Qwen3-VL-32B-shaped snapshot (64 layers, hidden 5120, MLP 25600, vocab 151936, a ViT
+    /// tower), at `dtype`.
+    fn qwen3_vl_32b(dtype: &'static str) -> SnapshotFacts {
+        let (h, inter, vocab, layers) = (5120u64, 25_600u64, 151_936u64, 64);
+        let mut t: Vec<(String, &str, Vec<u64>)> = vec![
+            (
+                "model.language_model.embed_tokens.weight".into(),
+                dtype,
+                vec![vocab, h],
+            ),
+            ("model.language_model.norm.weight".into(), dtype, vec![h]),
+            ("lm_head.weight".into(), dtype, vec![vocab, h]),
+            (
+                "model.visual.patch_embed.proj.weight".into(),
+                dtype,
+                vec![1152, 3, 2, 16, 16],
+            ),
+        ];
+        for i in 0..layers {
+            let p = |s: &str| format!("model.language_model.layers.{i}.{s}");
+            for (key, shape) in [
+                ("self_attn.q_proj.weight", vec![8192, h]),
+                ("self_attn.k_proj.weight", vec![1024, h]),
+                ("self_attn.v_proj.weight", vec![1024, h]),
+                ("self_attn.o_proj.weight", vec![h, 8192]),
+                ("mlp.gate_proj.weight", vec![inter, h]),
+                ("mlp.up_proj.weight", vec![inter, h]),
+                ("mlp.down_proj.weight", vec![h, inter]),
+                ("input_layernorm.weight", vec![h]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("self_attn.q_norm.weight", vec![128]),
+                ("self_attn.k_norm.weight", vec![128]),
+            ] {
+                t.push((p(key), dtype, shape));
+            }
+        }
+        for i in 0..27 {
+            let p = |s: &str| format!("model.visual.blocks.{i}.{s}");
+            t.push((p("attn.qkv.weight"), dtype, vec![3456, 1152]));
+            t.push((p("mlp.linear_fc1.weight"), dtype, vec![4304, 1152]));
+        }
+        synthetic_facts(json!({"model_type": "qwen3_vl"}), &t)
+    }
+
+    /// sc-24446: a load `main` verified and charged at `payload + casts` (the Qwen3.5/3.8,
+    /// Qwen3-VL and Prism families, unquantized: dense or stored-quantized, any stored dtype) is
+    /// never charged more for its arrays on this branch, so it is never refused where `main`
+    /// admitted it beyond the load's host heap — an allocation `main` did not price and the
+    /// exact probes measured. Checked on the committed Qwen3.8-27B manifest and on synthetic
+    /// headers for the families without one: a Qwen3-VL-32B-shaped snapshot (BF16 and F32), a
+    /// flat `qwen3_5_text` one, a stored-quantized `qwen3_5` one and a Prism one.
+    ///
+    /// MUTATION: make `SnapshotFacts::main_verified_arrays` return `None` (those cells fall to
+    /// the two-copy floor) and this goes RED.
+    #[test]
+    fn main_verified_cells_are_never_charged_more_than_main_charged_them() {
+        let mut cases: Vec<(&str, SnapshotFacts)> = vec![
+            ("Qwen3.8-27B (manifest)", manifest_facts("qwen3.8-27b")),
+            ("Qwen3-VL-32B BF16", qwen3_vl_32b("BF16")),
+            ("Qwen3-VL-32B F32", qwen3_vl_32b("F32")),
+        ];
+        let flat: Vec<(String, &str, Vec<u64>)> = (0..48)
+            .flat_map(|i| {
+                [
+                    (
+                        format!("model.layers.{i}.mlp.up_proj.weight"),
+                        "BF16",
+                        vec![17_408u64, 5120],
+                    ),
+                    (
+                        format!("model.layers.{i}.input_layernorm.weight"),
+                        "BF16",
+                        vec![5120u64],
+                    ),
+                ]
+            })
+            .collect();
+        cases.push((
+            "qwen3_5_text flat",
+            synthetic_facts(json!({"model_type": "qwen3_5_text"}), &flat),
+        ));
+        let stored: Vec<(String, &str, Vec<u64>)> = (0..48)
+            .flat_map(|i| {
+                let p = |s: &str| format!("model.language_model.layers.{i}.mlp.up_proj.{s}");
+                [
+                    (p("weight"), "U32", vec![17_408u64, 640]),
+                    (p("scales"), "BF16", vec![17_408u64, 80]),
+                    (p("biases"), "BF16", vec![17_408u64, 80]),
+                ]
+            })
+            .collect();
+        cases.push((
+            "qwen3_5 stored Q4",
+            synthetic_facts(json!({"model_type": "qwen3_5"}), &stored),
+        ));
+        cases.push((
+            "prism_hadamard_qwen35",
+            synthetic_facts(json!({"model_type": "prism_hadamard_qwen35"}), &stored),
+        ));
+        for (label, facts) in cases {
+            let main = main_charge(&facts, None).unwrap();
+            let branch = facts.required(None).unwrap();
+            let host = facts.host().unwrap();
+            assert!(
+                branch - host <= main,
+                "{label}: arrays charged {} > main's {main}",
+                branch - host
+            );
+            // On a 128 GiB host `main` admitted it iff this branch does, up to the host heap.
+            assert!(branch <= main + host, "{label}");
+        }
+        // And the 2x floor `main` used elsewhere is kept: a Qwen3-VL load-time Q4 is not tight.
+        let vl = qwen3_vl_32b("BF16");
+        assert!(
+            vl.required(Some(QuantSpec::q4())).unwrap() >= 2 * vl.payload,
+            "a cell main charged two copies keeps the floor"
+        );
     }
 
     /// Load-time Q4/Q8 adds the packed words (`n·bits/8`) and BF16 scales + biases
@@ -1920,6 +2154,21 @@ mod tests {
                     "{}: estimate {} does not cover peak {} + margin {}",
                     m.config,
                     m.estimate(&facts),
+                    m.peak(),
+                    m.margin(&facts)
+                );
+            }
+        }
+        // Every exact probe of a verified cell is covered by what the cell is actually charged
+        // (the lower of `main`'s charge and the materialized bound for a `main`-verified cell).
+        for m in MEASURED.iter().filter(|m| m.order == Order::Materialized) {
+            let facts = manifest_facts(m.manifest);
+            if m.cell(&facts).is_in(MATERIALIZED_VERIFIED) {
+                let charged = facts.required(m.quant()).unwrap();
+                assert!(
+                    charged >= m.peak() + m.margin(&facts),
+                    "{}: charged {charged} does not cover peak {} + margin {}",
+                    m.config,
                     m.peak(),
                     m.margin(&facts)
                 );
