@@ -122,8 +122,7 @@ fn reference_path_graphs(tally: GraphTally, switch_on: bool) -> GraphTally {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeRoute {
     /// The reference `Decode` loop over the growing cache: the parity oracle selected with
-    /// [`LlamaProvider::set_decode_path`], and the Qwen3-VL generic-causal multimodal request
-    /// (whose DeepStack / M-RoPE prefill has no step-seam form).
+    /// [`LlamaProvider::set_decode_path`].
     Reference,
     /// The unified engine over the step seam, on the static KV cache, running `proposer` with
     /// `drafts` drafts per verify step: the resolved speculative plan's proposer and depth (MTP,
@@ -1407,8 +1406,7 @@ impl LlamaProvider {
     /// cache — the parity oracle. Any other path is [`CoreError::InvalidRequest`]: speculation is
     /// chosen per request (`TextLlmRequest::speculative`), and a request whose speculative option
     /// resolves to a proposer (MTP, prompt lookup) always runs the engine with it, whatever this
-    /// says. A Qwen3-VL generic-causal multimodal request (DeepStack / M-RoPE prefill, no
-    /// step-seam form) decodes on the reference loop either way, and its record says so.
+    /// says — multimodal requests included (sc-24446).
     pub fn set_decode_path(&mut self, path: DecodePath) -> CoreResult<()> {
         match path {
             DecodePath::StepModel | DecodePath::Reference => {
@@ -1521,20 +1519,13 @@ impl LlamaProvider {
 
     /// Which loop this request decodes on, and why a resolved proposer could not run when it
     /// could not (sc-24433, epic sc-24432 E2): the engine with the plan's proposer (MTP, prompt
-    /// lookup) and depth; the engine with no proposer for a request whose speculation is off (the
-    /// selector's default — both families); the reference loop when the selector asks for it or
-    /// the request is a Qwen3-VL generic-causal multimodal one — which falls back to it, named,
-    /// even with a proposer resolved, because its prefill has no step-seam form.
-    /// `qwen_vl_multimodal` is whether the request carries Qwen-VL visuals.
-    fn decode_route(
-        &self,
-        plan: SpeculativePlan,
-        qwen_vl_multimodal: bool,
-    ) -> (DecodeRoute, Option<String>) {
-        let reference_only = matches!(self.model, Decoder::Causal(_)) && qwen_vl_multimodal;
-        let plain = match (&self.model, self.decode_path) {
-            (_, DecodePath::Reference) => DecodeRoute::Reference,
-            _ if reference_only => DecodeRoute::Reference,
+    /// lookup, a draft model) and depth; the engine with no proposer for a request whose
+    /// speculation is off (the selector's default — both families, text and multimodal alike: the
+    /// Qwen-VL DeepStack / M-RoPE prefill fills the engine's step cache, sc-24446); the reference
+    /// loop only when the selector asks for it.
+    fn decode_route(&self, plan: SpeculativePlan) -> (DecodeRoute, Option<String>) {
+        let plain = match self.decode_path {
+            DecodePath::Reference => DecodeRoute::Reference,
             _ => DecodeRoute::PLAIN_ENGINE,
         };
         match plan {
@@ -1543,14 +1534,6 @@ impl LlamaProvider {
                 proposer: SpeculativeProposer::DraftModel,
                 ..
             } if self.draft.is_none() => (plain, Some(core_llm::DRAFT_MODEL_NOT_LOADED.into())),
-            SpeculativePlan::Run { proposer, .. } if reference_only => (
-                DecodeRoute::Reference,
-                Some(format!(
-                    "speculative: `{proposer}` needs the step-seam engine, and a Qwen3-VL \
-                     multimodal request (DeepStack / M-RoPE prefill) decodes on the reference \
-                     loop; decoded without a proposer"
-                )),
-            ),
             SpeculativePlan::Run { proposer, depth } => (
                 DecodeRoute::Engine {
                     proposer: proposer.into(),
@@ -1832,6 +1815,7 @@ impl LlamaProvider {
             outcome,
             &mut self.descriptor.capabilities,
             &mut self.load_record.fallbacks,
+            recommended_depths(self.model.device()),
         );
         self.draft = draft;
         self.draft_report = Some(report);
@@ -1950,9 +1934,10 @@ impl LlamaProvider {
                 self.mtp = Some(predictor);
                 // The same backend-true depth a native head advertises (sc-24438): a companion
                 // head runs the identical one-layer predictor through the identical verify path.
+                let recommended = recommended_depths(self.model.device()).mtp;
                 self.descriptor
                     .capabilities
-                    .advertise_mtp(MTP_MAX_DEPTH, MTP_RECOMMENDED_DEPTH);
+                    .advertise_mtp(MTP_MAX_DEPTH, recommended);
             }
             Err(reason) => self
                 .load_record
@@ -2117,7 +2102,7 @@ impl LlamaProvider {
             // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
             // a top-level untied `lm_head`.
             let qcfg = Qwen35Config::from_json(&cfg_value).map_err(to_core)?;
-            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            let mut descriptor = descriptor_for_qwen35(&qcfg, device);
             if is_prism {
                 descriptor.family = "prism_hadamard_qwen35".into();
                 descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
@@ -2168,7 +2153,7 @@ impl LlamaProvider {
             (Decoder::Qwen35(m), descriptor, mtp)
         } else {
             let cfg = ModelConfig::from_dir(dir).map_err(to_core)?;
-            let descriptor = descriptor_for(&cfg);
+            let descriptor = descriptor_for(&cfg, device);
             // An explicit request (Q4 / Q8 / NVFP4, sc-24140) wins; otherwise the snapshot's own
             // persisted `quantization` block, as before.
             let format = requested
@@ -2182,7 +2167,7 @@ impl LlamaProvider {
             // The backend-true depth on both the legacy and the per-proposer field (sc-24438).
             descriptor
                 .capabilities
-                .advertise_mtp(MTP_MAX_DEPTH, MTP_RECOMMENDED_DEPTH);
+                .advertise_mtp(MTP_MAX_DEPTH, recommended_depths(device).mtp);
         }
 
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
@@ -2344,7 +2329,7 @@ impl LlamaProvider {
                 .map_err(to_core)?;
             let qcfg = Qwen35Config::from_json(&ck.config_json).map_err(to_core)?;
             let language_hidden_size = qcfg.hidden_size as usize;
-            let mut descriptor = descriptor_for_qwen35(&qcfg);
+            let mut descriptor = descriptor_for_qwen35(&qcfg, device);
             descriptor.capabilities.model_sampling_defaults = Some(bonsai_sampling_defaults());
             let model = Qwen35Model::from_prism_weights(
                 &ck.weights,
@@ -2470,7 +2455,7 @@ impl LlamaProvider {
             ));
         }
         let ck = GgufCheckpoint::open(path, device).map_err(to_core)?;
-        let mut descriptor = descriptor_for(&ck.config);
+        let mut descriptor = descriptor_for(&ck.config, device);
         let quant = requested.or(ck.config.quantization);
         // GGUF is the dense Llama-family path only (no hybrid Qwen3.6 GGUF remap).
         let causal = CausalLm::from_weights_with(&ck.weights, "", ck.config.clone(), quant)
@@ -2594,7 +2579,7 @@ impl LlamaProvider {
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
         let backend = crate::device::decode_backend(model.device());
         Self {
-            descriptor: provider_descriptor(),
+            descriptor: provider_descriptor_on(backend),
             model: Decoder::Causal(model),
             mtp: None,
             tokenizer,
@@ -4202,8 +4187,7 @@ impl TextLlm for LlamaProvider {
         );
         // Which loop decodes this request (sc-24140): decided once, so admission prices the
         // cache and graphs that loop will actually hold.
-        let (mut route, route_fallback) =
-            self.decode_route(resolution.plan, multimodal && !gemma4_mm_request);
+        let (mut route, route_fallback) = self.decode_route(resolution.plan);
         let mut fallbacks: Vec<String> = resolution
             .fallback
             .into_iter()
@@ -4334,8 +4318,7 @@ impl TextLlm for LlamaProvider {
                 req.max_new_tokens,
             );
             if let Some(why) = fit.fallback {
-                let (refit, route_fallback) =
-                    self.decode_route(fit.plan, multimodal && !gemma4_mm_request);
+                let (refit, route_fallback) = self.decode_route(fit.plan);
                 route = refit;
                 fallbacks.push(why);
                 fallbacks.extend(route_fallback);
@@ -4725,9 +4708,10 @@ impl TextLlm for LlamaProvider {
                 Decoder::Causal(model),
             ) = (route, &self.model)
             {
-                // The llama family (text, and the Gemma 4 soft-token splice) through the unified
-                // engine over the step seam, on the static KV cache (sc-24138): prompt lookup when
-                // the plan names it (sc-24433), else no proposer. The family has no MTP head;
+                // The llama family (text, the Qwen3-VL DeepStack / M-RoPE prefill and the Gemma 4
+                // soft-token splice) through the unified engine over the step seam, on the static
+                // KV cache (sc-24138, sc-24446): the plan's proposer — prompt lookup (sc-24433) or
+                // a draft model (sc-24436) — else no proposer. The family has no MTP head;
                 // admission above priced the static preallocation (the widest layer's geometry
                 // plus the verify overshoot, E6) and, with the runner on, its graph workspace
                 // (sc-24140). The reference `Decode` loop stays selectable (`set_decode_path`) as
@@ -4768,8 +4752,65 @@ impl TextLlm for LlamaProvider {
                 } else {
                     model
                 };
-                let run = match &g4 {
-                    Some(m) => {
+                let run = match (&mm, &g4) {
+                    (Some(m), _) => {
+                        // Qwen3-VL multimodal (sc-24446): the DeepStack / interleaved-M-RoPE
+                        // prefill fills the engine's own step cache (the reference prefill's
+                        // stack, `CausalLm::step_prefill_mrope_deepstack`), then the cache shifts
+                        // the continuation's text positions by `mrope_delta` — on the host and the
+                        // device-positions step alike — and the engine decodes with the plan's
+                        // proposer over the image-expanded history, as on the hybrid. Admission
+                        // above priced the expanded prompt from the visual geometry.
+                        let capacity = m.expanded_ids.len().saturating_add(config.max_new_tokens);
+                        let mut cache = model
+                            .new_cache_for(capacity, drafts)
+                            .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        let (t, h, w, delta) = &m.positions;
+                        let logits = model
+                            .step_prefill_mrope_deepstack(
+                                &m.embeds,
+                                [t.as_slice(), h.as_slice(), w.as_slice()],
+                                &mut cache,
+                                &m.visual_pos_mask,
+                                &m.deepstack,
+                            )
+                            .map_err(to_core)?;
+                        cache.set_rope_delta(*delta);
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        let prefill = generation_started.elapsed();
+                        let decode_started = std::time::Instant::now();
+                        let run = generate_speculative_with(
+                            stepper,
+                            proposer,
+                            SpeculativePrompt::Prefilled {
+                                cache: &mut cache,
+                                logits,
+                                hidden: None,
+                                history: &m.expanded_ids,
+                                position_delta: *delta,
+                                warm_proposer: true,
+                            },
+                            &config,
+                            drafts,
+                            &req.cancel,
+                            &mut sink,
+                            constraint,
+                            should_stop_opt,
+                            None,
+                        )
+                        .map_err(|e| self.request_error(e, prompt_len, req.max_new_tokens))?;
+                        model
+                            .device()
+                            .synchronize()
+                            .map_err(|e| to_core(e.into()))?;
+                        phase_prefill = prefill;
+                        phase_decode_started = decode_started;
+                        run
+                    }
+                    (None, Some(m)) => {
                         // Gemma 4 multimodal: the spliced embeddings prefill the step cache on
                         // ordinary causal 1-D positions (no M-RoPE, so no position shift), then the
                         // continuation decodes through the engine. The expanded prompt (soft-token
@@ -4829,7 +4870,7 @@ impl TextLlm for LlamaProvider {
                         phase_decode_started = decode_started;
                         run
                     }
-                    None => {
+                    (None, None) => {
                         // Text: prefill on top of the longest prefix the cross-turn cache
                         // restores (sc-24437), decode, then keep a copy of the request's KV.
                         model
@@ -4914,7 +4955,8 @@ impl TextLlm for LlamaProvider {
             } else {
                 let constraint = json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask);
                 match &mm {
-                    // Multimodal: prefill the spliced embeds with interleaved M-RoPE, then decode the
+                    // Multimodal on the reference loop (the parity oracle, `set_decode_path`):
+                    // prefill the spliced embeds with interleaved M-RoPE, then decode the
                     // continuation (text positions shifted by `mrope_delta`) through the shared loop.
                     Some(m) => {
                         let model = self.model.as_vlm();
@@ -5289,21 +5331,35 @@ pub const PROMPT_LOOKUP_MAX_DEPTH: u32 = SPECULATIVE_MAX_DEPTH;
 /// head). Advertised on both the legacy `mtp` field and the per-proposer list (sc-24438).
 pub const MTP_MAX_DEPTH: u32 = SPECULATIVE_MAX_DEPTH;
 
-/// The recommended MTP and prompt-lookup depths are the shared ones (E8): both backends run
-/// [`Speculative::Auto`](core_llm::Speculative::Auto) at the same depths.
-pub use core_llm::{MTP_RECOMMENDED_DEPTH, PROMPT_LOOKUP_RECOMMENDED_DEPTH};
+/// The per-proposer depths [`Speculative::Auto`](core_llm::Speculative::Auto) runs and every
+/// advertisement recommends for a model on `device`: its row of the decode-defaults table (E5,
+/// [`crate::device::decode_defaults`]).
+fn recommended_depths(device: &Device) -> &'static core_llm::RecommendedDepths {
+    &crate::device::decode_defaults(device).recommended_depths
+}
 
 /// The prompt-lookup advertisement every `candle-llama` decoder carries (the shared
-/// [`core_llm::prompt_lookup_capabilities`] at [`PROMPT_LOOKUP_MAX_DEPTH`]): both decoder
-/// families (the llama-family `CausalLm` and the qwen3_5 hybrid) run through the step-seam
-/// engine, so the proposer needs nothing from the checkpoint.
-fn prompt_lookup_capabilities() -> ProposerCapabilities {
-    core_llm::prompt_lookup_capabilities(PROMPT_LOOKUP_MAX_DEPTH)
+/// [`core_llm::prompt_lookup_capabilities`] at [`PROMPT_LOOKUP_MAX_DEPTH`], recommending
+/// `backend`'s defaults-table depth): both decoder families (the llama-family `CausalLm` and the
+/// qwen3_5 hybrid) run through the step-seam engine, so the proposer needs nothing from the
+/// checkpoint.
+fn prompt_lookup_capabilities(backend: core_llm::DecodeBackend) -> ProposerCapabilities {
+    core_llm::prompt_lookup_capabilities(
+        PROMPT_LOOKUP_MAX_DEPTH,
+        &backend.defaults().recommended_depths,
+    )
 }
 
 /// The descriptor for the `candle-llama` provider (constructible without loading weights; used for
-/// explicit catalog composition and inspection).
+/// explicit catalog composition and inspection). Without a device, its recommended depths are the
+/// defaults-table row of the device a load would open (CUDA in a `cuda` build, else Metal or the
+/// CPU, as [`select_device`] chooses).
 pub fn provider_descriptor() -> TextLlmDescriptor {
+    provider_descriptor_on(crate::device::decode_backend_for(cfg!(feature = "cuda")))
+}
+
+/// [`provider_descriptor`] for a model decoding on `backend`'s row of the defaults table.
+fn provider_descriptor_on(backend: core_llm::DecodeBackend) -> TextLlmDescriptor {
     TextLlmDescriptor {
         id: PROVIDER_ID.to_string(),
         family: "llama".to_string(),
@@ -5332,7 +5388,7 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
             mtp: None,
             // Prompt lookup runs on every decoder this provider loads (sc-24433); a checkpoint's
             // MTP head is advertised at load through the legacy `mtp` field.
-            speculative: vec![prompt_lookup_capabilities()],
+            speculative: vec![prompt_lookup_capabilities(backend)],
             // JSON-constrained decoding.
             supported_constraints: vec![ConstraintKind::Json],
         },
@@ -5341,8 +5397,8 @@ pub fn provider_descriptor() -> TextLlmDescriptor {
 
 /// A descriptor reflecting a *loaded* model: family from the dispatched architecture and the context
 /// length from `config.json`. (Quantization state is reported via [`LlamaProvider::is_quantized`].)
-fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
-    let mut d = provider_descriptor();
+fn descriptor_for(cfg: &ModelConfig, device: &Device) -> TextLlmDescriptor {
+    let mut d = provider_descriptor_on(crate::device::decode_backend(device));
     d.family = cfg.architecture.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
     d
@@ -5351,8 +5407,8 @@ fn descriptor_for(cfg: &ModelConfig) -> TextLlmDescriptor {
 /// A descriptor for a loaded Qwen3.6 (`qwen3_5`) hybrid decoder. The context length comes from the
 /// [`Qwen35Config`] (which `ModelConfig` does not represent). Text-only here; the vision path is a
 /// follow-on story.
-fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
-    let mut d = provider_descriptor();
+fn descriptor_for_qwen35(cfg: &Qwen35Config, device: &Device) -> TextLlmDescriptor {
+    let mut d = provider_descriptor_on(crate::device::decode_backend(device));
     d.family = Architecture::Qwen35.family().to_string();
     d.capabilities.max_context_tokens = cfg.max_position_embeddings.max(0) as usize;
     d
@@ -5645,6 +5701,12 @@ mod tests {
     use candle_core::Tensor;
     use core_llm::ProposerKind;
     use std::collections::HashMap;
+
+    /// A device's row of the decode-defaults table, read directly (not through the provider's own
+    /// reader) so a provider that stops following the table is caught.
+    fn table_depths(device: &candle_core::Device) -> core_llm::RecommendedDepths {
+        crate::device::decode_defaults(device).recommended_depths
+    }
 
     #[test]
     fn accelerator_only_selector_is_exact_to_qwen38_and_bonsai() {
@@ -8414,9 +8476,9 @@ mod tests {
 
     /// sc-24140 / sc-24433: one decision picks the loop — and so the price. A plan with a
     /// proposer (MTP, prompt lookup) always runs the engine with it; a request whose speculation
-    /// is off runs the engine with none — text and Qwen-VL multimodal alike on the hybrid —
-    /// unless the reference loop is selected. A proposer that cannot run on the chosen loop is a
-    /// named fallback, never silent.
+    /// is off runs the engine with none — text and multimodal alike (sc-24446: the decision no
+    /// longer reads the request's modality) — unless the reference loop is selected. A proposer
+    /// that cannot run is a named fallback, never silent.
     #[test]
     fn a_request_decodes_on_the_engine_unless_the_reference_loop_is_selected() {
         use super::DecodeRoute;
@@ -8434,49 +8496,32 @@ mod tests {
             depth: 4,
         };
         let engine = |proposer, drafts| (DecodeRoute::Engine { proposer, drafts }, None);
-        for multimodal in [false, true] {
-            assert_eq!(
-                provider.decode_route(off, multimodal),
-                (DecodeRoute::PLAIN_ENGINE, None),
-                "multimodal={multimodal}"
-            );
-            assert_eq!(
-                provider.decode_route(mtp, multimodal),
-                engine(ProposerKind::Mtp, 3)
-            );
-            assert_eq!(
-                provider.decode_route(lookup, multimodal),
-                engine(ProposerKind::PromptLookup, 4),
-                "the hybrid's multimodal prefill is a step-seam prefill"
-            );
-        }
-        let (route, why) = provider.decode_route(
-            SpeculativePlan::Run {
-                proposer: SpeculativeProposer::DraftModel,
-                depth: 2,
-            },
-            false,
+        assert_eq!(
+            provider.decode_route(off),
+            (DecodeRoute::PLAIN_ENGINE, None)
         );
+        assert_eq!(provider.decode_route(mtp), engine(ProposerKind::Mtp, 3));
+        assert_eq!(
+            provider.decode_route(lookup),
+            engine(ProposerKind::PromptLookup, 4)
+        );
+        let (route, why) = provider.decode_route(SpeculativePlan::Run {
+            proposer: SpeculativeProposer::DraftModel,
+            depth: 2,
+        });
         assert_eq!(route, DecodeRoute::PLAIN_ENGINE);
         assert!(why.unwrap().contains("`draft_model` has no draft model"));
         provider
             .set_decode_path(DecodePath::Reference)
             .expect("the reference loop is selectable");
+        assert_eq!(provider.decode_route(off), (DecodeRoute::Reference, None));
         assert_eq!(
-            provider.decode_route(off, false),
-            (DecodeRoute::Reference, None)
-        );
-        assert_eq!(
-            provider.decode_route(off, true),
-            (DecodeRoute::Reference, None)
-        );
-        assert_eq!(
-            provider.decode_route(mtp, false),
+            provider.decode_route(mtp),
             engine(ProposerKind::Mtp, 3),
             "an MTP plan runs the engine whatever the selector says"
         );
         assert_eq!(
-            provider.decode_route(lookup, false),
+            provider.decode_route(lookup),
             engine(ProposerKind::PromptLookup, 4),
             "so does a prompt-lookup plan"
         );
@@ -8486,8 +8531,7 @@ mod tests {
 
     /// sc-24436: with a resident draft, a `draft_model` plan runs the engine with the draft as
     /// its proposer — the reference selector does not change that — and admission prices the
-    /// draft's own prefill and cache on top of the target's (E7); a Qwen3-VL generic-causal
-    /// multimodal request, which has no step-seam prefill, falls back by name.
+    /// draft's own prefill and cache on top of the target's (E7).
     #[test]
     fn a_resident_draft_routes_draft_model_onto_the_engine_and_is_priced() {
         use super::DecodeRoute;
@@ -8505,16 +8549,11 @@ mod tests {
             proposer: ProposerKind::DraftModel,
             drafts: 3,
         };
-        assert_eq!(provider.decode_route(plan, false), (route, None));
+        assert_eq!(provider.decode_route(plan), (route, None));
         provider
             .set_decode_path(DecodePath::Reference)
             .expect("the reference loop is selectable");
-        assert_eq!(provider.decode_route(plan, false), (route, None));
-        let (fallback, why) = provider.decode_route(plan, true);
-        assert_eq!(fallback, DecodeRoute::Reference);
-        assert!(why
-            .unwrap()
-            .contains("`draft_model` needs the step-seam engine"));
+        assert_eq!(provider.decode_route(plan), (route, None));
 
         // E7: the draft's request is priced beside the target's, only on its own route.
         let (prompt, budget) = (40usize, 24u32);
@@ -8603,7 +8642,7 @@ mod tests {
             .usage
             .prompt_tokens as usize;
         let price = |plan| {
-            let (route, _) = provider.decode_route(plan, false);
+            let (route, _) = provider.decode_route(plan);
             provider.request_bytes(route, prompt, budget, 0).unwrap()
         };
         let run = |proposer| SpeculativePlan::Run { proposer, depth: 3 };
@@ -8618,7 +8657,7 @@ mod tests {
         assert!(draft_price > 0 && target_only < with_draft);
         assert!(matches!(
             provider
-                .decode_route(run(SpeculativeProposer::DraftModel), false)
+                .decode_route(run(SpeculativeProposer::DraftModel))
                 .0,
             DecodeRoute::Engine {
                 proposer: ProposerKind::DraftModel,
@@ -8897,37 +8936,6 @@ mod tests {
         assert!(error.to_string().contains("mtp.fc.weight"), "{error}");
     }
 
-    /// sc-24433: a Qwen3-VL generic-causal multimodal request has no step-seam prefill, so a
-    /// prompt-lookup plan falls back to the reference loop — and says so.
-    #[test]
-    fn a_causal_qwen_vl_multimodal_request_falls_back_from_prompt_lookup_with_a_named_reason() {
-        use super::DecodeRoute;
-        use core_llm::{SpeculativePlan, SpeculativeProposer};
-
-        let (_dir, provider) = synthetic_causal_provider();
-        let lookup = SpeculativePlan::Run {
-            proposer: SpeculativeProposer::PromptLookup,
-            depth: 4,
-        };
-        assert_eq!(
-            provider.decode_route(lookup, false),
-            (
-                DecodeRoute::Engine {
-                    proposer: ProposerKind::PromptLookup,
-                    drafts: 4
-                },
-                None
-            )
-        );
-        let (route, why) = provider.decode_route(lookup, true);
-        assert_eq!(route, DecodeRoute::Reference);
-        let why = why.expect("the fallback is named");
-        assert!(
-            why.starts_with("speculative: `prompt_lookup` needs the step-seam engine"),
-            "{why}"
-        );
-    }
-
     /// A tokenizer.json whose vocab is `t0..t{vocab-1}` (whitespace WordLevel), so every id of
     /// the synthetic decoder decodes to a distinct piece.
     fn synthetic_tokenizer_json(vocab: usize) -> String {
@@ -9075,7 +9083,9 @@ mod tests {
                 .descriptor()
                 .capabilities
                 .proposer(core_llm::SpeculativeProposer::PromptLookup),
-            Some(super::prompt_lookup_capabilities())
+            Some(super::prompt_lookup_capabilities(
+                crate::device::decode_backend(provider.model.device())
+            ))
         );
 
         let request = |mtp| TextLlmRequest {
@@ -9096,7 +9106,7 @@ mod tests {
         assert_eq!(report.path, "prompt_lookup");
         assert_eq!(
             report.draft_tokens,
-            Some(super::PROMPT_LOOKUP_RECOMMENDED_DEPTH)
+            Some(table_depths(provider.model.device()).prompt_lookup)
         );
         assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
         let record = provider.last_decode_record().unwrap();
@@ -9325,8 +9335,9 @@ mod tests {
     }
 
     /// A tiny Qwen3-VL (`qwen3_vl`: the generic-causal `CausalLm` decoder under
-    /// `model.language_model.*`, interleaved M-RoPE) with a [`synthetic_vision_tower`], loaded as
-    /// a provider (keep the directory alive with it) — the Causal multimodal fixture (sc-24433).
+    /// `model.language_model.*`, interleaved M-RoPE) with a [`synthetic_vision_tower`] carrying
+    /// one DeepStack tap (after ViT block 0, fused after decoder layer 0), loaded as a provider
+    /// (keep the directory alive with it) — the Causal multimodal fixture (sc-24433, sc-24446).
     fn synthetic_qwen3vl_provider() -> (tempfile::TempDir, super::LlamaProvider) {
         let (vocab, hidden, heads, layers) = (40usize, 32usize, 4usize, 3usize);
         let head_dim = hidden / heads;
@@ -9347,8 +9358,30 @@ mod tests {
                 );
             }
         }
-        let (vision_config, vision) = synthetic_vision_tower(hidden);
+        let (mut vision_config, vision) = synthetic_vision_tower(hidden);
         weights.extend(vision);
+        // The DeepStack tap's merger (post-shuffle norm over the merged patch rows): seeded
+        // rows of the tower's own merger geometry.
+        let merge_dim = vision_config["hidden_size"].as_u64().unwrap() as usize * 4;
+        vision_config["deepstack_visual_indexes"] = serde_json::json!([0]);
+        let mut rng = crate::primitives::SplitMix64::new(0x0d33_5ac4);
+        for (leaf, dims) in [
+            ("norm.weight", vec![merge_dim]),
+            ("norm.bias", vec![merge_dim]),
+            ("linear_fc1.weight", vec![merge_dim, merge_dim]),
+            ("linear_fc1.bias", vec![merge_dim]),
+            ("linear_fc2.weight", vec![hidden, merge_dim]),
+            ("linear_fc2.bias", vec![hidden]),
+        ] {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n)
+                .map(|_| crate::primitives::TokenRng::next_f32(&mut rng) - 0.5)
+                .collect();
+            weights.insert(
+                format!("model.visual.deepstack_merger_list.0.{leaf}"),
+                Tensor::from_vec(data, dims, &candle_core::Device::Cpu).unwrap(),
+            );
+        }
         let config = serde_json::json!({
             "architectures": ["Qwen3VLForConditionalGeneration"],
             "model_type": "qwen3_vl",
@@ -9487,14 +9520,15 @@ mod tests {
     ) -> Vec<core_llm_testkit::ParityCase> {
         use core_llm::{Speculative, SpeculativeProposer};
         use core_llm_testkit::ParityCase;
-        let mut cases: Vec<ParityCase> = [1, 3, super::PROMPT_LOOKUP_RECOMMENDED_DEPTH]
-            .into_iter()
-            .chain([super::PROMPT_LOOKUP_MAX_DEPTH])
-            .map(|depth| ParityCase {
-                speculative: Speculative::proposer(SpeculativeProposer::PromptLookup, depth),
-                expect_proposer: ProposerKind::PromptLookup,
-            })
-            .collect();
+        let mut cases: Vec<ParityCase> =
+            [1, 3, table_depths(&candle_core::Device::Cpu).prompt_lookup]
+                .into_iter()
+                .chain([super::PROMPT_LOOKUP_MAX_DEPTH])
+                .map(|depth| ParityCase {
+                    speculative: Speculative::proposer(SpeculativeProposer::PromptLookup, depth),
+                    expect_proposer: ProposerKind::PromptLookup,
+                })
+                .collect();
         cases.push(ParityCase {
             speculative: Speculative::Auto,
             expect_proposer: auto_proposer,
@@ -9683,7 +9717,10 @@ mod tests {
         let mtp = caps.proposer(SpeculativeProposer::Mtp).unwrap();
         assert_eq!(
             (mtp.max_depth, mtp.recommended_depth),
-            (super::MTP_MAX_DEPTH, super::MTP_RECOMMENDED_DEPTH)
+            (
+                super::MTP_MAX_DEPTH,
+                table_depths(with_head.model.device()).mtp
+            )
         );
         assert_eq!(
             caps.mtp,
@@ -9823,7 +9860,7 @@ mod tests {
             &image_fixture_prompts(),
             &[
                 lookup(1),
-                lookup(super::PROMPT_LOOKUP_RECOMMENDED_DEPTH),
+                lookup(table_depths(&candle_core::Device::Cpu).prompt_lookup),
                 lookup(super::PROMPT_LOOKUP_MAX_DEPTH),
                 ParityCase {
                     speculative: Speculative::Auto,
@@ -9850,46 +9887,104 @@ mod tests {
         assert!(out.usage.prompt_tokens > 64, "{:?}", out.usage);
     }
 
-    /// sc-24433 / epic sc-24432 E2, end to end: `auto` on a Qwen3-VL (generic-causal) multimodal
-    /// request resolves to prompt lookup, which that request's reference-loop prefill cannot run —
-    /// the output's report names the route fallback, decodes with no proposer, and emits the
-    /// `off` stream. The same request text-only runs prompt lookup with no fallback.
+    /// sc-24446 (epic sc-24432 E1, E8): a Qwen3-VL (generic-causal) multimodal request decodes
+    /// on the engine — its DeepStack / M-RoPE prefill fills the engine's step cache — and the
+    /// engine's `off` stream is the reference loop's, token event for token event, on both image
+    /// prompts (the image run at the head and mid-prompt). With the reference loop selected as
+    /// the `off` oracle, prompt lookup at depths 1, 3 and the advertised max — and `auto`, which
+    /// resolves to it — runs on the engine over the image-expanded history and emits exactly the
+    /// reference stream.
     #[test]
-    fn a_route_fallback_reaches_the_output_report() {
+    fn qwen3vl_multimodal_decodes_on_the_engine_greedy_exact_against_the_reference_loop() {
+        use core_llm::{Speculative, SpeculativeProposer};
+        use core_llm_testkit::ParityCase;
+
+        let (_dir, mut provider) = synthetic_qwen3vl_provider();
+        let prompts = image_fixture_prompts();
+        let off = |prompt| {
+            core_llm_testkit::bench_request(
+                prompt,
+                Speculative::Off,
+                &core_llm::Sampling::greedy(),
+                24,
+            )
+        };
+        let engine: Vec<_> = prompts
+            .iter()
+            .map(|prompt| {
+                let (events, out) = token_events(&provider, &off(prompt));
+                let report = out.decode.unwrap();
+                assert_eq!(report.path, "step_model", "{}", prompt.id);
+                assert_eq!(report.kv_cache, "static", "{}", prompt.id);
+                assert!(out.usage.prompt_tokens > 64, "{:?}", out.usage);
+                events
+            })
+            .collect();
+        provider
+            .set_decode_path(DecodePath::Reference)
+            .expect("the reference loop is selectable");
+        for (prompt, engine) in prompts.iter().zip(engine) {
+            let (reference, out) = token_events(&provider, &off(prompt));
+            assert_eq!(out.decode.unwrap().path, "reference");
+            assert_eq!(out.usage.generated_tokens, 24, "{}", prompt.id);
+            assert!(!reference.is_empty(), "{}", prompt.id);
+            assert_eq!(reference, engine, "{}: engine off vs reference", prompt.id);
+        }
+
+        let lookup = |depth| ParityCase {
+            speculative: Speculative::proposer(SpeculativeProposer::PromptLookup, depth),
+            expect_proposer: ProposerKind::PromptLookup,
+        };
+        let rows = core_llm_testkit::check_speculative_greedy_parity(
+            &provider,
+            &prompts,
+            &[
+                lookup(1),
+                lookup(3),
+                lookup(super::PROMPT_LOOKUP_MAX_DEPTH),
+                ParityCase {
+                    speculative: Speculative::Auto,
+                    expect_proposer: ProposerKind::PromptLookup,
+                },
+            ],
+            24,
+        )
+        .unwrap_or_else(|failures| panic!("{failures}"));
+        assert_eq!(rows.len(), 2 * 4);
+        assert!(rows.iter().all(|r| r.report.path == "prompt_lookup"));
+        assert_rows_drafted(&rows);
+    }
+
+    /// sc-24446 (epic sc-24432 E2, E3): the report of a Qwen3-VL multimodal request names the
+    /// engine path and the proposer that ran, and no fallback — `auto` runs prompt lookup on the
+    /// engine, `off` the engine with no proposer — exactly as the same request text-only does.
+    #[test]
+    fn a_qwen3vl_multimodal_report_names_the_engine_and_no_fallback() {
         use core_llm::{Sampling, Speculative};
 
         let (_dir, provider) = synthetic_qwen3vl_provider();
-        let prompts = image_fixture_prompts();
-        let request = |speculative| {
-            core_llm_testkit::bench_request(&prompts[0], speculative, &Sampling::greedy(), 12)
-        };
-        let (auto_events, auto) = token_events(&provider, &request(Speculative::Auto));
-        let report = auto.decode.expect("reported");
-        assert_eq!(report.fallbacks.len(), 1, "{:?}", report.fallbacks);
-        assert!(
-            report.fallbacks[0]
-                .starts_with("speculative: `prompt_lookup` needs the step-seam engine"),
-            "{:?}",
-            report.fallbacks
-        );
-        assert_eq!(report.path, "reference");
-        assert_eq!(report.proposer, ProposerKind::None);
-        let (off_events, off) = token_events(&provider, &request(Speculative::Off));
-        assert!(off.decode.unwrap().fallbacks.is_empty());
-        assert_eq!(
-            auto_events, off_events,
-            "the fallback decodes the off stream"
-        );
-
-        let text_only = core_llm_testkit::bench_request(
-            &fixture_prompts()[0],
-            Speculative::Auto,
-            &Sampling::greedy(),
-            12,
-        );
-        let report = token_events(&provider, &text_only).1.decode.unwrap();
-        assert_eq!(report.proposer, ProposerKind::PromptLookup);
-        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        let image = &image_fixture_prompts()[0];
+        let text = &fixture_prompts()[0];
+        for (label, prompt) in [("image", image), ("text", text)] {
+            let request = |speculative| {
+                core_llm_testkit::bench_request(prompt, speculative, &Sampling::greedy(), 12)
+            };
+            let auto = token_events(&provider, &request(Speculative::Auto))
+                .1
+                .decode
+                .expect("reported");
+            assert_eq!(auto.path, "prompt_lookup", "{label}");
+            assert_eq!(auto.proposer, ProposerKind::PromptLookup, "{label}");
+            assert!(auto.verify_steps > 0, "{label}");
+            assert!(auto.fallbacks.is_empty(), "{label}: {:?}", auto.fallbacks);
+            let off = token_events(&provider, &request(Speculative::Off))
+                .1
+                .decode
+                .expect("reported");
+            assert_eq!(off.path, "step_model", "{label}");
+            assert_eq!(off.proposer, ProposerKind::None, "{label}");
+            assert!(off.fallbacks.is_empty(), "{label}: {:?}", off.fallbacks);
+        }
     }
 
     /// The report the output carries is the record's, with the provider's fallback reasons passed
@@ -10258,7 +10353,7 @@ mod tests {
         assert_eq!(advertised.max_depth, super::MTP_MAX_DEPTH, "{label}");
         assert_eq!(
             advertised.recommended_depth,
-            super::MTP_RECOMMENDED_DEPTH,
+            table_depths(provider.model.device()).mtp,
             "{label}"
         );
         let census = provider.load_record().census.unwrap();
@@ -10570,7 +10665,7 @@ mod tests {
             } else {
                 (crate::models::qwen35::tests::text_model().1, None)
             };
-            let mut descriptor = descriptor_for_qwen35(model.config());
+            let mut descriptor = descriptor_for_qwen35(model.config(), model.device());
             if mtp.is_some() {
                 descriptor.capabilities.mtp = Some(core_llm::MtpCapabilities {
                     max_draft_tokens: u32::MAX,

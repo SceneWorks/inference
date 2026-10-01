@@ -13,16 +13,18 @@
 //!
 //! Both decodes run on the shared MLX engine's token-at-a-time loop
 //! ([`generate_speculative`] with [`NoProposer`], epic sc-24432 E8) over this model
-//! (`ReasonerTarget`), drawing every token through `ReasonerSampler` — the on-device argmax the
-//! greedy path always took, or mlx-gen's seeded host [`sample_token`] — so a rewrite is
-//! token-identical to the pre-engine loops.
+//! (`ReasonerTarget`), drawing every token through `ReasonerSampler` — mlx-llm's shared on-device
+//! argmax ([`argmax_device`]) the greedy path always took, or the media pipelines' seeded draw
+//! [`sample_token`] (mlx-llm's heap-order host reference) — so a rewrite is token-identical to the
+//! pre-engine loops. The caller's cancel is bridged onto the engine's flag after every emitted token,
+//! so a cancel ends the decode as the engine's typed `Cancelled` finish.
 //!
 //! The MoE experts can be quantized (Q4/Q8, sc-3172) so the reasoner loads at the same `~12 GB` as the
 //! encoder.
 
 use std::cell::RefCell;
 
-use mlx_rs::ops::indexing::{argmax, argmax_axis};
+use mlx_rs::ops::indexing::argmax_axis;
 use mlx_rs::ops::{matmul, split_sections};
 use mlx_rs::{Array, Dtype};
 
@@ -34,8 +36,9 @@ use mlx_llm::core_llm::{HostSampleReason, SamplerPath};
 use mlx_llm::decode::{
     generate_speculative, EngineOptions, FinishReason, GenerationConfig, LogitsScope,
     NoDraftRollback, NoProposer, Pipelining, SampledToken, SpeculativePrompt, SpeculativeTarget,
-    TargetOutput, TokenSampler,
+    StreamEvent, TargetOutput, TokenSampler,
 };
+use mlx_llm::primitives::sampler::argmax_device;
 use mlx_llm::primitives::SamplingParams;
 
 use crate::config::GptOssConfig;
@@ -159,19 +162,8 @@ impl LensReasonerModel {
             HARMONY_RETURN,
             ReasonerDraw::Greedy,
             cancel,
+            &mut |_| {},
         )
-    }
-
-    /// Host `[vocab]` logits of a `[1, 1, vocab]` (or `[vocab]`) logits row, pulled to `Vec<f32>`
-    /// for the *sampled* draw. The greedy draw keeps its on-device `argmax` (the KV-cache parity
-    /// oracle) and is deliberately left untouched.
-    fn host_logits(logits: &Array) -> Result<Vec<f32>> {
-        let vocab = *logits.shape().last().expect("logits rank >= 1");
-        Ok(logits
-            .reshape(&[vocab])?
-            .as_dtype(Dtype::Float32)?
-            .as_slice::<f32>()
-            .to_vec())
     }
 
     /// **Temperature-sampled** autoregressive generation (F-105): the same prefill + KV-cache decode as
@@ -197,6 +189,7 @@ impl LensReasonerModel {
                 rng: SplitMix64::new(seed),
             },
             cancel,
+            &mut |_| {},
         )
     }
 
@@ -204,7 +197,9 @@ impl LensReasonerModel {
     /// `ReasonerTarget` and runs its token-at-a-time loop to `stop` (the harmony `<|return|>`) or the
     /// budget, every draw `draw`'s. The pre-engine loop always drew the prefill's token, so the budget
     /// is at least one; it kept the final stop in its list, which the engine does not emit, so a
-    /// stop-token end appends it.
+    /// stop-token end appends it. `cancel` is bridged onto the engine's flag after every emitted
+    /// token (`on_event` sees each event first) — where the pre-engine loops checked it, before
+    /// every token after the first — and a cancelled run returns [`Error::Canceled`].
     fn decode(
         &self,
         input_ids: &[i32],
@@ -212,12 +207,21 @@ impl LensReasonerModel {
         stop: i32,
         draw: ReasonerDraw<'_>,
         cancel: Option<&CancelFlag>,
+        on_event: &mut dyn FnMut(&StreamEvent),
     ) -> Result<Vec<i32>> {
         let target = ReasonerTarget {
             model: self,
             failure: RefCell::new(None),
         };
-        let mut sampler = ReasonerSampler::new(draw, cancel);
+        let mut sampler = ReasonerSampler::new(draw);
+        let engine_cancel = mlx_llm::CancelFlag::new();
+        let bridged = engine_cancel.clone();
+        let mut bridge = |event: StreamEvent| {
+            on_event(&event);
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                bridged.cancel();
+            }
+        };
         let generation = GenerationConfig {
             max_new_tokens: max_new_tokens.max(1),
             sampling: sampler.params,
@@ -230,8 +234,8 @@ impl LensReasonerModel {
             SpeculativePrompt::Tokens(input_ids),
             &generation,
             0,
-            &mlx_llm::CancelFlag::new(),
-            &mut |_| {},
+            &engine_cancel,
+            &mut bridge,
             EngineOptions {
                 sampler: Some(&mut sampler),
                 // Every draw is read back on the host before the next step; nothing pipelines.
@@ -239,11 +243,17 @@ impl LensReasonerModel {
                 ..EngineOptions::default()
             },
         );
-        // A model or draw failure keeps its own typed error (a cancel stays `Canceled`).
+        // A model or draw failure keeps its own typed error.
         if let Some(error) = target.failure.take().or_else(|| sampler.failure.take()) {
             return Err(error);
         }
-        let run = run.map_err(|e| Error::Msg(format!("lens reasoner decode: {e}")))?;
+        let run = run.map_err(|e| match e {
+            mlx_llm::Error::Canceled => Error::Canceled,
+            e => Error::Msg(format!("lens reasoner decode: {e}")),
+        })?;
+        if run.output.finish_reason == FinishReason::Cancelled {
+            return Err(Error::Canceled);
+        }
         let mut out = run.output.tokens;
         if run.output.finish_reason == FinishReason::StopToken {
             out.extend(sampler.last);
@@ -349,25 +359,23 @@ enum ReasonerDraw<'a> {
 }
 
 /// The reasoner's draw on the engine's sampler seam — exactly the pre-engine loops' draws. Greedy is
-/// the on-device `argmax` of the logits row with one index read back (ties to the lowest index, the
-/// MLX `argmax` ≡ `torch.argmax` rule the parity oracle pins); sampled is mlx-gen's
-/// [`sample_token`] over the f32 host row and the running prompt + generated history, from the
-/// pipeline's own seeded [`SplitMix64`]. The pre-engine loops checked `cancel` before every token
-/// after the first, which is where this draw checks it.
+/// mlx-llm's shared on-device argmax ([`argmax_device`]: one index read back, ties to the lowest
+/// index, the MLX `argmax` ≡ `torch.argmax` rule the parity oracle pins); sampled is the media
+/// pipelines' [`sample_token`] over the logits row and the running prompt + generated history, from
+/// the pipeline's own seeded [`SplitMix64`].
 struct ReasonerSampler<'a> {
     draw: ReasonerDraw<'a>,
-    cancel: Option<&'a CancelFlag>,
     /// The same knobs in the engine's vocabulary (reported, never drawn from).
     params: SamplingParams,
     draws: u64,
     /// The last token drawn — on a stop-token end, the stop the engine does not emit.
     last: Option<i32>,
-    /// A draw's own error (a cancel), returned as-is by the decode.
+    /// A draw's own error, returned as-is by the decode.
     failure: Option<Error>,
 }
 
 impl<'a> ReasonerSampler<'a> {
-    fn new(draw: ReasonerDraw<'a>, cancel: Option<&'a CancelFlag>) -> Self {
+    fn new(draw: ReasonerDraw<'a>) -> Self {
         let params = match &draw {
             ReasonerDraw::Greedy => SamplingParams::default(),
             ReasonerDraw::Sampled { params, .. } => SamplingParams {
@@ -381,7 +389,6 @@ impl<'a> ReasonerSampler<'a> {
         };
         Self {
             draw,
-            cancel,
             params,
             draws: 0,
             last: None,
@@ -390,18 +397,11 @@ impl<'a> ReasonerSampler<'a> {
     }
 
     fn draw_token(&mut self, logits: &Array, history: &[i32]) -> Result<i32> {
-        if self.draws > 0 && self.cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(Error::Canceled);
-        }
         let token = match &mut self.draw {
             ReasonerDraw::Greedy => {
-                let vocab = *logits.shape().last().expect("logits rank >= 1");
-                argmax(&logits.reshape(&[vocab])?, None)?.item::<u32>() as i32
+                argmax_device(logits).map_err(|e| Error::Msg(format!("lens reasoner: {e}")))?
             }
-            ReasonerDraw::Sampled { params, rng } => {
-                let host = LensReasonerModel::host_logits(logits)?;
-                sample_token(&host, history, params, rng)
-            }
+            ReasonerDraw::Sampled { params, rng } => sample_token(logits, history, params, rng)?,
         };
         self.draws += 1;
         self.last = Some(token);
@@ -453,6 +453,7 @@ impl TokenSampler for ReasonerSampler<'_> {
     }
 
     fn uniform(&mut self) -> f32 {
+        use mlx_llm::primitives::TokenRng as _;
         match &mut self.draw {
             ReasonerDraw::Sampled { rng, .. } => rng.next_f32(),
             ReasonerDraw::Greedy => 0.0,
@@ -542,6 +543,7 @@ impl LensReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::ops::indexing::argmax;
 
     /// Deterministic fill in `[-scale, scale]`.
     fn fill(n: usize, seed: f32, scale: f32) -> Vec<f32> {
@@ -667,8 +669,9 @@ mod tests {
         Ok(idx.item::<u32>() as i32)
     }
 
-    /// The pre-engine host-logits helper, verbatim.
-    fn last_logits_host(m: &LensReasonerModel, hidden: &Array) -> Result<Vec<f32>> {
+    /// The pre-engine host-logits helper, but for handing the draw the row itself (the shared
+    /// sampler reads it to the host).
+    fn last_logits(m: &LensReasonerModel, hidden: &Array) -> Result<Array> {
         let t = hidden.shape()[1];
         let last = if t > 1 {
             split_sections(hidden, &[t - 1], 1)?[1].clone() // [1, 1, hidden]
@@ -677,12 +680,7 @@ mod tests {
         };
         let normed = mlx_rs::fast::rms_norm(&last, &m.final_norm, m.cfg.rms_eps)?;
         let logits = matmul(&normed, m.lm_head.t())?; // [1, 1, vocab]
-        let vocab = logits.shape()[2];
-        Ok(logits
-            .reshape(&[vocab])?
-            .as_dtype(Dtype::Float32)?
-            .as_slice::<f32>()
-            .to_vec())
+        Ok(logits)
     }
 
     /// The pre-engine greedy loop, verbatim but for its stop (the `HARMONY_RETURN` constant, a
@@ -734,8 +732,8 @@ mod tests {
         let hidden = m.run_layers(hidden, &mut caches, 0, true)?;
         let mut history: Vec<i32> = input_ids.to_vec();
         let mut rng = SplitMix64::new(seed);
-        let logits = last_logits_host(m, &hidden)?;
-        let mut next = sample_token(&logits, &history, params, &mut rng);
+        let logits = last_logits(m, &hidden)?;
+        let mut next = sample_token(&logits, &history, params, &mut rng)?;
         history.push(next);
         let mut position = input_ids.len() as i32;
         let mut out = vec![next];
@@ -749,8 +747,8 @@ mod tests {
             let h = m.embed_tokens.take_axis(&tok, 0)?;
             let h = m.run_layers(h, &mut caches, position, false)?;
             position += 1;
-            let logits = last_logits_host(m, &h)?;
-            next = sample_token(&logits, &history, params, &mut rng);
+            let logits = last_logits(m, &h)?;
+            next = sample_token(&logits, &history, params, &mut rng)?;
             history.push(next);
             out.push(next);
         }
@@ -771,7 +769,8 @@ mod tests {
                 rng: SplitMix64::new(seed),
             },
         };
-        m.decode(prompt, max, stop, draw, None).unwrap()
+        m.decode(prompt, max, stop, draw, None, &mut |_| {})
+            .unwrap()
     }
 
     /// E8 (sc-24446): both reasoner decodes run on the shared engine and are token-identical to the
@@ -878,5 +877,40 @@ mod tests {
                 .unwrap(),
             reference_sampled(&m, &prompt, 1, -1, &params, 1, Some(&cancel)).unwrap()
         );
+    }
+
+    /// A cancel set mid-decode is bridged onto the engine's flag: the engine finishes `Cancelled`
+    /// right after the token it was emitting, and the decode returns the typed [`Error::Canceled`]
+    /// (greedy and sampled).
+    #[test]
+    fn a_mid_run_cancel_ends_the_decode_typed() {
+        let m = tiny_reasoner();
+        let prompt = [3, 17, 42, 8, 30, 11, 5];
+        let params = SampleParams::temperature(0.7);
+        for sampled in [false, true] {
+            let draw = if sampled {
+                ReasonerDraw::Sampled {
+                    params: &params,
+                    rng: SplitMix64::new(3),
+                }
+            } else {
+                ReasonerDraw::Greedy
+            };
+            let cancel = CancelFlag::new();
+            let mut emitted = 0;
+            let run = m.decode(&prompt, 16, -1, draw, Some(&cancel), &mut |event| {
+                if let StreamEvent::Token { step, .. } = event {
+                    emitted = step + 1;
+                    if *step == 2 {
+                        cancel.cancel();
+                    }
+                }
+            });
+            assert!(matches!(run, Err(Error::Canceled)), "sampled {sampled}");
+            assert_eq!(
+                emitted, 3,
+                "sampled {sampled}: cancelled after the third token"
+            );
+        }
     }
 }

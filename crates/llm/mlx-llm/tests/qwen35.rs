@@ -139,7 +139,10 @@ fn frozen_qwen38_tokenizer_runs_tiny_native_text_and_mtp() {
     let mtp = provider.descriptor().capabilities.mtp.unwrap();
     assert_eq!(
         mtp.recommended_draft_tokens,
-        mlx_llm::provider::MTP_RECOMMENDED_DEPTH
+        mlx_llm::core_llm::DecodeBackend::Mlx
+            .defaults()
+            .recommended_depths
+            .mtp
     );
     // 2q/1kv/hd 4: a head dim the vector kernel does not serve, so the 8-row bound (sc-24438).
     assert_eq!(
