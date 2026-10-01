@@ -38,9 +38,12 @@ pub use draft_model::{
     write_draft_model_fixture, DraftLoader, DraftModelFixture, DRAFT_FIXTURE_VOCAB,
 };
 pub use speculative::{
-    bench_request, check_speculative_greedy_parity, parse_bench_sampling, run_speculative_bench,
-    sampling_json, speculative_prompt_set, BenchConfig, BenchDocument, BenchPrompt, BenchRow,
-    ParityCase, ParityRow, PromptClass, BENCH_SCHEMA,
+    bench_config, bench_env, bench_load_spec, bench_request, check_speculative_bench_on_fixture,
+    check_speculative_greedy_parity, parse_bench_format, parse_bench_sampling,
+    run_speculative_bench, run_speculative_bench_from_env, sampling_json, speculative_prompt_set,
+    BenchConfig, BenchDocument, BenchPrompt, BenchRow, BenchSample, BenchStats, ParityCase,
+    ParityRow, PromptClass, BENCH_DEFAULT_NEW_TOKENS, BENCH_DEFAULT_REPEATS, BENCH_SCHEMA,
+    BENCH_WARMUP_PROMPT,
 };
 pub use starvector::{
     check_starvector_bounded_fixture, check_starvector_cancellation, check_starvector_descriptor,

@@ -110,6 +110,9 @@ mod snapshot_hf;
 #[path = "speculative.rs"]
 mod speculative;
 
+#[path = "speculative_bench.rs"]
+mod speculative_bench;
+
 #[path = "stop_strings.rs"]
 mod stop_strings;
 
