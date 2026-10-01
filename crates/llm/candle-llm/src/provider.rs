@@ -9521,7 +9521,8 @@ mod tests {
     }
 
     /// The bytes a load of `spec` admits in the domain the load's budget caps — the device's on
-    /// a CUDA test host (the operational budget is device headroom there), the host's otherwise.
+    /// a CUDA test host (the operational budget is device headroom there, and the prefix cache
+    /// settles in it), the host's otherwise.
     fn admitted_bytes(spec: &core_llm::LoadSpec) -> u64 {
         let cuda = crate::device::select_device().unwrap().is_cuda();
         let estimate = super::LlamaProvider::load_memory_estimate(spec, cuda).unwrap();
@@ -10068,9 +10069,9 @@ mod tests {
             let (cfg, weights) = tiny_llama_parts();
             let dir = write_snapshot(&cfg, &weights, 40);
             let mut spec = LoadSpec::dense(dir.path().display().to_string());
-            let required = LlamaProvider::load_memory_estimate(&spec, false)
-                .unwrap()
-                .host_required_bytes;
+            // In the domain the operational budget caps — the device's on a CUDA test host, where
+            // the prefix cache lives too; the host's otherwise.
+            let required = super::admitted_bytes(&spec);
             let headroom = 4096;
             // The estimate names what the load asks for, beside what it requires.
             let asked = |spec: &LoadSpec| {
@@ -10082,9 +10083,7 @@ mod tests {
             spec.prefix_cache_bytes = Some(u64::MAX);
             assert_eq!(asked(&spec), u64::MAX);
             assert_eq!(
-                LlamaProvider::load_memory_estimate(&spec, false)
-                    .unwrap()
-                    .host_required_bytes,
+                super::admitted_bytes(&spec),
                 required,
                 "the budget is never part of what the load requires"
             );
