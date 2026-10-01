@@ -12,10 +12,9 @@
 //! **Dispatch.** A decode-sized step — at most [`DEVICE_DISPATCH_MAX_ROWS`] tokens — runs every
 //! (token, slot) pair's expert on its one row, with the routes as device data:
 //!
-//! * **Indexed** (CUDA): one launch per projection of
-//!   [`IndexedExperts`](candle_quant_kernels::IndexedExperts) — each pair's expert id is read on
-//!   the device and its weight read **in place** through a load-time device table of expert
-//!   addresses. No host read, no copy of an expert matrix, and launch shapes fixed by the step, so
+//! * **Indexed** (CUDA): one launch per projection of [`IndexedExperts`] — each pair's expert id
+//!   is read on the device and its weight read **in place** through a load-time device table of
+//!   expert addresses. No host read, no copy of an expert matrix, and launch shapes fixed by the step, so
 //!   the step is graph-capturable. Every expert format the crate loads into a bank has a kernel:
 //!   dense (f32 / bf16 / f16), GGML blocks (Q4_0 / Q8_0 / Q4_K — what quantize-on-load and a
 //!   prepared snapshot store — and every other type candle's decode MMVQ serves), the MLX-affine Q8
