@@ -266,6 +266,28 @@ fn campaign_forced_decode_on(
     Ok(measured)
 }
 
+/// The cache record of one prompt-cache turn: whether the lookup since `before` hit, and how many
+/// prompt tokens it reused.
+fn prompt_cache_turn(
+    before: crate::decode::PrefixStats,
+    store: &crate::decode::PrefixCache,
+    prompt_tokens: usize,
+) -> CoreResult<crate::campaign::PromptCacheTurn> {
+    let after = store.stats();
+    if after.lookups != before.lookups + 1 {
+        return Err(CoreError::Load(
+            "multi-turn prompt cache: a turn must perform exactly one prompt-cache lookup".into(),
+        ));
+    }
+    let cache_hit = after.hits > before.hits;
+    let reused = after.reused_prefix_tokens - before.reused_prefix_tokens;
+    Ok(crate::campaign::PromptCacheTurn {
+        prompt_tokens: prompt_tokens as u64,
+        cache_hit,
+        reused_prefix_tokens: reused as u64,
+    })
+}
+
 /// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
 /// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
 /// implement [`Decode`], so the generation loop is identical.
@@ -1233,7 +1255,7 @@ impl LlamaProvider {
             }
         };
         let mut captured = CacheLifecycleCapture::default();
-        let output = self.generate_inner(&request, &mut sink, Some(&mut captured), packed)?;
+        let output = self.generate_inner(&request, &mut sink, Some(&mut captured), packed, None)?;
         if output.finish_reason != Some(CoreFinish::Cancelled) {
             return Err(CoreError::Load(
                 "campaign cancellation did not finish as cancelled".into(),
@@ -2263,7 +2285,7 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
-        self.generate_inner(req, on_event, None, None)
+        self.generate_inner(req, on_event, None, None, None)
     }
 }
 
@@ -2278,7 +2300,216 @@ impl LlamaProvider {
         observer: &mut dyn crate::campaign::Observer,
         packed: Option<&crate::campaign::CompressedKvArm>,
     ) -> CoreResult<TextLlmOutput> {
-        self.generate_inner(req, on_event, Some(observer), packed)
+        self.generate_inner(req, on_event, Some(observer), packed, None)
+    }
+
+    /// Render `messages` with `req`'s template options and tokenize. The template already includes
+    /// BOS, so encode without auto special tokens. `enable_thinking` (sc-7585) flows into the
+    /// template kwarg so a no-think (Disabled) request injects the model's empty `<think></think>`
+    /// generation prompt; Auto omits the kwarg (template default).
+    fn render_prompt(
+        &self,
+        req: &TextLlmRequest,
+        messages: &[Message],
+    ) -> CoreResult<(String, Vec<i32>)> {
+        let prompt = self.template.render_with(
+            messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.enable_thinking_kwarg(),
+                // Bonsai's official model card does not recommend `low` as an effective distinct
+                // level, so it is omitted from the selectable capability list. The frozen template
+                // still accepts and renders `low`; preserve that compatibility input verbatim.
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
+                tools: &req.tools,
+            },
+        )?;
+        let prompt_ids: Vec<i32> = self
+            .tokenizer
+            .encode(&prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+        Ok((prompt, prompt_ids))
+    }
+
+    /// SC-20671 multi-turn prompt-cache fixture, turn 1: the request runs on the product
+    /// prompt-cache path into a fresh `store` (always a miss) and its `prompt + answer` K/V is
+    /// stored there for turn 2. Turn 1 is dense in every arm: the provider prefix store holds
+    /// shared prefixes as dense K/V, and only a compressed cache hit imports one. Returns the
+    /// answer, the turn's cache record, and its rendered prompt ids.
+    fn campaign_turn_one(
+        &self,
+        turn1: &TextLlmRequest,
+        store: &mut crate::decode::PrefixCache,
+    ) -> CoreResult<(TextLlmOutput, crate::campaign::PromptCacheTurn, Vec<i32>)> {
+        let (_, ids) = self.render_prompt(turn1, &turn1.messages)?;
+        let mut unobserved = CacheLifecycleCapture::default();
+        let before = store.stats();
+        let output = self.generate_inner(
+            turn1,
+            &mut |_| {},
+            Some(&mut unobserved),
+            None,
+            Some(&mut *store),
+        )?;
+        let turn = prompt_cache_turn(before, store, ids.len())?;
+        if turn.cache_hit || store.len() != 1 {
+            return Err(CoreError::Load(
+                "multi-turn prompt cache: turn 1 must miss a fresh store and store its K/V".into(),
+            ));
+        }
+        Ok((output, turn, ids))
+    }
+
+    /// Turn 2 of the multi-turn fixture: turn 1's conversation, its answer, then `follow_up`.
+    fn campaign_turn_two_request(
+        turn1: &TextLlmRequest,
+        answer: &TextLlmOutput,
+        follow_up: &str,
+    ) -> TextLlmRequest {
+        let mut turn2 = turn1.clone();
+        turn2
+            .messages
+            .push(Message::text(Role::Assistant, answer.text.clone()));
+        turn2.messages.push(Message::text(Role::User, follow_up));
+        turn2
+    }
+
+    /// Turn 2 must be served by a prompt-cache hit reusing at least the prompt it shares with
+    /// turn 1 (fail closed otherwise: the fixture would measure a cold prefill).
+    fn require_turn_two_hit(
+        turn: &crate::campaign::PromptCacheTurn,
+        turn1_ids: &[i32],
+        turn2_ids: &[i32],
+    ) -> CoreResult<()> {
+        let shared = turn1_ids
+            .iter()
+            .zip(turn2_ids)
+            .take_while(|(left, right)| left == right)
+            .count()
+            .min(turn2_ids.len().saturating_sub(1)) as u64;
+        if !turn.cache_hit || turn.reused_prefix_tokens == 0 || turn.reused_prefix_tokens < shared {
+            return Err(CoreError::Load(format!(
+                "multi-turn prompt cache: turn 2 was not served by a prompt-cache hit over its \
+                 shared prefix (hit={}, reused={}, shared={shared})",
+                turn.cache_hit, turn.reused_prefix_tokens
+            )));
+        }
+        Ok(())
+    }
+
+    /// SC-20671 multi-turn prompt-cache fixture on the product prompt-cache path. Turn 1 runs the
+    /// request and stores its K/V ([`Self::campaign_turn_one`]); turn 2 appends the answer and
+    /// `follow_up` and is served by the cache hit — a dense seed, or, with `packed`, the prefix
+    /// imported into the compressed cache — with `observer` attached. Turn 2's output and both
+    /// turns' cache records are returned; a turn 2 that missed is refused.
+    pub(crate) fn campaign_multi_turn_observed(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        on_event: &mut dyn FnMut(CoreEvent),
+        observer: &mut dyn crate::campaign::Observer,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<(TextLlmOutput, crate::campaign::MultiTurnPromptCacheTurns)> {
+        let mut store = crate::decode::PrefixCache::new(2);
+        let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
+        let turn2 = Self::campaign_turn_two_request(turn1, &answer, follow_up);
+        let (_, turn2_ids) = self.render_prompt(&turn2, &turn2.messages)?;
+        let before = store.stats();
+        let output =
+            self.generate_inner(&turn2, on_event, Some(observer), packed, Some(&mut store))?;
+        let turn2_cache = prompt_cache_turn(before, &store, turn2_ids.len())?;
+        Self::require_turn_two_hit(&turn2_cache, &turn1_ids, &turn2_ids)?;
+        drop(store);
+        mlx_rs::memory::clear_cache();
+        Ok((
+            output,
+            crate::campaign::MultiTurnPromptCacheTurns {
+                turn1: turn1_cache,
+                turn2: turn2_cache,
+            },
+        ))
+    }
+
+    /// The multi-turn fixture's turn-2 forced continuation (SC-20671 contract v4): turn 1 exactly
+    /// as [`Self::campaign_multi_turn_observed`] runs it, then turn 2's prompt served by the same
+    /// prompt-cache hit (dense seed, or with `packed` the compressed import) and greedily decoded
+    /// for `min(tokens, context window - turn 2 prompt)` ids through every stop token. With
+    /// `teacher_forced`, the decode is forced on that stream and the session's argmax at every
+    /// position is returned. A compressed pass must run wholly on the fused reader.
+    pub(crate) fn campaign_multi_turn_forced_continuation(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        tokens: usize,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+        teacher_forced: Option<&[i32]>,
+    ) -> CoreResult<(Vec<i32>, crate::campaign::MultiTurnPromptCacheTurns)> {
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "the multi-turn prompt-cache fixture requires the causal decoder's prefix cache"
+                    .into(),
+            ));
+        };
+        let mut store = crate::decode::PrefixCache::new(2);
+        let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
+        let turn2 = Self::campaign_turn_two_request(turn1, &answer, follow_up);
+        let (_, turn2_ids) = self.render_prompt(&turn2, &turn2.messages)?;
+        let window = usize::try_from(self.campaign_context_window()?)
+            .map_err(|_| CoreError::Load("context window overflows usize".into()))?;
+        let length = match teacher_forced {
+            Some(forced) => forced.len(),
+            None => tokens.min(window.saturating_sub(turn2_ids.len())),
+        };
+        let budget = u32::try_from(length)
+            .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            turn2_ids.len(),
+            budget,
+        )?;
+        let before = store.stats();
+        let measured = crate::decode::prefix::forced_cached_decode(
+            model,
+            &turn2_ids,
+            &mut store,
+            packed,
+            length,
+            &self.stop_tokens,
+            teacher_forced,
+        );
+        let turn2_cache = prompt_cache_turn(before, &store, turn2_ids.len());
+        drop(store);
+        mlx_rs::memory::clear_cache();
+        let measured = measured.map_err(to_core)?;
+        let turn2_cache = turn2_cache?;
+        Self::require_turn_two_hit(&turn2_cache, &turn1_ids, &turn2_ids)?;
+        if packed.is_some() {
+            let fused = measured.fallbacks.is_empty()
+                && measured.packed_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.accepted_direct_calls > 0
+                        && evidence.fallback_reasons.is_empty()
+                        && !evidence.dense_active
+                        && evidence.full_cache_dequantizations == 0
+                        && evidence.failed_dispatches == 0
+                });
+            if !fused {
+                return Err(CoreError::Load(
+                    "compressed multi-turn forced continuation did not run wholly on the fused \
+                     compressed reader"
+                        .into(),
+                ));
+            }
+        }
+        Ok((
+            measured.decode.tokens,
+            crate::campaign::MultiTurnPromptCacheTurns {
+                turn1: turn1_cache,
+                turn2: turn2_cache,
+            },
+        ))
     }
 
     fn generate_inner(
@@ -2287,6 +2518,7 @@ impl LlamaProvider {
         on_event: &mut dyn FnMut(CoreEvent),
         observer: Option<&mut dyn crate::campaign::Observer>,
         packed: Option<&crate::campaign::CompressedKvArm>,
+        prefix_cache: Option<&mut crate::decode::PrefixCache>,
     ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;
         if req.cancel.is_cancelled() {
@@ -2322,6 +2554,11 @@ impl LlamaProvider {
                 "compressed campaign decode supports only observed text generation".into(),
             ));
         }
+        if prefix_cache.is_some() && (observer.is_none() || multimodal || gemma4_mm_request) {
+            return Err(CoreError::Unsupported(
+                "campaign prompt-cache decode supports only observed text generation".into(),
+            ));
+        }
         let substituted;
         let messages: &[Message] = if gemma4_mm_request {
             substituted = substitute_gemma4_placeholders(&req.messages)?;
@@ -2333,29 +2570,7 @@ impl LlamaProvider {
             &req.messages
         };
 
-        // Render the conversation and tokenize. The template already includes BOS, so encode
-        // without auto special tokens. `enable_thinking` (sc-7585) flows into the template kwarg so
-        // a no-think (Disabled) request injects the model's empty `<think></think>` generation
-        // prompt; Auto omits the kwarg (template default).
-        let prompt = self.template.render_with(
-            messages,
-            &RenderOptions {
-                add_generation_prompt: true,
-                enable_thinking: req.enable_thinking_kwarg(),
-                // Bonsai's official model card does not recommend `low` as an effective distinct
-                // level, so it is omitted from the selectable capability list. The frozen template
-                // still accepts and renders `low`; preserve that compatibility input verbatim.
-                reasoning_effort: req.reasoning_effort,
-                preserve_thinking: req.preserve_thinking,
-                tools: &req.tools,
-            },
-        )?;
-        let prompt_ids: Vec<i32> = self
-            .tokenizer
-            .encode(&prompt, false)?
-            .into_iter()
-            .map(|id| id as i32)
-            .collect();
+        let (prompt, prompt_ids) = self.render_prompt(req, messages)?;
 
         // MLX uses unified memory. Admit from a fresh host availability snapshot before visual
         // preprocessing or model execution, using pure request geometry for visual expansion.
@@ -2732,16 +2947,40 @@ impl LlamaProvider {
                                 Some(packed) => packed,
                                 None => &self.model,
                             };
-                            let output = generate_with_observer(
-                                decoder,
-                                &prompt_ids,
-                                &config,
-                                &req.cancel,
-                                &mut sink,
-                                json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
-                                should_stop_opt,
-                                Some(&mut *observer),
-                            )
+                            let output = match (prefix_cache, &self.model) {
+                                // The product prompt-cache path (SC-20671 multi-turn fixture):
+                                // a hit seeds the dense cache or imports into the packed one.
+                                (Some(store), Decoder::Causal(model)) => {
+                                    crate::decode::prefix::generate_cached_with_observer(
+                                        model,
+                                        &prompt_ids,
+                                        &config,
+                                        &req.cancel,
+                                        &mut sink,
+                                        store,
+                                        json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                        should_stop_opt,
+                                        Some(&mut *observer),
+                                        packed,
+                                    )
+                                }
+                                (Some(_), Decoder::Qwen35(_)) => {
+                                    return Err(CoreError::Unsupported(
+                                        "the campaign prompt cache requires the causal decoder"
+                                            .into(),
+                                    ))
+                                }
+                                (None, _) => generate_with_observer(
+                                    decoder,
+                                    &prompt_ids,
+                                    &config,
+                                    &req.cancel,
+                                    &mut sink,
+                                    json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                    should_stop_opt,
+                                    Some(&mut *observer),
+                                ),
+                            }
                             .map_err(to_core)?;
                             for reason in packed_decoder
                                 .map(|packed| packed.selection_fallbacks.into_inner())
@@ -4810,6 +5049,181 @@ mod tests {
         );
         assert_eq!(hit_tokens, dense_tokens, "compressed reuse vs dense turn 2");
         assert_eq!(cold_tokens, dense_tokens, "compressed cold vs dense turn 2");
+    }
+
+    /// A tiny packed-capable on-disk snapshot (head dim 64, 32-word vocabulary, a 2048-token
+    /// window, no reachable stop token) the provider loads like a real one.
+    fn tiny_packed_capable_snapshot() -> tempfile::TempDir {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let dir = tempfile::tempdir().unwrap();
+        let mut vocab = serde_json::Map::new();
+        for (id, word) in ["<unk>", "<|", "|>", "user", "assistant", "eot_id"]
+            .into_iter()
+            .map(String::from)
+            .chain((6..32).map(|id| format!("w{id}")))
+            .enumerate()
+        {
+            vocab.insert(word, json!(id));
+        }
+        let tokenizer = json!({
+            "version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" }, "post_processor": null, "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
+        });
+        std::fs::write(dir.path().join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let config = json!({
+            "architectures": ["LlamaForCausalLM"], "hidden_size": 128,
+            "intermediate_size": 64, "num_hidden_layers": 2, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 64, "vocab_size": 32, "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0, "tie_word_embeddings": false,
+            "max_position_embeddings": 2048, "eos_token_id": 99,
+        });
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let mut rng = SplitMix64::new(0x5c20671);
+        let mut randn = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+            Array::from_slice(&data, shape)
+        };
+        let mut arrays = vec![
+            (
+                "model.embed_tokens.weight".to_string(),
+                randn(&[32, 128]) * 4.0f32,
+            ),
+            (
+                "model.norm.weight".into(),
+                Array::ones::<f32>(&[128]).unwrap(),
+            ),
+        ];
+        // A head partly aligned with the embeddings gives decisive next-token margins (a random
+        // head over 32 words leaves bf16-rounding ties that flip even dense against dense), while
+        // the attention path still moves the argmax (2-bit K/V flips positions).
+        let head = &arrays[0].1 * 4.0f32 + randn(&[32, 128]);
+        arrays.push(("lm_head.weight".into(), head));
+        for i in 0..2 {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            arrays.extend([
+                (
+                    p("input_layernorm.weight"),
+                    Array::ones::<f32>(&[128]).unwrap(),
+                ),
+                (
+                    p("post_attention_layernorm.weight"),
+                    Array::ones::<f32>(&[128]).unwrap(),
+                ),
+                (p("self_attn.q_proj.weight"), randn(&[128, 128])),
+                (p("self_attn.k_proj.weight"), randn(&[64, 128])),
+                (p("self_attn.v_proj.weight"), randn(&[64, 128])),
+                (p("self_attn.o_proj.weight"), randn(&[128, 128])),
+                (p("mlp.gate_proj.weight"), randn(&[64, 128])),
+                (p("mlp.up_proj.weight"), randn(&[64, 128])),
+                (p("mlp.down_proj.weight"), randn(&[128, 64])),
+            ]);
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
+
+    /// SC-20671 contract v4 multi-turn prompt-cache fixture on the product provider path, at
+    /// 8-bit. Turn 1 runs and stores its K/V; turn 2 (turn 1's conversation, answer and a
+    /// follow-up) is served by a prompt-cache hit in both arms — the compressed arm importing the
+    /// prefix — and the compressed arm, teacher-forced on the dense turn-2 forced continuation,
+    /// agrees at >= 0.999 of 1024 positions. A turn 2 the cache did not serve is refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn multi_turn_prompt_cache_fixture_agrees_at_8_bit_and_requires_a_turn_two_hit() {
+        let snapshot = tiny_packed_capable_snapshot();
+        let provider = LlamaProvider::load_for_campaign(&core_llm::LoadSpec::dense(
+            snapshot.path().to_string_lossy().to_string(),
+        ))
+        .unwrap();
+        let words = (0..70)
+            .map(|i| format!("w{}", (i * 7) % 26 + 6))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let turn1 = TextLlmRequest {
+            messages: vec![Message::text(Role::User, words)],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 8,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let follow_up = "w7 w9 w11 w13 w15 w17 w19 w21 w23";
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine8
+            .arm()
+            .unwrap();
+
+        let (reference, dense_turns) = provider
+            .campaign_multi_turn_forced_continuation(&turn1, follow_up, 1024, None, None)
+            .unwrap();
+        assert_eq!(reference.len(), 1024, "every stop token is decoded through");
+        let (choices, compressed_turns) = provider
+            .campaign_multi_turn_forced_continuation(
+                &turn1,
+                follow_up,
+                1024,
+                Some(&arm),
+                Some(&reference),
+            )
+            .unwrap();
+        dense_turns.validate("dense").unwrap();
+        assert!(
+            dense_turns.turn2.reused_prefix_tokens >= dense_turns.turn1.prompt_tokens,
+            "turn 2 reuses all of turn 1's prompt: {dense_turns:?}"
+        );
+        assert_eq!(compressed_turns, dense_turns, "the same flow in both arms");
+        let evidence =
+            crate::campaign::multi_turn_forced_continuation_evidence(&reference, &choices).unwrap();
+        eprintln!(
+            "mtpc v4: 8-bit turn-2 teacher-forced agreement {} ({}/{}; flips {:?})",
+            evidence.agreement, evidence.matches, evidence.tokens, evidence.first_flip_positions
+        );
+        assert!(
+            evidence.agreement >= crate::campaign::COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN,
+            "{evidence:?}"
+        );
+
+        // The observed fixture: both arms' turn 2 is the same prompt-cache hit.
+        let observed = |packed: Option<&crate::campaign::CompressedKvArm>| {
+            let mut capture = CompressedArmCapture::default();
+            let (output, turns) = provider
+                .campaign_multi_turn_observed(&turn1, follow_up, &mut |_| {}, &mut capture, packed)
+                .unwrap();
+            assert!(capture.fallbacks.is_empty(), "{:?}", capture.fallbacks);
+            (output.text, turns, capture.evidence)
+        };
+        let (dense_text, dense_observed, dense_evidence) = observed(None);
+        let (compressed_text, compressed_observed, compressed_evidence) = observed(Some(&arm));
+        assert_eq!(dense_observed, dense_turns);
+        assert_eq!(compressed_observed, dense_turns);
+        assert!(dense_evidence.is_empty(), "the dense arm stays dense");
+        assert!(
+            !compressed_evidence.is_empty()
+                && compressed_evidence
+                    .iter()
+                    .all(|e| e.accepted_direct_calls > 0 && !e.dense_active),
+            "turn 2 decodes on the fused reader over the imported prefix"
+        );
+        assert!(!dense_text.is_empty() && !compressed_text.is_empty());
+
+        // A turn 2 the cache did not serve is refused.
+        let mut store = crate::decode::PrefixCache::new(2);
+        let (answer, _, turn1_ids) = provider.campaign_turn_one(&turn1, &mut store).unwrap();
+        let turn2 = LlamaProvider::campaign_turn_two_request(&turn1, &answer, follow_up);
+        let (_, turn2_ids) = provider.render_prompt(&turn2, &turn2.messages).unwrap();
+        let missed = crate::campaign::PromptCacheTurn {
+            prompt_tokens: turn2_ids.len() as u64,
+            cache_hit: false,
+            reused_prefix_tokens: 0,
+        };
+        let error = LlamaProvider::require_turn_two_hit(&missed, &turn1_ids, &turn2_ids)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not served by a prompt-cache hit"),
+            "{error}"
+        );
     }
 
     /// A packed cache whose retained reader fails to bind still records the selection's own

@@ -789,10 +789,44 @@ pub(crate) fn forced_greedy_decode(
     teacher_forced: Option<&[i32]>,
     boundary: &mut dyn FnMut(&Array),
 ) -> Result<ForcedDecode> {
+    forced_greedy_decode_from(
+        decoder,
+        cache,
+        prompt_ids,
+        0,
+        tokens,
+        stop_tokens,
+        teacher_forced,
+        boundary,
+    )
+}
+
+/// [`forced_greedy_decode`] over a `cache` that already holds the first `prefilled` prompt ids (a
+/// prompt-cache hit, SC-20671 multi-turn fixture): only the uncached suffix is prefilled, at its
+/// true position, before the identical forced decode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_greedy_decode_from(
+    decoder: &dyn Decode,
+    cache: &mut dyn KvCache,
+    prompt_ids: &[i32],
+    prefilled: usize,
+    tokens: usize,
+    stop_tokens: &[i32],
+    teacher_forced: Option<&[i32]>,
+    boundary: &mut dyn FnMut(&Array),
+) -> Result<ForcedDecode> {
     if prompt_ids.is_empty() || tokens < 2 {
         return Err(Error::Msg(
             "forced steady decode needs a prompt and at least two tokens".into(),
         ));
+    }
+    if prefilled >= prompt_ids.len() || cache.offset() != prefilled as i32 {
+        return Err(Error::Msg(format!(
+            "forced decode over a {prefilled}-token prefix needs a cache holding exactly that \
+             prefix of a longer prompt (cache offset {}, prompt {})",
+            cache.offset(),
+            prompt_ids.len()
+        )));
     }
     if teacher_forced.is_some_and(|forced| forced.len() != tokens) {
         return Err(Error::Msg(
@@ -804,7 +838,11 @@ pub(crate) fn forced_greedy_decode(
     let mut history = prompt_ids.to_vec();
     let mut release = BufferRelease::new();
     let mut generated: Vec<i32> = Vec::with_capacity(tokens);
-    let mut logits = decoder.step(&input_ids(prompt_ids), cache, 0)?;
+    let mut logits = decoder.step(
+        &input_ids(&prompt_ids[prefilled..]),
+        cache,
+        prefilled as i32,
+    )?;
     let mut opened: Option<Instant> = None;
     let mut closed: Option<Instant> = None;
     for step in 0..tokens {
