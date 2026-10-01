@@ -187,7 +187,9 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertNotIn("yue2_precision_proof.py run", job)
         for required in ("cuDeviceGetLuid", "cuDeviceGetPCIBusId", "Get-Counter",
                          "Get-AuthenticodeSignature", "process-before", "process-after",
-                         "compute-apps-$gpu-$i", "pmon-$gpu-$i", "driverInitializationOnly"):
+                         "compute-apps-$gpu-$i", "pmon-$gpu-$i", "driverInitializationOnly",
+                         "-ListSet $name", "windows-counter-catalog.json",
+                         "GPU Process Memory(*)\\Dedicated Usage", "GPU Process Memory(*)\\Shared Usage"):
             self.assertIn(required, probe)
         for forbidden in ("extern int cuCtxCreate", "extern int cuDevicePrimaryCtxRetain",
                           "extern int cudaMalloc", "Start-Process", "Stop-Process"):

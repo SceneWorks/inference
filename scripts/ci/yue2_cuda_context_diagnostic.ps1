@@ -43,7 +43,10 @@ function Save-ProcessIdentity($Name) {
 }
 function Save-Counters($Name) {
     $at = (Get-Date).ToUniversalTime().ToString('o')
-    $patterns = @('\GPU Engine(*)\Utilization Percentage', '\GPU Process Memory(*)\Local Usage', '\GPU Process Memory(*)\Non Local Usage', '\GPU Adapter Memory(*)\Dedicated Usage')
+    $patterns = @('\GPU Engine(*)\Utilization Percentage',
+                  '\GPU Process Memory(*)\Dedicated Usage', '\GPU Process Memory(*)\Shared Usage',
+                  '\GPU Process Memory(*)\Local Usage', '\GPU Process Memory(*)\Non Local Usage',
+                  '\GPU Process Memory(*)\Total Committed', '\GPU Adapter Memory(*)\Dedicated Usage')
     $results = @()
     foreach ($pattern in $patterns) {
         try {
@@ -55,6 +58,20 @@ function Save-Counters($Name) {
         } catch { $results += @{ counter = $pattern; error = $_.Exception.Message } }
     }
     Save-Json "$Name.json" @{ utc = $at; targetPid = $TargetPid; counters = $results }
+}
+function Save-CounterCatalog {
+    $at = (Get-Date).ToUniversalTime().ToString('o')
+    $sets = @()
+    foreach ($name in @('GPU Engine', 'GPU Process Memory', 'GPU Adapter Memory')) {
+        try {
+            $set = Get-Counter -ListSet $name -ErrorAction Stop
+            $instances = @($set.PathsWithInstances | Where-Object {
+                $name -eq 'GPU Adapter Memory' -or $_ -match "(^|_)pid_$TargetPid(_|$)"
+            })
+            $sets += @{ name = $name; paths = @($set.Paths); targetOrAdapterInstances = $instances }
+        } catch { $sets += @{ name = $name; error = $_.Exception.Message } }
+    }
+    Save-Json 'windows-counter-catalog.json' @{ utc = $at; targetPid = $TargetPid; sets = $sets }
 }
 
 # CUDA Driver property APIs expose PCI bus ID and Windows adapter LUID for the
@@ -105,6 +122,7 @@ public static class Yue2CudaAdapterProperties {
 $started = (Get-Date).ToUniversalTime().ToString('o')
 Save-Json 'manifest.json' @{ schemaVersion = 1; purpose = 'diagnostic only, no idle verdict'; engineSha = $EngineSha; controlSha = $ControlSha; runner = $env:RUNNER_NAME; targetPid = $TargetPid; startedUtc = $started; completed = $false }
 Save-ProcessIdentity 'process-before'
+Save-CounterCatalog
 for ($i = 0; $i -lt 3; $i++) {
     Invoke-Smi "gpu-sample-$i" @('--query-gpu=index,uuid,pci.bus_id,name,driver_version,memory.total,memory.used,utilization.gpu,utilization.memory', '--format=csv,noheader,nounits')
     Invoke-Smi "driver-mode-$i" @('--query-gpu=index,uuid,driver_model.current,display_active', '--format=csv,noheader')
