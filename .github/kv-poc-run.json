@@ -1,0 +1,8 @@
+{
+  "mode": "w1",
+  "inference_ref": "4b7b0a915839b39ee39e21dbf673d1acc53680db",
+  "sceneworks_ref": "9a6f2bbfa302eb355b7f9c18967af902306dc6f2",
+  "runner_label": "rw-krea",
+  "phases": "a2",
+  "a2_methods": "group-affine-4"
+}
