@@ -1,0 +1,7 @@
+{
+  "mode": "w2",
+  "inference_ref": "565d8bc71c8c8b331c77f714f50846a24c17f227",
+  "sceneworks_ref": "9a6f2bbfa302eb355b7f9c18967af902306dc6f2",
+  "runner_label": "nax",
+  "phases": "c,d,d-control"
+}
