@@ -2,7 +2,7 @@
 //!
 //! K codes are token-group packed (`[B,H,groups,G·D·b/8]`, one f16 scale/zero per group and
 //! channel) and V codes are channel-group packed (`[B,H,tokens,D·b/8]`, one f16 scale/zero per token
-//! and channel group), for a code width `b` of 2 or 4 ([`PackedCodeBits`]). Every kernel takes `b`
+//! and channel group), for a code width `b` of 2, 4, or 8 ([`PackedCodeBits`]). Every kernel takes `b`
 //! as the compile-time template argument `BITS`, so each width is its own pipeline specialization
 //! and the decode loops carry no width branch. The not-yet-quantized residual of each (at most one quantization group of the
 //! most recent tokens) is a separate dense `[B,H,residual_capacity,D]` input, so the reader never
@@ -415,7 +415,7 @@ template <typename T> struct sc20676_device_element<device T*> { using type = T;
 // `EPL` codes starting at code `index` (a multiple of `EPL`): the lane's contiguous channels.
 template <int EPL, int BITS>
 inline void sc20676_unpack(const device uint8_t* base, uint index, thread uint* codes) {
-    static_assert(BITS == 2 || BITS == 4, "packed codes are 2 or 4 bits wide");
+    static_assert(BITS == 2 || BITS == 4 || BITS == 8, "packed codes are 2, 4, or 8 bits wide");
     constexpr uint PER_BYTE = 8u / uint(BITS);
     constexpr uint MASK = (1u << uint(BITS)) - 1u;
     if (uint(EPL) < PER_BYTE) {
@@ -432,10 +432,11 @@ inline void sc20676_unpack(const device uint8_t* base, uint index, thread uint* 
     }
 }
 
-// Four codes starting at code `index` (a multiple of four) as floats: one byte at 2 bits, two at 4.
+// Four codes starting at code `index` (a multiple of four) as floats: one byte at 2 bits, two at 4,
+// four at 8.
 template <int BITS>
 inline float4 sc20676_codes4(const device uint8_t* base, uint index) {
-    static_assert(BITS == 2 || BITS == 4, "packed codes are 2 or 4 bits wide");
+    static_assert(BITS == 2 || BITS == 4 || BITS == 8, "packed codes are 2, 4, or 8 bits wide");
     constexpr uint PER_BYTE = 8u / uint(BITS);
     constexpr uint MASK = (1u << uint(BITS)) - 1u;
     uint word = 0;
@@ -1446,6 +1447,8 @@ fn validate_dispatch(args: &PackedAttentionArgs<'_>) -> Result<ValidatedDispatch
 pub const PACKED_METAL_DEFAULT_IDENTITY: &str = "sc-20676-packed-group-affine-v1";
 /// Cache identity of the 4-bit SC-20676 packed group-affine reader.
 pub const PACKED_METAL_B4_IDENTITY: &str = "sc-20676-packed-group-affine-b4-v1";
+/// Cache identity of the 8-bit SC-20676 packed group-affine reader.
+pub const PACKED_METAL_B8_IDENTITY: &str = "sc-20676-packed-group-affine-b8-v1";
 
 /// Cache identity of the SC-20676 packed group-affine reader for `bits`-wide codes. The 2-bit
 /// identity predates the 4-bit representation and is kept for receipt continuity.
@@ -1453,6 +1456,7 @@ pub const fn packed_metal_identity(bits: PackedCodeBits) -> &'static str {
     match bits {
         PackedCodeBits::Two => PACKED_METAL_DEFAULT_IDENTITY,
         PackedCodeBits::Four => PACKED_METAL_B4_IDENTITY,
+        PackedCodeBits::Eight => PACKED_METAL_B8_IDENTITY,
     }
 }
 

@@ -1,6 +1,6 @@
 //! SC-20677 matched-budget comparison harness.
 //!
-//! Runs the existing group-affine reader (SC-20675/SC-20676, 2-bit and 4-bit codes) and every
+//! Runs the existing group-affine reader (SC-20675/SC-20676, 2-, 4- and 8-bit codes) and every
 //! [`super::rvq`] and
 //! [`super::rabitq`] configuration over the same K/V and query, then emits one JSON report with
 //! provenance, exact resident bytes, attention error against an exact fp32 attention over the
@@ -54,6 +54,7 @@ const fn group_affine_identity(bits: PackedCodeBits) -> &'static str {
     match bits {
         PackedCodeBits::Two => "sc-20677-group-affine-b2-g32",
         PackedCodeBits::Four => "sc-20677-group-affine-b4-g32",
+        PackedCodeBits::Eight => "sc-20677-group-affine-b8-g32",
     }
 }
 
@@ -706,8 +707,8 @@ fn measure_accepted(
 /// `(family, config, candidate-or-construction-refusal)`.
 pub type CandidateEntry = (String, String, Result<Box<dyn CompressedKvCandidate>>);
 
-/// The comparison set (E5): the group-affine reader at the incumbent 2-bit and the 4-bit code
-/// width, packed RVQ at 1..=3 bits per stage for K and V independently, and both RaBitQ score
+/// The comparison set (E5): the group-affine reader at the incumbent 2-bit and the 4- and 8-bit
+/// code widths, packed RVQ at 1..=3 bits per stage for K and V independently, and both RaBitQ score
 /// estimators.
 pub fn candidate_set(batch: usize, kv_heads: usize, head_dim: usize) -> Vec<CandidateEntry> {
     let mut set: Vec<CandidateEntry> = Vec::new();
@@ -1178,6 +1179,7 @@ mod tests {
     const QUALITY_CEILINGS: &[(&str, f64)] = &[
         ("b2-g32", 0.82),
         ("b4-g32", 0.135),
+        ("b8-g32", 0.008),
         ("k1x2-v1x2", 0.62),
         ("k1x2-v2x2", 0.49),
         ("k1x2-v3x2", 0.46),
@@ -1374,7 +1376,7 @@ mod tests {
         };
         let case = synthetic_case(shape, 7, PackedAttentionMask::Causal, None);
         let report = compare_case(&case, 1, &[], &[]).unwrap();
-        assert_eq!(report.results.len(), 2 + 9 + 4);
+        assert_eq!(report.results.len(), 3 + 9 + 4);
         let error = |config: &str| {
             report
                 .results
@@ -1391,6 +1393,7 @@ mod tests {
             );
         }
         // Finer group-affine codes and more RVQ bits must strictly reduce attention error.
+        assert!(error("b8-g32") < error("b4-g32"));
         assert!(error("b4-g32") < error("b2-g32"));
         assert!(error("k3x2-v3x2") < error("k2x2-v2x2"));
         assert!(error("k2x2-v2x2") < error("k1x2-v1x2"));
@@ -1463,6 +1466,7 @@ mod tests {
         let families: Vec<Box<dyn CompressedKvCandidate>> = vec![
             Box::new(GroupAffineCandidate::new(PackedCodeBits::Two, 1, 2, 128).unwrap()),
             Box::new(GroupAffineCandidate::new(PackedCodeBits::Four, 1, 2, 128).unwrap()),
+            Box::new(GroupAffineCandidate::new(PackedCodeBits::Eight, 1, 2, 128).unwrap()),
             Box::new(
                 RvqKvCandidate::new(
                     RvqConfig {

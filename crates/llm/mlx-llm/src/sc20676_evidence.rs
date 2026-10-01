@@ -3344,14 +3344,14 @@ fn bind_identity_kv_bits(identity: &mut serde_json::Value, bits: PackedCodeBits)
     }
 }
 
-/// `--kv-bits 2|4` (default 2): the packed arms' code width.
+/// `--kv-bits 2|4|8` (default 2): the packed arms' code width.
 fn kv_bits_flag(args: &[String]) -> std::result::Result<PackedCodeBits, String> {
     match args.iter().position(|arg| arg == "--kv-bits") {
         None => Ok(PackedCodeBits::Two),
         Some(index) => args
             .get(index + 1)
             .and_then(|value| value.parse::<u8>().ok())
-            .ok_or_else(|| "--kv-bits requires 2 or 4".to_string())
+            .ok_or_else(|| "--kv-bits requires 2, 4, or 8".to_string())
             .and_then(|bits| PackedCodeBits::from_bits(bits).map_err(|e| e.to_string())),
     }
 }

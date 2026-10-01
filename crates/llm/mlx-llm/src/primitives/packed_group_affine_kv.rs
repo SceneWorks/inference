@@ -1,7 +1,8 @@
 //! Physically packed group-affine KV representation (SC-20675) and its SC-20676 decoder route.
 //!
 //! Codes are [`PackedCodeBits`] wide (2-bit: four per byte, the SC-20673 qualified candidate;
-//! 4-bit: two per byte, the KIVI-style candidate) and each group has an f16 scale and zero. The
+//! 4-bit: two per byte, the KIVI-style candidate; 8-bit: one per byte) and each group has an f16
+//! scale and zero. The
 //! code width is a property of the cache and of its reader; a snapshot records it and a reader or
 //! snapshot of another width is refused. Two stores share one device layout:
 //!
@@ -37,7 +38,7 @@ use mlx_rs::{Array, Dtype};
 
 const MAGIC: &[u8; 8] = b"SW20675\0";
 const VERSION: u32 = 2;
-/// SC-20673 qualified the `b=2,g=32` group-affine candidate; `b=4,g=32` shares the group. K groups
+/// SC-20673 qualified the `b=2,g=32` group-affine candidate; `b=4` and `b=8` share the group. K groups
 /// span tokens and V groups span channels, but both use this same quantization group width.
 pub const PACKED_METAL_QUANT_GROUP_SIZE: usize = 32;
 
@@ -51,15 +52,18 @@ pub enum PackedCodeBits {
     Two,
     /// KIVI-style `b=4` (two codes per byte).
     Four,
+    /// `b=8` (one code per byte).
+    Eight,
 }
 
 impl PackedCodeBits {
-    pub const ALL: [Self; 2] = [Self::Two, Self::Four];
+    pub const ALL: [Self; 3] = [Self::Two, Self::Four, Self::Eight];
 
     pub const fn bits(self) -> u8 {
         match self {
             Self::Two => 2,
             Self::Four => 4,
+            Self::Eight => 8,
         }
     }
 
@@ -68,8 +72,9 @@ impl PackedCodeBits {
         match bits {
             2 => Ok(Self::Two),
             4 => Ok(Self::Four),
+            8 => Ok(Self::Eight),
             other => Err(Error::Config(format!(
-                "packed group-affine code width {other} is unsupported (expected 2 or 4)"
+                "packed group-affine code width {other} is unsupported (expected 2, 4, or 8)"
             ))),
         }
     }
@@ -81,7 +86,7 @@ impl PackedCodeBits {
 
     /// Largest code (`2^bits − 1`).
     pub const fn max_code(self) -> u8 {
-        (1u8 << self.bits()) - 1
+        ((1u16 << self.bits()) - 1) as u8
     }
 
     /// Quantization step divisor `2^bits − 1`, exactly as the GPU quantizer uses it.
@@ -4155,7 +4160,7 @@ mod tests {
     fn code_width_is_recorded_and_a_snapshot_of_another_width_is_refused_without_mutation() {
         assert_eq!(PackedCodeBits::from_bits(2).unwrap(), PackedCodeBits::Two);
         assert_eq!(PackedCodeBits::from_bits(4).unwrap(), PackedCodeBits::Four);
-        for unsupported in [0, 1, 3, 8] {
+        for unsupported in [0, 1, 3, 16] {
             assert!(PackedCodeBits::from_bits(unsupported).is_err());
         }
         assert_eq!(
@@ -4165,10 +4170,18 @@ mod tests {
             ),
             (2, 15)
         );
-        for (stored, other) in [
-            (PackedCodeBits::Two, PackedCodeBits::Four),
-            (PackedCodeBits::Four, PackedCodeBits::Two),
-        ] {
+        assert_eq!(
+            (
+                PackedCodeBits::Eight.codes_per_byte(),
+                PackedCodeBits::Eight.max_code()
+            ),
+            (1, 255)
+        );
+        for (stored, other) in PackedCodeBits::ALL
+            .into_iter()
+            .flat_map(|stored| PackedCodeBits::ALL.map(|other| (stored, other)))
+            .filter(|(stored, other)| stored != other)
+        {
             let payload = data(3, 1, 8, -2.0);
             let mut source =
                 PackedGroupAffineKvCache::with_bits("m", 1, 1, 1, 8, 4, stored).unwrap();
@@ -4247,6 +4260,53 @@ mod tests {
         );
     }
 
+    /// Every cross-width pairing is refused: binding a Metal reader to a cache of another width,
+    /// and dispatching a reader on another width's buffers (before anything is encoded).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn every_cross_width_reader_bind_and_dispatch_fails_closed() {
+        use crate::primitives::packed_metal::{
+            PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+        };
+        for stored in PackedCodeBits::ALL {
+            let mut cache = device_cache_bits(1, 1, 64, stored);
+            let kv = bhsd(&pseudo_random_outliers(1, 1, 40, 64, 3), 1, 1, 40, 64);
+            cache.append_device(0, &kv, &kv).unwrap();
+            let query = bhsd(&[0.1; 64], 1, 1, 1, 64);
+            for reader in PackedCodeBits::ALL
+                .into_iter()
+                .filter(|bits| *bits != stored)
+            {
+                let kernel = PackedMetalKernel::for_identity_family_and_bits(
+                    "test-packed",
+                    PackedMetalGpuFamily::Apple7OrNewer,
+                    reader,
+                )
+                .unwrap();
+                let layer = cache.device_layers[0].as_ref().unwrap();
+                let error = kernel
+                    .dispatch(&layer.args(&query, PackedMask::Causal))
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(&format!(
+                        "reader for {}-bit codes cannot read {}-bit codes",
+                        reader.bits(),
+                        stored.bits()
+                    )),
+                    "{error}"
+                );
+                let error = cache
+                    .bind_compiled_handle(CompiledKernelHandle::new(Arc::new(kernel)))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("compiled handle reads"), "{error}");
+                assert!(cache.compiled_handle().is_none());
+            }
+        }
+    }
+
     /// Stored bytes per resident token and KV head, read from the live storage, are exactly the
     /// representation's arithmetic: `D·b/8` code bytes for K and for V, plus two f16 per channel per
     /// 32-token K group and two f16 per 32-channel V group.
@@ -4255,7 +4315,11 @@ mod tests {
         let (width, group, heads, tokens) = (128, 32, 2, 4096 + 13);
         let keys = pseudo_random_outliers(1, heads, tokens, width, 0x0b17_5eed);
         let values = pseudo_random_outliers(1, heads, tokens, width, 0x5eed_0b17);
-        for (bits, per_token) in [(PackedCodeBits::Two, 96), (PackedCodeBits::Four, 160)] {
+        for (bits, per_token) in [
+            (PackedCodeBits::Two, 96),
+            (PackedCodeBits::Four, 160),
+            (PackedCodeBits::Eight, 288),
+        ] {
             let mut cache =
                 PackedGroupAffineKvCache::with_bits("m", 1, 1, heads, width, group, bits).unwrap();
             cache.append(0, &keys, &values, tokens).unwrap();

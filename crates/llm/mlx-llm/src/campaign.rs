@@ -1325,16 +1325,19 @@ pub enum CompressedKvMethod {
     GroupAffine,
     /// The same cache and reader with 4-bit (KIVI-style) codes, group 32.
     GroupAffine4,
+    /// The same cache and reader with 8-bit codes, group 32.
+    GroupAffine8,
 }
 
 impl CompressedKvMethod {
-    pub const ALL: [Self; 2] = [Self::GroupAffine, Self::GroupAffine4];
+    pub const ALL: [Self; 3] = [Self::GroupAffine, Self::GroupAffine4, Self::GroupAffine8];
 
     /// Stable receipt/CLI identifier.
     pub fn id(self) -> &'static str {
         match self {
             Self::GroupAffine => "group-affine",
             Self::GroupAffine4 => "group-affine-4",
+            Self::GroupAffine8 => "group-affine-8",
         }
     }
 
@@ -1343,6 +1346,7 @@ impl CompressedKvMethod {
         match self {
             Self::GroupAffine => crate::primitives::PackedCodeBits::Two,
             Self::GroupAffine4 => crate::primitives::PackedCodeBits::Four,
+            Self::GroupAffine8 => crate::primitives::PackedCodeBits::Eight,
         }
     }
 
@@ -1369,7 +1373,7 @@ impl CompressedKvMethod {
     /// any device this arm can dispatch on qualifies for the recent-family profile.
     pub fn kernel_gpu_family(self) -> crate::primitives::PackedMetalGpuFamily {
         match self {
-            Self::GroupAffine | Self::GroupAffine4 => {
+            Self::GroupAffine | Self::GroupAffine4 | Self::GroupAffine8 => {
                 crate::primitives::PackedMetalGpuFamily::Apple7OrNewer
             }
         }
@@ -1378,7 +1382,7 @@ impl CompressedKvMethod {
     /// Build this method's retained fused reader once per campaign session.
     pub fn arm(self) -> Result<CompressedKvArm, String> {
         let reader = match self {
-            Self::GroupAffine | Self::GroupAffine4 => {
+            Self::GroupAffine | Self::GroupAffine4 | Self::GroupAffine8 => {
                 let kernel = crate::primitives::PackedMetalKernel::for_identity_family_and_bits(
                     self.representation_identity(),
                     self.kernel_gpu_family(),
@@ -1426,7 +1430,9 @@ impl CompressedKvArm {
         model: &crate::models::CausalLm,
     ) -> crate::primitives::DecoderCacheSelection {
         match self.method {
-            CompressedKvMethod::GroupAffine | CompressedKvMethod::GroupAffine4 => {
+            CompressedKvMethod::GroupAffine
+            | CompressedKvMethod::GroupAffine4
+            | CompressedKvMethod::GroupAffine8 => {
                 model.select_cache_with_packed_reader(self.reader.clone(), 1, 1, false)
             }
         }
@@ -1436,7 +1442,9 @@ impl CompressedKvArm {
     /// dequantize-then-attend reference over the exact stored codes.
     pub fn kernel_parity_errors(&self) -> Result<Vec<f64>, String> {
         match self.method {
-            CompressedKvMethod::GroupAffine | CompressedKvMethod::GroupAffine4 => {
+            CompressedKvMethod::GroupAffine
+            | CompressedKvMethod::GroupAffine4
+            | CompressedKvMethod::GroupAffine8 => {
                 crate::primitives::group_affine_kernel_fp32_parity_errors(&self.reader)
             }
         }
@@ -6145,7 +6153,8 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 /// `--mode compressed --kv-method <method>` (parent, preflight, and worker) runs every scheduled
 /// row with its KV held in that method's compressed cache and fused decode attention, gated
 /// against a dense-KV reference arm on the same candidate weights (SC-20676). Methods:
-/// `group-affine` (2-bit codes) and `group-affine-4` (4-bit codes), both group 32. The GPU-window
+/// `group-affine` (2-bit codes), `group-affine-4` (4-bit) and `group-affine-8` (8-bit), all group
+/// 32. The GPU-window
 /// launch of the compressed campaign is one command from the inference checkout:
 ///
 /// ```text
@@ -14126,21 +14135,28 @@ pub(crate) mod tests {
         };
         const B2: &str = "sc-20676-packed-group-affine-v1";
         const B4: &str = "sc-20676-packed-group-affine-b4-v1";
-        validate(&set("group-affine", 2, B2)).unwrap();
-        validate(&set("group-affine-4", 4, B4)).unwrap();
-        for (method, bits, identity) in [
-            ("group-affine-4", 2, B2),
-            ("group-affine-4", 4, B2),
-            ("group-affine-4", 2, B4),
-            ("group-affine", 4, B4),
-            ("group-affine", 2, B4),
-            ("group-affine", 4, B2),
-        ] {
-            let error = validate(&set(method, bits, identity)).unwrap_err();
-            assert!(
-                error.contains(&format!("compressed method {method} is")),
-                "{method}/{bits}/{identity}: {error}"
-            );
+        const B8: &str = "sc-20676-packed-group-affine-b8-v1";
+        let table = [
+            ("group-affine", 2, B2),
+            ("group-affine-4", 4, B4),
+            ("group-affine-8", 8, B8),
+        ];
+        // Every (method, bits, identity) combination: only the method's own pair validates.
+        for (method, own_bits, own_identity) in table {
+            for (_, bits, _) in table {
+                for (_, _, identity) in table {
+                    let result = validate(&set(method, bits, identity));
+                    if bits == own_bits && identity == own_identity {
+                        result.unwrap();
+                    } else {
+                        let error = result.unwrap_err();
+                        assert!(
+                            error.contains(&format!("compressed method {method} is")),
+                            "{method}/{bits}/{identity}: {error}"
+                        );
+                    }
+                }
+            }
         }
         let error = validate(&set("rvq-unwired", 2, B2)).unwrap_err();
         assert!(error.contains("unknown compressed KV method"), "{error}");
@@ -14186,6 +14202,21 @@ pub(crate) mod tests {
         assert_eq!(
             CompressedKvMethod::GroupAffine4.representation_identity(),
             "sc-20676-packed-group-affine-b4-v1"
+        );
+        assert_eq!(
+            CompressedKvMethod::GroupAffine8.representation_identity(),
+            "sc-20676-packed-group-affine-b8-v1"
+        );
+        assert_eq!(
+            compressed_mode_flags(&args(&[
+                "parent",
+                "--mode",
+                "compressed",
+                "--kv-method",
+                "group-affine-8"
+            ]))
+            .unwrap(),
+            Some(CompressedKvMethod::GroupAffine8)
         );
         for bad in [
             &["--mode", "compressed"][..],
