@@ -234,24 +234,19 @@ impl TextLlmCapabilities {
             )));
         }
 
-        if req.speculative.is_some() && req.mtp != crate::MtpMode::Off {
+        if req.speculative.is_some() && req.mtp.is_some_and(|m| m != crate::MtpMode::Off) {
             return reject(
                 "set either `speculative` or the legacy `mtp`, not both (legacy `mtp` maps onto \
                  `speculative`)"
                     .into(),
             );
         }
-        // An explicit proposer must be advertised and ask for at least one draft. A depth above
-        // the advertised maximum is not refused: `resolve_speculative` clamps it and names the
-        // clamp in the report (sc-24438). `auto` and `off` never refuse (auto resolves to what the
-        // model offers, or runs plain with the reason named).
+        // An explicit proposer must ask for at least one draft — a malformed request. Nothing
+        // else about speculation is refused (epic sc-24432 E2: explicit fallback, never failure):
+        // a proposer the model does not advertise runs plain and `resolve_speculative` names why,
+        // and a depth above the advertised maximum is clamped and the clamp named (sc-24438).
+        // `auto` and `off` never refuse.
         if let crate::Speculative::Proposer { proposer, depth } = req.speculative_mode() {
-            if self.proposer(proposer).is_none() {
-                return Err(Error::Unsupported(format!(
-                    "[{id}] provider does not support speculative decoding with the \
-                     `{proposer}` proposer"
-                )));
-            }
             if depth == 0 {
                 return reject(format!("speculative `{proposer}` depth must be >= 1"));
             }
@@ -358,14 +353,31 @@ mod tests {
         );
     }
 
+    /// E2: an explicit legacy `mtp: enabled` on a model without a head is admitted — it decodes
+    /// plainly with the reason named by the resolver — while a zero draft count stays malformed.
     #[test]
-    fn explicit_mtp_requires_capability_and_valid_draft_count() {
+    fn explicit_mtp_without_a_head_is_admitted_and_a_zero_draft_count_is_refused() {
         let mut req = request();
-        req.mtp = MtpMode::Enabled { draft_tokens: 3 };
-        let err = TextLlmCapabilities::default()
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
+        TextLlmCapabilities::default()
             .validate_request("test", &req)
-            .unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
+            .unwrap();
+        let resolved =
+            crate::resolve_speculative(req.speculative_mode(), &TextLlmCapabilities::default());
+        assert_eq!(resolved.plan, crate::SpeculativePlan::Off);
+        assert_eq!(
+            resolved.fallback.as_deref(),
+            Some(
+                "speculative: `mtp` is not available for this model (this model does not \
+                 advertise it; decoded without a proposer)"
+            )
+        );
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 0 });
+        assert!(matches!(
+            TextLlmCapabilities::default().validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
 
         let caps = TextLlmCapabilities {
             mtp: Some(MtpCapabilities {
@@ -376,14 +388,14 @@ mod tests {
         };
         caps.validate_request("test", &req).unwrap();
 
-        req.mtp = MtpMode::Enabled { draft_tokens: 0 };
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 0 });
         assert!(matches!(
             caps.validate_request("test", &req),
             Err(Error::InvalidRequest(_))
         ));
         // sc-24438: a depth above the advertised maximum is admitted — the resolver clamps it and
         // names the clamp in the report — rather than refused.
-        req.mtp = MtpMode::Enabled { draft_tokens: 5 };
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 5 });
         caps.validate_request("test", &req).unwrap();
     }
 
@@ -426,9 +438,10 @@ mod tests {
         );
     }
 
-    /// sc-24433: an explicit proposer is checked against the per-proposer advertisement (legacy
-    /// MTP included), `auto` never refuses, and the new option and the legacy field cannot both
-    /// be set. (Since sc-24438 a too-deep request is clamped by the resolver, not refused.)
+    /// sc-24433: an explicit proposer is read against the per-proposer advertisement (legacy MTP
+    /// included), `auto` never refuses, and the new option and the legacy field cannot both be
+    /// set. (Since sc-24438 a too-deep request is clamped by the resolver, not refused; since the
+    /// sc-24432 feature-end review an un-advertised proposer is admitted and runs plain, named.)
     #[test]
     fn explicit_proposers_are_checked_per_proposer_and_the_two_fields_cannot_both_be_set() {
         use crate::{Speculative, SpeculativeProposer};
@@ -473,10 +486,23 @@ mod tests {
             caps.validate_request("test", &req),
             Err(Error::InvalidRequest(_))
         ));
+        // Not advertised: admitted (E2), and the resolver runs it plain with the reason named.
         req.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2));
-        let err = caps.validate_request("test", &req).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)));
-        assert!(err.to_string().contains("`draft_model`"), "{err}");
+        caps.validate_request("test", &req).unwrap();
+        let resolved = crate::resolve_speculative(req.speculative_mode(), &caps);
+        assert_eq!(resolved.plan, crate::SpeculativePlan::Off);
+        assert!(
+            resolved
+                .fallback
+                .as_deref()
+                .is_some_and(|why| why.starts_with("speculative: `draft_model` is not available")),
+            "{resolved:?}"
+        );
+        req.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 0));
+        assert!(matches!(
+            caps.validate_request("test", &req),
+            Err(Error::InvalidRequest(_))
+        ));
         req.speculative = Some(Speculative::proposer(SpeculativeProposer::Mtp, 5));
         caps.validate_request("test", &req).unwrap();
         req.speculative = Some(Speculative::Auto);
@@ -484,7 +510,7 @@ mod tests {
             .validate_request("test", &req)
             .unwrap();
 
-        req.mtp = MtpMode::Auto;
+        req.mtp = Some(MtpMode::Auto);
         let err = caps.validate_request("test", &req).unwrap_err();
         assert!(err.to_string().contains("not both"), "{err}");
         req.speculative = None;
@@ -494,7 +520,7 @@ mod tests {
     #[test]
     fn auto_mtp_is_a_safe_fallback_without_capability() {
         let mut req = request();
-        req.mtp = MtpMode::Auto;
+        req.mtp = Some(MtpMode::Auto);
         TextLlmCapabilities::default()
             .validate_request("test", &req)
             .unwrap();

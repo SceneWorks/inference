@@ -221,7 +221,7 @@ fn native_reasoning_json_stop_and_timing_routes() {
                         max_new_tokens: 12,
                         sampling: Sampling::greedy(),
                         thinking: mode,
-                        mtp,
+                        mtp: Some(mtp),
                         constraint: Some(Constraint::Json),
                         ..Default::default()
                     };

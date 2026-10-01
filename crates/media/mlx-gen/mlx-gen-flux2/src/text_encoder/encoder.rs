@@ -13,7 +13,13 @@ use mlx_gen::runtime::CancelFlag;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use mlx_llm::primitives::{sample, ContiguousKvCache, SamplingParams, SplitMix64};
+use mlx_llm::core_llm::{HostSampleReason, SamplerPath};
+use mlx_llm::decode::{
+    generate_speculative, EngineOptions, FinishReason, GenerationConfig, LogitsScope, NoProposer,
+    Pipelining, SampledToken, SpeculativePrompt, SpeculativeTarget, StreamEvent, TargetOutput,
+    TokenSampler, TruncateRollback,
+};
+use mlx_llm::primitives::{sample, ContiguousKvCache, KvCache, SamplingParams, SplitMix64};
 
 use super::generate::UpsampleSampling;
 use super::{join, lin, Qwen3DecoderLayer, TextRope};
@@ -281,9 +287,14 @@ impl Qwen3TextEncoder {
     /// Autoregressive generation from already-built prompt embeds `[1, prompt_len, hidden]` (the
     /// caption-upsampling prompt, whose embeds carry the spliced image features). Returns the
     /// generated token ids with the `eos_token` excluded. Stops at `eos_token` or
-    /// `max_new_tokens`; honors `cancel`. Evals per step so the lazy graph (and the growing K/V
-    /// cache) stays bounded over the up-to-512-token loop — the same per-step-eval discipline the
-    /// denoise loop uses (sc-5522).
+    /// `max_new_tokens`; honors `cancel`.
+    ///
+    /// The decode is the shared MLX engine's token-at-a-time loop ([`generate_speculative`] with
+    /// [`NoProposer`], epic sc-24432 E8) over this tower (`CaptionTarget`), drawing every token
+    /// through `CaptionSampler` — the heap-order host reference [`sample`] the FLUX.2 pipeline is
+    /// pinned to, from its own seeded [`SplitMix64`] — so a seeded caption is token-identical to the
+    /// pre-engine loop. Each draw reads its logits back, which evaluates the step's lazy graph and
+    /// keeps the growing K/V cache bounded over the up-to-512-token loop (sc-5522).
     pub fn generate_from_embeds(
         &self,
         prompt_embeds: &Array,
@@ -302,8 +313,6 @@ impl Qwen3TextEncoder {
         }
         let prompt_len = sh[1];
         let mut cache = ContiguousKvCache::new(self.layers.len());
-        let mut rng = SplitMix64::new(sampling.seed);
-        let mut generated: Vec<i32> = Vec::new();
 
         // The FLUX.2 caption-upsample reference uses plain temperature/top-p sampling: no top-k, no
         // repetition penalty. `temperature <= 0` greedy-argmaxes (lowest-index ties), matching the
@@ -320,27 +329,196 @@ impl Qwen3TextEncoder {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
+        let logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
         logits.eval()?;
-
-        for step in 0..sampling.max_new_tokens {
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let next = sample(&logits, &[], &params, &mut rng, None)
-                .map_err(|e| Error::Msg(e.to_string()))?;
-            if next == eos_token {
-                break;
-            }
-            generated.push(next);
-            if step + 1 == sampling.max_new_tokens {
-                break;
-            }
-            let token = Array::from_slice(&[next], &[1, 1]);
-            logits = self.decode_logits(&token, &mut cache, prompt_len + step as i32)?;
-            logits.eval()?;
+        if sampling.max_new_tokens > 0 && cancel.is_cancelled() {
+            return Err(Error::Canceled);
         }
-        Ok(generated)
+
+        let generation = GenerationConfig {
+            max_new_tokens: sampling.max_new_tokens,
+            sampling: params,
+            seed: Some(sampling.seed),
+            stop_tokens: vec![eos_token],
+        };
+        let mut draw = CaptionSampler::new(params, sampling.seed);
+        let decode_cancel = mlx_llm::CancelFlag::new();
+        let bridged_cancel = decode_cancel.clone();
+        let mut on_event = |_event: StreamEvent| {
+            if cancel.is_cancelled() {
+                bridged_cancel.cancel();
+            }
+        };
+        // The engine's history is the penalty window / n-gram context: the caption draw reads none
+        // (no penalty) and `NoProposer` none, and the prompt exists only as embeds here, so it is
+        // the prompt's length in placeholder ids.
+        let history = vec![0; prompt_len as usize];
+        let run = generate_speculative(
+            &CaptionTarget(self),
+            &mut NoProposer,
+            SpeculativePrompt::Prefilled {
+                cache: &mut cache,
+                logits,
+                hidden: None,
+                history: &history,
+                position_delta: 0,
+            },
+            &generation,
+            0,
+            &decode_cancel,
+            &mut on_event,
+            EngineOptions {
+                sampler: Some(&mut draw),
+                // The host reference draw is read back every step; nothing could pipeline.
+                pipelining: Pipelining::Off,
+                ..EngineOptions::default()
+            },
+        )
+        .map_err(from_llm_decode)?;
+        if run.output.finish_reason == FinishReason::Cancelled {
+            return Err(Error::Canceled);
+        }
+        Ok(run.output.tokens)
+    }
+}
+
+/// The caption-upsampling tower ([`Qwen3TextEncoder::decode_logits`]) as a target of the shared
+/// MLX engine. It serves the token-at-a-time loop only: the tower returns last-position logits, so
+/// a verify forward over drafts is refused, never approximated.
+struct CaptionTarget<'a>(&'a Qwen3TextEncoder);
+
+impl SpeculativeTarget for CaptionTarget<'_> {
+    type Cache = ContiguousKvCache;
+    type Rollback = TruncateRollback;
+
+    fn new_cache(&self) -> ContiguousKvCache {
+        ContiguousKvCache::new(self.0.layers.len())
+    }
+
+    fn cache_len(&self, cache: &ContiguousKvCache) -> i32 {
+        cache.offset()
+    }
+
+    fn rollback(&self, _: usize) -> TruncateRollback {
+        TruncateRollback
+    }
+
+    fn forward(
+        &self,
+        cache: &mut ContiguousKvCache,
+        ids: &Array,
+        rope_offset: i32,
+        scope: LogitsScope,
+        want_hidden: bool,
+    ) -> mlx_llm::Result<TargetOutput> {
+        if want_hidden || scope == LogitsScope::All {
+            return Err(mlx_llm::Error::Unsupported(
+                "the FLUX.2 caption tower returns last-position logits only".into(),
+            ));
+        }
+        let logits = self
+            .0
+            .decode_logits(ids, cache, rope_offset)
+            .map_err(|e| mlx_llm::Error::Msg(format!("flux2 caption-upsample forward: {e}")))?;
+        Ok(TargetOutput {
+            logits,
+            hidden: None,
+        })
+    }
+
+    fn attention_label(&self) -> &'static str {
+        // GQA by repeating the cached K/V heads before SDPA (`attention.rs`).
+        "expanded"
+    }
+}
+
+/// The FLUX.2 caption draw on the engine's sampler seam: the heap-order host reference [`sample`]
+/// (on-device argmax when greedy) with no history and no constraint, from the pipeline's seeded
+/// [`SplitMix64`] — the exact draw the pre-engine loop made.
+struct CaptionSampler {
+    params: SamplingParams,
+    rng: SplitMix64,
+    device_draws: u64,
+    host_draws: u64,
+}
+
+impl CaptionSampler {
+    fn new(params: SamplingParams, seed: u64) -> Self {
+        Self {
+            params,
+            rng: SplitMix64::new(seed),
+            device_draws: 0,
+            host_draws: 0,
+        }
+    }
+}
+
+impl TokenSampler for CaptionSampler {
+    fn params(&self) -> &SamplingParams {
+        &self.params
+    }
+
+    fn sample(
+        &mut self,
+        logits: &Array,
+        _history: &[i32],
+        allowed: Option<&[bool]>,
+    ) -> mlx_llm::Result<SampledToken> {
+        if allowed.is_some() {
+            return Err(mlx_llm::Error::Unsupported(
+                "the FLUX.2 caption sampler takes no constraint mask".into(),
+            ));
+        }
+        let token = sample(logits, &[], &self.params, &mut self.rng, None)?;
+        if self.params.is_plain_greedy() {
+            self.device_draws += 1;
+        } else {
+            self.host_draws += 1;
+        }
+        Ok(SampledToken::Host(token))
+    }
+
+    fn argmax_rows(&mut self, _: &Array) -> mlx_llm::Result<Vec<i32>> {
+        Err(mlx_llm::Error::Unsupported(
+            "the FLUX.2 caption decode is token-at-a-time; it never verifies drafts".into(),
+        ))
+    }
+
+    fn distribution(
+        &mut self,
+        _: &Array,
+        _: &[i32],
+        _: Option<&[bool]>,
+    ) -> mlx_llm::Result<Vec<(i32, f32)>> {
+        Err(mlx_llm::Error::Unsupported(
+            "the FLUX.2 caption decode is token-at-a-time; it never verifies drafts".into(),
+        ))
+    }
+
+    fn uniform(&mut self) -> f32 {
+        use mlx_llm::primitives::TokenRng as _;
+        self.rng.next_f32()
+    }
+
+    fn path(&self) -> Option<SamplerPath> {
+        match (self.host_draws, self.device_draws) {
+            (0, 0) => None,
+            (0, _) => Some(SamplerPath::Device),
+            _ => Some(SamplerPath::Host(HostSampleReason::Reference)),
+        }
+    }
+
+    fn reads_history(&self) -> bool {
+        false
+    }
+}
+
+/// Keep a cancellation observed by the shared decode loop typed as [`Error::Canceled`]; any other
+/// engine error is named as the caption decode's.
+fn from_llm_decode(e: mlx_llm::Error) -> Error {
+    match e {
+        mlx_llm::Error::Canceled => Error::Canceled,
+        other => Error::Msg(format!("flux2 caption-upsample decode: {other}")),
     }
 }
 
@@ -393,4 +571,136 @@ fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
         }
     }
     Ok(Array::from_slice(&data, &[b as i32, 1, s as i32, s as i32]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tiny dev (Mistral) tower of the committed `te_dev_golden` fixture plus a synthetic
+    /// final norm and LM head, so it can drive the caption decode (vocabulary 64).
+    fn tiny_caption_tower() -> Qwen3TextEncoder {
+        let mut w = Weights::from_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/te_dev_golden.safetensors"
+        ))
+        .unwrap();
+        let fill = |n: usize, seed: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i as f32 + seed) * 0.37).sin()).collect()
+        };
+        w.insert(
+            "model.norm.weight",
+            Array::from_slice(&fill(80, 1.0), &[80]),
+        );
+        w.insert(
+            "lm_head.weight",
+            Array::from_slice(&fill(64 * 80, 2.0), &[64, 80]),
+        );
+        let cfg = Qwen3TextEncoderConfig {
+            hidden_size: 80,
+            n_layers: 4,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 16,
+            rope_theta: 1_000_000_000.0,
+            rms_norm_eps: 1e-5,
+            qk_norm: false,
+            out_layers: [0, 1, 2],
+        };
+        let mut te = Qwen3TextEncoder::from_weights(&w, "", &cfg).unwrap();
+        te.load_generation_head(&w, "", None).unwrap();
+        te
+    }
+
+    /// The pre-engine caption-upsampling loop (sc-6030 / sc-7160), verbatim: the oracle the engine
+    /// port must reproduce token for token (E1/E8).
+    fn reference_caption_tokens(
+        te: &Qwen3TextEncoder,
+        prompt_embeds: &Array,
+        eos_token: i32,
+        sampling: UpsampleSampling,
+    ) -> Vec<i32> {
+        let prompt_len = prompt_embeds.shape()[1];
+        let mut cache = ContiguousKvCache::new(te.layers.len());
+        let mut rng = SplitMix64::new(sampling.seed);
+        let mut generated: Vec<i32> = Vec::new();
+        let params = SamplingParams {
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+            presence_penalty: 0.0,
+        };
+        let mut logits = te
+            .decode_logits_from_embeds(prompt_embeds, &mut cache, 0)
+            .unwrap();
+        logits.eval().unwrap();
+        for step in 0..sampling.max_new_tokens {
+            let next = sample(&logits, &[], &params, &mut rng, None).unwrap();
+            if next == eos_token {
+                break;
+            }
+            generated.push(next);
+            if step + 1 == sampling.max_new_tokens {
+                break;
+            }
+            let token = Array::from_slice(&[next], &[1, 1]);
+            logits = te
+                .decode_logits(&token, &mut cache, prompt_len + step as i32)
+                .unwrap();
+            logits.eval().unwrap();
+        }
+        generated
+    }
+
+    /// E8 (sc-24446): the FLUX.2 caption decode runs on the shared engine and is token-identical
+    /// to the pre-engine loop — greedy and seeded temperature / nucleus draws through the
+    /// heap-order host `sample` — with both an eos end and a budget end among the cases.
+    #[test]
+    fn caption_engine_decode_matches_the_pre_engine_loop() {
+        let te = tiny_caption_tower();
+        let ids = Array::from_slice(&[3i32, 17, 42, 8, 60, 11], &[1, 6]);
+        let embeds = te.embed(&ids).unwrap();
+        let cancel = CancelFlag::new();
+        let (mut eos_ends, mut budget_ends) = (0, 0);
+        for (temperature, top_p) in [(0.0, 1.0), (1.0, 1.0), (0.8, 0.9), (1.3, 0.6)] {
+            for seed in 0..6u64 {
+                for eos in [5, 63] {
+                    let sampling = UpsampleSampling {
+                        temperature,
+                        top_p,
+                        max_new_tokens: 24,
+                        seed,
+                    };
+                    let want = reference_caption_tokens(&te, &embeds, eos, sampling);
+                    let got = te
+                        .generate_from_embeds(&embeds, eos, sampling, &cancel)
+                        .unwrap();
+                    assert_eq!(got, want, "t {temperature} p {top_p} seed {seed} eos {eos}");
+                    if want.len() < sampling.max_new_tokens {
+                        eos_ends += 1;
+                    } else {
+                        budget_ends += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            eos_ends > 0 && budget_ends > 0,
+            "eos {eos_ends}, budget {budget_ends}"
+        );
+        // A cancel stays typed, as the pre-engine loop's did.
+        cancel.cancel();
+        let sampling = UpsampleSampling {
+            temperature: 0.0,
+            top_p: 1.0,
+            max_new_tokens: 4,
+            seed: 0,
+        };
+        assert!(matches!(
+            te.generate_from_embeds(&embeds, 5, sampling, &cancel),
+            Err(Error::Canceled)
+        ));
+    }
 }

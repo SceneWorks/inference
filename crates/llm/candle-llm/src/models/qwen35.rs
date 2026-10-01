@@ -1883,21 +1883,15 @@ impl Qwen35Mtp {
     /// RMSNorm vectors are `1 + w`. Every tensor in the head must be consumed.
     pub fn from_companion_dir(dir: &std::path::Path, target: &Qwen35Model) -> Result<Self> {
         if target.cfg.moe.is_some() {
-            return Err(Error::Config(
-                "a MoE target has no companion MTP predictor path on this architecture".into(),
-            ));
+            return Err(Error::Config(core_llm::COMPANION_MTP_MOE_REFUSAL.into()));
         }
         let value =
             core_llm::read_companion_mtp_config(dir).map_err(|e| Error::Config(e.to_string()))?;
         let head_cfg = Qwen35Config::from_json(&value)?;
         let geometry = head_cfg.companion_mtp_geometry();
-        let mismatches = geometry.mismatches(&target.cfg.companion_mtp_geometry());
-        if !mismatches.is_empty() {
-            return Err(Error::Config(format!(
-                "companion MTP head geometry does not match the target: {}",
-                mismatches.join("; ")
-            )));
-        }
+        geometry
+            .check_against(&target.cfg.companion_mtp_geometry())
+            .map_err(Error::Config)?;
         let quant = value
             .get("text_config")
             .and_then(|t| t.get("quantization"))
@@ -1931,51 +1925,30 @@ impl Qwen35Mtp {
                 None => Some([rows, cols]),
             }
         };
+        // The shared stored-tensor check (E8: MLX refuses exactly the same heads).
+        geometry
+            .check_tensors(prefix, logical, |key| {
+                raw.get(key).map(|t| t.dims().to_vec())
+            })
+            .map_err(Error::Config)?;
         let mut expected_keys = std::collections::BTreeSet::new();
-        let mut wrong = Vec::new();
-        for (name, expected) in geometry.matrices() {
-            let key = format!("{prefix}{name}.weight");
-            expected_keys.insert(key.clone());
+        for (name, _) in geometry.matrices() {
+            expected_keys.insert(format!("{prefix}{name}.weight"));
             if quant.is_some() {
                 expected_keys.insert(format!("{prefix}{name}.scales"));
                 expected_keys.insert(format!("{prefix}{name}.biases"));
             }
-            match logical(&key) {
-                Some(actual) if actual == expected => {}
-                Some(actual) => wrong.push(format!(
-                    "`{name}` is {actual:?}, the target needs {expected:?}"
-                )),
-                None => wrong.push(format!("`{name}` is missing or not a matrix")),
-            }
         }
-        for (name, expected) in geometry.norms() {
-            let key = format!("{prefix}{name}.weight");
-            match raw.get(&key).map(|t| t.dims().to_vec()) {
-                Some(shape) if shape == [expected] => {}
-                Some(shape) => wrong.push(format!(
-                    "`{name}` is {shape:?}, the target needs [{expected}]"
-                )),
-                None => wrong.push(format!("`{name}` is missing")),
-            }
-            expected_keys.insert(key);
+        for (name, _) in geometry.norms() {
+            expected_keys.insert(format!("{prefix}{name}.weight"));
         }
-        if !wrong.is_empty() {
-            return Err(Error::Config(format!(
-                "companion MTP head tensors do not match the target: {}",
-                wrong.join("; ")
-            )));
-        }
-        let mut unused: Vec<&str> = raw
-            .keys()
-            .filter(|key| !expected_keys.contains(*key))
-            .collect();
-        if !unused.is_empty() {
-            unused.sort_unstable();
-            return Err(Error::Config(format!(
-                "companion MTP head carries tensors the predictor does not use: {}",
-                unused.join(", ")
-            )));
-        }
+        core_llm::check_companion_unused(
+            raw.keys()
+                .filter(|key| !expected_keys.contains(*key))
+                .map(str::to_string)
+                .collect(),
+        )
+        .map_err(Error::Config)?;
 
         // The predictor reads the native `mtp.` layout.
         let device = raw.device().clone();

@@ -226,7 +226,11 @@ pub fn sampler_path(
     if degenerate_temperature(params.temperature) {
         return SamplerPath::Host(HostSampleReason::DegenerateTemperature);
     }
-    if REFERENCE_SAMPLER.with(Cell::get) {
+    // The defaults table's row for a CUDA device (E5) can turn the device sampler off; the other
+    // rows have no device sampler, which the availability check below reports.
+    if REFERENCE_SAMPLER.with(Cell::get)
+        || (device.is_cuda() && !crate::device::decode_defaults(device).device_sampler)
+    {
         return SamplerPath::Host(HostSampleReason::Reference);
     }
     if device_sampler_available(device, vocab) {

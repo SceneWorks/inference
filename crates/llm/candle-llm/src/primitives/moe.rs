@@ -159,10 +159,13 @@ pub fn moe_expert_gather_count() -> u64 {
     EXPERT_GATHERS.with(Cell::get)
 }
 
-/// Whether reading routes back to the host would cost `device` a pipeline drain: every GPU, and
-/// the CPU only when [`with_device_dispatch`] says to act like one.
+/// Whether a decode-sized step on `device` dispatches from device routes: the device's row of the
+/// defaults table ([`crate::device::decode_defaults`] `moe_device_dispatch` — every GPU, where
+/// reading routes back costs a pipeline drain, and not the CPU, where it is measured slower), or
+/// [`with_device_dispatch`] saying to act like a GPU.
 fn host_reads_stall(device: &Device) -> bool {
-    !device.is_cpu() || FORCE_DEVICE_DISPATCH.with(Cell::get)
+    crate::device::decode_defaults(device).moe_device_dispatch
+        || FORCE_DEVICE_DISPATCH.with(Cell::get)
 }
 
 /// A SwiGLU MLP over three projections: a routed expert of a bank Candle cannot stack, or the

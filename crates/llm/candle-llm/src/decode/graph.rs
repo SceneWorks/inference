@@ -103,17 +103,11 @@ use crate::primitives::switch::{ProcessSwitch, SwitchGuard};
 /// it off, and unset leaves [`CUDA_GRAPHS_DEFAULT`].
 pub const CUDA_GRAPHS_ENV: &str = "CANDLE_LLM_CUDA_GRAPHS";
 
-/// **The Candle CUDA-graph default** (epic sc-24432 E5) — the one place it is set: whether the
-/// runner captures when neither [`CUDA_GRAPHS_ENV`], [`set_cuda_graphs`] nor a load's
-/// `LoadSpec::cuda_graphs` says otherwise.
-///
-/// **Off.** Justification: until sc-24441 no production step was capturable at all (every model
-/// declared `positions_host_scalar`), so no measurement of a captured production decode exists
-/// yet. Dense `CausalLm` / `Qwen35Model` steps now capture (device positions + the vendored
-/// candle parameter cache) and are token-identical to eager by construction, but the decode-rate
-/// win on real weights — and the absence of a regression anywhere (E6) — is measured once by the
-/// epic's terminal benchmark campaign (sc-24446), which sets this value from that measurement.
-pub const CUDA_GRAPHS_DEFAULT: bool = false;
+/// **The Candle CUDA-graph default** (epic sc-24432 E5): whether the runner captures when neither
+/// [`CUDA_GRAPHS_ENV`], [`set_cuda_graphs`] nor a load's `LoadSpec::cuda_graphs` says otherwise —
+/// read from the per-backend defaults table ([`core_llm::defaults::CANDLE_CUDA`]), where the
+/// value and its justification live (PROVISIONAL until the sc-24446 campaign measures it).
+pub const CUDA_GRAPHS_DEFAULT: bool = core_llm::defaults::CANDLE_CUDA.cuda_graphs;
 
 /// Fallback reason: the switch is off.
 pub const REASON_DISABLED: &str = "disabled";
@@ -687,34 +681,31 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
     }
 
     /// Why this runner cannot capture on `cache` at all (checked before any capture, E5), or
-    /// `None` when it can.
+    /// `None` when it can: the device and build first ([`device_refusal`]), then the context's
+    /// event tracking, the cache's declaration and the model's.
     fn capability_refusal(&self, cache: &M::Cache) -> Option<&'static str> {
         if !cuda_graphs_enabled() {
             return Some(REASON_DISABLED);
         }
+        if let Some(reason) = device_refusal(self.model.device()) {
+            return Some(reason);
+        }
         #[cfg(not(feature = "cuda"))]
         {
+            // `device_refusal` refuses every device in a build without CUDA.
             let _ = cache;
             Some(REASON_CUDA_FEATURE_OFF)
         }
         #[cfg(feature = "cuda")]
         {
-            let Device::Cuda(dev) = self.model.device() else {
-                return Some(REASON_NOT_CUDA);
-            };
-            if cfg!(feature = "flash-attn") {
-                return Some(REASON_FLASH_ATTN_STREAM);
-            }
-            let stream = dev.cuda_stream();
-            if stream.cu_stream().is_null() {
-                return Some(REASON_LEGACY_STREAM);
-            }
-            let ctx = stream.context();
-            if !ctx.has_async_alloc() {
-                return Some(REASON_NO_ASYNC_ALLOC);
-            }
-            if ctx.is_managing_stream_synchronization() {
-                return Some(REASON_EVENT_TRACKING);
+            if let Device::Cuda(dev) = self.model.device() {
+                if dev
+                    .cuda_stream()
+                    .context()
+                    .is_managing_stream_synchronization()
+                {
+                    return Some(REASON_EVENT_TRACKING);
+                }
             }
             // The cache's declaration first: it names the state a cache change lifts (a
             // ring-less DeltaNet cache's replaced state, a growing KV), the gate ahead of the
@@ -727,6 +718,38 @@ impl<'m, M: StepModel> GraphRunner<'m, M> {
             }
             None
         }
+    }
+}
+
+/// Why no step on `device` can ever be captured in this build — the device-and-build half of the
+/// runner's capability check, settled before any capture and known at load (sc-24441, E3):
+/// `cuda_feature_off` (a build without CUDA), `not_cuda` (a CPU or Metal device), and on CUDA
+/// `flash_attn_stream` (a flash-attn build keeps every model on the legacy stream),
+/// `legacy_stream` (the device runs on the legacy stream) or `no_async_alloc` (no
+/// stream-ordered allocator). `None` when the device and build can capture; the decoder and its
+/// cache may still refuse ([`StepModel::graph_support`]).
+pub(crate) fn device_refusal(device: &Device) -> Option<&'static str> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = device;
+        Some(REASON_CUDA_FEATURE_OFF)
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let Device::Cuda(dev) = device else {
+            return Some(REASON_NOT_CUDA);
+        };
+        if cfg!(feature = "flash-attn") {
+            return Some(REASON_FLASH_ATTN_STREAM);
+        }
+        let stream = dev.cuda_stream();
+        if stream.cu_stream().is_null() {
+            return Some(REASON_LEGACY_STREAM);
+        }
+        if !stream.context().has_async_alloc() {
+            return Some(REASON_NO_ASYNC_ALLOC);
+        }
+        None
     }
 }
 

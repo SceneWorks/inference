@@ -45,16 +45,13 @@ use crate::primitives::switch::{ProcessSwitch, SwitchGuard};
 pub const DEVICE_POSITIONS_ENV: &str = "CANDLE_LLM_DEVICE_POSITIONS";
 
 /// Whether a decoder built on a **CUDA** device stages device positions when nothing asks
-/// otherwise — the one place the default is set, read by both static-cache decoders' constructors
-/// ([`CausalLm`](crate::models::CausalLm), [`Qwen35Model`](crate::models::Qwen35Model); E8).
-/// On: the device-positions step is what makes a CUDA graph capturable, and it moves the eager
-/// CUDA cached decode / verify step onto the length-aware [`candle_quant_kernels::decode_attention()`]
-/// too, so graphs on and off are one arithmetic (E5). A CPU or Metal decoder keeps the host path
-/// unless a caller asks for the device path ([`DEVICE_POSITIONS_ENV`],
-/// [`set_device_positions_default`], or the model's own `set_device_positions`). Provisional: the
-/// epic's terminal campaign (sc-24446) measures the eager CUDA decode on both attentions and
-/// confirms this default or flips it.
-pub const DEVICE_POSITIONS_DEFAULT: bool = true;
+/// otherwise, read by both static-cache decoders' constructors
+/// ([`CausalLm`](crate::models::CausalLm), [`Qwen35Model`](crate::models::Qwen35Model); E8) —
+/// the Candle CUDA row of the per-backend defaults table ([`core_llm::defaults::CANDLE_CUDA`]),
+/// where the value and its justification live. A CPU or Metal decoder takes its own row's
+/// default (off: the host path) unless a caller asks for the device path ([`DEVICE_POSITIONS_ENV`],
+/// [`set_device_positions_default`], or the model's own `set_device_positions`).
+pub const DEVICE_POSITIONS_DEFAULT: bool = core_llm::defaults::CANDLE_CUDA.device_positions;
 
 fn env_value_enables(v: &str) -> bool {
     matches!(v, "1" | "on" | "true" | "yes")
@@ -69,12 +66,13 @@ static SWITCH: ProcessSwitch = ProcessSwitch::new(
 
 /// Whether a decoder built now on `device` stages device positions: what was asked for
 /// explicitly — [`set_device_positions_default`], else [`DEVICE_POSITIONS_ENV`] — on any device;
-/// else [`DEVICE_POSITIONS_DEFAULT`] on a CUDA device and off elsewhere. The model still serves
-/// the path only where it can (`device_positions_support`).
+/// else the device's row of the defaults table ([`crate::device::decode_defaults`]: on for CUDA,
+/// [`DEVICE_POSITIONS_DEFAULT`]; off on Metal and the CPU). The model still serves the path only
+/// where it can (`device_positions_support`).
 pub fn device_positions_default(device: &Device) -> bool {
     SWITCH
         .explicit()
-        .unwrap_or(DEVICE_POSITIONS_DEFAULT && device.is_cuda())
+        .unwrap_or_else(|| crate::device::decode_defaults(device).device_positions)
 }
 
 /// Override the device-positions default for the process: `Some(true)` / `Some(false)` force it

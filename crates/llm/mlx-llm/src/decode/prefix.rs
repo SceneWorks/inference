@@ -522,9 +522,11 @@ pub fn generate_cached(
 }
 
 /// [`generate_cached`] with the same per-step constraint and host-stop seams as
-/// [`crate::decode::generate_with`]. Keeping these on the prefix path lets a caller reuse a static
-/// system-prompt prefix without giving up generation semantics such as Hugging Face's
-/// `no_repeat_ngram_size`.
+/// [`crate::decode::generate_with`].
+///
+/// Plain-loop parity reference only: production prefix-cached decoding runs
+/// [`prefill_with_prefix`] and the engine, then [`PrefixCache::store_run`].
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn generate_cached_with(
     model: &CausalLm,

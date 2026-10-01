@@ -849,6 +849,10 @@ pub struct Qwen35Model {
     lm_head: Projection,
     rope: Rope,
     mtp: Option<MtpPredictor>,
+    /// Why a configured native MTP head was not built (E2): the snapshot stores none of it, or it
+    /// is a variant this runtime does not run. Leads with `mtp:`; the provider names it in
+    /// `LoadReport::fallbacks`.
+    mtp_fallback: Option<String>,
     cfg: Qwen35Config,
     eps: f32,
     quantized: bool,
@@ -915,6 +919,13 @@ impl Qwen35Model {
     /// Whether this snapshot loaded a complete native multi-token predictor.
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    /// Why the config's native MTP head was not built, when it was not (E2): the named `mtp:`
+    /// load fallback — the snapshot stores none of its tensors, or it is a variant this runtime
+    /// does not run. `None` when the head was built or none was configured.
+    pub fn mtp_fallback(&self) -> Option<&str> {
+        self.mtp_fallback.as_deref()
     }
 
     /// A fresh MTP attention cache. Returns `None` for ordinary Qwen3.5/3.6 snapshots without the
@@ -1548,37 +1559,35 @@ impl Qwen35Model {
             });
         }
 
-        let mtp = match cfg.mtp_num_hidden_layers {
-            0 => {
-                if w.keys().any(|key| key.starts_with("mtp.")) {
-                    return Err(Error::Config(
-                        "qwen3_5 snapshot contains `mtp.*` tensors but config disables MTP".into(),
-                    ));
-                }
+        // The configured native head, by the rule Candle loads by too (E2, E8): built when
+        // complete; a declared head the snapshot does not carry, or a variant this runtime does
+        // not run (more than one layer, dedicated embeddings), loads the target plain with the
+        // reason named — and the config then prices no head state; a PARTIAL `mtp.*` set still
+        // fails the load in `build_mtp_predictor` (a missing tensor is integrity, not absence).
+        let mut cfg = cfg;
+        let mut mtp_fallback = None;
+        let mtp = match core_llm::native_mtp_plan(
+            cfg.mtp_num_hidden_layers,
+            cfg.mtp_use_dedicated_embeddings,
+            w.keys().any(|key| key.starts_with("mtp.")),
+        )
+        .map_err(|e| Error::Config(e.to_string()))?
+        {
+            core_llm::NativeMtp::Absent => None,
+            // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
+            // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`,
+            // sc-24438).
+            core_llm::NativeMtp::Build => Some(build_mtp_predictor(
+                &cfg,
+                "mtp.",
+                &|key| proj_q(key),
+                &|key| norm_w(key),
+                &|lp| build_ffn(w, lp, &cfg, quant, &proj_q),
+            )?),
+            core_llm::NativeMtp::Fallback(why) => {
+                mtp_fallback = Some(why);
+                cfg.mtp_num_hidden_layers = 0;
                 None
-            }
-            1 => {
-                if cfg.mtp_use_dedicated_embeddings {
-                    return Err(Error::Config(
-                        "qwen3_5 dedicated MTP embeddings are not supported by this architecture"
-                            .into(),
-                    ));
-                }
-                // The predictor layer carries the body's FFN choice: the dense MLP (27B) or
-                // the sparse-MoE block (35B-A3B), in either expert layout (vLLM
-                // `qwen3_5_mtp.py`, sc-24438).
-                Some(build_mtp_predictor(
-                    &cfg,
-                    "mtp.",
-                    &|key| proj_q(key),
-                    &|key| norm_w(key),
-                    &|lp| build_ffn(w, lp, &cfg, quant, &proj_q),
-                )?)
-            }
-            count => {
-                return Err(Error::Config(format!(
-                "qwen3_5 MTP exposes {count} predictor layers; this runtime requires exactly one"
-            )))
             }
         };
 
@@ -1590,6 +1599,7 @@ impl Qwen35Model {
             lm_head,
             rope,
             mtp,
+            mtp_fallback,
             eps,
             cfg,
             quantized: prism.is_some() || quant.is_some() || saw_stored.get(),
@@ -1859,61 +1869,36 @@ impl Qwen35Model {
     /// derived from. Every tensor in the head must be consumed.
     pub fn attach_companion_mtp(&mut self, dir: &std::path::Path) -> Result<()> {
         if self.mtp.is_some() {
-            return Err(Error::Config(
-                "the target already carries its own MTP predictor".into(),
-            ));
+            return Err(Error::Config(core_llm::COMPANION_MTP_ALREADY_NATIVE.into()));
         }
         if self.cfg.moe.is_some() {
-            return Err(Error::Config(
-                "a MoE target has no MTP predictor path on this architecture".into(),
-            ));
+            return Err(Error::Config(core_llm::COMPANION_MTP_MOE_REFUSAL.into()));
         }
         let value =
             core_llm::read_companion_mtp_config(dir).map_err(|e| Error::Config(e.to_string()))?;
         let head_cfg = Qwen35Config::from_json(&value)?;
         let head_geometry = head_cfg.companion_mtp_geometry();
-        let mismatches = head_geometry.mismatches(&self.cfg.companion_mtp_geometry());
-        if !mismatches.is_empty() {
-            return Err(Error::Config(format!(
-                "companion MTP head geometry does not match the target: {}",
-                mismatches.join("; ")
-            )));
-        }
+        head_geometry
+            .check_against(&self.cfg.companion_mtp_geometry())
+            .map_err(Error::Config)?;
         let w = Weights::from_dir(dir)?;
         let prefix = core_llm::companion_mtp_prefix(|key| w.contains(key))
             .map_err(|e| Error::Config(e.to_string()))?;
         let stored = head_cfg.quantization;
-        let mut wrong = Vec::new();
-        for (name, [rows, cols]) in head_geometry.matrices() {
-            let expected = [rows as i32, cols as i32];
-            let key = format!("{prefix}{name}.weight");
-            match logical_matrix_shape(&w, &key, stored) {
-                Some(actual) if actual == expected => {}
-                Some(actual) => wrong.push(format!(
-                    "`{name}` is {actual:?}, the target needs {expected:?}"
-                )),
-                None => wrong.push(format!("`{name}` is missing or not a matrix")),
-            }
-        }
-        for (name, expected) in head_geometry.norms() {
-            let expected = expected as i32;
-            match w
-                .get(&format!("{prefix}{name}.weight"))
-                .map(|a| a.shape().to_vec())
-            {
-                Some(shape) if shape == [expected] => {}
-                Some(shape) => wrong.push(format!(
-                    "`{name}` is {shape:?}, the target needs [{expected}]"
-                )),
-                None => wrong.push(format!("`{name}` is missing")),
-            }
-        }
-        if !wrong.is_empty() {
-            return Err(Error::Config(format!(
-                "companion MTP head tensors do not match the target: {}",
-                wrong.join("; ")
-            )));
-        }
+        // The shared stored-tensor check (E8: Candle refuses exactly the same heads).
+        let as_usize = |shape: &[i32]| -> Option<Vec<usize>> {
+            shape.iter().map(|&d| usize::try_from(d).ok()).collect()
+        };
+        head_geometry
+            .check_tensors(
+                prefix,
+                |key| {
+                    let [rows, cols] = logical_matrix_shape(&w, key, stored)?;
+                    Some([usize::try_from(rows).ok()?, usize::try_from(cols).ok()?])
+                },
+                |key| w.get(key).and_then(|a| as_usize(a.shape())),
+            )
+            .map_err(Error::Config)?;
         let saw_stored = Cell::new(false);
         let proj = |key: String| load_projection(&w, &key, stored, None, &saw_stored);
         let predictor = build_mtp_predictor(
@@ -1924,14 +1909,8 @@ impl Qwen35Model {
             // A dense target (MoE targets are refused above) → the dense SwiGLU arm.
             &|lp| build_ffn(&w, lp, &self.cfg, None, &proj),
         )?;
-        let mut unused = w.unused_keys();
-        if !unused.is_empty() {
-            unused.sort_unstable();
-            return Err(Error::Config(format!(
-                "companion MTP head carries tensors the predictor does not use: {}",
-                unused.join(", ")
-            )));
-        }
+        core_llm::check_companion_unused(w.unused_keys().into_iter().map(Into::into).collect())
+            .map_err(Error::Config)?;
         w.verify_accessed_gpu_view()?;
         self.mtp = Some(predictor);
         // The target now carries one predictor layer: what its config prices the head's state by
@@ -2688,13 +2667,66 @@ pub(crate) mod tests {
         assert_eq!(as_f32(&warm_next), as_f32(&full_next));
     }
 
+    /// E2 (sc-24432 feature-end review): a config declaring a native head the snapshot stores
+    /// no tensor of — or a variant this runtime does not run (two predictor layers, dedicated MTP
+    /// embeddings) — builds the target plain with a named `mtp:` fallback and prices no head
+    /// state; a PARTIAL `mtp.*` set still fails (integrity); `mtp.*` tensors under a config that
+    /// disables MTP stay a refused contradiction.
     #[test]
-    fn mtp_config_fails_if_any_predictor_tensor_is_missing() {
+    fn an_mtp_head_the_snapshot_cannot_run_is_a_named_fallback_but_a_partial_one_fails() {
         let cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
         let base_cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
         let weights = synthetic_weights(&base_cfg);
-        let err = Qwen35Model::from_weights(&weights, "model.language_model", cfg).unwrap_err();
-        assert!(err.to_string().contains("mtp."), "{err}");
+        let model = Qwen35Model::from_weights(&weights, "model.language_model", cfg.clone())
+            .expect("a configured head the snapshot does not carry loads the target plain");
+        assert!(!model.has_mtp());
+        let why = model.mtp_fallback().expect("the fallback is named");
+        assert!(
+            why.starts_with("mtp: ") && why.contains("stores no `mtp.*` tensor"),
+            "{why}"
+        );
+        assert_eq!(
+            model.config().mtp_num_hidden_layers,
+            0,
+            "no head state priced"
+        );
+
+        let full = synthetic_weights(&cfg);
+        let tensors = |keep: &dyn Fn(&str) -> bool| {
+            Weights::from_map(
+                full.keys()
+                    .filter(|k| keep(k))
+                    .map(|k| (k.to_string(), full.get(k).unwrap().clone()))
+                    .collect(),
+            )
+        };
+        for (edit, named) in [
+            (
+                (|c: &mut Qwen35Config| c.mtp_num_hidden_layers = 2) as fn(&mut Qwen35Config),
+                "declares 2 predictor layers",
+            ),
+            (
+                |c: &mut Qwen35Config| c.mtp_use_dedicated_embeddings = true,
+                "dedicated MTP embeddings",
+            ),
+        ] {
+            let mut variant = cfg.clone();
+            edit(&mut variant);
+            let model =
+                Qwen35Model::from_weights(&tensors(&|_| true), "model.language_model", variant)
+                    .unwrap_or_else(|e| panic!("{named}: the target still loads (E2): {e}"));
+            assert!(!model.has_mtp(), "{named}");
+            let why = model.mtp_fallback().unwrap_or_default();
+            assert!(why.starts_with("mtp: ") && why.contains(named), "{why}");
+        }
+        let partial = tensors(&|k| k != "mtp.fc.weight");
+        let Err(err) = Qwen35Model::from_weights(&partial, "model.language_model", cfg.clone())
+        else {
+            panic!("a partial `mtp.*` set fails the load");
+        };
+        assert!(err.to_string().contains("mtp.fc.weight"), "{err}");
+        let complete = Qwen35Model::from_weights(&full, "model.language_model", cfg).unwrap();
+        assert!(complete.has_mtp() && complete.mtp_fallback().is_none());
 
         let mtp_cfg = Qwen35Config::from_json(&cfg_json_mtp()).unwrap();
         let base_cfg = Qwen35Config::from_json(&cfg_json()).unwrap();

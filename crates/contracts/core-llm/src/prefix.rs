@@ -36,6 +36,8 @@
 
 use std::collections::VecDeque;
 
+use crate::defaults::DecodeBackend;
+
 /// An opaque handle to a stored prefix entry, stable until the entry is evicted.
 ///
 /// A backend uses it as the key into its own table of per-entry KV tensors.
@@ -185,34 +187,70 @@ fn common_prefix_len(a: &[i32], b: &[i32]) -> usize {
 // The byte-budgeted cross-turn store (epic sc-24432, story sc-24437).
 // ---------------------------------------------------------------------------------------------
 
-/// The prefix-cache budget a load reserves when [`LoadSpec::prefix_cache_bytes`] is unset: 1 GiB,
-/// clamped to what the load's own admission leaves ([`prefix_cache_budget`]).
+/// The prefix-cache budget a load on `backend` asks for before admission clamps it: the requested
+/// budget, or the backend's default ([`DecodeDefaults::prefix_cache_bytes`]) when unset. A load
+/// estimate reports it beside the bytes the load requires; [`prefix_cache_budget`] settles it
+/// against the load's headroom.
 ///
-/// **Default ON** (epic sc-24432 E5: a speed-up ships on unless a measured regression justifies
-/// off). The epic's terminal campaign (story sc-24446) measures TTFT and parity with the cache on
-/// against `prefix_cache_bytes: Some(0)` and confirms this value or flips it to `0`; this constant
-/// is the one place that decision lands. The budget is admission-honest either way: a load
+/// The default lives in the per-backend defaults table (epic sc-24432 E5, [`crate::defaults`]):
+/// on, PROVISIONAL until the terminal campaign (sc-24446) measures TTFT and parity with the cache
+/// on against `prefix_cache_bytes: Some(0)`. The budget is admission-honest either way: a load
 /// reports what it settled ([`LoadReport::prefix_cache_bytes`]) and a backend's load estimate
 /// names what it asks for, beside — never inside — what the load requires.
 ///
-/// [`LoadSpec::prefix_cache_bytes`]: crate::LoadSpec::prefix_cache_bytes
+/// [`DecodeDefaults::prefix_cache_bytes`]: crate::DecodeDefaults::prefix_cache_bytes
 /// [`LoadReport::prefix_cache_bytes`]: crate::LoadReport::prefix_cache_bytes
-pub const DEFAULT_PREFIX_CACHE_BYTES: u64 = 1 << 30;
-
-/// The prefix-cache budget a load asks for before admission clamps it: the requested budget, or
-/// [`DEFAULT_PREFIX_CACHE_BYTES`] when unset. A load estimate reports it beside the bytes the load
-/// requires; [`prefix_cache_budget`] settles it against the load's headroom.
-pub fn requested_prefix_cache_bytes(requested: Option<u64>) -> u64 {
-    requested.unwrap_or(DEFAULT_PREFIX_CACHE_BYTES)
+pub fn requested_prefix_cache_bytes(backend: DecodeBackend, requested: Option<u64>) -> u64 {
+    requested.unwrap_or(backend.defaults().prefix_cache_bytes)
 }
 
-/// The prefix-cache byte budget a load settles (E7): the requested budget (`None`:
-/// [`DEFAULT_PREFIX_CACHE_BYTES`]) clamped to the headroom the load's admission leaves —
-/// `available - load_required`, the same two figures the load was admitted on. So the cache can
-/// never push the load past its admission budget, and a load that fits without the cache never
-/// fails because of it; a tight host simply gets a smaller (or zero) cache.
-pub fn prefix_cache_budget(requested: Option<u64>, load_required: u64, available: u64) -> u64 {
-    requested_prefix_cache_bytes(requested).min(available.saturating_sub(load_required))
+/// The prefix-cache byte budget a load on `backend` settles (E7): the requested budget (`None`:
+/// the backend's default, [`requested_prefix_cache_bytes`]) clamped to the headroom the load's
+/// admission leaves — `available - load_required`, the same two figures the load was admitted on.
+/// So the cache can never push the load past its admission budget, and a load that fits without
+/// the cache never fails because of it; a tight host simply gets a smaller (or zero) cache.
+pub fn prefix_cache_budget(
+    backend: DecodeBackend,
+    requested: Option<u64>,
+    load_required: u64,
+    available: u64,
+) -> u64 {
+    requested_prefix_cache_bytes(backend, requested).min(available.saturating_sub(load_required))
+}
+
+/// Why a multimodal request never reads or feeds the cross-turn prefix cache (story sc-24437):
+/// the cache keys on token ids, which cannot tell two images or clips behind the same placeholder
+/// ids apart. One string on both backends (E8).
+pub const PREFIX_MULTIMODAL_BYPASS: &str =
+    "a multimodal prompt is never cached — its image / video / audio rows are not in the token key";
+
+/// Why a request's own prefix-cache snapshot was not taken: request admission could not hold it
+/// beside the request (E7).
+pub const PREFIX_NOT_ADMITTED: &str =
+    "not kept: admission could not hold this request's snapshot beside it";
+
+/// Why a request's own prefix-cache snapshot was dropped: its copy failed.
+pub const PREFIX_COPY_FAILED: &str = "not kept: the snapshot copy failed";
+
+/// Why a request on a paged KV cache keeps no snapshot: its blocks are shared through the pool's
+/// own copy-on-write, and the prefix cache does not copy them out.
+pub const PREFIX_PAGED_NOT_SNAPSHOTTED: &str = "not kept: paged KV backing is not snapshotted";
+
+/// The cross-turn prefix cache's part in a request before any lookup (story sc-24437) — the
+/// model-agnostic rule both backends start from (E8): `off` when the load settled a zero budget,
+/// `bypassed` with [`PREFIX_MULTIMODAL_BYPASS`] for a multimodal prompt, else `miss` (the lookup
+/// may still turn it into a `hit`). Only a `miss` request reads or feeds the cache.
+pub fn prefix_path_before_lookup(
+    prefix_on: bool,
+    multimodal: bool,
+) -> (&'static str, Option<&'static str>) {
+    if !prefix_on {
+        ("off", None)
+    } else if multimodal {
+        ("bypassed", Some(PREFIX_MULTIMODAL_BYPASS))
+    } else {
+        ("miss", None)
+    }
 }
 
 /// How a stored entry may be reused by a later prompt.
@@ -730,25 +768,23 @@ mod store_tests {
     /// E7: the budget a load reserves is what its admission leaves, never more.
     #[test]
     fn the_load_budget_is_clamped_to_the_admission_headroom() {
+        for backend in DecodeBackend::ALL {
+            let default = backend.defaults().prefix_cache_bytes;
+            assert_eq!(prefix_cache_budget(backend, None, 10, 1 << 40), default);
+            assert_eq!(requested_prefix_cache_bytes(backend, None), default);
+        }
+        let b = DecodeBackend::Mlx;
+        assert_eq!(prefix_cache_budget(b, Some(500), 100, 1_000), 500);
         assert_eq!(
-            prefix_cache_budget(None, 10, 1 << 40),
-            DEFAULT_PREFIX_CACHE_BYTES
-        );
-        assert_eq!(prefix_cache_budget(Some(500), 100, 1_000), 500);
-        assert_eq!(
-            prefix_cache_budget(Some(500), 600, 1_000),
+            prefix_cache_budget(b, Some(500), 600, 1_000),
             400,
             "the boundary"
         );
-        assert_eq!(prefix_cache_budget(Some(500), 1_000, 1_000), 0);
-        assert_eq!(prefix_cache_budget(Some(0), 0, 1_000), 0, "disabled");
-        assert_eq!(
-            requested_prefix_cache_bytes(None),
-            DEFAULT_PREFIX_CACHE_BYTES
-        );
-        assert_eq!(requested_prefix_cache_bytes(Some(7)), 7);
+        assert_eq!(prefix_cache_budget(b, Some(500), 1_000, 1_000), 0);
+        assert_eq!(prefix_cache_budget(b, Some(0), 0, 1_000), 0, "disabled");
+        assert_eq!(requested_prefix_cache_bytes(b, Some(7)), 7);
         let (required, available) = (600u64, 1_000u64);
-        let budget = prefix_cache_budget(Some(u64::MAX), required, available);
+        let budget = prefix_cache_budget(b, Some(u64::MAX), required, available);
         assert!(crate::admit_request_memory(required + budget, available).is_ok());
         assert!(crate::admit_request_memory(required + budget + 1, available).is_err());
     }
@@ -757,6 +793,17 @@ mod store_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E8: the shared pre-lookup rule — off, bypassed (named) for a multimodal prompt, else miss.
+    #[test]
+    fn the_pre_lookup_path_is_off_bypassed_or_miss() {
+        assert_eq!(prefix_path_before_lookup(false, true), ("off", None));
+        assert_eq!(
+            prefix_path_before_lookup(true, true),
+            ("bypassed", Some(PREFIX_MULTIMODAL_BYPASS))
+        );
+        assert_eq!(prefix_path_before_lookup(true, false), ("miss", None));
+    }
 
     #[test]
     fn empty_index_never_matches() {

@@ -400,16 +400,15 @@ impl DecodeRecord {
                 path: self.nvfp4_projections.label().to_string(),
                 reason: self.nvfp4_projections.cublaslt_reason.map(str::to_string),
             },
-            fused_primitives: core_llm::PathReport {
-                path: self.fused_primitives.label().to_string(),
-                reason: self.fused_primitives.reference_reason.map(str::to_string),
-            },
+            fused_primitives: self.fused_primitives.path_report(),
             target_forwards: self.target_forwards,
             prefill_forwards: self.prefill_forwards,
             proposed_tokens: self.proposed_tokens,
             accepted_tokens: self.accepted_tokens,
             verify_steps: self.verify_steps,
             replay_forwards: self.replay_forwards,
+            // No Candle loop enqueues a look-ahead forward it may discard (E3).
+            discarded_forwards: 0,
             prefix_hit_tokens: self.prefix_hit_tokens,
             prefix_cache: core_llm::PathReport {
                 path: self.prefix_cache.to_string(),

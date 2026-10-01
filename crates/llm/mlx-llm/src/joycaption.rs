@@ -367,6 +367,10 @@ pub struct JoyCaptionProvider {
     descriptor: TextLlmDescriptor,
     model: JoyCaptionModel,
     tokenizer: Tokenizer,
+    /// The speculative option a request that leaves it unset runs with — the MLX row of the
+    /// defaults table ([`core_llm::defaults::MLX`], E5). The captioner runs no proposer, so a
+    /// non-`off` default is reported as the named no-proposer fallback, as an explicit one is.
+    speculative_default: core_llm::Speculative,
 }
 
 impl JoyCaptionProvider {
@@ -384,6 +388,7 @@ impl JoyCaptionProvider {
             descriptor: descriptor(),
             model,
             tokenizer,
+            speculative_default: core_llm::defaults::MLX.speculative,
         })
     }
 
@@ -508,14 +513,12 @@ impl TextLlm for JoyCaptionProvider {
             prompt_tokens: prompt_len,
             generated_tokens: gen.tokens.len() as u32,
         };
-        // A captioner advertises no proposer: the resolution's fallback (an `auto` or proposer
-        // request it cannot run) joins the measured report, never a silent downgrade (E2).
-        let mut report = gen.report;
-        report.fallbacks =
-            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities)
-                .fallback
-                .into_iter()
-                .collect();
+        // A captioner advertises no proposer and has no prefix cache: the request's speculative
+        // fallback and the prefix-cache reason join the measured report in the shared words
+        // Candle's LLaVA uses — never a silent downgrade (E2, E8).
+        let report = gen
+            .report
+            .with_captioner_reasons(req.speculative_or(self.speculative_default));
         on_event(CoreEvent::Done {
             finish_reason: finish,
             usage,
@@ -979,10 +982,11 @@ mod tests {
     /// captioner that advertises no proposer.
     #[test]
     fn the_provider_reports_its_decode_and_the_auto_fallback() {
-        let provider = JoyCaptionProvider {
+        let mut provider = JoyCaptionProvider {
             descriptor: descriptor(),
             model: tiny_model(),
             tokenizer: word_tokenizer(50, &[("reserved_special_token_69", IMAGE_TOKEN_ID as u32)]),
+            speculative_default: core_llm::defaults::MLX.speculative,
         };
         let request = |speculative| TextLlmRequest {
             messages: vec![core_llm::Message {
@@ -1009,16 +1013,51 @@ mod tests {
             report.verify_steps + 1,
             u64::from(out.usage.generated_tokens)
         );
+        // The captioner's own reason, in the words Candle's twin reports (E2, E8) — never the
+        // generic "no MTP head, no prompt lookup on this backend" (MLX runs prompt lookup).
         assert_eq!(
             report.fallbacks,
-            vec![
-                "speculative: auto found no proposer this model can run (no MTP head, no prompt \
-                 lookup on this backend)"
-                    .to_string()
-            ]
+            core_llm::no_proposer_fallback(
+                core_llm::Speculative::Auto,
+                core_llm::CAPTIONER_NO_PROPOSER
+            )
+            .into_iter()
+            .collect::<Vec<_>>()
+        );
+        assert!(report.fallbacks[0].contains("advertises no proposer"));
+        assert_eq!(report.prefix_cache.path, "none");
+        assert_eq!(
+            report.prefix_cache.reason.as_deref(),
+            Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
         );
         let off = provider.generate(&request(None), &mut |_| {}).unwrap();
         assert_eq!(off.text, out.text, "the fallback decodes plainly");
         assert!(off.decode.unwrap().fallbacks.is_empty());
+        // E5: an unset option takes the provider's per-backend default, so a table `auto` decodes
+        // plainly with the same named no-proposer fallback as an explicit `auto`.
+        provider.speculative_default = core_llm::Speculative::Auto;
+        let defaulted = provider.generate(&request(None), &mut |_| {}).unwrap();
+        assert_eq!(
+            defaulted.text, out.text,
+            "the defaulted fallback decodes plainly"
+        );
+        assert_eq!(defaulted.decode.unwrap().fallbacks, report.fallbacks);
+        provider.speculative_default = core_llm::Speculative::Off;
+        // An explicit proposer it does not advertise is not refused: it decodes plainly, named.
+        let lookup =
+            core_llm::Speculative::proposer(core_llm::SpeculativeProposer::PromptLookup, 2);
+        let explicit = provider
+            .generate(&request(Some(lookup)), &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            explicit.text, out.text,
+            "the explicit fallback decodes plainly"
+        );
+        assert_eq!(
+            explicit.decode.unwrap().fallbacks,
+            core_llm::no_proposer_fallback(lookup, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
     }
 }

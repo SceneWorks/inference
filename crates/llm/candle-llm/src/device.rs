@@ -172,9 +172,75 @@ pub fn compute_dtype(device: &Device) -> DType {
     }
 }
 
+/// The decode-defaults row ([`core_llm::defaults`], epic sc-24432 E5) a model on `device` runs
+/// with: Candle CUDA, Candle Metal or Candle CPU.
+pub fn decode_backend(device: &Device) -> core_llm::DecodeBackend {
+    if device.is_cuda() {
+        core_llm::DecodeBackend::CandleCuda
+    } else if device.is_metal() {
+        core_llm::DecodeBackend::CandleMetal
+    } else {
+        core_llm::DecodeBackend::CandleCpu
+    }
+}
+
+/// The decode-defaults row of the device [`select_device`] opens, from whether it is CUDA alone
+/// (a load estimate knows no more): CUDA, else Metal in a `metal` build that `CANDLE_LLM_DEVICE`
+/// does not force onto the CPU, else the CPU.
+pub(crate) fn decode_backend_for(cuda: bool) -> core_llm::DecodeBackend {
+    let cpu_forced = std::env::var_os("CANDLE_LLM_DEVICE")
+        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("cpu"));
+    if cuda {
+        core_llm::DecodeBackend::CandleCuda
+    } else if cfg!(feature = "metal") && !cpu_forced {
+        core_llm::DecodeBackend::CandleMetal
+    } else {
+        core_llm::DecodeBackend::CandleCpu
+    }
+}
+
+/// [`decode_backend`]'s row of the defaults table.
+pub fn decode_defaults(device: &Device) -> &'static core_llm::DecodeDefaults {
+    decode_backend(device).defaults()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-24446 (E5): a device maps onto its row of the defaults table, and the process switches
+    /// whose path exists only on CUDA (fused primitives, NVFP4 GEMV, CUDA graphs) take their unset
+    /// state from the Candle CUDA row.
+    #[test]
+    fn devices_map_onto_their_defaults_row_and_the_cuda_switches_read_the_cuda_row() {
+        use core_llm::defaults::CANDLE_CUDA;
+        use core_llm::DecodeBackend;
+        assert_eq!(decode_backend(&Device::Cpu), DecodeBackend::CandleCpu);
+        assert_eq!(
+            decode_defaults(&Device::Cpu).backend,
+            DecodeBackend::CandleCpu
+        );
+        assert_eq!(decode_backend_for(true), DecodeBackend::CandleCuda);
+        let unset = |env: &str| std::env::var_os(env).is_none();
+        if unset(crate::primitives::fused::FUSED_KERNELS_ENV) {
+            let _policy = crate::primitives::fused::fused_policy_guard(None);
+            assert_eq!(
+                crate::primitives::fused::fused_kernels_enabled(),
+                CANDLE_CUDA.fused_kernels
+            );
+        }
+        if unset(crate::primitives::nvfp4_path::NVFP4_GEMV_ENV) {
+            let _policy = crate::primitives::nvfp4_path::nvfp4_gemv_policy_guard(None);
+            assert_eq!(
+                crate::primitives::nvfp4_path::nvfp4_gemv_enabled(),
+                CANDLE_CUDA.nvfp4_gemv
+            );
+        }
+        assert_eq!(
+            crate::decode::graph::CUDA_GRAPHS_DEFAULT,
+            CANDLE_CUDA.cuda_graphs
+        );
+    }
 
     #[test]
     fn cuda_stream_switch_parses_own_legacy_and_refuses_the_rest() {

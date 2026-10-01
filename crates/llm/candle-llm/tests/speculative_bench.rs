@@ -1,150 +1,206 @@
-//! The speculative-decoding benchmark harness on real weights (epic sc-24432, story sc-24433):
-//! the backend-neutral [`core_llm_testkit::run_speculative_bench`] over the
-//! [`core_llm_testkit::speculative_prompt_set`] — predictable (code edit, RAG answer, summary) and
-//! open-ended (chat, creative) — through a loaded `candle-llama` provider, written as one
-//! baseline-format JSON document (schema [`core_llm_testkit::BENCH_SCHEMA`]). The weights-free run
-//! of the same harness on a fixture model is `provider::tests::the_benchmark_harness_writes_a_baseline_document_for_the_fixture_model`;
-//! this `#[ignore]`d entry point is what the epic's terminal campaign drives. The harness first
-//! exists at this story's revision, so the baseline is this harness at this revision with `off`
-//! (and `{"proposer": "mtp", ...}` where the checkpoint has a head) as the pre-epic-equivalent
-//! options, compared against the same harness at the epic's final revision. Every input is passed
-//! in; nothing is derived from a cache:
+//! The speculative-decoding benchmark (epic sc-24432 acceptance test 3 / E6) on Candle: the
+//! `#[ignore]`d real-weight entry point the terminal campaign drives, the weights-free run of the
+//! same harness on the shared fixture, and the pre-epic baseline driver compiled against this tree.
 //!
-//! | variable                        | meaning                                                      |
-//! |---------------------------------|--------------------------------------------------------------|
-//! | `SPECULATIVE_BENCH_SNAPSHOT`    | snapshot directory (config.json, tokenizer*.json, shards)    |
-//! | `SPECULATIVE_BENCH_OUTPUT`      | JSON path to write (must not exist)                          |
-//! | `SPECULATIVE_BENCH_OPTIONS`     | JSON array of speculative options (default `["off","auto"]`), e.g. `["off",{"proposer":"prompt_lookup","depth":4}]` |
-//! | `SPECULATIVE_BENCH_SAMPLING`    | JSON sampling spec (default `"greedy"`): `"greedy"` or an object of `temperature`, `top_p`, `top_k`, `presence_penalty`, `repetition_penalty`, `repetition_context` over greedy, e.g. `{"temperature":0.7,"top_p":0.9}` (seed pinned to 0) |
-//! | `SPECULATIVE_BENCH_FORMAT`      | projection format quantized at load (`LoadSpec::quantize`): `bf16` (default, dense), `q8` / `q4`, `nvfp4` (CUDA sm_120+) |
-//! | `SPECULATIVE_BENCH_NEW_TOKENS`  | tokens generated per row (default 256)                       |
-//! | `SPECULATIVE_BENCH_MODEL`       | model label recorded verbatim (default: the snapshot's directory name, `@<format>` appended unless bf16) |
-//! | `SPECULATIVE_BENCH_BACKEND`     | backend label recorded verbatim (default `candle`)           |
-//! | `SPECULATIVE_BENCH_WARMUP`      | `0` skips the untimed warm-up run per row (default on)       |
+//! The entry point is [`core_llm_testkit::run_speculative_bench_from_env`] over a `candle-llama`
+//! provider; its doc lists every `SPECULATIVE_BENCH_*` knob, and [`core_llm_testkit::BenchRow`]
+//! documents the JSON schema the MLX entry point (`mlx-llm`'s `speculative_bench` module) writes
+//! too. The pre-epic revision predates the harness, so its rows come from
+//! `core-llm-testkit/baseline/speculative_bench_baseline.rs` (its header has the copy-and-run
+//! steps); it is compiled here as `baseline`, and the tests below hold it to the harness's prompt
+//! set, budgets and schema.
 //!
 //! ```text
-//! SPECULATIVE_BENCH_SNAPSHOT=/path/to/snapshot SPECULATIVE_BENCH_OUTPUT=/tmp/baseline.json \
-//!   cargo test --release --features cuda -p candle-llm --test speculative_bench -- --ignored --nocapture
+//! SPECULATIVE_BENCH_SNAPSHOT=/path/to/snapshot SPECULATIVE_BENCH_OUTPUT=/tmp/bench.json \
+//!   cargo test --release --features cuda -p candle-llm --test speculative_bench -- \
+//!   speculative_bench_writes_the_baseline_document --ignored --nocapture
 //! ```
 
-use core_llm::{LoadSpec, Quantize, Sampling, Speculative};
-use core_llm_testkit::{
-    parse_bench_sampling, run_speculative_bench, speculative_prompt_set, BenchConfig,
-};
+use core_llm::{LoadSpec, TextLlm};
 
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
-}
+#[path = "../../../contracts/core-llm/core-llm-testkit/baseline/speculative_bench_baseline.rs"]
+mod baseline;
 
-/// The options a run measures: `SPECULATIVE_BENCH_OPTIONS` as JSON (legacy `mtp` shapes
-/// included), or `off` and `auto`.
-fn options() -> Vec<Speculative> {
-    match env("SPECULATIVE_BENCH_OPTIONS") {
-        Some(json) => serde_json::from_str(&json)
-            .unwrap_or_else(|e| panic!("SPECULATIVE_BENCH_OPTIONS is not a JSON option list: {e}")),
-        None => vec![Speculative::Off, Speculative::Auto],
-    }
-}
-
-/// The sampling every row runs under: `SPECULATIVE_BENCH_SAMPLING`, or greedy.
-fn sampling() -> Sampling {
-    env("SPECULATIVE_BENCH_SAMPLING").map_or_else(Sampling::greedy, |spec| {
-        parse_bench_sampling(&spec).unwrap_or_else(|e| panic!("SPECULATIVE_BENCH_SAMPLING: {e}"))
-    })
-}
-
-/// `SPECULATIVE_BENCH_FORMAT` as the load's `quantize`: `bf16` is the dense load, `q8` / `q4`
-/// the GGML Q8_0 / Q4_K load path, `nvfp4` the at-load NVFP4 quantization (refused off CUDA
-/// sm_120+ with the typed capability error, never a fallback).
-fn quantize(format: &str) -> Option<Quantize> {
-    match format {
-        "bf16" => None,
-        "q8" => Some(Quantize::Q8),
-        "q4" => Some(Quantize::Q4),
-        "nvfp4" => Some(Quantize::Nvfp4),
-        other => panic!("SPECULATIVE_BENCH_FORMAT must be bf16, q8, q4 or nvfp4, got {other}"),
-    }
-}
-
-#[test]
-fn format_names_bf16_q8_q4_and_nvfp4() {
-    assert_eq!(quantize("bf16"), None);
-    assert_eq!(quantize("q8"), Some(Quantize::Q8));
-    assert_eq!(quantize("q4"), Some(Quantize::Q4));
-    assert_eq!(quantize("nvfp4"), Some(Quantize::Nvfp4));
-    assert!(std::panic::catch_unwind(|| quantize("fp8")).is_err());
-}
-
-#[test]
-fn sampling_defaults_to_greedy_and_parses_a_stochastic_spec() {
-    let parsed = parse_bench_sampling(r#"{"temperature": 0.7, "top_p": 0.9}"#).unwrap();
-    assert_eq!((parsed.temperature, parsed.top_p), (0.7, 0.9));
-    if env("SPECULATIVE_BENCH_SAMPLING").is_none() {
-        assert_eq!(sampling(), Sampling::greedy());
-    }
-}
-
-#[test]
-fn options_default_to_off_and_auto_and_parse_the_wire_form() {
-    // Read through the same parser the harness uses, without touching the process environment.
-    let parsed: Vec<Speculative> =
-        serde_json::from_str(r#"["off", {"proposer": "prompt_lookup", "depth": 4}]"#).unwrap();
-    assert_eq!(
-        parsed,
-        [
-            Speculative::Off,
-            Speculative::proposer(core_llm::SpeculativeProposer::PromptLookup, 4)
-        ]
-    );
-    if env("SPECULATIVE_BENCH_OPTIONS").is_none() {
-        assert_eq!(options(), [Speculative::Off, Speculative::Auto]);
-    }
+fn load(spec: &LoadSpec) -> Result<Box<dyn TextLlm>, String> {
+    candle_llm::LlamaProvider::load(spec)
+        .map(|p| Box::new(p) as Box<dyn TextLlm>)
+        .map_err(|e| e.to_string())
 }
 
 #[test]
 #[ignore = "needs a snapshot via SPECULATIVE_BENCH_SNAPSHOT and an output path via SPECULATIVE_BENCH_OUTPUT"]
 fn speculative_bench_writes_the_baseline_document() {
-    let snapshot = env("SPECULATIVE_BENCH_SNAPSHOT").expect("set SPECULATIVE_BENCH_SNAPSHOT");
-    let output = std::path::PathBuf::from(
-        env("SPECULATIVE_BENCH_OUTPUT").expect("set SPECULATIVE_BENCH_OUTPUT"),
-    );
-    assert!(
-        !output.exists(),
-        "{} exists; a baseline is never overwritten",
-        output.display()
-    );
-    let format = env("SPECULATIVE_BENCH_FORMAT").unwrap_or_else(|| "bf16".into());
-    let provider = candle_llm::LlamaProvider::load(&LoadSpec {
-        quantize: quantize(&format),
-        ..LoadSpec::dense(snapshot.clone())
-    })
-    .unwrap_or_else(|e| panic!("load {snapshot} ({format}): {e}"));
-    let config = BenchConfig {
-        model: env("SPECULATIVE_BENCH_MODEL").unwrap_or_else(|| {
-            let name = std::path::Path::new(&snapshot)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or(snapshot.clone());
-            if format == "bf16" {
-                name
-            } else {
-                format!("{name}@{format}")
-            }
-        }),
-        backend: env("SPECULATIVE_BENCH_BACKEND").unwrap_or_else(|| "candle".into()),
-        max_new_tokens: env("SPECULATIVE_BENCH_NEW_TOKENS")
-            .map(|v| {
-                v.parse()
-                    .expect("SPECULATIVE_BENCH_NEW_TOKENS is a token count")
-            })
-            .unwrap_or(256),
-        options: options(),
-        sampling: sampling(),
-        warmup: env("SPECULATIVE_BENCH_WARMUP").as_deref() != Some("0"),
-    };
-    let doc = run_speculative_bench(&provider, &speculative_prompt_set(), &config)
+    let (output, doc) = core_llm_testkit::run_speculative_bench_from_env("candle", &load)
         .unwrap_or_else(|e| panic!("{e}"));
-    doc.write_new(&output)
-        .unwrap_or_else(|e| panic!("write {}: {e}", output.display()));
     println!("wrote {} ({} rows)", output.display(), doc.rows.len());
+}
+
+/// The harness end to end on the shared fixture: every schema field over two repeats with the
+/// prefix cache off by default, and a warm-up that never lends the measured prompt to its row.
+#[test]
+fn the_bench_runs_on_the_fixture_with_isolated_warmups() {
+    let root = tempfile::tempdir().unwrap();
+    core_llm_testkit::check_speculative_bench_on_fixture(root.path(), "candle-cpu", &load)
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// The baseline driver copies the harness's prompt set and budgets verbatim.
+#[test]
+fn the_baseline_driver_runs_the_harness_prompt_set_and_budgets() {
+    let harness: Vec<_> = core_llm_testkit::speculative_prompt_set()
+        .into_iter()
+        .map(|p| {
+            (
+                p.id,
+                p.class.label().to_string(),
+                p.messages[0].text_content(),
+            )
+        })
+        .collect();
+    let copied: Vec<_> = baseline::PROMPTS
+        .iter()
+        .map(|(id, class, text)| (id.to_string(), class.to_string(), text.to_string()))
+        .collect();
+    assert_eq!(copied, harness);
+    assert_eq!(baseline::BENCH_SCHEMA, core_llm_testkit::BENCH_SCHEMA);
+    assert_eq!(
+        baseline::DEFAULT_NEW_TOKENS,
+        core_llm_testkit::BENCH_DEFAULT_NEW_TOKENS
+    );
+    assert_eq!(
+        baseline::DEFAULT_REPEATS,
+        core_llm_testkit::BENCH_DEFAULT_REPEATS
+    );
+}
+
+/// The keys of a JSON object, and of every nested object, as dotted paths, sorted.
+fn keys(value: &serde_json::Value) -> Vec<String> {
+    fn walk(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        for (k, v) in value.as_object().into_iter().flatten() {
+            let path = format!("{prefix}{k}");
+            walk(v, &format!("{path}."), out);
+            out.push(path);
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, "", &mut out);
+    out.sort();
+    out
+}
+
+/// The baseline driver writes the harness's schema: the same document, row, statistics and sample
+/// keys, the same statistics over the same repeats, and the same option wire form.
+#[test]
+fn the_baseline_driver_writes_the_harness_schema() {
+    use core_llm::{DecodeReport, LoadReport, MtpMode, Sampling, Speculative};
+    use core_llm_testkit::{BenchConfig, BenchDocument, BenchRow, BenchSample, PromptClass};
+
+    let report = DecodeReport::default();
+    let repeats = [(10.0, 50.0), (12.0, 54.0), (14.0, 52.0)];
+    let harness_row = BenchRow {
+        prompt_id: "chat".into(),
+        class: PromptClass::OpenEnded,
+        requested: Speculative::Off,
+        prompt_tokens: 9,
+        generated_tokens: 4,
+        timing_source: "backend",
+        report: Some(report.clone()),
+        samples: repeats
+            .iter()
+            .map(|&(ttft, tok_s)| BenchSample {
+                ttft_ms: Some(ttft),
+                prefill_ms: ttft,
+                decode_ms: 4e3 / tok_s,
+                decode_tok_s: Some(tok_s),
+                generated_tokens: 4,
+                prefix_hit_tokens: Some(0),
+            })
+            .collect(),
+    }
+    .to_json();
+    let measured: Vec<_> = repeats
+        .iter()
+        .map(|&(ttft, tok_s)| baseline::Measured {
+            ttft_ms: Some(ttft),
+            prefill_ms: ttft,
+            decode_ms: 4e3 / tok_s,
+            decode_tok_s: Some(tok_s),
+            timing_source: "backend",
+            prompt_tokens: 9,
+            generated_tokens: 4,
+            report: Some(report.clone()),
+            mtp: None,
+        })
+        .collect();
+    let baseline_row = baseline::row_json("chat", "open_ended", &MtpMode::Off, &measured);
+    // The harness's populated `prefix_cache` object; pre-epic reports have none (`null`).
+    let mut want = keys(&harness_row);
+    want.retain(|k| !k.starts_with("prefix_cache."));
+    assert_eq!(keys(&baseline_row), want);
+    for key in [
+        "prompt_id",
+        "class",
+        "requested",
+        "ttft_ms",
+        "decode_tok_s",
+        "prefill_ms",
+        "decode_ms",
+        "repeats",
+        "fused",
+    ] {
+        assert_eq!(baseline_row[key], harness_row[key], "{key}");
+    }
+    for key in [
+        "prefix_cache",
+        "prefix_hit_tokens",
+        "graph_path",
+        "verify_steps",
+    ] {
+        assert!(baseline_row[key].is_null(), "pre-epic `{key}` is null");
+    }
+
+    let harness_doc = BenchDocument {
+        config: BenchConfig {
+            model: "m".into(),
+            backend: "candle".into(),
+            max_new_tokens: 4,
+            sampling: Sampling::greedy(),
+            options: vec![Speculative::Off, Speculative::Auto],
+            warmup: true,
+            repeats: 3,
+        },
+        load: Some(LoadReport::default()),
+        rows: Vec::new(),
+    }
+    .to_json();
+    let baseline_config = baseline::Config {
+        model: "m".into(),
+        backend: "candle".into(),
+        max_new_tokens: 4,
+        sampling: Sampling::greedy(),
+        warmup: true,
+        repeats: 3,
+        options: vec![MtpMode::Off, MtpMode::Auto],
+    };
+    let baseline_doc =
+        baseline::document_json(&baseline_config, Some(&LoadReport::default()), Vec::new());
+    assert_eq!(keys(&baseline_doc), keys(&harness_doc));
+    for key in [
+        "schema",
+        "model",
+        "backend",
+        "max_new_tokens",
+        "sampling",
+        "options",
+        "repeats",
+        "warmup",
+    ] {
+        assert_eq!(baseline_doc[key], harness_doc[key], "{key}");
+    }
+    // The legacy `enabled` mode's wire form is the harness's `{"proposer": "mtp", "depth": N}`.
+    let enabled = MtpMode::Enabled { draft_tokens: 3 };
+    assert_eq!(
+        baseline::mode_json(&enabled),
+        serde_json::to_value(Speculative::from(enabled)).unwrap()
+    );
 }

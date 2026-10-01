@@ -6,8 +6,7 @@
 //! ([`crate::main`]) wires them to a TCP socket + a loaded `core_llm::TextLlm` provider.
 
 use mlx_llm::core_llm::{
-    Constraint, Content, DecodeReport, Message, MtpMode, Role, Sampling, Speculative,
-    TextLlmRequest,
+    Constraint, Content, DecodeReport, Message, Role, Sampling, Speculative, TextLlmRequest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -181,7 +180,7 @@ impl ChatRequest {
             // The request's speculative option (or its legacy `mtp` spelling) as sent; the
             // provider validates it against what the loaded model advertises (sc-24438).
             speculative: self.speculative,
-            mtp: MtpMode::Off,
+            mtp: None,
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
@@ -231,14 +230,43 @@ pub fn final_chunk(
     v.to_string()
 }
 
-/// The decode report an OpenAI client can see (sc-24438, epic sc-24432 E2): which proposer ran,
-/// its depth, and every fallback — a clamped depth, an unavailable proposer — by name, so no
+/// The decode report an OpenAI client can see (sc-24438, epic sc-24432 E2/E3) — the whole
+/// [`DecodeReport`], field for field: the path and the proposer that ran, its depth and the
+/// realized mean accepted length, the sampler path, the KV cache and attention, the graph path
+/// and CUDA-graph runner, the NVFP4 and fused-primitive paths, every forward count, the prefix
+/// cache's part, and every fallback — a clamped depth, an unavailable proposer — by name, so no
 /// downgrade is silent over HTTP. Carried as the `x_decode` extension member of the non-streaming
 /// body and of the final SSE chunk before `[DONE]`.
 pub fn x_decode(report: &DecodeReport) -> Value {
+    let path = |p: &mlx_llm::core_llm::PathReport| json!({ "path": p.path, "reason": p.reason });
     json!({
+        "path": report.path,
         "proposer": report.proposer.label(),
         "draft_tokens": report.draft_tokens,
+        "mean_accepted_length": report.mean_accepted_length(),
+        "sampler": report.sampler,
+        "kv_cache": report.kv_cache,
+        "attention": report.attention,
+        "graph_path": report.graph_path,
+        "cuda_graphs": {
+            "enabled": report.cuda_graphs.enabled,
+            "path": report.cuda_graphs.path,
+            "replayed": report.cuda_graphs.replayed,
+            "eager": report.cuda_graphs.eager,
+            "captured": report.cuda_graphs.captured,
+            "fallback_reason": report.cuda_graphs.fallback_reason,
+        },
+        "nvfp4_projections": path(&report.nvfp4_projections),
+        "fused_primitives": path(&report.fused_primitives),
+        "target_forwards": report.target_forwards,
+        "prefill_forwards": report.prefill_forwards,
+        "proposed_tokens": report.proposed_tokens,
+        "accepted_tokens": report.accepted_tokens,
+        "verify_steps": report.verify_steps,
+        "replay_forwards": report.replay_forwards,
+        "discarded_forwards": report.discarded_forwards,
+        "prefix_cache": path(&report.prefix_cache),
+        "prefix_hit_tokens": report.prefix_hit_tokens,
         "fallbacks": report.fallbacks,
     })
 }
@@ -385,7 +413,8 @@ mod tests {
     }
 
     /// sc-24438 AC3: the new `speculative` option and the legacy `mtp` shape both reach the
-    /// contract as sent (never forced to off), and an omitted option is `off`.
+    /// contract as sent (never forced to off), and an omitted option stays unset — the provider
+    /// applies its per-backend default (`TextLlmRequest::speculative_or`, E5).
     #[test]
     fn speculative_and_the_legacy_mtp_field_map_onto_the_contract() {
         use mlx_llm::core_llm::SpeculativeProposer;
@@ -398,7 +427,8 @@ mod tests {
         };
         let r = spec("");
         assert_eq!(r.speculative, None);
-        assert_eq!(r.speculative_mode(), Speculative::Off);
+        assert_eq!(r.requested_speculative(), None);
+        assert_eq!(r.speculative_or(Speculative::Auto), Speculative::Auto);
         for (extra, want) in [
             (r#","speculative":"auto""#, Speculative::Auto),
             (r#","speculative":"off""#, Speculative::Off),
@@ -420,7 +450,7 @@ mod tests {
             let r = spec(extra);
             assert_eq!(r.speculative, Some(want), "{extra}");
             assert_eq!(r.speculative_mode(), want, "{extra}");
-            assert_eq!(r.mtp, MtpMode::Off, "{extra}");
+            assert_eq!(r.mtp, None, "{extra}");
         }
     }
 
