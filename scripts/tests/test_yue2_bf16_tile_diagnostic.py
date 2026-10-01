@@ -20,13 +20,170 @@ diag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(diag)
 
 
+def synthetic_math_report(root: Path, applicable: bool) -> tuple[Path, dict, dict]:
+    data = root / "data"
+    data.mkdir()
+    fixture = root / "crates/audio/candle-audio-yue2/tests/fixtures/vae_real_reference.json"
+    fixture.parent.mkdir(parents=True)
+    standard = {"repo": "m-a-p/YuE2-Vae", "revision": "95535e72a97bc0f09b8ada125d26b4009428c0e8",
+                "weights_sha256": diag.DECODER_SHA256["standard"],
+                "config_sha256": "f0191bb9694009956de44e0c361a6f1334760be4c8f848e599bde242a54a0970"}
+    meta = {"decoders": {"standard": standard}}
+    fixture.write_text(json.dumps(meta), encoding="utf-8")
+
+    def array(name: str, dtype: str, channels: int, frames: int, changed: bool = False) -> dict:
+        values = [0.0] * (channels * frames)
+        if changed:
+            values[4] = 0.03125
+        raw = struct.pack("<" + "f" * len(values), *values)
+        path = data / f"{name}.f32le"
+        path.write_bytes(raw)
+        return {"file": path.name, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+                "layout": "bct_f32le", "shape": [1, channels, frames], "dtype": dtype}
+
+    def arm(label: str, dtype: str, changed: bool = False) -> dict:
+        stages = (("input", 64), ("preBias", 1), ("postBias", 1))
+        full = {stage: array(f"{label}-full-{stage}", dtype, channels, 75)
+                for stage, channels in stages}
+        windows = []
+        for index, start in enumerate(range(0, 75, 16)):
+            end, left = min(start + 16, 75), max(0, start - 16)
+            right = min(75, end + 16)
+            captures = {stage: array(f"{label}-tile-{index}-{stage}", dtype, channels, right-left,
+                                     changed and index == 0 and stage == "preBias")
+                        for stage, channels in stages}
+            comparisons = {}
+            for stage, channels in stages:
+                full_values = diag.first_conv_array(data, full[stage], dtype, [1, channels, 75])
+                tile_values = diag.first_conv_array(data, captures[stage], dtype, [1, channels, right-left])
+                comparisons[stage] = diag.first_conv_comparison(
+                    full_values, tile_values, channels, 75, right-left, start, left, end-start)
+            windows.append({"start": start, "end": end, "left": left, "right": right,
+                            "coreLength": end-start, "captures": captures, "alignedCore": comparisons})
+        return {"resident": {"sourceDtype": "F32", "foldDtype": "F32", "residentDtype": dtype,
+                             "weightShape": [1,64,7], "biasShape": [1],
+                             "weightF32LeSha256": "a"*64, "biasF32LeSha256": "b"*64},
+                "full": full, "windows": windows}
+
+    baseline, f32 = arm("bf16", "BF16", applicable), arm("f32", "F32")
+    controlled = {"status": "not_applicable", "reason": "no_positive_pre_bias_residual",
+                  "flagged": None, "crossArm": None, "modeEventsFile": "math-mode-events.jsonl"}
+    events = [{"action": "before_default_arm", "status": "CUBLAS_STATUS_SUCCESS", "rawMode": 0}]
+    if applicable:
+        flagged = arm("bf16-disallow", "BF16")
+        comparisons = {"full": {}, "windows": []}
+        stages = (("input",64),("preBias",1),("postBias",1))
+        for stage, channels in stages:
+            a = diag.first_conv_array(data, baseline["full"][stage], "BF16", [1,channels,75])
+            b = diag.first_conv_array(data, flagged["full"][stage], "BF16", [1,channels,75])
+            comparisons["full"][stage] = diag.first_conv_all_comparison(a,b,channels,75,0)
+        for original, changed in zip(baseline["windows"],flagged["windows"]):
+            length = original["right"]-original["left"]
+            row = {}
+            for stage, channels in stages:
+                a = diag.first_conv_array(data, original["captures"][stage], "BF16", [1,channels,length])
+                b = diag.first_conv_array(data, changed["captures"][stage], "BF16", [1,channels,length])
+                row[stage] = diag.first_conv_all_comparison(a,b,channels,length,original["left"])
+            comparisons["windows"].append(row)
+        controlled.update(status="collected", reason="positive_pre_bias_residual",
+                          flagged=flagged, crossArm=comparisons)
+        events += [{"action": action, "status": "CUBLAS_STATUS_SUCCESS", "rawMode": mode}
+                   for action,mode in (("before_flagged_arm",0),("set_disallow",16),
+                                       ("read_disallow",16),("restore_default",0),("read_restored",0))]
+    event_path = data / controlled["modeEventsFile"]
+    event_path.write_text("".join(json.dumps(row)+"\n" for row in events), encoding="utf-8")
+    controlled["modeEventsSha256"] = hashlib.sha256(event_path.read_bytes()).hexdigest()
+    report = {"schemaVersion": 3, "selector": "first_conv_math",
+              "purpose": "controlled_diagnostic_only_no_gate_change", "engineSha": diag.ENGINE_SHA,
+              "referenceSha256": diag.REFERENCE_SHA256,
+              "referenceMetadataSha256": hashlib.sha256(fixture.read_bytes()).hexdigest(),
+              "latentIdentity": {"sha256": diag.LATENT_SHA256, "shape": [75,64],
+                                 "source": {"stage_identity": "precision_reference:long_latent"}},
+              "backend": "cuda", "deviceOrdinal": 0, "decoderIdentity": standard,
+              "frames": 75, "coreFrames": 16, "haloFrames": 16,
+              "operator": {"name": "decoder.layers.0.Conv1d", "kernel": 7, "padding": 3,
+                           "stride": 1, "dilation": 1, "groups": 1},
+              "originalWaveformObservation": {"runId": "36884387320", "clampedMaxAbs": 0.03125,
+                                              "originalBound": 1/64,
+                                              "interpretation": "prior_failed_waveform_proof_not_a_first_conv_gate"},
+              "runs": {"bf16": baseline, "f32": f32}, "controlled": controlled}
+    (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+    return data, meta, report
+
+
 class DiagnosticGuards(unittest.TestCase):
     def test_explicit_selector_keeps_waveform_default_and_forwards_to_child(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("default: waveform", workflow)
-        self.assertIn("options: [waveform, first_conv]", workflow)
+        self.assertIn("options: [waveform, first_conv, first_conv_math]", workflow)
         self.assertIn('run --diagnostic "$env:YUE2_DIAGNOSTIC_SELECTOR"', workflow)
-        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv"))
+        self.assertEqual(diag.DIAGNOSTICS, ("waveform", "first_conv", "first_conv_math"))
+
+    def test_first_conv_math_conditional_arms_and_restore_receipt(self):
+        for applicable in (False, True):
+            with self.subTest(applicable=applicable), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                data, meta, report = synthetic_math_report(root, applicable)
+                old = Path.cwd()
+                try:
+                    os.chdir(root)
+                    diag.verify_first_conv_math_data(data, meta)
+                    if applicable:
+                        comparison = report["controlled"]["crossArm"]["windows"][0]["preBias"]
+                        comparison["differentValues"] = 0
+                        (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+                        with self.assertRaisesRegex(RuntimeError, "flagged window tensor comparison"):
+                            diag.verify_first_conv_math_data(data, meta)
+                        comparison["differentValues"] = 1
+                        (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+                        events = data / "math-mode-events.jsonl"
+                        rows = events.read_text(encoding="utf-8").splitlines()
+                        rows[-1] = json.dumps({"action":"read_restored","status":"CUBLAS_STATUS_SUCCESS","rawMode":16})
+                        events.write_text("\n".join(rows)+"\n", encoding="utf-8")
+                        report["controlled"]["modeEventsSha256"] = hashlib.sha256(events.read_bytes()).hexdigest()
+                        (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+                        with self.assertRaisesRegex(RuntimeError, "sequence incomplete"):
+                            diag.verify_first_conv_math_data(data, meta)
+                    else:
+                        report["controlled"]["status"] = "collected"
+                        (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+                        with self.assertRaisesRegex(RuntimeError, "inapplicable"):
+                            diag.verify_first_conv_math_data(data, meta)
+                finally:
+                    os.chdir(old)
+
+    def test_math_gate_signed_zero_and_input_mismatch_do_not_enable_flag(self):
+        windows = [{"alignedCore": {"input": {"differentValues": 0},
+                                    "preBias": {"differentValues": 1, "maxAbs": 0.0}}}]
+        self.assertEqual(diag.first_conv_math_gate(windows), "no_positive_pre_bias_residual")
+        windows[0]["alignedCore"]["preBias"]["maxAbs"] = 0.03125
+        self.assertEqual(diag.first_conv_math_gate(windows), "positive_pre_bias_residual")
+        windows[0]["alignedCore"]["input"]["differentValues"] = 1
+        self.assertEqual(diag.first_conv_math_gate(windows), "input_core_mismatch")
+
+    def test_math_report_preserves_input_bit_mismatch_as_not_applicable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data, meta, report = synthetic_math_report(root, False)
+            window = report["runs"]["bf16"]["windows"][0]
+            input_row = window["captures"]["input"]
+            path = data / input_row["file"]
+            raw = bytearray(path.read_bytes())
+            raw[4*4:5*4] = struct.pack("<f", -0.0)
+            path.write_bytes(raw)
+            input_row["sha256"] = hashlib.sha256(raw).hexdigest()
+            full = diag.first_conv_array(data, report["runs"]["bf16"]["full"]["input"],
+                                         "BF16", [1,64,75])
+            tile = diag.first_conv_array(data, input_row, "BF16", [1,64,32])
+            window["alignedCore"]["input"] = diag.first_conv_comparison(full,tile,64,75,32,0,0,16)
+            report["controlled"]["reason"] = "input_core_mismatch"
+            (data / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            old = Path.cwd()
+            try:
+                os.chdir(root)
+                diag.verify_first_conv_math_data(data, meta)
+            finally:
+                os.chdir(old)
 
     def test_first_conv_f32_json_scalars_compare_by_actual_tensor_bits(self):
         exact = struct.unpack("<f", struct.pack("<f", 1.2345679))[0]

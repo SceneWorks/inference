@@ -17,7 +17,7 @@ on:
         type: choice
         required: true
         default: waveform
-        options: [waveform, first_conv]
+        options: [waveform, first_conv, first_conv_math]
         description: One bounded diagnostic, with waveform preserving the existing default
       reference_run_id:
         type: string
