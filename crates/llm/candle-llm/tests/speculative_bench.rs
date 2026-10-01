@@ -8,7 +8,10 @@
 //! too. The pre-epic revision predates the harness, so its rows come from
 //! `core-llm-testkit/baseline/speculative_bench_baseline.rs` (its header has the copy-and-run
 //! steps); it is compiled here as `baseline`, and the tests below hold it to the harness's prompt
-//! set, budgets and schema.
+//! set, budgets and schema. Campaign evidence comes from
+//! `scripts/release/speculative_bench_campaign.py` (the CUDA lane of `real-weights.yml`), which
+//! stamps the commit at compile time (`SPECULATIVE_BENCH_BUILD_GIT_SHA`); a hand run like the one
+//! below records no stamp, which the campaign's checks refuse.
 //!
 //! ```text
 //! SPECULATIVE_BENCH_SNAPSHOT=/path/to/snapshot SPECULATIVE_BENCH_OUTPUT=/tmp/bench.json \
@@ -112,6 +115,22 @@ fn the_baseline_driver_runs_the_harness_prompt_set_and_budgets() {
     assert_eq!(baseline::BENCH_SWITCHES, core_llm_testkit::BENCH_SWITCHES);
     assert_eq!(baseline::BENCH_ENV, core_llm_testkit::BENCH_ENV);
     assert_eq!(baseline::GIT_SHA_ENV, core_llm_testkit::BENCH_GIT_SHA_ENV);
+    assert_eq!(
+        baseline::ALLOW_SHA_OVERRIDE_ENV,
+        core_llm_testkit::BENCH_ALLOW_SHA_OVERRIDE_ENV
+    );
+    assert_eq!(
+        baseline::BUILD_GIT_SHA_ENV,
+        core_llm_testkit::BENCH_BUILD_GIT_SHA_ENV
+    );
+    assert_eq!(
+        baseline::BUILD_GIT_DIRTY_ENV,
+        core_llm_testkit::BENCH_BUILD_GIT_DIRTY_ENV
+    );
+    assert_eq!(
+        baseline::build_stamp(),
+        core_llm_testkit::bench_build_stamp()
+    );
     assert_eq!(
         baseline::MAX_GIT_CHANGES,
         core_llm_testkit::BenchProvenance::MAX_CHANGES
@@ -322,4 +341,68 @@ fn the_baseline_driver_writes_the_harness_schema() {
         baseline::mode_json(&enabled),
         serde_json::to_value(Speculative::from(enabled)).unwrap()
     );
+}
+
+/// The baseline driver reconciles the compile-time stamp with the checkout exactly as the harness
+/// does: the same `git` block for every (checkout, stamp, override) combination, and the same
+/// refusals — a stale binary, a malformed stamp, an operator SHA without permission.
+#[test]
+fn the_baseline_driver_reconciles_the_build_stamp_as_the_harness_does() {
+    use core_llm_testkit::{
+        git_provenance, reconcile_git_provenance, BENCH_ALLOW_SHA_OVERRIDE_ENV, BENCH_GIT_SHA_ENV,
+    };
+    let checkout = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let outside = tempfile::tempdir().unwrap();
+    let now = git_provenance(&checkout, &|_| None);
+    let head = now.git_sha.clone().unwrap_or_else(|| "0".repeat(40));
+    let other = "0".repeat(40);
+    let dirty = match now.git_dirty {
+        Some(true) => "1",
+        _ => "0",
+    };
+    let clean_flip = if dirty == "1" { "0" } else { "1" };
+    let builds: Vec<(Option<&str>, Option<&str>)> = vec![
+        (None, None),
+        (Some(&head), Some(dirty)),
+        (Some(&head), Some(clean_flip)),
+        (Some(&other), Some(dirty)),
+        (Some("c1e8f8e02"), None),
+        (None, Some("yes")),
+    ];
+    type Var = Box<dyn Fn(&str) -> Option<String>>;
+    let overrides = |sha: Option<String>, allow: bool| -> Var {
+        Box::new(move |name: &str| match name {
+            n if n == BENCH_GIT_SHA_ENV => sha.clone(),
+            n if n == BENCH_ALLOW_SHA_OVERRIDE_ENV && allow => Some("1".into()),
+            _ => None,
+        })
+    };
+    let vars = [
+        overrides(None, false),
+        overrides(Some(head.clone()), true),
+        overrides(Some(head.clone()), false),
+        overrides(Some(other.clone()), true),
+    ];
+    let mut refused = 0;
+    for repo in [checkout.as_path(), outside.path()] {
+        for &build in &builds {
+            for (i, var) in vars.iter().enumerate() {
+                let harness = reconcile_git_provenance(git_provenance(repo, &**var), build, &**var)
+                    .map(|p| p.to_json()["git"].clone());
+                let driver = baseline::git_json(repo, build, &**var);
+                let tag = format!("{} {build:?} var #{i}", repo.display());
+                assert_eq!(
+                    harness.is_ok(),
+                    driver.is_ok(),
+                    "{tag}: {harness:?} {driver:?}"
+                );
+                if let (Ok(h), Ok(d)) = (&harness, &driver) {
+                    assert_eq!(h, d, "{tag}");
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+    }
+    assert!(refused > 0, "the table exercises the refusals");
 }

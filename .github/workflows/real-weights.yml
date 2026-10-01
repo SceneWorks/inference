@@ -4894,8 +4894,10 @@ jobs:
           retention-days: 30
 
   # sc-24446 (epic sc-24432 terminal campaign): the decode-speedups benchmark on the CUDA box — per
-  # matrix row, the epic's `speculative_bench` entry point and then the pre-epic baseline driver, one
-  # process at a time, every document into one run-scoped directory uploaded as one artifact.
+  # matrix row, the epic's `speculative_bench` entry point and the pre-epic baseline driver as
+  # alternating processes (epic, baseline, epic, … — the row's `process_repeats`), one at a time,
+  # every document into one run-scoped directory uploaded as one artifact. `compare` in the same
+  # script turns the artifact into the E6 verdicts and E5 defaults decisions.
   # Dispatch-only on its own profile (never `all`, never a PR or push): one matrix is hours of one
   # card.
   #
@@ -4903,11 +4905,14 @@ jobs:
   # pre-epic revision c1e8f8e02 (`inference-pre-epic`), into which the epic's baseline driver is
   # copied as its header says. Neither nests in the other, so each document's recorded `git status`
   # describes only its own tree — the runner refuses a head document from a dirty tree and a
-  # baseline document whose tree differs by more than the copied driver. The pre-epic build has its
-  # own persistent target directory beside the shared one.
+  # baseline document whose tree differs by more than the copied driver. The runner script builds
+  # both (the pre-epic one in its own persistent target directory beside the shared one) with the
+  # commit and dirty flag stamped at compile time, so a stale binary is refused, not measured.
   #
   # `CUDA_VISIBLE_DEVICES=1`: the box has two RTX PRO 6000s and CI's CUDA lanes use cuda:0, so the
   # campaign takes the second card (candle-llm opens device 0 of the devices it can see).
+  # `CUDA_DEVICE_ORDER=PCI_BUS_ID` makes CUDA number the cards as nvidia-smi does (the default
+  # FASTEST_FIRST order need not), so ordinal 1 is the inventory's GPU 1.
   #
   # `timeout-minutes: 600` is a runaway guard, not a budget: two cold `--release --features cuda`
   # builds, then every row's runs back to back. Re-size it from the first campaign that completes.
@@ -4924,6 +4929,7 @@ jobs:
       DECODE_BENCH_SNAPSHOT_QWEN38: ${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}
       DECODE_BENCH_SNAPSHOT_BONSAI_MLX: ${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}
       DECODE_BENCH_PRE_EPIC_TARGET: ${{ github.workspace }}/../cargo-target-pre-epic
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
       CUDA_VISIBLE_DEVICES: "1"
       # The bottom rung of the arch ladder, not the hardware — see the note on `same-l-cuda`.
       CUDA_COMPUTE_CAP: "80"
@@ -4971,19 +4977,9 @@ jobs:
           where nvidia-smi >nul 2>&1 || (echo nvidia-smi not on PATH; exit /b 0)
           nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free --format=csv > "%DECODE_BENCH_OUT%\cuda-device-inventory.csv"
           type "%DECODE_BENCH_OUT%\cuda-device-inventory.csv"
-      - name: Build the epic benchmark binary
-        shell: cmd
-        run: |
-          call "%VCVARS%"
-          cargo test --locked --release -p candle-llm --features cuda --test speculative_bench --no-run || exit /b 1
-      - name: Build the pre-epic baseline driver
-        shell: cmd
-        working-directory: inference-pre-epic
-        run: |
-          call "%VCVARS%"
-          set "CARGO_TARGET_DIR=%DECODE_BENCH_PRE_EPIC_TARGET%"
-          cargo test --locked --release -p candle-llm --features cuda --test speculative_bench_baseline --no-run || exit /b 1
-      - name: Run every matrix row (epic entry, then baseline driver)
+      # The runner builds both checkouts first (stamped: `SPECULATIVE_BENCH_BUILD_GIT_SHA`), then
+      # alternates the epic and baseline processes per row.
+      - name: Build both checkouts and run every matrix row (epic and baseline alternating)
         shell: cmd
         run: call scripts\ci\real-weights\candle-decode-speedups-bench\run-every-matrix-row.cmd
       - name: Keep the decode-speedups benchmark documents
