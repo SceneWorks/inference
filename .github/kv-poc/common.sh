@@ -24,6 +24,15 @@
 : "${INFERENCE_SHA:?INFERENCE_SHA is required}"
 : "${SCENEWORKS_SHA:?SCENEWORKS_SHA is required}"
 
+# Host affinity. Each job reuses what the previous one left in THIS host's $KV_ROOT, so a run whose
+# jobs split across the two Macs fails later with a missing tree or frozen dir on the other box
+# (run 36816509385). config.sh resolves the one runner the run must stay on; refuse anything else
+# before touching state. Unset outside the workflow (local tests source this file).
+if [ -n "${KV_EXPECTED_RUNNER:-}" ] && [ "${RUNNER_NAME:-}" != "$KV_EXPECTED_RUNNER" ]; then
+  echo "::error title=wrong runner::this job landed on '${RUNNER_NAME:-?}' ($(hostname)), but the campaign's state lives on '$KV_EXPECTED_RUNNER'; its runs-on labels no longer select that runner alone (check the org runner labels, kv-poc/config.sh)"
+  exit 1
+fi
+
 KV_ROOT="${KV_POC_ROOT:-$HOME/kv-poc}"
 KV_HF_HUB="${KV_POC_HF_HUB:-/Volumes/Models/huggingface/hub}"
 INF="$KV_ROOT/$INFERENCE_SHA/inference"

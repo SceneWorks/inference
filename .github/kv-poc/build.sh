@@ -182,7 +182,9 @@ stage_binaries() {
 # both campaign parents bind the executable bytes into their resume identities.
 stage_w2_binaries() {
   local b entry path sha metallib_sha krea
-  verify_tree "$INF" "$INFERENCE_URL" "$INFERENCE_SHA"
+  # Its own job: (re)establish the tree idempotently (reused when present, no fetch) instead of
+  # assuming w2-assets' clone is still there.
+  ensure_clone "$INFERENCE_URL" "$INF" "$INFERENCE_SHA"
   (cd "$KV_DIR" && shasum -a 256 -c inputs.sha256)
   if [ -f "$F2/SHA256SUMS" ]; then
     verify_frozen "$F2"
