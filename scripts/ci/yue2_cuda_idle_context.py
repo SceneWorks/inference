@@ -10,6 +10,7 @@ import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -71,10 +72,14 @@ def _gpu_row(directory: Path, name: str, *, has_free: bool) -> dict:
 def _pmon(directory: Path, name: str, pid: int) -> None:
     sample = read_json(directory, name)
     require(sample.get("exitCode") == 0, f"{name} unavailable")
+    _pmon_output(sample.get("output", []), name, pid)
+
+
+def _pmon_output(output: list[str], name: str, pid: int) -> None:
     columns = None
     processes = set()
     compute_rows = 0
-    for line in sample.get("output", []):
+    for line in output:
         fields = line.split()
         if line.startswith("#"):
             if "pid" in fields and "type" in fields:
@@ -84,12 +89,21 @@ def _pmon(directory: Path, name: str, pid: int) -> None:
             continue
         require(columns is not None and all(key in columns for key in ("gpu", "pid", "type")),
                 f"{name} missing typed pmon header")
+        require(all(key in columns for key in ("sm", "mem", "enc", "dec", "jpg", "ofa")),
+                f"{name} missing utilization columns")
         require(len(fields) > max(columns[key] for key in ("gpu", "pid", "type")), f"{name} truncated row")
         gpu, proc, kind = (fields[columns[key]] for key in ("gpu", "pid", "type"))
         require(gpu == "0", f"{name} wrong physical GPU")
         if proc == "-" and kind == "-":
             continue
         require(proc.isdigit() and kind in ("C", "C+G", "G"), f"{name} unknown process type")
+        for metric in ("sm", "mem", "enc", "dec", "jpg", "ofa"):
+            require(len(fields) > columns[metric], f"{name} truncated utilization")
+            value = fields[columns[metric]]
+            if value == "-":
+                continue  # Unsupported pmon telemetry still needs valid Windows counters.
+            require(re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", value) is not None and float(value) == 0,
+                    f"{name} active or invalid {metric} utilization")
         if kind != "G":
             processes.add((int(proc), kind))
             compute_rows += 1
@@ -132,8 +146,9 @@ def _counters(directory: Path, epoch: int, pid: int, luid: str, *, baseline: boo
                    if sample.get("instance", "").lower().startswith(prefix)]
         require(samples and all(str(sample.get("status")) == "0" for sample in samples),
                 f"{path} target status missing or invalid")
-        require(all(isinstance(sample.get("cookedValue"), (int, float)) and
-                    sample["cookedValue"] >= 0 for sample in samples), f"{path} target value invalid")
+        require(all(type(sample.get("cookedValue")) in (int, float) and
+                    math.isfinite(sample["cookedValue"]) and sample["cookedValue"] >= 0
+                    for sample in samples), f"{path} target value invalid")
         if key == "engine":
             result[key] = {sample["instance"].lower(): sample["cookedValue"] for sample in samples}
             require(len(result[key]) == len(samples) and all(value == 0 for value in result[key].values()),
@@ -267,6 +282,7 @@ def reviewed_baseline() -> tuple[dict, Path]:
 def census_mixed_context(pid: int, initial_pmon: str) -> tuple[str, bool]:
     baseline, _ = reviewed_baseline()
     require(pid == baseline["identity"][0], "unreviewed mixed-context PID")
+    _pmon_output(initial_pmon.splitlines(), "initial pmon", pid)
     with tempfile.TemporaryDirectory(prefix="yue2-cuda-guard-") as root:
         output = Path(root)
         script = Path(__file__).with_name("yue2_cuda_context_diagnostic.ps1")

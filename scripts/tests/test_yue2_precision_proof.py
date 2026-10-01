@@ -153,6 +153,12 @@ class PrecisionControlTests(unittest.TestCase):
                 path.write_text(json.dumps({"targetPid": pid, "counters": value}), encoding="utf-8")
                 return IDLE._counters(Path(directory), 0, pid, luid, baseline=False)
             self.assertEqual(check(rows)["processDedicated"], 19_341_312)
+            for index in range(len(rows)):
+                for invalid in (float("inf"), float("-inf"), float("nan"), True):
+                    changed = copy.deepcopy(rows)
+                    changed[index]["samples"][0]["cookedValue"] = invalid
+                    with self.subTest(counter=index, invalid=invalid), self.assertRaises(RuntimeError):
+                        check(changed)
             for mutation in (
                 lambda x: x[0]["samples"][0].__setitem__("status", "1"),
                 lambda x: x[0]["samples"][0].__setitem__("cookedValue", 0.1),
@@ -170,19 +176,37 @@ class PrecisionControlTests(unittest.TestCase):
             pmon = root / "pmon-0-0.json"
             apps = root / "compute-apps-0-0.json"
             def check(rows, app_rows):
-                pmon.write_text(json.dumps({"exitCode": 0, "output": ["# gpu pid type fb sm", *rows]}), encoding="utf-8")
+                pmon.write_text(json.dumps({"exitCode": 0, "output": ["# gpu pid type fb sm mem enc dec jpg ofa", *rows]}), encoding="utf-8")
                 apps.write_text(json.dumps({"exitCode": 0, "output": app_rows}), encoding="utf-8")
                 IDLE._pmon(root, "pmon-0-0", 38212)
                 IDLE._compute_apps(root, "compute-apps-0-0", 38212)
-            check(["0 38212 C+G 0 -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"])
+            check(["0 38212 C+G 0 - - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"])
             for rows, app_rows in (
                 ([], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
-                (["0 38212 C+G 0 -", "0 999 C+G 0 -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
-                (["0 38212 C+G 0 -", "0 999 C 0 2"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
-                (["0 38212 C+G 0 -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]", "999, C:\\Other.exe, [N/A]"]),
+                (["0 38212 C+G 0 - - - - - -", "0 999 C+G 0 - - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 - - - - - -", "0 999 C 0 2 - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 - - - - - -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]", "999, C:\\Other.exe, [N/A]"]),
             ):
                 with self.subTest(rows=rows, app_rows=app_rows), self.assertRaises(RuntimeError):
                     check(rows, app_rows)
+
+    def test_pmon_positive_utilization_refuses_even_with_idle_windows_samples(self):
+        header = "# gpu pid type sm mem enc dec jpg ofa fb ccpm command"
+        values = ["0", "38212", "C+G", "-", "-", "-", "-", "-", "-", "19", "0", "desktop.exe"]
+        IDLE._pmon_output([header, " ".join(values)], "initial pmon", 38212)
+        for missing in range(3, 9):
+            columns = header.split()[1:]
+            fields = values.copy()
+            columns.pop(missing)
+            fields.pop(missing)
+            with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                IDLE._pmon_output(["# " + " ".join(columns), " ".join(fields)], "initial pmon", 38212)
+        for index in range(3, 9):
+            for invalid in ("50", "0.1", "NaN", "Infinity", "bad"):
+                changed = values.copy()
+                changed[index] = invalid
+                with self.subTest(metric=index, value=invalid), self.assertRaises(RuntimeError):
+                    IDLE._pmon_output([header, " ".join(changed)], "initial pmon", 38212)
 
     def test_metal_census_refuses_foreign_workers_by_executable_only(self):
         rows = "\n".join((
