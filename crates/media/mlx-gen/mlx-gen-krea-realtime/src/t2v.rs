@@ -1312,6 +1312,29 @@ mod tests {
         }
     }
 
+    /// SC-20684: the decode returns the denoise's cached buffers at its START, before the VAE builds
+    /// its working set — a clear after the decode would let both phases' buffers coexist in the
+    /// process footprint. Behaviour is measured in `tests/t2v_pipeline.rs`; the position is pinned here.
+    #[test]
+    fn decode_latents_to_video_clears_the_denoise_cache_before_decoding() {
+        let source = include_str!("t2v.rs");
+        let body = source
+            .split_once("pub fn decode_latents_to_video(")
+            .expect("decode_latents_to_video")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let clear = body
+            .find("mlx_rs::memory::clear_cache();")
+            .expect("decode_latents_to_video must clear MLX's cache");
+        let decode = body.find("decode_to_frames(").expect("VAE decode");
+        assert!(
+            clear < decode,
+            "the cache clear must precede the VAE decode"
+        );
+    }
+
     /// sc-22738: no reported route re-raises the Conditioning fault at its own call site (that was
     /// the reviewed defect — it fired with the 14B DiT and the VAE already resident), and each one
     /// threads its request-scoped `job.memory` into `stage_components` so the hook can see it.
