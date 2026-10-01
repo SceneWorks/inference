@@ -281,6 +281,18 @@ impl QuantizedLinear {
         weight + self.bias.as_ref().map_or(0, dense)
     }
 
+    /// The logical `(out, in)` weight shape.
+    pub fn dims(&self) -> (usize, usize) {
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) | QuantizedWeight::Dequant(q) => {
+                q.shape().dims2().unwrap_or((0, 0))
+            }
+            QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => {
+                t.dims2().unwrap_or((0, 0))
+            }
+        }
+    }
+
     /// Logical weight elements (`out · in`).
     pub fn weight_elems(&self) -> usize {
         match &self.inner {
@@ -288,6 +300,22 @@ impl QuantizedLinear {
                 q.shape().elem_count()
             }
             QuantizedWeight::Matmul(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => t.elem_count(),
+        }
+    }
+
+    /// The resident GGML block tensor and how this projection's forward uses it, for an MoE bank's
+    /// indexed expert table (sc-24440): `(weight, dequant)` — `dequant` for the MLX-affine Q8
+    /// tier, whose forward dequantizes the weight to the activation dtype; otherwise the forward
+    /// is `QMatMul`'s. `None` for a float-typed GGUF matrix (no blocks) or a projection with a bias
+    /// (the indexed kernels add none).
+    pub fn indexed_source(&self) -> Option<(std::sync::Arc<QTensor>, bool)> {
+        if self.bias.is_some() {
+            return None;
+        }
+        match &self.inner {
+            QuantizedWeight::Matmul(QMatMul::QTensor(q)) => Some((q.clone(), false)),
+            QuantizedWeight::Dequant(q) => Some((q.clone(), true)),
+            QuantizedWeight::Matmul(_) => None,
         }
     }
 

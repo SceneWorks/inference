@@ -890,6 +890,21 @@ impl CausalLm {
         }
     }
 
+    /// The widest per-token working set of this model's Mixture-of-Experts dispatch in bytes
+    /// ([`SparseMoe::step_bytes_per_token`](crate::primitives::moe::SparseMoe::step_bytes_per_token)
+    /// over every MoE layer; sc-24440) — `0` for a dense model. Admission prices it per token row
+    /// on top of the dense step working set.
+    pub fn moe_step_bytes_per_token(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => Some(m.step_bytes_per_token()),
+                Ffn::Dense(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions —
     /// the term admission charges for the static KV cache (E6). Saturating.
     pub fn static_kv_bytes(&self, capacity: usize) -> usize {
@@ -1866,8 +1881,10 @@ impl StepModel for CausalLm {
     /// device data: with device positions on (the CUDA default) a step reads its RoPE positions,
     /// KV write index and attention length from the cache's staged buffers. Still declared
     /// uncapturable, so the runner refuses before any capture: a Mixture-of-Experts layer whose
-    /// experts Candle cannot index by a device id (quantized) dispatches them from host-read
-    /// routes (`moe_expert_host_dispatch`; the router itself runs on the device since sc-24440);
+    /// experts no indexed kernel serves — Prism-packed, a mixed or biased bank, NVFP4 with the
+    /// decode GEMV off, a kernel that does not compile, any bank off CUDA — dispatches them from
+    /// host-read routes (`moe_expert_host_dispatch:<cause>`, sc-24440; dense, GGML, MLX-affine Q8
+    /// and NVFP4 banks are dispatched on the device and capture);
     /// with device positions off the positions are Rust-side scalars (`positions_host_scalar`);
     /// and a stack the device path does not serve says why
     /// ([`CausalLm::device_positions_support`]).

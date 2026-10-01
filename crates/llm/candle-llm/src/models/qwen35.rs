@@ -2419,6 +2419,21 @@ impl Qwen35Model {
         })
     }
 
+    /// The widest per-token working set of this model's Mixture-of-Experts dispatch in bytes
+    /// ([`SparseMoe::step_bytes_per_token`](crate::primitives::moe::SparseMoe::step_bytes_per_token)
+    /// over every MoE layer; sc-24440) — `0` for a dense model. Admission prices it per token row
+    /// on top of the dense step working set.
+    pub fn moe_step_bytes_per_token(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => Some(m.step_bytes_per_token()),
+                Ffn::Dense(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions:
     /// K and V for every full-attention layer in the compute dtype — the term admission charges
     /// for the preallocation (E6). Saturating.
@@ -3251,9 +3266,11 @@ impl StepModel for Qwen35Model {
     /// device data: with device positions on (the CUDA default) a step reads its RoPE positions,
     /// KV write index, attention length and DeltaNet ring slots from the cache's staged buffers.
     /// Still declared uncapturable, so the runner refuses before any capture: an MoE block
-    /// (35B-A3B) whose experts Candle cannot index by a device id (quantized) dispatches them from
-    /// host-read routes (`moe_expert_host_dispatch`; the router itself runs on the device since
-    /// sc-24440); with device positions off the positions are Rust-side scalars
+    /// (35B-A3B) whose experts no indexed kernel serves — Prism-packed, a mixed or biased bank,
+    /// NVFP4 with the decode GEMV off, a kernel that does not compile, any bank off CUDA —
+    /// dispatches them from host-read routes (`moe_expert_host_dispatch:<cause>`, sc-24440; dense,
+    /// GGML, MLX-affine Q8 and NVFP4 banks are dispatched on the device and capture); with device
+    /// positions off the positions are Rust-side scalars
     /// (`positions_host_scalar`); and a model the device path does not serve says why
     /// ([`Qwen35Model::device_positions_support`]).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
