@@ -121,3 +121,9 @@ summary ""
 summary "Safe stop for a running campaign job (it exits 75 after the in-flight row): \`$(stop_command)\`"
 echo "precheck as of now: $go"
 exit 0
+
+# one-off: top memory consumers (pid, rss MiB, footprint via footprint(1) best effort, command)
+echo "== top 15 processes by RSS =="
+ps -axo pid=,rss=,comm= | sort -k2 -nr | head -15 | awk '{printf "%7s %9.1f MiB  %s\n",$1,$2/1024,$3}'
+echo "== memory_pressure =="
+memory_pressure 2>/dev/null | tail -5 || true
