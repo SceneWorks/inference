@@ -13,6 +13,7 @@ result; a pre-spawn refusal, watchdog abort or failed child is only ever an unac
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -21,6 +22,7 @@ import platform
 import re
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -223,6 +225,8 @@ FOOTPRINT_READS_PER_TICK = 4
 FOOTPRINT_FAILED_TICK_LIMIT = 5
 # Host reads per preflight or watchdog tick: one read plus three immediate retries.
 HOST_READS_PER_TICK = 4
+# CUDA free/attribution reads per preflight or watchdog tick: one read plus three retries.
+GPU_READS_PER_TICK = 4
 _RUSAGE_INFO_V4 = 4
 
 
@@ -253,31 +257,66 @@ def proc_pid_rusage_footprint(pid: int) -> tuple[int, int]:
     read without spawning a sampler process. ESRCH (the PID is gone) raises
     ProcessLookupError; every other failure raises OSError carrying its errno.
     """
-    global _libproc
-    if _libproc is None:
-        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        library.proc_pid_rusage.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
-        library.proc_pid_rusage.restype = ctypes.c_int
-        _libproc = library
+    library = _load_libproc()
+    if library is None:
+        raise OSError(errno.ENOSYS, "proc_pid_rusage needs macOS libproc")
     info = _RusageInfoV4()
-    if _libproc.proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(info)) != 0:
+    if library.proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(info)) != 0:
         code = ctypes.get_errno()
         raise OSError(code, os.strerror(code))  # ESRCH constructs ProcessLookupError
     return info.ri_phys_footprint, info.ri_lifetime_max_phys_footprint
 
 
-def read_host(probe: object) -> tuple[int, dict[str, object] | None]:
-    """One host measurement, retried immediately; probe-failure once every read failed."""
-    last = SupervisionError("probe-failure", "no host read attempted")
-    for _ in range(HOST_READS_PER_TICK):
+def retry_reads(read: Callable[[], object], reads: int, label: str):
+    """One probe measurement, retried immediately; probe-failure once every read failed.
+
+    Mirrors the Rust campaign supervisor: a transient probe failure (a sampler timing out
+    under heavy host I/O) is retried within the tick, and the detail keeps the read count
+    and the last error. Any other SupervisionError is a real verdict and propagates at once.
+    """
+    last = SupervisionError("probe-failure", f"no {label} read attempted")
+    for _ in range(reads):
         try:
-            return probe.host_admission()
+            return read()
         except SupervisionError as error:
             if error.reason != "probe-failure":
                 raise
             last = error
-    raise SupervisionError(
-        "probe-failure", f"host probe failed {HOST_READS_PER_TICK} reads; last error {last.detail}")
+    raise SupervisionError("probe-failure", f"{label} probe failed {reads} reads; last error {last.detail}")
+
+
+class FailedTicks:
+    """Consecutive watchdog ticks on which one probe failed every in-tick read.
+
+    The row stops as probe-failure only once FOOTPRINT_FAILED_TICK_LIMIT consecutive ticks
+    failed; any successful tick resets the count. The other watchdogs keep running meanwhile.
+    """
+
+    def __init__(self, label: str):
+        self.label = label
+        self.count = 0
+
+    def failed(self, error: SupervisionError) -> None:
+        if error.reason != "probe-failure":
+            raise error
+        self.count += 1
+        if self.count >= FOOTPRINT_FAILED_TICK_LIMIT:
+            raise SupervisionError(
+                "probe-failure",
+                f"{self.label} failed on {self.count} consecutive ticks; last error {error.detail}") from error
+
+    def succeeded(self) -> None:
+        self.count = 0
+
+
+def read_host(probe: object) -> tuple[int, dict[str, object] | None]:
+    """One host measurement, retried immediately; probe-failure once every read failed."""
+    return retry_reads(probe.host_admission, HOST_READS_PER_TICK, "host")
+
+
+def read_gpu(read: Callable[[], object]):
+    """One CUDA (nvidia-smi/NVML) measurement, retried immediately like the host probe."""
+    return retry_reads(read, GPU_READS_PER_TICK, "CUDA")
 
 
 def darwin_phys_footprint(pid: int, *, read: Callable[[int], tuple[int, int]] = proc_pid_rusage_footprint) -> int | None:
@@ -315,8 +354,82 @@ def linux_free_bytes(output: str) -> int:
     return fields["MemAvailable"]
 
 
-def _process_table() -> dict[int, tuple[int, int]]:
-    output = _bounded_output(["/bin/ps", "-axo", "pid=,ppid=,pgid=,stat="])
+# Seconds the `ps` fallback may take. The fallback only runs where libproc is unavailable;
+# a 2 s budget aborted a Krea row while a 14B load saturated host I/O (SC-20684).
+PS_FALLBACK_TIMEOUT_SECONDS = 10.0
+# Process-table reads per watchdog tick: one read plus three immediate retries.
+PROCESS_TABLE_READS_PER_TICK = 4
+_PROC_PIDT_SHORTBSDINFO = 13
+_SZOMB = 5
+
+
+class _ProcBsdShortInfo(ctypes.Structure):
+    """<sys/proc_info.h> struct proc_bsdshortinfo."""
+
+    _fields_ = [(name, ctypes.c_uint32) for name in ("pbsi_pid", "pbsi_ppid", "pbsi_pgid", "pbsi_status")] + [
+        ("pbsi_comm", ctypes.c_char * 16)] + [(name, ctypes.c_uint32) for name in (
+            "pbsi_flags", "pbsi_uid", "pbsi_gid", "pbsi_ruid", "pbsi_rgid", "pbsi_svuid",
+            "pbsi_svgid", "pbsi_rfu")]
+
+
+def _load_libproc():
+    """libproc with every symbol this module calls typed, loaded once; None off macOS."""
+    global _libproc
+    if _libproc is None:
+        if sys.platform != "darwin":
+            return None
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_pid_rusage.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+        library.proc_pid_rusage.restype = ctypes.c_int
+        library.proc_listallpids.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        library.proc_listallpids.restype = ctypes.c_int
+        library.proc_pidinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+        library.proc_pidinfo.restype = ctypes.c_int
+        _libproc = library
+    return _libproc
+
+
+def libproc_process_table(library) -> dict[int, tuple[int, int]]:
+    """{pid: (ppid, pgid)} for every live non-zombie process, from libproc syscalls only.
+
+    proc_listallpids, then proc_pidinfo(PROC_PIDT_SHORTBSDINFO) per PID: the same fields
+    `ps -axo pid=,ppid=,pgid=,stat=` prints, without spawning a process. PROC_PIDT_SHORTBSDINFO
+    is readable for every user's processes, so a setuid descendant is never hidden. A zombie
+    (listed, but its read fails ESRCH) or a PID that exited between the listing and its read is
+    skipped, as ps's Z rows are; any other failure raises OSError carrying its errno.
+    """
+    capacity = library.proc_listallpids(None, 0)
+    if capacity <= 0:
+        code = ctypes.get_errno()
+        raise OSError(code, f"proc_listallpids: {os.strerror(code)}")
+    while True:
+        capacity += 256
+        buffer = (ctypes.c_int * capacity)()
+        count = library.proc_listallpids(buffer, ctypes.sizeof(buffer))
+        if count <= 0:
+            code = ctypes.get_errno()
+            raise OSError(code, f"proc_listallpids: {os.strerror(code)}")
+        if count < capacity:
+            break  # A full buffer may have truncated the listing.
+    result = {}
+    info = _ProcBsdShortInfo()
+    for pid in buffer[:count]:
+        if pid <= 0:
+            continue  # kernel_task; ps does not list it
+        if library.proc_pidinfo(pid, _PROC_PIDT_SHORTBSDINFO, 0, ctypes.byref(info),
+                                ctypes.sizeof(info)) != ctypes.sizeof(info):
+            code = ctypes.get_errno()
+            if code == errno.ESRCH:
+                continue
+            raise OSError(code, f"proc_pidinfo({pid}): {os.strerror(code)}")
+        if info.pbsi_status != _SZOMB:
+            result[pid] = (info.pbsi_ppid, info.pbsi_pgid)
+    return result
+
+
+def ps_process_table() -> dict[int, tuple[int, int]]:
+    """The `ps` fallback for hosts without libproc (Linux)."""
+    output = _bounded_output(["/bin/ps", "-axo", "pid=,ppid=,pgid=,stat="], timeout=PS_FALLBACK_TIMEOUT_SECONDS)
     result = {}
     for line in output.splitlines():
         parts = line.split()
@@ -328,6 +441,24 @@ def _process_table() -> dict[int, tuple[int, int]]:
         if not state.startswith("Z"):
             result[int(pid)] = (int(parent), int(group))
     return result
+
+
+def _read_process_table() -> dict[int, tuple[int, int]]:
+    try:
+        library = _load_libproc()
+    except (OSError, AttributeError):
+        library = None  # libproc absent or missing a symbol: fall back to ps
+    if library is None:
+        return ps_process_table()
+    try:
+        return libproc_process_table(library)
+    except OSError as error:
+        raise SupervisionError("probe-failure", f"libproc process table: errno {error.errno}: {error.strerror}") from error
+
+
+def _process_table() -> dict[int, tuple[int, int]]:
+    """The owned-tree snapshot, read with immediate retries like every watchdog probe."""
+    return retry_reads(_read_process_table, PROCESS_TABLE_READS_PER_TICK, "process table")
 
 
 def _group_pids(pgid: int) -> set[int]:
@@ -752,7 +883,10 @@ def _run_admitted(
         raise SupervisionError("preflight-memory", "host available is below reserve plus child cap")
     gpu_free = None
     if policy.backend in {"linux-cuda", "windows-cuda"}:
-        gpu_free = probe.gpu_free()
+        try:
+            gpu_free = read_gpu(probe.gpu_free)
+        except SupervisionError as error:
+            raise SupervisionError(error.reason, f"preflight {error.detail}") from error
         if gpu_free < policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes:
             raise SupervisionError("preflight-memory", "CUDA free is below reserve plus child cap")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -786,8 +920,10 @@ def _run_admitted(
         peak_host = 0
         peak_gpu = 0
         samples: list[dict[str, object]] = []
-        failed_footprint_ticks = 0
-        failed_host_ticks = 0
+        failed_tree_ticks = FailedTicks("process-tree probe")
+        failed_footprint_ticks = FailedTicks("child footprint probe")
+        failed_host_ticks = FailedTicks("live host probe")
+        failed_gpu_ticks = FailedTicks("CUDA probe")
         def check_artifact_caps() -> None:
             if stdout_path.stat().st_size > policy.stdout_cap_bytes or stderr_path.stat().st_size > policy.stderr_cap_bytes:
                 raise SupervisionError("log-cap", "child exceeded a bounded transcript file")
@@ -836,25 +972,26 @@ def _run_admitted(
                     raise SupervisionError("deadline", "child exceeded the hard wall-clock deadline")
                 check_artifact_caps()
                 status = child.poll()
-                pids, owned = owned_processes()
-                finished = finished_result(status, pids, owned)
-                if finished is not None:
-                    return finished
+                try:
+                    pids, owned = owned_processes()
+                except SupervisionError as error:
+                    # The host watchdog keeps running on a failed process-tree tick; the
+                    # exit, footprint and CUDA checks wait for the next tree snapshot.
+                    failed_tree_ticks.failed(error)
+                    pids = None
+                else:
+                    failed_tree_ticks.succeeded()
+                    finished = finished_result(status, pids, owned)
+                    if finished is not None:
+                        return finished
                 try:
                     available, live_host = read_host(probe)
                 except SupervisionError as error:
-                    if error.reason != "probe-failure":
-                        raise
                     # The child footprint watchdog keeps running on a failed host tick.
-                    failed_host_ticks += 1
-                    if failed_host_ticks >= FOOTPRINT_FAILED_TICK_LIMIT:
-                        raise SupervisionError(
-                            "probe-failure",
-                            f"live host probe failed on {failed_host_ticks} consecutive ticks; "
-                            f"last error {error.detail}") from error
+                    failed_host_ticks.failed(error)
                     available, live_host = None, None
                 else:
-                    failed_host_ticks = 0
+                    failed_host_ticks.succeeded()
                 if available is not None and available < policy.host_free_reserve_bytes:
                     metric = live_host["metric"] if live_host is not None else "host-free"
                     error = SupervisionError(
@@ -869,25 +1006,23 @@ def _run_admitted(
                     except SupervisionError as error:
                         # A short-lived child may exit after the ownership
                         # snapshot and before its footprint is read.
-                        finished = finished_result(child.poll(), *owned_processes())
+                        try:
+                            finished = finished_result(child.poll(), *owned_processes())
+                        except SupervisionError as recheck:
+                            if recheck.reason != "probe-failure":
+                                raise
+                            finished = None  # the tree recheck failed too: a failed tick
                         if finished is not None:
                             return finished
-                        if error.reason != "probe-failure":
-                            raise
                         # A live root, owned descendant, or uncertain ownership
                         # stops the row only once the failure is sustained.
-                        failed_footprint_ticks += 1
-                        if failed_footprint_ticks >= FOOTPRINT_FAILED_TICK_LIMIT:
-                            raise SupervisionError(
-                                "probe-failure",
-                                f"child footprint probe failed on {failed_footprint_ticks} "
-                                f"consecutive ticks; last error {error.detail}") from error
+                        failed_footprint_ticks.failed(error)
                         footprint = None
                     else:
                         # None: every owned process was gone (ESRCH); the next
                         # tick's poll and ownership snapshot classify the exit.
                         if footprint is not None:
-                            failed_footprint_ticks = 0
+                            failed_footprint_ticks.succeeded()
                     if footprint is not None:
                         peak_host = max(peak_host, footprint)
                         samples.append({"phase": "process-sample", "sample_kind": "process",
@@ -897,7 +1032,13 @@ def _run_admitted(
                         if footprint > policy.child_footprint_cap_bytes:
                             raise SupervisionError("child-footprint", "owned tree exceeded child cap")
                     if policy.backend in {"linux-cuda", "windows-cuda"}:
-                        device_free, device_used = probe.gpu_free_and_tree_bytes(owner)
+                        try:
+                            device_free, device_used = read_gpu(lambda: probe.gpu_free_and_tree_bytes(owner))
+                        except SupervisionError as error:
+                            failed_gpu_ticks.failed(error)
+                            time.sleep(policy.poll_millis / 1000)
+                            continue
+                        failed_gpu_ticks.succeeded()
                         peak_gpu = max(peak_gpu, device_used)
                         if device_free < policy.gpu_free_reserve_bytes or device_used > policy.child_gpu_cap_bytes:
                             raise SupervisionError("device-memory", "owned CUDA use or free reserve exceeded cap")

@@ -567,6 +567,167 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("errno 1: Operation not permitted", caught.exception.detail)
         self.assertEqual(len(reads), 5 * safety.FOOTPRINT_READS_PER_TICK)
 
+    @staticmethod
+    def ps_timeout():
+        return safety.SupervisionError(
+            "probe-failure", "/bin/ps: Command '['/bin/ps', '-axo', 'pid=,ppid=,pgid=,stat=']' "
+            "timed out after 2.0 seconds")
+
+    def scripted_table(self, failing):
+        """_read_process_table that raises the SC-20684 ps timeout on the read indexes failing()
+        selects and otherwise reads the real table."""
+        real = safety._read_process_table
+        reads = []
+        def read():
+            reads.append(None)
+            if failing(len(reads)):
+                raise self.ps_timeout()
+            return real()
+        return read, reads
+
+    def test_process_table_retries_within_a_tick(self):
+        read, reads = self.scripted_table(lambda n: n <= 3)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            self.assertIn(os.getpid(), safety._process_table())
+        self.assertEqual(len(reads), 4)
+        read, reads = self.scripted_table(lambda n: True)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            with self.assertRaises(safety.SupervisionError) as caught:
+                safety._process_table()
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("process table probe failed 4 reads; last error /bin/ps:", caught.exception.detail)
+        self.assertIn("timed out after 2.0 seconds", caught.exception.detail)
+        self.assertEqual(len(reads), safety.PROCESS_TABLE_READS_PER_TICK)
+
+    def test_transient_process_tree_failures_never_stop_a_row(self):
+        stop, script = self.stop_when_present_script()
+        per_tick = safety.PROCESS_TABLE_READS_PER_TICK
+        # Four failed ticks, a good tick, four more failed ticks: never five in a row.
+        def failing(n):
+            if n > 1 + 8 * per_tick:
+                stop.touch()
+                return False
+            return n != 1 + 4 * per_tick
+        read, reads = self.scripted_table(failing)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            result = self.run_child(script, policy=self.patient_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertGreater(len(reads), 1 + 8 * per_tick)
+
+    def test_sustained_process_tree_failure_stops_with_detail_and_count(self):
+        _stop, script = self.stop_when_present_script()
+        limit = safety.FOOTPRINT_FAILED_TICK_LIMIT * safety.PROCESS_TABLE_READS_PER_TICK
+        # Every watchdog read fails; the reaper's later reads see the real table.
+        read, reads = self.scripted_table(lambda n: n <= limit)
+        with patch.object(safety, "_read_process_table", side_effect=read):
+            with self.assertRaises(safety.SupervisionError) as caught:
+                self.run_child(script, policy=self.patient_policy())
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("process-tree probe failed on 5 consecutive ticks; last error process table "
+                      "probe failed 4 reads; last error /bin/ps:", caught.exception.detail)
+        self.assertIn("timed out after 2.0 seconds", caught.exception.detail)
+        self.assertGreaterEqual(len(reads), limit)
+
+    def cuda_policy(self):
+        return dataclasses.replace(
+            self.patient_policy(), backend="linux-cuda",
+            cuda_device_uuid="GPU-12345678-1234-1234-1234-123456789abc",
+            gpu_free_reserve_bytes=100, child_gpu_cap_bytes=10**6)
+
+    class GpuScriptProbe(Probe):
+        """gpu_free_and_tree_bytes fails on the calls failing() selects."""
+        def __init__(self, failing, *, preflight=()):
+            super().__init__()
+            self.failing = failing
+            self.preflight = list(preflight)
+            self.reads = 0
+            self.preflight_reads = 0
+        def gpu_free(self):
+            self.preflight_reads += 1
+            if self.preflight:
+                step = self.preflight.pop(0)
+                if step is not None:
+                    raise step
+            return super().gpu_free()
+        def gpu_free_and_tree_bytes(self, owner):
+            self.reads += 1
+            if self.failing(self.reads):
+                raise safety.SupervisionError("probe-failure", "nvidia-smi: timed out after 2.0 seconds")
+            return super().gpu_free_and_tree_bytes(owner)
+
+    def test_transient_cuda_failures_never_stop_a_row(self):
+        stop, script = self.stop_when_present_script()
+        per_tick = safety.GPU_READS_PER_TICK
+        fault = safety.SupervisionError("probe-failure", "nvidia-smi: timed out after 2.0 seconds")
+        def failing(n):
+            if n > 1 + 8 * per_tick:
+                stop.touch()
+                return False
+            return n != 1 + 4 * per_tick
+        probe = self.GpuScriptProbe(failing, preflight=[fault] * 3)
+        result = self.run_child(script, probe=probe, policy=self.cuda_policy())
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(probe.preflight_reads, 4)
+        self.assertGreater(probe.reads, 1 + 8 * per_tick)
+
+    def test_sustained_cuda_failure_stops_with_detail_and_count(self):
+        _stop, script = self.stop_when_present_script()
+        probe = self.GpuScriptProbe(lambda n: True)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child(script, probe=probe, policy=self.cuda_policy())
+        self.assertEqual(caught.exception.reason, "probe-failure")
+        self.assertIn("CUDA probe failed on 5 consecutive ticks; last error CUDA probe failed 4 reads; "
+                      "last error nvidia-smi: timed out after 2.0 seconds", caught.exception.detail)
+        self.assertEqual(probe.reads, 5 * safety.GPU_READS_PER_TICK)
+        (self.root / "stdout").unlink()
+        (self.root / "stderr").unlink()
+
+        fault = safety.SupervisionError("probe-failure", "nvidia-smi: timed out after 2.0 seconds")
+        probe = self.GpuScriptProbe(lambda n: False, preflight=[fault] * 4)
+        with self.assertRaises(safety.SupervisionError) as caught:
+            self.run_child("open('spawned','w').close()", probe=probe, policy=self.cuda_policy())
+        self.assertIn("preflight CUDA probe failed 4 reads; last error nvidia-smi", caught.exception.detail)
+        self.assertFalse((self.root / "spawned").exists())
+
+    def test_ps_fallback_runs_only_without_libproc_and_with_the_long_timeout(self):
+        calls = []
+        def output(argv, *, timeout):
+            calls.append((argv, timeout))
+            return f"{os.getpid()} 1 {os.getpgrp()} S\n77 1 77 Z\n"
+        with patch.object(safety, "_load_libproc", return_value=None), \
+             patch.object(safety, "_bounded_output", side_effect=output):
+            self.assertEqual(safety._process_table(), {os.getpid(): (1, os.getpgrp())})
+        self.assertEqual(calls, [(["/bin/ps", "-axo", "pid=,ppid=,pgid=,stat="], 10.0)])
+        if sys.platform == "darwin":
+            with patch.object(safety, "_bounded_output", side_effect=AssertionError("ps spawned")):
+                self.assertIn(os.getpid(), safety._process_table())
+
+    @unittest.skipUnless(sys.platform == "darwin", "libproc is Darwin-only")
+    def test_libproc_tree_matches_ps_on_a_live_child_tree(self):
+        import subprocess
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import subprocess, sys, time\n"
+             "kids = [subprocess.Popen(['sleep', '30']) for _ in range(2)]\n"
+             "grand = subprocess.Popen([sys.executable, '-c', "
+             "'import subprocess, time; subprocess.Popen([\"sleep\", \"30\"]); time.sleep(30)'])\n"
+             "zombie = subprocess.Popen(['true']); time.sleep(.5)\n"
+             "print('ready', flush=True); time.sleep(30)"],
+            stdout=subprocess.PIPE, encoding="utf-8", start_new_session=True)
+        try:
+            self.addCleanup(child.stdout.close)
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            group = lambda table: {pid: row for pid, row in table.items() if row[1] == child.pid}
+            libproc = group(safety.libproc_process_table(safety._load_libproc()))
+            ps = group(safety.ps_process_table())
+            self.assertEqual(libproc, ps)
+            # Root, two sleeps, the Python grandchild and its sleep; the reaped-later zombie is excluded.
+            self.assertEqual(len(libproc), 5)
+            self.assertEqual(safety._expand_owned(safety._process_table(), {child.pid}), set(libproc))
+        finally:
+            os.killpg(child.pid, 9)
+            child.wait()
+
     @unittest.skipUnless(sys.platform == "darwin", "proc_pid_rusage is Darwin-only")
     def test_proc_pid_rusage_reads_a_child_allocation_like_footprint(self):
         import re
