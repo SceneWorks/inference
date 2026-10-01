@@ -550,15 +550,15 @@ fn assert_host_routes_are_reported(model: &Qwen35Model) {
     assert_eq!(record.sampler.logits_to_host, TOKENS as u64);
 }
 
-/// The greedy stream of the token-at-a-time seam loop with each token the test's own host argmax
-/// of the step's logits (ties to the lowest id) — independent of the device argmax under test.
-fn host_argmax_oracle<M: StepModel>(model: &M, prompt: &[i32], max_new_tokens: usize) -> Vec<i32> {
-    let mut cache = model
-        .new_cache_for(prompt.len() + max_new_tokens, 0)
-        .unwrap();
+/// Teacher-force `tokens` through the plain token-at-a-time seam loop and check that each one is a
+/// maximum of the step's logits, read on the host by the test itself — independent of the device
+/// argmax under test. Tie-aware on purpose: the tiny fixtures' periodic weights give exact logit
+/// ties (rows `r` and `r + 29` of the llama head are identical), and the CUDA argmax does not
+/// promise the lowest tied index, so the oracle checks "an argmax", never "the lowest one".
+fn assert_host_argmax_stream<M: StepModel>(model: &M, prompt: &[i32], tokens: &[i32]) {
+    let mut cache = model.new_cache_for(prompt.len() + tokens.len(), 0).unwrap();
     let mut step = prompt.to_vec();
-    let mut tokens = Vec::new();
-    while tokens.len() < max_new_tokens {
+    for (i, &token) in tokens.iter().enumerate() {
         let logits = model
             .forward_step(&mut cache, StepRequest::last(&step))
             .unwrap()
@@ -570,13 +570,14 @@ fn host_argmax_oracle<M: StepModel>(model: &M, prompt: &[i32], max_new_tokens: u
             .unwrap()
             .to_vec1()
             .unwrap();
-        let next = (0..row.len())
-            .reduce(|best, i| if row[i] > row[best] { i } else { best })
-            .unwrap() as i32;
-        tokens.push(next);
-        step = vec![next];
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let chosen = row[usize::try_from(token).unwrap()];
+        assert!(
+            max.is_finite() && chosen == max,
+            "step {i}: token {token} scores {chosen}, the row maximum is {max}"
+        );
+        step = vec![token];
     }
-    tokens
 }
 
 /// E1: greedy is the device argmax on every device, one sync per token, no logits copy, and
@@ -588,7 +589,7 @@ fn assert_greedy_unchanged<M: StepModel>(model: &M) {
     let (tokens, record) = run_step(model, &greedy);
     let (reference, _) = with_reference_sampler(|| run_step(model, &greedy));
     assert_eq!(tokens, reference);
-    assert_eq!(tokens, host_argmax_oracle(model, &PROMPT, TOKENS));
+    assert_host_argmax_stream(model, &PROMPT, &tokens);
     assert_eq!(record.sampler.path, Some(SamplerPath::Device));
     assert_eq!(record.sampler.logits_to_host, 0);
     assert_eq!(record.host_syncs, TOKENS as u64);

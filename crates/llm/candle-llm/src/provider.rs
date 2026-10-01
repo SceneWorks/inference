@@ -6701,7 +6701,12 @@ mod tests {
         };
         let provider = load(true);
         let fallbacks = provider.load_report().unwrap().fallbacks;
-        let device = crate::device::select_device().unwrap();
+        // The device a graph load opens: under the load's switch, which on CUDA puts it on its
+        // own stream (a device opened outside it would be on the legacy stream and refuse).
+        let device = {
+            let _graphs = crate::decode::cuda_graphs_scope(Some(true));
+            crate::device::select_device().unwrap()
+        };
         let device_refusal = crate::backend::cuda_graphs_device_refusal(&device);
         if !device.is_cuda() {
             // The CPU case: the device refuses every capture, named first, whatever the decoder.
