@@ -747,12 +747,9 @@ mod cuda {
             &causal_on(&qk, &qkw, Some(QuantSpec::q4())),
             K256.layers as u64,
         );
+        // (DeepSeek-V2's MLA projections are 24 wide in this fixture — no whole GGML block — so
+        // it is checked dense only, as the CPU goldens do.)
         check("deepseek_v2", &causal_on(&ds, &dsw, None), 2);
-        check(
-            "deepseek_v2_q8",
-            &causal_on(&ds, &dsw, Some(QuantSpec::q8())),
-            2,
-        );
         let qwen35 = Qwen35Model::from_weights(
             &on(&device, &q35w),
             "model.language_model",

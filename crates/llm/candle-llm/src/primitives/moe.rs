@@ -1250,7 +1250,7 @@ mod cuda_tests {
                     &scales,
                     &biases,
                     None,
-                    QuantSpec::q8(),
+                    QuantSpec::from_bits_and_group_size(8, group).unwrap(),
                     dev,
                 )
                 .unwrap()

@@ -983,8 +983,11 @@ mod tests {
     fn the_ggml_code_is_candles_mmvq_verbatim() {
         let vendored = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../media/candle-gen/vendor/candle-kernels/src/mmvq_gguf.cu");
+        // Line endings are the checkout's (CRLF on a Windows runner): compare without them.
         let vendored = std::fs::read_to_string(&vendored)
-            .unwrap_or_else(|e| panic!("{}: {e}", vendored.display()));
+            .unwrap_or_else(|e| panic!("{}: {e}", vendored.display()))
+            .replace('\r', "");
+        let source = MOE_GEMV_SRC.src.replace('\r', "");
         let core = between(
             &vendored,
             "// Constants, types, and helpers shared with the indexed MoE kernels.",
@@ -998,7 +1001,7 @@ mod tests {
         for (name, segment) in [("core", core), ("quantize", quantize)] {
             let derived = rename(segment);
             assert!(
-                MOE_GEMV_SRC.src.contains(&derived),
+                source.contains(&derived),
                 "the {name} segment of moe_gemv.cu is not candle's mmvq_gguf.cu text"
             );
         }
@@ -1017,9 +1020,7 @@ mod tests {
         ] {
             let kernel = ggml_kernel(d).unwrap();
             assert!(
-                MOE_GEMV_SRC
-                    .src
-                    .contains(&format!("MOE_MMVQ_ENTRY({}", &kernel[9..])),
+                source.contains(&format!("MOE_MMVQ_ENTRY({}", &kernel[9..])),
                 "{d:?}"
             );
         }
