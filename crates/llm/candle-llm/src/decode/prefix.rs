@@ -472,9 +472,13 @@ where
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // A prefill segment (sc-24441): from a restored, non-empty cache it still attends as a
+        // cold prefill does, never on the decode step's device-positions path.
         let out = model.forward_step(
             cache,
-            StepRequest::last(&prompt[segment.clone()]).with_hidden(want_hidden),
+            StepRequest::last(&prompt[segment.clone()])
+                .with_hidden(want_hidden)
+                .as_prefill(),
         )?;
         hidden_rows.extend(out.hidden);
         logits = Some(out.logits);
@@ -700,13 +704,18 @@ mod engine_tests {
     }
 
     fn tiny_llama() -> CausalLm {
+        tiny_llama_on(&Device::Cpu, candle_core::DType::F32)
+    }
+
+    /// [`tiny_llama`]'s weights on `device`, computing in `dtype`.
+    fn tiny_llama_on(device: &Device, dtype: candle_core::DType) -> CausalLm {
         let (vocab, hidden, inter, heads, kv_heads, layers) = (40, 16, 32, 4, 2, 2);
         let head_dim = hidden / heads;
         let mut rng = SplitMix64::new(0x24437);
         let mut rand = |dims: &[usize]| {
             let n: usize = dims.iter().product();
             let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.8).collect();
-            Tensor::from_vec(data, dims.to_vec(), &Device::Cpu).unwrap()
+            Tensor::from_vec(data, dims.to_vec(), device).unwrap()
         };
         let mut w = HashMap::new();
         w.insert(
@@ -747,7 +756,8 @@ mod engine_tests {
             "max_position_embeddings": 256, "tie_word_embeddings": false
         }))
         .unwrap();
-        CausalLm::from_weights(&Weights::from_map(w, Device::Cpu), "", cfg).unwrap()
+        CausalLm::from_weights_dtype(&Weights::from_map(w, device.clone()), "", cfg, None, dtype)
+            .unwrap()
     }
 
     fn greedy(max_new_tokens: usize) -> GenerationConfig {
@@ -829,6 +839,208 @@ mod engine_tests {
         pc.store(prompt, &run.output.tokens, &cache, pre.boundary, None)
             .unwrap();
         (run.output.tokens, reused, run.stats)
+    }
+
+    /// sc-24441 × sc-24437: with device positions on, a prefix hit's decode steps attend with the
+    /// length-aware decode attention while its restored suffix prefill — marked a prefill — and a
+    /// cold prefill both attend `sdpa_gqa`. Greedy tokens of a prefix hit match a cold run (and,
+    /// with `tol`, so do the prefill logits) — for a suffix inside and past the device step bound.
+    /// The restored request's prefill logits (restore + suffix prefill) against a cold
+    /// prefill's of the same prompt: within `tol` (absolute, per logit), when given.
+    fn prefill_logits_match<M>(
+        model: &M,
+        pc: &mut PrefixCache,
+        prompt: &[i32],
+        tol: Option<f32>,
+        what: &str,
+    ) where
+        M: StepModel + ?Sized,
+        M::Cache: PrefixSnapshot,
+    {
+        let Some(tol) = tol else { return };
+        let mut cache = model.new_cache_for(prompt.len() + 8, 2).unwrap();
+        let restored = pc.restore_into(&mut cache, prompt, false).unwrap();
+        assert!(restored.is_some(), "{what}: a hit");
+        let hit = prefill_restored(
+            model,
+            &mut cache,
+            restored,
+            prompt,
+            None,
+            false,
+            &CancelFlag::new(),
+        )
+        .unwrap()
+        .logits;
+        let mut cold_cache = model.new_cache_for(prompt.len() + 8, 2).unwrap();
+        let cold = model
+            .forward_step(&mut cold_cache, StepRequest::last(prompt))
+            .unwrap()
+            .logits;
+        let diff = (hit.to_dtype(candle_core::DType::F32).unwrap()
+            - cold.to_dtype(candle_core::DType::F32).unwrap())
+        .unwrap()
+        .abs()
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .max(0)
+        .unwrap()
+        .to_scalar::<f32>()
+        .unwrap();
+        assert!(
+            diff <= tol,
+            "{what}: prefill logits differ by {diff} > {tol}"
+        );
+    }
+
+    fn causal_hit_matches_cold(model: &CausalLm, tol: Option<f32>, what: &str) {
+        assert!(model.device_positions_active(), "{what}: device positions");
+        let p1 = vec![3, 9, 4, 11, 3, 9, 4, 11, 5];
+        for suffix in [3usize, 20] {
+            // A fresh cache per case: an earlier case's stored run would serve a longer prefix.
+            let mut pc = PrefixCache::with_budget(1 << 30);
+            let (gen1, _, _) = turn(model, &mut NoProposer, &mut pc, &p1, None, 6);
+            let mut p2 = p1.clone();
+            p2.extend_from_slice(&gen1);
+            p2.extend((0..suffix).map(|i| (i * 7 % 37) as i32 + 1));
+            let expected = p1.len() + gen1.len() - 1;
+            prefill_logits_match(
+                model,
+                &mut pc,
+                &p2,
+                tol,
+                &format!("{what}: suffix {suffix}"),
+            );
+            let (gen2, reused, _) = turn(model, &mut NoProposer, &mut pc, &p2, None, 8);
+            assert_eq!(reused, expected, "{what}: suffix {suffix}");
+            assert_eq!(
+                gen2,
+                cold(model, &mut NoProposer, &p2, 8).0,
+                "{what}: suffix {suffix}"
+            );
+        }
+    }
+
+    /// The hybrid's half of [`causal_hit_matches_cold`]: restore the recurrent state at the
+    /// boundary, prefill a suffix inside and past the device step bound, match a cold run.
+    fn hybrid_hit_matches_cold(model: &crate::models::Qwen35Model, tol: Option<f32>, what: &str) {
+        assert!(model.device_positions_active(), "{what}: device positions");
+        let conversation = vec![3, 9, 4, 11, 3, 9, 4, 11];
+        let mut p1 = conversation.clone();
+        p1.extend_from_slice(&[40, 41]);
+        for suffix in [5usize, 20] {
+            let mut pc = PrefixCache::with_budget(1 << 30);
+            turn(model, &mut NoProposer, &mut pc, &p1, Some(8), 5);
+            let mut p = conversation.clone();
+            p.extend((0..suffix).map(|i| (i * 7 % 37) as i32 + 1));
+            prefill_logits_match(model, &mut pc, &p, tol, &format!("{what}: suffix {suffix}"));
+            let (tokens, reused, _) = turn(model, &mut NoProposer, &mut pc, &p, None, 6);
+            assert_eq!(reused, conversation.len(), "{what}: suffix {suffix}");
+            assert_eq!(
+                tokens,
+                cold(model, &mut NoProposer, &p, 6).0,
+                "{what}: suffix {suffix}"
+            );
+        }
+    }
+
+    /// sc-24441 × sc-24437: a prefill segment from a restored (non-empty) cache is marked a
+    /// prefill, so with device positions on it runs the host-position path and the reference
+    /// attention — bit for bit what the same model with device positions off computes from the
+    /// same restored state — never the decode step's length-aware attention. Both families.
+    #[test]
+    fn a_restored_suffix_prefill_attends_as_a_cold_prefill() {
+        fn restored_logits<M>(model: &M, pc: &mut PrefixCache, prompt: &[i32]) -> Vec<f32>
+        where
+            M: StepModel + ?Sized,
+            M::Cache: PrefixSnapshot,
+        {
+            let mut cache = model.new_cache_for(prompt.len() + 8, 2).unwrap();
+            let restored = pc.restore_into(&mut cache, prompt, false).unwrap();
+            assert!(restored.is_some(), "a hit");
+            prefill_restored(
+                model,
+                &mut cache,
+                restored,
+                prompt,
+                None,
+                false,
+                &CancelFlag::new(),
+            )
+            .unwrap()
+            .logits
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+        }
+        let off = tiny_llama();
+        let mut on = tiny_llama();
+        on.set_device_positions(true);
+        let mut pc = PrefixCache::with_budget(1 << 30);
+        let p1 = vec![3, 9, 4, 11, 3, 9, 4, 11, 5];
+        let (gen1, _, _) = turn(&off, &mut NoProposer, &mut pc, &p1, None, 6);
+        let mut p2 = p1.clone();
+        p2.extend_from_slice(&gen1);
+        p2.extend_from_slice(&[7, 2, 13]);
+        assert_eq!(
+            restored_logits(&on, &mut pc, &p2),
+            restored_logits(&off, &mut pc, &p2),
+            "causal"
+        );
+
+        let (_, off) = text_model();
+        let (_, mut on) = text_model();
+        on.set_device_positions(true);
+        let mut pc = PrefixCache::with_budget(1 << 30);
+        let conversation = vec![3, 9, 4, 11, 3, 9, 4, 11];
+        let mut p1 = conversation.clone();
+        p1.extend_from_slice(&[40, 41]);
+        turn(&off, &mut NoProposer, &mut pc, &p1, Some(8), 5);
+        let mut p = conversation;
+        p.extend_from_slice(&[20, 21, 22, 40, 41]);
+        assert_eq!(
+            restored_logits(&on, &mut pc, &p),
+            restored_logits(&off, &mut pc, &p),
+            "hybrid"
+        );
+    }
+
+    /// sc-24441 × sc-24437 on the CPU: a prefix hit with device positions on (decode steps
+    /// through the reference decode attention) matches a cold run, both families.
+    #[test]
+    fn restored_prefills_on_device_positions_match_a_cold_run() {
+        let mut causal = tiny_llama();
+        causal.set_device_positions(true);
+        causal_hit_matches_cold(&causal, Some(1e-4), "causal f32 cpu");
+        let (_, mut hybrid) = text_model();
+        hybrid.set_device_positions(true);
+        hybrid_hit_matches_cold(&hybrid, Some(1e-4), "hybrid f32 cpu");
+    }
+
+    /// sc-24441 × sc-24437 on CUDA (the `windows-cuda` lane): with the CUDA default (device
+    /// positions on), a prefix hit's greedy tokens match a cold run's — causal and hybrid, f32
+    /// and the production bf16.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn restored_prefills_match_a_cold_run_on_cuda() {
+        let device = crate::device::select_device().unwrap();
+        if !device.is_cuda() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        // Prefill logits within 1e-3 in f32 (a different but equally rounded order); in bf16 the
+        // greedy tokens are the contract.
+        for (dtype, tol) in [
+            (candle_core::DType::F32, Some(1e-3)),
+            (candle_core::DType::BF16, None),
+        ] {
+            let causal = tiny_llama_on(&device, dtype);
+            causal_hit_matches_cold(&causal, tol, &format!("causal {dtype:?} cuda"));
+            let (_, hybrid) = crate::models::qwen35::tests::text_model_dtype_on(&device, dtype);
+            hybrid_hit_matches_cold(&hybrid, tol, &format!("hybrid {dtype:?} cuda"));
+        }
     }
 
     /// AC1 on the softmax family (the static step cache): turn 2 extends turn 1's

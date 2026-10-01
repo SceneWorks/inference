@@ -1070,6 +1070,7 @@ impl CausalLm {
         cache: &mut StepKvCache,
     ) -> Result<Tensor> {
         let (b, s, _) = embeds.dims3()?;
+        let _prefill = crate::primitives::prefill_scope(true);
         let h = self.step_hidden(embeds, cache)?;
         let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
         Ok(self
@@ -1085,10 +1086,13 @@ impl CausalLm {
         // that stages its positions reads every position from the device — RoPE, KV write,
         // attention length and mask — so the step is replayable as a CUDA graph. The prompt
         // prefill (from an empty cache, whatever its length) and any longer step take the host
-        // path below; both keep the cache's host length in step.
+        // path below, as does a prefill segment from a non-empty cache (a prefix-cache hit's
+        // suffix: `StepRequest::prefill`), so a restored prompt attends as a cold prefill does;
+        // both keep the cache's host length in step.
         if s <= MAX_DEVICE_STEP_TOKENS
             && DecodeCache::len(cache) > 0
             && cache.device_positions().is_some()
+            && !crate::primitives::in_prefill()
         {
             cache.stage_positions()?;
             let tables = match cache.device_positions() {
@@ -1631,6 +1635,7 @@ impl CausalLm {
             && !additive_gqa
             && matches!(mask, AttnMask::Causal)
             && input_embeds.dim(1)? <= MAX_DEVICE_STEP_TOKENS
+            && !crate::primitives::in_prefill()
             && self.device_positions_active())
         .then(|| {
             let start = u32::try_from(cache.offset())
@@ -1900,6 +1905,7 @@ impl StepModel for CausalLm {
         let ids = request.tokens.ids(&self.device)?;
         let embeds = self.embed(&ids)?;
         let (b, s, _) = embeds.dims3()?;
+        let _prefill = crate::primitives::prefill_scope(request.prefill);
         let h = self.step_hidden(&embeds, cache)?;
         let logits = match request.scope {
             LogitsScope::Last => {

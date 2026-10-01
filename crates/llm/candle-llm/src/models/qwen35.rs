@@ -2544,6 +2544,7 @@ impl Qwen35Model {
             && cache.offset() > 0
             && cache.positions.is_some()
             && offset == cache.offset() + cache.rope_delta()
+            && !crate::primitives::in_prefill()
         {
             cache.stage_positions()?;
             cache.begin_forward(s)?;
@@ -2581,6 +2582,7 @@ impl Qwen35Model {
     fn decode_start(&self, cache: &Qwen35Cache, s: usize) -> Result<Option<Tensor>> {
         if s > MAX_DEVICE_STEP_TOKENS
             || cache.offset() <= 0
+            || crate::primitives::in_prefill()
             || self.attn_formulation != AttnFormulation::Gqa
             || !self.device_positions_active()
         {
@@ -3288,6 +3290,7 @@ impl StepModel for Qwen35Model {
         // RoPE positions continue from the cache, shifted by the caller's delta (M-RoPE prompts).
         let offset = cache.offset() + cache.rope_delta();
         let ids = request.tokens.ids(&self.device)?;
+        let _prefill = crate::primitives::prefill_scope(request.prefill);
         let (logits, hidden) = match (request.scope, request.want_hidden) {
             (LogitsScope::Last, false) => (self.decode_logits(&ids, cache, offset)?, None),
             (LogitsScope::Last, true) => {
@@ -4449,6 +4452,25 @@ pub(crate) mod tests {
         (cfg, model)
     }
 
+    /// [`text_model_on`] computing in `dtype` (sc-24441: the CUDA prefix-parity check runs f32
+    /// and the production bf16).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn text_model_dtype_on(
+        device: &Device,
+        dtype: DType,
+    ) -> (Qwen35Config, Qwen35Model) {
+        let cfg = Qwen35Config::from_json(&cfg_json()).unwrap();
+        let model = Qwen35Model::from_weights_dtype(
+            &synthetic_weights_on(&cfg, device),
+            "model.language_model",
+            cfg.clone(),
+            None,
+            dtype,
+        )
+        .unwrap();
+        (cfg, model)
+    }
+
     /// The synthetic decoder with **every** layer a full-attention layer (interval 1: no
     /// Gated DeltaNet state), on `device` — the shape whose static cache holds nothing but
     /// stable-address KV buffers (story sc-24134).
@@ -5428,6 +5450,7 @@ pub(crate) mod tests {
                         tokens: crate::decode::StepTokens::Host(&verify),
                         scope: LogitsScope::All,
                         want_hidden: false,
+                        prefill: false,
                     },
                 )
                 .unwrap();

@@ -343,6 +343,7 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
                         tokens: StepTokens::Host(&sequence[cur..end]),
                         scope: LogitsScope::All,
                         want_hidden: false,
+                        prefill: false,
                     },
                 )
                 .unwrap()
@@ -560,6 +561,7 @@ fn llama_teacher_forced(
                         tokens: StepTokens::Host(&sequence[cur..end]),
                         scope: LogitsScope::All,
                         want_hidden: false,
+                        prefill: false,
                     },
                 )
                 .unwrap()

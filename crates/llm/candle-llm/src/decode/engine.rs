@@ -562,6 +562,7 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
                 tokens: StepTokens::Device(&verify_ids),
                 scope: LogitsScope::All,
                 want_hidden: wants_hidden,
+                prefill: false,
             },
         )?;
         stats.forwards += 1;

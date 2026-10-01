@@ -9711,11 +9711,17 @@ mod tests {
             "every step of the Off request went through the runner: {}",
             engine.cuda_graphs.describe()
         );
-        let reason = engine
-            .cuda_graphs
-            .fallback_reason
-            .expect("an eager step names why");
-        assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH);
+        // An eager step names why — unless it is the warm-up or capture of a shape the runner
+        // did capture (sc-24441: the dense decoders capture on CUDA; a 3-token request can end
+        // before the first replay, and its prefill segments are never captured).
+        match engine.cuda_graphs.fallback_reason {
+            Some(reason) => assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH),
+            None => assert!(
+                engine.cuda_graphs.captured > 0,
+                "an eager step with no reason belongs to a captured shape: {}",
+                engine.cuda_graphs.describe()
+            ),
+        }
         assert_eq!(run(&off).cuda_graphs.label(), "none");
 
         let describe = |provider: &mut super::LlamaProvider| {
