@@ -13,7 +13,11 @@
 //!
 //! The censored variant reuses the **already-loaded** text-encoder Gemma backbone
 //! ([`GemmaModel::decode_logits`]); the uncensored variant loads a separate 4-bit Gemma — both go
-//! through the same loop here ([`enhance`]), differing only in model + [`SampleParams`].
+//! through the same decode here ([`enhance`]), differing only in model + [`SampleParams`]. The
+//! decode is the shared MLX engine's token-at-a-time loop ([`generate_speculative`] with
+//! [`NoProposer`], epic sc-24432 E8) over the Gemma-3 decoder, drawing every token through this
+//! pipeline's own host sampler ([`sample_token`] with its seeded [`SplitMix64`]) so a seeded
+//! enhancement is token-identical to the pre-engine loop.
 //!
 //! **Stop tokens.** The reference hardcodes `token == 1 or token == 107`, but in the Gemma-3
 //! tokenizer **107 is `\n`** (a newline) and `<end_of_turn>` is **106**; `generation_config.json`
@@ -24,11 +28,12 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Result};
-use mlx_llm::core_llm::{DecodeReport, PathReport};
+use mlx_llm::core_llm::{DecodeReport, HostSampleReason, PathReport, SamplerPath};
 use mlx_llm::decode::{
-    generate_speculative, prefill_with_prefix, ConstraintMask, EngineOptions, GenerationConfig,
-    NoProposer, PrefixPrefill, RewindableConstraintMask, SpeculativePrompt, SpeculativeRun,
-    StreamEvent,
+    generate_speculative, prefill_with_prefix, CacheRollback, ConstraintMask, EngineOptions,
+    FinishReason, GenerationConfig, LogitsScope, NoProposer, Pipelining, PrefixPrefill,
+    RewindableConstraintMask, Rollback, SampledToken, SpeculativePrompt, SpeculativeRun,
+    SpeculativeTarget, StreamEvent, TargetOutput, TokenSampler,
 };
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::{CausalLm, PrefixCache};
@@ -38,7 +43,7 @@ use mlx_llm::{CausalLm, PrefixCache};
 pub use mlx_gen::text_sample::SampleParams;
 use mlx_gen::text_sample::{sample_token, SplitMix64};
 
-use crate::gemma::GemmaModel;
+use crate::gemma::{GemmaKvCache, GemmaModel};
 use crate::tokenizer::LtxTokenizer;
 
 /// Vendored default system prompts (the mlx_video wheel ships `enhance_prompt.py` / `text_encoder.py`
@@ -155,39 +160,228 @@ pub fn enhance(
     if prompt_ids.is_empty() {
         return Ok(String::new());
     }
+    let generated = decode_gemma3(gemma, &prompt_ids, cfg, sampler, cancel)?;
+    let text = tokenizer.decode(&generated)?;
+    Ok(clean_response(&text))
+}
 
-    // `history` carries the prompt + generated tokens; the repetition penalty looks at its tail (the
-    // reference applies the penalty over `tokens[-context_size:]` of the running sequence).
-    let mut history = prompt_ids.clone();
-    let mut cache = gemma.new_cache();
-    let mut rng = SplitMix64::new(cfg.seed);
+/// The Gemma-3 decoder ([`GemmaModel::decode_logits`]) as a target of the shared MLX engine. It
+/// serves the token-at-a-time loop only: [`decode_logits`](GemmaModel::decode_logits) returns the
+/// last position's logits, so a verify forward over drafts is refused, never approximated.
+struct Gemma3Target<'a>(&'a GemmaModel);
 
-    // Prefill on the full prompt → logits for the first generated token.
-    let prompt_len = prompt_ids.len() as i32;
-    let ids = Array::from_slice(&prompt_ids, &[1, prompt_len]);
-    let mut logits = gemma.decode_logits(&ids, &mut cache, 0)?;
+/// The rollback of a target that never verifies drafts: the token-at-a-time loop never arms it,
+/// and a recovery is refused.
+struct NoDraftRollback;
 
-    let mut generated: Vec<i32> = Vec::new();
-    for step in 0..cfg.max_tokens {
-        if cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(Error::Canceled);
+impl CacheRollback<GemmaKvCache> for NoDraftRollback {
+    fn label(&self) -> &'static str {
+        "none"
+    }
+
+    fn begin(&mut self, _: &mut GemmaKvCache) {}
+
+    fn recover(&mut self, _: &mut GemmaKvCache, _: i32) -> mlx_llm::Result<Rollback> {
+        Err(mlx_llm::Error::Unsupported(
+            "the LTX-2.3 Gemma-3 enhancer decodes token-at-a-time; it never verifies drafts".into(),
+        ))
+    }
+}
+
+impl SpeculativeTarget for Gemma3Target<'_> {
+    type Cache = GemmaKvCache;
+    type Rollback = NoDraftRollback;
+
+    fn new_cache(&self) -> GemmaKvCache {
+        self.0.new_cache()
+    }
+
+    fn cache_len(&self, cache: &GemmaKvCache) -> i32 {
+        cache.offset()
+    }
+
+    fn rollback(&self, _: usize) -> NoDraftRollback {
+        NoDraftRollback
+    }
+
+    fn forward(
+        &self,
+        cache: &mut GemmaKvCache,
+        ids: &Array,
+        rope_offset: i32,
+        scope: LogitsScope,
+        want_hidden: bool,
+    ) -> mlx_llm::Result<TargetOutput> {
+        if want_hidden || scope == LogitsScope::All {
+            return Err(mlx_llm::Error::Unsupported(
+                "the LTX-2.3 Gemma-3 enhancer target returns last-position logits only".into(),
+            ));
+        }
+        let logits = self
+            .0
+            .decode_logits(ids, cache, rope_offset)
+            .map_err(|e| mlx_llm::Error::Msg(format!("ltx-2.3 enhancer forward: {e}")))?;
+        Ok(TargetOutput {
+            logits,
+            hidden: None,
+        })
+    }
+
+    fn attention_label(&self) -> &'static str {
+        // Native-GQA fused SDPA over the K/V cache (`GemmaModel::attn_step`).
+        "gqa"
+    }
+}
+
+/// The LTX-2.3 enhancer's draw on the engine's sampler seam: mlx-gen's shared host sampler
+/// [`sample_token`] over the f32 host logits and the running prompt + generated history, from the
+/// pipeline's own seeded [`SplitMix64`] — exactly the draw the pre-engine loop made (its
+/// repetition penalty, top-k and nucleus follow the reference `make_sampler` /
+/// `make_logits_processors`, not mlx-llm's device sampler), so a seeded enhancement is
+/// token-identical. It reads the history (the penalty window), so the engine never pipelines it.
+struct EnhanceSampler<'a> {
+    knobs: &'a SampleParams,
+    /// The same knobs in the engine's vocabulary (reported, never drawn from).
+    params: SamplingParams,
+    rng: SplitMix64,
+    draws: u64,
+    /// The last token drawn — on a stop-token end, the stop token the engine does not emit.
+    last: Option<i32>,
+}
+
+impl<'a> EnhanceSampler<'a> {
+    fn new(knobs: &'a SampleParams, seed: u64) -> Self {
+        Self {
+            knobs,
+            params: SamplingParams {
+                temperature: knobs.temperature,
+                top_p: knobs.top_p,
+                top_k: usize::try_from(knobs.top_k).unwrap_or(0),
+                presence_penalty: 0.0,
+                repetition_penalty: knobs.repetition_penalty.unwrap_or(1.0),
+                repetition_context: knobs.repetition_context,
+            },
+            rng: SplitMix64::new(seed),
+            draws: 0,
+            last: None,
+        }
+    }
+}
+
+impl TokenSampler for EnhanceSampler<'_> {
+    fn params(&self) -> &SamplingParams {
+        &self.params
+    }
+
+    fn sample(
+        &mut self,
+        logits: &Array,
+        history: &[i32],
+        allowed: Option<&[bool]>,
+    ) -> mlx_llm::Result<SampledToken> {
+        if allowed.is_some() {
+            return Err(mlx_llm::Error::Unsupported(
+                "the LTX-2.3 enhancer sampler takes no constraint mask".into(),
+            ));
         }
         // Pull the `[vocab]` logits to the host once, then draw from the shared host-side sampler.
         let logits_host = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let next = sample_token(&logits_host, &history, sampler, &mut rng);
-        generated.push(next);
-        history.push(next);
-        if STOP_TOKENS.contains(&next) {
-            break;
-        }
-        // Feed the token back at its absolute position (the generated token at index `step` sits at
-        // `prompt_len + step`, just past the prefilled prompt).
-        let nxt = Array::from_slice(&[next], &[1, 1]);
-        logits = gemma.decode_logits(&nxt, &mut cache, prompt_len + step as i32)?;
+        let token = sample_token(&logits_host, history, self.knobs, &mut self.rng);
+        self.draws += 1;
+        self.last = Some(token);
+        Ok(SampledToken::Host(token))
     }
 
-    let text = tokenizer.decode(&generated)?;
-    Ok(clean_response(&text))
+    fn argmax_rows(&mut self, _: &Array) -> mlx_llm::Result<Vec<i32>> {
+        Err(mlx_llm::Error::Unsupported(
+            "the LTX-2.3 enhancer decodes token-at-a-time; it never verifies drafts".into(),
+        ))
+    }
+
+    fn distribution(
+        &mut self,
+        _: &Array,
+        _: &[i32],
+        _: Option<&[bool]>,
+    ) -> mlx_llm::Result<Vec<(i32, f32)>> {
+        Err(mlx_llm::Error::Unsupported(
+            "the LTX-2.3 enhancer decodes token-at-a-time; it never verifies drafts".into(),
+        ))
+    }
+
+    fn uniform(&mut self) -> f32 {
+        self.rng.next_f32()
+    }
+
+    fn path(&self) -> Option<SamplerPath> {
+        (self.draws > 0).then_some(SamplerPath::Host(HostSampleReason::Reference))
+    }
+}
+
+/// The LTX-2.3 enhancement decode on the shared MLX engine ([`generate_speculative`] with
+/// [`NoProposer`]): prefill the prompt, then draw up to `cfg.max_tokens` tokens through
+/// [`EnhanceSampler`], stopping on [`STOP_TOKENS`]. Returns the generated ids **including** a final
+/// stop token (the pre-engine loop's list; the detokenizer drops special tokens). `cancel` is
+/// checked after the prefill and, bridged onto the engine's flag, after every emitted token; a
+/// cancel returns [`Error::Canceled`].
+fn decode_gemma3(
+    gemma: &GemmaModel,
+    prompt_ids: &[i32],
+    cfg: &EnhanceConfig,
+    sampler: &SampleParams,
+    cancel: Option<&CancelFlag>,
+) -> Result<Vec<i32>> {
+    let target = Gemma3Target(gemma);
+    let mut cache = gemma.new_cache();
+    // Prefill on the full prompt → logits for the first generated token.
+    let ids = Array::from_slice(prompt_ids, &[1, prompt_ids.len() as i32]);
+    let logits = gemma.decode_logits(&ids, &mut cache, 0)?;
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
+    let mut draw = EnhanceSampler::new(sampler, cfg.seed);
+    let generation = GenerationConfig {
+        max_new_tokens: cfg.max_tokens,
+        sampling: draw.params,
+        seed: Some(cfg.seed),
+        stop_tokens: STOP_TOKENS.to_vec(),
+    };
+    let decode_cancel = mlx_llm::CancelFlag::new();
+    let bridged_cancel = decode_cancel.clone();
+    let mut on_event = |_event: StreamEvent| {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            bridged_cancel.cancel();
+        }
+    };
+    let run = generate_speculative(
+        &target,
+        &mut NoProposer,
+        SpeculativePrompt::Prefilled {
+            cache: &mut cache,
+            logits,
+            hidden: None,
+            history: prompt_ids,
+            position_delta: 0,
+        },
+        &generation,
+        0,
+        &decode_cancel,
+        &mut on_event,
+        EngineOptions {
+            sampler: Some(&mut draw),
+            // Every draw reads the host history, so nothing could pipeline; say so explicitly.
+            pipelining: Pipelining::Off,
+            ..EngineOptions::default()
+        },
+    )
+    .map_err(|e| from_llm_decode(e, "ltx-2.3 enhancer decode"))?;
+    let mut generated = run.output.tokens;
+    match run.output.finish_reason {
+        FinishReason::Cancelled => return Err(Error::Canceled),
+        FinishReason::StopToken => generated.extend(draw.last),
+        _ => {}
+    }
+    Ok(generated)
 }
 
 /// The already-tokenized Gemma-4 prefill. T2V can reuse a cached textual prefix; I2V must prefill
@@ -199,8 +393,9 @@ pub enum Gemma4EnhancePrefill {
 
 /// Preserve contract-bearing `mlx-llm` errors across the media-crate boundary. In particular, a
 /// cancellation observed by the shared decode loop must remain `Canceled` all the way to the
-/// worker instead of becoming an ordinary string error.
-fn from_gemma4_decode(e: mlx_llm::Error) -> Error {
+/// worker instead of becoming an ordinary string error. `context` names the decode in any other
+/// error.
+fn from_llm_decode(e: mlx_llm::Error, context: &str) -> Error {
     match e {
         mlx_llm::Error::Unsupported(message) => Error::Unsupported(message),
         mlx_llm::Error::Canceled => Error::Canceled,
@@ -219,8 +414,13 @@ fn from_gemma4_decode(e: mlx_llm::Error) -> Error {
             gpu,
             attempts,
         },
-        other => Error::Msg(format!("ltx_2_5 enhancer decode: {other}")),
+        other => Error::Msg(format!("{context}: {other}")),
     }
+}
+
+/// [`from_llm_decode`] for the LTX-2.5 Gemma-4 enhancer.
+fn from_gemma4_decode(e: mlx_llm::Error) -> Error {
+    from_llm_decode(e, "ltx_2_5 enhancer decode")
 }
 
 /// Hugging Face `NoRepeatNGramLogitsProcessor`, expressed through the shared decode constraint seam.
@@ -453,6 +653,110 @@ pub fn enhance_gemma4(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-engine LTX-2.3 enhancement loop (sc-2845), verbatim but for its tokenizer: the
+    /// oracle the engine port must reproduce token for token (E1/E8). It returns the generated ids
+    /// including a final stop token.
+    fn reference_gemma3_tokens(
+        gemma: &GemmaModel,
+        prompt_ids: &[i32],
+        cfg: &EnhanceConfig,
+        sampler: &SampleParams,
+    ) -> Vec<i32> {
+        let mut history = prompt_ids.to_vec();
+        let mut cache = gemma.new_cache();
+        let mut rng = SplitMix64::new(cfg.seed);
+        let prompt_len = prompt_ids.len() as i32;
+        let ids = Array::from_slice(prompt_ids, &[1, prompt_len]);
+        let mut logits = gemma.decode_logits(&ids, &mut cache, 0).unwrap();
+        let mut generated: Vec<i32> = Vec::new();
+        for step in 0..cfg.max_tokens {
+            let logits_host = logits
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .as_slice::<f32>()
+                .to_vec();
+            let next = sample_token(&logits_host, &history, sampler, &mut rng);
+            generated.push(next);
+            history.push(next);
+            if STOP_TOKENS.contains(&next) {
+                break;
+            }
+            let nxt = Array::from_slice(&[next], &[1, 1]);
+            logits = gemma
+                .decode_logits(&nxt, &mut cache, prompt_len + step as i32)
+                .unwrap();
+        }
+        generated
+    }
+
+    /// A tiny synthetic Gemma-3 with a vocabulary that holds both stop tokens and a sliding window
+    /// short enough that the decode crosses it.
+    fn tiny_gemma3() -> GemmaModel {
+        use crate::gemma::hidden_state_pinning_tests::{tiny_cfg, tiny_weights};
+        let mut cfg = tiny_cfg(3);
+        cfg.sliding_window_pattern = 2;
+        cfg.sliding_window = 6;
+        let w = tiny_weights(&cfg, 128, 0.5);
+        GemmaModel::from_weights_with_prefix(&w, cfg, None, "").unwrap()
+    }
+
+    /// E8 (sc-24446): the LTX-2.3 enhancer runs on the shared engine and is token-identical to the
+    /// pre-engine loop — greedy, the censored sampler (temperature + repetition penalty), the
+    /// uncensored one and a top-k / nucleus mix, over several seeds — with both a stop-token end
+    /// and a budget end among the cases.
+    #[test]
+    fn gemma3_enhancer_engine_decode_matches_the_pre_engine_loop() {
+        let gemma = tiny_gemma3();
+        let prompt: Vec<i32> = vec![2, 5, 9, 17, 33, 64, 100, 7];
+        let samplers = [
+            SampleParams::temperature(0.0),
+            SampleParams::censored(0.7),
+            SampleParams::uncensored(1.0),
+            SampleParams {
+                temperature: 0.9,
+                top_k: 12,
+                top_p: 0.8,
+                repetition_penalty: Some(1.1),
+                repetition_context: 5,
+            },
+        ];
+        let (mut stopped, mut budget) = (0, 0);
+        for sampler in &samplers {
+            for seed in 0..6u64 {
+                let cfg = EnhanceConfig {
+                    max_tokens: 20,
+                    seed,
+                };
+                let want = reference_gemma3_tokens(&gemma, &prompt, &cfg, sampler);
+                let got = decode_gemma3(&gemma, &prompt, &cfg, sampler, None).unwrap();
+                assert_eq!(got, want, "{sampler:?} seed {seed}");
+                if want.last().is_some_and(|t| STOP_TOKENS.contains(t)) {
+                    stopped += 1;
+                } else {
+                    assert_eq!(want.len(), cfg.max_tokens, "{sampler:?} seed {seed}");
+                    budget += 1;
+                }
+            }
+        }
+        assert!(
+            stopped > 0 && budget > 0,
+            "stopped {stopped}, budget {budget}"
+        );
+        // A cancel observed after the prefill stays typed, as the pre-engine loop's did.
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        assert!(matches!(
+            decode_gemma3(
+                &gemma,
+                &prompt,
+                &EnhanceConfig::default(),
+                &SampleParams::censored(0.7),
+                Some(&cancel)
+            ),
+            Err(Error::Canceled)
+        ));
+    }
     use sha2::Digest as _;
 
     #[test]
