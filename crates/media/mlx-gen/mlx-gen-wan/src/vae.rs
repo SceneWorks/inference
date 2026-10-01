@@ -28,8 +28,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder, PinnedWeightsFile, Result};
 
 use crate::vae_common::{
-    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate,
-    validate_decoder_tiling, DeadStageBuffers, FeatCache,
+    contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, validate_decoder_tiling,
+    DeadStageBuffers, FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
@@ -445,9 +445,8 @@ impl Decoder3d {
     /// per-position channel-L2 norm, so evaluating it on a crop is exact up to the convolution
     /// padding at the crop boundary — which is what the trapezoidal overlap blend absorbs.
     ///
-    /// With [`DeadStageBuffers::Release`] each up-stage (its residual blocks plus the resample that
-    /// ends it, or the last stage's residual blocks) is materialized before its dead buffers are
-    /// released; with [`DeadStageBuffers::Keep`] the tail stays one lazy graph, as before.
+    /// With [`DeadStageBuffers::Release`] every residual block and resample is materialized and its
+    /// freed buffers released; with [`DeadStageBuffers::Keep`] the tail stays one lazy graph.
     fn forward_upsample_tail(&self, middle: &Array, dead: DeadStageBuffers) -> Result<Array> {
         let mut x = middle.clone();
         for layer in &self.upsamples {
@@ -455,14 +454,9 @@ impl Decoder3d {
                 UpLayer::Res(r) => r.forward(&x)?,
                 UpLayer::Up(u) => u.forward(&x)?,
             };
-            if dead.releases() && matches!(layer, UpLayer::Up(_)) {
-                eval(&x)?;
-                dead.stage_finished();
+            if dead.releases() {
+                dead.materialize(&x)?;
             }
-        }
-        if dead.releases() {
-            eval(&x)?;
-            dead.stage_finished();
         }
         let x = silu(&rms_norm_channels(&x, &self.head_norm)?)?;
         self.head_conv.forward(&x, None)
@@ -747,7 +741,10 @@ impl WanVae {
         let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
         let x = self.conv2.forward(&denorm, None)?;
         let out = self.decoder.forward(&x)?;
-        contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)
+        let out = contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)?;
+        // Single pass: the head's freed buffers leave the cache with the output (sc-20686).
+        DeadStageBuffers::Release.materialize(&out)?;
+        Ok(out)
     }
 
     /// Decode with **tiling** for memory-bounded large/long-video decode (`cfg`): split the latent
@@ -907,12 +904,14 @@ mod tests {
         }
     }
 
-    /// A tiny-width z16 decoder (production topology, base width 8) with seeded random weights.
-    fn tiny_decoder() -> WanVae {
+    /// A z16 decoder with the production topology at base width `dim` (96 in production), seeded
+    /// random f32 weights (production z16 decodes f32), each materialized as it is made.
+    fn synthetic_decoder(dim: i32) -> WanVae {
         let key = mlx_rs::random::key(20686).unwrap();
         let mut tensors = std::collections::HashMap::new();
         let mut put = |name: String, shape: &[i32]| {
             let value = mlx_rs::random::normal::<f32>(shape, None, Some(0.2), Some(&key)).unwrap();
+            mlx_rs::transforms::eval([&value]).unwrap();
             tensors.insert(name, value);
         };
         fn conv(put: &mut dyn FnMut(String, &[i32]), p: &str, o: i32, i: i32, kt: i32, k: i32) {
@@ -928,7 +927,6 @@ mod tests {
                 conv(put, &format!("{p}.shortcut"), o, i, 1, 1);
             }
         }
-        let dim = 8;
         let top = dim * DIM_MULT[3];
         conv(&mut put, "conv2", 16, 16, 1, 1);
         conv(&mut put, "decoder.conv1", top, 16, 3, 3);
@@ -983,45 +981,148 @@ mod tests {
         WanVae::from_weights(&Weights::from_map(tensors)).unwrap()
     }
 
-    fn stage_releases() -> usize {
-        crate::vae_common::STAGE_RELEASES.with(std::cell::Cell::get)
+    fn block_releases() -> usize {
+        crate::vae_common::BLOCK_RELEASES.with(std::cell::Cell::get)
     }
 
-    /// sc-20686: a single-pass decode materializes and releases each up-stage (one flush per
-    /// stage) without changing a single output value; a tiled decode keeps its stage pool.
-    #[test]
-    fn single_pass_decode_releases_each_dead_stage_and_tiles_keep_them() {
-        let vae = tiny_decoder();
-        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+    fn eval(x: &Array) {
+        mlx_rs::transforms::eval([x]).unwrap();
+    }
 
-        let before = stage_releases();
-        let released = vae.decode(&latent).unwrap();
-        assert_eq!(stage_releases() - before, DIM_MULT.len());
-
-        let denorm = add(divide(&latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
+    /// The same decode with the tail run in `dead` mode (denormalize → conv2 → middle → tail →
+    /// clamp), evaluated.
+    fn decode_with(vae: &WanVae, latent: &Array, dead: DeadStageBuffers) -> Array {
+        let denorm = add(divide(latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
         let middle = vae
             .decoder
             .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
             .unwrap();
-        let kept = vae
-            .decoder
-            .forward_upsample_tail(&middle, DeadStageBuffers::Keep)
+        let out = vae.decoder.forward_upsample_tail(&middle, dead).unwrap();
+        let out = contiguous(&minimum(maximum(&out, scalar(-1.0)).unwrap(), scalar(1.0)).unwrap())
             .unwrap();
-        let kept =
-            contiguous(&minimum(maximum(&kept, scalar(-1.0)).unwrap(), scalar(1.0)).unwrap())
-                .unwrap();
+        eval(&out);
+        out
+    }
+
+    /// sc-20686: a single-pass decode materializes and releases after every residual block and
+    /// resample plus once with the output, without changing a single output value; a tiled decode
+    /// stays one lazy graph per tile and releases nothing. Sized: dim 8, latent [1,16,2,8,8] → a
+    /// few MiB.
+    #[test]
+    fn single_pass_decode_releases_every_block_and_tiles_keep_them() {
+        let vae = synthetic_decoder(8);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+
+        let before = block_releases();
+        let released = vae.decode(&latent).unwrap();
+        assert_eq!(block_releases() - before, vae.decoder.upsamples.len() + 1);
+
+        let kept = decode_with(&vae, &latent, DeadStageBuffers::Keep);
         assert_eq!(released.shape(), kept.shape());
         assert_eq!(released.as_slice::<f32>(), kept.as_slice::<f32>());
 
-        let before = stage_releases();
+        let before = block_releases();
         let tiled = vae
             .decode_tiled(&latent, &TilingConfig::spatial_only(32, 16), None)
             .unwrap();
+        eval(&tiled);
         assert_eq!(tiled.shape(), released.shape());
-        assert_eq!(
-            stage_releases(),
-            before,
-            "tiled decode must keep its stage pool"
+        assert_eq!(block_releases(), before, "tiled decode must keep its pool");
+    }
+
+    const CACHE_CHILD: &str = "WAN_Z16_DECODE_CACHE_CHILD";
+
+    /// sc-20686: right after a single-pass decode MLX's allocator cache is empty, both of what the
+    /// decode freed and of what was cached before it, while the same decode with the pool kept
+    /// leaves its garbage cached. MLX's counters are process-wide and this binary runs tests on
+    /// parallel threads, so the measurement runs alone in a child process of this test binary.
+    /// Sized: dim 16 f32 weights (< 8 MiB), latent [1,16,2,8,8], a 16 MiB seeded scratch; total
+    /// well under 128 MiB.
+    #[test]
+    fn single_pass_decode_leaves_mlx_cache_empty() {
+        if std::env::var_os(CACHE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae::tests::single_pass_decode_leaves_mlx_cache_empty",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CACHE_CHILD, "1")
+                .output()
+                .expect("spawn the isolated decode-cache child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated decode-cache child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use mlx_rs::memory::{clear_cache, get_cache_memory};
+        const MIB: usize = 1 << 20;
+        let vae = synthetic_decoder(16);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+        eval(&latent);
+
+        clear_cache();
+        drop(decode_with(&vae, &latent, DeadStageBuffers::Keep));
+        let kept = get_cache_memory();
+        assert!(
+            kept >= 4 * MIB,
+            "the control decode must leave garbage: {kept} B"
+        );
+
+        {
+            let scratch = mlx_rs::ops::zeros::<f32>(&[(4 * MIB) as i32]).unwrap();
+            eval(&scratch);
+        }
+        assert!(get_cache_memory() >= kept + 16 * MIB);
+        let out = vae.decode(&latent).unwrap();
+        eval(&out);
+        let released = get_cache_memory();
+        assert!(
+            released < MIB && released * 16 < kept,
+            "a single-pass decode must leave the cache empty: {released} B (kept pool {kept} B)"
+        );
+    }
+
+    /// Measurement harness (sc-20686), not a gate: the production-width z16 decoder (dim 96, f32,
+    /// synthetic weights) single-pass decode's live and live + cache peaks per output voxel. Sized:
+    /// ~0.3 GB of weights + the decode, ~0.6 GB at the default latent `2,8,8` (32,768 voxels);
+    /// total < 1 GB. Override the latent with `WAN_DECODE_HARNESS_LATENT=t,h,w` (sizes scale with
+    /// the voxel count). Run alone: `cargo test -p mlx-gen-wan --lib
+    /// vae::tests::decode_footprint_harness -- --ignored --exact --test-threads=1 --nocapture`.
+    #[test]
+    #[ignore = "measurement harness; production-width weights; run alone on request"]
+    fn decode_footprint_harness() {
+        let [t, h, w] = std::env::var("WAN_DECODE_HARNESS_LATENT").map_or([2, 8, 8], |raw| {
+            let dims: Vec<i32> = raw.split(',').map(|v| v.trim().parse().unwrap()).collect();
+            [dims[0], dims[1], dims[2]]
+        });
+        let vae = synthetic_decoder(96);
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, t, h, w], None, None, None).unwrap();
+        eval(&latent);
+        mlx_rs::memory::clear_cache();
+        let base = mlx_rs::memory::get_active_memory() as u64;
+        mlx_rs::memory::reset_peak_memory();
+        let probe =
+            mlx_gen::memory_probe::AllocatorProbe::start(std::time::Duration::from_millis(1));
+        let out = vae.decode(&latent).unwrap();
+        eval(&out);
+        let report = probe.finish();
+        let live = (mlx_rs::memory::get_peak_memory() as u64).saturating_sub(base);
+        let footprint = report
+            .sampled_footprint_peak_bytes
+            .max(live + base)
+            .saturating_sub(base);
+        let shape = out.shape();
+        let voxels = f64::from(shape[2] * shape[3] * shape[4]);
+        eprintln!(
+            "z16 f32 single-pass latent {t},{h},{w}: {voxels} voxels; live {:.0} B/voxel, \
+             live+cache {:.0} B/voxel",
+            live as f64 / voxels,
+            footprint as f64 / voxels
         );
     }
 }
