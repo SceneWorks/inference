@@ -1530,10 +1530,11 @@ fn sc20684_packed_campaign_observer() {
     let load_started = Instant::now();
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), config.wan.text_len)
         .expect("load product tokenizer");
-    let mut text_weights =
-        mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors"))
-            .expect("open product text encoder");
-    let context = {
+    // The product's own UMT5 release (`encode_prompt`): the encoder and its weight map live only
+    // inside the phase, its context is materialized, then MLX's cache of their buffers is returned.
+    let context = mlx_gen_krea_realtime::materialize_and_release_phase(|| {
+        let mut text_weights =
+            mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors"))?;
         let encoder = Umt5Encoder::from_weights_quantized(
             &mut text_weights,
             &config.wan,
@@ -1541,22 +1542,14 @@ fn sc20684_packed_campaign_observer() {
                 bits: 8,
                 group_size: 64,
             },
+        )?;
+        encoder.encode(
+            &tokenizer,
+            "a red fox trotting through a snowy pine forest at sunrise",
         )
-        .expect("load product text encoder");
-        let value = encoder
-            .encode(
-                &tokenizer,
-                "a red fox trotting through a snowy pine forest at sunrise",
-            )
-            .expect("encode product prompt");
-        mlx_rs::transforms::eval([&value]).expect("materialize product prompt context");
-        value
-    };
-    drop(text_weights);
+    })
+    .expect("encode product prompt and release the text encoder");
     drop(tokenizer);
-    // Same release as the product's `encode_prompt`: the UMT5's freed buffers would otherwise stay
-    // in MLX's process-wide cache, unusable by the DiT/VAE shapes, for the whole role.
-    mlx_rs::memory::clear_cache();
     let dit_weights = mlx_gen::weights::Weights::from_file(root.join("dit.safetensors"))
         .expect("open product DiT");
     let raw: std::collections::HashMap<String, Array> = dit_weights

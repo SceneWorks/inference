@@ -702,22 +702,32 @@ fn encode_prompt(
     te_quant: Option<WanQuant>,
 ) -> Result<Array> {
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), cfg.wan.text_len)?;
-    let mut w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
-    let enc = match te_quant {
-        Some(q) => Umt5Encoder::from_weights_quantized(&mut w, &cfg.wan, q)?,
-        None => Umt5Encoder::from_weights(&w, &cfg.wan)?,
-    };
-    let context = enc.encode(&tokenizer, prompt)?;
-    mlx_rs::transforms::eval([&context])?;
-    // Release the UMT5 at the allocator, not only at the Rust handle. MLX recycles a freed Metal
-    // buffer into its process-wide cache and reuses it only for a near-identical size; it trims that
-    // cache only once active + cached nears 0.95 x the device working set (~91 GiB on a 128 GiB
-    // Mac). The encoder's Q8 packs and staging cannot be reused by the DiT/VAE shapes, so without
-    // this they stay in the process footprint for the whole render (SC-20684 cap overrun).
-    drop(enc);
-    drop(w);
+    materialize_and_release_phase(|| {
+        let mut w = Weights::from_file(root.join("t5_encoder.safetensors"))?;
+        let enc = match te_quant {
+            Some(q) => Umt5Encoder::from_weights_quantized(&mut w, &cfg.wan, q)?,
+            None => Umt5Encoder::from_weights(&w, &cfg.wan)?,
+        };
+        enc.encode(&tokenizer, prompt)
+    })
+}
+
+/// Run one staged component phase whose weights live only inside `phase`, materialize its output,
+/// then return the phase's freed buffers from MLX's allocator cache.
+///
+/// Dropping a component's Rust handles is not enough: MLX recycles every freed Metal buffer into a
+/// process-wide cache, reuses one only for a near-identical size, and trims that cache only once
+/// active + cached memory nears 0.95 x the device working set (~91 GiB on a 128 GiB Mac). The
+/// UMT5's Q8 packs and staging fit no DiT/VAE shape, so without the clear they would stay in the
+/// process footprint for the whole render (the SC-20684 child-cap overrun). The output is evaluated
+/// *after* `phase` returned, so the lazy graph is the last owner of the component's weights and
+/// they are freed by that evaluation, before the clear.
+#[doc(hidden)]
+pub fn materialize_and_release_phase(phase: impl FnOnce() -> Result<Array>) -> Result<Array> {
+    let output = phase()?;
+    mlx_rs::transforms::eval([&output])?;
     mlx_rs::memory::clear_cache();
-    Ok(context)
+    Ok(output)
 }
 
 /// Open the snapshot's transformer weights: a single-file `dit.safetensors` (the converted MLX layout)
@@ -1274,6 +1284,32 @@ mod tests {
             transformer < body.find("ProviderVae::from_weights(").expect("vae build"),
             "the VAE build must follow the transformer load"
         );
+    }
+
+    /// SC-20684: the product's UMT5 is loaded and run only inside the release phase, so its
+    /// weights are freed and MLX's cache of them is cleared before the DiT load. The helper's
+    /// behaviour (active falls, cache cleared) is measured in `tests/t2v_pipeline.rs`.
+    #[test]
+    fn encode_prompt_builds_the_text_encoder_inside_the_release_phase() {
+        let source = include_str!("t2v.rs");
+        let body = source
+            .split_once("fn encode_prompt(")
+            .expect("encode_prompt")
+            .1
+            .split_once("\n}\n")
+            .expect("function end")
+            .0;
+        let phase = body
+            .find("materialize_and_release_phase(||")
+            .expect("encode_prompt must run the UMT5 inside the release phase");
+        for component in [
+            "Weights::from_file(",
+            "Umt5Encoder::from_weights",
+            ".encode(",
+        ] {
+            let at = body.find(component).expect(component);
+            assert!(phase < at, "{component} must be owned by the release phase");
+        }
     }
 
     /// sc-22738: no reported route re-raises the Conditioning fault at its own call site (that was
