@@ -16,7 +16,9 @@
 //!   `baseline/` directory, which emits the same schema; the pre- and post-epic campaign rows
 //!   compare field for field.
 //! * **Provenance** ([`BenchProvenance`]): every document records the checkout it was built from
-//!   (`git rev-parse HEAD` at run time, [`BENCH_GIT_SHA_ENV`] as the fallback), the effective state
+//!   — the SHA and dirty flag stamped into the binary at compile time ([`BENCH_BUILD_GIT_SHA_ENV`],
+//!   [`BENCH_BUILD_GIT_DIRTY_ENV`]) beside `git rev-parse HEAD` / `git status` at run time, a
+//!   mismatch refused — the effective state
 //!   of every runtime decode switch ([`BENCH_SWITCHES`], read from the backend's switch objects by
 //!   the entry point) and the device-selection environment ([`BENCH_ENV`]), and the reasoning
 //!   setting the requests carried ([`BenchThinking`], `SPECULATIVE_BENCH_THINKING`).
@@ -33,7 +35,7 @@ use std::time::{Duration, Instant};
 use crate::draft_model::{draft_model_prompts, write_draft_model_fixture, DraftLoader};
 
 /// The benchmark document's schema identifier; bump it when a field changes meaning.
-pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/3";
+pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/4";
 
 /// The reasoning setting every benchmark request carries (`SPECULATIVE_BENCH_THINKING`): which
 /// `enable_thinking` / `reasoning_effort` chat-template kwargs the requests send. A reasoning model
@@ -143,9 +145,34 @@ pub const BENCH_SWITCHES: [&str; 9] = [
 /// the process saw and whether Candle was forced onto the CPU.
 pub const BENCH_ENV: [&str; 2] = ["CUDA_VISIBLE_DEVICES", "CANDLE_LLM_DEVICE"];
 
-/// The runtime SHA a run records when `git rev-parse HEAD` cannot answer (no `git`, no checkout):
-/// set by the operator, recorded with `source` `SPECULATIVE_BENCH_GIT_SHA`.
+/// The operator's SHA override (`source` `SPECULATIVE_BENCH_GIT_SHA`): accepted only when the
+/// binary carries no compile-time SHA ([`BENCH_BUILD_GIT_SHA_ENV`]) **and**
+/// [`BENCH_ALLOW_SHA_OVERRIDE_ENV`] is `1` (the campaign script's `--allow-sha-override`); then it
+/// is the recorded SHA when `git rev-parse HEAD` cannot answer, and must equal `HEAD` when it can.
+/// Set in any other case, the run is refused ([`reconcile_git_provenance`]).
 pub const BENCH_GIT_SHA_ENV: &str = "SPECULATIVE_BENCH_GIT_SHA";
+
+/// `1` permits [`BENCH_GIT_SHA_ENV`] (see there).
+pub const BENCH_ALLOW_SHA_OVERRIDE_ENV: &str = "SPECULATIVE_BENCH_ALLOW_SHA_OVERRIDE";
+
+/// The **compile-time** variable carrying the checkout's 40-hex `HEAD` into the benchmark binary
+/// (`option_env!`, so cargo rebuilds the crate when it changes): the campaign script
+/// (`scripts/release/speculative_bench_campaign.py`) sets it, after checking `HEAD`, for every
+/// build and run. A binary built without it records `build_sha: null`, which the campaign refuses.
+pub const BENCH_BUILD_GIT_SHA_ENV: &str = "SPECULATIVE_BENCH_BUILD_GIT_SHA";
+
+/// The compile-time dirty flag (`0` / `1`, `git status --porcelain` non-empty at build time) set
+/// beside [`BENCH_BUILD_GIT_SHA_ENV`].
+pub const BENCH_BUILD_GIT_DIRTY_ENV: &str = "SPECULATIVE_BENCH_BUILD_GIT_DIRTY";
+
+/// What this binary was compiled from: [`BENCH_BUILD_GIT_SHA_ENV`] and
+/// [`BENCH_BUILD_GIT_DIRTY_ENV`] as `option_env!` saw them (each `None` when unset).
+pub fn bench_build_stamp() -> (Option<&'static str>, Option<&'static str>) {
+    (
+        option_env!("SPECULATIVE_BENCH_BUILD_GIT_SHA"),
+        option_env!("SPECULATIVE_BENCH_BUILD_GIT_DIRTY"),
+    )
+}
 
 /// What an entry point reports about its backend's runtime switches: `(variable, effective state)`
 /// for each switch the backend has, read from the switch objects (a bool, or a label for a
@@ -155,9 +182,14 @@ pub type BenchSwitches<'a> = &'a dyn Fn() -> Vec<(&'static str, Value)>;
 /// The checkout a benchmark binary was built from, and the runtime switches it ran under.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BenchProvenance {
-    /// `HEAD` of the checkout (40 hex), or [`BENCH_GIT_SHA_ENV`]'s value; `None` when neither
-    /// answered.
+    /// `HEAD` of the checkout at run time (40 hex), or [`BENCH_GIT_SHA_ENV`]'s value; `None` when
+    /// neither answered.
     pub git_sha: Option<String>,
+    /// The SHA stamped at compile time ([`BENCH_BUILD_GIT_SHA_ENV`]); `None` when the build set
+    /// none.
+    pub build_sha: Option<String>,
+    /// The dirty flag stamped at compile time ([`BENCH_BUILD_GIT_DIRTY_ENV`]).
+    pub build_dirty: Option<bool>,
     /// Whether the checkout differed from `HEAD` (`git status --porcelain`, untracked files
     /// included); `None` when `git` did not answer.
     pub git_dirty: Option<bool>,
@@ -177,9 +209,11 @@ impl BenchProvenance {
     pub const MAX_CHANGES: usize = 50;
 
     /// The provenance of this process: the checkout this crate was compiled from (its manifest
-    /// directory — the benchmark binary is built from the same checkout), the raw environment
-    /// read through `var`, and `switches` — refused when it names a variable outside
-    /// [`BENCH_SWITCHES`] or names one twice, so a renamed switch cannot drop out of the record.
+    /// directory — the benchmark binary is built from the same checkout) reconciled with the
+    /// compile-time stamp ([`bench_build_stamp`], [`reconcile_git_provenance`]), the raw
+    /// environment read through `var`, and `switches` — refused when it names a variable outside
+    /// [`BENCH_SWITCHES`] or names one twice, so a renamed switch cannot drop out of the record,
+    /// and when the binary's compile-time SHA or dirty flag is not the checkout's now.
     pub fn collect(
         switches: Vec<(&'static str, Value)>,
         var: &dyn Fn(&str) -> Option<String>,
@@ -194,7 +228,11 @@ impl BenchProvenance {
                 return Err(format!("switch {name} is reported twice"));
             }
         }
-        let mut provenance = git_provenance(Path::new(env!("CARGO_MANIFEST_DIR")), var);
+        let mut provenance = reconcile_git_provenance(
+            git_provenance(Path::new(env!("CARGO_MANIFEST_DIR")), var),
+            bench_build_stamp(),
+            var,
+        )?;
         provenance.switches = switches;
         provenance.env = BENCH_SWITCHES
             .iter()
@@ -204,7 +242,8 @@ impl BenchProvenance {
         Ok(provenance)
     }
 
-    /// The document's `provenance` block: `git` (`{"sha", "dirty", "changes", "source"}`),
+    /// The document's `provenance` block: `git` (`{"sha", "dirty", "changes", "source",
+    /// "build_sha", "build_dirty"}` — run time, then compile time),
     /// `switches` (one `{"env", "effective"}` per [`BENCH_SWITCHES`] variable: the raw value and
     /// the backend's effective state, each `null` when absent) and `env` (each [`BENCH_ENV`]
     /// variable's raw value).
@@ -239,6 +278,8 @@ impl BenchProvenance {
                 "dirty": self.git_dirty,
                 "changes": self.git_changes,
                 "source": self.git_source,
+                "build_sha": self.build_sha,
+                "build_dirty": self.build_dirty,
             },
             "switches": switches,
             "env": env,
@@ -248,7 +289,8 @@ impl BenchProvenance {
 
 /// The git state of the checkout at `repo`: `git rev-parse HEAD` and `git status --porcelain`,
 /// run now; when `git` cannot answer, the SHA from [`BENCH_GIT_SHA_ENV`] (read through `var`)
-/// with the tree state unknown; else nothing.
+/// with the tree state unknown; else nothing. [`reconcile_git_provenance`] decides whether the
+/// operator's SHA may stand.
 pub fn git_provenance(repo: &Path, var: &dyn Fn(&str) -> Option<String>) -> BenchProvenance {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
@@ -287,6 +329,82 @@ pub fn git_provenance(repo: &Path, var: &dyn Fn(&str) -> Option<String>) -> Benc
         },
         None => BenchProvenance::default(),
     }
+}
+
+/// Reconcile the run-time git state (`runtime`, [`git_provenance`]) with the compile-time stamp
+/// `build` (`(sha, dirty)`, [`bench_build_stamp`]) and record the stamp. Refused:
+///
+/// * a stamped SHA that is not 40 hex, or a dirty flag that is not `0` / `1`;
+/// * a stamped SHA (or dirty flag) that differs from what `git` reports for the checkout now —
+///   the binary was not built from this tree (a stale test binary, a moved checkout);
+/// * [`BENCH_GIT_SHA_ENV`] set while the binary carries a stamped SHA, or without
+///   [`BENCH_ALLOW_SHA_OVERRIDE_ENV`] `=1`, or naming a SHA other than the one `git` reports.
+pub fn reconcile_git_provenance(
+    mut runtime: BenchProvenance,
+    build: (Option<&str>, Option<&str>),
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<BenchProvenance, String> {
+    let (build_sha, build_dirty) = build;
+    let build_sha = build_sha.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(sha) = build_sha {
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{BENCH_BUILD_GIT_SHA_ENV} is {sha:?}, not a 40-hex commit"
+            ));
+        }
+    }
+    let build_dirty = match build_dirty.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        Some(other) => {
+            return Err(format!(
+                "{BENCH_BUILD_GIT_DIRTY_ENV} is {other:?}, not 0 or 1"
+            ));
+        }
+    };
+    let from_git = runtime.git_source == Some("git");
+    if runtime.git_source == Some(BENCH_GIT_SHA_ENV) || var(BENCH_GIT_SHA_ENV).is_some() {
+        let given = var(BENCH_GIT_SHA_ENV).unwrap_or_default();
+        if build_sha.is_some() {
+            return Err(format!(
+                "{BENCH_GIT_SHA_ENV}={given} refused: this binary carries its compile-time SHA"
+            ));
+        }
+        if var(BENCH_ALLOW_SHA_OVERRIDE_ENV).as_deref() != Some("1") {
+            return Err(format!(
+                "{BENCH_GIT_SHA_ENV}={given} refused without {BENCH_ALLOW_SHA_OVERRIDE_ENV}=1"
+            ));
+        }
+        if from_git && runtime.git_sha.as_deref() != Some(given.trim()) {
+            return Err(format!(
+                "{BENCH_GIT_SHA_ENV}={given} is not the checkout's HEAD {:?}",
+                runtime.git_sha
+            ));
+        }
+    }
+    if from_git {
+        if let Some(sha) = build_sha {
+            if runtime.git_sha.as_deref() != Some(sha) {
+                return Err(format!(
+                    "this binary was compiled from {sha} but the checkout is at {:?}: rebuild it",
+                    runtime.git_sha
+                ));
+            }
+        }
+        if let (Some(built), Some(now)) = (build_dirty, runtime.git_dirty) {
+            if built != now {
+                return Err(format!(
+                    "this binary was compiled from a {} tree but the checkout is {} now: rebuild it",
+                    if built { "dirty" } else { "clean" },
+                    if now { "dirty" } else { "clean" },
+                ));
+            }
+        }
+    }
+    runtime.build_sha = build_sha.map(str::to_string);
+    runtime.build_dirty = build_dirty;
+    Ok(runtime)
 }
 
 /// `SPECULATIVE_BENCH_THINKING` read through `var` ([`BenchThinking::parse`]); unset is
@@ -1132,11 +1250,15 @@ pub fn bench_config(
 /// | `SPECULATIVE_BENCH_BACKEND` | backend label recorded verbatim (default: the entry point's) |
 /// | `SPECULATIVE_BENCH_WARMUP` | `0` skips the untimed warm-up per row (default on) |
 /// | `SPECULATIVE_BENCH_THINKING` | reasoning setting of every request ([`BenchThinking::parse`]): `default` (the template's; the default), `off`, `on`, or a `reasoning_effort` level `xhigh` / `medium` / `low` (thinking on at that effort) |
-/// | `SPECULATIVE_BENCH_GIT_SHA` | the runtime SHA to record when `git rev-parse HEAD` cannot answer ([`BENCH_GIT_SHA_ENV`]) |
+/// | `SPECULATIVE_BENCH_GIT_SHA` | the operator's SHA, only with `SPECULATIVE_BENCH_ALLOW_SHA_OVERRIDE=1` and no compile-time SHA ([`BENCH_GIT_SHA_ENV`]) |
 ///
-/// The document's `provenance` ([`BenchProvenance`]) records the checkout's `HEAD` and tree
-/// state, the effective state of `switches` (the backend's runtime switches, read after the run)
-/// and the raw [`BENCH_SWITCHES`] / [`BENCH_ENV`] variables.
+/// At **compile time** `SPECULATIVE_BENCH_BUILD_GIT_SHA` / `SPECULATIVE_BENCH_BUILD_GIT_DIRTY`
+/// stamp the binary ([`bench_build_stamp`]). The document's `provenance` ([`BenchProvenance`])
+/// records the checkout's `HEAD` and tree state now and the stamp, the effective state of
+/// `switches` (the backend's runtime switches, read after the run) and the raw
+/// [`BENCH_SWITCHES`] / [`BENCH_ENV`] variables. The provenance is collected once before the load
+/// too, so a binary that is not the checkout's ([`reconcile_git_provenance`]) is refused before it
+/// measures anything.
 pub fn run_speculative_bench_from_env(
     default_backend: &str,
     load: DraftLoader<'_>,
@@ -1154,6 +1276,7 @@ pub fn run_speculative_bench_from_env(
     }
     let spec = bench_load_spec(&snapshot, &bench_env)?;
     let config = bench_config(&snapshot, default_backend, &bench_env)?;
+    BenchProvenance::collect(Vec::new(), &bench_env)?;
     let provider = load(&spec).map_err(|e| format!("load {snapshot}: {e}"))?;
     let mut doc = run_speculative_bench(provider.as_ref(), &speculative_prompt_set(), &config)?;
     doc.provenance = BenchProvenance::collect(switches(), &bench_env)?;
@@ -2036,7 +2159,14 @@ mod tests {
         );
         assert_eq!(
             sorted_keys(&json["git"]),
-            ["changes", "dirty", "sha", "source"]
+            [
+                "build_dirty",
+                "build_sha",
+                "changes",
+                "dirty",
+                "sha",
+                "source"
+            ]
         );
         // This crate is compiled from a checkout: `git` answers with the 40-hex `HEAD` when it is
         // installed (the fallback below covers a host without it).
@@ -2072,5 +2202,70 @@ mod tests {
             given.git_dirty, None,
             "the operator's SHA says nothing of the tree"
         );
+    }
+
+    /// The compile-time stamp and the run-time checkout must agree, and the operator's SHA stands
+    /// only without a stamp and with the explicit permission.
+    #[test]
+    fn the_build_stamp_must_be_the_checkout_and_the_operator_sha_needs_permission() {
+        let head = "c1e8f8e023bf4e1fe94a61c4c39e08f881fdd8e6";
+        let other = "99f0717948b35b28b3cf8b8491c3297121c6508c";
+        let checkout = |dirty: bool| BenchProvenance {
+            git_sha: Some(head.into()),
+            git_dirty: Some(dirty),
+            git_source: Some("git"),
+            ..BenchProvenance::default()
+        };
+        let none = |_: &str| None;
+        let ok = reconcile_git_provenance(checkout(false), (Some(head), Some("0")), &none).unwrap();
+        assert_eq!(
+            (ok.build_sha.as_deref(), ok.build_dirty),
+            (Some(head), Some(false))
+        );
+        assert_eq!(ok.to_json()["git"]["build_sha"], head);
+        // A stale binary (built at another commit, or from a tree that has since changed).
+        for (built, dirty, now_dirty) in [
+            (other, "0", false),
+            (head, "0", true),
+            (head, "1", false),
+            ("not-a-sha", "0", false),
+            (head, "yes", false),
+        ] {
+            let err =
+                reconcile_git_provenance(checkout(now_dirty), (Some(built), Some(dirty)), &none);
+            assert!(err.is_err(), "{built} {dirty} {now_dirty}: {err:?}");
+        }
+        // No stamp: the run-time state stands, recorded as unstamped.
+        let bare = reconcile_git_provenance(checkout(true), (None, None), &none).unwrap();
+        assert_eq!((bare.build_sha, bare.build_dirty), (None, None));
+
+        // The operator's SHA.
+        let outside = BenchProvenance {
+            git_sha: Some(head.into()),
+            git_source: Some(BENCH_GIT_SHA_ENV),
+            ..BenchProvenance::default()
+        };
+        let allowed = |name: &str| match name {
+            BENCH_GIT_SHA_ENV => Some(head.to_string()),
+            BENCH_ALLOW_SHA_OVERRIDE_ENV => Some("1".to_string()),
+            _ => None,
+        };
+        let unpermitted = |name: &str| (name == BENCH_GIT_SHA_ENV).then(|| head.to_string());
+        let accepted = reconcile_git_provenance(outside.clone(), (None, None), &allowed).unwrap();
+        assert_eq!(accepted.git_source, Some(BENCH_GIT_SHA_ENV));
+        assert!(reconcile_git_provenance(outside.clone(), (None, None), &unpermitted).is_err());
+        assert!(
+            reconcile_git_provenance(outside, (Some(head), None), &allowed).is_err(),
+            "a stamped binary never takes the operator's SHA"
+        );
+        // Set beside a checkout that answers, it must name that checkout's HEAD.
+        assert!(reconcile_git_provenance(checkout(false), (None, None), &allowed).is_ok());
+        let wrong = |name: &str| match name {
+            BENCH_GIT_SHA_ENV => Some(other.to_string()),
+            BENCH_ALLOW_SHA_OVERRIDE_ENV => Some("1".to_string()),
+            _ => None,
+        };
+        assert!(reconcile_git_provenance(checkout(false), (None, None), &wrong).is_err());
+        assert!(reconcile_git_provenance(checkout(false), (None, None), &unpermitted).is_err());
     }
 }

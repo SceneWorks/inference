@@ -4156,6 +4156,8 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             ("DECODE_BENCH_SNAPSHOT_QWEN38", "${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}"),
             ("DECODE_BENCH_SNAPSHOT_BONSAI_MLX", "${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}"),
             ("CUDA_VISIBLE_DEVICES", "1"),
+            # CUDA numbers the cards as nvidia-smi does, so ordinal 1 is the inventory's GPU 1.
+            ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"),
             ("CUDA_PATH", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"),
         ):
             if env.get(name) != value:
@@ -4188,23 +4190,22 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         target = "..\\inference-pre-epic\\crates\\llm\\candle-llm\\tests\\speculative_bench_baseline.rs"
         if driver not in copy or target not in copy or "|| exit /b 1" not in copy:
             errors.append(f"the driver is not copied into the pre-epic checkout: {copy!r}")
-        builds = {
-            "Build the epic benchmark binary": "--test speculative_bench --no-run",
-            "Build the pre-epic baseline driver": "--test speculative_bench_baseline --no-run",
-        }
-        for name, test in builds.items():
-            run = named.get(name, {}).get("run", "")
-            command = f"cargo test --locked --release -p candle-llm --features cuda {test} || exit /b 1"
-            if 'call "%VCVARS%"' not in run or command not in run:
-                errors.append(f"{name}: does not build {test!r} under vcvars")
-            if index.get(name, -1) < index.get(wrapper, len(steps)):
-                errors.append(f"{name}: runs before RUSTC_WRAPPER is cleared")
-        pre_epic = named.get("Build the pre-epic baseline driver", {})
-        if pre_epic.get("working-directory") != "inference-pre-epic" or (
-            'set "CARGO_TARGET_DIR=%DECODE_BENCH_PRE_EPIC_TARGET%"' not in pre_epic.get("run", "")
-        ):
-            errors.append("the pre-epic build is not in its checkout with its own target dir")
-        run = named.get("Run every matrix row (epic entry, then baseline driver)", {}).get("run", "")
+        # The runner script builds both checkouts itself, stamping the commit at compile time; a
+        # separate unstamped build would only be rebuilt (or, run as is, refused).
+        for step in steps:
+            if "cargo test" in step.get("run", ""):
+                errors.append(f"{step.get('name')}: builds outside the stamping runner script")
+        plan = named.get(
+            "Validate the matrix and initialize the run-scoped evidence directory", {}
+        ).get("run", "")
+        if "speculative_bench_campaign.py plan --lane cuda " not in plan:
+            errors.append("the matrix is not planned for the cuda lane")
+        if campaign.LANES["cuda"].features != ("cuda",) or campaign.LANES["cuda"].backend != "candle-cuda":
+            errors.append("the runner's cuda lane does not build candle-llm with `cuda`")
+        run_name = "Build both checkouts and run every matrix row (epic and baseline alternating)"
+        if index.get(run_name, -1) < index.get(wrapper, len(steps)):
+            errors.append("the runner builds before RUSTC_WRAPPER is cleared")
+        run = named.get(run_name, {}).get("run", "")
         for fragment in (
             'call "%VCVARS%"',
             '"%REVIEWED_PYTHON%" scripts/release/speculative_bench_campaign.py run ',
@@ -4244,6 +4245,7 @@ class CiWorkflowPolicyTests(unittest.TestCase):
         for mutate in (
             lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench'"}),
             lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "0"}),
+            lambda job: job["env"].pop("CUDA_DEVICE_ORDER"),
             lambda job: job.update({"timeout-minutes": 240}),
             lambda job: job["steps"][1]["with"].update({"ref": "main"}),
             lambda job: job["steps"][-1].pop("if"),
