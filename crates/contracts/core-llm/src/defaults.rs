@@ -233,7 +233,8 @@ pub const CANDLE_CUDA: DecodeDefaults = DecodeDefaults {
     // within its tolerance and replaces `T` sequential steps.
     gdn_chunked_prefill: true,
     // justification: on, MEASURED faster than cuBLASLt for decode-sized NVFP4 projections
-    // (sc-24136 evidence) and it serves the indexed NVFP4 MoE kernels. Runtime switch `CANDLE_LLM_NVFP4_GEMV`.
+    // (sc-24136 evidence) and it serves the indexed NVFP4 MoE kernels. Runtime switch
+    // `CANDLE_LLM_NVFP4_GEMV`.
     nvfp4_gemv: true,
     // justification: n/a — an MLX routing.
     sdpa_kernel_routing: false,
