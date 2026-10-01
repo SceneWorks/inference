@@ -79,7 +79,7 @@ impl DeadStageBuffers {
         if self.releases() {
             #[cfg(test)]
             BLOCK_RELEASES.with(|count| count.set(count.get() + 1));
-            mlx_rs::memory::clear_cache();
+            mlx_gen::memory_probe::clear_cache();
         }
         Ok(())
     }

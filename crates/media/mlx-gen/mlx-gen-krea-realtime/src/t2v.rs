@@ -343,7 +343,7 @@ pub fn decode_latents_to_video(
     // cache, sized for DiT shapes the VAE never requests. Return them before the decode builds its
     // own working set so the two phases' buffers never coexist in the process footprint (see
     // `encode_prompt`). Live arrays — the DiT, the latents — are untouched.
-    mlx_rs::memory::clear_cache();
+    mlx_gen::memory_probe::clear_cache();
     // `decode_to_frames` reshapes `[C,F,H,W]` → `[1,C,F,H,W]`, decodes (single-pass or tiled), and
     // returns `[F_out, H_out, W_out, 3]` uint8; `frames_to_images` splits it into one `Image`/frame.
     let frames_u8 = decode_to_frames(vae, latents, tiling, Some(cancel))?;
@@ -726,7 +726,7 @@ fn encode_prompt(
 pub fn materialize_and_release_phase(phase: impl FnOnce() -> Result<Array>) -> Result<Array> {
     let output = phase()?;
     mlx_rs::transforms::eval([&output])?;
-    mlx_rs::memory::clear_cache();
+    mlx_gen::memory_probe::clear_cache();
     Ok(output)
 }
 
@@ -1326,7 +1326,7 @@ mod tests {
             .expect("function end")
             .0;
         let clear = body
-            .find("mlx_rs::memory::clear_cache();")
+            .find("mlx_gen::memory_probe::clear_cache();")
             .expect("decode_latents_to_video must clear MLX's cache");
         let decode = body.find("decode_to_frames(").expect("VAE decode");
         assert!(

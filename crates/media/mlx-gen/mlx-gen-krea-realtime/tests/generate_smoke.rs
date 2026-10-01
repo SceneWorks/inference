@@ -847,10 +847,33 @@ fn sc20684_decode_plan_prices_the_full_raw_frame_count() {
     assert_eq!(estimate, Some(12_643_205_120));
 }
 
+/// Every recorded allocator-sampler gap, with the phase and release windows it spanned.
+fn sc20684_sampler_gaps(
+    allocator: &mlx_gen::memory_probe::AllocatorProbeReport,
+) -> Vec<serde_json::Value> {
+    allocator
+        .gaps
+        .iter()
+        .map(|gap| {
+            serde_json::json!({
+                "startMicros": gap.start_micros,
+                "durationMicros": gap.duration_micros,
+                "uncoveredMicros": gap.uncovered_micros,
+                "releaseMicros": gap.release_micros,
+                "releaseWindows": gap.release_windows,
+                "phaseAtStart": gap.phase_at_start,
+                "phaseAtEnd": gap.phase_at_end,
+            })
+        })
+        .collect()
+}
+
 /// One phase-boundary memory reading. It is also printed as it is taken, so a role the launcher's
 /// footprint watchdog aborts mid-run still leaves which phases completed, and with what MLX active
 /// versus cached bytes, in its bounded stdout transcript.
 fn sc20684_phase_memory(name: &str) -> serde_json::Value {
+    // The allocator probe attributes each sampler gap to the last phase reached.
+    mlx_gen::memory_probe::set_phase(name);
     let value = serde_json::json!({
         "phase": name,
         "process": sc20684_process_memory(),
@@ -1495,6 +1518,7 @@ fn sc20684_packed_campaign_observer() {
     let campaign_started = Instant::now();
     let process_start = sc20684_process_memory();
     mlx_rs::memory::reset_peak_memory();
+    mlx_gen::memory_probe::set_phase("process-start");
     let allocator_probe = mlx_gen::memory_probe::AllocatorProbe::start_default();
     let mode = Sc20684Mode::parse();
     let tier = sc20684_cache_tier();
@@ -1660,7 +1684,7 @@ fn sc20684_packed_campaign_observer() {
         drop(dense_cache);
         drop(dense_latents);
         drop(conditioning);
-        mlx_rs::memory::clear_cache();
+        mlx_gen::memory_probe::clear_cache();
         phase_memory.push(sc20684_phase_memory("release"));
         let release_process = sc20684_process_memory();
         let release_active = mlx_rs::memory::get_active_memory() as u64;
@@ -1742,6 +1766,11 @@ fn sc20684_packed_campaign_observer() {
                     "samplingSpanMicros": allocator.sampling_span_micros,
                     "intervalMicros": allocator.interval_micros,
                     "maxGapMicros": allocator.max_gap_micros,
+                    "maxUncoveredGapMicros": allocator.max_uncovered_gap_micros,
+                    "gaps": sc20684_sampler_gaps(&allocator),
+                    "gapsNotRecorded": allocator.gaps_not_recorded,
+                    "releaseWindowCount": allocator.release_window_count,
+                    "realtimeSampler": allocator.realtime_sampler,
                     "releaseActiveBytes": release_active,
                     "releaseCacheBytes": release_cache,
                 },
@@ -1798,7 +1827,7 @@ fn sc20684_packed_campaign_observer() {
     // The candidate's measurements are taken. Return the packed decode's cached working set before
     // the dense parity generation: its buffers fit no DiT shape, so MLX would otherwise hold them
     // beside the dense run until its ~0.95 x working-set trim, far above the child cap.
-    mlx_rs::memory::clear_cache();
+    mlx_gen::memory_probe::clear_cache();
     // Printed like every phase reading, but kept out of `phaseMemory`, whose labels the launcher
     // validates in a fixed order. Without the clear this reads the packed decode's ~12 GiB working
     // set; the 1 GiB bound tolerates a Metal completion handler recycling a late temporary between
@@ -1970,7 +1999,7 @@ fn sc20684_packed_campaign_observer() {
             == mlx_gen_krea_realtime::compressed_kv::PACKED_METAL_THREADGROUP_SCRATCH_BYTES;
     drop(cancelled_cache);
     drop(cancellation_conditioning);
-    mlx_rs::memory::clear_cache();
+    mlx_gen::memory_probe::clear_cache();
     let cancellation_active_after_release = mlx_rs::memory::get_active_memory() as u64;
     let cancellation_cache_after_release = mlx_rs::memory::get_cache_memory() as u64;
     let cancellation_scratch_released = cancellation_active_after_release
@@ -2006,7 +2035,7 @@ fn sc20684_packed_campaign_observer() {
     let verification_terminal = sc20684_process_memory();
     let verification_terminal_active = mlx_rs::memory::get_active_memory() as u64;
     let verification_terminal_cache = mlx_rs::memory::get_cache_memory() as u64;
-    mlx_rs::memory::clear_cache();
+    mlx_gen::memory_probe::clear_cache();
     phase_memory.push(sc20684_phase_memory("release"));
     let release_process = sc20684_process_memory();
     let release_active = mlx_rs::memory::get_active_memory() as u64;
@@ -2100,6 +2129,11 @@ fn sc20684_packed_campaign_observer() {
                 "samplingSpanMicros": allocator.sampling_span_micros,
                 "intervalMicros": allocator.interval_micros,
                 "maxGapMicros": allocator.max_gap_micros,
+                "maxUncoveredGapMicros": allocator.max_uncovered_gap_micros,
+                "gaps": sc20684_sampler_gaps(&allocator),
+                "gapsNotRecorded": allocator.gaps_not_recorded,
+                "releaseWindowCount": allocator.release_window_count,
+                "realtimeSampler": allocator.realtime_sampler,
                 "releaseActiveBytes": release_active,
                 "releaseCacheBytes": release_cache,
             },
