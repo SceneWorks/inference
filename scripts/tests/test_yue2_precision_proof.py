@@ -164,6 +164,26 @@ class PrecisionControlTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     check(changed)
 
+    def test_fresh_probe_refuses_new_or_disappearing_mixed_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pmon = root / "pmon-0-0.json"
+            apps = root / "compute-apps-0-0.json"
+            def check(rows, app_rows):
+                pmon.write_text(json.dumps({"exitCode": 0, "output": ["# gpu pid type fb sm", *rows]}), encoding="utf-8")
+                apps.write_text(json.dumps({"exitCode": 0, "output": app_rows}), encoding="utf-8")
+                IDLE._pmon(root, "pmon-0-0", 38212)
+                IDLE._compute_apps(root, "compute-apps-0-0", 38212)
+            check(["0 38212 C+G 0 -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"])
+            for rows, app_rows in (
+                ([], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 -", "0 999 C+G 0 -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 -", "0 999 C 0 2"], ["38212, C:\\Redacted\\desktop.exe, [N/A]"]),
+                (["0 38212 C+G 0 -"], ["38212, C:\\Redacted\\desktop.exe, [N/A]", "999, C:\\Other.exe, [N/A]"]),
+            ):
+                with self.subTest(rows=rows, app_rows=app_rows), self.assertRaises(RuntimeError):
+                    check(rows, app_rows)
+
     def test_metal_census_refuses_foreign_workers_by_executable_only(self):
         rows = "\n".join((
             "101 /tmp/precision_real_weights-deadbeef",
