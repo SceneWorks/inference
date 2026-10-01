@@ -750,12 +750,68 @@ def parse_event_transcript(payload, variant, arm):
     return events
 
 
+PRODUCT_ADMISSION_ESTIMATE_SCHEMA = "sc20686-product-admission-estimate-v1"
+PRODUCT_ADMISSION_ESTIMATE_SOURCE = "product-admission-profile"
+
+
+def product_admission_estimate(entrypoint, snapshot, variant, extra_args=(), timeout_seconds=600):
+    """The MLX entrypoint's `--sc20686-estimate` answer for one coordinate: the product's own
+    pre-spawn admission estimate of exactly the run `run_entrypoint` would start (same route,
+    snapshot and coordinate arguments). The estimate mode loads no weights and never touches MLX,
+    so it runs unsupervised and bounded by `timeout_seconds`. A failed or malformed answer is an
+    error: the coordinate is not started on a guess."""
+    command = [
+        str(Path(entrypoint).resolve()), "--sc20686-estimate", "--variant", variant,
+        "--snapshot", str(Path(snapshot).resolve()), *map(str, extra_args),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL,
+                                   timeout=timeout_seconds, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ValueError(f"{variant} product admission estimate did not run: {error}") from error
+    if completed.returncode != 0:
+        tail = completed.stderr.decode("utf-8", "replace").strip()[-400:]
+        raise ValueError(f"{variant} product admission estimate failed ({completed.returncode}): {tail}")
+    try:
+        document = json.loads(completed.stdout.decode("utf-8").strip().splitlines()[-1])
+    except (UnicodeDecodeError, json.JSONDecodeError, IndexError) as error:
+        raise ValueError(f"{variant} product admission estimate is malformed") from error
+    phases = document.get("phases") if isinstance(document, dict) else None
+    estimate = document.get("estimateBytes") if isinstance(document, dict) else None
+    if (document.get("schema") != PRODUCT_ADMISSION_ESTIMATE_SCHEMA
+            or document.get("route") != variant
+            or document.get("source") != PRODUCT_ADMISSION_ESTIMATE_SOURCE
+            or type(estimate) is not int or estimate <= 0
+            or not isinstance(phases, dict) or not phases
+            or any(type(value) is not int or value < 0 for value in phases.values())
+            or max(phases.values()) != estimate):
+        raise ValueError(f"{variant} product admission estimate is malformed")
+    return document
+
+
+def admission_estimate_arguments(estimate, measured_peak_host_bytes, policy):
+    """The run_guarded estimate arguments for one arm: the product estimate (max with the measured
+    peak of a completed arm of the same coordinate request, applied by the supervisor), or the
+    cap fallback when there is no estimate or the product estimate exceeds the child cap (the
+    product's conservative single-pass decode pricing can exceed a cap the run itself fits)."""
+    if estimate is None or estimate["estimateBytes"] > policy.child_footprint_cap_bytes:
+        return {}
+    measured = (measured_peak_host_bytes if measured_peak_host_bytes is not None
+                and measured_peak_host_bytes <= policy.child_footprint_cap_bytes else None)
+    return {"static_floor_host_bytes": estimate["estimateBytes"],
+            "host_estimate_source": PRODUCT_ADMISSION_ESTIMATE_SOURCE,
+            "measured_peak_host_bytes": measured}
+
+
 def run_entrypoint(
     entrypoint, snapshot, variant, arm, inference_revision, residency_strategy,
     extra_args=(), timeout_seconds=21600, *, safety_policy, static_floor_host_bytes=None,
-    static_floor_gpu_bytes=None, probe=None, failure_root=None,
+    static_floor_gpu_bytes=None, probe=None, failure_root=None, product_estimate=None,
+    measured_peak_host_bytes=None,
 ):
-    # Admission is runtime-guarded (watchdog caps, free reserves, deadline); no static
+    # Admission is runtime-guarded (watchdog caps, free reserves, deadline) under
+    # estimate-plus-reserve-v1: `product_estimate` (the entrypoint's `--sc20686-estimate` answer)
+    # is the arm's estimate unless it exceeds the cap, which falls back to the cap. No static
     # whole-process peak bound is required. Refusal, abort or failure is sealed unaccepted.
     # Provider stdout is free to contain progress bars (including carriage returns).  The adapter
     # owns this private file and accepts observer events only from it, never by filtering stdout.
@@ -782,11 +838,16 @@ def run_entrypoint(
         command.extend(("--out", str(media_output)))
         if safety_policy.deadline_seconds > timeout_seconds:
             raise supervisor.SupervisionError("invalid-timeout", "safety deadline exceeds requested run timeout")
+        estimate_arguments = admission_estimate_arguments(
+            product_estimate, measured_peak_host_bytes, safety_policy)
+        if estimate_arguments and static_floor_host_bytes is not None:
+            raise ValueError(f"{variant}/{arm} has both a static floor and a product estimate")
+        estimate_arguments.setdefault("static_floor_host_bytes", static_floor_host_bytes)
         result = supervisor.run_guarded(
             command, cwd=run_directory, env=os.environ.copy(), policy=safety_policy,
             stdout_path=run_directory / "stdout.log", stderr_path=run_directory / "stderr.log",
-            event_path=event_path, static_floor_host_bytes=static_floor_host_bytes,
-            static_floor_gpu_bytes=static_floor_gpu_bytes, probe=probe,
+            event_path=event_path, static_floor_gpu_bytes=static_floor_gpu_bytes, probe=probe,
+            **estimate_arguments,
         )
         stdout = (run_directory / "stdout.log").read_bytes()
         stderr = (run_directory / "stderr.log").read_bytes()
@@ -812,6 +873,7 @@ def run_entrypoint(
                 "elapsedSeconds": result.elapsed_seconds,
                 "ownedProcessGroupReaped": True,
                 "admission": result.admission,
+                **({"productAdmissionEstimate": product_estimate} if product_estimate is not None else {}),
             },
         )
     except Exception as error:
@@ -1413,7 +1475,7 @@ def _retain_refused_run(run, resume_root, variant, arm, error):
 
 def publish_campaign(coordinates, runner, row_builder, destination, input_artifacts=None,
                      *, resume_root=None, resume_identity_sha=None, preflight=None, stop_files=(),
-                     schedule_control=False):
+                     schedule_control=False, on_unit=None):
     """Run every coordinate's arms and publish one sealed bundle. The decision campaign runs the
     normal/cancel pair and seals reducer rows; `schedule_control` runs the Metal lane's single
     control arm (no per-read evaluation windows) and seals product-schedule peak summaries."""
@@ -1455,6 +1517,9 @@ def publish_campaign(coordinates, runner, row_builder, destination, input_artifa
                         raise ValueError(f"{stem} reuses or lacks an owned process identity")
                     used_pids.add(pid)
                 captured_runs.append(run)
+                if on_unit is not None:
+                    # Completed (fresh or resumed) arms inform the next arm's admission estimate.
+                    on_unit(coordinate, arm, run)
                 # Validate the fresh transcript before preserving this expensive arm.
                 if not resumed and resume_root is not None:
                     preview_manifest, preview_sources = media_artifacts(run, stem, arm)
@@ -1679,6 +1744,36 @@ def main():
         else:
             inference_revision = verify_inference_revision(args.inference_revision)
         source_map_hash = digest(SOURCE_MAP.read_bytes())
+        # estimate-plus-reserve-v1: each Metal-lane arm is admitted on its entrypoint's product
+        # admission estimate (asked once per coordinate), raised to the measured peak of a
+        # completed arm of the same coordinate request. The Candle lanes' entrypoints have no
+        # estimate mode, so their arms fall back to the cap.
+        estimates, completed_peaks = {}, {}
+
+        def coordinate_estimate(spec):
+            if backend != "mlx-metal":
+                return None
+            key = (spec.variant, spec.name)
+            if key not in estimates:
+                estimates[key] = product_admission_estimate(
+                    spec.entrypoint, spec.snapshot, spec.variant, spec.args)
+            return estimates[key]
+
+        def record_unit(spec, _arm, run):
+            peak = (run.supervision or {}).get("peakHostBytes")
+            if type(peak) is int and peak > 0:
+                key = (spec.variant, spec.name)
+                completed_peaks[key] = max(peak, completed_peaks.get(key, 0))
+
+        def estimated_run(spec, arm):
+            return run_entrypoint(
+                spec.entrypoint, spec.snapshot, spec.variant, arm,
+                inference_revision, spec.residency_strategy, spec.args,
+                args.run_timeout_seconds, safety_policy=safety_policy,
+                failure_root=args.resume_dir / "failed",
+                product_estimate=coordinate_estimate(spec),
+                measured_peak_host_bytes=completed_peaks.get((spec.variant, spec.name)),
+            )
         if args.schedule_control and (backend != "mlx-metal" or not args.matrix):
             raise ValueError("--schedule-control is a Metal-lane (darwin-mlx) matrix mode")
         if args.matrix:
@@ -1717,14 +1812,7 @@ def main():
                 resolved["mode"] = "schedule-control"
             resume_identity_sha = _prepare_resume(args.resume_dir, resolved, safety_policy, stop_files)
 
-            def runner(spec, arm):
-                run = run_entrypoint(
-                    spec.entrypoint, spec.snapshot, spec.variant, arm,
-                    inference_revision, spec.residency_strategy, spec.args,
-                    args.run_timeout_seconds, safety_policy=safety_policy,
-                    failure_root=args.resume_dir / "failed",
-                )
-                return run
+            runner = estimated_run
 
             def preflight(spec):
                 verify_coordinate_inputs(spec)
@@ -1766,7 +1854,7 @@ def main():
                 "resume-identity.json": (args.resume_dir / "identity.json").read_bytes(),
             }, resume_root=args.resume_dir, resume_identity_sha=resume_identity_sha,
                 preflight=preflight, stop_files=stop_files,
-                schedule_control=args.schedule_control)
+                schedule_control=args.schedule_control, on_unit=record_unit)
             return 0
 
         if not all((args.family, args.snapshot, args.output, args.variant, args.coordinate_name, args.entrypoint)):
@@ -1798,14 +1886,7 @@ def main():
         )
         snapshot_hash, snapshot_bytes = snapshot_identity(spec.snapshot)
 
-        def runner(single_spec, arm):
-            run = run_entrypoint(
-                single_spec.entrypoint, single_spec.snapshot, single_spec.variant, arm,
-                inference_revision, single_spec.residency_strategy, single_spec.args,
-                args.run_timeout_seconds, safety_policy=safety_policy,
-                failure_root=args.resume_dir / "failed",
-            )
-            return run
+        runner = estimated_run
 
         def preflight(single_spec):
             verify_coordinate_inputs(single_spec)
@@ -1853,7 +1934,7 @@ def main():
             "safety-policy.json": safety_policy.canonical_bytes,
             "resume-identity.json": (args.resume_dir / "identity.json").read_bytes(),
         }, resume_root=args.resume_dir, resume_identity_sha=resume_identity_sha,
-            preflight=preflight, stop_files=stop_files)
+            preflight=preflight, stop_files=stop_files, on_unit=record_unit)
         return 0
     except supervisor.OperatorStop as stop:
         print(f"SC-20686 adapter {stop}", file=sys.stderr)

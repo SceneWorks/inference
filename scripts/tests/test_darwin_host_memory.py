@@ -181,7 +181,8 @@ class PhasePrecheckRamTests(unittest.TestCase):
     def reserve_gib(self, policy: Path) -> subprocess.CompletedProcess:
         env = {**os.environ, "INFERENCE_SHA": "x", "SCENEWORKS_SHA": "y"}
         return subprocess.run(["bash", "-c", f'source "{COMMON}"; policy_reserve_gib "{policy}"'],
-                              capture_output=True, text=True, env=env, check=False)
+                              capture_output=True, text=True, encoding="utf-8", env=env,
+                              check=False)
 
     @unittest.skipUnless(shutil.which("python3.12"), "common.sh reads policies with python3.12")
     def test_every_phase_policy_needs_only_its_reserve(self):

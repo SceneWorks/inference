@@ -18,6 +18,7 @@
 //! text-encoder (S1), VAE (S2), and transformer (S3) modules land.
 
 pub mod adapters;
+pub mod admission_estimate;
 mod artifact_inventory;
 mod block_stream;
 pub mod caption_upsample;

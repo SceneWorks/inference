@@ -1203,6 +1203,60 @@ mlx_gen::register_generators! {
     pub(crate) const VACE_FUN_REGISTRATION = descriptor_vace_fun => load_vace_fun
 }
 
+/// SC-20686 estimate-plus-reserve admission: the [`crate::model::DenoiseFacts`] the two VACE
+/// routes' generate-time fit gates price for `req` (single expert, or the MoE residency of the
+/// dual-expert VACE-Fun), from the load spec, the snapshot headers and the request alone.
+pub(crate) fn vace_denoise_facts(
+    route: &str,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<crate::model::DenoiseFacts> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(Error::Msg(format!(
+            "{route}: expected a model directory for the admission estimate"
+        )));
+    };
+    let (config, resident_bytes) = match route {
+        MODEL_ID_VACE => (
+            WanVaceConfig::from_model_dir(root)?,
+            vace_dit_resident_bytes(&vace_transformer_weights_path(root), spec.quantize),
+        ),
+        MODEL_ID_VACE_FUN => (
+            WanVaceConfig::vace_fun_from_model_dir(root)?,
+            moe_denoise_resident_bytes(
+                spec.offload_policy,
+                req.sampler.as_deref(),
+                vace_dit_resident_bytes(
+                    &vace_fun_expert_weights_path(root, MoeExpert::Low),
+                    spec.quantize,
+                ),
+                vace_dit_resident_bytes(
+                    &vace_fun_expert_weights_path(root, MoeExpert::High),
+                    spec.quantize,
+                ),
+            ),
+        ),
+        other => {
+            return Err(Error::Msg(format!(
+                "{other}: not a VACE route for the admission estimate"
+            )))
+        }
+    };
+    let base = &config.base;
+    let frames = req.control_clip().map(|c| c.frames.len()).unwrap_or(1);
+    Ok(crate::model::DenoiseFacts {
+        resident_bytes,
+        tokens: vace_denoise_tokens(&config, req)?,
+        dim: base.dim,
+        // VACE CFG runs cond/uncond as two sequential B=1 forwards (vace.rs F-073).
+        cfg_batched: false,
+        width: align_dim(req.width, base.patch_size.2, VAE_S),
+        height: align_dim(req.height, base.patch_size.1, VAE_S),
+        frames: u32::try_from(frames)
+            .map_err(|_| Error::Msg(format!("{route}: frame count overflows")))?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

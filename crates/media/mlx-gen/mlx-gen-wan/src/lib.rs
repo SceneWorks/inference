@@ -50,6 +50,7 @@
 //! `tests/ti2v_real_parity.rs` (`#[ignore]` — heavy weights outside CI).
 
 pub mod adapters;
+pub mod admission_estimate;
 pub mod block_stream;
 pub mod chunk;
 pub mod config;

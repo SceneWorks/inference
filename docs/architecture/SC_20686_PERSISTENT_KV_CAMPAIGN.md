@@ -56,11 +56,23 @@ admitted by its runtime guards: the policy must configure every guard (deadline,
 sampling, termination grace, host reserve, child footprint cap, GPU UUID, GPU
 reserve and child GPU cap), and immediately before spawn host and selected-GPU
 free memory must cover the arm's estimate plus reserve (`estimate-plus-reserve-v1`).
-The adapter computes no per-coordinate static estimate before spawn (`run_entrypoint`
-passes none; the routes' encode/decode pricing lives in the provider crates and
-their whole-request peak in calibration evidence, neither of which the adapter
-reads), so every arm falls back to its cap (`child-footprint-cap-fallback`): its
-admission is still cap plus reserve. The host and CUDA watchdogs then
+On the Metal lane each arm's estimate is the product's own admission profile
+(`product-admission-profile`): before a coordinate's first arm the adapter runs its MLX
+entrypoint with `--sc20686-estimate` and the coordinate's exact arguments, which resolves
+the route like the run (product `LoadSpec`, geometry, tier, Lightning, references /
+control clip) and prints, without loading weights or touching MLX, the max of the staged
+phases: text encoder; VAE + conservative encode working set; DiT resident (the fit gate's
+residency, adapters included) + VAE + its `72 B/token/dim` activation (VACE at the
+documented +30% under-fit); DiT + VAE + the conservative single-pass decode working set
+(Wan, `mlx_gen_wan::admission_estimate`); for FLUX.2 Klein the Qwen3 encoder vs DiT +
+VAE + the registered 1024² activation anchor scaled by the squared token ratio (target
+plus references), doubled for true CFG, plus the KV route's cached reference K/V
+(`mlx_gen_flux2::admission_estimate`). A later arm of the same coordinate uses the max of
+that estimate and the completed arm's measured peak. An estimate above the cap (the
+conservative single-pass z16 decode prices 768x512x33 A14B/VACE coordinates at ~91-97
+GiB, though the runtime's budgeted decode measured ~63 GiB) falls back to the cap
+(`child-footprint-cap-fallback`), as do the Candle lanes, whose entrypoints have no
+estimate mode. The host and CUDA watchdogs then
 terminate the owned tree on a cap or reserve breach. Every sealed unit's
 `supervision.json` records that `admission` (`mode: runtime-guarded`, `rule`,
 caps, reserves, optional static floors, each estimate's source and bytes, the
@@ -308,7 +320,7 @@ coordinates seal an explicit `--seed 42`.
 The policy is the strict `darwin-mlx` schema (`schemaVersion`, `backend`, `deadlineSeconds`,
 `pollMillis`, `termGraceMillis`, `hostFreeReserveBytes`, `childFootprintCapBytes`, `stdoutCapBytes`,
 `stderrCapBytes`, `eventCapBytes`); the caps must be chosen for the host that runs it, and every arm
-is refused before spawn unless free memory covers its estimate (here the cap fallback) plus reserve. The run needs the Metal GPU for
+is refused before spawn unless free memory covers its estimate (above) plus reserve. The run needs the Metal GPU for
 its duration. Each snapshot is an immutable tier root (`<revision>/q4` or a revision directory),
 except the two Metal VACE routes, which take the worker-assembled snapshot (`transformer/` beside
 `t5_encoder.safetensors`, `vae.safetensors`, `tokenizer.json`; VACE-Fun adds `transformer_2/`)

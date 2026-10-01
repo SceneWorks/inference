@@ -52,6 +52,89 @@ class CampaignAdapterTests(unittest.TestCase):
         admission["gpuAvailableBytes"] = policy.gpu_free_reserve_bytes + admission["gpuEstimateBytes"]
         return admission
 
+    def fake_estimator(self, root, document):
+        """An executable answering `--sc20686-estimate` with `document` (or exiting 3 when None)."""
+        script = root / "estimator"
+        body = "import sys\n" + (
+            "sys.exit(3)\n" if document is None else
+            f"assert sys.argv[1:5] == ['--sc20686-estimate', '--variant', 'route', '--snapshot']\n"
+            f"print('progress noise')\nprint({json.dumps(json.dumps(document))})\n")
+        script.write_text(f"#!/usr/bin/env python3\n{body}", encoding="utf-8")
+        script.chmod(0o755)
+        return script
+
+    def test_product_admission_estimate_is_parsed_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            good = {"schema": self.adapter.PRODUCT_ADMISSION_ESTIMATE_SCHEMA, "route": "route",
+                    "source": "product-admission-profile", "estimateBytes": 700,
+                    "phases": {"conditioning": 100, "decode": 700}, "components": {}}
+            estimate = self.adapter.product_admission_estimate(
+                self.fake_estimator(root, good), root, "route", ("--width", "512"))
+            self.assertEqual(estimate["estimateBytes"], 700)
+            for broken in ({**good, "schema": "v0"}, {**good, "route": "other"},
+                           {**good, "source": "guess"}, {**good, "estimateBytes": 0},
+                           {**good, "estimateBytes": 699}, {**good, "phases": {}}, None):
+                with self.subTest(broken=broken):
+                    with self.assertRaisesRegex(ValueError, "product admission estimate"):
+                        self.adapter.product_admission_estimate(
+                            self.fake_estimator(root, broken), root, "route")
+
+    def test_runner_admits_on_the_product_estimate_plus_reserve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            executable = root / "producer"
+            executable.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "open(sys.argv[sys.argv.index('--sc20686-events') + 1], 'w').write('{}\\n')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            safety = self.runner_safety()
+            policy, probe = safety["safety_policy"], safety["probe"]
+            estimate = {"schema": self.adapter.PRODUCT_ADMISSION_ESTIMATE_SCHEMA, "route": "route",
+                        "source": "product-admission-profile", "estimateBytes": 4096,
+                        "phases": {"decode": 4096}, "components": {}}
+
+            def run(measured=None, product=estimate):
+                result = self.adapter.run_entrypoint(
+                    executable, snapshot, "route", "normal", "a" * 40, "sequential", (),
+                    timeout_seconds=5, failure_root=root / "failed", product_estimate=product,
+                    measured_peak_host_bytes=measured, **safety)
+                self.adapter.cleanup_campaign_run(result)
+                return result.supervision
+
+            # Exactly estimate plus reserve is admitted; far below the cap plus reserve.
+            probe.host_free = lambda: policy.host_free_reserve_bytes + 4096
+            supervision = run()
+            admission = self.adapter.supervisor.validate_admission(
+                supervision["admission"], policy_sha256=policy.sha256)
+            self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"]),
+                             ("product-admission-profile", 4096))
+            self.assertEqual(supervision["productAdmissionEstimate"], estimate)
+            # One byte less is refused before spawn.
+            probe.host_free = lambda: policy.host_free_reserve_bytes + 4095
+            with self.assertRaisesRegex(ValueError, "preflight-memory"):
+                run()
+            # A completed arm of the same coordinate that measured more raises the estimate.
+            probe.host_free = lambda: policy.host_free_reserve_bytes + 4096
+            with self.assertRaisesRegex(ValueError, "preflight-memory"):
+                run(measured=4097)
+            probe.host_free = lambda: policy.host_free_reserve_bytes + 4097
+            admission = run(measured=4097)["admission"]
+            self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"]),
+                             (self.adapter.supervisor.MEASURED_PEAK_ESTIMATE_SOURCE, 4097))
+            # A product estimate above the cap (or none) falls back to the cap.
+            probe.host_free = lambda: 10**12
+            for product in ({**estimate, "estimateBytes": policy.child_footprint_cap_bytes + 1,
+                             "phases": {"decode": policy.child_footprint_cap_bytes + 1}}, None):
+                admission = run(product=product)["admission"]
+                self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"]),
+                                 (self.adapter.supervisor.CAP_FALLBACK_ESTIMATE_SOURCE,
+                                  policy.child_footprint_cap_bytes))
+
     def test_runner_admits_by_runtime_guards_and_seals_refusal_or_abort_as_unaccepted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -917,11 +1000,15 @@ class CampaignAdapterTests(unittest.TestCase):
             def row_builder(_spec, arm, _events, _hashes):
                 return {"family": "wan", "variant": "wan_vace", "coordinate_name": "small", "arm": arm}
 
+            seen = []
+
             def publish():
                 return self.adapter.publish_campaign(
                     [spec], runner, row_builder, root / "final",
                     resume_root=resume, resume_identity_sha=identity_sha,
                     stop_files=self.adapter.supervisor.operator_stop_files(None, resume),
+                    on_unit=lambda coordinate, arm, run: seen.append(
+                        (coordinate.variant, arm, run.supervision["pid"])),
                 )
 
             resume.mkdir()
@@ -949,6 +1036,9 @@ class CampaignAdapterTests(unittest.TestCase):
                 publish()
             self.assertEqual(calls, ["normal", "cancel"])
             self.assertTrue((resume / "units" / "run-00-cancel" / "record.json").is_file())
+            # Every completed arm, fresh or resumed, reaches the next arm's admission estimate.
+            self.assertEqual(seen, [("wan_vace", "normal", 101), ("wan_vace", "normal", 101),
+                                    ("wan_vace", "cancel", 102)])
 
     def test_resume_directory_tolerates_the_operator_stop_file(self):
         with tempfile.TemporaryDirectory() as directory:

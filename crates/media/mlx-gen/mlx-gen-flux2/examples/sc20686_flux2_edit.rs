@@ -60,7 +60,11 @@ const SWITCHES: &[&str] = &[
     "--sc20686-campaign",
     "--sc20686-cancel",
     "--sc20686-schedule-control",
+    "--sc20686-estimate",
 ];
+
+/// Schema of the one JSON line `--sc20686-estimate` prints (read by the campaign adapter).
+const ESTIMATE_SCHEMA: &str = "sc20686-product-admission-estimate-v1";
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self> {
@@ -105,7 +109,7 @@ impl Args {
             Some(value) => value
                 .parse()
                 .map_err(|_| format!("{key} is malformed").into()),
-            None if self.has("--sc20686-campaign") => {
+            None if self.has("--sc20686-campaign") || self.has("--sc20686-estimate") => {
                 Err(format!("SC-20686 campaign requires an explicit {key}").into())
             }
             None => Ok(default),
@@ -137,6 +141,12 @@ fn main() -> Result<()> {
     let args = Args::parse(&std::env::args().collect::<Vec<_>>())?;
     let route = args.required("--variant")?;
     let campaign = args.has("--sc20686-campaign");
+    let estimate = args.has("--sc20686-estimate");
+    if estimate && campaign {
+        return Err(
+            "--sc20686-estimate prices a run; it is exclusive with --sc20686-campaign".into(),
+        );
+    }
     let cancel_arm = args.has("--sc20686-cancel");
     let control_arm = args.has("--sc20686-schedule-control");
     if !campaign && (cancel_arm || control_arm) {
@@ -199,6 +209,29 @@ fn main() -> Result<()> {
     };
 
     let spec = route_load_spec(&route, Path::new(&args.required("--snapshot")?))?;
+    if estimate {
+        // The product admission estimate of exactly this run: no weights load, MLX is untouched.
+        let priced =
+            mlx_gen_flux2::admission_estimate::product_admission_estimate(&route, &spec, &request)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": ESTIMATE_SCHEMA,
+                "route": route,
+                "source": "product-admission-profile",
+                "estimateBytes": priced.peak_bytes(),
+                "phases": priced.phases().iter().map(|(phase, bytes)| (phase.to_string(), serde_json::json!(bytes))).collect::<serde_json::Map<_, _>>(),
+                "components": {
+                    "textEncoderBytes": priced.text_encoder_bytes,
+                    "transformerBytes": priced.transformer_bytes,
+                    "vaeBytes": priced.vae_bytes,
+                    "activationBytes": priced.activation_bytes,
+                    "referenceKvBytes": priced.reference_kv_bytes,
+                },
+            })
+        );
+        return Ok(());
+    }
     let generator = match route.as_str() {
         "flux2_klein_9b_edit" => mlx_gen_flux2::load_klein_9b_edit(&spec)?,
         "flux2_klein_9b_kv_edit" => mlx_gen_flux2::load_klein_9b_kv_edit(&spec)?,

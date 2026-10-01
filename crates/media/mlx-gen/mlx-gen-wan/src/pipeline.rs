@@ -1915,6 +1915,21 @@ pub fn ti2v_blend_init(z_img: &Array, mask: &Array, noise: &Array) -> Result<Arr
     )?)
 }
 
+/// The activation working set (bytes) [`preflight_denoise_memory_guard`] prices for one denoise
+/// forward -- the same `72 B · batch · tokens · dim` as [`estimated_denoise_peak_gib`], batch 2 when
+/// CFG runs batched -- in checked integer bytes for the SC-20686 admission estimate. `None` on
+/// overflow.
+pub(crate) fn denoise_activation_bytes(
+    tokens: usize,
+    dim: usize,
+    cfg_enabled: bool,
+) -> Option<u64> {
+    72_u64
+        .checked_mul(if cfg_enabled { 2 } else { 1 })?
+        .checked_mul(u64::try_from(tokens).ok()?)?
+        .checked_mul(u64::try_from(dim).ok()?)
+}
+
 #[cfg(test)]
 #[path = "sc20686_hooks_tests.rs"]
 mod sc20686_hooks_tests;
@@ -3309,5 +3324,29 @@ mod tests {
             video_encode_peak_bytes_for_vae(WanVae::VAE_TILING, 64, 64, 0),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod denoise_activation_tests {
+    use super::*;
+
+    /// The admission estimate prices exactly the activation the generate-time fit gate does.
+    #[test]
+    fn integer_activation_matches_the_fit_gate() {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        for (tokens, dim, cfg) in [
+            (13_824, 5_120, true),
+            (1_280, 1_536, false),
+            (32_560, 3_072, true),
+        ] {
+            let bytes = denoise_activation_bytes(tokens, dim, cfg).unwrap();
+            let gib = estimated_denoise_peak_gib(0, tokens, dim, cfg);
+            assert!(
+                (bytes as f64 / GIB - gib).abs() < 1e-9,
+                "{tokens} {dim} {cfg}"
+            );
+        }
+        assert_eq!(denoise_activation_bytes(usize::MAX, usize::MAX, true), None);
     }
 }

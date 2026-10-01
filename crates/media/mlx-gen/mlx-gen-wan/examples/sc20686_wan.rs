@@ -78,7 +78,11 @@ const SWITCHES: &[&str] = &[
     "--sc20686-campaign",
     "--sc20686-cancel",
     "--sc20686-schedule-control",
+    "--sc20686-estimate",
 ];
+
+/// Schema of the one JSON line `--sc20686-estimate` prints (read by the campaign adapter).
+const ESTIMATE_SCHEMA: &str = "sc20686-product-admission-estimate-v1";
 
 impl Args {
     fn parse(raw: &[String]) -> Result<Self> {
@@ -123,11 +127,17 @@ impl Args {
             Some(value) => value
                 .parse()
                 .map_err(|_| format!("{key} is malformed").into()),
-            None if self.has("--sc20686-campaign") => {
+            None if self.strict() => {
                 Err(format!("SC-20686 campaign requires an explicit {key}").into())
             }
             None => Ok(default),
         }
+    }
+
+    /// Campaign and estimate modes state every coordinate argument explicitly: the estimate prices
+    /// exactly the request the campaign run will make.
+    fn strict(&self) -> bool {
+        self.has("--sc20686-campaign") || self.has("--sc20686-estimate")
     }
 }
 
@@ -198,7 +208,7 @@ fn lightning_pair(route: &str, args: &Args) -> Result<Option<Lightning>> {
         Some("on") => true,
         Some("off") => false,
         Some(other) => return Err(format!("--lightning must be on or off, not {other}").into()),
-        None if args.has("--sc20686-campaign") => {
+        None if args.strict() => {
             return Err("SC-20686 campaign requires an explicit --lightning on|off".into())
         }
         None => true,
@@ -305,6 +315,12 @@ fn main() -> Result<()> {
         }
     }
     let campaign = args.has("--sc20686-campaign");
+    let estimate = args.has("--sc20686-estimate");
+    if estimate && campaign {
+        return Err(
+            "--sc20686-estimate prices a run; it is exclusive with --sc20686-campaign".into(),
+        );
+    }
     let cancel_arm = args.has("--sc20686-cancel");
     let control_arm = args.has("--sc20686-schedule-control");
     if !campaign && (cancel_arm || control_arm) {
@@ -315,7 +331,8 @@ fn main() -> Result<()> {
     if cancel_arm && control_arm {
         return Err("the cancellation and schedule-control arms are exclusive".into());
     }
-    // Campaign mode must name the frozen residency explicitly; an ordinary render uses it.
+    // Campaign mode must name the frozen residency explicitly; an ordinary render (and the
+    // estimate, which prices the campaign's product residency) uses it.
     let residency = if campaign {
         args.required("--sc20686-residency")?
     } else {
@@ -350,7 +367,6 @@ fn main() -> Result<()> {
     };
 
     let snapshot = PathBuf::from(args.required("--snapshot")?);
-    let out = PathBuf::from(args.required("--out")?);
     let request = GenerationRequest {
         prompt: args.coordinate(
             "--prompt",
@@ -380,6 +396,14 @@ fn main() -> Result<()> {
         .into());
     }
     let spec = route_load_spec(&route, &residency, &snapshot, lightning.as_ref())?;
+    if estimate {
+        // The product admission estimate of exactly this run: no weights load, MLX is untouched.
+        let priced =
+            mlx_gen_wan::admission_estimate::product_admission_estimate(&route, &spec, &request)?;
+        println!("{}", estimate_line(&route, &priced));
+        return Ok(());
+    }
+    let out = PathBuf::from(args.required("--out")?);
     let generator = load(&route, &spec)?;
     let mut on_progress = |progress: Progress| match progress {
         Progress::Step { current, total } => eprintln!("[sc20686-wan] step {current}/{total}"),
@@ -417,6 +441,28 @@ fn main() -> Result<()> {
         out.display()
     );
     Ok(())
+}
+
+/// The `--sc20686-estimate` output: the estimate, its source and every priced component.
+fn estimate_line(
+    route: &str,
+    priced: &mlx_gen_wan::admission_estimate::WanAdmissionEstimate,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": ESTIMATE_SCHEMA,
+        "route": route,
+        "source": "product-admission-profile",
+        "estimateBytes": priced.peak_bytes(),
+        "phases": priced.phases().iter().map(|(phase, bytes)| (phase.to_string(), serde_json::json!(bytes))).collect::<serde_json::Map<_, _>>(),
+        "components": {
+            "textEncoderBytes": priced.text_encoder_bytes,
+            "vaeBytes": priced.vae_bytes,
+            "ditResidentBytes": priced.dit_resident_bytes,
+            "denoiseActivationBytes": priced.denoise_activation_bytes,
+            "encodeWorkingSetBytes": priced.encode_working_set_bytes,
+            "decodeWorkingSetBytes": priced.decode_working_set_bytes,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -567,6 +613,29 @@ mod tests {
             Some(&other_architecture)
         )
         .is_err());
+    }
+
+    /// `--sc20686-estimate` prices exactly the campaign's request: every coordinate argument and the
+    /// Lightning toggle must be stated, never defaulted.
+    #[test]
+    fn the_estimate_mode_is_as_strict_as_the_campaign() {
+        assert_eq!(args(&[]).coordinate("--width", 512_u32).unwrap(), 512);
+        assert!(args(&["--sc20686-estimate"])
+            .coordinate("--width", 512_u32)
+            .is_err());
+        assert_eq!(
+            args(&["--sc20686-estimate", "--width", "768"])
+                .coordinate("--width", 512_u32)
+                .unwrap(),
+            768
+        );
+        assert!(lightning_pair("wan2_2_t2v_14b", &args(&["--sc20686-estimate"])).is_err());
+        assert!(lightning_pair(
+            "wan2_2_t2v_14b",
+            &args(&["--sc20686-estimate", "--lightning", "off"])
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

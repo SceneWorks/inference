@@ -1962,6 +1962,97 @@ pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
 /// reuses it.
 ///
 /// [`is_hidden_file`]: mlx_gen::gen_core::weightsmeta::is_hidden_file
+/// SC-20686 estimate-plus-reserve admission: exactly what a dense Wan route's generate-time fit gate
+/// ([`preflight_denoise_memory_guard`]) prices for `req`, plus the output geometry its decode runs
+/// at, resolved from the load spec, the snapshot's `config.json`/file sizes and the request alone --
+/// no weights are loaded and MLX is never touched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DenoiseFacts {
+    pub(crate) resident_bytes: u64,
+    pub(crate) tokens: usize,
+    pub(crate) dim: usize,
+    pub(crate) cfg_batched: bool,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) frames: u32,
+}
+
+/// [`DenoiseFacts`] of the TI2V-5B and the two A14B routes, mirroring their `generate_impl`.
+pub(crate) fn dense_denoise_facts(
+    route: &str,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<DenoiseFacts> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(Error::Msg(format!(
+            "{route}: expected a model directory for the admission estimate"
+        )));
+    };
+    let cfg = WanModelConfig::from_model_dir(root)?;
+    let quant = resolve_load_time_quant(route, &cfg, spec.quantize)?;
+    let adapter_mode = if cfg.quantization.is_some() {
+        AdapterResidencyMode::Additive
+    } else {
+        AdapterResidencyMode::Folded
+    };
+    let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
+    let trim = req.trim_first_frames.unwrap_or(0) as usize;
+    let unsized_adapters = || {
+        Error::Msg(format!(
+            "{route}: cannot size every additive adapter for the estimate"
+        ))
+    };
+    let (vae, resident_bytes, cfg_batched) = match route {
+        MODEL_ID => {
+            let adapters = adapter_stack_resident_bytes(&spec.adapters, adapter_mode)
+                .ok_or_else(unsized_adapters)?;
+            let guidance = cfg.sample_guide_scale.resolve_single(req.guidance);
+            (
+                Ti2vProviderVae::VAE_TILING,
+                dit_resident_bytes(&[root.join("model.safetensors")], quant)
+                    .saturating_add(adapters),
+                guidance > 1.0,
+            )
+        }
+        MODEL_ID_T2V_14B | MODEL_ID_I2V_14B => {
+            let low = dit_resident_bytes(&[root.join("low_noise_model.safetensors")], quant);
+            let high = dit_resident_bytes(&[root.join("high_noise_model.safetensors")], quant);
+            let (low_adapters, high_adapters) =
+                wan14b_adapter_bytes_per_expert(&spec.adapters, adapter_mode)
+                    .ok_or_else(unsized_adapters)?;
+            (
+                A14bProviderVae::VAE_TILING,
+                wan14b_denoise_resident_bytes(
+                    spec.offload_policy,
+                    req.sampler.as_deref(),
+                    low.saturating_add(low_adapters),
+                    high.saturating_add(high_adapters),
+                ),
+                true,
+            )
+        }
+        other => {
+            return Err(Error::Msg(format!(
+                "{other}: not a dense Wan route for the admission estimate"
+            )))
+        }
+    };
+    let stride = provider_vae_stride(vae);
+    let gen_frames = frames + trim * stride.0;
+    let (width, height) = resolve_capped_dims(req, &cfg, vae);
+    let latent = latent_shape(gen_frames, height, width, cfg.vae_z_dim, stride)?;
+    Ok(DenoiseFacts {
+        resident_bytes,
+        tokens: seq_len(latent, cfg.patch_size),
+        dim: cfg.dim,
+        cfg_batched,
+        width,
+        height,
+        frames: u32::try_from(gen_frames)
+            .map_err(|_| Error::Msg(format!("{route}: frame count overflows")))?,
+    })
+}
+
 pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
     fn weight_bytes_at(p: &std::path::Path) -> u64 {
         match std::fs::metadata(p) {
