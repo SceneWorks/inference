@@ -91,7 +91,10 @@ pub use joycaption::{JoyCaptionModel, JoyCaptionProvider};
 pub use models::CausalLm;
 pub use provider::LlamaProvider;
 pub use residency::{EncoderResidency, StreamObservation};
-pub use snapshot::{write_hf_snapshot, write_snapshot, SnapshotReport, SnapshotTokenizer};
+pub use snapshot::{
+    write_hf_snapshot, write_hf_snapshot_without_native_mtp, write_snapshot, SnapshotReport,
+    SnapshotTokenizer,
+};
 pub use starvector_1b::StarVector1bProvider;
 pub use starvector_8b::StarVector8bProvider;
 

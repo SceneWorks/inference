@@ -24,6 +24,16 @@ tree it was meant to measure: the measured commit on a clean tree (epic), or :da
 whose only changes are the driver's (baseline). The snapshot's content identity
 (:func:`snapshot_identity`) is recorded per row and re-read after every process.
 
+MLX load admission prices a load-time ``q4``/``q8`` at twice the snapshot's BF16 payload
+(``mlx_llm::load_memory``, identical at both revisions), so on a 128 GiB host Qwen3.8-27B
+(2 x 55.6 GB = 111.1 GB) and Qwen3.6-35B-A3B (2 x 71.9 GB) are refused before any weight is read.
+Measure them from a Q4 snapshot prepared once with ``cargo run --release -p mlx-llm --example
+prepare_snapshot -- <source> <out_dir> q4`` (the same quantized projections; admitted at its own
+~20 GB payload) and leave ``format`` at its default; the row's snapshot identity — which hashes the
+prepared ``config.json``'s ``quantization`` block — is what ``compare`` holds both runs to. The
+pre-epic MLX loader refuses Qwen3.6-35B-A3B's MoE MTP head outright, so that model's epic/baseline
+rows use a snapshot prepared with ``--without-mtp`` and the ``off`` option only.
+
 Lanes (``--lane``): ``cuda`` (Candle/CUDA, the ``decode-speedups-bench`` profile of
 ``.github/workflows/real-weights.yml``), ``mlx`` (Apple silicon, run locally with ``local``) and
 ``cpu`` (Candle on the CPU, for exercising the pipeline on a fixture).
@@ -46,7 +56,9 @@ The matrix is JSON: ``{"rows": [ROW, ...]}``, each ``ROW`` an object with
                       ``$DECODE_BENCH_SNAPSHOT_BONSAI_MLX``) or an absolute snapshot path
   runs                subset of ``["epic", "baseline"]`` (default both)
   process_repeats     processes per run, alternating with the other run (default 3, at least 1)
-  format              ``bf16`` (default) / ``q8`` / ``q4`` / ``nvfp4``
+  format              ``bf16`` (default) / ``q8`` / ``q4`` / ``nvfp4``: the projection format
+                      quantized **at load**; ``bf16`` loads the snapshot as stored, so a packed or
+                      prepared-Q4 snapshot keeps its own format (see below)
   options             speculative options, the harness's wire form (default ``["off", "auto"]``)
   sampling            ``"greedy"`` (default) or a sampling object
   thinking            ``default`` / ``off`` / ``on`` / ``xhigh`` / ``medium`` / ``low``
