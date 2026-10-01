@@ -285,7 +285,7 @@ fn fused_rotation_applies(x: &Array, block: i32, stream: &Stream) -> bool {
     if tests::FORCE_UNFUSED.with(std::cell::Cell::get) {
         return false;
     }
-    shape_ok && stream_is_gpu(stream)
+    shape_ok && stream_is_gpu(stream) && crate::switches::FUSED_ROTATION.enabled()
 }
 
 fn fused_block_hadamard(
@@ -681,6 +681,29 @@ pub(crate) mod tests {
             on_cpu.is_err(),
             "the kernel ignored the stream it was handed"
         );
+    }
+
+    /// sc-24446 (E5): with the fused rotation switched off (`MLX_LLM_FUSED_ROTATION`; here its
+    /// thread-scoped layer) a GPU stream runs the unfused chain, bit-identical to the kernel.
+    #[test]
+    fn the_fused_rotation_switch_off_runs_the_unfused_chain_on_the_gpu() {
+        let width = 2048;
+        let signs = random_signs(width, 32);
+        let scale = Array::from_slice(&[hadamard_scale(1024)], &[1]);
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let key = mlx_rs::random::key(35).unwrap();
+            let x = mlx_rs::random::normal::<f32>(&[1, 2, width][..], None, None, Some(&key))
+                .unwrap()
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let rotate = || block_hadamard(&x, &signs, &scale, 1024, false).unwrap();
+            let (fused, on) = recording_rotation_routes(rotate);
+            assert_eq!(on, [RotationRoute::Fused]);
+            let (unfused, off) =
+                crate::switches::FUSED_ROTATION.scoped(false, || recording_rotation_routes(rotate));
+            assert_eq!(off, [RotationRoute::Unfused], "the switch is off");
+            assert!(bits(&fused) == bits(&unfused));
+        });
     }
 
     #[test]

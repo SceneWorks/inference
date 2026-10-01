@@ -518,6 +518,11 @@ impl PrismPackedWeight {
             if !super::fused::try_fused() {
                 return Ok(None);
             }
+            // The defaults table's Candle CUDA row (E5) may keep the rotation on the op chain.
+            if !crate::device::decode_defaults(x.device()).fused_rotation {
+                note_reference(super::fused::REASON_DISABLED);
+                return Ok(None);
+            }
             if !matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16) {
                 note_reference("dtype");
                 return Ok(None);

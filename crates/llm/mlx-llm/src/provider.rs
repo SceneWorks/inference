@@ -581,6 +581,10 @@ pub struct LlamaProvider {
     /// optional accelerator — the companion MTP head (sc-24444) — requested but not attached,
     /// named in `fallbacks`. Read through [`TextLlm::load_report`].
     load_report: core_llm::LoadReport,
+    /// The speculative option a request that leaves it unset runs with (E5, sc-24446): the MLX
+    /// defaults-table row ([`core_llm::defaults::MLX`]) unless
+    /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
+    speculative_default: core_llm::Speculative,
 }
 
 /// A draft model resident beside its target (sc-24436).
@@ -726,8 +730,12 @@ impl LlamaProvider {
         // The cross-turn prefix cache's budget (sc-24437, E7): what the load asked for, clamped to
         // the headroom this admission leaves beside the target, any admitted draft and any
         // admitted companion head, so the cache can never push the load past it.
-        let prefix_budget =
-            core_llm::prefix_cache_budget(spec.prefix_cache_bytes, admitted, available);
+        let prefix_budget = core_llm::prefix_cache_budget(
+            core_llm::DecodeBackend::Mlx,
+            spec.prefix_cache_bytes,
+            admitted,
+            available,
+        );
 
         let mut provider = Self::load_admitted(spec, quant)?.with_prefix_budget(prefix_budget);
         provider.load_report.requested = spec.quantize;
@@ -950,6 +958,7 @@ impl LlamaProvider {
             gemma4,
             _prism_vision_weights: prism_vision_weights,
             prefix: RefCell::new(PrefixCache::with_budget(0)),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         })
@@ -1041,8 +1050,9 @@ impl LlamaProvider {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         })
@@ -1076,6 +1086,19 @@ impl LlamaProvider {
         self
     }
 
+    /// The speculative option a request that leaves it unset runs with on this provider: the MLX
+    /// defaults-table default ([`core_llm::DecodeDefaults::speculative`], epic sc-24432 E5)
+    /// unless [`set_speculative_default`](Self::set_speculative_default) replaced it.
+    pub fn speculative_default(&self) -> core_llm::Speculative {
+        self.speculative_default
+    }
+
+    /// Replace the speculative option an unset request runs with on this provider (a deployment
+    /// choice, e.g. a server flag); a request's own `speculative` / legacy `mtp` still wins.
+    pub fn set_speculative_default(&mut self, speculative: core_llm::Speculative) {
+        self.speculative_default = speculative;
+    }
+
     /// Whether a Prism VLM's dense vision tensors were retained for the multimodal adapter.
     pub fn has_deferred_prism_vision(&self) -> bool {
         self._prism_vision_weights.is_some()
@@ -1101,8 +1124,9 @@ impl LlamaProvider {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         }
@@ -1739,9 +1763,12 @@ impl TextLlm for LlamaProvider {
         // The backend-neutral speculative resolution (core-llm, sc-24433) against what this
         // provider advertises, then the proposer this request's shape can run on the engine
         // (sc-24434). Anything less than the request asked for is named in the report's
-        // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure.
-        let resolution =
-            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities);
+        // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure. A request
+        // that leaves the option unset runs the MLX defaults-table default (E5, sc-24446).
+        let resolution = core_llm::resolve_speculative(
+            req.speculative_or(self.speculative_default),
+            &self.descriptor.capabilities,
+        );
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
@@ -4234,8 +4261,9 @@ mod tests {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         }
@@ -4259,8 +4287,9 @@ mod tests {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         }
@@ -4935,7 +4964,7 @@ mod tests {
         assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
         let mut legacy = spec_request(Speculative::Off);
         legacy.speculative = None;
-        legacy.mtp = MtpMode::Enabled { draft_tokens: 40 };
+        legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 40 });
         let fallbacks = check(&hybrid, legacy, ProposerKind::Mtp, mtp_max, "legacy");
         assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
     }
@@ -4989,7 +5018,7 @@ mod tests {
             let (_, off_ids) = run(&provider, &spec_request(Speculative::Off));
             let mut legacy = spec_request(Speculative::Off);
             legacy.speculative = None;
-            legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
+            legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
             for (case, req) in [
                 (
                     "explicit",
@@ -5719,7 +5748,7 @@ mod tests {
             spec.prefix_cache_bytes = None;
             assert_eq!(
                 LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
-                headroom.min(core_llm::DEFAULT_PREFIX_CACHE_BYTES)
+                headroom.min(core_llm::defaults::MLX.prefix_cache_bytes)
             );
         }
         spec.prefix_cache_bytes = Some(u64::MAX);
@@ -5857,5 +5886,35 @@ mod tests {
                 vec![prompt[..boundary].to_vec()]
             );
         }
+    }
+
+    /// sc-24446 (E5): a provider loads with the MLX defaults-table speculative default, and a
+    /// request that leaves the option unset runs whatever the provider's default is — here set to
+    /// `auto` so the hook is observable — while an explicit off (new or legacy spelling) wins.
+    #[test]
+    fn an_unset_speculative_option_runs_the_providers_default() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let mut provider =
+            LlamaProvider::load(&LoadSpec::dense(fixture.target.to_string_lossy())).unwrap();
+        assert_eq!(
+            provider.speculative_default(),
+            core_llm::defaults::MLX.speculative,
+            "loaded with the defaults table's default"
+        );
+        let prompt = &core_llm_testkit::draft_model_prompts()[0];
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            core_llm::defaults::MLX.speculative,
+            prompt,
+            8,
+        );
+        provider.set_speculative_default(core_llm::Speculative::Auto);
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            core_llm::Speculative::Auto,
+            prompt,
+            8,
+        );
     }
 }

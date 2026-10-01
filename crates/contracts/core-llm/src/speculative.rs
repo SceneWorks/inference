@@ -182,6 +182,16 @@ pub fn resolve_speculative(
     }
 }
 
+/// The MTP depth [`Speculative::Auto`](crate::Speculative::Auto) runs on a checkpoint's MTP head (the
+/// upstream recommendation). Recorded per backend in [`crate::defaults`].
+pub const MTP_RECOMMENDED_DEPTH: u32 = 3;
+
+/// The prompt-lookup depth [`Speculative::Auto`](crate::Speculative::Auto) runs on a model without
+/// an MTP head. A lookup that finds no match proposes nothing and the step is an ordinary
+/// single-token decode, so the depth only prices a match. Recorded per backend in
+/// [`crate::defaults`].
+pub const PROMPT_LOOKUP_RECOMMENDED_DEPTH: u32 = 4;
+
 /// The draft-model depth advertised as recommended (sc-24436): four drafts per verify step, or
 /// the provider's bound when that is shallower.
 pub const DRAFT_MODEL_RECOMMENDED_DEPTH: u32 = 4;

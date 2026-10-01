@@ -479,17 +479,20 @@ pub struct TextLlmRequest {
     /// `None` omits the kwarg and preserves the model's default (Qwen3.8 defaults to `true`).
     pub preserve_thinking: Option<bool>,
     /// The speculative-decoding option (epic sc-24432 E4). `None` (the default) defers to the
-    /// legacy [`mtp`](Self::mtp) field; `Some` is the request's explicit choice, including an
-    /// explicit `Some(Speculative::Off)`. Read the effective option through
-    /// [`speculative_mode`](Self::speculative_mode).
+    /// legacy [`mtp`](Self::mtp) field, and when that is unset too the request runs the
+    /// **backend's default** ([`DecodeDefaults::speculative`](crate::DecodeDefaults::speculative),
+    /// applied by the provider through [`speculative_or`](Self::speculative_or)); `Some` is the
+    /// request's explicit choice, including an explicit `Some(Speculative::Off)`.
     pub speculative: Option<Speculative>,
     /// Legacy in-checkpoint multi-token prediction policy, kept so pre-sc-24432 callers still
-    /// compile and behave: it maps onto [`speculative`](Self::speculative) through
-    /// [`From<MtpMode> for Speculative`](Speculative) whenever that field is `None`. Setting both
-    /// (a `Some` speculative option and a non-`Off` legacy mode) is refused by
+    /// behave: `Some(mode)` maps onto [`speculative`](Self::speculative) through
+    /// [`From<MtpMode> for Speculative`](Speculative) whenever that field is `None` — so an
+    /// explicit `Some(MtpMode::Off)` is an explicit off — and `None` (the default) leaves the
+    /// choice to the backend default. Setting both (a `Some` speculative option and a non-`Off`
+    /// legacy mode) is refused by
     /// [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
     /// rather than silently preferring one.
-    pub mtp: MtpMode,
+    pub mtp: Option<MtpMode>,
     /// Tools / functions offered to the model (matching `transformers` `tools=`). Rendered into the
     /// prompt by the chat template and used to type-coerce the model's parsed tool calls. Honored only
     /// by providers advertising [`supports_tools`](crate::TextLlmCapabilities::supports_tools); a
@@ -535,10 +538,27 @@ impl TextLlmRequest {
         self.thinking.enable_thinking_kwarg()
     }
 
-    /// The effective speculative option: [`speculative`](Self::speculative) when set, else the
-    /// legacy [`mtp`](Self::mtp) mapped onto it.
+    /// The speculative option the request itself asks for: [`speculative`](Self::speculative)
+    /// when set, else the legacy [`mtp`](Self::mtp) mapped onto it, else `None` — the request
+    /// leaves the choice to the backend's default.
+    pub fn requested_speculative(&self) -> Option<Speculative> {
+        self.speculative.or_else(|| self.mtp.map(Speculative::from))
+    }
+
+    /// The effective speculative option on a backend whose default is `default`
+    /// ([`DecodeDefaults::speculative`](crate::DecodeDefaults::speculative)): the request's own
+    /// choice ([`requested_speculative`](Self::requested_speculative)), else `default`. Every
+    /// provider resolves a request through this, with its own backend's row.
+    pub fn speculative_or(&self, default: Speculative) -> Speculative {
+        self.requested_speculative().unwrap_or(default)
+    }
+
+    /// [`speculative_or`](Self::speculative_or) with [`Speculative::Off`] for an unset option —
+    /// the request's choice read with no backend default applied (a backend-agnostic check, such
+    /// as [`validate_request`](crate::TextLlmCapabilities::validate_request)'s depth refusal,
+    /// which only an explicit proposer can trip).
     pub fn speculative_mode(&self) -> Speculative {
-        self.speculative.unwrap_or_else(|| self.mtp.into())
+        self.speculative_or(Speculative::Off)
     }
 }
 
@@ -599,8 +619,13 @@ mod tests {
         assert!(!request.sampling.is_greedy());
         assert_eq!(request.reasoning_effort, None);
         assert_eq!(request.preserve_thinking, None);
-        assert_eq!(request.mtp, MtpMode::Off);
+        assert_eq!(request.mtp, None);
         assert_eq!(request.speculative, None);
+        assert_eq!(
+            request.requested_speculative(),
+            None,
+            "unset: the backend decides"
+        );
         assert_eq!(request.speculative_mode(), Speculative::Off);
     }
 
@@ -695,14 +720,14 @@ mod tests {
     #[test]
     fn the_legacy_mtp_field_maps_onto_the_speculative_option() {
         let mut request = TextLlmRequest::new(Vec::new(), 8);
-        request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+        request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
         assert_eq!(
             request.speculative_mode(),
             Speculative::proposer(SpeculativeProposer::Mtp, 3)
         );
-        request.mtp = MtpMode::Auto;
+        request.mtp = Some(MtpMode::Auto);
         assert_eq!(request.speculative_mode(), Speculative::Auto);
-        request.mtp = MtpMode::Off;
+        request.mtp = Some(MtpMode::Off);
         request.speculative = Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4));
         assert_eq!(
             request.speculative_mode(),
@@ -715,6 +740,27 @@ mod tests {
             SpeculativeProposer::PromptLookup
         );
         assert_eq!(SpeculativeProposer::DraftModel.to_string(), "draft_model");
+    }
+
+    /// sc-24446 (E5): a request that leaves the option unset — `speculative` and the legacy `mtp`
+    /// both `None` — runs the backend's default; anything the request sets, including an explicit
+    /// legacy `Some(MtpMode::Off)` or `Some(Speculative::Off)`, wins over it.
+    #[test]
+    fn an_unset_option_takes_the_backend_default_and_an_explicit_off_does_not() {
+        let backend_default = Speculative::Auto;
+        let mut request = TextLlmRequest::new(Vec::new(), 8);
+        assert_eq!(request.speculative_or(backend_default), backend_default);
+        request.mtp = Some(MtpMode::Off);
+        assert_eq!(request.requested_speculative(), Some(Speculative::Off));
+        assert_eq!(request.speculative_or(backend_default), Speculative::Off);
+        request.mtp = None;
+        request.speculative = Some(Speculative::Off);
+        assert_eq!(request.speculative_or(backend_default), Speculative::Off);
+        request.speculative = Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2));
+        assert_eq!(
+            request.speculative_or(backend_default),
+            Speculative::proposer(SpeculativeProposer::DraftModel, 2)
+        );
     }
 
     #[test]
@@ -800,7 +846,8 @@ pub struct LoadSpec {
     pub mtp_head_source: Option<String>,
     /// Byte budget of the cross-turn prefix cache (story sc-24437): the KV (and, for a hybrid
     /// decoder, recurrent state) of earlier requests' prefixes, reused when a later prompt
-    /// extends one. `None` asks for [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES);
+    /// extends one. `None` asks for the backend's default
+    /// ([`DecodeDefaults::prefix_cache_bytes`](crate::DecodeDefaults::prefix_cache_bytes));
     /// `Some(0)` turns the cache off. The load admits it: the settled budget is this clamped to
     /// the headroom the load's own admission leaves ([`prefix_cache_budget`](crate::prefix_cache_budget)).
     pub prefix_cache_bytes: Option<u64>,

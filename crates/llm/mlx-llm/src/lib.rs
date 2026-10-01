@@ -62,6 +62,7 @@ pub mod residency;
 pub mod snapshot;
 pub mod starvector_1b;
 pub mod starvector_8b;
+pub mod switches;
 
 // Self-removing temp fixtures for the crate's unit suites (sc-17768). This is the SAME file the
 // integration suites pull in as `mod common;` — included by path rather than copied, so the two

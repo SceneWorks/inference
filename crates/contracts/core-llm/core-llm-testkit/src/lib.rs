@@ -29,9 +29,11 @@ use core_llm::{
 use std::path::PathBuf;
 
 pub mod comparison;
+pub mod defaults;
 pub mod draft_model;
 pub mod speculative;
 pub mod starvector;
+pub use defaults::check_speculative_default;
 pub use draft_model::{
     check_draft_model_refused, check_draft_model_resident, check_draft_model_short_context,
     check_draft_model_stop_token, draft_model_parity_cases, draft_model_prompts,

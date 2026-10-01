@@ -34,9 +34,14 @@ fn env_value_enables(v: &str) -> bool {
     !matches!(v, "0" | "off" | "false" | "no" | "reference")
 }
 
-/// The fused-primitive switch (on unless the environment turns it off), on the crate's one
-/// switch implementation, [`ProcessSwitch`].
-static SWITCH: ProcessSwitch = ProcessSwitch::new(FUSED_KERNELS_ENV, true, env_value_enables);
+/// The fused-primitive switch, on the crate's one switch implementation, [`ProcessSwitch`]:
+/// unset, the Candle CUDA row of the defaults table ([`core_llm::defaults::CANDLE_CUDA`]) — the
+/// only device the fused path exists on.
+static SWITCH: ProcessSwitch = ProcessSwitch::new(
+    FUSED_KERNELS_ENV,
+    core_llm::defaults::CANDLE_CUDA.fused_kernels,
+    env_value_enables,
+);
 
 /// Whether the fused path may be tried at all (the switch; a `cuda` build is still required for
 /// it to exist).

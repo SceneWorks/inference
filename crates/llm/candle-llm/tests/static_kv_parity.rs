@@ -403,7 +403,7 @@ fn teacher_forced_static_vs_attn_kv_logit_parity_report() {
 #[ignore = "needs the Qwen3.8-27B snapshot via BONSAI_QWEN38_SNAPSHOT and a GPU"]
 fn provider_off_path_is_token_identical_to_the_reference_loop() {
     use candle_llm::LlamaProvider;
-    use core_llm::{LoadSpec, Message, MtpMode, Sampling, StreamEvent, TextLlm, TextLlmRequest};
+    use core_llm::{LoadSpec, Message, Sampling, StreamEvent, TextLlm, TextLlmRequest};
 
     let snapshot = common::qwen35::snapshot_from_env(SNAPSHOT_VAR)
         .unwrap_or_else(|| panic!("set {SNAPSHOT_VAR}"));
@@ -417,7 +417,7 @@ fn provider_off_path_is_token_identical_to_the_reference_loop() {
         sampling: Sampling::greedy(),
         max_new_tokens: FIXTURE_TOKENS as u32,
         seed: Some(0),
-        mtp: MtpMode::Off,
+        mtp: None,
         ..Default::default()
     };
     type Event = (u32, usize, String, String);

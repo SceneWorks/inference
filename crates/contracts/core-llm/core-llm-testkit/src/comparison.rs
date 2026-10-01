@@ -96,9 +96,12 @@ pub fn request_evidence(request: &TextLlmRequest) -> Value {
             "tool_calls":message.tool_calls.iter().map(|call|json!({"name":call.name,"arguments":call.arguments})).collect::<Vec<_>>()})
     }).collect::<Vec<_>>();
     let mtp = match request.mtp {
-        MtpMode::Off => json!({"mode":"off"}),
-        MtpMode::Auto => json!({"mode":"auto"}),
-        MtpMode::Enabled { draft_tokens } => json!({"mode":"enabled", "draft_tokens":draft_tokens}),
+        None => Value::Null,
+        Some(MtpMode::Off) => json!({"mode":"off"}),
+        Some(MtpMode::Auto) => json!({"mode":"auto"}),
+        Some(MtpMode::Enabled { draft_tokens }) => {
+            json!({"mode":"enabled", "draft_tokens":draft_tokens})
+        }
     };
     json!({"messages":messages, "max_new_tokens":request.max_new_tokens, "seed":request.seed,
         "sampling":{"temperature":request.sampling.temperature,"top_p":request.sampling.top_p,
@@ -640,13 +643,13 @@ pub fn capability_acceptance_cases() -> Vec<ComparisonCase> {
     let mut mtp = by_id("arithmetic");
     mtp.id = "mtp_greedy".into();
     mtp.category = "mtp_acceptance".into();
-    mtp.request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    mtp.request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
     cases.push(mtp);
 
     let mut mtp_json = by_id("json");
     mtp_json.id = "mtp_json".into();
     mtp_json.category = "mtp_structured_acceptance".into();
-    mtp_json.request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+    mtp_json.request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
     mtp_json.request.thinking = ThinkingMode::Enabled;
     mtp_json.request.reasoning_effort = Some(core_llm::ReasoningEffort::Medium);
     mtp_json.request.max_new_tokens = 512;
@@ -659,7 +662,7 @@ pub fn capability_acceptance_cases() -> Vec<ComparisonCase> {
         let mut case = by_id(source);
         case.id = id.into();
         case.category = category.into();
-        case.request.mtp = MtpMode::Enabled { draft_tokens: 3 };
+        case.request.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
         cases.push(case);
     }
     cases
@@ -1630,7 +1633,7 @@ mod tests {
         for id in ["mtp_greedy", "mtp_json", "mtp_image", "mtp_video"] {
             assert!(matches!(
                 cases.iter().find(|case| case.id == id).unwrap().request.mtp,
-                MtpMode::Enabled { draft_tokens: 3 }
+                Some(MtpMode::Enabled { draft_tokens: 3 })
             ));
         }
         let json = cases
@@ -1640,7 +1643,10 @@ mod tests {
         assert_eq!(json.request.thinking, ThinkingMode::Enabled);
         assert!(json.request.constraint.is_some());
         let mtp_json = cases.iter().find(|case| case.id == "mtp_json").unwrap();
-        assert!(matches!(mtp_json.request.mtp, MtpMode::Enabled { .. }));
+        assert!(matches!(
+            mtp_json.request.mtp,
+            Some(MtpMode::Enabled { .. })
+        ));
         assert_eq!(mtp_json.request.thinking, ThinkingMode::Enabled);
         assert!(mtp_json.request.constraint.is_some());
         assert!(cases

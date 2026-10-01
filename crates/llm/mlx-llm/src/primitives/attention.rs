@@ -164,7 +164,13 @@ enum SdpaRoute {
 ///   time — the bound the chunked admission estimate prices for decoders;
 /// - otherwise (short queries, or an unmasked vision-tower call already priced quadratically) → one
 ///   call; MLX runs its fallback.
+///
+/// The MLX defaults-table row ([`core_llm::defaults::MLX`] `sdpa_kernel_routing`) can turn this
+/// routing off, back to [`pre_sc24442_route`].
 fn sdpa_route(queries: &Array, keys: &Array, values: &Array, mask: AttnMask<'_>) -> SdpaRoute {
+    if !core_llm::defaults::MLX.sdpa_kernel_routing {
+        return pre_sc24442_route(queries);
+    }
     let (hq, q_len, qd) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);
     let (hkv, k_len, vd) = (keys.shape()[1], keys.shape()[2], values.shape()[3]);
     let full_head_dim = qd == vd && matches!(qd, 64 | 80 | 128);
@@ -197,6 +203,20 @@ fn sdpa_route(queries: &Array, keys: &Array, values: &Array, mask: AttnMask<'_>)
             rows,
             eval_tiles: false,
         }
+    }
+}
+
+/// The route `sdpa` took before sc-24442: `q_len > 8` × multi-head × power-of-2 `head_dim >= 64`
+/// calls in 8-row tiles (the sc-7455 mitigation), every other shape as one fused call.
+fn pre_sc24442_route(queries: &Array) -> SdpaRoute {
+    let (heads, q_len, head_dim) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);
+    if q_len > 8 && heads >= 2 && head_dim >= 64 && (head_dim as u32).is_power_of_two() {
+        SdpaRoute::Tiled {
+            rows: 8,
+            eval_tiles: false,
+        }
+    } else {
+        SdpaRoute::Fused
     }
 }
 
@@ -240,25 +260,12 @@ pub(crate) fn vector_verify_rows(hq: i32, hkv: i32, qd: i32, vd: i32) -> i32 {
 pub(crate) mod route_override {
     use std::cell::Cell;
 
-    use super::SdpaRoute;
+    use super::{pre_sc24442_route, SdpaRoute};
     use mlx_rs::Array;
 
     thread_local! {
         static PRE_SC24442: Cell<bool> = const { Cell::new(false) };
         static DIFFERING_CALLS: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// The route the pre-sc-24442 `sdpa` took for these queries.
-    fn pre_sc24442_route(queries: &Array) -> SdpaRoute {
-        let (heads, q_len, head_dim) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);
-        if q_len > 8 && heads >= 2 && head_dim >= 64 && (head_dim as u32).is_power_of_two() {
-            SdpaRoute::Tiled {
-                rows: 8,
-                eval_tiles: false,
-            }
-        } else {
-            SdpaRoute::Fused
-        }
     }
 
     /// Replace `route` with the pre-sc-24442 one inside [`with_pre_sc24442_routing`]; otherwise

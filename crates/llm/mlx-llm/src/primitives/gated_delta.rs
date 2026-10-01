@@ -69,9 +69,12 @@ pub fn compute_g(a: &Array, a_log: &Array, dt_bias: &Array) -> Result<Array> {
 ///   2.7 ms at 512 tokens, 7.3 ms vs 11.3 ms at 2048, against 40 / 161 ms for the op loop) and it
 ///   is exact f32, whereas MLX runs f32 GEMMs as TF32 on NAX GPUs (M5+), which puts the
 ///   chunkwise form ~2e-3 off the reference there.
+///   With the kernel switched off ([`GDN_KERNEL`](crate::switches::GDN_KERNEL)) a GPU stream runs
+///   the op-by-op reference (the pre-sc-24443 path), not the chunkwise form, whose TF32 GEMMs are
+///   not exact there.
 /// - **CPU stream, `T ≥ `[`CHUNKED_PREFILL_MIN_TOKENS`]** — the chunkwise-parallel form
 ///   ([`gated_delta_chunked`]; a custom Metal kernel cannot run off the GPU, and the CPU GEMMs are
-///   exact f32).
+///   exact f32), unless the MLX defaults-table row turns it off (`gdn_chunked_prefill`).
 /// - **CPU stream, shorter `T`** — the op-by-op reference.
 ///
 /// The recurrent state layout is unchanged by every path: `[B, Hv, Dv, Dk]`, the value-major form
@@ -96,9 +99,12 @@ pub fn gated_delta_recurrence(
     // (the task-local stream when set, which need not be on the process default device).
     let stream = Stream::task_local_or_default();
     let (y, next) = if stream_is_gpu(&stream) {
+        if !crate::switches::GDN_KERNEL.enabled() {
+            return gated_delta_recurrence_ops(q, k, v, g, beta, state);
+        }
         let (y, next, _) = kernel_segmented(q, k, v, g, beta, state, &stream, false)?;
         (y, next)
-    } else if t >= CHUNKED_PREFILL_MIN_TOKENS {
+    } else if core_llm::defaults::MLX.gdn_chunked_prefill && t >= CHUNKED_PREFILL_MIN_TOKENS {
         gated_delta_chunked(q, k, v, g, beta, state)?
     } else {
         return gated_delta_recurrence_ops(q, k, v, g, beta, state);
@@ -131,17 +137,18 @@ pub fn gated_delta_recurrence_checkpointed(
     let force_ops = FORCE_OPS_REFERENCE.with(|f| f.get());
     #[cfg(not(test))]
     let force_ops = false;
-    let (y, next, states) = if !force_ops && stream_is_gpu(&stream) {
-        let (y, next, states) = kernel_segmented(q, k, v, g, beta, state, &stream, true)?;
-        (
-            y,
-            next,
-            states.expect("the checkpoint kernel returns per-token states"),
-        )
-    } else {
-        let (y, next, states) = ops_recurrence(q, k, v, g, beta, state, true)?;
-        (y, next, states.expect("collected per-token states"))
-    };
+    let (y, next, states) =
+        if !force_ops && stream_is_gpu(&stream) && crate::switches::GDN_KERNEL.enabled() {
+            let (y, next, states) = kernel_segmented(q, k, v, g, beta, state, &stream, true)?;
+            (
+                y,
+                next,
+                states.expect("the checkpoint kernel returns per-token states"),
+            )
+        } else {
+            let (y, next, states) = ops_recurrence(q, k, v, g, beta, state, true)?;
+            (y, next, states.expect("collected per-token states"))
+        };
     let state_dtype = state.map_or(q.dtype(), Array::dtype);
     Ok((
         cast_to(y, q.dtype())?,
@@ -1667,6 +1674,40 @@ mod tests {
             let (_, s) =
                 gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state)).unwrap();
             assert_eq!(s.dtype(), Dtype::Float32);
+        });
+    }
+
+    /// sc-24446 (E5): with the GDN kernel switched off (`MLX_LLM_GDN_KERNEL`; here its
+    /// thread-scoped layer) a GPU stream runs the op-by-op reference for both entry points, at
+    /// the length the kernel would otherwise take, and matches the kernel's result.
+    #[test]
+    fn the_gdn_kernel_switch_off_runs_the_reference_on_the_gpu() {
+        use crate::switches::GDN_KERNEL;
+        mlx_rs::with_new_default_stream(Stream::gpu(), || {
+            let x = inputs([1, 80, 2, 4, 32, 16], Dtype::Float32, 41);
+            let run = || gated_delta_recurrence(&x.q, &x.k, &x.v, &x.g, &x.beta, Some(&x.state));
+            let ((y_on, s_on), on) = recording_routes(|| run().unwrap());
+            assert_eq!(on, [Route::Kernel]);
+            let ((y_off, s_off), off) =
+                GDN_KERNEL.scoped(false, || recording_routes(|| run().unwrap()));
+            assert_eq!(
+                off,
+                [Route::Ops],
+                "the switch is off: the reference, not chunked"
+            );
+            let (ey, es) = (errors(&y_off, &y_on), errors(&s_off, &s_on));
+            assert!(ey.0 < 2e-5 && es.0 < 2e-5, "y {ey:?} state {es:?}");
+
+            let checkpointed =
+                || gated_delta_recurrence_checkpointed(&x.q, &x.k, &x.v, &x.g, &x.beta, None);
+            let (_, on) = recording_routes(|| checkpointed().unwrap());
+            assert_eq!(on, [Route::CheckpointKernel]);
+            let (_, off) =
+                GDN_KERNEL.scoped(false, || recording_routes(|| checkpointed().unwrap()));
+            assert!(
+                !off.contains(&Route::CheckpointKernel) && !off.is_empty(),
+                "the switch is off: {off:?}"
+            );
         });
     }
 

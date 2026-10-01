@@ -234,7 +234,7 @@ impl TextLlmCapabilities {
             )));
         }
 
-        if req.speculative.is_some() && req.mtp != crate::MtpMode::Off {
+        if req.speculative.is_some() && req.mtp.is_some_and(|m| m != crate::MtpMode::Off) {
             return reject(
                 "set either `speculative` or the legacy `mtp`, not both (legacy `mtp` maps onto \
                  `speculative`)"
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn explicit_mtp_requires_capability_and_valid_draft_count() {
         let mut req = request();
-        req.mtp = MtpMode::Enabled { draft_tokens: 3 };
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
         let err = TextLlmCapabilities::default()
             .validate_request("test", &req)
             .unwrap_err();
@@ -376,14 +376,14 @@ mod tests {
         };
         caps.validate_request("test", &req).unwrap();
 
-        req.mtp = MtpMode::Enabled { draft_tokens: 0 };
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 0 });
         assert!(matches!(
             caps.validate_request("test", &req),
             Err(Error::InvalidRequest(_))
         ));
         // sc-24438: a depth above the advertised maximum is admitted — the resolver clamps it and
         // names the clamp in the report — rather than refused.
-        req.mtp = MtpMode::Enabled { draft_tokens: 5 };
+        req.mtp = Some(MtpMode::Enabled { draft_tokens: 5 });
         caps.validate_request("test", &req).unwrap();
     }
 
@@ -484,7 +484,7 @@ mod tests {
             .validate_request("test", &req)
             .unwrap();
 
-        req.mtp = MtpMode::Auto;
+        req.mtp = Some(MtpMode::Auto);
         let err = caps.validate_request("test", &req).unwrap_err();
         assert!(err.to_string().contains("not both"), "{err}");
         req.speculative = None;
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn auto_mtp_is_a_safe_fallback_without_capability() {
         let mut req = request();
-        req.mtp = MtpMode::Auto;
+        req.mtp = Some(MtpMode::Auto);
         TextLlmCapabilities::default()
             .validate_request("test", &req)
             .unwrap();

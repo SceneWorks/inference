@@ -135,7 +135,10 @@ pub fn gated_delta_recurrence_with_sink(
     } else {
         chunked
     };
-    if chunked < CHUNKED_PREFILL_MIN_TOKENS {
+    // The defaults table's row for this device (E5) may keep every token on the per-token step.
+    if chunked < CHUNKED_PREFILL_MIN_TOKENS
+        || !crate::device::decode_defaults(q.device()).gdn_chunked_prefill
+    {
         return gated_delta_recurrence_per_token(q, k, v, g, beta, state, sink);
     }
     let head = |x: &Tensor| x.narrow(1, 0, chunked);

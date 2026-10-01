@@ -6,8 +6,7 @@
 //! ([`crate::main`]) wires them to a TCP socket + a loaded `core_llm::TextLlm` provider.
 
 use mlx_llm::core_llm::{
-    Constraint, Content, DecodeReport, Message, MtpMode, Role, Sampling, Speculative,
-    TextLlmRequest,
+    Constraint, Content, DecodeReport, Message, Role, Sampling, Speculative, TextLlmRequest,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -181,7 +180,7 @@ impl ChatRequest {
             // The request's speculative option (or its legacy `mtp` spelling) as sent; the
             // provider validates it against what the loaded model advertises (sc-24438).
             speculative: self.speculative,
-            mtp: MtpMode::Off,
+            mtp: None,
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
@@ -420,7 +419,7 @@ mod tests {
             let r = spec(extra);
             assert_eq!(r.speculative, Some(want), "{extra}");
             assert_eq!(r.speculative_mode(), want, "{extra}");
-            assert_eq!(r.mtp, MtpMode::Off, "{extra}");
+            assert_eq!(r.mtp, None, "{extra}");
         }
     }
 

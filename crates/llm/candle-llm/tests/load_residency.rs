@@ -192,7 +192,7 @@ fn load_residency_by_format() {
         sampling: Sampling::greedy(),
         max_new_tokens: new_tokens,
         seed: Some(0),
-        mtp: MtpMode::Off,
+        mtp: None,
         ..Default::default()
     };
     // Sampled at every streamed token (the stream can merge a token into its neighbour's text
