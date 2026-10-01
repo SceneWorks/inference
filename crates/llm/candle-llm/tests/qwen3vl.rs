@@ -20,8 +20,8 @@
 
 use candle_llm::LlamaProvider;
 use core_llm::{
-    Channel, Content, ImageRef, LoadSpec, Message, Role, Sampling, Speculative, StreamEvent,
-    TextLlm, TextLlmOutput, TextLlmRequest, ThinkingMode, VideoRef,
+    Channel, Content, ImageRef, LoadSpec, Message, ProposerKind, Role, Sampling, Speculative,
+    StreamEvent, TextLlm, TextLlmOutput, TextLlmRequest, ThinkingMode, VideoRef,
 };
 
 fn model_dir() -> String {
@@ -85,7 +85,7 @@ fn qwen3vl_vision_grounds_on_image() {
     ] {
         let img = solid_image(256, 256, rgb);
         // `auto` resolves to prompt lookup (no MTP head), which a Qwen3-VL multimodal request
-        // cannot run on its reference-loop prefill: the report names the fallback (sc-24433).
+        // runs on the engine after its DeepStack / M-RoPE prefill — no fallback (sc-24446).
         let (out, content) = run(
             &p,
             &TextLlmRequest {
@@ -96,12 +96,13 @@ fn qwen3vl_vision_grounds_on_image() {
                 )
             },
         );
-        let fallbacks = out.decode.clone().expect("reported").fallbacks;
+        let report = out.decode.clone().expect("reported");
+        assert_eq!(report.path, "prompt_lookup", "{label}");
+        assert_eq!(report.proposer, ProposerKind::PromptLookup, "{label}");
         assert!(
-            fallbacks.first().is_some_and(
-                |f| f.starts_with("speculative: `prompt_lookup` needs the step-seam engine")
-            ),
-            "{label}: {fallbacks:?}"
+            report.fallbacks.is_empty(),
+            "{label}: {:?}",
+            report.fallbacks
         );
         println!(
             "\n=== Qwen3-VL VISION ({label}) ===\n[answer] {:?}\n",

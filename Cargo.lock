@@ -2289,6 +2289,7 @@ name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
  "memmap2",
+ "mlx-llm",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "safetensors 0.4.5",

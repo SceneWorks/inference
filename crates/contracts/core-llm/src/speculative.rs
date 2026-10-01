@@ -233,13 +233,17 @@ pub const PROMPT_LOOKUP_RECOMMENDED_DEPTH: u32 = 4;
 
 /// The prompt-lookup advertisement every text decoder carries (both backends' decoders run the
 /// proposer through their step engine, so it needs nothing from the checkpoint), at the
-/// provider's per-model verify bound `max_depth`, recommending
-/// [`PROMPT_LOOKUP_RECOMMENDED_DEPTH`] (or `max_depth` when shallower).
-pub fn prompt_lookup_capabilities(max_depth: u32) -> crate::ProposerCapabilities {
+/// provider's per-model verify bound `max_depth`, recommending the backend's defaults-table depth
+/// (`depths`, [`DecodeDefaults::recommended_depths`](crate::DecodeDefaults::recommended_depths))
+/// or `max_depth` when shallower.
+pub fn prompt_lookup_capabilities(
+    max_depth: u32,
+    depths: &crate::RecommendedDepths,
+) -> crate::ProposerCapabilities {
     crate::ProposerCapabilities {
         proposer: crate::SpeculativeProposer::PromptLookup,
         max_depth,
-        recommended_depth: PROMPT_LOOKUP_RECOMMENDED_DEPTH.min(max_depth),
+        recommended_depth: depths.prompt_lookup.min(max_depth),
     }
 }
 
@@ -262,15 +266,19 @@ pub const DRAFT_MODEL_NOT_LOADED: &str = "speculative: `draft_model` has no draf
 pub const DRAFT_MODEL_RECOMMENDED_DEPTH: u32 = 4;
 
 /// The `draft_model` advertisement a provider carries while a compatible draft is resident
-/// (sc-24436): `1..=max_depth` drafts per verify step, recommended
-/// [`DRAFT_MODEL_RECOMMENDED_DEPTH`] (or `max_depth` when shallower). `max_depth` is the same
-/// per-model verify bound the provider advertises for its other proposers — every draft is one
-/// more verify row, whichever proposer drew it — so a provider passes that one value here.
-pub fn draft_model_capabilities(max_depth: u32) -> crate::ProposerCapabilities {
+/// (sc-24436): `1..=max_depth` drafts per verify step, recommending the backend's defaults-table
+/// depth (`depths`, [`DecodeDefaults::recommended_depths`](crate::DecodeDefaults::recommended_depths))
+/// or `max_depth` when shallower. `max_depth` is the same per-model verify bound the provider
+/// advertises for its other proposers — every draft is one more verify row, whichever proposer
+/// drew it — so a provider passes that one value here.
+pub fn draft_model_capabilities(
+    max_depth: u32,
+    depths: &crate::RecommendedDepths,
+) -> crate::ProposerCapabilities {
     crate::ProposerCapabilities {
         proposer: crate::SpeculativeProposer::DraftModel,
         max_depth,
-        recommended_depth: DRAFT_MODEL_RECOMMENDED_DEPTH.min(max_depth),
+        recommended_depth: depths.draft_model.min(max_depth),
     }
 }
 
@@ -336,7 +344,8 @@ pub fn draft_load_refusal(error: impl std::fmt::Display) -> String {
 
 /// Settle what became of a load's named draft (sc-24436) — the model-agnostic half of a
 /// backend's `attach_draft`: a compatible draft (`Ok`) is kept and `draft_model` advertised on
-/// `capabilities` at the model's [`verify_depth_bound`]; a refused one (`Err`, its reason leading
+/// `capabilities` at the model's [`verify_depth_bound`], recommending the backend row's `depths`;
+/// a refused one (`Err`, its reason leading
 /// with `draft model:`) is named in the load's `fallbacks` (E2) as well as in the returned
 /// [`DraftReport`](crate::DraftReport), and the target loads alone. Returns the draft to keep
 /// resident and the report.
@@ -345,6 +354,7 @@ pub fn settle_draft<D>(
     outcome: std::result::Result<D, String>,
     capabilities: &mut crate::TextLlmCapabilities,
     fallbacks: &mut Vec<String>,
+    depths: &crate::RecommendedDepths,
 ) -> (Option<D>, crate::DraftReport) {
     let source = source.into();
     match outcome {
@@ -352,7 +362,7 @@ pub fn settle_draft<D>(
             let max_depth = verify_depth_bound(capabilities);
             capabilities
                 .speculative
-                .push(draft_model_capabilities(max_depth));
+                .push(draft_model_capabilities(max_depth, depths));
             (Some(draft), crate::DraftReport::resident(source))
         }
         Err(why) => (
@@ -570,6 +580,42 @@ fn weight_of(candidates: &[(i32, f32)], token: i32) -> f32 {
 mod tests {
     use super::*;
 
+    /// A defaults-table row's recommended depths, spelled out so these tests do not move with the
+    /// table.
+    const DEPTHS: crate::RecommendedDepths = crate::RecommendedDepths {
+        mtp: 3,
+        prompt_lookup: 4,
+        draft_model: 4,
+    };
+
+    /// E5: the shared advertisements recommend the depth of the defaults-table row they are handed
+    /// — a different row advertises a different depth (still clamped to the verify bound) — and
+    /// every backend's row is what the providers hand them.
+    #[test]
+    fn the_advertised_recommended_depth_is_the_rows() {
+        let row = crate::RecommendedDepths {
+            mtp: 2,
+            prompt_lookup: 6,
+            draft_model: 5,
+        };
+        assert_eq!(prompt_lookup_capabilities(8, &row).recommended_depth, 6);
+        assert_eq!(prompt_lookup_capabilities(8, &DEPTHS).recommended_depth, 4);
+        assert_eq!(draft_model_capabilities(8, &row).recommended_depth, 5);
+        assert_eq!(draft_model_capabilities(8, &DEPTHS).recommended_depth, 4);
+        assert_eq!(prompt_lookup_capabilities(3, &row).recommended_depth, 3);
+        let mut caps = crate::TextLlmCapabilities {
+            speculative: vec![prompt_lookup_capabilities(8, &row)],
+            ..Default::default()
+        };
+        let mut fallbacks = Vec::new();
+        settle_draft("/d", Ok(()), &mut caps, &mut fallbacks, &row);
+        assert_eq!(
+            caps.proposer(crate::SpeculativeProposer::DraftModel)
+                .map(|c| c.recommended_depth),
+            Some(5)
+        );
+    }
+
     // --- n-gram proposer ---
 
     #[test]
@@ -723,12 +769,13 @@ mod tests {
     /// exceeds the bound, and `draft_model` is advertised at the prompt-lookup bound.
     #[test]
     fn the_shared_advertisements_respect_the_verify_bound() {
-        let deep = prompt_lookup_capabilities(7);
+        let depths = &crate::DecodeBackend::Mlx.defaults().recommended_depths;
+        let deep = prompt_lookup_capabilities(7, depths);
         assert_eq!(
             (deep.max_depth, deep.recommended_depth),
-            (7, PROMPT_LOOKUP_RECOMMENDED_DEPTH)
+            (7, depths.prompt_lookup)
         );
-        let shallow = prompt_lookup_capabilities(2);
+        let shallow = prompt_lookup_capabilities(2, depths);
         assert_eq!((shallow.max_depth, shallow.recommended_depth), (2, 2));
         let mut caps = crate::TextLlmCapabilities::default();
         assert_eq!(verify_depth_bound(&caps), 1, "no prompt lookup: one draft");
@@ -743,14 +790,14 @@ mod tests {
     fn settling_a_draft_names_a_refusal_and_advertises_a_resident_draft() {
         use crate::SpeculativeProposer;
         let mut caps = crate::TextLlmCapabilities {
-            speculative: vec![prompt_lookup_capabilities(5)],
+            speculative: vec![prompt_lookup_capabilities(5, &DEPTHS)],
             ..Default::default()
         };
         let mut fallbacks = Vec::new();
         let why = draft_load_refusal("no such file");
         assert_eq!(why, "draft model: its load failed (no such file)");
         let (kept, report): (Option<()>, _) =
-            settle_draft("/d", Err(why.clone()), &mut caps, &mut fallbacks);
+            settle_draft("/d", Err(why.clone()), &mut caps, &mut fallbacks, &DEPTHS);
         assert!(kept.is_none());
         assert_eq!(caps.proposer(SpeculativeProposer::DraftModel), None);
         assert_eq!(report, crate::DraftReport::refused("/d", why.clone()));
@@ -761,11 +808,11 @@ mod tests {
         assert_eq!(load.fallbacks, vec![why]);
 
         let mut fallbacks = Vec::new();
-        let (kept, report) = settle_draft("/d", Ok(7u8), &mut caps, &mut fallbacks);
+        let (kept, report) = settle_draft("/d", Ok(7u8), &mut caps, &mut fallbacks, &DEPTHS);
         assert_eq!(kept, Some(7));
         assert_eq!(
             caps.proposer(SpeculativeProposer::DraftModel),
-            Some(draft_model_capabilities(5))
+            Some(draft_model_capabilities(5, &DEPTHS))
         );
         assert_eq!(report, crate::DraftReport::resident("/d"));
         assert!(fallbacks.is_empty());
@@ -821,11 +868,11 @@ mod tests {
             "{why}"
         );
 
-        let caps = draft_model_capabilities(8);
+        let caps = draft_model_capabilities(8, &DEPTHS);
         assert_eq!(caps.proposer, SpeculativeProposer::DraftModel);
         assert_eq!((caps.max_depth, caps.recommended_depth), (8, 4));
         // The provider's bound is the advertisement's; the recommendation never exceeds it.
-        let shallow = draft_model_capabilities(3);
+        let shallow = draft_model_capabilities(3, &DEPTHS);
         assert_eq!((shallow.max_depth, shallow.recommended_depth), (3, 3));
         // Advertised, `{proposer: draft_model}` runs at the requested depth.
         let resident = crate::TextLlmCapabilities {
@@ -858,7 +905,7 @@ mod tests {
             recommended_depth: 4,
         };
         let caps = crate::TextLlmCapabilities {
-            speculative: vec![lookup, draft_model_capabilities(8)],
+            speculative: vec![lookup, draft_model_capabilities(8, &DEPTHS)],
             ..Default::default()
         };
         let asked = resolve_speculative(
@@ -884,7 +931,7 @@ mod tests {
         );
         // No proposer for `auto` either: plain decoding, both reasons named.
         let only_draft = crate::TextLlmCapabilities {
-            speculative: vec![draft_model_capabilities(8)],
+            speculative: vec![draft_model_capabilities(8, &DEPTHS)],
             ..Default::default()
         };
         let fit = fit_draft_context(asked, &only_draft, 64, 40, 21);

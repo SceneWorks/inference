@@ -2196,7 +2196,7 @@ impl Ltx {
         let cache = self.enhancer_cache.as_ref().ok_or_else(|| {
             Error::Msg("ltx_2_5: Gemma-4 enhancer cache is absent from the 2.5 route".into())
         })?;
-        let (prompt, decode) = enhance::enhance_gemma4(
+        let (prompt, _decode) = enhance::enhance_gemma4(
             &model,
             &tokenizer,
             prefill,
@@ -2213,7 +2213,6 @@ impl Ltx {
             ));
         }
         eprintln!("ENHANCED_PROMPT:{prompt}");
-        eprintln!("ENHANCER_DECODE:{decode:?}");
         Ok(Some(prompt))
     }
 }

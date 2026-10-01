@@ -33,15 +33,19 @@
 //! companion heads or cross-turn prefix cache. Every other knob is the harness's
 //! (`SNAPSHOT`, `OUTPUT`, `SAMPLING`, `FORMAT`, `NEW_TOKENS`, `REPEATS`, `MODEL`, `BACKEND` —
 //! default: the provider descriptor's backend, `candle` / `mlx` as the harness's entry points
-//! label them — `WARMUP`, `THINKING` and `GIT_SHA`). With no prefix cache the warm-up runs the
-//! measured request, as the harness does with its cache off.
+//! label them — `WARMUP`, `THINKING`, `GIT_SHA` and `ALLOW_SHA_OVERRIDE`). With no prefix cache
+//! the warm-up runs the measured request, as the harness does with its cache off.
 //!
 //! `SPECULATIVE_BENCH_THINKING` is the harness's (`core_llm_testkit::BenchThinking`): `default`,
 //! `off`, `on`, `xhigh`, `medium` or `low`, sent through the request's `thinking` /
 //! `reasoning_effort` fields, which the pre-epic revision already has. The document's
-//! `provenance` is the harness's (`core_llm_testkit::BenchProvenance`): the checkout's `HEAD`
-//! (`git rev-parse` at run time, else `SPECULATIVE_BENCH_GIT_SHA`) and tree state — the copied-in
-//! driver shows as an untracked change, which is the expected difference — every recorded switch
+//! `provenance` is the harness's (`core_llm_testkit::BenchProvenance`): the checkout's `HEAD` and
+//! tree state at run time (`git rev-parse` / `git status`; the copied-in driver shows as an
+//! untracked change — on MLX also the registered module — which is the expected difference) beside
+//! the SHA and dirty flag stamped at compile time (`SPECULATIVE_BENCH_BUILD_GIT_SHA` /
+//! `SPECULATIVE_BENCH_BUILD_GIT_DIRTY`, read with `option_env!`), a mismatch refused before the
+//! load (`core_llm_testkit::reconcile_git_provenance`; `SPECULATIVE_BENCH_GIT_SHA` stands only
+//! unstamped and with `SPECULATIVE_BENCH_ALLOW_SHA_OVERRIDE=1`) — every recorded switch
 //! variable's raw value, and the effective state of the switches the revision has, read from
 //! their switch objects: on Candle the CUDA-graph, fused-kernel and NVFP4-GEMV switches and (in a
 //! `cuda` build) the CUDA stream; device positions and every MLX switch postdate the pre-epic
@@ -49,7 +53,11 @@
 //!
 //! # Run it at the pre-epic revision
 //!
-//! From a checkout of this tree (`$EPIC`) on the campaign host:
+//! The campaign script `scripts/release/speculative_bench_campaign.py` does all of this
+//! mechanically — `run` on the CUDA lane (`.github/workflows/real-weights.yml`), `local` on the MLX
+//! host (it creates both worktrees, applies the copy below, stamps both builds and checks every
+//! document) — and is the supported way to produce campaign evidence. By hand, from a checkout of
+//! this tree (`$EPIC`) on the campaign host:
 //!
 //! ```text
 //! git -C "$EPIC" worktree add ../inference-pre-epic c1e8f8e02 && cd "$EPIC/../inference-pre-epic"
@@ -57,6 +65,7 @@
 //!
 //! # Candle (the CUDA campaign host): a per-file test target.
 //! cp "$SRC" crates/llm/candle-llm/tests/speculative_bench_baseline.rs
+//! export SPECULATIVE_BENCH_BUILD_GIT_SHA="$(git rev-parse HEAD)" SPECULATIVE_BENCH_BUILD_GIT_DIRTY=1
 //! SPECULATIVE_BENCH_SNAPSHOT=/path/to/snapshot SPECULATIVE_BENCH_OUTPUT=/tmp/pre-epic.json \
 //!   cargo test --release --features cuda -p candle-llm --test speculative_bench_baseline -- \
 //!   --ignored --nocapture
@@ -121,7 +130,7 @@ use std::path::Path;
 use std::time::Instant;
 
 /// `core_llm_testkit::BENCH_SCHEMA`.
-pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/3";
+pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/4";
 /// `core_llm_testkit::BENCH_SWITCHES`.
 pub const BENCH_SWITCHES: [&str; 9] = [
     "CANDLE_LLM_CUDA_GRAPHS",
@@ -138,6 +147,20 @@ pub const BENCH_SWITCHES: [&str; 9] = [
 pub const BENCH_ENV: [&str; 2] = ["CUDA_VISIBLE_DEVICES", "CANDLE_LLM_DEVICE"];
 /// `core_llm_testkit::BENCH_GIT_SHA_ENV`.
 pub const GIT_SHA_ENV: &str = "SPECULATIVE_BENCH_GIT_SHA";
+/// `core_llm_testkit::BENCH_ALLOW_SHA_OVERRIDE_ENV`.
+pub const ALLOW_SHA_OVERRIDE_ENV: &str = "SPECULATIVE_BENCH_ALLOW_SHA_OVERRIDE";
+/// `core_llm_testkit::BENCH_BUILD_GIT_SHA_ENV`.
+pub const BUILD_GIT_SHA_ENV: &str = "SPECULATIVE_BENCH_BUILD_GIT_SHA";
+/// `core_llm_testkit::BENCH_BUILD_GIT_DIRTY_ENV`.
+pub const BUILD_GIT_DIRTY_ENV: &str = "SPECULATIVE_BENCH_BUILD_GIT_DIRTY";
+
+/// `core_llm_testkit::bench_build_stamp`: this binary's compile-time SHA and dirty flag.
+pub fn build_stamp() -> (Option<&'static str>, Option<&'static str>) {
+    (
+        option_env!("SPECULATIVE_BENCH_BUILD_GIT_SHA"),
+        option_env!("SPECULATIVE_BENCH_BUILD_GIT_DIRTY"),
+    )
+}
 /// `core_llm_testkit::BenchProvenance::MAX_CHANGES`.
 pub const MAX_GIT_CHANGES: usize = 50;
 /// `core_llm_testkit::BENCH_DEFAULT_NEW_TOKENS`.
@@ -253,8 +276,13 @@ pub fn thinking_json(thinking: &Thinking, caps: &TextLlmCapabilities) -> Value {
     })
 }
 
-/// `core_llm_testkit::git_provenance` as the `git` block of the provenance JSON.
-fn git_json(repo: &Path, var: &dyn Fn(&str) -> Option<String>) -> Value {
+/// `core_llm_testkit::git_provenance` + `reconcile_git_provenance` as the `git` block of the
+/// provenance JSON: the checkout at `repo` now, reconciled with the compile-time stamp `build`.
+pub fn git_json(
+    repo: &Path,
+    build: (Option<&str>, Option<&str>),
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<Value, String> {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .arg("-C")
@@ -265,11 +293,60 @@ fn git_json(repo: &Path, var: &dyn Fn(&str) -> Option<String>) -> Value {
             .filter(|out| out.status.success())
             .and_then(|out| String::from_utf8(out.stdout).ok())
     };
+    let (build_sha, build_dirty) = build;
+    let build_sha = build_sha.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(sha) = build_sha {
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{BUILD_GIT_SHA_ENV} is {sha:?}, not a 40-hex commit"
+            ));
+        }
+    }
+    let build_dirty = match build_dirty.map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some("0") => Some(false),
+        Some("1") => Some(true),
+        Some(other) => return Err(format!("{BUILD_GIT_DIRTY_ENV} is {other:?}, not 0 or 1")),
+    };
     let sha = git(&["rev-parse", "HEAD"])
         .map(|s| s.trim().to_string())
         .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    let given = var(GIT_SHA_ENV);
+    if let Some(given) = &given {
+        if build_sha.is_some() {
+            return Err(format!(
+                "{GIT_SHA_ENV}={given} refused: this binary carries its compile-time SHA"
+            ));
+        }
+        if var(ALLOW_SHA_OVERRIDE_ENV).as_deref() != Some("1") {
+            return Err(format!(
+                "{GIT_SHA_ENV}={given} refused without {ALLOW_SHA_OVERRIDE_ENV}=1"
+            ));
+        }
+        if sha.is_some() && sha.as_deref() != Some(given.trim()) {
+            return Err(format!(
+                "{GIT_SHA_ENV}={given} is not the checkout's HEAD {sha:?}"
+            ));
+        }
+    }
     if let Some(sha) = sha {
         let status = git(&["status", "--porcelain"]);
+        let dirty = status.as_ref().map(|s| !s.trim().is_empty());
+        if let Some(built) = build_sha.filter(|built| *built != sha) {
+            return Err(format!(
+                "this binary was compiled from {built} but the checkout is at {:?}: rebuild it",
+                Some(&sha)
+            ));
+        }
+        if let (Some(built), Some(now)) = (build_dirty, dirty) {
+            if built != now {
+                return Err(format!(
+                    "this binary was compiled from a {} tree but the checkout is {} now: rebuild it",
+                    if built { "dirty" } else { "clean" },
+                    if now { "dirty" } else { "clean" },
+                ));
+            }
+        }
         let changes: Vec<String> = status
             .iter()
             .flat_map(|s| s.lines())
@@ -277,24 +354,28 @@ fn git_json(repo: &Path, var: &dyn Fn(&str) -> Option<String>) -> Value {
             .take(MAX_GIT_CHANGES)
             .map(str::to_string)
             .collect();
-        return json!({
+        return Ok(json!({
             "sha": sha,
-            "dirty": status.as_ref().map(|s| !s.trim().is_empty()),
+            "dirty": dirty,
             "changes": changes,
             "source": "git",
-        });
+            "build_sha": build_sha,
+            "build_dirty": build_dirty,
+        }));
     }
-    let sha = var(GIT_SHA_ENV).map(|s| s.trim().to_string());
-    json!({
+    let sha = given.map(|s| s.trim().to_string());
+    Ok(json!({
         "sha": sha,
         "dirty": null,
         "changes": Vec::<String>::new(),
         "source": sha.as_ref().map(|_| GIT_SHA_ENV),
-    })
+        "build_sha": build_sha,
+        "build_dirty": build_dirty,
+    }))
 }
 
 /// `core_llm_testkit::BenchProvenance::collect` + `to_json`: the checkout this driver was compiled
-/// from, `switches` (the backend's effective states; a variable outside [`BENCH_SWITCHES`] or named
+/// from ([`git_json`] with this binary's [`build_stamp`]; a stale binary is refused), `switches` (the backend's effective states; a variable outside [`BENCH_SWITCHES`] or named
 /// twice is refused) and the raw environment read through `var`.
 pub fn provenance_json(
     switches: &[(&'static str, Value)],
@@ -328,7 +409,7 @@ pub fn provenance_json(
         .map(|&name| (name.to_string(), json!(var(name))))
         .collect();
     Ok(json!({
-        "git": git_json(Path::new(env!("CARGO_MANIFEST_DIR")), var),
+        "git": git_json(Path::new(env!("CARGO_MANIFEST_DIR")), build_stamp(), var)?,
         "switches": switches,
         "env": env,
     }))
@@ -683,6 +764,8 @@ fn speculative_bench_baseline_writes_the_document() {
     let thinking = env("SPECULATIVE_BENCH_THINKING").map_or_else(Thinking::default, |v| {
         parse_thinking(v.trim()).unwrap_or_else(|e| panic!("{e}"))
     });
+    // Refuse a binary that is not this checkout's before measuring anything.
+    provenance_json(&backend_switches(), &env).unwrap_or_else(|e| panic!("{e}"));
     let provider = Provider::load(&LoadSpec {
         quantize,
         ..LoadSpec::dense(snapshot.clone())

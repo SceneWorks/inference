@@ -1386,6 +1386,64 @@ impl CausalLm {
         visual_pos_mask: &[bool],
         deepstack: &[Tensor],
     ) -> Result<Tensor> {
+        let h = self.mrope_deepstack_hidden(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+            self.attn_formulation,
+        )?;
+        self.last_position_logits(&h)
+    }
+
+    /// [`decode_logits_from_embeds_mrope_deepstack`](Self::decode_logits_from_embeds_mrope_deepstack)
+    /// into a step-seam cache — the Qwen3-VL multimodal prefill of a request that then decodes
+    /// through the engine (sc-24446): the same interleaved-M-RoPE / DeepStack stack, attending in
+    /// the cache's formulation exactly as [`StepModel::forward_step`] would. The caller sets the
+    /// cache's RoPE delta (`mrope_delta`) afterwards, so the continuation's text positions follow
+    /// the compressed visual positions.
+    pub fn step_prefill_mrope_deepstack(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut StepKvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+    ) -> Result<Tensor> {
+        let formulation = self.cache_formulation(cache);
+        let h = self.mrope_deepstack_hidden(
+            embeds,
+            positions,
+            cache,
+            visual_pos_mask,
+            deepstack,
+            formulation,
+        )?;
+        self.last_position_logits(&h)
+    }
+
+    /// Logits `[b, vocab]` of the last position of final hidden states `h` `[b, s, hidden]`
+    /// (pre-norm).
+    fn last_position_logits(&self, h: &Tensor) -> Result<Tensor> {
+        let (b, s, _) = h.dims3()?;
+        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
+        let logits = self.project_logits(&last_h)?;
+        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+    }
+
+    /// The interleaved-M-RoPE / DeepStack decoder stack over `embeds` into `cache`, attending in
+    /// `formulation`: final hidden states `[b, s, hidden]` (pre-norm). The one body behind both
+    /// the reference and the step-seam Qwen3-VL prefill.
+    fn mrope_deepstack_hidden(
+        &self,
+        embeds: &Tensor,
+        positions: [&[i32]; 3],
+        cache: &mut dyn KvCache,
+        visual_pos_mask: &[bool],
+        deepstack: &[Tensor],
+        formulation: AttnFormulation,
+    ) -> Result<Tensor> {
         // Interleaved M-RoPE is Qwen3-VL's whole-model schedule; a per-layer-type table (Gemma 4)
         // has no M-RoPE form, and running the sliding schedule on every layer would be silently
         // wrong rather than an error.
@@ -1403,7 +1461,6 @@ impl CausalLm {
             &self.device,
         )?;
         let h0 = embeds.to_dtype(self.dtype)?;
-        let (b, s, _) = h0.dims3()?;
         // The hidden state + RoPE tables follow each layer onto its device (a no-op clone for a
         // single-device model); DeepStack features are moved onto the running device by the fusion.
         let mut cur = h0.device().clone();
@@ -1411,7 +1468,7 @@ impl CausalLm {
         let mut sin_d = sin.clone();
         // Qwen3-VL only (Gemma 4 is refused above), so no layer ever reads or writes this.
         let mut shared_kv = SharedKv::default();
-        let h = deepstack_fused_decoder_layers(
+        deepstack_fused_decoder_layers(
             &h0,
             visual_pos_mask,
             deepstack,
@@ -1430,16 +1487,13 @@ impl CausalLm {
                     cache: &mut *cache,
                     layer_idx: i,
                     shared_kv: &mut shared_kv,
-                    formulation: self.attn_formulation,
+                    formulation,
                     additive_gqa: false,
                     step: StepAttention::Reference,
                 };
                 self.layers[i].forward(&h, &cos_d, &sin_d, AttnMask::Causal, &mut state)
             },
-        )?;
-        let last_h = h.narrow(1, s - 1, 1)?.contiguous()?;
-        let logits = self.project_logits(&last_h)?;
-        Ok(logits.reshape((b, self.cfg.vocab_size as usize))?)
+        )
     }
 
     /// Batched forward over a **left-padded** `[batch, seq]` step with **per-sequence** RoPE positions

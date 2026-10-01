@@ -27,7 +27,8 @@
 //! E8) over the understanding path (`UndTarget`), drawing each token through `UndSampler` — the
 //! rollouts' own draw (the host argmax of a prefix row, the on-device argmax of a decode step, the
 //! shared stochastic sampler over the host row) from their own seeded stream — so every stream is
-//! token-identical to the pre-engine loops.
+//! token-identical to the pre-engine loops. The pipeline's cancel is bridged onto the engine's
+//! flag, so a cancel ends a rollout as the engine's typed `Cancelled` finish.
 
 use std::cell::RefCell;
 
@@ -39,7 +40,7 @@ use mlx_llm::core_llm::{HostSampleReason, SamplerPath};
 use mlx_llm::decode::{
     generate_speculative, EngineOptions, FinishReason, GenerationConfig, LogitsScope,
     NoDraftRollback, NoProposer, Pipelining, SampledToken, SpeculativePrompt, SpeculativeTarget,
-    TargetOutput, TokenSampler,
+    StreamEvent, TargetOutput, TokenSampler,
 };
 use mlx_llm::primitives::KvCache as _;
 
@@ -401,8 +402,9 @@ pub(crate) struct UndRollout {
 impl Qwen3Backbone {
     /// Roll out up to `max_new_tokens` understanding-path tokens on the shared engine from
     /// `first_logits` (the prefix's last-position row), the first fed at temporal `t_idx + 1`, until
-    /// any of `stops` is drawn. `cancel` is checked before every draw — where the pre-engine loops
-    /// checked it — and returns [`Error::Canceled`].
+    /// any of `stops` is drawn. `cancel` is bridged onto the engine's flag — set before the run, the
+    /// engine refuses it before any draw; set mid-run, it is observed after the token being emitted
+    /// and the engine finishes `Cancelled` — and either way returns [`Error::Canceled`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rollout_budgeted(
         &self,
@@ -415,12 +417,40 @@ impl Qwen3Backbone {
         cancel: Option<&CancelFlag>,
         attention: AttentionPlan<'_>,
     ) -> Result<UndRollout> {
+        self.rollout_observed(
+            first_logits,
+            cache,
+            t_idx,
+            stops,
+            max_new_tokens,
+            sampler,
+            cancel,
+            attention,
+            &mut |_| {},
+        )
+    }
+
+    /// [`rollout_budgeted`](Self::rollout_budgeted), handing every engine event to `on_event`
+    /// before the cancel bridge reads the pipeline's flag.
+    #[allow(clippy::too_many_arguments)]
+    fn rollout_observed(
+        &self,
+        first_logits: &[f32],
+        cache: &mut KvCache,
+        t_idx: i32,
+        stops: &[i32],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        cancel: Option<&CancelFlag>,
+        attention: AttentionPlan<'_>,
+        on_event: &mut dyn FnMut(&StreamEvent),
+    ) -> Result<UndRollout> {
         let target = UndTarget {
             backbone: self,
             attention,
             failure: RefCell::new(None),
         };
-        let mut draw = UndSampler::new(sampler, cancel);
+        let mut draw = UndSampler::new(sampler);
         let generation = GenerationConfig {
             max_new_tokens,
             sampling: draw.params,
@@ -432,6 +462,20 @@ impl Qwen3Backbone {
         // (spliced image rows included) is its length in placeholder ids.
         let history = vec![0; start.max(1) as usize];
         let logits = Array::from_slice(first_logits, &[1, first_logits.len() as i32]);
+        // The pipeline's cancel, bridged onto the engine's flag: before a run that would draw (the
+        // engine's typed pre-inference refusal; a zero budget draws nothing and ends `Ok`, as the
+        // pre-engine loops did) and after every emitted token (its `Cancelled` finish).
+        let engine_cancel = mlx_llm::CancelFlag::new();
+        if max_new_tokens > 0 && cancel.is_some_and(CancelFlag::is_cancelled) {
+            engine_cancel.cancel();
+        }
+        let bridged = engine_cancel.clone();
+        let mut bridge = |event: StreamEvent| {
+            on_event(&event);
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                bridged.cancel();
+            }
+        };
         let run = generate_speculative(
             &target,
             &mut NoProposer,
@@ -445,8 +489,8 @@ impl Qwen3Backbone {
             },
             &generation,
             0,
-            &mlx_llm::CancelFlag::new(),
-            &mut |_| {},
+            &engine_cancel,
+            &mut bridge,
             EngineOptions {
                 sampler: Some(&mut draw),
                 // Every draw is read back before the next step; nothing pipelines.
@@ -454,11 +498,17 @@ impl Qwen3Backbone {
                 ..EngineOptions::default()
             },
         );
-        // A model or draw failure keeps its own typed error (a cancel stays `Canceled`).
+        // A model or draw failure keeps its own typed error.
         if let Some(error) = target.failure.take().or_else(|| draw.failure.take()) {
             return Err(error);
         }
-        let run = run.map_err(|e| Error::Msg(format!("sensenova text decode: {e}")))?;
+        let run = run.map_err(|e| match e {
+            mlx_llm::Error::Canceled => Error::Canceled,
+            e => Error::Msg(format!("sensenova text decode: {e}")),
+        })?;
+        if run.output.finish_reason == FinishReason::Cancelled {
+            return Err(Error::Canceled);
+        }
         let stop = (run.output.finish_reason == FinishReason::StopToken)
             .then_some(draw.last)
             .flatten();
@@ -548,24 +598,22 @@ impl SpeculativeTarget for UndTarget<'_> {
 /// A rollout's draw on the engine's sampler seam — exactly the pre-engine loops' draws. The first
 /// draw reads the prefix row it was handed on the host ([`Sampler::pick`]); a greedy decode step
 /// reduces to the argmax on device (one index read back, F-140); a stochastic decode step pulls the
-/// f32 row to the host and draws [`Sampler::pick`] from the rollout's seeded stream. `cancel` is
-/// checked before every draw.
-struct UndSampler<'a> {
+/// f32 row to the host and draws [`Sampler::pick`] from the rollout's seeded stream.
+struct UndSampler {
     sampler: Sampler,
     rng: SplitMix64,
-    cancel: Option<&'a CancelFlag>,
     /// The same knobs in the engine's vocabulary (reported, never drawn from).
     params: SamplingParams,
     device_draws: u64,
     host_draws: u64,
     /// The last token drawn — on a stop-token end, the stop the engine does not emit.
     last: Option<i32>,
-    /// A draw's own error (a cancel), returned as-is by the rollout.
+    /// A draw's own error, returned as-is by the rollout.
     failure: Option<Error>,
 }
 
-impl<'a> UndSampler<'a> {
-    fn new(sampler: Sampler, cancel: Option<&'a CancelFlag>) -> Self {
+impl UndSampler {
+    fn new(sampler: Sampler) -> Self {
         let params = match sampler {
             Sampler::Greedy => SamplingParams::default(),
             Sampler::Sample {
@@ -585,7 +633,6 @@ impl<'a> UndSampler<'a> {
         Self {
             sampler,
             rng: SplitMix64::new(sampler.seed()),
-            cancel,
             params,
             device_draws: 0,
             host_draws: 0,
@@ -595,9 +642,6 @@ impl<'a> UndSampler<'a> {
     }
 
     fn draw(&mut self, logits: &Array) -> Result<i32> {
-        if self.cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(Error::Canceled);
-        }
         let first = self.host_draws + self.device_draws == 0;
         let token = if matches!(self.sampler, Sampler::Greedy) && !first {
             self.device_draws += 1;
@@ -613,7 +657,7 @@ impl<'a> UndSampler<'a> {
     }
 }
 
-impl TokenSampler for UndSampler<'_> {
+impl TokenSampler for UndSampler {
     fn params(&self) -> &SamplingParams {
         &self.params
     }
@@ -1163,5 +1207,41 @@ mod tests {
             }
         }
         assert!(stop_ends > 0 && budget_ends > 0);
+    }
+
+    /// The pipeline's cancel, set mid-rollout, is bridged onto the engine's flag: the engine
+    /// finishes `Cancelled` right after the token it was emitting and the rollout returns the typed
+    /// [`Error::Canceled`] (greedy and stochastic).
+    #[test]
+    fn a_mid_run_cancel_ends_the_rollout_typed() {
+        let (model, ids, idx) = fixture();
+        for sampler in [Sampler::Greedy, samplers()[1]] {
+            let (mut c, first, t_idx) = prefill(&model, &ids, &idx);
+            let cancel = CancelFlag::new();
+            let mut emitted = 0;
+            let run = model.rollout_observed(
+                &first,
+                &mut c,
+                t_idx,
+                &[],
+                12,
+                sampler,
+                Some(&cancel),
+                AttentionPlan::UNBOUNDED,
+                &mut |event| {
+                    if let StreamEvent::Token { step, .. } = event {
+                        emitted = step + 1;
+                        if *step == 2 {
+                            cancel.cancel();
+                        }
+                    }
+                },
+            );
+            assert!(matches!(run, Err(Error::Canceled)), "{sampler:?}");
+            assert_eq!(
+                emitted, 3,
+                "{sampler:?}: cancelled right after the third token"
+            );
+        }
     }
 }

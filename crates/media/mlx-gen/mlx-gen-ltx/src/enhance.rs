@@ -15,16 +15,17 @@
 //! ([`GemmaModel::decode_logits`]); the uncensored variant loads a separate 4-bit Gemma — both go
 //! through the same decode here ([`enhance`]), differing only in model + [`SampleParams`]. The
 //! decode is the shared MLX engine's token-at-a-time loop ([`generate_speculative`] with
-//! [`NoProposer`], epic sc-24432 E8) over the Gemma-3 decoder, drawing every token through this
-//! pipeline's own host sampler ([`sample_token`] with its seeded [`SplitMix64`]) so a seeded
-//! enhancement is token-identical to the pre-engine loop.
+//! [`NoProposer`], epic sc-24432 E8) over the Gemma-3 decoder, drawing every token through the
+//! media pipelines' draw policy ([`sample_token`]: mlx-llm's heap-order host reference, from the
+//! pipeline's own seeded [`SplitMix64`]) so a seeded enhancement is token-identical to the
+//! pre-engine loop drawing the same way.
 //!
 //! **Stop tokens.** The reference hardcodes `token == 1 or token == 107`, but in the Gemma-3
 //! tokenizer **107 is `\n`** (a newline) and `<end_of_turn>` is **106**; `generation_config.json`
 //! gives the authoritative `eos_token_id = [1, 106]`. We stop on **{1, 106}** ([`STOP_TOKENS`]) —
 //! the reference's `107` would truncate at the first newline (a latent bug in the reference).
 
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Result};
@@ -37,9 +38,9 @@ use mlx_llm::decode::{
 };
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::{CausalLm, PrefixCache};
-// The token sampler (temperature / top-k / top-p / repetition penalty) + seeded PRNG live in the core
-// crate's shared `text_sample` module (sc-9561 / F-105) so the lens PromptReasoner reuses them rather
-// than cloning. `SampleParams` stays part of this crate's public API via the re-export.
+// The token-draw knobs + the media pipelines' draw policy over mlx-llm's shared sampler and seeded
+// PRNG live in the core crate's `text_sample` module (sc-9561 / F-105, sc-24446) so the lens
+// PromptReasoner shares them. `SampleParams` stays part of this crate's public API via the re-export.
 pub use mlx_gen::text_sample::SampleParams;
 use mlx_gen::text_sample::{sample_token, SplitMix64};
 
@@ -215,12 +216,12 @@ impl SpeculativeTarget for Gemma3Target<'_> {
     }
 }
 
-/// The LTX-2.3 enhancer's draw on the engine's sampler seam: mlx-gen's shared host sampler
-/// [`sample_token`] over the f32 host logits and the running prompt + generated history, from the
-/// pipeline's own seeded [`SplitMix64`] — exactly the draw the pre-engine loop made (its
-/// repetition penalty, top-k and nucleus follow the reference `make_sampler` /
-/// `make_logits_processors`, not mlx-llm's device sampler), so a seeded enhancement is
-/// token-identical. It reads the history (the penalty window), so the engine never pipelines it.
+/// The LTX-2.3 enhancer's draw on the engine's sampler seam: the media pipelines' draw
+/// [`sample_token`] (mlx-llm's heap-order host reference) over the logits row and the running
+/// prompt + generated history, from the pipeline's own seeded [`SplitMix64`] — its repetition
+/// penalty, top-k and nucleus follow the reference `make_sampler` / `make_logits_processors`, not
+/// mlx-llm's device sampler. It reads the history (the penalty window), so the engine never
+/// pipelines it.
 struct EnhanceSampler<'a> {
     knobs: &'a SampleParams,
     /// The same knobs in the engine's vocabulary (reported, never drawn from).
@@ -266,9 +267,8 @@ impl TokenSampler for EnhanceSampler<'_> {
                 "the LTX-2.3 enhancer sampler takes no constraint mask".into(),
             ));
         }
-        // Pull the `[vocab]` logits to the host once, then draw from the shared host-side sampler.
-        let logits_host = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let token = sample_token(&logits_host, history, self.knobs, &mut self.rng);
+        let token = sample_token(logits, history, self.knobs, &mut self.rng)
+            .map_err(|e| mlx_llm::Error::Msg(e.to_string()))?;
         self.draws += 1;
         self.last = Some(token);
         Ok(SampledToken::Host(token))
@@ -292,6 +292,7 @@ impl TokenSampler for EnhanceSampler<'_> {
     }
 
     fn uniform(&mut self) -> f32 {
+        use mlx_llm::primitives::TokenRng as _;
         self.rng.next_f32()
     }
 
@@ -304,8 +305,8 @@ impl TokenSampler for EnhanceSampler<'_> {
 /// [`NoProposer`]): prefill the prompt, then draw up to `cfg.max_tokens` tokens through
 /// [`EnhanceSampler`], stopping on [`STOP_TOKENS`]. Returns the generated ids **including** a final
 /// stop token (the pre-engine loop's list; the detokenizer drops special tokens). `cancel` is
-/// checked after the prefill and, bridged onto the engine's flag, after every emitted token; a
-/// cancel returns [`Error::Canceled`].
+/// checked after the prefill (unless the budget is zero, which returns no tokens) and, bridged onto
+/// the engine's flag, after every emitted token; a cancel returns [`Error::Canceled`].
 fn decode_gemma3(
     gemma: &GemmaModel,
     prompt_ids: &[i32],
@@ -318,6 +319,11 @@ fn decode_gemma3(
     // Prefill on the full prompt → logits for the first generated token.
     let ids = Array::from_slice(prompt_ids, &[1, prompt_ids.len() as i32]);
     let logits = gemma.decode_logits(&ids, &mut cache, 0)?;
+    // A zero budget draws nothing: the pre-engine loop never reached its per-token cancel check
+    // and returned no tokens.
+    if cfg.max_tokens == 0 {
+        return Ok(Vec::new());
+    }
     if cancel.is_some_and(CancelFlag::is_cancelled) {
         return Err(Error::Canceled);
     }
@@ -653,12 +659,7 @@ mod tests {
         let mut logits = gemma.decode_logits(&ids, &mut cache, 0).unwrap();
         let mut generated: Vec<i32> = Vec::new();
         for step in 0..cfg.max_tokens {
-            let logits_host = logits
-                .as_dtype(Dtype::Float32)
-                .unwrap()
-                .as_slice::<f32>()
-                .to_vec();
-            let next = sample_token(&logits_host, &history, sampler, &mut rng);
+            let next = sample_token(&logits, &history, sampler, &mut rng).unwrap();
             generated.push(next);
             history.push(next);
             if STOP_TOKENS.contains(&next) {
@@ -738,6 +739,36 @@ mod tests {
             ),
             Err(Error::Canceled)
         ));
+    }
+
+    /// `enhance_max_tokens = 0`: the pre-engine loop drew nothing, so it never reached its
+    /// per-token cancel check and returned no tokens — even with a cancel tripped during the
+    /// prefill. The engine port keeps that.
+    #[test]
+    fn gemma3_zero_budget_returns_no_tokens_even_when_cancelled() {
+        let gemma = tiny_gemma3();
+        let prompt: Vec<i32> = vec![2, 5, 9, 17, 33, 64, 100, 7];
+        let cfg = EnhanceConfig {
+            max_tokens: 0,
+            ..EnhanceConfig::default()
+        };
+        let cancel = CancelFlag::new();
+        for cancel in [None, Some(&cancel)] {
+            if let Some(flag) = cancel {
+                flag.cancel();
+            }
+            let sampler = SampleParams::censored(0.7);
+            assert_eq!(
+                reference_gemma3_tokens(&gemma, &prompt, &cfg, &sampler),
+                Vec::<i32>::new()
+            );
+            assert_eq!(
+                decode_gemma3(&gemma, &prompt, &cfg, &sampler, cancel).unwrap(),
+                Vec::<i32>::new(),
+                "cancelled: {}",
+                cancel.is_some()
+            );
+        }
     }
     use sha2::Digest as _;
 

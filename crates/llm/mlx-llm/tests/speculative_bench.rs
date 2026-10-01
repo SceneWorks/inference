@@ -4,6 +4,10 @@
 //! test) over an `mlx-llama` provider: [`core_llm_testkit::run_speculative_bench_from_env`] lists
 //! every `SPECULATIVE_BENCH_*` knob and [`core_llm_testkit::BenchRow`] documents the JSON schema.
 //! The pre-epic baseline driver is `core-llm-testkit/baseline/speculative_bench_baseline.rs`.
+//! Campaign evidence comes from `scripts/release/speculative_bench_campaign.py local --lane mlx`,
+//! which builds both revisions with the commit stamped at compile time
+//! (`SPECULATIVE_BENCH_BUILD_GIT_SHA`) and alternates their processes; a hand run like the one
+//! below records no stamp, which the campaign's checks refuse.
 //!
 //! `--release` links the Release libmlx cell, so fetch that one (the script's default is Debug):
 //!

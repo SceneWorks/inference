@@ -41,14 +41,15 @@ pub use draft_model::{
     DRAFT_FIXTURE_VOCAB,
 };
 pub use speculative::{
-    advertised_parity_cases, bench_config, bench_env, bench_load_spec, bench_request,
-    bench_thinking, check_speculative_bench_on_fixture, check_speculative_greedy_parity,
-    git_provenance, parse_bench_format, parse_bench_sampling, run_speculative_bench,
-    run_speculative_bench_from_env, sampling_json, speculative_prompt_set, BenchConfig,
-    BenchDocument, BenchPrompt, BenchProvenance, BenchRow, BenchSample, BenchStats, BenchSwitches,
-    BenchThinking, ParityCase, ParityRow, PromptClass, BENCH_DEFAULT_NEW_TOKENS,
-    BENCH_DEFAULT_REPEATS, BENCH_ENV, BENCH_GIT_SHA_ENV, BENCH_SCHEMA, BENCH_SWITCHES,
-    BENCH_WARMUP_PROMPT,
+    advertised_parity_cases, bench_build_stamp, bench_config, bench_env, bench_load_spec,
+    bench_request, bench_thinking, check_speculative_bench_on_fixture,
+    check_speculative_greedy_parity, git_provenance, parse_bench_format, parse_bench_sampling,
+    reconcile_git_provenance, run_speculative_bench, run_speculative_bench_from_env, sampling_json,
+    speculative_prompt_set, BenchConfig, BenchDocument, BenchPrompt, BenchProvenance, BenchRow,
+    BenchSample, BenchStats, BenchSwitches, BenchThinking, ParityCase, ParityRow, PromptClass,
+    BENCH_ALLOW_SHA_OVERRIDE_ENV, BENCH_BUILD_GIT_DIRTY_ENV, BENCH_BUILD_GIT_SHA_ENV,
+    BENCH_DEFAULT_NEW_TOKENS, BENCH_DEFAULT_REPEATS, BENCH_ENV, BENCH_GIT_SHA_ENV, BENCH_SCHEMA,
+    BENCH_SWITCHES, BENCH_WARMUP_PROMPT,
 };
 pub use starvector::{
     check_starvector_bounded_fixture, check_starvector_cancellation, check_starvector_descriptor,
