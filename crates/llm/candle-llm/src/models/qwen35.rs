@@ -5492,6 +5492,24 @@ pub(crate) mod tests {
             DecodeCache::graph_identity(&cache),
             "fresh position buffers"
         );
+
+        // A prefix restore (sc-24437): a fresh cache seeded with the live cache's prefix and
+        // moved into its place holds the same positions in different buffers.
+        let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        let identity = DecodeCache::graph_identity(&cache);
+        let state = cache.prefix_snapshot().unwrap();
+        let mut restored = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        restored.restore_prefix(&state).unwrap();
+        cache = restored;
+        assert_eq!(cache.len(), 3);
+        assert_ne!(
+            identity,
+            DecodeCache::graph_identity(&cache),
+            "a restored cache in its place"
+        );
     }
 
     /// sc-24134 after sc-24131 and sc-24441: the CUDA-graph declarations. A linear layer that

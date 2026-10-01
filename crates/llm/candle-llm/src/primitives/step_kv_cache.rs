@@ -734,6 +734,29 @@ mod tests {
         // The same K/V buffers with fresh position buffers.
         cache.positions = Some(DevicePositions::new(&Device::Cpu).unwrap());
         assert_ne!(identity, cache.graph_identity(), "fresh position buffers");
+
+        // A prefix restore (sc-24437): a fresh cache seeded with the live cache's prefix and
+        // moved into its place holds the same positions in different buffers.
+        use crate::decode::prefix::PrefixSnapshot;
+        let fresh = || {
+            StepKvCache::preallocated(&l, 16)
+                .unwrap()
+                .with_device_positions()
+                .unwrap()
+        };
+        let mut cache = fresh();
+        feed(&mut cache, 3, 0.0);
+        let identity = cache.graph_identity();
+        let entry = cache.snapshot(3).unwrap();
+        let mut restored = fresh();
+        restored.restore(&entry, 3).unwrap();
+        cache = restored;
+        assert_eq!(DecodeCache::len(&cache), 3);
+        assert_ne!(
+            identity,
+            cache.graph_identity(),
+            "a restored cache in its place"
+        );
     }
 
     /// The paged backing sits behind the same seam: exact rollback, memory as reserved slots.
