@@ -24,8 +24,11 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Result};
+use mlx_llm::core_llm::{DecodeReport, PathReport};
 use mlx_llm::decode::{
-    generate_cached_with, generate_from_prefill, ConstraintMask, GenerationConfig, StreamEvent,
+    generate_speculative, prefill_with_prefix, ConstraintMask, EngineOptions, GenerationConfig,
+    NoProposer, PrefixPrefill, RewindableConstraintMask, SpeculativePrompt, SpeculativeRun,
+    StreamEvent,
 };
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::{CausalLm, PrefixCache};
@@ -271,10 +274,153 @@ impl ConstraintMask for NoRepeatNgram {
     }
 }
 
-/// Run the v1.2.0 Gemma-4 enhancement generation policy over the shared decoder stack: greedy
-/// decoding, five-gram suppression, final-logit soft-capping from `ModelConfig`, cancellation, and
-/// the shared streaming loop. Text prefills use the reusable prefix cache; image prefills enter the
-/// same loop after the caller's vision splice.
+/// The constraint's whole state is the token history (the mask is rebuilt from it on every
+/// [`ConstraintMask::allowed`]), so a checkpoint is the history length and a rewind truncates the
+/// history back to it. The token-at-a-time engine run the enhancer takes never rewinds; this keeps
+/// the constraint exact under any proposer the shared engine can run.
+impl RewindableConstraintMask for NoRepeatNgram {
+    fn checkpoint(&self) -> usize {
+        self.history.len()
+    }
+
+    fn rewind(&mut self, checkpoint: usize) {
+        self.history.truncate(checkpoint);
+    }
+}
+
+/// Why the multimodal (I2V) enhancer prefill never reads or feeds the prefix cache.
+const MULTIMODAL_PREFIX_BYPASS: &str =
+    "a multimodal prompt is never cached — its image rows are not in the token key";
+
+/// The v1.2.0 Gemma-4 enhancement sampling policy: greedy, bounded by `cfg`, stopping on
+/// [`STOP_TOKENS`].
+fn gemma4_generation(cfg: &EnhanceConfig) -> GenerationConfig {
+    GenerationConfig {
+        max_new_tokens: cfg.max_tokens,
+        sampling: SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        },
+        seed: Some(cfg.seed),
+        stop_tokens: STOP_TOKENS.to_vec(),
+    }
+}
+
+/// The v1.2.0 Gemma-4 enhancement decode on the shared MLX engine ([`generate_speculative`] with
+/// [`NoProposer`]): greedy, five-gram suppression through the engine's constraint seam, the
+/// request's cancel bridged per token. Text prefills restore and feed the reusable prefix cache;
+/// image prefills enter after the caller's vision splice and bypass it. The returned run carries
+/// the engine's [`DecodeReport`] with the prefix cache's part filled in.
+///
+/// The no-repeat mask is host state that the next draw reads, so the engine draws on the host
+/// (`sampler = host:constraint`) and does not pipeline: a look-ahead draw would need the mask
+/// advanced by a token the host has not read yet.
+fn decode_gemma4(
+    gemma: &CausalLm,
+    prefill: Gemma4EnhancePrefill,
+    cfg: &EnhanceConfig,
+    vocab_size: usize,
+    cancel: &CancelFlag,
+    prefix_cache: &mut PrefixCache,
+) -> Result<SpeculativeRun> {
+    let history = match &prefill {
+        Gemma4EnhancePrefill::Text(ids) => ids,
+        Gemma4EnhancePrefill::Multimodal { input_ids, .. } => input_ids,
+    };
+    let generation = gemma4_generation(cfg);
+    let mut no_repeat = NoRepeatNgram::new(GEMMA4_NO_REPEAT_NGRAM, history.clone(), vocab_size);
+    let decode_cancel = mlx_llm::CancelFlag::new();
+    let bridged_cancel = decode_cancel.clone();
+    let mut on_event = |_event: StreamEvent| {
+        if cancel.is_cancelled() {
+            bridged_cancel.cancel();
+        }
+    };
+    let options = EngineOptions {
+        constraint: Some(&mut no_repeat),
+        ..EngineOptions::default()
+    };
+    match prefill {
+        Gemma4EnhancePrefill::Text(prompt_ids) => {
+            let PrefixPrefill {
+                mut cache,
+                logits,
+                fed_tokens,
+                ..
+            } = prefill_with_prefix(
+                gemma,
+                prefix_cache,
+                &prompt_ids,
+                None,
+                false,
+                &decode_cancel,
+            )
+            .map_err(from_gemma4_decode)?;
+            let mut run = generate_speculative(
+                gemma,
+                &mut NoProposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &prompt_ids,
+                    position_delta: 0,
+                },
+                &generation,
+                0,
+                &decode_cancel,
+                &mut on_event,
+                options,
+            )
+            .map_err(from_gemma4_decode)?;
+            prefix_cache
+                .store_run(&prompt_ids, &run, cache, None, None)
+                .map_err(from_gemma4_decode)?;
+            // Measured, not looked up: the prompt positions the prefill did not feed.
+            let hit = prompt_ids.len() - fed_tokens;
+            run.report.prefix_hit_tokens = hit as u64;
+            run.report.prefix_cache = PathReport {
+                path: if hit > 0 { "hit" } else { "miss" }.into(),
+                reason: None,
+            };
+            Ok(run)
+        }
+        Gemma4EnhancePrefill::Multimodal { input_ids, embeds } => {
+            let mut cache = gemma.new_cache();
+            let logits = gemma
+                .decode_logits_from_embeds(&embeds, &mut cache, 0)
+                .map_err(|e| Error::Msg(format!("ltx_2_5 enhancer multimodal prefill: {e}")))?;
+            let mut run = generate_speculative(
+                gemma,
+                &mut NoProposer,
+                SpeculativePrompt::Prefilled {
+                    cache: &mut cache,
+                    logits,
+                    hidden: None,
+                    history: &input_ids,
+                    position_delta: 0,
+                },
+                &generation,
+                0,
+                &decode_cancel,
+                &mut on_event,
+                options,
+            )
+            .map_err(from_gemma4_decode)?;
+            run.report.prefix_cache = PathReport {
+                path: "bypassed".into(),
+                reason: Some(MULTIMODAL_PREFIX_BYPASS.into()),
+            };
+            Ok(run)
+        }
+    }
+}
+
+/// Run the v1.2.0 Gemma-4 enhancement generation policy over the shared decoder stack and the
+/// shared MLX decode engine: greedy decoding, five-gram suppression, final-logit soft-capping from
+/// `ModelConfig`, cancellation. Text prefills use the reusable prefix cache; image prefills enter
+/// the same engine after the caller's vision splice. Returns the cleaned rewrite and the engine's
+/// measured [`DecodeReport`] for the enhancement decode.
 #[allow(clippy::too_many_arguments)]
 pub fn enhance_gemma4(
     gemma: &CausalLm,
@@ -284,70 +430,24 @@ pub fn enhance_gemma4(
     vocab_size: usize,
     cancel: &CancelFlag,
     prefix_cache: &mut PrefixCache,
-) -> Result<String> {
+) -> Result<(String, DecodeReport)> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
-    let history = match &prefill {
-        Gemma4EnhancePrefill::Text(ids) => ids,
-        Gemma4EnhancePrefill::Multimodal { input_ids, .. } => input_ids,
+    let empty = match &prefill {
+        Gemma4EnhancePrefill::Text(ids) => ids.is_empty(),
+        Gemma4EnhancePrefill::Multimodal { input_ids, .. } => input_ids.is_empty(),
     };
-    if history.is_empty() {
-        return Ok(String::new());
+    if empty {
+        return Ok((String::new(), DecodeReport::default()));
     }
-    let generation = GenerationConfig {
-        max_new_tokens: cfg.max_tokens,
-        sampling: SamplingParams {
-            temperature: 0.0,
-            ..Default::default()
-        },
-        seed: Some(cfg.seed),
-        stop_tokens: STOP_TOKENS.to_vec(),
-    };
-    let mut no_repeat = NoRepeatNgram::new(GEMMA4_NO_REPEAT_NGRAM, history.clone(), vocab_size);
-    let decode_cancel = mlx_llm::CancelFlag::new();
-    let bridged_cancel = decode_cancel.clone();
-    let mut on_event = |_event: StreamEvent| {
-        if cancel.is_cancelled() {
-            bridged_cancel.cancel();
-        }
-    };
-    let output = match prefill {
-        Gemma4EnhancePrefill::Text(prompt_ids) => generate_cached_with(
-            gemma,
-            &prompt_ids,
-            &generation,
-            &decode_cancel,
-            &mut on_event,
-            prefix_cache,
-            Some(&mut no_repeat),
-            None,
-        ),
-        Gemma4EnhancePrefill::Multimodal { input_ids, embeds } => {
-            let mut cache = gemma.new_cache();
-            let logits = gemma
-                .decode_logits_from_embeds(&embeds, &mut cache, 0)
-                .map_err(|e| Error::Msg(format!("ltx_2_5 enhancer multimodal prefill: {e}")))?;
-            generate_from_prefill(
-                gemma,
-                &mut cache,
-                logits,
-                input_ids,
-                &generation,
-                &decode_cancel,
-                &mut on_event,
-                Some(&mut no_repeat),
-                None,
-            )
-        }
-    }
-    .map_err(from_gemma4_decode)?;
+    let run = decode_gemma4(gemma, prefill, cfg, vocab_size, cancel, prefix_cache)?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
 
-    let ids: Vec<u32> = output.tokens.iter().map(|&id| id as u32).collect();
-    Ok(clean_response(&tokenizer.decode(&ids, true)?))
+    let ids: Vec<u32> = run.output.tokens.iter().map(|&id| id as u32).collect();
+    Ok((clean_response(&tokenizer.decode(&ids, true)?), run.report))
 }
 
 #[cfg(test)]
@@ -448,6 +548,253 @@ mod tests {
             from_gemma4_decode(mlx_llm::Error::Canceled),
             Error::Canceled
         ));
+    }
+
+    #[test]
+    fn gemma4_no_repeat_ngram_rewind_restores_the_checkpointed_mask() {
+        let mut constraint = NoRepeatNgram::new(3, vec![4, 5, 6, 4, 5], 8);
+        let before = constraint.allowed().to_vec();
+        assert!(!before[6], "token 6 would repeat [4,5,6]");
+        let checkpoint = constraint.checkpoint();
+        for token in [7, 4, 5] {
+            constraint.accept(token);
+        }
+        let explored = constraint.allowed().to_vec();
+        assert!(!explored[7], "the explored history also bans 7 after [4,5]");
+        constraint.rewind(checkpoint);
+        assert_eq!(
+            constraint.allowed(),
+            before.as_slice(),
+            "a rewind must restore exactly the checkpointed mask"
+        );
+    }
+
+    /// The 4-layer `gemma4_unified` fixture `mlx-llm`'s decoder goldens are built from (the same
+    /// one `gemma4_te`'s residency tests load): a real Gemma-4 config — sliding/full alternation,
+    /// final-logit soft-capping — and its complete weight set. Returns the model and its vocab.
+    fn tiny_gemma4() -> (CausalLm, usize) {
+        const DECODER_GOLDENS: &str =
+            include_str!("../../../../llm/testdata/gemma4/gemma4_decoder_goldens.json");
+        let goldens: serde_json::Value =
+            serde_json::from_str(DECODER_GOLDENS).expect("parse gemma4 decoder goldens");
+        let cfg = mlx_llm::ModelConfig::from_json(&goldens["config"]).expect("fixture config");
+        assert!(
+            cfg.is_gemma4(),
+            "the fixture must exercise the Gemma-4 path"
+        );
+        let floats = |v: &serde_json::Value| -> Vec<f64> {
+            v.as_array()
+                .expect("array")
+                .iter()
+                .map(|x| x.as_f64().expect("number"))
+                .collect()
+        };
+        let mut map = std::collections::HashMap::new();
+        for (key, entry) in goldens["weights"].as_object().expect("weights object") {
+            let shape: Vec<i32> = floats(&entry["shape"]).iter().map(|&x| x as i32).collect();
+            let data: Vec<f32> = floats(&entry["data"]).iter().map(|&x| x as f32).collect();
+            map.insert(key.clone(), Array::from_slice(&data, &shape));
+        }
+        let vocab = cfg.vocab_size as usize;
+        let weights = mlx_llm::primitives::Weights::from_map(map);
+        (
+            CausalLm::from_weights(&weights, "", cfg).expect("tiny Gemma-4 CausalLm"),
+            vocab,
+        )
+    }
+
+    /// A prompt avoiding the fixture's stop id `1` whose greedy run is position-sensitive on this
+    /// fixture: shifting the decode RoPE positions by one changes its tokens from the second on,
+    /// so token identity also pins the engine's decode positions (many fixture prompts' argmax
+    /// margins are wide enough to hide an off-by-one).
+    const PARITY_PROMPT: [i32; 12] = [22, 26, 11, 20, 8, 16, 38, 35, 25, 7, 14, 21];
+
+    fn parity_cfg() -> EnhanceConfig {
+        EnhanceConfig {
+            max_tokens: 48,
+            seed: GEMMA4_DEFAULT_SEED,
+        }
+    }
+
+    fn no_repeat(prompt: &[i32], vocab: usize) -> NoRepeatNgram {
+        NoRepeatNgram::new(GEMMA4_NO_REPEAT_NGRAM, prompt.to_vec(), vocab)
+    }
+
+    fn has_repeated_ngram(tokens: &[i32], n: usize) -> bool {
+        let grams: Vec<&[i32]> = tokens.windows(n).collect();
+        grams
+            .iter()
+            .enumerate()
+            .any(|(i, g)| grams[i + 1..].contains(g))
+    }
+
+    /// E8: the enhancer's text decode runs the shared engine, token-for-token the pre-engine plain
+    /// loop (`generate_cached_with`, i.e. `stream::decode_loop`) under the same five-gram
+    /// constraint, and a second request served from the prefix cache matches too. The report names
+    /// what ran: no proposer, the host sampler for the constraint, the prefix cache miss then hit.
+    #[test]
+    fn gemma4_text_enhancer_engine_decode_matches_the_plain_loop() {
+        let (model, vocab) = tiny_gemma4();
+        let prompt = PARITY_PROMPT.to_vec();
+        let cfg = parity_cfg();
+        let generation = gemma4_generation(&cfg);
+
+        let reference = mlx_llm::decode::generate_cached_with(
+            &model,
+            &prompt,
+            &generation,
+            &mlx_llm::CancelFlag::new(),
+            &mut |_| {},
+            &mut PrefixCache::with_budget(1 << 30),
+            Some(&mut no_repeat(&prompt, vocab)),
+            None,
+        )
+        .expect("plain loop")
+        .tokens;
+        assert!(
+            reference.len() >= 16,
+            "the fixture must decode a non-trivial run, got {reference:?}"
+        );
+        let unconstrained = mlx_llm::decode::generate(
+            &model,
+            &prompt,
+            &generation,
+            &mlx_llm::CancelFlag::new(),
+            &mut |_| {},
+        )
+        .expect("unconstrained plain loop")
+        .tokens;
+        assert!(
+            has_repeated_ngram(&unconstrained, GEMMA4_NO_REPEAT_NGRAM)
+                && unconstrained != reference,
+            "the five-gram ban must change this fixture's greedy run, or parity proves nothing \
+             about the constraint: {unconstrained:?}"
+        );
+
+        let mut cache = PrefixCache::with_budget(1 << 30);
+        let cancel = CancelFlag::new();
+        for (turn, expected_path) in ["miss", "hit"].into_iter().enumerate() {
+            let run = decode_gemma4(
+                &model,
+                Gemma4EnhancePrefill::Text(prompt.clone()),
+                &cfg,
+                vocab,
+                &cancel,
+                &mut cache,
+            )
+            .expect("engine decode");
+            assert_eq!(
+                run.output.tokens, reference,
+                "turn {turn}: the engine must emit the plain loop's tokens"
+            );
+            let report = &run.report;
+            assert_eq!(report.proposer, mlx_llm::core_llm::ProposerKind::None);
+            assert_eq!(report.sampler, "host:constraint");
+            assert_eq!(report.prefix_cache.path, expected_path, "turn {turn}");
+            assert_eq!(
+                report.prefix_hit_tokens > 0,
+                expected_path == "hit",
+                "turn {turn}: {report:?}"
+            );
+        }
+    }
+
+    /// The I2V enhancer prefill (spliced embeddings, caller-prefilled cache) on the engine matches
+    /// the pre-engine `generate_from_prefill` loop token for token, and bypasses the prefix cache.
+    #[test]
+    fn gemma4_multimodal_enhancer_engine_decode_matches_the_plain_loop() {
+        let (model, vocab) = tiny_gemma4();
+        let prompt = PARITY_PROMPT.to_vec();
+        let cfg = parity_cfg();
+        let ids = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
+        let embeds = model.embed(&ids).expect("embeds");
+
+        let mut ref_cache = model.new_cache();
+        let logits = model
+            .decode_logits_from_embeds(&embeds, &mut ref_cache, 0)
+            .expect("reference prefill");
+        let reference = mlx_llm::decode::generate_from_prefill(
+            &model,
+            &mut ref_cache,
+            logits,
+            prompt.clone(),
+            &gemma4_generation(&cfg),
+            &mlx_llm::CancelFlag::new(),
+            &mut |_| {},
+            Some(&mut no_repeat(&prompt, vocab)),
+            None,
+        )
+        .expect("plain loop")
+        .tokens;
+        assert!(reference.len() >= 16, "non-trivial run: {reference:?}");
+
+        let mut cache = PrefixCache::with_budget(1 << 30);
+        let run = decode_gemma4(
+            &model,
+            Gemma4EnhancePrefill::Multimodal {
+                input_ids: prompt,
+                embeds,
+            },
+            &cfg,
+            vocab,
+            &CancelFlag::new(),
+            &mut cache,
+        )
+        .expect("engine decode");
+        assert_eq!(run.output.tokens, reference);
+        assert_eq!(run.report.prefix_cache.path, "bypassed");
+        assert!(
+            cache.is_empty(),
+            "a multimodal prompt must not feed the cache"
+        );
+    }
+
+    /// A seeded stochastic run under the same constraint also matches: the engine's `MlxSampler`
+    /// and the plain loop draw through the same `sample_with_path` host draw from the same seeded
+    /// stream, one uniform per row, in the same order (the enhancer itself is greedy; this pins
+    /// that the constraint seam does not perturb the draw order either).
+    #[test]
+    fn gemma4_constrained_stochastic_engine_run_matches_the_plain_loop() {
+        let (model, vocab) = tiny_gemma4();
+        let prompt = PARITY_PROMPT.to_vec();
+        let generation = GenerationConfig {
+            sampling: SamplingParams {
+                temperature: 0.9,
+                top_p: 0.95,
+                ..Default::default()
+            },
+            seed: Some(7),
+            ..gemma4_generation(&parity_cfg())
+        };
+        let reference = mlx_llm::decode::generate_with(
+            &model,
+            &prompt,
+            &generation,
+            &mlx_llm::CancelFlag::new(),
+            &mut |_| {},
+            Some(&mut no_repeat(&prompt, vocab)),
+            None,
+        )
+        .expect("plain loop")
+        .tokens;
+        let mut constraint = no_repeat(&prompt, vocab);
+        let run = generate_speculative(
+            &model,
+            &mut NoProposer,
+            SpeculativePrompt::Tokens(&prompt),
+            &generation,
+            0,
+            &mlx_llm::CancelFlag::new(),
+            &mut |_| {},
+            EngineOptions {
+                constraint: Some(&mut constraint),
+                ..EngineOptions::default()
+            },
+        )
+        .expect("engine");
+        assert!(reference.len() >= 8, "non-trivial run: {reference:?}");
+        assert_eq!(run.output.tokens, reference);
+        assert_eq!(run.report.sampler, "host:constraint");
     }
 
     // `SampleParams` presets + `SplitMix64` determinism are covered in the shared
