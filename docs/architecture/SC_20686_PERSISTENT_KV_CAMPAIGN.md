@@ -55,10 +55,16 @@ transient graphs, and output coexistence, and none is required. Each arm is
 admitted by its runtime guards: the policy must configure every guard (deadline,
 sampling, termination grace, host reserve, child footprint cap, GPU UUID, GPU
 reserve and child GPU cap), and immediately before spawn host and selected-GPU
-free memory must cover cap plus reserve. The host and CUDA watchdogs then
+free memory must cover the arm's estimate plus reserve (`estimate-plus-reserve-v1`).
+The adapter computes no per-coordinate static estimate before spawn (`run_entrypoint`
+passes none; the routes' encode/decode pricing lives in the provider crates and
+their whole-request peak in calibration evidence, neither of which the adapter
+reads), so every arm falls back to its cap (`child-footprint-cap-fallback`): its
+admission is still cap plus reserve. The host and CUDA watchdogs then
 terminate the owned tree on a cap or reserve breach. Every sealed unit's
-`supervision.json` records that `admission` (`mode: runtime-guarded`, caps,
-reserves, optional static floors) with `wholeProcessPeakBoundBytes: null` and
+`supervision.json` records that `admission` (`mode: runtime-guarded`, `rule`,
+caps, reserves, optional static floors, each estimate's source and bytes, the
+available bytes compared) with `wholeProcessPeakBoundBytes: null` and
 its `wholeProcessPeakUnknownReason`; a resumed unit without it is rejected. A
 pre-spawn refusal, watchdog abort, or failed child writes a sealed
 `unaccepted.json` (`accepted: false`, outcome `refused`/`aborted`/`failed`) into
@@ -302,7 +308,7 @@ coordinates seal an explicit `--seed 42`.
 The policy is the strict `darwin-mlx` schema (`schemaVersion`, `backend`, `deadlineSeconds`,
 `pollMillis`, `termGraceMillis`, `hostFreeReserveBytes`, `childFootprintCapBytes`, `stdoutCapBytes`,
 `stderrCapBytes`, `eventCapBytes`); the caps must be chosen for the host that runs it, and every arm
-is refused before spawn unless free memory covers cap plus reserve. The run needs the Metal GPU for
+is refused before spawn unless free memory covers its estimate (here the cap fallback) plus reserve. The run needs the Metal GPU for
 its duration. Each snapshot is an immutable tier root (`<revision>/q4` or a revision directory),
 except the two Metal VACE routes, which take the worker-assembled snapshot (`transformer/` beside
 `t5_encoder.safetensors`, `vae.safetensors`, `tokenizer.json`; VACE-Fun adds `transformer_2/`)

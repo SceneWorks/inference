@@ -23,11 +23,12 @@ class Probe:
         return self.free
 
     def host_admission(self):
-        free = self.host_free()
-        return free, safety.darwin_host_memory(4096, {
-            "freePages": free // 4096, "speculativePages": 0, "purgeablePages": 0,
+        # Like SystemProbe: the admission measure is the components' availableBytes (whole pages).
+        host = safety.darwin_host_memory(4096, {
+            "freePages": self.host_free() // 4096, "speculativePages": 0, "purgeablePages": 0,
             "inactivePages": 0, "fileBackedPages": 0,
             "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
+        return host["availableBytes"], host
 
     def tree_footprint(self, _pgid):
         return self.footprint
@@ -56,12 +57,15 @@ class SupervisorTests(unittest.TestCase):
         self.policy = safety.load_policy(policy_file)
 
     def run_child(self, script, *, probe=None, floor=None, gpu_floor=None, policy=None,
-                  event_path=None, on_spawn=None):
+                  event_path=None, on_spawn=None, measured=None):
         return safety.run_guarded(
             [sys.executable, "-c", script], cwd=self.root, env=os.environ.copy(),
             policy=policy or self.policy, stdout_path=self.root / "stdout",
             stderr_path=self.root / "stderr", static_floor_host_bytes=floor,
-            static_floor_gpu_bytes=gpu_floor, probe=probe or Probe(),
+            static_floor_gpu_bytes=gpu_floor,
+            host_estimate_source=None if floor is None else "test-static-estimate",
+            gpu_estimate_source=None if gpu_floor is None else "test-static-estimate",
+            measured_peak_host_bytes=measured, probe=probe or Probe(),
             event_path=event_path, on_spawn=on_spawn,
         )
 
@@ -85,24 +89,51 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(admission["hostFreeReserveBytes"], self.policy.host_free_reserve_bytes)
         self.assertEqual(admission["policySha256"], self.policy.sha256)
         self.assertIsNone(admission["staticFloorHostBytes"])
+        # No static estimate: the row falls back to its cap, recorded with the rule and the
+        # measurement the rule compared.
+        self.assertEqual(admission["rule"], safety.ESTIMATE_PLUS_RESERVE_RULE)
+        self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"]),
+                         (safety.CAP_FALLBACK_ESTIMATE_SOURCE, self.policy.child_footprint_cap_bytes))
+        self.assertEqual(admission["hostAvailableBytes"], admission["hostMemoryComponents"]["availableBytes"])
         # The unknown transient peak is a recorded field (null plus reason), not a refusal.
         self.assertIsNone(admission["wholeProcessPeakBoundBytes"])
         self.assertEqual(admission["wholeProcessPeakUnknownReason"], safety.UNKNOWN_PEAK_REASON)
         for mutation in ({"mode": "static-peak-proof"}, {"wholeProcessPeakUnknownReason": ""},
                          {"wholeProcessPeakBoundBytes": 10**6}, {"policySha256": "0" * 64},
-                         {"backend": "unknown"}, {"staticFloorHostBytes": 10**6 + 1}):
+                         {"backend": "unknown"}, {"staticFloorHostBytes": 10**6 + 1},
+                         {"rule": "cap-plus-reserve"}, {"rule": None}, {"hostEstimateSource": None},
+                         {"hostEstimateBytes": None}, {"hostEstimateBytes": 10**6 + 1},
+                         {"hostEstimateBytes": 10**6 - 1}, {"hostEstimateSource": "unnamed-static"},
+                         {"staticFloorHostBytes": 1024},
+                         {"hostAvailableBytes": admission["hostAvailableBytes"] - 1},
+                         {"gpuEstimateBytes": 1}):
             with self.subTest(mutation=mutation):
                 with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
                     safety.validate_admission({**admission, **mutation}, policy_sha256=self.policy.sha256)
+        for missing in ("rule", "hostEstimateSource", "hostEstimateBytes", "hostAvailableBytes"):
+            with self.subTest(missing=missing):
+                with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
+                    safety.validate_admission({key: value for key, value in admission.items() if key != missing},
+                                              policy_sha256=self.policy.sha256)
         cuda = safety.runtime_guarded_admission(dataclasses.replace(
             self.policy, backend="linux-cuda", gpu_free_reserve_bytes=1024, child_gpu_cap_bytes=10**6,
-            cuda_device_uuid="GPU-12345678-1234-1234-1234-123456789abc"), static_floor_gpu_bytes=1024)
-        safety.validate_admission(cuda, policy_sha256=self.policy.sha256)
+            cuda_device_uuid="GPU-12345678-1234-1234-1234-123456789abc"), static_floor_gpu_bytes=1024,
+            gpu_estimate_source="test-static-estimate")
+        self.assertEqual((cuda["gpuEstimateSource"], cuda["gpuEstimateBytes"]), ("test-static-estimate", 1024))
+        # A static admission (no measurement yet) is structurally valid; only a run row must
+        # also record available memory covering estimate plus reserve.
+        safety.validate_admission(cuda, policy_sha256=self.policy.sha256, admitted=False)
+        with self.assertRaisesRegex(safety.SupervisionError, "below reserve plus estimate"):
+            safety.validate_admission(cuda, policy_sha256=self.policy.sha256)
+        measured = {**cuda, "hostAvailableBytes": 100 + 10**6, "gpuAvailableBytes": 1024 + 1024}
+        safety.validate_admission(measured, policy_sha256=self.policy.sha256)
         for mutation in ({"cudaDeviceUuid": None}, {"gpuFreeReserveBytes": None},
-                         {"childGpuCapBytes": 0}, {"staticFloorGpuBytes": 10**6 + 1}):
+                         {"childGpuCapBytes": 0}, {"staticFloorGpuBytes": 10**6 + 1},
+                         {"gpuEstimateSource": None}, {"gpuEstimateBytes": 1023},
+                         {"gpuAvailableBytes": 1024 + 1023}, {"hostAvailableBytes": 100 + 10**6 - 1}):
             with self.subTest(mutation=mutation):
                 with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
-                    safety.validate_admission({**cuda, **mutation}, policy_sha256=self.policy.sha256)
+                    safety.validate_admission({**measured, **mutation}, policy_sha256=self.policy.sha256)
 
     def test_row_without_runtime_guards_is_refused_before_spawn(self):
         for field, value in (("host_free_reserve_bytes", 0), ("child_footprint_cap_bytes", 0),
@@ -126,7 +157,14 @@ class SupervisorTests(unittest.TestCase):
                                    policy=dataclasses.replace(cuda, **{field: value}))
                 self.assertFalse((self.root / "spawned").exists())
         with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
-            safety.runtime_guarded_admission(cuda, static_floor_gpu_bytes=10**6 + 1)
+            safety.runtime_guarded_admission(cuda, static_floor_gpu_bytes=10**6 + 1,
+                                             gpu_estimate_source="test-static-estimate")
+        # A static estimate without its source (or a source without an estimate) is malformed.
+        for floor, source in ((1024, None), (None, "test-static-estimate"), (0, "test-static-estimate")):
+            with self.subTest(floor=floor, source=source):
+                with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
+                    safety.runtime_guarded_admission(self.policy, static_floor_host_bytes=floor,
+                                                     host_estimate_source=source)
         self.assertEqual(safety.runtime_guarded_admission(cuda)["childGpuCapBytes"], 10**6)
         record = self.read_unaccepted(caught.exception)
         self.assertEqual((record["accepted"], record["outcome"]), (False, "refused"))
@@ -143,10 +181,60 @@ class SupervisorTests(unittest.TestCase):
             self.run_child("open('spawned','w').close()",
                            floor=self.policy.child_footprint_cap_bytes + 1)
         self.assertFalse((self.root / "spawned").exists())
-        # Free RAM exactly covering cap plus reserve, and a floor under the cap, are admitted.
-        result = self.run_child("open('spawned','w').close()", probe=Probe(free=needed), floor=1024)
-        self.assertEqual(result.admission["staticFloorHostBytes"], 1024)
+        # Without an estimate the row falls back to the cap: covering cap plus reserve (to the next
+        # whole page) is admitted.
+        result = self.run_child("open('spawned','w').close()", probe=Probe(free=needed + 4095))
+        self.assertEqual(result.admission["hostEstimateSource"], safety.CAP_FALLBACK_ESTIMATE_SOURCE)
         self.assertTrue((self.root / "spawned").exists())
+
+    def test_a_row_is_admitted_on_its_estimate_plus_reserve(self):
+        # Estimate 8092 + reserve 100: admitted at exactly 8192 available (two pages), refused one
+        # byte (here: one page) less, both far below the cap (10**6) plus reserve.
+        estimate = 2 * 4096 - self.policy.host_free_reserve_bytes
+        needed = self.policy.host_free_reserve_bytes + estimate
+        with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory") as caught:
+            self.run_child("open('spawned','w').close()", probe=Probe(free=needed - 1), floor=estimate)
+        self.assertFalse((self.root / "spawned").exists())
+        self.assertIn(safety.ESTIMATE_PLUS_RESERVE_RULE, caught.exception.detail)
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual((record["outcome"], record["admission"]["hostAvailableBytes"]), ("refused", needed - 4096))
+        safety.validate_admission(record["admission"], policy_sha256=self.policy.sha256, admitted=False)
+        with self.assertRaisesRegex(safety.SupervisionError, "below reserve plus estimate"):
+            safety.validate_admission(record["admission"], policy_sha256=self.policy.sha256)
+        result = self.run_child("open('spawned','w').close()", probe=Probe(free=needed), floor=estimate)
+        self.assertTrue((self.root / "spawned").exists())
+        admission = safety.validate_admission(result.admission, policy_sha256=self.policy.sha256)
+        self.assertEqual((admission["staticFloorHostBytes"], admission["hostEstimateSource"],
+                          admission["hostEstimateBytes"], admission["hostAvailableBytes"]),
+                         (estimate, "test-static-estimate", estimate, needed))
+        # A completed identical unit that measured more raises the estimate to its peak.
+        (self.root / "spawned").unlink()
+        for path in ("stdout", "stderr"):
+            (self.root / path).unlink()
+        with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
+            self.run_child("open('spawned','w').close()", probe=Probe(free=needed), floor=estimate,
+                           measured=estimate + 1)
+        self.assertFalse((self.root / "spawned").exists())
+        self.assertEqual(safety.admission_estimate(1024, "s", 2048, 10**6, "host"),
+                         (safety.MEASURED_PEAK_ESTIMATE_SOURCE, 2048))
+        self.assertEqual(safety.admission_estimate(1024, "s", 512, 10**6, "host"), ("s", 1024))
+        self.assertEqual(safety.admission_estimate(None, None, 512, 10**6, "host"),
+                         (safety.CAP_FALLBACK_ESTIMATE_SOURCE, 10**6))
+        with self.assertRaisesRegex(safety.SupervisionError, "preflight-memory"):
+            safety.admission_estimate(1024, "s", 10**6 + 1, 10**6, "host")
+
+    def test_an_estimate_admitted_row_is_still_aborted_at_its_cap(self):
+        # Admitted on an 8092-byte estimate (exactly estimate plus reserve available), the child's
+        # owned footprint then exceeds the 10**6 cap: the unchanged footprint watchdog aborts and
+        # reaps it.
+        estimate = 2 * 4096 - self.policy.host_free_reserve_bytes
+        with self.assertRaisesRegex(safety.SupervisionError, "child-footprint") as caught:
+            self.run_child("import time; time.sleep(5)", floor=estimate,
+                           probe=Probe(free=2 * 4096, footprint=self.policy.child_footprint_cap_bytes + 1))
+        self.assertFalse(safety._group_pids(caught.exception.pid))
+        record = self.read_unaccepted(caught.exception)
+        self.assertEqual(record["outcome"], "aborted")
+        self.assertEqual(record["admission"]["hostEstimateBytes"], estimate)
 
     def test_insufficient_cuda_free_is_a_sealed_unaccepted_refusal(self):
         cuda = dataclasses.replace(self.policy, backend="linux-cuda",

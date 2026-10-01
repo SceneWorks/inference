@@ -25,8 +25,9 @@ the ``Executable`` path that command prints. The executable must be built and se
 invoking this launcher. No static
 whole-process peak bound exists for these cells; each role is admitted by the
 supervisor's runtime guards (watchdog cap, host reserve, deadline, sampling) when
-pre-spawn host available RAM covers cap plus reserve. The admission, with the unknown
-peak recorded as null plus reason, is sealed with every role. A pre-spawn refusal,
+pre-spawn host available RAM covers the role's source-budget estimate plus the reserve
+(``role_admission_estimate``; the supervisor's estimate-plus-reserve rule). The admission,
+with the unknown peak recorded as null plus reason, is sealed with every role. A pre-spawn refusal,
 watchdog abort or failed child is written as a sealed unaccepted log record and
 leaves the campaign incomplete; it is never an accepted role.
 
@@ -233,27 +234,75 @@ def _validate_source_budget(value: object, mode: str, tier: str, model: dict[str
         raise CampaignError("source budget decode plan differs from frozen campaign plan")
     if budget["runtimeOverheadBytes"] is not None or budget["wholeProcessPeakBoundBytes"] is not None:
         raise CampaignError("source budget must leave unmeasured runtime overhead and whole-process peak unknown")
-    logical = sum(model["files"][name]["size"] for name in
-                  ("dit.safetensors", "t5_encoder.safetensors", "vae.safetensors"))
-    if budget["modelLogicalBytes"] != logical:
+    expected = _source_budget_components(mode, tier, model)
+    if budget["modelLogicalBytes"] != expected["modelLogicalBytes"]:
         raise CampaignError("source budget logical model bytes differ from sealed inventory")
-    per_token = 435_200 if tier == "q8" else 230_400
-    schedule = (1, 3, 3) if mode == "i2v" else (3, 3, 1)
+    if (budget["terminalKvBytes"] != expected["terminalKvBytes"]
+            or budget["appendOldStagedAndNewDenseBytes"] != expected["appendOldStagedAndNewDenseBytes"]):
+        raise CampaignError("source budget KV shape arithmetic differs from campaign geometry")
+    if budget["decodeWorkingSetEstimateBytes"] != expected["decodeWorkingSetEstimateBytes"]:
+        raise CampaignError("source budget decode estimate differs from frozen z16 plan")
+    return budget
+
+
+# Dense K/V bytes per token of the Krea 14B DiT (2 x 40 layers x 5120 dim x bf16): the rate of each
+# chunk's new dense tokens in the source budget, and of the whole cache on the dense path.
+DENSE_KV_BYTES_PER_TOKEN = 819_200
+
+
+def _append_coexistence(schedule: tuple[int, ...], per_token: int) -> tuple[int, int]:
+    """(terminal KV bytes, peak old + staged cache plus the new chunk's dense K/V) at per_token."""
     previous = 0
     append_coexistence = 0
     for frames in schedule:
         current = frames * 1_560
         staged = previous + current
         append_coexistence = max(append_coexistence,
-                                 (previous + staged) * per_token + current * 819_200)
+                                 (previous + staged) * per_token + current * DENSE_KV_BYTES_PER_TOKEN)
         previous = staged
-    if budget["terminalKvBytes"] != previous * per_token or budget["appendOldStagedAndNewDenseBytes"] != append_coexistence:
-        raise CampaignError("source budget KV shape arithmetic differs from campaign geometry")
+    return previous * per_token, append_coexistence
+
+
+def _source_budget_components(mode: str, tier: str, model: dict[str, Any]) -> dict[str, int]:
+    """The observer's sourceBudget numbers (generate_smoke ``sc20684_source_budget``), derived
+    before spawn from the sealed model inventory and the frozen campaign geometry."""
+    logical = sum(model["files"][name]["size"] for name in
+                  ("dit.safetensors", "t5_encoder.safetensors", "vae.safetensors"))
+    per_token = 435_200 if tier == "q8" else 230_400
+    schedule = (1, 3, 3) if mode == "i2v" else (3, 3, 1)
+    terminal, append_coexistence = _append_coexistence(schedule, per_token)
     output_voxels = 28 * 480 * 832
     tile_voxels = 28 * 256 * 256
-    if budget["decodeWorkingSetEstimateBytes"] != 64 * output_voxels + 6_500 * tile_voxels:
-        raise CampaignError("source budget decode estimate differs from frozen z16 plan")
-    return budget
+    return {
+        "modelLogicalBytes": logical,
+        "terminalKvBytes": terminal,
+        "appendOldStagedAndNewDenseBytes": append_coexistence,
+        "decodeWorkingSetEstimateBytes": 64 * output_voxels + 6_500 * tile_voxels,
+        # The same append arithmetic on the dense path (every cached token at the dense rate).
+        "denseAppendOldStagedAndNewDenseBytes": _append_coexistence(schedule, DENSE_KV_BYTES_PER_TOKEN)[1],
+    }
+
+
+ROLE_ESTIMATE_SOURCES = {
+    "paired": "sc20684-source-budget-paired-v1",
+    "dense-baseline": "sc20684-source-budget-dense-baseline-v1",
+}
+
+
+def role_admission_estimate(mode: str, tier: str, model: dict[str, Any], role: str) -> tuple[str, int]:
+    """A role's estimate-plus-reserve admission estimate from its source-budget components.
+
+    Every component a role prices is summed as if coexisting (conservative; never a peak proof):
+    the paired role holds the logical model, the packed append peak, a dense parity generation's
+    append peak (the packed cache outlives it) and the decode working set; the dense baseline
+    holds the logical model, the dense append peak and the decode working set."""
+    budget = _source_budget_components(mode, tier, model)
+    base = budget["modelLogicalBytes"] + budget["decodeWorkingSetEstimateBytes"] + budget["denseAppendOldStagedAndNewDenseBytes"]
+    if role == "paired":
+        return ROLE_ESTIMATE_SOURCES[role], base + budget["appendOldStagedAndNewDenseBytes"]
+    if role == "dense-baseline":
+        return ROLE_ESTIMATE_SOURCES[role], base
+    raise CampaignError(f"unknown SC-20684 measurement role {role}")
 
 
 def _validate_phase_memory(value: object, phases: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1421,11 +1470,13 @@ def run_matrix(
                        if (index := path.name[len(role_name) + 1:].split(".", 1)[0]).isdecimal()]
             attempt = max(indices) + 1 if indices else 0
             unaccepted = logs / f"{role_name}.{attempt}.unaccepted.json"
+            estimate_source, estimate_bytes = role_admission_estimate(mode, tier, model, role)
             try:
                 result = supervisor.run_guarded(
                     argv, cwd=ROOT, env=env, policy=safety_policy,
                     stdout_path=logs / f"{role_name}.{attempt}.stdout.log",
                     stderr_path=logs / f"{role_name}.{attempt}.stderr.log",
+                    static_floor_host_bytes=estimate_bytes, host_estimate_source=estimate_source,
                 )
             except supervisor.SupervisionError as error:
                 supervisor.write_unaccepted_record(

@@ -148,7 +148,11 @@ class DarwinHostMemoryTests(unittest.TestCase):
             with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
                 safety.validate_admission(admission, policy_sha256=darwin.sha256)
             admission["hostMemoryComponents"] = CASES[0]["expect"]
-            safety.validate_admission(admission, policy_sha256=darwin.sha256)
+            # The rule's compared measure must be the components' own availableBytes.
+            with self.assertRaisesRegex(safety.SupervisionError, "invalid-admission"):
+                safety.validate_admission(admission, policy_sha256=darwin.sha256, admitted=False)
+            admission["hostAvailableBytes"] = CASES[0]["expect"]["availableBytes"]
+            safety.validate_admission(admission, policy_sha256=darwin.sha256, admitted=False)
             cuda = policy("linux-cuda", {"cudaDeviceUuid": "GPU-00000000-0000-0000-0000-000000000000",
                                          "gpuFreeReserveBytes": 1, "childGpuCapBytes": 1})
             foreign = {**safety.runtime_guarded_admission(cuda), "hostMemoryComponents": CASES[0]["expect"]}
@@ -168,3 +172,46 @@ class DarwinHostMemoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhasePrecheckRamTests(unittest.TestCase):
+    """The kv-poc phase precheck requires only the policy's host reserve; per-unit
+    estimate-plus-reserve admission (Rust and Python parents) decides each unit."""
+
+    def reserve_gib(self, policy: Path) -> subprocess.CompletedProcess:
+        env = {**os.environ, "INFERENCE_SHA": "x", "SCENEWORKS_SHA": "y"}
+        return subprocess.run(["bash", "-c", f'source "{COMMON}"; policy_reserve_gib "{policy}"'],
+                              capture_output=True, text=True, env=env, check=False)
+
+    @unittest.skipUnless(shutil.which("python3.12"), "common.sh reads policies with python3.12")
+    def test_every_phase_policy_needs_only_its_reserve(self):
+        for name in ("llm.json", "capture.json", "media-64.json"):
+            policy = ROOT / ".github/kv-poc/policies" / name
+            data = json.loads(policy.read_bytes())
+            result = self.reserve_gib(policy)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # Rounded up to whole GiB; the child cap never enters the precheck.
+            self.assertEqual(int(result.stdout), -(-data["hostFreeReserveBytes"] // 1024**3), name)
+            self.assertLess(int(result.stdout) * 1024**3,
+                            data["hostFreeReserveBytes"] + data["childFootprintCapBytes"], name)
+        with tempfile.TemporaryDirectory() as directory:
+            for body in ({"childFootprintCapBytes": 1}, {"hostFreeReserveBytes": 0}):
+                broken = Path(directory) / "broken.json"
+                broken.write_text(json.dumps(body), encoding="utf-8")
+                self.assertNotEqual(self.reserve_gib(broken).returncode, 0, body)
+
+    def test_phase_precheck_never_requires_cap_plus_reserve(self):
+        phase = (ROOT / ".github/kv-poc/phase.sh").read_text(encoding="utf-8")
+        precheck = phase[phase.index("# 2. Precheck."):phase.index('echo "precheck: GO"')]
+        self.assertIn('need="$(policy_reserve_gib "$phase_policy"', precheck)
+        for phase_name, policy in (("a1|a2|a3", "$F/policies/llm.json"), ("b", "$F/policies/capture.json"),
+                                   ("*", "$F2/policies/$W2_POLICY")):
+            self.assertIn(f'{phase_name}) phase_policy="{policy}"', precheck)
+        for script in (precheck, COMMON.read_text(encoding="utf-8"),
+                       (ROOT / ".github/kv-poc/probe.sh").read_text(encoding="utf-8")):
+            self.assertNotIn("childFootprintCapBytes", script)
+            self.assertNotIn("need=84", script)
+            self.assertNotIn("policy_need_gib", script)
+        # Its other checks stay: LM Studio idle and no competing GPU/build processes.
+        self.assertIn("lms_idle ||", precheck)
+        self.assertIn("busy_processes", precheck)

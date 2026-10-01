@@ -44,6 +44,14 @@ class CampaignAdapterTests(unittest.TestCase):
         )
         return {"safety_policy": policy, "probe": Probe()}
 
+    def measured_admission(self, policy):
+        """A CUDA admission as run_guarded records it: with the host and device measurements
+        covering each estimate (the cap fallback) plus its reserve."""
+        admission = self.adapter.supervisor.runtime_guarded_admission(policy)
+        admission["hostAvailableBytes"] = policy.host_free_reserve_bytes + admission["hostEstimateBytes"]
+        admission["gpuAvailableBytes"] = policy.gpu_free_reserve_bytes + admission["gpuEstimateBytes"]
+        return admission
+
     def test_runner_admits_by_runtime_guards_and_seals_refusal_or_abort_as_unaccepted(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -67,6 +75,13 @@ class CampaignAdapterTests(unittest.TestCase):
                 run.supervision["admission"], policy_sha256=policy.sha256)
             self.assertIsNone(admission["wholeProcessPeakBoundBytes"])
             self.assertEqual(admission["childGpuCapBytes"], policy.child_gpu_cap_bytes)
+            # SC-20686 coordinates have no static estimate in the campaign path: host and device
+            # fall back to their caps.
+            fallback = self.adapter.supervisor.CAP_FALLBACK_ESTIMATE_SOURCE
+            self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"]),
+                             (fallback, policy.child_footprint_cap_bytes))
+            self.assertEqual((admission["gpuEstimateSource"], admission["gpuEstimateBytes"]),
+                             (fallback, policy.child_gpu_cap_bytes))
             self.adapter.cleanup_campaign_run(run)
             self.assertFalse((root / "failed").exists())
 
@@ -77,7 +92,7 @@ class CampaignAdapterTests(unittest.TestCase):
                  "preflight-memory"),
                 ("refused", "gpu_free",
                  lambda: policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes - 1,
-                 "CUDA free is below reserve plus child cap"),
+                 "CUDA free .* is below reserve .* plus estimate .*child-footprint-cap-fallback"),
                 ("aborted", "tree_footprint",
                  lambda _owner: policy.child_footprint_cap_bytes + 1, "child-footprint"),
             ):
@@ -98,7 +113,8 @@ class CampaignAdapterTests(unittest.TestCase):
                 self.assertIs(record["accepted"], False)
                 self.assertEqual(record["coordinate"], "route/normal")
                 self.assertEqual(record["pid"] is None, record["outcome"] == "refused")
-                self.adapter.supervisor.validate_admission(record["admission"], policy_sha256=policy.sha256)
+                self.adapter.supervisor.validate_admission(record["admission"], policy_sha256=policy.sha256,
+                                                           admitted=record["outcome"] != "refused")
 
     def test_runner_seals_spawn_timeout_and_evidence_failures_as_unaccepted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -770,8 +786,7 @@ class CampaignAdapterTests(unittest.TestCase):
                     ({"phase": "process-sample", "sample_kind": "process", "peak_bytes": 1},),
                     event, media, None,
                     {"pid": 123, "exitCode": 0, "ownedProcessGroupReaped": True,
-                     "admission": self.adapter.supervisor.runtime_guarded_admission(
-                         self.runner_safety()["safety_policy"])},
+                     "admission": self.measured_admission(self.runner_safety()["safety_policy"])},
                 )
 
             def row_builder(_spec, arm, _events, _hashes):
@@ -841,7 +856,7 @@ class CampaignAdapterTests(unittest.TestCase):
             resume.mkdir()
             (resume / "units").mkdir()
             (resume / "identity.json").write_bytes(identity_raw)
-            admission = self.adapter.supervisor.runtime_guarded_admission(policy)
+            admission = self.measured_admission(policy)
 
             def runner(_spec, _arm):
                 return self.adapter.CampaignRun(
@@ -896,7 +911,7 @@ class CampaignAdapterTests(unittest.TestCase):
                     ("producer", "--sc20686-events", str(root / "events"), "--out", str(output)),
                     (sample,), event, output, None,
                     {"pid": 100 + len(calls), "exitCode": 0, "ownedProcessGroupReaped": True,
-                     "admission": self.adapter.supervisor.runtime_guarded_admission(policy)},
+                     "admission": self.measured_admission(policy)},
                 )
 
             def row_builder(_spec, arm, _events, _hashes):

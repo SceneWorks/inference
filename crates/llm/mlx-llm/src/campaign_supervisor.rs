@@ -27,6 +27,108 @@ pub const HOST_MEMORY_ADMISSION_ENV: &str = "SCENEWORKS_CAMPAIGN_HOST_MEMORY_ADM
 /// 2^63 bytes, so all three fail closed on the same input.
 const AVAILABLE_BYTES_LIMIT: u64 = 1 << 63;
 
+/// The pre-spawn admission rule of every campaign parent (this supervisor and
+/// `scripts/media_campaign_supervisor.py`): a unit (row, arm, role, capture, coordinate) starts
+/// only when host available memory covers that unit's estimated peak plus the host reserve. The
+/// child footprint cap and the live host-reserve watchdog are unchanged by it: a unit that grows
+/// past its cap, or eats into the reserve, is still aborted (runtime catching is the tradeoff).
+pub const ESTIMATE_PLUS_RESERVE_RULE: &str = "estimate-plus-reserve-v1";
+/// Estimate source of a unit with no static estimate: the child footprint cap itself, which makes
+/// its admission exactly the former cap-plus-reserve rule.
+pub const CAP_FALLBACK_ESTIMATE_SOURCE: &str = "child-footprint-cap-fallback";
+/// Estimate source when an already-completed identical unit measured a peak above the static
+/// estimate, so a known underestimate is never reused.
+pub const MEASURED_PEAK_ESTIMATE_SOURCE: &str = "measured-peak-of-completed-identical-unit";
+
+/// One unit's admission estimate: the bytes the rule adds to the host reserve and where they came
+/// from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionEstimate {
+    pub source: String,
+    pub bytes: u64,
+}
+
+impl AdmissionEstimate {
+    /// `max(static estimate, measured peak of an already-completed identical unit)`, or the child
+    /// footprint cap when the unit has no static estimate. An estimate above the cap refuses the
+    /// unit before spawn: the cap watchdog would abort it anyway.
+    pub fn resolve(
+        static_estimate: Option<(&str, u64)>,
+        measured_peak_bytes: Option<u64>,
+        cap_bytes: u64,
+    ) -> Result<Self, String> {
+        let mut estimate = match static_estimate {
+            Some((source, bytes)) => Self {
+                source: source.into(),
+                bytes,
+            },
+            None => Self {
+                source: CAP_FALLBACK_ESTIMATE_SOURCE.into(),
+                bytes: cap_bytes,
+            },
+        };
+        if let Some(measured) = measured_peak_bytes.filter(|measured| *measured > estimate.bytes) {
+            estimate = Self {
+                source: MEASURED_PEAK_ESTIMATE_SOURCE.into(),
+                bytes: measured,
+            };
+        }
+        if estimate.bytes > cap_bytes {
+            return Err(format!(
+                "admission estimate {} bytes ({}) exceeds the child footprint cap {cap_bytes} bytes; refused before spawn",
+                estimate.bytes, estimate.source
+            ));
+        }
+        estimate.validate(cap_bytes)?;
+        Ok(estimate)
+    }
+
+    /// A recorded estimate names its source and lies in `1..=cap`; the cap fallback is the cap.
+    pub fn validate(&self, cap_bytes: u64) -> Result<(), String> {
+        if self.source.is_empty()
+            || self.bytes == 0
+            || self.bytes > cap_bytes
+            || (self.source == CAP_FALLBACK_ESTIMATE_SOURCE && self.bytes != cap_bytes)
+        {
+            return Err("admission estimate lacks a source or lies outside 1..=child cap".into());
+        }
+        Ok(())
+    }
+}
+
+/// What the supervisor hands its worker in [`HOST_MEMORY_ADMISSION_ENV`]: the rule, the unit's
+/// estimate, and the host measurement it was admitted on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostAdmission {
+    pub rule: String,
+    pub estimate_source: String,
+    pub estimate_bytes: u64,
+    pub host_memory: HostMemory,
+}
+
+impl HostAdmission {
+    pub fn estimate(&self) -> AdmissionEstimate {
+        AdmissionEstimate {
+            source: self.estimate_source.clone(),
+            bytes: self.estimate_bytes,
+        }
+    }
+
+    /// The decision must be this rule's, with a valid estimate, on a measurement covering
+    /// estimate plus reserve.
+    pub fn validate(&self, reserve_bytes: u64, cap_bytes: u64) -> Result<(), String> {
+        if self.rule != ESTIMATE_PLUS_RESERVE_RULE {
+            return Err(format!(
+                "host admission rule is not {ESTIMATE_PLUS_RESERVE_RULE}"
+            ));
+        }
+        self.estimate().validate(cap_bytes)?;
+        self.host_memory
+            .validate_admits(reserve_bytes, self.estimate_bytes)
+    }
+}
+
 /// The raw vm_stat page counters the measure is computed from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VmStatPages {
@@ -131,29 +233,30 @@ impl HostMemory {
         Ok(())
     }
 
-    /// An admitted row's measurement must also cover cap plus reserve.
-    pub fn validate_admits(&self, reserve_bytes: u64, cap_bytes: u64) -> Result<(), String> {
+    /// An admitted unit's measurement must also cover its estimate plus the reserve
+    /// ([`ESTIMATE_PLUS_RESERVE_RULE`]).
+    pub fn validate_admits(&self, reserve_bytes: u64, estimate_bytes: u64) -> Result<(), String> {
         self.validate()?;
         if reserve_bytes
-            .checked_add(cap_bytes)
+            .checked_add(estimate_bytes)
             .is_none_or(|required| self.available_bytes < required)
         {
-            return Err("recorded host available memory is below reserve plus child cap".into());
+            return Err("recorded host available memory is below reserve plus estimate".into());
         }
         Ok(())
     }
 }
 
-/// Worker side: the measurement its supervisor admitted it on, checked against the policy the
-/// worker itself loaded. A worker started outside the supervisor has none and refuses.
-pub fn admitted_host_memory(reserve_bytes: u64, cap_bytes: u64) -> Result<HostMemory, String> {
+/// Worker side: the decision its supervisor admitted it on, checked against the policy the worker
+/// itself loaded. A worker started outside the supervisor has none and refuses.
+pub fn admitted_host(reserve_bytes: u64, cap_bytes: u64) -> Result<HostAdmission, String> {
     let raw = std::env::var(HOST_MEMORY_ADMISSION_ENV).map_err(|_| {
         format!("{HOST_MEMORY_ADMISSION_ENV} is unset: the worker was not admitted by the campaign supervisor")
     })?;
-    let host: HostMemory = serde_json::from_str(&raw)
+    let admission: HostAdmission = serde_json::from_str(&raw)
         .map_err(|error| format!("{HOST_MEMORY_ADMISSION_ENV} is malformed: {error}"))?;
-    host.validate_admits(reserve_bytes, cap_bytes)?;
-    Ok(host)
+    admission.validate(reserve_bytes, cap_bytes)?;
+    Ok(admission)
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +278,8 @@ pub struct RunRequest {
     pub context_tokens: u64,
     /// Largest token count any request in this row can present to the model.
     pub request_tokens: u64,
+    /// The row's estimated peak, admitted under [`ESTIMATE_PLUS_RESERVE_RULE`].
+    pub estimate: AdmissionEstimate,
     /// Fresh paths outside the repository; existing files are never overwritten.
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
@@ -398,6 +503,10 @@ fn validate(policy: &SafetyPolicy, request: &RunRequest) -> Result<(), Failure> 
             .checked_add(policy.child_footprint_cap_bytes)
             .is_none()
         || request.stdout_path == request.stderr_path
+        || request
+            .estimate
+            .validate(policy.child_footprint_cap_bytes)
+            .is_err()
     {
         return Err(Failure::new(
             StopReason::InvalidPolicy,
@@ -535,11 +644,17 @@ fn run_admitted<P: MemoryProbe>(
     preflight_deadline: Instant,
 ) -> Result<ExitStatus, Failure> {
     let available = host.available_bytes;
-    let admission = policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes;
+    let estimate = &request.estimate;
+    // `validate` bounded the estimate by the cap, and reserve plus cap does not overflow.
+    let admission = policy.host_free_reserve_bytes + estimate.bytes;
     if available < admission {
         return Err(Failure::new(
             StopReason::PreflightMemory,
-            format!("host available {available} bytes is below admission {admission} bytes"),
+            format!(
+                "host available {available} bytes is below admission {admission} bytes \
+                 ({ESTIMATE_PLUS_RESERVE_RULE}: estimate {} bytes from {} plus reserve {} bytes)",
+                estimate.bytes, estimate.source, policy.host_free_reserve_bytes
+            ),
             None,
         ));
     }
@@ -566,7 +681,13 @@ fn run_admitted<P: MemoryProbe>(
     // The files created above reserve the paths. Drain threads own them; the child only owns pipe
     // write ends, so neither an unbounded output() buffer nor a full pipe can stall the parent.
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let host_json = serde_json::to_string(host).map_err(|error| {
+    let host_json = serde_json::to_string(&HostAdmission {
+        rule: ESTIMATE_PLUS_RESERVE_RULE.into(),
+        estimate_source: estimate.source.clone(),
+        estimate_bytes: estimate.bytes,
+        host_memory: host.clone(),
+    })
+    .map_err(|error| {
         Failure::new(
             StopReason::Io,
             format!("encode host admission: {error}"),
@@ -1006,8 +1127,19 @@ mod tests {
         RunRequest {
             context_tokens: 100,
             request_tokens: 80,
+            // No static estimate: admitted against the cap (200) plus reserve (100).
+            estimate: AdmissionEstimate::resolve(None, None, 200).unwrap(),
             stdout_path: root.join("stdout.log"),
             stderr_path: root.join("stderr.log"),
+        }
+    }
+
+    /// A request whose unit has a static estimate of `bytes`.
+    fn estimated_request(bytes: u64) -> RunRequest {
+        RunRequest {
+            estimate: AdmissionEstimate::resolve(Some(("test-static-estimate", bytes)), None, 200)
+                .unwrap(),
+            ..new_request()
         }
     }
 
@@ -1128,6 +1260,8 @@ mod tests {
             .unwrap();
         host.validate_admits(host.available_bytes - 1, 1).unwrap();
         assert!(host.validate_admits(host.available_bytes, 1).is_err());
+        host.validate_admits(1, host.available_bytes - 1).unwrap();
+        assert!(host.validate_admits(1, host.available_bytes).is_err());
         for tampered in [
             HostMemory {
                 available_bytes: host.available_bytes + host.page_size_bytes,
@@ -1229,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_receives_the_measurement_it_was_admitted_on() {
+    fn worker_receives_the_decision_it_was_admitted_on() {
         let host = HostMemory::from_pages(
             4096,
             VmStatPages {
@@ -1238,8 +1372,14 @@ mod tests {
             },
         )
         .unwrap();
-        let request = new_request();
-        let expected = serde_json::to_string(&host).unwrap();
+        let request = estimated_request(150);
+        let decision = HostAdmission {
+            rule: ESTIMATE_PLUS_RESERVE_RULE.into(),
+            estimate_source: "test-static-estimate".into(),
+            estimate_bytes: 150,
+            host_memory: host.clone(),
+        };
+        let expected = serde_json::to_string(&decision).unwrap();
         run_guarded(
             Command::new("/bin/sh").args([
                 "-c",
@@ -1250,9 +1390,185 @@ mod tests {
             &mut FakeProbe::hosts([Ok(host.clone())]),
         )
         .unwrap();
-        let decoded: HostMemory = serde_json::from_str(&expected).unwrap();
-        decoded.validate_admits(100, 200).unwrap();
-        assert!(decoded.validate_admits(4000, 97).is_err());
+        let decoded: HostAdmission = serde_json::from_str(&expected).unwrap();
+        assert_eq!(decoded, decision);
+        // 4096 available covers estimate 150 + reserve 3946 exactly, not one byte more.
+        decoded.validate(3946, 200).unwrap();
+        assert!(decoded.validate(3947, 200).is_err());
+        // A decision under another rule, without an estimate source, with an estimate above the
+        // worker's cap, or claiming the cap fallback below the cap is refused.
+        for tampered in [
+            HostAdmission {
+                rule: "cap-plus-reserve".into(),
+                ..decision.clone()
+            },
+            HostAdmission {
+                estimate_source: String::new(),
+                ..decision.clone()
+            },
+            HostAdmission {
+                estimate_source: CAP_FALLBACK_ESTIMATE_SOURCE.into(),
+                ..decision.clone()
+            },
+            HostAdmission {
+                estimate_bytes: 0,
+                ..decision.clone()
+            },
+        ] {
+            assert!(tampered.validate(100, 200).is_err(), "{tampered:?}");
+        }
+        assert!(decision.validate(100, 149).is_err());
+        // The legacy payload (a bare measurement, no estimate) no longer decodes.
+        assert!(
+            serde_json::from_str::<HostAdmission>(&serde_json::to_string(&host).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn a_unit_is_admitted_on_its_estimate_plus_reserve() {
+        // Estimate 50 + reserve 100: admitted at exactly 150 available, refused at 149, although
+        // both are far below the former cap (200) plus reserve.
+        let request = estimated_request(50);
+        let status = run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request,
+            &policy(),
+            &mut FakeProbe::new([Ok(150)]),
+        )
+        .unwrap();
+        assert!(status.success());
+        let request = estimated_request(50);
+        let failure = run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request,
+            &policy(),
+            &mut FakeProbe::new([Ok(149)]),
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, StopReason::PreflightMemory);
+        assert!(
+            failure.detail.contains(ESTIMATE_PLUS_RESERVE_RULE)
+                && failure.detail.contains("test-static-estimate"),
+            "{}",
+            failure.detail
+        );
+        assert!(failure.pid.is_none() && !request.stdout_path.exists());
+    }
+
+    #[test]
+    fn a_unit_without_an_estimate_falls_back_to_the_cap() {
+        let fallback = AdmissionEstimate::resolve(None, None, 200).unwrap();
+        assert_eq!(
+            fallback,
+            AdmissionEstimate {
+                source: CAP_FALLBACK_ESTIMATE_SOURCE.into(),
+                bytes: 200,
+            }
+        );
+        let request = new_request();
+        assert_eq!(request.estimate, fallback);
+        let failure = run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request,
+            &policy(),
+            &mut FakeProbe::new([Ok(299)]),
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, StopReason::PreflightMemory);
+        assert!(failure.detail.contains(CAP_FALLBACK_ESTIMATE_SOURCE));
+        let request = new_request();
+        assert!(run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request,
+            &policy(),
+            &mut FakeProbe::new([Ok(300)]),
+        )
+        .unwrap()
+        .success());
+    }
+
+    #[test]
+    fn the_estimate_is_the_larger_of_static_and_a_measured_identical_unit() {
+        let resolve = |measured| AdmissionEstimate::resolve(Some(("static", 50)), measured, 200);
+        assert_eq!(resolve(None).unwrap().bytes, 50);
+        assert_eq!(resolve(Some(40)).unwrap().source, "static");
+        assert_eq!(
+            resolve(Some(60)).unwrap(),
+            AdmissionEstimate {
+                source: MEASURED_PEAK_ESTIMATE_SOURCE.into(),
+                bytes: 60,
+            }
+        );
+        // A measured peak never lowers the cap fallback.
+        assert_eq!(
+            AdmissionEstimate::resolve(None, Some(60), 200)
+                .unwrap()
+                .bytes,
+            200
+        );
+        // An estimate above the cap is refused before spawn; a zero one is malformed.
+        assert!(resolve(Some(201)).is_err());
+        assert!(AdmissionEstimate::resolve(Some(("static", 201)), None, 200).is_err());
+        assert!(AdmissionEstimate::resolve(Some(("static", 0)), None, 200).is_err());
+        assert!(AdmissionEstimate::resolve(Some(("", 50)), None, 200).is_err());
+        // The supervisor refuses a request carrying an out-of-range estimate as invalid policy.
+        let mut request = new_request();
+        request.estimate.bytes = 201;
+        let failure = run_guarded(
+            &mut Command::new("/usr/bin/true"),
+            &request,
+            &policy(),
+            &mut FakeProbe::new([Ok(1000)]),
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, StopReason::InvalidPolicy);
+    }
+
+    #[test]
+    fn an_estimate_admitted_unit_is_still_aborted_at_its_cap_and_reserve() {
+        // Admitted on estimate 50 (150 available), the child then grows past the 200 cap: the
+        // unchanged footprint watchdog aborts and reaps it.
+        let request = estimated_request(50);
+        let mut probe = FakeProbe::new([Ok(150)]);
+        probe.footprint_after = Box::new(|| Ok(201));
+        let failure = run_guarded(
+            Command::new("/bin/sleep").arg("2"),
+            &request,
+            &policy(),
+            &mut probe,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.reason,
+            StopReason::ChildFootprint,
+            "{}",
+            failure.detail
+        );
+        assert!(gone(failure.pid.unwrap()));
+        // A child at exactly its cap keeps running.
+        let request = estimated_request(50);
+        let mut probe = FakeProbe::new([Ok(150)]);
+        probe.footprint_after = Box::new(|| Ok(200));
+        assert!(run_guarded(
+            Command::new("/bin/sleep").arg("0.05"),
+            &request,
+            &policy(),
+            &mut probe,
+        )
+        .unwrap()
+        .success());
+        // Admitted on its estimate, the host then falls under the reserve: the unchanged
+        // host-reserve watchdog aborts it.
+        let request = estimated_request(50);
+        let failure = run_guarded(
+            Command::new("/bin/sleep").arg("2"),
+            &request,
+            &policy(),
+            &mut FakeProbe::new([Ok(150), Ok(99)]),
+        )
+        .unwrap_err();
+        assert_eq!(failure.reason, StopReason::HostMemory, "{}", failure.detail);
+        assert!(gone(failure.pid.unwrap()));
     }
 
     #[cfg(target_os = "macos")]

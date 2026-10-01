@@ -50,6 +50,9 @@ pub const CAPTURE_SCHEMA: &str = "sc-20677-kv-capture/v1";
 pub const CAPTURE_MANIFEST: &str = "capture-manifest.json";
 pub const CAPTURE_SHA256SUMS: &str = "SHA256SUMS";
 const CAPTURE_TOOL: &str = "sc20677_capture_kv";
+/// Admission estimate source of the capture worker: the snapshot inventory bytes (its resident
+/// weights).
+pub const SC20677_ESTIMATE_SOURCE: &str = "sc20677-snapshot-inventory-bytes";
 const TOKENIZATION: &str = "encode(prompt, special=true) then encode(prompt, special=false) repeated, truncated to --tokens";
 
 /// Resolve `--layers` (`0,mid,last` or integers) against the loaded decoder's layer count.
@@ -602,9 +605,11 @@ fn parent(args: &[String]) -> Result<(), String> {
     let policy_sha256 = policy.seal()?;
     let inventory =
         campaign::inventory_snapshot(&snapshot).map_err(|e| format!("snapshot inventory: {e}"))?;
-    // Resident weights are the conservative static floor; the supervisor's runtime guards (cap,
-    // host reserve, deadline) are what admit the worker.
-    let admission = campaign::runtime_guarded_admission(&policy, inventory.bytes)?;
+    // Resident weights are the static floor and the admission estimate: the supervisor admits the
+    // worker when host available memory covers them plus the reserve, and its runtime guards (cap,
+    // host reserve, deadline) catch a capture that grows beyond them.
+    let admission =
+        campaign::runtime_guarded_admission(&policy, inventory.bytes, SC20677_ESTIMATE_SOURCE)?;
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -634,6 +639,7 @@ fn parent(args: &[String]) -> Result<(), String> {
     let request = RunRequest {
         context_tokens: tokens,
         request_tokens: tokens,
+        estimate: admission.estimate(),
         stdout_path: logs.join(format!("{prefix}.stdout.log")),
         stderr_path: logs.join(format!("{prefix}.stderr.log")),
     };
@@ -703,11 +709,6 @@ fn worker(args: &[String]) -> Result<(), String> {
     if policy.seal()? != flag(args, "--policy-sha256")? {
         return Err("worker safety policy seal differs from the parent's".into());
     }
-    // The supervisor's pre-spawn host measurement travels with the sealed capture metadata.
-    let admitted_host = campaign_supervisor::admitted_host_memory(
-        policy.host_free_reserve_bytes,
-        policy.child_footprint_cap_bytes,
-    )?;
     let snapshot = PathBuf::from(flag(args, "--snapshot")?);
     let out = PathBuf::from(flag(args, "--out")?);
     let prompt_path = PathBuf::from(flag(args, "--prompt-file")?);
@@ -720,6 +721,10 @@ fn worker(args: &[String]) -> Result<(), String> {
     if inventory.sha256 != flag(args, "--snapshot-sha256")? {
         return Err("snapshot inventory changed between parent and worker".into());
     }
+    // The supervisor's admission decision (rule, estimate, pre-spawn host measurement) travels
+    // with the sealed capture metadata.
+    let admission =
+        campaign::supervised_admission(&policy, inventory.bytes, SC20677_ESTIMATE_SOURCE)?;
     let inference_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(3)
@@ -768,7 +773,7 @@ fn worker(args: &[String]) -> Result<(), String> {
         ("inferenceRevision".to_string(), inference_revision),
         (
             "hostMemoryAdmission".to_string(),
-            serde_json::to_string(&admitted_host).map_err(|e| e.to_string())?,
+            serde_json::to_string(&admission).map_err(|e| e.to_string())?,
         ),
     ]);
     let capture = capture_decode_step(model, &ids, &layers)?;

@@ -78,12 +78,16 @@ positive `deadlineSeconds`, `pollMillis`, `termGraceMillis`,
 No static whole-process transient peak bound exists for the six Krea cells, and
 none is required: each role is **admitted by its runtime guards**. The policy must
 configure every guard (deadline, sampling, termination grace, host reserve, child
-footprint cap), and immediately before spawn host available RAM must cover cap plus
-reserve (on macOS `darwin-vm-stat-available-v3`, Activity Monitor's "Cached Files"
+footprint cap), and immediately before spawn host available RAM must cover the role's
+estimate plus the reserve (`estimate-plus-reserve-v1`; the estimate is the launcher's
+`role_admission_estimate`, the observer's `sourceBudget` components summed as if coexisting:
+logical model + decode working set + dense append peak, plus the packed append peak for the
+paired role, which also runs the dense parity generation) (on macOS `darwin-vm-stat-available-v3`, Activity Monitor's "Cached Files"
 model: `(free + speculative + purgeable + max(0, file-backed - speculative)) * page
 size`, recorded component by component in `admission.hostMemoryComponents`); the `phys_footprint` watchdog then terminates the owned process group on a
 cap or reserve breach. Each preserved role's `supervision.admission` records the
-cap, reserve and guards with `wholeProcessPeakBoundBytes: null` and a
+rule, the estimate source and bytes, the available bytes it compared, the cap, reserve and guards
+with `wholeProcessPeakBoundBytes: null` and a
 `wholeProcessPeakUnknownReason`; a resumed role without it is rejected. A pre-spawn
 refusal, watchdog abort, or failed child writes a sealed
 `logs/<cell>.<role>.<attempt>.unaccepted.json` (`accepted: false`) and leaves the

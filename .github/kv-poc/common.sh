@@ -132,8 +132,8 @@ host_memory_from_vm_stat() {
     }'
 }
 
-# Admission-available host RAM in whole GiB (floored, so ">= 84" matches the parents' byte
-# comparison against 84 GiB exactly); fails when vm_stat cannot be measured.
+# Admission-available host RAM in whole GiB (floored, so ">= N" never passes a byte measure below
+# N GiB); fails when vm_stat cannot be measured.
 available_gib() {
   local measured
   measured="$(vm_stat | host_memory_from_vm_stat)" && [ -n "$measured" ] || return 1
@@ -205,10 +205,13 @@ verify_frozen() { # [dir] (default: the W1 frozen dir)
     || { echo "::error title=frozen dir mismatch::$dir does not match its SHA256SUMS"; return 1; }
 }
 
-# Cap + reserve of a darwin-mlx media safety policy, in whole GiB (the parents admit each arm only
-# when available RAM covers both).
-policy_need_gib() {
-  python3.12 -c 'import json, sys; p = json.load(open(sys.argv[1])); print(-(-(p["childFootprintCapBytes"] + p["hostFreeReserveBytes"]) // 1073741824))' "$1"
+# The host reserve of a campaign safety policy (W1 llm.json / capture.json, W2 media), in whole GiB
+# rounded up. The phase precheck requires only this much available RAM: the parents admit each unit
+# (row, arm, role, capture, coordinate) by their estimate-plus-reserve-v1 rule -- available >= that
+# unit's estimated peak + reserve -- and the child cap and reserve watchdogs still abort a unit that
+# outgrows its estimate, so a phase-wide cap + reserve check would only refuse units that fit.
+policy_reserve_gib() {
+  python3.12 -c 'import json, sys; p = json.load(open(sys.argv[1])); r = p["hostFreeReserveBytes"]; assert type(r) is int and r > 0; print(-(-r // 1073741824))' "$1"
 }
 
 # The worker-assembled VACE snapshot layout (mlx_gen_wan::convert::assemble_wan_vace[_fun]_snapshot,

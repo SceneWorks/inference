@@ -5,9 +5,12 @@ A row is admitted by its runtime guards, never by a static whole-process peak pr
 loader, lazy graphs, allocator/driver headroom and output coexistence make that peak
 unobtainable from source. This module never starts a child without a mandatory policy that
 configures every guard (deadline, sampling, termination grace, host reserve, child footprint
-watchdog cap, and for CUDA the device reserve/cap) and a fresh host/device probe covering
-cap plus reserve. The admission and the unknown peak (null plus reason) travel with every
-result; a pre-spawn refusal, watchdog abort or failed child is only ever an unaccepted record.
+watchdog cap, and for CUDA the device reserve/cap) and a fresh host/device probe covering the
+row's estimated peak plus the reserve (ESTIMATE_PLUS_RESERVE_RULE, shared with the Rust
+campaign supervisor). A row without a static estimate falls back to its cap. The cap and reserve
+watchdogs are unchanged: a row that outgrows its estimate past either is still aborted. The
+admission and the unknown peak (null plus reason) travel with every result; a pre-spawn refusal,
+watchdog abort or failed child is only ever an unaccepted record.
 """
 
 from __future__ import annotations
@@ -32,6 +35,11 @@ from scripts import media_campaign_windows as windows
 
 
 RUNTIME_GUARDED_ADMISSION = "runtime-guarded"
+# Mirrors crates/llm/mlx-llm campaign_supervisor::ESTIMATE_PLUS_RESERVE_RULE and its estimate
+# sources: admit a row when available memory covers its estimate plus the reserve.
+ESTIMATE_PLUS_RESERVE_RULE = "estimate-plus-reserve-v1"
+CAP_FALLBACK_ESTIMATE_SOURCE = "child-footprint-cap-fallback"
+MEASURED_PEAK_ESTIMATE_SOURCE = "measured-peak-of-completed-identical-unit"
 UNKNOWN_PEAK_REASON = (
     "whole-process transient peak (loader, lazy graphs, allocator/driver headroom, output "
     "coexistence) is not statically derivable; the row is admitted by the runtime watchdog "
@@ -664,15 +672,41 @@ def _positive(value: object) -> bool:
     return type(value) in (int, float) and math.isfinite(value) and value > 0
 
 
+def admission_estimate(static_bytes: int | None, source: str | None, measured_peak_bytes: int | None,
+                       cap: int, label: str) -> tuple[str, int]:
+    """max(static estimate, measured peak of an already-completed identical unit), or the cap
+    when the row has no static estimate. An estimate above the cap refuses before spawn."""
+    if static_bytes is None:
+        if source is not None:
+            raise SupervisionError("invalid-admission", f"{label} estimate source names no estimate")
+        estimate = (CAP_FALLBACK_ESTIMATE_SOURCE, cap)
+    else:
+        if type(static_bytes) is not int or static_bytes <= 0 or not isinstance(source, str) or not source:
+            raise SupervisionError("invalid-admission", f"{label} static estimate is malformed")
+        estimate = (source, static_bytes)
+    if measured_peak_bytes is not None:
+        if type(measured_peak_bytes) is not int or measured_peak_bytes <= 0:
+            raise SupervisionError("invalid-admission", f"{label} measured peak is malformed")
+        if measured_peak_bytes > estimate[1]:
+            estimate = (MEASURED_PEAK_ESTIMATE_SOURCE, measured_peak_bytes)
+    if estimate[1] > cap:
+        raise SupervisionError("preflight-memory", f"{label} estimate exceeds child cap")
+    return estimate
+
+
 def runtime_guarded_admission(
     policy: SafetyPolicy, *, static_floor_host_bytes: int | None = None,
-    static_floor_gpu_bytes: int | None = None,
+    static_floor_gpu_bytes: int | None = None, host_estimate_source: str | None = None,
+    gpu_estimate_source: str | None = None, measured_peak_host_bytes: int | None = None,
+    measured_peak_gpu_bytes: int | None = None,
 ) -> dict[str, object]:
     """Admit a row by its runtime guards rather than by a static whole-process peak proof.
 
     Refuses before spawn unless every supervisor guard is configured, and when a caller has a
-    conservative static floor, unless that floor fits under the cap. The host/device free
-    probe against cap plus reserve happens in run_guarded immediately before spawn.
+    static estimate (floor plus its named source), unless it fits under the cap. The estimate is
+    max(static, measured peak of an already-completed identical unit), or the cap when there is
+    no static estimate. run_guarded probes host/device free memory against estimate plus reserve
+    immediately before spawn.
     """
     cuda = policy.backend in {"linux-cuda", "windows-cuda"}
     guards = [policy.deadline_seconds, policy.poll_millis, policy.term_grace_millis,
@@ -686,17 +720,19 @@ def runtime_guarded_admission(
             or policy.term_grace_millis >= policy.deadline_seconds * 1000
             or (cuda and not policy.cuda_device_uuid)):
         raise SupervisionError("unguarded-policy", "runtime guards are not all configured; refusing before spawn")
-    floors = ((static_floor_host_bytes, policy.child_footprint_cap_bytes, "host"),
-              (static_floor_gpu_bytes, policy.child_gpu_cap_bytes if cuda else None, "CUDA"))
-    for floor, cap, label in floors:
-        if floor is None:
-            continue
-        if type(floor) is not int or floor <= 0 or cap is None:
-            raise SupervisionError("invalid-admission", f"{label} static floor is malformed")
-        if floor > cap:
-            raise SupervisionError("preflight-memory", f"{label} static floor exceeds child cap")
+    host_source, host_bytes = admission_estimate(
+        static_floor_host_bytes, host_estimate_source, measured_peak_host_bytes,
+        policy.child_footprint_cap_bytes, "host")
+    gpu_source = gpu_bytes = None
+    if cuda:
+        gpu_source, gpu_bytes = admission_estimate(
+            static_floor_gpu_bytes, gpu_estimate_source, measured_peak_gpu_bytes,
+            policy.child_gpu_cap_bytes, "CUDA")
+    elif (static_floor_gpu_bytes, gpu_estimate_source, measured_peak_gpu_bytes) != (None, None, None):
+        raise SupervisionError("invalid-admission", "CUDA static floor is malformed")
     return {
         "mode": RUNTIME_GUARDED_ADMISSION,
+        "rule": ESTIMATE_PLUS_RESERVE_RULE,
         "backend": policy.backend,
         "policySha256": policy.sha256,
         "deadlineSeconds": policy.deadline_seconds,
@@ -709,14 +745,45 @@ def runtime_guarded_admission(
         "childGpuCapBytes": policy.child_gpu_cap_bytes,
         "staticFloorHostBytes": static_floor_host_bytes,
         "staticFloorGpuBytes": static_floor_gpu_bytes,
+        "hostEstimateSource": host_source,
+        "hostEstimateBytes": host_bytes,
+        "gpuEstimateSource": gpu_source,
+        "gpuEstimateBytes": gpu_bytes,
+        # The pre-spawn measurements the rule compared (set by run_guarded once probed).
+        "hostAvailableBytes": None,
+        "gpuAvailableBytes": None,
         "wholeProcessPeakBoundBytes": None,
         "wholeProcessPeakUnknownReason": UNKNOWN_PEAK_REASON,
     }
 
 
-def validate_admission(value: object, *, policy_sha256: str) -> dict[str, object]:
-    """Reject a sealed record whose row was not admitted by the resume policy's runtime guards."""
+def _validate_estimate(value: dict, label: str, source_key: str, bytes_key: str, floor_key: str,
+                       cap_key: str, reserve_key: str, available_key: str, admitted: bool) -> None:
+    source, estimate, floor, cap = value.get(source_key), value.get(bytes_key), value.get(floor_key), value.get(cap_key)
+    if (not isinstance(source, str) or not source or type(estimate) is not int
+            or type(cap) is not int or not 0 < estimate <= cap):
+        raise SupervisionError("invalid-admission", f"record lacks a valid {label} estimate-plus-reserve estimate")
+    if floor is None:
+        valid = source == CAP_FALLBACK_ESTIMATE_SOURCE and estimate == cap
+    else:
+        valid = (type(floor) is int and 0 < floor <= estimate
+                 and source != CAP_FALLBACK_ESTIMATE_SOURCE)
+    if not valid:
+        raise SupervisionError("invalid-admission", f"recorded {label} estimate contradicts its floor or cap fallback")
+    available = value.get(available_key)
+    if available is not None and (type(available) is not int or available < 0):
+        raise SupervisionError("invalid-admission", f"recorded {label} available memory is malformed")
+    if admitted and (available is None or available < value[reserve_key] + estimate):
+        raise SupervisionError("invalid-admission", f"recorded {label} available memory is below reserve plus estimate")
+
+
+def validate_admission(value: object, *, policy_sha256: str, admitted: bool = True) -> dict[str, object]:
+    """Reject a sealed record whose row was not admitted by the resume policy's runtime guards.
+
+    An accepted row (admitted=True) must also record available memory covering its estimate plus
+    the reserve; an unaccepted record (a refusal) may record a short measurement."""
     if (not isinstance(value, dict) or value.get("mode") != RUNTIME_GUARDED_ADMISSION
+            or value.get("rule") != ESTIMATE_PLUS_RESERVE_RULE
             or value.get("policySha256") != policy_sha256
             or value.get("backend") not in {"darwin-mlx", "linux-cuda", "windows-cuda"}
             or not _positive(value.get("childFootprintCapBytes"))
@@ -725,14 +792,16 @@ def validate_admission(value: object, *, policy_sha256: str) -> dict[str, object
             or value.get("wholeProcessPeakBoundBytes") is not None
             or not isinstance(value.get("wholeProcessPeakUnknownReason"), str)
             or not value["wholeProcessPeakUnknownReason"]):
-        raise SupervisionError("invalid-admission", "record lacks a runtime-guarded admission")
+        raise SupervisionError("invalid-admission", "record lacks a runtime-guarded estimate-plus-reserve admission")
     if value["backend"] in {"linux-cuda", "windows-cuda"} and (
             not isinstance(value.get("cudaDeviceUuid"), str) or not value["cudaDeviceUuid"]
             or not _positive(value.get("gpuFreeReserveBytes"))
             or not _positive(value.get("childGpuCapBytes"))):
         raise SupervisionError("invalid-admission", "CUDA admission lacks its device guards")
     if value["backend"] == "darwin-mlx":
-        validate_host_memory(value.get("hostMemoryComponents"))
+        components = validate_host_memory(value.get("hostMemoryComponents"))
+        if value.get("hostAvailableBytes") != components["availableBytes"]:
+            raise SupervisionError("invalid-admission", "recorded host available differs from its vm_stat components")
     elif "hostMemoryComponents" in value:
         raise SupervisionError("invalid-admission", "only a macOS admission records vm_stat components")
     for key, cap in (("staticFloorHostBytes", "childFootprintCapBytes"),
@@ -741,6 +810,15 @@ def validate_admission(value: object, *, policy_sha256: str) -> dict[str, object
         if floor is not None and (type(floor) is not int or not _positive(value.get(cap))
                                   or not 0 < floor <= value[cap]):
             raise SupervisionError("invalid-admission", f"recorded {key} exceeds its cap")
+    _validate_estimate(value, "host", "hostEstimateSource", "hostEstimateBytes", "staticFloorHostBytes",
+                       "childFootprintCapBytes", "hostFreeReserveBytes", "hostAvailableBytes", admitted)
+    if value["backend"] == "darwin-mlx":
+        if any(value.get(key) is not None for key in
+               ("staticFloorGpuBytes", "gpuEstimateSource", "gpuEstimateBytes", "gpuAvailableBytes")):
+            raise SupervisionError("invalid-admission", "a macOS admission records no CUDA estimate")
+    else:
+        _validate_estimate(value, "CUDA", "gpuEstimateSource", "gpuEstimateBytes", "staticFloorGpuBytes",
+                           "childGpuCapBytes", "gpuFreeReserveBytes", "gpuAvailableBytes", admitted)
     return value
 
 
@@ -887,14 +965,17 @@ class RunResult:
 def run_guarded(
     argv: list[str], *, cwd: Path, env: dict[str, str], policy: SafetyPolicy,
     stdout_path: Path, stderr_path: Path, static_floor_host_bytes: int | None = None,
-    static_floor_gpu_bytes: int | None = None, event_path: Path | None = None,
+    static_floor_gpu_bytes: int | None = None, host_estimate_source: str | None = None,
+    gpu_estimate_source: str | None = None, measured_peak_host_bytes: int | None = None,
+    measured_peak_gpu_bytes: int | None = None, event_path: Path | None = None,
     probe: object | None = None, clock: Callable[[], float] = time.monotonic,
     on_spawn: Callable[[int, int | None], None] | None = None,
 ) -> RunResult:
-    """Run one row under runtime-guarded admission.
+    """Run one row under runtime-guarded, estimate-plus-reserve admission.
 
-    Any SupervisionError carries the admission (None only for an unguarded policy) and the
-    owned child PID (None when refused before spawn) so callers can seal it as unaccepted.
+    Any SupervisionError carries the admission (None only for an unguarded policy or a
+    malformed estimate) and the owned child PID (None when refused before spawn) so callers can
+    seal it as unaccepted.
     """
     admission = None
     spawned: list[int] = []
@@ -908,6 +989,9 @@ def run_guarded(
         admission = runtime_guarded_admission(
             policy, static_floor_host_bytes=static_floor_host_bytes,
             static_floor_gpu_bytes=static_floor_gpu_bytes,
+            host_estimate_source=host_estimate_source, gpu_estimate_source=gpu_estimate_source,
+            measured_peak_host_bytes=measured_peak_host_bytes,
+            measured_peak_gpu_bytes=measured_peak_gpu_bytes,
         )
         return _run_admitted(
             argv, cwd=cwd, env=env, policy=policy, admission=admission,
@@ -944,16 +1028,26 @@ def _run_admitted(
         raise SupervisionError(error.reason, f"preflight {error.detail}") from error
     if policy.backend == "darwin-mlx":
         admission["hostMemoryComponents"] = host_memory
-    if host_free < policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes:
-        raise SupervisionError("preflight-memory", "host available is below reserve plus child cap")
+    admission["hostAvailableBytes"] = host_free
+    if host_free < policy.host_free_reserve_bytes + admission["hostEstimateBytes"]:
+        raise SupervisionError(
+            "preflight-memory",
+            f"host available {host_free} bytes is below reserve {policy.host_free_reserve_bytes} plus "
+            f"estimate {admission['hostEstimateBytes']} bytes ({admission['hostEstimateSource']}; "
+            f"{ESTIMATE_PLUS_RESERVE_RULE})")
     gpu_free = None
     if policy.backend in {"linux-cuda", "windows-cuda"}:
         try:
             gpu_free = read_gpu(probe.gpu_free)
         except SupervisionError as error:
             raise SupervisionError(error.reason, f"preflight {error.detail}") from error
-        if gpu_free < policy.gpu_free_reserve_bytes + policy.child_gpu_cap_bytes:
-            raise SupervisionError("preflight-memory", "CUDA free is below reserve plus child cap")
+        admission["gpuAvailableBytes"] = gpu_free
+        if gpu_free < policy.gpu_free_reserve_bytes + admission["gpuEstimateBytes"]:
+            raise SupervisionError(
+                "preflight-memory",
+                f"CUDA free {gpu_free} bytes is below reserve {policy.gpu_free_reserve_bytes} plus "
+                f"estimate {admission['gpuEstimateBytes']} bytes ({admission['gpuEstimateSource']}; "
+                f"{ESTIMATE_PLUS_RESERVE_RULE})")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     with stdout_path.open("xb") as stdout, stderr_path.open("xb") as stderr:

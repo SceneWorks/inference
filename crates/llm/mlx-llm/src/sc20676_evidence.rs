@@ -42,6 +42,9 @@ use crate::{Error, ModelConfig, Result};
 /// pass) instead of refusing the receipt.
 pub const SC20676_SCHEMA_VERSION: u32 = 6;
 pub const SC20676_HARNESS_VERSION: &str = "sc-20676-packed-metal-evidence-v6";
+/// Admission estimate source of an SC-20676 arm: the candidate role's
+/// `campaign::static_role_footprint_budget`.
+pub const SC20676_ESTIMATE_SOURCE: &str = "sc20676-static-role-footprint-budget";
 /// Length of the dense reference continuation greedy agreement is measured over: long enough for
 /// the 0.999 agreement threshold to be meaningful (one flip is ~0.001).
 pub const SC20676_REFERENCE_TOKENS: usize = 1_024;
@@ -2323,10 +2326,26 @@ fn sc20676_admitted_tokens(
     Ok((total, request))
 }
 
+/// The arm's admission estimate: the pinned candidate's conservative load-plus-KV floor
+/// ([`SC20676_ESTIMATE_SOURCE`]).
+fn sc20676_admission_floor(
+    family: &str,
+    snapshot: &Path,
+    total_tokens: u64,
+    request_tokens: u64,
+) -> std::result::Result<u64, String> {
+    campaign::static_role_footprint_budget(
+        campaign::benchmark_model(family, false)?,
+        snapshot,
+        total_tokens,
+        request_tokens,
+    )
+}
+
 /// Admit one arm by its runtime guards (supervised worker, footprint watchdog cap, host reserve,
 /// deadline, sampling) instead of an unobtainable static whole-process peak proof. The pinned
-/// candidate's conservative load-plus-KV floor is recorded as the arm's estimate and still refuses
-/// before spawn when it alone exceeds the child cap.
+/// candidate's conservative load-plus-KV floor is the arm's admission estimate (host available
+/// must cover it plus the reserve) and still refuses before spawn when it alone exceeds the cap.
 fn sc20676_runtime_admission(
     family: &str,
     snapshot: &Path,
@@ -2334,13 +2353,21 @@ fn sc20676_runtime_admission(
     request_tokens: u64,
     policy: &campaign::CampaignSafetyPolicy,
 ) -> std::result::Result<campaign::ReceiptAdmission, String> {
-    let floor = campaign::static_role_footprint_budget(
-        campaign::benchmark_model(family, false)?,
-        snapshot,
-        total_tokens,
-        request_tokens,
-    )?;
-    campaign::runtime_guarded_admission(policy, floor)
+    let floor = sc20676_admission_floor(family, snapshot, total_tokens, request_tokens)?;
+    campaign::runtime_guarded_admission(policy, floor, SC20676_ESTIMATE_SOURCE)
+}
+
+/// Worker side of [`sc20676_runtime_admission`]: the same estimate, checked against the decision
+/// the supervisor admitted the arm on.
+fn sc20676_supervised_admission(
+    family: &str,
+    snapshot: &Path,
+    total_tokens: u64,
+    request_tokens: u64,
+    policy: &campaign::CampaignSafetyPolicy,
+) -> std::result::Result<campaign::ReceiptAdmission, String> {
+    let floor = sc20676_admission_floor(family, snapshot, total_tokens, request_tokens)?;
+    campaign::supervised_admission(policy, floor, SC20676_ESTIMATE_SOURCE)
 }
 
 /// Packed needle outcome relative to the same-weights dense output: exact recovery when the dense
@@ -2387,12 +2414,7 @@ pub fn run_sc20676_worker(
     let (total_tokens, request_tokens) =
         sc20676_admitted_tokens(mode, target_prompt_tokens, policy)?;
     let admission =
-        sc20676_runtime_admission(family, snapshot, total_tokens, request_tokens, policy)?
-            .with_host_memory(Some(campaign_supervisor::admitted_host_memory(
-                policy.host_free_reserve_bytes,
-                policy.child_footprint_cap_bytes,
-            )?));
-    admission.validate_admitted()?;
+        sc20676_supervised_admission(family, snapshot, total_tokens, request_tokens, policy)?;
     let native = u64::try_from(cfg.max_position_embeddings)
         .map_err(|_| "SC-20676 model native context is invalid")?;
     if target_prompt_tokens
@@ -3851,6 +3873,7 @@ pub fn sc20676_cli(args: &[String]) -> std::result::Result<campaign::CampaignOut
             let request = RunRequest {
                 context_tokens: total_tokens,
                 request_tokens,
+                estimate: admission.estimate(),
                 stdout_path: logs.join(format!("{log_prefix}.stdout.log")),
                 stderr_path: logs.join(format!("{log_prefix}.stderr.log")),
             };
@@ -4232,9 +4255,12 @@ mod tests {
             }),
             admission: campaign::ReceiptAdmission {
                 mode: campaign::RUNTIME_GUARDED_ADMISSION.into(),
+                rule: campaign_supervisor::ESTIMATE_PLUS_RESERVE_RULE.into(),
                 child_footprint_cap_bytes: 1 << 30,
                 host_free_reserve_bytes: 1 << 30,
                 static_footprint_floor_bytes: 1 << 20,
+                estimate_source: SC20676_ESTIMATE_SOURCE.into(),
+                estimate_bytes: 1 << 20,
                 host_memory_components: campaign_supervisor::HostMemory::from_pages(
                     16_384,
                     campaign_supervisor::VmStatPages {

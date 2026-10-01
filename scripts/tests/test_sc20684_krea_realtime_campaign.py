@@ -51,10 +51,13 @@ MODEL = {
 def measured_admission(supervisor, policy) -> dict:
     """A darwin admission as run_guarded records it: with its vm_stat components."""
     admission = supervisor.runtime_guarded_admission(policy)
+    # Available memory covering the admission's estimate (the cap fallback) plus the reserve.
+    needed = admission["hostFreeReserveBytes"] + admission["hostEstimateBytes"]
     admission["hostMemoryComponents"] = supervisor.darwin_host_memory(16384, {
-        "freePages": 10**9 // 16384, "speculativePages": 0, "purgeablePages": 0,
+        "freePages": -(-needed // 16384), "speculativePages": 0, "purgeablePages": 0,
         "inactivePages": 0, "fileBackedPages": 0,
             "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
+    admission["hostAvailableBytes"] = admission["hostMemoryComponents"]["availableBytes"]
     return admission
 
 
@@ -1063,11 +1066,43 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             with self.assertRaisesRegex(campaign.CampaignError, "unexpected resume artifact: halt"):
                 prepare()
 
+    def test_role_estimates_price_the_source_budget_and_fit_the_media_cap(self) -> None:
+        # The parent's pre-spawn arithmetic is the observer's sourceBudget (validated against it).
+        for mode, tier in campaign.CASES:
+            budget = source_budget(mode, tier)
+            components = campaign._source_budget_components(mode, tier, MODEL)
+            for key in ("modelLogicalBytes", "terminalKvBytes", "appendOldStagedAndNewDenseBytes",
+                        "decodeWorkingSetEstimateBytes"):
+                self.assertEqual(components[key], budget[key], (mode, tier, key))
+            dense = components["denseAppendOldStagedAndNewDenseBytes"]
+            base = budget["modelLogicalBytes"] + budget["decodeWorkingSetEstimateBytes"] + dense
+            self.assertEqual(campaign.role_admission_estimate(mode, tier, MODEL, "dense-baseline"),
+                             ("sc20684-source-budget-dense-baseline-v1", base))
+            self.assertEqual(campaign.role_admission_estimate(mode, tier, MODEL, "paired"),
+                             ("sc20684-source-budget-paired-v1", base + budget["appendOldStagedAndNewDenseBytes"]))
+        with self.assertRaises(campaign.CampaignError):
+            campaign.role_admission_estimate("t2v", "q8", MODEL, "unknown")
+        # With the pinned W2 Krea inventory every role's estimate fits under the media policy's
+        # cap, so no role falls back to (or is refused by) the cap.
+        pins = ROOT / ".github/kv-poc/models-w2.tsv"
+        sizes = {line.split("\t")[2].split("/", 1)[1]: int(line.split("\t")[3])
+                 for line in pins.read_text(encoding="utf-8").splitlines()
+                 if line.startswith(f"{campaign.MODEL_REPOSITORY}\t")}
+        pinned = {**MODEL, "files": {name: {"size": size, "sha256": "c" * 64} for name, size in sizes.items()}}
+        cap = json.loads((ROOT / ".github/kv-poc/policies/media-64.json").read_bytes())["childFootprintCapBytes"]
+        for mode, tier in campaign.CASES:
+            for role in ("paired", "dense-baseline"):
+                _, estimate = campaign.role_admission_estimate(mode, tier, pinned, role)
+                self.assertLess(estimate, cap, (mode, tier, role))
+
     def test_roles_are_admitted_by_runtime_guards_and_failures_are_unaccepted_records(self) -> None:
         policy = campaign.supervisor.SafetyPolicy(
-            "darwin-mlx", 10, 20, 100, 1024, 10**9, 10**5, 10**5,
+            "darwin-mlx", 10, 20, 100, 1024, 64 * GIB, 10**5, 10**5,
             10**5, None, None, None, "f" * 64, b"{}\n",
         )
+        # The paired role's source-budget estimate, far below the 64 GiB cap.
+        estimate_source, estimate = campaign.role_admission_estimate("t2v", "q8", MODEL, "paired")
+        self.assertLess(estimate, policy.child_footprint_cap_bytes)
         original = campaign.supervisor.run_guarded
 
         class Probe:
@@ -1078,10 +1113,11 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 return self.free
 
             def host_admission(self) -> tuple[int, dict[str, object]]:
-                return self.free, campaign.supervisor.darwin_host_memory(4096, {
+                host = campaign.supervisor.darwin_host_memory(4096, {
                     "freePages": self.free // 4096, "speculativePages": 0, "purgeablePages": 0,
                     "inactivePages": 0, "fileBackedPages": 0,
             "anonymousPages": 0, "throttledPages": 0, "activePages": 0})
+                return host["availableBytes"], host
 
             def tree_footprint(self, _owner: object) -> int:
                 return self.footprint
@@ -1101,8 +1137,11 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             root = Path(directory)
             marker = root / "spawned"
             spawn = f"open({str(marker)!r}, 'w').close()"
-            # Admitted without any static peak bound: the product process is spawned.
-            error = run(root / "admitted", Probe(10**12, 1024), spawn)
+            # Admitted on the role's estimate plus reserve, without any static peak bound: the
+            # product process is spawned although available RAM is far below cap plus reserve.
+            admit = -(-(policy.host_free_reserve_bytes + estimate) // 4096) * 4096
+            self.assertLess(admit, policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes)
+            error = run(root / "admitted", Probe(admit, 1024), spawn)
             self.assertIsInstance(error, campaign.CampaignError)
             self.assertTrue(marker.exists())
             self.assertTrue((root / "admitted/logs/t2v-q8.paired.0.stdout.log").is_file())
@@ -1112,6 +1151,9 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                              (False, "failed", "invalid-evidence"))
             self.assertIsInstance(sealed["pid"], int)
             campaign.supervisor.validate_admission(sealed["admission"], policy_sha256=policy.sha256)
+            self.assertEqual((sealed["admission"]["hostEstimateSource"], sealed["admission"]["hostEstimateBytes"],
+                              sealed["admission"]["staticFloorHostBytes"]),
+                             (estimate_source, estimate, estimate))
             self.assertFalse((root / "admitted/roles").exists())
             marker.unlink()
 
@@ -1122,14 +1164,15 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["pid"]), (False, "failed", None))
 
             refused = root / "refused"
-            short = policy.host_free_reserve_bytes + policy.child_footprint_cap_bytes - 1
+            short = policy.host_free_reserve_bytes + estimate - 1
             for attempt in range(2):
                 error = run(refused, Probe(short, 1024), spawn)
                 self.assertEqual(error.reason, "preflight-memory")
                 sealed = record(refused, attempt)
                 self.assertEqual((sealed["accepted"], sealed["outcome"], sealed["pid"]), (False, "refused", None))
                 self.assertEqual(sealed["coordinate"], "t2v-q8.paired")
-                campaign.supervisor.validate_admission(sealed["admission"], policy_sha256=policy.sha256)
+                campaign.supervisor.validate_admission(sealed["admission"], policy_sha256=policy.sha256,
+                                                       admitted=False)
             # A gap in attempt indices must not reuse an index: the next attempt is max + 1.
             for path in (refused / "logs").glob("t2v-q8.paired.0.*"):
                 path.unlink()

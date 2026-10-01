@@ -145,14 +145,18 @@ fi
 
 # 2. Precheck. Fails the job with the reason; never stops or kills anything.
 problems=""
-# W1: llm.json 68 GiB cap + 16 reserve. W2: the media policy's cap + reserve (media-64: 64 + 16).
-need=84
-if [ "$W2" = 1 ]; then
-  need="$(policy_need_gib "$F2/policies/$W2_POLICY" 2>/dev/null)" || { need=0; problems="$problems; $F2/policies/$W2_POLICY is unreadable"; }
-fi
+# RAM: only the phase policy's host reserve (16 GiB for llm.json, capture.json and media-64). The
+# parent admits each unit by estimate-plus-reserve-v1 (available >= that unit's estimate + reserve,
+# recorded in its admission) and refuses, unaccepted, any unit that does not fit at its start.
+case "$phase" in
+  a1|a2|a3) phase_policy="$F/policies/llm.json" ;;
+  b) phase_policy="$F/policies/capture.json" ;;
+  *) phase_policy="$F2/policies/$W2_POLICY" ;;
+esac
+need="$(policy_reserve_gib "$phase_policy" 2>/dev/null)" || { need=0; problems="$problems; $phase_policy is unreadable"; }
 if measured="$(vm_stat | host_memory_from_vm_stat)" && [ -n "$measured" ]; then
   gib=$(( ${measured%% *} / 1073741824 ))
-  echo "available RAM (free + speculative + purgeable + file cache): ${gib} GiB (need >= ${need} = cap + reserve)"
+  echo "available RAM (free + speculative + purgeable + file cache): ${gib} GiB (need >= ${need} = the host reserve; each unit is admitted on its own estimate + reserve)"
   echo "  components (available-bytes page-size free speculative purgeable inactive file-backed anonymous throttled active file-cache pages): $measured"
   [ "$gib" -ge "$need" ] || problems="$problems; available RAM is ${gib} GiB (< ${need})"
 else

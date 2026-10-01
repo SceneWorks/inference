@@ -58,7 +58,7 @@ row "chip" "$(code "$chip") ($(code "$model"))"
 row "hw.memsize" "$(( memsize / 1073741824 )) GiB ($memsize bytes)"
 row "macOS" "$(code "$macos ($build)")"
 row "NAX" "$nax"
-row "available RAM" "${free_gib} GiB (free + speculative + purgeable + file cache; W1 precheck needs >= 84, W2 >= its policy's cap + reserve)"
+row "available RAM" "${free_gib} GiB (free + speculative + purgeable + file cache; each phase precheck needs >= its policy's host reserve, and each unit its estimate + reserve)"
 row "inactive / purgeable / compressed" "${inactive_gib} / ${purgeable_gib} / ${compressed_gib} GiB"
 row "LM Studio" "$(code "$LMS_STATE")"
 row "GPU/build processes" "$(code "${busy:-none}")"
@@ -92,9 +92,9 @@ else
 fi
 if [ -d "$R" ]; then row "runs dir $R" "$(code "$(ls "$R" "$R/evidence" 2>/dev/null | tr '\n' ' ')")"; else row "runs dir" "none yet"; fi
 
-need_gib=84
+need_gib="$(policy_reserve_gib "$KV_DIR/policies/llm.json")" || need_gib=16
 if [ "${KV_MODE:-}" = w2 ]; then
-  need_gib="$(policy_need_gib "$KV_DIR/policies/$W2_POLICY")" || need_gib=80
+  need_gib="$(policy_reserve_gib "$KV_DIR/policies/$W2_POLICY")" || need_gib=16
   if [ -f "$F2/SHA256SUMS" ]; then
     if (cd "$F2" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1); then row "W2 frozen dir" "sealed, verifies"; else row "W2 frozen dir" "sealed but DOES NOT verify"; fi
   else
@@ -103,7 +103,7 @@ if [ "${KV_MODE:-}" = w2 ]; then
   for route in wan_vace wan_vace_fun; do
     if problem="$(verify_w2_vace "$route")"; then row "W2 assembled $route" "verifies"; else row "W2 assembled $route" "$(code "$problem") (the w2-assets job assembles it)"; fi
   done
-  row "W2 precheck RAM" "cap + reserve of $W2_POLICY = ${need_gib} GiB"
+  row "W2 precheck RAM" "host reserve of $W2_POLICY = ${need_gib} GiB (each arm/role: its estimate + reserve)"
   summary ""
   summary "#### W2 pinned assets (\`models-w2.tsv\`) vs free disk (report only; the w2-assets job fails on a shortfall)"
   summary '```'
