@@ -59,20 +59,46 @@ fn silu(x: &Array) -> Result<Array> {
     mlx_gen::nn::silu(x)
 }
 
-/// Load a biased diffusers `nn.Linear` (`{prefix}.weight` `[out, in]` + `{prefix}.bias`). The
-/// `keep_f32` flag casts the loaded weight/bias to f32 (the `_keep_in_fp32_modules` /
-/// `_skip_layerwise_casting_patterns` set — patch/condition embedders, the output proj); the
-/// attn/FFN Linears load as stored (bf16 in production) and matmul against a `compute_dtype`-cast
-/// activation.
-fn load_linear(w: &Weights, prefix: &str, keep_f32: bool) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{prefix}.weight"))?.clone();
-    let bias = w.require(&format!("{prefix}.bias"))?.clone();
-    let (weight, bias) = if keep_f32 {
-        (f32c(&weight)?, f32c(&bias)?)
-    } else {
-        (weight, bias)
-    };
+/// Load a biased diffusers `nn.Linear` (`{prefix}.weight` `[out, in]` + `{prefix}.bias`). `dtype`
+/// is the precision it is held in: f32 for the `_keep_in_fp32_modules` /
+/// `_skip_layerwise_casting_patterns` set (patch/condition embedders, the output proj), else the
+/// model's `compute_dtype` for the attn/FFN/VACE projections, which matmul against a
+/// `compute_dtype`-cast activation. Casting at load (as diffusers' `torch_dtype` does) rather than
+/// holding the stored dtype matters for a mixed checkpoint: Wan2.1-VACE-1.3B stores its main blocks
+/// F32 beside BF16 VACE blocks, which ran its main-block GEMMs in F32 at twice the weight memory.
+fn load_linear(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLinear> {
+    let weight = load_as(w, &format!("{prefix}.weight"), dtype)?;
+    let bias = load_as(w, &format!("{prefix}.bias"), dtype)?;
     Ok(AdaptableLinear::dense(weight, Some(bias)))
+}
+
+/// Whether [`WanVaceTransformer::from_weights`] holds diffusers tensor `name` in f32 — the reference's
+/// `_keep_in_fp32_modules` / layerwise-casting-skip set: the patch/condition embedders, the output
+/// projection, and every modulation table and affine `norm2` — rather than at the compute dtype. The
+/// load-time resident pricing uses this to price each tensor at the width the loader holds it in.
+pub(crate) fn vace_tensor_kept_f32(name: &str) -> bool {
+    let top = name.split('.').next().unwrap_or_default();
+    matches!(
+        top,
+        "patch_embedding"
+            | "vace_patch_embedding"
+            | "condition_embedder"
+            | "proj_out"
+            | "scale_shift_table"
+    ) || name.ends_with(".scale_shift_table")
+        || name.contains(".norm2.")
+}
+
+/// One stored tensor held at `dtype`. A cast is evaluated here, so the held parameter does not keep
+/// its stored-dtype source alive through a lazy graph (the cast's whole point is the smaller copy).
+fn load_as(w: &Weights, key: &str, dtype: Dtype) -> Result<Array> {
+    let stored = w.require(key)?;
+    if stored.dtype() == dtype {
+        return Ok(stored.clone());
+    }
+    let cast = stored.as_dtype(dtype)?;
+    cast.eval()?;
+    Ok(cast)
 }
 
 /// Flatten a diffusers Conv3d patch-embedding weight `[dim, in, pt, ph, pw]` → an equivalent Linear
@@ -108,15 +134,17 @@ struct Attn {
 }
 
 impl Attn {
-    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig, dtype: Dtype) -> Result<Self> {
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q: load_linear(w, &format!("{prefix}.to_q"), false)?,
-            k: load_linear(w, &format!("{prefix}.to_k"), false)?,
-            v: load_linear(w, &format!("{prefix}.to_v"), false)?,
-            o: load_linear(w, &format!("{prefix}.to_out.0"), false)?,
-            norm_q: w.require(&format!("{prefix}.norm_q.weight"))?.clone(),
-            norm_k: w.require(&format!("{prefix}.norm_k.weight"))?.clone(),
+            q: load_linear(w, &format!("{prefix}.to_q"), dtype)?,
+            k: load_linear(w, &format!("{prefix}.to_k"), dtype)?,
+            v: load_linear(w, &format!("{prefix}.to_v"), dtype)?,
+            o: load_linear(w, &format!("{prefix}.to_out.0"), dtype)?,
+            // The qk-RMSNorm weights are cast with the projections (they are not in the
+            // reference's `_keep_in_fp32_modules`).
+            norm_q: load_as(w, &format!("{prefix}.norm_q.weight"), dtype)?,
+            norm_k: load_as(w, &format!("{prefix}.norm_k.weight"), dtype)?,
             num_heads: cfg.base.num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -224,19 +252,19 @@ struct CoreBlock {
 }
 
 impl CoreBlock {
-    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig) -> Result<Self> {
+    fn load(w: &Weights, prefix: &str, cfg: &WanVaceConfig, dtype: Dtype) -> Result<Self> {
         let dim = cfg.base.dim as i32;
         Ok(Self {
             mod_table: f32c(
                 &w.require(&format!("{prefix}.scale_shift_table"))?
                     .reshape(&[1, 1, 6, dim])?,
             )?,
-            self_attn: Attn::load(w, &format!("{prefix}.attn1"), cfg)?,
-            cross_attn: Attn::load(w, &format!("{prefix}.attn2"), cfg)?,
+            self_attn: Attn::load(w, &format!("{prefix}.attn1"), cfg, dtype)?,
+            cross_attn: Attn::load(w, &format!("{prefix}.attn2"), cfg, dtype)?,
             norm2_w: f32c(w.require(&format!("{prefix}.norm2.weight"))?)?,
             norm2_b: f32c(w.require(&format!("{prefix}.norm2.bias"))?)?,
-            ffn_fc1: load_linear(w, &format!("{prefix}.ffn.net.0.proj"), false)?,
-            ffn_fc2: load_linear(w, &format!("{prefix}.ffn.net.2"), false)?,
+            ffn_fc1: load_linear(w, &format!("{prefix}.ffn.net.0.proj"), dtype)?,
+            ffn_fc2: load_linear(w, &format!("{prefix}.ffn.net.2"), dtype)?,
             eps: cfg.base.eps as f32,
         })
     }
@@ -303,16 +331,22 @@ struct VaceBlock {
 }
 
 impl VaceBlock {
-    fn load(w: &Weights, prefix: &str, has_proj_in: bool, cfg: &WanVaceConfig) -> Result<Self> {
+    fn load(
+        w: &Weights,
+        prefix: &str,
+        has_proj_in: bool,
+        cfg: &WanVaceConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
         let proj_in = if has_proj_in {
-            Some(load_linear(w, &format!("{prefix}.proj_in"), false)?)
+            Some(load_linear(w, &format!("{prefix}.proj_in"), dtype)?)
         } else {
             None
         };
         Ok(Self {
             proj_in,
-            core: CoreBlock::load(w, prefix, cfg)?,
-            proj_out: load_linear(w, &format!("{prefix}.proj_out"), false)?,
+            core: CoreBlock::load(w, prefix, cfg, dtype)?,
+            proj_out: load_linear(w, &format!("{prefix}.proj_out"), dtype)?,
         })
     }
 
@@ -402,7 +436,12 @@ impl WanVaceTransformer {
         let dim = cfg.base.dim as i32;
         let mut blocks = Vec::with_capacity(cfg.base.num_layers);
         for i in 0..cfg.base.num_layers {
-            blocks.push(CoreBlock::load(w, &format!("blocks.{i}"), cfg)?);
+            blocks.push(CoreBlock::load(
+                w,
+                &format!("blocks.{i}"),
+                cfg,
+                compute_dtype,
+            )?);
         }
         let mut vace_blocks = Vec::with_capacity(cfg.vace_layers.len());
         for j in 0..cfg.vace_layers.len() {
@@ -411,6 +450,7 @@ impl WanVaceTransformer {
                 &format!("vace_blocks.{j}"),
                 j == 0,
                 cfg,
+                compute_dtype,
             )?);
         }
         let half = cfg.base.freq_dim / 2;
@@ -420,15 +460,31 @@ impl WanVaceTransformer {
         let dit = Self {
             patch_embedding: load_patch_embedding(w, "patch_embedding")?,
             vace_patch_embedding: load_patch_embedding(w, "vace_patch_embedding")?,
-            time_embedding_0: load_linear(w, "condition_embedder.time_embedder.linear_1", true)?,
-            time_embedding_1: load_linear(w, "condition_embedder.time_embedder.linear_2", true)?,
-            time_projection: load_linear(w, "condition_embedder.time_proj", true)?,
-            text_embedding_0: load_linear(w, "condition_embedder.text_embedder.linear_1", true)?,
-            text_embedding_1: load_linear(w, "condition_embedder.text_embedder.linear_2", true)?,
+            time_embedding_0: load_linear(
+                w,
+                "condition_embedder.time_embedder.linear_1",
+                Dtype::Float32,
+            )?,
+            time_embedding_1: load_linear(
+                w,
+                "condition_embedder.time_embedder.linear_2",
+                Dtype::Float32,
+            )?,
+            time_projection: load_linear(w, "condition_embedder.time_proj", Dtype::Float32)?,
+            text_embedding_0: load_linear(
+                w,
+                "condition_embedder.text_embedder.linear_1",
+                Dtype::Float32,
+            )?,
+            text_embedding_1: load_linear(
+                w,
+                "condition_embedder.text_embedder.linear_2",
+                Dtype::Float32,
+            )?,
             blocks,
             vace_blocks,
             head_modulation: f32c(&w.require("scale_shift_table")?.reshape(&[1, 2, dim])?)?,
-            head: load_linear(w, "proj_out", true)?,
+            head: load_linear(w, "proj_out", Dtype::Float32)?,
             rope: RopeTable::new(cfg.head_dim()),
             inv_freq: Array::from_slice(&inv, &[half as i32]),
             cfg: cfg.clone(),
@@ -1165,6 +1221,130 @@ mod tests {
             "vace_in_channels": 96
         }));
         (weights, config)
+    }
+
+    fn tiny_inputs(weights: &Weights) -> (Array, Array, Array) {
+        let latent = weights
+            .require("in.hidden_states")
+            .unwrap()
+            .reshape(&[16, 4, 8, 8])
+            .unwrap();
+        let control = weights
+            .require("in.control_hidden_states")
+            .unwrap()
+            .reshape(&[96, 4, 8, 8])
+            .unwrap();
+        // The trimmed `[L, text_dim]` T5 embedding the product's encoder returns.
+        let raw = weights
+            .require("in.encoder_hidden_states")
+            .unwrap()
+            .reshape(&[-1, 32])
+            .unwrap();
+        (latent, control, raw)
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        mlx_rs::ops::abs(mlx_rs::ops::subtract(f32c(a).unwrap(), f32c(b).unwrap()).unwrap())
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    /// SC-20686: the VACE text context is built exactly as the reference builds it — diffusers
+    /// `WanVACEPipeline._get_t5_prompt_embeds` trims each prompt's T5 output to its token count and
+    /// zero-pads it to `max_sequence_length` (512), and the transformer attends over all 512 with no
+    /// mask. The product's padded context drives the forward bit-identically to that reference, and
+    /// the pre-fix unpadded context does not.
+    #[test]
+    fn vace_text_context_is_the_reference_zero_padded_context() {
+        let (weights, config) = tiny_vace_fixture();
+        let dit = WanVaceTransformer::from_weights(&weights, &config, Dtype::Float32).unwrap();
+        let (latent, control, raw) = tiny_inputs(&weights);
+        let prompt = mlx_rs::ops::indexing::IndexOp::index(&raw, ..5);
+        assert_eq!(config.base.text_len, 512);
+        let reference =
+            concatenate_axis(&[&prompt, &Array::zeros::<f32>(&[512 - 5, 32]).unwrap()], 0)
+                .unwrap()
+                .reshape(&[1, 512, 32])
+                .unwrap();
+        let ours = crate::model_vace::vace_text_context(&prompt, &config.base).unwrap();
+        assert_eq!(ours.shape(), &[512, 32]);
+        let scales = [1.0, 0.5];
+        let forward = |context: &Array| {
+            dit.forward_vace(&latent, &control, 500.0, context, &scales)
+                .unwrap()
+        };
+        let expected = forward(&reference);
+        assert_eq!(
+            max_abs_diff(&forward(&ours.reshape(&[1, 512, 32]).unwrap()), &expected),
+            0.0
+        );
+        let unpadded = forward(&prompt.reshape(&[1, 5, 32]).unwrap());
+        assert!(
+            max_abs_diff(&unpadded, &expected) > 1e-4,
+            "zero padding must reach the cross-attention (projected pads are not zeros)"
+        );
+    }
+
+    /// SC-20686: Wan2.1-VACE-1.3B ships its main blocks F32 beside BF16 VACE blocks. The attn/FFN/VACE
+    /// projections and qk-RMSNorm weights load at the model's compute dtype (diffusers casts every
+    /// module outside `_keep_in_fp32_modules` with `torch_dtype`), while the reference's f32 set —
+    /// embedders, modulation tables, the affine `norm2`, the output projection — stays f32. A bf16
+    /// forward then tracks the all-f32 reference within bf16 tolerance.
+    #[test]
+    fn mixed_checkpoint_projections_load_at_the_compute_dtype() {
+        let (f32_weights, config) = tiny_vace_fixture();
+        let mut mixed = tiny_vace_fixture().0;
+        mixed
+            .cast_matching(Dtype::Bfloat16, |key| key.starts_with("vace_blocks."))
+            .unwrap();
+        let dit = WanVaceTransformer::from_weights(&mixed, &config, Dtype::Bfloat16).unwrap();
+        for block in dit
+            .blocks
+            .iter()
+            .chain(dit.vace_blocks.iter().map(|vb| &vb.core))
+        {
+            for attn in [&block.self_attn, &block.cross_attn] {
+                for linear in [&attn.q, &attn.k, &attn.v, &attn.o] {
+                    assert_eq!(linear.weight_dtype(), Some(Dtype::Bfloat16));
+                }
+                assert_eq!(attn.norm_q.dtype(), Dtype::Bfloat16);
+                assert_eq!(attn.norm_k.dtype(), Dtype::Bfloat16);
+            }
+            assert_eq!(block.ffn_fc1.weight_dtype(), Some(Dtype::Bfloat16));
+            assert_eq!(block.ffn_fc2.weight_dtype(), Some(Dtype::Bfloat16));
+            assert_eq!(block.mod_table.dtype(), Dtype::Float32);
+            assert_eq!(block.norm2_w.dtype(), Dtype::Float32);
+        }
+        assert_eq!(dit.text_embedding_0.weight_dtype(), Some(Dtype::Float32));
+        assert_eq!(dit.head.weight_dtype(), Some(Dtype::Float32));
+        assert_eq!(dit.head_modulation.dtype(), Dtype::Float32);
+
+        let reference =
+            WanVaceTransformer::from_weights(&f32_weights, &config, Dtype::Float32).unwrap();
+        let (latent, control, raw) = tiny_inputs(&f32_weights);
+        let context = crate::model_vace::vace_text_context(&raw, &config.base)
+            .unwrap()
+            .reshape(&[1, 512, 32])
+            .unwrap();
+        let scales = [1.0, 0.5];
+        let ours = dit
+            .forward_vace(&latent, &control, 500.0, &context, &scales)
+            .unwrap();
+        let expected = reference
+            .forward_vace(&latent, &control, 500.0, &context, &scales)
+            .unwrap();
+        let scale = mlx_rs::ops::abs(&expected)
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let error = max_abs_diff(&ours, &expected);
+        assert!(
+            error <= 0.05 * scale.max(1.0),
+            "bf16 forward drifted: {error} (scale {scale})"
+        );
     }
 
     #[test]

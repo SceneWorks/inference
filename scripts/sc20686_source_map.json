@@ -441,7 +441,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 818
+              "line": 837
             }
           ],
           "release": [
@@ -490,7 +490,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 818
+              "line": 837
             }
           ],
           "release": [
@@ -548,7 +548,7 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/transformer.rs",
               "symbol": "sc20686::cross_kv_cache_id",
-              "line": 818
+              "line": 837
             }
           ],
           "release": [
@@ -599,14 +599,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 179
+              "line": 207
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 185
+              "line": 213
             }
           ],
           "release": [
@@ -628,19 +628,19 @@
             "read": "WanVace::attn2(sdpa)"
           },
           "entrypoint_stem": "sc20686_wan",
-          "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step",
+          "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step, each branch over its prompt zero-padded to text_len (512) as the reference builds it",
           "cfg_kv_batch": "never",
           "route": "wan_vace",
           "activation": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 456
+              "line": 469
             }
           ],
           "product_residency": "resident",
           "offload": "resident model lifecycle",
-          "product_load": "mlx_gen_wan::product_load (also called by the SceneWorks worker): the worker-assembled wan_vace snapshot, i.e. the dense Wan2.1-VACE-1.3B-diffusers transformer (dim 1536, 30 layers; any other size is refused) plus the UMT5/z16-VAE/tokenizer of the base-Wan 14B q4 tier, LoadSpec::quantize None (dense bf16). The Candle lane's wan_vace is the Wan2.1-VACE-14B tree instead"
+          "product_load": "mlx_gen_wan::product_load (also called by the SceneWorks worker): the worker-assembled wan_vace snapshot, i.e. the Wan2.1-VACE-1.3B-diffusers transformer (dim 1536, 30 layers; any other size is refused) plus the UMT5/z16-VAE/tokenizer of the base-Wan 14B q4 tier, LoadSpec::quantize None; every attn/FFN/VACE projection and qk-norm held at the bf16 compute dtype (the checkpoint's F32 main blocks are cast at load), the reference's f32 set (embedders, modulation, norm2, output projection) kept f32. The Candle lane's wan_vace is the Wan2.1-VACE-14B tree instead"
         },
         "wan2_2_vace_fun_14b": {
           "family": "wan",
@@ -648,14 +648,14 @@
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::record_recomputed_kv",
-              "line": 179
+              "line": 207
             }
           ],
           "reads": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/vace.rs",
               "symbol": "sc20686::begin_read",
-              "line": 185
+              "line": 213
             }
           ],
           "release": [
@@ -677,14 +677,14 @@
             "read": "WanVace::attn2(sdpa)"
           },
           "entrypoint_stem": "sc20686_wan",
-          "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step",
+          "recompute": "recomputed in every main and VACE block, every CFG branch, every denoise step, each branch over its prompt zero-padded to text_len (512) as the reference builds it",
           "cfg_kv_batch": "never",
           "route": "wan2_2_vace_fun_14b",
           "activation": [
             {
               "path": "crates/media/mlx-gen/mlx-gen-wan/src/model_vace.rs",
               "symbol": "sc20686::observe_generation",
-              "line": 856
+              "line": 893
             }
           ],
           "product_residency": "sequential",

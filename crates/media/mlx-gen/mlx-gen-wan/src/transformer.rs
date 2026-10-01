@@ -211,6 +211,25 @@ fn gelu_ffn(x: &Array) -> Result<Array> {
     }
 }
 
+/// Zero-pad one prompt's trimmed T5 embedding `[L_text, text_dim]` to `[text_len, text_dim]` — the
+/// reference text context: the original Wan `WanModel` and diffusers' Wan pipelines
+/// (`_get_t5_prompt_embeds`: `u[:seq_len]` then `torch.cat([u, u.new_zeros(max_sequence_length -
+/// len, dim)])`, `max_sequence_length = 512`) pad with zeros, and the transformer then projects and
+/// attends over all `text_len` tokens with no mask. Shared by base Wan's [`WanTransformer::embed_text`]
+/// and the VACE pipelines, so both build the context the reference way. A prompt already at or past
+/// `text_len` (the tokenizer truncates to it) is returned unchanged.
+pub fn pad_text_context(t5_embed: &Array, text_len: usize) -> Result<Array> {
+    let text_len = text_len as i32;
+    let l = t5_embed.shape()[0];
+    let dim_text = t5_embed.shape()[1];
+    Ok(if l < text_len {
+        let pad = Array::zeros::<f32>(&[text_len - l, dim_text])?.as_dtype(t5_embed.dtype())?;
+        concatenate_axis(&[t5_embed, &pad], 0)?
+    } else {
+        t5_embed.clone()
+    })
+}
+
 #[cfg(test)]
 mod retained_compile_tests {
     use super::*;
@@ -1555,16 +1574,8 @@ impl WanTransformer {
     /// Embed a single T5 prompt embedding `[L_text, text_dim]` → `[1, text_len, dim]` (bf16),
     /// zero-padded to `text_len`. Mirrors `WanModel.embed_text` for one prompt.
     pub fn embed_text(&self, t5_embed: &Array) -> Result<Array> {
-        let text_len = self.cfg.text_len as i32;
-        let l = t5_embed.shape()[0];
-        let dim_text = t5_embed.shape()[1];
-        let ctx = if l < text_len {
-            let pad = Array::zeros::<f32>(&[text_len - l, dim_text])?.as_dtype(t5_embed.dtype())?;
-            concatenate_axis(&[t5_embed, &pad], 0)?
-        } else {
-            t5_embed.clone()
-        };
-        let ctx = ctx.reshape(&[1, text_len, dim_text])?;
+        let ctx = pad_text_context(t5_embed, self.cfg.text_len)?;
+        let ctx = ctx.reshape(&[1, self.cfg.text_len as i32, t5_embed.shape()[1]])?;
         let h = self.text_embedding_0.forward(&ctx)?;
         let h = gelu_tanh(&h)?;
         // Cast to bf16 (the reference's `.astype(model_dtype)`); the cross-attn K/V run bf16.

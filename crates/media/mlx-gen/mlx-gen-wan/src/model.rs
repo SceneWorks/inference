@@ -1982,13 +1982,17 @@ pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64
             Err(_) => 0,
         }
     }
-    let ratio = match quant.map(|q| q.bits()) {
+    let raw: u64 = files.iter().map(|p| weight_bytes_at(p)).sum();
+    (raw as f64 * quant_resident_ratio(quant)) as u64
+}
+
+/// The resident fraction of a bf16 weight surface after load-time quantization.
+pub(crate) fn quant_resident_ratio(quant: Option<Quant>) -> f64 {
+    match quant.map(|q| q.bits()) {
         Some(4) => 0.30, // 4-bit affine: ~0.5 B/param + scales vs bf16 2 B/param
         Some(8) => 0.55, // 8-bit affine: ~1 B/param + scales
         _ => 1.0,
-    };
-    let raw: u64 = files.iter().map(|p| weight_bytes_at(p)).sum();
-    (raw as f64 * ratio) as u64
+    }
 }
 
 /// The resident transformer bytes the sc-4986 [`preflight_denoise_memory_guard`] must budget for the

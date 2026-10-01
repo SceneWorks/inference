@@ -152,13 +152,28 @@ Only residency comes from the sealed axis above.
 | --- | --- | --- |
 | `flux2_klein_9b_edit`, `flux2_klein_9b_kv_edit` | the product's default `q4/` Klein tier root (`resolved_route` `flux2_klein_9b` / `flux2_klein_9b_kv`) | none: the tier is packed |
 | `wan2_2_ti2v_5b`, `wan2_2_t2v_14b`, `wan2_2_i2v_14b` | the product's default `q4/` quant-matrix tier root | none: the tier's `config.json` is authoritative |
-| `wan_vace` | the worker-assembled `wan_vace` snapshot: the dense **Wan2.1-VACE-1.3B** transformer plus the base-Wan 14B `q4/` tier's UMT5, z16 VAE and tokenizer | none: dense bf16 |
+| `wan_vace` | the worker-assembled `wan_vace` snapshot: the dense **Wan2.1-VACE-1.3B** transformer plus the base-Wan 14B `q4/` tier's UMT5, z16 VAE and tokenizer | none: dense, projections held bf16 |
 | `wan2_2_vace_fun_14b` | the worker-assembled dense VACE-Fun 14B high/low experts plus the same shared components | **Q4**, forced by the product unless the user picks |
 
 The entrypoints and the adapter refuse any other tier (a packed tier whose `quantization.bits` is
 not 4), and a VACE snapshot that is not the worker's assembled layout for that route (VACE-Fun also
 needs `transformer_2/`). The Mac product's `wan_vace` is the 1.3B transformer, not the
 Wan2.1-VACE-14B tree the Candle lane reads; the Wan entrypoint refuses any other transformer size.
+
+Two product fixes (SC-20686, both change Wan-VACE output numerics) set what these routes measure:
+
+* **Text context.** Each CFG branch's prompt embedding is zero-padded to `text_len` (512) and the
+  transformer attends over all 512 tokens unmasked, as diffusers `WanVACEPipeline`
+  (`_get_t5_prompt_embeds`: trim to the token count, then `torch.cat([u, u.new_zeros(512 - len,
+  dim)])`) and base Wan build it (shared `mlx_gen_wan::pad_text_context`). The MLX VACE pipelines
+  previously attended over the unpadded prompt (e.g. 13 and 126 tokens). Every recomputed text K/V
+  slice is therefore 512 tokens on both branches.
+* **Weight dtype.** The Wan2.1-VACE-1.3B checkpoint stores its 30 main blocks F32 beside BF16 VACE
+  blocks; every attn/FFN/VACE projection and qk-norm weight is now cast to the bf16 compute dtype at
+  load (diffusers casts every module outside `_keep_in_fp32_modules` under `torch_dtype`), while the
+  reference's f32 set — embedders, modulation tables, the affine `norm2`, the output projection —
+  stays f32. The 1.3B transformer's resident weights fall from 6.66 GiB to 4.06 GiB, and the
+  preflight now prices VACE weights at those load dtypes rather than their stored width.
 
 The two VACE snapshots are assembled exactly as the worker assembles them
 (`mlx_gen_wan::convert::assemble_wan_vace_snapshot` / `assemble_wan_vace_fun_snapshot`, linked):

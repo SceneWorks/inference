@@ -280,18 +280,21 @@ fn vace_text_kv_is_recomputed_and_hooks_are_bit_identical() {
     );
 }
 
-/// SC-20686 W2: the product feeds Wan-VACE each CFG branch's own unpadded `[L, text_dim]` context,
-/// so the cond and uncond branches recompute slices of different lengths. The bound `skv` is the
-/// longest branch's token count (not the context width, which the 2-D product shape used to yield),
-/// and every projection records its own live dtype for the slice-by-slice exactness check.
+/// SC-20686: the product feeds Wan-VACE each CFG branch's prompt zero-padded to `text_len` (512),
+/// as the reference does, so every recomputed text K/V slice spans 512 tokens on both branches even
+/// though the prompts differ in length; the bound `skv` is that length (never the context width the
+/// 2-D product shape once yielded), and every projection records its own live dtype.
 #[test]
-fn vace_branches_of_different_lengths_bind_the_longest_and_record_each_slice() {
+fn vace_padded_branches_recompute_512_token_slices_and_record_each_dtype() {
     let (transformer, init, control, context) = tiny_vace();
     let text_dim = context.shape()[2];
-    // The product's 2-D `[L, text_dim]` shape; like the live run, the cond prompt is the shorter
-    // branch (13 vs 126 tokens there; 5 vs 12 here).
-    let uncond = context.reshape(&[-1, text_dim]).unwrap();
-    let cond = mlx_rs::ops::indexing::IndexOp::index(&uncond, ..5);
+    // The product's prompts (cond shorter than uncond, as in the live run: 13 vs 126 tokens), each
+    // padded by the product's own VACE context seam.
+    let raw = context.reshape(&[-1, text_dim]).unwrap();
+    let base = &crate::config::WanVaceConfig::from_config_json(&serde_json::json!({})).base;
+    let pad = |t5: &Array| crate::model_vace::vace_text_context(t5, base).unwrap();
+    let uncond = pad(&raw);
+    let cond = pad(&mlx_rs::ops::indexing::IndexOp::index(&raw, ..5));
     let (root, snapshot) = snapshot();
     let (scope, events) = activate(root.path(), &snapshot, "wan_vace");
     crate::vace::denoise_vace(
@@ -316,8 +319,8 @@ fn vace_branches_of_different_lengths_bind_the_longest_and_record_each_slice() {
     let events = events.borrow();
     let metadata = of(&events, "metadata").pop().unwrap();
     assert_eq!(
-        metadata["geometry"]["skv"], 12,
-        "the longest branch, not the model width"
+        metadata["geometry"]["skv"], 512,
+        "the padded context, not the model width"
     );
     let created = of(&events, "cross-kv-created");
     let mut lengths = std::collections::BTreeSet::new();
@@ -332,9 +335,12 @@ fn vace_branches_of_different_lengths_bind_the_longest_and_record_each_slice() {
         lengths.insert(tokens);
         assert_eq!(event["transient_bytes"], 2 * 4 * tokens * 16 * 4, "{shape}");
     }
-    assert_eq!(lengths.into_iter().collect::<Vec<_>>(), [5, 12]);
+    assert_eq!(lengths.into_iter().collect::<Vec<_>>(), [512]);
     let metrics = of(&events, "metrics").pop().unwrap();
-    assert_eq!(metrics["current_read_transient_bytes"], 2 * 4 * 12 * 16 * 4);
+    assert_eq!(
+        metrics["current_read_transient_bytes"],
+        2 * 4 * 512 * 16 * 4
+    );
 }
 
 #[test]
