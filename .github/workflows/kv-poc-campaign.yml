@@ -1,8 +1,10 @@
 name: KV PoC campaigns (epic 20669, W1 + W2)
 
 # Runs epic 20669's GPU windows on a selected Mac (`rw-krea` = nax-macos-2, the second Mac; `nax` =
-# the dev Mac). Measurement, not a gate: no pull_request / schedule trigger, and nothing here can
-# become a required check.
+# the dev Mac nax-macos). The runner label names a HOST: config.sh maps it to a label set only that
+# Mac carries and every job asserts its runner name, because each job reuses the previous job's
+# $HOME/kv-poc state and the raw `nax` label is registered on both Macs. Measurement, not a gate:
+# no pull_request / schedule trigger, and nothing here can become a required check.
 #   W1 (mode=w1), the LLM KV campaign, with the exact commands of the dev-Mac prep's W1-COMMANDS.sh:
 #     A1 dense sc20671 -> A3 packed sc20676 -> A2 compressed sc20671 -> B sc20677 capture + compare.
 #     A3 runs once per `a3_bits` value (`--kv-bits`, default "2") and A2 once per `a2_methods`
@@ -138,6 +140,7 @@ jobs:
       a3_bits: ${{ steps.resolve.outputs.a3_bits }}
       a2_methods: ${{ steps.resolve.outputs.a2_methods }}
       runs_on: ${{ steps.resolve.outputs.runs_on }}
+      runner_name: ${{ steps.resolve.outputs.runner_name }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -165,6 +168,7 @@ jobs:
     timeout-minutes: 15
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_MODE: ${{ needs.config.outputs.mode }}
     steps:
@@ -184,6 +188,7 @@ jobs:
     timeout-minutes: 180
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -210,6 +215,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "330"
     steps:
@@ -247,6 +253,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       BASELINE_EVIDENCE_SHA: ${{ needs.config.outputs.baseline_evidence_sha }}
       KV_A3_BITS: ${{ needs.config.outputs.a3_bits }}
@@ -287,6 +294,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_A2_METHODS: ${{ needs.config.outputs.a2_methods }}
       KV_SOFT_BUDGET_MIN: "330"
@@ -326,6 +334,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "60"
     steps:
@@ -358,6 +367,7 @@ jobs:
     timeout-minutes: 360
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -380,6 +390,7 @@ jobs:
     timeout-minutes: 180
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -402,6 +413,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "240"
     steps:
@@ -438,6 +450,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "360"
     steps:
@@ -475,6 +488,7 @@ jobs:
       stopped: ${{ steps.run.outputs.stopped }}
     env:
       INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_SOFT_BUDGET_MIN: "240"
     steps:
