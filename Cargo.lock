@@ -2838,9 +2838,11 @@ dependencies = [
 name = "mlx-llm-server"
 version = "0.0.0"
 dependencies = [
+ "core-llm-testkit",
  "mlx-llm",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

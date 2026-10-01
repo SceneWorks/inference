@@ -386,18 +386,10 @@ impl TextLlm for StarVector1bProvider {
                 generated_tokens: output.generated_tokens,
             },
             mtp: None,
-            // StarVector advertises no proposer: the resolution's fallback (an `auto` or proposer
-            // request it cannot run) joins the measured report, never a silent downgrade (E2).
-            decode: report.map(|mut report| {
-                report.fallbacks = core_llm::resolve_speculative(
-                    request.speculative_mode(),
-                    &self.descriptor.capabilities,
-                )
-                .fallback
-                .into_iter()
-                .collect();
-                report
-            }),
+            // StarVector advertises no proposer and has no prefix cache: the request's speculative
+            // fallback and the prefix-cache reason join the measured report in the shared words
+            // Candle's StarVector uses — never a silent downgrade (E2, E8).
+            decode: report.map(|report| report.with_captioner_reasons(request.speculative_mode())),
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
@@ -910,18 +902,43 @@ mod tests {
             report.verify_steps + 1,
             u64::from(out.usage.generated_tokens)
         );
+        // The captioner's own reason, in the words Candle's twin reports (E2, E8) — never the
+        // generic "no MTP head, no prompt lookup on this backend" (MLX runs prompt lookup).
         assert_eq!(
             report.fallbacks,
-            vec![
-                "speculative: auto found no proposer this model can run (no MTP head, no prompt \
-                 lookup on this backend)"
-                    .to_string()
-            ]
+            core_llm::no_proposer_fallback(
+                core_llm::Speculative::Auto,
+                core_llm::CAPTIONER_NO_PROPOSER
+            )
+            .into_iter()
+            .collect::<Vec<_>>()
+        );
+        assert!(report.fallbacks[0].contains("advertises no proposer"));
+        assert_eq!(report.prefix_cache.path, "none");
+        assert_eq!(
+            report.prefix_cache.reason.as_deref(),
+            Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
         );
         let off = provider
             .generate(&image_request(None), &mut |_| {})
             .unwrap();
         assert_eq!(off.text, out.text, "the fallback decodes plainly");
         assert!(off.decode.unwrap().fallbacks.is_empty());
+        // An explicit proposer it does not advertise is not refused: it decodes plainly, named.
+        let lookup =
+            core_llm::Speculative::proposer(core_llm::SpeculativeProposer::PromptLookup, 2);
+        let explicit = provider
+            .generate(&image_request(Some(lookup)), &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            explicit.text, out.text,
+            "the explicit fallback decodes plainly"
+        );
+        assert_eq!(
+            explicit.decode.unwrap().fallbacks,
+            core_llm::no_proposer_fallback(lookup, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -215,6 +215,41 @@ pub fn prefix_cache_budget(requested: Option<u64>, load_required: u64, available
     requested_prefix_cache_bytes(requested).min(available.saturating_sub(load_required))
 }
 
+/// Why a multimodal request never reads or feeds the cross-turn prefix cache (story sc-24437):
+/// the cache keys on token ids, which cannot tell two images or clips behind the same placeholder
+/// ids apart. One string on both backends (E8).
+pub const PREFIX_MULTIMODAL_BYPASS: &str =
+    "a multimodal prompt is never cached — its image / video / audio rows are not in the token key";
+
+/// Why a request's own prefix-cache snapshot was not taken: request admission could not hold it
+/// beside the request (E7).
+pub const PREFIX_NOT_ADMITTED: &str =
+    "not kept: admission could not hold this request's snapshot beside it";
+
+/// Why a request's own prefix-cache snapshot was dropped: its copy failed.
+pub const PREFIX_COPY_FAILED: &str = "not kept: the snapshot copy failed";
+
+/// Why a request on a paged KV cache keeps no snapshot: its blocks are shared through the pool's
+/// own copy-on-write, and the prefix cache does not copy them out.
+pub const PREFIX_PAGED_NOT_SNAPSHOTTED: &str = "not kept: paged KV backing is not snapshotted";
+
+/// The cross-turn prefix cache's part in a request before any lookup (story sc-24437) — the
+/// model-agnostic rule both backends start from (E8): `off` when the load settled a zero budget,
+/// `bypassed` with [`PREFIX_MULTIMODAL_BYPASS`] for a multimodal prompt, else `miss` (the lookup
+/// may still turn it into a `hit`). Only a `miss` request reads or feeds the cache.
+pub fn prefix_path_before_lookup(
+    prefix_on: bool,
+    multimodal: bool,
+) -> (&'static str, Option<&'static str>) {
+    if !prefix_on {
+        ("off", None)
+    } else if multimodal {
+        ("bypassed", Some(PREFIX_MULTIMODAL_BYPASS))
+    } else {
+        ("miss", None)
+    }
+}
+
 /// How a stored entry may be reused by a later prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefixReuse {
@@ -757,6 +792,17 @@ mod store_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E8: the shared pre-lookup rule — off, bypassed (named) for a multimodal prompt, else miss.
+    #[test]
+    fn the_pre_lookup_path_is_off_bypassed_or_miss() {
+        assert_eq!(prefix_path_before_lookup(false, true), ("off", None));
+        assert_eq!(
+            prefix_path_before_lookup(true, true),
+            ("bypassed", Some(PREFIX_MULTIMODAL_BYPASS))
+        );
+        assert_eq!(prefix_path_before_lookup(true, false), ("miss", None));
+    }
 
     #[test]
     fn empty_index_never_matches() {

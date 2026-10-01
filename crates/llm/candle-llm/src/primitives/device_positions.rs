@@ -51,7 +51,11 @@ pub const DEVICE_POSITIONS_ENV: &str = "CANDLE_LLM_DEVICE_POSITIONS";
 /// CUDA cached decode / verify step onto the length-aware [`candle_quant_kernels::decode_attention()`]
 /// too, so graphs on and off are one arithmetic (E5). A CPU or Metal decoder keeps the host path
 /// unless a caller asks for the device path ([`DEVICE_POSITIONS_ENV`],
-/// [`set_device_positions_default`], or the model's own `set_device_positions`). Provisional: the
+/// [`set_device_positions_default`], or the model's own `set_device_positions`). **Why off
+/// there:** the path exists to make a step capturable, and only CUDA captures graphs; Metal has
+/// no `write_rows_at` / `decode_attention` kernel at all (the step would fail), and the CPU runs
+/// both as host reference code that reads the staged position back every step — an extra upload
+/// and read-back per step that buys nothing without a graph to replay. Provisional: the
 /// epic's terminal campaign (sc-24446) measures the eager CUDA decode on both attentions and
 /// confirms this default or flips it.
 pub const DEVICE_POSITIONS_DEFAULT: bool = true;

@@ -121,12 +121,13 @@ pub struct SpeculativeResolution {
 /// * `off` never speculates;
 /// * `auto` runs MTP at its recommended depth where the model has a head, else prompt lookup at
 ///   its recommended depth, else decodes plainly with the reason named;
-/// * `{proposer, depth}` runs that proposer. Its admissibility (advertised, `depth >= 1`) is
-///   checked by [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
-///   first, so an un-advertised proposer here is the caller's contract violation: it resolves to
-///   `off` with the reason named rather than inventing a proposer. A depth above the advertised
-///   `max_depth` — the backend-true bound — is clamped to it and the clamp named in the fallback
-///   (sc-24438), never refused and never run past the bound.
+/// * `{proposer, depth}` runs that proposer. `depth >= 1` is checked by
+///   [`TextLlmCapabilities::validate_request`](crate::TextLlmCapabilities::validate_request)
+///   first; a proposer the model does not advertise is **not** refused there (E2: explicit
+///   fallback, never failure): it resolves here to `off` with the reason named, and the request
+///   decodes plainly. A depth above the advertised `max_depth` — the backend-true bound — is
+///   clamped to it and the clamp named in the fallback (sc-24438), never refused and never run
+///   past the bound.
 pub fn resolve_speculative(
     mode: crate::Speculative,
     capabilities: &crate::TextLlmCapabilities,
@@ -149,18 +150,14 @@ pub fn resolve_speculative(
             })
             .unwrap_or_else(|| SpeculativeResolution {
                 plan: SpeculativePlan::Off,
-                fallback: Some(
-                    "speculative: auto found no proposer this model can run (no MTP head, no \
-                     prompt lookup on this backend)"
-                        .into(),
-                ),
+                fallback: Some(format!(
+                    "{AUTO_FOUND_NO_PROPOSER} ({NO_PROPOSER_ADVERTISED})"
+                )),
             }),
         Speculative::Proposer { proposer, depth } => match capabilities.proposer(proposer) {
             None => SpeculativeResolution {
                 plan: SpeculativePlan::Off,
-                fallback: Some(format!(
-                    "speculative: `{proposer}` is not available for this model"
-                )),
+                fallback: Some(proposer_unavailable(proposer, NO_SUCH_PROPOSER_ADVERTISED)),
             },
             Some(cap) => {
                 let clamped = depth.clamp(1, cap.max_depth.max(1));
@@ -181,6 +178,82 @@ pub fn resolve_speculative(
         },
     }
 }
+
+/// How an `auto` fallback with no runnable proposer begins; the reason follows in parentheses.
+const AUTO_FOUND_NO_PROPOSER: &str = "speculative: auto found no proposer this model can run";
+
+/// Why `auto` ran no proposer on a model that advertises none (the generic reason; a family with
+/// its own reason names it through [`no_proposer_fallback`]).
+const NO_PROPOSER_ADVERTISED: &str = "it advertises none; decoded without a proposer";
+
+/// Why an explicit proposer the model does not advertise ran plain (the generic reason).
+const NO_SUCH_PROPOSER_ADVERTISED: &str =
+    "this model does not advertise it; decoded without a proposer";
+
+/// The fallback for an explicit `proposer` that cannot run, with `why`.
+fn proposer_unavailable(proposer: crate::SpeculativeProposer, why: &str) -> String {
+    format!("speculative: `{proposer}` is not available for this model ({why})")
+}
+
+/// Why a captioner or SVG decoder (JoyCaption / LLaVA, StarVector — both backends) runs no
+/// proposer: its continuation decodes token-at-a-time after a multimodal prefill, and the family
+/// advertises no proposer for it. One string, so both backends say the same thing (E8).
+pub const CAPTIONER_NO_PROPOSER: &str = "this captioner / SVG decoder advertises no proposer: \
+     its continuation decodes token-at-a-time after a multimodal prefill";
+
+/// Why a captioner or SVG decoder reports the cross-turn prefix cache as `none` (story sc-24437):
+/// the cache is not wired to it, and its prompt's image rows are not in the token key. One string
+/// for both backends (E8).
+pub const CAPTIONER_NO_PREFIX_CACHE: &str = "prefix_cache: not wired to this captioner / SVG \
+     decoder — its prompt's image rows are not in the token key";
+
+/// The fallback a family that advertises **no** proposer names for `mode`, with the family's own
+/// `why` (e.g. [`CAPTIONER_NO_PROPOSER`]) instead of the generic reason
+/// [`resolve_speculative`] gives (E2/E3): `None` for `off`; for `auto` and an explicit proposer,
+/// the same leading words `resolve_speculative` uses, so a product matches one vocabulary.
+pub fn no_proposer_fallback(mode: crate::Speculative, why: &str) -> Option<String> {
+    match mode {
+        crate::Speculative::Off => None,
+        crate::Speculative::Auto => Some(format!("{AUTO_FOUND_NO_PROPOSER} ({why})")),
+        crate::Speculative::Proposer { proposer, .. } => Some(proposer_unavailable(proposer, why)),
+    }
+}
+
+/// The MTP depth [`Speculative::Auto`](crate::Speculative::Auto) runs on a Qwen3.8 head — native
+/// or companion — on both backends (the upstream recommendation).
+pub const MTP_RECOMMENDED_DEPTH: u32 = 3;
+
+/// The prompt-lookup depth [`Speculative::Auto`](crate::Speculative::Auto) runs on a model without
+/// an MTP head (sc-24433), on both backends. A lookup that finds no match proposes nothing and the
+/// step is an ordinary single-token decode, so the depth only prices a match; 4 keeps the
+/// Qwen3.5 hybrid's DeltaNet checkpoint ring at `K + 2 = 6` states.
+pub const PROMPT_LOOKUP_RECOMMENDED_DEPTH: u32 = 4;
+
+/// The prompt-lookup advertisement every text decoder carries (both backends' decoders run the
+/// proposer through their step engine, so it needs nothing from the checkpoint), at the
+/// provider's per-model verify bound `max_depth`, recommending
+/// [`PROMPT_LOOKUP_RECOMMENDED_DEPTH`] (or `max_depth` when shallower).
+pub fn prompt_lookup_capabilities(max_depth: u32) -> crate::ProposerCapabilities {
+    crate::ProposerCapabilities {
+        proposer: crate::SpeculativeProposer::PromptLookup,
+        max_depth,
+        recommended_depth: PROMPT_LOOKUP_RECOMMENDED_DEPTH.min(max_depth),
+    }
+}
+
+/// A model's verify-depth bound: the depth its descriptor advertises for prompt lookup (the
+/// per-model bound, sc-24438), which `draft_model` advertises too — every draft is one more
+/// verify row whichever proposer drew it (sc-24436). Every text decoder advertises prompt lookup;
+/// one draft per step otherwise.
+pub fn verify_depth_bound(capabilities: &crate::TextLlmCapabilities) -> u32 {
+    capabilities
+        .proposer(crate::SpeculativeProposer::PromptLookup)
+        .map_or(1, |lookup| lookup.max_depth)
+}
+
+/// The fallback a `draft_model` plan names on a provider with no resident draft (both backends).
+pub const DRAFT_MODEL_NOT_LOADED: &str = "speculative: `draft_model` has no draft model loaded \
+     on this provider; decoded without a proposer";
 
 /// The draft-model depth advertised as recommended (sc-24436): four drafts per verify step, or
 /// the provider's bound when that is shallower.
@@ -215,9 +288,7 @@ pub fn draft_compatibility(
     draft_logits: usize,
 ) -> Result<usize, String> {
     if let Some(why) = target.vocabulary_mismatch(draft) {
-        return Err(format!(
-            "draft model: its tokenizer vocabulary is not the target's ({why})"
-        ));
+        return Err(vocabulary_refusal(&why));
     }
     if draft_logits > target_logits {
         return Err(format!(
@@ -225,6 +296,68 @@ pub fn draft_compatibility(
         ));
     }
     Ok(draft_logits.min(draft.vocab_size()))
+}
+
+fn vocabulary_refusal(why: &str) -> String {
+    format!("draft model: its tokenizer vocabulary is not the target's ({why})")
+}
+
+/// The draft's own `tokenizer.json` (beside the weights at `draft_source`) checked against the
+/// target's before any draft weight is read (sc-24436): the named refusal when the vocabularies
+/// differ, `None` when they agree or the draft ships no readable tokenizer (its loaded tokenizer
+/// is then checked by [`draft_compatibility`]).
+pub fn draft_tokenizer_refusal(
+    target: &crate::Tokenizer,
+    draft_source: &std::path::Path,
+) -> Option<String> {
+    crate::Tokenizer::from_file(draft_source.join("tokenizer.json"))
+        .ok()
+        .and_then(|draft| target.vocabulary_mismatch(&draft))
+        .map(|why| vocabulary_refusal(&why))
+}
+
+/// A named draft refused for `error` (an unreadable source, a refused device, a load-time format
+/// the draft cannot take), leading with `draft model:`.
+pub fn draft_refusal(error: impl std::fmt::Display) -> String {
+    format!("draft model: {error}")
+}
+
+/// A named draft whose load estimate failed (`error`) — it cannot be priced beside the target.
+pub fn draft_unpriced_refusal(error: impl std::fmt::Display) -> String {
+    format!("draft model: its load cannot be priced ({error})")
+}
+
+/// A named draft whose load failed (`error`) after admission.
+pub fn draft_load_refusal(error: impl std::fmt::Display) -> String {
+    format!("draft model: its load failed ({error})")
+}
+
+/// Settle what became of a load's named draft (sc-24436) — the model-agnostic half of a
+/// backend's `attach_draft`: a compatible draft (`Ok`) is kept and `draft_model` advertised on
+/// `capabilities` at the model's [`verify_depth_bound`]; a refused one (`Err`, its reason leading
+/// with `draft model:`) is named in the load's `fallbacks` (E2) as well as in the returned
+/// [`DraftReport`](crate::DraftReport), and the target loads alone. Returns the draft to keep
+/// resident and the report.
+pub fn settle_draft<D>(
+    source: impl Into<String>,
+    outcome: std::result::Result<D, String>,
+    capabilities: &mut crate::TextLlmCapabilities,
+    fallbacks: &mut Vec<String>,
+) -> (Option<D>, crate::DraftReport) {
+    let source = source.into();
+    match outcome {
+        Ok(draft) => {
+            let max_depth = verify_depth_bound(capabilities);
+            capabilities
+                .speculative
+                .push(draft_model_capabilities(max_depth));
+            (Some(draft), crate::DraftReport::resident(source))
+        }
+        Err(why) => (
+            None,
+            crate::DraftReport::refused(source, why).named_in(fallbacks),
+        ),
+    }
 }
 
 /// A `draft_model` plan the resident draft cannot cover (sc-24436, E2): when the positions its
@@ -506,7 +639,13 @@ mod tests {
         let auto = plan(Speculative::Auto, &nothing);
         assert_eq!(auto.plan, SpeculativePlan::Off);
         assert_eq!(auto.plan.proposer(), ProposerKind::None);
-        assert!(auto.fallback.unwrap().contains("auto found no proposer"));
+        assert_eq!(
+            auto.fallback.as_deref(),
+            Some(
+                "speculative: auto found no proposer this model can run (it advertises none; \
+                 decoded without a proposer)"
+            )
+        );
 
         // The legacy mode is the same option.
         assert_eq!(
@@ -547,6 +686,92 @@ mod tests {
             ProposerKind::from(SpeculativeProposer::DraftModel),
             ProposerKind::DraftModel
         );
+    }
+
+    /// A family that advertises no proposer names its own reason for `auto` and for an explicit
+    /// proposer, with the same leading words the resolver uses; `off` names nothing (E2/E8).
+    #[test]
+    fn a_family_without_proposers_names_its_own_reason() {
+        use crate::{Speculative, SpeculativeProposer};
+        assert_eq!(
+            no_proposer_fallback(Speculative::Off, CAPTIONER_NO_PROPOSER),
+            None
+        );
+        assert_eq!(
+            no_proposer_fallback(Speculative::Auto, CAPTIONER_NO_PROPOSER).as_deref(),
+            Some(
+                "speculative: auto found no proposer this model can run (this captioner / SVG \
+                 decoder advertises no proposer: its continuation decodes token-at-a-time after \
+                 a multimodal prefill)"
+            )
+        );
+        let explicit = no_proposer_fallback(
+            Speculative::proposer(SpeculativeProposer::Mtp, 2),
+            CAPTIONER_NO_PROPOSER,
+        )
+        .unwrap();
+        assert!(
+            explicit.starts_with("speculative: `mtp` is not available for this model (")
+                && explicit.contains(CAPTIONER_NO_PROPOSER),
+            "{explicit}"
+        );
+    }
+
+    /// E8: the shared prompt-lookup advertisement and verify bound — the recommendation never
+    /// exceeds the bound, and `draft_model` is advertised at the prompt-lookup bound.
+    #[test]
+    fn the_shared_advertisements_respect_the_verify_bound() {
+        let deep = prompt_lookup_capabilities(7);
+        assert_eq!(
+            (deep.max_depth, deep.recommended_depth),
+            (7, PROMPT_LOOKUP_RECOMMENDED_DEPTH)
+        );
+        let shallow = prompt_lookup_capabilities(2);
+        assert_eq!((shallow.max_depth, shallow.recommended_depth), (2, 2));
+        let mut caps = crate::TextLlmCapabilities::default();
+        assert_eq!(verify_depth_bound(&caps), 1, "no prompt lookup: one draft");
+        caps.speculative.push(deep);
+        assert_eq!(verify_depth_bound(&caps), 7);
+    }
+
+    /// E2 (sc-24436): a refused draft is named in both `LoadReport::draft` and
+    /// `LoadReport::fallbacks` and advertises nothing; a resident one advertises `draft_model` at
+    /// the verify bound and names no fallback.
+    #[test]
+    fn settling_a_draft_names_a_refusal_and_advertises_a_resident_draft() {
+        use crate::SpeculativeProposer;
+        let mut caps = crate::TextLlmCapabilities {
+            speculative: vec![prompt_lookup_capabilities(5)],
+            ..Default::default()
+        };
+        let mut fallbacks = Vec::new();
+        let why = draft_load_refusal("no such file");
+        assert_eq!(why, "draft model: its load failed (no such file)");
+        let (kept, report): (Option<()>, _) =
+            settle_draft("/d", Err(why.clone()), &mut caps, &mut fallbacks);
+        assert!(kept.is_none());
+        assert_eq!(caps.proposer(SpeculativeProposer::DraftModel), None);
+        assert_eq!(report, crate::DraftReport::refused("/d", why.clone()));
+        assert_eq!(fallbacks, vec![why.clone()]);
+        // The load report's own entry point names an admission refusal the same way.
+        let mut load = crate::LoadReport::default();
+        load.record_draft(crate::DraftReport::refused("/d", why.clone()));
+        assert_eq!(load.fallbacks, vec![why]);
+
+        let mut fallbacks = Vec::new();
+        let (kept, report) = settle_draft("/d", Ok(7u8), &mut caps, &mut fallbacks);
+        assert_eq!(kept, Some(7));
+        assert_eq!(
+            caps.proposer(SpeculativeProposer::DraftModel),
+            Some(draft_model_capabilities(5))
+        );
+        assert_eq!(report, crate::DraftReport::resident("/d"));
+        assert!(fallbacks.is_empty());
+        assert_eq!(
+            draft_unpriced_refusal("x"),
+            "draft model: its load cannot be priced (x)"
+        );
+        assert_eq!(draft_refusal("x"), "draft model: x");
     }
 
     fn word_tokenizer(prefix: &str, vocab: usize) -> crate::Tokenizer {

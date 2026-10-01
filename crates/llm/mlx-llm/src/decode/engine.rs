@@ -908,6 +908,9 @@ where
     let mut generated: Vec<i32> = Vec::new();
     let mut finish = FinishReason::MaxTokens;
     let mut timer = prefill_clock.map(GenerationTimer::start_at);
+    // The fused-primitive routes this run builds (E3); a caller that prefilled outside the engine
+    // reports its own window instead.
+    let fused_start = crate::primitives::fused::fused_tally();
     let finished = |generated: Vec<i32>,
                     finish: FinishReason,
                     stats: SpeculativeStats,
@@ -932,7 +935,14 @@ where
                 tokens: generated,
                 finish_reason: finish,
             },
-            report: report(target, kind, width, &stats, sampler.path()),
+            report: report(
+                target,
+                kind,
+                width,
+                &stats,
+                sampler.path(),
+                crate::primitives::fused::fused_tally().since(&fused_start),
+            ),
             stats,
             timer,
         }
@@ -1301,13 +1311,15 @@ where
 }
 
 /// The run's measured report. Backend features MLX does not have (CUDA graphs, NVFP4
-/// projections, a fused-versus-reference primitive switch) report `none`.
+/// projections) report `none`; the fused primitives report the routes the run's ops took
+/// (`fused`, the tally since the run started).
 fn report<T: SpeculativeTarget + ?Sized>(
     target: &T,
     proposer: ProposerKind,
     drafts: usize,
     stats: &SpeculativeStats,
     sampler: Option<SamplerPath>,
+    fused: core_llm::FusedTally,
 ) -> DecodeReport {
     let path = match proposer {
         ProposerKind::None => "step_model",
@@ -1334,7 +1346,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
         },
         graph_path: "none".into(),
         nvfp4_projections: none(),
-        fused_primitives: none(),
+        fused_primitives: fused.path_report(),
         target_forwards: stats.forwards as u64,
         // The engine prefills the prompt (or counts a caller's prefill) as one forward; a caller
         // whose prefill took more adds them (sc-24437).
@@ -1343,6 +1355,9 @@ fn report<T: SpeculativeTarget + ?Sized>(
         accepted_tokens: stats.accepted as u64,
         verify_steps: stats.verify_steps as u64,
         replay_forwards: stats.replays as u64,
+        // A pipelined loop's look-ahead enqueued and never read back (counted in
+        // `target_forwards`), so `target_forwards == prefill + verify + replay + discarded`.
+        discarded_forwards: stats.discarded as u64,
         prefix_hit_tokens: 0,
         prefix_cache: none(),
         fallbacks: Vec::new(),
@@ -1740,8 +1755,8 @@ pub(crate) mod tests {
         assert_eq!(r.prefill_forwards, 1, "{label}: one prefill forward: {r:?}");
         assert_eq!(
             r.target_forwards,
-            r.prefill_forwards + r.verify_steps + r.replay_forwards,
-            "{label}: forwards = prefill + verify steps + replays: {r:?}"
+            r.prefill_forwards + r.verify_steps + r.replay_forwards + r.discarded_forwards,
+            "{label}: forwards = prefill + verify steps + replays + discarded: {r:?}"
         );
     }
 
@@ -2385,6 +2400,11 @@ pub(crate) mod tests {
         );
         assert!(!r.cuda_graphs.enabled);
         assert_eq!(r.cuda_graphs.path, "none");
+        // E3: MLX has no graph runner, so no step went through one — `none`, never `eager`.
+        assert_eq!(r.graph_path, "none");
+        // A speculative run never looks ahead, and the causal fixture runs no fused primitive.
+        assert_eq!(r.discarded_forwards, 0);
+        assert_eq!(r.fused_primitives.path, "none");
         assert!(
             r.fallbacks.is_empty(),
             "fallbacks are the provider's to add"
@@ -3496,6 +3516,18 @@ pub(crate) mod tests {
                     on.stats.discarded, 1,
                     "{label}: the look-ahead is discarded"
                 );
+                // E3: the report counts the discarded look-ahead, so the documented forward
+                // invariant holds on every end — pipelined or not.
+                assert_eq!(on.report.discarded_forwards, 1, "{label}");
+                assert_eq!(off.report.discarded_forwards, 0, "{label}");
+                for (run, which) in [(&on, "pipelined"), (&off, "unpipelined")] {
+                    let r = &run.report;
+                    assert_eq!(
+                        r.target_forwards,
+                        r.prefill_forwards + r.verify_steps + r.replay_forwards + r.discarded_forwards,
+                        "{label} ({which}): forwards = prefill + verify + replay + discarded: {r:?}"
+                    );
+                }
                 assert_eq!(
                     on.report.target_forwards,
                     off.report.target_forwards + 1,

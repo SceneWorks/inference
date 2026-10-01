@@ -442,22 +442,33 @@ pub fn check_draft_model_resident(provider: &dyn TextLlm, source: &str) -> Resul
 }
 
 /// A provider loaded with the foreign draft ([`DraftModelFixture::spec_with_foreign_draft`]):
-/// the target loaded, its load report names the draft refused for its tokenizer vocabulary,
-/// `draft_model` is not advertised (a request for it is refused up front), and `off` decodes
-/// exactly as `alone` — the same target loaded with no draft — does.
+/// the target loaded, its load report names the draft refused for its tokenizer vocabulary (in
+/// `draft` and in `fallbacks`), `draft_model` is not advertised (a request for it decodes plainly
+/// with the reason named, E2), and `off` decodes exactly as `alone` — the same target loaded with
+/// no draft — does.
 pub fn check_draft_model_refused(
     provider: &dyn TextLlm,
     alone: &dyn TextLlm,
     source: &str,
 ) -> Result<(), String> {
-    let draft = provider
+    let report = provider
         .load_report()
-        .and_then(|r| r.draft)
+        .ok_or("the provider reports no load")?;
+    let draft = report
+        .draft
+        .clone()
         .ok_or("the load report does not name the refused draft")?;
     let refusal = draft.refusal.clone().unwrap_or_default();
     if draft.source != source || !refusal.contains("tokenizer vocabulary is not the target's") {
         return Err(format!(
             "the load report names {draft:?}, not {source} refused for its tokenizer"
+        ));
+    }
+    // E2: every load fallback is named in one place — the refusal is in `fallbacks` too.
+    if !report.fallbacks.contains(&refusal) {
+        return Err(format!(
+            "the load's fallbacks {:?} do not name the refused draft ({refusal})",
+            report.fallbacks
         ));
     }
     let caps = &provider.descriptor().capabilities;
@@ -471,8 +482,26 @@ pub fn check_draft_model_refused(
         &Sampling::greedy(),
         MAX_NEW_TOKENS,
     );
-    if provider.validate(&ask).is_ok() {
-        return Err("a request for an unadvertised `draft_model` validated".into());
+    // E2: an explicit `draft_model` the model does not advertise is not refused: it decodes
+    // plainly — exactly `off`'s tokens — with the reason named.
+    provider.validate(&ask).map_err(|e| {
+        format!("a request for an unadvertised `draft_model` was refused, not run plain: {e}")
+    })?;
+    let plain = provider
+        .generate(&ask, &mut |_| {})
+        .map_err(|e| e.to_string())?;
+    let plain_report = plain.decode.clone().ok_or("no decode report")?;
+    if plain_report.proposer != ProposerKind::None
+        || !plain_report
+            .fallbacks
+            .iter()
+            .any(|f| f.starts_with("speculative: `draft_model` is not available"))
+    {
+        return Err(format!(
+            "an unadvertised `draft_model` request reports {:?} / {:?}, not plain with the \
+             reason named",
+            plain_report.proposer, plain_report.fallbacks
+        ));
     }
     let off = bench_request(
         &prompts[0],
@@ -486,7 +515,7 @@ pub fn check_draft_model_refused(
     let without = alone
         .generate(&off, &mut |_| {})
         .map_err(|e| e.to_string())?;
-    if with.text != without.text || with.usage != without.usage {
+    if with.text != without.text || with.usage != without.usage || plain.text != with.text {
         return Err(
             "the target with a refused draft decodes differently from the target alone".into(),
         );

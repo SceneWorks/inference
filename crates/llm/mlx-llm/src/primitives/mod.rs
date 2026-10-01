@@ -15,6 +15,7 @@
 
 pub mod attention;
 pub mod coherence;
+pub mod fused;
 pub mod gated_delta;
 pub mod kv_cache;
 pub mod moe;

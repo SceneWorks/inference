@@ -231,14 +231,43 @@ pub fn final_chunk(
     v.to_string()
 }
 
-/// The decode report an OpenAI client can see (sc-24438, epic sc-24432 E2): which proposer ran,
-/// its depth, and every fallback — a clamped depth, an unavailable proposer — by name, so no
+/// The decode report an OpenAI client can see (sc-24438, epic sc-24432 E2/E3) — the whole
+/// [`DecodeReport`], field for field: the path and the proposer that ran, its depth and the
+/// realized mean accepted length, the sampler path, the KV cache and attention, the graph path
+/// and CUDA-graph runner, the NVFP4 and fused-primitive paths, every forward count, the prefix
+/// cache's part, and every fallback — a clamped depth, an unavailable proposer — by name, so no
 /// downgrade is silent over HTTP. Carried as the `x_decode` extension member of the non-streaming
 /// body and of the final SSE chunk before `[DONE]`.
 pub fn x_decode(report: &DecodeReport) -> Value {
+    let path = |p: &mlx_llm::core_llm::PathReport| json!({ "path": p.path, "reason": p.reason });
     json!({
+        "path": report.path,
         "proposer": report.proposer.label(),
         "draft_tokens": report.draft_tokens,
+        "mean_accepted_length": report.mean_accepted_length(),
+        "sampler": report.sampler,
+        "kv_cache": report.kv_cache,
+        "attention": report.attention,
+        "graph_path": report.graph_path,
+        "cuda_graphs": {
+            "enabled": report.cuda_graphs.enabled,
+            "path": report.cuda_graphs.path,
+            "replayed": report.cuda_graphs.replayed,
+            "eager": report.cuda_graphs.eager,
+            "captured": report.cuda_graphs.captured,
+            "fallback_reason": report.cuda_graphs.fallback_reason,
+        },
+        "nvfp4_projections": path(&report.nvfp4_projections),
+        "fused_primitives": path(&report.fused_primitives),
+        "target_forwards": report.target_forwards,
+        "prefill_forwards": report.prefill_forwards,
+        "proposed_tokens": report.proposed_tokens,
+        "accepted_tokens": report.accepted_tokens,
+        "verify_steps": report.verify_steps,
+        "replay_forwards": report.replay_forwards,
+        "discarded_forwards": report.discarded_forwards,
+        "prefix_cache": path(&report.prefix_cache),
+        "prefix_hit_tokens": report.prefix_hit_tokens,
         "fallbacks": report.fallbacks,
     })
 }

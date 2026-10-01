@@ -76,20 +76,7 @@ fn safetensors_dir_extra(dir: &Path) -> Result<u64> {
 /// float and the `1 + w` norm results. Header-only; never constructs a tensor. The head's
 /// per-request attention cache is priced by request admission on the `mtp` route.
 pub(crate) fn companion_head_bytes(dir: &Path) -> Result<u64> {
-    if !dir.is_dir() {
-        return Err(Error::Load(format!(
-            "companion MTP head `{}` is not a directory",
-            dir.display()
-        )));
-    }
-    let payload = core_llm::checkpoint_payload_bytes(dir)?;
-    if payload == 0 {
-        return Err(Error::Load(format!(
-            "companion MTP head `{}` holds no .safetensors",
-            dir.display()
-        )));
-    }
-    payload
+    core_llm::companion_head_payload_bytes(dir)?
         .checked_add(safetensors_dir_extra(dir)?)
         .ok_or_else(overflow)
 }
