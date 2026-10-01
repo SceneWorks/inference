@@ -406,10 +406,22 @@ impl TextLlm for CandleStarVector8bProvider {
             // The continuation decodes through the shared engine (sc-24138), so it reports its
             // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
             // `None` only when the bounded stream stopped on the static prefix, before a decode.
-            decode: record.map(|record| record.report(false)),
+            // StarVector advertises no proposer and has no prefix cache: both are named, in the
+            // words MLX's StarVector uses (E2, E8).
+            decode: record.map(|record| svg_report(&record, request)),
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
+}
+
+/// An SVG continuation's measured report (sc-24139): the engine record with the CUDA-graph
+/// switch off (no graph runner wraps this decoder), and — StarVector advertising no proposer and
+/// having no prefix cache — the request's speculative fallback and the prefix-cache reason named
+/// in the words MLX's StarVector uses (E2, E8).
+fn svg_report(record: &DecodeRecord, request: &TextLlmRequest) -> core_llm::DecodeReport {
+    record
+        .report(false)
+        .with_captioner_reasons(request.speculative_mode())
 }
 
 impl StarVectorProvider for CandleStarVector8bProvider {
@@ -622,6 +634,47 @@ fn to_core(error: Error) -> CoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E2/E8 (sc-24432 feature-end review): the captioner advertises no proposer, so an `auto` or
+    /// explicit speculative request decodes plainly with the reason named — the same words MLX's
+    /// StarVector reports — and its prefix cache's `none` is named too; `off` names no fallback.
+    #[test]
+    fn the_report_names_the_speculative_fallback_and_the_prefix_cache() {
+        use core_llm::{Message, Speculative, SpeculativeProposer};
+        let record = crate::decode::DecodeRecord::plain(
+            crate::decode::DecodePath::StepModel,
+            3,
+            2,
+            Default::default(),
+        );
+        let request = |speculative| core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            speculative: Some(speculative),
+            ..Default::default()
+        };
+        for mode in [
+            Speculative::Auto,
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 2),
+        ] {
+            let report = svg_report(&record, &request(mode));
+            assert_eq!(
+                report.fallbacks,
+                core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{mode:?}"
+            );
+            assert_eq!(report.fallbacks.len(), 1, "{mode:?}");
+            assert_eq!(report.proposer, core_llm::ProposerKind::None);
+        }
+        let off = svg_report(&record, &request(Speculative::Off));
+        assert!(off.fallbacks.is_empty());
+        assert_eq!(off.prefix_cache.path, "none");
+        assert_eq!(
+            off.prefix_cache.reason.as_deref(),
+            Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
+        );
+    }
     use core_llm_testkit::{check_starvector_bounded_fixture, StarVectorProfile};
     use serde_json::json;
 
@@ -649,7 +702,7 @@ mod tests {
         let source = include_str!("starvector_8b.rs");
         let production = &source[..source.find("mod tests {").expect("the test module")];
         assert!(!production.contains("decode: None"));
-        assert!(production.contains("decode: record.map(|record| record.report(false))"));
+        assert!(production.contains("decode: record.map(|record| svg_report(&record, "));
         assert!(production.contains("Some(record.with_request_span(&span))"));
     }
     /// sc-24139: NVFP4 is refused by name, any other load-time format with the existing refusal,

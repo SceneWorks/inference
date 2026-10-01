@@ -540,11 +540,23 @@ impl core_llm::TextLlm for CandleStarVectorProvider {
             // The continuation decodes through the shared engine (sc-24138), so it reports its
             // path. No graph runner wraps this decoder, so the CUDA-graph switch was off here.
             // `None` only when the bounded stream stopped on the seeded prompt, before a decode.
-            decode: record.map(|record| record.report(false)),
+            // StarVector advertises no proposer and has no prefix cache: both are named, in the
+            // words MLX's StarVector uses (E2, E8).
+            decode: record.map(|record| svg_report(&record, req)),
             finish_reason: Some(finish),
         })
     }
 }
+/// An SVG continuation's measured report (sc-24139): the engine record with the CUDA-graph
+/// switch off (no graph runner wraps this decoder), and — StarVector advertising no proposer and
+/// having no prefix cache — the request's speculative fallback and the prefix-cache reason named
+/// in the words MLX's StarVector uses (E2, E8).
+fn svg_report(record: &DecodeRecord, req: &core_llm::TextLlmRequest) -> core_llm::DecodeReport {
+    record
+        .report(false)
+        .with_captioner_reasons(req.speculative_mode())
+}
+
 impl core_llm::StarVectorProvider for CandleStarVectorProvider {
     fn starvector_descriptor(&self) -> &core_llm::StarVectorDescriptor {
         &self.svg
@@ -752,6 +764,47 @@ fn to_core(error: Error) -> core_llm::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E2/E8 (sc-24432 feature-end review): the captioner advertises no proposer, so an `auto` or
+    /// explicit speculative request decodes plainly with the reason named — the same words MLX's
+    /// StarVector reports — and its prefix cache's `none` is named too; `off` names no fallback.
+    #[test]
+    fn the_report_names_the_speculative_fallback_and_the_prefix_cache() {
+        use core_llm::{Message, Speculative, SpeculativeProposer};
+        let record = crate::decode::DecodeRecord::plain(
+            crate::decode::DecodePath::StepModel,
+            3,
+            2,
+            Default::default(),
+        );
+        let request = |speculative| core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            speculative: Some(speculative),
+            ..Default::default()
+        };
+        for mode in [
+            Speculative::Auto,
+            Speculative::proposer(SpeculativeProposer::PromptLookup, 2),
+        ] {
+            let report = svg_report(&record, &request(mode));
+            assert_eq!(
+                report.fallbacks,
+                core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{mode:?}"
+            );
+            assert_eq!(report.fallbacks.len(), 1, "{mode:?}");
+            assert_eq!(report.proposer, core_llm::ProposerKind::None);
+        }
+        let off = svg_report(&record, &request(Speculative::Off));
+        assert!(off.fallbacks.is_empty());
+        assert_eq!(off.prefix_cache.path, "none");
+        assert_eq!(
+            off.prefix_cache.reason.as_deref(),
+            Some(core_llm::CAPTIONER_NO_PREFIX_CACHE)
+        );
+    }
     use crate::primitives::SplitMix64;
     use candle_core::DType;
     use core_llm::{StarVectorBoundedStream, StarVectorProvider, StarVectorStreamEvent, TextLlm};
@@ -1304,7 +1357,7 @@ mod tests {
         let source = include_str!("starvector.rs");
         let production = &source[..source.find("mod tests {").expect("the test module")];
         assert!(!production.contains("decode: None"));
-        assert!(production.contains("decode: record.map(|record| record.report(false))"));
+        assert!(production.contains("decode: record.map(|record| svg_report(&record, "));
         assert!(production.contains("Some(record.with_request_span(&span))"));
     }
 

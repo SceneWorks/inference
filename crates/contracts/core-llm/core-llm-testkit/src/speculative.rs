@@ -667,14 +667,15 @@ mod tests {
         let err = check_speculative_greedy_parity(&stub(false, true), &prompts[..1], &cases(), 6)
             .unwrap_err();
         assert!(err.contains("expected `prompt_lookup`"), "{err}");
-        // A refused option is a failure, never a skipped row.
+        // An option that cannot run (an unadvertised proposer decodes plainly, E2) is a
+        // failure, never a skipped row.
         let refused = [ParityCase {
             speculative: Speculative::proposer(SpeculativeProposer::DraftModel, 2),
             expect_proposer: ProposerKind::DraftModel,
         }];
         let err = check_speculative_greedy_parity(&stub(false, false), &prompts[..1], &refused, 6)
             .unwrap_err();
-        assert!(err.contains("validate refused"), "{err}");
+        assert!(err.contains("expected `draft_model`"), "{err}");
     }
 
     #[test]

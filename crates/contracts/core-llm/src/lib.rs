@@ -82,16 +82,20 @@ pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
 pub use mtp_head::{
-    companion_mtp_prefix, read_companion_mtp_config, CompanionMtpGeometry, COMPANION_MTP_MODEL_TYPE,
+    admit_companion_head, check_companion_unused, companion_head_fallback,
+    companion_head_payload_bytes, companion_mtp_prefix, native_mtp_plan, read_companion_mtp_config,
+    CompanionMtpGeometry, NativeMtp, COMPANION_MTP_ALREADY_NATIVE, COMPANION_MTP_DROPPED,
+    COMPANION_MTP_FAMILY_REFUSAL, COMPANION_MTP_MODEL_TYPE, COMPANION_MTP_MOE_REFUSAL,
 };
 pub use output::{
     Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,
 };
 pub use paging::BlockAllocator;
 pub use prefix::{
-    prefix_cache_budget, requested_prefix_cache_bytes, InsertOutcome, PrefixAdmission, PrefixHit,
-    PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse, PrefixStats, PrefixStore,
-    DEFAULT_PREFIX_CACHE_BYTES,
+    prefix_cache_budget, prefix_path_before_lookup, requested_prefix_cache_bytes, InsertOutcome,
+    PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse,
+    PrefixStats, PrefixStore, DEFAULT_PREFIX_CACHE_BYTES, PREFIX_COPY_FAILED,
+    PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED, PREFIX_PAGED_NOT_SNAPSHOTTED,
 };
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
@@ -109,8 +113,8 @@ pub use registry::{
     ModelRequirements, TextLlmRegistration, TextLlmRegistry, TextLlmRegistryBuilder,
 };
 pub use report::{
-    BackendCapabilities, CudaGraphsReport, DecodeReport, DraftReport, FeatureSupport, LoadReport,
-    PathReport, ProjectionReport,
+    prefix_budget_fallback, BackendCapabilities, CudaGraphsReport, DecodeReport, DraftReport,
+    FeatureSupport, FusedTally, LoadReport, PathReport, ProjectionReport,
 };
 pub use request::{
     HostSampleReason, LoadSpec, MtpMode, Quantize, ReasoningEffort, SamplerPath, Sampling,
@@ -126,9 +130,13 @@ pub use resource::{
 };
 pub use schedule::{Scheduler, SeqId, SeqSpec};
 pub use speculative::{
-    accept_greedy_run, accept_token, draft_compatibility, draft_model_capabilities,
-    fit_draft_context, greedy_commit, ngram_propose, resolve_speculative, Acceptance, ProposerKind,
-    SpeculativePlan, SpeculativeResolution, DRAFT_MODEL_RECOMMENDED_DEPTH,
+    accept_greedy_run, accept_token, draft_compatibility, draft_load_refusal,
+    draft_model_capabilities, draft_refusal, draft_tokenizer_refusal, draft_unpriced_refusal,
+    fit_draft_context, greedy_commit, ngram_propose, no_proposer_fallback,
+    prompt_lookup_capabilities, resolve_speculative, settle_draft, verify_depth_bound, Acceptance,
+    ProposerKind, SpeculativePlan, SpeculativeResolution, CAPTIONER_NO_PREFIX_CACHE,
+    CAPTIONER_NO_PROPOSER, DRAFT_MODEL_NOT_LOADED, DRAFT_MODEL_RECOMMENDED_DEPTH,
+    MTP_RECOMMENDED_DEPTH, PROMPT_LOOKUP_RECOMMENDED_DEPTH,
 };
 pub use starvector::{
     generated_token_budget, validate_advertised_generated_token_cap,

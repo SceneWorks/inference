@@ -131,7 +131,9 @@ pub struct DecodeReport {
     /// The KV cache implementation (`growing`, `static`).
     pub kv_cache: String,
     /// How attention was computed (`gqa`, `expanded`; `decode_attention` when a Candle request's
-    /// cached steps ran the length-aware decode attention, sc-24441).
+    /// cached steps ran the length-aware decode attention, sc-24441; `opaque` when the engine
+    /// drove a decoder only through its token-at-a-time step and cannot see how it attends — the
+    /// MLX captioner / SVG step targets).
     pub attention: String,
     /// The CUDA-graph runner's part.
     pub cuda_graphs: CudaGraphsReport,
@@ -152,7 +154,8 @@ pub struct DecodeReport {
     /// [`target_forwards`](Self::target_forwards): one for a prompt prefilled in one pass, two
     /// when a hybrid decoder's prefill split at the cross-turn prefix cache's snapshot boundary
     /// (story sc-24437), `0` on a path that does not report it. On the speculative engine
-    /// `target_forwards == prefill_forwards + verify_steps + replay_forwards`.
+    /// `target_forwards == prefill_forwards + verify_steps + replay_forwards +
+    /// discarded_forwards`.
     pub prefill_forwards: u64,
     /// Draft tokens proposed.
     pub proposed_tokens: u64,
@@ -164,6 +167,11 @@ pub struct DecodeReport {
     pub verify_steps: u64,
     /// Verify steps recovered by a step-start rollback plus a replay forward.
     pub replay_forwards: u64,
+    /// Target forwards a pipelined loop enqueued as look-ahead and then discarded unread, counted
+    /// in [`target_forwards`](Self::target_forwards): the step already enqueued when the run ended
+    /// on a stop token, a stop string or a cancel (MLX pipelined decode, story sc-24439) — never
+    /// emitted. `0` on a loop that does not look ahead (every Candle path).
+    pub discarded_forwards: u64,
     /// Leading prompt tokens whose cache state came from the cross-turn prefix cache instead of a
     /// prefill forward (story sc-24437): the prefill ran only the prompt past them. `0` on a miss,
     /// when the cache is off, and on a request it refuses (a multimodal prompt — its reason is in
@@ -188,6 +196,20 @@ pub struct DecodeReport {
 }
 
 impl DecodeReport {
+    /// Name what a captioner or SVG decoder (JoyCaption / LLaVA, StarVector — both backends)
+    /// does not run (E2/E3): the speculative fallback for the request's `mode`
+    /// ([`no_proposer_fallback`](crate::no_proposer_fallback) with
+    /// [`CAPTIONER_NO_PROPOSER`](crate::CAPTIONER_NO_PROPOSER)) and why its prefix cache is
+    /// `none` ([`CAPTIONER_NO_PREFIX_CACHE`](crate::CAPTIONER_NO_PREFIX_CACHE)). One call, so both
+    /// backends' captioners report the same words (E8).
+    pub fn with_captioner_reasons(mut self, mode: crate::Speculative) -> Self {
+        self.fallbacks = crate::no_proposer_fallback(mode, crate::CAPTIONER_NO_PROPOSER)
+            .into_iter()
+            .collect();
+        self.prefix_cache.reason = Some(crate::CAPTIONER_NO_PREFIX_CACHE.to_string());
+        self
+    }
+
     /// The realized mean accepted length: draft tokens accepted per verification pass
     /// (`accepted_tokens / verify_steps`), or `None` when no proposer ran or no verify step did.
     /// Each verify step also commits one target-chosen token, so tokens per verify step is this
@@ -211,6 +233,55 @@ pub struct ProjectionReport {
     pub resident_bytes: u64,
 }
 
+/// Fused-versus-reference primitive runs on one thread (epic sc-24432 E3): each backend keeps a
+/// monotone thread-local tally of the primitives that have a fused route, counting every run by
+/// the route that served it, and a request reports [`since`](Self::since) its start. The same
+/// labels on both backends ([`label`](Self::label)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FusedTally {
+    /// Runs served by a fused kernel.
+    pub fused: u64,
+    /// Runs served by the reference (unfused) route.
+    pub reference: u64,
+    /// Why the most recent reference run happened (`None` if none happened).
+    pub reference_reason: Option<&'static str>,
+}
+
+impl FusedTally {
+    /// The counts accumulated since `start` (the reason is the latest one, when a reference run
+    /// happened since `start`).
+    pub fn since(&self, start: &FusedTally) -> FusedTally {
+        FusedTally {
+            fused: self.fused.wrapping_sub(start.fused),
+            reference: self.reference.wrapping_sub(start.reference),
+            reference_reason: if self.reference != start.reference {
+                self.reference_reason
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Which route served the runs: `fused` (only fused), `reference` (no fused run), `mixed`
+    /// (both), or `none` (no run).
+    pub fn label(&self) -> &'static str {
+        match (self.fused, self.reference) {
+            (0, 0) => "none",
+            (_, 0) => "fused",
+            (0, _) => "reference",
+            _ => "mixed",
+        }
+    }
+
+    /// The report a request carries ([`DecodeReport::fused_primitives`]).
+    pub fn path_report(&self) -> PathReport {
+        PathReport {
+            path: self.label().to_string(),
+            reason: self.reference_reason.map(str::to_string),
+        }
+    }
+}
+
 /// What a load produced (sc-24139): the weight format the caller requested and the projection
 /// kinds the loaded decoder actually holds. Read through
 /// [`TextLlm::load_report`](crate::TextLlm::load_report).
@@ -226,10 +297,14 @@ pub struct LoadReport {
     /// load. `None` where the switch does not apply — a provider that never routes decode steps
     /// through a CUDA-graph runner — so a product shows the settled value, not the request.
     pub cuda_graphs: Option<bool>,
-    /// Every optional accelerator the load was asked for but did not attach, each leading with
-    /// the feature (`mtp_head: …`; `cuda_graphs: …` when the graph switch is on but the
-    /// decoder's step cannot be captured), so a product can show why (epic sc-24432 E2: the model still
-    /// loaded; the accelerator is absent). Empty when everything requested was attached.
+    /// Every optional accelerator the load was asked for (or the checkpoint declared) but did not
+    /// attach, each leading with the feature — `mtp_head: …` (a companion head refused), `mtp: …`
+    /// (a configured native MTP head the snapshot does not carry, or an unsupported head variant),
+    /// `draft model: …` (a named draft refused; also in [`draft`](Self::draft)),
+    /// `prefix_cache: …` (a requested cache settled to zero bytes for lack of headroom),
+    /// `cuda_graphs: …` (the graph switch is on but the device, the build or the decoder's step
+    /// cannot capture) — so a product can show why (epic sc-24432 E2: the model still loaded; the
+    /// accelerator is absent). Empty when everything requested was attached.
     pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (story sc-24437): the requested
     /// budget ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes), else
@@ -242,6 +317,41 @@ pub struct LoadReport {
     /// epic sc-24432 story sc-24436): resident, or refused with the reason named. `None` when no
     /// draft was named.
     pub draft: Option<DraftReport>,
+}
+
+impl LoadReport {
+    /// Record what became of the load's named draft (sc-24436): in [`draft`](Self::draft), and —
+    /// for a refused draft — its reason in [`fallbacks`](Self::fallbacks) too (E2: every fallback
+    /// named in one place).
+    pub fn record_draft(&mut self, draft: DraftReport) {
+        self.draft = Some(draft.named_in(&mut self.fallbacks));
+    }
+
+    /// Record the prefix-cache budget the load settled (story sc-24437) for a request of
+    /// `requested` ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes)): in
+    /// [`prefix_cache_bytes`](Self::prefix_cache_bytes), and — when a non-zero request settled to
+    /// zero because admission left no headroom — a named `prefix_cache: …` entry in
+    /// [`fallbacks`](Self::fallbacks). An explicit `Some(0)` turns the cache off and names nothing.
+    pub fn record_prefix_budget(&mut self, requested: Option<u64>, settled: u64) {
+        self.fallbacks
+            .extend(prefix_budget_fallback(requested, settled));
+        self.prefix_cache_bytes = Some(settled);
+    }
+}
+
+/// The load fallback for a prefix-cache budget (story sc-24437) that settled to zero bytes
+/// although `requested` ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes),
+/// `None` = [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES)) asked for some —
+/// load admission left no headroom beside the model (E2/E7). `None` when the cache settled to a
+/// non-zero budget or the request turned it off (`Some(0)`).
+pub fn prefix_budget_fallback(requested: Option<u64>, settled: u64) -> Option<String> {
+    let asked = crate::requested_prefix_cache_bytes(requested);
+    (settled == 0 && asked > 0).then(|| {
+        format!(
+            "prefix_cache: the requested {asked}-byte cache settled to 0 bytes — load admission \
+             left no headroom beside the model; requests decode without it"
+        )
+    })
 }
 
 /// What became of a load's named draft model (sc-24436). A draft never fails the load (epic
@@ -278,6 +388,13 @@ impl DraftReport {
     pub fn is_resident(&self) -> bool {
         self.refusal.is_none()
     }
+
+    /// This report, with a refusal's reason also pushed onto a load's `fallbacks` (E2: every
+    /// load fallback named in [`LoadReport::fallbacks`]).
+    pub fn named_in(self, fallbacks: &mut Vec<String>) -> Self {
+        fallbacks.extend(self.refusal.clone());
+        self
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +419,36 @@ mod tests {
         );
     }
 
+    /// E2/E8: a captioner's report names its speculative fallback (none for `off`) and why its
+    /// prefix cache is `none`, in the shared words.
+    #[test]
+    fn a_captioner_report_names_its_proposer_and_prefix_cache_reasons() {
+        let base = DecodeReport {
+            prefix_cache: PathReport {
+                path: "none".into(),
+                reason: None,
+            },
+            ..DecodeReport::default()
+        };
+        let auto = base
+            .clone()
+            .with_captioner_reasons(crate::Speculative::Auto);
+        assert_eq!(auto.fallbacks.len(), 1);
+        assert!(
+            auto.fallbacks[0].contains(crate::CAPTIONER_NO_PROPOSER),
+            "{:?}",
+            auto.fallbacks
+        );
+        assert_eq!(auto.prefix_cache.path, "none");
+        assert_eq!(
+            auto.prefix_cache.reason.as_deref(),
+            Some(crate::CAPTIONER_NO_PREFIX_CACHE)
+        );
+        let off = base.with_captioner_reasons(crate::Speculative::Off);
+        assert!(off.fallbacks.is_empty());
+        assert!(off.prefix_cache.reason.is_some());
+    }
+
     #[test]
     fn mean_accepted_length_is_accepted_drafts_per_verify_step() {
         let mut report = DecodeReport {
@@ -316,6 +463,68 @@ mod tests {
         report.accepted_tokens = 6;
         assert_eq!(report.mean_accepted_length(), Some(1.5));
         assert!(report.fallbacks.is_empty());
+    }
+
+    /// E2: a non-zero prefix-cache request settled to zero bytes is named; an explicit `0` and
+    /// a cache that fits name nothing.
+    #[test]
+    fn a_prefix_cache_settled_to_zero_by_admission_is_named() {
+        let mut load = LoadReport::default();
+        load.record_prefix_budget(None, 0);
+        assert_eq!(load.prefix_cache_bytes, Some(0));
+        assert_eq!(load.fallbacks.len(), 1, "{:?}", load.fallbacks);
+        assert!(
+            load.fallbacks[0].starts_with("prefix_cache: the requested 1073741824-byte cache"),
+            "{:?}",
+            load.fallbacks
+        );
+        for (requested, settled) in [(Some(0), 0), (Some(64), 64), (None, 5)] {
+            let mut load = LoadReport::default();
+            load.record_prefix_budget(requested, settled);
+            assert_eq!(load.prefix_cache_bytes, Some(settled));
+            assert!(load.fallbacks.is_empty(), "{requested:?} -> {settled}");
+        }
+    }
+
+    /// E3: the fused tally reports the route that ran since a request's start, with the latest
+    /// reference reason only when a reference run happened in that window.
+    #[test]
+    fn the_fused_tally_reports_the_routes_since_the_start() {
+        let start = FusedTally {
+            fused: 2,
+            reference: 1,
+            reference_reason: Some("old"),
+        };
+        assert_eq!(start.since(&start).label(), "none");
+        assert_eq!(start.since(&start).path_report().reason, None);
+        let fused = FusedTally { fused: 5, ..start };
+        assert_eq!(
+            fused.since(&start).path_report(),
+            PathReport {
+                path: "fused".into(),
+                reason: None
+            }
+        );
+        let mixed = FusedTally {
+            fused: 5,
+            reference: 2,
+            reference_reason: Some("cpu_stream"),
+        };
+        assert_eq!(
+            mixed.since(&start).path_report(),
+            PathReport {
+                path: "mixed".into(),
+                reason: Some("cpu_stream".into())
+            }
+        );
+        let reference = FusedTally {
+            reference: 3,
+            ..mixed
+        };
+        assert_eq!(
+            reference.since(&FusedTally { fused: 5, ..start }).label(),
+            "reference"
+        );
     }
 
     #[test]

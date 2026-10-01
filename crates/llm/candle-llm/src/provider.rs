@@ -53,17 +53,9 @@ use crate::primitives::{KvCache, StepKvCache, Weights};
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "candle-llama";
 
-/// Why a multimodal request bypasses the cross-turn prefix cache (sc-24437).
-const PREFIX_MULTIMODAL: &str = "a multimodal prompt is never cached — its image / video / audio \
-                                 rows are not in the token key";
-/// Why a request's own prefix-cache snapshot was not taken (sc-24437, E7).
-const PREFIX_NOT_ADMITTED: &str =
-    "not kept: admission could not hold this request's snapshot beside it";
-/// Why a request's own prefix-cache snapshot was dropped.
-const PREFIX_COPY_FAILED: &str = "not kept: the snapshot copy failed";
-/// Why a request on a paged KV cache keeps no snapshot: its blocks are shared through the pool's
-/// own copy-on-write, and the prefix cache does not copy them out.
-const PREFIX_PAGED_NOT_SNAPSHOTTED: &str = "not kept: paged KV backing is not snapshotted";
+// The prefix-cache reasons are the shared ones (sc-24437, E8): both backends name a bypass or a
+// snapshot that was not kept in the same words.
+use core_llm::{PREFIX_COPY_FAILED, PREFIX_NOT_ADMITTED, PREFIX_PAGED_NOT_SNAPSHOTTED};
 
 /// The prefix-cache reason for a failed [`PrefixCache::store`]: the paged backing's typed refusal
 /// (`Unsupported` — the only one a snapshot raises) is named as such; anything else is a failed
@@ -1005,10 +997,20 @@ pub struct LoadRecord {
     pub prefix_cache_bytes: Option<u64>,
 }
 
+/// Why a load whose CUDA-graph switch is on can never capture (sc-24441, E3): the device-and-build
+/// refusal (`device`, already worded `cuda_graphs: …`) first, else the decoder's own
+/// [`graph_support`](crate::decode::StepModel::graph_support) refusal as `cuda_graphs: <reason>`;
+/// `None` when both can capture.
+fn graph_load_refusal(
+    device: Option<String>,
+    decoder: std::result::Result<(), &'static str>,
+) -> Option<String> {
+    device.or_else(|| decoder.err().map(|reason| format!("cuda_graphs: {reason}")))
+}
+
 /// The load fallback Candle names for a companion MTP head requested on a target outside the
 /// Qwen3.5/3.8 family, which has no predictor path to attach it to.
-pub const CANDLE_MTP_HEAD_FALLBACK: &str =
-    "mtp_head: companion MTP heads attach to Qwen3.5/3.8-family (qwen3_5, Prism) targets only";
+pub const CANDLE_MTP_HEAD_FALLBACK: &str = core_llm::COMPANION_MTP_FAMILY_REFUSAL;
 
 impl LoadRecord {
     /// The backend-neutral report a product renders (sc-24139): the requested format, the
@@ -1523,14 +1525,7 @@ impl LlamaProvider {
             SpeculativePlan::Run {
                 proposer: SpeculativeProposer::DraftModel,
                 ..
-            } if self.draft.is_none() => (
-                plain,
-                Some(
-                    "speculative: `draft_model` has no draft model loaded on this provider; \
-                     decoded without a proposer"
-                        .into(),
-                ),
-            ),
+            } if self.draft.is_none() => (plain, Some(core_llm::DRAFT_MODEL_NOT_LOADED.into())),
             SpeculativePlan::Run { proposer, .. } if reference_only => (
                 DecodeRoute::Reference,
                 Some(format!(
@@ -1693,20 +1688,32 @@ impl LlamaProvider {
         };
         provider.load_record.requested = spec.quantize;
         provider.load_record.cuda_graphs = Some(cuda_graphs);
-        provider.load_record.fallbacks = fallbacks;
+        // The load's own fallbacks (a refused companion head) join what the decoder's load named
+        // (a configured native MTP head the snapshot does not carry).
+        provider.load_record.fallbacks.splice(0..0, fallbacks);
         provider.attach_mtp_head(mtp_head.map(|(head, _)| head));
         provider.load_record.prefix_cache_bytes = Some(prefix_budget);
+        provider
+            .load_record
+            .fallbacks
+            .extend(core_llm::prefix_budget_fallback(
+                spec.prefix_cache_bytes,
+                prefix_budget,
+            ));
         provider.prefix = Mutex::new(PrefixCache::with_budget(prefix_budget));
         match draft {
             None => {}
             Some((draft_spec, Some(refusal))) => {
-                provider.draft_report = Some(DraftReport::refused(draft_spec.source, refusal));
+                provider.draft_report = Some(
+                    DraftReport::refused(draft_spec.source, refusal)
+                        .named_in(&mut provider.load_record.fallbacks),
+                );
             }
             Some((draft_spec, None)) => {
                 provider.attach_draft(&draft_spec, &device, requested.as_ref())
             }
         }
-        provider.note_graph_refusal(cuda_graphs);
+        provider.note_graph_refusal(cuda_graphs, &device);
         Ok(provider)
     }
 
@@ -1731,7 +1738,7 @@ impl LlamaProvider {
                 if let Some((required, available)) = device {
                     core_llm::admit_request_memory(required, available)?;
                 }
-                Some(format!("draft model: its load cannot be priced ({e})"))
+                Some(core_llm::draft_unpriced_refusal(e))
             }
             Ok(estimate) => {
                 let host =
@@ -1765,16 +1772,10 @@ impl LlamaProvider {
         let source = spec.source.clone();
         let path = Path::new(&source);
         let target_logits = self.model.memory_geometry().vocab_size as usize;
-        let early = Tokenizer::from_file(path.join("tokenizer.json"))
-            .ok()
-            .and_then(|tokenizer| self.tokenizer.vocabulary_mismatch(&tokenizer))
-            .map(|why| {
-                format!("draft model: its tokenizer vocabulary is not the target's ({why})")
-            });
-        let early = early.or_else(|| {
+        let early = core_llm::draft_tokenizer_refusal(&self.tokenizer, path).or_else(|| {
             ensure_supported_device(path, device)
                 .err()
-                .map(|e| format!("draft model: {e}"))
+                .map(core_llm::draft_refusal)
         });
         let outcome = match early {
             Some(why) => Err(why),
@@ -1790,7 +1791,7 @@ impl LlamaProvider {
                     Self::load_dir(path, device, requested)
                 };
                 match loaded {
-                    Err(e) => Err(format!("draft model: its load failed ({e})")),
+                    Err(e) => Err(core_llm::draft_load_refusal(e)),
                     Ok(draft) => core_llm::draft_compatibility(
                         &self.tokenizer,
                         target_logits,
@@ -1806,18 +1807,14 @@ impl LlamaProvider {
                 }
             }
         };
-        self.draft_report = Some(match outcome {
-            Ok(model) => {
-                self.draft = Some(model);
-                let max_depth = self.verify_depth_bound();
-                self.descriptor
-                    .capabilities
-                    .speculative
-                    .push(core_llm::draft_model_capabilities(max_depth));
-                DraftReport::resident(source)
-            }
-            Err(why) => DraftReport::refused(source, why),
-        });
+        let (draft, report) = core_llm::settle_draft(
+            source,
+            outcome,
+            &mut self.descriptor.capabilities,
+            &mut self.load_record.fallbacks,
+        );
+        self.draft = draft;
+        self.draft_report = Some(report);
     }
 
     /// What a request on `route` is admitted against before any preprocessing: the target's
@@ -1875,17 +1872,6 @@ impl LlamaProvider {
         }
     }
 
-    /// The model's verify-depth bound: the depth its descriptor advertises for prompt lookup (the
-    /// per-model bound, sc-24438), which `draft_model` advertises too — every draft is one more
-    /// verify row whichever proposer drew it (sc-24436). Every decoder advertises prompt lookup;
-    /// one draft per step otherwise.
-    fn verify_depth_bound(&self) -> u32 {
-        self.descriptor
-            .capabilities
-            .proposer(SpeculativeProposer::PromptLookup)
-            .map_or(1, |lookup| lookup.max_depth)
-    }
-
     /// The resident draft's context window (`0`: no draft, or an unbounded one).
     fn draft_context(&self) -> usize {
         self.draft.as_ref().map_or(0, |draft| draft.context)
@@ -1924,9 +1910,10 @@ impl LlamaProvider {
     fn attach_mtp_head(&mut self, head: Option<&Path>) {
         let Some(head) = head else { return };
         let outcome = match (&self.model, &self.mtp) {
-            (Decoder::Qwen35(_), Some(_)) => {
-                Err("mtp_head: the target already carries its own MTP predictor".to_string())
-            }
+            (Decoder::Qwen35(_), Some(_)) => Err(format!(
+                "mtp_head: {}",
+                core_llm::COMPANION_MTP_ALREADY_NATIVE
+            )),
             (Decoder::Qwen35(model), None) => {
                 Qwen35Mtp::from_companion_dir(head, model).map_err(|e| format!("mtp_head: {e}"))
             }
@@ -1947,10 +1934,10 @@ impl LlamaProvider {
                     .capabilities
                     .advertise_mtp(MTP_MAX_DEPTH, MTP_RECOMMENDED_DEPTH);
             }
-            Err(reason) => self.load_record.fallbacks.push(format!(
-                "{reason} (`{}`); the model loaded without a companion head",
-                head.display()
-            )),
+            Err(reason) => self
+                .load_record
+                .fallbacks
+                .push(core_llm::companion_head_fallback(&reason, head)),
         }
     }
 
@@ -2100,6 +2087,9 @@ impl LlamaProvider {
         } else {
             (Weights::from_dir(dir, device).map_err(to_core)?, None)
         };
+        // What the decoder's own load could not attach (E2): a configured native MTP head the
+        // snapshot does not carry, or a variant this runtime does not run.
+        let mut load_fallbacks = Vec::new();
         let (model, mut descriptor, mtp) = if arch == Architecture::Qwen35 {
             // Qwen3.6 hybrid decoder: its own config, the VLM-nested `model.language_model` prefix, and
             // a top-level untied `lm_head`.
@@ -2132,19 +2122,25 @@ impl LlamaProvider {
                 Qwen35Model::from_weights_format(&weights, prefix, qcfg, format.as_ref())
                     .map_err(to_core)?
             };
-            let configured_layers = m.config().mtp_num_hidden_layers;
-            let has_mtp_tensors = weights.keys().any(|key| key.starts_with("mtp."));
-            let mtp = if configured_layers > 0 {
-                Some(
+            // The configured native head (E2, the rule MLX loads by): built when complete; a
+            // declared head the snapshot does not carry, or a variant this runtime does not
+            // run, loads the target plain with the reason named; a partial `mtp.*` set still
+            // fails the load (integrity).
+            let cfg = m.config();
+            let mtp = match core_llm::native_mtp_plan(
+                cfg.mtp_num_hidden_layers,
+                cfg.mtp_use_dedicated_embeddings,
+                weights.keys().any(|key| key.starts_with("mtp.")),
+            )? {
+                core_llm::NativeMtp::Absent => None,
+                core_llm::NativeMtp::Build => Some(
                     Qwen35Mtp::from_weights_format(&weights, &m, format.as_ref())
                         .map_err(to_core)?,
-                )
-            } else if has_mtp_tensors {
-                return Err(CoreError::Load(
-                    "qwen3_5 checkpoint carries MTP tensors while config disables MTP".into(),
-                ));
-            } else {
-                None
+                ),
+                core_llm::NativeMtp::Fallback(why) => {
+                    load_fallbacks.push(why);
+                    None
+                }
             };
             (Decoder::Qwen35(m), descriptor, mtp)
         } else {
@@ -2297,7 +2293,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
-                fallbacks: Vec::new(),
+                fallbacks: load_fallbacks,
                 prefix_cache_bytes: None,
             },
         })
@@ -2537,18 +2533,25 @@ impl LlamaProvider {
         }
     }
 
-    /// With the CUDA-graph switch the load settled on (`cuda_graphs`), name a decoder whose step
-    /// the graph runner can never capture in the load's fallbacks — `cuda_graphs: <reason>`, the
-    /// decoder's own [`graph_support`](crate::decode::StepModel::graph_support) refusal — so a
-    /// product knows at load, not after the first generation (sc-24441, E3). Each request still
-    /// reports its eager steps and their reason. Nothing is named with the switch off or for a
-    /// capturable decoder.
-    fn note_graph_refusal(&mut self, cuda_graphs: bool) {
-        if let (true, Err(reason)) = (cuda_graphs, self.model.graph_support()) {
-            self.load_record
-                .fallbacks
-                .push(format!("cuda_graphs: {reason}"));
+    /// With the CUDA-graph switch the load settled on (`cuda_graphs`), name why the graph runner
+    /// can never capture on this load in its fallbacks — the load `device`'s or the build's
+    /// refusal first (`cuda_graphs: not_cuda: …`, `cuda_feature_off`, `flash_attn_stream`,
+    /// `legacy_stream`, `no_async_alloc`), else the decoder's own
+    /// [`graph_support`](crate::decode::StepModel::graph_support) refusal (`cuda_graphs:
+    /// <reason>`) — so a product knows at load, not after the first generation (sc-24441, E3).
+    /// Each request still reports its eager steps and their reason. Nothing is named with the
+    /// switch off or for a capturable device and decoder.
+    fn note_graph_refusal(&mut self, cuda_graphs: bool, device: &Device) {
+        if !cuda_graphs {
+            return;
         }
+        // The device and build first — a CPU / Metal device, a build without CUDA, a legacy or
+        // allocator-less stream refuse every capture whatever the decoder declares — in the
+        // words `backend_capabilities` uses; then the decoder's own declaration.
+        self.load_record.fallbacks.extend(graph_load_refusal(
+            crate::backend::cuda_graphs_device_refusal(device),
+            self.model.graph_support(),
+        ));
     }
 
     /// The load telemetry: the requested weight format and the resident weight census by
@@ -3587,19 +3590,7 @@ fn load_memory_budget() -> CoreResult<Option<u64>> {
 /// norm vector (f32). The head's per-request attention cache is priced by request admission on
 /// the `mtp` route.
 pub(crate) fn companion_head_bytes(dir: &Path) -> CoreResult<u64> {
-    if !dir.is_dir() {
-        return Err(CoreError::Load(format!(
-            "companion MTP head `{}` is not a directory",
-            dir.display()
-        )));
-    }
-    let payload = core_llm::checkpoint_payload_bytes(dir)?;
-    if payload == 0 {
-        return Err(CoreError::Load(format!(
-            "companion MTP head `{}` holds no .safetensors",
-            dir.display()
-        )));
-    }
+    let payload = core_llm::companion_head_payload_bytes(dir)?;
     let overflow = || CoreError::Load("companion MTP head admission overflow".into());
     let tensors = snapshot_tensor_headers(dir)?;
     let group_size = read_json(dir, "config.json").and_then(|config| {
@@ -3647,32 +3638,20 @@ pub(crate) fn companion_head_bytes(dir: &Path) -> CoreResult<u64> {
 
 /// Admit a companion MTP head's resident bytes on top of what the load already admitted — the
 /// target and any admitted draft (E7) — in the host domain `(admitted, available)` and, on CUDA,
-/// the device domain too, returning the head and its bytes. `Err` is the named load fallback
-/// (E2): the head is unreadable, or the admitted bytes plus the head's exceed a budget.
+/// the device domain too ([`core_llm::admit_companion_head`], the rule MLX admits by), returning
+/// the head and its bytes. `Err` is the named load fallback (E2): the head is unreadable, or the
+/// admitted bytes plus the head's exceed a budget.
 fn admit_companion_head(
     head: &Path,
     host: (u64, u64),
     device: Option<(u64, u64)>,
 ) -> Result<(&Path, u64), String> {
-    let head_bytes = companion_head_bytes(head)
-        .map_err(|e| format!("mtp_head: {e}; the model loaded without a companion head"))?;
-    for (domain, (target_bytes, available)) in
-        std::iter::once(("host", host)).chain(device.map(|d| ("device", d)))
-    {
-        let total = target_bytes.checked_add(head_bytes).ok_or_else(|| {
-            "mtp_head: load admission overflow; the model loaded without a companion head"
-                .to_string()
-        })?;
-        core_llm::admit_request_memory(total, available).map_err(|e| {
-            format!(
-                "mtp_head: refused by load admission: the head's {head_bytes} bytes on top of \
-                 the target's {target_bytes} exceed the {domain} budget ({e}); the model loaded \
-                 without a companion head (`{}`)",
-                head.display()
-            )
-        })?;
-    }
-    Ok((head, head_bytes))
+    core_llm::admit_companion_head(
+        head,
+        companion_head_bytes(head),
+        std::iter::once(("host", host.0, host.1))
+            .chain(device.map(|(admitted, available)| ("device", admitted, available))),
+    )
 }
 
 /// The process-wide override caps the execution-memory domain. On a discrete CUDA device, host
@@ -4206,18 +4185,14 @@ impl TextLlm for LlamaProvider {
         // snapshots at the end of the rendered conversation, the prefix the next turn extends.
         let prefix_on = self.prefix_cache().budget_bytes() > 0;
         let prefix_route = !multimodal && !gemma4_mm_request && route != DecodeRoute::Reference;
-        let (mut prefix_path, mut prefix_reason) = if !prefix_on {
-            ("off", None)
-        } else if multimodal || gemma4_mm_request {
-            ("bypassed", Some(PREFIX_MULTIMODAL))
-        } else if !prefix_route {
-            (
-                "bypassed",
-                Some("the reference decode loop is the parity oracle and always prefills cold"),
-            )
-        } else {
-            ("miss", None)
-        };
+        let (mut prefix_path, mut prefix_reason) =
+            match core_llm::prefix_path_before_lookup(prefix_on, multimodal || gemma4_mm_request) {
+                ("miss", _) if !prefix_route => (
+                    "bypassed",
+                    Some("the reference decode loop is the parity oracle and always prefills cold"),
+                ),
+                shared => shared,
+            };
         let prefix_mtp = matches!(
             route,
             DecodeRoute::Engine {
@@ -4749,8 +4724,10 @@ impl TextLlm for LlamaProvider {
                     .as_mut()
                     .map(|m| m as &mut dyn RewindableConstraintMask);
                 // The CUDA-graph runner (sc-24134) wraps the model when the switch is on, as on
-                // the MTP path: the family declares its steps uncapturable
-                // (`positions_host_scalar`), so every step runs eager and the record names why.
+                // the MTP path. With device positions staged (sc-24441, the CUDA default) a dense
+                // llama-family step is capturable and the runner replays it; a decoder on host
+                // positions (`positions_host_scalar`), a MoE bank that cannot capture, or a device
+                // or build the runner refuses runs every step eager, and the record names why.
                 let graphs = GraphRunner::new(model);
                 let stepper: &dyn StepModel<Cache = StepKvCache> = if cuda_graphs_enabled() {
                     &graphs
@@ -5278,25 +5255,16 @@ pub const PROMPT_LOOKUP_MAX_DEPTH: u32 = SPECULATIVE_MAX_DEPTH;
 /// head). Advertised on both the legacy `mtp` field and the per-proposer list (sc-24438).
 pub const MTP_MAX_DEPTH: u32 = SPECULATIVE_MAX_DEPTH;
 
-/// The MTP depth [`Speculative::Auto`](core_llm::Speculative::Auto) runs on a Qwen3.8 head (the
-/// upstream recommendation).
-pub const MTP_RECOMMENDED_DEPTH: u32 = 3;
+/// The recommended MTP and prompt-lookup depths are the shared ones (E8): both backends run
+/// [`Speculative::Auto`](core_llm::Speculative::Auto) at the same depths.
+pub use core_llm::{MTP_RECOMMENDED_DEPTH, PROMPT_LOOKUP_RECOMMENDED_DEPTH};
 
-/// The prompt-lookup depth [`Speculative::Auto`](core_llm::Speculative::Auto) runs on a model
-/// without an MTP head (sc-24433). A lookup that finds no match proposes nothing and the step is
-/// an ordinary single-token decode, so the depth only prices a match; 4 keeps the checkpoint ring
-/// of the hybrid at `K + 2 = 6` states.
-pub const PROMPT_LOOKUP_RECOMMENDED_DEPTH: u32 = 4;
-
-/// The prompt-lookup advertisement every `candle-llama` decoder carries: both decoder families
-/// (the llama-family `CausalLm` and the qwen3_5 hybrid) run through the step-seam engine, so the
-/// proposer needs nothing from the checkpoint.
+/// The prompt-lookup advertisement every `candle-llama` decoder carries (the shared
+/// [`core_llm::prompt_lookup_capabilities`] at [`PROMPT_LOOKUP_MAX_DEPTH`]): both decoder
+/// families (the llama-family `CausalLm` and the qwen3_5 hybrid) run through the step-seam
+/// engine, so the proposer needs nothing from the checkpoint.
 fn prompt_lookup_capabilities() -> ProposerCapabilities {
-    ProposerCapabilities {
-        proposer: SpeculativeProposer::PromptLookup,
-        max_depth: PROMPT_LOOKUP_MAX_DEPTH,
-        recommended_depth: PROMPT_LOOKUP_RECOMMENDED_DEPTH,
-    }
+    core_llm::prompt_lookup_capabilities(PROMPT_LOOKUP_MAX_DEPTH)
 }
 
 /// The descriptor for the `candle-llama` provider (constructible without loading weights; used for
@@ -6664,11 +6632,13 @@ mod tests {
         );
     }
 
-    /// sc-24441 (E3): with the CUDA-graph switch on, a load whose decoder the runner can never
-    /// capture names it in the load's fallbacks (`cuda_graphs: <graph_support reason>`) — here a
-    /// dense llama with device positions off (`positions_host_scalar`) — and names nothing with
-    /// the switch off or for a capturable decoder (device positions on). The device-positions
-    /// default is process state read once, so each setting runs in a child process of its own.
+    /// sc-24441 (E3): with the CUDA-graph switch on, a load the runner can never capture on
+    /// names why in the load's fallbacks — the load device's (or the build's) refusal first, in
+    /// the words `backend_capabilities` uses (`cuda_graphs: not_cuda: …` on this CPU test host;
+    /// `cuda_feature_off` in a build without CUDA), else the decoder's own `graph_support`
+    /// refusal — here a dense llama with device positions off (`positions_host_scalar`) — and
+    /// names nothing with the switch off. The device-positions default is process state read
+    /// once, so each setting runs in a child process of its own.
     #[test]
     fn a_graph_load_names_a_decoder_the_runner_cannot_capture() {
         use core_llm::TextLlm;
@@ -6697,16 +6667,66 @@ mod tests {
         };
         let provider = load(true);
         let fallbacks = provider.load_report().unwrap().fallbacks;
+        let device = crate::device::select_device().unwrap();
+        let device_refusal = crate::backend::cuda_graphs_device_refusal(&device);
+        if !device.is_cuda() {
+            // The CPU case: the device refuses every capture, named first, whatever the decoder.
+            let reason = if cfg!(feature = "cuda") {
+                "not_cuda"
+            } else {
+                "cuda_feature_off"
+            };
+            assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+            assert!(
+                fallbacks[0].starts_with(&format!("cuda_graphs: {reason}: ")),
+                "{fallbacks:?}"
+            );
+        }
         if setting == "1" {
             assert_eq!(provider.model.graph_support(), Ok(()), "capturable");
-            assert!(fallbacks.is_empty(), "{fallbacks:?}");
+            assert_eq!(fallbacks, device_refusal.into_iter().collect::<Vec<_>>());
         } else {
             assert_eq!(
                 fallbacks,
-                vec!["cuda_graphs: positions_host_scalar".to_string()]
+                vec![device_refusal.unwrap_or_else(|| "cuda_graphs: positions_host_scalar".into())]
             );
             assert!(load(false).load_report().unwrap().fallbacks.is_empty());
         }
+    }
+
+    /// sc-24441 (E3): the load names the device-and-build graph refusal ahead of the decoder's,
+    /// and the decoder's when the device can capture.
+    #[test]
+    fn the_device_graph_refusal_is_named_before_the_decoders() {
+        let device = Some("cuda_graphs: not_cuda: CUDA graphs need a CUDA load device".to_string());
+        assert_eq!(
+            super::graph_load_refusal(device.clone(), Err("positions_host_scalar")),
+            device
+        );
+        assert_eq!(super::graph_load_refusal(device.clone(), Ok(())), device);
+        assert_eq!(
+            super::graph_load_refusal(None, Err("positions_host_scalar")).as_deref(),
+            Some("cuda_graphs: positions_host_scalar")
+        );
+        assert_eq!(super::graph_load_refusal(None, Ok(())), None);
+        // A build without CUDA (or a CPU device in a CUDA build) refuses by the backend's words.
+        let cpu = crate::backend::cuda_graphs_device_refusal(&candle_core::Device::Cpu).unwrap();
+        let reason = if cfg!(feature = "cuda") {
+            "not_cuda"
+        } else {
+            "cuda_feature_off"
+        };
+        assert_eq!(
+            Some(cpu),
+            crate::backend::capabilities_for_device("candle-cpu", &candle_core::Device::Cpu)
+                .cuda_graphs
+                .reason
+        );
+        assert!(
+            crate::backend::cuda_graphs_device_refusal(&candle_core::Device::Cpu)
+                .unwrap()
+                .starts_with(&format!("cuda_graphs: {reason}: ")),
+        );
     }
 
     /// sc-24441: the reference loop's record names the decode attention when the decoder's
@@ -8722,6 +8742,122 @@ mod tests {
         .is_none());
     }
 
+    /// sc-24436 E2/E7 through the real load (sc-24432 feature-end review): a budget that fits the
+    /// target but not target + draft refuses the draft by name in BOTH the load report's `draft`
+    /// and its `fallbacks`, and the target loads alone.
+    #[test]
+    fn a_draft_refused_by_load_admission_is_named_in_the_load_fallbacks() {
+        use core_llm::TextLlm;
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let spec = fixture.spec_with_draft();
+        let draft_source = fixture.draft.to_string_lossy().into_owned();
+        let target = admitted_bytes(&core_llm::LoadSpec::dense(fixture.target.to_string_lossy()));
+        let draft = admitted_bytes(&super::draft_load_spec(&spec, &draft_source));
+        let provider =
+            super::with_load_budget(target + draft - 1, || super::LlamaProvider::load(&spec))
+                .expect("the target fits and loads alone");
+        let report = provider.load_report().unwrap();
+        let refused = report.draft.clone().expect("the named draft is reported");
+        let refusal = refused.refusal.clone().expect("refused by load admission");
+        assert!(refusal.starts_with("draft model:"), "{refusal}");
+        assert_eq!(refused.source, draft_source);
+        assert!(
+            report.fallbacks.contains(&refusal),
+            "the refused draft is named in the load fallbacks: {:?}",
+            report.fallbacks
+        );
+        assert!(provider
+            .descriptor()
+            .capabilities
+            .proposer(core_llm::SpeculativeProposer::DraftModel)
+            .is_none());
+    }
+
+    /// E2 (sc-24432 feature-end review): a qwen3_5 config declaring a native MTP head the
+    /// snapshot does not carry — or a variant this runtime does not run (two predictor layers,
+    /// dedicated MTP embeddings) — loads the target plain with a named `mtp:` load fallback and
+    /// MTP unadvertised, and decodes; a PARTIAL `mtp.*` set is still a load error (integrity).
+    #[test]
+    fn a_configured_mtp_head_the_snapshot_cannot_run_is_a_named_load_fallback() {
+        use core_llm::{Message, Sampling, TextLlm, TextLlmRequest};
+        let variant = |edit: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>),
+                       keep: &dyn Fn(&str) -> bool| {
+            let mut json = crate::models::qwen35::tests::synthetic_cfg_json();
+            let text = json["text_config"].as_object_mut().unwrap();
+            text.insert("linear_value_head_dim".into(), serde_json::json!(8));
+            text.insert("mtp_num_hidden_layers".into(), serde_json::json!(1));
+            let cfg = crate::models::Qwen35Config::from_json(&json).unwrap();
+            let weights = crate::models::qwen35::tests::synthetic_snapshot_weights(&cfg);
+            assert!(weights.keys().any(|k| k.starts_with("mtp.")), "a full head");
+            let tensors: HashMap<String, Tensor> = weights
+                .keys()
+                .filter(|k| keep(k))
+                .map(|k| (k.to_string(), weights.get(k).unwrap().clone()))
+                .collect();
+            edit(json["text_config"].as_object_mut().unwrap());
+            let mut config = serde_json::json!({
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "model_type": "qwen3_5",
+            });
+            config["text_config"] = json["text_config"].clone();
+            write_snapshot(&config, &tensors, cfg.vocab_size as usize)
+        };
+        let request = TextLlmRequest {
+            messages: vec![Message::user("t3 t7 t11 t2")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 3,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let no_head: &dyn Fn(&str) -> bool = &|k| !k.starts_with("mtp.");
+        let all: &dyn Fn(&str) -> bool = &|_| true;
+        type Edit = fn(&mut serde_json::Map<String, serde_json::Value>);
+        type Keep<'a> = &'a dyn Fn(&str) -> bool;
+        let cases: [(Edit, Keep, &str); 3] = [
+            (|_| {}, no_head, "stores no `mtp.*` tensor"),
+            (
+                |t| {
+                    t.insert("mtp_num_hidden_layers".into(), serde_json::json!(2));
+                },
+                all,
+                "declares 2 predictor layers",
+            ),
+            (
+                |t| {
+                    t.insert(
+                        "mtp_use_dedicated_embeddings".into(),
+                        serde_json::json!(true),
+                    );
+                },
+                all,
+                "dedicated MTP embeddings",
+            ),
+        ];
+        for (edit, keep, named) in cases {
+            let dir = variant(&edit, keep);
+            let provider = super::LlamaProvider::load(&spec_at(dir.path(), None))
+                .unwrap_or_else(|e| panic!("{named}: the target still loads (E2): {e}"));
+            let fallbacks = provider.load_report().unwrap().fallbacks;
+            assert_eq!(fallbacks.len(), 1, "{named}: {fallbacks:?}");
+            assert!(
+                fallbacks[0].starts_with("mtp: ") && fallbacks[0].contains(named),
+                "{named}: {fallbacks:?}"
+            );
+            assert!(mtp_advertised(&provider).is_none(), "{named}");
+            assert!(provider.mtp.is_none(), "{named}");
+            let out = provider.generate(&request, &mut |_| {}).unwrap();
+            assert_eq!(out.usage.generated_tokens, 3, "{named}");
+        }
+        // A partial head is a corrupt snapshot, not an absent accelerator: the load fails, naming
+        // the missing tensor.
+        let partial = variant(&|_| {}, &|k| k != "mtp.fc.weight");
+        let error = super::LlamaProvider::load(&spec_at(partial.path(), None))
+            .err()
+            .expect("a partial `mtp.*` set fails the load");
+        assert!(error.to_string().contains("mtp.fc.weight"), "{error}");
+    }
+
     /// sc-24433: a Qwen3-VL generic-causal multimodal request has no step-seam prefill, so a
     /// prompt-lookup plan falls back to the reference loop — and says so.
     #[test]
@@ -8881,12 +9017,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_is_refused() {
+    fn auto_on_a_qwen35_snapshot_without_a_head_runs_prompt_lookup_and_explicit_mtp_runs_plain() {
         // AC3 (sc-24130), revised by sc-24433 AC2, weights-free: the synthetic Qwen3.5 decoder
         // written as a snapshot with no `mtp.*` tensors and `mtp_num_hidden_layers = 0`. The
         // provider advertises no MTP but does advertise prompt lookup, so `auto` (the new option
         // or the legacy `mtp: Auto` alias) runs the engine with prompt lookup at its recommended
-        // depth, and the record names it; an explicit MTP request is refused; `off` is the engine
+        // depth, and the record names it; an explicit MTP (or `draft_model`) request the model
+        // does not advertise decodes plainly with the reason named (E2: explicit fallback, never
+        // failure — the sc-24432 feature-end review); `off` is the engine
         // with no proposer on the static KV cache (sc-24140), one verify step per token after the
         // first — and the same tokens.
         use core_llm::{Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
@@ -8946,10 +9084,36 @@ mod tests {
         );
         assert_eq!(record.replay_forwards, 0);
         assert!(off.decode.unwrap().fallbacks.is_empty());
-        assert!(matches!(
-            provider.generate(&request(MtpMode::Enabled { draft_tokens: 2 }), &mut |_| {}),
-            Err(core_llm::Error::Unsupported(_))
-        ));
+        for (speculative, proposer) in [
+            (
+                core_llm::Speculative::from(MtpMode::Enabled { draft_tokens: 2 }),
+                "mtp",
+            ),
+            (
+                core_llm::Speculative::proposer(core_llm::SpeculativeProposer::DraftModel, 2),
+                "draft_model",
+            ),
+        ] {
+            let plain = provider
+                .generate(
+                    &TextLlmRequest {
+                        speculative: Some(speculative),
+                        ..request(MtpMode::Off)
+                    },
+                    &mut |_| {},
+                )
+                .expect("an unadvertised proposer decodes plainly");
+            assert_eq!(plain.text, off.text, "{proposer}: the plain path's tokens");
+            let report = plain.decode.unwrap();
+            assert_eq!(report.proposer, ProposerKind::None, "{proposer}");
+            assert_eq!(
+                report.fallbacks,
+                vec![format!(
+                    "speculative: `{proposer}` is not available for this model (this model \
+                     does not advertise it; decoded without a proposer)"
+                )]
+            );
+        }
 
         // The reference loop stays selectable as the oracle for a request whose speculation is
         // off; it names itself, and on CPU f32 (where the two caches are bit-identical) it is the
@@ -10131,15 +10295,23 @@ mod tests {
             "{fallbacks:?}"
         );
         assert!(mtp_advertised(&provider).is_none());
-        assert!(provider
-            .validate(&head_request(Speculative::proposer(
-                SpeculativeProposer::Mtp,
-                3
-            )))
-            .is_err());
+        // An explicit MTP request then decodes plainly, the reason named (E2), never refused.
+        let (mtp_ids, mtp_out) = token_events(
+            &provider,
+            &head_request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
+        );
         let (ids, out) = token_events(&provider, &head_request(Speculative::Off));
         assert_eq!(ids.len(), 20);
         assert!(out.decode.unwrap().fallbacks.is_empty());
+        assert_eq!(mtp_ids, ids, "the plain path's tokens");
+        let mtp_report = mtp_out.decode.unwrap();
+        assert_eq!(mtp_report.proposer, ProposerKind::None);
+        assert_eq!(mtp_report.fallbacks.len(), 1, "{:?}", mtp_report.fallbacks);
+        assert!(
+            mtp_report.fallbacks[0].starts_with("speculative: `mtp` is not available"),
+            "{:?}",
+            mtp_report.fallbacks
+        );
 
         let missing = with_head(&target, &target.path().join("no-such-head"));
         let provider = super::LlamaProvider::load(&missing).expect("a missing head is not fatal");
@@ -10276,7 +10448,15 @@ mod tests {
             super::LlamaProvider::load(&spec)
         })
         .expect("target + head fit");
-        assert!(fits.load_record().fallbacks.is_empty());
+        // Nothing beside target + head is left for the prefix cache: it settles to 0 bytes, named
+        // (E2), and the head attaches.
+        assert_eq!(fits.load_record().prefix_cache_bytes, Some(0));
+        assert_eq!(
+            fits.load_record().fallbacks,
+            core_llm::prefix_budget_fallback(None, 0)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
         assert!(mtp_advertised(&fits).is_some());
         // The prefix-cache snapshot of an MTP request carries the head's KV too (sc-24437).
         let snapshot = |mtp| fits.prefix_snapshot_bytes(64, Some(64), mtp).unwrap();

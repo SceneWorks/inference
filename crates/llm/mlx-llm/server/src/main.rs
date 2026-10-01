@@ -1,7 +1,8 @@
 //! Example OpenAI-compatible chat server on the mlx-llm engine (story 7174).
 //!
 //! ```text
-//! cargo run --release -p mlx-llm-server -- --model <snapshot_dir> [--port 8080] [--quant q4|q8]
+//! cargo run --release -p mlx-llm-server -- --model <snapshot_dir> [--port 8080] [--quant q4|q8] \
+//!     [--mtp-head <dir>] [--draft-model <dir>] [--prefix-cache-bytes <n>]
 //! ```
 //!
 //! Serves `POST /v1/chat/completions` (streaming SSE or buffered JSON), `GET /v1/models`, and a
@@ -81,16 +82,43 @@ struct Args {
     provider: Option<String>,
     /// A companion MTP head directory attached to the model (sc-24444).
     mtp_head: Option<String>,
+    /// A draft model loaded beside the target for the `draft_model` proposer (sc-24436).
+    draft_model: Option<String>,
+    /// The cross-turn prefix cache's byte budget (sc-24437; `0` turns it off; unset = the
+    /// backend default, clamped by load admission either way).
+    prefix_cache_bytes: Option<u64>,
+}
+
+impl Args {
+    /// The load this configuration asks for: every load-time accelerator the CLI names reaches
+    /// the provider, and the load report names any it could not attach (E2).
+    fn load_spec(&self) -> LoadSpec {
+        LoadSpec {
+            source: self.model.clone(),
+            projector_source: None,
+            quantize: self.quantize,
+            cuda_graphs: None,
+            mtp_head_source: self.mtp_head.clone(),
+            prefix_cache_bytes: self.prefix_cache_bytes,
+            draft_source: self.draft_model.clone(),
+        }
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut model = None;
     let mut host = "127.0.0.1".to_string();
     let mut port = 8080u16;
     let mut quantize = None;
     let mut provider = None;
     let mut mtp_head = None;
-    let mut args = std::env::args().skip(1);
+    let mut draft_model = None;
+    let mut prefix_cache_bytes = None;
+    let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let mut next = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
@@ -99,6 +127,14 @@ fn parse_args() -> Result<Args, String> {
             "--port" | "-p" => port = next()?.parse().map_err(|_| "invalid --port".to_string())?,
             "--provider" => provider = Some(next()?),
             "--mtp-head" => mtp_head = Some(next()?),
+            "--draft-model" => draft_model = Some(next()?),
+            "--prefix-cache-bytes" => {
+                prefix_cache_bytes = Some(
+                    next()?
+                        .parse()
+                        .map_err(|_| "invalid --prefix-cache-bytes (expected bytes)".to_string())?,
+                )
+            }
             "--quant" => {
                 quantize = Some(match next()?.as_str() {
                     "q4" => Quantize::Q4,
@@ -107,7 +143,7 @@ fn parse_args() -> Result<Args, String> {
                 })
             }
             "-h" | "--help" => {
-                println!("usage: mlx-llm-server --model <dir> [--host 127.0.0.1] [--port 8080] [--quant q4|q8] [--provider <id>] [--mtp-head <dir>]");
+                println!("usage: mlx-llm-server --model <dir> [--host 127.0.0.1] [--port 8080] [--quant q4|q8] [--provider <id>] [--mtp-head <dir>] [--draft-model <dir>] [--prefix-cache-bytes <n>]");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?}")),
@@ -120,17 +156,37 @@ fn parse_args() -> Result<Args, String> {
         quantize,
         provider,
         mtp_head,
+        draft_model,
+        prefix_cache_bytes,
     })
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
+    let (provider, default_model) = load_provider(&args)?;
+
+    let listener = TcpListener::bind((args.host.as_str(), args.port))?;
+    let addr = listener.local_addr()?;
+    eprintln!("mlx-llm-server listening on http://{addr}  (model: {default_model})");
+
+    serve(
+        &listener,
+        provider.as_ref(),
+        &default_model,
+        ConnectionLimits::PRODUCTION,
+    );
+    Ok(())
+}
+
+/// Load the provider `args` names (its load spec: [`Args::load_spec`]) and the default model
+/// name responses carry; every load fallback is printed by name (E2).
+fn load_provider(args: &Args) -> Result<(Box<dyn TextLlm>, String), Box<dyn std::error::Error>> {
     let registry = mlx_llm::text_registry()?;
 
     // Use the requested provider id, else default to a bundled *text* (non-vision) provider. Several
     // may be present (e.g. a VLM captioner alongside the generic text model), so don't just grab the
     // first. The catalog is explicit and contains no process-global discovery state.
-    let provider_id = match args.provider {
+    let provider_id = match args.provider.clone() {
         Some(id) => id,
         None => {
             let descriptors = || registry.registrations().map(|r| (r.descriptor)());
@@ -145,16 +201,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "loading model from {} via provider '{provider_id}' …",
         args.model
     );
-    let spec = LoadSpec {
-        source: args.model.clone(),
-        projector_source: None,
-        quantize: args.quantize,
-        cuda_graphs: None,
-        mtp_head_source: args.mtp_head.clone(),
-        prefix_cache_bytes: None,
-        draft_source: None,
-    };
-    let provider = registry.load_textllm(&provider_id, &spec)?;
+    let provider = registry.load_textllm(&provider_id, &args.load_spec())?;
     // An optional accelerator the load could not attach is named, never fatal (sc-24444).
     for fallback in provider
         .load_report()
@@ -169,18 +216,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| provider_id.clone());
-
-    let listener = TcpListener::bind((args.host.as_str(), args.port))?;
-    let addr = listener.local_addr()?;
-    eprintln!("mlx-llm-server listening on http://{addr}  (model: {default_model})");
-
-    serve(
-        &listener,
-        provider.as_ref(),
-        &default_model,
-        ConnectionLimits::PRODUCTION,
-    );
-    Ok(())
+    Ok((provider, default_model))
 }
 
 /// The serial accept loop. A per-connection error (including a read timeout) drops that connection
@@ -862,10 +898,11 @@ mod tests {
     }
 
     /// sc-24438 AC3, end to end over the socket: the new `speculative` option and the legacy
-    /// `mtp` shape reach the provider as sent; an unknown value, both fields at once, or a
-    /// proposer the model does not advertise is a 400 and never reaches generation. The decode
-    /// report reaches the client as `x_decode` — a too-deep request's clamp named — in the
-    /// non-streaming body and in the final SSE chunk before `[DONE]` (E2: never silent).
+    /// `mtp` shape reach the provider as sent; an unknown value or both fields at once is a 400
+    /// and never reaches generation, while a proposer the model does not advertise runs plain
+    /// with the reason named (E2: explicit fallback, never failure). The whole decode report
+    /// reaches the client as `x_decode` — a too-deep request's clamp named — in the
+    /// non-streaming body and in the final SSE chunk before `[DONE]` (E2/E3: never silent).
     #[test]
     fn the_speculative_field_reaches_the_provider_and_unknown_values_are_400() {
         use core_llm::{ProposerCapabilities, Speculative, SpeculativeProposer};
@@ -913,7 +950,6 @@ mod tests {
             r#","speculative":{"proposer":"ngram","depth":2}"#,
             r#","mtp":{"mode":"always"}"#,
             r#","speculative":"auto","mtp":{"mode":"auto"}"#,
-            r#","speculative":{"proposer":"draft_model","depth":2}"#,
         ] {
             let resp = post_chat(addr, &body(extra));
             assert!(resp.starts_with("HTTP/1.1 400"), "{extra}: {resp:?}");
@@ -923,23 +959,37 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "no refused request generated"
         );
-
-        let clamp = "speculative: `prompt_lookup` depth 40 clamped to 7 (advertised 1..=7)";
-        let too_deep = r#","speculative":{"proposer":"prompt_lookup","depth":40}"#;
         let json_after_headers = |resp: &str| -> serde_json::Value {
             serde_json::from_str(resp.split_once("\r\n\r\n").unwrap().1).unwrap()
         };
+        // An unadvertised proposer: generated plainly, the reason named in `x_decode`.
+        let unadvertised = post_chat(
+            addr,
+            &body(r#","speculative":{"proposer":"draft_model","depth":2}"#),
+        );
+        assert!(unadvertised.starts_with("HTTP/1.1 200"), "{unadvertised:?}");
+        assert_eq!(
+            seen.lock().unwrap().pop(),
+            Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2))
+        );
+        let plain = json_after_headers(&unadvertised);
+        assert_eq!(plain["x_decode"]["proposer"], "none");
+        assert_eq!(
+            plain["x_decode"]["fallbacks"],
+            serde_json::json!([
+                "speculative: `draft_model` is not available for this model (this model does not \
+                 advertise it; decoded without a proposer)"
+            ])
+        );
+
+        let clamp = "speculative: `prompt_lookup` depth 40 clamped to 7 (advertised 1..=7)";
+        let too_deep = r#","speculative":{"proposer":"prompt_lookup","depth":40}"#;
         let body_resp = post_chat(addr, &body(too_deep));
         assert!(body_resp.starts_with("HTTP/1.1 200"), "{body_resp:?}");
         let v = json_after_headers(&body_resp);
-        assert_eq!(
-            v["x_decode"],
-            serde_json::json!({
-                "proposer": "prompt_lookup",
-                "draft_tokens": 7,
-                "fallbacks": [clamp],
-            })
-        );
+        assert_eq!(v["x_decode"]["proposer"], "prompt_lookup");
+        assert_eq!(v["x_decode"]["draft_tokens"], 7);
+        assert_eq!(v["x_decode"]["fallbacks"], serde_json::json!([clamp]));
         let stream_resp = post_chat(addr, &body(&format!(r#"{too_deep},"stream":true"#)));
         assert!(stream_resp.starts_with("HTTP/1.1 200"), "{stream_resp:?}");
         let events: Vec<&str> = stream_resp
@@ -954,6 +1004,183 @@ mod tests {
             "the stream names the clamp too"
         );
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// E3, end to end over the socket: `x_decode` carries the WHOLE decode report — every field
+    /// the backend measured, under its own name — not just the proposer and its fallbacks.
+    #[test]
+    fn x_decode_serializes_the_whole_decode_report() {
+        struct Reporting(core_llm::TextLlmDescriptor);
+        impl TextLlm for Reporting {
+            fn descriptor(&self) -> &core_llm::TextLlmDescriptor {
+                &self.0
+            }
+            fn validate(&self, _: &core_llm::TextLlmRequest) -> core_llm::Result<()> {
+                Ok(())
+            }
+            fn generate(
+                &self,
+                _: &core_llm::TextLlmRequest,
+                _: &mut dyn FnMut(StreamEvent),
+            ) -> core_llm::Result<core_llm::TextLlmOutput> {
+                Ok(core_llm::TextLlmOutput {
+                    text: "ok".into(),
+                    finish_reason: Some(core_llm::FinishReason::Stop),
+                    decode: Some(core_llm::DecodeReport {
+                        path: "prompt_lookup".into(),
+                        proposer: core_llm::ProposerKind::PromptLookup,
+                        draft_tokens: Some(4),
+                        sampler: "host:penalty".into(),
+                        kv_cache: "growing".into(),
+                        attention: "gqa".into(),
+                        cuda_graphs: core_llm::CudaGraphsReport {
+                            enabled: true,
+                            path: "eager".into(),
+                            replayed: 0,
+                            eager: 3,
+                            captured: 0,
+                            fallback_reason: Some("disabled".into()),
+                        },
+                        graph_path: "eager".into(),
+                        nvfp4_projections: core_llm::PathReport {
+                            path: "none".into(),
+                            reason: None,
+                        },
+                        fused_primitives: core_llm::PathReport {
+                            path: "mixed".into(),
+                            reason: Some("cpu_stream".into()),
+                        },
+                        target_forwards: 9,
+                        prefill_forwards: 2,
+                        proposed_tokens: 12,
+                        accepted_tokens: 6,
+                        verify_steps: 4,
+                        replay_forwards: 2,
+                        discarded_forwards: 1,
+                        prefix_hit_tokens: 5,
+                        prefix_cache: core_llm::PathReport {
+                            path: "hit".into(),
+                            reason: Some("why".into()),
+                        },
+                        fallbacks: vec!["speculative: x".into()],
+                    }),
+                    ..Default::default()
+                })
+            }
+        }
+        let provider = Reporting(core_llm::TextLlmDescriptor {
+            id: "reporting".into(),
+            family: "stub".into(),
+            backend: "test".into(),
+            capabilities: Default::default(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            serve(&listener, &provider, "m", ConnectionLimits::PRODUCTION);
+        });
+        let resp = post_chat(
+            addr,
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#,
+        );
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            v["x_decode"],
+            serde_json::json!({
+                "path": "prompt_lookup",
+                "proposer": "prompt_lookup",
+                "draft_tokens": 4,
+                "mean_accepted_length": 1.5,
+                "sampler": "host:penalty",
+                "kv_cache": "growing",
+                "attention": "gqa",
+                "graph_path": "eager",
+                "cuda_graphs": {
+                    "enabled": true, "path": "eager", "replayed": 0, "eager": 3,
+                    "captured": 0, "fallback_reason": "disabled",
+                },
+                "nvfp4_projections": {"path": "none", "reason": null},
+                "fused_primitives": {"path": "mixed", "reason": "cpu_stream"},
+                "target_forwards": 9,
+                "prefill_forwards": 2,
+                "proposed_tokens": 12,
+                "accepted_tokens": 6,
+                "verify_steps": 4,
+                "replay_forwards": 2,
+                "discarded_forwards": 1,
+                "prefix_cache": {"path": "hit", "reason": "why"},
+                "prefix_hit_tokens": 5,
+                "fallbacks": ["speculative: x"],
+            })
+        );
+    }
+
+    /// The CLI's load-time accelerators reach the load (sc-24436, sc-24437), end to end over the
+    /// socket on a real tiny MLX target: `--draft-model` loads the draft resident and a
+    /// `{proposer: draft_model}` request runs it (named in `x_decode`), and
+    /// `--prefix-cache-bytes` settles the prefix cache's budget the load reports.
+    #[test]
+    fn the_draft_model_and_prefix_cache_flags_reach_the_load() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let args = parse_args_from(
+            [
+                "--model",
+                &fixture.target.to_string_lossy(),
+                "--draft-model",
+                &fixture.draft.to_string_lossy(),
+                "--prefix-cache-bytes",
+                "65536",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        let spec = args.load_spec();
+        assert_eq!(
+            spec.draft_source.as_deref(),
+            Some(&*fixture.draft.to_string_lossy())
+        );
+        assert_eq!(spec.prefix_cache_bytes, Some(65536));
+        assert!(parse_args_from(
+            ["--model", "m", "--prefix-cache-bytes", "lots"].map(String::from)
+        )
+        .is_err());
+
+        let (provider, model) = load_provider(&args).unwrap();
+        let report = provider.load_report().unwrap();
+        assert!(
+            report.draft.as_ref().is_some_and(|d| d.is_resident()),
+            "{report:?}"
+        );
+        assert_eq!(report.prefix_cache_bytes, Some(65536));
+
+        // One request over the socket, served by the real connection handler on this thread
+        // (MLX stays on the thread that loaded it).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            post_chat(
+                addr,
+                r#"{"messages":[{"role":"user","content":"t3 t9 t4 t11 t3 t9 t4 t11"}],"max_tokens":6,"temperature":0,"speculative":{"proposer":"draft_model","depth":2}}"#,
+            )
+        });
+        let (stream, _) = listener.accept().unwrap();
+        handle_connection(
+            stream,
+            provider.as_ref(),
+            &model,
+            ConnectionLimits::PRODUCTION,
+        )
+        .unwrap();
+        let resp = client.join().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(v["x_decode"]["proposer"], "draft_model", "{v}");
+        assert_eq!(v["x_decode"]["fallbacks"], serde_json::json!([]), "{v}");
+        assert_eq!(v["x_decode"]["prefix_cache"]["path"], "miss", "{v}");
     }
 
     #[test]

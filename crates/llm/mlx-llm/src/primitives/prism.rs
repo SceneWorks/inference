@@ -275,17 +275,28 @@ pub(crate) fn recording_rotation_routes<R>(f: impl FnOnce() -> R) -> (R, Vec<Rot
 }
 
 /// Whether [`block_hadamard`] dispatches the fused kernel for this input on `stream` (the stream
-/// the dispatch will run on — a custom Metal kernel runs only on a GPU stream).
-fn fused_rotation_applies(x: &Array, block: i32, stream: &Stream) -> bool {
+/// the dispatch will run on — a custom Metal kernel runs only on a GPU stream), or why not (the
+/// reason the request's fused-primitive report names, E3).
+fn fused_rotation_applies(
+    x: &Array,
+    block: i32,
+    stream: &Stream,
+) -> std::result::Result<(), &'static str> {
     let shape_ok = (2..=FUSED_MAX_BLOCK).contains(&block)
         && (block as u32).is_power_of_two()
         && matches!(x.dtype(), Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32)
         && x.size() > 0;
     #[cfg(test)]
     if tests::FORCE_UNFUSED.with(std::cell::Cell::get) {
-        return false;
+        return Err(super::fused::REASON_FORCED_REFERENCE);
     }
-    shape_ok && stream_is_gpu(stream)
+    if !shape_ok {
+        Err(super::fused::REASON_SHAPE)
+    } else if !stream_is_gpu(stream) {
+        Err(super::fused::REASON_CPU_STREAM)
+    } else {
+        Ok(())
+    }
 }
 
 fn fused_block_hadamard(
@@ -364,14 +375,19 @@ fn block_hadamard(
     // Resolve the stream once: the device check and the kernel dispatch must see the same one
     // (the task-local stream when set, which need not be on the process default device).
     let stream = Stream::task_local_or_default();
-    if fused_rotation_applies(x, block, &stream) {
-        #[cfg(test)]
-        record(RotationRoute::Fused);
-        fused_block_hadamard(x, signs, scale, block, width, inverse, &stream)
-    } else {
-        #[cfg(test)]
-        record(RotationRoute::Unfused);
-        block_hadamard_unfused(x, signs, block, inverse, hadamard_scale(block))
+    match fused_rotation_applies(x, block, &stream) {
+        Ok(()) => {
+            #[cfg(test)]
+            record(RotationRoute::Fused);
+            super::fused::note_fused();
+            fused_block_hadamard(x, signs, scale, block, width, inverse, &stream)
+        }
+        Err(reason) => {
+            #[cfg(test)]
+            record(RotationRoute::Unfused);
+            super::fused::note_reference(reason);
+            block_hadamard_unfused(x, signs, block, inverse, hadamard_scale(block))
+        }
     }
 }
 
@@ -552,7 +568,7 @@ pub(crate) mod tests {
                     let signs = random_signs(width, seed + 10_000);
                     let scale = Array::from_slice(&[hadamard_scale(block)], &[1]);
                     for inverse in [false, true] {
-                        assert!(fused_rotation_applies(&x, block, &gpu));
+                        assert!(fused_rotation_applies(&x, block, &gpu).is_ok());
                         let fused =
                             fused_block_hadamard(&x, &signs, &scale, block, width, inverse, &gpu)
                                 .unwrap();
@@ -621,14 +637,65 @@ pub(crate) mod tests {
     fn rotation_dispatch_uses_the_kernel_only_where_it_is_proven() {
         let gpu = Stream::gpu();
         let x = Array::zeros::<f32>(&[1, 16384]).unwrap();
-        assert!(!fused_rotation_applies(&x, 16384, &gpu));
-        assert!(!fused_rotation_applies(&x, 1536, &gpu));
-        assert!(fused_rotation_applies(&x, 1024, &gpu));
-        assert!(!fused_rotation_applies(&x, 1024, &Stream::cpu()));
-        with_unfused_rotation(|| assert!(!fused_rotation_applies(&x, 1024, &gpu)));
-        assert!(fused_rotation_applies(&x, 1024, &gpu));
+        use crate::primitives::fused::{REASON_CPU_STREAM, REASON_FORCED_REFERENCE, REASON_SHAPE};
+        assert_eq!(fused_rotation_applies(&x, 16384, &gpu), Err(REASON_SHAPE));
+        assert_eq!(fused_rotation_applies(&x, 1536, &gpu), Err(REASON_SHAPE));
+        assert_eq!(fused_rotation_applies(&x, 1024, &gpu), Ok(()));
+        assert_eq!(
+            fused_rotation_applies(&x, 1024, &Stream::cpu()),
+            Err(REASON_CPU_STREAM)
+        );
+        with_unfused_rotation(|| {
+            assert_eq!(
+                fused_rotation_applies(&x, 1024, &gpu),
+                Err(REASON_FORCED_REFERENCE)
+            )
+        });
+        assert_eq!(fused_rotation_applies(&x, 1024, &gpu), Ok(()));
         let ints = Array::zeros::<i32>(&[1, 1024]).unwrap();
-        assert!(!fused_rotation_applies(&ints, 1024, &gpu));
+        assert_eq!(fused_rotation_applies(&ints, 1024, &gpu), Err(REASON_SHAPE));
+    }
+
+    /// E3: every rotation counts in the request's fused-primitive report by the route that ran —
+    /// the kernel as `fused`, the unfused chain as `reference` with why (a forced oracle run, a
+    /// CPU stream).
+    #[test]
+    fn every_rotation_route_is_tallied_for_the_request_report() {
+        use crate::primitives::fused::{fused_tally, REASON_CPU_STREAM, REASON_FORCED_REFERENCE};
+        let signs = random_signs(1024, 41);
+        let scale = Array::from_slice(&[hadamard_scale(1024)], &[1]);
+        let x = Array::zeros::<f32>(&[1, 2, 1024]).unwrap();
+        let rotate = || block_hadamard(&x, &signs, &scale, 1024, false).unwrap();
+        let ran = |f: &dyn Fn()| {
+            let start = fused_tally();
+            f();
+            fused_tally().since(&start)
+        };
+        let fused = ran(&|| {
+            mlx_rs::with_new_default_stream(Stream::gpu(), || {
+                rotate();
+            })
+        });
+        assert_eq!(
+            (fused.fused, fused.reference, fused.label()),
+            (1, 0, "fused")
+        );
+        let forced = ran(&|| {
+            mlx_rs::with_new_default_stream(Stream::gpu(), || {
+                with_unfused_rotation(|| {
+                    rotate();
+                })
+            })
+        });
+        assert_eq!(forced.label(), "reference");
+        assert_eq!(forced.reference_reason, Some(REASON_FORCED_REFERENCE));
+        let cpu = ran(&|| {
+            crate::primitives::kv_cache::testing::on_cpu(|| {
+                rotate();
+            })
+        });
+        assert_eq!((cpu.fused, cpu.reference), (0, 1));
+        assert_eq!(cpu.reference_reason, Some(REASON_CPU_STREAM));
     }
 
     /// The route follows the stream ops are issued on, never the process default device: a
