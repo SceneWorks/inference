@@ -57,21 +57,23 @@ sampling, termination grace, host reserve, child footprint cap, GPU UUID, GPU
 reserve and child GPU cap), and immediately before spawn host and selected-GPU
 free memory must cover the arm's estimate plus reserve (`estimate-plus-reserve-v1`).
 On the Metal lane each arm's estimate is the product's own admission profile
-(`product-admission-profile`): before a coordinate's first arm the adapter runs its MLX
-entrypoint with `--sc20686-estimate` and the coordinate's exact arguments, which resolves
+(`product-admission-profile`): before every arm the adapter measures the admission budget
+(host available minus the reserve) and runs the coordinate's MLX entrypoint with
+`--sc20686-estimate --sc20686-budget-bytes <budget>` and its exact arguments, which resolves
 the route like the run (product `LoadSpec`, geometry, tier, Lightning, references /
 control clip) and prints, without loading weights or touching MLX, the max of the staged
 phases: text encoder; VAE + conservative encode working set; DiT resident (the fit gate's
 residency, adapters included) + VAE + its `72 B/token/dim` activation (VACE at the
-documented +30% under-fit); DiT + VAE + the conservative single-pass decode working set
+documented +30% under-fit); DiT + VAE + the decode working set of exactly the tiling decision
+the product's automatic planner (`auto_tiling_budgeted[_z16]`) makes with the budget left beside
+the DiT and VAE (`decodeMode` single-pass / tiled / over-budget, the last priced single-pass),
+and the run is pinned to that decision through `WAN_VAE_BUDGET_GIB` = the priced safe budget
 (Wan, `mlx_gen_wan::admission_estimate`); for FLUX.2 Klein the Qwen3 encoder vs DiT +
 VAE + the registered 1024² activation anchor scaled by the squared token ratio (target
 plus references), doubled for true CFG, plus the KV route's cached reference K/V
 (`mlx_gen_flux2::admission_estimate`). A later arm of the same coordinate uses the max of
-that estimate and the completed arm's measured peak. An estimate above the cap (the
-conservative single-pass z16 decode prices 768x512x33 A14B/VACE coordinates at ~91-97
-GiB, though the runtime's budgeted decode measured ~63 GiB) falls back to the cap
-(`child-footprint-cap-fallback`), as do the Candle lanes, whose entrypoints have no
+that estimate and the completed arm's measured peak. An estimate above the cap falls back
+to the cap (`child-footprint-cap-fallback`), as do the Candle lanes, whose entrypoints have no
 estimate mode. The host and CUDA watchdogs then
 terminate the owned tree on a cap or reserve breach. Every sealed unit's
 `supervision.json` records that `admission` (`mode: runtime-guarded`, `rule`,

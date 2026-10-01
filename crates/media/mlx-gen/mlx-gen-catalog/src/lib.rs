@@ -261,6 +261,28 @@ pub fn conservative_video_decode_memory_profile(
         })
 }
 
+/// SC-20686 / E8: the decode working set an MLX video provider's automatic planner actually selects
+/// with `free_bytes` free at decode time, and that decision (`"single-pass"`, `"tiled"`, or
+/// `"over-budget"`, which prices the conservative single pass). Only the Wan family plans its decode
+/// from a free-memory budget; every other provider returns `None`, and callers keep its
+/// [`conservative_video_decode_memory_profile`].
+pub fn budgeted_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    free_bytes: u64,
+) -> Option<(media::VideoDecodeMemoryProfile, &'static str)> {
+    mlx_gen_wan::budgeted_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        free_bytes,
+    )
+    .map(|(profile, planned)| (profile, planned.mode.as_str()))
+}
+
 /// The provider-owned conservative VAE **encode** working set for an MLX video provider (sc-20686,
 /// epic E8): the Wan-VAE families (Wan, Krea Realtime, Bernini, SCAIL-2). `None` when the request
 /// encodes nothing or the provider's encoder has no calibrated cost (LTX).

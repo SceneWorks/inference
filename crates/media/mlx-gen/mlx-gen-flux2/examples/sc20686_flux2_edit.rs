@@ -45,6 +45,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--sc20686-events",
     "--sc20686-source-ref",
     "--sc20686-residency",
+    "--sc20686-budget-bytes",
     "--snapshot",
     "--out",
     "--prompt",
@@ -220,6 +221,9 @@ fn main() -> Result<()> {
                 "route": route,
                 "source": "product-admission-profile",
                 "estimateBytes": priced.peak_bytes(),
+                // An image VAE decode: no budget-planned tiling (the budget, if given, is unused).
+                "decodeMode": "single-pass",
+                "decodeSafeBudgetGib": null,
                 "phases": priced.phases().iter().map(|(phase, bytes)| (phase.to_string(), serde_json::json!(bytes))).collect::<serde_json::Map<_, _>>(),
                 "components": {
                     "textEncoderBytes": priced.text_encoder_bytes,

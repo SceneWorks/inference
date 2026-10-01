@@ -1930,6 +1930,124 @@ pub(crate) fn denoise_activation_bytes(
         .checked_mul(u64::try_from(dim).ok()?)
 }
 
+/// The decode mode the product's automatic Wan VAE planner selects at one free-memory budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlannedDecodeMode {
+    /// The single-pass decode fits the safe budget (the planner returns no tiling).
+    SinglePass,
+    /// The largest candidate tile that fits the safe budget.
+    Tiled,
+    /// Not even the smallest tile fits: the run refuses catchably before its denoise.
+    OverBudget,
+}
+
+impl PlannedDecodeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SinglePass => "single-pass",
+            Self::Tiled => "tiled",
+            Self::OverBudget => "over-budget",
+        }
+    }
+}
+
+/// The product's automatic decode decision at `free_bytes` of free memory, priced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlannedDecode {
+    pub mode: PlannedDecodeMode,
+    /// The safe budget the planner chose against: `free × 0.85` (`wan_vae_safe_budget_gib`'s
+    /// free-aware arm). A run given `WAN_VAE_BUDGET_GIB` = this value makes the same decision.
+    pub safe_budget_gib: f64,
+    /// The priced decode working set: the chosen plan's cost, or the conservative single-pass cost
+    /// when no plan fits (`OverBudget`).
+    pub working_set_bytes: u64,
+}
+
+/// SC-20686 / E8: price a Wan VAE decode at the decision the product's automatic planner
+/// ([`auto_tiling_budgeted`] for z48 -- bf16, as the dense 5B decodes -- and
+/// [`auto_tiling_budgeted_z16`] for z16) makes when `free_bytes` are free at decode time, instead of
+/// the conservative single-pass bound. `frames` are the decoded output frames the planner sees
+/// (z16: the full non-causal `4 · T_lat`). `None` for a non-Wan VAE or invalid geometry.
+pub fn planned_video_decode(
+    vae: VaeTiling,
+    width: u32,
+    height: u32,
+    frames: u32,
+    free_bytes: u64,
+) -> Option<PlannedDecode> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let safe_budget_gib = free_aware_budget_gib(free_bytes as f64 / GIB, WAN_VAE_BUDGET_SAFE_FRAC);
+    let (h, w, f) = (
+        i32::try_from(height).ok()?,
+        i32::try_from(width).ok()?,
+        i32::try_from(frames).ok()?,
+    );
+    let plan = if vae == Wan22Vae::VAE_TILING {
+        plan_vae22_tiling(h, w, f, safe_budget_gib, true)
+    } else if vae == WanVae::VAE_TILING {
+        plan_z16_tiling(h, w, f, safe_budget_gib)
+    } else {
+        return None;
+    };
+    let single_pass = video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, None)?;
+    let (mode, working_set_bytes) = match plan {
+        Ok(None) => (PlannedDecodeMode::SinglePass, single_pass),
+        Ok(Some(tiling)) => (
+            PlannedDecodeMode::Tiled,
+            video_decode_peak_bytes_for_vae_and_tiling(vae, width, height, frames, Some(&tiling))?,
+        ),
+        Err(_) => (PlannedDecodeMode::OverBudget, single_pass),
+    };
+    Some(PlannedDecode {
+        mode,
+        safe_budget_gib,
+        working_set_bytes,
+    })
+}
+
+#[cfg(test)]
+mod planned_decode_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The planned decode is exactly the product planner's decision at the same safe budget.
+    #[test]
+    fn planned_decode_follows_the_product_planner() {
+        for (vae, frames) in [(WanVae::VAE_TILING, 36), (Wan22Vae::VAE_TILING, 33)] {
+            let single =
+                video_decode_peak_bytes_for_vae_and_tiling(vae, 768, 512, frames, None).unwrap();
+            // A budget the single pass fits: single pass, priced at the single-pass cost.
+            let roomy = planned_video_decode(vae, 768, 512, frames, 200 * GIB).unwrap();
+            assert_eq!(roomy.mode, PlannedDecodeMode::SinglePass);
+            assert_eq!(roomy.working_set_bytes, single);
+            // A smaller budget tiles: the chosen tile's cost, under the safe budget, below single.
+            let tight = planned_video_decode(vae, 768, 512, frames, 40 * GIB).unwrap();
+            assert_eq!(tight.mode, PlannedDecodeMode::Tiled);
+            assert!((tight.safe_budget_gib - 34.0).abs() < 1e-9);
+            assert!(tight.working_set_bytes < single);
+            assert!(tight.working_set_bytes as f64 <= tight.safe_budget_gib * GIB as f64);
+            let (h, w, f) = (512, 768, frames as i32);
+            let expected = if vae == WanVae::VAE_TILING {
+                plan_z16_tiling(h, w, f, tight.safe_budget_gib)
+            } else {
+                plan_vae22_tiling(h, w, f, tight.safe_budget_gib, true)
+            }
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                tight.working_set_bytes,
+                video_decode_peak_bytes_for_vae_and_tiling(vae, 768, 512, frames, Some(&expected))
+                    .unwrap()
+            );
+            // No tile fits: over budget, priced at the conservative single pass.
+            let starved = planned_video_decode(vae, 768, 512, frames, GIB / 4).unwrap();
+            assert_eq!(starved.mode, PlannedDecodeMode::OverBudget);
+            assert_eq!(starved.working_set_bytes, single);
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "sc20686_hooks_tests.rs"]
 mod sc20686_hooks_tests;

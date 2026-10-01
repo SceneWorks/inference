@@ -40,6 +40,26 @@ pub fn conservative_video_decode_memory_profile(
 }
 
 #[cfg(feature = "media")]
+/// Resolve the decode working set a provider's automatic planner selects with `free_bytes` free at
+/// decode time, and the decision (sc-20686, epic E8); `None` for a provider without a
+/// budget-planned decode (use [`conservative_video_decode_memory_profile`]).
+pub fn budgeted_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    free_bytes: u64,
+) -> Option<(VideoDecodeMemoryProfile, &'static str)> {
+    mlx_gen_catalog::budgeted_video_decode_memory_profile(
+        provider_id,
+        width,
+        height,
+        frames,
+        free_bytes,
+    )
+}
+
+#[cfg(feature = "media")]
 /// Resolve a provider-owned conservative VAE encode profile (sc-20686, epic E8): the conditioning
 /// encode working set, composed like the decode profile (the phases never overlap).
 pub fn conservative_video_encode_memory_profile(

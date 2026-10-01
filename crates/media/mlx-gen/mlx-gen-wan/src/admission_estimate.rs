@@ -11,9 +11,11 @@
 //!   `72 B · batch · tokens · dim` activation working set;
 //! * VAE encode: the provider's conservative encode working set
 //!   ([`crate::conservative_video_encode_memory_profile`], sc-20686 E8);
-//! * VAE decode: the provider's conservative single-pass decode working set
-//!   ([`crate::conservative_video_decode_memory_profile`]), which bounds every tiled plan the
-//!   runtime's free-aware selector can choose.
+//! * VAE decode: with the admission budget (`available - reserve`), the working set of exactly the
+//!   decision the product's automatic planner makes with the budget left after the resident DiT and
+//!   VAE ([`crate::budgeted_video_decode_memory_profile`]; the run is pinned to the same safe budget
+//!   through `WAN_VAE_BUDGET_GIB`); without one, the conservative single pass
+//!   ([`crate::conservative_video_decode_memory_profile`]), which bounds every decision.
 //!
 //! Phases are staged, so the estimate is the MAX of the phase totals, not their sum. The DiT stays
 //! resident through decode (measured on the SC-20686 Metal lane: the post-denoise window still holds
@@ -31,7 +33,7 @@ use crate::model_vace::{MODEL_ID_VACE, MODEL_ID_VACE_FUN};
 const VACE_ACTIVATION_UNDERFIT_PERCENT: u64 = 130;
 
 /// One route request's priced components and phase totals (bytes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WanAdmissionEstimate {
     pub text_encoder_bytes: u64,
     pub vae_bytes: u64,
@@ -39,6 +41,9 @@ pub struct WanAdmissionEstimate {
     pub denoise_activation_bytes: u64,
     pub encode_working_set_bytes: u64,
     pub decode_working_set_bytes: u64,
+    /// The product planner's decode decision at the admission budget; `None` prices the
+    /// conservative single pass (no budget given).
+    pub decode: Option<crate::pipeline::PlannedDecode>,
 }
 
 impl WanAdmissionEstimate {
@@ -77,6 +82,7 @@ pub fn product_admission_estimate(
     route: &str,
     spec: &LoadSpec,
     req: &GenerationRequest,
+    budget_bytes: Option<u64>,
 ) -> Result<WanAdmissionEstimate> {
     let WeightsSource::Dir(root) = &spec.weights else {
         return Err(Error::Msg(format!(
@@ -134,14 +140,34 @@ pub fn product_admission_estimate(
         u32::try_from(references).map_err(|_| overflow())?,
     )
     .map_or(0, |profile| profile.working_set_bytes());
-    let decode_working_set_bytes = crate::conservative_video_decode_memory_profile(
-        route,
-        facts.width,
-        facts.height,
-        facts.frames,
-    )
-    .ok_or_else(|| Error::Msg(format!("{route}: no conservative decode memory profile")))?
-    .working_set_bytes();
+    // The decode: with an admission budget, exactly the product planner's decision with the budget
+    // left after the DiT and VAE it decodes beside (`free = limit - resident`, as the run measures
+    // it); without one, the conservative single pass that bounds every decision.
+    let (decode_working_set_bytes, decode) = match budget_bytes {
+        Some(budget) => {
+            let free = budget.saturating_sub(vae_bytes.saturating_add(facts.resident_bytes));
+            let (profile, planned) = crate::budgeted_video_decode_memory_profile(
+                route,
+                facts.width,
+                facts.height,
+                facts.frames,
+                free,
+            )
+            .ok_or_else(|| Error::Msg(format!("{route}: no budgeted decode memory profile")))?;
+            (profile.working_set_bytes(), Some(planned))
+        }
+        None => (
+            crate::conservative_video_decode_memory_profile(
+                route,
+                facts.width,
+                facts.height,
+                facts.frames,
+            )
+            .ok_or_else(|| Error::Msg(format!("{route}: no conservative decode memory profile")))?
+            .working_set_bytes(),
+            None,
+        ),
+    };
     Ok(WanAdmissionEstimate {
         text_encoder_bytes,
         vae_bytes,
@@ -149,6 +175,7 @@ pub fn product_admission_estimate(
         denoise_activation_bytes,
         encode_working_set_bytes,
         decode_working_set_bytes,
+        decode,
     })
 }
 
@@ -230,7 +257,7 @@ mod tests {
     ) -> WanAdmissionEstimate {
         let spec =
             crate::product_load::product_load_spec(route, root, policy, false, None).unwrap();
-        product_admission_estimate(route, &spec, req).unwrap()
+        product_admission_estimate(route, &spec, req, None).unwrap()
     }
 
     #[test]
@@ -270,6 +297,57 @@ mod tests {
             phases[3].1,
             priced.vae_bytes + priced.dit_resident_bytes + priced.decode_working_set_bytes
         );
+    }
+
+    /// With the admission budget, the decode is the product planner's decision for the budget left
+    /// beside the resident DiT and VAE, not the conservative single pass.
+    #[test]
+    fn the_budgeted_estimate_prices_the_planner_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("t2v/q4");
+        snapshot(&root, "t2v", true);
+        let spec = crate::product_load::product_load_spec(
+            MODEL_ID_T2V_14B,
+            &root,
+            OffloadPolicy::Sequential,
+            false,
+            None,
+        )
+        .unwrap();
+        let req = request(768, 512, 33, 4.0);
+        let conservative = product_admission_estimate(MODEL_ID_T2V_14B, &spec, &req, None).unwrap();
+        assert!(conservative.decode.is_none());
+        let budget = 62 * GIB;
+        let priced =
+            product_admission_estimate(MODEL_ID_T2V_14B, &spec, &req, Some(budget)).unwrap();
+        let free = budget - priced.vae_bytes - priced.dit_resident_bytes;
+        let (profile, planned) =
+            crate::budgeted_video_decode_memory_profile(MODEL_ID_T2V_14B, 768, 512, 33, free)
+                .unwrap();
+        assert_eq!(priced.decode, Some(planned));
+        assert_eq!(planned.mode, crate::pipeline::PlannedDecodeMode::Tiled);
+        assert_eq!(priced.decode_working_set_bytes, profile.working_set_bytes());
+        assert!(priced.peak_bytes() < conservative.peak_bytes());
+        assert!(
+            priced.peak_bytes() <= budget,
+            "a tiled plan fits the budget it was planned for"
+        );
+        // A budget the single pass fits prices exactly the conservative single pass.
+        let roomy =
+            product_admission_estimate(MODEL_ID_T2V_14B, &spec, &req, Some(200 * GIB)).unwrap();
+        assert_eq!(
+            roomy.decode.unwrap().mode,
+            crate::pipeline::PlannedDecodeMode::SinglePass
+        );
+        assert_eq!(roomy.peak_bytes(), conservative.peak_bytes());
+        // A budget no tile fits is over budget and prices the single pass (the admission refuses).
+        let starved =
+            product_admission_estimate(MODEL_ID_T2V_14B, &spec, &req, Some(10 * GIB)).unwrap();
+        assert_eq!(
+            starved.decode.unwrap().mode,
+            crate::pipeline::PlannedDecodeMode::OverBudget
+        );
+        assert_eq!(starved.peak_bytes(), conservative.peak_bytes());
     }
 
     /// The SC-20686 Metal lane's accepted D units (nax-macos-2, run 36907062374): the product
@@ -333,6 +411,7 @@ mod tests {
                     MODEL_ID_T2V_14B,
                     &lightning_spec,
                     &request(768, 512, 33, 1.0),
+                    None,
                 )
                 .unwrap(),
                 67_541_059_000,

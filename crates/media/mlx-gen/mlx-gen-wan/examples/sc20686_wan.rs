@@ -55,6 +55,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--sc20686-events",
     "--sc20686-source-ref",
     "--sc20686-residency",
+    "--sc20686-budget-bytes",
     "--snapshot",
     "--out",
     "--prompt",
@@ -398,8 +399,18 @@ fn main() -> Result<()> {
     let spec = route_load_spec(&route, &residency, &snapshot, lightning.as_ref())?;
     if estimate {
         // The product admission estimate of exactly this run: no weights load, MLX is untouched.
-        let priced =
-            mlx_gen_wan::admission_estimate::product_admission_estimate(&route, &spec, &request)?;
+        // The admission budget (`available - reserve` at spawn time): the decode is priced at the
+        // product planner's decision with it, and the adapter pins the run to the same decision.
+        let budget = args
+            .get("--sc20686-budget-bytes")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .map_err(|_| "--sc20686-budget-bytes is malformed")
+            })
+            .transpose()?;
+        let priced = mlx_gen_wan::admission_estimate::product_admission_estimate(
+            &route, &spec, &request, budget,
+        )?;
         println!("{}", estimate_line(&route, &priced));
         return Ok(());
     }
@@ -453,6 +464,8 @@ fn estimate_line(
         "route": route,
         "source": "product-admission-profile",
         "estimateBytes": priced.peak_bytes(),
+        "decodeMode": priced.decode.map_or("single-pass-conservative", |decode| decode.mode.as_str()),
+        "decodeSafeBudgetGib": priced.decode.map(|decode| decode.safe_budget_gib),
         "phases": priced.phases().iter().map(|(phase, bytes)| (phase.to_string(), serde_json::json!(bytes))).collect::<serde_json::Map<_, _>>(),
         "components": {
             "textEncoderBytes": priced.text_encoder_bytes,

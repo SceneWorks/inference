@@ -537,19 +537,54 @@ pub fn conservative_video_decode_memory_profile_for_vae(
     // request need not itself lie on that lattice, so price the full decoded allocation:
     // `4 * ceil(requested_frames / 4)`. The z48 path is causal and already prices the requested
     // output count directly.
-    let decoded_frames = if vae == model::A14bProviderVae::VAE_TILING {
-        let temporal_scale = vae.temporal_scale as u32;
-        frames
-            .checked_add(temporal_scale - 1)?
-            .checked_div(temporal_scale)?
-            .checked_mul(temporal_scale)?
-    } else {
-        frames
-    };
+    let decoded_frames = decoded_video_frames(vae, frames)?;
     mlx_gen::VideoDecodeMemoryProfile::new(
         pipeline::conservative_video_decode_peak_bytes_for_vae(vae, width, height, decoded_frames)?,
         0,
     )
+}
+
+/// The decoded frame count a concrete Wan VAE materializes for a `frames`-long request: the z16
+/// decode is non-causal and decodes four output frames per latent frame (`4 · ceil(frames / 4)`);
+/// the causal z48 decodes exactly `frames`.
+fn decoded_video_frames(vae: mlx_gen::tiling::VaeTiling, frames: u32) -> Option<u32> {
+    if vae == model::A14bProviderVae::VAE_TILING {
+        let temporal_scale = vae.temporal_scale as u32;
+        frames
+            .checked_add(temporal_scale - 1)?
+            .checked_div(temporal_scale)?
+            .checked_mul(temporal_scale)
+    } else {
+        Some(frames)
+    }
+}
+
+/// SC-20686 / E8: the decode working set of a Wan generator id at the decision its automatic
+/// planner (`auto_tiling_budgeted` / `auto_tiling_budgeted_z16`) makes with `free_bytes` free at
+/// decode time -- single pass when it fits the free-aware safe budget, else the largest fitting tile
+/// -- instead of the conservative single-pass bound, plus that decision. The planner's tile is
+/// monotone in the budget, so pricing at an upper bound of the run's free memory never under-prices
+/// the decode the run makes. A budget no tile fits prices the conservative single pass (the run
+/// refuses). `None` for a non-Wan id or invalid geometry.
+pub fn budgeted_video_decode_memory_profile(
+    provider_id: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    free_bytes: u64,
+) -> Option<(mlx_gen::VideoDecodeMemoryProfile, pipeline::PlannedDecode)> {
+    let vae = vae_tiling(provider_id)?;
+    let planned = pipeline::planned_video_decode(
+        vae,
+        width,
+        height,
+        decoded_video_frames(vae, frames)?,
+        free_bytes,
+    )?;
+    Some((
+        mlx_gen::VideoDecodeMemoryProfile::new(planned.working_set_bytes, 0)?,
+        planned,
+    ))
 }
 
 /// Resolve the provider-owned conservative VAE decode working-set peak for a Wan generator id.

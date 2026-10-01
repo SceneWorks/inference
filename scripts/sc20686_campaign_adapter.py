@@ -754,16 +754,29 @@ PRODUCT_ADMISSION_ESTIMATE_SCHEMA = "sc20686-product-admission-estimate-v1"
 PRODUCT_ADMISSION_ESTIMATE_SOURCE = "product-admission-profile"
 
 
-def product_admission_estimate(entrypoint, snapshot, variant, extra_args=(), timeout_seconds=600):
-    """The MLX entrypoint's `--sc20686-estimate` answer for one coordinate: the product's own
-    pre-spawn admission estimate of exactly the run `run_entrypoint` would start (same route,
-    snapshot and coordinate arguments). The estimate mode loads no weights and never touches MLX,
-    so it runs unsupervised and bounded by `timeout_seconds`. A failed or malformed answer is an
-    error: the coordinate is not started on a guess."""
+DECODE_MODES = frozenset({"single-pass", "tiled", "over-budget", "single-pass-conservative"})
+# The product's own deterministic Wan VAE decode-budget knob (mlx-gen-wan `WAN_VAE_BUDGET_GIB`):
+# the run is pinned to the safe budget its estimate priced, so it makes the same tiling decision.
+WAN_VAE_BUDGET_ENV = "WAN_VAE_BUDGET_GIB"
+
+
+def product_admission_estimate(entrypoint, snapshot, variant, extra_args=(), timeout_seconds=600,
+                               *, budget_bytes=None):
+    """The MLX entrypoint's `--sc20686-estimate` answer for one arm: the product's own pre-spawn
+    admission estimate of exactly the run `run_entrypoint` would start (same route, snapshot and
+    coordinate arguments). With `budget_bytes` (host available minus the reserve, measured just
+    before the arm) the VAE decode is priced at the product planner's tiling decision for that
+    budget, which the run is then pinned to. The estimate mode loads no weights and never touches
+    MLX, so it runs unsupervised and bounded by `timeout_seconds`. A failed or malformed answer is
+    an error: the coordinate is not started on a guess."""
     command = [
         str(Path(entrypoint).resolve()), "--sc20686-estimate", "--variant", variant,
         "--snapshot", str(Path(snapshot).resolve()), *map(str, extra_args),
     ]
+    if budget_bytes is not None:
+        if type(budget_bytes) is not int or budget_bytes < 0:
+            raise ValueError(f"{variant} admission budget is malformed")
+        command += ["--sc20686-budget-bytes", str(budget_bytes)]
     try:
         completed = subprocess.run(command, capture_output=True, stdin=subprocess.DEVNULL,
                                    timeout=timeout_seconds, check=False)
@@ -784,9 +797,28 @@ def product_admission_estimate(entrypoint, snapshot, variant, extra_args=(), tim
             or type(estimate) is not int or estimate <= 0
             or not isinstance(phases, dict) or not phases
             or any(type(value) is not int or value < 0 for value in phases.values())
-            or max(phases.values()) != estimate):
+            or max(phases.values()) != estimate
+            or document.get("decodeMode") not in DECODE_MODES):
+        raise ValueError(f"{variant} product admission estimate is malformed")
+    safe = document.get("decodeSafeBudgetGib")
+    if safe is not None and (type(safe) not in (int, float) or not math.isfinite(safe) or safe < 0):
         raise ValueError(f"{variant} product admission estimate is malformed")
     return document
+
+
+def host_admission_budget(policy, probe=None):
+    """Host available memory minus the reserve, measured now (the admission measure the
+    supervisor compares): the budget the arm's decode is priced and pinned at."""
+    probe = probe if probe is not None else supervisor.SystemProbe(policy)
+    available, _components = supervisor.read_host(probe)
+    return max(0, available - policy.host_free_reserve_bytes)
+
+
+def estimate_run_environment(estimate):
+    """The run's environment pin for its estimate: the planner's safe decode budget, so the run
+    tiles exactly as priced (absent without a budget-planned decode)."""
+    safe = None if estimate is None else estimate.get("decodeSafeBudgetGib")
+    return {} if safe is None else {WAN_VAE_BUDGET_ENV: repr(float(safe))}
 
 
 def admission_estimate_arguments(estimate, measured_peak_host_bytes, policy):
@@ -844,7 +876,8 @@ def run_entrypoint(
             raise ValueError(f"{variant}/{arm} has both a static floor and a product estimate")
         estimate_arguments.setdefault("static_floor_host_bytes", static_floor_host_bytes)
         result = supervisor.run_guarded(
-            command, cwd=run_directory, env=os.environ.copy(), policy=safety_policy,
+            command, cwd=run_directory, env={**os.environ, **estimate_run_environment(product_estimate)},
+            policy=safety_policy,
             stdout_path=run_directory / "stdout.log", stderr_path=run_directory / "stderr.log",
             event_path=event_path, static_floor_gpu_bytes=static_floor_gpu_bytes, probe=probe,
             **estimate_arguments,
@@ -1748,16 +1781,15 @@ def main():
         # admission estimate (asked once per coordinate), raised to the measured peak of a
         # completed arm of the same coordinate request. The Candle lanes' entrypoints have no
         # estimate mode, so their arms fall back to the cap.
-        estimates, completed_peaks = {}, {}
+        completed_peaks = {}
 
         def coordinate_estimate(spec):
+            # Asked per arm: the decode is priced at the admission budget measured just before it.
             if backend != "mlx-metal":
                 return None
-            key = (spec.variant, spec.name)
-            if key not in estimates:
-                estimates[key] = product_admission_estimate(
-                    spec.entrypoint, spec.snapshot, spec.variant, spec.args)
-            return estimates[key]
+            return product_admission_estimate(
+                spec.entrypoint, spec.snapshot, spec.variant, spec.args,
+                budget_bytes=host_admission_budget(safety_policy))
 
         def record_unit(spec, _arm, run):
             peak = (run.supervision or {}).get("peakHostBytes")

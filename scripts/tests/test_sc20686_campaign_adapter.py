@@ -58,7 +58,11 @@ class CampaignAdapterTests(unittest.TestCase):
         body = "import sys\n" + (
             "sys.exit(3)\n" if document is None else
             f"assert sys.argv[1:5] == ['--sc20686-estimate', '--variant', 'route', '--snapshot']\n"
-            f"print('progress noise')\nprint({json.dumps(json.dumps(document))})\n")
+            f"budget = sys.argv[sys.argv.index('--sc20686-budget-bytes') + 1] "
+            f"if '--sc20686-budget-bytes' in sys.argv else None\n"
+            f"document = {json.dumps(json.dumps(document))}\n"
+            f"print('progress noise')\n"
+            f"print(document.replace('BUDGET', str(budget)))\n")
         script.write_text(f"#!/usr/bin/env python3\n{body}", encoding="utf-8")
         script.chmod(0o755)
         return script
@@ -68,13 +72,26 @@ class CampaignAdapterTests(unittest.TestCase):
             root = Path(directory)
             good = {"schema": self.adapter.PRODUCT_ADMISSION_ESTIMATE_SCHEMA, "route": "route",
                     "source": "product-admission-profile", "estimateBytes": 700,
-                    "phases": {"conditioning": 100, "decode": 700}, "components": {}}
+                    "phases": {"conditioning": 100, "decode": 700}, "components": {},
+                    "decodeMode": "tiled", "decodeSafeBudgetGib": 41.25, "budget": "BUDGET"}
             estimate = self.adapter.product_admission_estimate(
-                self.fake_estimator(root, good), root, "route", ("--width", "512"))
+                self.fake_estimator(root, good), root, "route", ("--width", "512"),
+                budget_bytes=123)
             self.assertEqual(estimate["estimateBytes"], 700)
+            # The admission budget reaches the estimate mode, and its decode decision is recorded.
+            self.assertEqual((estimate["budget"], estimate["decodeMode"]), ("123", "tiled"))
+            self.assertEqual(self.adapter.estimate_run_environment(estimate),
+                             {"WAN_VAE_BUDGET_GIB": "41.25"})
+            self.assertEqual(self.adapter.estimate_run_environment(
+                {**estimate, "decodeSafeBudgetGib": None}), {})
+            with self.assertRaisesRegex(ValueError, "budget is malformed"):
+                self.adapter.product_admission_estimate(
+                    self.fake_estimator(root, good), root, "route", budget_bytes=-1)
             for broken in ({**good, "schema": "v0"}, {**good, "route": "other"},
                            {**good, "source": "guess"}, {**good, "estimateBytes": 0},
-                           {**good, "estimateBytes": 699}, {**good, "phases": {}}, None):
+                           {**good, "estimateBytes": 699}, {**good, "phases": {}},
+                           {**good, "decodeMode": "guessed"}, {**good, "decodeSafeBudgetGib": -1},
+                           None):
                 with self.subTest(broken=broken):
                     with self.assertRaisesRegex(ValueError, "product admission estimate"):
                         self.adapter.product_admission_estimate(
@@ -87,8 +104,9 @@ class CampaignAdapterTests(unittest.TestCase):
             snapshot.mkdir()
             executable = root / "producer"
             executable.write_text(
-                "#!/usr/bin/env python3\nimport sys\n"
-                "open(sys.argv[sys.argv.index('--sc20686-events') + 1], 'w').write('{}\\n')\n",
+                "#!/usr/bin/env python3\nimport json, os, sys\n"
+                "open(sys.argv[sys.argv.index('--sc20686-events') + 1], 'w').write("
+                "json.dumps({'pin': os.environ.get('WAN_VAE_BUDGET_GIB')}) + '\\n')\n",
                 encoding="utf-8",
             )
             executable.chmod(0o755)
@@ -96,13 +114,22 @@ class CampaignAdapterTests(unittest.TestCase):
             policy, probe = safety["safety_policy"], safety["probe"]
             estimate = {"schema": self.adapter.PRODUCT_ADMISSION_ESTIMATE_SCHEMA, "route": "route",
                         "source": "product-admission-profile", "estimateBytes": 4096,
-                        "phases": {"decode": 4096}, "components": {}}
+                        "phases": {"decode": 4096}, "components": {},
+                        "decodeMode": "tiled", "decodeSafeBudgetGib": 3.5}
+            # The admission budget is host available minus the reserve, measured now.
+            probe.host_free = lambda: policy.host_free_reserve_bytes + 5000
+            self.assertEqual(self.adapter.host_admission_budget(policy, probe), 5000)
+            probe.host_free = lambda: policy.host_free_reserve_bytes - 1
+            self.assertEqual(self.adapter.host_admission_budget(policy, probe), 0)
+
+            pins = []
 
             def run(measured=None, product=estimate):
                 result = self.adapter.run_entrypoint(
                     executable, snapshot, "route", "normal", "a" * 40, "sequential", (),
                     timeout_seconds=5, failure_root=root / "failed", product_estimate=product,
                     measured_peak_host_bytes=measured, **safety)
+                pins.append(result.events[0]["pin"])
                 self.adapter.cleanup_campaign_run(result)
                 return result.supervision
 
@@ -114,6 +141,8 @@ class CampaignAdapterTests(unittest.TestCase):
             self.assertEqual((admission["hostEstimateSource"], admission["hostEstimateBytes"]),
                              ("product-admission-profile", 4096))
             self.assertEqual(supervision["productAdmissionEstimate"], estimate)
+            # The run is pinned to the decode budget its estimate priced.
+            self.assertEqual(pins[-1], "3.5")
             # One byte less is refused before spawn.
             probe.host_free = lambda: policy.host_free_reserve_bytes + 4095
             with self.assertRaisesRegex(ValueError, "preflight-memory"):
