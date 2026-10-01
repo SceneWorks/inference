@@ -21,6 +21,12 @@
 //! * **No MoE graph refusal.** [`StepModel::graph_support`] no longer names
 //!   `moe_router_host_read` for an MoE model.
 //!
+//! * **On CUDA (the `windows-cuda` lane), the indexed dispatch.** Every fixture — dense, Q8_0,
+//!   Q4_0, Q4_K, and NVFP4 on an sm_120 device — decodes greedily through the CUDA-graph runner
+//!   with its experts dispatched by the indexed kernels, token-identical to the same request
+//!   dispatched grouped (the per-expert path); the graph is captured and replayed (a host read in
+//!   the step would refuse it), and a decode step reads nothing back and gathers no expert matrix.
+//!
 //! Regenerate the goldens (only ever against a known-good tree, and say so in the commit):
 //!
 //! ```text
@@ -578,5 +584,193 @@ fn moe_models_are_not_refused_for_a_router_host_read() {
             Err("moe_router_host_read"),
             "{name}: still refused for its router"
         );
+    }
+}
+
+/// sc-24440 part 2: the indexed MoE dispatch on CUDA, end to end. Each fixture runs twice on the
+/// device: eagerly with every MoE step dispatched grouped (routes read back, each expert on its
+/// own tokens — the path the indexed kernels replace), and through the CUDA-graph runner with
+/// the default dispatch (indexed). The greedy tokens are identical, the decode steps are
+/// captured and replayed, and one eager decode step on the indexed path issues no host sync, runs
+/// every MoE layer indexed and gathers no expert matrix.
+#[cfg(feature = "cuda")]
+mod cuda {
+    use super::*;
+    use candle_llm::decode::graph::cuda_graphs_policy_guard;
+    use candle_llm::decode::{
+        generate_step, CancelFlag, GenerationConfig, GraphRunner, StepModel, StepRequest,
+    };
+    use candle_llm::device::select_device;
+    use candle_llm::primitives::moe::{
+        moe_expert_gather_count, moe_indexed_dispatch_count, with_grouped_dispatch,
+    };
+    use candle_llm::primitives::ProjectionFormat;
+
+    fn greedy(max_new_tokens: usize) -> GenerationConfig {
+        let mut config = GenerationConfig {
+            max_new_tokens,
+            seed: Some(0),
+            stop_tokens: Vec::new(),
+            ..Default::default()
+        };
+        config.sampling.temperature = 0.0;
+        config
+    }
+
+    fn on(device: &Device, weights: &HashMap<String, Tensor>) -> Weights {
+        let moved = weights
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_device(device).unwrap()))
+            .collect();
+        Weights::from_map(moved, device.clone())
+    }
+
+    /// Run the comparison on one model (`moe_layers` MoE layers).
+    fn check<M: StepModel>(name: &str, model: &M, moe_layers: u64) {
+        assert_eq!(model.graph_support(), Ok(()), "{name}: graph support");
+        let config = greedy(GREEDY_STEPS);
+        let (grouped, _) = with_grouped_dispatch(|| {
+            generate_step(
+                model,
+                &PROMPT,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+            )
+        })
+        .unwrap();
+        let gathers = moe_expert_gather_count();
+        let runner = GraphRunner::new(model);
+        let (indexed, record) = generate_step(
+            &runner,
+            &PROMPT,
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap();
+        eprintln!(
+            "[moe_routing] {name}: {} — {:?}",
+            record.cuda_graphs.describe(),
+            indexed.tokens
+        );
+        assert_eq!(
+            indexed.tokens, grouped.tokens,
+            "{name}: indexed dispatch diverged from the grouped dispatch"
+        );
+        assert_eq!(record.cuda_graphs.fallback_reason, None, "{name}");
+        assert!(record.cuda_graphs.replayed > 0, "{name}: no graph replayed");
+        assert_eq!(
+            moe_expert_gather_count(),
+            gathers,
+            "{name}: an expert was gathered"
+        );
+
+        // One eager decode step on the indexed path.
+        let mut cache = model.new_cache_for(PROMPT.len() + 4, 0).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&PROMPT))
+            .unwrap();
+        model.device().synchronize().unwrap();
+        let before = (
+            host_sync_count(),
+            moe_indexed_dispatch_count(),
+            moe_expert_gather_count(),
+        );
+        model
+            .forward_step(&mut cache, StepRequest::last(&[7]))
+            .unwrap();
+        assert_eq!(
+            (
+                host_sync_count() - before.0,
+                moe_indexed_dispatch_count() - before.1,
+                moe_expert_gather_count() - before.2,
+            ),
+            (0, moe_layers, 0),
+            "{name}: (host syncs, indexed MoE layers, expert gathers) of one decode step"
+        );
+    }
+
+    /// A Qwen2-MoE whose every projection input is a whole Q4_K super-block (256), so a Q4 load
+    /// stores its experts Q4_K (the narrower fixtures fall back to Q4_0).
+    const K256: Dims = Dims {
+        hidden: 256,
+        heads: 4,
+        head_dim: 64,
+        vocab: 64,
+        layers: 2,
+        experts: 8,
+        top_k: 2,
+        moe_inter: 256,
+        shared_inter: 256,
+    };
+
+    #[test]
+    fn moe_fixtures_decode_indexed_on_cuda_token_identical_to_the_grouped_dispatch() {
+        let _graphs = cuda_graphs_policy_guard(Some(true));
+        let device = match select_device() {
+            Ok(d @ Device::Cuda(_)) => d,
+            _ => {
+                eprintln!("skipping: no CUDA device");
+                return;
+            }
+        };
+        let causal_on = |config: &Value, w: &HashMap<String, Tensor>, quant| {
+            let cfg = ModelConfig::from_json(config).unwrap();
+            CausalLm::from_weights_with(&on(&device, w), "", cfg, quant).unwrap()
+        };
+        let (q2, q2w) = qwen2_moe(TINY, false, 0x2444_0001);
+        let (q2n, q2nw) = qwen2_moe(WIDE, true, 0x2444_0002);
+        let (qk, qkw) = qwen2_moe(K256, true, 0x2444_0005);
+        let (ds, dsw) = deepseek_v2(0x2444_0003);
+        let (q35, q35w) = qwen35_moe(0x2444_0004);
+        check("qwen2_moe", &causal_on(&q2, &q2w, None), TINY.layers as u64);
+        check(
+            "qwen2_moe_norm",
+            &causal_on(&q2n, &q2nw, None),
+            WIDE.layers as u64,
+        );
+        check(
+            "qwen2_moe_norm_q8",
+            &causal_on(&q2n, &q2nw, Some(QuantSpec::q8())),
+            WIDE.layers as u64,
+        );
+        check(
+            "qwen2_moe_norm_q4 (Q4_0)",
+            &causal_on(&q2n, &q2nw, Some(QuantSpec::q4())),
+            WIDE.layers as u64,
+        );
+        check(
+            "qwen2_moe_k256_q4 (Q4_K)",
+            &causal_on(&qk, &qkw, Some(QuantSpec::q4())),
+            K256.layers as u64,
+        );
+        check("deepseek_v2", &causal_on(&ds, &dsw, None), 2);
+        check(
+            "deepseek_v2_q8",
+            &causal_on(&ds, &dsw, Some(QuantSpec::q8())),
+            2,
+        );
+        let qwen35 = Qwen35Model::from_weights(
+            &on(&device, &q35w),
+            "model.language_model",
+            Qwen35Config::from_json(&q35).unwrap(),
+        )
+        .unwrap();
+        check("qwen35_moe", &qwen35, 4);
+        match ProjectionFormat::nvfp4(&device) {
+            Ok(format) => {
+                let cfg = ModelConfig::from_json(&q2n).unwrap();
+                let model =
+                    CausalLm::from_weights_format(&on(&device, &q2nw), "", cfg, Some(&format))
+                        .unwrap();
+                check("qwen2_moe_norm_nvfp4", &model, WIDE.layers as u64);
+            }
+            Err(why) => {
+                candle_quant_kernels::skip_without_sm120(&format!("NVFP4 MoE fixture ({why})"))
+            }
+        }
     }
 }

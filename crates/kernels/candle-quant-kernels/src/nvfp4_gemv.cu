@@ -164,7 +164,11 @@ __device__ __forceinline__ void mma_compute_unit(const MmaUnit& un, const u32* l
     }
 }
 
-extern "C" __global__ void __launch_bounds__(MMA_THREADS) nvfp4_gemv_bf16(
+// The whole GEMV of one weight against `m_rows` activation rows, for the block's 16 output rows
+// (`blockIdx.x`). Both entry points below run exactly this code: the plain GEMV, and the indexed
+// MoE GEMV (sc-24440) that picks the weight per task from device tables — so a task's output is
+// bit-identical to the plain GEMV of that expert on that row.
+__device__ __forceinline__ void nvfp4_gemv_core(
     const unsigned char* __restrict__ packed,
     const unsigned char* __restrict__ scales,
     const bf16_t* __restrict__ x,
@@ -244,4 +248,47 @@ extern "C" __global__ void __launch_bounds__(MMA_THREADS) nvfp4_gemv_bf16(
             y[(size_t)(m0 + 1) * (size_t)n_rows + n_g8] = f32_to_bf16(v[3] * gs);
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(MMA_THREADS) nvfp4_gemv_bf16(
+    const unsigned char* __restrict__ packed,
+    const unsigned char* __restrict__ scales,
+    const bf16_t* __restrict__ x,
+    bf16_t* __restrict__ y,
+    int n_rows,
+    int k,
+    int cols_padded,
+    int num_k_atoms,
+    float gs,
+    int vec_x,
+    int m_rows) {
+    nvfp4_gemv_core(packed, scales, x, y, n_rows, k, cols_padded, num_k_atoms, gs, vec_x, m_rows);
+}
+
+// The indexed MoE GEMV (sc-24440): task `blockIdx.y` (= token * slots + slot) multiplies ONE
+// activation row by the NVFP4 weight of expert `ids[task]`, whose packed nibbles, block scales and
+// per-tensor scale are read from device tables built at load (`packed_tab`, `scales_tab`: u64
+// addresses; `gs_tab`: f32). Every expert of a bank has the same shape, so `n_rows`, `k`,
+// `cols_padded` and `num_k_atoms` are shared. The activation row is the task's token row
+// (`per_slot == 0`) or the task's own row (`per_slot != 0`); the output row is the task's.
+extern "C" __global__ void __launch_bounds__(MMA_THREADS) nvfp4_gemv_indexed_bf16(
+    const unsigned long long* __restrict__ packed_tab,
+    const unsigned long long* __restrict__ scales_tab,
+    const float* __restrict__ gs_tab,
+    const bf16_t* __restrict__ x,
+    const unsigned int* __restrict__ ids,
+    bf16_t* __restrict__ y,
+    int n_rows,
+    int k,
+    int cols_padded,
+    int num_k_atoms,
+    int vec_x,
+    int slots,
+    int per_slot) {
+    const int task = blockIdx.y;
+    const unsigned int e = ids[task];
+    const int row = per_slot ? task : task / slots;
+    nvfp4_gemv_core((const unsigned char*)packed_tab[e], (const unsigned char*)scales_tab[e],
+                    x + (size_t)row * (size_t)k, y + (size_t)task * (size_t)n_rows, n_rows, k,
+                    cols_padded, num_k_atoms, gs_tab[e], vec_x, 1);
 }

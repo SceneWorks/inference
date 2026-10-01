@@ -9,43 +9,56 @@
 //! drained the GPU pipeline once per MoE layer and made every MoE model refuse CUDA-graph capture
 //! (`moe_router_host_read`).
 //!
-//! **Dispatch** depends on how the routed experts are stored:
+//! **Dispatch.** A decode-sized step — at most [`DEVICE_DISPATCH_MAX_ROWS`] tokens — runs every
+//! (token, slot) pair's expert on its one row, with the routes as device data:
 //!
-//! * A **dense** bank (every expert a plain `[out, in]` weight, the unquantized load) is held
-//!   stacked (`[experts, out, in]`). A decode-sized step — at most [`DEVICE_DISPATCH_MAX_ROWS`]
-//!   tokens — gathers each (token, slot) pair's expert weights by its device index and runs one
-//!   batched matmul per projection: no host read and shapes fixed by the step, so nothing in it
-//!   stops a graph capture (whether a recorded step replays is still the graph runner's census to
-//!   decide — candle uploads some ops' layouts from the host). Every (token, slot) pair is its own
-//!   one-row product, so a row never depends on its batch; the products are accumulated in
-//!   ascending expert order, the order the grouped loop below adds them, so a one-token step
-//!   reproduces the grouped dispatch bit for bit.
-//! * Larger batches (a prefill), and banks Candle cannot index by a device id — GGML-quantized,
-//!   NVFP4 or Prism experts, each its own kernel with no gathered matmul — are dispatched
-//!   grouped: the device-computed routes are read back once (one counted host sync), each expert
-//!   runs on just its tokens, and the weighted outputs are `index_add`ed back. That is the
-//!   routing arithmetic of the pre-change block, fed by the device router. A model with such a
-//!   bank therefore still reads the device during a decode step and says so in
+//! * **Indexed** (CUDA): one launch per projection of
+//!   [`IndexedExperts`](candle_quant_kernels::IndexedExperts) — each pair's expert id is read on
+//!   the device and its weight read **in place** through a load-time device table of expert
+//!   addresses. No host read, no copy of an expert matrix, and launch shapes fixed by the step, so
+//!   the step is graph-capturable. Every expert format the crate loads into a bank has a kernel:
+//!   dense (f32 / bf16 / f16), GGML blocks (Q4_0 / Q8_0 / Q4_K — what quantize-on-load and a
+//!   prepared snapshot store — and every other type candle's decode MMVQ serves), the MLX-affine Q8
+//!   tier (Q8_0 dequantized per forward) and NVFP4. A GGML or NVFP4 pair's output is bit-identical
+//!   to that expert's own decode forward on that row (the kernels run candle's MMVQ / the NVFP4
+//!   decode GEMV's core); dense and dequant pairs agree with the per-expert matmul to its rounding.
+//! * **Gathered** (a dense bank off CUDA, or where the indexed kernel is unavailable): each pair's
+//!   stacked expert weights are gathered by the device index (`index_select` — a copy of `slots`
+//!   expert matrices per projection) and multiplied in one batched matmul.
+//!
+//! Every pair is its own one-row product, so a row never depends on its batch; the products are
+//! accumulated in ascending expert order, the order the grouped loop below adds them, so a
+//! one-token step reproduces the grouped dispatch's sums.
+//!
+//! * **Grouped**: larger batches (a prefill), and a bank no device dispatch serves — Prism-packed
+//!   experts (no Prism MoE checkpoint is in the supported set: Prism GGUF synthesizes a dense
+//!   Qwen3.5 config, the MLX Prism release is the dense Bonsai), a bank whose experts mix formats
+//!   or carry a bias, NVFP4 with the decode GEMV switched off or a non-bf16 activation, an indexed
+//!   kernel that does not compile on the device — read the device-computed routes back once (one
+//!   counted host sync), run each expert on just its tokens, and `index_add` the weighted outputs
+//!   back. A decode step through such a bank reads the device, so the model says so in
 //!   [`SparseMoe::graph_refusal`] (`moe_expert_host_dispatch`).
 //! * On the **CPU** every step is dispatched grouped. A host read costs nothing there (the tensors
 //!   already live in host memory, and there is no graph to break), and the grouped dispatch reads
-//!   each routed expert's weights in place where the stacked one first copies them: measured
-//!   1.5–1.8x slower stacked at 64 experts / k = 8 / hidden 1024 / expert FFN 512, t = 1–8
+//!   each routed expert's weights in place where the gathered one first copies them: measured
+//!   1.5–1.8x slower gathered at 64 experts / k = 8 / hidden 1024 / expert FFN 512, t = 1–8
 //!   (`tests::stacked_vs_grouped_cpu_timing`). [`with_device_dispatch`] forces the GPU choice on
-//!   the CPU so tests exercise the dispatch a GPU step takes.
+//!   the CPU so tests exercise the dispatch a GPU step takes; [`with_grouped_dispatch`] forces the
+//!   grouped one anywhere, the reference a GPU test compares against.
 
 use std::cell::Cell;
 
 use candle_core::{DType, Device, Tensor};
+use candle_quant_kernels::{IndexedExperts, IndexedFormat, MoeGemvError, MoeRows};
 
 use crate::error::{Error, Result};
 use crate::primitives::host_sync::note_host_sync;
 use crate::primitives::nn::swiglu;
 use crate::primitives::projection::{Projection, WeightCensus};
 
-/// The most tokens a step may route through the stacked device dispatch. Decode steps (one token
-/// per sequence, a handful of sequences) fit; a prefill goes grouped, where each expert's weights
-/// are read once for all of its tokens instead of gathered once per (token, slot) pair.
+/// The most tokens a step may route through a device dispatch. Decode steps (one token per
+/// sequence, a handful of sequences) fit; a prefill goes grouped, where each expert's weights are
+/// read once for all of its tokens instead of once per (token, slot) pair.
 pub const DEVICE_DISPATCH_MAX_ROWS: usize = 8;
 
 /// The graph-capture refusal of a model whose MoE bank is dispatched from host-read routes.
@@ -53,28 +66,58 @@ pub const REASON_EXPERT_HOST_DISPATCH: &str = "moe_expert_host_dispatch";
 
 thread_local! {
     static FORCE_DEVICE_DISPATCH: Cell<bool> = const { Cell::new(false) };
+    static FORCE_GROUPED_DISPATCH: Cell<bool> = const { Cell::new(false) };
     static DEVICE_DISPATCHES: Cell<u64> = const { Cell::new(0) };
+    static INDEXED_DISPATCHES: Cell<u64> = const { Cell::new(0) };
+    static EXPERT_GATHERS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Run `f` with `flag` set on this thread, restoring it after (also on unwind).
+fn with_flag<R>(flag: &'static std::thread::LocalKey<Cell<bool>>, f: impl FnOnce() -> R) -> R {
+    struct Restore(&'static std::thread::LocalKey<Cell<bool>>, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            self.0.with(|c| c.set(self.1));
+        }
+    }
+    let _restore = Restore(flag, flag.with(|c| c.replace(true)));
+    f()
 }
 
 /// Run `f` with this thread's MoE steps dispatched as on a GPU even when the tensors live on the
 /// CPU (which otherwise dispatches every step grouped — see the module docs). Test support: it lets
-/// a CPU test drive the stacked device dispatch through a whole model.
+/// a CPU test drive the device dispatch through a whole model.
 pub fn with_device_dispatch<R>(f: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            FORCE_DEVICE_DISPATCH.with(|c| c.set(self.0));
-        }
-    }
-    let _restore = Restore(FORCE_DEVICE_DISPATCH.with(|c| c.replace(true)));
-    f()
+    with_flag(&FORCE_DEVICE_DISPATCH, f)
 }
 
-/// MoE layer steps this thread has run through the stacked device dispatch (monotone; take
-/// deltas). With [`host_sync_count`](crate::primitives::host_sync_count) it says which dispatch a
-/// step's MoE layers took: every layer on the device, none reading back.
+/// Run `f` with this thread's MoE steps dispatched grouped on every device — the per-expert
+/// dispatch the device dispatches are measured against. Test and evidence support.
+pub fn with_grouped_dispatch<R>(f: impl FnOnce() -> R) -> R {
+    with_flag(&FORCE_GROUPED_DISPATCH, f)
+}
+
+fn bump(counter: &'static std::thread::LocalKey<Cell<u64>>) {
+    counter.with(|c| c.set(c.get().wrapping_add(1)));
+}
+
+/// MoE layer steps this thread has run through a device dispatch, indexed or gathered (monotone;
+/// take deltas). With [`host_sync_count`](crate::primitives::host_sync_count) it says which
+/// dispatch a step's MoE layers took: every layer on the device, none reading back.
 pub fn moe_device_dispatch_count() -> u64 {
     DEVICE_DISPATCHES.with(Cell::get)
+}
+
+/// MoE layer steps this thread has run through the indexed kernels (monotone; take deltas): every
+/// expert weight read in place, nothing gathered.
+pub fn moe_indexed_dispatch_count() -> u64 {
+    INDEXED_DISPATCHES.with(Cell::get)
+}
+
+/// MoE layer steps this thread has run through the gathered dispatch (monotone; take deltas): each
+/// one copied `slots` whole expert matrices per projection per token by a device index.
+pub fn moe_expert_gather_count() -> u64 {
+    EXPERT_GATHERS.with(Cell::get)
 }
 
 /// Whether reading routes back to the host would cost `device` a pipeline drain: every GPU, and
@@ -129,8 +172,10 @@ pub enum ExpertPart {
     Down,
 }
 
-/// The routed experts.
-enum ExpertBank {
+const PARTS: [ExpertPart; 3] = [ExpertPart::Gate, ExpertPart::Up, ExpertPart::Down];
+
+/// How the routed experts are held.
+enum Layout {
     /// Dense experts stacked per projection: `gate` / `up` `[experts, inter, hidden]`, `down`
     /// `[experts, hidden, inter]`.
     Stacked {
@@ -138,8 +183,97 @@ enum ExpertBank {
         up: Tensor,
         down: Tensor,
     },
-    /// Experts Candle cannot index by a device id (quantized / NVFP4 / Prism, or a mixed bank).
+    /// Experts of any other representation (quantized / NVFP4 / Prism, or a mixed bank).
     PerExpert(Vec<SwiGlu>),
+}
+
+/// The routed experts: their layout, plus — for a CUDA bank the indexed kernels serve — the
+/// gate / up / down expert-address tables they read the weights through.
+struct ExpertBank {
+    layout: Layout,
+    /// The indexed tables, or why the bank has none (a stable label: `not_cuda`, `prism`,
+    /// `mixed`, `format`, ...).
+    indexed: std::result::Result<Box<[IndexedExperts; 3]>, &'static str>,
+}
+
+/// How a step's routed experts are dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dispatch {
+    /// The indexed kernels (CUDA): weights read in place by the device ids.
+    Indexed,
+    /// Stacked expert weights gathered by the device ids, then a batched matmul.
+    Gathered,
+    /// Routes read back to the host; each expert run on its own tokens.
+    Grouped,
+}
+
+/// The indexed tables for one projection of a per-expert bank, or why there are none.
+fn indexed_part(
+    experts: &[SwiGlu],
+    part: ExpertPart,
+) -> std::result::Result<std::result::Result<IndexedExperts, &'static str>, MoeGemvError> {
+    let projections = experts.iter().map(|e| e.part(part)).collect::<Vec<_>>();
+    let built = match projections.first() {
+        Some(Projection::Quantized(_)) => {
+            let mut sources = Vec::with_capacity(projections.len());
+            for p in &projections {
+                match p {
+                    Projection::Quantized(q) => match q.indexed_source() {
+                        Some(source) => sources.push(source),
+                        None => return Ok(Err("format")),
+                    },
+                    _ => return Ok(Err("mixed")),
+                }
+            }
+            let dequant = sources[0].1;
+            if sources.iter().any(|(_, d)| *d != dequant) {
+                return Ok(Err("mixed"));
+            }
+            let tensors = sources.into_iter().map(|(q, _)| q).collect::<Vec<_>>();
+            IndexedExperts::ggml(&tensors, dequant)
+        }
+        Some(Projection::Nvfp4(_)) => {
+            let mut weights = Vec::with_capacity(projections.len());
+            for p in &projections {
+                match p {
+                    Projection::Nvfp4(w) => weights.push(w.clone()),
+                    _ => return Ok(Err("mixed")),
+                }
+            }
+            IndexedExperts::nvfp4(&weights)
+        }
+        Some(Projection::Prism(_)) => return Ok(Err("prism")),
+        // A dense projection in a per-expert bank: a biased or mixed bank (an all-dense, bias-free
+        // bank is stacked instead).
+        Some(Projection::Dense(_)) | None => return Ok(Err("format")),
+    };
+    match built {
+        Ok(bank) => Ok(Ok(bank)),
+        Err(MoeGemvError::Refused(r)) => Ok(Err(r.label())),
+        Err(e @ (MoeGemvError::Compile(_) | MoeGemvError::Candle(_))) => Err(e),
+    }
+}
+
+/// The three tables from per-projection results: the first refusal wins.
+fn indexed_bank(
+    parts: [std::result::Result<std::result::Result<IndexedExperts, &'static str>, MoeGemvError>;
+        3],
+) -> Result<std::result::Result<Box<[IndexedExperts; 3]>, &'static str>> {
+    let [g, u, d] = parts;
+    Ok(
+        match (
+            g.map_err(gemv_err)?,
+            u.map_err(gemv_err)?,
+            d.map_err(gemv_err)?,
+        ) {
+            (Ok(g), Ok(u), Ok(d)) => Ok(Box::new([g, u, d])),
+            (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => Err(why),
+        },
+    )
+}
+
+fn gemv_err(e: MoeGemvError) -> Error {
+    Error::Candle(e.into())
 }
 
 impl ExpertBank {
@@ -154,7 +288,11 @@ impl ExpertBank {
                 .all(|p| dense(p).is_some())
         });
         if !stackable {
-            return Ok(Self::PerExpert(experts));
+            let indexed = indexed_bank(PARTS.map(|part| indexed_part(&experts, part)))?;
+            return Ok(Self {
+                layout: Layout::PerExpert(experts),
+                indexed,
+            });
         }
         let mut parts: [Vec<Tensor>; 3] = Default::default();
         for e in &experts {
@@ -163,17 +301,26 @@ impl ExpertBank {
             }
         }
         let [gate, up, down] = parts;
-        Ok(Self::Stacked {
-            gate: Tensor::stack(&gate, 0)?,
-            up: Tensor::stack(&up, 0)?,
-            down: Tensor::stack(&down, 0)?,
+        let (gate, up, down) = (
+            Tensor::stack(&gate, 0)?,
+            Tensor::stack(&up, 0)?,
+            Tensor::stack(&down, 0)?,
+        );
+        let indexed = indexed_bank([&gate, &up, &down].map(|w| match IndexedExperts::dense(w) {
+            Ok(bank) => Ok(Ok(bank)),
+            Err(MoeGemvError::Refused(r)) => Ok(Err(r.label())),
+            Err(e) => Err(e),
+        }))?;
+        Ok(Self {
+            layout: Layout::Stacked { gate, up, down },
+            indexed,
         })
     }
 
     /// Expert `e`'s `part` applied to `x` `[n, in]`.
     fn project(&self, e: usize, part: ExpertPart, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Stacked { gate, up, down } => {
+        match &self.layout {
+            Layout::Stacked { gate, up, down } => {
                 let w = match part {
                     ExpertPart::Gate => gate,
                     ExpertPart::Up => up,
@@ -182,19 +329,92 @@ impl ExpertBank {
                 // The same `x · wᵀ` a dense `Linear` runs on its own `[out, in]` weight.
                 Ok(x.matmul(&w.get(e)?.t()?)?)
             }
-            Self::PerExpert(experts) => experts[e].part(part).forward(x),
+            Layout::PerExpert(experts) => experts[e].part(part).forward(x),
         }
     }
 
     /// Expert `e`'s SwiGLU on `x` `[n, hidden]`.
     fn expert(&self, e: usize, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Stacked { .. } => {
+        match &self.layout {
+            Layout::Stacked { .. } => {
                 let g = self.project(e, ExpertPart::Gate, x)?;
                 let up = self.project(e, ExpertPart::Up, x)?;
                 self.project(e, ExpertPart::Down, &swiglu(&g, &up)?)
             }
-            Self::PerExpert(experts) => experts[e].forward(x),
+            Layout::PerExpert(experts) => experts[e].forward(x),
+        }
+    }
+
+    /// Why the indexed kernels cannot serve a step of `act` activations, or `None` when they can:
+    /// the bank has tables, their kernels compile on the device (the nvrtc seam's cached outcome)
+    /// and serve `act`, and — NVFP4 — the decode GEMV switch is on (the indexed NVFP4 kernel is
+    /// that GEMV's core; with the switch off every NVFP4 projection runs cuBLASLt).
+    fn indexed_refusal(&self, act: DType) -> Option<&'static str> {
+        let banks = match &self.indexed {
+            Ok(banks) => banks,
+            Err(why) => return Some(why),
+        };
+        for bank in banks.iter() {
+            if bank.format().io_dtype(act).is_none() {
+                return Some("dtype");
+            }
+            if bank.format() == IndexedFormat::Nvfp4
+                && !crate::primitives::nvfp4_path::nvfp4_gemv_enabled()
+            {
+                return Some("nvfp4_gemv_disabled");
+            }
+            if let Err(e) = bank.available() {
+                return Some(e.label());
+            }
+        }
+        None
+    }
+
+    /// Device bytes a `t`-row decode step's routed dispatch allocates beyond its input, per
+    /// token row, for activations of `act` on this bank's device (the larger of the two device
+    /// dispatches it may take, so admission covers whichever runs).
+    fn step_bytes_per_token(&self, act: DType, slots: usize) -> u64 {
+        let e = act.size_in_bytes();
+        let (inter, hidden) = self.dims();
+        // The grouped dispatch: each routed expert's three projections and SwiGLU on its row.
+        let mut bytes = slots * (3 * inter + 2 * hidden) * e;
+        if let Ok(banks) = &self.indexed {
+            // Each projection's own workspace, plus the activation casts around it (GGML widens
+            // to f32 and narrows back) and the SwiGLU / weighting temporaries.
+            let mut indexed = 0usize;
+            for (bank, rows) in
+                banks
+                    .iter()
+                    .zip([MoeRows::PerToken, MoeRows::PerToken, MoeRows::PerSlot])
+            {
+                let (n, k) = bank.shape();
+                let input = match rows {
+                    MoeRows::PerToken => k,
+                    MoeRows::PerSlot => slots * k,
+                };
+                indexed += bank.workspace_bytes(act, 1, slots, rows) + input * 4 + slots * n * e;
+            }
+            bytes = bytes.max(indexed);
+        } else if matches!(self.layout, Layout::Stacked { .. }) && !self.on_cpu() {
+            // The gathered dispatch's copies: `slots` expert matrices per projection.
+            bytes = bytes.max(slots * 3 * inter * hidden * e + slots * (3 * inter + hidden) * e);
+        }
+        bytes as u64
+    }
+
+    /// `(expert FFN width, hidden)`.
+    fn dims(&self) -> (usize, usize) {
+        match &self.layout {
+            Layout::Stacked { gate, .. } => (gate.dim(1).unwrap_or(0), gate.dim(2).unwrap_or(0)),
+            Layout::PerExpert(experts) => experts.first().map_or((0, 0), |e| e.gate.dims()),
+        }
+    }
+
+    fn on_cpu(&self) -> bool {
+        match &self.layout {
+            Layout::Stacked { gate, .. } => gate.device().is_cpu(),
+            // A per-expert bank has tables only on CUDA.
+            Layout::PerExpert(_) => self.indexed.is_err(),
         }
     }
 }
@@ -217,7 +437,7 @@ pub struct MoeRouting {
 /// (DeepSeek-V2). `n_group` / `topk_group` group-limited routing (DeepSeek-V2-236B / V3) is not
 /// modelled — the verification model (V2-Lite) uses plain greedy top-k.
 pub struct SparseMoe {
-    /// Router weight `[experts, hidden]`.
+    /// Router weight `[experts, hidden]`, in the model's activation dtype.
     router: Tensor,
     bank: ExpertBank,
     num_experts: usize,
@@ -228,8 +448,10 @@ pub struct SparseMoe {
 }
 
 impl SparseMoe {
-    /// Assemble the block from the router `[experts, hidden]`, the per-expert SwiGLUs (stacked
-    /// here when every projection is dense), the shared expert and its optional gate.
+    /// Assemble the block from the router `[experts, hidden]` (in the model's activation dtype),
+    /// the per-expert SwiGLUs (stacked here when every projection is dense; on CUDA, indexed
+    /// through load-time expert-address tables when their format has a kernel), the shared expert
+    /// and its optional gate.
     pub fn new(
         router: Tensor,
         experts: Vec<SwiGlu>,
@@ -263,18 +485,48 @@ impl SparseMoe {
         self.routing.experts_per_tok.clamp(1, self.num_experts)
     }
 
-    /// Whether a `t`-row step takes the stacked device dispatch on a GPU: the bank is stacked and
-    /// the step is decode-sized. The one dispatch decision — [`forward`](Self::forward) and
+    /// The device dispatch a `t`-row step takes on a GPU, or [`Dispatch::Grouped`]: indexed when
+    /// the indexed kernels serve the bank, else gathered for a stacked bank — both only for a
+    /// decode-sized step. The one dispatch decision — [`forward`](Self::forward) and
     /// [`graph_refusal`](Self::graph_refusal) both read it.
-    fn device_dispatch(&self, t: usize) -> bool {
-        matches!(self.bank, ExpertBank::Stacked { .. }) && t <= DEVICE_DISPATCH_MAX_ROWS
+    fn device_dispatch(&self, t: usize) -> Dispatch {
+        if t > DEVICE_DISPATCH_MAX_ROWS {
+            return Dispatch::Grouped;
+        }
+        if self.bank.indexed_refusal(self.router.dtype()).is_none() {
+            return Dispatch::Indexed;
+        }
+        match self.bank.layout {
+            Layout::Stacked { .. } => Dispatch::Gathered,
+            Layout::PerExpert(_) => Dispatch::Grouped,
+        }
     }
 
     /// Why a decode step through this block cannot be captured as a CUDA graph, if it cannot: a
     /// decode-sized step (up to [`DEVICE_DISPATCH_MAX_ROWS`] tokens) that is not dispatched on the
-    /// device reads its routes back to the host.
+    /// device reads its routes back to the host. With the indexed kernels that is only a bank none
+    /// of them serves — see the module docs, and [`SparseMoe::host_dispatch_cause`] for which.
     pub fn graph_refusal(&self) -> Option<&'static str> {
-        (!self.device_dispatch(DEVICE_DISPATCH_MAX_ROWS)).then_some(REASON_EXPERT_HOST_DISPATCH)
+        (self.device_dispatch(DEVICE_DISPATCH_MAX_ROWS) == Dispatch::Grouped)
+            .then_some(REASON_EXPERT_HOST_DISPATCH)
+    }
+
+    /// Why a decode step's experts are dispatched from host-read routes, when they are: the
+    /// indexed kernels' refusal of this bank (`not_cuda`, `prism`, `mixed`, `format`, `dtype`,
+    /// `nvfp4_gemv_disabled`, a compile label), `None` when a device dispatch serves it.
+    pub fn host_dispatch_cause(&self) -> Option<&'static str> {
+        match self.device_dispatch(DEVICE_DISPATCH_MAX_ROWS) {
+            Dispatch::Grouped => self.bank.indexed_refusal(self.router.dtype()),
+            Dispatch::Indexed | Dispatch::Gathered => None,
+        }
+    }
+
+    /// Device bytes a decode step through this block's routed experts allocates per token row
+    /// (the dispatch's workspace and temporaries, `experts_per_tok` slots) — what admission prices
+    /// per token on top of the dense step working set.
+    pub fn step_bytes_per_token(&self) -> u64 {
+        self.bank
+            .step_bytes_per_token(self.router.dtype(), self.top_k())
     }
 
     /// Route every token on the device: the top-k expert ids `[t, k]` (u32, most probable first)
@@ -312,11 +564,20 @@ impl SparseMoe {
         let t = b * s;
         let xf = x.reshape((t, h))?;
         let (ids, weights) = self.route(&xf)?;
-        let routed = match &self.bank {
-            ExpertBank::Stacked { gate, up, down }
-                if self.device_dispatch(t) && host_reads_stall(xf.device()) =>
-            {
-                DEVICE_DISPATCHES.with(|c| c.set(c.get().wrapping_add(1)));
+        let dispatch = if FORCE_GROUPED_DISPATCH.with(Cell::get) || !host_reads_stall(xf.device()) {
+            Dispatch::Grouped
+        } else {
+            self.device_dispatch(t)
+        };
+        let routed = match (dispatch, &self.bank.indexed, &self.bank.layout) {
+            (Dispatch::Indexed, Ok(banks), _) => {
+                bump(&DEVICE_DISPATCHES);
+                bump(&INDEXED_DISPATCHES);
+                dispatch_indexed(&xf, &ids, &weights, banks)?
+            }
+            (Dispatch::Gathered, _, Layout::Stacked { gate, up, down }) => {
+                bump(&DEVICE_DISPATCHES);
+                bump(&EXPERT_GATHERS);
                 dispatch_stacked(&xf, &ids, &weights, [gate, up, down])?
             }
             _ => self.dispatch_grouped(&xf, &ids, &weights)?,
@@ -389,9 +650,9 @@ impl SparseMoe {
         e: usize,
         part: ExpertPart,
     ) -> crate::primitives::projection::ProjectionKind {
-        match &self.bank {
-            ExpertBank::Stacked { .. } => crate::primitives::projection::ProjectionKind::Dense,
-            ExpertBank::PerExpert(experts) => experts[e].part(part).kind(),
+        match &self.bank.layout {
+            Layout::Stacked { .. } => crate::primitives::projection::ProjectionKind::Dense,
+            Layout::PerExpert(experts) => experts[e].part(part).kind(),
         }
     }
 
@@ -402,8 +663,8 @@ impl SparseMoe {
         if let Some(gate) = &self.shared_gate {
             census.record_tensor(gate);
         }
-        match &self.bank {
-            ExpertBank::Stacked { gate, up, down } => {
+        match &self.bank.layout {
+            Layout::Stacked { gate, up, down } => {
                 for w in [gate, up, down] {
                     let experts = w.dim(0).unwrap_or(0) as u64;
                     let tally = &mut census.projections.dense;
@@ -412,7 +673,7 @@ impl SparseMoe {
                     tally.resident_bytes += (w.elem_count() * w.dtype().size_in_bytes()) as u64;
                 }
             }
-            ExpertBank::PerExpert(experts) => {
+            Layout::PerExpert(experts) => {
                 for expert in experts {
                     expert.record(census);
                 }
@@ -422,9 +683,64 @@ impl SparseMoe {
     }
 }
 
-/// The stacked device dispatch: gather each (token, slot) pair's expert weights by its device
-/// index and run one batched matmul per projection. Everything stays on the device and every
-/// shape is fixed by `(t, k)`, so the step is graph-replayable.
+/// The indexed dispatch: each projection one launch over every (token, slot) pair, the expert
+/// read in place by its device id ([`IndexedExperts`]). Pairs are visited in ascending expert
+/// order per token and their weighted outputs summed in that order, as the grouped dispatch sums
+/// them.
+fn dispatch_indexed(
+    xf: &Tensor,
+    ids: &Tensor,
+    weights: &Tensor,
+    [gate, up, down]: &[IndexedExperts; 3],
+) -> Result<Tensor> {
+    let (t, h) = xf.dims2()?;
+    let k = ids.dim(1)?;
+    // `ids` is `route`'s fresh `[t, k]` tensor (see `dispatch_stacked` on why a view would not
+    // do on the CPU).
+    let (ids, perm) = ids.sort_last_dim(true)?;
+    let weights = weights.gather(&perm, 1)?.to_dtype(xf.dtype())?; // [t, k]
+    let g = project_indexed(gate, xf, &ids, MoeRows::PerToken)?; // [t·k, inter]
+    let u = project_indexed(up, xf, &ids, MoeRows::PerToken)?;
+    let y = project_indexed(down, &swiglu(&g, &u)?, &ids, MoeRows::PerSlot)?; // [t·k, h]
+    let y = y
+        .reshape((t, k, h))?
+        .broadcast_mul(&weights.unsqueeze(2)?)?;
+    let mut out = Tensor::zeros((t, h), xf.dtype(), xf.device())?;
+    for j in 0..k {
+        out = (out + y.narrow(1, j, 1)?.squeeze(1)?)?;
+    }
+    Ok(out)
+}
+
+/// One indexed projection in the dtype convention of the per-expert forward it replaces: the
+/// activation in the format's input dtype (GGML: widened to f32, as `QuantizedLinear` does), the
+/// result back in the activation's dtype.
+fn project_indexed(
+    bank: &IndexedExperts,
+    x: &Tensor,
+    ids: &Tensor,
+    rows: MoeRows,
+) -> Result<Tensor> {
+    let io = bank.format().io_dtype(x.dtype()).ok_or_else(|| {
+        Error::Msg(format!(
+            "{:?} activations reached an indexed bank that refuses them",
+            x.dtype()
+        ))
+    })?;
+    let y = bank
+        .forward(&x.to_dtype(io)?, ids, rows)
+        .map_err(gemv_err)?;
+    if bank.format() == IndexedFormat::Nvfp4 {
+        // The NVFP4 path tally counts this launch as a decode-GEMV run (its kernel is the GEMV's).
+        crate::primitives::nvfp4_path::note_gemv();
+    }
+    Ok(y.to_dtype(x.dtype())?)
+}
+
+/// The gathered dispatch: gather each (token, slot) pair's expert weights by its device index and
+/// run one batched matmul per projection. Everything stays on the device and every shape is
+/// fixed by `(t, k)`, so the step is graph-replayable — but each pair copies its expert's whole
+/// matrices first. The dispatch a dense bank takes where the indexed kernels do not serve it.
 fn dispatch_stacked(
     xf: &Tensor,
     ids: &Tensor,
@@ -579,7 +895,7 @@ mod tests {
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         for routing in [NORM, SCALED, WIDE_K] {
             let moe = block(8, 32, 16, routing, None);
-            let ExpertBank::Stacked { gate, up, down } = &moe.bank else {
+            let Layout::Stacked { gate, up, down } = &moe.bank.layout else {
                 panic!("a dense bank stacks")
             };
             let device = |x: &Tensor, ids: &Tensor, weights: &Tensor| {
@@ -651,6 +967,42 @@ mod tests {
         );
         assert_eq!(with_device_dispatch(|| step_counts(&q8, &x)), (1, 0));
         assert_eq!(q8.graph_refusal(), Some(REASON_EXPERT_HOST_DISPATCH));
+        // The indexed tables exist on CUDA only: on the CPU a quantized bank says so by name.
+        assert_eq!(q8.host_dispatch_cause(), Some("not_cuda"));
+        assert_eq!(dense.host_dispatch_cause(), None);
+    }
+
+    /// Off CUDA a dense bank's device dispatch is the gathered one (it copies its experts — the
+    /// copy counter says so), and [`with_grouped_dispatch`] overrides every device choice.
+    #[test]
+    fn the_gathered_dispatch_is_counted_and_grouped_can_be_forced() {
+        let x = randn(&[1, 1, 64], &mut SplitMix64::new(6));
+        let dense = block(8, 64, 64, NORM, None);
+        let (gathers, indexed) = (moe_expert_gather_count(), moe_indexed_dispatch_count());
+        assert_eq!(with_device_dispatch(|| step_counts(&dense, &x)), (0, 1));
+        assert_eq!(moe_expert_gather_count() - gathers, 1);
+        assert_eq!(moe_indexed_dispatch_count() - indexed, 0);
+        assert_eq!(
+            with_device_dispatch(|| with_grouped_dispatch(|| step_counts(&dense, &x))),
+            (1, 0)
+        );
+        assert!(
+            FORCE_GROUPED_DISPATCH.with(|c| !c.get()),
+            "the flag is restored"
+        );
+    }
+
+    /// Admission's per-token bytes cover the dispatch a step takes: on the CPU the grouped one
+    /// (each routed expert's projections and SwiGLU on its row).
+    #[test]
+    fn step_bytes_cover_the_grouped_dispatch_on_the_cpu() {
+        let (e, h, inter) = (8, 64, 32);
+        let dense = block(e, h, inter, SCALED, None);
+        let slots = SCALED.experts_per_tok;
+        let grouped = (slots * (3 * inter + 2 * h) * 4) as u64;
+        assert_eq!(dense.step_bytes_per_token(), grouped);
+        let q8 = block(e, h, inter, SCALED, Some(QuantSpec::q8()));
+        assert_eq!(q8.step_bytes_per_token(), grouped);
     }
 
     /// The graph refusal and `forward` make one decision: a full decode batch
@@ -692,7 +1044,7 @@ mod tests {
             routed_scaling_factor: 1.0,
         };
         let moe = block(e, h, inter, routing, None);
-        let ExpertBank::Stacked { gate, up, down } = &moe.bank else {
+        let Layout::Stacked { gate, up, down } = &moe.bank.layout else {
             panic!("a dense bank stacks")
         };
         let median_ms = |f: &dyn Fn()| {
@@ -742,8 +1094,15 @@ mod tests {
             "storage_and_layout",
             "to_cpu_storage",
         ];
-        const DEVICE_PATH: [&str; 2] = ["route", "dispatch_stacked"];
-        const DEVICE_OPS: [&str; 28] = [
+        const DEVICE_PATH: [&str; 4] = [
+            "route",
+            "dispatch_stacked",
+            "dispatch_indexed",
+            "project_indexed",
+        ];
+        // `forward` is `IndexedExperts::forward` (candle-quant-kernels): kernel launches over
+        // device tables, no host read — audited, and listed on purpose.
+        const DEVICE_OPS: [&str; 36] = [
             "Ok",
             "f64::from",
             "Tensor::zeros",
@@ -772,6 +1131,14 @@ mod tests {
             "reshape",
             "index_select",
             "transpose",
+            "project_indexed",
+            "format",
+            "io_dtype",
+            "ok_or_else",
+            "Error::Msg",
+            "forward",
+            "map_err",
+            "crate::primitives::nvfp4_path::note_gemv",
         ];
         // The callee of every `name(` / `path::name(` / `name::<T>(` on a line.
         fn calls(line: &str) -> Vec<String> {
@@ -825,5 +1192,204 @@ mod tests {
             }
         }
         assert!(raw.is_empty(), "uncounted host reads:\n{}", raw.join("\n"));
+    }
+}
+
+/// The indexed dispatch on a CUDA device (sc-24440): for every expert format a bank can hold, a
+/// decode step routes and runs every expert on the device — indexed, no host read, nothing
+/// gathered — and agrees with the grouped per-expert dispatch: bit for bit at one token for GGML
+/// and NVFP4 (the kernels are those projections' own decode forwards), to rounding otherwise.
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_tests {
+    use super::*;
+    use crate::primitives::host_sync::host_sync_count;
+    use crate::primitives::projection::{ProjectionFormat, QuantSpec};
+    use crate::primitives::quant::QuantizedLinear;
+    use crate::primitives::sampler::{SplitMix64, TokenRng};
+    use candle_core::quantized::GgmlDType;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Fmt {
+        Dense,
+        Ggml(GgmlDType),
+        MlxQ8,
+        Nvfp4,
+    }
+
+    fn randn(shape: &[usize], rng: &mut SplitMix64, dev: &Device, dtype: DType) -> Tensor {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+        Tensor::from_vec(data, shape, dev)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap()
+    }
+
+    fn projection(
+        rows: usize,
+        cols: usize,
+        rng: &mut SplitMix64,
+        dev: &Device,
+        dtype: DType,
+        fmt: Fmt,
+    ) -> Projection {
+        let w = randn(&[rows, cols], rng, dev, dtype);
+        match fmt {
+            Fmt::Dense => Projection::load(w, None).unwrap(),
+            Fmt::Ggml(d) => Projection::Quantized(QuantizedLinear::quantize(&w, d, None).unwrap()),
+            Fmt::MlxQ8 => {
+                let group = 32;
+                let words: Vec<u32> = (0..rows * cols / 4)
+                    .map(|_| (rng.next_f32() * u32::MAX as f32) as u32)
+                    .collect();
+                let scales = randn(&[rows, cols / group], rng, &Device::Cpu, DType::F32)
+                    .affine(0.01, 0.0)
+                    .unwrap();
+                let biases = randn(&[rows, cols / group], rng, &Device::Cpu, DType::F32);
+                Projection::load_mlx_affine_q8(
+                    &Tensor::from_vec(words, (rows, cols / 4), &Device::Cpu).unwrap(),
+                    &scales,
+                    &biases,
+                    None,
+                    QuantSpec::q8(),
+                    dev,
+                )
+                .unwrap()
+            }
+            Fmt::Nvfp4 => {
+                let format = ProjectionFormat::nvfp4(dev).unwrap();
+                Projection::load_as(w, None, Some(&format)).unwrap()
+            }
+        }
+    }
+
+    fn block(dev: &Device, dtype: DType, h: usize, inter: usize, fmt: Fmt) -> SparseMoe {
+        let e = 8;
+        let mut rng = SplitMix64::new(0x2444_0300);
+        let router = randn(&[e, h], &mut rng, dev, dtype);
+        let swiglu = |rng: &mut SplitMix64, fmt: Fmt| SwiGlu {
+            gate: projection(inter, h, rng, dev, dtype, fmt),
+            up: projection(inter, h, rng, dev, dtype, fmt),
+            down: projection(h, inter, rng, dev, dtype, fmt),
+        };
+        let experts = (0..e).map(|_| swiglu(&mut rng, fmt)).collect();
+        let shared = swiglu(&mut rng, Fmt::Dense);
+        let gate = randn(&[1, h], &mut rng, dev, dtype);
+        SparseMoe::new(router, experts, shared, Some(gate), WIDE_K).unwrap()
+    }
+
+    const WIDE_K: MoeRouting = MoeRouting {
+        experts_per_tok: 3,
+        norm_topk_prob: true,
+        routed_scaling_factor: 1.0,
+    };
+
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn every_expert_format_is_dispatched_indexed_and_matches_the_grouped_dispatch() {
+        let dev = crate::device::new_cuda_for_test().expect("a CUDA device");
+        let sm120 = ProjectionFormat::nvfp4(&dev).is_ok();
+        let cases: Vec<(Fmt, DType, usize, usize)> = vec![
+            (Fmt::Dense, DType::F32, 64, 96),
+            (Fmt::Dense, DType::BF16, 64, 96),
+            (Fmt::Dense, DType::F16, 64, 96),
+            (Fmt::Ggml(GgmlDType::Q8_0), DType::BF16, 64, 96),
+            (Fmt::Ggml(GgmlDType::Q4_0), DType::BF16, 64, 96),
+            (Fmt::Ggml(GgmlDType::Q4K), DType::BF16, 256, 256),
+            (Fmt::Ggml(GgmlDType::Q6K), DType::F32, 256, 256),
+            (Fmt::MlxQ8, DType::BF16, 64, 96),
+            (Fmt::Nvfp4, DType::BF16, 64, 96),
+        ];
+        for (fmt, dtype, h, inter) in cases {
+            if matches!(fmt, Fmt::Nvfp4) && !sm120 {
+                candle_quant_kernels::skip_without_sm120("NVFP4 MoE experts");
+                continue;
+            }
+            let moe = block(&dev, dtype, h, inter, fmt);
+            assert_eq!(moe.graph_refusal(), None, "{fmt:?} {dtype:?}");
+            assert_eq!(moe.host_dispatch_cause(), None, "{fmt:?} {dtype:?}");
+            for t in [1usize, 3, DEVICE_DISPATCH_MAX_ROWS] {
+                let x = randn(&[1, t, h], &mut SplitMix64::new(t as u64 + 9), &dev, dtype);
+                let before = (
+                    host_sync_count(),
+                    moe_indexed_dispatch_count(),
+                    moe_expert_gather_count(),
+                );
+                let indexed = moe.forward(&x).unwrap();
+                assert_eq!(
+                    (
+                        host_sync_count() - before.0,
+                        moe_indexed_dispatch_count() - before.1,
+                        moe_expert_gather_count() - before.2,
+                    ),
+                    (0, 1, 0),
+                    "{fmt:?} {dtype:?} t={t}: (host syncs, indexed dispatches, gathers)"
+                );
+                let again = moe.forward(&x).unwrap();
+                assert_eq!(host(&indexed), host(&again), "deterministic");
+                let grouped = with_grouped_dispatch(|| moe.forward(&x).unwrap());
+                let (a, b) = (host(&indexed), host(&grouped));
+                let exact = t == 1 && matches!(fmt, Fmt::Ggml(_) | Fmt::Nvfp4);
+                if exact {
+                    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&a), bits(&b), "{fmt:?} {dtype:?}: indexed vs grouped");
+                } else {
+                    let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let tol = match dtype {
+                        DType::F32 => 1e-5,
+                        _ => 2e-2,
+                    } * (1.0 + scale);
+                    let diff = a
+                        .iter()
+                        .zip(&b)
+                        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                    assert!(
+                        diff <= tol,
+                        "{fmt:?} {dtype:?} t={t}: indexed vs grouped differ by {diff} (tol {tol})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// NVFP4's indexed kernel is the decode GEMV's core: with the GEMV switched off every NVFP4
+    /// projection runs cuBLASLt, so the bank is dispatched grouped and the refusal names why.
+    #[test]
+    fn an_nvfp4_bank_follows_the_decode_gemv_switch() {
+        let dev = crate::device::new_cuda_for_test().expect("a CUDA device");
+        if ProjectionFormat::nvfp4(&dev).is_err() {
+            candle_quant_kernels::skip_without_sm120("NVFP4 MoE experts");
+            return;
+        }
+        let moe = block(&dev, DType::BF16, 64, 96, Fmt::Nvfp4);
+        let _off = crate::primitives::nvfp4_path::nvfp4_gemv_policy_guard(Some(false));
+        assert_eq!(moe.graph_refusal(), Some(REASON_EXPERT_HOST_DISPATCH));
+        assert_eq!(moe.host_dispatch_cause(), Some("nvfp4_gemv_disabled"));
+    }
+
+    /// Admission's per-token bytes on CUDA cover the indexed dispatch's workspace (GGML: the f32
+    /// outputs and the Q8_1 activation copies) — more than the grouped estimate.
+    #[test]
+    fn step_bytes_cover_the_indexed_workspace() {
+        let dev = crate::device::new_cuda_for_test().expect("a CUDA device");
+        let moe = block(&dev, DType::BF16, 64, 96, Fmt::Ggml(GgmlDType::Q8_0));
+        let Ok(banks) = &moe.bank.indexed else {
+            panic!("a CUDA Q8_0 bank is indexed")
+        };
+        let slots = WIDE_K.experts_per_tok;
+        let workspace: usize = banks
+            .iter()
+            .zip([MoeRows::PerToken, MoeRows::PerToken, MoeRows::PerSlot])
+            .map(|(b, r)| b.workspace_bytes(DType::BF16, 1, slots, r))
+            .sum();
+        assert!(moe.step_bytes_per_token() as usize > workspace);
     }
 }

@@ -396,6 +396,10 @@ impl PrismPackedWeight {
         Ok(transformed.reshape(shape)?)
     }
 
+    /// The forward rotation of `x` (GDN reorder, signs, block Hadamard). On the CPU it runs in
+    /// f32 on the host and returns `x`'s dtype; on a device it is [`transform_forward_tensor`]
+    /// (Self::transform_forward_tensor), which returns **f32** when the fused CUDA rotation ran (its
+    /// output cast is fused — the caller widens to f32 next anyway) and `x`'s dtype otherwise.
     fn transform_forward(&self, x: &Tensor) -> Result<Tensor> {
         if self.role == PrismTransformRole::None {
             return Ok(x.clone());
@@ -435,11 +439,31 @@ impl PrismPackedWeight {
             }
             return Ok(Tensor::from_vec(values, shape, x.device())?.to_dtype(x.dtype())?);
         }
+        if let Some(y) = self.fused_rotation(x, Rotation::Inverse, signs)? {
+            return Ok(y);
+        }
         let h = fwht_tensor(x, self.block_size)?;
         multiply_signs(&h, signs)
     }
 
+    /// The device rotation: the fused CUDA kernel where it serves `x` (sc-24440), otherwise the
+    /// op chain ([`transform_forward_chain`](Self::transform_forward_chain)).
     fn transform_forward_tensor(&self, x: &Tensor) -> Result<Tensor> {
+        let signs = self
+            .signs
+            .as_deref()
+            .ok_or_else(|| Error::Config(format!("Prism {} has no explicit signs", self.name)))?;
+        if let Some(y) = self.fused_rotation(x, Rotation::Forward, signs)? {
+            return Ok(y);
+        }
+        self.transform_forward_chain(x)
+    }
+
+    /// The forward rotation as the device-tensor op chain — GDN reorder, sign product,
+    /// `log2(block)` butterfly stages and the normalizing affine, each a stored tensor of `x`'s
+    /// dtype. The path every non-CUDA device and every input the fused kernel refuses takes, and
+    /// the oracle the fused kernel is bit-identical to.
+    fn transform_forward_chain(&self, x: &Tensor) -> Result<Tensor> {
         let mut out = x.clone();
         if let Some(gdn) = self.gdn {
             out = gdn_reorder_tensor(&out, gdn)?;
@@ -449,6 +473,51 @@ impl PrismPackedWeight {
             .as_deref()
             .ok_or_else(|| Error::Config(format!("Prism {} has no explicit signs", self.name)))?;
         fwht_tensor(&multiply_signs(&out, signs)?, self.block_size)
+    }
+
+    /// The fused CUDA rotation (sc-24440) of `x` in `rotation`'s order, or `None` when it does
+    /// not serve the input — not CUDA, a dtype other than f32 / bf16 / f16, a Hadamard block
+    /// wider than [`FUSED_ROTATION_MAX_BLOCK`], or the fused-kernel switch off — recorded in the
+    /// fused-primitive tally either way (`crate::primitives::fused`). The forward returns f32 (the
+    /// forward's cast fused), the inverse `x`'s dtype; both bit-identical to the op chain.
+    fn fused_rotation(
+        &self,
+        x: &Tensor,
+        rotation: Rotation,
+        signs: &[i8],
+    ) -> Result<Option<Tensor>> {
+        if !x.device().is_cuda() {
+            return Ok(None);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use super::fused::{note_fused, note_reference};
+            if !super::fused::try_fused() {
+                return Ok(None);
+            }
+            if !matches!(x.dtype(), DType::F32 | DType::BF16 | DType::F16) {
+                note_reference("dtype");
+                return Ok(None);
+            }
+            if self.block_size > FUSED_ROTATION_MAX_BLOCK {
+                note_reference("shape");
+                return Ok(None);
+            }
+            let signs = sign_tensor(signs, x.device())?;
+            let gather = match (rotation, self.gdn) {
+                (Rotation::Forward, Some(layout)) => Some(gdn_gather_index(layout, x.device())?),
+                _ => None,
+            };
+            let y = cuda::rotate(x, &signs, gather.as_ref(), self.block_size, rotation)?;
+            note_fused();
+            Ok(Some(y))
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            // A CUDA tensor cannot exist without the feature.
+            let _ = (rotation, signs);
+            Ok(None)
+        }
     }
 
     fn cpu_matmul(&self, x: &Tensor) -> Result<Tensor> {
@@ -586,6 +655,28 @@ impl PrismRegistry {
     }
 }
 
+/// Widest Hadamard block the fused CUDA rotation serves: one block's values live in its shared
+/// memory as f32 (32 KiB here, under every device's 48 KiB default).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const FUSED_ROTATION_MAX_BLOCK: usize = 8192;
+
+/// The order of a rotation: the forward (activation) transform or the inverse (embedding) one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+enum Rotation {
+    /// GDN gather, signs, then the normalized Hadamard.
+    Forward,
+    /// The normalized Hadamard, then signs.
+    Inverse,
+}
+
+/// `signs` as an F32 `[width]` tensor on `device`.
+fn sign_tensor(signs: &[i8], device: &Device) -> Result<Tensor> {
+    let signs = signs.iter().map(|&v| v as f32).collect::<Vec<_>>();
+    let width = signs.len();
+    Ok(Tensor::from_vec(signs, (width,), device)?)
+}
+
 fn multiply_signs(x: &Tensor, signs: &[i8]) -> Result<Tensor> {
     let width = x.dim(x.rank() - 1)?;
     if signs.len() != width {
@@ -594,8 +685,7 @@ fn multiply_signs(x: &Tensor, signs: &[i8]) -> Result<Tensor> {
             signs.len()
         )));
     }
-    let signs = signs.iter().map(|&v| v as f32).collect::<Vec<_>>();
-    let signs = Tensor::from_vec(signs, (width,), x.device())?.to_dtype(x.dtype())?;
+    let signs = sign_tensor(signs, x.device())?.to_dtype(x.dtype())?;
     Ok(x.broadcast_mul(&signs)?)
 }
 
@@ -635,6 +725,14 @@ fn gdn_reorder_tensor(x: &Tensor, layout: GdnLayout) -> Result<Tensor> {
             layout.width()
         )));
     }
+    let gather = gdn_gather_index(layout, x.device())?;
+    Ok(x.index_select(&gather, x.rank() - 1)?)
+}
+
+/// The GDN activation reorder's `[width]` U32 gather index (column `c` reads column
+/// `gather[c]`) on `device`.
+fn gdn_gather_index(layout: GdnLayout, device: &Device) -> Result<Tensor> {
+    let width = layout.width();
     let mut gather = vec![0u32; width];
     for head_dim in 0..layout.head_dim {
         for group in 0..layout.groups {
@@ -646,8 +744,7 @@ fn gdn_reorder_tensor(x: &Tensor, layout: GdnLayout) -> Result<Tensor> {
             }
         }
     }
-    let gather = Tensor::from_vec(gather, (width,), x.device())?;
-    Ok(x.index_select(&gather, x.rank() - 1)?)
+    Ok(Tensor::from_vec(gather, (width,), device)?)
 }
 
 /// The Prism packed-operator kernels, compiled through the shared nvrtc compile-once seam
@@ -974,6 +1071,136 @@ mod cuda {
             CudaStorage::wrap_cuda_slice(output, dev.clone()),
             Shape::from((count, width)),
         ))
+    }
+
+    /// `1 / sqrt(block)` as `dtype` holds it: candle's `affine` hands its kernel the factor as
+    /// `T::from_f64` — the CPU cast below is that same conversion.
+    fn affine_factor(block: usize, dtype: DType) -> Result<f32> {
+        let factor = (block as f64).sqrt().recip();
+        Ok(Tensor::from_vec(vec![factor], 1, &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?[0])
+    }
+
+    /// The fused block-Hadamard rotation (`prism_rotate` in `prism_cuda.cu`) of `x` `[.., width]`
+    /// (f32 / bf16 / f16): one launch, one block per (row, Hadamard block). `signs` is F32
+    /// `[width]`; `gather` (forward only) the U32 `[width]` GDN source-column index. The forward
+    /// returns F32 (the chain's trailing cast fused), the inverse `x`'s dtype.
+    pub(super) fn rotate(
+        x: &Tensor,
+        signs: &Tensor,
+        gather: Option<&Tensor>,
+        block: usize,
+        rotation: Rotation,
+    ) -> Result<Tensor> {
+        let Device::Cuda(dev) = x.device() else {
+            return Err(Error::Unsupported(
+                "the fused Prism rotation is CUDA-only".into(),
+            ));
+        };
+        let shape = x.dims().to_vec();
+        let width = *shape
+            .last()
+            .ok_or_else(|| Error::Config("Prism rotation needs a non-scalar activation".into()))?;
+        if block == 0 || !block.is_power_of_two() || width % block != 0 || signs.dim(0)? != width {
+            return Err(Error::Config(format!(
+                "Prism rotation: width {width}, block {block}, {} signs",
+                signs.dim(0)?
+            )));
+        }
+        let rows = x.elem_count() / width;
+        let x = x.contiguous()?;
+        let signs = signs.to_dtype(DType::F32)?.contiguous()?;
+        let gather = gather.map(|g| g.contiguous()).transpose()?;
+        let (dtype_code, mul) = match x.dtype() {
+            DType::F32 => (0i32, affine_factor(block, DType::F32)?),
+            DType::BF16 => (1, affine_factor(block, DType::BF16)?),
+            DType::F16 => (2, affine_factor(block, DType::F16)?),
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "the fused Prism rotation serves f32 / bf16 / f16, not {other:?}"
+                )))
+            }
+        };
+        let out_dtype = match rotation {
+            Rotation::Forward => DType::F32,
+            Rotation::Inverse => x.dtype(),
+        };
+        let out_code = i32::from(out_dtype != DType::F32);
+        let inverse = i32::from(rotation == Rotation::Inverse);
+        let function = function(dev, "prism_rotate")?;
+        let config = LaunchConfig {
+            grid_dim: ((width / block) as u32, rows as u32, 1),
+            block_dim: ((block / 2).clamp(1, 256) as u32, 1, 1),
+            shared_mem_bytes: (block * std::mem::size_of::<f32>()) as u32,
+        };
+        let (width_u, block_u) = (width as u32, block as u32);
+        let stream = dev.cuda_stream();
+        let (xs, xl) = x.storage_and_layout();
+        let (ss, sl) = signs.storage_and_layout();
+        let candle_core::Storage::Cuda(xs) = &*xs else {
+            return Err(Error::Unsupported(
+                "Prism rotation input is not on CUDA".into(),
+            ));
+        };
+        let candle_core::Storage::Cuda(ss) = &*ss else {
+            return Err(Error::Unsupported(
+                "Prism rotation signs are not on CUDA".into(),
+            ));
+        };
+        let signs_view = ss.as_cuda_slice::<f32>()?.slice(sl.start_offset()..);
+        let gather_storage = gather.as_ref().map(|g| g.storage_and_layout());
+        let gather_view = match &gather_storage {
+            Some((gs, gl)) => match &**gs {
+                candle_core::Storage::Cuda(gs) => {
+                    Some(gs.as_cuda_slice::<u32>()?.slice(gl.start_offset()..))
+                }
+                _ => {
+                    return Err(Error::Unsupported(
+                        "Prism rotation gather index is not on CUDA".into(),
+                    ))
+                }
+            },
+            None => None,
+        };
+        let null = 0u64;
+        macro_rules! launch {
+            ($t:ty, $o:ty) => {{
+                let xv = xs.as_cuda_slice::<$t>()?.slice(xl.start_offset()..);
+                // SAFETY: the kernel writes every output element.
+                let output = unsafe { dev.alloc::<$o>(rows * width) }?;
+                let mut builder = stream.launch_builder(&function);
+                builder.arg(&xv).arg(&signs_view);
+                match &gather_view {
+                    Some(g) => builder.arg(g),
+                    None => builder.arg(&null),
+                };
+                builder
+                    .arg(&output)
+                    .arg(&width_u)
+                    .arg(&block_u)
+                    .arg(&mul)
+                    .arg(&dtype_code)
+                    .arg(&out_code)
+                    .arg(&inverse);
+                // SAFETY: matches `prism_rotate` in `prism_cuda.cu`.
+                unsafe { builder.launch(config) }.w()?;
+                Tensor::from_storage(
+                    candle_core::Storage::Cuda(CudaStorage::wrap_cuda_slice(output, dev.clone())),
+                    Shape::from(shape.clone()),
+                    candle_core::op::BackpropOp::none(),
+                    false,
+                )
+            }};
+        }
+        Ok(match (x.dtype(), out_dtype) {
+            (DType::F32, _) => launch!(f32, f32),
+            (DType::BF16, DType::F32) => launch!(half::bf16, f32),
+            (DType::BF16, _) => launch!(half::bf16, half::bf16),
+            (DType::F16, DType::F32) => launch!(half::f16, f32),
+            _ => launch!(half::f16, half::f16),
+        })
     }
 
     pub(super) fn matmul(weight: &PrismPackedWeight, x: &Tensor) -> Result<Tensor> {
@@ -1322,6 +1549,144 @@ mod tests {
                 .trim_start();
             directive.starts_with("include")
         }));
+    }
+
+    /// sc-24440: the fused CUDA rotation is bit-identical to the op chain it replaces — forward
+    /// (with and without the GDN gather; the chain's trailing f32 cast included) and inverse — for
+    /// every served dtype and block size, zeros of both signs and wide magnitudes included; and a
+    /// Prism forward through it equals the forward with the fused kernels switched off, the
+    /// fused-primitive tally recording which ran.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_fused_rotation_is_bit_identical_to_the_op_chain() {
+        let device = crate::device::new_cuda_for_test()
+            .expect("CUDA is required for the fused rotation fixture");
+        let bits = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        let cases: [(usize, usize, Option<GdnLayout>); 6] = [
+            (128, 128, None),
+            (256, 64, None),
+            (
+                512,
+                128,
+                Some(GdnLayout {
+                    head_dim: 64,
+                    groups: 2,
+                    repetitions: 4,
+                }),
+            ),
+            (2048, 1024, None),
+            (8, 2, None),
+            (4, 1, None),
+        ];
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            for (width, block, gdn) in cases {
+                let rows = 3;
+                let values = (0..rows * width)
+                    .map(|i| match i % 17 {
+                        0 => 0.0,
+                        1 => -0.0,
+                        2 => 1e4 * (i as f32).sin(),
+                        3 => 1e-4 * (i as f32).cos(),
+                        _ => (i as f32 * 0.37).sin() * 3.0,
+                    })
+                    .collect::<Vec<_>>();
+                let x = Tensor::from_vec(values, (rows, width), &device)
+                    .unwrap()
+                    .to_dtype(dtype)
+                    .unwrap();
+                let signs = (0..width)
+                    .map(|i| if (i * 7) % 5 < 2 { -1i8 } else { 1 })
+                    .collect::<Vec<_>>();
+                let sign_t = sign_tensor(&signs, &device).unwrap();
+                // Forward: the chain (`transform_forward_chain`'s ops), then the forward's cast.
+                let mut chain = x.clone();
+                if let Some(layout) = gdn {
+                    chain = gdn_reorder_tensor(&chain, layout).unwrap();
+                }
+                let chain = fwht_tensor(&multiply_signs(&chain, &signs).unwrap(), block)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let gather = gdn.map(|layout| gdn_gather_index(layout, &device).unwrap());
+                let fused =
+                    cuda::rotate(&x, &sign_t, gather.as_ref(), block, Rotation::Forward).unwrap();
+                assert_eq!(fused.dtype(), DType::F32);
+                assert_eq!(
+                    bits(&fused),
+                    bits(&chain),
+                    "forward {dtype:?} width {width} block {block} gdn {}",
+                    gdn.is_some()
+                );
+                // Inverse: Hadamard then signs, in the activation dtype.
+                let chain = multiply_signs(&fwht_tensor(&x, block).unwrap(), &signs).unwrap();
+                let fused = cuda::rotate(&x, &sign_t, None, block, Rotation::Inverse).unwrap();
+                assert_eq!(fused.dtype(), dtype);
+                assert_eq!(
+                    bits(&fused),
+                    bits(&chain),
+                    "inverse {dtype:?} width {width} block {block}"
+                );
+            }
+        }
+
+        // A whole Prism forward: fused vs the switch off.
+        let name = "model.layers.0.mlp.down_proj.weight";
+        let weight = {
+            let host = mlx_weight(name, &[1; 128], PrismTransformRole::Forward);
+            let PackedStorage::MlxAffine2 {
+                host_words,
+                host_scales,
+                ..
+            } = &host.storage
+            else {
+                panic!("an MLX affine-2 weight")
+            };
+            PrismPackedWeight::from_mlx_affine2(
+                name,
+                Tensor::from_slice(host_words.as_deref().unwrap(), (1, 8), &device).unwrap(),
+                Tensor::from_slice(host_scales.as_deref().unwrap(), (1, 1), &device).unwrap(),
+                &Tensor::from_vec(vec![-0.5f32], (1, 1), &device).unwrap(),
+                &metadata(
+                    name,
+                    PrismTransformRole::Forward,
+                    (0..128).map(|i| if i % 3 == 0 { -1 } else { 1 }).collect(),
+                ),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let x = Tensor::from_vec(
+            (0..2 * 128)
+                .map(|i| (i as f32 * 0.11).cos())
+                .collect::<Vec<_>>(),
+            (1, 2, 128),
+            &device,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let before = super::super::fused::fused_tally();
+        let fused = {
+            let _on = super::super::fused::fused_policy_guard(Some(true));
+            weight.forward(&x).unwrap()
+        };
+        assert!(super::super::fused::fused_tally().since(&before).fused >= 1);
+        let chain = {
+            let _off = super::super::fused::fused_policy_guard(Some(false));
+            weight.forward(&x).unwrap()
+        };
+        assert_eq!(bits(&fused), bits(&chain), "Prism forward, fused vs chain");
     }
 
     #[cfg(feature = "cuda")]

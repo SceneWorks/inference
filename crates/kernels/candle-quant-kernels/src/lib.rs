@@ -32,6 +32,11 @@
 //!   CUDA graph of the decode step replays at any position; deterministic by fixed key chunking,
 //!   with a host reference of the same arithmetic.
 //!
+//! - [`moe_gemv`] — the indexed MoE GEMV (sc-24440): one projection of a decode step's routed
+//!   experts as one launch, the routes read on the device and every expert weight read in place
+//!   from a load-time device table of expert addresses — GGML (candle's own decode MMVQ, every
+//!   type it serves), dense, Q8_0-dequant and NVFP4 (the decode GEMV's core) banks.
+//!
 //! - [`sm120_gate`] — the sm_120 test gate (sc-24140): a GPU test's "no sm_120 device" skip, which
 //!   `REQUIRE_SM120=1` turns into a hard failure so an acceptance run proves the tests executed.
 //!
@@ -41,6 +46,7 @@
 pub mod cublaslt;
 pub mod decode_attention;
 pub mod fused_decode;
+pub mod moe_gemv;
 pub mod nvfp4;
 pub mod nvfp4_gemv;
 pub mod nvfp4_linear;
@@ -67,6 +73,10 @@ pub use fused_decode::{
     check_rms_norm, check_rms_norm_rope, check_swiglu, FusedError, FusedRefusal, RmsNormPlan,
     RopePlan, FUSED_DECODE_SRC, FUSED_ROPE_MAX_HEAD_DIM,
 };
+pub use moe_gemv::{
+    ggml_kernel, indexed_workspace_bytes, IndexedExperts, IndexedFormat, MoeGemvError,
+    MoeGemvRefusal, MoeRows, MAX_TABLE_BYTES_PER_EXPERT, MOE_GEMV_SRC,
+};
 pub use nvfp4::{
     e2m1_from_f32, e4m3_from_f32, e4m3_to_f32, Nvfp4Tensor, E2M1_LUT, E2M1_MAX, E4M3_MAX,
     NVFP4_BLOCK,
@@ -89,8 +99,8 @@ pub use nvrtc::{device_compute_cap, CompiledKernel};
 pub use nvrtc::{nvrtc_arch_for, ptx_entry_points, KernelCompileError, KernelSource};
 
 /// Every kernel source this crate compiles through the [`nvrtc`] seam: the fused decode
-/// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer and the length-aware
-/// decode attention.
+/// primitives, the NVFP4 decode GEMV, the fused NVFP4 activation quantizer, the length-aware
+/// decode attention and the indexed MoE GEMV.
 ///
 /// Checks that must hold for every runtime-compiled kernel walk this list (with
 /// `candle_llm::primitives::NVRTC_SOURCES`), e.g. `candle-llm`'s zero-local-memory test
@@ -101,6 +111,7 @@ pub const NVRTC_SOURCES: &[KernelSource] = &[
     NVFP4_GEMV_SRC,
     cublaslt::NVFP4_QUANT_SRC,
     DECODE_ATTENTION_SRC,
+    MOE_GEMV_SRC,
 ];
 pub use sm120_gate::{skip_without_sm120, sm120_required, REQUIRE_SM120_ENV};
 

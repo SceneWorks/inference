@@ -171,3 +171,104 @@ extern "C" __global__ void NAME( \
 
 PRISM_GGUF_EMBED(prism_pq2_embedding_f32, prism_pq2_value)
 PRISM_GGUF_EMBED(prism_ptq_embedding_f32, prism_ptq_value)
+
+// ---------------------------------------------------------------------------------------------
+// Fused block-Hadamard rotation (sc-24440, assigned from sc-24444's review). One launch replaces
+// the device-tensor chain `transform_forward_tensor` / `transform_inverse` runs:
+//
+//   forward: [GDN gather] -> x * sign -> FWHT (log2(B) butterfly stages) -> * bf(1/sqrt(B)) + 0
+//   inverse: FWHT -> * bf(1/sqrt(B)) + 0 -> * sign
+//
+// BIT-IDENTICAL to that chain: every value is rounded to the activation dtype exactly where the
+// chain stores a tensor of it — after the sign product, after EVERY butterfly add / sub, after the
+// affine's product and again after its `+ 0` — and each such op is computed in f32 then rounded
+// once, which equals the dtype's own correctly-rounded op (bf16 / f16: a product or sum of two
+// such values is exact in f32 or rounds innocuously; 24 >= 2p + 2 for p = 8, 11). `mul` is the
+// affine factor already rounded to the dtype on the host (candle's `T::from_f64`). The forward's
+// trailing `.to_dtype(F32)` is fused as an f32 store.
+//
+// One block per (activation row, Hadamard block); the block's values live in shared memory
+// (`block` f32), butterflies split over the threads, a barrier between stages.
+// ---------------------------------------------------------------------------------------------
+
+__device__ __forceinline__ float prism_bf16_round(float f) {
+    uint32_t u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return __uint_as_float((u | 0x00400000u) & 0xffff0000u);
+    uint32_t lsb = (u >> 16) & 1u;
+    return __uint_as_float(((u + 0x7fffu + lsb) >> 16) << 16);
+}
+
+__device__ __forceinline__ float prism_f16_round(float f) {
+    uint16_t h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+    float r;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(r) : "h"(h));
+    return r;
+}
+
+// dtype codes: 0 = f32, 1 = bf16, 2 = f16.
+__device__ __forceinline__ float prism_round(float v, int dtype) {
+    return dtype == 1 ? prism_bf16_round(v) : dtype == 2 ? prism_f16_round(v) : v;
+}
+
+__device__ __forceinline__ float prism_load(const void* x, size_t i, int dtype) {
+    if (dtype == 1) return __uint_as_float(((uint32_t)((const uint16_t*)x)[i]) << 16);
+    if (dtype == 2) {
+        float f;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(((const uint16_t*)x)[i]));
+        return f;
+    }
+    return ((const float*)x)[i];
+}
+
+__device__ __forceinline__ void prism_store(void* y, size_t i, float v, int dtype) {
+    if (dtype == 1) {
+        ((uint16_t*)y)[i] = (uint16_t)(__float_as_uint(prism_bf16_round(v)) >> 16);
+    } else if (dtype == 2) {
+        uint16_t h;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+        ((uint16_t*)y)[i] = h;
+    } else {
+        ((float*)y)[i] = v;
+    }
+}
+
+// x: [rows, width] of `dtype`; signs: [width] f32 (+-1); gather: [width] u32 source column of each
+// column (forward only; null = identity); y: [rows, width] of `out_dtype` (0 = f32, else
+// `dtype`). `inverse` selects the inverse order. `mul` is the dtype-rounded 1/sqrt(block).
+extern "C" __global__ void prism_rotate(
+    const void* __restrict__ x, const float* __restrict__ signs,
+    const uint32_t* __restrict__ gather, void* __restrict__ y,
+    uint32_t width, uint32_t block, float mul, int dtype, int out_dtype, int inverse) {
+    extern __shared__ float v[];
+    const uint32_t row = blockIdx.y;
+    const uint32_t base = blockIdx.x * block;
+    const size_t row_at = (size_t)row * width;
+    for (uint32_t c = threadIdx.x; c < block; c += blockDim.x) {
+        const uint32_t col = base + c;
+        const uint32_t src = (gather && !inverse) ? gather[col] : col;
+        float value = prism_load(x, row_at + src, dtype);
+        if (!inverse) value = prism_round(value * signs[col], dtype);
+        v[c] = value;
+    }
+    __syncthreads();
+    const uint32_t half = block / 2;
+    for (uint32_t step = 1; step < block; step <<= 1) {
+        for (uint32_t i = threadIdx.x; i < half; i += blockDim.x) {
+            const uint32_t lo = (i / step) * 2 * step + (i % step);
+            const uint32_t hi = lo + step;
+            const float a = v[lo];
+            const float b = v[hi];
+            v[lo] = prism_round(a + b, dtype);
+            v[hi] = prism_round(a - b, dtype);
+        }
+        __syncthreads();
+    }
+    for (uint32_t c = threadIdx.x; c < block; c += blockDim.x) {
+        const uint32_t col = base + c;
+        // The affine: `x * mul` rounded, then `+ 0` rounded (turns -0 into +0, like the chain).
+        float value = prism_round(prism_round(v[c] * mul, dtype) + 0.0f, dtype);
+        if (inverse) value = prism_round(value * signs[col], dtype);
+        prism_store(y, row_at + col, value, out_dtype == 0 ? 0 : dtype);
+    }
+}

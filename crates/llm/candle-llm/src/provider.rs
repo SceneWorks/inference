@@ -345,6 +345,16 @@ impl Decoder {
                     )
                 }
             };
+        // A Mixture-of-Experts step's routed dispatch (sc-24440) holds its own per-token working
+        // set — `slots` expert projections, the indexed kernels' outputs and Q8_1 activation
+        // copies — which the dense `3 · intermediate` term must cover: the estimators charge
+        // `3 · intermediate · element_bytes` per token row for the MLP, so the MoE bytes are
+        // folded in as an equivalent intermediate width when they are the larger.
+        let moe_bytes = match self {
+            Decoder::Causal(m) => m.moe_step_bytes_per_token(),
+            Decoder::Qwen35(m) => m.moe_step_bytes_per_token(),
+        };
+        let intermediate = (intermediate.max(0) as u64).max(moe_bytes.div_ceil(3 * 4));
         LlmMemoryGeometry {
             query_heads: query_heads.max(0) as u64,
             kv_heads: kv_heads.max(0) as u64,
@@ -352,7 +362,7 @@ impl Decoder {
             layers: layers as u64,
             element_bytes: 4,
             hidden_size: hidden as u64,
-            intermediate_size: intermediate as u64,
+            intermediate_size: intermediate,
             vocab_size: vocab as u64,
             recurrent_bytes: recurrent,
         }
@@ -1747,6 +1757,7 @@ impl LlamaProvider {
         let overflow = || CoreError::Load("load memory estimate overflow".into());
         let requested = CopyFormat::requested(spec.quantize);
         // What the load holds on its device while it builds the decoder.
+        let mut moe_tables = 0u64;
         let working = if crate::gguf::is_gguf_path(&spec.source) {
             if crate::prism_checkpoint::PrismGgufCheckpoint::is_prism(source).map_err(to_core)? {
                 // Prism GGUF: packed blocks the loader wraps, never re-quantized.
@@ -1757,6 +1768,7 @@ impl LlamaProvider {
         } else {
             let config = read_json(source, "config.json");
             let decoder = PricedDecoder::from_config(config.as_ref());
+            moe_tables = decoder.moe_indexed_table_bytes();
             let format = decoder.format(requested);
             let builds = matches!(
                 decoder,
@@ -1795,8 +1807,15 @@ impl LlamaProvider {
         } else {
             0
         };
+        // The indexed MoE dispatch's expert-address tables, built at a CUDA load (sc-24440).
+        let moe_tables = on_device(moe_tables);
         let device_required = device_required
-            .map(|bytes| bytes.checked_add(graph_param_cache).ok_or_else(overflow))
+            .map(|bytes| {
+                bytes
+                    .checked_add(graph_param_cache)
+                    .and_then(|b| b.checked_add(moe_tables))
+                    .ok_or_else(overflow)
+            })
             .transpose()?;
         Ok(LoadMemoryEstimate {
             payload_bytes: payload,
@@ -2797,6 +2816,27 @@ enum PricedDecoder {
 }
 
 impl PricedDecoder {
+    /// An upper bound of the device tables the indexed MoE dispatch builds at a CUDA load
+    /// (sc-24440): for every MoE layer (the MTP head's included), each of the three routed-expert
+    /// projections holds [`MAX_TABLE_BYTES_PER_EXPERT`](candle_quant_kernels::MAX_TABLE_BYTES_PER_EXPERT)
+    /// per expert at most. `0` for a dense model.
+    fn moe_indexed_table_bytes(&self) -> u64 {
+        let per_layer = |experts: u64| {
+            experts.saturating_mul(3 * candle_quant_kernels::MAX_TABLE_BYTES_PER_EXPERT as u64)
+        };
+        match self {
+            PricedDecoder::Causal(cfg) => cfg.moe.map_or(0, |m| {
+                let layers = cfg.num_layers.saturating_sub(m.first_k_dense_replace) as u64;
+                layers.saturating_mul(per_layer(m.num_experts as u64))
+            }),
+            PricedDecoder::Qwen35(cfg, _) => cfg.moe.as_ref().map_or(0, |m| {
+                let layers = cfg.num_layers.saturating_add(cfg.mtp_num_hidden_layers) as u64;
+                layers.saturating_mul(per_layer(m.num_experts.max(0) as u64))
+            }),
+            PricedDecoder::Prism | PricedDecoder::Refused => 0,
+        }
+    }
+
     /// Dispatch `config` exactly as `load_dir` does.
     fn from_config(config: Option<&Value>) -> Self {
         let Some(config) = config else {
@@ -6965,6 +7005,53 @@ mod tests {
         };
         let out = provider.generate(&request, &mut |_| {}).expect("decode");
         assert_eq!(out.usage.generated_tokens, 4);
+    }
+
+    /// sc-24440: a CUDA load prices the indexed MoE dispatch's expert-address tables — every
+    /// MoE layer's three projections at the widest entry per expert — and a dense model none.
+    #[test]
+    fn a_load_prices_the_moe_expert_tables() {
+        let cfg = |extra: serde_json::Value| {
+            let mut c = serde_json::json!({
+                "model_type": "qwen2_moe", "architectures": ["Qwen2MoeForCausalLM"],
+                "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 5,
+                "num_attention_heads": 4, "num_key_value_heads": 4, "vocab_size": 64,
+                "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "max_position_embeddings": 64,
+            });
+            c.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            c
+        };
+        let moe = cfg(serde_json::json!({
+            "num_experts": 12, "num_experts_per_tok": 2, "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 64,
+        }));
+        let priced = super::PricedDecoder::from_config(Some(&moe));
+        assert!(matches!(priced, super::PricedDecoder::Causal(_)));
+        let per = candle_quant_kernels::MAX_TABLE_BYTES_PER_EXPERT as u64;
+        assert_eq!(priced.moe_indexed_table_bytes(), 5 * 3 * 12 * per);
+        let dense = super::PricedDecoder::from_config(Some(&cfg(serde_json::json!({}))));
+        assert_eq!(dense.moe_indexed_table_bytes(), 0);
+    }
+
+    /// sc-24440: admission's MLP term covers the MoE dispatch's per-token working set — the
+    /// geometry's intermediate width is at least the routed experts' bytes per token row over the
+    /// `3 · element_bytes` the estimators charge per intermediate unit.
+    #[test]
+    fn the_admission_geometry_covers_the_moe_dispatch() {
+        use core_llm::Quantize;
+        let dir = q8_capable_qwen35_snapshot(true);
+        let provider = super::LlamaProvider::load(&spec_at(dir.path(), Some(Quantize::Q8)))
+            .expect("load the MoE snapshot Q8");
+        let Decoder::Qwen35(m) = &provider.model else {
+            panic!("the qwen3_5 MoE snapshot loads the hybrid decoder")
+        };
+        let moe = m.moe_step_bytes_per_token();
+        assert!(moe > 0, "an MoE model prices its routed dispatch");
+        let geometry = provider.model.memory_geometry();
+        assert!(geometry.intermediate_size * 3 * geometry.element_bytes >= moe);
+        assert!(geometry.intermediate_size >= m.config().intermediate_size.max(0) as u64);
     }
 
     /// Last-position logits of a loaded provider (either decoder) over a fixed prompt, on the

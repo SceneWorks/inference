@@ -2088,6 +2088,21 @@ impl Qwen35Model {
         })
     }
 
+    /// The widest per-token working set of this model's Mixture-of-Experts dispatch in bytes
+    /// ([`SparseMoe::step_bytes_per_token`](crate::primitives::moe::SparseMoe::step_bytes_per_token)
+    /// over every MoE layer; sc-24440) — `0` for a dense model. Admission prices it per token row
+    /// on top of the dense step working set.
+    pub fn moe_step_bytes_per_token(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe(m) => Some(m.step_bytes_per_token()),
+                Ffn::Dense(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Bytes [`new_static_cache`](Self::new_static_cache) preallocates for `capacity` positions:
     /// K and V for every full-attention layer in the compute dtype — the term admission charges
     /// for the preallocation (E6). Saturating.
