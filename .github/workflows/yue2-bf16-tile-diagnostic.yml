@@ -1,0 +1,147 @@
+name: YuE2 bounded BF16 tile diagnosis
+
+# CUDA-only diagnostic for failed M3 full/tiled comparison; no acceptance, model
+# generation, app profile, quality sweep, or Metal dispatch. Numerical gates unchanged.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_engine_sha:
+        type: string
+        required: true
+        description: Exact failed M3 source, unchanged production implementation
+      expected_control_sha:
+        type: string
+        required: true
+        description: Exact reviewed diagnostic workflow and harness SHA
+      reference_run_id:
+        type: string
+        required: true
+        description: Existing M3 CPU reference run, never regenerated
+      idle_cuda_context_run_id:
+        type: string
+        required: false
+        default: ""
+        description: Reviewed idle desktop context receipt; empty keeps refusal
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: inference-real-weights-physical-host
+  cancel-in-progress: false
+
+env:
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
+
+jobs:
+  cuda:
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: engine
+    env:
+      EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+      EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+      YUE2_IDLE_CONTEXT_RUN_ID: ${{ inputs.idle_cuda_context_run_id }}
+      YUE2_HF_HUB: ${{ vars.CANDLE_GEN_MODELS_ROOT }}
+      CUDA_VISIBLE_DEVICES: "0"
+      CUDA_COMPUTE_CAP: "80"
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Download exact reviewed desktop-context receipt when requested
+        if: inputs.idle_cuda_context_run_id != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-4127a675fc8575555e029e01b7f6867488880a8f-control-88b257d1d2e0ef3c153fb3b1bf96bce66edc5f97-36850466402-1
+          run-id: ${{ inputs.idle_cuda_context_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-reviewed-idle-context
+      - name: Verify exact engine source and fixture run selector
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          REFERENCE_RUN_ID: ${{ inputs.reference_run_id }}
+        run: |
+          if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_engine_sha must be 40 lowercase hex' }
+          if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_control_sha must be 40 lowercase hex' }
+          if ($env:REFERENCE_RUN_ID -notmatch '^[0-9]+$') { throw 'reference_run_id must name a fixture run' }
+          if ($env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA -or (git -C ../control rev-parse HEAD).Trim() -cne $env:EXPECTED_CONTROL_SHA) { throw 'workflow control SHA mismatch' }
+          if ((git rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA) { throw 'engine SHA mismatch' }
+          if (git -C ../control status --porcelain --untracked-files=normal) { throw 'workflow control checkout is dirty' }
+          if (git status --porcelain --untracked-files=normal) { throw 'engine checkout is dirty' }
+          if (-not (Test-Path $env:YUE2_HF_HUB)) { throw 'YuE2 pinned hub is unavailable' }
+          foreach ($repo in @('YuE2-3B', 'YuE2-Vae', 'YuE2-Vae-legacy')) {
+            $revision = switch ($repo) { 'YuE2-3B' { '1a96eca688d6ae5d7f0feb88573fec89920fcd19' } 'YuE2-Vae' { '95535e72a97bc0f09b8ada125d26b4009428c0e8' } default { 'b54118f0fc462f08999d1ec07e88817f4ee3f770' } }
+            if (-not (Test-Path (Join-Path $env:YUE2_HF_HUB "models--m-a-p--$repo\snapshots\$revision"))) { throw "missing pinned $repo snapshot" }
+          }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" | Out-Null
+          nvidia-smi --query-gpu=index,name,compute_cap,driver_version,memory.total,memory.used,memory.free --format=csv | Out-File -Encoding utf8 "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\hardware-before.csv"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: yue2-precision-reference
+          run-id: ${{ inputs.reference_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/yue2-precision-reference
+      - name: Install reviewed Python 3.12
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.12.3"
+          enable-cache: false
+      - name: Resolve pinned interpreter and verify reference
+        shell: cmd
+        run: |
+          uv python install 3.12.10 --managed-python --no-registry --no-bin --no-config || exit /b 1
+          for /f "delims=" %%P in ('uv python find 3.12.10 --managed-python --no-project --no-config') do set "REVIEWED_PYTHON=%%P"
+          if not defined REVIEWED_PYTHON exit /b 1
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_precision_proof.py verify-reference --directory "%RUNNER_TEMP%\yue2-precision-reference" --engine-sha "${{ inputs.expected_engine_sha }}" || exit /b 1
+          echo REVIEWED_PYTHON=%REVIEWED_PYTHON%>>"%GITHUB_ENV%"
+      - name: Select checked Git Bash before pinned Rust
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable branch
+        with:
+          toolchain: 1.96.0
+      - name: Build the external M3 VAE diagnostic harness
+        shell: cmd
+        run: |
+          set "RUSTC_WRAPPER="
+          call "%VCVARS%" || exit /b 1
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py prepare-harness --template ..\control\scripts\ci\yue2_bf16_tile_diagnostic --destination "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness" --engine-sha "%EXPECTED_ENGINE_SHA%" --control-sha "%EXPECTED_CONTROL_SHA%" || exit /b 1
+          cargo build --locked --offline --release --manifest-path "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\harness\Cargo.toml" --features cuda --message-format=json > "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" 2> "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"
+          if errorlevel 1 (type "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.log"& exit /b 1)
+          "%REVIEWED_PYTHON%" ..\control\scripts\ci\yue2_bf16_tile_diagnostic.py resolve-binary --build-json "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\build.jsonl" --output "%RUNNER_TEMP%\yue2-bf16-tile-diagnostic\binary.txt" || exit /b 1
+      - name: Run only the bounded same-input VAE diagnostic
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+        run: |
+          $binary = (Get-Content "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic\binary.txt" -Raw).Trim()
+          & $env:REVIEWED_PYTHON ../control/scripts/ci/yue2_bf16_tile_diagnostic.py run --binary "$binary" --reference "$env:RUNNER_TEMP\yue2-precision-reference" --evidence "$env:RUNNER_TEMP\yue2-bf16-tile-diagnostic" --engine-sha "$env:EXPECTED_ENGINE_SHA" --control-sha "$env:EXPECTED_CONTROL_SHA"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload immutable diagnostic output and failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-bf16-tile-diagnostic-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/yue2-bf16-tile-diagnostic
+          if-no-files-found: warn
+          retention-days: 30
