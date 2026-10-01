@@ -1603,12 +1603,12 @@ impl LlamaProvider {
             core_llm::available_host_memory_bytes(),
             host_load_budget(device.is_cuda(), budget),
         )?;
-        core_llm::admit_request_memory(host_required, host_available)?;
+        core_llm::admit_load_memory(host_required, host_available)?;
         let device_available = device_required
             .map(|_| request_available_memory(&device))
             .transpose()?;
         if let (Some(device_required), Some(available)) = (device_required, device_available) {
-            core_llm::admit_request_memory(device_required, available)?;
+            core_llm::admit_load_memory(device_required, available)?;
         }
         // A named draft (sc-24436, E7) is priced beside the admitted target in both domains.
         let draft = Self::admit_draft(
@@ -1737,9 +1737,9 @@ impl LlamaProvider {
         let draft_spec = draft_load_spec(spec, source);
         let refusal = match Self::load_memory_estimate_as(&draft_spec, cuda, false) {
             Err(e) => {
-                core_llm::admit_request_memory(host.0, host.1)?;
+                core_llm::admit_load_memory(host.0, host.1)?;
                 if let Some((required, available)) = device {
-                    core_llm::admit_request_memory(required, available)?;
+                    core_llm::admit_load_memory(required, available)?;
                 }
                 Some(core_llm::draft_unpriced_refusal(e))
             }
@@ -1751,7 +1751,7 @@ impl LlamaProvider {
                         core_llm::admit_draft_load(target, draft, available)?
                     }
                     (Some((target, available)), None) => {
-                        core_llm::admit_request_memory(target, available)?;
+                        core_llm::admit_load_memory(target, available)?;
                         None
                     }
                     (None, _) => None,
@@ -5831,7 +5831,7 @@ mod tests {
         let current_free = 60_000_000_000;
         let available =
             core_llm::effective_memory_budget(Some(current_free), Some(102_171_148_288)).unwrap();
-        let error = core_llm::admit_request_memory(device_required.unwrap(), available)
+        let error = core_llm::admit_load_memory(device_required.unwrap(), available)
             .expect_err("current CUDA shortfall must fail closed");
         assert!(error
             .to_string()

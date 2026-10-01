@@ -206,6 +206,19 @@ pub fn admit_request_memory(required: u64, available: u64) -> Result<()> {
     Ok(())
 }
 
+/// Reject a model **load** whose estimated resident weights and load-time conversions exceed the
+/// available memory, before any weight is read (sc-24446). The same check as
+/// [`admit_request_memory`], worded as the load refusal it is: a request-side remedy (shorter
+/// prompt, fewer new tokens) cannot help a load.
+pub fn admit_load_memory(required: u64, available: u64) -> Result<()> {
+    if required > available {
+        return Err(Error::InvalidRequest(format!(
+            "load admission: loading this model requires an estimated {required} bytes of resident weights and load-time conversions but only {available} bytes are available; free memory or load a smaller model or quantization tier"
+        )));
+    }
+    Ok(())
+}
+
 /// Load admission for a target plus a named draft model (epic sc-24432 E7, story sc-24436): the
 /// draft's weights are admitted **beside** the target's, never instead of them. `Err` when the
 /// target alone does not fit — the ordinary load refusal, a draft never masks it; `Ok(None)` when
@@ -217,7 +230,7 @@ pub fn admit_draft_load(
     draft_required: u64,
     available: u64,
 ) -> Result<Option<String>> {
-    admit_request_memory(target_required, available)?;
+    admit_load_memory(target_required, available)?;
     Ok(match target_required.checked_add(draft_required) {
         Some(both) if both <= available => None,
         _ => Some(format!(
@@ -396,7 +409,8 @@ mod tests {
             why.starts_with("draft model:") && why.contains("41") && why.contains("100"),
             "{why}"
         );
-        assert!(admit_draft_load(101, 0, 100).is_err(), "the target alone");
+        let target = admit_draft_load(101, 0, 100).expect_err("the target alone");
+        assert!(target.to_string().contains("load admission:"), "{target}");
         assert!(admit_draft_load(60, u64::MAX, 100).unwrap().is_some());
     }
 
@@ -529,6 +543,17 @@ mod tests {
         assert!(error.contains("estimated 200 bytes"));
         assert!(error.contains("only 100 bytes are available"));
         assert!(error.contains("reduce prompt/media length or max_new_tokens"));
+    }
+
+    /// A load refusal names itself as one and never offers the request-side remedy.
+    #[test]
+    fn load_rejection_names_load_admission_not_request_length() {
+        let error = admit_load_memory(200, 100).unwrap_err().to_string();
+        assert!(error.contains("load admission:"), "{error}");
+        assert!(error.contains("estimated 200 bytes"));
+        assert!(error.contains("only 100 bytes are available"));
+        assert!(!error.contains("max_new_tokens"), "{error}");
+        assert!(admit_load_memory(100, 100).is_ok());
     }
 
     #[test]

@@ -62,6 +62,9 @@ mod gguf_tokenizer;
 #[path = "joycaption.rs"]
 mod joycaption;
 
+#[path = "load_admission_probe.rs"]
+mod load_admission_probe;
+
 #[path = "ltx_2_5_te_tier_quality.rs"]
 mod ltx_2_5_te_tier_quality;
 

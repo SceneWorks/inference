@@ -127,7 +127,7 @@ pub use request::{
     Speculative, SpeculativeProposer, TextLlmRequest, ThinkingMode,
 };
 pub use resource::{
-    admit_draft_load, admit_request_memory, admit_request_memory_with_geometry,
+    admit_draft_load, admit_load_memory, admit_request_memory, admit_request_memory_with_geometry,
     available_host_memory_bytes, checkpoint_payload_bytes, checkpoint_staging_bytes,
     effective_memory_budget, estimate_chunked_request_bytes,
     estimate_chunked_request_bytes_with_recurrent_copies, estimate_request_bytes,

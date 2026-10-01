@@ -138,7 +138,7 @@ pub fn admit_companion_head(
         let total = target_bytes
             .checked_add(head_bytes)
             .ok_or_else(|| format!("mtp_head: load admission overflow; {COMPANION_MTP_DROPPED}"))?;
-        crate::admit_request_memory(total, available).map_err(|e| {
+        crate::admit_load_memory(total, available).map_err(|e| {
             format!(
                 "mtp_head: refused by load admission: the head's {head_bytes} bytes on top of \
                  the target's {target_bytes} exceed the {domain} budget ({e}); \

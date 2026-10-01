@@ -617,14 +617,14 @@ impl DraftPlan {
     /// (E2); a draft that cannot be priced or does not fit beside the target is refused by name.
     fn admit(spec: &LoadSpec, target_required: u64, available: u64) -> CoreResult<Self> {
         let Some(source) = spec.draft_source.as_deref() else {
-            core_llm::admit_request_memory(target_required, available)?;
+            core_llm::admit_load_memory(target_required, available)?;
             return Ok(DraftPlan::None);
         };
         let draft_spec = draft_load_spec(spec, source);
         let draft_required = match crate::load_memory::required_bytes(&draft_spec) {
             Ok(bytes) => bytes,
             Err(e) => {
-                core_llm::admit_request_memory(target_required, available)?;
+                core_llm::admit_load_memory(target_required, available)?;
                 return Ok(DraftPlan::Refused(DraftReport::refused(
                     source,
                     core_llm::draft_unpriced_refusal(e),
@@ -675,7 +675,7 @@ fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static st
 
 /// The MLX projection format of a load-time quantization tier. NVFP4 is a CUDA sm_120
 /// capability (sc-24135): refused by name, never substituted.
-fn quant_spec(quantize: Quantize) -> CoreResult<QuantSpec> {
+pub(crate) fn quant_spec(quantize: Quantize) -> CoreResult<QuantSpec> {
     match quantize {
         Quantize::Q4 => Ok(QuantSpec::q4()),
         Quantize::Q8 => Ok(QuantSpec::q8()),
@@ -5484,9 +5484,16 @@ mod tests {
         let head: &Path = fx.head.as_ref();
         let head_bytes = crate::load_memory::companion_head_bytes(head).unwrap();
         let payload = core_llm::checkpoint_payload_bytes(head).unwrap();
-        // Seven 1-D norm vectors (4 × 128 + 2 × 64 + 128 wide) at four intermediate bytes each.
+        // Seven 1-D norm vectors (4 × 128 + 2 × 64 + 128 wide) at four intermediate bytes each,
+        // and one 16 KiB page of rounding per stored tensor and per norm result (sc-24446).
         let norms = (5 * 128 + 2 * 64) * 4;
-        assert_eq!(head_bytes, payload + norms);
+        let tensors = crate::load_memory::safetensors_headers(head)
+            .unwrap()
+            .iter()
+            .flat_map(|h| h.as_object().unwrap().keys())
+            .filter(|k| *k != "__metadata__")
+            .count() as u64;
+        assert_eq!(head_bytes, payload + norms + (tensors + 7) * 16 * 1024);
 
         let target =
             crate::load_memory::required_bytes(&LoadSpec::dense(fx.target.to_str().unwrap()))
