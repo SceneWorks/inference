@@ -149,6 +149,19 @@ pub trait DecodeCache {
     }
 }
 
+/// Fold device-buffer addresses into a graph identity (sc-24441): the caches that back graphs
+/// start from their own address and fold in every buffer a captured step reads or writes, so a
+/// fresh cache swapped in at the same host address — with its own, freshly allocated buffers —
+/// never replays a graph recorded against the old ones.
+pub(crate) fn fold_graph_identity(
+    identity: usize,
+    addresses: impl IntoIterator<Item = (usize, usize)>,
+) -> usize {
+    addresses.into_iter().fold(identity, |id, (a, b)| {
+        id.rotate_left(7) ^ a ^ b.rotate_left(13)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

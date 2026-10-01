@@ -25,7 +25,10 @@ use candle_core::{DType, Device, Tensor};
 
 use crate::error::{Error, Result};
 use crate::primitives::decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
-use crate::primitives::kv_cache::{ContiguousKvCache, KvCache, KvCacheKind, StaticKvCache};
+use crate::primitives::device_positions::DevicePositions;
+use crate::primitives::kv_cache::{
+    ContiguousKvCache, IndexedKv, KvCache, KvCacheKind, StaticKvCache,
+};
 use crate::primitives::paged_kv_cache::PagedKvCache;
 
 /// One layer's cached key/value geometry.
@@ -113,6 +116,9 @@ pub struct StepKvCache {
     backing: Backing,
     rope_delta: i32,
     bytes_per_position: usize,
+    /// The device-staged step positions of a static backing built
+    /// [`with_device_positions`](Self::with_device_positions) (sc-24441); `None` otherwise.
+    positions: Option<DevicePositions>,
 }
 
 impl std::fmt::Debug for StepKvCache {
@@ -126,6 +132,7 @@ impl std::fmt::Debug for StepKvCache {
             .field("backing", &backing)
             .field("len", &KvCache::offset(self))
             .field("rope_delta", &self.rope_delta)
+            .field("device_positions", &self.positions.is_some())
             .finish()
     }
 }
@@ -137,6 +144,7 @@ impl StepKvCache {
             backing: Backing::Growing(ContiguousKvCache::new(layout.layers.len())),
             rope_delta: 0,
             bytes_per_position: layout.bytes_per_position(),
+            positions: None,
         }
     }
 
@@ -173,7 +181,36 @@ impl StepKvCache {
             backing: Backing::Static(layers),
             rope_delta: 0,
             bytes_per_position: layout.bytes_per_position(),
+            positions: None,
         })
+    }
+
+    /// This static cache staging its step positions on the device (sc-24441): the decoder writes
+    /// K/V through [`KvCache::update_indexed`] at the staged start and attends with the
+    /// length-aware decode attention, so a step reads no host-side position and the cache backs a
+    /// CUDA-graph replay ([`DecodeCache::graph_support`] `Ok`). The buffers live on the first
+    /// caching layer's device (the decoder refuses the path for a pipeline-sharded stack). A
+    /// growing or paged backing is [`Error::Msg`].
+    pub fn with_device_positions(mut self) -> Result<Self> {
+        let Backing::Static(layers) = &self.backing else {
+            return Err(Error::Msg(
+                "StepKvCache: device positions need the static (preallocated) backing".into(),
+            ));
+        };
+        let device = layers
+            .iter()
+            .flatten()
+            .next()
+            .map(|l| l.views(0).map(|(k, _)| k.device().clone()))
+            .transpose()?
+            .ok_or_else(|| Error::Msg("StepKvCache: no caching layer".into()))?;
+        self.positions = Some(DevicePositions::new(&device)?);
+        Ok(self)
+    }
+
+    /// The staged device positions, when this cache keeps them.
+    pub fn device_positions(&self) -> Option<&DevicePositions> {
+        self.positions.as_ref()
     }
 
     /// An existing paged cache behind the seam (see the module docs for why it is kept).
@@ -182,6 +219,7 @@ impl StepKvCache {
             backing: Backing::Paged(cache),
             rope_delta: 0,
             bytes_per_position: layout.bytes_per_position(),
+            positions: None,
         }
     }
 
@@ -325,6 +363,34 @@ impl KvCache for StepKvCache {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+
+    /// The write at the device-staged step start (static backing with device positions only).
+    fn update_indexed(
+        &mut self,
+        layer: usize,
+        keys: &Tensor,
+        values: &Tensor,
+    ) -> Result<Option<IndexedKv>> {
+        let (Backing::Static(layers), Some(positions)) = (&mut self.backing, &self.positions)
+        else {
+            return Ok(None);
+        };
+        let start = positions.start()?;
+        let slot = layers
+            .get_mut(layer)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| {
+                Error::Msg(format!(
+                    "StepKvCache: layer {layer} has no static KV slot (it caches nothing)"
+                ))
+            })?;
+        let (keys, values) = slot.update_at(0, keys, values, &start)?;
+        Ok(Some(IndexedKv {
+            keys,
+            values,
+            start,
+        }))
+    }
 }
 
 impl DecodeCache for StepKvCache {
@@ -378,17 +444,76 @@ impl DecodeCache for StepKvCache {
         }
     }
 
-    /// Not a CUDA-graph backing (story sc-24134), declared so the runner refuses before any
-    /// capture: the growing backing reallocates its K/V as it grows (`growing_kv`), the paged
-    /// backing reserves blocks as it grows (`paged_kv`), and the static backing — stable buffers,
-    /// but written at its Rust-side offset and read up to its host-side length, with no
-    /// [`stage_positions`](DecodeCache::stage_positions) / [`replay_advance`](DecodeCache::replay_advance)
-    /// — says `positions_host_scalar`. No replay against this cache has been proven.
+    /// A CUDA-graph backing (stories sc-24134, sc-24441) exactly when it is the static backing
+    /// with device positions: stable buffers, written at the device-staged start and attended up
+    /// to it, with [`stage_positions`](DecodeCache::stage_positions) /
+    /// [`replay_advance`](DecodeCache::replay_advance) doing a replayed step's host side. Declared
+    /// otherwise so the runner refuses before any capture: the growing backing reallocates its K/V
+    /// as it grows (`growing_kv`), the paged backing reserves blocks as it grows (`paged_kv`), and
+    /// a static backing without device positions is written at its Rust-side offset
+    /// (`positions_host_scalar`).
     fn graph_support(&self) -> std::result::Result<(), &'static str> {
-        match self.backing {
-            Backing::Growing(_) => Err("growing_kv"),
-            Backing::Paged(_) => Err("paged_kv"),
-            Backing::Static(_) => Err("positions_host_scalar"),
+        match (&self.backing, &self.positions) {
+            (Backing::Growing(_), _) => Err("growing_kv"),
+            (Backing::Paged(_), _) => Err("paged_kv"),
+            (Backing::Static(_), None) => Err("positions_host_scalar"),
+            (Backing::Static(_), Some(_)) => Ok(()),
+        }
+    }
+
+    /// The cache's own address folded with every static layer's K/V buffer addresses and the
+    /// staged [`DevicePositions`] buffers — everything a captured step reads or writes — so a
+    /// fresh cache moved into this one's place (a restored prefix) never replays a graph recorded
+    /// against the old buffers (sc-24441). Stable across steps and rollbacks: the static buffers
+    /// are written in place.
+    fn graph_identity(&self) -> usize {
+        use crate::primitives::decode_cache::fold_graph_identity;
+        let mut id = self as *const Self as usize;
+        if let Backing::Static(layers) = &self.backing {
+            id = fold_graph_identity(
+                id,
+                layers
+                    .iter()
+                    .flatten()
+                    .filter_map(|l| l.storage_addresses(0).ok()),
+            );
+        }
+        if let Some(Ok(positions)) = self.positions.as_ref().map(DevicePositions::addresses) {
+            id = fold_graph_identity(id, [positions]);
+        }
+        id
+    }
+
+    /// Stage the next step's start and RoPE positions (length + delta) on the device.
+    fn stage_positions(&mut self) -> Result<()> {
+        match &self.positions {
+            Some(p) => p.stage(DecodeCache::len(self), self.rope_delta, None),
+            None => Ok(()),
+        }
+    }
+
+    /// A replayed step's host side: the capacity check and every static layer's length.
+    fn replay_advance(&mut self, n: usize) -> Result<()> {
+        match (&mut self.backing, &self.positions) {
+            (Backing::Static(layers), Some(_)) => {
+                for l in layers.iter().flatten() {
+                    if l.offset() as usize + n > l.capacity() {
+                        return Err(Error::KvCapacityExceeded {
+                            requested: l.offset() as usize + n,
+                            capacity: l.capacity(),
+                        });
+                    }
+                }
+                for l in layers.iter_mut().flatten() {
+                    l.advance(n)?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::Unsupported(
+                "StepKvCache::replay_advance: only a static cache with device positions backs a \
+                 graph replay"
+                    .into(),
+            )),
         }
     }
 }
@@ -529,6 +654,109 @@ mod tests {
         DecodeCache::reset(&mut growing);
         assert_eq!(DecodeCache::len(&growing), 0);
         assert_eq!(growing.rope_delta(), 0);
+    }
+
+    /// sc-24441: a static cache with device positions writes each step at the start it staged
+    /// on the device (the same rows the host-offset write lands), hands back the whole buffers,
+    /// declares itself a graph backing, and a replay's host side advances every layer — refusing
+    /// past the capacity. Other backings have no indexed write and cannot replay.
+    #[test]
+    fn device_positions_write_at_the_staged_start_and_replay_advances() {
+        let l = layout();
+        let mut staged = StepKvCache::preallocated(&l, 16)
+            .unwrap()
+            .with_device_positions()
+            .unwrap();
+        let mut plain = StepKvCache::preallocated(&l, 16).unwrap();
+        assert_eq!(staged.graph_support(), Ok(()));
+        assert_eq!(plain.graph_support(), Err("positions_host_scalar"));
+        let shapes = [(0usize, 2usize, 4usize, 4usize), (1, 1, 8, 8), (2, 3, 6, 4)];
+        for (s, phase) in [(4usize, 0.0f32), (1, 10.0), (3, 20.0)] {
+            staged.stage_positions().unwrap();
+            for &(layer, h, dk, dv) in &shapes {
+                let (k, v) = (step(h, s, dk, phase), step(h, s, dv, phase + 0.5));
+                let kv = staged.update_indexed(layer, &k, &v).unwrap().unwrap();
+                let (pk, pv) = plain.update(layer, &k, &v).unwrap();
+                assert_eq!(kv.keys.dim(2).unwrap(), 16, "the whole buffer");
+                let len = pk.dim(2).unwrap();
+                assert_eq!(host(&kv.keys.narrow(2, 0, len).unwrap()), host(&pk));
+                assert_eq!(host(&kv.values.narrow(2, 0, len).unwrap()), host(&pv));
+                assert_eq!(
+                    kv.start.to_vec1::<u32>().unwrap(),
+                    vec![(len - s) as u32],
+                    "written at the staged start"
+                );
+            }
+        }
+        assert_eq!(DecodeCache::len(&staged), 8);
+        staged.replay_advance(3).unwrap();
+        assert_eq!(DecodeCache::len(&staged), 11);
+        assert!(matches!(
+            staged.replay_advance(6),
+            Err(Error::KvCapacityExceeded { .. })
+        ));
+        assert_eq!(
+            DecodeCache::len(&staged),
+            11,
+            "refused before any layer moved"
+        );
+        assert!(plain.replay_advance(1).is_err());
+        let mut growing = StepKvCache::growing(&l);
+        assert!(growing
+            .update_indexed(0, &step(2, 1, 4, 0.0), &step(2, 1, 4, 0.0))
+            .unwrap()
+            .is_none());
+        assert!(StepKvCache::growing(&l).with_device_positions().is_err());
+    }
+
+    /// sc-24441: the graph identity follows the buffers a captured step touches — stable across
+    /// steps and rollbacks, but a fresh static cache moved into the same place (fresh K/V) or
+    /// fresh position buffers read as a different identity, so the runner never replays a graph
+    /// into freed buffers.
+    #[test]
+    fn graph_identity_follows_the_kv_and_position_buffers() {
+        let l = layout();
+        let mut cache = StepKvCache::preallocated(&l, 16).unwrap();
+        feed(&mut cache, 3, 0.0);
+        let identity = cache.graph_identity();
+        feed(&mut cache, 1, 1.0);
+        cache.rollback_to(2).unwrap();
+        assert_eq!(identity, cache.graph_identity(), "stable");
+        // A fresh cache in the same place: only its static K/V buffers differ.
+        cache = StepKvCache::preallocated(&l, 16).unwrap();
+        assert_ne!(identity, cache.graph_identity(), "fresh K/V buffers");
+
+        let mut cache = StepKvCache::preallocated(&l, 16)
+            .unwrap()
+            .with_device_positions()
+            .unwrap();
+        let identity = cache.graph_identity();
+        // The same K/V buffers with fresh position buffers.
+        cache.positions = Some(DevicePositions::new(&Device::Cpu).unwrap());
+        assert_ne!(identity, cache.graph_identity(), "fresh position buffers");
+
+        // A prefix restore (sc-24437): a fresh cache seeded with the live cache's prefix and
+        // moved into its place holds the same positions in different buffers.
+        use crate::decode::prefix::PrefixSnapshot;
+        let fresh = || {
+            StepKvCache::preallocated(&l, 16)
+                .unwrap()
+                .with_device_positions()
+                .unwrap()
+        };
+        let mut cache = fresh();
+        feed(&mut cache, 3, 0.0);
+        let identity = cache.graph_identity();
+        let entry = cache.snapshot(3).unwrap();
+        let mut restored = fresh();
+        restored.restore(&entry, 3).unwrap();
+        cache = restored;
+        assert_eq!(DecodeCache::len(&cache), 3);
+        assert_ne!(
+            identity,
+            cache.graph_identity(),
+            "a restored cache in its place"
+        );
     }
 
     /// The paged backing sits behind the same seam: exact rollback, memory as reserved slots.

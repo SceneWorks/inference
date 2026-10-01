@@ -130,10 +130,18 @@ pub struct DecodeReport {
     pub sampler: String,
     /// The KV cache implementation (`growing`, `static`).
     pub kv_cache: String,
-    /// How attention was computed (`gqa`, `expanded`).
+    /// How attention was computed (`gqa`, `expanded`; `decode_attention` when a Candle request's
+    /// cached steps ran the length-aware decode attention, sc-24441).
     pub attention: String,
     /// The CUDA-graph runner's part.
     pub cuda_graphs: CudaGraphsReport,
+    /// Which graph path served the generation's steps (epic sc-24432 E3): `captured` when a
+    /// captured, verified CUDA graph replayed at least one step (warm-up, self-check and prefill
+    /// steps still run eager), `eager` when steps went through the graph runner but none replayed
+    /// ([`CudaGraphsReport::fallback_reason`] names why), `none` when no step went through the
+    /// runner (the switch was off, or the path does not use it), or a backend without CUDA
+    /// graphs.
+    pub graph_path: String,
     /// NVFP4 projection calls by path (`none` for a model without NVFP4 projections).
     pub nvfp4_projections: PathReport,
     /// Fused-versus-reference primitive runs.
@@ -219,7 +227,8 @@ pub struct LoadReport {
     /// through a CUDA-graph runner — so a product shows the settled value, not the request.
     pub cuda_graphs: Option<bool>,
     /// Every optional accelerator the load was asked for but did not attach, each leading with
-    /// the feature (`mtp_head: …`), so a product can show why (epic sc-24432 E2: the model still
+    /// the feature (`mtp_head: …`; `cuda_graphs: …` when the graph switch is on but the
+    /// decoder's step cannot be captured), so a product can show why (epic sc-24432 E2: the model still
     /// loaded; the accelerator is absent). Empty when everything requested was attached.
     pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (story sc-24437): the requested

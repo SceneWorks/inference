@@ -87,6 +87,12 @@ pub struct StepRequest<'a> {
     /// Also return the final-normalized hidden states `[batch, n, hidden]` (what a native MTP head
     /// pairs with the next token). `false` skips the extra tensor.
     pub want_hidden: bool,
+    /// The step is (a segment of) a prompt prefill, not a decode or verify step: a model runs it
+    /// on the host-position path with the reference attention even from a non-empty cache — a
+    /// prefix-cache hit's suffix, a split prefill's second segment (sc-24441 × sc-24437) — so a
+    /// restored request's prompt attends exactly as a cold prefill's, and the graph runner runs
+    /// it eager, never warming or capturing it ([`StepRequest::as_prefill`]).
+    pub prefill: bool,
 }
 
 impl<'a> StepRequest<'a> {
@@ -96,6 +102,7 @@ impl<'a> StepRequest<'a> {
             tokens: StepTokens::Host(tokens),
             scope: LogitsScope::Last,
             want_hidden: false,
+            prefill: false,
         }
     }
 
@@ -105,6 +112,7 @@ impl<'a> StepRequest<'a> {
             tokens: StepTokens::Host(tokens),
             scope: LogitsScope::All,
             want_hidden: false,
+            prefill: false,
         }
     }
 
@@ -114,6 +122,7 @@ impl<'a> StepRequest<'a> {
             tokens: StepTokens::Device(ids),
             scope: LogitsScope::Last,
             want_hidden: false,
+            prefill: false,
         }
     }
 
@@ -124,12 +133,19 @@ impl<'a> StepRequest<'a> {
             tokens: StepTokens::Device(ids),
             scope: LogitsScope::All,
             want_hidden: false,
+            prefill: false,
         }
     }
 
     /// The same request, also returning the final-normalized hidden states.
     pub fn with_hidden(mut self, want_hidden: bool) -> Self {
         self.want_hidden = want_hidden;
+        self
+    }
+
+    /// The same request marked as a prompt-prefill segment ([`StepRequest::prefill`]).
+    pub fn as_prefill(mut self) -> Self {
+        self.prefill = true;
         self
     }
 

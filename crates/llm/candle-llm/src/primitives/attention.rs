@@ -21,7 +21,10 @@
 //! (different reduction order), the same tolerance the batched / prefix-reuse GPU paths carry.
 //!
 //! [`sdpa_gqa_causal`] (epic sc-24128, story sc-24132) is the **zero-copy grouped-query** causal
-//! attention the static-KV decode path runs: queries `[b, H, s, d]` against un-expanded keys/values
+//! attention the static-KV path runs for a prompt prefill (and, on a model without device
+//! positions, for every step; since sc-24441 a cached decode / verify step of a model with device
+//! positions — the CUDA default — attends with the length-aware
+//! [`candle_quant_kernels::decode_attention()`] on every cache instead): queries `[b, H, s, d]` against un-expanded keys/values
 //! `[b, Hkv, L, d]`, with the `H / Hkv` query groups folded into the query-sequence axis so one
 //! batched matmul per side serves every group — no [`repeat_kv`] expansion, and no `contiguous`
 //! copy of the cache's narrowed K/V views (the matmul reads their strides directly). The causal
@@ -110,6 +113,13 @@ pub enum AttnFormulation {
     /// a labelled comparison row against the sealed pre-epic baseline (it reproduces that
     /// baseline's bits); it materializes the expansion every step, so it is never the fast path.
     Expanded,
+    /// The length-aware [`candle_quant_kernels::decode_attention()`] over the cache (sc-24441):
+    /// what a request's cached decode / verify steps ran when its decoder stages device positions
+    /// (the CUDA default, [`DEVICE_POSITIONS_DEFAULT`](crate::primitives::DEVICE_POSITIONS_DEFAULT)).
+    /// Its prompt prefill still attends [`AttnFormulation::Gqa`]. A **report** label: as a
+    /// selector it is [`AttnFormulation::Gqa`] ([`AttnFormulation::selector`]) — which cached
+    /// steps run the decode attention is the device-positions setting's call, not the selector's.
+    DecodeAttention,
 }
 
 impl AttnFormulation {
@@ -118,6 +128,17 @@ impl AttnFormulation {
         match self {
             AttnFormulation::Gqa => "gqa",
             AttnFormulation::Expanded => "expanded",
+            AttnFormulation::DecodeAttention => "decode_attention",
+        }
+    }
+
+    /// The arithmetic selector this names: [`AttnFormulation::DecodeAttention`] (a report label)
+    /// selects [`AttnFormulation::Gqa`]; the others select themselves. Every model's
+    /// `set_attn_formulation` stores this, so a selector field never holds the report label.
+    pub fn selector(self) -> AttnFormulation {
+        match self {
+            AttnFormulation::DecodeAttention => AttnFormulation::Gqa,
+            other => other,
         }
     }
 }

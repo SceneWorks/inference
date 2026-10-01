@@ -17,7 +17,10 @@
 //!   growing reallocation, and the buffers' device addresses never change across steps or a
 //!   rollback (the property the CUDA-graph runner, S6, captures against). Rollback is an offset
 //!   move; the buffers are untouched. Capacity is fixed at construction and a write past it is the
-//!   typed [`Error::KvCapacityExceeded`], raised before any device write.
+//!   typed [`Error::KvCapacityExceeded`], raised before any device write. A cache that stages
+//!   device positions (sc-24441) writes a decode step at a device-held index instead
+//!   ([`StaticKvCache::update_at`], [`KvCache::update_indexed`]) and hands the whole buffers to the
+//!   length-aware decode attention, so no host-side position reaches a kernel.
 //!
 //! GQA is handled without materializing the expanded heads: the attention primitive
 //! [`sdpa_gqa_causal`](crate::primitives::attention::sdpa_gqa_causal) folds the query groups into
@@ -132,6 +135,37 @@ pub trait KvCache {
     /// [`Qwen35Model`]: crate::models::Qwen35Model
     /// [`Qwen35Cache`]: crate::models::Qwen35Cache
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// The device-positions write (sc-24441): write `layer`'s step `keys`/`values` at the step
+    /// start the cache staged on the device ([`DevicePositions`]) and hand back the layer's
+    /// **whole** preallocated buffers with that start, for the length-aware decode attention —
+    /// nothing in the write or the attention reads a host-side position, so the step replays as a
+    /// CUDA graph. `Ok(None)` for a cache that stages no device positions: every growing / paged
+    /// cache, and a static one built without them (the default).
+    ///
+    /// [`DevicePositions`]: crate::primitives::DevicePositions
+    fn update_indexed(
+        &mut self,
+        layer: usize,
+        keys: &Tensor,
+        values: &Tensor,
+    ) -> Result<Option<IndexedKv>> {
+        let _ = (layer, keys, values);
+        Ok(None)
+    }
+}
+
+/// What [`KvCache::update_indexed`] returns: a layer's whole `[batch, n_kv_heads, capacity, dim]`
+/// key and value buffers (the step's own rows already written) and the device `u32` step start
+/// they were written at — the operands of [`candle_quant_kernels::decode_attention()`].
+#[derive(Clone, Debug)]
+pub struct IndexedKv {
+    /// The layer's key buffer, every row up to the capacity.
+    pub keys: Tensor,
+    /// The layer's value buffer.
+    pub values: Tensor,
+    /// `[1]` `u32` on the device: the row the step's first key was written at.
+    pub start: Tensor,
 }
 
 /// Growing-concat KV cache: one `Option<(K, V)>` slot per layer, concatenated along the sequence
@@ -413,6 +447,74 @@ impl StaticKvCache {
     pub fn layer_offset(&self, layer: usize) -> usize {
         self.len[layer]
     }
+
+    /// The step's shape check and capacity check shared by both writes: the step end, or the
+    /// typed [`Error::KvCapacityExceeded`] before anything is written.
+    fn check_step(&self, layer: usize, keys: &Tensor, values: &Tensor) -> Result<usize> {
+        let (b, h, s, d) = keys.dims4()?;
+        let (bb, hb, cap, db) = self.k[layer].dims4()?;
+        let vd = self.v[layer].dim(3)?;
+        if (b, h, d) != (bb, hb, db) || values.dims() != [b, h, s, vd] {
+            return Err(Error::Msg(format!(
+                "StaticKvCache: step keys {:?} / values {:?} do not fit buffers \
+                 [{bb}, {hb}, {cap}, {db}] / [{bb}, {hb}, {cap}, {vd}]",
+                keys.dims(),
+                values.dims()
+            )));
+        }
+        let end = self.len[layer] + s;
+        if end > cap {
+            return Err(Error::KvCapacityExceeded {
+                requested: end,
+                capacity: cap,
+            });
+        }
+        Ok(end)
+    }
+
+    /// The device-positions write (sc-24441): write the step's keys/values at the row `start`
+    /// holds **on the device** ([`candle_quant_kernels::write_rows_at`]) — the cache's own length,
+    /// staged by the caller — advance the host length like [`KvCache::update`], and return the
+    /// layer's whole buffers (see [`KvCache::update_indexed`]). The capacity check runs on the
+    /// host length before anything is written.
+    pub fn update_at(
+        &mut self,
+        layer: usize,
+        keys: &Tensor,
+        values: &Tensor,
+        start: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let end = self.check_step(layer, keys, values)?;
+        candle_quant_kernels::write_rows_at(&self.k[layer], &keys.contiguous()?, start, SEQ_AXIS)?;
+        candle_quant_kernels::write_rows_at(
+            &self.v[layer],
+            &values.contiguous()?,
+            start,
+            SEQ_AXIS,
+        )?;
+        self.len[layer] = end;
+        Ok((self.k[layer].clone(), self.v[layer].clone()))
+    }
+
+    /// The host bookkeeping of an `n`-position step whose device work a CUDA-graph replay did
+    /// (sc-24441): the capacity check, then every layer's length advances by `n`. Nothing is
+    /// written — the replayed graph wrote the rows at the staged device start.
+    pub fn advance(&mut self, n: usize) -> Result<()> {
+        for layer in 0..self.len.len() {
+            let end = self.len[layer] + n;
+            let cap = self.capacity;
+            if end > cap {
+                return Err(Error::KvCapacityExceeded {
+                    requested: end,
+                    capacity: cap,
+                });
+            }
+        }
+        for l in &mut self.len {
+            *l += n;
+        }
+        Ok(())
+    }
 }
 
 impl StaticKvCache {
@@ -436,25 +538,8 @@ impl KvCache for StaticKvCache {
     /// In-place write at the layer's offset; returns the bounded views. Fails **before** writing
     /// when the step would end past the capacity ([`Error::KvCapacityExceeded`]).
     fn update(&mut self, layer: usize, keys: &Tensor, values: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (b, h, s, d) = keys.dims4()?;
-        let (bb, hb, cap, db) = self.k[layer].dims4()?;
-        let vd = self.v[layer].dim(3)?;
-        if (b, h, d) != (bb, hb, db) || values.dims() != [b, h, s, vd] {
-            return Err(Error::Msg(format!(
-                "StaticKvCache: step keys {:?} / values {:?} do not fit buffers \
-                 [{bb}, {hb}, {cap}, {db}] / [{bb}, {hb}, {cap}, {vd}]",
-                keys.dims(),
-                values.dims()
-            )));
-        }
         let offset = self.len[layer];
-        let end = offset + s;
-        if end > cap {
-            return Err(Error::KvCapacityExceeded {
-                requested: end,
-                capacity: cap,
-            });
-        }
+        let end = self.check_step(layer, keys, values)?;
         // `slice_set` wants contiguous operands; the decoders hand over contiguous head-major
         // projections, so these are no-op clones on the decode path.
         self.k[layer].slice_set(&keys.contiguous()?, SEQ_AXIS, offset)?;

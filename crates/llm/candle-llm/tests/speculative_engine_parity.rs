@@ -343,6 +343,7 @@ fn teacher_forced_verify_shaped_forward_vs_single_token_knife_edge_gate() {
                         tokens: StepTokens::Host(&sequence[cur..end]),
                         scope: LogitsScope::All,
                         want_hidden: false,
+                        prefill: false,
                     },
                 )
                 .unwrap()
@@ -560,6 +561,7 @@ fn llama_teacher_forced(
                         tokens: StepTokens::Host(&sequence[cur..end]),
                         scope: LogitsScope::All,
                         want_hidden: false,
+                        prefill: false,
                     },
                 )
                 .unwrap()
@@ -590,8 +592,8 @@ fn llama_teacher_forced(
 ///
 /// * **exact** (gated, token-identical to the reference loop): the static step seam; the
 ///   reference loop and the static step seam with the fused primitives switched off; and the
-///   CUDA-graph runner with the switch on — which a `CausalLm` step refuses
-///   (`positions_host_scalar`), so every step runs eager through the runner's fallback;
+///   CUDA-graph runner with the switch on — whose captured `CausalLm` steps replay (sc-24441:
+///   device positions), verified bit-exact against eager by the runner's self-checks;
 /// * **teacher-forced verify-shaped gate** (gated): every row of an `M = 2..6` verify forward
 ///   flips the argmax only at a reference position whose top-2 gap is `<= 1` bf16 ULP;
 /// * **free-running n-gram rows** (K = 2, 3, 4 — the sc-24138 comparison rows): recorded — first
@@ -607,8 +609,8 @@ fn llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate() {
         .unwrap_or_else(|| panic!("set {QWEN3_8B_VAR}"));
     // The device as a graphs-on load gets it: `select_device` resolves the stream from the switch,
     // so with it on the model runs on its own stream (every row below — the stream changes no
-    // arithmetic) and the graph-runner row exercises the `CausalLm` step's own refusal, not the
-    // legacy stream's.
+    // arithmetic) and the graph-runner row captures the `CausalLm` step (the legacy stream
+    // cannot be captured).
     let device = {
         let _graphs = cuda_graphs_policy_guard(Some(true));
         select_device().unwrap()
@@ -676,8 +678,8 @@ fn llama_family_qwen3_8b_exact_rows_and_teacher_forced_knife_edge_gate() {
         exact.iter().all(|(_, d)| d.is_none()),
         "exact rows must be token-identical to the reference loop: {exact:?}"
     );
-    assert_eq!(graphs.replayed, 0, "a CausalLm step is not replayable");
-    assert_eq!(graphs.fallback_reason, Some("positions_host_scalar"));
+    assert!(graphs.replayed > 0, "the CausalLm decode step replays");
+    assert_eq!(graphs.fallback_reason, None);
 
     // The knife-edges: the reference positions whose top-2 gap is within one bf16 ULP on the
     // single-token static path.

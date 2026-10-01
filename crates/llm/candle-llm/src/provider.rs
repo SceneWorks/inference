@@ -161,7 +161,8 @@ impl DecodeRoute {
     }
 }
 
-/// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens: on
+/// The bytes admission prices for a request of `admitted_prompt` + `max_new_tokens` tokens (the
+/// engine's device-positions step buffers included, [`Decoder::device_step_bytes`]): on
 /// the reference geometry for the reference loop, and on the step seam's geometry whenever the
 /// engine runs — its cache keeps a per-token checkpoint ring of `K + 2` recurrent states per
 /// linear layer the reference cache does not (sc-24131; `2` with no proposer), and its verify
@@ -190,14 +191,13 @@ fn priced_request_bytes(
         DecodeRoute::Reference => model.memory_geometry(),
     };
     let graph_workspace = match route {
-        DecodeRoute::Engine { drafts, .. } => engine_graph_workspace(
-            model,
-            drafts,
-            u64::try_from(admitted_prompt)
+        DecodeRoute::Engine { drafts, .. } => {
+            let positions = u64::try_from(admitted_prompt)
                 .ok()?
-                .checked_add(u64::from(max_new_tokens))?,
-            cuda_graphs,
-        )?,
+                .checked_add(u64::from(max_new_tokens))?;
+            engine_graph_workspace(model, drafts, positions, cuda_graphs)?
+                .checked_add(model.device_step_bytes(drafts, positions)?)?
+        }
         DecodeRoute::Reference => 0,
     };
     core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
@@ -236,21 +236,76 @@ fn engine_graph_workspace(
 /// prompt + budget) is known: the static KV preallocation for those positions plus the verify
 /// overshoot of `drafts` positions (a prompt-lookup plan, sc-24433; `0` with no proposer), plus —
 /// when the CUDA-graph runner wraps the engine (`cuda_graphs`) — its graph workspace over the
-/// same reach (sc-24140). `None` on overflow.
+/// same reach (sc-24140), and the device-positions step buffers (sc-24441). `None` on overflow.
 fn spliced_prompt_bytes(
     model: &Decoder,
     capacity: usize,
     drafts: u32,
     cuda_graphs: bool,
 ) -> Option<u64> {
-    let graphs = engine_graph_workspace(model, drafts, u64::try_from(capacity).ok()?, cuda_graphs)?;
+    let positions = u64::try_from(capacity).ok()?;
+    let graphs = engine_graph_workspace(model, drafts, positions, cuda_graphs)?;
     let preallocated = capacity.checked_add(usize::try_from(drafts).ok()?)?;
     u64::try_from(model.static_kv_bytes(preallocated))
         .ok()?
-        .checked_add(graphs)
+        .checked_add(graphs)?
+        .checked_add(model.device_step_bytes(drafts, positions)?)
 }
 
 impl Decoder {
+    /// Device bytes the engine's device-positions step (sc-24441) holds beyond the static KV, for
+    /// a request whose prompt and budget reach `positions` positions with `drafts` drafts per
+    /// verify step: the cache's staged position buffers ([`DevicePositions::BYTES`]) and one
+    /// step's length-aware attention workspace — a `drafts + 1`-token step over the whole
+    /// capacity, the widest head ([`candle_quant_kernels::decode_attention_workspace_bytes`]; it is
+    /// freed after each layer, so one is live at a time). `0` when the decoder's caches do not
+    /// stage device positions. `None` on overflow.
+    ///
+    /// [`DevicePositions::BYTES`]: crate::primitives::DevicePositions::BYTES
+    fn device_step_bytes(&self, drafts: u32, positions: u64) -> Option<u64> {
+        let (active, heads, head_dim) = match self {
+            Decoder::Causal(m) => (
+                m.device_positions_active(),
+                m.config().num_heads,
+                m.kv_layout()
+                    .layers
+                    .iter()
+                    .flatten()
+                    .map(|l| l.key_dim.max(l.value_dim))
+                    .max()
+                    .unwrap_or(0),
+            ),
+            Decoder::Qwen35(m) => (
+                m.device_positions_active(),
+                m.config().num_heads,
+                m.config().head_dim.max(0) as usize,
+            ),
+        };
+        if !active {
+            return Some(0);
+        }
+        let capacity = usize::try_from(positions.checked_add(u64::from(drafts))?).ok()?;
+        let queries = usize::try_from(drafts.checked_add(1)?).ok()?;
+        let workspace = candle_quant_kernels::decode_attention_workspace_bytes(
+            1,
+            heads.max(0) as usize,
+            queries,
+            capacity,
+            head_dim,
+        );
+        u64::try_from(crate::primitives::DevicePositions::BYTES.checked_add(workspace)?).ok()
+    }
+
+    /// Whether the decoder's step can be captured as a CUDA graph at all
+    /// ([`StepModel::graph_support`](crate::decode::StepModel::graph_support)).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        use crate::decode::StepModel;
+        match self {
+            Decoder::Causal(m) => m.graph_support(),
+            Decoder::Qwen35(m) => m.graph_support(),
+        }
+    }
+
     /// Bytes a static KV cache of `capacity` positions preallocates for this decoder (the
     /// model's own `static_kv_bytes`) — what a request that ran past that capacity was refused
     /// for (sc-24140).
@@ -348,11 +403,13 @@ impl Decoder {
     /// (sc-24138: `Gqa` by default — the static cache's arithmetic — when every layer can express
     /// it; `Expanded` when that pre-migration arithmetic is selected as a comparison, or when a
     /// layer cannot attend un-expanded: a Gemma 2 soft-cap, a Gemma 4 sliding window, MLA); the
-    /// Qwen3.5 hybrid reports its selector.
+    /// Qwen3.5 hybrid reports its selector. Either reports `DecodeAttention` when its device
+    /// positions are active and it attends un-expanded: the reference loop's cached steps then
+    /// run the length-aware decode attention (sc-24441).
     fn attn_formulation(&self) -> crate::primitives::AttnFormulation {
         match self {
-            Decoder::Causal(m) => m.effective_attn_formulation(m.attn_formulation()),
-            Decoder::Qwen35(m) => m.attn_formulation(),
+            Decoder::Causal(m) => m.decode_attention_formulation(m.attn_formulation()),
+            Decoder::Qwen35(m) => m.decode_attention_formulation(m.attn_formulation()),
         }
     }
 
@@ -873,22 +930,33 @@ fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
 /// What a request's `draft_model` proposer holds beside the target (E7, sc-24436): the draft's
 /// own prefill of the same prompt and a static cache of the request's reach plus the `K + 1`
 /// draft positions a step writes, with — for a hybrid draft — the `K + 2` retained recurrent
-/// checkpoints [`DraftModelProposer`] keeps. `None` on overflow.
+/// checkpoints [`DraftModelProposer`] keeps; and, when the draft's caches stage device positions
+/// (the CUDA default, sc-24441), their position buffers and one step's decode-attention workspace
+/// over that reach ([`Decoder::device_step_bytes`]). `None` on overflow.
 fn draft_request_bytes(
     draft: &Decoder,
     admitted_prompt: usize,
     max_new_tokens: u32,
     drafts: u32,
 ) -> Option<u64> {
+    let budget = max_new_tokens.checked_add(drafts.checked_add(1)?)?;
+    // The draft's cache holds the request's reach plus the `K + 1` positions a step writes
+    // (`new_cache_for(capacity, K + 1)`), and its widest step is a `K + 1`-token replay:
+    // `device_step_bytes` spans `positions + K` with `K + 1` queries.
+    let positions = u64::try_from(admitted_prompt)
+        .ok()?
+        .checked_add(u64::from(max_new_tokens))?
+        .checked_add(1)?;
     core_llm::estimate_chunked_request_bytes_with_recurrent_copies(
         admitted_prompt,
-        max_new_tokens.checked_add(drafts.checked_add(1)?)?,
+        budget,
         draft.memory_geometry_with_checkpoints(usize::try_from(drafts).ok()?.checked_add(2)?),
         0,
         0,
         EAGER_ATTN_QUERY_CHUNK_SIZE,
         1,
-    )
+    )?
+    .checked_add(draft.device_step_bytes(drafts, positions)?)
 }
 
 /// The load telemetry of a [`LlamaProvider`] (sc-24135, epic sc-24128 E2): which weight format was
@@ -914,10 +982,12 @@ pub struct LoadRecord {
     /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
     /// follows the process switch.
     pub cuda_graphs: Option<bool>,
-    /// Every feature the load asked for but did not deliver, each named by the feature
-    /// (`mtp_head: …`): a companion MTP head ([`LoadSpec::mtp_head_source`]) that was refused by
-    /// load admission, did not match the target, or named a non-Qwen3.5 target. The target still
-    /// loaded (epic sc-24432 E2).
+    /// Every feature the load asked for but did not deliver, each named by the feature:
+    /// `mtp_head: …`, a companion MTP head ([`LoadSpec::mtp_head_source`]) that was refused by
+    /// load admission, did not match the target, or named a non-Qwen3.5 target; and, with the
+    /// CUDA-graph switch on, `cuda_graphs: <graph_support reason>` for a decoder whose step the
+    /// graph runner can never capture (sc-24441), known at load so a product can disable its
+    /// graph toggle before the first generation. The target still loaded (epic sc-24432 E2).
     pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (sc-24437): the requested
     /// budget clamped to the headroom admission left. `None` for a provider assembled without a
@@ -1626,6 +1696,7 @@ impl LlamaProvider {
                 provider.attach_draft(&draft_spec, &device, requested.as_ref())
             }
         }
+        provider.note_graph_refusal(cuda_graphs);
         Ok(provider)
     }
 
@@ -1644,7 +1715,7 @@ impl LlamaProvider {
             return Ok(None);
         };
         let draft_spec = draft_load_spec(spec, source);
-        let refusal = match Self::load_memory_estimate(&draft_spec, cuda) {
+        let refusal = match Self::load_memory_estimate_as(&draft_spec, cuda, false) {
             Err(e) => {
                 core_llm::admit_request_memory(host.0, host.1)?;
                 if let Some((required, available)) = device {
@@ -1883,7 +1954,23 @@ impl LlamaProvider {
     /// caller (or the residency evidence) reads the figure the load was admitted against. Reads
     /// only file sizes, `config.json` and tensor headers — never tensor data; an unreadable
     /// source is [`CoreError::Load`].
+    ///
+    /// A CUDA load whose decoder the CUDA-graph runner wraps (its policy: `spec.cuda_graphs`,
+    /// else the process switch) also prices the parameter cache the runner's captures leave
+    /// resident for the process ([`LoadMemoryEstimate::graph_param_cache_bytes`], sc-24441).
     pub fn load_memory_estimate(spec: &LoadSpec, cuda: bool) -> CoreResult<LoadMemoryEstimate> {
+        Self::load_memory_estimate_as(spec, cuda, true)
+    }
+
+    /// [`load_memory_estimate`](Self::load_memory_estimate) of `spec` as a provider's target
+    /// (`target`: the graph runner wraps it under its policy) or as a resident draft (never
+    /// wrapped: the draft proposer runs its forwards eagerly, so it adds nothing to the
+    /// parameter cache).
+    fn load_memory_estimate_as(
+        spec: &LoadSpec,
+        cuda: bool,
+        target: bool,
+    ) -> CoreResult<LoadMemoryEstimate> {
         let source = Path::new(&spec.source);
         let payload = core_llm::checkpoint_payload_bytes(source)?;
         let staging = core_llm::checkpoint_staging_bytes(source)?;
@@ -1938,6 +2025,15 @@ impl LlamaProvider {
             load_memory_requirements(payload, staging, projector, cuda, working)
                 .ok_or_else(overflow)?;
         let on_device = |bytes: u64| if cuda { bytes } else { 0 };
+        let graphs = target && spec.cuda_graphs.unwrap_or_else(cuda_graphs_enabled);
+        let graph_param_cache = if graphs {
+            on_device(crate::decode::graph_param_cache_load_bytes())
+        } else {
+            0
+        };
+        let device_required = device_required
+            .map(|bytes| bytes.checked_add(graph_param_cache).ok_or_else(overflow))
+            .transpose()?;
         Ok(LoadMemoryEstimate {
             payload_bytes: payload,
             host_required_bytes: host_required,
@@ -1946,6 +2042,7 @@ impl LlamaProvider {
             source_bytes: on_device(working.source),
             cast_copy_bytes: on_device(working.cast),
             quantized_copy_bytes: on_device(working.copy),
+            graph_param_cache_bytes: graph_param_cache,
         })
     }
 
@@ -2421,6 +2518,20 @@ impl LlamaProvider {
         }
     }
 
+    /// With the CUDA-graph switch the load settled on (`cuda_graphs`), name a decoder whose step
+    /// the graph runner can never capture in the load's fallbacks — `cuda_graphs: <reason>`, the
+    /// decoder's own [`graph_support`](crate::decode::StepModel::graph_support) refusal — so a
+    /// product knows at load, not after the first generation (sc-24441, E3). Each request still
+    /// reports its eager steps and their reason. Nothing is named with the switch off or for a
+    /// capturable decoder.
+    fn note_graph_refusal(&mut self, cuda_graphs: bool) {
+        if let (true, Err(reason)) = (cuda_graphs, self.model.graph_support()) {
+            self.load_record
+                .fallbacks
+                .push(format!("cuda_graphs: {reason}"));
+        }
+    }
+
     /// The load telemetry: the requested weight format and the resident weight census by
     /// projection kind (sc-24135).
     pub fn load_record(&self) -> LoadRecord {
@@ -2800,8 +2911,8 @@ pub struct LoadMemoryEstimate {
     /// its quantized copy).
     pub host_required_bytes: u64,
     /// Device bytes a CUDA load needs (`None` on a host device): `source_bytes`, 25 percent
-    /// headroom over it, `cast_copy_bytes`, `quantized_copy_bytes` and any external projector's
-    /// bound.
+    /// headroom over it, `cast_copy_bytes`, `quantized_copy_bytes`, any external projector's
+    /// bound and `graph_param_cache_bytes`.
     pub device_required_bytes: Option<u64>,
     /// The cross-turn prefix cache's budget the load asks for (sc-24437):
     /// [`LoadSpec::prefix_cache_bytes`], else [`core_llm::DEFAULT_PREFIX_CACHE_BYTES`]. Memory
@@ -2823,6 +2934,12 @@ pub struct LoadMemoryEstimate {
     /// the loader stores in the requested (or a snapshot's persisted) format, at the bytes the
     /// quantizer allocates for them (`0` for a dense or Prism load, and off CUDA).
     pub quantized_copy_bytes: u64,
+    /// What the CUDA-graph runner's captures leave resident in the vendored candle's parameter
+    /// cache for the rest of the process
+    /// ([`graph_param_cache_load_bytes`](crate::decode::graph_param_cache_load_bytes), sc-24441):
+    /// priced once per load because the cache outlives every request and the model itself.
+    /// `0` off CUDA, with the graph runner off, and for a resident draft (never wrapped).
+    pub graph_param_cache_bytes: u64,
 }
 
 /// How a load prices its host domain.
@@ -6507,6 +6624,153 @@ mod tests {
         );
     }
 
+    /// sc-24441 (E3): with the CUDA-graph switch on, a load whose decoder the runner can never
+    /// capture names it in the load's fallbacks (`cuda_graphs: <graph_support reason>`) — here a
+    /// dense llama with device positions off (`positions_host_scalar`) — and names nothing with
+    /// the switch off or for a capturable decoder (device positions on). The device-positions
+    /// default is process state read once, so each setting runs in a child process of its own.
+    #[test]
+    fn a_graph_load_names_a_decoder_the_runner_cannot_capture() {
+        use core_llm::TextLlm;
+        const CHILD: &str = "CANDLE_LLM_GRAPH_REFUSAL_TEST_CHILD";
+        let Ok(setting) = std::env::var(CHILD) else {
+            let name = std::thread::current().name().unwrap().to_owned();
+            for setting in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &name, "--nocapture"])
+                    .env(CHILD, setting)
+                    .env(crate::primitives::DEVICE_POSITIONS_ENV, setting)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "device positions {setting}");
+            }
+            return;
+        };
+        let (cfg, weights) = tiny_llama_parts();
+        let dir = write_snapshot(&cfg, &weights, 40);
+        let load = |graphs: bool| {
+            super::LlamaProvider::load(&core_llm::LoadSpec {
+                cuda_graphs: Some(graphs),
+                ..spec_at(dir.path(), None)
+            })
+            .unwrap()
+        };
+        let provider = load(true);
+        let fallbacks = provider.load_report().unwrap().fallbacks;
+        if setting == "1" {
+            assert_eq!(provider.model.graph_support(), Ok(()), "capturable");
+            assert!(fallbacks.is_empty(), "{fallbacks:?}");
+        } else {
+            assert_eq!(
+                fallbacks,
+                vec!["cuda_graphs: positions_host_scalar".to_string()]
+            );
+            assert!(load(false).load_report().unwrap().fallbacks.is_empty());
+        }
+    }
+
+    /// sc-24441: the reference loop's record names the decode attention when the decoder's
+    /// device positions are active (its cached steps run it over the growing cache), for both
+    /// families, and the selector otherwise.
+    #[test]
+    fn the_reference_loop_reports_the_decode_attention_with_device_positions() {
+        use crate::primitives::AttnFormulation;
+        let mut causal = tiny_llama_for_admission();
+        let (_, mut hybrid) = crate::models::qwen35::tests::text_model();
+        assert_eq!(
+            Decoder::Causal(tiny_llama_for_admission()).attn_formulation(),
+            AttnFormulation::Gqa
+        );
+        assert_eq!(
+            Decoder::Qwen35(crate::models::qwen35::tests::text_model().1).attn_formulation(),
+            AttnFormulation::Gqa
+        );
+        causal.set_device_positions(true);
+        hybrid.set_device_positions(true);
+        let (causal, hybrid) = (Decoder::Causal(causal), Decoder::Qwen35(hybrid));
+        assert_eq!(causal.attn_formulation(), AttnFormulation::DecodeAttention);
+        assert_eq!(hybrid.attn_formulation(), AttnFormulation::DecodeAttention);
+    }
+
+    /// sc-24441 (E7): a decoder whose caches stage device positions is priced, on every engine
+    /// admission (the request, the Gemma-style spliced re-admission, a `draft_model` draft's
+    /// request), for the position buffers plus one step's decode-attention workspace — a
+    /// `K + 1`-query step over the whole cache — and for nothing when it does not. Both decoder
+    /// families; both device-positions settings; literal bytes (4 heads, width 8).
+    #[test]
+    fn device_positions_price_their_buffers_and_the_decode_attention_workspace() {
+        use crate::primitives::DevicePositions;
+        use candle_quant_kernels::decode_attention_workspace_bytes;
+        let engine = |drafts| super::DecodeRoute::Engine {
+            proposer: ProposerKind::PromptLookup,
+            drafts,
+        };
+        let decoders = |on: bool| {
+            let mut causal = tiny_llama_for_admission();
+            causal.set_device_positions(on);
+            let (_, mut hybrid) = crate::models::qwen35::tests::text_model();
+            hybrid.set_device_positions(on);
+            [Decoder::Causal(causal), Decoder::Qwen35(hybrid)]
+        };
+        // (prompt, budget, K, the device-positions bytes). Positions = prompt + budget; the
+        // cache spans positions + K; 256-key chunks.
+        let cases = [
+            (40usize, 24u32, 3u32, 776u64),
+            (40, 24, 0, 296),
+            (300, 24, 3, 1_416),
+        ];
+        for (off, on) in decoders(false).iter().zip(decoders(true).iter()) {
+            for &(prompt, budget, k, bytes) in &cases {
+                let positions = prompt + budget as usize;
+                assert_eq!(
+                    bytes as usize,
+                    DevicePositions::BYTES
+                        + decode_attention_workspace_bytes(
+                            1,
+                            4,
+                            k as usize + 1,
+                            positions + k as usize,
+                            8,
+                        ),
+                );
+                assert_eq!(off.device_step_bytes(k, positions as u64), Some(0));
+                assert_eq!(on.device_step_bytes(k, positions as u64), Some(bytes));
+                for graphs in [false, true] {
+                    let priced = |d: &Decoder| {
+                        super::priced_request_bytes(d, engine(k), prompt, budget, 0, graphs)
+                            .unwrap()
+                    };
+                    assert_eq!(priced(on), priced(off) + bytes, "request, graphs={graphs}");
+                    let spliced =
+                        |d: &Decoder| super::spliced_prompt_bytes(d, positions, k, graphs).unwrap();
+                    assert_eq!(
+                        spliced(on),
+                        spliced(off) + bytes,
+                        "spliced, graphs={graphs}"
+                    );
+                }
+                // The reference loop runs no static cache: nothing to price.
+                let reference = |d: &Decoder| {
+                    super::priced_request_bytes(
+                        d,
+                        super::DecodeRoute::Reference,
+                        prompt,
+                        budget,
+                        0,
+                        false,
+                    )
+                };
+                assert_eq!(reference(on), reference(off));
+            }
+            // A draft (sc-24436) caches the reach plus `K + 1` and replays up to `K + 1` tokens:
+            // 4 queries over 40 + 24 + 4 positions.
+            assert_eq!(
+                super::draft_request_bytes(on, 40, 24, 3).unwrap(),
+                super::draft_request_bytes(off, 40, 24, 3).unwrap() + 776
+            );
+        }
+    }
+
     /// sc-24140 (E6): the Gemma 4 soft-token splice re-admits its expanded prompt with the
     /// static preallocation and, when the CUDA-graph runner wraps the engine, the runner's graph
     /// workspace over the same reach (one step token count: no proposer).
@@ -6829,12 +7093,15 @@ mod tests {
         dir
     }
 
+    /// The graph runner is pinned off: a CUDA estimate otherwise follows the process switch
+    /// (the parameter-cache term, sc-24441), which other tests flip concurrently.
     fn spec_at(
         source: &std::path::Path,
         quantize: Option<core_llm::Quantize>,
     ) -> core_llm::LoadSpec {
         core_llm::LoadSpec {
             quantize,
+            cuda_graphs: Some(false),
             ..core_llm::LoadSpec::dense(source.display().to_string())
         }
     }
@@ -8199,6 +8466,58 @@ mod tests {
         );
     }
 
+    /// sc-24441 (E7): a CUDA load the graph runner wraps prices the parameter cache its
+    /// captures leave resident for the process — 32 MiB, once per load — and nothing with the
+    /// runner off or off CUDA; a resident draft is never wrapped, so its admission beside the
+    /// target carries none.
+    #[test]
+    fn a_cuda_load_under_the_graph_runner_prices_the_parameter_cache_once() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let with = |graphs: bool| core_llm::LoadSpec {
+            cuda_graphs: Some(graphs),
+            ..fixture.spec_with_draft()
+        };
+        let estimate =
+            |graphs, cuda| super::LlamaProvider::load_memory_estimate(&with(graphs), cuda);
+        let (on, off) = (
+            estimate(true, true).unwrap(),
+            estimate(false, true).unwrap(),
+        );
+        assert_eq!(on.graph_param_cache_bytes, 32 << 20);
+        assert_eq!(off.graph_param_cache_bytes, 0);
+        assert_eq!(
+            on.device_required_bytes,
+            Some(off.device_required_bytes.unwrap() + (32 << 20))
+        );
+        let host = estimate(true, false).unwrap();
+        assert_eq!(
+            (host.graph_param_cache_bytes, host.device_required_bytes),
+            (0, None)
+        );
+        // The draft beside a graph-wrapped target: exactly room for its own unwrapped load.
+        let draft = super::LlamaProvider::load_memory_estimate(
+            &core_llm::LoadSpec {
+                cuda_graphs: Some(false),
+                ..core_llm::LoadSpec::dense(fixture.draft.to_string_lossy())
+            },
+            true,
+        )
+        .unwrap()
+        .device_required_bytes
+        .unwrap();
+        let target = on.device_required_bytes.unwrap();
+        let (_, refusal) = super::LlamaProvider::admit_draft(
+            &with(true),
+            true,
+            (on.host_required_bytes, u64::MAX),
+            Some((target, target + draft)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(refusal, None, "the draft carries no parameter cache");
+    }
+
     /// sc-24436 E7: a named draft is admitted at load only beside the target, in the host domain
     /// and (on CUDA) the device domain; without room it is refused by name and the target still
     /// loads; a target that does not fit is refused exactly as before.
@@ -8206,12 +8525,17 @@ mod tests {
     fn a_draft_is_admitted_at_load_only_beside_the_target() {
         let root = tempfile::tempdir().unwrap();
         let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
-        let spec = fixture.spec_with_draft();
+        // The graph runner pinned off: a CUDA estimate otherwise follows the process switch.
+        let unwrapped = |spec: core_llm::LoadSpec| core_llm::LoadSpec {
+            cuda_graphs: Some(false),
+            ..spec
+        };
+        let spec = unwrapped(fixture.spec_with_draft());
         let target = super::LlamaProvider::load_memory_estimate(&spec, false)
             .unwrap()
             .host_required_bytes;
         let draft = super::LlamaProvider::load_memory_estimate(
-            &core_llm::LoadSpec::dense(fixture.draft.to_string_lossy()),
+            &unwrapped(core_llm::LoadSpec::dense(fixture.draft.to_string_lossy())),
             false,
         )
         .unwrap()
@@ -8248,8 +8572,9 @@ mod tests {
                 .unwrap()
         };
         let target_device = device_bytes(&spec);
-        let draft_device =
-            device_bytes(&core_llm::LoadSpec::dense(fixture.draft.to_string_lossy()));
+        let draft_device = device_bytes(&unwrapped(core_llm::LoadSpec::dense(
+            fixture.draft.to_string_lossy(),
+        )));
         assert!(draft_device > 0);
         let cuda =
             |device| super::LlamaProvider::admit_draft(&spec, true, (target, u64::MAX), device);
@@ -9378,17 +9703,26 @@ mod tests {
         let (mut on, mut off) = (load(true), load(false));
         let engine = run(&on);
         assert_eq!(engine.path, DecodePath::StepModel);
-        assert_eq!(
-            engine.cuda_graphs.eager + engine.cuda_graphs.replayed,
-            engine.target_forwards,
+        // Every target forward went through the runner — once each, or, for the step a graph is
+        // captured at (sc-24441: the dense decoders capture on CUDA), as the eager reference plus
+        // the eager re-run of the capture check.
+        assert!(
+            engine.cuda_graphs.eager + engine.cuda_graphs.replayed >= engine.target_forwards,
             "every step of the Off request went through the runner: {}",
             engine.cuda_graphs.describe()
         );
-        let reason = engine
-            .cuda_graphs
-            .fallback_reason
-            .expect("an eager step names why");
-        assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH);
+        // An eager step names why — unless the runner could capture this decoder (sc-24441: the
+        // dense decoders capture on CUDA), where an eager step without a reason is a prefill
+        // segment, a warm-up or a capture's eager reference, and a 3-token request can end before
+        // any shape is captured or replayed.
+        match engine.cuda_graphs.fallback_reason {
+            Some(reason) => assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH),
+            None => assert!(
+                on.model.device().is_cuda() && on.model.graph_support().is_ok(),
+                "an eager step with no reason on a decoder the runner cannot capture: {}",
+                engine.cuda_graphs.describe()
+            ),
+        }
         assert_eq!(run(&off).cuda_graphs.label(), "none");
 
         let describe = |provider: &mut super::LlamaProvider| {

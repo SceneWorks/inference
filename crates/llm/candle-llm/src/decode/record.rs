@@ -395,6 +395,7 @@ impl DecodeRecord {
                 captured: self.cuda_graphs.captured,
                 fallback_reason: self.cuda_graphs.fallback_reason.map(str::to_string),
             },
+            graph_path: self.cuda_graphs.graph_path().to_string(),
             nvfp4_projections: core_llm::PathReport {
                 path: self.nvfp4_projections.label().to_string(),
                 reason: self.nvfp4_projections.cublaslt_reason.map(str::to_string),

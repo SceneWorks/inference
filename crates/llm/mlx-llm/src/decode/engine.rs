@@ -1332,6 +1332,7 @@ fn report<T: SpeculativeTarget + ?Sized>(
             path: "none".into(),
             ..CudaGraphsReport::default()
         },
+        graph_path: "none".into(),
         nvfp4_projections: none(),
         fused_primitives: none(),
         target_forwards: stats.forwards as u64,

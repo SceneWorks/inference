@@ -1757,22 +1757,34 @@ fn engine_refuses_a_draft_with_another_vocabulary() {
     assert!(err.to_string().contains("vocab mismatch"), "{err}");
 }
 
-/// sc-24134 × sc-24138: the families migrated onto the step seam declare that their steps cannot
-/// be replayed as CUDA graphs — every step's positions are Rust-side scalars (the RoPE offset or
-/// the learned-position rows taken at the cache's host-side length, the KV written there) — and
-/// the step cache names why it is not a graph backing on each backing, so the graph runner
-/// refuses by name before any capture instead of trusting the trait's permissive default.
+/// sc-24134 × sc-24138 × sc-24441: the families migrated onto the step seam declare whether
+/// their steps can be replayed as CUDA graphs, and the step cache names why it is not a graph
+/// backing on each backing, so the graph runner refuses by name before any capture instead of
+/// trusting the trait's permissive default. With device positions off (the CPU default) every
+/// step's positions are Rust-side scalars; the llama family with them on is capturable, on a
+/// static cache that stages them. StarCoder2, StarVector and LLaVA keep host positions.
 #[test]
 fn migrated_families_declare_their_steps_uncapturable() {
-    let causal = tiny_causal(false, 7);
+    let mut causal = tiny_causal(false, 7);
+    assert!(!causal.device_positions(), "off on the CPU by default");
     assert_eq!(
         StepModel::graph_support(&causal),
         Err("positions_host_scalar")
     );
+    let mut g4 = gemma4();
+    assert_eq!(StepModel::graph_support(&g4), Err("positions_host_scalar"));
+    causal.set_device_positions(true);
+    g4.set_device_positions(true);
+    assert_eq!(StepModel::graph_support(&causal), Ok(()));
+    assert_eq!(StepModel::graph_support(&g4), Ok(()));
+    let staged = causal.new_static_cache(8).unwrap();
+    assert!(staged.device_positions().is_some());
+    assert_eq!(DecodeCache::graph_support(&staged), Ok(()));
     assert_eq!(
-        StepModel::graph_support(&gemma4()),
-        Err("positions_host_scalar")
+        DecodeCache::graph_support(&causal.new_step_cache()),
+        Err("growing_kv")
     );
+    causal.set_device_positions(false);
     assert_eq!(
         StepModel::graph_support(tiny_llava().language()),
         Err("positions_host_scalar")
@@ -1793,4 +1805,132 @@ fn migrated_families_declare_their_steps_uncapturable() {
         DecodeCache::graph_support(&causal.new_static_cache(8).unwrap()),
         Err("positions_host_scalar")
     );
+}
+
+// ---- device positions (sc-24441) ----------------------------------------------------------------
+
+/// Every logit row of `a` within f32 rounding of `b`'s, with the same argmax.
+fn assert_rows_close(what: &str, a: &Tensor, b: &Tensor) {
+    assert_eq!(a.dims(), b.dims(), "{what}: shape");
+    let (a, b) = (host(a), host(b));
+    let scale = b.iter().fold(1f32, |m, x| m.max(x.abs()));
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!(
+            (x - y).abs() <= 1e-4 * scale,
+            "{what}: [{i}] device positions {x} vs host {y}"
+        );
+    }
+}
+
+/// Drive `host` (device positions off) and `dev` (on) through the same steps on their static
+/// step caches — a short prefill, single decodes, a 4-token all-position verify with hidden
+/// states, a rollback into it, and a decode past the rollback — and require every output to agree
+/// to f32 rounding: the device path (RoPE from device positions, K/V written at a device index,
+/// the length-aware decode attention) is the host path's arithmetic with the positions moved.
+fn assert_device_positions_steps_match(what: &str, host_model: &CausalLm, dev_model: &CausalLm) {
+    let mut hc = host_model.new_cache_for(40, 3).unwrap();
+    let mut dc = dev_model.new_cache_for(40, 3).unwrap();
+    // The device-positions model's growing reference cache attends its cached short steps with
+    // the same length-aware attention: bit-identical to its static path by construction.
+    let mut gc = dev_model.new_step_cache();
+    assert!(hc.device_positions().is_none(), "{what}: host cache");
+    assert!(dc.device_positions().is_some(), "{what}: device cache");
+    assert_eq!(DecodeCache::graph_support(&dc), Ok(()), "{what}");
+    let steps: [(&[i32], bool); 5] = [
+        (&[3, 17, 5, 29, 3, 17, 5], false),
+        (&[11], false),
+        (&[2], false),
+        (&[7, 9, 4, 13], true),
+        (&[21], false),
+    ];
+    for (n, (tokens, all)) in steps.iter().enumerate() {
+        let req = if *all {
+            StepRequest::all(tokens).with_hidden(true)
+        } else {
+            StepRequest::last(tokens)
+        };
+        let h = host_model.forward_step(&mut hc, req).unwrap();
+        let d = dev_model.forward_step(&mut dc, req).unwrap();
+        let g = dev_model.forward_step(&mut gc, req).unwrap();
+        assert_rows_close(&format!("{what} step {n} logits"), &d.logits, &h.logits);
+        assert_eq!(
+            host(&g.logits),
+            host(&d.logits),
+            "{what} step {n}: growing vs static, one arithmetic"
+        );
+        if let (Some(dh), Some(hh)) = (&d.hidden, &h.hidden) {
+            assert_rows_close(&format!("{what} step {n} hidden"), dh, hh);
+        }
+        assert_eq!(
+            DecodeCache::len(&hc),
+            DecodeCache::len(&dc),
+            "{what}: lengths"
+        );
+        if *all {
+            // Reject the last two verify positions, as a speculative engine would.
+            let back = DecodeCache::len(&hc) - 2;
+            hc.rollback_to(back).unwrap();
+            dc.rollback_to(back).unwrap();
+            gc.rollback_to(back).unwrap();
+        }
+    }
+    // Greedy through the step driver and through the speculative engine (prompt lookup, whose
+    // verify steps accept and reject): the same tokens on both paths.
+    let config = greedy_config(NEW_TOKENS);
+    let (h, _) = generate_step(
+        host_model,
+        &LLAMA_PROMPT,
+        &config,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    let (d, record) = generate_step(
+        dev_model,
+        &LLAMA_PROMPT,
+        &config,
+        &CancelFlag::new(),
+        &mut |_| {},
+        None,
+    )
+    .unwrap();
+    assert_eq!(d.tokens, h.tokens, "{what}: step driver");
+    assert_eq!(record.kv_cache, KvCacheKind::Static);
+    let spec = |m: &CausalLm| {
+        generate_speculative(
+            m,
+            &mut NgramProposer { max_ngram: 3 },
+            SpeculativePrompt::Tokens(&LLAMA_PROMPT),
+            &config,
+            3,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+        )
+        .unwrap()
+    };
+    let (hs, ds) = (spec(host_model), spec(dev_model));
+    assert_eq!(ds.output.tokens, hs.output.tokens, "{what}: speculative");
+    assert_eq!(ds.stats.accepted, hs.stats.accepted, "{what}: acceptance");
+    assert_eq!(
+        ds.output.tokens, h.tokens,
+        "{what}: speculation is greedy-exact"
+    );
+}
+
+/// sc-24441 AC (CPU half): the device-positions step path emits the host path's greedy tokens on
+/// the llama family's fixtures — Llama, dense Qwen3 (per-head q/k norm) and Gemma 4 (sliding
+/// window of 3, per-layer-type RoPE with a proportional partial schedule, shared K/V projection).
+#[test]
+fn device_positions_steps_match_the_host_path() {
+    for (what, host_model, mut dev_model) in [
+        ("llama", tiny_causal(false, 7), tiny_causal(false, 7)),
+        ("qwen3", tiny_causal(true, 11), tiny_causal(true, 11)),
+        ("gemma4", gemma4(), gemma4()),
+    ] {
+        dev_model.set_device_positions(true);
+        assert_eq!(dev_model.device_positions_support(), Ok(()), "{what}");
+        assert_device_positions_steps_match(what, &host_model, &dev_model);
+    }
 }
