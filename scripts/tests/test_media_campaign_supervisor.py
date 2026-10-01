@@ -201,6 +201,13 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual((record["accepted"], record["outcome"], record["pid"]),
                          (False, "aborted", caught.exception.pid))
         safety.validate_admission(record["admission"], policy_sha256=self.policy.sha256)
+        # The breaching sample is sealed with the abort, so a cap overrun names its size and time.
+        breach = record["watchdogChildFootprint"]
+        self.assertEqual((breach["footprintBytes"], breach["capBytes"], breach["sampleCount"]),
+                         (10**7, self.policy.child_footprint_cap_bytes, 1))
+        self.assertEqual(breach["trajectory"], [{"elapsedMillis": breach["elapsedMillis"],
+                                                 "footprintBytes": 10**7}])
+        self.assertNotIn("processes", breach)  # the fixture probe exposes no per-process split
         (self.root / "stdout").unlink()
         (self.root / "stderr").unlink()
         with self.assertRaisesRegex(safety.SupervisionError, "child-exit") as caught:
@@ -760,8 +767,27 @@ class SupervisorTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "proc_pid_rusage is Darwin-only")
     def test_system_probe_caps_a_real_child_through_proc_pid_rusage(self):
         # A Python interpreter's footprint is well above the 1 MB fixture cap.
-        with self.assertRaisesRegex(safety.SupervisionError, "child-footprint"):
+        with self.assertRaisesRegex(safety.SupervisionError, "child-footprint") as caught:
             self.run_child("import time; time.sleep(5)", probe=safety.SystemProbe(self.policy))
+        breach = caught.exception.watchdog_child_footprint
+        # The per-process split is the same sample as the breaching total, keyed by owned PID.
+        self.assertEqual([item["pid"] for item in breach["processes"]], [caught.exception.pid])
+        self.assertEqual(sum(item["footprintBytes"] for item in breach["processes"]),
+                         breach["footprintBytes"])
+        self.assertGreater(breach["footprintBytes"], breach["capBytes"])
+
+    def test_child_footprint_trajectory_is_evenly_thinned_and_ends_at_the_breach(self):
+        trajectory = [(index * 250, 1000 + index) for index in range(1000)]
+        breach = safety.child_footprint_breach(1999, 1500, trajectory, {7: 1500, 3: 499})
+        points = breach["trajectory"]
+        self.assertEqual(len(points), safety.CHILD_FOOTPRINT_TRAJECTORY_POINTS)
+        self.assertEqual(points[0], {"elapsedMillis": 0, "footprintBytes": 1000})
+        self.assertEqual(points[-1], {"elapsedMillis": 999 * 250, "footprintBytes": 1999})
+        self.assertEqual([point["elapsedMillis"] for point in points],
+                         sorted({point["elapsedMillis"] for point in points}))
+        self.assertEqual((breach["elapsedMillis"], breach["sampleCount"]), (999 * 250, 1000))
+        self.assertEqual(breach["processes"], [{"pid": 3, "footprintBytes": 499},
+                                               {"pid": 7, "footprintBytes": 1500}])
 
     def test_footprint_exit_race_requires_terminal_root_and_empty_owned_tree(self):
         class FailedProbe(Probe):

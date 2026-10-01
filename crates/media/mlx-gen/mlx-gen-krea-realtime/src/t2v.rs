@@ -339,6 +339,11 @@ pub fn decode_latents_to_video(
     tiling: Option<&TilingConfig>,
     cancel: &CancelFlag,
 ) -> Result<GenerationOutput> {
+    // The AR denoise is done: its freed activations and superseded KV staging sit in MLX's buffer
+    // cache, sized for DiT shapes the VAE never requests. Return them before the decode builds its
+    // own working set so the two phases' buffers never coexist in the process footprint (see
+    // `encode_prompt`). Live arrays — the DiT, the latents — are untouched.
+    mlx_rs::memory::clear_cache();
     // `decode_to_frames` reshapes `[C,F,H,W]` → `[1,C,F,H,W]`, decodes (single-pass or tiled), and
     // returns `[F_out, H_out, W_out, 3]` uint8; `frames_to_images` splits it into one `Image`/frame.
     let frames_u8 = decode_to_frames(vae, latents, tiling, Some(cancel))?;
@@ -704,6 +709,14 @@ fn encode_prompt(
     };
     let context = enc.encode(&tokenizer, prompt)?;
     mlx_rs::transforms::eval([&context])?;
+    // Release the UMT5 at the allocator, not only at the Rust handle. MLX recycles a freed Metal
+    // buffer into its process-wide cache and reuses it only for a near-identical size; it trims that
+    // cache only once active + cached nears 0.95 x the device working set (~91 GiB on a 128 GiB
+    // Mac). The encoder's Q8 packs and staging cannot be reused by the DiT/VAE shapes, so without
+    // this they stay in the process footprint for the whole render (SC-20684 cap overrun).
+    drop(enc);
+    drop(w);
+    mlx_rs::memory::clear_cache();
     Ok(context)
 }
 
