@@ -18,9 +18,10 @@
 //!
 //! Route inputs: `--image <png>` (I2V-14B); `--control-dir <dir> --mask-dir <dir>
 //! [--reference <png>]` (VACE and VACE-Fun); `--lightning on|off` on the A14B routes (the product
-//! default is on; campaign mode must state it), with `--lora-high <file> --lora-low <file>` naming
-//! the product's per-architecture Lightning pair when on (which forces the 4-step, guidance-1
-//! recipe). The campaign adapter owns every `--sc20686-*` flag.
+//! default is on; campaign mode must state it). When on, `--lightning-hub <hf hub dir>` is the
+//! Hugging Face hub the product resolves the `lightx2v/Wan2.2-Lightning` snapshot from, and
+//! `--lora-high <file> --lora-low <file>` must be the product's per-architecture pair in it (which
+//! forces the 4-step, guidance-1 recipe). The campaign adapter owns every `--sc20686-*` flag.
 
 use std::path::{Path, PathBuf};
 
@@ -69,6 +70,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--mask-dir",
     "--reference",
     "--lightning",
+    "--lightning-hub",
     "--lora-high",
     "--lora-low",
 ];
@@ -168,14 +170,26 @@ fn product_policy(route: &str, residency: &str) -> Result<OffloadPolicy> {
     })
 }
 
-/// The route's Lightning pair: `--lightning on|off` on the routes that bake Lightning (an ordinary
+/// The A14B Lightning inputs: the Hugging Face hub holding `lightx2v/Wan2.2-Lightning` (the
+/// snapshot is resolved from it exactly as the product resolves it) and the sealed LoRA pair the
+/// campaign hashed, which may arrive symlink-resolved to its blobs.
+#[derive(Debug, PartialEq)]
+struct Lightning {
+    hub: PathBuf,
+    high: PathBuf,
+    low: PathBuf,
+}
+
+/// The route's Lightning inputs: `--lightning on|off` on the routes that bake Lightning (an ordinary
 /// render may omit it and gets the product default, on), refused on every other route. On requires
-/// `--lora-high`/`--lora-low`; off forbids them.
-fn lightning_pair(route: &str, args: &Args) -> Result<Option<(PathBuf, PathBuf)>> {
+/// `--lightning-hub`, `--lora-high` and `--lora-low`; off forbids them.
+fn lightning_pair(route: &str, args: &Args) -> Result<Option<Lightning>> {
     let bakes = product_load::lightning_default(route);
-    let loras = args.get("--lora-high").is_some() || args.get("--lora-low").is_some();
+    let inputs = ["--lightning-hub", "--lora-high", "--lora-low"]
+        .iter()
+        .any(|flag| args.get(flag).is_some());
     if !bakes {
-        if args.get("--lightning").is_some() || loras {
+        if args.get("--lightning").is_some() || inputs {
             return Err(format!("{route} has no Lightning toggle").into());
         }
         return Ok(None);
@@ -190,43 +204,45 @@ fn lightning_pair(route: &str, args: &Args) -> Result<Option<(PathBuf, PathBuf)>
         None => true,
     };
     if !on {
-        if loras {
-            return Err("--lora-high/--lora-low require --lightning on".into());
+        if inputs {
+            return Err("--lightning-hub/--lora-high/--lora-low require --lightning on".into());
         }
         return Ok(None);
     }
-    Ok(Some((
-        PathBuf::from(args.required("--lora-high")?),
-        PathBuf::from(args.required("--lora-low")?),
-    )))
+    Ok(Some(Lightning {
+        hub: PathBuf::from(args.required("--lightning-hub")?),
+        high: PathBuf::from(args.required("--lora-high")?),
+        low: PathBuf::from(args.required("--lora-low")?),
+    }))
 }
 
 /// The route's `LoadSpec`: the product's own load decisions (`product_load_spec`) at the frozen
 /// campaign residency. Never assembled here, so the campaign measures the product's memory shape.
-/// A Lightning pair must be exactly the files the product resolves in that Lightning snapshot.
+/// The Lightning snapshot is resolved from the hub by the product resolver (never derived from a
+/// LoRA path, which the adapter hands over symlink-resolved to its blob), and the sealed pair must
+/// be byte-for-byte the files the product loads from it.
 fn route_load_spec(
     route: &str,
     residency: &str,
     snapshot: &Path,
-    lightning: Option<&(PathBuf, PathBuf)>,
+    lightning: Option<&Lightning>,
 ) -> Result<LoadSpec> {
     let policy = product_policy(route, residency)?;
     let lightning_snapshot = lightning
-        .map(|(high, _)| {
-            high.parent()
-                .and_then(Path::parent)
-                .ok_or("--lora-high is not inside a Lightning snapshot")
-        })
+        .map(|lightning| product_load::lightning_snapshot_in_hub(&lightning.hub))
         .transpose()?;
     let spec = product_load::product_load_spec(
         route,
         snapshot,
         policy,
         lightning.is_some(),
-        lightning_snapshot,
+        lightning_snapshot.as_deref(),
     )?;
-    if let Some((high, low)) = lightning {
-        let given = [high.canonicalize()?, low.canonicalize()?];
+    if let Some(lightning) = lightning {
+        let given = [
+            lightning.high.canonicalize()?,
+            lightning.low.canonicalize()?,
+        ];
         let product = spec
             .adapters
             .iter()
@@ -445,11 +461,26 @@ mod tests {
             &vace.join("transformer/config.json"),
             r#"{"num_attention_heads": 12, "attention_head_dim": 128, "num_layers": 30}"#,
         );
-        let loras = root.path().join("lightning");
+        // A synthetic Hugging Face hub laid out as the cache stores Lightning: snapshot files are
+        // symlinks into `blobs/`, and `refs/main` names the snapshot.
+        let hub = root.path().join("hub");
+        let repo = hub.join("models--lightx2v--Wan2.2-Lightning");
+        let lightning_snapshot = repo
+            .join("snapshots")
+            .join(product_load::LIGHTNING_REVISION);
+        write(&repo.join("refs/main"), product_load::LIGHTNING_REVISION);
         for route in ["wan2_2_t2v_14b", "wan2_2_i2v_14b"] {
-            let subdir = loras.join(product_load::lightning_subdir(route).expect("A14B"));
-            write(&subdir.join("high_noise_model.safetensors"), "high");
-            write(&subdir.join("low_noise_model.safetensors"), "low");
+            let subdir = product_load::lightning_subdir(route).expect("A14B");
+            for name in [
+                "high_noise_model.safetensors",
+                "low_noise_model.safetensors",
+            ] {
+                let blob = repo.join("blobs").join(format!("{subdir}-{name}"));
+                write(&blob, name);
+                let link = lightning_snapshot.join(subdir).join(name);
+                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(&blob, &link).unwrap();
+            }
         }
         assert_eq!(ROUTES.len(), PRODUCT_QUANT.len());
         for (route, residency) in ROUTES {
@@ -467,11 +498,19 @@ mod tests {
                 "sequential" => OffloadPolicy::Sequential,
                 _ => OffloadPolicy::Resident,
             };
-            let pair = product_load::lightning_subdir(route).map(|subdir| {
-                (
-                    loras.join(subdir).join("high_noise_model.safetensors"),
-                    loras.join(subdir).join("low_noise_model.safetensors"),
-                )
+            // The adapter seals the pair by path and hands it over symlink-resolved (blob paths).
+            let pair = product_load::lightning_subdir(route).map(|subdir| Lightning {
+                hub: hub.clone(),
+                high: lightning_snapshot
+                    .join(subdir)
+                    .join("high_noise_model.safetensors")
+                    .canonicalize()
+                    .unwrap(),
+                low: lightning_snapshot
+                    .join(subdir)
+                    .join("low_noise_model.safetensors")
+                    .canonicalize()
+                    .unwrap(),
             });
             // Lightning off everywhere, then the product default (on) where the route bakes it.
             for lightning in [None, pair.as_ref()] {
@@ -488,11 +527,25 @@ mod tests {
                     .iter()
                     .map(|a| (a.path.clone(), a.scale, a.moe_expert))
                     .collect();
-                let expected = lightning
-                    .map(|(high, low)| {
+                // The product loads the pair from the resolved snapshot, never the repo root.
+                let expected = product_load::lightning_subdir(route)
+                    .filter(|_| lightning.is_some())
+                    .map(|subdir| {
                         vec![
-                            (high.clone(), 1.0, Some(MoeExpert::High)),
-                            (low.clone(), 1.0, Some(MoeExpert::Low)),
+                            (
+                                lightning_snapshot
+                                    .join(subdir)
+                                    .join("high_noise_model.safetensors"),
+                                1.0,
+                                Some(MoeExpert::High),
+                            ),
+                            (
+                                lightning_snapshot
+                                    .join(subdir)
+                                    .join("low_noise_model.safetensors"),
+                                1.0,
+                                Some(MoeExpert::Low),
+                            ),
                         ]
                     })
                     .unwrap_or_default();
@@ -500,19 +553,18 @@ mod tests {
             }
         }
         // A pair from the other architecture is not the product's Lightning pair.
-        let (i2v_high, i2v_low) = (
-            loras
-                .join(product_load::lightning_subdir("wan2_2_i2v_14b").unwrap())
-                .join("high_noise_model.safetensors"),
-            loras
-                .join(product_load::lightning_subdir("wan2_2_i2v_14b").unwrap())
-                .join("low_noise_model.safetensors"),
-        );
+        let i2v =
+            lightning_snapshot.join(product_load::lightning_subdir("wan2_2_i2v_14b").unwrap());
+        let other_architecture = Lightning {
+            hub: hub.clone(),
+            high: i2v.join("high_noise_model.safetensors"),
+            low: i2v.join("low_noise_model.safetensors"),
+        };
         assert!(route_load_spec(
             "wan2_2_t2v_14b",
             "sequential",
             &q4,
-            Some(&(i2v_high, i2v_low))
+            Some(&other_architecture)
         )
         .is_err());
     }
@@ -527,24 +579,34 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        // Even with the pair present, campaign mode never falls back to the default.
+        // Even with the inputs present, campaign mode never falls back to the default.
+        let inputs = [
+            "--lightning-hub",
+            "/hub",
+            "--lora-high",
+            "/h",
+            "--lora-low",
+            "/l",
+        ];
+        let campaign: Vec<&str> = std::iter::once("--sc20686-campaign")
+            .chain(inputs)
+            .collect();
+        assert!(lightning_pair("wan2_2_t2v_14b", &args(&campaign)).is_err());
+        let on: Vec<&str> = ["--lightning", "on"].into_iter().chain(inputs).collect();
+        assert_eq!(
+            lightning_pair("wan2_2_i2v_14b", &args(&on)).unwrap(),
+            Some(Lightning {
+                hub: PathBuf::from("/hub"),
+                high: PathBuf::from("/h"),
+                low: PathBuf::from("/l"),
+            })
+        );
+        // On without the hub is refused: the snapshot is never guessed from the LoRA paths.
         assert!(lightning_pair(
-            "wan2_2_t2v_14b",
-            &args(&[
-                "--sc20686-campaign",
-                "--lora-high",
-                "/h",
-                "--lora-low",
-                "/l"
-            ])
+            "wan2_2_i2v_14b",
+            &args(&["--lightning", "on", "--lora-high", "/h", "--lora-low", "/l"])
         )
         .is_err());
-        let on = lightning_pair(
-            "wan2_2_i2v_14b",
-            &args(&["--lightning", "on", "--lora-high", "/h", "--lora-low", "/l"]),
-        )
-        .unwrap();
-        assert_eq!(on, Some((PathBuf::from("/h"), PathBuf::from("/l"))));
         // Routes without Lightning refuse the toggle.
         assert!(lightning_pair("wan_vace", &args(&[])).unwrap().is_none());
         assert!(lightning_pair("wan_vace", &args(&["--lightning", "off"])).is_err());
