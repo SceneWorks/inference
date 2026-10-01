@@ -40,7 +40,7 @@ use mlx_gen::{CancelFlag, Error, LatentDecoder, Result};
 
 use crate::vae_common::{
     contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate,
-    validate_decoder_tiling, FeatCache,
+    validate_decoder_tiling, DeadStageBuffers, FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
@@ -1083,7 +1083,7 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        self.forward_upsample_tail(&self.forward_middle(x)?)
+        self.forward_upsample_tail(&self.forward_middle(x)?, DeadStageBuffers::Release)
     }
 
     /// The **globally-scoped** half: `conv1` → the three middle blocks, at latent resolution
@@ -1104,11 +1104,12 @@ impl Decoder3d {
 
     /// The **spatially-local** half: the `UpResBlock` stack and the `Head22` epilogue. Convolutions,
     /// nearest upsample, channel-duplicating shortcuts and the per-position channel-L2 norm only.
-    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+    fn forward_upsample_tail(&self, middle: &Array, dead: DeadStageBuffers) -> Result<Array> {
         let mut x = middle.clone();
         for up in &self.upsamples {
             x = up.forward(&x, true)?;
             eval(&x)?;
+            dead.stage_finished();
         }
         self.head.forward(&x)
     }
@@ -1409,7 +1410,9 @@ impl Wan22Vae {
         // body runs in `compute_dtype` (bf16 halves its activation peak, sc-5039); the f32 blend
         // accumulators are unchanged (the clamp scalars promote each tile back to f32).
         tile_decode_accumulate(&middle, &plan, [1, 2, 3], cancel, |tile| {
-            let dec = self.decoder.forward_upsample_tail(tile)?;
+            let dec = self
+                .decoder
+                .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
             let dec = unpatchify(&dec, 2)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })
@@ -1486,5 +1489,72 @@ mod tests {
         let x = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
         let r = repeat_last(&x, 2).unwrap();
         assert_eq!(r.as_slice::<f32>(), &[1.0, 1.0, 2.0, 2.0]);
+    }
+
+    /// A tiny-width z48 decoder (production topology, `dec_dim` 8) with seeded random weights.
+    fn tiny_decoder() -> Wan22Vae {
+        let schema = Wan22Topology::from_i32(8, 8, 48).unwrap().schema();
+        let key = mlx_rs::random::key(20686).unwrap();
+        let tensors = schema
+            .decoder
+            .iter()
+            .map(|spec| {
+                let shape: Vec<i32> = spec.shape.iter().map(|&d| d as i32).collect();
+                let value =
+                    mlx_rs::random::normal::<f32>(&shape, None, Some(0.2), Some(&key)).unwrap();
+                (spec.name.clone(), value)
+            })
+            .collect();
+        Wan22Vae::from_weights_dims(&Weights::from_map(tensors), 8, 8, 48).unwrap()
+    }
+
+    fn stage_releases() -> usize {
+        crate::vae_common::STAGE_RELEASES.with(std::cell::Cell::get)
+    }
+
+    /// sc-20686: a single-pass decode releases each up-stage's dead buffers (one flush per stage)
+    /// without changing a single output value; a tiled decode keeps them pooled for the next tile.
+    #[test]
+    fn single_pass_decode_releases_each_dead_stage_and_tiles_keep_them() {
+        let vae = tiny_decoder();
+        let latent = mlx_rs::random::normal::<f32>(&[48, 2, 8, 8], None, None, None).unwrap();
+
+        let before = stage_releases();
+        let released = vae.decode(&latent).unwrap();
+        eval(&released).unwrap();
+        assert_eq!(stage_releases() - before, DIM_MULT_LEN);
+
+        let z = vae.to_channels_last(&latent).unwrap();
+        let denorm = add(multiply(&z, &vae.std).unwrap(), &vae.mean).unwrap();
+        let middle = vae
+            .decoder
+            .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+            .unwrap();
+        let kept = vae
+            .decoder
+            .forward_upsample_tail(&middle, DeadStageBuffers::Keep)
+            .unwrap();
+        let kept = contiguous(
+            &minimum(
+                maximum(unpatchify(&kept, 2).unwrap(), scalar(-1.0)).unwrap(),
+                scalar(1.0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(released.shape(), kept.shape());
+        assert_eq!(released.as_slice::<f32>(), kept.as_slice::<f32>());
+
+        let before = stage_releases();
+        let tiled = vae
+            .decode_tiled(&latent, &TilingConfig::spatial_only(64, 32), None)
+            .unwrap();
+        eval(&tiled).unwrap();
+        assert_eq!(tiled.shape(), released.shape());
+        assert_eq!(
+            stage_releases(),
+            before,
+            "tiled decode must keep its stage pool"
+        );
     }
 }

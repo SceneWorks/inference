@@ -54,6 +54,9 @@ class SupervisionError(ValueError):
         self.pid: int | None = None
         # The live macOS sample that tripped the host-reserve watchdog, when one did.
         self.watchdog_host_memory: dict[str, object] | None = None
+        # The owned-tree sample that tripped the child-footprint cap, when one did: the
+        # breaching total, its per-process split and the run's footprint trajectory.
+        self.watchdog_child_footprint: dict[str, object] | None = None
 
 
 def digest(raw: bytes) -> str:
@@ -507,6 +510,8 @@ class PosixTree:
 class SystemProbe:
     def __init__(self, policy: SafetyPolicy):
         self.policy = policy
+        # {pid: bytes} behind the most recent tree_footprint total (POSIX backends only).
+        self.last_tree_breakdown: dict[int, int] = {}
         actual = {"Darwin": "darwin-mlx", "Linux": "linux-cuda",
                   "Windows": "windows-cuda"}.get(platform.system(), "unsupported")
         if actual != policy.backend:
@@ -552,6 +557,7 @@ class SystemProbe:
             except windows.WindowsJobError as error:
                 raise SupervisionError("probe-failure", str(error)) from error
         pids = owner.members()
+        self.last_tree_breakdown = {}
         if not pids:
             return None
         total = 0
@@ -562,6 +568,7 @@ class SystemProbe:
                 if footprint is None:
                     continue  # exited after the process-table snapshot
                 total += footprint
+                self.last_tree_breakdown[pid] = footprint
                 sampled = True
             else:
                 try:
@@ -572,6 +579,7 @@ class SystemProbe:
                 if not match:
                     raise SupervisionError("probe-failure", f"process {pid} RSS malformed")
                 total += int(match.group(1)) * 1024
+                self.last_tree_breakdown[pid] = int(match.group(1)) * 1024
                 sampled = True
         return total if sampled else None
 
@@ -736,6 +744,35 @@ def validate_admission(value: object, *, policy_sha256: str) -> dict[str, object
     return value
 
 
+# Evenly spaced owned-tree samples kept in a child-footprint abort record: enough to tell a
+# load spike from a run-long climb without spooling every 250 ms tick into the record.
+CHILD_FOOTPRINT_TRAJECTORY_POINTS = 64
+
+
+def child_footprint_breach(footprint: int, cap: int, trajectory: list[tuple[int, int]],
+                           breakdown: dict[int, int] | None) -> dict[str, object]:
+    """The sealed evidence for a child-footprint abort: the breaching owned-tree total, the
+    per-process split of that same sample (when the probe exposes one), and an evenly spaced
+    trajectory of the run's samples ending at the breach."""
+    count = len(trajectory)
+    if count <= CHILD_FOOTPRINT_TRAJECTORY_POINTS:
+        picked = trajectory
+    else:
+        step = (count - 1) / (CHILD_FOOTPRINT_TRAJECTORY_POINTS - 1)
+        picked = [trajectory[round(index * step)] for index in range(CHILD_FOOTPRINT_TRAJECTORY_POINTS)]
+    record: dict[str, object] = {
+        "footprintBytes": footprint,
+        "capBytes": cap,
+        "elapsedMillis": trajectory[-1][0] if trajectory else None,
+        "sampleCount": count,
+        "trajectory": [{"elapsedMillis": at, "footprintBytes": value} for at, value in picked],
+    }
+    if breakdown:
+        record["processes"] = [{"pid": pid, "footprintBytes": value}
+                               for pid, value in sorted(breakdown.items())]
+    return record
+
+
 def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: SupervisionError) -> Path:
     """Persist a refused, aborted or failed row as a sealed, explicitly unaccepted record."""
     if error.reason in FAILED_REASONS:
@@ -748,6 +785,8 @@ def write_unaccepted_record(path: Path, *, kind: str, coordinate: str, error: Su
         "admission": error.admission,
         **({"watchdogHostMemory": error.watchdog_host_memory}
            if error.watchdog_host_memory is not None else {}),
+        **({"watchdogChildFootprint": error.watchdog_child_footprint}
+           if error.watchdog_child_footprint is not None else {}),
     })
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as stream:
@@ -946,6 +985,7 @@ def _run_admitted(
         peak_host = 0
         peak_gpu = 0
         samples: list[dict[str, object]] = []
+        trajectory: list[tuple[int, int]] = []  # (elapsed ms, owned-tree footprint) per sample
         failed_tree_ticks = FailedTicks("process-tree probe")
         failed_footprint_ticks = FailedTicks("child footprint probe")
         failed_host_ticks = FailedTicks("live host probe")
@@ -1048,10 +1088,15 @@ def _run_admitted(
                         peak_host = max(peak_host, footprint)
                         samples.append({"phase": "process-sample", "sample_kind": "process",
                                         "peak_bytes": footprint, "at_ns": time.time_ns()})
+                        trajectory.append((int((clock() - started) * 1000), footprint))
                         if len(samples) * 160 > policy.event_cap_bytes:
                             raise SupervisionError("event-cap", "process sample spool exceeded cap")
                         if footprint > policy.child_footprint_cap_bytes:
-                            raise SupervisionError("child-footprint", "owned tree exceeded child cap")
+                            error = SupervisionError("child-footprint", "owned tree exceeded child cap")
+                            error.watchdog_child_footprint = child_footprint_breach(
+                                footprint, policy.child_footprint_cap_bytes, trajectory,
+                                getattr(probe, "last_tree_breakdown", None))
+                            raise error
                     if policy.backend in {"linux-cuda", "windows-cuda"}:
                         try:
                             device_free, device_used = read_gpu(lambda: probe.gpu_free_and_tree_bytes(owner))
