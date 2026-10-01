@@ -27,8 +27,10 @@ name: KV PoC campaigns (epic 20669, W1 + W2)
 #   * push to `kv-poc-run/**`: parameters come from `.github/kv-poc-run.json` on the pushed commit
 #     ({mode, inference_ref, sceneworks_ref, runner_label, phases}, plus the optional
 #     baseline_evidence_ref: the inference SHA whose A1 evidence A3 binds, default inference_ref;
-#     a3_bits: comma list of 2|4, default "2"; a2_methods: comma list of
-#     group-affine|group-affine-4, default "group-affine").
+#     a3_bits: comma list of 2|4|8, default "2"; a2_methods: comma list of
+#     group-affine|group-affine-4|group-affine-8, default "group-affine"; a2_only_coordinate: one
+#     scheduled SC-20671 coordinate, default "" = all eight rows. A single-coordinate A2 publishes
+#     a partial, non-publishable manifest into its own `-only-<name>` dirs, never a campaign).
 #     This is how the campaign runs before this file reaches `main` (a workflow_dispatch workflow
 #     must exist on the default branch to be dispatched). Start W1 by flipping "mode" to "w1" in
 #     that file and pushing; start W2 with "mode": "w2" and an inference_ref that carries the W2 sources (SC-20686 product_load /
@@ -103,13 +105,17 @@ on:
         type: string
         default: ""
       a3_bits:
-        description: "A3 --kv-bits values, comma list of 2|4 run in order (max 2), e.g. 2,4"
+        description: "A3 --kv-bits values, comma list of 2|4|8 run in order (max 2), e.g. 2,4"
         type: string
         default: "2"
       a2_methods:
-        description: "A2 --kv-method values, comma list of group-affine|group-affine-4 run in order (max 2)"
+        description: "A2 --kv-method values, comma list of group-affine|group-affine-4|group-affine-8 run in order (max 2)"
         type: string
         default: "group-affine"
+      a2_only_coordinate:
+        description: "Empty = all eight A2 rows. One SC-20671 coordinate (e.g. llama-memory-material-single-single-shot-warm) = that row only, published as a PARTIAL non-publishable run in its own dirs"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -139,6 +145,7 @@ jobs:
       phases: ${{ steps.resolve.outputs.phases }}
       a3_bits: ${{ steps.resolve.outputs.a3_bits }}
       a2_methods: ${{ steps.resolve.outputs.a2_methods }}
+      a2_only_coordinate: ${{ steps.resolve.outputs.a2_only_coordinate }}
       runs_on: ${{ steps.resolve.outputs.runs_on }}
       runner_name: ${{ steps.resolve.outputs.runner_name }}
     steps:
@@ -159,6 +166,7 @@ jobs:
           DISPATCH_BASELINE_EVIDENCE_REF: ${{ inputs.baseline_evidence_ref }}
           DISPATCH_A3_BITS: ${{ inputs.a3_bits }}
           DISPATCH_A2_METHODS: ${{ inputs.a2_methods }}
+          DISPATCH_A2_ONLY_COORDINATE: ${{ inputs.a2_only_coordinate }}
         run: bash .github/kv-poc/config.sh
 
   probe:
@@ -297,6 +305,7 @@ jobs:
       KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
       SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
       KV_A2_METHODS: ${{ needs.config.outputs.a2_methods }}
+      KV_A2_ONLY_COORDINATE: ${{ needs.config.outputs.a2_only_coordinate }}
       KV_SOFT_BUDGET_MIN: "330"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

@@ -17,6 +17,10 @@
 # and never skips the next value; a stop request ends the list (exit 75 -> stopped=true, a
 # re-dispatch resumes); a hard failure ends the list and fails the job. The soft budget is PER
 # INVOCATION (it restarts when each value starts); config.sh caps each list at 2 values.
+# $KV_A2_ONLY_COORDINATE (optional) runs every a2 invocation as `--only-coordinate <name>`: one
+# scheduled row, published as a partial non-publishable manifest into its own
+# sc20671-compressed-<m>-only-<name>-resume / evidence/sc20671-compressed-<m>-only-<name> dirs, so a
+# partial run never resumes into, or stands in for, the full A2 campaign.
 #
 # SAFE STOP. A background watcher polls every 60 s for `refs/heads/kv-poc-stop/<run_id>` on the
 # inference remote, and also enforces this job's soft budget ($KV_SOFT_BUDGET_MIN). Either one
@@ -60,7 +64,10 @@ select_value() { # <value>: RESUME, OUT and LABEL of that invocation
   case "$phase" in
     a1) RESUME="$R/sc20671-dense-resume"; OUT="$R/evidence/sc20671-dense" ;;
     a3) RESUME="$R/sc20676-b$V-resume"; OUT="$R/evidence/sc20676-packed-b$V"; LABEL="a3 --kv-bits $V" ;;
-    a2) RESUME="$R/sc20671-compressed-$V-resume"; OUT="$R/evidence/sc20671-compressed-$V"; LABEL="a2 --kv-method $V" ;;
+    a2)
+      ONLY="${KV_A2_ONLY_COORDINATE:+-only-$KV_A2_ONLY_COORDINATE}"
+      RESUME="$R/sc20671-compressed-$V$ONLY-resume"; OUT="$R/evidence/sc20671-compressed-$V$ONLY"
+      LABEL="a2 --kv-method $V${KV_A2_ONLY_COORDINATE:+ --only-coordinate $KV_A2_ONLY_COORDINATE (PARTIAL)}" ;;
     b) RESUME=""; OUT="" ;;
     c) RESUME="$R/sc20684-resume"; OUT="$R/evidence/sc20684-krea" ;;
     d) RESUME="$R/sc20686-mlx-resume"; OUT="$R/evidence/sc20686-mlx" ;;
@@ -303,8 +310,10 @@ for v in $values; do
         --safety-policy "$F/policies/llm.json" --kv-bits "$V" --resume-dir "$RESUME" --out "$OUT" || rc=$?
       ;;
     a2)
+      ONLY_ARGS=()
+      [ -z "${KV_A2_ONLY_COORDINATE:-}" ] || ONLY_ARGS=(--only-coordinate "$KV_A2_ONLY_COORDINATE")
       run_cmd "$F/sc20671_kv_baseline" parent --mode compressed --kv-method "$V" "${LLM_ARGS[@]}" \
-        --resume-dir "$RESUME" --out "$OUT" || rc=$?
+        ${ONLY_ARGS[@]+"${ONLY_ARGS[@]}"} --resume-dir "$RESUME" --out "$OUT" || rc=$?
       ;;
     b)
       for fam in "llama:$LQ" "qwen:$QQ"; do

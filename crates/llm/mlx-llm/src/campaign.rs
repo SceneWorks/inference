@@ -18,6 +18,9 @@ use crate::campaign_supervisor::{self, RunRequest, SafetyPolicy, SystemProbe};
 
 pub const SC20671_SCHEDULE_VERSION: u64 = 2;
 pub const SC20671_CAMPAIGN_KIND: &str = "sc-20671-complete-covering-set";
+/// Manifest kind of an `--only-coordinate` run: one scheduled row, never a campaign. Every
+/// complete-campaign loader (here and in SceneWorks) refuses it by kind.
+pub const SC20671_PARTIAL_RUN_KIND: &str = "sc-20671-partial-coordinate-run";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -4675,13 +4678,43 @@ pub fn publish_complete_campaign(
     resume_identity: &serde_json::Value,
     policy: &CampaignSafetyPolicy,
 ) -> Result<(), String> {
+    publish_campaign(destination, prepared, resume_identity, policy, None)
+}
+
+/// Publish a complete campaign, or (`only_coordinate`) the single row of a partial run under a
+/// manifest marked partial and non-publishable that no campaign loader accepts.
+fn publish_campaign(
+    destination: &Path,
+    prepared: &[PreparedCoordinateReceipt],
+    resume_identity: &serde_json::Value,
+    policy: &CampaignSafetyPolicy,
+    only_coordinate: Option<&str>,
+) -> Result<(), String> {
     let policy_sha256 = policy.seal()?;
     if destination.exists() {
         return Err("campaign destination must be absent for atomic publication".into());
     }
-    let schedule = required_schedule();
+    if resume_identity
+        .get("onlyCoordinate")
+        .and_then(serde_json::Value::as_str)
+        != only_coordinate
+    {
+        return Err(
+            "publication scope differs from the resume identity's coordinate filter".into(),
+        );
+    }
+    let full_schedule = required_schedule();
+    let schedule = selected_schedule_indices(only_coordinate)?
+        .into_iter()
+        .map(|index| full_schedule[index].clone())
+        .collect::<Vec<_>>();
     if prepared.len() != schedule.len() {
-        return Err("complete campaign requires exactly eight prepared receipts".into());
+        return Err(match only_coordinate {
+            None => "complete campaign requires exactly eight prepared receipts".into(),
+            Some(slug) => {
+                format!("partial run of {slug} requires exactly its one prepared receipt")
+            }
+        });
     }
     let mut outcomes = Vec::with_capacity(prepared.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -4818,7 +4851,7 @@ pub fn publish_complete_campaign(
         }
         let mut manifest = serde_json::json!({
             "schemaVersion": 2,
-            "kind": SC20671_CAMPAIGN_KIND,
+            "kind": if only_coordinate.is_some() { SC20671_PARTIAL_RUN_KIND } else { SC20671_CAMPAIGN_KIND },
             "scheduleVersion": SC20671_SCHEDULE_VERSION,
             "policySha256": policy_sha256,
             "resumeIdentitySha256": seal_bytes(&canonical_json_bytes(resume_identity).map_err(|e| e.to_string())?),
@@ -4827,6 +4860,11 @@ pub fn publish_complete_campaign(
         });
         if let Some(passed) = campaign_quality_gate_passed(&receipts)? {
             manifest["qualityGatePassed"] = serde_json::json!(passed);
+        }
+        if let Some(slug) = only_coordinate {
+            manifest["partial"] = serde_json::json!(true);
+            manifest["publishable"] = serde_json::json!(false);
+            manifest["onlyCoordinate"] = serde_json::json!(slug);
         }
         let (identity_bytes, identity_sha) = seal_json(resume_identity)?;
         let (policy_bytes, _) =
@@ -5504,6 +5542,28 @@ pub struct CampaignLaunch {
     /// `Some` launches every scheduled row in `compressed` mode with this KV method; `None` is the
     /// dense baseline campaign.
     pub compressed: Option<CompressedKvMethod>,
+    /// `--only-coordinate <slug>`: run just this scheduled row. The run publishes a partial,
+    /// non-publishable manifest ([`SC20671_PARTIAL_RUN_KIND`]), never a campaign.
+    pub only_coordinate: Option<String>,
+}
+
+/// Indices into [`required_schedule`] a launch runs: all of them, or the one `--only-coordinate`
+/// names (an unscheduled name is refused, listing the schedule).
+fn selected_schedule_indices(only_coordinate: Option<&str>) -> Result<Vec<usize>, String> {
+    let slugs = required_coordinates()
+        .iter()
+        .map(coordinate_slug)
+        .collect::<Vec<_>>();
+    match only_coordinate {
+        None => Ok((0..slugs.len()).collect()),
+        Some(slug) => slugs
+            .iter()
+            .position(|candidate| candidate == slug)
+            .map(|index| vec![index])
+            .ok_or_else(|| {
+                format!("--only-coordinate {slug:?} is not a scheduled coordinate; expected one of {slugs:?}")
+            }),
+    }
 }
 
 pub(crate) fn file_seal(path: &Path) -> Result<String, String> {
@@ -5554,6 +5614,10 @@ fn resume_identity(
         "qwenReference": inventory_value(3),
     });
     bind_resume_mode(&mut identity, launch.compressed);
+    if let Some(slug) = &launch.only_coordinate {
+        // A single-row run never shares a resume directory with a full campaign.
+        identity["onlyCoordinate"] = slug.as_str().into();
+    }
     Ok(identity)
 }
 
@@ -5643,7 +5707,11 @@ pub fn preflight_complete_campaign(launch: &CampaignLaunch) -> Result<serde_json
         return Err("campaign prompt must not be empty".into());
     }
     let mut row_admission = Vec::new();
-    for row in required_schedule() {
+    let schedule = required_schedule();
+    for row in selected_schedule_indices(launch.only_coordinate.as_deref())?
+        .into_iter()
+        .map(|index| schedule[index].clone())
+    {
         let (candidate, reference) = if row.coordinate.family == "llama" {
             (
                 &launch.llama_snapshot,
@@ -5846,15 +5914,16 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
         validate_benchmark_snapshot(&launch.qwen_fp32_reference_snapshot, &QWEN_REFERENCE)?,
     ];
     let schedule = required_schedule();
+    let selected = selected_schedule_indices(launch.only_coordinate.as_deref())?;
     let prompt = fs::read_to_string(&launch.prompt_file).map_err(|e| e.to_string())?;
     if prompt.trim().is_empty() {
         return Err("campaign prompt must not be empty".into());
     }
     let mut identity = resume_identity(launch, &policy_sha256, &inventories)?;
     let identity_sha256 = prepare_resume_root(&launch.resume_dir, &mut identity)?;
-    let slugs = schedule
+    let slugs = selected
         .iter()
-        .map(|row| coordinate_slug(&row.coordinate))
+        .map(|index| coordinate_slug(&schedule[*index].coordinate))
         .collect::<Vec<_>>();
     validate_resume_entries(&launch.resume_dir, &launch.stop_files, &slugs)?;
     let mut prepared = Vec::with_capacity(schedule.len());
@@ -5864,7 +5933,8 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
         &launch.resume_dir.join("logs"),
         "sc-20671-operator-stop",
         |index, step| {
-            let row = &schedule[index];
+            let schedule_index = selected[index];
+            let row = &schedule[schedule_index];
             let slug = coordinate_slug(&row.coordinate);
             let child_dir = launch.resume_dir.join(&slug);
             let binding_path = row_binding_path(&launch.resume_dir, &slug);
@@ -5908,7 +5978,7 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
             command
                 .arg("worker")
                 .arg("--coordinate-index")
-                .arg(index.to_string())
+                .arg(schedule_index.to_string())
                 .arg("--snapshot")
                 .arg(snapshot)
                 .arg("--prompt-file")
@@ -6088,7 +6158,22 @@ pub fn launch_complete_campaign(launch: &CampaignLaunch) -> Result<CampaignOutco
         );
         return Ok(CampaignOutcome::IncompleteWithRefusals(stopped.refused));
     }
-    publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?;
+    match &launch.only_coordinate {
+        Some(slug) => {
+            publish_campaign(
+                &launch.destination,
+                &prepared,
+                &identity,
+                &policy,
+                Some(slug),
+            )?;
+            eprintln!(
+                "sc20671-kv-baseline: PARTIAL run of {slug} only, published as a non-publishable {SC20671_PARTIAL_RUN_KIND} at {}; it is not a campaign",
+                launch.destination.display()
+            );
+        }
+        None => publish_complete_campaign(&launch.destination, &prepared, &identity, &policy)?,
+    }
     report_campaign_quality_gates(
         &prepared
             .iter()
@@ -6120,6 +6205,19 @@ fn validate_resume_entries(
         }
     }
     Ok(())
+}
+
+/// `name <value>` when present (a flag without a value is refused).
+fn optional_flag(args: &[String], name: &str) -> Result<Option<String>, String> {
+    match args.iter().position(|arg| arg == name) {
+        None => Ok(None),
+        Some(index) => args
+            .get(index + 1)
+            .filter(|value| !value.starts_with("--"))
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("{name} requires a value")),
+    }
 }
 
 fn required_flag(args: &[String], name: &str) -> Result<String, String> {
@@ -6154,7 +6252,8 @@ fn compressed_mode_flags(args: &[String]) -> Result<Option<CompressedKvMethod>, 
 /// row with its KV held in that method's compressed cache and fused decode attention, gated
 /// against a dense-KV reference arm on the same candidate weights (SC-20676). Methods:
 /// `group-affine` (2-bit codes), `group-affine-4` (4-bit) and `group-affine-8` (8-bit), all group
-/// 32. The GPU-window
+/// 32. `--only-coordinate <coordinate>` runs one scheduled row and publishes a partial,
+/// non-publishable `sc-20671-partial-coordinate-run` manifest (never a campaign). The GPU-window
 /// launch of the compressed campaign is one command from the inference checkout:
 ///
 /// ```text
@@ -6198,6 +6297,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 resume_dir,
                 safety_policy: PathBuf::from(required_flag(args, "--safety-policy")?),
                 compressed: compressed_mode_flags(args)?,
+                only_coordinate: optional_flag(args, "--only-coordinate")?,
             };
             if mode == "preflight" {
                 let value = preflight_complete_campaign(&launch)?;
@@ -6263,6 +6363,14 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
                 .get(index)
                 .cloned()
                 .ok_or("--coordinate-index is outside the frozen eight-coordinate schedule")?;
+            if let Some(only) = identity.get("onlyCoordinate") {
+                if only.as_str() != Some(coordinate_slug(&row.coordinate).as_str()) {
+                    return Err(
+                        "worker coordinate differs from the resume identity's coordinate filter"
+                            .into(),
+                    );
+                }
+            }
             let snapshot = PathBuf::from(required_flag(args, "--snapshot")?);
             let reference_snapshot =
                 PathBuf::from(required_flag(args, "--fp32-reference-snapshot")?);
@@ -6672,7 +6780,7 @@ pub fn sc20671_cli(args: &[String]) -> Result<CampaignOutcome, String> {
             .map_err(|e| e.to_string())?;
             Ok(CampaignOutcome::Completed)
         }
-        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--stop-file <path>] [options]".into()),
+        _ => Err("usage: sc20671-kv-baseline parent|preflight|worker [--mode dense|compressed --kv-method <method>] [--only-coordinate <coordinate>] [--stop-file <path>] [options]".into()),
     }
 }
 
@@ -6762,7 +6870,8 @@ pub struct ScheduledCoordinate {
 }
 
 /// The parent executable consumes exactly this schedule.  It never accepts a caller-supplied row
-/// list, which prevents a selectively successful campaign from being published as the baseline.
+/// list, which prevents a selectively successful campaign from being published as the baseline;
+/// `--only-coordinate` runs one of these rows and publishes it only as a partial run.
 pub fn required_schedule() -> Vec<ScheduledCoordinate> {
     required_coordinates()
         .into_iter()
@@ -11858,6 +11967,97 @@ pub(crate) mod tests {
         for (index, coordinate) in coordinates.iter().enumerate() {
             assert!(!coordinates[index + 1..].contains(coordinate));
         }
+    }
+
+    /// `--only-coordinate` selects exactly one scheduled row (an unscheduled name is refused), its
+    /// publication must match the resume identity's filter and hold exactly that row, and a
+    /// partial-run manifest is never loadable as a complete campaign.
+    #[test]
+    fn only_coordinate_runs_one_row_and_never_publishes_a_campaign() {
+        const SLUG: &str = "llama-memory-material-single-single-shot-warm";
+        assert_eq!(
+            selected_schedule_indices(None).unwrap(),
+            (0..8).collect::<Vec<_>>()
+        );
+        let selected = selected_schedule_indices(Some(SLUG)).unwrap();
+        assert_eq!(selected, vec![2]);
+        assert_eq!(coordinate_slug(&required_schedule()[2].coordinate), SLUG);
+        assert!(selected_schedule_indices(Some("llama-32k"))
+            .unwrap_err()
+            .contains("not a scheduled coordinate"));
+        let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            optional_flag(&args(&["parent"]), "--only-coordinate").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_flag(
+                &args(&["parent", "--only-coordinate", SLUG]),
+                "--only-coordinate"
+            )
+            .unwrap()
+            .as_deref(),
+            Some(SLUG)
+        );
+        for bad in [&["--only-coordinate"][..], &["--only-coordinate", "--out"]] {
+            assert!(
+                optional_flag(&args(bad), "--only-coordinate").is_err(),
+                "{bad:?}"
+            );
+        }
+
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1024,
+            child_footprint_cap_bytes: 2048,
+            max_context_tokens: 4096,
+            max_request_tokens: 4096,
+            stdout_cap_bytes: 4096,
+            stderr_cap_bytes: 4096,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("partial");
+        let full = serde_json::json!({ "kind": "sc-20671-resume-identity" });
+        let mut partial = full.clone();
+        partial["onlyCoordinate"] = SLUG.into();
+        // The publication scope must be the identity's: neither can stand in for the other.
+        for (identity, only) in [(&full, Some(SLUG)), (&partial, None)] {
+            assert_eq!(
+                publish_campaign(&destination, &[], identity, &policy, only).unwrap_err(),
+                "publication scope differs from the resume identity's coordinate filter"
+            );
+        }
+        assert_eq!(
+            publish_campaign(&destination, &[], &partial, &policy, Some(SLUG)).unwrap_err(),
+            format!("partial run of {SLUG} requires exactly its one prepared receipt")
+        );
+        assert!(!destination.exists());
+
+        // A partial manifest (correctly sealed) is refused by the complete-campaign loader.
+        fs::create_dir(&destination).unwrap();
+        let manifest = canonical_json_bytes(&serde_json::json!({
+            "schemaVersion": 2,
+            "kind": SC20671_PARTIAL_RUN_KIND,
+            "scheduleVersion": SC20671_SCHEDULE_VERSION,
+            "partial": true,
+            "publishable": false,
+            "onlyCoordinate": SLUG,
+            "coordinates": [],
+        }))
+        .unwrap();
+        fs::write(destination.join("campaign.json"), &manifest).unwrap();
+        fs::write(
+            destination.join("campaign.json.sha256"),
+            format!("{}  campaign.json\n", seal_bytes(&manifest)),
+        )
+        .unwrap();
+        assert_eq!(
+            load_validated_complete_campaign(&destination).unwrap_err(),
+            "SC-20671 campaign manifest identity is invalid"
+        );
     }
 
     #[test]

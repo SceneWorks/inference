@@ -6,10 +6,13 @@
 # baseline_evidence_ref (optional, default inference_ref): the inference SHA whose completed A1
 # evidence ($HOME/kv-poc/<sha>-runs/evidence/sc20671-dense) A3 binds. sc20676 itself refuses it
 # unless that SHA is an ancestor of inference_ref with an unchanged SC-20671 dense closure.
-# a3_bits (optional, default "2"): comma list of A3 `--kv-bits` values (2, 4), run in list order.
+# a3_bits (optional, default "2"): comma list of A3 `--kv-bits` values (2, 4, 8), run in list order.
 # a2_methods (optional, default "group-affine"): comma list of A2 `--kv-method` values
-# (group-affine, group-affine-4), run in list order. At most 2 values each: the a3/a2 jobs' hard
-# timeouts are sized for two sequential invocations (kv-poc-campaign.yml TIMEOUTS).
+# (group-affine, group-affine-4, group-affine-8), run in list order. At most 2 values each: the
+# a3/a2 jobs' hard timeouts are sized for two sequential invocations (kv-poc-campaign.yml TIMEOUTS).
+# a2_only_coordinate (optional, default ""): run A2 as `--only-coordinate <name>`, one of the eight
+# scheduled SC-20671 coordinates. The run publishes a partial, non-publishable manifest (never a
+# campaign) into its own `-only-<name>` resume + evidence dirs, so it never touches a full A2.
 # Either way every value is validated here, so a typo fails in seconds on a hosted runner instead
 # of queueing a self-hosted job on a label no runner carries (which waits silently forever).
 set -euo pipefail
@@ -26,6 +29,7 @@ if [ "$EVENT_NAME" = "push" ]; then
   baseline_sha="$(read_key baseline_evidence_ref "")"
   a3_bits="$(read_key a3_bits 2)"
   a2_methods="$(read_key a2_methods group-affine)"
+  a2_only_coordinate="$(read_key a2_only_coordinate "")"
   source_desc="$file @ ${GITHUB_SHA}"
 else
   mode="$DISPATCH_MODE"
@@ -36,6 +40,7 @@ else
   baseline_sha="$DISPATCH_BASELINE_EVIDENCE_REF"
   a3_bits="${DISPATCH_A3_BITS:-2}"
   a2_methods="${DISPATCH_A2_METHODS:-group-affine}"
+  a2_only_coordinate="${DISPATCH_A2_ONLY_COORDINATE:-}"
   source_desc="workflow_dispatch inputs"
 fi
 
@@ -100,8 +105,17 @@ value_list() { # <key> <list> <allowed values...>; sets $listed to the canonical
   listed="$seen"
 }
 # Not in $(...): `fail` must print its ::error line to the job log, not into a variable.
-value_list a3_bits "$a3_bits" 2 4; a3_bits="$listed"
-value_list a2_methods "$a2_methods" group-affine group-affine-4; a2_methods="$listed"
+value_list a3_bits "$a3_bits" 2 4 8; a3_bits="$listed"
+value_list a2_methods "$a2_methods" group-affine group-affine-4 group-affine-8; a2_methods="$listed"
+# The frozen SC-20671 schedule (campaign.rs required_coordinates); sc20671 refuses any other name.
+a2_only_coordinate="${a2_only_coordinate// /}"
+case " $a2_only_coordinate " in
+  "  "|" llama-short-single-chunked-cold "|" llama-medium-supported-batch-single-shot-warm "\
+  |" llama-memory-material-single-single-shot-warm "|" llama-fit-boundary-single-chunked-cold "\
+  |" qwen-short-single-single-shot-cold "|" qwen-medium-supported-batch-chunked-warm "\
+  |" qwen-memory-material-single-single-shot-warm "|" qwen-fit-boundary-single-chunked-cold ") ;;
+  *) fail "a2_only_coordinate must be empty or one scheduled SC-20671 coordinate, got '$a2_only_coordinate'" ;;
+esac
 
 runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l | split(" "))')"
 {
@@ -114,6 +128,7 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "phases=${canonical},"
   echo "a3_bits=$a3_bits"
   echo "a2_methods=$a2_methods"
+  echo "a2_only_coordinate=$a2_only_coordinate"
   echo "runs_on=$runs_on"
   echo "runner_name=$runner_name"
 } >> "$GITHUB_OUTPUT"
@@ -132,5 +147,6 @@ runs_on="$(jq -cn --arg l "$host_labels" '["self-hosted","macOS","ARM64"] + ($l 
   echo "| phases | \`${canonical#,}\` |"
   echo "| A3 --kv-bits | \`$a3_bits\` |"
   echo "| A2 --kv-method | \`$a2_methods\` |"
+  echo "| A2 --only-coordinate | ${a2_only_coordinate:+\`$a2_only_coordinate\` (PARTIAL, non-publishable)}${a2_only_coordinate:-all eight rows} |"
 } >> "$GITHUB_STEP_SUMMARY"
 cat "$GITHUB_STEP_SUMMARY"
