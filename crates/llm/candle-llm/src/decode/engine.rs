@@ -335,12 +335,118 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     drafts: usize,
     cancel: &CancelFlag,
     on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+) -> Result<SpeculativeRun> {
+    run_engine(
+        model,
+        proposer,
+        prompt,
+        config,
+        drafts,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        on_prefill_complete,
+        None,
+    )
+}
+
+/// A caller's own token draw on the engine's sampler seam (epic sc-24432 E8, sc-24446): the
+/// draw a pipeline pinned to an upstream reference makes — its own argmax, its own shaped
+/// distribution and seeded stream — so moving that pipeline onto the one engine loop
+/// ([`generate_with_sampler`]) leaves its tokens unchanged.
+pub trait TokenSampler {
+    /// Draw one token from the logits row of the current position (`[1, vocab]` from a prefill,
+    /// `[1, 1, vocab]` from a decode step) given the running `history` (prompt + generated ids)
+    /// and an optional constraint mask, and say where the draw ran. The engine records the path
+    /// on the run's sampler telemetry, so the record names the draw that actually happened — the
+    /// draw itself must therefore not record (the shared [`sample`] records its own path; a
+    /// sampler built on the shared primitives draws through the unrecorded ones, such as
+    /// [`sample_host`](crate::primitives::sampler::sample_host)).
+    fn sample(
+        &mut self,
+        logits: &Tensor,
+        history: &[i32],
+        allowed: Option<&[bool]>,
+    ) -> Result<(i32, SamplerPath)>;
+}
+
+/// The engine's token-at-a-time loop ([`NoProposer`], `K = 0`) drawing every token through
+/// `sampler` instead of the shared [`sample`] — the same prefill (or adopted cache), stop,
+/// caller-stop, cancel and budget contract as [`generate_speculative_with`], and the same record.
+/// Only the draw is the caller's; a speculative run keeps the shared sampler, whose distribution
+/// the acceptance test is defined over.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_sampler<M: StepModel + ?Sized>(
+    model: &M,
+    prompt: SpeculativePrompt<'_, M::Cache>,
+    config: &GenerationConfig,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
+    constraint: Option<&mut dyn RewindableConstraintMask>,
+    should_stop: Option<&dyn Fn() -> bool>,
+    sampler: &mut dyn TokenSampler,
+) -> Result<SpeculativeRun> {
+    run_engine(
+        model,
+        &mut NoProposer,
+        prompt,
+        config,
+        0,
+        cancel,
+        on_event,
+        constraint,
+        should_stop,
+        None,
+        Some(sampler),
+    )
+}
+
+/// One draw: the caller's sampler (its path recorded here), else the shared [`sample`].
+fn draw(
+    sampler: Option<&mut (dyn TokenSampler + '_)>,
+    logits: &Tensor,
+    history: &[i32],
+    config: &GenerationConfig,
+    rng: &mut SplitMix64,
+    mask: Option<&[bool]>,
+) -> Result<i32> {
+    match sampler {
+        Some(sampler) => {
+            let (token, path) = sampler.sample(logits, history, mask)?;
+            note_sampler_path(path);
+            Ok(token)
+        }
+        None => sample(logits, history, &config.sampling, rng, mask),
+    }
+}
+
+/// The engine body. `sampler` is `Some` only for the token-at-a-time loop
+/// ([`generate_with_sampler`] passes [`NoProposer`] and `K = 0`).
+#[allow(clippy::too_many_arguments)]
+fn run_engine<M: StepModel + ?Sized, P: Proposer + ?Sized>(
+    model: &M,
+    proposer: &mut P,
+    prompt: SpeculativePrompt<'_, M::Cache>,
+    config: &GenerationConfig,
+    drafts: usize,
+    cancel: &CancelFlag,
+    on_event: &mut dyn FnMut(StreamEvent),
     mut constraint: Option<&mut dyn RewindableConstraintMask>,
     should_stop: Option<&dyn Fn() -> bool>,
     mut on_prefill_complete: Option<&mut dyn FnMut() -> Result<()>>,
+    mut sampler: Option<&mut dyn TokenSampler>,
 ) -> Result<SpeculativeRun> {
     if cancel.is_cancelled() {
         return Err(Error::Canceled); // typed pre-inference cancel
+    }
+    if sampler.is_some() && (drafts != 0 || proposer.kind() != ProposerKind::None) {
+        return Err(Error::Msg(
+            "a caller sampler serves the token-at-a-time loop only".into(),
+        ));
     }
     let span = RequestSpan::begin();
     let mut stats = SpeculativeStats::default();
@@ -471,7 +577,14 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
     // ---- First token: ordinary sampling from the prefill logits (one sync, as every loop). ----
     let first = {
         let mask = constraint.as_mut().map(|c| c.allowed());
-        sample(&logits, &history, &config.sampling, &mut rng, mask)?
+        draw(
+            sampler.as_deref_mut(),
+            &logits,
+            &history,
+            config,
+            &mut rng,
+            mask,
+        )?
     };
     if config.stop_tokens.contains(&first) {
         finish = FinishReason::StopToken;
@@ -575,18 +688,32 @@ pub fn generate_speculative_with<M: StepModel + ?Sized, P: Proposer + ?Sized>(
             break;
         }
 
-        // 3. Decide, on host, from one transfer.
-        let (draft_ids, committed, accepted) = decide(
-            &out.logits,
-            &drafted,
-            &proposal.dists,
-            &history,
-            config,
-            &mut rng,
-            greedy,
-            plain_greedy,
-            constraint.as_deref_mut(),
-        )?;
+        // 3. Decide, on host, from one transfer. A caller sampler only ever runs without drafts:
+        //    its one row is the caller's draw.
+        let (draft_ids, committed, accepted) = match sampler.as_deref_mut() {
+            Some(sampler) => {
+                let n = out.logits.dim(1)?;
+                if n != 1 {
+                    return Err(Error::Msg(format!(
+                        "verify returned {n} positions for 0 drafts"
+                    )));
+                }
+                let mask = constraint.as_mut().map(|c| c.allowed());
+                let token = draw(Some(sampler), &out.logits, &history, config, &mut rng, mask)?;
+                (Vec::new(), vec![token], 0)
+            }
+            None => decide(
+                &out.logits,
+                &drafted,
+                &proposal.dists,
+                &history,
+                config,
+                &mut rng,
+                greedy,
+                plain_greedy,
+                constraint.as_deref_mut(),
+            )?,
+        };
         if let (Some(c), Some(checkpoint)) = (constraint.as_mut(), constraint_checkpoint) {
             c.rewind(checkpoint);
         }
@@ -1366,6 +1493,98 @@ mod tests {
         );
         assert_eq!(record.host_syncs, 12, "one sync per token");
         assert_eq!(run.record.host_syncs_per_verify_step(), Some(1.0));
+    }
+
+    // ---- A caller sampler draws every token of the one loop (E8, sc-24446) ----
+
+    /// Draws the shared host reference (the unrecorded `sample_host`, which is what `sample` runs on
+    /// a CPU device) from its own seeded stream — or, with `fixed`, always that id — and records
+    /// each draw's history length.
+    struct Recording {
+        params: SamplingParams,
+        rng: SplitMix64,
+        fixed: Option<i32>,
+        histories: Vec<usize>,
+    }
+
+    impl TokenSampler for Recording {
+        fn sample(
+            &mut self,
+            logits: &Tensor,
+            history: &[i32],
+            allowed: Option<&[bool]>,
+        ) -> Result<(i32, SamplerPath)> {
+            self.histories.push(history.len());
+            let token = match self.fixed {
+                Some(id) => id,
+                None => crate::primitives::sampler::sample_host(
+                    logits,
+                    history,
+                    &self.params,
+                    &mut self.rng,
+                    allowed,
+                )?,
+            };
+            Ok((
+                token,
+                SamplerPath::Host(core_llm::HostSampleReason::Reference),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_caller_sampler_draws_every_token_of_the_token_at_a_time_loop() {
+        let (_cfg, model) = text_model();
+        let with = |config: &GenerationConfig, sampler: &mut Recording| {
+            generate_with_sampler(
+                &model,
+                SpeculativePrompt::Tokens(&PROMPT),
+                config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                sampler,
+            )
+            .unwrap()
+        };
+        for config in [greedy(10), stochastic(10)] {
+            let expected = run(&model, &mut NoProposer, &PROMPT, &config, 0);
+            let mut sampler = Recording {
+                params: config.sampling,
+                rng: SplitMix64::new(config.seed.unwrap()),
+                fixed: None,
+                histories: Vec::new(),
+            };
+            let got = with(&config, &mut sampler);
+            // The same draw on the same stream is the same run; every draw saw the running
+            // prompt + generated history, and the record names the caller's path.
+            assert_eq!(got.output.tokens, expected.output.tokens);
+            let want: Vec<usize> = (0..10).map(|i| PROMPT.len() + i).collect();
+            assert_eq!(sampler.histories, want);
+            assert_eq!(
+                got.record.sampler.path,
+                Some(SamplerPath::Host(core_llm::HostSampleReason::Reference))
+            );
+            assert_eq!(got.record.sampler.host_draws, 10);
+            assert_eq!(got.record.sampler.device_draws, 0);
+            assert_eq!(got.record.proposer, ProposerKind::None);
+        }
+        // The caller's draw, not the shared sampler's, decides each token and the stop.
+        let mut config = greedy(10);
+        let mut fixed = Recording {
+            params: config.sampling,
+            rng: SplitMix64::new(0),
+            fixed: Some(5),
+            histories: Vec::new(),
+        };
+        assert_eq!(with(&config, &mut fixed).output.tokens, vec![5; 10]);
+        config.stop_tokens = vec![5];
+        fixed.histories.clear();
+        let stopped = with(&config, &mut fixed);
+        assert_eq!(stopped.output.tokens, Vec::<i32>::new());
+        assert_eq!(stopped.output.finish_reason, FinishReason::StopToken);
+        assert_eq!(fixed.histories, vec![PROMPT.len()]);
     }
 
     // ---- Every host decision is recorded; a degenerate row commits its argmax (sc-24140) ----

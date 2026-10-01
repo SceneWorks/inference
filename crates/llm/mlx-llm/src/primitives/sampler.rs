@@ -735,6 +735,30 @@ mod tests {
         assert_eq!(argmax_host(&[1.0, 5.0, 5.0, 2.0]), 1);
     }
 
+    /// MLX's `argmax` keeps the first maximum on the device too — across the threadgroups a wide
+    /// row is reduced over — so the device, rows and host paths agree on an exact tie.
+    #[test]
+    fn device_argmax_ties_break_to_lowest_index() {
+        let vocab = 1usize << 17;
+        for maxima in [
+            &[70_000usize, 5, 131_000][..],
+            &[131_071, 64_000][..],
+            &[3, 4][..],
+        ] {
+            let mut row = vec![0.25f32; vocab];
+            for &i in maxima {
+                row[i] = 7.5;
+            }
+            let lowest = *maxima.iter().min().unwrap() as i32;
+            assert_eq!(argmax_host(&row), lowest);
+            assert_eq!(argmax_device(&logits(&row)).unwrap(), lowest);
+            let mut two = row.clone();
+            two.extend_from_slice(&row);
+            let rows = Array::from_slice(&two, &[1, 2, vocab as i32]);
+            assert_eq!(argmax_rows_device(&rows).unwrap(), vec![lowest, lowest]);
+        }
+    }
+
     #[test]
     fn sampling_is_deterministic_for_fixed_seed() {
         let params = SamplingParams {

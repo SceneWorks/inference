@@ -131,6 +131,27 @@ pub trait CacheRollback<C> {
     fn recover(&mut self, cache: &mut C, keep: i32) -> Result<Rollback>;
 }
 
+/// The rollback of a target that only serves the token-at-a-time loop ([`NoProposer`]): that loop
+/// never arms it (a step without drafts writes nothing to recover), and a recovery is refused,
+/// never approximated — e.g. a sliding-window cache that evicts as it grows cannot rebuild a
+/// rolled-back position.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoDraftRollback;
+
+impl<C> CacheRollback<C> for NoDraftRollback {
+    fn label(&self) -> &'static str {
+        "none"
+    }
+
+    fn begin(&mut self, _: &mut C) {}
+
+    fn recover(&mut self, _: &mut C, _: i32) -> Result<Rollback> {
+        Err(Error::Unsupported(
+            "this target decodes token-at-a-time; it never verifies drafts".into(),
+        ))
+    }
+}
+
 /// Direct rollback by [`KvCache::truncate`] — every softmax KV cache: dropping rejected positions
 /// is bookkeeping, no forward.
 #[derive(Clone, Copy, Debug, Default)]

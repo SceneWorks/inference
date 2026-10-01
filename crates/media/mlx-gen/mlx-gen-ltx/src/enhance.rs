@@ -30,10 +30,10 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Result};
 use mlx_llm::core_llm::{DecodeReport, HostSampleReason, PathReport, SamplerPath};
 use mlx_llm::decode::{
-    generate_speculative, prefill_with_prefix, CacheRollback, ConstraintMask, EngineOptions,
-    FinishReason, GenerationConfig, LogitsScope, NoProposer, Pipelining, PrefixPrefill,
-    RewindableConstraintMask, Rollback, SampledToken, SpeculativePrompt, SpeculativeRun,
-    SpeculativeTarget, StreamEvent, TargetOutput, TokenSampler,
+    generate_speculative, prefill_with_prefix, ConstraintMask, EngineOptions, FinishReason,
+    GenerationConfig, LogitsScope, NoDraftRollback, NoProposer, Pipelining, PrefixPrefill,
+    RewindableConstraintMask, SampledToken, SpeculativePrompt, SpeculativeRun, SpeculativeTarget,
+    StreamEvent, TargetOutput, TokenSampler,
 };
 use mlx_llm::primitives::sampler::SamplingParams;
 use mlx_llm::{CausalLm, PrefixCache};
@@ -169,24 +169,6 @@ pub fn enhance(
 /// serves the token-at-a-time loop only: [`decode_logits`](GemmaModel::decode_logits) returns the
 /// last position's logits, so a verify forward over drafts is refused, never approximated.
 struct Gemma3Target<'a>(&'a GemmaModel);
-
-/// The rollback of a target that never verifies drafts: the token-at-a-time loop never arms it,
-/// and a recovery is refused.
-struct NoDraftRollback;
-
-impl CacheRollback<GemmaKvCache> for NoDraftRollback {
-    fn label(&self) -> &'static str {
-        "none"
-    }
-
-    fn begin(&mut self, _: &mut GemmaKvCache) {}
-
-    fn recover(&mut self, _: &mut GemmaKvCache, _: i32) -> mlx_llm::Result<Rollback> {
-        Err(mlx_llm::Error::Unsupported(
-            "the LTX-2.3 Gemma-3 enhancer decodes token-at-a-time; it never verifies drafts".into(),
-        ))
-    }
-}
 
 impl SpeculativeTarget for Gemma3Target<'_> {
     type Cache = GemmaKvCache;

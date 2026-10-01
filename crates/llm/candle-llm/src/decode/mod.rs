@@ -32,9 +32,9 @@ pub use batch::{generate_batch, BatchRequest};
 pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
-    generate_speculative, generate_speculative_with, DraftSample, DraftSampler, Drafts, NoProposer,
-    Proposal, ProposeContext, Proposer, RewindableConstraintMask, SpeculativePrompt,
-    SpeculativeRun,
+    generate_speculative, generate_speculative_with, generate_with_sampler, DraftSample,
+    DraftSampler, Drafts, NoProposer, Proposal, ProposeContext, Proposer, RewindableConstraintMask,
+    SpeculativePrompt, SpeculativeRun, TokenSampler,
 };
 pub use graph::{
     cuda_graphs_enabled, cuda_graphs_scope, graph_param_cache_load_bytes, graph_tally,
