@@ -1086,6 +1086,31 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
             self.assertIsNone(sealed["admission"]["wholeProcessPeakBoundBytes"])
             self.assertFalse((aborted / "roles").exists())
 
+    def test_sampler_gap_refusal_names_the_gap_limit_and_cadence(self) -> None:
+        # W2 run 36821253163: 5271 ticks over 810.4 s at a 50 ms interval, one 678 ms gap.
+        def sampled(row: dict, gap: int) -> dict:
+            row["memory"]["mlx"].update({"intervalMicros": 50_000, "sampleCount": 5271,
+                                         "samplingSpanMicros": 810_445_773, "maxGapMicros": gap})
+            return row
+        self.validate_from(sampled(observation("t2v", "q8", "run"), 500_000))
+        with self.assertRaises(campaign.CampaignError) as caught:
+            self.validate_from(sampled(observation("t2v", "q8", "run"), 678_127))
+        self.assertEqual(
+            str(caught.exception),
+            "memory sampler coverage has an excessive gap: max gap 678127 us exceeds 500000 us "
+            "(10 x 50000 us interval); 5271 samples over 810445773 us, mean spacing 153784 us")
+
+        candidate = self.validate()
+        def baseline(gap: int) -> dict:
+            return campaign._validate_baseline_observation(
+                sampled(baseline_observation("t2v", "q8", "baseline", candidate), gap),
+                expected_mode="t2v", expected_tier="q8", run_id="baseline",
+                candidate=candidate)
+        with self.assertRaisesRegex(campaign.CampaignError,
+                                    "dense baseline memory sampler coverage has an excessive gap: "
+                                    "max gap 678127 us exceeds 500000 us"):
+            baseline(678_127)
+
     def validate_from(self, row: dict, mode: str = "t2v", tier: str = "q8") -> dict:
         return campaign._validate_observation(
             row,

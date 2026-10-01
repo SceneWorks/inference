@@ -643,8 +643,7 @@ def _validate_observation(
         raise CampaignError("memory sampler paired footprint peak is internally inconsistent")
     if mlx["exactActivePeakBytes"] < mlx["sampledActivePeakBytes"]:
         raise CampaignError("exact MLX active peak cannot be below a sampled active value")
-    if mlx["maxGapMicros"] > mlx["intervalMicros"] * 10:
-        raise CampaignError("memory sampler coverage has an excessive gap")
+    _require_sampler_coverage(mlx, "memory sampler")
     if type(memory["releaseVerified"]) is not bool:
         raise CampaignError("memory.releaseVerified must be a boolean")
     loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024
@@ -812,6 +811,24 @@ def _validate_observation(
     return row
 
 
+# The longest allowed gap between allocator-sampler ticks, in sampler intervals. The sampled
+# active+cache peak is a decision domain (decision_policy materialMemory.requiredDomains) and
+# nothing else bounds MLX's cache between ticks -- MLX keeps no exact active+cache high-water
+# mark, and the Darwin lifetime phys_footprint also counts non-MLX memory -- so a longer gap
+# leaves an unbounded hole in that evidence and the row is refused.
+SAMPLER_MAX_GAP_INTERVALS = 10
+
+
+def _require_sampler_coverage(mlx: dict[str, Any], label: str) -> None:
+    limit = mlx["intervalMicros"] * SAMPLER_MAX_GAP_INTERVALS
+    if mlx["maxGapMicros"] > limit:
+        raise CampaignError(
+            f"{label} coverage has an excessive gap: max gap {mlx['maxGapMicros']} us exceeds "
+            f"{limit} us ({SAMPLER_MAX_GAP_INTERVALS} x {mlx['intervalMicros']} us interval); "
+            f"{mlx['sampleCount']} samples over {mlx['samplingSpanMicros']} us, mean spacing "
+            f"{mlx['samplingSpanMicros'] // max(mlx['sampleCount'] - 1, 1)} us")
+
+
 def _validate_baseline_observation(
     observation: object,
     *,
@@ -904,8 +921,9 @@ def _validate_baseline_observation(
         _integer(mlx[key], f"dense baseline memory.mlx.{key}", minimum=1 if key in {"exactActivePeakBytes", "sampledActivePeakBytes", "sampledFootprintPeakBytes", "sampleCount", "periodicSampleCount", "samplingSpanMicros", "intervalMicros"} else 0)
     if mlx["sampledFootprintPeakBytes"] != mlx["footprintPeakActiveBytes"] + mlx["footprintPeakCacheBytes"]:
         raise CampaignError("dense baseline paired allocator peak is inconsistent")
-    if mlx["exactActivePeakBytes"] < mlx["sampledActivePeakBytes"] or mlx["maxGapMicros"] > mlx["intervalMicros"] * 10:
+    if mlx["exactActivePeakBytes"] < mlx["sampledActivePeakBytes"]:
         raise CampaignError("dense baseline allocator coverage is inconsistent")
+    _require_sampler_coverage(mlx, "dense baseline memory sampler")
     if type(memory["releaseVerified"]) is not bool:
         raise CampaignError("dense baseline memory.releaseVerified must be a boolean")
     loaded_release_limit = memory["weightsLoaded"]["physFootprintBytes"] + 512 * 1024 * 1024
