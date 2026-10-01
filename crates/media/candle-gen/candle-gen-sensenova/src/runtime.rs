@@ -36,7 +36,7 @@ use candle_llm::decode::{
     generate_with_sampler, FinishReason, GenerationConfig, LogitsScope, SpeculativePrompt,
     StepModel, StepOutput, StepRequest, TokenSampler,
 };
-use candle_llm::primitives::sampler::{argmax_host, sample_host};
+use candle_llm::primitives::sampler::sample_host;
 use candle_llm::primitives::{
     CacheMemory, DecodeCache, HostSampleReason, SamplerPath, SamplingParams, SplitMix64,
 };
@@ -440,6 +440,7 @@ impl TokenSampler for UndPick {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_llm::primitives::sampler::argmax_host;
 
     fn row(logits: &[f32]) -> Tensor {
         Tensor::from_slice(logits, logits.len(), &Device::Cpu).unwrap()

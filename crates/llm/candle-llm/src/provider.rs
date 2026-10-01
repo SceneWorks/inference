@@ -5352,7 +5352,8 @@ fn prompt_lookup_capabilities(backend: core_llm::DecodeBackend) -> ProposerCapab
 
 /// The descriptor for the `candle-llama` provider (constructible without loading weights; used for
 /// explicit catalog composition and inspection). Without a device, its recommended depths are the
-/// defaults-table row of the device a load would open ([`crate::device::decode_backend_for`]).
+/// defaults-table row of the device a load would open (CUDA in a `cuda` build, else Metal or the
+/// CPU, as [`select_device`] chooses).
 pub fn provider_descriptor() -> TextLlmDescriptor {
     provider_descriptor_on(crate::device::decode_backend_for(cfg!(feature = "cuda")))
 }
