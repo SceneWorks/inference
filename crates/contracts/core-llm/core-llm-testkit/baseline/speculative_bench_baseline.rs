@@ -33,8 +33,19 @@
 //! companion heads or cross-turn prefix cache. Every other knob is the harness's
 //! (`SNAPSHOT`, `OUTPUT`, `SAMPLING`, `FORMAT`, `NEW_TOKENS`, `REPEATS`, `MODEL`, `BACKEND` —
 //! default: the provider descriptor's backend, `candle` / `mlx` as the harness's entry points
-//! label them — and `WARMUP`). With no prefix cache the warm-up runs the measured request, as the
-//! harness does with its cache off.
+//! label them — `WARMUP`, `THINKING` and `GIT_SHA`). With no prefix cache the warm-up runs the
+//! measured request, as the harness does with its cache off.
+//!
+//! `SPECULATIVE_BENCH_THINKING` is the harness's (`core_llm_testkit::BenchThinking`): `default`,
+//! `off`, `on`, `xhigh`, `medium` or `low`, sent through the request's `thinking` /
+//! `reasoning_effort` fields, which the pre-epic revision already has. The document's
+//! `provenance` is the harness's (`core_llm_testkit::BenchProvenance`): the checkout's `HEAD`
+//! (`git rev-parse` at run time, else `SPECULATIVE_BENCH_GIT_SHA`) and tree state — the copied-in
+//! driver shows as an untracked change, which is the expected difference — every recorded switch
+//! variable's raw value, and the effective state of the switches the revision has, read from
+//! their switch objects: on Candle the CUDA-graph, fused-kernel and NVFP4-GEMV switches and (in a
+//! `cuda` build) the CUDA stream; device positions and every MLX switch postdate the pre-epic
+//! revision and are `null`.
 //!
 //! # Run it at the pre-epic revision
 //!
@@ -50,12 +61,15 @@
 //!   cargo test --release --features cuda -p candle-llm --test speculative_bench_baseline -- \
 //!   --ignored --nocapture
 //!
-//! # MLX (Apple M-series): one integration binary, so register the module, and load mlx-llm.
-//! sed 's/^use candle_llm::LlamaProvider as Provider;$/use mlx_llm::LlamaProvider as Provider;/' \
+//! # MLX (Apple M-series): one integration binary, so register the module, and swap the Candle
+//! # backend block for the MLX one (delete the block, un-comment the `//mlx ` lines).
+//! sed -e '/^\/\/ BEGIN candle backend/,/^\/\/ END candle backend$/d' -e 's/^\/\/mlx //' \
 //!   "$SRC" > crates/llm/mlx-llm/tests/speculative_bench_baseline.rs
 //! printf '\n#[path = "speculative_bench_baseline.rs"]\nmod speculative_bench_baseline;\n' \
 //!   >> crates/llm/mlx-llm/tests/main.rs
-//! eval "$(scripts/fetch-prebuilt-mlx.sh)" && export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH
+//! # `--release` links the Release libmlx cell (the script's default is the Debug one).
+//! eval "$(scripts/fetch-prebuilt-mlx.sh --build-type Release)" \
+//!   && export PMETAL_MLX_PREBUILT_DIR PMETAL_METALLIB_PATH
 //! SPECULATIVE_BENCH_SNAPSHOT=/path/to/snapshot SPECULATIVE_BENCH_OUTPUT=/tmp/pre-epic.json \
 //!   cargo test --release -p mlx-llm --test integration -- speculative_bench_baseline:: \
 //!   --ignored --nocapture
@@ -64,18 +78,68 @@
 //! Then run the epic's entry point with the same knobs (its prefix cache defaults to off) and
 //! compare the two documents row for row.
 
-// The one line the MLX copy rewrites (see above).
+// BEGIN candle backend: the MLX copy deletes this block and un-comments the `//mlx ` lines below
+// (see above).
 use candle_llm::LlamaProvider as Provider;
 
+/// The effective state of the Candle runtime switches both revisions have, read from their switch
+/// objects (`core_llm_testkit::BenchSwitches`).
+pub fn backend_switches() -> Vec<(&'static str, Value)> {
+    use candle_llm::decode::graph;
+    use candle_llm::primitives::{fused, nvfp4_path};
+    let mut switches = vec![
+        (graph::CUDA_GRAPHS_ENV, json!(graph::cuda_graphs_enabled())),
+        (
+            fused::FUSED_KERNELS_ENV,
+            json!(fused::fused_kernels_enabled()),
+        ),
+        (
+            nvfp4_path::NVFP4_GEMV_ENV,
+            json!(nvfp4_path::nvfp4_gemv_enabled()),
+        ),
+    ];
+    if cfg!(feature = "cuda") {
+        let stream = candle_llm::device::CudaStreamKind::from_env()
+            .map_or_else(|e| json!(format!("error: {e}")), |kind| json!(kind.label()));
+        switches.push((candle_llm::device::CUDA_STREAM_ENV, stream));
+    }
+    switches
+}
+// END candle backend
+//mlx use mlx_llm::LlamaProvider as Provider;
+//mlx /// The pre-epic revision has no MLX runtime switches (sc-24446 added them): all `null`.
+//mlx pub fn backend_switches() -> Vec<(&'static str, Value)> {
+//mlx     Vec::new()
+//mlx }
+
 use core_llm::{
-    DecodeReport, LoadReport, LoadSpec, Message, MtpMode, MtpStats, Quantize, Sampling,
-    StreamEvent, TextLlm, TextLlmRequest,
+    DecodeReport, LoadReport, LoadSpec, Message, MtpMode, MtpStats, Quantize, ReasoningEffort,
+    Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmRequest, ThinkingMode,
 };
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::Instant;
 
 /// `core_llm_testkit::BENCH_SCHEMA`.
-pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/2";
+pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/3";
+/// `core_llm_testkit::BENCH_SWITCHES`.
+pub const BENCH_SWITCHES: [&str; 9] = [
+    "CANDLE_LLM_CUDA_GRAPHS",
+    "CANDLE_LLM_CUDA_STREAM",
+    "CANDLE_LLM_DEVICE_POSITIONS",
+    "CANDLE_LLM_FUSED_KERNELS",
+    "CANDLE_LLM_NVFP4_GEMV",
+    "MLX_LLM_PIPELINING",
+    "MLX_LLM_DEVICE_SAMPLER",
+    "MLX_LLM_FUSED_ROTATION",
+    "MLX_LLM_GDN_KERNEL",
+];
+/// `core_llm_testkit::BENCH_ENV`.
+pub const BENCH_ENV: [&str; 2] = ["CUDA_VISIBLE_DEVICES", "CANDLE_LLM_DEVICE"];
+/// `core_llm_testkit::BENCH_GIT_SHA_ENV`.
+pub const GIT_SHA_ENV: &str = "SPECULATIVE_BENCH_GIT_SHA";
+/// `core_llm_testkit::BenchProvenance::MAX_CHANGES`.
+pub const MAX_GIT_CHANGES: usize = 50;
 /// `core_llm_testkit::BENCH_DEFAULT_NEW_TOKENS`.
 pub const DEFAULT_NEW_TOKENS: u32 = 256;
 /// `core_llm_testkit::BENCH_DEFAULT_REPEATS`.
@@ -129,6 +193,145 @@ pub struct Config {
     pub warmup: bool,
     pub repeats: u32,
     pub options: Vec<MtpMode>,
+    pub thinking: Thinking,
+}
+
+/// A `SPECULATIVE_BENCH_THINKING` setting (`core_llm_testkit::BenchThinking`): its spelling and
+/// the request controls it sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Thinking {
+    pub label: &'static str,
+    pub mode: ThinkingMode,
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl Default for Thinking {
+    fn default() -> Self {
+        Self {
+            label: "default",
+            mode: ThinkingMode::Auto,
+            effort: None,
+        }
+    }
+}
+
+/// `core_llm_testkit::BenchThinking::parse`.
+pub fn parse_thinking(value: &str) -> Result<Thinking, String> {
+    let (label, mode, effort) = match value {
+        "default" => ("default", ThinkingMode::Auto, None),
+        "off" => ("off", ThinkingMode::Disabled, None),
+        "on" => ("on", ThinkingMode::Enabled, None),
+        "xhigh" => ("xhigh", ThinkingMode::Enabled, Some(ReasoningEffort::XHigh)),
+        "medium" => (
+            "medium",
+            ThinkingMode::Enabled,
+            Some(ReasoningEffort::Medium),
+        ),
+        "low" => ("low", ThinkingMode::Enabled, Some(ReasoningEffort::Low)),
+        _ => {
+            return Err(format!(
+                "SPECULATIVE_BENCH_THINKING must be default, off, on, xhigh, medium or low, \
+                 got {value}"
+            ))
+        }
+    };
+    Ok(Thinking {
+        label,
+        mode,
+        effort,
+    })
+}
+
+/// `core_llm_testkit::BenchThinking::to_json`.
+pub fn thinking_json(thinking: &Thinking, caps: &TextLlmCapabilities) -> Value {
+    json!({
+        "setting": thinking.label,
+        "enable_thinking": thinking.mode.enable_thinking_kwarg(),
+        "reasoning_effort": thinking.effort.map(ReasoningEffort::as_str),
+        "supports_thinking": caps.supports_thinking,
+        "supports_reasoning_effort": caps.supports_reasoning_effort,
+    })
+}
+
+/// `core_llm_testkit::git_provenance` as the `git` block of the provenance JSON.
+fn git_json(repo: &Path, var: &dyn Fn(&str) -> Option<String>) -> Value {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+    };
+    let sha = git(&["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    if let Some(sha) = sha {
+        let status = git(&["status", "--porcelain"]);
+        let changes: Vec<String> = status
+            .iter()
+            .flat_map(|s| s.lines())
+            .filter(|l| !l.trim().is_empty())
+            .take(MAX_GIT_CHANGES)
+            .map(str::to_string)
+            .collect();
+        return json!({
+            "sha": sha,
+            "dirty": status.as_ref().map(|s| !s.trim().is_empty()),
+            "changes": changes,
+            "source": "git",
+        });
+    }
+    let sha = var(GIT_SHA_ENV).map(|s| s.trim().to_string());
+    json!({
+        "sha": sha,
+        "dirty": null,
+        "changes": Vec::<String>::new(),
+        "source": sha.as_ref().map(|_| GIT_SHA_ENV),
+    })
+}
+
+/// `core_llm_testkit::BenchProvenance::collect` + `to_json`: the checkout this driver was compiled
+/// from, `switches` (the backend's effective states; a variable outside [`BENCH_SWITCHES`] or named
+/// twice is refused) and the raw environment read through `var`.
+pub fn provenance_json(
+    switches: &[(&'static str, Value)],
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<Value, String> {
+    for (i, (name, _)) in switches.iter().enumerate() {
+        if !BENCH_SWITCHES.contains(name) {
+            return Err(format!(
+                "switch {name} is not one of the recorded BENCH_SWITCHES"
+            ));
+        }
+        if switches[..i].iter().any(|(other, _)| other == name) {
+            return Err(format!("switch {name} is reported twice"));
+        }
+    }
+    let switches: serde_json::Map<String, Value> = BENCH_SWITCHES
+        .iter()
+        .map(|&name| {
+            let effective = switches
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(Value::Null, |(_, v)| v.clone());
+            (
+                name.to_string(),
+                json!({"env": var(name), "effective": effective}),
+            )
+        })
+        .collect();
+    let env: serde_json::Map<String, Value> = BENCH_ENV
+        .iter()
+        .map(|&name| (name.to_string(), json!(var(name))))
+        .collect();
+    Ok(json!({
+        "git": git_json(Path::new(env!("CARGO_MANIFEST_DIR")), var),
+        "switches": switches,
+        "env": env,
+    }))
 }
 
 /// One measured generation.
@@ -144,7 +347,8 @@ pub struct Measured {
     pub mtp: Option<MtpStats>,
 }
 
-fn env(name: &str) -> Option<String> {
+/// `core_llm_testkit::bench_env`.
+pub fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
@@ -263,6 +467,8 @@ fn request(text: &str, mode: MtpMode, config: &Config) -> TextLlmRequest {
         max_new_tokens: config.max_new_tokens,
         seed: Some(0),
         mtp: mode.into(),
+        thinking: config.thinking.mode,
+        reasoning_effort: config.thinking.effort,
         ..Default::default()
     }
 }
@@ -305,7 +511,13 @@ fn measure(provider: &dyn TextLlm, req: &TextLlmRequest) -> Result<Measured, Str
 
 /// One row in the harness's schema (`core_llm_testkit::BenchRow::to_json`) over `runs`, the
 /// first measured repeat's telemetry first.
-pub fn row_json(prompt_id: &str, class: &str, mode: &MtpMode, runs: &[Measured]) -> Value {
+pub fn row_json(
+    prompt_id: &str,
+    class: &str,
+    mode: &MtpMode,
+    thinking: &Thinking,
+    runs: &[Measured],
+) -> Value {
     let first = &runs[0];
     let report = first.report.as_ref();
     let mtp = first.mtp.as_ref();
@@ -326,6 +538,7 @@ pub fn row_json(prompt_id: &str, class: &str, mode: &MtpMode, runs: &[Measured])
         "prompt_id": prompt_id,
         "class": class,
         "requested": mode_json(mode),
+        "thinking": thinking.label,
         "proposer": proposer,
         "path": report.map(|r| r.path.clone()),
         "draft_tokens": report.and_then(|r| r.draft_tokens),
@@ -372,14 +585,22 @@ pub fn row_json(prompt_id: &str, class: &str, mode: &MtpMode, runs: &[Measured])
     })
 }
 
-/// The document in the harness's schema (`core_llm_testkit::BenchDocument::to_json`).
-pub fn document_json(config: &Config, load: Option<&LoadReport>, rows: Vec<Value>) -> Value {
+/// The document in the harness's schema (`core_llm_testkit::BenchDocument::to_json`), with the
+/// loaded provider's capabilities and the run's [`provenance_json`].
+pub fn document_json(
+    config: &Config,
+    load: Option<&LoadReport>,
+    caps: &TextLlmCapabilities,
+    provenance: Value,
+    rows: Vec<Value>,
+) -> Value {
     json!({
         "schema": BENCH_SCHEMA,
         "model": config.model,
         "backend": config.backend,
         "max_new_tokens": config.max_new_tokens,
         "sampling": sampling_json(&config.sampling),
+        "thinking": thinking_json(&config.thinking, caps),
         "warmup": config.warmup,
         "repeats": config.repeats,
         "options": config.options.iter().map(mode_json).collect::<Vec<_>>(),
@@ -389,6 +610,7 @@ pub fn document_json(config: &Config, load: Option<&LoadReport>, rows: Vec<Value
             "cuda_graphs": r.cuda_graphs,
             "fallbacks": null,
         })),
+        "provenance": provenance,
         "rows": rows,
     })
 }
@@ -410,7 +632,7 @@ pub fn run(provider: &dyn TextLlm, config: &Config) -> Result<Vec<Value>, String
             let runs = (0..config.repeats)
                 .map(|r| measure(provider, &req).map_err(|e| format!("{tag} repeat {r}: {e}")))
                 .collect::<Result<Vec<_>, _>>()?;
-            rows.push(row_json(id, class, mode, &runs));
+            rows.push(row_json(id, class, mode, &config.thinking, &runs));
         }
     }
     Ok(rows)
@@ -458,6 +680,9 @@ fn speculative_bench_baseline_writes_the_document() {
             .collect(),
         None => vec![MtpMode::Off, MtpMode::Auto],
     };
+    let thinking = env("SPECULATIVE_BENCH_THINKING").map_or_else(Thinking::default, |v| {
+        parse_thinking(v.trim()).unwrap_or_else(|e| panic!("{e}"))
+    });
     let provider = Provider::load(&LoadSpec {
         quantize,
         ..LoadSpec::dense(snapshot.clone())
@@ -483,10 +708,18 @@ fn speculative_bench_baseline_writes_the_document() {
         warmup: env("SPECULATIVE_BENCH_WARMUP").as_deref() != Some("0"),
         repeats: count("SPECULATIVE_BENCH_REPEATS", DEFAULT_REPEATS),
         options,
+        thinking,
     };
     let rows = run(&provider, &config).unwrap_or_else(|e| panic!("{e}"));
     let n = rows.len();
-    let doc = document_json(&config, provider.load_report().as_ref(), rows);
+    let provenance = provenance_json(&backend_switches(), &env).unwrap_or_else(|e| panic!("{e}"));
+    let doc = document_json(
+        &config,
+        provider.load_report().as_ref(),
+        &provider.descriptor().capabilities,
+        provenance,
+        rows,
+    );
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

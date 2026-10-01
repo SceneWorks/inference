@@ -9935,6 +9935,7 @@ mod tests {
             warmup: false,
             sampling: core_llm::Sampling::greedy(),
             repeats: 1,
+            thinking: core_llm_testkit::BenchThinking::Default,
         };
         let prompts = core_llm_testkit::speculative_prompt_set();
         let doc = core_llm_testkit::run_speculative_bench(&provider, &prompts, &config)
