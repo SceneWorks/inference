@@ -768,6 +768,7 @@ dependencies = [
  "candle-gen",
  "candle-gen-flux2",
  "candle-gen-pid",
+ "candle-llm",
  "image",
  "rand",
  "rand_distr",
@@ -1006,6 +1007,7 @@ name = "candle-gen-sensenova"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-llm",
  "image",
  "rand",
  "rand_distr",
@@ -2550,6 +2552,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-flux2",
  "mlx-gen-pid",
+ "mlx-llm",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
  "serde_json",

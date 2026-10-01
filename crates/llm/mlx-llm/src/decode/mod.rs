@@ -24,9 +24,10 @@ pub use cancel::CancelFlag;
 pub use continuous::{generate_continuous, BatchExactness, ContinuousConfig};
 pub use engine::{
     generate_speculative, CacheRollback, CheckpointRingRollback, DraftSampler, EngineOptions,
-    LogitsScope, MlxSampler, NoProposer, Pipelining, Proposal, ProposeContext, Proposer,
-    RewindableConstraintMask, Rollback, SampledToken, SnapshotRollback, SpeculativePrompt,
-    SpeculativeRun, SpeculativeTarget, StepTarget, TargetOutput, TokenSampler, TruncateRollback,
+    LogitsScope, MlxSampler, NoDraftRollback, NoProposer, Pipelining, Proposal, ProposeContext,
+    Proposer, RewindableConstraintMask, Rollback, SampledToken, SnapshotRollback,
+    SpeculativePrompt, SpeculativeRun, SpeculativeTarget, StepTarget, TargetOutput, TokenSampler,
+    TruncateRollback,
 };
 pub use prefix::{
     generate_cached, generate_cached_with, prefill_restored, prefill_with_prefix, Boundary,
