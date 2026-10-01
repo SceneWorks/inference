@@ -232,6 +232,7 @@ fn tiny_config() -> ModelConfig {
         yarn: None,
         mrope_section: None,
         gemma4: None,
+        activation_role: Default::default(),
     }
 }
 

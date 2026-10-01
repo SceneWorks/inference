@@ -13,6 +13,7 @@
 //! though the first decoders run batch-1. The [`KvCache`] trait is the seam the P4 paged cache
 //! (story 7169) slots in behind without touching decoders.
 
+pub mod activation;
 pub mod attention;
 pub mod coherence;
 pub mod fused;

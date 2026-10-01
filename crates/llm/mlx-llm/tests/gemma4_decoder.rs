@@ -46,9 +46,13 @@ const GOLDENS: &str = include_str!("../../testdata/gemma4/gemma4_decoder_goldens
 /// oracle ran, and none of the gap is a different set of weights.
 ///
 /// **Measured**, not guessed: the worst relative deviation across all five hidden states is
-/// **5.8e-3** (logits 2.9e-3, stepped-decode-vs-prefill 3.9e-4) on an idle machine. The budget is
-/// ~3.4x that, which is the headroom `tests/architecture_forward.rs` documents MLX's Metal kernels
-/// needing under runner load (drift of ~1.6e-3 absolute observed there on values near 1).
+/// **5.8e-3** (logits 2.9e-3, stepped-decode-vs-prefill 3.9e-4) on an idle machine with the `f32`
+/// GeGLU activations the LTX-2.5 text encoder keeps. The budget is ~3.4x that, which is the
+/// headroom `tests/architecture_forward.rs` documents MLX's Metal kernels needing under runner
+/// load (drift of ~1.6e-3 absolute observed there on values near 1). The BF16 GeGLU every LLM
+/// decode path runs since sc-24446 (the default role, which the goldens below load) measures
+/// **1.3e-2** hidden / **1.1e-2** logits — inside the budget with ~1.5x headroom
+/// ([`the_reference_holds_under_either_activation_dtype`]).
 ///
 /// Loose in absolute terms and still decisive: the four mutations land at 1.1e-1 to 5.8e-1
 /// relative — 6x to 30x this budget. [`mutations_are_all_outside_the_tolerance`] pins that gap
@@ -890,5 +894,52 @@ fn gemma4_truncate_rollback_forgets_the_rejected_drafts() {
             &other_plain,
             &format!("{label}: the step after the rollback"),
         );
+    }
+}
+
+/// sc-24446: the reference holds under **either** activation dtype the policy can pick
+/// (`mlx_llm::primitives::activation`) — the `f32` GeGLU the LTX-2.5 text encoder keeps and the
+/// BF16 GeGLU every LLM decode path runs — at every hidden state and every logit, inside the one
+/// [`ABS_TOL`] budget. Measured: worst relative deviation 5.8e-3 (hidden) / 3.0e-3 (logits) on the
+/// `f32` path, 1.3e-2 / 1.1e-2 on the BF16 path — rounding the GeGLU output (and hence the
+/// residual stream) to BF16's 8-bit significand once per layer, against an `f32` NumPy oracle.
+#[test]
+fn the_reference_holds_under_either_activation_dtype() {
+    use mlx_llm::primitives::activation::ActivationRole;
+    let g = goldens();
+    let ids = prompt_ids(&g);
+    let want_layers = g["hidden_states"]["layers"].as_array().unwrap();
+    let want_logits = floats(&g["logits"]["data"]);
+    for (role, stream) in [
+        (ActivationRole::LtxTextEncoder, Dtype::Float32),
+        (ActivationRole::LlmDecode, Dtype::Bfloat16),
+    ] {
+        let mut model_cfg = ModelConfig::from_json(&g["config"]).unwrap();
+        model_cfg.activation_role = role;
+        let mut map: HashMap<String, Array> = HashMap::new();
+        for (key, entry) in g["weights"].as_object().unwrap() {
+            let shape: Vec<i32> = entry["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect();
+            map.insert(
+                key.clone(),
+                Array::from_slice(&floats(&entry["data"]), &shape),
+            );
+        }
+        let model = CausalLm::from_weights(&Weights::from_map(map), "", model_cfg).unwrap();
+        let states = model
+            .hidden_states(&input_ids(&ids), &mut model.new_cache(), 0)
+            .unwrap();
+        assert_eq!(states.last().unwrap().dtype(), stream, "{role:?}");
+        for (i, (got, want)) in states.iter().zip(want_layers).enumerate() {
+            assert_abs_close(&host(got), &floats(want), &format!("{role:?} hidden[{i}]"));
+        }
+        let logits = model
+            .decode_logits_all(&input_ids(&ids), &mut model.new_cache(), 0)
+            .unwrap();
+        assert_abs_close(&host(&logits), &want_logits, &format!("{role:?} logits"));
     }
 }

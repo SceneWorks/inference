@@ -3051,7 +3051,8 @@ const MLX_MAX_BUFFER_BYTES: u64 = 50 * 1024 * 1024;
 const MLX_MAX_OPS_PER_BUFFER: u64 = 50;
 
 /// What a forward's promoted weight copies can hold at once when the decoder's activations are
-/// `f32` against BF16 weights (Gemma's GeGLU, [`CausalLm::activations_promote`]; sc-24446).
+/// `f32` against BF16 weights (a Gemma GeGLU whose role the activation-dtype policy keeps on
+/// `f32`, [`CausalLm::activations_promote`]; sc-24446).
 ///
 /// Each dense matmul materializes an `f32` copy of its weight (a quantized matmul, of its scales
 /// and biases), held until the command buffer that consumes it completes. The LM head's copy —
@@ -6223,20 +6224,25 @@ mod tests {
         .unwrap();
     }
 
-    /// sc-24446 (d): a one-token request's MLX working set is priced, including what a Gemma
-    /// forward promotes. Gemma's GeGLU leaves its activations `f32` against BF16 weights, so a
-    /// forward materializes an `f32` copy of the LM head (vocabulary × hidden × 4 bytes — 2.4 GB
-    /// on Gemma 2, 4.0 GB on Gemma 4) and of every dense projection it runs; request admission
-    /// prices that ([`promoted_weight_bytes`]) on top of the decoder's own workspace. On a tied
-    /// 65,536-token fixture, dense and at load-time Q4, the measured second-request peak (the
-    /// model already materialized) stays within the request estimate — and exceeds the estimate
-    /// without the promotion term, so the term is load-bearing. A SwiGLU decoder promotes
-    /// nothing.
+    /// sc-24446 (d): a one-token request's MLX working set is priced, under either activation
+    /// dtype ([`crate::primitives::activation`]).
     ///
-    /// MUTATION: return `Some(0)` from `Decoder::promoted_request_bytes` and the Gemma cases go
-    /// RED.
+    /// * **LLM decode** (every provider load): a Gemma GeGLU returns BF16, so the forward stays
+    ///   BF16 and promotes nothing — `promoted_request_bytes` is 0 — and the measured
+    ///   second-request peak on a tied 65,536-token fixture, dense and at load-time Q4, stays
+    ///   within the request estimate, as a SwiGLU decoder's does.
+    /// * **A role pinned to `f32`** (the LTX-2.5 text encoder): the GeGLU leaves the stream `f32`,
+    ///   every dense matmul materializes an `f32` copy of its BF16 weight (the LM head's alone
+    ///   vocabulary × hidden × 4 bytes), and the promotion term is what covers the measured
+    ///   one-token forward — it exceeds the estimate without it.
+    ///
+    /// The final hidden state is `f32` exactly when the model reports promoting activations.
+    ///
+    /// MUTATION: return `Some(0)` from `Decoder::promoted_request_bytes` and the pinned cases go
+    /// RED; make `CausalLm::activations_promote` ignore the role and the LLM-decode Gemma cases do.
     #[test]
-    fn a_one_token_request_working_set_is_priced_including_gemma_weight_promotion() {
+    fn a_one_token_request_working_set_is_priced_under_either_activation_dtype() {
+        use crate::primitives::activation::ActivationRole;
         for (model_type, arch, gemma) in [
             ("llama", "LlamaForCausalLM", false),
             ("gemma2", "Gemma2ForCausalLM", true),
@@ -6247,6 +6253,9 @@ mod tests {
                 let mut spec = LoadSpec::dense(dir.path().display().to_string());
                 spec.quantize = quantize;
                 spec.prefix_cache_bytes = Some(0);
+                let label = format!("{model_type} {quantize:?}");
+
+                // LLM decode, through the provider.
                 let provider = LlamaProvider::load(&spec).unwrap();
                 let req = TextLlmRequest {
                     messages: vec![Message::user("t3 t9 t4 t11")],
@@ -6260,51 +6269,100 @@ mod tests {
                 let estimate = provider
                     .speculative_request_bytes(SpeculativeRoute::Plain, prompt.len(), 1, 0)
                     .unwrap();
-                let promoted = provider.model.promoted_request_bytes().unwrap();
                 let Decoder::Causal(m) = &provider.model else {
                     unreachable!("a causal fixture")
                 };
-                // What the pricing keys on is what the forward does: the final hidden state is
-                // `f32` exactly when the model reports promoting activations.
-                let hidden = m
-                    .hidden_states(&input_ids(&[3, 9, 4]), &mut m.new_cache(), 0)
-                    .unwrap();
-                assert_eq!(
-                    hidden.last().unwrap().dtype() == mlx_rs::Dtype::Float32,
-                    m.activations_promote(),
-                    "{model_type}: activation dtype {:?}",
-                    hidden.last().unwrap().dtype()
-                );
+                assert_hidden_dtype_matches_promotion(m, &label);
+                assert!(!m.activations_promote(), "{label}: LLM decode promotes");
+                assert_eq!(provider.model.promoted_request_bytes(), Some(0), "{label}");
                 provider.generate(&req, &mut |_| {}).unwrap();
-                mlx_rs::memory::clear_cache();
-                let before = mlx_rs::memory::get_active_memory();
-                mlx_rs::memory::reset_peak_memory();
-                provider.generate(&req, &mut |_| {}).unwrap();
-                let working_set = (mlx_rs::memory::get_peak_memory() - before) as u64;
-                let label = format!("{model_type} {quantize:?}");
+                let working_set = second_run_peak(|| {
+                    provider.generate(&req, &mut |_| {}).unwrap();
+                });
                 assert!(
                     working_set <= estimate,
                     "{label}: working set {working_set} exceeds the estimate {estimate}"
                 );
-                if gemma {
-                    assert!(m.activations_promote(), "{label}");
-                    assert!(
-                        working_set > estimate - promoted,
-                        "{label}: the promotion term is not load-bearing ({working_set} <= {})",
-                        estimate - promoted
-                    );
-                } else {
-                    assert_eq!(promoted, 0, "{label}");
+
+                // A role pinned to f32, on the decoder directly.
+                if !gemma {
+                    continue;
                 }
+                let cfg_value = read_config_value(dir.path()).unwrap();
+                let mut cfg = ModelConfig::from_json(&cfg_value).unwrap();
+                cfg.activation_role = ActivationRole::LtxTextEncoder;
+                let w = Weights::from_dir(dir.path()).unwrap();
+                let quant = quantize.map(|q| quant_spec(q).unwrap());
+                let pinned =
+                    Decoder::Causal(CausalLm::from_weights_with(&w, "", cfg, quant).unwrap());
+                let Decoder::Causal(m) = &pinned else {
+                    unreachable!()
+                };
+                assert_hidden_dtype_matches_promotion(m, &label);
+                assert!(m.activations_promote(), "{label}: the pinned role promotes");
+                let promoted = pinned.promoted_request_bytes().unwrap();
+                assert!(promoted > 0, "{label}");
+                let ids = input_ids(&[3, 9, 4, 11]);
+                let decoder_estimate = estimate_mlx_request_bytes(
+                    4,
+                    1,
+                    pinned.memory_geometry(),
+                    0,
+                    0,
+                    pinned.workspace_contract(),
+                )
+                .unwrap();
+                let forward = || {
+                    m.decode_logits(&ids, &mut m.new_cache(), 0)
+                        .unwrap()
+                        .eval()
+                        .unwrap();
+                };
+                forward();
+                let working_set = second_run_peak(forward);
+                assert!(
+                    working_set <= decoder_estimate + promoted,
+                    "{label} pinned: working set {working_set} exceeds {}",
+                    decoder_estimate + promoted
+                );
+                assert!(
+                    working_set > decoder_estimate,
+                    "{label} pinned: the promotion term is not load-bearing ({working_set} <= \
+                     {decoder_estimate})"
+                );
             }
         }
+    }
+
+    /// The final hidden state is `f32` exactly when `m` reports promoting activations.
+    fn assert_hidden_dtype_matches_promotion(m: &CausalLm, label: &str) {
+        let hidden = m
+            .hidden_states(&input_ids(&[3, 9, 4]), &mut m.new_cache(), 0)
+            .unwrap();
+        let dtype = hidden.last().unwrap().dtype();
+        assert_eq!(
+            dtype == mlx_rs::Dtype::Float32,
+            m.activations_promote(),
+            "{label}: activation dtype {dtype:?}"
+        );
+    }
+
+    /// MLX's peak active-memory growth over `run` (the model already materialized by a first run).
+    fn second_run_peak(run: impl FnOnce()) -> u64 {
+        mlx_rs::memory::clear_cache();
+        let before = mlx_rs::memory::get_active_memory();
+        mlx_rs::memory::reset_peak_memory();
+        run();
+        (mlx_rs::memory::get_peak_memory() - before) as u64
     }
 
     /// The request estimate covers every one-token request MLX working set the sc-24446 guarded
     /// probes recorded on real weights (`native-memory-admission.md`: a second identical
     /// one-token "Hi" request on the materialized model, MLX peak active growth), computed from
-    /// each model's geometry, its rendered prompt length and — for Gemma — the promoted LM head
-    /// and largest promoted projection (a dense MLP matrix at BF16; its scales and biases at Q4).
+    /// each model's geometry, its rendered prompt length and — for Gemma, recorded with the `f32`
+    /// GeGLU a pinned role still runs — the promoted LM head and largest promoted projection (a
+    /// dense MLP matrix at BF16; its scales and biases at Q4). Gemma's LLM-decode path no longer
+    /// promotes (its BF16 working set is re-probed on real weights).
     /// Recorded evidence, not a machine golden: the relation is pinned. Before sc-24446 the
     /// estimate was 6–9 MB for the Llama / Qwen3 cases (measured 35–87 MB) and 14–31 MB for the
     /// Gemma cases (measured 2.4–5.4 GB).

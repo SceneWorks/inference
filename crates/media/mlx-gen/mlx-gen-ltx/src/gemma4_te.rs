@@ -357,7 +357,10 @@ fn load_backbone(
     // be invisible and the packed encoder would load as if dense. The stream reads that same
     // `cfg.quantization` per materialized layer, so a packed tier streams packed.
     let identity_config = gemma_config_value(te_path)?;
-    let cfg = ModelConfig::from_json(&identity_config).map_err(from_llm)?;
+    let mut cfg = ModelConfig::from_json(&identity_config).map_err(from_llm)?;
+    // The activation-dtype policy (sc-24446): this encoder's real-weight goldens were captured
+    // with `f32` GeGLU activations, so it keeps that path (`mlx_llm::primitives::activation`).
+    cfg.activation_role = mlx_llm::primitives::activation::ActivationRole::LtxTextEncoder;
     let hidden_size = cfg.hidden_size;
 
     // (4) Residency. `Sequential` (sc-18798) materializes one decoder layer at a time from

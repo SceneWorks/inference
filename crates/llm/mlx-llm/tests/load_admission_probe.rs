@@ -90,6 +90,22 @@ fn load_admission_probe() {
     let mlx_request_working_set = mlx_rs::memory::get_peak_memory() - before_second;
     let footprint_request_growth =
         peak.load(Ordering::Relaxed).max(phys_footprint()) - footprint_before_second;
+    // Optional decode-speed sample (sc-24446): `LOAD_PROBE_DECODE_TOKENS` greedy tokens.
+    let decode_tokens_per_sec = std::env::var("LOAD_PROBE_DECODE_TOKENS")
+        .ok()
+        .and_then(|n| n.parse::<u32>().ok())
+        .map(|n| {
+            let req = TextLlmRequest {
+                messages: vec![Message::user(
+                    "Write a long story about a lighthouse keeper.",
+                )],
+                max_new_tokens: n,
+                ..req.clone()
+            };
+            let started = Instant::now();
+            let out = provider.generate(&req, &mut |_| {}).expect("decode sample");
+            f64::from(out.usage.generated_tokens) / started.elapsed().as_secs_f64()
+        });
     done.store(true, Ordering::Relaxed);
     sampler.join().unwrap();
     let peak = peak_first;
@@ -112,6 +128,7 @@ fn load_admission_probe() {
             "mlx_cache_end": mlx_rs::memory::get_cache_memory(),
             "load_secs": load_secs,
             "tokens": out.usage.generated_tokens,
+            "decode_tokens_per_sec": decode_tokens_per_sec,
         })
     );
 }

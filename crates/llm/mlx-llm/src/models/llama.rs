@@ -51,6 +51,7 @@ use mlx_rs::{Array, Dtype};
 use crate::config::{Architecture, BidirectionalAttention, LayerAttentionType, ModelConfig};
 use crate::error::{Error, Result};
 use crate::models::deepstack::deepstack_fused_decoder_layers;
+use crate::primitives::activation::{gelu_precision, ActivationRole, GeluPrecision};
 use crate::primitives::attention::{sdpa_capped, sliding_causal_mask, AttnMask};
 use crate::primitives::kv_cache::KvCache;
 use crate::primitives::moe::{MoeRouting, SparseMoe, SwiGlu, SwitchLinear};
@@ -218,12 +219,13 @@ impl CausalLm {
         Self::build(w, prefix, cfg, quant, None)
     }
 
-    /// Whether a forward's activations are wider than its weights. Every Gemma generation's GeGLU
-    /// runs `mlx_rs::nn::gelu_approximate`, whose constants are `f32` arrays: a BF16 input
-    /// comes back `f32`, and the residual stream, every later projection's input and the final
-    /// hidden state stay `f32` (sc-24446). The SwiGLU decoders keep BF16 throughout.
+    /// Whether a forward's activations are wider than its weights: a Gemma GeGLU whose role the
+    /// activation-dtype policy keeps on the `f32` path ([`crate::primitives::activation`]) — its
+    /// residual stream, every later projection's input and the final hidden state are `f32`
+    /// (sc-24446). An LLM decoder's GeGLU and every SwiGLU decoder keep BF16 throughout.
     pub fn activations_promote(&self) -> bool {
         self.cfg.architecture.is_gemma()
+            && gelu_precision(self.cfg.activation_role) == GeluPrecision::F32
     }
 
     /// When [`CausalLm::activations_promote`]: the LM head's elements, and the most elements any
@@ -1655,13 +1657,17 @@ struct LlamaMlp {
     gate: Projection,
     up: Projection,
     down: Projection,
-    gelu: bool,
+    /// GeGLU (Gemma) for this role — the activation-dtype policy's key; `None` ⇒ SwiGLU.
+    gelu: Option<ActivationRole>,
 }
 
 impl LlamaMlp {
     fn forward(&self, x: &Array) -> Result<Array> {
         let g = self.gate.forward(x)?;
-        let g = if self.gelu { gelu_tanh(&g)? } else { silu(&g)? };
+        let g = match self.gelu {
+            Some(role) => gelu_tanh(&g, role)?,
+            None => silu(&g)?,
+        };
         let up = self.up.forward(x)?;
         self.down.forward(&multiply(&g, &up)?)
     }
@@ -1970,7 +1976,7 @@ impl LayerPlan {
                 gate,
                 up,
                 down: proj(lp("mlp.down_proj.weight"))?,
-                gelu: gemma,
+                gelu: gemma.then_some(cfg.activation_role),
             })
         };
 
@@ -2110,6 +2116,85 @@ mod tests {
             seen.compared_steps > seen.tie_steps,
             "most greedy steps must be decisive enough to compare: {seen:?}"
         );
+    }
+
+    /// sc-24446 parity gate for the Gemma decoders' GeGLU in the activation dtype: Gemma 2 on a
+    /// random BF16 fixture (soft-capped attention and logits, sandwich norms, `1 + w`) and Gemma 4
+    /// on the decoder-golden fixture (sliding / full alternation, layer scalars, k = v), each held
+    /// to the gate's logit budget and greedy-margin rule against its own `f32` path
+    /// ([`crate::primitives::activation::parity`]).
+    #[test]
+    fn gemma_geglu_activation_dtype_parity() {
+        use crate::primitives::activation::parity::{assert_geglu_parity, random_bf16};
+        use serde_json::json;
+        // Gemma 2.
+        let (v, h, inter, layers, heads, kv, hd) = (64, 64, 128, 2, 4, 2, 16);
+        let mut shapes: Vec<(String, Vec<i32>)> = vec![
+            ("model.embed_tokens.weight".into(), vec![v, h]),
+            ("model.norm.weight".into(), vec![h]),
+        ];
+        for i in 0..layers {
+            let l = |s: &str| format!("model.layers.{i}.{s}");
+            for (key, shape) in [
+                ("input_layernorm.weight", vec![h]),
+                ("post_attention_layernorm.weight", vec![h]),
+                ("pre_feedforward_layernorm.weight", vec![h]),
+                ("post_feedforward_layernorm.weight", vec![h]),
+                ("self_attn.q_proj.weight", vec![heads * hd, h]),
+                ("self_attn.k_proj.weight", vec![kv * hd, h]),
+                ("self_attn.v_proj.weight", vec![kv * hd, h]),
+                ("self_attn.o_proj.weight", vec![h, heads * hd]),
+                ("mlp.gate_proj.weight", vec![inter, h]),
+                ("mlp.up_proj.weight", vec![inter, h]),
+                ("mlp.down_proj.weight", vec![h, inter]),
+            ] {
+                shapes.push((l(key), shape));
+            }
+        }
+        let cfg = ModelConfig::from_json(&json!({
+            "architectures": ["Gemma2ForCausalLM"], "model_type": "gemma2",
+            "hidden_size": h, "intermediate_size": inter, "num_hidden_layers": layers,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+            "vocab_size": v, "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "attn_logit_softcapping": 50.0, "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": hd, "sliding_window": 4096,
+            "max_position_embeddings": 8192
+        }))
+        .unwrap();
+        let gemma2 = CausalLm::from_weights(
+            &Weights::from_map(random_bf16(&shapes, 0x2444_6603)),
+            "",
+            cfg,
+        )
+        .unwrap();
+        let report = assert_geglu_parity("gemma2", &gemma2, &[3, 17, 5, 40, 9], 16);
+        eprintln!("gemma2 GeGLU parity: {report:?}");
+
+        // Gemma 4, on the decoder-golden fixture.
+        let g: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../testdata/gemma4/gemma4_decoder_goldens.json"
+        ))
+        .unwrap();
+        let floats = |v: &serde_json::Value| -> Vec<f32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect()
+        };
+        let mut map = std::collections::HashMap::new();
+        for (key, entry) in g["weights"].as_object().unwrap() {
+            let shape: Vec<i32> = floats(&entry["shape"]).iter().map(|&x| x as i32).collect();
+            map.insert(
+                key.clone(),
+                Array::from_slice(&floats(&entry["data"]), &shape),
+            );
+        }
+        let cfg = ModelConfig::from_json(&g["config"]).unwrap();
+        let gemma4 = CausalLm::from_weights(&Weights::from_map(map), "", cfg).unwrap();
+        let prompt: Vec<i32> = floats(&g["prompt"]).iter().map(|&x| x as i32).collect();
+        let report = assert_geglu_parity("gemma4", &gemma4, &prompt, 16);
+        eprintln!("gemma4 GeGLU parity: {report:?}");
     }
 
     #[test]

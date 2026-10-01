@@ -199,7 +199,10 @@ impl VisionBlock {
     }
 
     fn mlp(&self, x: &Array) -> Result<Array> {
-        let h = gelu_tanh(&linear(x, &self.fc1_w, self.fc1_b.as_ref())?)?;
+        let h = gelu_tanh(
+            &linear(x, &self.fc1_w, self.fc1_b.as_ref())?,
+            crate::primitives::activation::ActivationRole::VisionEncoder,
+        )?;
         linear(&h, &self.fc2_w, self.fc2_b.as_ref())
     }
 }

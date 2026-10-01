@@ -244,22 +244,48 @@ now priced on top of the decoder's own workspace (`provider.rs`), with the recor
 (`the_request_estimate_covers_the_recorded_one_token_working_sets`) and a fixture measurement
 (`a_one_token_request_working_set_is_priced_including_gemma_weight_promotion`):
 
-- **Gemma promotes its weights every forward.** Gemma's GeGLU runs `mlx_rs::nn::gelu_approximate`,
-  whose constants are `f32` arrays, so a BF16 input comes back `f32` and the residual stream, every
-  later projection's input and the final hidden state stay `f32` (`CausalLm::activations_promote`;
-  a SwiGLU decoder stays BF16). Each dense matmul then materializes an `f32` copy of its BF16
-  weight — the LM head's alone is vocabulary × hidden × 4 bytes: 2.36 GB on Gemma 2, 4.03 GB on the
-  262K-token Gemma 4 — and each quantized matmul an `f32` copy of its scales and biases. Priced as
-  the LM head's copy plus MLX's evaluation window (ten committed command buffers and the one
-  encoding) × (the 50 MB per-buffer cap + the largest promoted projection).
+- **Gemma promoted its weights every forward.** `mlx_rs::nn::gelu_approximate` builds its
+  constants as `f32` arrays, so Gemma's GeGLU turned a BF16 input into `f32` and the residual
+  stream, every later projection's input and the final hidden state stayed `f32`. Each dense matmul
+  then materialized an `f32` copy of its BF16 weight — the LM head's alone is vocabulary × hidden ×
+  4 bytes: 2.36 GB on Gemma 2, 4.03 GB on the 262K-token Gemma 4 — and each quantized matmul an
+  `f32` copy of its scales and biases. That is now an **activation-dtype policy**
+  (`mlx-llm/src/primitives/activation.rs`, the one place every tanh-GELU asks): LLM decode paths
+  (`ActivationRole::LlmDecode` — every provider load, draft models, the LTX-2.5 prompt enhancer,
+  StarVector's GPTBigCode / StarCoder2 decoders) return the GELU in its input's dtype, so the
+  stream stays BF16 and promotes nothing; the LTX-2.5 text encoder (`LtxTextEncoder`, its
+  real-weight goldens captured with `f32` activations) and vision towers / projectors
+  (`VisionEncoder`) keep `f32`. For a role that keeps `f32`, request admission prices the
+  promotion (`CausalLm::activations_promote`): the LM head's copy plus MLX's evaluation window (ten
+  committed command buffers and the one encoding) × (the 50 MB per-buffer cap + the largest
+  promoted projection); for every other decoder that term is zero.
 - **MLX runtime terms the shared estimates do not see** (generic decoders; the Qwen3.5 hybrid's
   contract already prices its own): K/V held in whole 256-position blocks, every layer's
   temporaries in flight across that window (capped at window × 50 MB), and a page of rounding per
   op output in it.
 
-The Gemma promotion is a dtype leak, not an inherent cost — computing GeGLU in the activation's
-dtype would remove both the copies and their traffic — but it changes Gemma's (and every
-`gelu_tanh` model's) numerics, so it is priced here rather than changed.
+#### Activation-dtype parity gate (sc-24446)
+
+A role switches to the activation dtype only behind a fixture gate
+(`primitives::activation::parity`): the decoder greedy-decodes 16 tokens on the `f32` path, the
+BF16 path is teacher-forced along them, and every step must hold `|Δlogit| ≤ 2⁻⁵ · max(|logit|,
+1)` (eight BF16 ULPs at the logit's magnitude: one BF16 rounding of each GeGLU output, 2⁻⁹
+relative, then a BF16 stream, over 2–4 layers and the head) with greedy tokens agreeing wherever
+the `f32` top-2 margin exceeds twice that step's `|Δlogit|`. Measured worst `|Δlogit|` relative:
+Gemma 2 1.06e-2, Gemma 4 1.08e-2 (0 flips each), GPTBigCode 8.7e-3 (1 flip, on a margin inside
+the rule), StarCoder2 8.3e-3 (0 flips). A wrong activation (SiLU for GELU) lands at 7.7e-2–1.4e-1.
+
+Existing goldens: none moved past its tolerance; none was regenerated. The Gemma 4 decoder goldens
+(`tests/gemma4_decoder.rs`, an `f32` NumPy oracle, budget 2e-2 relative) measure 1.3e-2 hidden /
+1.1e-2 logits on the BF16 path (5.8e-3 / 3.0e-3 on `f32`), both pinned by
+`the_reference_holds_under_either_activation_dtype`. `architecture_forward`'s Gemma 2 golden is
+not numerically pinned on MLX (eager-attention drift; shape, finiteness and cache growth only).
+The LTX-2.5 text encoder stays on `f32` until its real-weight goldens
+(`ltx_2_5_te_connector_inputs`, `ltx_2_5_te_tier_quality`) are run with BF16.
+
+Decode speed on a tiny Gemma 2 fixture (8 layers, hidden 1024, vocabulary 32K, one-token steps,
+release build, GPU shared with a running benchmark campaign): BF16 weights 7.1–8.1 → 4.9–5.9 ms per
+token (1.4×) with the BF16 GeGLU; load-time Q4 5.4–5.7 → 4.6–4.7 ms (1.2×).
 
 Request bounds include expanded visual tokens, eager attention scores/mask/softmax, full-length
 K/V storage, recurrent state, projection/MLP/logit buffers, MTP cache/rollback and draft-width
