@@ -4774,6 +4774,7 @@ mod tests {
             phase: Option<&'static str>,
             prefill_active: Option<u64>,
             prefill_kv: u64,
+            element_bytes: u64,
         }
         impl crate::campaign::Observer for PrefillCapture {
             fn phase(&mut self, name: &'static str) {
@@ -4783,9 +4784,10 @@ mod tests {
                 }
             }
             fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
-            fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, _element: u64) {
+            fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, element: u64) {
                 if self.phase == Some("prefill-peak") {
                     self.prefill_kv = self.prefill_kv.max(bytes);
+                    self.element_bytes = element;
                 }
             }
         }
@@ -4793,8 +4795,6 @@ mod tests {
         // 40 tokens: past the fused-SDPA row limit (the dense first step), one flushed 32-token
         // group and an 8-token residual.
         let prompt = (0..40).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
-        // Dense f32 K + V of the prompt for the tiny model (2 layers, 1 KV head, D64).
-        let dense_prompt_kv = 2 * 2 * 40 * 64 * 4;
         let config = GenerationConfig {
             max_new_tokens: 2,
             seed: Some(0),
@@ -4830,7 +4830,9 @@ mod tests {
                 decoder.selection_fallbacks.borrow().is_empty(),
                 "{method:?} selected the packed cache"
             );
-            // The failing scenario: the prompt's dense K/V is smaller than the reported store.
+            // The failing scenario: the prompt's dense K + V (2 layers, 1 KV head, D64, at the
+            // cache's element width) is smaller than the reported store.
+            let dense_prompt_kv = 2 * 2 * 40 * 64 * capture.element_bytes;
             assert!(
                 dense_prompt_kv < capture.prefill_kv,
                 "{method:?}: dense {dense_prompt_kv} B vs store {} B",
