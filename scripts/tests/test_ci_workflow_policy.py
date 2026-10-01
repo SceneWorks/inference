@@ -4121,6 +4121,139 @@ class CiWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(mutation=mutate):
                 self.assertTrue(self.qwen_image_2_1_lane_errors(mutated, source))
 
+    def decode_speedups_bench_errors(self, workflow: dict) -> list[str]:
+        """Everything `test_decode_speedups_bench_…` below binds, as a list of findings."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "speculative_bench_campaign",
+            WORKFLOW.parents[2] / "scripts" / "release" / "speculative_bench_campaign.py",
+        )
+        assert spec and spec.loader
+        campaign = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(campaign)
+
+        errors: list[str] = []
+        inputs = workflow[True]["workflow_dispatch"]["inputs"]
+        if "decode-speedups-bench" not in inputs["profile"]["options"]:
+            errors.append("`decode-speedups-bench` is not a dispatchable profile")
+        if inputs.get("decode_bench_matrix", {}).get("type") != "string":
+            errors.append("no string `decode_bench_matrix` input")
+        job = workflow["jobs"].get("candle-decode-speedups-bench")
+        if job is None:
+            return errors + ["no `candle-decode-speedups-bench` job"]
+        if job["if"] != (
+            "github.event_name == 'workflow_dispatch' && inputs.profile == 'decode-speedups-bench'"
+        ):
+            errors.append(f"not dispatch-only on its own profile: {job['if']!r}")
+        if job["runs-on"] != ["self-hosted", "windows", "cuda", "real-weights"]:
+            errors.append(f"wrong runner: {job['runs-on']!r}")
+        if job.get("timeout-minutes", 0) < 480:
+            errors.append(f"timeout {job.get('timeout-minutes')} is under 480 minutes")
+        env = job.get("env", {})
+        for name, value in (
+            ("DECODE_BENCH_MATRIX", "${{ inputs.decode_bench_matrix }}"),
+            ("DECODE_BENCH_SNAPSHOT_QWEN38", "${{ vars.CANDLE_BONSAI_QWEN38_SNAPSHOT }}"),
+            ("DECODE_BENCH_SNAPSHOT_BONSAI_MLX", "${{ vars.CANDLE_BONSAI_MLX_SNAPSHOT }}"),
+            ("CUDA_VISIBLE_DEVICES", "1"),
+            ("CUDA_PATH", "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"),
+        ):
+            if env.get(name) != value:
+                errors.append(f"job env {name} is {env.get(name)!r}, expected {value!r}")
+        for name in campaign.SNAPSHOT_ALIASES.values():
+            if name not in env:
+                errors.append(f"snapshot alias variable {name} is not mapped")
+        # The untrusted matrix reaches the job through `env:` only, never a step body or `with:`.
+        steps = job["steps"]
+        if "inputs.decode_bench_matrix" in json.dumps(steps):
+            errors.append("a step interpolates the untrusted matrix input")
+
+        checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+        expected = [
+            {"path": "inference"},
+            {"ref": campaign.PRE_EPIC_SHA, "path": "inference-pre-epic"},
+        ]
+        if [s.get("with") for s in checkouts] != expected:
+            errors.append(f"checkouts are {[s.get('with') for s in checkouts]!r}")
+        if job.get("defaults", {}).get("run", {}).get("working-directory") != "inference":
+            errors.append("steps do not run in the dispatched checkout")
+
+        named = {s.get("name"): s for s in steps}
+        index = {s.get("name"): i for i, s in enumerate(steps)}
+        wrapper = "Disable unstable sccache wrapper for the heavy Candle lane"
+        if "RUSTC_WRAPPER=" not in named.get(wrapper, {}).get("run", ""):
+            errors.append("RUSTC_WRAPPER is not cleared")
+        copy = named.get("Copy the baseline driver into the pre-epic checkout", {}).get("run", "")
+        driver = "crates\\contracts\\core-llm\\core-llm-testkit\\baseline\\speculative_bench_baseline.rs"
+        target = "..\\inference-pre-epic\\crates\\llm\\candle-llm\\tests\\speculative_bench_baseline.rs"
+        if driver not in copy or target not in copy or "|| exit /b 1" not in copy:
+            errors.append(f"the driver is not copied into the pre-epic checkout: {copy!r}")
+        builds = {
+            "Build the epic benchmark binary": "--test speculative_bench --no-run",
+            "Build the pre-epic baseline driver": "--test speculative_bench_baseline --no-run",
+        }
+        for name, test in builds.items():
+            run = named.get(name, {}).get("run", "")
+            command = f"cargo test --locked --release -p candle-llm --features cuda {test} || exit /b 1"
+            if 'call "%VCVARS%"' not in run or command not in run:
+                errors.append(f"{name}: does not build {test!r} under vcvars")
+            if index.get(name, -1) < index.get(wrapper, len(steps)):
+                errors.append(f"{name}: runs before RUSTC_WRAPPER is cleared")
+        pre_epic = named.get("Build the pre-epic baseline driver", {})
+        if pre_epic.get("working-directory") != "inference-pre-epic" or (
+            'set "CARGO_TARGET_DIR=%DECODE_BENCH_PRE_EPIC_TARGET%"' not in pre_epic.get("run", "")
+        ):
+            errors.append("the pre-epic build is not in its checkout with its own target dir")
+        run = named.get("Run every matrix row (epic entry, then baseline driver)", {}).get("run", "")
+        for fragment in (
+            'call "%VCVARS%"',
+            '"%REVIEWED_PYTHON%" scripts/release/speculative_bench_campaign.py run ',
+            '--epic-sha "%GITHUB_SHA%"',
+            "--pre-epic-root ..\\inference-pre-epic",
+            '--pre-epic-target-dir "%DECODE_BENCH_PRE_EPIC_TARGET%"',
+            '--output "%DECODE_BENCH_OUT%"',
+        ):
+            if fragment not in run:
+                errors.append(f"the run step lacks {fragment!r}")
+        upload = named.get("Keep the decode-speedups benchmark documents", {})
+        if upload.get("if") != "${{ !cancelled() }}":
+            errors.append("the documents upload must survive a failed row")
+        if upload.get("with", {}).get("if-no-files-found") != "error":
+            errors.append("an empty upload must red")
+        if upload.get("with", {}).get("path") != (
+            "${{ runner.temp }}/decode-speedups-bench-${{ github.run_id }}-${{ github.run_attempt }}"
+        ):
+            errors.append("the upload is not the run-scoped directory")
+        return errors
+
+    def test_decode_speedups_bench_is_dispatch_only_and_runs_both_checkouts_per_row(self) -> None:
+        """sc-24446: the epic sc-24432 campaign lane — dispatch-only, on the second card, the
+        untrusted matrix only through `env:`, the dispatched ref and the pre-epic revision checked
+        out side by side with the driver copied in, and every document kept."""
+        workflow = yaml.safe_load(real_weights_inline_text())
+        self.assertEqual(self.decode_speedups_bench_errors(workflow), [])
+        header = (
+            REAL_WEIGHTS_WORKFLOW.parents[2]
+            / "crates/contracts/core-llm/core-llm-testkit/baseline/speculative_bench_baseline.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("worktree add ../inference-pre-epic c1e8f8e02", header)
+
+        def interpolate(job: dict) -> None:
+            job["steps"][-2]["run"] += ' & echo "${{ inputs.decode_bench_matrix }}"'
+
+        for mutate in (
+            lambda job: job.update({"if": "inputs.profile == 'all' || inputs.profile == 'decode-speedups-bench'"}),
+            lambda job: job["env"].update({"CUDA_VISIBLE_DEVICES": "0"}),
+            lambda job: job.update({"timeout-minutes": 240}),
+            lambda job: job["steps"][1]["with"].update({"ref": "main"}),
+            lambda job: job["steps"][-1].pop("if"),
+            interpolate,
+        ):
+            mutated = copy.deepcopy(workflow)
+            mutate(mutated["jobs"]["candle-decode-speedups-bench"])
+            with self.subTest(mutation=mutate):
+                self.assertTrue(self.decode_speedups_bench_errors(mutated))
+
 
 class WorkflowFileSizeTests(unittest.TestCase):
     # GitHub refuses any workflow file over 512,000 bytes and every run of it then startup-fails

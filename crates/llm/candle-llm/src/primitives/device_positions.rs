@@ -75,6 +75,21 @@ pub fn device_positions_default(device: &Device) -> bool {
         .unwrap_or_else(|| crate::device::decode_defaults(device).device_positions)
 }
 
+/// [`device_positions_default`] for the device [`select_device`](crate::device::select_device)
+/// would open in this process — CUDA in a `cuda` build unless `CANDLE_LLM_DEVICE=cpu`, else
+/// Metal in a `metal` build, else the CPU — **without opening it** (a second CUDA device would
+/// put a second stream on the context). The speculative benchmark records it as the switch's
+/// effective state (sc-24446).
+pub fn device_positions_default_for_selected_device() -> bool {
+    let cpu_forced = std::env::var_os("CANDLE_LLM_DEVICE")
+        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("cpu"));
+    SWITCH.explicit().unwrap_or_else(|| {
+        crate::device::decode_backend_for(cfg!(feature = "cuda") && !cpu_forced)
+            .defaults()
+            .device_positions
+    })
+}
+
 /// Override the device-positions default for the process: `Some(true)` / `Some(false)` force it
 /// on every device, `None` returns to the environment's setting (else the CUDA default).
 pub fn set_device_positions_default(enabled: Option<bool>) {
@@ -297,6 +312,21 @@ impl DeviceRope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bench's record follows an explicit setting on any build, and otherwise the default
+    /// row of the device this build selects.
+    #[test]
+    fn the_selected_device_default_follows_the_switch_then_the_selected_row() {
+        for explicit in [true, false] {
+            let _guard = device_positions_policy_guard(Some(explicit));
+            assert_eq!(device_positions_default_for_selected_device(), explicit);
+        }
+        let _guard = device_positions_policy_guard(None);
+        if SWITCH.explicit().is_none() && !cfg!(feature = "cuda") {
+            // CPU (or Metal) row: the host path.
+            assert!(!device_positions_default_for_selected_device());
+        }
+    }
 
     fn host(t: &Tensor) -> Vec<f32> {
         t.to_dtype(DType::F32)

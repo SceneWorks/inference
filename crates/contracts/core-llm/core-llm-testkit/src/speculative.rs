@@ -15,10 +15,16 @@
 //!   predates this harness, so its rows come from the standalone driver in this crate's
 //!   `baseline/` directory, which emits the same schema; the pre- and post-epic campaign rows
 //!   compare field for field.
+//! * **Provenance** ([`BenchProvenance`]): every document records the checkout it was built from
+//!   (`git rev-parse HEAD` at run time, [`BENCH_GIT_SHA_ENV`] as the fallback), the effective state
+//!   of every runtime decode switch ([`BENCH_SWITCHES`], read from the backend's switch objects by
+//!   the entry point) and the device-selection environment ([`BENCH_ENV`]), and the reasoning
+//!   setting the requests carried ([`BenchThinking`], `SPECULATIVE_BENCH_THINKING`).
 
 use core_llm::{
-    DecodeReport, FinishReason, LoadReport, LoadSpec, Message, ProposerKind, Quantize, Sampling,
-    Speculative, SpeculativeProposer, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmRequest,
+    DecodeReport, FinishReason, LoadReport, LoadSpec, Message, ProposerKind, Quantize,
+    ReasoningEffort, Sampling, Speculative, SpeculativeProposer, StreamEvent, TextLlm,
+    TextLlmCapabilities, TextLlmRequest, ThinkingMode,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -27,7 +33,269 @@ use std::time::{Duration, Instant};
 use crate::draft_model::{draft_model_prompts, write_draft_model_fixture, DraftLoader};
 
 /// The benchmark document's schema identifier; bump it when a field changes meaning.
-pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/2";
+pub const BENCH_SCHEMA: &str = "sceneworks.decode-speedups.baseline/3";
+
+/// The reasoning setting every benchmark request carries (`SPECULATIVE_BENCH_THINKING`): which
+/// `enable_thinking` / `reasoning_effort` chat-template kwargs the requests send. A reasoning model
+/// decodes a different stream (and, under thinking, a much longer one) per setting, so a row is only
+/// comparable with a row of the same setting — the document and every row record it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BenchThinking {
+    /// `default`: the template's own default — [`ThinkingMode::Auto`], no `reasoning_effort`, so
+    /// neither kwarg is rendered.
+    #[default]
+    Default,
+    /// `off`: [`ThinkingMode::Disabled`] (`enable_thinking=false`).
+    Off,
+    /// `on`: [`ThinkingMode::Enabled`] (`enable_thinking=true`) at the template's default effort.
+    On,
+    /// `xhigh` / `medium` / `low`: [`ThinkingMode::Enabled`] with Qwen's `reasoning_effort` at that
+    /// level (refused by a provider that does not advertise `supports_reasoning_effort`).
+    Effort(ReasoningEffort),
+}
+
+impl BenchThinking {
+    /// Parse a `SPECULATIVE_BENCH_THINKING` value: `default`, `off`, `on`, or a `reasoning_effort`
+    /// level (`xhigh`, `medium`, `low`). Anything else is an error, never the default.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "default" => Ok(Self::Default),
+            "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
+            level => level
+                .parse::<ReasoningEffort>()
+                .map(Self::Effort)
+                .map_err(|_| {
+                    format!(
+                    "SPECULATIVE_BENCH_THINKING must be default, off, on, xhigh, medium or low, \
+                     got {value}"
+                )
+                }),
+        }
+    }
+
+    /// The setting's spelling (`default`, `off`, `on`, `xhigh`, `medium`, `low`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Effort(effort) => effort.as_str(),
+        }
+    }
+
+    /// The request's [`TextLlmRequest::thinking`].
+    pub fn mode(self) -> ThinkingMode {
+        match self {
+            Self::Default => ThinkingMode::Auto,
+            Self::Off => ThinkingMode::Disabled,
+            Self::On | Self::Effort(_) => ThinkingMode::Enabled,
+        }
+    }
+
+    /// The request's [`TextLlmRequest::reasoning_effort`].
+    pub fn reasoning_effort(self) -> Option<ReasoningEffort> {
+        match self {
+            Self::Effort(effort) => Some(effort),
+            _ => None,
+        }
+    }
+
+    /// Set `req`'s reasoning controls to this setting.
+    pub fn apply(self, req: &mut TextLlmRequest) {
+        req.thinking = self.mode();
+        req.reasoning_effort = self.reasoning_effort();
+    }
+
+    /// The document's `thinking` block: the setting, the kwargs it renders, and whether `caps`
+    /// (the loaded provider's) honor them — a setting the model does not support is either
+    /// refused (`on`, an effort level) or rendered to no effect (`off`), and the reader needs to
+    /// know which run that was.
+    pub fn to_json(self, caps: &TextLlmCapabilities) -> Value {
+        json!({
+            "setting": self.label(),
+            "enable_thinking": self.mode().enable_thinking_kwarg(),
+            "reasoning_effort": self.reasoning_effort().map(ReasoningEffort::as_str),
+            "supports_thinking": caps.supports_thinking,
+            "supports_reasoning_effort": caps.supports_reasoning_effort,
+        })
+    }
+}
+
+/// The runtime decode switches every document records (`provenance.switches`), by their
+/// environment variable — Candle's and MLX's alike, so documents from both backends (and the
+/// pre-epic baseline driver's) have one key set. A backend's entry point reports the **effective**
+/// state of its own switches from the switch objects ([`BenchSwitches`]); a switch the backend
+/// (or revision) does not have is recorded with `effective: null`.
+pub const BENCH_SWITCHES: [&str; 9] = [
+    "CANDLE_LLM_CUDA_GRAPHS",
+    "CANDLE_LLM_CUDA_STREAM",
+    "CANDLE_LLM_DEVICE_POSITIONS",
+    "CANDLE_LLM_FUSED_KERNELS",
+    "CANDLE_LLM_NVFP4_GEMV",
+    "MLX_LLM_PIPELINING",
+    "MLX_LLM_DEVICE_SAMPLER",
+    "MLX_LLM_FUSED_ROTATION",
+    "MLX_LLM_GDN_KERNEL",
+];
+
+/// The device-selection variables every document records verbatim (`provenance.env`): which GPU
+/// the process saw and whether Candle was forced onto the CPU.
+pub const BENCH_ENV: [&str; 2] = ["CUDA_VISIBLE_DEVICES", "CANDLE_LLM_DEVICE"];
+
+/// The runtime SHA a run records when `git rev-parse HEAD` cannot answer (no `git`, no checkout):
+/// set by the operator, recorded with `source` `SPECULATIVE_BENCH_GIT_SHA`.
+pub const BENCH_GIT_SHA_ENV: &str = "SPECULATIVE_BENCH_GIT_SHA";
+
+/// What an entry point reports about its backend's runtime switches: `(variable, effective state)`
+/// for each switch the backend has, read from the switch objects (a bool, or a label for a
+/// non-boolean switch such as the CUDA stream). Every variable must be one of [`BENCH_SWITCHES`].
+pub type BenchSwitches<'a> = &'a dyn Fn() -> Vec<(&'static str, Value)>;
+
+/// The checkout a benchmark binary was built from, and the runtime switches it ran under.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BenchProvenance {
+    /// `HEAD` of the checkout (40 hex), or [`BENCH_GIT_SHA_ENV`]'s value; `None` when neither
+    /// answered.
+    pub git_sha: Option<String>,
+    /// Whether the checkout differed from `HEAD` (`git status --porcelain`, untracked files
+    /// included); `None` when `git` did not answer.
+    pub git_dirty: Option<bool>,
+    /// The `git status --porcelain` lines, at most [`BenchProvenance::MAX_CHANGES`].
+    pub git_changes: Vec<String>,
+    /// `git`, [`BENCH_GIT_SHA_ENV`], or `None`.
+    pub git_source: Option<&'static str>,
+    /// The backend's effective switch states ([`BenchSwitches`]).
+    pub switches: Vec<(&'static str, Value)>,
+    /// Each [`BENCH_SWITCHES`] and [`BENCH_ENV`] variable's raw value at collection (`None` when
+    /// unset).
+    pub env: Vec<(&'static str, Option<String>)>,
+}
+
+impl BenchProvenance {
+    /// The most `git status --porcelain` lines a document records.
+    pub const MAX_CHANGES: usize = 50;
+
+    /// The provenance of this process: the checkout this crate was compiled from (its manifest
+    /// directory — the benchmark binary is built from the same checkout), the raw environment
+    /// read through `var`, and `switches` — refused when it names a variable outside
+    /// [`BENCH_SWITCHES`] or names one twice, so a renamed switch cannot drop out of the record.
+    pub fn collect(
+        switches: Vec<(&'static str, Value)>,
+        var: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        for (i, (name, _)) in switches.iter().enumerate() {
+            if !BENCH_SWITCHES.contains(name) {
+                return Err(format!(
+                    "switch {name} is not one of the recorded BENCH_SWITCHES"
+                ));
+            }
+            if switches[..i].iter().any(|(other, _)| other == name) {
+                return Err(format!("switch {name} is reported twice"));
+            }
+        }
+        let mut provenance = git_provenance(Path::new(env!("CARGO_MANIFEST_DIR")), var);
+        provenance.switches = switches;
+        provenance.env = BENCH_SWITCHES
+            .iter()
+            .chain(&BENCH_ENV)
+            .map(|&name| (name, var(name)))
+            .collect();
+        Ok(provenance)
+    }
+
+    /// The document's `provenance` block: `git` (`{"sha", "dirty", "changes", "source"}`),
+    /// `switches` (one `{"env", "effective"}` per [`BENCH_SWITCHES`] variable: the raw value and
+    /// the backend's effective state, each `null` when absent) and `env` (each [`BENCH_ENV`]
+    /// variable's raw value).
+    pub fn to_json(&self) -> Value {
+        let raw = |name: &str| {
+            self.env
+                .iter()
+                .find(|(n, _)| *n == name)
+                .and_then(|(_, v)| v.clone())
+        };
+        let switches: serde_json::Map<String, Value> = BENCH_SWITCHES
+            .iter()
+            .map(|&name| {
+                let effective = self
+                    .switches
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map_or(Value::Null, |(_, v)| v.clone());
+                (
+                    name.to_string(),
+                    json!({"env": raw(name), "effective": effective}),
+                )
+            })
+            .collect();
+        let env: serde_json::Map<String, Value> = BENCH_ENV
+            .iter()
+            .map(|&name| (name.to_string(), json!(raw(name))))
+            .collect();
+        json!({
+            "git": {
+                "sha": self.git_sha,
+                "dirty": self.git_dirty,
+                "changes": self.git_changes,
+                "source": self.git_source,
+            },
+            "switches": switches,
+            "env": env,
+        })
+    }
+}
+
+/// The git state of the checkout at `repo`: `git rev-parse HEAD` and `git status --porcelain`,
+/// run now; when `git` cannot answer, the SHA from [`BENCH_GIT_SHA_ENV`] (read through `var`)
+/// with the tree state unknown; else nothing.
+pub fn git_provenance(repo: &Path, var: &dyn Fn(&str) -> Option<String>) -> BenchProvenance {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+    };
+    let sha = git(&["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    if let Some(sha) = sha {
+        let status = git(&["status", "--porcelain"]);
+        return BenchProvenance {
+            git_sha: Some(sha),
+            git_dirty: status.as_ref().map(|s| !s.trim().is_empty()),
+            git_changes: status
+                .iter()
+                .flat_map(|s| s.lines())
+                .filter(|l| !l.trim().is_empty())
+                .take(BenchProvenance::MAX_CHANGES)
+                .map(str::to_string)
+                .collect(),
+            git_source: Some("git"),
+            ..BenchProvenance::default()
+        };
+    }
+    match var(BENCH_GIT_SHA_ENV) {
+        Some(sha) => BenchProvenance {
+            git_sha: Some(sha.trim().to_string()),
+            git_source: Some(BENCH_GIT_SHA_ENV),
+            ..BenchProvenance::default()
+        },
+        None => BenchProvenance::default(),
+    }
+}
+
+/// `SPECULATIVE_BENCH_THINKING` read through `var` ([`BenchThinking::parse`]); unset is
+/// [`BenchThinking::Default`].
+pub fn bench_thinking(var: &dyn Fn(&str) -> Option<String>) -> Result<BenchThinking, String> {
+    var("SPECULATIVE_BENCH_THINKING").map_or(Ok(BenchThinking::Default), |v| {
+        BenchThinking::parse(v.trim())
+    })
+}
 
 /// Whether a prompt's answer largely re-uses its context (where prompt lookup pays) or not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,6 +676,8 @@ pub struct BenchConfig {
     pub warmup: bool,
     /// Measured repeats per (prompt, option), at least one.
     pub repeats: u32,
+    /// The reasoning setting every request (warm-ups included) carries.
+    pub thinking: BenchThinking,
 }
 
 /// One measured repeat of a [`BenchRow`].
@@ -498,6 +768,7 @@ impl BenchStats {
 /// |-----|---------|
 /// | `prompt_id`, `class` | the prompt and `predictable` / `open_ended` |
 /// | `requested` | the option sent (`"off"`, `"auto"`, `{"proposer", "depth"}`) |
+/// | `thinking` | the reasoning setting the request carried ([`BenchThinking::label`]) |
 /// | `proposer`, `path`, `draft_tokens` | [`DecodeReport`]'s proposer label, decode path and depth |
 /// | `prompt_tokens`, `generated_tokens` | token counts |
 /// | `repeats` | measured repeats (the length of `samples`) |
@@ -526,6 +797,8 @@ pub struct BenchRow {
     pub class: PromptClass,
     /// The option requested.
     pub requested: Speculative,
+    /// The reasoning setting the request carried.
+    pub thinking: BenchThinking,
     /// Prompt tokens.
     pub prompt_tokens: u32,
     /// Tokens the first repeat generated.
@@ -550,6 +823,7 @@ impl BenchRow {
             "prompt_id": self.prompt_id,
             "class": self.class.label(),
             "requested": self.requested,
+            "thinking": self.thinking.label(),
             "proposer": report.map(|r| r.proposer.label()),
             "path": report.map(|r| r.path.clone()),
             "draft_tokens": report.and_then(|r| r.draft_tokens),
@@ -590,16 +864,21 @@ pub struct BenchDocument {
     pub config: BenchConfig,
     /// The provider's [`TextLlm::load_report`] (`None` when it reports none).
     pub load: Option<LoadReport>,
+    /// The provider's capabilities (the `thinking` block records its reasoning support).
+    pub capabilities: TextLlmCapabilities,
+    /// The checkout and runtime switches the run measured ([`BenchProvenance`]).
+    pub provenance: BenchProvenance,
     /// One row per (prompt, option), prompt-major.
     pub rows: Vec<BenchRow>,
 }
 
 impl BenchDocument {
     /// The baseline-format JSON document ([`BENCH_SCHEMA`]): `schema`, `model`, `backend`,
-    /// `max_new_tokens`, `sampling` ([`sampling_json`]), `warmup`, `repeats`, `options`, `load`
-    /// (`{"prefix_cache_bytes", "draft": {"source", "refusal"} | null, "cuda_graphs",
-    /// "fallbacks"}` from the load report — the settled prefix-cache budget and what became of a
-    /// named draft / MTP head — or `null`), and `rows` ([`BenchRow`]'s schema).
+    /// `max_new_tokens`, `sampling` ([`sampling_json`]), `thinking` ([`BenchThinking::to_json`]),
+    /// `warmup`, `repeats`, `options`, `load` (`{"prefix_cache_bytes", "draft": {"source",
+    /// "refusal"} | null, "cuda_graphs", "fallbacks"}` from the load report — the settled
+    /// prefix-cache budget and what became of a named draft / MTP head — or `null`), `provenance`
+    /// ([`BenchProvenance::to_json`]), and `rows` ([`BenchRow`]'s schema).
     pub fn to_json(&self) -> Value {
         let load = self.load.as_ref().map(|r| {
             json!({
@@ -615,10 +894,12 @@ impl BenchDocument {
             "backend": self.config.backend,
             "max_new_tokens": self.config.max_new_tokens,
             "sampling": sampling_json(&self.config.sampling),
+            "thinking": self.config.thinking.to_json(&self.capabilities),
             "warmup": self.config.warmup,
             "repeats": self.config.repeats,
             "options": self.config.options,
             "load": load,
+            "provenance": self.provenance.to_json(),
             "rows": self.rows.iter().map(BenchRow::to_json).collect::<Vec<_>>(),
         })
     }
@@ -659,10 +940,12 @@ fn bench_sample(run: &Observed) -> (BenchSample, &'static str) {
 }
 
 /// Run the benchmark: every prompt under every option in `config.options`, under
-/// `config.sampling` — an untimed warm-up (when `config.warmup`; [`BENCH_WARMUP_PROMPT`] says
-/// which request) and then `config.repeats` measured runs — one [`BenchRow`] each. Fails on the
-/// first request the provider refuses or cannot generate — a benchmark row that silently went
-/// missing would read as coverage.
+/// `config.sampling` and `config.thinking` — an untimed warm-up (when `config.warmup`;
+/// [`BENCH_WARMUP_PROMPT`] says which request) and then `config.repeats` measured runs — one
+/// [`BenchRow`] each. Fails on the first request the provider refuses or cannot generate — a
+/// benchmark row that silently went missing would read as coverage. The document's provenance
+/// records the checkout and environment with no backend switches; an entry point replaces it with
+/// its backend's ([`run_speculative_bench_from_env`]).
 pub fn run_speculative_bench(
     provider: &dyn TextLlm,
     prompts: &[BenchPrompt],
@@ -677,10 +960,15 @@ pub fn run_speculative_bench(
         .and_then(|r| r.prefix_cache_bytes)
         .is_some_and(|bytes| bytes > 0);
     let warmup_prompt = BenchPrompt::user("warmup", PromptClass::OpenEnded, BENCH_WARMUP_PROMPT);
+    let request = |prompt: &BenchPrompt, option: Speculative| {
+        let mut req = bench_request(prompt, option, &config.sampling, config.max_new_tokens);
+        config.thinking.apply(&mut req);
+        req
+    };
     let mut rows = Vec::with_capacity(prompts.len() * config.options.len());
     for prompt in prompts {
         for &option in &config.options {
-            let req = bench_request(prompt, option, &config.sampling, config.max_new_tokens);
+            let req = request(prompt, option);
             let tag = format!(
                 "[{}] {}",
                 prompt.id,
@@ -688,12 +976,7 @@ pub fn run_speculative_bench(
             );
             if config.warmup {
                 let warm = if isolated_warmup {
-                    bench_request(
-                        &warmup_prompt,
-                        option,
-                        &config.sampling,
-                        config.max_new_tokens,
-                    )
+                    request(&warmup_prompt, option)
                 } else {
                     req.clone()
                 };
@@ -713,6 +996,7 @@ pub fn run_speculative_bench(
                 prompt_id: prompt.id.clone(),
                 class: prompt.class,
                 requested: option,
+                thinking: config.thinking,
                 prompt_tokens: run.prompt_tokens,
                 generated_tokens: run.generated,
                 timing_source,
@@ -724,6 +1008,8 @@ pub fn run_speculative_bench(
     Ok(BenchDocument {
         config: config.clone(),
         load,
+        capabilities: provider.descriptor().capabilities.clone(),
+        provenance: BenchProvenance::collect(Vec::new(), &bench_env)?,
         rows,
     })
 }
@@ -820,6 +1106,7 @@ pub fn bench_config(
         options,
         warmup: var("SPECULATIVE_BENCH_WARMUP").as_deref() != Some("0"),
         repeats: count("SPECULATIVE_BENCH_REPEATS", BENCH_DEFAULT_REPEATS)?,
+        thinking: bench_thinking(var)?,
     })
 }
 
@@ -844,9 +1131,16 @@ pub fn bench_config(
 /// | `SPECULATIVE_BENCH_MODEL` | model label recorded verbatim (default: the snapshot's directory name, `@<format>` appended unless bf16) |
 /// | `SPECULATIVE_BENCH_BACKEND` | backend label recorded verbatim (default: the entry point's) |
 /// | `SPECULATIVE_BENCH_WARMUP` | `0` skips the untimed warm-up per row (default on) |
+/// | `SPECULATIVE_BENCH_THINKING` | reasoning setting of every request ([`BenchThinking::parse`]): `default` (the template's; the default), `off`, `on`, or a `reasoning_effort` level `xhigh` / `medium` / `low` (thinking on at that effort) |
+/// | `SPECULATIVE_BENCH_GIT_SHA` | the runtime SHA to record when `git rev-parse HEAD` cannot answer ([`BENCH_GIT_SHA_ENV`]) |
+///
+/// The document's `provenance` ([`BenchProvenance`]) records the checkout's `HEAD` and tree
+/// state, the effective state of `switches` (the backend's runtime switches, read after the run)
+/// and the raw [`BENCH_SWITCHES`] / [`BENCH_ENV`] variables.
 pub fn run_speculative_bench_from_env(
     default_backend: &str,
     load: DraftLoader<'_>,
+    switches: BenchSwitches<'_>,
 ) -> Result<(PathBuf, BenchDocument), String> {
     let snapshot =
         bench_env("SPECULATIVE_BENCH_SNAPSHOT").ok_or("set SPECULATIVE_BENCH_SNAPSHOT")?;
@@ -861,7 +1155,8 @@ pub fn run_speculative_bench_from_env(
     let spec = bench_load_spec(&snapshot, &bench_env)?;
     let config = bench_config(&snapshot, default_backend, &bench_env)?;
     let provider = load(&spec).map_err(|e| format!("load {snapshot}: {e}"))?;
-    let doc = run_speculative_bench(provider.as_ref(), &speculative_prompt_set(), &config)?;
+    let mut doc = run_speculative_bench(provider.as_ref(), &speculative_prompt_set(), &config)?;
+    doc.provenance = BenchProvenance::collect(switches(), &bench_env)?;
     doc.write_new(&output)
         .map_err(|e| format!("write {}: {e}", output.display()))?;
     Ok((output, doc))
@@ -878,11 +1173,17 @@ pub fn run_speculative_bench_from_env(
 /// * with a prefix-cache budget, the warm-up does not lend the measured prompt to its first
 ///   repeat: that repeat restores exactly the template lead-in a different prompt run first would
 ///   (measured on a separately loaded control), and the second repeat's sample records its own,
-///   larger hit.
+///   larger hit;
+/// * the document records the `default` reasoning setting on every row, and `switches` — the
+///   entry point's switch reader — reports at least one switch, each a recorded
+///   [`BENCH_SWITCHES`] variable with a non-null effective state, which the provenance block
+///   carries; a request for thinking the fixture does not advertise is refused, never run as the
+///   default.
 pub fn check_speculative_bench_on_fixture(
     root: &Path,
     backend: &str,
     load: DraftLoader<'_>,
+    switches: BenchSwitches<'_>,
 ) -> Result<(), String> {
     let fixture = write_draft_model_fixture(root).map_err(|e| format!("write the fixture: {e}"))?;
     let target = fixture.target.to_string_lossy().into_owned();
@@ -899,13 +1200,54 @@ pub fn check_speculative_bench_on_fixture(
         ],
         warmup: true,
         repeats: 2,
+        thinking: bench_thinking(&|_| None)?,
     };
     let mut failures = Vec::new();
 
     let cold = load(&bench_load_spec(&target, &|_| None)?)?;
-    let json = run_speculative_bench(cold.as_ref(), &prompts, &config)?.to_json();
+    let mut doc = run_speculative_bench(cold.as_ref(), &prompts, &config)?;
+    let reported = switches();
+    if reported.is_empty() || reported.iter().any(|(_, v)| v.is_null()) {
+        failures.push(format!("the switch reader reported {reported:?}"));
+    }
+    doc.provenance = BenchProvenance::collect(reported.clone(), &bench_env)?;
+    let json = doc.to_json();
     if json["load"]["prefix_cache_bytes"] != json!(0) {
         failures.push(format!("the default load settled {}", json["load"]));
+    }
+    if json["thinking"]["setting"] != "default"
+        || json["thinking"]["enable_thinking"] != Value::Null
+    {
+        failures.push(format!(
+            "the default reasoning setting is {}",
+            json["thinking"]
+        ));
+    }
+    let recorded = json["provenance"]["switches"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    if recorded.len() != BENCH_SWITCHES.len() {
+        failures.push(format!(
+            "the provenance records {} switches",
+            recorded.len()
+        ));
+    }
+    for (name, value) in &reported {
+        if recorded.get(*name).map(|s| &s["effective"]) != Some(value) {
+            failures.push(format!("the provenance lost switch {name}: {recorded:?}"));
+        }
+    }
+    let refused = run_speculative_bench(
+        cold.as_ref(),
+        &prompts[..1],
+        &BenchConfig {
+            thinking: BenchThinking::On,
+            ..config.clone()
+        },
+    );
+    if !cold.descriptor().capabilities.supports_thinking && refused.is_ok() {
+        failures.push("thinking `on` ran on a provider without a thinking mode".into());
     }
     let rows = json["rows"].as_array().cloned().unwrap_or_default();
     if rows.len() != prompts.len() * config.options.len() {
@@ -913,6 +1255,9 @@ pub fn check_speculative_bench_on_fixture(
     }
     for row in &rows {
         let tag = format!("[{}] {}", row["prompt_id"], row["requested"]);
+        if row["thinking"] != "default" {
+            failures.push(format!("{tag}: thinking {}", row["thinking"]));
+        }
         for key in [
             "graph_path",
             "attention",
@@ -1036,6 +1381,8 @@ mod tests {
         mislabel: bool,
         prefix_cache_bytes: Option<u64>,
         seen: RefCell<Vec<String>>,
+        /// Each request's reasoning controls, in request order.
+        seen_thinking: RefCell<Vec<(ThinkingMode, Option<ReasoningEffort>)>>,
     }
 
     fn stub(diverge: bool, mislabel: bool) -> SpeculativeStub {
@@ -1058,6 +1405,7 @@ mod tests {
             mislabel,
             prefix_cache_bytes: Some(0),
             seen: RefCell::default(),
+            seen_thinking: RefCell::default(),
         }
     }
 
@@ -1090,6 +1438,9 @@ mod tests {
             )
             .plan;
             self.seen.borrow_mut().push(req.messages[0].text_content());
+            self.seen_thinking
+                .borrow_mut()
+                .push((req.thinking, req.reasoning_effort));
             let speculating = plan.proposer() != ProposerKind::None;
             let mut text = String::new();
             for i in 0..req.max_new_tokens as usize {
@@ -1208,6 +1559,18 @@ mod tests {
         );
     }
 
+    /// An object's keys, sorted (independent of `serde_json`'s map ordering feature).
+    fn sorted_keys(value: &Value) -> Vec<&str> {
+        let mut keys: Vec<_> = value
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
     fn stub_config() -> BenchConfig {
         BenchConfig {
             model: "spec-stub".into(),
@@ -1220,6 +1583,7 @@ mod tests {
             warmup: true,
             sampling: Sampling::greedy(),
             repeats: 3,
+            thinking: BenchThinking::Default,
         }
     }
 
@@ -1239,7 +1603,42 @@ mod tests {
         );
         assert_eq!(json["sampling"], sampling_json(&Sampling::greedy()));
         assert_eq!(json["sampling"]["temperature"], 0.0);
+        assert_eq!(
+            json["thinking"],
+            json!({"setting": "default", "enable_thinking": null, "reasoning_effort": null,
+                   "supports_thinking": false, "supports_reasoning_effort": false})
+        );
+        assert_eq!(
+            sorted_keys(&json),
+            [
+                "backend",
+                "load",
+                "max_new_tokens",
+                "model",
+                "options",
+                "provenance",
+                "repeats",
+                "rows",
+                "sampling",
+                "schema",
+                "thinking",
+                "warmup"
+            ]
+        );
+        let switches = json["provenance"]["switches"].as_object().unwrap();
+        assert_eq!(sorted_keys(&json["provenance"]["switches"]), {
+            let mut names = BENCH_SWITCHES.to_vec();
+            names.sort_unstable();
+            names
+        });
+        // `run_speculative_bench` alone knows no backend: every effective state is unreported.
+        assert!(switches.values().all(|s| s["effective"].is_null()));
+        assert_eq!(
+            sorted_keys(&json["provenance"]["env"]),
+            ["CANDLE_LLM_DEVICE", "CUDA_VISIBLE_DEVICES"]
+        );
         let off = &json["rows"][0];
+        assert_eq!(off["thinking"], "default");
         assert_eq!(off["prompt_id"], "code_edit");
         assert_eq!(off["sampler"], "none");
         assert_eq!(off["class"], "predictable");
@@ -1488,5 +1887,190 @@ mod tests {
         ] {
             assert!(parse_bench_sampling(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_thinking_setting_parses_to_its_request_controls_and_refuses_anything_else() {
+        let cases = [
+            ("default", ThinkingMode::Auto, None, None),
+            ("off", ThinkingMode::Disabled, None, Some(false)),
+            ("on", ThinkingMode::Enabled, None, Some(true)),
+            (
+                "xhigh",
+                ThinkingMode::Enabled,
+                Some(ReasoningEffort::XHigh),
+                Some(true),
+            ),
+            (
+                "medium",
+                ThinkingMode::Enabled,
+                Some(ReasoningEffort::Medium),
+                Some(true),
+            ),
+            (
+                "low",
+                ThinkingMode::Enabled,
+                Some(ReasoningEffort::Low),
+                Some(true),
+            ),
+        ];
+        for (spelling, mode, effort, kwarg) in cases {
+            let thinking = BenchThinking::parse(spelling).unwrap();
+            assert_eq!(thinking.label(), spelling);
+            assert_eq!(
+                (thinking.mode(), thinking.reasoning_effort()),
+                (mode, effort)
+            );
+            let mut req = TextLlmRequest::default();
+            thinking.apply(&mut req);
+            assert_eq!((req.thinking, req.reasoning_effort), (mode, effort));
+            let json = thinking.to_json(&TextLlmCapabilities::default());
+            assert_eq!(json["setting"], spelling);
+            assert_eq!(json["enable_thinking"], json!(kwarg));
+            assert_eq!(
+                json["reasoning_effort"],
+                json!(effort.map(ReasoningEffort::as_str))
+            );
+        }
+        for bad in ["", "ON", "true", "high", "auto", "think"] {
+            let err = BenchThinking::parse(bad).unwrap_err();
+            assert!(err.contains("SPECULATIVE_BENCH_THINKING"), "{bad}: {err}");
+        }
+        let env = |value: &'static str| {
+            move |name: &str| (name == "SPECULATIVE_BENCH_THINKING").then(|| value.to_string())
+        };
+        assert_eq!(bench_thinking(&|_| None).unwrap(), BenchThinking::Default);
+        assert_eq!(
+            bench_config("m", "candle", &env("low")).unwrap().thinking,
+            BenchThinking::Effort(ReasoningEffort::Low)
+        );
+        assert!(bench_config("m", "candle", &env("maximum")).is_err());
+    }
+
+    /// Every request the bench sends — warm-up and measured — carries the configured reasoning
+    /// setting, every row records it, and a provider that cannot honor it refuses the run.
+    #[test]
+    fn the_bench_sends_and_records_the_thinking_setting_and_a_refusal_fails_the_run() {
+        let prompts = speculative_prompt_set();
+        let mut provider = stub(false, false);
+        provider.descriptor.capabilities.supports_thinking = true;
+        provider.descriptor.capabilities.supports_reasoning_effort = true;
+        let config = BenchConfig {
+            options: vec![Speculative::Off],
+            repeats: 2,
+            thinking: BenchThinking::Effort(ReasoningEffort::Medium),
+            ..stub_config()
+        };
+        let json = run_speculative_bench(&provider, &prompts[..2], &config)
+            .unwrap()
+            .to_json();
+        assert_eq!(
+            *provider.seen_thinking.borrow(),
+            [(ThinkingMode::Enabled, Some(ReasoningEffort::Medium)); 6],
+            "two warm-ups and four measured repeats"
+        );
+        assert_eq!(
+            json["thinking"],
+            json!({"setting": "medium", "enable_thinking": true, "reasoning_effort": "medium",
+                   "supports_thinking": true, "supports_reasoning_effort": true})
+        );
+        for row in json["rows"].as_array().unwrap() {
+            assert_eq!(row["thinking"], "medium", "{row}");
+        }
+
+        // No thinking mode at all; a thinking mode without Qwen's effort control.
+        let mut thinking_only = stub(false, false);
+        thinking_only.descriptor.capabilities.supports_thinking = true;
+        for (provider, thinking, needle) in [
+            (&stub(false, false), BenchThinking::On, "thinking"),
+            (
+                &thinking_only,
+                BenchThinking::Effort(ReasoningEffort::Low),
+                "reasoning_effort",
+            ),
+        ] {
+            let err = run_speculative_bench(
+                provider,
+                &prompts[..1],
+                &BenchConfig {
+                    thinking,
+                    ..config.clone()
+                },
+            )
+            .unwrap_err();
+            assert!(err.contains(needle), "{thinking:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_provenance_records_every_switch_and_refuses_an_unrecorded_one() {
+        let var = |name: &str| match name {
+            "CUDA_VISIBLE_DEVICES" => Some("1".to_string()),
+            "CANDLE_LLM_CUDA_GRAPHS" => Some("0".to_string()),
+            _ => None,
+        };
+        let provenance = BenchProvenance::collect(
+            vec![
+                ("CANDLE_LLM_CUDA_GRAPHS", json!(false)),
+                ("CANDLE_LLM_CUDA_STREAM", json!("legacy")),
+            ],
+            &var,
+        )
+        .unwrap();
+        let json = provenance.to_json();
+        assert_eq!(
+            json["switches"]["CANDLE_LLM_CUDA_GRAPHS"],
+            json!({"env": "0", "effective": false})
+        );
+        assert_eq!(
+            json["switches"]["CANDLE_LLM_CUDA_STREAM"],
+            json!({"env": null, "effective": "legacy"})
+        );
+        assert_eq!(
+            json["switches"]["MLX_LLM_PIPELINING"],
+            json!({"env": null, "effective": null})
+        );
+        assert_eq!(
+            json["env"],
+            json!({"CUDA_VISIBLE_DEVICES": "1", "CANDLE_LLM_DEVICE": null})
+        );
+        assert_eq!(
+            sorted_keys(&json["git"]),
+            ["changes", "dirty", "sha", "source"]
+        );
+        // This crate is compiled from a checkout: `git` answers with the 40-hex `HEAD` when it is
+        // installed (the fallback below covers a host without it).
+        if provenance.git_source == Some("git") {
+            let sha = provenance.git_sha.as_deref().unwrap();
+            assert!(sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(provenance.git_dirty.is_some());
+        }
+
+        for bad in [
+            vec![("CANDLE_LLM_CUDA_GRAPH", json!(true))],
+            vec![
+                ("MLX_LLM_PIPELINING", json!(true)),
+                ("MLX_LLM_PIPELINING", json!(false)),
+            ],
+        ] {
+            assert!(BenchProvenance::collect(bad, &var).is_err());
+        }
+    }
+
+    #[test]
+    fn git_provenance_falls_back_to_the_operator_sha_outside_a_checkout() {
+        let outside = tempfile::tempdir().unwrap();
+        let none = git_provenance(outside.path(), &|_| None);
+        assert_eq!(none, BenchProvenance::default());
+        let sha = "c1e8f8e023bf4e1fe94a61c4c39e08f881fdd8e6";
+        let given = git_provenance(outside.path(), &|name: &str| {
+            (name == BENCH_GIT_SHA_ENV).then(|| sha.to_string())
+        });
+        assert_eq!(given.git_sha.as_deref(), Some(sha));
+        assert_eq!(given.git_source, Some(BENCH_GIT_SHA_ENV));
+        assert_eq!(
+            given.git_dirty, None,
+            "the operator's SHA says nothing of the tree"
+        );
     }
 }
