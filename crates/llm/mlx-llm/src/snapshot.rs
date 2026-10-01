@@ -669,16 +669,48 @@ pub fn write_hf_snapshot(
     out_dir: impl AsRef<Path>,
     quantize: Option<QuantSpec>,
 ) -> Result<SnapshotReport> {
-    let source = source_dir.as_ref();
-    let out_dir = out_dir.as_ref();
+    write_hf_snapshot_inner(source_dir.as_ref(), out_dir.as_ref(), quantize, false)
+}
 
+/// [`write_hf_snapshot`] without the checkpoint's native MTP head: every `mtp.*` tensor is dropped
+/// and `mtp_num_hidden_layers` (top level and `text_config`) is set to `0`, so the snapshot loads as
+/// the plain decoder on every runtime — including one that refuses the head itself, as the
+/// pre-epic-sc-24432 MLX loader refuses a Qwen3.5-MoE predictor. The decode-speedups benchmark
+/// (sc-24446) measures such a model's `off` rows on both revisions from one such snapshot.
+pub fn write_hf_snapshot_without_native_mtp(
+    source_dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    quantize: Option<QuantSpec>,
+) -> Result<SnapshotReport> {
+    write_hf_snapshot_inner(source_dir.as_ref(), out_dir.as_ref(), quantize, true)
+}
+
+fn write_hf_snapshot_inner(
+    source: &Path,
+    out_dir: &Path,
+    quantize: Option<QuantSpec>,
+    drop_native_mtp: bool,
+) -> Result<SnapshotReport> {
     // config.json is required — it carries the architecture + shapes the loader dispatches on. Read
     // it as a Value so the writer can add the quantization block; all other keys pass through.
     let config_path = source.join("config.json");
     let config_text = std::fs::read_to_string(&config_path)
         .map_err(|e| Error::Config(format!("read {}: {e}", config_path.display())))?;
-    let config: Value = serde_json::from_str(&config_text)
+    let mut config: Value = serde_json::from_str(&config_text)
         .map_err(|e| Error::Config(format!("parse {}: {e}", config_path.display())))?;
+    if drop_native_mtp {
+        fn no_mtp_layers(map: &mut serde_json::Map<String, Value>) {
+            if map.contains_key("mtp_num_hidden_layers") {
+                map.insert("mtp_num_hidden_layers".into(), json!(0));
+            }
+        }
+        if let Value::Object(map) = &mut config {
+            no_mtp_layers(map);
+            if let Some(Value::Object(text)) = map.get_mut("text_config") {
+                no_mtp_layers(text);
+            }
+        }
+    }
 
     // Tokenizer files pass through verbatim (byte-identical) when present.
     let tokenizer = SnapshotTokenizer {
@@ -686,8 +718,11 @@ pub fn write_hf_snapshot(
         tokenizer_config_json: read_to_string_if_exists(&source.join("tokenizer_config.json"))?,
     };
 
-    let weights = Weights::from_dir(source)?;
-    let report = write_snapshot(out_dir, weights.into_map(), config, &tokenizer, quantize)?;
+    let mut tensors = Weights::from_dir(source)?.into_map();
+    if drop_native_mtp {
+        tensors.retain(|key, _| !key.starts_with("mtp."));
+    }
+    let report = write_snapshot(out_dir, tensors, config, &tokenizer, quantize)?;
     copy_snapshot_sidecars(source, out_dir)?;
     Ok(report)
 }
@@ -996,6 +1031,74 @@ mod tests {
                 max_abs <= 1e-5,
                 "moe={moe}: stored/load-time MTP parity max_abs={max_abs}"
             );
+        }
+    }
+
+    /// `write_hf_snapshot_without_native_mtp` (sc-24446) writes the plain decoder: no `mtp.*`
+    /// tensor, `mtp_num_hidden_layers: 0`, a model without a head whose body is the full
+    /// snapshot's — dense and MoE.
+    #[test]
+    fn qwen35_snapshot_without_native_mtp_loads_the_plain_decoder() {
+        for moe in [false, true] {
+            let label = if moe { "moe" } else { "dense" };
+            let src = unique_dir(&format!("qwen35-nomtp-src-{label}"));
+            std::fs::create_dir_all(&src).unwrap();
+            let (tensors, config) = tiny_qwen35_mtp(moe);
+            std::fs::write(src.join("config.json"), config.to_string()).unwrap();
+            let refs: Vec<(&str, &Array)> = tensors.iter().map(|(k, a)| (k.as_str(), a)).collect();
+            Array::save_safetensors(refs, None, src.join("model.safetensors")).unwrap();
+            let spec = QuantSpec::q4();
+            let (full, plain) = (
+                unique_dir(&format!("qwen35-full-{label}")),
+                unique_dir(&format!("qwen35-nomtp-{label}")),
+            );
+            write_hf_snapshot(&src, &full, Some(spec)).unwrap();
+            write_hf_snapshot_without_native_mtp(&src, &plain, Some(spec)).unwrap();
+
+            let load = |dir: &Path| {
+                let json: Value = serde_json::from_str(
+                    &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+                )
+                .unwrap();
+                let weights = Weights::from_dir(dir).unwrap();
+                let model = Qwen35Model::from_weights_with(
+                    &weights,
+                    "model.language_model",
+                    Qwen35Config::from_json(&json).unwrap(),
+                    None,
+                )
+                .unwrap();
+                (json, weights, model)
+            };
+            let (_, _, with_head) = load(&full);
+            let (json, weights, without) = load(&plain);
+            assert!(
+                with_head.has_mtp(),
+                "moe={moe}: the full snapshot keeps its head"
+            );
+            assert!(!without.has_mtp(), "moe={moe}: the head is gone");
+            assert!(
+                without.mtp_fallback().is_none(),
+                "moe={moe}: absent, not a fallback"
+            );
+            assert_eq!(json["text_config"]["mtp_num_hidden_layers"], 0);
+            assert!(
+                weights.keys().all(|k| !k.starts_with("mtp.")),
+                "moe={moe}: mtp.* dropped"
+            );
+            assert_eq!(
+                json["quantization"]["bits"], 4,
+                "moe={moe}: the body is still q4"
+            );
+
+            let ids = Array::from_slice(&[1i32, 2], &[1, 2]);
+            let logits = |model: &Qwen35Model| {
+                let out = model.forward(&ids, &mut model.new_cache(), 0).unwrap();
+                let out = out.as_dtype(Dtype::Float32).unwrap();
+                out.eval().unwrap();
+                out.as_slice::<f32>().to_vec()
+            };
+            assert_eq!(logits(&with_head), logits(&without), "moe={moe}: same body");
         }
     }
 
