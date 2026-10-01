@@ -171,9 +171,12 @@ VACE repository revision.
 The A14B routes default to the Lightning distill (`advanced.lightning` unset means on): the
 per-architecture `lightx2v/Wan2.2-Lightning` high/low LoRA pair at strength 1.0, forced to 4 steps at
 guidance 1. Every Metal A14B coordinate states `--lightning on|off`: the shared coordinates are the
-Lightning-off request, and the `-lightning` coordinates are the product default, naming the pair with
-`--lora-high`/`--lora-low` (`SC20686_WAN_{T2V,I2V}_LIGHTNING_{HIGH,LOW}`), which the entrypoint
-refuses unless it is exactly the product's pair for that architecture.
+Lightning-off request, and the `-lightning` coordinates are the product default. They name the
+Hugging Face hub (`--lightning-hub`, `SC20686_HF_HUB`) from which the entrypoint resolves the
+`lightx2v/Wan2.2-Lightning` snapshot exactly as the product does (`refs/main`, else the pinned
+revision; never the repository root), and the sealed pair (`--lora-high`/`--lora-low`,
+`SC20686_WAN_{T2V,I2V}_LIGHTNING_{HIGH,LOW}`), which the entrypoint refuses unless it is
+byte-identical to the pair the product loads from that snapshot.
 
 Three source facts differ from the Candle lane and are recorded as cache kinds in the lane's source map
 (`sc20686_source_map.json`, `lanes.mlx-metal`), not smoothed over:
@@ -261,7 +264,7 @@ export SC20686_MLX_WAN_TI2V_5B_SNAPSHOT=… SC20686_MLX_WAN_T2V_14B_SNAPSHOT=…
   SC20686_MLX_WAN_VACE_FUN_14B_SNAPSHOT=… SC20686_WAN_I2V_REFERENCE=… \
   SC20686_VACE_CONTROL_17_DIR=… SC20686_VACE_MASK_17_DIR=… SC20686_VACE_CONTROL_33_DIR=… \
   SC20686_VACE_MASK_33_DIR=… SC20686_VACE_REFERENCE=… SC20686_WAN_T2V_LIGHTNING_HIGH=… \
-  SC20686_WAN_T2V_LIGHTNING_LOW=… SC20686_WAN_I2V_LIGHTNING_HIGH=… SC20686_WAN_I2V_LIGHTNING_LOW=…
+  SC20686_WAN_T2V_LIGHTNING_LOW=… SC20686_WAN_I2V_LIGHTNING_HIGH=… SC20686_WAN_I2V_LIGHTNING_LOW=… SC20686_HF_HUB=…
 python3 scripts/sc20686_campaign_adapter.py --campaign --matrix \
   --inference-revision "$(git rev-parse HEAD)" \
   --safety-policy /abs/sc20686-darwin-mlx-policy.json \

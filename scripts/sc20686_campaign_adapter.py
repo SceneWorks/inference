@@ -482,7 +482,7 @@ LIGHTNING_ROUTES = ("wan2_2_t2v_14b", "wan2_2_i2v_14b")
 
 
 def validate_metal_lightning(route, name, arguments):
-    lightning_flags = ("--lightning", "--lora-high", "--lora-low")
+    lightning_flags = ("--lightning", "--lightning-hub", "--lora-high", "--lora-low")
     if route not in LIGHTNING_ROUTES:
         if any(flag in arguments for flag in lightning_flags):
             raise ValueError(f"Lightning is only a product toggle on the A14B routes: {route}/{name}")
@@ -494,10 +494,12 @@ def validate_metal_lightning(route, name, arguments):
     if toggle not in ("on", "off") or (toggle == "on") != name.endswith("-lightning"):
         raise ValueError(f"A14B coordinate Lightning toggle differs from its name: {route}/{name}")
     if toggle == "off":
-        if "--lora-high" in arguments or "--lora-low" in arguments:
+        if any(flag in arguments for flag in ("--lightning-hub", "--lora-high", "--lora-low")):
             raise ValueError(f"Lightning-off coordinate carries a LoRA: {route}/{name}")
         return
-    for flag in ("--lora-high", "--lora-low"):
+    # The entrypoint resolves the Lightning snapshot from the hub, as the product does; the pair is
+    # sealed (hashed) by path and only checked against what the product loads.
+    for flag in ("--lightning-hub", "--lora-high", "--lora-low"):
         argument_value(arguments, flag)
     if float(argument_value(arguments, "--guidance")) != 1.0 or argument_value(arguments, "--steps") != "4":
         raise ValueError(f"Lightning coordinate must run the 4-step guidance-1 recipe: {route}/{name}")

@@ -307,7 +307,8 @@ class MetalLaneTests(unittest.TestCase):
                         values[0:0] = ["--reference", str(reference)]
                 if metal and route in self.adapter.LIGHTNING_ROUTES:
                     values[0:0] = (
-                        ["--lightning", "on", "--lora-high", str(lora / "high.safetensors"),
+                        ["--lightning", "on", "--lightning-hub", str(root / "hub"),
+                         "--lora-high", str(lora / "high.safetensors"),
                          "--lora-low", str(lora / "low.safetensors")]
                         if name.endswith("-lightning") else ["--lightning", "off"]
                     )
@@ -354,7 +355,7 @@ class MetalLaneTests(unittest.TestCase):
     def test_metal_a14b_coordinates_state_the_product_lightning_toggle(self):
         check = self.adapter.validate_metal_lightning
         recipe = ("--guidance", "1", "--steps", "4")
-        pair = ("--lora-high", "/h", "--lora-low", "/l")
+        pair = ("--lightning-hub", "/hub", "--lora-high", "/h", "--lora-low", "/l")
         check("wan2_2_t2v_14b", "square-17f", ("--lightning", "off", "--guidance", "5"))
         check("wan2_2_i2v_14b", "square-17f-ref1-lightning", ("--lightning", "on", *pair, *recipe))
         check("wan2_2_ti2v_5b", "square-17f", ("--guidance", "5"))
@@ -364,7 +365,10 @@ class MetalLaneTests(unittest.TestCase):
             ("wan2_2_t2v_14b", "square-17f-lightning", ("--lightning", "off"), "differs"),
             ("wan2_2_t2v_14b", "square-17f", ("--lightning", "off", *pair), "carries a LoRA"),
             ("wan2_2_t2v_14b", "square-17f-lightning", ("--lightning", "on", *recipe),
-             "exactly one --lora-high"),
+             "exactly one --lightning-hub"),
+            ("wan2_2_t2v_14b", "square-17f-lightning",
+             ("--lightning", "on", "--lora-high", "/h", "--lora-low", "/l", *recipe),
+             "exactly one --lightning-hub"),
             ("wan2_2_t2v_14b", "square-17f-lightning",
              ("--lightning", "on", *pair, "--guidance", "5", "--steps", "4"), "4-step"),
             ("wan_vace", "square-17f-control", ("--lightning", "off"), "only a product toggle"),

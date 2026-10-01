@@ -33,6 +33,8 @@ pub const LIGHTNING_STEPS: u32 = 4;
 pub const LIGHTNING_GUIDANCE: f32 = 1.0;
 /// The Hugging Face repository holding the Lightning LoRA pairs.
 pub const LIGHTNING_REPO: &str = "lightx2v/Wan2.2-Lightning";
+/// The [`LIGHTNING_REPO`] revision the product pins for its download.
+pub const LIGHTNING_REVISION: &str = "18bccf8884ec0a078eed79785eb4ef13ea16ce1e";
 
 fn unknown(route: &str) -> Error {
     Error::Msg(format!(
@@ -76,8 +78,44 @@ pub fn lightning_subdir(route: &str) -> Option<&'static str> {
     }
 }
 
-/// The `(high, low)` Lightning LoRA files for `route` inside a [`LIGHTNING_REPO`] snapshot.
+/// The [`LIGHTNING_REPO`] snapshot dir in a Hugging Face hub cache
+/// (`<hub>/models--lightx2v--Wan2.2-Lightning/snapshots/<revision>`): the revision `refs/main` names
+/// when that snapshot holds files (as the product worker's HF-cache resolver prefers), else the
+/// pinned [`LIGHTNING_REVISION`]. Never the repository root.
+pub fn lightning_snapshot_in_hub(hub: &Path) -> Result<PathBuf> {
+    let repo = hub.join(format!("models--{}", LIGHTNING_REPO.replace('/', "--")));
+    let has_files = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
+    };
+    let refs_main = std::fs::read_to_string(repo.join("refs").join("main"))
+        .ok()
+        .map(|revision| revision.trim().to_owned())
+        .filter(|revision| !revision.is_empty() && !revision.contains(['/', '\\', '.']));
+    refs_main
+        .into_iter()
+        .chain(std::iter::once(LIGHTNING_REVISION.to_owned()))
+        .map(|revision| repo.join("snapshots").join(revision))
+        .find(|snapshot| has_files(snapshot))
+        .ok_or_else(|| {
+            Error::Msg(format!(
+                "{LIGHTNING_REPO} has no installed snapshot under {}",
+                repo.display()
+            ))
+        })
+}
+
+/// The `(high, low)` Lightning LoRA files for `route` inside a [`LIGHTNING_REPO`] snapshot dir
+/// (`.../snapshots/<revision>`, as [`lightning_snapshot_in_hub`] or the worker's HF-cache resolver
+/// returns it). A repository root or any other dir is refused: the pair only exists per snapshot.
 pub fn lightning_lora_files(route: &str, snapshot: &Path) -> Result<(PathBuf, PathBuf)> {
+    if snapshot.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("snapshots")) {
+        return Err(Error::Msg(format!(
+            "{route}: {} is not a {LIGHTNING_REPO} snapshot dir (.../snapshots/<revision>)",
+            snapshot.display()
+        )));
+    }
     let subdir = lightning_subdir(route).ok_or_else(|| {
         Error::Msg(format!(
             "{route}: no Lightning distill LoRA; only the A14B MoE models bake Lightning"
@@ -217,19 +255,67 @@ mod tests {
         root
     }
 
-    fn lightning_snapshot() -> tempfile::TempDir {
-        let root = tempfile::tempdir().expect("temp root");
+    /// A synthetic Hugging Face hub holding the Lightning repo the way the cache lays it out:
+    /// `models--lightx2v--Wan2.2-Lightning/{refs/main, snapshots/<rev>/<subdir>/* -> blobs/*}`.
+    struct LightningHub {
+        hub: tempfile::TempDir,
+    }
+
+    impl LightningHub {
+        fn repo(&self) -> PathBuf {
+            self.hub.path().join("models--lightx2v--Wan2.2-Lightning")
+        }
+
+        fn path(&self) -> PathBuf {
+            self.repo().join("snapshots").join(LIGHTNING_REVISION)
+        }
+    }
+
+    fn lightning_snapshot() -> LightningHub {
+        let hub = LightningHub {
+            hub: tempfile::tempdir().expect("temp hub"),
+        };
+        let repo = hub.repo();
+        std::fs::create_dir_all(repo.join("refs")).expect("refs");
+        std::fs::write(repo.join("refs/main"), LIGHTNING_REVISION).expect("refs/main");
+        std::fs::create_dir_all(repo.join("blobs")).expect("blobs");
         for route in [MODEL_ID_T2V_14B, MODEL_ID_I2V_14B] {
-            let dir = root.path().join(lightning_subdir(route).expect("A14B"));
+            let subdir = lightning_subdir(route).expect("A14B");
+            let dir = hub.path().join(subdir);
             std::fs::create_dir_all(&dir).expect("subdir");
             for name in [
                 "high_noise_model.safetensors",
                 "low_noise_model.safetensors",
             ] {
-                std::fs::write(dir.join(name), b"lora").expect("lora");
+                let blob = repo.join("blobs").join(format!("{subdir}-{name}"));
+                std::fs::write(&blob, b"lora").expect("blob");
+                std::os::unix::fs::symlink(&blob, dir.join(name)).expect("snapshot link");
             }
         }
-        root
+        hub
+    }
+
+    #[test]
+    fn lightning_resolves_the_hf_snapshot_never_the_repo_root() {
+        let hub = lightning_snapshot();
+        assert_eq!(
+            lightning_snapshot_in_hub(hub.hub.path()).unwrap(),
+            hub.path()
+        );
+        let (high, low) = lightning_lora_files(MODEL_ID_T2V_14B, &hub.path()).unwrap();
+        assert!(high.starts_with(hub.path()) && low.starts_with(hub.path()));
+        // The SC-20686 W2 defect: a path built on the repository root (`models--…/<subdir>/…`,
+        // what a snapshot derived from a symlink-resolved blob path yields) is refused outright.
+        let error = lightning_lora_files(MODEL_ID_T2V_14B, &hub.repo()).unwrap_err();
+        assert!(error.to_string().contains("not a"), "{error}");
+        // A stale `refs/main` naming an absent snapshot falls back to the pinned revision.
+        std::fs::write(hub.repo().join("refs/main"), "0".repeat(40)).unwrap();
+        assert_eq!(
+            lightning_snapshot_in_hub(hub.hub.path()).unwrap(),
+            hub.path()
+        );
+        std::fs::remove_dir_all(hub.repo().join("snapshots")).unwrap();
+        assert!(lightning_snapshot_in_hub(hub.hub.path()).is_err());
     }
 
     #[test]
@@ -285,13 +371,13 @@ mod tests {
             ),
         ] {
             let lightning = lightning_default(route);
-            let snapshot = lightning.then_some(loras.path());
+            let snapshot = lightning.then(|| loras.path());
             let spec = product_load_spec(
                 route,
                 weights,
                 OffloadPolicy::Sequential,
                 lightning,
-                snapshot,
+                snapshot.as_deref(),
             )
             .expect(route);
             assert!(matches!(&spec.weights, WeightsSource::Dir(dir) if dir == weights));
@@ -349,7 +435,7 @@ mod tests {
             q4.path(),
             OffloadPolicy::Sequential,
             true,
-            Some(loras.path()),
+            Some(loras.path().as_path()),
         )
         .expect_err("the 5B has no Lightning distill");
         assert!(error.to_string().contains("only the A14B"), "{error}");
