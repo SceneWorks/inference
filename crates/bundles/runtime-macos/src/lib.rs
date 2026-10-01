@@ -40,6 +40,27 @@ pub fn conservative_video_decode_memory_profile(
 }
 
 #[cfg(feature = "media")]
+/// Resolve a provider-owned conservative VAE encode profile (sc-20686, epic E8): the conditioning
+/// encode working set, composed like the decode profile (the phases never overlap).
+pub fn conservative_video_encode_memory_profile(
+    provider_id: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    reference_count: u32,
+) -> Option<VideoDecodeMemoryProfile> {
+    mlx_gen_catalog::conservative_video_encode_memory_profile(
+        provider_id,
+        mode,
+        width,
+        height,
+        frames,
+        reference_count,
+    )
+}
+
+#[cfg(feature = "media")]
 /// Resolve the load-exact provider numeric tier used by calibrated video memory admission.
 pub fn resolved_video_memory_numeric_tier(
     provider_id: &str,

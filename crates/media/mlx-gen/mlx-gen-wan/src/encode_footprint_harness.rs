@@ -169,52 +169,69 @@ fn measure(run: impl FnOnce()) -> (u64, u64, u64) {
 
 fn report(label: &str, voxels: f64, (live, footprint, cache): (u64, u64, u64)) {
     eprintln!(
-        "{label}: {voxels} input voxels; live {:.0} B/voxel, live+cache {:.0} B/voxel, cache left \
-         {cache} B",
+        "{label}: {voxels} input voxels; live {live} B ({:.0} B/voxel), live+cache {footprint} B \
+         ({:.0} B/voxel), cache left {cache} B",
         live as f64 / voxels,
         footprint as f64 / voxels
     );
 }
 
-/// Measurement harness (sc-20686), not a gate: single-pass encode of a `[1,3,5,64,64]` clip (20,480
-/// input voxels) through the production-width z16 encoder (dim 96, f32, synthetic weights, ~0.5 GB of
-/// decoder + encoder weights) and the production-width z48 encoder (f32 encoder weights ~0.5 GB,
-/// zero-cost decoder). Activations at this clip are well under 0.5 GB; total < 1.5 GB. Run alone:
-/// `cargo test -p mlx-gen-wan --lib encode_footprint_harness -- --ignored --test-threads=1
-/// --nocapture`.
+/// Measurement harness (sc-20686), not a gate: single-pass encode of `[T,H,W]` clips through the
+/// production-width z16 encoder (dim 96, f32 — production's encode dtype, synthetic weights, ~0.5 GB
+/// of decoder + encoder weights) and the production-width z48 encoder (f32 — the TI2V conditioning
+/// load — encoder weights ~0.5 GB, zero-cost decoder). Default points `1,64,128;5,64,128;9,64,128`
+/// (≤ 73,728 input voxels; activations well under 0.5 GB; total < 1.5 GB); override with
+/// `WAN_ENCODE_HARNESS_POINTS="t,h,w;…"` (sizes scale with H·W). Run alone: `cargo test -p
+/// mlx-gen-wan --lib encode_footprint_harness -- --ignored --test-threads=1 --nocapture`.
 #[test]
 #[ignore = "measurement harness; production-width weights; run alone on request"]
 fn encode_footprint_harness() {
-    let (t, h, w) = (5, 64, 64);
-    let voxels = f64::from(t * h * w);
+    let raw = std::env::var("WAN_ENCODE_HARNESS_POINTS")
+        .unwrap_or_else(|_| "1,64,128;5,64,128;9,64,128".into());
+    let points: Vec<(i32, i32, i32)> = raw
+        .split(';')
+        .map(|point| {
+            let v: Vec<i32> = point
+                .split(',')
+                .map(|x| x.trim().parse().unwrap())
+                .collect();
+            (v[0], v[1], v[2])
+        })
+        .collect();
     let key = mlx_rs::random::key(7).unwrap();
     {
         let vae = synthetic_z16(96);
-        let video =
-            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, t, h, w], Some(&key)).unwrap();
-        mlx_rs::transforms::eval([&video]).unwrap();
-        report(
-            "z16 f32 encode",
-            voxels,
-            measure(|| {
-                let z = vae.encode(&video).unwrap();
-                mlx_rs::transforms::eval([&z]).unwrap();
-            }),
-        );
+        for &(t, h, w) in &points {
+            let video =
+                mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, t, h, w], Some(&key))
+                    .unwrap();
+            mlx_rs::transforms::eval([&video]).unwrap();
+            report(
+                &format!("z16 f32 encode {t}x{h}x{w}"),
+                f64::from(t * h * w),
+                measure(|| {
+                    let z = vae.encode(&video).unwrap();
+                    mlx_rs::transforms::eval([&z]).unwrap();
+                }),
+            );
+        }
     }
     mlx_rs::memory::clear_cache();
     {
         let vae = synthetic_z48_production_encoder();
-        let video =
-            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, t, h, w, 3], Some(&key)).unwrap();
-        mlx_rs::transforms::eval([&video]).unwrap();
-        report(
-            "z48 f32 encode",
-            voxels,
-            measure(|| {
-                let z = vae.encode(&video).unwrap();
-                mlx_rs::transforms::eval([&z]).unwrap();
-            }),
-        );
+        for &(t, h, w) in &points {
+            let video =
+                mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, t, h, w, 3], Some(&key))
+                    .unwrap();
+            mlx_rs::transforms::eval([&video]).unwrap();
+            report(
+                &format!("z48 f32 encode {t}x{h}x{w}"),
+                f64::from(t * h * w),
+                measure(|| {
+                    let z = vae.encode(&video).unwrap();
+                    mlx_rs::transforms::eval([&z]).unwrap();
+                }),
+            );
+        }
     }
 }

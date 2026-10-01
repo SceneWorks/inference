@@ -261,6 +261,57 @@ pub fn conservative_video_decode_memory_profile(
         })
 }
 
+/// The provider-owned conservative VAE **encode** working set for an MLX video provider (sc-20686,
+/// epic E8): the Wan-VAE families (Wan, Krea Realtime, Bernini, SCAIL-2). `None` when the request
+/// encodes nothing or the provider's encoder has no calibrated cost (LTX).
+pub fn conservative_video_encode_memory_profile(
+    provider_id: &str,
+    mode: &str,
+    width: u32,
+    height: u32,
+    frames: u32,
+    reference_count: u32,
+) -> Option<media::VideoDecodeMemoryProfile> {
+    mlx_gen_wan::conservative_video_encode_memory_profile(
+        provider_id,
+        mode,
+        width,
+        height,
+        frames,
+        reference_count,
+    )
+    .or_else(|| {
+        mlx_gen_bernini::conservative_video_encode_memory_profile(
+            provider_id,
+            mode,
+            width,
+            height,
+            frames,
+            reference_count,
+        )
+    })
+    .or_else(|| {
+        mlx_gen_scail2::conservative_video_encode_memory_profile(
+            provider_id,
+            mode,
+            width,
+            height,
+            frames,
+            reference_count,
+        )
+    })
+    .or_else(|| {
+        mlx_gen_krea_realtime::conservative_video_encode_memory_profile(
+            provider_id,
+            mode,
+            width,
+            height,
+            frames,
+            reference_count,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
