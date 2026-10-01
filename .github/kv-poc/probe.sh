@@ -120,4 +120,8 @@ summary "Precheck as of now: **$go** (report only; each campaign job re-checks b
 summary ""
 summary "Safe stop for a running campaign job (it exits 75 after the in-flight row): \`$(stop_command)\`"
 echo "precheck as of now: $go"
+echo "== top 20 processes by footprint (phys_footprint via ps rss proxy + footprint) =="
+ps -axo pid=,ppid=,rss=,etime=,command= | sort -k3 -nr | head -20 | awk '{printf "%7s %7s %9.1f MiB %12s  ", $1,$2,$3/1024,$4; for(i=5;i<=NF&&i<=9;i++) printf "%s ", $i; print ""}'
+echo "== processes named like campaign children =="
+ps -axo pid=,ppid=,rss=,etime=,command= | grep -E 'sc20671|sc20676|sc20677|sc20686|sc2068|integration-|krea|kv_baseline|python3.12' | grep -v grep | cut -c1-200
 exit 0
