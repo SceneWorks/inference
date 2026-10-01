@@ -46,3 +46,19 @@ pub use quant::QuantizedLinear;
 pub use rope::{apply_rope, Rope};
 pub use sampler::{sample, shaped_candidates, SamplingParams, SplitMix64, TokenRng};
 pub use weights::Weights;
+
+/// Whether `stream` is a GPU stream — the only place a custom Metal kernel can run. Every fused
+/// kernel resolves [`Stream::task_local_or_default`](mlx_rs::Stream::task_local_or_default) once,
+/// gates on this, and dispatches on that same stream: the task-local stream need not be on the
+/// process default device.
+pub(crate) fn stream_is_gpu(stream: &mlx_rs::Stream) -> bool {
+    // SAFETY: `dev` is created and freed here; `stream` outlives both calls.
+    unsafe {
+        let mut dev = mlx_sys::mlx_device_new();
+        let mut ty: mlx_sys::mlx_device_type = mlx_sys::mlx_device_type__MLX_CPU;
+        let ok = mlx_sys::mlx_stream_get_device(&mut dev, stream.as_ptr()) == 0
+            && mlx_sys::mlx_device_get_type(&mut ty, dev) == 0;
+        mlx_sys::mlx_device_free(dev);
+        ok && ty == mlx_sys::mlx_device_type__MLX_GPU
+    }
+}

@@ -227,7 +227,8 @@ pub struct LoadReport {
     /// through a CUDA-graph runner — so a product shows the settled value, not the request.
     pub cuda_graphs: Option<bool>,
     /// Every optional accelerator the load was asked for but did not attach, each leading with
-    /// the feature (`mtp_head: …`), so a product can show why (epic sc-24432 E2: the model still
+    /// the feature (`mtp_head: …`; `cuda_graphs: …` when the graph switch is on but the
+    /// decoder's step cannot be captured), so a product can show why (epic sc-24432 E2: the model still
     /// loaded; the accelerator is absent). Empty when everything requested was attached.
     pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (story sc-24437): the requested

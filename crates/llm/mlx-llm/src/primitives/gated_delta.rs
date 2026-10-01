@@ -31,6 +31,7 @@ use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype, Stream};
 
 use crate::error::{Error, Result};
+use crate::primitives::stream_is_gpu;
 
 /// The per-step gate `g = exp(−exp(A_log) · softplus(a + dt_bias))` (a faithful port of
 /// `mlx_lm.models.gated_delta.compute_g`). `a` is `[B, T, Hv]` (the gating projection), `A_log` and
@@ -276,19 +277,6 @@ pub(crate) fn recording_routes<R>(f: impl FnOnce() -> R) -> (R, Vec<Route>) {
     let out = f();
     let routes = ROUTES.with(|r| r.replace(previous)).unwrap_or_default();
     (out, routes)
-}
-
-/// Whether `stream` is a GPU stream — the only place a custom Metal kernel can run.
-fn stream_is_gpu(stream: &Stream) -> bool {
-    // SAFETY: `dev` is created and freed here; `stream` outlives both calls.
-    unsafe {
-        let mut dev = mlx_sys::mlx_device_new();
-        let mut ty: mlx_sys::mlx_device_type = mlx_sys::mlx_device_type__MLX_CPU;
-        let ok = mlx_sys::mlx_stream_get_device(&mut dev, stream.as_ptr()) == 0
-            && mlx_sys::mlx_device_get_type(&mut ty, dev) == 0;
-        mlx_sys::mlx_device_free(dev);
-        ok && ty == mlx_sys::mlx_device_type__MLX_GPU
-    }
 }
 
 fn cast_to(x: Array, dtype: Dtype) -> Result<Array> {

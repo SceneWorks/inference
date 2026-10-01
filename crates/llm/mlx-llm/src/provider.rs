@@ -577,8 +577,9 @@ pub struct LlamaProvider {
     /// then. A second decoder with its own cache per request, driven as a proposer by the engine.
     draft: Option<ResidentDraft>,
     /// What the load settled: the requested weight format, what became of a named draft
-    /// (resident, or refused with the reason) and the prefix cache's admitted budget. Read
-    /// through [`TextLlm::load_report`].
+    /// (resident, or refused with the reason), the prefix cache's admitted budget, and every other
+    /// optional accelerator — the companion MTP head (sc-24444) — requested but not attached,
+    /// named in `fallbacks`. Read through [`TextLlm::load_report`].
     load_report: core_llm::LoadReport,
 }
 
@@ -643,9 +644,10 @@ fn draft_load_spec(spec: &LoadSpec, source: &str) -> LoadSpec {
         projector_source: None,
         quantize: spec.quantize,
         cuda_graphs: spec.cuda_graphs,
-        // A draft keeps no cross-turn prefix cache of its own (sc-24437).
+        // A draft keeps no cross-turn prefix cache of its own (sc-24437), and no companion head.
         prefix_cache_bytes: Some(0),
         draft_source: None,
+        mtp_head_source: None,
     }
 }
 
@@ -700,23 +702,37 @@ impl LlamaProvider {
         let required = crate::load_memory::required_bytes(spec)?;
         let available = core_llm::effective_memory_budget(
             core_llm::available_host_memory_bytes(),
-            core_llm::operational_memory_override()?,
+            load_memory_budget()?,
         )?;
         let draft = DraftPlan::admit(spec, required, available)?;
-        // The cross-turn prefix cache's budget (sc-24437, E7): what the load asked for, clamped to
-        // the headroom this admission leaves beside the target and any admitted draft, so the
-        // cache can never push the load past it.
-        let admitted = match &draft {
+        let mut admitted = match &draft {
             DraftPlan::Load(draft_spec) => {
                 required.saturating_add(crate::load_memory::required_bytes(draft_spec)?)
             }
             DraftPlan::None | DraftPlan::Refused(_) => required,
         };
+        // E7: a companion head is resident weights; it is admitted on top of the target and any
+        // admitted draft, and a head that does not fit is refused by name while the target still
+        // loads (E2).
+        let mut fallbacks = Vec::new();
+        let mtp_head = spec.mtp_head_source.as_deref().and_then(|source| {
+            admit_companion_head(Path::new(source), admitted, available)
+                .map_err(|reason| fallbacks.push(reason))
+                .ok()
+        });
+        if let Some((_, head_bytes)) = mtp_head {
+            admitted = admitted.saturating_add(head_bytes);
+        }
+        // The cross-turn prefix cache's budget (sc-24437, E7): what the load asked for, clamped to
+        // the headroom this admission leaves beside the target, any admitted draft and any
+        // admitted companion head, so the cache can never push the load past it.
         let prefix_budget =
             core_llm::prefix_cache_budget(spec.prefix_cache_bytes, admitted, available);
 
         let mut provider = Self::load_admitted(spec, quant)?.with_prefix_budget(prefix_budget);
         provider.load_report.requested = spec.quantize;
+        provider.load_report.fallbacks = fallbacks;
+        provider.attach_mtp_head(mtp_head.map(|(head, _)| head));
         match draft {
             DraftPlan::None => {}
             DraftPlan::Refused(report) => provider.load_report.draft = Some(report),
@@ -937,6 +953,36 @@ impl LlamaProvider {
             draft: None,
             load_report: core_llm::LoadReport::default(),
         })
+    }
+
+    /// Attach an admitted companion MTP head (sc-24444). It attaches only to a Qwen3.5/3.8-family
+    /// target (dense `qwen3_5` or Prism/Bonsai) without a native head, and only when its geometry
+    /// matches; anything else is a named load fallback and the target stays exactly as loaded.
+    fn attach_mtp_head(&mut self, head: Option<&Path>) {
+        let Some(head) = head else { return };
+        let outcome = match &mut self.model {
+            Decoder::Qwen35(model) => model
+                .attach_companion_mtp(head)
+                .map(|()| speculative_max_depth([qwen35_attention_geometry(model.config())]))
+                .map_err(|e| format!("mtp_head: {e}")),
+            Decoder::Causal(_) => Err(format!(
+                "mtp_head: companion MTP heads attach to Qwen3.5/3.8-family (qwen3_5, Prism) \
+                 targets only; this model's family is `{}`",
+                self.descriptor.family
+            )),
+        };
+        match outcome {
+            // The same backend-true depth a native head advertises (sc-24438): a companion head
+            // runs the identical one-layer predictor through the identical verify path.
+            Ok(max_depth) => self
+                .descriptor
+                .capabilities
+                .advertise_mtp(max_depth, MTP_RECOMMENDED_DEPTH),
+            Err(reason) => self.load_report.fallbacks.push(format!(
+                "{reason} (`{}`); the model loaded without a companion head",
+                head.display()
+            )),
+        }
     }
 
     fn load_prism_gguf(spec: &LoadSpec, path: &Path) -> CoreResult<Self> {
@@ -1581,14 +1627,14 @@ impl TextLlm for LlamaProvider {
         &self.descriptor
     }
 
-    fn load_report(&self) -> Option<core_llm::LoadReport> {
-        Some(self.load_report.clone())
-    }
-
     fn validate(&self, req: &TextLlmRequest) -> CoreResult<()> {
         self.descriptor
             .capabilities
             .validate_request(&self.descriptor.id, req)
+    }
+
+    fn load_report(&self) -> Option<core_llm::LoadReport> {
+        Some(self.load_report.clone())
     }
 
     fn generate(
@@ -2817,6 +2863,60 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     d
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's operational load budget on this thread ([`with_load_budget`]); the process-wide
+    /// [`core_llm::AVAILABLE_MEMORY_OVERRIDE`] would leak into every concurrently loading test.
+    static LOAD_BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with load admission capped at `budget` bytes on this thread.
+#[cfg(test)]
+pub(crate) fn with_load_budget<R>(budget: u64, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LOAD_BUDGET.with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(LOAD_BUDGET.with(|b| b.replace(Some(budget))));
+    f()
+}
+
+/// The operational budget load admission caps measured availability with
+/// ([`core_llm::operational_memory_override`]).
+fn load_memory_budget() -> CoreResult<Option<u64>> {
+    #[cfg(test)]
+    if let Some(budget) = LOAD_BUDGET.with(std::cell::Cell::get) {
+        return Ok(Some(budget));
+    }
+    core_llm::operational_memory_override()
+}
+
+/// Admit a companion MTP head's resident bytes on top of what the load already admitted (the
+/// target and any admitted draft, E7), returning the head and its bytes. `Err` is the named load
+/// fallback (E2): the head is unreadable, or those bytes plus the head's exceed the budget.
+fn admit_companion_head(
+    head: &Path,
+    target_bytes: u64,
+    available: u64,
+) -> Result<(&Path, u64), String> {
+    let head_bytes = crate::load_memory::companion_head_bytes(head)
+        .map_err(|e| format!("mtp_head: {e}; the model loaded without a companion head"))?;
+    let total = target_bytes.checked_add(head_bytes).ok_or_else(|| {
+        "mtp_head: load admission overflow; the model loaded without a companion head".to_string()
+    })?;
+    core_llm::admit_request_memory(total, available).map_err(|e| {
+        format!(
+            "mtp_head: refused by load admission: the head's {head_bytes} bytes on top of the \
+             target's {target_bytes} exceed the budget ({e}); the model loaded without a \
+             companion head (`{}`)",
+            head.display()
+        )
+    })?;
+    Ok((head, head_bytes))
+}
+
 /// Read and parse `config.json` from a snapshot directory into a JSON value (used to dispatch the
 /// architecture before constructing the architecture-specific config).
 fn read_config_value(dir: &Path) -> CoreResult<serde_json::Value> {
@@ -2969,10 +3069,12 @@ fn estimate_qwen35_workspace_extra_bytes(
     let conv_width = key_width.checked_mul(2)?.checked_add(value_width)?;
     let attention_width = query_heads.checked_mul(head_dim)?;
 
-    // PrismLinear builds cast -> sign multiply -> Hadamard -> cast graphs independently for each
-    // projection. The full-attention block has the wider simultaneous input-width sum; the linear
-    // block uses two mixer input rotations plus its output rotation. Four buffers per input width
-    // safely covers the F32 chain and the BF16 result even when donation is unavailable.
+    // PrismLinear rotates each projection input independently. The full-attention block has the
+    // wider simultaneous input-width sum; the linear block uses two mixer input rotations plus its
+    // output rotation. Four buffers per input width covers the unfused cast -> sign multiply ->
+    // Hadamard -> cast chain (F32 intermediates plus the BF16 result, no donation) — the path a
+    // block the fused kernel does not cover still takes. The fused kernel (sc-24444) writes only
+    // the output buffer, so this stays an upper bound on the Bonsai path.
     let packed_rotation_elements = if prism {
         let linear_widths = checked_sum([hidden.checked_mul(4)?, value_width, intermediate])?;
         let attention_widths =
@@ -5024,6 +5126,287 @@ mod tests {
                 "hybrid draft {width}: its request with its ring, no snapshot"
             );
         }
+    }
+
+    // ---- Prism/Bonsai companion MTP head (epic sc-24432, story sc-24444). ----
+
+    /// A Prism snapshot directory and, when `head` names a variant, a companion head beside it.
+    struct PrismLoad {
+        target: crate::test_fixture::Fixture,
+        head: crate::test_fixture::Fixture,
+    }
+
+    fn prism_load(head_text: Option<serde_json::Value>) -> PrismLoad {
+        let target = crate::test_fixture::Fixture::new("mlx-prism-target-", None);
+        // Seed 6 decodes a varied greedy run (not a single repeated id) through the chat template.
+        crate::synthetic::write_prism_snapshot(&target, 6);
+        let head = crate::test_fixture::Fixture::new("mlx-prism-head-", None);
+        let text = head_text
+            .unwrap_or_else(|| crate::synthetic::prism_qwen35_config()["text_config"].clone());
+        crate::synthetic::write_companion_head(&head, &text, 5, None);
+        PrismLoad { target, head }
+    }
+
+    fn prism_request(speculative: core_llm::Speculative) -> TextLlmRequest {
+        TextLlmRequest {
+            messages: vec![Message::user("t3 t9 t40 t11 t3 t9 t40 t11 t7")],
+            sampling: Sampling::greedy(),
+            max_new_tokens: 20,
+            seed: Some(3),
+            speculative: Some(speculative),
+            ..Default::default()
+        }
+    }
+
+    /// Story sc-24444 AC2: a Prism snapshot loaded with a companion head advertises MTP, and
+    /// `{proposer: mtp}` at depths 1, 3 and the advertised max — through the real load path and the provider's
+    /// engine — emits exactly `off`'s greedy tokens, with the report naming the head as the
+    /// proposer that ran.
+    #[test]
+    fn prism_with_a_companion_head_decodes_mtp_with_the_off_tokens() {
+        use core_llm::Speculative;
+        let fx = prism_load(None);
+        let spec =
+            LoadSpec::dense(fx.target.to_str().unwrap()).with_mtp_head(fx.head.to_str().unwrap());
+        let provider = LlamaProvider::load(&spec).unwrap();
+        assert_eq!(provider.descriptor().family, "prism_hadamard_qwen35");
+        let report = provider.load_report().unwrap();
+        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        // The companion head advertises the same backend-true depth a native head does (sc-24438).
+        let advertised = provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .expect("the attached head is advertised");
+        assert_eq!(advertised.recommended_depth, MTP_RECOMMENDED_DEPTH);
+
+        let (off, off_ids) = run(&provider, &prism_request(Speculative::Off));
+        assert_eq!(off_ids.len(), 20);
+        let distinct: std::collections::BTreeSet<_> = off_ids.iter().collect();
+        assert!(
+            distinct.len() > 2,
+            "fixture must not be degenerate: {off_ids:?}"
+        );
+        assert_eq!(
+            off_ids,
+            plain_loop(&provider, &prism_request(Speculative::Off))
+        );
+        assert_eq!(off.decode.unwrap().proposer, ProposerKind::None);
+        for depth in [1, 3, advertised.max_depth] {
+            let req = prism_request(Speculative::proposer(SpeculativeProposer::Mtp, depth));
+            let (out, ids) = run(&provider, &req);
+            assert_eq!(ids, off_ids, "depth {depth}");
+            let report = out.decode.expect("the engine reports its path");
+            assert_eq!(report.proposer, ProposerKind::Mtp, "depth {depth}");
+            assert_eq!(report.draft_tokens, Some(depth), "depth {depth}");
+            assert!(
+                report.proposed_tokens > 0,
+                "depth {depth}: the head drafted"
+            );
+            assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        }
+
+        // Without the head the same snapshot has no MTP, and loads the same greedy tokens.
+        let bare = LlamaProvider::load(&LoadSpec::dense(fx.target.to_str().unwrap())).unwrap();
+        assert!(bare.load_report().unwrap().fallbacks.is_empty());
+        assert!(bare
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        assert_eq!(run(&bare, &prism_request(Speculative::Off)).1, off_ids);
+    }
+
+    /// Story sc-24444 AC2 / E2: a head whose geometry does not match, a missing head, and a head
+    /// named for a non-Qwen3.5 target are each refused with a named load fallback; the model still
+    /// loads, advertises no MTP and decodes plainly.
+    #[test]
+    fn an_unattachable_companion_head_is_a_named_load_fallback_never_a_load_failure() {
+        use core_llm::Speculative;
+        let mut text = crate::synthetic::prism_qwen35_config()["text_config"].clone();
+        text["intermediate_size"] = json!(128);
+        let fx = prism_load(Some(text));
+        let spec =
+            LoadSpec::dense(fx.target.to_str().unwrap()).with_mtp_head(fx.head.to_str().unwrap());
+        let provider = LlamaProvider::load(&spec).expect("the target still loads (E2)");
+        let fallbacks = provider.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(fallbacks[0].starts_with("mtp_head: "), "{fallbacks:?}");
+        assert!(
+            fallbacks[0].contains("intermediate_size 128 != target 256"),
+            "{fallbacks:?}"
+        );
+        assert!(
+            fallbacks[0].contains("the model loaded without a companion head"),
+            "{fallbacks:?}"
+        );
+        assert!(provider
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        let (out, ids) = run(&provider, &prism_request(Speculative::Off));
+        assert_eq!(ids.len(), 20);
+        assert!(out.decode.unwrap().fallbacks.is_empty());
+        // An explicit MTP request is refused up front (it is not advertised), and `auto` names
+        // why it ran no MTP by choosing prompt lookup.
+        assert!(provider
+            .validate(&prism_request(Speculative::proposer(
+                SpeculativeProposer::Mtp,
+                3
+            )))
+            .is_err());
+        let (auto, auto_ids) = run(&provider, &prism_request(Speculative::Auto));
+        assert_eq!(auto_ids, ids);
+        assert_eq!(auto.decode.unwrap().proposer, ProposerKind::PromptLookup);
+
+        let missing = LoadSpec::dense(fx.target.to_str().unwrap())
+            .with_mtp_head(fx.target.join("no-such-head").to_str().unwrap());
+        let provider = LlamaProvider::load(&missing).expect("a missing head is not fatal");
+        let fallbacks = provider.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(fallbacks[0].contains("is not a directory"), "{fallbacks:?}");
+
+        let mut causal = causal_provider();
+        causal.attach_mtp_head(Some(fx.head.as_ref()));
+        let fallbacks = &causal.load_report.fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(
+            fallbacks[0].contains("attach to Qwen3.5/3.8-family"),
+            "{fallbacks:?}"
+        );
+        assert!(causal.descriptor.capabilities.mtp.is_none());
+    }
+
+    /// Story sc-24444 E7: the head's resident bytes are its safetensors payload plus the header's
+    /// norm intermediates, and load admission adds them to the target's: a budget that fits the
+    /// target but not target + head refuses the head by name and nothing else. The head's
+    /// per-request cache is priced by request admission on the `mtp` route.
+    /// Story sc-24444 E7 with sc-24436/sc-24437: the companion head, a draft model and the
+    /// prefix cache are admitted together — the head on top of the target and the admitted
+    /// draft, the prefix cache in what they leave. A budget that fits target + draft but not the
+    /// head too keeps the draft, refuses the head by name and gives the cache the rest; one that
+    /// fits all three plus `x` bytes settles the prefix cache at exactly `x`.
+    #[test]
+    fn companion_head_draft_and_prefix_cache_are_admitted_together() {
+        let fx = prism_load(None);
+        let head: &Path = fx.head.as_ref();
+        let head_bytes = crate::load_memory::companion_head_bytes(head).unwrap();
+        let target =
+            crate::load_memory::required_bytes(&LoadSpec::dense(fx.target.to_str().unwrap()))
+                .unwrap();
+        let mut spec = LoadSpec::dense(fx.target.to_str().unwrap())
+            .with_mtp_head(fx.head.to_str().unwrap())
+            .with_draft(fx.target.to_str().unwrap());
+        spec.prefix_cache_bytes = Some(u64::MAX / 4);
+        let draft = crate::load_memory::required_bytes(&draft_load_spec(
+            &spec,
+            fx.target.to_str().unwrap(),
+        ))
+        .unwrap();
+
+        let short = with_load_budget(target + draft + head_bytes - 1, || {
+            LlamaProvider::load(&spec)
+        })
+        .expect("target + draft fit");
+        let report = short.load_report().unwrap();
+        assert!(report.draft.as_ref().unwrap().is_resident(), "{report:?}");
+        assert_eq!(report.fallbacks.len(), 1, "{:?}", report.fallbacks);
+        assert!(
+            report.fallbacks[0].starts_with("mtp_head: refused by load admission"),
+            "{:?}",
+            report.fallbacks
+        );
+        assert_eq!(
+            report.prefix_cache_bytes,
+            Some(head_bytes - 1),
+            "the refused head's room is the cache's"
+        );
+
+        let x = 4096;
+        let all = with_load_budget(target + draft + head_bytes + x, || {
+            LlamaProvider::load(&spec)
+        })
+        .expect("all three fit");
+        let report = all.load_report().unwrap();
+        assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+        assert!(report.draft.as_ref().unwrap().is_resident(), "{report:?}");
+        assert_eq!(report.prefix_cache_bytes, Some(x));
+        assert!(all
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_some());
+    }
+
+    #[test]
+    fn companion_head_bytes_are_counted_by_load_and_request_admission() {
+        let fx = prism_load(None);
+        let head: &Path = fx.head.as_ref();
+        let head_bytes = crate::load_memory::companion_head_bytes(head).unwrap();
+        let payload = core_llm::checkpoint_payload_bytes(head).unwrap();
+        // Seven 1-D norm vectors (4 × 128 + 2 × 64 + 128 wide) at four intermediate bytes each.
+        let norms = (5 * 128 + 2 * 64) * 4;
+        assert_eq!(head_bytes, payload + norms);
+
+        let target =
+            crate::load_memory::required_bytes(&LoadSpec::dense(fx.target.to_str().unwrap()))
+                .unwrap();
+        let with_head =
+            LoadSpec::dense(fx.target.to_str().unwrap()).with_mtp_head(fx.head.to_str().unwrap());
+        assert_eq!(
+            crate::load_memory::required_bytes(&with_head).unwrap(),
+            target,
+            "the target's own price is unchanged; the head is admitted on top of it"
+        );
+        assert!(admit_companion_head(head, target, target + head_bytes).is_ok());
+        let refused = admit_companion_head(head, target, target + head_bytes - 1).unwrap_err();
+        assert!(
+            refused.starts_with("mtp_head: refused by load admission"),
+            "{refused}"
+        );
+        assert!(refused.contains(&head_bytes.to_string()), "{refused}");
+
+        // Through the real load: a budget that fits the target but not target + head refuses the
+        // head by name and loads the target without MTP; one more byte admits both.
+        let short = with_load_budget(target + head_bytes - 1, || LlamaProvider::load(&with_head))
+            .expect("the target fits and still loads (E2)");
+        let fallbacks = short.load_report().unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert!(
+            fallbacks[0].starts_with("mtp_head: refused by load admission"),
+            "{fallbacks:?}"
+        );
+        assert!(short
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_none());
+        let fits = with_load_budget(target + head_bytes, || LlamaProvider::load(&with_head))
+            .expect("target + head fit");
+        assert!(fits.load_report().unwrap().fallbacks.is_empty());
+        assert!(fits
+            .descriptor()
+            .capabilities
+            .proposer(SpeculativeProposer::Mtp)
+            .is_some());
+
+        let provider = LlamaProvider::load(&with_head).unwrap();
+        // The prefix-cache snapshot of an MTP request carries the head's KV too (sc-24437).
+        let snapshot = |mtp| provider.prefix_snapshot_bytes(Some(64), mtp).unwrap();
+        assert!(
+            snapshot(true) > snapshot(false) + 4 * 128,
+            "the head's KV is priced"
+        );
+        let price = |route| {
+            provider
+                .speculative_request_bytes(route, 64, 32, 0)
+                .unwrap()
+        };
+        assert!(
+            price(SpeculativeRoute::Mtp { width: 3 }) > price(SpeculativeRoute::Plain),
+            "the head's cache and rollback are priced on the mtp route"
+        );
     }
 
     /// E1/E8: the backend-neutral greedy parity suite (core-llm-testkit) — the one Candle runs —

@@ -748,6 +748,13 @@ mod tests {
             spec.cuda_graphs.is_none(),
             "a dense load keeps the backend's graph default"
         );
+        assert!(
+            spec.mtp_head_source.is_none(),
+            "no companion head unless asked"
+        );
+        let spec = spec.with_mtp_head("head");
+        assert_eq!(spec.mtp_head_source.as_deref(), Some("head"));
+        assert_eq!(spec.projector_source.as_deref(), Some("projector.gguf"));
         assert!(spec.draft_source.is_none(), "no draft unless one is named");
         let spec = spec.with_draft("draft-dir");
         assert_eq!(spec.draft_source.as_deref(), Some("draft-dir"));
@@ -778,6 +785,19 @@ pub struct LoadSpec {
     /// generation in [`DecodeReport::cuda_graphs`](crate::DecodeReport::cuda_graphs) where the
     /// backend reports one. Backends without CUDA ignore it.
     pub cuda_graphs: Option<bool>,
+    /// Optional companion multi-token-prediction head (epic sc-24432, story sc-24444): a separate
+    /// artifact holding only a predictor layer — e.g. `EigenLabs/Qwen3.8-27B-MTP-4bit` for a Ternary
+    /// Bonsai 2 27B Prism target, whose packed checkpoint ships no MTP head — that the provider
+    /// attaches to the target so `{proposer: mtp}` can run. The head borrows the target's
+    /// embedding and LM head. `None` loads the target alone. An accelerator, never a requirement
+    /// (E2): a head the backend cannot attach (mismatched geometry by the shared
+    /// [`CompanionMtpGeometry`](crate::CompanionMtpGeometry) check, unreadable, over the admission
+    /// budget, a target outside the Qwen3.5/3.8 family) leaves the target loaded without it, and the
+    /// general text providers (MLX and Candle `LlamaProvider`) name the reason in
+    /// [`LoadReport::fallbacks`](crate::LoadReport::fallbacks); a head attached is advertised as the
+    /// `mtp` proposer. Task-specific providers (captioners, SVG generators) ignore it. Distinct from
+    /// a separate draft *model*, which is a whole decoder with its own embeddings.
+    pub mtp_head_source: Option<String>,
     /// Byte budget of the cross-turn prefix cache (story sc-24437): the KV (and, for a hybrid
     /// decoder, recurrent state) of earlier requests' prefixes, reused when a later prompt
     /// extends one. `None` asks for [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES);
@@ -824,6 +844,7 @@ impl LoadSpec {
             projector_source: None,
             quantize: None,
             cuda_graphs: None,
+            mtp_head_source: None,
             prefix_cache_bytes: None,
             draft_source: None,
         }
@@ -832,6 +853,13 @@ impl LoadSpec {
     /// Associate an exact multimodal projector artifact with this model load.
     pub fn with_projector(mut self, source: impl Into<String>) -> Self {
         self.projector_source = Some(source.into());
+        self
+    }
+
+    /// Attach a companion MTP head artifact to this model load
+    /// ([`mtp_head_source`](Self::mtp_head_source)).
+    pub fn with_mtp_head(mut self, source: impl Into<String>) -> Self {
+        self.mtp_head_source = Some(source.into());
         self
     }
 

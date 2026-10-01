@@ -415,6 +415,7 @@ fn nvfp4_real_weight_evidence() {
         projector_source: None,
         quantize: Some(core_llm::Quantize::Nvfp4),
         cuda_graphs: None,
+        mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
     })
@@ -469,6 +470,7 @@ fn nvfp4_refused_on_cpu_for_the_real_snapshot() {
         projector_source: None,
         quantize: Some(core_llm::Quantize::Nvfp4),
         cuda_graphs: None,
+        mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
     }) {

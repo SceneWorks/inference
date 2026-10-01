@@ -26,13 +26,27 @@ pub(crate) fn mlx_affine_q8_in_dim(
     biases: (usize, usize),
     group_size: usize,
 ) -> Option<usize> {
+    mlx_affine_in_dim(8, weight_is_u32, weight, scales, biases, group_size)
+}
+
+/// [`mlx_affine_q8_in_dim`] for a `bits`-wide MLX affine triple (4 or 8: `32 / bits` codes per
+/// `U32` word) — the layouts [`QuantizedLinear::from_mlx_affine`] accepts. `None` for any other.
+pub(crate) fn mlx_affine_in_dim(
+    bits: usize,
+    weight_is_u32: bool,
+    weight: (usize, usize),
+    scales: (usize, usize),
+    biases: (usize, usize),
+    group_size: usize,
+) -> Option<usize> {
     let (out_dim, packed_cols) = weight;
     let in_dim = scales.1.checked_mul(group_size)?;
-    (weight_is_u32
+    (matches!(bits, 4 | 8)
+        && weight_is_u32
         && group_size != 0
         && scales.0 == out_dim
         && biases == scales
-        && packed_cols.checked_mul(4) == Some(in_dim))
+        && packed_cols.checked_mul(32 / bits) == Some(in_dim))
     .then_some(in_dim)
 }
 
@@ -185,9 +199,25 @@ impl QuantizedLinear {
         group_size: usize,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_mlx_affine(weight, scales, biases, bias, group_size, 8, device)
+    }
+
+    /// [`from_mlx_affine_q8`](Self::from_mlx_affine_q8) for a `bits`-wide triple (4 or 8; `32 /
+    /// bits` little-endian codes per `U32` word, MLX's `quantize` layout): the exact affine grid
+    /// `scale · code + bias`, re-packed to the resident Q8_0 form.
+    pub fn from_mlx_affine(
+        weight: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        bias: Option<Tensor>,
+        group_size: usize,
+        bits: usize,
+        device: &Device,
+    ) -> Result<Self> {
         let (out_dim, packed_cols) = weight.dims2()?;
         let (_, scale_cols) = scales.dims2()?;
-        let Some(in_dim) = mlx_affine_q8_in_dim(
+        let Some(in_dim) = mlx_affine_in_dim(
+            bits,
             weight.dtype() == DType::U32,
             (out_dim, packed_cols),
             scales.dims2()?,
@@ -195,7 +225,7 @@ impl QuantizedLinear {
             group_size,
         ) else {
             return Err(crate::error::Error::Config(format!(
-                "invalid MLX affine Q8 triple: weight {:?} {:?}, scales {:?}, biases {:?}, group {group_size}",
+                "invalid MLX affine Q{bits} triple: weight {:?} {:?}, scales {:?}, biases {:?}, group {group_size}",
                 weight.dtype(),
                 weight.shape(),
                 scales.shape(),
@@ -215,14 +245,16 @@ impl QuantizedLinear {
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        let per_word = 32 / bits;
+        let mask = (1u32 << bits) - 1;
         let mut grid = vec![0f32; out_dim * in_dim];
         for row in 0..out_dim {
             let word_row = row * packed_cols;
             let group_row = row * scale_cols;
             let value_row = row * in_dim;
             for col in 0..in_dim {
-                let word = words[word_row + col / 4];
-                let code = ((word >> (8 * (col % 4))) & 0xff) as f32;
+                let word = words[word_row + col / per_word];
+                let code = ((word >> (bits * (col % per_word))) & mask) as f32;
                 let group = group_row + col / group_size;
                 grid[value_row + col] = scales[group] * code + biases[group];
             }
@@ -406,5 +438,52 @@ mod tests {
 
         let y = packed.forward(&x).unwrap();
         assert_eq!(y.dims(), &[2, out]);
+    }
+
+    /// sc-24444: a 4-bit MLX affine triple (eight little-endian nibbles per word — a published
+    /// companion MTP head's layout) reconstructs its exact affine grid before the Q8_0 repack, and
+    /// the 8-bit reading of the same words is refused by geometry.
+    #[test]
+    fn mlx_affine_q4_reconstructs_lsb_nibbles_bias_and_input_groups() {
+        let dev = Device::Cpu;
+        let (out, inn, group) = (2usize, 64usize, 32usize);
+        let codes: Vec<u8> = (0..out * inn)
+            .map(|i| [0, 15, 1, 14, 7, 8, 3, 12][i % 8] ^ ((i / 8) % 2) as u8)
+            .collect();
+        let words: Vec<u32> = codes
+            .chunks_exact(8)
+            .map(|chunk| {
+                chunk.iter().enumerate().fold(0u32, |word, (index, code)| {
+                    word | ((*code as u32) << (index * 4))
+                })
+            })
+            .collect();
+        let scale_values = vec![0.1f32, 0.05, 0.02, 0.08];
+        let bias_values = vec![-0.75f32, 0.25, -0.1, 0.4];
+        let weight = Tensor::from_vec(words, (out, inn / 8), &dev).unwrap();
+        let scales = Tensor::from_vec(scale_values.clone(), (out, inn / group), &dev).unwrap();
+        let biases = Tensor::from_vec(bias_values.clone(), (out, inn / group), &dev).unwrap();
+
+        let packed =
+            QuantizedLinear::from_mlx_affine(&weight, &scales, &biases, None, group, 4, &dev)
+                .unwrap();
+        let resident = match &packed.inner {
+            QuantizedWeight::Dequant(weight) => weight.dequantize(&dev).unwrap(),
+            QuantizedWeight::Matmul(_) => panic!("MLX affine Q4 must use the packed-source path"),
+        };
+        let got = resident.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (index, (actual, &code)) in got.iter().zip(&codes).enumerate() {
+            let (row, col) = (index / inn, index % inn);
+            let g = row * (inn / group) + col / group;
+            let expected = scale_values[g] * f32::from(code) + bias_values[g];
+            assert!(
+                (actual - expected).abs() < 0.01,
+                "index {index}: {actual} vs affine source {expected}"
+            );
+        }
+        assert!(
+            QuantizedLinear::from_mlx_affine_q8(&weight, &scales, &biases, None, group, &dev)
+                .is_err()
+        );
     }
 }
