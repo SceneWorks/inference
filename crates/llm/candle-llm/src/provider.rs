@@ -3411,8 +3411,9 @@ pub(crate) fn with_load_budget<R>(budget: u64, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The operational budget load admission caps measured availability with
-/// ([`core_llm::operational_memory_override`]).
+/// The operational budget admission caps measured availability with
+/// ([`core_llm::operational_memory_override`]) — the host domain's on a host device, the
+/// device domain's on CUDA.
 fn load_memory_budget() -> CoreResult<Option<u64>> {
     #[cfg(test)]
     if let Some(budget) = LOAD_BUDGET.with(std::cell::Cell::get) {
@@ -3607,7 +3608,7 @@ fn request_available_memory(device: &Device) -> CoreResult<u64> {
     } else {
         core_llm::available_host_memory_bytes()
     };
-    core_llm::effective_memory_budget(capacity, core_llm::operational_memory_override()?)
+    core_llm::effective_memory_budget(capacity, load_memory_budget()?)
 }
 
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
@@ -9519,6 +9520,17 @@ mod tests {
         crate::models::qwen35::tests::text_model_snapshot_parts().2["text_config"].clone()
     }
 
+    /// The bytes a load of `spec` admits in the domain the load's budget caps — the device's on
+    /// a CUDA test host (the operational budget is device headroom there), the host's otherwise.
+    fn admitted_bytes(spec: &core_llm::LoadSpec) -> u64 {
+        let cuda = crate::device::select_device().unwrap().is_cuda();
+        let estimate = super::LlamaProvider::load_memory_estimate(spec, cuda).unwrap();
+        match cuda {
+            true => estimate.device_required_bytes.unwrap(),
+            false => estimate.host_required_bytes,
+        }
+    }
+
     fn with_head(target: &tempfile::TempDir, head: &std::path::Path) -> core_llm::LoadSpec {
         core_llm::LoadSpec::dense(target.path().display().to_string())
             .with_mtp_head(head.display().to_string())
@@ -9723,13 +9735,8 @@ mod tests {
         let source = target.path().display().to_string();
         let mut spec = with_head(&target, head.path()).with_draft(source.clone());
         spec.prefix_cache_bytes = Some(u64::MAX / 4);
-        let estimate = |spec: &core_llm::LoadSpec| {
-            super::LlamaProvider::load_memory_estimate(spec, false)
-                .unwrap()
-                .host_required_bytes
-        };
-        let target_bytes = estimate(&core_llm::LoadSpec::dense(source.clone()));
-        let draft_bytes = estimate(&super::draft_load_spec(&spec, &source));
+        let target_bytes = admitted_bytes(&core_llm::LoadSpec::dense(source.clone()));
+        let draft_bytes = admitted_bytes(&super::draft_load_spec(&spec, &source));
 
         let short = super::with_load_budget(target_bytes + draft_bytes + head_bytes - 1, || {
             super::LlamaProvider::load(&spec)
@@ -9783,16 +9790,11 @@ mod tests {
         assert_eq!(head_bytes, payload + repack + norms);
 
         let spec = with_head(&target, head.path());
-        let target_bytes = super::LlamaProvider::load_memory_estimate(
-            &core_llm::LoadSpec::dense(target.path().display().to_string()),
-            false,
-        )
-        .unwrap()
-        .host_required_bytes;
+        let target_bytes = admitted_bytes(&core_llm::LoadSpec::dense(
+            target.path().display().to_string(),
+        ));
         assert_eq!(
-            super::LlamaProvider::load_memory_estimate(&spec, false)
-                .unwrap()
-                .host_required_bytes,
+            admitted_bytes(&spec),
             target_bytes,
             "the target's own price is unchanged; the head is admitted on top of it"
         );
