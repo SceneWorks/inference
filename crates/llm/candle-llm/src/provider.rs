@@ -9835,14 +9835,15 @@ mod tests {
             "every step of the Off request went through the runner: {}",
             engine.cuda_graphs.describe()
         );
-        // An eager step names why — unless it is the warm-up or capture of a shape the runner
-        // did capture (sc-24441: the dense decoders capture on CUDA; a 3-token request can end
-        // before the first replay, and its prefill segments are never captured).
+        // An eager step names why — unless the runner could capture this decoder (sc-24441: the
+        // dense decoders capture on CUDA), where an eager step without a reason is a prefill
+        // segment, a warm-up or a capture's eager reference, and a 3-token request can end before
+        // any shape is captured or replayed.
         match engine.cuda_graphs.fallback_reason {
             Some(reason) => assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH),
             None => assert!(
-                engine.cuda_graphs.captured > 0,
-                "an eager step with no reason belongs to a captured shape: {}",
+                on.model.device().is_cuda() && on.model.graph_support().is_ok(),
+                "an eager step with no reason on a decoder the runner cannot capture: {}",
                 engine.cuda_graphs.describe()
             ),
         }
