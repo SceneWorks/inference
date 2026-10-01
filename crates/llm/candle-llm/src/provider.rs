@@ -296,6 +296,16 @@ impl Decoder {
         u64::try_from(crate::primitives::DevicePositions::BYTES.checked_add(workspace)?).ok()
     }
 
+    /// Whether the decoder's step can be captured as a CUDA graph at all
+    /// ([`StepModel::graph_support`](crate::decode::StepModel::graph_support)).
+    fn graph_support(&self) -> std::result::Result<(), &'static str> {
+        use crate::decode::StepModel;
+        match self {
+            Decoder::Causal(m) => m.graph_support(),
+            Decoder::Qwen35(m) => m.graph_support(),
+        }
+    }
+
     /// Bytes a static KV cache of `capacity` positions preallocates for this decoder (the
     /// model's own `static_kv_bytes`) — what a request that ran past that capacity was refused
     /// for (sc-24140).
@@ -966,7 +976,7 @@ fn draft_request_bytes(
 /// llama family (sc-24140) keeps a projection whose shape the FP4 GEMM cannot serve dense, counted
 /// under `census.projections.dense` — this record is how a caller (and the evidence harness)
 /// sees which, and reads the resident bits/param.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadRecord {
     /// The load-time weight format the caller requested (`None` = the checkpoint's own dtype, or
     /// its persisted `quantization` block).
@@ -981,6 +991,11 @@ pub struct LoadRecord {
     /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
     /// follows the process switch.
     pub cuda_graphs: Option<bool>,
+    /// Every feature the load asked for but did not deliver, each named by the feature: with the
+    /// CUDA-graph switch on, a decoder whose step cannot be captured
+    /// (`cuda_graphs: <graph_support reason>`, sc-24441), known at load so a product can disable
+    /// its graph toggle before the first generation. The model still loaded (epic sc-24432 E2).
+    pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (sc-24437): the requested
     /// budget clamped to the headroom admission left. `None` for a provider assembled without a
     /// load.
@@ -1018,6 +1033,7 @@ impl LoadRecord {
             requested: self.requested,
             projections,
             cuda_graphs: self.cuda_graphs,
+            fallbacks: self.fallbacks.clone(),
             prefix_cache_bytes: self.prefix_cache_bytes,
             draft: None,
         }
@@ -1656,6 +1672,7 @@ impl LlamaProvider {
                 provider.attach_draft(&draft_spec, &device, requested.as_ref())
             }
         }
+        provider.note_graph_refusal(cuda_graphs);
         Ok(provider)
     }
 
@@ -2209,6 +2226,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                fallbacks: Vec::new(),
                 prefix_cache_bytes: None,
             },
         })
@@ -2414,6 +2432,7 @@ impl LlamaProvider {
                 requested: None,
                 census,
                 cuda_graphs: None,
+                fallbacks: Vec::new(),
                 prefix_cache_bytes: None,
             },
         })
@@ -2447,10 +2466,24 @@ impl LlamaProvider {
         }
     }
 
+    /// With the CUDA-graph switch the load settled on (`cuda_graphs`), name a decoder whose step
+    /// the graph runner can never capture in the load's fallbacks — `cuda_graphs: <reason>`, the
+    /// decoder's own [`graph_support`](crate::decode::StepModel::graph_support) refusal — so a
+    /// product knows at load, not after the first generation (sc-24441, E3). Each request still
+    /// reports its eager steps and their reason. Nothing is named with the switch off or for a
+    /// capturable decoder.
+    fn note_graph_refusal(&mut self, cuda_graphs: bool) {
+        if let (true, Err(reason)) = (cuda_graphs, self.model.graph_support()) {
+            self.load_record
+                .fallbacks
+                .push(format!("cuda_graphs: {reason}"));
+        }
+    }
+
     /// The load telemetry: the requested weight format and the resident weight census by
     /// projection kind (sc-24135).
     pub fn load_record(&self) -> LoadRecord {
-        self.load_record
+        self.load_record.clone()
     }
 
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
@@ -6431,6 +6464,51 @@ mod tests {
             scalar_term < gemma4.static_kv_bytes(capacity as usize) as u64,
             "the scalar geometry under-prices the full layers"
         );
+    }
+
+    /// sc-24441 (E3): with the CUDA-graph switch on, a load whose decoder the runner can never
+    /// capture names it in the load's fallbacks (`cuda_graphs: <graph_support reason>`) — here a
+    /// dense llama with device positions off (`positions_host_scalar`) — and names nothing with
+    /// the switch off or for a capturable decoder (device positions on). The device-positions
+    /// default is process state read once, so each setting runs in a child process of its own.
+    #[test]
+    fn a_graph_load_names_a_decoder_the_runner_cannot_capture() {
+        use core_llm::TextLlm;
+        const CHILD: &str = "CANDLE_LLM_GRAPH_REFUSAL_TEST_CHILD";
+        let Ok(setting) = std::env::var(CHILD) else {
+            let name = std::thread::current().name().unwrap().to_owned();
+            for setting in ["0", "1"] {
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &name, "--nocapture"])
+                    .env(CHILD, setting)
+                    .env(crate::primitives::DEVICE_POSITIONS_ENV, setting)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "device positions {setting}");
+            }
+            return;
+        };
+        let (cfg, weights) = tiny_llama_parts();
+        let dir = write_snapshot(&cfg, &weights, 40);
+        let load = |graphs: bool| {
+            super::LlamaProvider::load(&core_llm::LoadSpec {
+                cuda_graphs: Some(graphs),
+                ..spec_at(dir.path(), None)
+            })
+            .unwrap()
+        };
+        let provider = load(true);
+        let fallbacks = provider.load_report().unwrap().fallbacks;
+        if setting == "1" {
+            assert_eq!(provider.model.graph_support(), Ok(()), "capturable");
+            assert!(fallbacks.is_empty(), "{fallbacks:?}");
+        } else {
+            assert_eq!(
+                fallbacks,
+                vec!["cuda_graphs: positions_host_scalar".to_string()]
+            );
+            assert!(load(false).load_report().unwrap().fallbacks.is_empty());
+        }
     }
 
     /// sc-24441: the reference loop's record names the decode attention when the decoder's
