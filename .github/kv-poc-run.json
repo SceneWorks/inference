@@ -1,0 +1,7 @@
+{
+  "mode": "w2",
+  "inference_ref": "8cdc198e2e0149bc94c85586766b3a538dc71df9",
+  "sceneworks_ref": "2ed5b7c069de8d770aed064e547b68770f68ec02",
+  "runner_label": "rw-krea",
+  "phases": "d,d-control"
+}
