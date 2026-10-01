@@ -191,8 +191,8 @@ impl LoadCell {
 /// snapshot's committed manifest. Only these: Gemma 4 unified BF16 measured above its bound under
 /// the uniform method, and every load-time Q4/Q8 probe was sampled every 100 ms across a
 /// `clear_cache`, which can hide up to the load's derived bytes, so none clears the margin
-/// floor; they keep the two-copy floor until the exact-peak re-probes
-/// (`docs/reference/qwen38/native-memory-admission.md`).
+/// floor. Those cells are charged by the exact-peak re-probes instead ([`MATERIALIZED_VERIFIED`],
+/// which takes precedence; `docs/reference/qwen38/native-memory-admission.md`).
 pub(crate) const EARLIER_VERIFIED: &[Cell] = &[
     Cell {
         model_type: "llama",
@@ -212,8 +212,102 @@ pub(crate) const EARLIER_VERIFIED: &[Cell] = &[
 ];
 
 /// Cells whose [`materialized_bound`] an exact-peak (kernel `phys_footprint` maximum) probe of
-/// the provider's materialize-at-load order covers with margin. Empty until those probes run.
-pub(crate) const MATERIALIZED_VERIFIED: &[Cell] = &[];
+/// the provider's materialize-at-load order covers with margin — the 2026-10-01 re-probe session
+/// (21 probes, every one covered; the tightest, Qwen3.6-35B-A3B BF16, by 85 MB beyond its 0.5 %
+/// margin). A stored-quantized Qwen3.6 snapshot was probed too but has no committed manifest, so
+/// its cell is not listed.
+pub(crate) const MATERIALIZED_VERIFIED: &[Cell] = &[
+    Cell {
+        model_type: "llama",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "llama",
+        conversion: Conversion::LoadQ4,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "llama",
+        conversion: Conversion::LoadQ8,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3",
+        conversion: Conversion::LoadQ4,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3",
+        conversion: Conversion::LoadQ8,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "gemma2",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "gemma2",
+        conversion: Conversion::LoadQ4,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "gemma2",
+        conversion: Conversion::LoadQ8,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "gemma4_unified",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "gemma4_unified",
+        conversion: Conversion::LoadQ4,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "gemma4_unified",
+        conversion: Conversion::LoadQ8,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3_5",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3_5",
+        conversion: Conversion::LoadQ4,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3_5",
+        conversion: Conversion::LoadQ8,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3_5_moe",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3_5_moe",
+        conversion: Conversion::LoadQ4,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3_5_moe",
+        conversion: Conversion::LoadQ8,
+        dtype: "BF16",
+    },
+];
 
 /// Host heap per `tokenizer.json` byte: the parsed vocabulary, merges and added-token tables.
 /// The sc-24446 probes measured 12–17× (Llama 3.2, Qwen3, Gemma 2); 24× keeps headroom.
@@ -768,35 +862,38 @@ mod tests {
             .collect()
     }
 
-    /// The probed cells, unquantized: the payload once plus each buffer's page rounding and the
-    /// norm's two BF16 intermediates — no second copy of any BF16 matrix. Every other cell keeps
-    /// the two-copy floor, including a family the loader dispatches alike (Mistral, dense Qwen2 —
-    /// the Llama decoder), a different stored dtype of a probed family (F16, F32), a config
-    /// without `model_type`, and the families whose probes do not clear the margin (Qwen3.5/3.8,
-    /// Qwen3-VL, Prism, Gemma 4 unified).
+    /// The probed cells are charged their materialize-at-load bound (the exact-peak re-probes
+    /// cover every listed cell); every other cell keeps the two-copy floor, including a family
+    /// the loader dispatches alike (Mistral, dense Qwen2 — the Llama decoder), a different stored
+    /// dtype of a probed family (F16, F32), a config without `model_type`, and the unprobed
+    /// families (Qwen3.5 text-only, Qwen3-VL, Prism).
     ///
     /// MUTATION: drop the dtype or the `model_type` from `LoadCell::is_in`'s match and this goes
     /// RED.
     #[test]
-    fn only_probed_cells_charge_the_payload_once_plus_derived_arrays() {
-        let once = |payload: u64| payload + 4 * R + (64 * 4 + R) + H;
-        for model_type in ["llama", "qwen3", "gemma2"] {
-            let (dir, payload) =
-                snapshot(json!({ "model_type": model_type }), &refs(&dense("model")));
-            assert_eq!(required(&dir, None), once(payload), "{model_type}");
+    fn only_probed_cells_charge_their_probed_bound() {
+        for (model_type, prefix) in [
+            ("llama", "model"),
+            ("qwen3", "model"),
+            ("gemma2", "model"),
+            ("qwen3_5", "model.language_model"),
+            ("gemma4_unified", "model.language_model"),
+        ] {
+            let (dir, _) = snapshot(json!({ "model_type": model_type }), &refs(&dense(prefix)));
+            let headers = safetensors_headers(dir.path()).unwrap();
+            assert_eq!(
+                required(&dir, None),
+                materialized_bound(&headers, None).unwrap() + H,
+                "{model_type}"
+            );
         }
         for (config, prefix) in [
             (json!({"model_type": "mistral"}), "model"),
             (json!({"model_type": "qwen2"}), "model"),
             (json!({}), "model"),
-            (json!({"model_type": "qwen3_5"}), "model.language_model"),
             (json!({"model_type": "qwen3_5_text"}), "model"),
             (json!({"model_type": "qwen3_vl"}), "model.language_model"),
             (json!({"model_type": "prism_hadamard_qwen35"}), "model"),
-            (
-                json!({"model_type": "gemma4_unified"}),
-                "model.language_model",
-            ),
         ] {
             let (dir, payload) = snapshot(config.clone(), &refs(&dense(prefix)));
             assert_eq!(required(&dir, None), 2 * payload + H, "{config}");
@@ -814,8 +911,8 @@ mod tests {
     /// Load-time Q4/Q8 adds the packed words (`n·bits/8`) and BF16 scales + biases
     /// (`4·n/group`) of every quantized projection — never of the embedding or the LM head —
     /// on top of the BF16 payload that stays resident until the quantized arrays are evaluated
-    /// (the earlier order's bound). No load-time cell is probed with margin, so each is charged
-    /// at least two copies.
+    /// (the earlier order's bound). Every listed load-time cell is exact-probed, so it is charged
+    /// its materialize-at-load bound instead.
     #[test]
     fn quantize_at_load_charges_packed_words_scales_and_biases_per_bits() {
         let up = 1024 * 1024;
@@ -836,7 +933,7 @@ mod tests {
                 );
                 assert_eq!(
                     required(&dir, Some(quantize)),
-                    earlier.max(2 * payload) + H,
+                    materialized_bound(&facts.headers, Some(q)).unwrap() + H,
                     "{model_type} {quantize:?}"
                 );
             }
@@ -877,7 +974,7 @@ mod tests {
                 json!({"model_type": "qwen3_5_moe"}),
                 vec![(
                     "model.language_model.layers.0.mlp.experts.down_proj".into(),
-                    "BF16",
+                    "F32",
                     vec![2, 1024, 1024],
                 )],
                 None,
@@ -1468,6 +1565,216 @@ mod tests {
             first_request: 80_870_000_000,
             request_working_set: 230_000_000,
         },
+        Measured {
+            config: "Llama 3.2 1B Instruct BF16 (materialize-at-load, exact)",
+            manifest: "llama-3.2-1b-instruct-bf16",
+            quantize: None,
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(2_742_617_960),
+            first_request: 2_799_716_320,
+            request_working_set: 170_459_136,
+        },
+        Measured {
+            config: "Llama 3.2 1B Instruct load-time Q4 (materialize-at-load, exact)",
+            manifest: "llama-3.2-1b-instruct-bf16",
+            quantize: Some(core_llm::Quantize::Q4),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(1_463_157_480),
+            first_request: 1_465_303_808,
+            request_working_set: 225_771_520,
+        },
+        Measured {
+            config: "Llama 3.2 1B Instruct load-time Q8 (materialize-at-load, exact)",
+            manifest: "llama-3.2-1b-instruct-bf16",
+            quantize: Some(core_llm::Quantize::Q8),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(1_951_187_568),
+            first_request: 1_953_383_048,
+            request_working_set: 225_722_368,
+        },
+        Measured {
+            config: "Qwen3-1.7B BF16 (materialize-at-load, exact)",
+            manifest: "qwen3-1.7b-bf16",
+            quantize: None,
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(3_746_859_552),
+            first_request: 3_776_973_464,
+            request_working_set: 218_431_488,
+        },
+        Measured {
+            config: "Qwen3-1.7B load-time Q4 (materialize-at-load, exact)",
+            manifest: "qwen3-1.7b-bf16",
+            quantize: Some(core_llm::Quantize::Q4),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(1_821_000_496),
+            first_request: 1_767_818_032,
+            request_working_set: 236_208_128,
+        },
+        Measured {
+            config: "Qwen3-1.7B load-time Q8 (materialize-at-load, exact)",
+            manifest: "qwen3-1.7b-bf16",
+            quantize: Some(core_llm::Quantize::Q8),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(2_525_938_432),
+            first_request: 2_460_451_632,
+            request_working_set: 236_273_664,
+        },
+        Measured {
+            config: "Gemma 2 2B-it BF16 (materialize-at-load, exact)",
+            manifest: "gemma-2-2b-it",
+            quantize: None,
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(5_636_362_200),
+            first_request: 5_547_003_864,
+            request_working_set: 188_186_624,
+        },
+        Measured {
+            config: "Gemma 2 2B-it load-time Q4 (materialize-at-load, exact)",
+            manifest: "gemma-2-2b-it",
+            quantize: Some(core_llm::Quantize::Q4),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(2_888_287_576),
+            first_request: 2_660_632_160,
+            request_working_set: 194_674_688,
+        },
+        Measured {
+            config: "Gemma 2 2B-it load-time Q8 (materialize-at-load, exact)",
+            manifest: "gemma-2-2b-it",
+            quantize: Some(core_llm::Quantize::Q8),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(3_900_425_560),
+            first_request: 3_672_770_216,
+            request_working_set: 194_641_920,
+        },
+        Measured {
+            config: "Qwen3-8B BF16 (materialize-at-load, exact)",
+            manifest: "qwen3-8b",
+            quantize: None,
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(16_693_522_000),
+            first_request: 16_730_746_544,
+            request_working_set: 225_345_536,
+        },
+        Measured {
+            config: "Qwen3-8B load-time Q4 (materialize-at-load, exact)",
+            manifest: "qwen3-8b",
+            quantize: Some(core_llm::Quantize::Q4),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(7_090_473_408),
+            first_request: 7_035_423_336,
+            request_working_set: 268_976_128,
+        },
+        Measured {
+            config: "Qwen3-8B load-time Q8 (materialize-at-load, exact)",
+            manifest: "qwen3-8b",
+            quantize: Some(core_llm::Quantize::Q8),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(10_562_963_856),
+            first_request: 10_498_083_360,
+            request_working_set: 253_558_784,
+        },
+        Measured {
+            config: "Gemma 4 unified (LTX-2.5 enhancer) BF16 (materialize-at-load, exact)",
+            manifest: "ltx-2.5-enhancer",
+            quantize: None,
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(24_570_315_912),
+            first_request: 24_457_020_576,
+            request_working_set: 247_988_224,
+        },
+        Measured {
+            config: "Gemma 4 unified (LTX-2.5 enhancer) load-time Q4 (materialize-at-load, exact)",
+            manifest: "ltx-2.5-enhancer",
+            quantize: Some(core_llm::Quantize::Q4),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(9_086_339_400),
+            first_request: 8_794_950_392,
+            request_working_set: 294_895_616,
+        },
+        Measured {
+            config: "Gemma 4 unified (LTX-2.5 enhancer) load-time Q8 (materialize-at-load, exact)",
+            manifest: "ltx-2.5-enhancer",
+            quantize: Some(core_llm::Quantize::Q8),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(14_415_464_824),
+            first_request: 14_236_994_464,
+            request_working_set: 286_801_920,
+        },
+        Measured {
+            config: "Qwen3.8-27B load-time Q4 (materialize-at-load, exact)",
+            manifest: "qwen3.8-27b",
+            quantize: Some(core_llm::Quantize::Q4),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(20_303_780_152),
+            first_request: 20_560_501_384,
+            request_working_set: 381_976_744,
+        },
+        Measured {
+            config: "Qwen3.8-27B load-time Q8 (materialize-at-load, exact)",
+            manifest: "qwen3.8-27b",
+            quantize: Some(core_llm::Quantize::Q8),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(32_868_407_344),
+            first_request: 32_947_755_296,
+            request_working_set: 378_470_592,
+        },
+        Measured {
+            config: "Qwen3.8-27B BF16 (materialize-at-load, exact)",
+            manifest: "qwen3.8-27b",
+            quantize: None,
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(55_920_090_112),
+            first_request: 56_155_151_552,
+            request_working_set: 358_727_728,
+        },
+        Measured {
+            config: "Qwen3.6-35B-A3B load-time Q4 (materialize-at-load, exact)",
+            manifest: "qwen3.6-35b-a3b",
+            quantize: Some(core_llm::Quantize::Q4),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(23_362_096_536),
+            first_request: 22_820_441_232,
+            request_working_set: 250_724_400,
+        },
+        Measured {
+            config: "Qwen3.6-35B-A3B load-time Q8 (materialize-at-load, exact)",
+            manifest: "qwen3.6-35b-a3b",
+            quantize: Some(core_llm::Quantize::Q8),
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(40_661_502_568),
+            first_request: 40_046_054_472,
+            request_working_set: 245_137_456,
+        },
+        Measured {
+            config: "Qwen3.6-35B-A3B BF16 (materialize-at-load, exact)",
+            manifest: "qwen3.6-35b-a3b",
+            quantize: None,
+            order: Order::Materialized,
+            sampling: Sampling::Exact,
+            after_load: Some(72_264_862_120),
+            first_request: 72_381_942_328,
+            request_working_set: 240_877_592,
+        },
     ];
 
     /// Which load order a probe ran.
@@ -1487,8 +1794,7 @@ mod tests {
         /// since the last sample, bounded by the arrays the first request derived.
         Every100Ms,
         /// The kernel's exact maximum (`ri_interval_max_phys_footprint` /
-        /// `ri_lifetime_max_phys_footprint`): nothing missed. The re-probes record it.
-        #[allow(dead_code)]
+        /// `ri_lifetime_max_phys_footprint`): nothing missed.
         Exact,
     }
 
@@ -1629,9 +1935,11 @@ mod tests {
         assert!(!gemma4.cell(&facts).is_in(EARLIER_VERIFIED));
         // A sampled load-time probe cannot clear its margin: the first request's derived arrays,
         // which a `clear_cache` between samples can hide, are as large as the margin it needs.
-        for m in MEASURED.iter().filter(|m| m.quantize.is_some()) {
+        for m in MEASURED
+            .iter()
+            .filter(|m| m.quantize.is_some() && m.sampling == Sampling::Every100Ms)
+        {
             let facts = manifest_facts(m.manifest);
-            assert_eq!(m.sampling, Sampling::Every100Ms);
             assert!(
                 !m.covered(&facts),
                 "{}: a sampled load-time probe counted",

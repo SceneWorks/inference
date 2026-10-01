@@ -162,14 +162,11 @@ decoder matrix is stored in (`LoadCell`):
 
 | Cell | Charged |
 | --- | --- |
-| `llama` / `qwen3` / `gemma2`, dense, BF16 | earlier bound (covered probes) |
-| every other cell — `gemma4_unified` dense (its probe sits above its bound), every load-time Q4/Q8 (sampled probes cannot clear the margin, below), `qwen3_5` / `qwen3_5_moe` / Prism / Qwen3-VL / stored-quantized, Mistral, dense Qwen2, F16/F32 checkpoints, a config without `model_type` | `max(2×, earlier)` until the exact-peak re-probes |
+| `llama`, `qwen3`, `gemma2`, `gemma4_unified`, `qwen3_5`, `qwen3_5_moe` × dense / load-time Q4 / load-time Q8, BF16-stored | `materialized_bound` + host (exact-peak probes, 2026-10-01, all covered) |
+| every other cell — stored-quantized snapshots (incl. a prepared Qwen3.6 Q4: probed at 22.72 GB but its 9.4 MB manifest is not committed), Prism, Qwen3-VL, `qwen3_5_text`, Mistral, dense Qwen2, F16/F32 checkpoints, a config without `model_type` | `max(2×, earlier)` + host |
 
-`MATERIALIZED_VERIFIED` is empty until those re-probes run (one post-campaign session,
-`/Volumes/Models/sc24446-moe-probes.sh`). Until then Qwen3.8-27B is charged 111.8 GB at every
-conversion and Qwen3.6-35B-A3B 144.5 GB — both refused on a 128 GiB host — where the earlier
-verified bounds charged Qwen3.8-27B 69.9 GB (Q4) / 82.3 GB (Q8): those verifications rested on
-sampled probes that, under the uniform method and margin below, do not clear.
+On this 128 GiB host (~97 GB available idle) every probed cell is admitted — charges in the
+measured-probes table below; the largest, Qwen3.6-35B-A3B BF16, at 72.7 GB.
 
 Header-only bounds for the probe targets (arrays only, recomputed from the committed manifests;
 host heap excluded; GB):
@@ -245,10 +242,43 @@ the rules above (`verified_cells_are_exactly_the_probed_and_covered_ones`). Esti
 | Qwen3.8-27B | Q4 | 70.185 | 69.477 | 14.326 | no | 69.713 / 0.236 |
 | Qwen3.8-27B | Q8 | 82.573 | 80.640 | 26.770 | no | 80.870 / 0.230 |
 
-The re-probe session (`/Volumes/Models/sc24446-moe-probes.sh`) re-measures every cell on the
-current build — group-by-group materialize-at-load, BF16 GeGLU for LLM decode — with the kernel's
-**exact** footprint maxima (`ri_interval_max_phys_footprint`, `tests/common/footprint.rs`), so its
-rows need only the 0.5 % variation margin; only cells it covers enter `MATERIALIZED_VERIFIED`.
+#### Exact-peak re-probes of the current build (2026-10-01)
+
+Every cell re-measured on the current build — group-by-group materialize-at-load with pacing,
+BF16 GeGLU for LLM decode — one model at a time under the 80 GB guard (no cap hit), with the
+kernel's **exact** footprint maxima (`ri_interval_max_phys_footprint`,
+`tests/common/footprint.rs`) over a driver-settled baseline, so the rows need only the 0.5 %
+variation margin. Every row is a `Measured { Order::Materialized, Sampling::Exact }` entry; all
+21 are covered, and exactly their cells form `MATERIALIZED_VERIFIED`. "Request" is the exact
+footprint growth of a second one-token request (driver wake, cache and host heap included).
+
+| Snapshot | Conversion | Charged (GB) | Exact load peak (GB) | Slack beyond margin (GB) | Request (GB) | Main charged (GB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Llama 3.2 1B | BF16 | 3.162 | 2.743 | 0.406 | 0.170 | 4.943 |
+| Llama 3.2 1B | Q4 | 2.010 | 1.463 | 0.540 | 0.226 | 4.943 |
+| Llama 3.2 1B | Q8 | 2.497 | 1.951 | 0.536 | 0.226 | 4.943 |
+| Qwen3-1.7B | BF16 | 4.190 | 3.747 | 0.425 | 0.218 | 6.882 |
+| Qwen3-1.7B | Q4 | 2.372 | 1.821 | 0.542 | 0.236 | 6.882 |
+| Qwen3-1.7B | Q8 | 3.077 | 2.526 | 0.539 | 0.236 | 6.882 |
+| Gemma 2 2B-it | BF16 | 6.124 | 5.636 | 0.459 | 0.188 | 10.457 |
+| Gemma 2 2B-it | Q4 | 3.532 | 2.888 | 0.629 | 0.195 | 10.457 |
+| Gemma 2 2B-it | Q8 | 4.544 | 3.900 | 0.624 | 0.195 | 10.457 |
+| Qwen3-8B | BF16 | 17.132 | 16.694 | 0.355 | 0.225 | 32.763 |
+| Qwen3-8B | Q4 | 7.928 | 7.090 | 0.802 | 0.269 | 32.763 |
+| Qwen3-8B | Q8 | 11.401 | 10.563 | 0.785 | 0.254 | 32.763 |
+| Gemma 4 unified enhancer | BF16 | 25.191 | 24.570 | 0.497 | 0.248 | 47.839 |
+| Gemma 4 unified enhancer | Q4 | 10.500 | 9.086 | 1.368 | 0.295 | 47.839 |
+| Gemma 4 unified enhancer | Q8 | 15.950 | 14.415 | 1.463 | 0.287 | 47.839 |
+| Qwen3.8-27B | BF16 | 56.373 | 55.920 | 0.173 | 0.359 | 55.573 |
+| Qwen3.8-27B | Q4 | 22.337 | 20.304 | 1.931 | 0.382 | 111.126 (refused) |
+| Qwen3.8-27B | Q8 | 34.712 | 32.868 | 1.680 | 0.378 | 111.126 (refused) |
+| Qwen3.6-35B-A3B | BF16 | 72.711 | 72.265 | 0.085 | 0.241 | 143.808 (refused) |
+| Qwen3.6-35B-A3B | Q4 | 26.552 | 23.362 | 3.073 | 0.251 | 143.808 (refused) |
+| Qwen3.6-35B-A3B | Q8 | 43.783 | 40.662 | 2.918 | 0.245 | 143.808 (refused) |
+
+The tightest are the two large BF16 loads (Qwen3.6 by 85 MB, Qwen3.8 by 173 MB beyond the 0.5 %
+margin): BF16 keeps every source as the model's own array, so the bound is the payload plus a few
+hundred MB and a sub-percent run-to-run variation is all the headroom there is to need.
 
 ### One-token request working set (sc-24446)
 
@@ -261,8 +291,9 @@ only figure those probes kept; their Gemma rows ran the `f32` GeGLU) and against
 measurements taken **both** as the exact, driver-settled `phys_footprint` peak growth (MLX's
 cache, the host heap and the driver's wake included) and as MLX's active peak, the estimate
 covering the larger (`a_one_token_request_working_set_is_priced_under_either_activation_dtype`).
-Footprint request working sets on real weights — and Gemma's BF16 LLM-decode working set, never
-yet measured — are in the re-probe session:
+The exact footprint request working sets of the 2026-10-01 re-probes — 0.17–0.38 GB on every
+BF16-GeGLU / SwiGLU path, Gemma included, and 2.67–6.41 GB on Gemma's `f32` GeGLU path — are
+pinned too (`the_request_estimate_covers_the_exact_footprint_working_sets`). The terms:
 
 - **Gemma promoted its weights every forward.** `mlx_rs::nn::gelu_approximate` builds its
   constants as `f32` arrays, so Gemma's GeGLU turned a BF16 input into `f32` and the residual
@@ -316,9 +347,12 @@ not numerically pinned on MLX (eager-attention drift; shape, finiteness and cach
 The LTX-2.5 text encoder stays on `f32` until its real-weight goldens
 (`ltx_2_5_te_connector_inputs`, `ltx_2_5_te_tier_quality`) are run with BF16.
 
-Decode speed on a tiny Gemma 2 fixture (8 layers, hidden 1024, vocabulary 32K, one-token steps,
-release build, GPU shared with a running benchmark campaign): BF16 weights 7.1–8.1 → 4.9–5.9 ms per
-token (1.4×) with the BF16 GeGLU; load-time Q4 5.4–5.7 → 4.6–4.7 ms (1.2×).
+Decode speed on real weights (128 greedy tokens after a short prompt, release build, idle GPU,
+2026-10-01), `f32` GeGLU → BF16 GeGLU: Gemma 2 2B-it BF16 19.4 → 86.5 tok/s (4.5×), Q4 55.3 →
+152.0 (2.7×); the Gemma 4 unified enhancer BF16 4.1 → 20.3 tok/s (5.0×), Q4 25.1 → 50.3 (2.0×).
+The `f32` path's one-token request footprint was 3.81 GB (Gemma 2 BF16) / 2.67 GB (Q4) and 6.41 GB
+(enhancer BF16) / 4.66 GB (Q4); the BF16 path's 0.19–0.30 GB. (Tiny-fixture figures from before
+the re-probes: 1.4× BF16, 1.2× Q4.)
 
 Request bounds include expanded visual tokens, eager attention scores/mask/softmax, full-length
 K/V storage, recurrent state, projection/MLP/logit buffers, MTP cache/rollback and draft-width

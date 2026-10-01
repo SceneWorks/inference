@@ -6465,6 +6465,136 @@ mod tests {
         }
     }
 
+    /// sc-24446: the request estimate covers every one-token request working set the 2026-10-01
+    /// exact-peak re-probes measured on real weights — the kernel's `phys_footprint` maximum over
+    /// a second identical one-token "Hi" request after the driver settled (MLX's cache, the host
+    /// heap and the driver's wake included), on the current build: BF16 GeGLU for every LLM
+    /// decode path, and the `f32` GeGLU (a role pinned to it, with the promotion term) for the
+    /// Gemma rows marked so. Recorded evidence, not a machine golden: the relation is pinned.
+    ///
+    /// MUTATION: drop the driver's wake from the request estimate and the BF16 rows go RED.
+    #[test]
+    fn the_request_estimate_covers_the_exact_footprint_working_sets() {
+        let geometry = |q, kv, hd, layers, hidden, inter, vocab, recurrent| LlmMemoryGeometry {
+            query_heads: q,
+            kv_heads: kv,
+            head_dim: hd,
+            layers,
+            element_bytes: 4,
+            hidden_size: hidden,
+            intermediate_size: inter,
+            vocab_size: vocab,
+            recurrent_bytes: recurrent,
+        };
+        let llama = geometry(32, 8, 64, 16, 2048, 8192, 128_256, 0);
+        let qwen3_small = geometry(16, 8, 128, 28, 2048, 6144, 151_936, 0);
+        let qwen3_8b = geometry(32, 8, 128, 36, 4096, 12_288, 151_936, 0);
+        let gemma2 = geometry(8, 4, 256, 26, 2304, 9216, 256_000, 0);
+        let gemma4 = geometry(16, 8, 256, 48, 3840, 15_360, 262_144, 0);
+        let qwen38 = frozen_dense_qwen35_config();
+        let qwen38_geometry = geometry(
+            24,
+            4,
+            256,
+            64,
+            5120,
+            17_408,
+            248_320,
+            64 * 48 * 128 * (128 + 4) * 4,
+        );
+        let qwen35 = MlxWorkspaceContract::Qwen35 {
+            config: &qwen38,
+            prism: false,
+        };
+        let qwen36_inter = Qwen35Config::from_json(
+            &serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../testdata/load_admission/qwen3.6-35b-a3b.json"
+            ))
+            .unwrap()["config"],
+        )
+        .unwrap()
+        .intermediate_size as u64;
+        let qwen36 = geometry(
+            16,
+            2,
+            256,
+            40,
+            2048,
+            qwen36_inter,
+            248_320,
+            40 * 32 * 128 * (128 + 4) * 4,
+        );
+        let (g2_head, g2_mlp) = (256_000 * 2304, 9216 * 2304);
+        let (g4_head, g4_mlp) = (262_144 * 3840, 15_360 * 3840);
+        let promoted = |head, largest| promoted_weight_bytes(head, largest).unwrap();
+        use MlxWorkspaceContract::{Chunked, Eager};
+        // (row, geometry, contract, rendered prompt tokens, promoted bytes, measured footprint)
+        let cases = [
+            ("Llama 3.2 1B BF16", llama, Chunked, 36, 0, 171_000_000u64),
+            ("Llama 3.2 1B Q4/Q8", llama, Chunked, 36, 0, 226_000_000),
+            ("Qwen3-1.7B", qwen3_small, Chunked, 13, 0, 237_000_000),
+            ("Qwen3-8B", qwen3_8b, Chunked, 13, 0, 269_000_000),
+            (
+                "Gemma 2 2B-it (BF16 GeGLU)",
+                gemma2,
+                Eager,
+                10,
+                0,
+                195_000_000,
+            ),
+            (
+                "Gemma 4 enhancer (BF16 GeGLU)",
+                gemma4,
+                Eager,
+                14,
+                0,
+                295_000_000,
+            ),
+            ("Qwen3.8-27B", qwen38_geometry, qwen35, 13, 0, 382_000_000),
+            ("Qwen3.6-35B-A3B", qwen36, Eager, 13, 0, 251_000_000),
+            (
+                "Gemma 2 2B-it BF16 (f32 GeGLU)",
+                gemma2,
+                Eager,
+                10,
+                promoted(g2_head, g2_mlp),
+                3_811_000_000,
+            ),
+            (
+                "Gemma 2 2B-it Q4 (f32 GeGLU)",
+                gemma2,
+                Eager,
+                10,
+                promoted(g2_head, g2_mlp / 64 * 2),
+                2_668_000_000,
+            ),
+            (
+                "Gemma 4 enhancer BF16 (f32 GeGLU)",
+                gemma4,
+                Eager,
+                14,
+                promoted(g4_head, g4_mlp),
+                6_411_000_000,
+            ),
+            (
+                "Gemma 4 enhancer Q4 (f32 GeGLU)",
+                gemma4,
+                Eager,
+                14,
+                promoted(g4_head, g4_mlp / 64 * 2),
+                4_659_000_000,
+            ),
+        ];
+        for (row, geometry, contract, prompt, promoted, measured) in cases {
+            let estimate =
+                estimate_mlx_request_bytes(prompt, 1, geometry, 0, 0, contract).unwrap() + promoted;
+            assert!(
+                estimate >= measured,
+                "{row}: estimate {estimate} < measured footprint {measured}"
+            );
+        }
+    }
+
     /// sc-24446: the K/V caches hold whole 256-position blocks — over the committed positions and
     /// over any verify width written past them — and a prompt-lookup / draft overshoot that
     /// crosses into a new block charges the rest of that block.
@@ -6584,10 +6714,10 @@ mod tests {
     /// pinned. Two limits, both stated rather than hidden:
     ///
     /// * the probes recorded MLX's **active** peak, not `phys_footprint` (cache retention and
-    ///   host heap uncounted); the footprint working sets are in the pending re-probes;
+    ///   host heap uncounted); the exact footprint working sets are pinned by
+    ///   `the_request_estimate_covers_the_exact_footprint_working_sets`;
     /// * every Gemma row ran the `f32` GeGLU, so it is pinned with the promotion term — today
-    ///   that is the path a role pinned to `f32` (the LTX-2.5 text encoder) runs. Gemma's BF16
-    ///   LLM-decode working set has **not** been measured on real weights yet (pending).
+    ///   that is the path a role pinned to `f32` (the LTX-2.5 text encoder) runs.
     ///
     /// Before sc-24446 the estimate was 6–9 MB for the Llama / Qwen3 cases (measured 35–87 MB)
     /// and 14–31 MB for the Gemma cases (measured 2.4–5.4 GB).
