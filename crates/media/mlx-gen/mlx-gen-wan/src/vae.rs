@@ -738,10 +738,14 @@ impl WanVae {
 
     /// Decode a normalized latent `[B, z, T, H, W]` → video `[B, 3, 4·T, 8·H, 8·W]` in `[-1, 1]`.
     pub fn decode(&self, z: &Array) -> Result<Array> {
-        let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
-        let x = self.conv2.forward(&denorm, None)?;
-        let out = self.decoder.forward(&x)?;
-        let out = contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)?;
+        // The intermediates are scoped to this block so they are dropped before the release below
+        // rather than freed into the cache after it (sc-20686).
+        let out = {
+            let denorm = add(&divide(z, &self.inv_std)?, &self.mean)?;
+            let x = self.conv2.forward(&denorm, None)?;
+            let out = self.decoder.forward(&x)?;
+            contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)?
+        };
         // Single pass: the head's freed buffers leave the cache with the output (sc-20686).
         DeadStageBuffers::Release.materialize(&out)?;
         Ok(out)

@@ -597,13 +597,13 @@ impl ResidualBlock {
         }
     }
 
-    /// Decode path (no cache).
-    fn forward(&self, x: &Array) -> Result<Array> {
+    /// Decode path (no cache). `dead` governs the mid-block boundary after `conv1`.
+    fn forward(&self, x: &Array, dead: DeadStageBuffers) -> Result<Array> {
         let h = self.shortcut(x)?;
         let y = self
             .conv1
             .forward(&silu(&rms_norm_last(x, &self.norm1)?)?, None)?;
-        eval(&y)?;
+        dead.materialize(&y)?;
         let y = self
             .conv2
             .forward(&silu(&rms_norm_last(&y, &self.norm2)?)?, None)?;
@@ -923,7 +923,7 @@ impl UpResBlock {
     fn forward(&self, x: &Array, first_chunk: bool, dead: DeadStageBuffers) -> Result<Array> {
         let mut x_main = x.clone();
         for rb in &self.resblocks {
-            x_main = rb.forward(&x_main)?;
+            x_main = rb.forward(&x_main, dead)?;
             dead.materialize(&x_main)?;
         }
         if let Some(up) = &self.resample {
@@ -1097,9 +1097,9 @@ impl Decoder3d {
     /// axis and is genuinely tiling-invariant; the attention is the op that is not.
     fn forward_middle(&self, x: &Array) -> Result<Array> {
         let mut x = self.conv1.forward(x, None)?;
-        x = self.middle.0.forward(&x)?;
+        x = self.middle.0.forward(&x, DeadStageBuffers::Keep)?;
         x = self.middle.1.forward(&x)?;
-        x = self.middle.2.forward(&x)?;
+        x = self.middle.2.forward(&x, DeadStageBuffers::Keep)?;
         eval(&x)?;
         Ok(x)
     }
@@ -1356,15 +1356,18 @@ impl Wan22Vae {
 
     /// Decode a channels-last normalized latent `[1, T, H, W, z]` → video `[1, T', 16H, 16W, 3]`.
     fn decode_cl(&self, z: &Array) -> Result<Array> {
-        let denorm = add(&multiply(z, &self.std)?, &self.mean)?;
-        // Enter the (optional) bf16 decode island: denorm stays f32, the conv-heavy body runs in
-        // `compute_dtype` (no-op cast in f32 mode). The final clamp scalars are f32, so the output
-        // promotes back to f32 regardless.
-        let denorm = denorm.as_dtype(self.compute_dtype)?;
-        let x = self.conv2.forward(&denorm, None)?;
-        let out = self.decoder.forward(&x)?;
-        let out = unpatchify(&out, 2)?;
-        let out = contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)?;
+        // The intermediates are scoped to this block so they are dropped before the release below
+        // rather than freed into the cache after it (sc-20686).
+        let out = {
+            let denorm = add(&multiply(z, &self.std)?, &self.mean)?;
+            // Enter the (optional) bf16 decode island: denorm stays f32, the conv-heavy body runs
+            // in `compute_dtype` (no-op cast in f32 mode). The final clamp scalars are f32, so the
+            // output promotes back to f32 regardless.
+            let denorm = denorm.as_dtype(self.compute_dtype)?;
+            let x = self.conv2.forward(&denorm, None)?;
+            let out = unpatchify(&self.decoder.forward(&x)?, 2)?;
+            contiguous(&minimum(&maximum(&out, scalar(-1.0))?, scalar(1.0))?)?
+        };
         // Single pass: the head's freed buffers leave the cache with the output (sc-20686).
         DeadStageBuffers::Release.materialize(&out)?;
         Ok(out)
@@ -1545,8 +1548,8 @@ mod tests {
         out
     }
 
-    /// sc-20686: a single-pass decode releases at every block boundary of every up-stage plus once
-    /// with the output, without changing a single output value; a tiled decode releases nothing.
+    /// sc-20686: a single-pass decode releases inside and after every block of every up-stage plus
+    /// once with the output, without changing a single output value; a tiled decode releases nothing.
     /// Sized: dec_dim 8, latent [48,2,8,8] → a few MiB.
     #[test]
     fn single_pass_decode_releases_every_block_and_tiles_keep_them() {
@@ -1557,7 +1560,8 @@ mod tests {
             .upsamples
             .iter()
             .map(|up| {
-                up.resblocks.len()
+                // Each residual block releases mid-block (after conv1) and at its output.
+                2 * up.resblocks.len()
                     + usize::from(up.resample.is_some())
                     + usize::from(up.shortcut.is_some())
                     + 1
