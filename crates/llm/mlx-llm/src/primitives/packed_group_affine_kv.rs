@@ -112,16 +112,52 @@ impl PackedCodeBits {
         (bytes[index / self.codes_per_byte()] >> self.shift(index)) & self.max_code()
     }
 
-    /// CPU reference quantization of one group's value: `clamp(round((x − min) / scale), 0,
-    /// 2^bits − 1)`.
-    fn quantize(self, value: f32, min: f32, scale: f32) -> u8 {
-        ((value - min) / scale).round().clamp(0.0, self.levels()) as u8
+    /// CPU reference quantization of one group's value against the group's STORED (f16) zero and
+    /// scale: `clamp(round((x − zero) / scale), 0, 2^bits − 1)`, so the dequantized
+    /// `zero + scale · code` is the nearest level of exactly what the reader sees.
+    fn quantize(self, value: f32, zero: f16, scale: f16) -> u8 {
+        ((value - zero.to_f32()) / scale.to_f32())
+            .round()
+            .clamp(0.0, self.levels()) as u8
     }
 
-    /// CPU reference group scale.
-    fn scale(self, min: f32, max: f32) -> f32 {
-        ((max - min) / self.levels()).max(f32::EPSILON)
+    /// The stored f16 `(zero, scale)` of a group spanning `[min, max]` (the GPU quantizer's
+    /// `sc20676_affine`, bit for bit). The zero is `min` rounded to f16 and stepped down one f16
+    /// ulp if it rounded above `min`, so every value is at or above it; the scale is
+    /// `(max − zero) / (2^bits − 1)` floored at the smallest normal f16 (no subnormal scales, and a
+    /// zero-range group is exact at code 0) and stepped up one ulp if rounding left `max` beyond
+    /// the top level. Codes therefore never clamp, and the round-trip error of every value is at
+    /// most half the stored scale, however large `|min|` is relative to the range.
+    fn affine(self, min: f32, max: f32) -> (f16, f16) {
+        let mut zero = f16::from_f32(min);
+        if zero.to_f32() > min {
+            let down = f16_next_down(zero);
+            if down.is_finite() {
+                zero = down;
+            }
+        }
+        let range = max - zero.to_f32();
+        let mut scale = f16::from_f32((range / self.levels()).max(f16::MIN_POSITIVE.to_f32()));
+        if range / scale.to_f32() > self.levels() {
+            let up = f16::from_bits(scale.to_bits() + 1);
+            if up.is_finite() {
+                scale = up;
+            }
+        }
+        (zero, scale)
     }
+}
+
+/// The largest f16 below `value` (finite, non-NaN input).
+fn f16_next_down(value: f16) -> f16 {
+    let bits = value.to_bits();
+    f16::from_bits(if bits & 0x7fff == 0 {
+        0x8001
+    } else if bits & 0x8000 == 0 {
+        bits - 1
+    } else {
+        bits + 1
+    })
 }
 
 /// MLX exposes array extents as signed `i32`s, while packed-cache storage uses `usize`.
@@ -1507,14 +1543,14 @@ impl PackedTensor {
             let slice = &values[start..end];
             let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
             let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let scale = bits.scale(min, max);
-            self.scales.push(f16::from_f32(scale));
-            self.zeros.push(f16::from_f32(min));
+            let (zero, scale) = bits.affine(min, max);
+            self.scales.push(scale);
+            self.zeros.push(zero);
             for (i, value) in slice.iter().copied().enumerate() {
                 bits.pack(
                     &mut self.codes[code_start..],
                     start + i,
-                    bits.quantize(value, min, scale),
+                    bits.quantize(value, zero, scale),
                 );
             }
         }
@@ -1661,15 +1697,15 @@ impl TokenGroupKeyTensor {
                 let max = (0..self.group_size)
                     .map(|token| self.pending[(token * self.rows + row) * self.width + channel])
                     .fold(f32::NEG_INFINITY, f32::max);
-                let scale = bits.scale(min, max);
-                self.scales.push(f16::from_f32(scale));
-                self.zeros.push(f16::from_f32(min));
+                let (zero, scale) = bits.affine(min, max);
+                self.scales.push(scale);
+                self.zeros.push(zero);
                 for token in 0..self.group_size {
                     let value = self.pending[(token * self.rows + row) * self.width + channel];
                     bits.pack(
                         &mut self.codes[code_start + row * code_bytes_per_group..],
                         token * self.width + channel,
-                        bits.quantize(value, min, scale),
+                        bits.quantize(value, zero, scale),
                     );
                 }
             }
@@ -4303,6 +4339,80 @@ mod tests {
                     .to_string();
                 assert!(error.contains("compiled handle reads"), "{error}");
                 assert!(cache.compiled_handle().is_none());
+            }
+        }
+    }
+
+    /// Codes are computed against the STORED f16 zero and scale: on adversarial groups (a large
+    /// `|min|` with a tiny range, zero range, sub-normal-f16 ranges) every width's round trip stays
+    /// within half the stored scale, and the scale stays the group's range plus at most one f16
+    /// ulp of `min`, over the levels. Quantizing against the f32 statistics instead dequantizes
+    /// with the rounded zero, an error of up to half an f16 ulp of `min` (e.g. 0.25 at 1000).
+    #[test]
+    fn round_trip_error_is_within_half_the_stored_scale_on_adversarial_groups() {
+        let (width, group, tokens) = (64, 32, 32);
+        let cases: [(f32, f32); 7] = [
+            (1000.3, 1e-2),
+            (-777.7, 1e-3),
+            (60_000.0, 1.0),
+            (3.0, 0.0),
+            (0.0, 1e-6),
+            (-1e-4, 2e-4),
+            (-2.5, 5.0),
+        ];
+        for bits in PackedCodeBits::ALL {
+            for (min, range) in cases {
+                let mut rng = 0x9e37_79b9_u32;
+                let values = (0..tokens * width)
+                    .map(|index| {
+                        rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        // Both K (per channel over tokens) and V (per token over channels) groups
+                        // hit their exact min and max.
+                        let fraction = match index % 7 {
+                            0 => 0.0,
+                            1 => 1.0,
+                            _ => (rng >> 8) as f32 / (1u32 << 24) as f32,
+                        };
+                        min + range * fraction
+                    })
+                    .collect::<Vec<_>>();
+                let mut cache =
+                    PackedGroupAffineKvCache::with_bits("m", 1, 1, 1, width, group, bits).unwrap();
+                cache.append(0, &values, &values, tokens).unwrap();
+                let storage = cache.layers[0].as_ref().unwrap();
+                let stored_scale = storage
+                    .keys
+                    .scales
+                    .iter()
+                    .chain(&storage.values.scales)
+                    .map(|scale| scale.to_f32())
+                    .fold(0.0f32, f32::max);
+                let mut worst = 0.0f32;
+                for token in 0..tokens {
+                    let (keys, dequantized) = cache.read_row(0, token, 0).unwrap();
+                    for (channel, (key, value)) in keys.iter().zip(&dequantized).enumerate() {
+                        let input = values[token * width + channel];
+                        worst = worst.max((key - input).abs()).max((value - input).abs());
+                    }
+                }
+                let magnitude = min.abs() + range;
+                let bound = 0.5 * stored_scale + 4.0 * f32::EPSILON * magnitude;
+                eprintln!(
+                    "{bits:?} min {min} range {range}: max round-trip error {worst:e} (stored scale {stored_scale:e})"
+                );
+                assert!(worst <= bound, "{bits:?} {min}/{range}: {worst} > {bound}");
+                // The stored scale is the range plus at most one f16 ulp of `min`, over the
+                // levels (floored at the smallest normal f16).
+                let ulp = (f16::from_f32(min).to_f32()
+                    - f16_next_down(f16::from_f32(min)).to_f32())
+                .abs()
+                .max(f16::from_f32(min.abs()).to_f32() * f32::EPSILON);
+                let ceiling = ((range + 2.0 * ulp) / bits.levels()).max(f16::MIN_POSITIVE.to_f32())
+                    * (1.0 + 2.0f32.powi(-9));
+                assert!(
+                    stored_scale <= ceiling,
+                    "{bits:?} {min}/{range}: scale {stored_scale} > {ceiling}"
+                );
             }
         }
     }

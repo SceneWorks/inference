@@ -4799,7 +4799,15 @@ fn publish_campaign(
             .pid;
         outcomes.push((coordinate, discipline, pid));
     }
-    validate_schedule_outcomes(&schedule, &outcomes)?;
+    match only_coordinate {
+        None => validate_schedule_outcomes(&schedule, &outcomes)?,
+        // A partial run is its one selected row, never a matrix.
+        Some(_) => match (schedule.as_slice(), outcomes.as_slice()) {
+            ([row], [(coordinate, discipline, pid)])
+                if *coordinate == row.coordinate && *discipline == row.discipline && *pid != 0 => {}
+            _ => return Err("partial run outcome does not equal its selected row".into()),
+        },
+    }
 
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -12058,6 +12066,173 @@ pub(crate) mod tests {
             load_validated_complete_campaign(&destination).unwrap_err(),
             "SC-20671 campaign manifest identity is invalid"
         );
+    }
+
+    /// One real prepared row published as a partial run: the manifest is marked partial and
+    /// non-publishable, binds its one row, and the complete-campaign loader refuses it.
+    #[test]
+    fn a_real_prepared_row_publishes_as_a_partial_run_the_campaign_loader_refuses() {
+        let continuation = test_forced_continuation(FORCED_CONTINUATION_TOKENS);
+        let suites = compressed_test_suites(&continuation, &[]);
+        let quality = receipt_quality_over_repeats(&suites).unwrap();
+        let mut receipt = compressed_test_builder(quality).finish().unwrap();
+        // The builder's receipt is llama short single-shot cold; the schedule's single-shot cold
+        // short row is qwen's.
+        receipt.matrix.family = "qwen".into();
+        receipt.timings.compile_attribution.probe_evidence = test_compile_probe_evidence(
+            "single-shot-generation",
+            "measured-repeats",
+            "qwen-short-single-single-shot-cold",
+            &[3.0, 1.0, 1.0, 1.0, 1.0],
+        );
+        let matrix = &receipt.matrix;
+        let coordinate = required_coordinates()
+            .into_iter()
+            .find(|coordinate| {
+                coordinate_slug(coordinate)
+                    == format!(
+                        "{}-{}-{}-{}-{}",
+                        matrix.family,
+                        matrix.context_band,
+                        matrix.request_mode,
+                        matrix.prefill_mode,
+                        matrix.process_temperature
+                    )
+            })
+            .expect("the test receipt is a scheduled coordinate");
+        // The test suites carry placeholder producer identities; bind them to this receipt's
+        // provenance (as one product session's halves are) and reseal each artifact.
+        let fixtures = sealed_product_fixture_artifacts(&suites, &coordinate)
+            .unwrap()
+            .into_iter()
+            .map(|artifact| {
+                let mut value: serde_json::Value = serde_json::from_slice(&artifact.bytes).unwrap();
+                let repeat = value["binding"]["repeat"].as_u64().unwrap() as usize;
+                let provenance = &receipt.provenance;
+                for (role, session, inventory) in [
+                    (
+                        "candidate",
+                        provenance.campaign_session_id.clone(),
+                        provenance.model_file_sha256.clone(),
+                    ),
+                    (
+                        "reference",
+                        "f".repeat(64),
+                        provenance.model_file_sha256.clone(),
+                    ),
+                ] {
+                    let arm = value["binding"][role].as_object_mut().unwrap();
+                    for key in ["coordinateSessionId", "qualitySessionId"] {
+                        arm.insert(key.into(), session.clone().into());
+                    }
+                    for key in ["coordinateInventorySha256", "qualityInventorySha256"] {
+                        arm.insert(key.into(), inventory.clone().into());
+                    }
+                    // This row's operation (single, single-shot).
+                    arm.insert("operation".into(), "single-shot-generation".into());
+                }
+                let kernel = value["fixture"] == "kernel-fp32-reference";
+                let candidate = value["binding"]["candidate"].as_object_mut().unwrap();
+                if kernel {
+                    candidate.insert(
+                        "coordinateEvidenceSha256".into(),
+                        receipt
+                            .provenance
+                            .coordinate_operation_sha256
+                            .clone()
+                            .into(),
+                    );
+                }
+                let probe = &receipt.timings.compile_attribution.probe_evidence[repeat];
+                candidate.insert("compileSetupMs".into(), probe.setup_ms.into());
+                candidate.insert("compileDispatchMs".into(), probe.dispatch_ms.into());
+                candidate.insert(
+                    "operationEvidenceSha256".into(),
+                    probe.operation_evidence_sha256.clone().into(),
+                );
+                let bytes = canonical_json_bytes(&value).unwrap();
+                SealedFixtureArtifact {
+                    sidecar: format!("{}  {}\n", seal_bytes(&bytes), artifact.name),
+                    name: artifact.name,
+                    bytes,
+                }
+            })
+            .collect::<Vec<_>>();
+        // Bind the receipt's fixture evidence to the sealed artifacts, as `product_receipt` does.
+        for name in REQUIRED_FIXTURES {
+            let artifact = fixtures
+                .iter()
+                .find(|artifact| artifact.name == format!("fixtures/{name}.json"))
+                .unwrap();
+            let evidence = receipt.quality.fixture_evidence.get_mut(name).unwrap();
+            evidence.artifact_name = artifact.name.clone();
+            evidence.artifact_sha256 = seal_bytes(&artifact.bytes);
+            evidence.artifact_sidecar_sha256 = seal_bytes(artifact.sidecar.as_bytes());
+        }
+        let bundle = assemble_artifacts_with_fixtures(receipt, fixtures).unwrap();
+        validate_artifact_bundle(&bundle).unwrap();
+        let prepared = [PreparedCoordinateReceipt {
+            coordinate: coordinate.clone(),
+            bundle,
+        }];
+        let policy = CampaignSafetyPolicy {
+            schema_version: 1,
+            row_deadline_seconds: 10,
+            poll_millis: 100,
+            term_grace_millis: 500,
+            host_free_reserve_bytes: 1 << 30,
+            child_footprint_cap_bytes: 1 << 30,
+            max_context_tokens: 1 << 20,
+            max_request_tokens: 1 << 20,
+            stdout_cap_bytes: 4096,
+            stderr_cap_bytes: 4096,
+        };
+        let slug = coordinate_slug(&coordinate);
+        let identity = serde_json::json!({
+            "schemaVersion": 1, "kind": "sc-20671-resume-identity",
+            "scheduleVersion": SC20671_SCHEDULE_VERSION,
+            "coordinates": required_coordinates().iter().map(coordinate_slug).collect::<Vec<_>>(),
+            "policySha256": policy.seal().unwrap(),
+            "onlyCoordinate": slug,
+        });
+        let root = tempfile::tempdir().unwrap();
+        // The full-campaign path refuses a single row; the partial path publishes it.
+        let full = root.path().join("full");
+        let mut full_identity = identity.clone();
+        full_identity
+            .as_object_mut()
+            .unwrap()
+            .remove("onlyCoordinate");
+        assert_eq!(
+            publish_campaign(&full, &prepared, &full_identity, &policy, None).unwrap_err(),
+            "complete campaign requires exactly eight prepared receipts"
+        );
+        let destination = root.path().join("partial");
+        publish_campaign(&destination, &prepared, &identity, &policy, Some(&slug)).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(destination.join("campaign.json")).unwrap()).unwrap();
+        assert_eq!(manifest["kind"], SC20671_PARTIAL_RUN_KIND);
+        assert_eq!(manifest["partial"], true);
+        assert_eq!(manifest["publishable"], false);
+        assert_eq!(manifest["onlyCoordinate"], slug.as_str());
+        assert_eq!(manifest["coordinates"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["coordinates"][0]["coordinate"], slug.as_str());
+        assert!(destination.join(&slug).join("receipt.json").is_file());
+        assert_eq!(
+            load_validated_complete_campaign(&destination).unwrap_err(),
+            "SC-20671 campaign manifest identity is invalid"
+        );
+        // The one outcome must be its selected row.
+        let other = root.path().join("other");
+        let mut wrong = identity.clone();
+        let other_slug = required_coordinates()
+            .iter()
+            .map(coordinate_slug)
+            .find(|other| *other != slug)
+            .unwrap();
+        wrong["onlyCoordinate"] = other_slug.as_str().into();
+        assert!(publish_campaign(&other, &prepared, &wrong, &policy, Some(&other_slug)).is_err());
+        assert!(!other.exists());
     }
 
     #[test]

@@ -412,6 +412,32 @@ template <typename T> struct sc20676_device_element<device T*> { using type = T;
 
 // `8 / BITS` codes per byte, low bits first. Every branch below is on template constants, so each
 // (EPL, BITS) specialization compiles to straight-line shifts and masks.
+// The largest half below `h` (finite input).
+inline half sc20676_next_down(half h) {
+    const ushort bits = as_type<ushort>(h);
+    const ushort next = (bits & 0x7fffu) == 0u ? ushort(0x8001u)
+                      : ((bits & 0x8000u) == 0u ? ushort(bits - 1u) : ushort(bits + 1u));
+    return as_type<half>(next);
+}
+
+// Stored f16 zero and scale of a group spanning [lo, hi] (the CPU reference's
+// `PackedCodeBits::affine`, bit for bit): zero = lo rounded to f16, stepped down one ulp if it
+// rounded above lo; scale = (hi - zero) / levels floored at the smallest normal half, stepped up one
+// ulp if rounding left hi beyond the top level. Codes are then computed against these stored values.
+inline void sc20676_affine(float lo, float hi, float levels, thread half& zero, thread half& scale) {
+    zero = half(lo);
+    if (float(zero) > lo) {
+        const half down = sc20676_next_down(zero);
+        if (isfinite(down)) zero = down;
+    }
+    const float range = hi - float(zero);
+    scale = half(fmax(precise::divide(range, levels), 6.103515625e-05f));
+    if (precise::divide(range, float(scale)) > levels) {
+        const half up = as_type<half>(ushort(as_type<ushort>(scale) + 1u));
+        if (isfinite(up)) scale = up;
+    }
+}
+
 // `EPL` codes starting at code `index` (a multiple of `EPL`): the lane's contiguous channels.
 template <int EPL, int BITS>
 inline void sc20676_unpack(const device uint8_t* base, uint index, thread uint* codes) {
@@ -2098,9 +2124,9 @@ fn tile_splits(validated: &ValidatedDispatch, rows_per_tile: usize) -> usize {
 }
 
 /// Quantize completed K token groups per channel exactly as the CPU reference
-/// (`TokenGroupKeyTensor::flush_pending_group`): f32 min/max, `scale = max((max−min)/L, ε)` with
-/// `L = 2^BITS − 1`, codes `clamp(round((x−min)/scale), 0, L)` with IEEE division and
-/// round-half-away-from-zero, and f16 scale/zero. The source is the virtual sequence
+/// (`TokenGroupKeyTensor::flush_pending_group`): f32 min/max, the stored f16 zero and scale of
+/// `sc20676_affine` (`L = 2^BITS − 1` levels), and codes `clamp(round((x−zero)/scale), 0, L)`
+/// against those stored values, with IEEE division and round-half-away-from-zero. The source is the virtual sequence
 /// `residual[0..p] ++ fresh`. One thread owns a quad of channels of one group: per token its four
 /// codes are `BITS / 2` whole bytes.
 const QUANTIZE_KEYS_BODY: &str = r#"
@@ -2121,6 +2147,7 @@ const QUANTIZE_KEYS_BODY: &str = r#"
     const uint c0 = quad * 4u;
     float lo[4];
     float hi[4];
+    float zf[4];
     float sc[4];
     for (uint k = 0; k < 4u; ++k) {
         lo[k] = INFINITY;
@@ -2136,9 +2163,13 @@ const QUANTIZE_KEYS_BODY: &str = r#"
         }
     }
     for (uint k = 0; k < 4u; ++k) {
-        sc[k] = fmax(precise::divide(hi[k] - lo[k], LEVELS), FLT_EPSILON);
-        scales[(bh * groups + g) * D + c0 + k] = half(sc[k]);
-        zeros[(bh * groups + g) * D + c0 + k] = half(lo[k]);
+        half zero;
+        half scale;
+        sc20676_affine(lo[k], hi[k], LEVELS, zero, scale);
+        zf[k] = float(zero);
+        sc[k] = float(scale);
+        scales[(bh * groups + g) * D + c0 + k] = scale;
+        zeros[(bh * groups + g) * D + c0 + k] = zero;
     }
     for (uint t = 0; t < uint(G); ++t) {
         const uint vt = g * uint(G) + t;
@@ -2146,7 +2177,7 @@ const QUANTIZE_KEYS_BODY: &str = r#"
         for (uint k = 0; k < 4u; ++k) {
             const float x = vt < p ? float(tail[(bh * TCAP + vt) * D + c0 + k])
                                    : float(fresh[(bh * STEP + vt - p) * D + c0 + k]);
-            const uint code = uint(clamp(round(precise::divide(x - lo[k], sc[k])), 0.0f, LEVELS));
+            const uint code = uint(clamp(round(precise::divide(x - zf[k], sc[k])), 0.0f, LEVELS));
             word |= code << (uint(BITS) * k);
         }
         const uint first = (bh * groups + g) * KW + (t * uint(D) + c0) * uint(BITS) / 8u;
@@ -2181,16 +2212,20 @@ const QUANTIZE_VALUES_BODY: &str = r#"
         lo = fmin(lo, x);
         hi = fmax(hi, x);
     }
-    const float sc = fmax(precise::divide(hi - lo, LEVELS), FLT_EPSILON);
-    scales[(bh * rows + r) * VG + grp] = half(sc);
-    zeros[(bh * rows + r) * VG + grp] = half(lo);
+    half zero;
+    half scale;
+    sc20676_affine(lo, hi, LEVELS, zero, scale);
+    const float zf = float(zero);
+    const float sc = float(scale);
+    scales[(bh * rows + r) * VG + grp] = scale;
+    zeros[(bh * rows + r) * VG + grp] = zero;
     for (uint quad = 0; quad < uint(G) / 4u; ++quad) {
         uint word = 0;
         for (uint k = 0; k < 4u; ++k) {
             const uint c = c0 + quad * 4u + k;
             const float x = r < p ? float(tail[(bh * TCAP + r) * D + c])
                                   : float(fresh[(bh * STEP + r - p) * D + c]);
-            const uint code = uint(clamp(round(precise::divide(x - lo, sc)), 0.0f, LEVELS));
+            const uint code = uint(clamp(round(precise::divide(x - zf, sc)), 0.0f, LEVELS));
             word |= code << (uint(BITS) * k);
         }
         const uint first = (bh * rows + r) * VW + (c0 + quad * 4u) * uint(BITS) / 8u;
