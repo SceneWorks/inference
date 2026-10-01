@@ -499,7 +499,7 @@ impl ConstraintMask for EvenOnly {
 const PROMPT: [i32; 5] = [1, 7, 42, 300, 9];
 const TOKENS: usize = 24;
 
-fn run_step(model: &Qwen35Model, config: &GenerationConfig) -> (Vec<i32>, DecodeRecord) {
+fn run_step<M: StepModel>(model: &M, config: &GenerationConfig) -> (Vec<i32>, DecodeRecord) {
     let (out, record) = generate_step(
         model,
         &PROMPT,
@@ -550,14 +550,45 @@ fn assert_host_routes_are_reported(model: &Qwen35Model) {
     assert_eq!(record.sampler.logits_to_host, TOKENS as u64);
 }
 
+/// The greedy stream of the token-at-a-time seam loop with each token the test's own host argmax
+/// of the step's logits (ties to the lowest id) — independent of the device argmax under test.
+fn host_argmax_oracle<M: StepModel>(model: &M, prompt: &[i32], max_new_tokens: usize) -> Vec<i32> {
+    let mut cache = model
+        .new_cache_for(prompt.len() + max_new_tokens, 0)
+        .unwrap();
+    let mut step = prompt.to_vec();
+    let mut tokens = Vec::new();
+    while tokens.len() < max_new_tokens {
+        let logits = model
+            .forward_step(&mut cache, StepRequest::last(&step))
+            .unwrap()
+            .logits;
+        let row: Vec<f32> = logits
+            .flatten_all()
+            .unwrap()
+            .to_dtype(candle_core::DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let next = (0..row.len())
+            .reduce(|best, i| if row[i] > row[best] { i } else { best })
+            .unwrap() as i32;
+        tokens.push(next);
+        step = vec![next];
+    }
+    tokens
+}
+
 /// E1: greedy is the device argmax on every device, one sync per token, no logits copy, and
-/// token-identical with the reference sampler forced.
-fn assert_greedy_unchanged(model: &Qwen35Model) {
+/// token-identical with the reference sampler forced and with the host argmax of the plain seam
+/// loop — on either decoder family (epic AT1).
+fn assert_greedy_unchanged<M: StepModel>(model: &M) {
     let mut greedy = stochastic(TOKENS);
     greedy.sampling.temperature = 0.0;
     let (tokens, record) = run_step(model, &greedy);
     let (reference, _) = with_reference_sampler(|| run_step(model, &greedy));
     assert_eq!(tokens, reference);
+    assert_eq!(tokens, host_argmax_oracle(model, &PROMPT, TOKENS));
     assert_eq!(record.sampler.path, Some(SamplerPath::Device));
     assert_eq!(record.sampler.logits_to_host, 0);
     assert_eq!(record.host_syncs, TOKENS as u64);
@@ -576,6 +607,7 @@ fn cpu_routes_are_reported_and_never_silent() {
     let (_, record) = with_reference_sampler(|| run_step(&model, &stochastic(TOKENS)));
     assert_eq!(record.sampler.label(), "host:reference");
     assert_host_routes_are_reported(&model);
+    assert_greedy_unchanged(&tiny_llama(&Device::Cpu));
     assert_greedy_unchanged(&model);
 }
 
@@ -1134,6 +1166,7 @@ mod cuda {
     fn ac3_cuda_penalties_and_constraints_take_the_host_path() {
         let model = tiny_qwen35(&gpu());
         assert_host_routes_are_reported(&model);
+        assert_greedy_unchanged(&tiny_llama(&gpu()));
         assert_greedy_unchanged(&model);
     }
 

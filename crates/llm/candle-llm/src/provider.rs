@@ -9514,8 +9514,9 @@ mod tests {
     /// sc-24438 AC2: a qwen3_5 MoE snapshot carrying an MTP head — its predictor layer a
     /// sparse-MoE block, as the 35B-A3B ships it, in the fused (Qwen3.6) and the per-expert
     /// (Qwen3.5) expert layout — loads (before, `Qwen35Mtp` refused it and the whole load failed),
-    /// advertises MTP on both fields, and **runs** it: `{mtp, 3}`, the legacy `enabled 3` and
-    /// `auto` each report the MTP proposer with drafts proposed, and emit exactly `off`'s stream.
+    /// advertises MTP on both fields, and **runs** it: `{mtp}` at depths 1, 3 and the advertised
+    /// max, the legacy `enabled 3` and `auto` each report the MTP proposer with drafts proposed,
+    /// and emit exactly `off`'s stream.
     /// Under Q8 the head is priced: the estimate equals the copy the load builds, head included,
     /// and exceeds the headless MoE snapshot's.
     #[test]
@@ -9556,19 +9557,25 @@ mod tests {
             let mut legacy = request(Speculative::Off);
             legacy.speculative = None;
             legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
-            for (case, req) in [
+            // Epic AT1: the explicit option at depths 1, 3 and the advertised max.
+            let explicit = |depth| {
                 (
-                    "explicit",
-                    request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
-                ),
-                ("legacy", legacy),
-                ("auto", request(Speculative::Auto)),
+                    depth,
+                    request(Speculative::proposer(SpeculativeProposer::Mtp, depth)),
+                )
+            };
+            for (case, (depth, req)) in [
+                ("explicit 1", explicit(1)),
+                ("explicit 3", explicit(3)),
+                ("explicit max", explicit(mtp.max_depth)),
+                ("legacy", (3, legacy)),
+                ("auto", (3, request(Speculative::Auto))),
             ] {
                 provider.validate(&req).expect(case);
                 let (events, out) = token_events(&provider, &req);
                 let report = out.decode.unwrap();
                 assert_eq!(report.proposer, ProposerKind::Mtp, "{label} {case}");
-                assert_eq!(report.draft_tokens, Some(3), "{label} {case}");
+                assert_eq!(report.draft_tokens, Some(depth), "{label} {case}");
                 assert!(
                     report.proposed_tokens > 0,
                     "{label} {case}: the head drafted"

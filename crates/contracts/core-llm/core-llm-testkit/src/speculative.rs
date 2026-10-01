@@ -14,8 +14,8 @@
 //!   are this document, so they compare field for field.
 
 use core_llm::{
-    DecodeReport, FinishReason, Message, ProposerKind, Sampling, Speculative, StreamEvent, TextLlm,
-    TextLlmRequest,
+    DecodeReport, FinishReason, Message, ProposerKind, Sampling, Speculative, SpeculativeProposer,
+    StreamEvent, TextLlm, TextLlmCapabilities, TextLlmRequest,
 };
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -348,6 +348,24 @@ pub fn check_speculative_greedy_parity(
     } else {
         Err(failures.join("\n"))
     }
+}
+
+/// The parity rows for every proposer `caps` advertises (epic sc-24432 AT1): depths 1, 3 (at most
+/// the maximum) and the advertised maximum — read from the capabilities, never assumed — each
+/// expected to run that proposer.
+pub fn advertised_parity_cases(caps: &TextLlmCapabilities) -> Vec<ParityCase> {
+    SpeculativeProposer::ALL
+        .into_iter()
+        .filter_map(|proposer| caps.proposer(proposer))
+        .flat_map(|advertised| {
+            let mut depths = vec![1, 3.min(advertised.max_depth), advertised.max_depth];
+            depths.dedup();
+            depths.into_iter().map(move |depth| ParityCase {
+                speculative: Speculative::proposer(advertised.proposer, depth),
+                expect_proposer: advertised.proposer.into(),
+            })
+        })
+        .collect()
 }
 
 /// What a benchmark run measures and labels.

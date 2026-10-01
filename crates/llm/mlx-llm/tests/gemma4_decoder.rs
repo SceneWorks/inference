@@ -741,3 +741,154 @@ fn only_the_sliding_layers_ship_a_value_projection() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Speculative decoding on Gemma 4 (epic sc-24432 AT1)
+// ---------------------------------------------------------------------------------------------
+
+/// Both fixture variants — the alternating-layer model and its KV-shared tail — with every
+/// projection and embedding scaled by 0.3. At the goldens' own scale the tiny model saturates and
+/// greedy emits one token forever, which prompt lookup always predicts; scaled, the stream moves
+/// between tokens, so lookup's drafts are both accepted and rejected.
+fn speculative_fixtures(g: &Value) -> [(&'static str, CausalLm); 2] {
+    let scaled = |section: &Value| {
+        let mut section = section.clone();
+        for (key, entry) in section["weights"].as_object_mut().unwrap() {
+            if key.contains("norm") || key.contains("layer_scalar") {
+                continue;
+            }
+            let data = floats(&entry["data"]).iter().map(|x| x * 0.3).collect();
+            entry["data"] = serde_json::to_value::<Vec<f32>>(data).unwrap();
+        }
+        model_from(&section)
+    };
+    [
+        ("gemma4", scaled(g)),
+        ("gemma4 kv-shared", scaled(&g["kv_shared"])),
+    ]
+}
+
+/// A whitespace WordLevel tokenizer over `t0..t{vocab-1}`: every id decodes to its own piece.
+fn word_tokenizer(vocab: usize) -> core_llm::Tokenizer {
+    let entries: Vec<String> = (0..vocab).map(|i| format!("\"t{i}\": {i}")).collect();
+    core_llm::Tokenizer::from_json(&format!(
+        r#"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {{ "type": "Whitespace" }}, "post_processor": null,
+            "decoder": null,
+            "model": {{ "type": "WordLevel", "vocab": {{ {} }}, "unk_token": "t0" }} }}"#,
+        entries.join(", ")
+    ))
+    .unwrap()
+}
+
+/// Gemma 4's speculative verify through the provider: prompt lookup at depths 1, 3 and the
+/// advertised max emits exactly `off`'s greedy stream on both fixture variants. Every verify runs
+/// `decode_logits_all` over `1 + depth` rows at a cache offset past the prompt — the sliding
+/// layers' 3-key window bottom-right aligned over the cached keys, each layer type on its own
+/// RoPE table — and the suite's drafts are both accepted and rejected, so a rejection truncates
+/// the cache back over drafts the window and the shared KV tail already saw.
+#[test]
+fn gemma4_prompt_lookup_is_greedy_exact_at_every_depth() {
+    use core_llm::{ProposerKind, SpeculativeProposer, TextLlm};
+    let g = goldens();
+    let vocab = g["config"]["text_config"]["vocab_size"].as_u64().unwrap() as usize;
+    let prompts = core_llm_testkit::draft_model_prompts();
+    for (label, model) in speculative_fixtures(&g) {
+        let provider = mlx_llm::LlamaProvider::from_parts(model, word_tokenizer(vocab), vec![]);
+        let caps = &provider.descriptor().capabilities;
+        // The sliding layers' head dim 8 is no fused-kernel dim: the 8-row verify bound.
+        assert_eq!(
+            caps.proposer(SpeculativeProposer::PromptLookup)
+                .unwrap()
+                .max_depth,
+            7,
+            "{label}"
+        );
+        let cases = core_llm_testkit::advertised_parity_cases(caps);
+        assert_eq!(cases.len(), 3, "{label}: prompt lookup at 1, 3 and max");
+        let rows =
+            core_llm_testkit::check_speculative_greedy_parity(&provider, &prompts, &cases, 24)
+                .unwrap_or_else(|failures| panic!("{label}: {failures}"));
+        assert!(rows
+            .iter()
+            .all(|r| r.report.fallbacks.is_empty()
+                && r.report.proposer == ProposerKind::PromptLookup));
+        let (proposed, accepted) = rows.iter().fold((0, 0), |(p, a), r| {
+            (p + r.report.proposed_tokens, a + r.report.accepted_tokens)
+        });
+        assert!(
+            accepted > 0 && accepted < proposed,
+            "{label}: drafts accepted and rejected ({accepted} of {proposed})"
+        );
+    }
+}
+
+/// Gemma 4's truncate rollback at the model seam: a verify forward of `[t, d1, d2, d3]` at an
+/// offset past the prompt scores `t` as a single-token step does, and after the drafts are
+/// rejected — the cache truncated back to just after `t` — a step on a different token scores as
+/// a cache that never saw the drafts (both within the fixture's bf16 budget, [`ABS_TOL`]), on
+/// both fixture variants. Without the truncation the drafts stay in the window and the shared KV
+/// tail, and the step reads them.
+#[test]
+fn gemma4_truncate_rollback_forgets_the_rejected_drafts() {
+    let g = goldens();
+    let prompt = prompt_ids(&g);
+    let n = prompt.len() as i32;
+    let (t, drafts, other) = (7, [11, 2, 30], 19);
+    for (label, model) in speculative_fixtures(&g) {
+        let vocab = model.config().vocab_size as usize;
+
+        // The reference: no drafts ever reach the cache.
+        let mut plain = model.new_cache();
+        model
+            .decode_logits(&input_ids(&prompt), &mut plain, 0)
+            .unwrap();
+        let t_plain = host(
+            &model
+                .decode_logits(&input_ids(&[t]), &mut plain, n)
+                .unwrap(),
+        );
+        let other_plain = host(
+            &model
+                .decode_logits(&input_ids(&[other]), &mut plain, n + 1)
+                .unwrap(),
+        );
+
+        // The speculative path: verify `t` and three drafts in one forward, reject the drafts.
+        let mut spec = model.new_cache();
+        model
+            .decode_logits(&input_ids(&prompt), &mut spec, 0)
+            .unwrap();
+        let verify = host(
+            &model
+                .decode_logits_all(
+                    &input_ids(&[t, drafts[0], drafts[1], drafts[2]]),
+                    &mut spec,
+                    n,
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            verify.len(),
+            4 * vocab,
+            "{label}: one logits row per verified token"
+        );
+        let row0 = &verify[..vocab];
+        assert_abs_close(
+            row0,
+            &t_plain,
+            &format!("{label}: verify row 0 vs a single step"),
+        );
+        mlx_llm::primitives::KvCache::truncate(&mut spec, n + 1).unwrap();
+        let other_spec = host(
+            &model
+                .decode_logits(&input_ids(&[other]), &mut spec, n + 1)
+                .unwrap(),
+        );
+        assert_abs_close(
+            &other_spec,
+            &other_plain,
+            &format!("{label}: the step after the rollback"),
+        );
+    }
+}

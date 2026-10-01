@@ -402,6 +402,89 @@ pub(crate) mod route_override {
     }
 }
 
+/// Test-only record of the MLX SDPA kernel every fused call reaches, so a test can prove which
+/// kernel a decoder's attention — a speculative verify's above all — actually ran (epic sc-24432
+/// AT1): the production vector / full kernels, or MLX's score-materializing fallback.
+#[cfg(test)]
+pub(crate) mod kernel_tally {
+    use std::cell::RefCell;
+
+    use mlx_rs::Array;
+
+    use super::{
+        gqa_factor, vector_kernel_serves, MLX_SDPA_VECTOR_MAX_QLEN, MLX_SDPA_VECTOR_MAX_ROWS,
+    };
+
+    /// The MLX 0.32 kernel one fused call reaches (`ScaledDotProductAttention::use_fallback`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum SdpaKernel {
+        /// The single-pass vector (decode) kernel.
+        Vector,
+        /// The fused full (steel) kernel.
+        Full,
+        /// MLX's unfused, score-materializing fallback.
+        Fallback,
+    }
+
+    /// One fused call: its query/key head dim, query rows and the kernel it reached.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct SdpaCall {
+        pub head_dim: i32,
+        pub q_len: i32,
+        pub kernel: SdpaKernel,
+    }
+
+    thread_local! {
+        static CALLS: RefCell<Option<Vec<SdpaCall>>> = const { RefCell::new(None) };
+    }
+
+    /// The kernel MLX runs a `[b, hq, q_len, qd]` × `[b, hkv, k_len, qd]` × `[…, vd]` call on.
+    pub(crate) fn kernel(queries: &Array, keys: &Array, values: &Array) -> SdpaKernel {
+        let (hq, q_len, qd) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);
+        let (hkv, k_len, vd) = (keys.shape()[1], keys.shape()[2], values.shape()[3]);
+        if q_len <= MLX_SDPA_VECTOR_MAX_QLEN
+            && q_len <= k_len
+            && q_len * gqa_factor(hq, hkv) <= MLX_SDPA_VECTOR_MAX_ROWS
+            && vector_kernel_serves(hq, hkv, qd, vd)
+        {
+            SdpaKernel::Vector
+        } else if q_len > MLX_SDPA_VECTOR_MAX_QLEN && qd == vd && matches!(qd, 64 | 80 | 128) {
+            SdpaKernel::Full
+        } else {
+            SdpaKernel::Fallback
+        }
+    }
+
+    /// Note one fused call, when a [`record`] is running on this thread.
+    pub(super) fn note(queries: &Array, keys: &Array, values: &Array) {
+        CALLS.with(|calls| {
+            if let Some(calls) = calls.borrow_mut().as_mut() {
+                calls.push(SdpaCall {
+                    head_dim: queries.shape()[3],
+                    q_len: queries.shape()[2],
+                    kernel: kernel(queries, keys, values),
+                });
+            }
+        });
+    }
+
+    /// Run `f`, returning its result and every fused SDPA call it made on this thread.
+    pub(crate) fn record<R>(f: impl FnOnce() -> R) -> (R, Vec<SdpaCall>) {
+        struct Stop;
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                CALLS.with(|calls| calls.borrow_mut().take());
+            }
+        }
+        CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+        let stop = Stop;
+        let out = f();
+        let calls = CALLS.with(|calls| calls.borrow_mut().take().unwrap_or_default());
+        drop(stop);
+        (out, calls)
+    }
+}
+
 /// The raw fused MLX op, one call.
 fn sdpa_fused(
     queries: &Array,
@@ -417,6 +500,8 @@ fn sdpa_fused(
         // `sdpa` materializes the window before dispatching; nothing else reaches the fused kernel.
         AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
     };
+    #[cfg(test)]
+    kernel_tally::note(queries, keys, values);
     Ok(scaled_dot_product_attention(
         queries, keys, values, scale, m, None,
     )?)
