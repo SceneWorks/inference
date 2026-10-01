@@ -116,7 +116,7 @@ permissions:
 # only label their run file has ever named); the per-phase precheck still refuses to start beside
 # any other MLX/cargo process whatever the label.
 concurrency:
-  group: kv-poc-campaign-${{ inputs.runner_label || 'rw-krea' }}
+  group: kv-poc-campaign-${{ inputs.runner_label || github.ref_name }}
   cancel-in-progress: false
 
 defaults:
