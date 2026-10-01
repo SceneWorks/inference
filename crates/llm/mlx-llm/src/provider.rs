@@ -700,6 +700,22 @@ pub(crate) fn quant_spec(quantize: Quantize) -> CoreResult<QuantSpec> {
     }
 }
 
+/// Materialize a lazily built decoder group by group ([`Weights::materialize_groups`]) and
+/// refuse the load if any source it read went unconsumed (sc-24446): such a source is held
+/// resident beside the model, outside what `load_memory::required_bytes` prices — an
+/// enumeration gap in the decoder's `param_groups`, never a property of the checkpoint.
+fn materialize_decoder(weights: &mut Weights, groups: &[Vec<Array>]) -> CoreResult<()> {
+    let report = weights.materialize_groups(groups).map_err(to_core)?;
+    if report.leftover > 0 {
+        return Err(CoreError::Load(format!(
+            "load materialization: {} source tensor(s) the decoder read were consumed by none of \
+             its arrays; the load would hold them outside its admitted bound",
+            report.leftover
+        )));
+    }
+    Ok(())
+}
+
 impl LlamaProvider {
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
@@ -841,9 +857,7 @@ impl LlamaProvider {
                 descriptor.family = "prism_hadamard_qwen35".into();
                 let model =
                     Qwen35Model::build_prism_lazy(&weights, qcfg, &pack).map_err(to_core)?;
-                weights
-                    .materialize_groups(&model.param_groups())
-                    .map_err(to_core)?;
+                materialize_decoder(&mut weights, &model.param_groups())?;
                 if pack.has_vision_tower {
                     let keys = weights
                         .keys()
@@ -864,9 +878,7 @@ impl LlamaProvider {
                     Qwen35Model::build_lazy(&weights, prefix, qcfg, quant).map_err(to_core)?;
                 // Group by group: read, verify, convert, release (sc-24446) — the order
                 // `load_memory::required_bytes` prices.
-                weights
-                    .materialize_groups(&model.param_groups())
-                    .map_err(to_core)?;
+                materialize_decoder(&mut weights, &model.param_groups())?;
                 model
             };
             // A configured head that was not built is named and not advertised: the loaded
@@ -880,9 +892,7 @@ impl LlamaProvider {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
             let m = CausalLm::build_lazy(&weights, "", cfg, quant).map_err(to_core)?;
-            weights
-                .materialize_groups(&m.param_groups())
-                .map_err(to_core)?;
+            materialize_decoder(&mut weights, &m.param_groups())?;
             (Decoder::Causal(m), descriptor)
         };
 
@@ -2700,7 +2710,19 @@ impl LlamaProvider {
                     .hidden_size
                     .checked_add(geometry.vocab_size)?
                     .checked_mul(geometry.element_bytes)?;
-                (0, width.checked_mul(kv_position.checked_add(rows)?)?)
+                // The verify step writes `width` positions past the committed ones; the caches
+                // round *that* up to a block. What the target estimate already priced: its own
+                // padding over prompt + generation, plus the `width` rows below.
+                let committed = u64::try_from(prompt_tokens)
+                    .ok()?
+                    .checked_add(u64::from(max_new_tokens))?;
+                let block_extra = kv_overshoot_padding(committed, width)?;
+                (
+                    0,
+                    width
+                        .checked_mul(kv_position.checked_add(rows)?)?
+                        .checked_add(block_extra.checked_mul(kv_position)?)?,
+                )
             }
             other => (u32::try_from(other.width()).ok()?, 0),
         };
@@ -3250,36 +3272,73 @@ fn estimate_mlx_request_bytes(
         mtp_width,
         contract,
     )?;
-    match contract {
-        // The hybrid's contract already prices MLX's evaluation window and allocator rounding
-        // from its own frozen probes.
-        MlxWorkspaceContract::Qwen35 { .. } => Some(decoder),
-        MlxWorkspaceContract::Eager | MlxWorkspaceContract::Chunked => decoder.checked_add(
-            mlx_runtime_request_bytes(prompt_tokens, max_new_tokens, geometry)?,
-        ),
-    }
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let runtime = match contract {
+        // The hybrid's contract already prices MLX's evaluation window, allocator rounding and
+        // block-allocated caches from its own frozen probes; only the driver's wake is added.
+        MlxWorkspaceContract::Qwen35 { .. } => MLX_REQUEST_WAKE_BYTES,
+        MlxWorkspaceContract::Eager => mlx_runtime_request_bytes(
+            prompt_tokens,
+            prompt.checked_add(u64::from(max_new_tokens))?,
+            u64::from(mtp_width),
+            prompt,
+            geometry,
+        )?,
+        MlxWorkspaceContract::Chunked => mlx_runtime_request_bytes(
+            prompt_tokens,
+            prompt.checked_add(u64::from(max_new_tokens))?,
+            u64::from(mtp_width),
+            prompt.min(SDPA_SCORE_TILE_QLEN as u64),
+            geometry,
+        )?,
+    };
+    decoder.checked_add(runtime)
 }
 
-/// What MLX's runtime holds for a request beyond the decoder's own tensors (sc-24446), which
-/// the shared estimates do not see — measured on the one-token requests of the sc-24446 probes
-/// (35–87 MB on Llama 3.2 1B, Qwen3-1.7B and Qwen3-8B, against 6–9 MB estimated before):
+/// The `phys_footprint` a request re-acquires from the Metal driver after the process has idled
+/// ([`crate::load_memory::MLX_DRIVER_WAKE_BYTES`]), charged once per request.
+const MLX_REQUEST_WAKE_BYTES: u64 = crate::load_memory::MLX_DRIVER_WAKE_BYTES;
+
+/// K/V positions a request's caches allocate beyond `positions`: [`ContiguousKvCache`] grows in
+/// whole [`KV_BLOCK_TOKENS`](crate::primitives::kv_cache::KV_BLOCK_TOKENS)-position blocks.
+fn kv_block_padding(positions: u64) -> Option<u64> {
+    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+    round_up(positions, block)?.checked_sub(positions)
+}
+
+/// Block positions a `width`-position verify overshoot past `committed` positions allocates
+/// beyond `committed`'s own block padding and the `width` positions themselves.
+fn kv_overshoot_padding(committed: u64, width: u64) -> Option<u64> {
+    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
+    let with = round_up(committed.checked_add(width)?, block)?;
+    let without = round_up(committed, block)?.checked_add(width)?;
+    Some(with.saturating_sub(without))
+}
+
+/// What MLX's runtime holds for a generic decoder's request beyond the decoder's own tensors
+/// (sc-24446), which the shared estimates do not see — measured on the one-token requests of the
+/// sc-24446 probes (35–87 MB MLX active on Llama 3.2 1B, Qwen3-1.7B and Qwen3-8B, against 6–9 MB
+/// estimated before):
 ///
-/// * **KV block padding.** [`ContiguousKvCache`] allocates whole
-///   [`KV_BLOCK_TOKENS`](crate::primitives::kv_cache::KV_BLOCK_TOKENS)-position blocks, so a
-///   request holds its K/V rounded up to a block, not `prompt + max_new_tokens` positions.
+/// * **KV block padding**: the caches hold whole blocks over every position the request can write
+///   — the `committed` prompt and generation plus a `verify_width` step past them (an MTP verify;
+///   the prompt-lookup / draft overshoot is added by its route).
 /// * **In-flight layer temporaries.** MLX keeps every op's inputs until the command buffer that
-///   ran it completes, and runs ahead by up to [`MLX_EVAL_BUFFER_WINDOW`] buffers of at most
-///   [`MLX_MAX_BUFFER_BYTES`] and [`MLX_MAX_OPS_PER_BUFFER`] ops each — so a short forward
-///   holds more than the one layer of activations the shared estimate prices: every other
-///   layer's, capped by that window, plus a page of rounding per op output in it.
+///   ran it completes, and runs ahead by up to [`MLX_EVAL_BUFFER_WINDOW`] buffers, each holding at
+///   most [`MLX_MAX_BUFFER_BYTES`] plus the one op that crosses it. The shared estimate prices one
+///   layer's activations; the rest in flight is every other layer's, capped by that window —
+///   whose crossing op can be a whole `prompt × inter` MLP activation or an `attention_rows`-row
+///   score block (eager: the full `prompt × prompt` per head).
+/// * **Allocation rounding**: a page per op output in the window.
+/// * **The driver's wake** ([`MLX_REQUEST_WAKE_BYTES`]).
 fn mlx_runtime_request_bytes(
     prompt_tokens: usize,
-    max_new_tokens: u32,
+    committed: u64,
+    verify_width: u64,
+    attention_rows: u64,
     geometry: LlmMemoryGeometry,
 ) -> Option<u64> {
     let prompt = u64::try_from(prompt_tokens).ok()?;
-    let total = prompt.checked_add(u64::from(max_new_tokens))?;
-    let block = u64::try_from(crate::primitives::kv_cache::KV_BLOCK_TOKENS).ok()?;
     let kv_position = checked_product([
         geometry.layers,
         geometry.kv_heads,
@@ -3287,29 +3346,45 @@ fn mlx_runtime_request_bytes(
         geometry.element_bytes,
         2,
     ])?;
-    let kv_padding = round_up(total, block)?
-        .checked_sub(total)?
-        .checked_mul(kv_position)?;
-    let per_layer = checked_product([
+    // Every allocated position past the committed ones: the verify width the step writes beyond
+    // them and the rest of their last block.
+    let kv_padding = checked_sum([
+        verify_width,
+        kv_block_padding(committed.checked_add(verify_width)?)?,
+    ])?
+    .checked_mul(kv_position)?;
+    let scores = checked_product([
         prompt,
-        checked_sum([
-            geometry.intermediate_size.checked_mul(3)?,
-            geometry.hidden_size.checked_mul(8)?,
-        ])?,
+        attention_rows,
+        geometry.query_heads,
         geometry.element_bytes,
     ])?;
+    let mlp = checked_product([prompt, geometry.intermediate_size, geometry.element_bytes])?;
+    let per_layer = checked_sum([
+        checked_product([
+            prompt,
+            checked_sum([
+                geometry.intermediate_size.checked_mul(3)?,
+                geometry.hidden_size.checked_mul(8)?,
+            ])?,
+            geometry.element_bytes,
+        ])?,
+        scores.checked_mul(3)?,
+    ])?;
+    let window = MLX_EVAL_BUFFER_WINDOW
+        .checked_mul(checked_sum([MLX_MAX_BUFFER_BYTES, mlp.max(scores)])?)?;
     let in_flight = geometry
         .layers
         .saturating_sub(1)
         .checked_mul(per_layer)?
-        .min(MLX_EVAL_BUFFER_WINDOW.checked_mul(MLX_MAX_BUFFER_BYTES)?);
+        .min(window);
     // Each in-flight buffer's op outputs are page-rounded allocations, however small.
     let rounding = checked_product([
         MLX_EVAL_BUFFER_WINDOW,
         MLX_MAX_OPS_PER_BUFFER,
         MLX_ALLOCATION_PAGE_BYTES,
     ])?;
-    checked_sum([kv_padding, in_flight, rounding])
+    checked_sum([kv_padding, in_flight, rounding, MLX_REQUEST_WAKE_BYTES])
 }
 
 /// The decoder's own request tensors under its workspace contract (the shared estimates, plus
@@ -3659,12 +3734,18 @@ mod tests {
         let eager =
             estimate_mlx_request_bytes(29_600, 128, geometry, 0, 0, MlxWorkspaceContract::Eager)
                 .unwrap();
-        assert!(fused < 36_000_000_000, "bounded MLX peak: {fused}");
+        // sc-24446 prices MLX's in-flight window (eleven command buffers, each up to 50 MB plus
+        // the crossing op — here a 2 GB `prompt × inter` MLP activation), so the fused bound grew
+        // from ~36 GB; it stays an order of magnitude under the quadratic eager one.
+        assert!(
+            fused * 8 < eager,
+            "bounded MLX peak: {fused} vs eager {eager}"
+        );
         assert!(eager > 400_000_000_000, "quadratic eager peak: {eager}");
         assert_eq!(
             eager,
             core_llm::estimate_request_bytes(29_600, 128, geometry, 0, 0).unwrap()
-                + mlx_runtime_request_bytes(29_600, 128, geometry).unwrap(),
+                + mlx_runtime_request_bytes(29_600, 29_728, 0, 29_600, geometry).unwrap(),
             "non-fused paths retain the shared fail-closed estimate, plus MLX's runtime terms"
         );
     }
@@ -3742,10 +3823,10 @@ mod tests {
         assert!(arithmetic >= 773_229_760, "estimate: {arithmetic}");
         assert!(context_64 >= 4_091_010_468, "estimate: {context_64}");
         assert!(context_512 >= 22_885_373_536, "estimate: {context_512}");
-        assert_eq!(arithmetic, 788_726_144);
-        assert_eq!(context_64, 7_974_200_704);
-        assert_eq!(context_512, 32_756_098_432);
-        assert_eq!(context_2048, 117_722_604_928);
+        assert_eq!(arithmetic, 788_726_144 + MLX_REQUEST_WAKE_BYTES);
+        assert_eq!(context_64, 7_974_200_704 + MLX_REQUEST_WAKE_BYTES);
+        assert_eq!(context_512, 32_756_098_432 + MLX_REQUEST_WAKE_BYTES);
+        assert_eq!(context_2048, 117_722_604_928 + MLX_REQUEST_WAKE_BYTES);
         assert!(arithmetic < context_64 && context_64 < context_512 && context_512 < context_2048);
         assert!(
             core_llm::admit_request_memory(context_2048, 47_922_610_176).is_err(),
@@ -3775,8 +3856,8 @@ mod tests {
         // 256-step floor. A normal 128-token prompt remains admitted on an 8-GB machine.
         let scalar = estimate_mlx_request_bytes(1, 1, geometry, 0, 0, contract).unwrap();
         let ordinary = estimate_mlx_request_bytes(128, 128, geometry, 0, 0, contract).unwrap();
-        assert_eq!(scalar, 231_142_880);
-        assert_eq!(ordinary, 2_695_981_056);
+        assert_eq!(scalar, 231_142_880 + MLX_REQUEST_WAKE_BYTES);
+        assert_eq!(ordinary, 2_695_981_056 + MLX_REQUEST_WAKE_BYTES);
         assert!(scalar < ordinary);
         assert!(core_llm::admit_request_memory(ordinary, 8_000_000_000).is_ok());
         assert!(
@@ -5322,9 +5403,15 @@ mod tests {
                 off + ring + w * (kv_position + rows),
                 "moe lookup {width}"
             );
+            // The generic runtime terms also hold the verify width's K/V positions and their
+            // block padding (sc-24446).
+            let positions = |extra: u64| w + kv_block_padding(96 + extra).unwrap();
             assert_eq!(
                 price(&moe, SpeculativeRoute::Mtp { width }),
-                off + ring + 2 * kv + w * rows,
+                off + ring
+                    + 2 * kv
+                    + w * rows
+                    + (positions(w) - (kv_block_padding(96).unwrap())) * kv_position,
                 "moe mtp {width}: the ring and the live state charged once"
             );
         }
@@ -6229,8 +6316,10 @@ mod tests {
     ///
     /// * **LLM decode** (every provider load): a Gemma GeGLU returns BF16, so the forward stays
     ///   BF16 and promotes nothing — `promoted_request_bytes` is 0 — and the measured
-    ///   second-request peak on a tied 65,536-token fixture, dense and at load-time Q4, stays
-    ///   within the request estimate, as a SwiGLU decoder's does.
+    ///   second-request working set on a tied 65,536-token fixture, dense and at load-time Q4,
+    ///   stays within the request estimate, as a SwiGLU decoder's does. Measured both as the exact
+    ///   settled `phys_footprint` peak growth (driver wake, MLX cache and host heap included) and
+    ///   as MLX's active peak growth; the estimate covers the larger.
     /// * **A role pinned to `f32`** (the LTX-2.5 text encoder): the GeGLU leaves the stream `f32`,
     ///   every dense matmul materializes an `f32` copy of its BF16 weight (the LM head's alone
     ///   vocabulary × hidden × 4 bytes), and the promotion term is what covers the measured
@@ -6280,8 +6369,8 @@ mod tests {
                     provider.generate(&req, &mut |_| {}).unwrap();
                 });
                 assert!(
-                    working_set <= estimate,
-                    "{label}: working set {working_set} exceeds the estimate {estimate}"
+                    working_set.max() <= estimate,
+                    "{label}: working set {working_set:?} exceeds the estimate {estimate}"
                 );
 
                 // A role pinned to f32, on the decoder directly.
@@ -6321,13 +6410,16 @@ mod tests {
                 forward();
                 let working_set = second_run_peak(forward);
                 assert!(
-                    working_set <= decoder_estimate + promoted,
-                    "{label} pinned: working set {working_set} exceeds {}",
+                    working_set.max() <= decoder_estimate + promoted,
+                    "{label} pinned: working set {working_set:?} exceeds {}",
                     decoder_estimate + promoted
                 );
+                // The promoted copies are GPU transients: MLX's active peak sees them even where
+                // the settled footprint reuses the driver's pooled pages. Without the term, the
+                // decoder's own tensors (the estimate less the driver's wake) do not cover them.
                 assert!(
-                    working_set > decoder_estimate,
-                    "{label} pinned: the promotion term is not load-bearing ({working_set} <= \
+                    working_set.active > decoder_estimate - MLX_REQUEST_WAKE_BYTES,
+                    "{label} pinned: the promotion term is not load-bearing ({working_set:?} vs \
                      {decoder_estimate})"
                 );
             }
@@ -6347,25 +6439,158 @@ mod tests {
         );
     }
 
-    /// MLX's peak active-memory growth over `run` (the model already materialized by a first run).
-    fn second_run_peak(run: impl FnOnce()) -> u64 {
+    /// A request's working set two ways (the model already materialized by a first run): the
+    /// exact `phys_footprint` peak growth after the driver has settled — what macOS charges, MLX's
+    /// buffer cache, the host heap and the driver's wake included — and MLX's own peak active
+    /// growth, which still sees a GPU transient whose pages the driver recycled from its pool.
+    fn second_run_peak(run: impl Fn()) -> WorkingSet {
+        let footprint = crate::test_fixture::footprint::peak_growth(&run);
         mlx_rs::memory::clear_cache();
         let before = mlx_rs::memory::get_active_memory();
         mlx_rs::memory::reset_peak_memory();
         run();
-        (mlx_rs::memory::get_peak_memory() - before) as u64
+        let active = (mlx_rs::memory::get_peak_memory() - before) as u64;
+        WorkingSet { footprint, active }
     }
 
-    /// The request estimate covers every one-token request MLX working set the sc-24446 guarded
+    #[derive(Debug)]
+    struct WorkingSet {
+        footprint: u64,
+        active: u64,
+    }
+
+    impl WorkingSet {
+        fn max(&self) -> u64 {
+            self.footprint.max(self.active)
+        }
+    }
+
+    /// sc-24446: the K/V caches hold whole 256-position blocks — over the committed positions and
+    /// over any verify width written past them — and a prompt-lookup / draft overshoot that
+    /// crosses into a new block charges the rest of that block.
+    ///
+    /// MUTATION: multiply the runtime K/V padding by zero, or drop `kv_overshoot_padding`, and
+    /// this goes RED.
+    #[test]
+    fn kv_block_padding_covers_committed_and_verify_positions() {
+        let g = LlmMemoryGeometry {
+            query_heads: 8,
+            kv_heads: 4,
+            head_dim: 64,
+            layers: 6,
+            element_bytes: 4,
+            hidden_size: 512,
+            intermediate_size: 1024,
+            vocab_size: 4096,
+            recurrent_bytes: 0,
+        };
+        let kv_position = 6 * 4 * 64 * 4 * 2;
+        let runtime =
+            |committed, width| mlx_runtime_request_bytes(8, committed, width, 8, g).unwrap();
+        // 10 committed positions allocate a whole block: 246 more than 256 committed do.
+        assert_eq!(runtime(10, 0) - runtime(256, 0), 246 * kv_position);
+        // Three verify positions past 255 committed: the three and the new block's rest.
+        assert_eq!(
+            runtime(255, 3) - runtime(255, 0),
+            (3 + 254 - 1) * kv_position
+        );
+        assert_eq!(kv_overshoot_padding(255, 3), Some(512 - (256 + 3)));
+        assert_eq!(kv_overshoot_padding(100, 3), Some(0));
+    }
+
+    /// sc-24446: a prompt-lookup verify step whose overshoot crosses into a new K/V block is
+    /// charged that block's rest, beyond the overshoot positions themselves.
+    ///
+    /// MUTATION: drop `kv_overshoot_padding` from `speculative_request_bytes` and this goes RED.
+    #[test]
+    fn a_lookup_overshoot_into_a_new_block_charges_the_block() {
+        let provider = causal_provider();
+        let g = provider.model.memory_geometry();
+        let kv_position = g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let rows = (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let price = |route| {
+            provider
+                .speculative_request_bytes(route, 200, 50, 0)
+                .unwrap()
+        };
+        let off = price(SpeculativeRoute::Plain);
+        let lookup = price(SpeculativeRoute::PromptLookup { width: 8 });
+        // 250 committed positions + 8 overshoot = 258: a second block, 248 positions beyond.
+        assert_eq!(lookup - off, 8 * (kv_position + rows) + 248 * kv_position);
+    }
+
+    /// sc-24446: a decoder whose `param_groups` leaves a source it read unconsumed is refused at
+    /// load — the source would stay resident outside the admitted bound.
+    ///
+    /// MUTATION: drop the `leftover > 0` refusal from `materialize_decoder` and this goes RED.
+    #[test]
+    fn an_unconsumed_source_is_a_load_error() {
+        let dir = crate::test_fixture::Fixture::new("mlx-llm-leftover-", None);
+        let path = dir.join("model.safetensors");
+        let a = Array::from_slice(&[1.0f32, 2.0], &[2]);
+        Array::save_safetensors([("used", &a), ("orphan", &a)], None, &path).unwrap();
+        let mut w = Weights::from_file(&path).unwrap();
+        let used = w
+            .require("used")
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Bfloat16)
+            .unwrap();
+        w.require("orphan").unwrap();
+        let err = materialize_decoder(&mut w, &[vec![used]]).unwrap_err();
+        assert!(err.to_string().contains("load materialization"), "{err}");
+    }
+
+    /// sc-24446: the in-flight window prices each command buffer's crossing op — a long eager
+    /// prefill's `prompt × prompt` score block per head, or a `prompt × inter` MLP activation —
+    /// not just the 50 MB per-buffer cap.
+    ///
+    /// MUTATION: drop the crossing op from the window and this goes RED.
+    #[test]
+    fn the_in_flight_window_prices_each_buffers_crossing_op() {
+        let g = LlmMemoryGeometry {
+            query_heads: 8,
+            kv_heads: 4,
+            head_dim: 256,
+            layers: 26,
+            element_bytes: 4,
+            hidden_size: 2304,
+            intermediate_size: 9216,
+            vocab_size: 256_000,
+            recurrent_bytes: 0,
+        };
+        let prompt = 8192u64;
+        let committed = prompt + 1;
+        let fixed = (round_up(committed, 256).unwrap() - committed) * (26 * 4 * 256 * 4 * 2)
+            + MLX_EVAL_BUFFER_WINDOW * MLX_MAX_OPS_PER_BUFFER * MLX_ALLOCATION_PAGE_BYTES
+            + MLX_REQUEST_WAKE_BYTES;
+        let in_flight =
+            mlx_runtime_request_bytes(prompt as usize, committed, 0, prompt, g).unwrap() - fixed;
+        let scores = prompt * prompt * 8 * 4;
+        assert!(
+            scores > prompt * 9216 * 4,
+            "the eager score block is the crossing op"
+        );
+        assert_eq!(
+            in_flight,
+            MLX_EVAL_BUFFER_WINDOW * (MLX_MAX_BUFFER_BYTES + scores)
+        );
+        assert!(in_flight > 10 * MLX_EVAL_BUFFER_WINDOW * MLX_MAX_BUFFER_BYTES);
+    }
+
+    /// The request estimate covers every one-token request working set the sc-24446 guarded
     /// probes recorded on real weights (`native-memory-admission.md`: a second identical
-    /// one-token "Hi" request on the materialized model, MLX peak active growth), computed from
-    /// each model's geometry, its rendered prompt length and — for Gemma, recorded with the `f32`
-    /// GeGLU a pinned role still runs — the promoted LM head and largest promoted projection (a
-    /// dense MLP matrix at BF16; its scales and biases at Q4). Gemma's LLM-decode path no longer
-    /// promotes (its BF16 working set is re-probed on real weights).
-    /// Recorded evidence, not a machine golden: the relation is pinned. Before sc-24446 the
-    /// estimate was 6–9 MB for the Llama / Qwen3 cases (measured 35–87 MB) and 14–31 MB for the
-    /// Gemma cases (measured 2.4–5.4 GB).
+    /// one-token "Hi" request on the materialized model), computed from each model's geometry
+    /// and rendered prompt length. Recorded evidence, not a machine golden: the relation is
+    /// pinned. Two limits, both stated rather than hidden:
+    ///
+    /// * the probes recorded MLX's **active** peak, not `phys_footprint` (cache retention and
+    ///   host heap uncounted); the footprint working sets are in the pending re-probes;
+    /// * every Gemma row ran the `f32` GeGLU, so it is pinned with the promotion term — today
+    ///   that is the path a role pinned to `f32` (the LTX-2.5 text encoder) runs. Gemma's BF16
+    ///   LLM-decode working set has **not** been measured on real weights yet (pending).
+    ///
+    /// Before sc-24446 the estimate was 6–9 MB for the Llama / Qwen3 cases (measured 35–87 MB)
+    /// and 14–31 MB for the Gemma cases (measured 2.4–5.4 GB).
     #[test]
     fn the_request_estimate_covers_the_recorded_one_token_working_sets() {
         let geometry = |q, kv, hd, layers, hidden, inter, vocab, recurrent| LlmMemoryGeometry {

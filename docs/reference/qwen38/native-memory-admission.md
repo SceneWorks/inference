@@ -53,10 +53,22 @@ Read from `mlx-llm` (`Weights::from_dir`, `Weights::materialize_groups`, `Causal
    MLX's buffer cache. A source consumed into a different array (a quantized projection, a BF16
    cast, a `1 + w` norm, a stacked expert bank) is returned to the system before the next group
    reads its own; a source the model keeps as stored (a BF16 matrix) stays as the model's array.
-   Every accessed source is still read and verified before the load returns — one no group
-   consumed is verified and kept (`Materialized::leftover`, zero for every decoder's
-   enumeration, pinned by the tests) — and no array is left lazy, so the first request neither
-   reads a weight nor derives one inside its command stream.
+   Every accessed source is still read and verified before the load returns, and no array is
+   left lazy, so the first request neither reads a weight nor derives one inside its command
+   stream. A source no group consumed (`Materialized::leftover`) would stay resident outside the
+   priced bound, so the provider **refuses the load** (`materialize_decoder`); every
+   architecture's fixture loads through the provider path to pin each enumeration
+   (`every_architecture_loads_through_the_provider_with_every_source_consumed`,
+   `gemma4_loads_through_the_provider_with_every_source_consumed`, the MoE suite, and the Qwen3.5
+   / Prism provider tests).
+
+   **Pacing.** The Metal driver returns a released buffer to the system asynchronously — measured
+   0.1–1.25 s after `clear_cache` — so a fast load could read group after group while earlier
+   groups' sources still count against the process. Before each group reads, its
+   `phys_footprint` is held (waiting at most 3 s) to the start value plus the arrays built, the
+   previous group's consumed sources and a 128 MiB slack: at most one released group is ever
+   outstanding (`a_group_waits_for_the_driver_to_return_the_previous_groups_sources`). MLX's own
+   cache is empty after every group (`Materialized::cache_after_groups`, pinned 0).
 3. Vision towers and Gemma 4's media embedders keep the earlier order: their constructors verify
    every source up front and keep it beside their (lazily derived) arrays.
 4. A caller that keeps its own `Weights` map (`CausalLm::from_weights_with`,
@@ -86,9 +98,10 @@ snapshots, Qwen2-MoE, DeepSeek-V2) keep the separate gate and up banks.
 
 ### The bounds (`mlx-llm/src/load_memory.rs`)
 
-**Materialize-at-load bound** (`materialized_bound`): `resident + max(window)` plus the host
-heap. While group `g` converts, memory holds the arrays already built, `g`'s sources and
-transients and `g`'s outputs — at most every resident array plus `g`'s window:
+**Materialize-at-load bound** (`materialized_bound`): `resident + max(window) +
+max(consumed sources of a group) + 128 MiB` plus the host heap. While group `g` converts, memory
+holds the arrays already built, `g`'s sources and transients, `g`'s outputs and — under pacing — the
+previous group's consumed sources the driver has not yet returned, plus the pacing slack:
 
 | Term | Charge | Why |
 | --- | --- | --- |
@@ -120,56 +133,56 @@ order's peak — the stored payload once, plus per stored tensor of `n` elements
 | load-time Q4/Q8 | `n·bits/8 + 4·n/group` for every language float matrix whose input width divides the group, except embeddings and the LM head | packed words + BF16 scales + biases |
 | expert stacking | one more copy of each `*experts.{e}.*` tensor in its loaded form (quantized, BF16, or the stored packed part) | `SwitchLinear::stack` (sc-24440) concatenates the bank |
 
-The materialize-at-load order never holds more than the earlier bound (each group's sources are a
-slice of the payload, its outputs and transients a slice of the derived set — pinned against MLX's
-measured peak on a fixture, `the_materialized_bound_covers_the_provider_load_order_on_a_fixture`),
-so the earlier bound stays an upper bound for every cell its probes verified.
+The materialize-at-load order never holds more than the earlier bound beyond the pacing slack
+(each group's sources are a slice of the payload, its outputs and transients a slice of the
+derived set — pinned on a fixture against MLX's active peak and the exact `phys_footprint` peak,
+`the_materialized_bound_covers_the_provider_load_order_on_a_fixture`), so the earlier bound stays
+an upper bound for every cell its probes verified.
 
 Beside the arrays, a load builds host heap MLX does not see: the parsed tokenizer (measured at
 12–17× the `tokenizer.json` bytes for Llama 3.2, Qwen3 and Gemma 2), the chat template, the lazy
-graph's nodes and the Metal pipeline states its checksum and first forward compile. Every
-safetensors load is charged `24 × tokenizer.json bytes + 64 MiB` for it. The Metal device and MLX's
-kernel library (~170 MB) are process-wide one-time costs and are not charged per load.
+graph's nodes and the Metal pipeline states its checksum and first forward compile. And the Metal
+driver takes back the resources it returned while the process idled: 112 MiB for one tiny op,
+129 MiB for the whole load of a 100 KB snapshot (exact kernel peak), 137–170 MiB for a fixture's
+one-token request (`MLX_DRIVER_WAKE_BYTES` = 256 MiB). Every safetensors load is charged
+`24 × tokenizer.json bytes + 64 MiB + 256 MiB` for them. The Metal device and MLX's kernel library
+(~170 MB) are process-wide one-time costs and are not charged per load.
 
-**What a load is charged**, by the probe evidence behind it:
+**What a load is charged**, by the probe evidence behind its **cell** — the snapshot's top-level
+`model_type` (exactly: Mistral or dense Qwen2 are not Llama, though one decoder serves them), the
+conversion (dense, load-time Q4, load-time Q8, stored-quantized) and the one floating dtype every
+decoder matrix is stored in (`LoadCell`):
 
-1. a cell in `MATERIALIZED_VERIFIED` (architecture × MoE × conversion, each backed by a guarded
-   real-weight probe of the materialize-at-load order): `materialized_bound` + host heap;
-2. a cell the earlier probes verified (`verified_load`): the earlier bound + host heap;
+1. a cell in `MATERIALIZED_VERIFIED` (each backed by an exact-peak probe of the
+   materialize-at-load order): `materialized_bound` + host heap;
+2. a cell in `EARLIER_VERIFIED` (each backed by a covered probe of the earlier order): the earlier
+   bound + host heap;
 3. anything else: the two-copy bound **raised to the earlier bound when that is larger**, plus
    the host heap.
 
-`MATERIALIZED_VERIFIED` is empty until the materialize-at-load probes run (below); until then
-every load keeps the bound its earlier probes backed.
+| Cell | Charged |
+| --- | --- |
+| `llama` / `qwen3` / `gemma2`, dense, BF16 | earlier bound (covered probes) |
+| every other cell — `gemma4_unified` dense (its probe sits above its bound), every load-time Q4/Q8 (sampled probes cannot clear the margin, below), `qwen3_5` / `qwen3_5_moe` / Prism / Qwen3-VL / stored-quantized, Mistral, dense Qwen2, F16/F32 checkpoints, a config without `model_type` | `max(2×, earlier)` until the exact-peak re-probes |
 
-| Architecture (loader dispatch) | Unquantized (dense / stored) | Load-time Q4 / Q8 |
-| --- | --- | --- |
-| Qwen3.5/3.6/3.8 dense, Prism (`qwen3_5*`, `prism_hadamard_qwen35`) | verified (bbddc165b; stored-quantized prepared snapshots included) | verified (sc-24446 probes) |
-| Qwen3-VL | verified (bbddc165b) | unverified → `max(2×, required)` |
-| Qwen3 | verified, dense only (sc-24446 probes) | verified (sc-24446 probes) |
-| Llama (also Mistral, dense Qwen2 — one decoder) | verified, dense only (sc-24446 probes) | verified (sc-24446 probes) |
-| Gemma 2 | verified, dense only (sc-24446 probes) | verified (sc-24446 probes) |
-| Gemma 4 unified (LTX-2.5 enhancer) | verified, dense only (sc-24446 probes) | verified (sc-24446 probes) |
-| any MoE checkpoint (Qwen3.6-35B-A3B `qwen3_5_moe`, Qwen2-MoE, DeepSeek-V2) | unverified → `max(2×, required)` | unverified → `max(2×, required)` |
-| stored-quantized snapshot outside Qwen3.5 | unverified → `max(2×, required)` | — |
-| Phi-3, GLM-4, DeepSeek-V2 (MLA), plain Gemma 4 | unverified → `max(2×, required)` | unverified → `max(2×, required)` |
+`MATERIALIZED_VERIFIED` is empty until those re-probes run (one post-campaign session,
+`/Volumes/Models/sc24446-moe-probes.sh`). Until then Qwen3.8-27B is charged 111.8 GB at every
+conversion and Qwen3.6-35B-A3B 144.5 GB — both refused on a 128 GiB host — where the earlier
+verified bounds charged Qwen3.8-27B 69.9 GB (Q4) / 82.3 GB (Q8): those verifications rested on
+sampled probes that, under the uniform method and margin below, do not clear.
 
-Header-only bounds for the materialize-at-load probe targets (arrays only, host heap excluded;
-GB):
+Header-only bounds for the probe targets (arrays only, recomputed from the committed manifests;
+host heap excluded; GB):
 
 | Snapshot | Payload | BF16: earlier / materialized | Q4: earlier / materialized | Q8: earlier / materialized |
 | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B (`995ad96e`) | 71.90 | 71.93 / 71.93 | 91.34 / 24.09 | 108.58 / 41.32 |
-| Qwen3.6-35B-A3B prepared Q4 (stored) | 22.38 | 44.08 / 24.44 | — | — |
-| Qwen3.8-27B (`1d4bf0f2`) | 55.56 | 55.60 / 55.60 | 69.54 / 20.79 | 81.93 / 33.17 |
-| Gemma 4 unified enhancer (`791ef617`) | 23.92 | 23.96 / 23.95 | 30.12 / 8.77 | 35.60 / 14.22 |
-| Qwen3-8B (`b968826d`) | 16.38 | 16.39 / 16.39 | 20.30 / 6.80 | 23.78 / 10.27 |
+| Qwen3.6-35B-A3B (`995ad96e`) | 71.90 | 71.93 / 72.07 | 91.34 / 25.91 | 108.58 / 43.14 |
+| Qwen3.8-27B (`1d4bf0f2`) | 55.56 | 55.60 / 55.73 | 69.54 / 21.69 | 81.93 / 34.07 |
+| Gemma 4 unified enhancer (`791ef617`) | 23.92 | 23.96 / 24.08 | 30.12 / 9.39 | 35.60 / 14.84 |
+| Qwen3-8B (`b968826d`) | 16.38 | 16.39 / 16.52 | 20.30 / 7.32 | 23.78 / 10.79 |
 
 The Qwen3.6 earlier bounds already exclude the gate/up split copies the fused bank removed (they
-were ≈ 116 / 135 / 153 GB with them). The two-copy floor still applies to MoE until its probes
-run, so Qwen3.6-35B-A3B is charged ≈ 144.2 GB at BF16, Q4 and Q8 alike today (twice the payload,
-host heap included) — refused on a 128 GiB host — and ≈ 72.3 / 24.5 / 41.7 GB once its
-materialize-at-load cells are probe-verified.
+were ≈ 116 / 135 / 153 GB with them).
 
 For GGUF it counts the source mapping, retained affine words and both intermediate/final scales,
 dense conversion arrays, and the largest per-tensor host conversion/reordering buffers. Projectors
@@ -193,56 +206,63 @@ model.
 ### Measured probes (sc-24446)
 
 2026-10-01, Apple M5 Max (Mac17,6), 128 GiB, one model at a time under the memory guard
-(`HARD_GB=80`, 0.5 s guard plus an in-process 100 ms `phys_footprint` sampler —
-`mlx-llm/tests/load_admission_probe.rs`). The baseline is taken after the Metal device and MLX's
-kernel library initialize. "Measured load peak" is the load's share: for BF16, the footprint
-growth through the end of the load (nothing is derived later); for load-time Q4/Q8, whose
-quantized arrays are evaluated by the first forward, the first one-token request's peak growth
-minus the request's own MLX working set, measured by a second identical request on the
-materialized model. The raw first-request growth includes that request working set, which
-request admission prices, not load admission.
+(`HARD_GB=80`), earlier (verify-everything-then-derive) load order, `phys_footprint` sampled
+in-process every 100 ms over a baseline taken after the Metal device and MLX's kernel library
+initialized.
 
-| Snapshot | Conversion | Estimate (GB) | Measured load peak (GB) | Margin | Raw first-request growth / request MLX working set (GB) |
-| --- | --- | --- | --- | --- | --- |
-| Gemma 2 2B-it | BF16 | 5.724 | 5.519 | 3.72% | 9.052 / 3.528 |
-| Gemma 2 2B-it | Q4 | 6.865 | 6.587 | 4.23% | 9.013 / 2.426 |
-| Llama 3.2 1B Instruct | BF16 | 2.760 | 2.622 | 5.24% | 2.680 / 0.035 |
-| Llama 3.2 1B Instruct | Q4 | 3.309 | 3.023 | 9.46% | 3.065 / 0.041 |
-| Llama 3.2 1B Instruct | Q8 | 3.796 | 3.685 | 2.99% | 3.723 / 0.038 |
-| Qwen3-1.7B | BF16 | 3.790 | 3.574 | 6.05% | 3.658 / 0.046 |
-| Qwen3-1.7B | Q4 | 4.586 | 4.418 | 3.79% | 4.456 / 0.038 |
-| Qwen3-8B | Q4 | 20.644 | 19.875 | 3.87% | 19.962 / 0.087 |
-| Qwen3-8B | Q8 | 24.117 | 23.906 | 0.88% | 23.988 / 0.082 |
-| Qwen3-8B | BF16 | 16.733 | 16.513 | 1.33% | 16.610 / 0.053 |
-| Gemma 4 unified (LTX-2.5 enhancer) | BF16 | 24.797 | 24.304 | 2.03% | 30.482 / 5.416 |
-| Gemma 4 unified (LTX-2.5 enhancer) | Q4 | 30.963 | 29.925 | 3.47% | 34.391 / 4.466 |
-| Qwen3.8-27B | Q4 | 69.917 | 69.477 | 0.63% | 69.713 / 0.236 |
-| Qwen3.8-27B | Q8 | 82.304 | 80.640 | 2.06% | 80.870 / 0.230 |
+**One method for every cell** (`load_memory::tests::Measured::peak`): the load's share of the
+peak is `max(footprint growth through the end of the load, first one-token request's peak
+growth − that request's own working set)`, the working set measured by a second identical
+request on the materialized model. (These probes recorded the working set as MLX's active peak,
+not its footprint — which can only overstate the load's share.)
 
-The `every_recorded_probe_peak_is_covered_by_its_estimate_with_margin` test pins these relations
-(estimate ≥ measured + 0.5%); the ignored `pinned_real_weight_estimates_match_the_recorded_table`
-audit recomputes every estimate from the local headers. Load-time Q8 was measured on Llama, Qwen3
-and Qwen3.8; Gemma 2 and Gemma 4 Q8 run the identical quantize path at a different `bits` and are
-covered by the same derivation. The raw Qwen3.8 Q8 peak footprint was 81.0 GB (75.3 GiB) — under
-the 80 GiB guard cap, which its 0.5 s `footprint` sampling under-read at 70 GiB.
+**Margin** (`Measured::margin`): 0.5 % of the peak for run-to-run variation, plus — for a sampled
+probe — everything the sampler can have missed: the arrays the first request derived, which a
+`clear_cache` between two 100 ms samples can hide (the 0.5 s guard under-read the Qwen3.8 Q8 load
+by 5 GiB). So no sampled load-time probe can verify its cell: the margin it needs is as large as
+its quantized arrays.
 
-On a 128 GiB host (~105 GB available when idle) this admits Qwen3.8-27B at load-time Q4
-(69.9 GB, previously 111.1 GB → refused) and Q8 (82.3 GB), the Gemma 4 enhancer at BF16 (24.8 GB,
-previously 47.8 GB) and Q4 (31.0 GB), and Qwen3-8B Q4 with a Qwen3-1.7B Q4 draft
-(20.6 + 4.6 GB, previously 32.8 + 6.9 GB). Qwen3.6-35B-A3B (MoE) stays refused: ≈ 144.2 GB at
-BF16, Q4 and Q8 (the retained two-copy floor), host heap included.
+Every row is **recomputed from code on every test run**: its estimate from the committed
+header-only manifest of the pinned snapshot (`crates/llm/testdata/load_admission/*.json` — config,
+every tensor's name / dtype / shape, shard and tokenizer sizes; no weights), its peak and margin by
+the rules above (`verified_cells_are_exactly_the_probed_and_covered_ones`). Estimates include the
+256 MiB driver wake.
 
-These probes ran under the earlier verify-everything-then-derive order and back the earlier bound;
-the materialize-at-load order needs its own (pending, below the table of header-only bounds).
+| Snapshot | Conversion | Estimate (GB) | Uniform peak (GB) | Required margin (GB) | Covered | Raw first-request growth / request MLX working set (GB) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Gemma 2 2B-it | BF16 | 5.992 | 5.524 | 0.035 | yes | 9.052 / 3.528 |
+| Gemma 2 2B-it | Q4 | 7.134 | 6.587 | 1.182 | no | 9.013 / 2.426 |
+| Llama 3.2 1B Instruct | BF16 | 3.028 | 2.645 | 0.016 | yes | 2.680 / 0.035 |
+| Llama 3.2 1B Instruct | Q4 | 3.578 | 3.024 | 0.568 | no | 3.065 / 0.041 |
+| Llama 3.2 1B Instruct | Q8 | 4.064 | 3.685 | 1.057 | no | 3.723 / 0.038 |
+| Qwen3-1.7B | BF16 | 4.058 | 3.612 | 0.025 | yes | 3.658 / 0.046 |
+| Qwen3-1.7B | Q4 | 4.854 | 4.418 | 0.825 | no | 4.456 / 0.038 |
+| Qwen3-8B | Q4 | 20.912 | 19.875 | 4.021 | no | 19.962 / 0.087 |
+| Qwen3-8B | Q8 | 24.385 | 23.906 | 7.514 | no | 23.988 / 0.082 |
+| Qwen3-8B | BF16 | 17.001 | 16.557 | 0.093 | yes | 16.610 / 0.053 |
+| Gemma 4 unified (LTX-2.5 enhancer) | BF16 | 25.065 | 25.066 | 0.163 | **no — above its estimate** | 30.482 / 5.416 |
+| Gemma 4 unified (LTX-2.5 enhancer) | Q4 | 31.231 | 29.925 | 6.354 | no | 34.391 / 4.466 |
+| Qwen3.8-27B | Q4 | 70.185 | 69.477 | 14.326 | no | 69.713 / 0.236 |
+| Qwen3.8-27B | Q8 | 82.573 | 80.640 | 26.770 | no | 80.870 / 0.230 |
+
+The re-probe session (`/Volumes/Models/sc24446-moe-probes.sh`) re-measures every cell on the
+current build — group-by-group materialize-at-load, BF16 GeGLU for LLM decode — with the kernel's
+**exact** footprint maxima (`ri_interval_max_phys_footprint`, `tests/common/footprint.rs`), so its
+rows need only the 0.5 % variation margin; only cells it covers enter `MATERIALIZED_VERIFIED`.
 
 ### One-token request working set (sc-24446)
 
 The second-request MLX working sets above were not priced by request admission: its estimate for
 those one-token "Hi" requests was 6–9 MB on Llama 3.2 1B / Qwen3-1.7B / Qwen3-8B (measured
-35–87 MB) and 14–31 MB on Gemma 2 / the Gemma 4 enhancer (measured 2.4–5.4 GB). Two causes, both
-now priced on top of the decoder's own workspace (`provider.rs`), with the recorded probes pinned
-(`the_request_estimate_covers_the_recorded_one_token_working_sets`) and a fixture measurement
-(`a_one_token_request_working_set_is_priced_including_gemma_weight_promotion`):
+35–87 MB) and 14–31 MB on Gemma 2 / the Gemma 4 enhancer (measured 2.4–5.4 GB). The causes,
+now priced on top of the decoder's own workspace (`provider.rs`), are pinned against the recorded
+probes (`the_request_estimate_covers_the_recorded_one_token_working_sets` — MLX active peaks, the
+only figure those probes kept; their Gemma rows ran the `f32` GeGLU) and against fixture
+measurements taken **both** as the exact, driver-settled `phys_footprint` peak growth (MLX's
+cache, the host heap and the driver's wake included) and as MLX's active peak, the estimate
+covering the larger (`a_one_token_request_working_set_is_priced_under_either_activation_dtype`).
+Footprint request working sets on real weights — and Gemma's BF16 LLM-decode working set, never
+yet measured — are in the re-probe session:
 
 - **Gemma promoted its weights every forward.** `mlx_rs::nn::gelu_approximate` builds its
   constants as `f32` arrays, so Gemma's GeGLU turned a BF16 input into `f32` and the residual
@@ -260,9 +280,17 @@ now priced on top of the decoder's own workspace (`provider.rs`), with the recor
   committed command buffers and the one encoding) × (the 50 MB per-buffer cap + the largest
   promoted projection); for every other decoder that term is zero.
 - **MLX runtime terms the shared estimates do not see** (generic decoders; the Qwen3.5 hybrid's
-  contract already prices its own): K/V held in whole 256-position blocks, every layer's
-  temporaries in flight across that window (capped at window × 50 MB), and a page of rounding per
-  op output in it.
+  contract already prices its own): K/V held in whole 256-position blocks over every position the
+  request can write — committed prompt and generation, an MTP verify width, and a prompt-lookup /
+  draft overshoot crossing into a new block (`kv_block_padding_covers_committed_and_verify_positions`,
+  `a_lookup_overshoot_into_a_new_block_charges_the_block`); every other layer's temporaries in
+  flight across MLX's window, capped at 11 × (50 MB + the op that crosses each buffer — a long
+  eager prefill's full `prompt × prompt` score block per head, or a `prompt × inter` MLP
+  activation; `the_in_flight_window_prices_each_buffers_crossing_op`); a page of rounding per op
+  output in it.
+- **The driver's wake** (256 MiB, every request and every contract): after the process idles, the
+  Metal driver's returned resources are taken back by the next evaluation — 137–170 MiB measured
+  for a fixture's one-token request.
 
 #### Activation-dtype parity gate (sc-24446)
 
@@ -273,12 +301,17 @@ BF16 path is teacher-forced along them, and every step must hold `|Δlogit| ≤ 
 relative, then a BF16 stream, over 2–4 layers and the head) with greedy tokens agreeing wherever
 the `f32` top-2 margin exceeds twice that step's `|Δlogit|`. Measured worst `|Δlogit|` relative:
 Gemma 2 1.06e-2, Gemma 4 1.08e-2 (0 flips each), GPTBigCode 8.7e-3 (1 flip, on a margin inside
-the rule), StarCoder2 8.3e-3 (0 flips). A wrong activation (SiLU for GELU) lands at 7.7e-2–1.4e-1.
+the rule), StarCoder2 8.3e-3 (0 flips). A different activation (SiLU for GELU) lands at
+7.7e-2–1.4e-1 and is caught; a near-identical one (the exact erf GELU) is not caught by the gate —
+`gelu_tanh_is_the_tanh_approximation` pins the tanh formula directly instead.
 
 Existing goldens: none moved past its tolerance; none was regenerated. The Gemma 4 decoder goldens
-(`tests/gemma4_decoder.rs`, an `f32` NumPy oracle, budget 2e-2 relative) measure 1.3e-2 hidden /
-1.1e-2 logits on the BF16 path (5.8e-3 / 3.0e-3 on `f32`), both pinned by
-`the_reference_holds_under_either_activation_dtype`. `architecture_forward`'s Gemma 2 golden is
+(`tests/gemma4_decoder.rs`, an `f32` NumPy oracle) load the fixture in the text encoder's role
+(`f32` GeGLU: 5.8e-3 hidden / 3.0e-3 logits against the 2e-2 budget, ~3.4× headroom). The BF16
+path measures 1.3e-2 / 1.1e-2 and is held to a **derived** budget, `BF16_ABS_TOL = 2e-2 + 2⁻⁵`
+(triangle inequality: its distance to the oracle is at most the parity gate's bound on its
+distance to the `f32` path plus the `f32` path's budget) — ~3.9× headroom, with the narrowest
+mutation still 2.1× outside it (`the_reference_holds_under_either_activation_dtype`). `architecture_forward`'s Gemma 2 golden is
 not numerically pinned on MLX (eager-attention drift; shape, finiteness and cache growth only).
 The LTX-2.5 text encoder stays on `f32` until its real-weight goldens
 (`ltx_2_5_te_connector_inputs`, `ltx_2_5_te_tier_quality`) are run with BF16.

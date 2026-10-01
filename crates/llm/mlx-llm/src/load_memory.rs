@@ -1,5 +1,4 @@
 //! Header-only upper bounds for the actual MLX checkpoint load paths.
-use crate::config::Architecture;
 use crate::primitives::projection::QuantSpec;
 use core_llm::{Error, LoadSpec, Result};
 use serde_json::Value;
@@ -11,17 +10,17 @@ fn overflow() -> Error {
 
 /// Price source buffers, conversion outputs and staging without evaluating any MLX array.
 ///
-/// Safetensors, by how much of the load is backed by a guarded real-weight probe (sc-24446):
+/// Safetensors, by which guarded real-weight probe backs the load's cell
+/// ([`LoadCell`]: `model_type` × conversion × stored dtype; sc-24446):
 ///
-/// * probed under the provider's materialize-at-load order ([`materialized_verified`]): the
-///   group-by-group peak, [`materialized_bound`] — every resident array plus the largest group's
-///   sources and transients;
-/// * probed under the earlier verify-everything-then-derive order ([`verified_load`]): the stored
-///   payload once plus every derived allocation ([`derived_bytes`]). The materialize-at-load
-///   order never holds more than that (each group's sources are a slice of the payload, its
-///   outputs and transients a slice of the derived set), so the bound stays an upper bound;
+/// * a cell probed under the provider's materialize-at-load order ([`MATERIALIZED_VERIFIED`]):
+///   the group-by-group peak, [`materialized_bound`];
+/// * a cell probed under the earlier verify-everything-then-derive order ([`EARLIER_VERIFIED`]):
+///   the stored payload once plus every derived allocation ([`derived_bytes`]). The
+///   materialize-at-load order holds no more than that beyond its pacing slack (each group's
+///   sources are a slice of the payload, its outputs and transients a slice of the derived set);
 /// * anything else: the conservative two-copy bound, raised to the derived total where that is
-///   larger, so an unverified load is never charged less than its derived allocations.
+///   larger, so an unprobed load is never charged less than its derived allocations.
 ///
 /// Every safetensors bound adds the load's host heap ([`host_bytes`]).
 pub(crate) fn required_bytes(spec: &LoadSpec) -> Result<u64> {
@@ -36,31 +35,76 @@ pub(crate) fn required_bytes(spec: &LoadSpec) -> Result<u64> {
             .unwrap_or(0);
         return language.checked_add(projector).ok_or_else(overflow);
     }
-    let source = core_llm::checkpoint_payload_bytes(path)?;
-    let config: Value = serde_json::from_reader(
-        File::open(path.join("config.json")).map_err(|e| Error::Load(e.to_string()))?,
-    )
-    .map_err(|e| Error::Load(e.to_string()))?;
     let quant = spec.quantize.map(crate::provider::quant_spec).transpose()?;
-    let headers = safetensors_headers(path)?;
-    let arrays = if materialized_verified(&config, &headers, quant) {
-        materialized_bound(&headers, quant)?
-    } else {
-        let derived = source
-            .checked_add(derived_bytes(&headers, quant)?)
-            .ok_or_else(overflow)?;
-        if verified_load(&config, &headers, quant.is_some()) {
-            derived
+    SnapshotFacts::read(path)?.required(quant)
+}
+
+/// Everything [`required_bytes`] reads from a safetensors snapshot — header-only: its
+/// `config.json`, every shard's header, the shards' total size and the `tokenizer.json` size. The
+/// tests rebuild it from a committed manifest of a pinned snapshot (no weights), so the recorded
+/// probes are recomputed from code on every run.
+#[derive(Clone, Debug)]
+pub(crate) struct SnapshotFacts {
+    pub(crate) config: Value,
+    pub(crate) headers: Vec<Value>,
+    /// Total `*.safetensors` bytes ([`core_llm::checkpoint_payload_bytes`]).
+    pub(crate) payload: u64,
+    /// `tokenizer.json` bytes (0 when absent).
+    pub(crate) tokenizer_bytes: u64,
+}
+
+impl SnapshotFacts {
+    /// Read the facts of the snapshot directory `dir`.
+    pub(crate) fn read(dir: &Path) -> Result<Self> {
+        let config: Value = serde_json::from_reader(
+            File::open(dir.join("config.json")).map_err(|e| Error::Load(e.to_string()))?,
+        )
+        .map_err(|e| Error::Load(e.to_string()))?;
+        let tokenizer_bytes = match std::fs::metadata(dir.join("tokenizer.json")) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(Error::Load(e.to_string())),
+        };
+        Ok(Self {
+            config,
+            headers: safetensors_headers(dir)?,
+            payload: core_llm::checkpoint_payload_bytes(dir)?,
+            tokenizer_bytes,
+        })
+    }
+
+    /// The bound a load at `quant` is charged ([`required_bytes`]).
+    pub(crate) fn required(&self, quant: Option<QuantSpec>) -> Result<u64> {
+        let cell = LoadCell::of(&self.config, &self.headers, quant);
+        let arrays = if cell.is_in(MATERIALIZED_VERIFIED) {
+            materialized_bound(&self.headers, quant)?
         } else {
-            derived.max(source.checked_mul(2).ok_or_else(overflow)?)
-        }
-    };
-    arrays.checked_add(host_bytes(path)?).ok_or_else(overflow)
+            let derived = self.earlier_arrays(quant)?;
+            if cell.is_in(EARLIER_VERIFIED) {
+                derived
+            } else {
+                derived.max(self.payload.checked_mul(2).ok_or_else(overflow)?)
+            }
+        };
+        arrays.checked_add(self.host()?).ok_or_else(overflow)
+    }
+
+    /// The earlier order's peak: the payload once plus every derived allocation.
+    pub(crate) fn earlier_arrays(&self, quant: Option<QuantSpec>) -> Result<u64> {
+        self.payload
+            .checked_add(derived_bytes(&self.headers, quant)?)
+            .ok_or_else(overflow)
+    }
+
+    /// The load's host heap ([`host_bytes`]).
+    pub(crate) fn host(&self) -> Result<u64> {
+        host_bytes(self.tokenizer_bytes)
+    }
 }
 
 /// How a checkpoint's weights reach the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Conversion {
+pub(crate) enum Conversion {
     /// Dense floating weights, used as stored (cast to BF16 where wider).
     Dense,
     /// Dense weights quantized to Q4 at load.
@@ -71,34 +115,105 @@ enum Conversion {
     Stored,
 }
 
-/// The (architecture × MoE × conversion) cells whose [`materialized_bound`] a guarded real-weight
-/// probe has covered under the provider's materialize-at-load order (`MEASURED` in the tests
-/// pins each probe; `docs/reference/qwen38/native-memory-admission.md` has the table). Empty
-/// until those probes run: every load keeps the bound its earlier probes backed.
-const MATERIALIZED_VERIFIED: &[(Architecture, bool, Conversion)] = &[];
-
-/// Whether this load's [`materialized_bound`] is probe-backed ([`MATERIALIZED_VERIFIED`]).
-/// Dispatches exactly as the loader does ([`Architecture::from_config`]).
-fn materialized_verified(config: &Value, headers: &[Value], quant: Option<QuantSpec>) -> bool {
-    let Ok(arch) = Architecture::from_config(config) else {
-        return false;
-    };
-    let names = || {
-        headers
-            .iter()
-            .filter_map(Value::as_object)
-            .flat_map(|h| h.keys())
-    };
-    let moe = names().any(|name| name.contains(".mlp.experts."));
-    let conversion = match quant.map(|q| q.bits) {
-        Some(4) => Conversion::LoadQ4,
-        Some(8) => Conversion::LoadQ8,
-        Some(_) => return false,
-        None if names().any(|name| name.ends_with(".scales")) => Conversion::Stored,
-        None => Conversion::Dense,
-    };
-    MATERIALIZED_VERIFIED.contains(&(arch, moe, conversion))
+/// The cell a load's bound is verified per: the snapshot's top-level `model_type` (exactly — a
+/// family the loader dispatches alike, such as Mistral or dense Qwen2 through the Llama decoder,
+/// is its own cell), the conversion, and the one floating dtype every decoder matrix is stored
+/// in (`"mixed"` when they differ, which no table lists).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cell {
+    pub(crate) model_type: &'static str,
+    pub(crate) conversion: Conversion,
+    pub(crate) dtype: &'static str,
 }
+
+/// A load's cell, as read from its snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoadCell {
+    pub(crate) model_type: String,
+    pub(crate) conversion: Option<Conversion>,
+    pub(crate) dtype: String,
+}
+
+impl LoadCell {
+    pub(crate) fn of(config: &Value, headers: &[Value], quant: Option<QuantSpec>) -> Self {
+        let model_type = config
+            .get("model_type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let names = || {
+            headers
+                .iter()
+                .filter_map(Value::as_object)
+                .flat_map(|h| h.iter())
+        };
+        let conversion = match quant.map(|q| q.bits) {
+            Some(4) => Some(Conversion::LoadQ4),
+            Some(8) => Some(Conversion::LoadQ8),
+            Some(_) => None,
+            None if names().any(|(name, _)| name.ends_with(".scales")) => Some(Conversion::Stored),
+            None => Some(Conversion::Dense),
+        };
+        let mut dtypes: Vec<&str> = names()
+            .filter(|(name, info)| {
+                !media_tensor(name)
+                    && !name.ends_with(".scales")
+                    && !name.ends_with(".biases")
+                    && info["shape"].as_array().is_some_and(|s| s.len() >= 2)
+            })
+            .filter_map(|(_, info)| info["dtype"].as_str())
+            .filter(|d| matches!(*d, "F16" | "BF16" | "F32" | "F64"))
+            .collect();
+        dtypes.sort_unstable();
+        dtypes.dedup();
+        let dtype = match dtypes.as_slice() {
+            [one] => (*one).to_string(),
+            _ => "mixed".to_string(),
+        };
+        Self {
+            model_type,
+            conversion,
+            dtype,
+        }
+    }
+
+    pub(crate) fn is_in(&self, table: &[Cell]) -> bool {
+        table.iter().any(|c| {
+            Some(c.conversion) == self.conversion
+                && c.model_type == self.model_type
+                && c.dtype == self.dtype
+        })
+    }
+}
+
+/// Cells whose earlier-order bound ([`SnapshotFacts::earlier_arrays`]) a guarded real-weight
+/// probe covers with margin — each backed by a `MEASURED` row the tests recompute from the
+/// snapshot's committed manifest. Only these: Gemma 4 unified BF16 measured above its bound under
+/// the uniform method, and every load-time Q4/Q8 probe was sampled every 100 ms across a
+/// `clear_cache`, which can hide up to the load's derived bytes, so none clears the margin
+/// floor; they keep the two-copy floor until the exact-peak re-probes
+/// (`docs/reference/qwen38/native-memory-admission.md`).
+pub(crate) const EARLIER_VERIFIED: &[Cell] = &[
+    Cell {
+        model_type: "llama",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "qwen3",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+    Cell {
+        model_type: "gemma2",
+        conversion: Conversion::Dense,
+        dtype: "BF16",
+    },
+];
+
+/// Cells whose [`materialized_bound`] an exact-peak (kernel `phys_footprint` maximum) probe of
+/// the provider's materialize-at-load order covers with margin. Empty until those probes run.
+pub(crate) const MATERIALIZED_VERIFIED: &[Cell] = &[];
 
 /// Host heap per `tokenizer.json` byte: the parsed vocabulary, merges and added-token tables.
 /// The sc-24446 probes measured 12–17× (Llama 3.2, Qwen3, Gemma 2); 24× keeps headroom.
@@ -109,51 +224,24 @@ const TOKENIZER_HEAP_PER_BYTE: u64 = 24;
 /// compile (measured ≤ 30 MiB beside the tokenizer).
 const LOAD_HOST_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The `phys_footprint` the Metal driver takes back when a process that has idled evaluates
+/// again (sc-24446): it returns its command-queue and pipeline resources asynchronously (measured
+/// 0.1–1.25 s after the last work) and the next evaluation re-acquires them — 112 MiB for one tiny
+/// op and 129 MiB for the whole load of a 100 KB snapshot (exact kernel peak), 137–170 MiB for a
+/// fixture's one-token request, on an idle Apple M5 Max. Charged to every load and every request
+/// with ~1.5x headroom over the largest.
+pub(crate) const MLX_DRIVER_WAKE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Host (non-MLX) memory a safetensors load adds beside its arrays (sc-24446): the tokenizer
-/// it parses and a fixed allowance for everything else the load builds on the heap. The Metal
+/// it parses (`tokenizer_bytes` of `tokenizer.json`), a fixed allowance for everything else
+/// the load builds on the heap, and the driver's wake ([`MLX_DRIVER_WAKE_BYTES`]). The Metal
 /// device and MLX's kernel library are process-wide one-time costs, not a load's.
-fn host_bytes(dir: &Path) -> Result<u64> {
-    let tokenizer = match std::fs::metadata(dir.join("tokenizer.json")) {
-        Ok(meta) => meta.len(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(Error::Load(e.to_string())),
-    };
-    tokenizer
+fn host_bytes(tokenizer_bytes: u64) -> Result<u64> {
+    tokenizer_bytes
         .checked_mul(TOKENIZER_HEAP_PER_BYTE)
         .and_then(|v| v.checked_add(LOAD_HOST_BYTES))
+        .and_then(|v| v.checked_add(MLX_DRIVER_WAKE_BYTES))
         .ok_or_else(overflow)
-}
-
-/// Whether this (architecture × conversion) has a derived bound backed by a reading of its
-/// constructor and a guarded real-weight peak (`docs/reference/qwen38/native-memory-admission.md`
-/// has the table). Dispatches exactly as the loader does ([`Architecture::from_config`]).
-///
-/// Unverified, by name: every MoE checkpoint (per-expert banks are stacked into new arrays —
-/// priced by [`derived_bytes`], never measured here); a stored-quantized checkpoint outside the
-/// Qwen3.5 family; load-time quantization of Qwen3-VL; Phi-3, Qwen2-MoE, GLM-4, DeepSeek-V2 and
-/// plain Gemma 4.
-fn verified_load(config: &Value, headers: &[Value], quantize_at_load: bool) -> bool {
-    let names = || {
-        headers
-            .iter()
-            .filter_map(Value::as_object)
-            .flat_map(|h| h.keys())
-    };
-    if names().any(|name| expert_index(name).is_some() || name.contains(".mlp.experts.")) {
-        return false;
-    }
-    let stored_quantized = names().any(|name| name.ends_with(".scales"));
-    match Architecture::from_config(config) {
-        Ok(Architecture::Qwen35) => true,
-        Ok(Architecture::Qwen3Vl) => !quantize_at_load,
-        Ok(
-            Architecture::Qwen3
-            | Architecture::Llama
-            | Architecture::Gemma2
-            | Architecture::Gemma4Unified,
-        ) => !stored_quantized,
-        _ => false,
-    }
 }
 
 /// Every `*.safetensors` header in `dir`, read header-only.
@@ -463,6 +551,10 @@ fn materialization_group(name: &str) -> &str {
 ///   array), and its transients: a BF16 cast ahead of a quantize, a per-expert array ahead of its
 ///   stack, the norm's intermediates, the load-boundary checksum's word widening.
 ///
+/// Plus what the pacing lets stay outstanding (`Weights::materialize_groups`): the Metal driver
+/// returns a released buffer asynchronously, so one group's consumed sources (the largest such
+/// group's) may still count while the next group converts, and the pacing slack.
+///
 /// Each buffer is charged one 16 KiB page of rounding (three for a quantized triple).
 fn materialized_bound(headers: &[Value], quant: Option<QuantSpec>) -> Result<u64> {
     let r = ALLOCATION_ROUNDING;
@@ -473,6 +565,7 @@ fn materialized_bound(headers: &[Value], quant: Option<QuantSpec>) -> Result<u64
     };
     let mut resident = 0u64;
     let mut windows: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    let mut sources: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
     for header in headers {
         for t in header_tensors(header)? {
             if media_tensor(t.name) {
@@ -516,10 +609,21 @@ fn materialized_bound(headers: &[Value], quant: Option<QuantSpec>) -> Result<u64
             resident = sum(&[resident, kept])?;
             let group = windows.entry(materialization_group(t.name)).or_default();
             *group = sum(&[*group, sum(&window)?])?;
+            if consumed {
+                let released = sources.entry(materialization_group(t.name)).or_default();
+                *released = sum(&[*released, t.stored, r])?;
+            }
         }
     }
     let window = windows.values().copied().max().unwrap_or(0);
-    sum(&[resident, window])
+    // Pacing lets one released group's sources still be on their way back from the driver.
+    let outstanding = sources.values().copied().max().unwrap_or(0);
+    sum(&[
+        resident,
+        window,
+        outstanding,
+        crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES,
+    ])
 }
 
 fn gguf_bytes(path: &Path, projector: bool) -> Result<u64> {
@@ -580,8 +684,9 @@ mod tests {
 
     /// MLX's Metal page (`vm_page_size` on Apple silicon): every buffer above it is rounded up.
     const R: u64 = 16 * 1024;
-    /// The fixed host allowance of a load with no `tokenizer.json`.
-    const H: u64 = 64 * 1024 * 1024;
+    /// The fixed host allowance of a load with no `tokenizer.json`: the heap and the driver's
+    /// wake.
+    const H: u64 = 64 * 1024 * 1024 + MLX_DRIVER_WAKE_BYTES;
 
     /// A load's host heap: 24 bytes per `tokenizer.json` byte plus the fixed allowance.
     #[test]
@@ -663,37 +768,54 @@ mod tests {
             .collect()
     }
 
-    /// Every verified architecture, unquantized: the payload once plus each buffer's page
-    /// rounding and the norm's two BF16 intermediates — no second copy of any BF16 matrix.
+    /// The probed cells, unquantized: the payload once plus each buffer's page rounding and the
+    /// norm's two BF16 intermediates — no second copy of any BF16 matrix. Every other cell keeps
+    /// the two-copy floor, including a family the loader dispatches alike (Mistral, dense Qwen2 —
+    /// the Llama decoder), a different stored dtype of a probed family (F16, F32), a config
+    /// without `model_type`, and the families whose probes do not clear the margin (Qwen3.5/3.8,
+    /// Qwen3-VL, Prism, Gemma 4 unified).
+    ///
+    /// MUTATION: drop the dtype or the `model_type` from `LoadCell::is_in`'s match and this goes
+    /// RED.
     #[test]
-    fn verified_unquantized_loads_charge_the_payload_once_plus_derived_arrays() {
+    fn only_probed_cells_charge_the_payload_once_plus_derived_arrays() {
+        let once = |payload: u64| payload + 4 * R + (64 * 4 + R) + H;
+        for model_type in ["llama", "qwen3", "gemma2"] {
+            let (dir, payload) =
+                snapshot(json!({ "model_type": model_type }), &refs(&dense("model")));
+            assert_eq!(required(&dir, None), once(payload), "{model_type}");
+        }
         for (config, prefix) in [
+            (json!({"model_type": "mistral"}), "model"),
+            (json!({"model_type": "qwen2"}), "model"),
+            (json!({}), "model"),
             (json!({"model_type": "qwen3_5"}), "model.language_model"),
             (json!({"model_type": "qwen3_5_text"}), "model"),
             (json!({"model_type": "qwen3_vl"}), "model.language_model"),
             (json!({"model_type": "prism_hadamard_qwen35"}), "model"),
-            (json!({"model_type": "qwen3"}), "model"),
-            (json!({"model_type": "llama"}), "model"),
-            (json!({"model_type": "mistral"}), "model"),
-            (json!({"model_type": "gemma2"}), "model"),
             (
                 json!({"model_type": "gemma4_unified"}),
                 "model.language_model",
             ),
         ] {
-            let tensors = dense(prefix);
-            let (dir, payload) = snapshot(config.clone(), &refs(&tensors));
-            assert_eq!(
-                required(&dir, None),
-                payload + 4 * R + (64 * 4 + R) + H,
-                "{config}"
-            );
+            let (dir, payload) = snapshot(config.clone(), &refs(&dense(prefix)));
+            assert_eq!(required(&dir, None), 2 * payload + H, "{config}");
+        }
+        for dtype in ["F16", "F32"] {
+            let tensors: Tensors = dense("model")
+                .into_iter()
+                .map(|(n, _, s)| (n, dtype, s))
+                .collect();
+            let (dir, payload) = snapshot(json!({"model_type": "llama"}), &refs(&tensors));
+            assert!(required(&dir, None) >= 2 * payload + H, "llama {dtype}");
         }
     }
 
     /// Load-time Q4/Q8 adds the packed words (`n·bits/8`) and BF16 scales + biases
     /// (`4·n/group`) of every quantized projection — never of the embedding or the LM head —
-    /// on top of the BF16 payload that stays resident until the quantized arrays are evaluated.
+    /// on top of the BF16 payload that stays resident until the quantized arrays are evaluated
+    /// (the earlier order's bound). No load-time cell is probed with margin, so each is charged
+    /// at least two copies.
     #[test]
     fn quantize_at_load_charges_packed_words_scales_and_biases_per_bits() {
         let up = 1024 * 1024;
@@ -704,9 +826,17 @@ mod tests {
             for model_type in ["qwen3_5", "qwen3", "llama", "gemma2", "gemma4_unified"] {
                 let tensors = dense("model");
                 let (dir, payload) = snapshot(json!({ "model_type": model_type }), &refs(&tensors));
+                let facts = SnapshotFacts::read(dir.path()).unwrap();
+                let q = crate::provider::quant_spec(quantize).unwrap();
+                let earlier = payload + 4 * R + (64 * 4 + R) + (quantized + R);
+                assert_eq!(
+                    facts.earlier_arrays(Some(q)).unwrap(),
+                    earlier,
+                    "{model_type}"
+                );
                 assert_eq!(
                     required(&dir, Some(quantize)),
-                    payload + 4 * R + (64 * 4 + R) + (quantized + R) + H,
+                    earlier.max(2 * payload) + H,
                     "{model_type} {quantize:?}"
                 );
             }
@@ -716,9 +846,10 @@ mod tests {
             json!({"model_type": "qwen3"}),
             &[("model.layers.0.mlp.up_proj.weight", "BF16", &[128, 48])],
         );
+        let facts = SnapshotFacts::read(dir.path()).unwrap();
         assert_eq!(
-            required(&dir, Some(core_llm::Quantize::Q4)),
-            payload + R + H
+            facts.earlier_arrays(Some(QuantSpec::q4())).unwrap(),
+            payload + R
         );
         // NVFP4 is refused by name, never priced as another format.
         let mut spec = LoadSpec::dense(dir.path().display().to_string());
@@ -925,9 +1056,15 @@ mod tests {
         let layer0 = bank * 2 + R;
         let layer1 = (64 * 64 * 4 + R) + (64 * 64 * 2 + R);
         assert!(layer0 > top && layer0 > layer1);
+        // Outstanding under pacing: the largest group's consumed sources (layer 0's bank; the
+        // router is kept as stored), plus the pacing slack.
+        let outstanding = bank * 2 + R;
         assert_eq!(
             materialized_bound(&[h], Some(QuantSpec::q4())).unwrap(),
-            resident + layer0
+            resident
+                + layer0
+                + outstanding
+                + crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES
         );
     }
 
@@ -940,14 +1077,16 @@ mod tests {
             "model.layers.0.mlp.experts.1.up_proj.weight": {"dtype": "BF16", "shape": [128, 64]},
         });
         let n = 128 * 64;
+        let outstanding =
+            2 * (2 * n + R) + crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES;
         assert_eq!(
             materialized_bound(std::slice::from_ref(&h), None).unwrap(),
-            2 * (2 * n + R) + 2 * (2 * n + R)
+            2 * (2 * n + R) + 2 * (2 * n + R) + outstanding
         );
         let q = n / 2 + n / 64 * 4;
         assert_eq!(
             materialized_bound(&[h], Some(QuantSpec::q4())).unwrap(),
-            2 * (q + 3 * R) + 2 * ((2 * n + R) + (q + 3 * R))
+            2 * (q + 3 * R) + 2 * ((2 * n + R) + (q + 3 * R)) + outstanding
         );
     }
 
@@ -974,7 +1113,7 @@ mod tests {
         for quant in [None, Some(QuantSpec::q4())] {
             assert_eq!(
                 materialized_bound(std::slice::from_ref(&h), quant).unwrap(),
-                expected
+                expected + crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES
             );
         }
     }
@@ -1012,18 +1151,23 @@ mod tests {
 
     /// sc-24446: the bound covers what the provider's load order actually allocates. A wide
     /// Qwen3.6-MoE fixture (fused and per-expert, with its MTP head) is loaded exactly as the
-    /// provider loads it — lazily, then [`Weights::materialize_groups`] — dense and at Q8 / Q4,
-    /// and MLX's peak active memory over the load stays within [`materialized_bound`], which in
-    /// turn never exceeds the payload-plus-every-derived-array bound of the earlier order.
+    /// provider loads it — lazily, then [`Weights::materialize_groups`] — dense and at Q8 / Q4.
+    /// Measured two ways: MLX's peak active memory stays within [`materialized_bound`] less the
+    /// pacing slack (which only the footprint's host and driver noise may use), and the exact
+    /// settled `phys_footprint` peak growth stays within the bound plus the load's fixed host
+    /// allowance. The bound, less its slack, never exceeds the payload-plus-every-derived-array
+    /// bound of the earlier order.
     ///
-    /// MUTATION: skip releasing each group's sources (`Weights::materialize_groups`) and the peak
-    /// exceeds the bound from the first (fused, unquantized F32) case on.
+    /// MUTATION: skip releasing each group's sources (`Weights::materialize_groups`) and the
+    /// active peak exceeds the bound from the first (fused, unquantized F32) case on.
     ///
     /// [`Weights::materialize_groups`]: crate::primitives::Weights::materialize_groups
     #[test]
     fn the_materialized_bound_covers_the_provider_load_order_on_a_fixture() {
         use crate::models::Qwen35Model;
         use crate::primitives::Weights;
+        use crate::test_fixture::footprint;
+        let slack = crate::primitives::weights::MATERIALIZE_PACE_SLACK_BYTES;
         for fused in [true, false] {
             for quant in [None, Some(QuantSpec::q8()), Some(QuantSpec::q4())] {
                 let (dir, cfg) = wide_qwen35_moe_snapshot(fused);
@@ -1031,185 +1175,468 @@ mod tests {
                 let bound = materialized_bound(&headers, quant).unwrap();
                 let payload = core_llm::checkpoint_payload_bytes(dir.path()).unwrap();
                 let earlier = payload + derived_bytes(&headers, quant).unwrap();
-                assert!(bound <= earlier, "{fused} {quant:?}: {bound} > {earlier}");
+                assert!(
+                    bound - slack <= earlier,
+                    "{fused} {quant:?}: {bound} > {earlier}"
+                );
 
                 mlx_rs::memory::clear_cache();
+                footprint::settle();
+                let base_footprint = footprint::current();
+                footprint::reset_peak();
                 let base = mlx_rs::memory::get_active_memory();
                 mlx_rs::memory::reset_peak_memory();
                 let mut w = Weights::from_dir(dir.path()).unwrap();
                 let model =
                     Qwen35Model::build_lazy(&w, "model.language_model", cfg, quant).unwrap();
                 let report = w.materialize_groups(&model.param_groups()).unwrap();
-                let peak = mlx_rs::memory::get_peak_memory().saturating_sub(base) as u64;
+                let active = mlx_rs::memory::get_peak_memory().saturating_sub(base) as u64;
+                let footprint = footprint::peak_since_reset().saturating_sub(base_footprint);
                 assert_eq!(report.leftover, 0);
                 assert!(
-                    peak <= bound,
-                    "fused={fused} {quant:?}: peak {peak} exceeds the bound {bound}"
+                    active <= bound - slack,
+                    "fused={fused} {quant:?}: active peak {active} exceeds the bound {}",
+                    bound - slack
+                );
+                assert!(
+                    footprint <= bound + host_bytes(0).unwrap(),
+                    "fused={fused} {quant:?}: footprint peak {footprint} exceeds {}",
+                    bound + host_bytes(0).unwrap()
                 );
                 if quant.is_some() {
                     // Quantizing at load releases every converted source group by group.
-                    assert!(bound < earlier, "fused={fused} {quant:?}");
+                    assert!(bound - slack < earlier, "fused={fused} {quant:?}");
                 }
                 drop(model);
             }
         }
     }
 
+    /// Where the committed snapshot manifests live: header-only facts of each pinned snapshot
+    /// a `MEASURED` probe loaded — its `config.json`, every tensor's name, dtype and shape, the
+    /// shards' total bytes and the `tokenizer.json` size. No weights.
+    fn manifest_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/load_admission")
+    }
+
+    fn manifest_value(facts: &SnapshotFacts, source: &str) -> Value {
+        let mut tensors = serde_json::Map::new();
+        for header in &facts.headers {
+            for (name, info) in header.as_object().unwrap() {
+                if name == "__metadata__" {
+                    continue;
+                }
+                tensors.insert(
+                    name.clone(),
+                    json!({"dtype": info["dtype"], "shape": info["shape"]}),
+                );
+            }
+        }
+        json!({
+            "source": source,
+            "config": facts.config,
+            "payload": facts.payload,
+            "tokenizer_bytes": facts.tokenizer_bytes,
+            "tensors": tensors,
+        })
+    }
+
+    /// A committed manifest as the facts [`required_bytes`] reads.
+    pub(super) fn manifest_facts(name: &str) -> SnapshotFacts {
+        let path = manifest_dir().join(format!("{name}.json"));
+        let v: Value = serde_json::from_reader(
+            File::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+        )
+        .unwrap();
+        SnapshotFacts {
+            config: v["config"].clone(),
+            headers: vec![v["tensors"].clone()],
+            payload: v["payload"].as_u64().unwrap(),
+            tokenizer_bytes: v["tokenizer_bytes"].as_u64().unwrap(),
+        }
+    }
+
+    /// The pinned snapshots, by manifest name: (name, path under `LOAD_PROBE_SNAPSHOT_ROOT`, or
+    /// absolute). (A prepared per-expert Qwen3.6 snapshot's manifest is 9.4 MB — 92K tensor
+    /// entries — and is not committed; its cell stays unverified.)
+    const PINNED: &[(&str, &str)] = &[
+        ("gemma-2-2b-it", "models--SceneWorks--gemma-2-2b-it/snapshots/684c553b5b41a1c835989d89f62f585e6269a7de"),
+        ("llama-3.2-1b-instruct-bf16", "models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/863c846a9ac6fad4e49e1743d52984dff262e953"),
+        ("qwen3-1.7b-bf16", "models--mlx-community--Qwen3-1.7B-bf16/snapshots/9cd6692855d3e06772228e9a962b2606359b2d24"),
+        ("qwen3-8b", "models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"),
+        ("ltx-2.5-enhancer", "models--SceneWorks--ltx-2.5-mlx/snapshots/791ef61731ad067bd13ebff8cc0f07532476d9ef/enhancer"),
+        ("qwen3.8-27b", "models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"),
+        ("qwen3.6-35b-a3b", "models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0"),
+    ];
+
+    fn pinned_path(hub: &std::path::Path, rel: &str) -> std::path::PathBuf {
+        if rel.starts_with('/') {
+            std::path::PathBuf::from(rel)
+        } else {
+            hub.join(rel)
+        }
+    }
+
+    /// (Re)write the committed manifests from the local pinned snapshots — header-only.
+    #[test]
+    #[ignore = "writes testdata from the pinned snapshots under LOAD_PROBE_SNAPSHOT_ROOT"]
+    fn write_pinned_snapshot_manifests() {
+        let hub = std::path::PathBuf::from(
+            std::env::var("LOAD_PROBE_SNAPSHOT_ROOT").expect("set LOAD_PROBE_SNAPSHOT_ROOT"),
+        );
+        std::fs::create_dir_all(manifest_dir()).unwrap();
+        for (name, rel) in PINNED {
+            let facts = SnapshotFacts::read(&pinned_path(&hub, rel)).unwrap();
+            let value = manifest_value(&facts, rel);
+            std::fs::write(
+                manifest_dir().join(format!("{name}.json")),
+                serde_json::to_string(&value).unwrap() + "\n",
+            )
+            .unwrap();
+        }
+    }
+
+    /// Header-only audit: each committed manifest still matches its local pinned snapshot.
+    #[test]
+    #[ignore = "requires the pinned snapshots under LOAD_PROBE_SNAPSHOT_ROOT"]
+    fn committed_manifests_match_the_pinned_snapshots() {
+        let hub = std::path::PathBuf::from(
+            std::env::var("LOAD_PROBE_SNAPSHOT_ROOT").expect("set LOAD_PROBE_SNAPSHOT_ROOT"),
+        );
+        for (name, rel) in PINNED {
+            let local = manifest_value(&SnapshotFacts::read(&pinned_path(&hub, rel)).unwrap(), rel);
+            let committed: Value = serde_json::from_reader(
+                File::open(manifest_dir().join(format!("{name}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(local, committed, "{name}");
+        }
+    }
+
     /// Guarded real-weight probes (sc-24446), 2026-10-01, Apple M5 Max (Mac17,6), 128 GiB unified
     /// memory, macOS 26: one load through `LlamaProvider::load` plus one-token requests
-    /// (`tests/load_admission_probe.rs`, `phys_footprint` sampled in-process every 100 ms, over a
-    /// baseline taken after Metal and MLX's kernel library initialized). `measured_peak` is the
-    /// load's share of the peak: for an unquantized load, the footprint growth through the end of
-    /// the load (nothing is derived later); for load-time quantization — whose arrays are only
-    /// evaluated by the first forward — the first request's peak growth minus the request's own
-    /// MLX working set (a second identical request on the materialized model), which request
-    /// admission prices. Each estimate is `required_bytes` for the same pinned snapshot; the
-    /// `pinned_real_weight_estimates_match_the_recorded_table` audit recomputes it from the
-    /// headers so the table cannot drift from the code. These are recorded evidence, not a
-    /// machine golden: the test asserts only the relation.
+    /// (`tests/load_admission_probe.rs`), each figure footprint growth over a baseline taken after
+    /// Metal and MLX's kernel library initialized.
+    ///
+    /// **One method for every cell** ([`Measured::peak`]): the load's share of the peak is the
+    /// larger of the footprint growth through the end of the load and the first one-token
+    /// request's peak growth less that request's own working set (a second identical request on
+    /// the materialized model — what request admission prices). These rows were sampled every
+    /// 100 ms and ran the earlier verify-everything-then-derive order; the working set is MLX's
+    /// active peak (the probe did not record its footprint), which can only overstate the load's
+    /// share. Each row's estimate is recomputed from code, from the committed manifest of its
+    /// pinned snapshot ([`manifest_facts`]). Recorded evidence, not a machine golden: the tests
+    /// assert relations only.
     pub(super) const MEASURED: &[Measured] = &[
         Measured {
             config: "Gemma 2 2B-it BF16",
-            snapshot: "models--SceneWorks--gemma-2-2b-it/snapshots/684c553b5b41a1c835989d89f62f585e6269a7de",
+            manifest: "gemma-2-2b-it",
             quantize: None,
-            estimate: 5_723_841_512,
-            measured_peak: 5_518_511_596,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: Some(5_518_511_596),
+            first_request: 9_052_000_000,
+            request_working_set: 3_528_000_000,
         },
         Measured {
             config: "Gemma 2 2B-it load-time Q4",
-            snapshot: "models--SceneWorks--gemma-2-2b-it/snapshots/684c553b5b41a1c835989d89f62f585e6269a7de",
+            manifest: "gemma-2-2b-it",
             quantize: Some(core_llm::Quantize::Q4),
-            estimate: 6_865_478_632,
-            measured_peak: 6_586_586_804,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 9_013_000_000,
+            request_working_set: 2_426_000_000,
         },
         Measured {
             config: "Llama 3.2 1B Instruct BF16",
-            snapshot: "models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/863c846a9ac6fad4e49e1743d52984dff262e953",
+            manifest: "llama-3.2-1b-instruct-bf16",
             quantize: None,
-            estimate: 2_760_013_225,
-            measured_peak: 2_622_474_088,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: Some(2_622_474_088),
+            first_request: 2_680_000_000,
+            request_working_set: 35_000_000,
         },
         Measured {
             config: "Llama 3.2 1B Instruct load-time Q4",
-            snapshot: "models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/863c846a9ac6fad4e49e1743d52984dff262e953",
+            manifest: "llama-3.2-1b-instruct-bf16",
             quantize: Some(core_llm::Quantize::Q4),
-            estimate: 3_309_204_905,
-            measured_peak: 3_023_299_764,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 3_065_000_000,
+            request_working_set: 41_000_000,
         },
         Measured {
             config: "Llama 3.2 1B Instruct load-time Q8",
-            snapshot: "models--mlx-community--Llama-3.2-1B-Instruct-bf16/snapshots/863c846a9ac6fad4e49e1743d52984dff262e953",
+            manifest: "llama-3.2-1b-instruct-bf16",
             quantize: Some(core_llm::Quantize::Q8),
-            estimate: 3_795_744_169,
-            measured_peak: 3_685_410_288,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 3_723_000_000,
+            request_working_set: 38_000_000,
         },
         Measured {
             config: "Qwen3-1.7B BF16",
-            snapshot: "models--mlx-community--Qwen3-1.7B-bf16/snapshots/9cd6692855d3e06772228e9a962b2606359b2d24",
+            manifest: "qwen3-1.7b-bf16",
             quantize: None,
-            estimate: 3_789_864_045,
-            measured_peak: 3_573_647_904,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: Some(3_573_647_904),
+            first_request: 3_658_000_000,
+            request_working_set: 46_000_000,
         },
         Measured {
             config: "Qwen3-1.7B load-time Q4",
-            snapshot: "models--mlx-community--Qwen3-1.7B-bf16/snapshots/9cd6692855d3e06772228e9a962b2606359b2d24",
+            manifest: "qwen3-1.7b-bf16",
             quantize: Some(core_llm::Quantize::Q4),
-            estimate: 4_585_798_765,
-            measured_peak: 4_418_239_520,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 4_456_000_000,
+            request_working_set: 38_000_000,
         },
         Measured {
             config: "Qwen3-8B load-time Q4",
-            snapshot: "models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+            manifest: "qwen3-8b",
             quantize: Some(core_llm::Quantize::Q4),
-            estimate: 20_644_038_072,
-            measured_peak: 19_874_702_744,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 19_962_000_000,
+            request_working_set: 87_000_000,
         },
         Measured {
             config: "Qwen3-8B load-time Q8",
-            snapshot: "models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+            manifest: "qwen3-8b",
             quantize: Some(core_llm::Quantize::Q8),
-            estimate: 24_116_921_784,
-            measured_peak: 23_905_933_824,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 23_988_000_000,
+            request_working_set: 82_000_000,
         },
         Measured {
             config: "Qwen3-8B BF16",
-            snapshot: "models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+            manifest: "qwen3-8b",
             quantize: None,
-            estimate: 16_732_915_128,
-            measured_peak: 16_513_117_776,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: Some(16_513_117_776),
+            first_request: 16_610_000_000,
+            request_working_set: 53_000_000,
         },
         Measured {
             config: "Gemma 4 unified (LTX-2.5 enhancer) BF16",
-            snapshot: "models--SceneWorks--ltx-2.5-mlx/snapshots/791ef61731ad067bd13ebff8cc0f07532476d9ef/enhancer",
+            manifest: "ltx-2.5-enhancer",
             quantize: None,
-            estimate: 24_796_675_216,
-            measured_peak: 24_304_141_352,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: Some(24_304_141_352),
+            first_request: 30_482_000_000,
+            request_working_set: 5_416_000_000,
         },
         Measured {
             config: "Gemma 4 unified (LTX-2.5 enhancer) load-time Q4",
-            snapshot: "models--SceneWorks--ltx-2.5-mlx/snapshots/791ef61731ad067bd13ebff8cc0f07532476d9ef/enhancer",
+            manifest: "ltx-2.5-enhancer",
             quantize: Some(core_llm::Quantize::Q4),
-            estimate: 30_962_780_304,
-            measured_peak: 29_924_992_928,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 34_391_000_000,
+            request_working_set: 4_466_000_000,
         },
         Measured {
             config: "Qwen3.8-27B load-time Q4",
-            snapshot: "models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            manifest: "qwen3.8-27b",
             quantize: Some(core_llm::Quantize::Q4),
-            estimate: 69_916_536_056,
-            measured_peak: 69_476_846_942,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 69_713_000_000,
+            request_working_set: 236_000_000,
         },
         Measured {
             config: "Qwen3.8-27B load-time Q8",
-            snapshot: "models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+            manifest: "qwen3.8-27b",
             quantize: Some(core_llm::Quantize::Q8),
-            estimate: 82_304_150_776,
-            measured_peak: 80_639_984_014,
+            order: Order::Earlier,
+            sampling: Sampling::Every100Ms,
+            after_load: None,
+            first_request: 80_870_000_000,
+            request_working_set: 230_000_000,
         },
     ];
 
-    /// One recorded probe.
-    pub(super) struct Measured {
-        /// What was loaded: snapshot (HF repo @ revision) and conversion.
-        pub(super) config: &'static str,
-        /// Snapshot directory relative to `LOAD_PROBE_SNAPSHOT_ROOT` (the local hub directory).
-        pub(super) snapshot: &'static str,
-        pub(super) quantize: Option<core_llm::Quantize>,
-        /// `required_bytes` for this snapshot and conversion.
-        pub(super) estimate: u64,
-        /// Peak `phys_footprint` growth over the pre-load footprint, sampled every 100 ms
-        /// in-process, across load + a one-token request.
-        pub(super) measured_peak: u64,
+    /// Which load order a probe ran.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Order {
+        /// Every accessed source verified up front, derived arrays built by the first forward.
+        Earlier,
+        /// The provider's group-by-group materialize-at-load order.
+        Materialized,
     }
 
-    /// Margin the estimate must keep above every recorded peak, in tenths of a percent (0.5%).
-    /// The tightest recorded margin is Qwen3.8-27B at load-time Q4 (0.63%).
-    const MARGIN_PERMILLE: u64 = 5;
+    /// How a probe read its peak.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Sampling {
+        /// `phys_footprint` sampled every 100 ms (and once after each step): a peak that a
+        /// `clear_cache` cuts short between two samples is missed — at most what was allocated
+        /// since the last sample, bounded by the arrays the first request derived.
+        Every100Ms,
+        /// The kernel's exact maximum (`ri_interval_max_phys_footprint` /
+        /// `ri_lifetime_max_phys_footprint`): nothing missed. The re-probes record it.
+        #[allow(dead_code)]
+        Exact,
+    }
 
+    /// One recorded probe.
+    pub(super) struct Measured {
+        /// What was loaded and how.
+        pub(super) config: &'static str,
+        /// The committed manifest of the pinned snapshot (`crates/llm/testdata/load_admission`).
+        pub(super) manifest: &'static str,
+        pub(super) quantize: Option<core_llm::Quantize>,
+        pub(super) order: Order,
+        pub(super) sampling: Sampling,
+        /// Footprint growth through the end of the load, when recorded.
+        pub(super) after_load: Option<u64>,
+        /// The first one-token request's peak footprint growth over the pre-load baseline.
+        pub(super) first_request: u64,
+        /// The request's own working set (a second identical request).
+        pub(super) request_working_set: u64,
+    }
+
+    impl Measured {
+        /// The load's share of the peak — the one method every cell is measured by.
+        pub(super) fn peak(&self) -> u64 {
+            self.after_load
+                .unwrap_or(0)
+                .max(self.first_request.saturating_sub(self.request_working_set))
+        }
+
+        fn quant(&self) -> Option<QuantSpec> {
+            self.quantize
+                .map(|q| crate::provider::quant_spec(q).unwrap())
+        }
+
+        /// The bound this probe's order is charged, recomputed from the manifest.
+        pub(super) fn estimate(&self, facts: &SnapshotFacts) -> u64 {
+            let arrays = match self.order {
+                Order::Earlier => facts.earlier_arrays(self.quant()).unwrap(),
+                Order::Materialized => materialized_bound(&facts.headers, self.quant()).unwrap(),
+            };
+            arrays + facts.host().unwrap()
+        }
+
+        /// The margin the estimate must keep above [`Measured::peak`]: 0.5 % for run-to-run
+        /// variation (the tightest exact relation recorded so far), plus — for a sampled probe —
+        /// everything the sampler can have missed: the arrays the first request derived
+        /// ([`derived_bytes`]), which a `clear_cache` between two 100 ms samples can hide. (The
+        /// 0.5 s memory guard was observed under-reading one 81 GB load by 5 GiB.)
+        pub(super) fn margin(&self, facts: &SnapshotFacts) -> u64 {
+            let variation = self.peak() / 200;
+            match self.sampling {
+                Sampling::Exact => variation,
+                Sampling::Every100Ms => {
+                    variation + derived_bytes(&facts.headers, self.quant()).unwrap()
+                }
+            }
+        }
+
+        /// The cell this probe measured.
+        pub(super) fn cell(&self, facts: &SnapshotFacts) -> LoadCell {
+            LoadCell::of(&facts.config, &facts.headers, self.quant())
+        }
+
+        pub(super) fn covered(&self, facts: &SnapshotFacts) -> bool {
+            self.estimate(facts) >= self.peak() + self.margin(facts)
+        }
+    }
+
+    /// Print every recorded probe recomputed from code (for the doc's table).
     #[test]
-    fn every_recorded_probe_peak_is_covered_by_its_estimate_with_margin() {
+    #[ignore = "prints the recorded probes' recomputed relations"]
+    fn print_recorded_probes() {
         for m in MEASURED {
-            assert!(
-                m.estimate >= m.measured_peak + m.measured_peak * MARGIN_PERMILLE / 1000,
-                "{}: estimate {} does not cover measured peak {} with {MARGIN_PERMILLE}‰ margin",
+            let facts = manifest_facts(m.manifest);
+            println!(
+                "PROBE {} | cell {:?} | estimate {} | peak {} | margin {} | covered {}",
                 m.config,
-                m.estimate,
-                m.measured_peak
+                m.cell(&facts),
+                m.estimate(&facts),
+                m.peak(),
+                m.margin(&facts),
+                m.covered(&facts)
             );
         }
     }
 
-    /// Header-only: recompute each recorded estimate from the local pinned snapshot.
+    /// sc-24446: every recorded probe is recomputed from code — its estimate from the committed
+    /// manifest of its pinned snapshot, its peak by the one method — and a cell is verified
+    /// (`EARLIER_VERIFIED` / `MATERIALIZED_VERIFIED`) **only** if a probe of that order measured
+    /// it, and every such probe is covered with the margin. A probe that is not covered keeps its
+    /// cell on the two-copy floor.
+    ///
+    /// MUTATION: add a cell to either table without a covering probe (e.g. Gemma 4 unified BF16,
+    /// whose uniform peak 25.066 GB exceeds its 25.065 GB estimate, or Llama load-time Q4), or drop
+    /// the sampler term from [`Measured::margin`] (which would let the sampled load-time probes
+    /// count as covered), and this goes RED.
     #[test]
-    #[ignore = "requires the pinned snapshots under LOAD_PROBE_SNAPSHOT_ROOT"]
-    fn pinned_real_weight_estimates_match_the_recorded_table() {
-        let hub = std::path::PathBuf::from(
-            std::env::var("LOAD_PROBE_SNAPSHOT_ROOT").expect("set LOAD_PROBE_SNAPSHOT_ROOT"),
-        );
+    fn verified_cells_are_exactly_the_probed_and_covered_ones() {
+        for (table, order) in [
+            (EARLIER_VERIFIED, Order::Earlier),
+            (MATERIALIZED_VERIFIED, Order::Materialized),
+        ] {
+            for cell in table {
+                let probes: Vec<&Measured> = MEASURED
+                    .iter()
+                    .filter(|m| m.order == order)
+                    .filter(|m| m.cell(&manifest_facts(m.manifest)).is_in(&[*cell]))
+                    .collect();
+                assert!(
+                    !probes.is_empty(),
+                    "{cell:?}: verified with no probe behind it"
+                );
+            }
+        }
         for m in MEASURED {
-            let mut spec = LoadSpec::dense(hub.join(m.snapshot).display().to_string());
-            spec.quantize = m.quantize;
-            assert_eq!(required_bytes(&spec).unwrap(), m.estimate, "{}", m.config);
+            let facts = manifest_facts(m.manifest);
+            let table = match m.order {
+                Order::Earlier => EARLIER_VERIFIED,
+                Order::Materialized => MATERIALIZED_VERIFIED,
+            };
+            if m.cell(&facts).is_in(table) {
+                assert!(
+                    m.covered(&facts),
+                    "{}: estimate {} does not cover peak {} + margin {}",
+                    m.config,
+                    m.estimate(&facts),
+                    m.peak(),
+                    m.margin(&facts)
+                );
+            }
+        }
+        // The Gemma 4 unified BF16 probe, by the uniform method, sits above its estimate.
+        let gemma4 = MEASURED
+            .iter()
+            .find(|m| m.config == "Gemma 4 unified (LTX-2.5 enhancer) BF16")
+            .unwrap();
+        let facts = manifest_facts(gemma4.manifest);
+        assert!(gemma4.peak() > gemma4.estimate(&facts));
+        assert!(!gemma4.cell(&facts).is_in(EARLIER_VERIFIED));
+        // A sampled load-time probe cannot clear its margin: the first request's derived arrays,
+        // which a `clear_cache` between samples can hide, are as large as the margin it needs.
+        for m in MEASURED.iter().filter(|m| m.quantize.is_some()) {
+            let facts = manifest_facts(m.manifest);
+            assert_eq!(m.sampling, Sampling::Every100Ms);
+            assert!(
+                !m.covered(&facts),
+                "{}: a sampled load-time probe counted",
+                m.config
+            );
         }
     }
 

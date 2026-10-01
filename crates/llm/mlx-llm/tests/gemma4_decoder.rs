@@ -49,15 +49,23 @@ const GOLDENS: &str = include_str!("../../testdata/gemma4/gemma4_decoder_goldens
 /// **5.8e-3** (logits 2.9e-3, stepped-decode-vs-prefill 3.9e-4) on an idle machine with the `f32`
 /// GeGLU activations the LTX-2.5 text encoder keeps. The budget is ~3.4x that, which is the
 /// headroom `tests/architecture_forward.rs` documents MLX's Metal kernels needing under runner
-/// load (drift of ~1.6e-3 absolute observed there on values near 1). The BF16 GeGLU every LLM
-/// decode path runs since sc-24446 (the default role, which the goldens below load) measures
-/// **1.3e-2** hidden / **1.1e-2** logits — inside the budget with ~1.5x headroom
-/// ([`the_reference_holds_under_either_activation_dtype`]).
+/// load (drift of ~1.6e-3 absolute observed there on values near 1). The goldens below load the
+/// fixture with the LTX-2.5 text encoder's activation role (`f32` GeGLU) — these are the hidden
+/// states its feature extractor consumes — so this budget keeps that headroom; the BF16 GeGLU
+/// every LLM decode path runs is held to [`BF16_ABS_TOL`].
 ///
 /// Loose in absolute terms and still decisive: the four mutations land at 1.1e-1 to 5.8e-1
 /// relative — 6x to 30x this budget. [`mutations_are_all_outside_the_tolerance`] pins that gap
 /// every run rather than trusting this comment.
 const ABS_TOL: f32 = 2.0e-2;
+
+/// The budget for the BF16 GeGLU path (sc-24446), **derived, not fitted**: by the triangle
+/// inequality its distance to the `f32` oracle is at most its distance to this decoder's `f32`
+/// path plus that path's distance to the oracle — the parity gate's `2⁻⁵` of the tensor's
+/// magnitude (eight BF16 ULPs: one 2⁻⁹ rounding of each GeGLU output, then a BF16 stream, over the
+/// fixture's layers; `mlx_llm::primitives::activation`) plus [`ABS_TOL`]. Measured 1.3e-2 hidden /
+/// 1.1e-2 logits: ~3.9x headroom. The narrowest mutation (1.1e-1) still lands 2.1x outside it.
+const BF16_ABS_TOL: f32 = ABS_TOL + 1.0 / 32.0;
 
 /// How far outside [`ABS_TOL`] a mutation must land for the fixture to count as discriminating.
 ///
@@ -92,6 +100,16 @@ fn scale_of(want: &[f32]) -> f32 {
     want.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1.0)
 }
 
+fn assert_close_within(got: &[f32], want: &[f32], tol: f32, what: &str) {
+    let scale = scale_of(want);
+    let err = max_abs_err(got, want);
+    assert!(
+        err <= tol * scale,
+        "{what}: max|delta| = {err} exceeds {} (rel {tol} of magnitude {scale})",
+        tol * scale
+    );
+}
+
 fn assert_abs_close(got: &[f32], want: &[f32], what: &str) {
     let scale = scale_of(want);
     let err = max_abs_err(got, want);
@@ -115,7 +133,9 @@ fn host(a: &Array) -> Vec<f32> {
 /// `section` is the fixture root (the top level, or the `kv_shared` variant), both of which carry a
 /// `config` and a `weights` map.
 fn model_from(section: &Value) -> CausalLm {
-    let cfg = ModelConfig::from_json(&section["config"]).expect("fixture config parses");
+    let mut cfg = ModelConfig::from_json(&section["config"]).expect("fixture config parses");
+    // The text encoder's role: `f32` GeGLU activations, the path the oracle's budget is set for.
+    cfg.activation_role = mlx_llm::primitives::activation::ActivationRole::LtxTextEncoder;
     assert!(
         cfg.is_gemma4(),
         "the fixture must exercise the Gemma 4 path"
@@ -542,6 +562,11 @@ fn mutations_are_all_outside_the_tolerance() {
             .collect();
         let err = worst_relative(&mutated, want);
         assert!(
+            err > BF16_ABS_TOL * 2.0,
+            "mutation {name:?} deviates by only {err} (rel), within 2x the {BF16_ABS_TOL} BF16 \
+             budget"
+        );
+        assert!(
             err > ABS_TOL * MUTATION_MARGIN,
             "mutation {name:?} ({}) deviates from the golden by only {err} (rel), within \
              {MUTATION_MARGIN}x the {ABS_TOL} budget the real forward sits inside at {real} — the \
@@ -902,7 +927,11 @@ fn gemma4_truncate_rollback_forgets_the_rejected_drafts() {
 /// BF16 GeGLU every LLM decode path runs — at every hidden state and every logit, inside the one
 /// [`ABS_TOL`] budget. Measured: worst relative deviation 5.8e-3 (hidden) / 3.0e-3 (logits) on the
 /// `f32` path, 1.3e-2 / 1.1e-2 on the BF16 path — rounding the GeGLU output (and hence the
-/// residual stream) to BF16's 8-bit significand once per layer, against an `f32` NumPy oracle.
+/// residual stream) to BF16's 8-bit significand once per layer, against an `f32` NumPy oracle;
+/// held to [`ABS_TOL`] and the derived [`BF16_ABS_TOL`] respectively.
+///
+/// MUTATION: map `ActivationRole::LlmDecode` to `GeluPrecision::F32` in the policy (so the
+/// "BF16" case silently ran the `f32` path) and this goes RED.
 #[test]
 fn the_reference_holds_under_either_activation_dtype() {
     use mlx_llm::primitives::activation::ActivationRole;
@@ -934,12 +963,75 @@ fn the_reference_holds_under_either_activation_dtype() {
             .hidden_states(&input_ids(&ids), &mut model.new_cache(), 0)
             .unwrap();
         assert_eq!(states.last().unwrap().dtype(), stream, "{role:?}");
+        let tol = if stream == Dtype::Float32 {
+            ABS_TOL
+        } else {
+            BF16_ABS_TOL
+        };
         for (i, (got, want)) in states.iter().zip(want_layers).enumerate() {
-            assert_abs_close(&host(got), &floats(want), &format!("{role:?} hidden[{i}]"));
+            assert_close_within(
+                &host(got),
+                &floats(want),
+                tol,
+                &format!("{role:?} hidden[{i}]"),
+            );
         }
         let logits = model
             .decode_logits_all(&input_ids(&ids), &mut model.new_cache(), 0)
             .unwrap();
-        assert_abs_close(&host(&logits), &want_logits, &format!("{role:?} logits"));
+        assert_close_within(
+            &host(&logits),
+            &want_logits,
+            tol,
+            &format!("{role:?} logits"),
+        );
+    }
+}
+
+/// sc-24446: the Gemma 4 decoder (both fixtures: alternating sliding / full, and the KV-shared
+/// tail) loads through the production provider path with every source it read consumed — its
+/// layer scalars, q/k norms and k = v projections included (an unconsumed source is a load
+/// error).
+///
+/// MUTATION: drop `layer_scalar` from `LlamaLayer::arrays` and this goes RED.
+#[test]
+fn gemma4_loads_through_the_provider_with_every_source_consumed() {
+    let g = goldens();
+    for section in [&g, &g["kv_shared"]] {
+        let mut map: HashMap<String, Array> = HashMap::new();
+        for (key, entry) in section["weights"].as_object().unwrap() {
+            let shape: Vec<i32> = entry["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_i64().unwrap() as i32)
+                .collect();
+            map.insert(
+                key.clone(),
+                Array::from_slice(&floats(&entry["data"]), &shape),
+            );
+        }
+        let cfg = ModelConfig::from_json(&section["config"]).unwrap();
+        // A text-only snapshot: the fixture carries no media front-end tensors.
+        let mut config = section["config"].clone();
+        // The multimodal block names its splice token ids even for a text-only checkpoint.
+        let last = cfg.vocab_size as i64 - 1;
+        for (i, key) in [
+            "image_token_id",
+            "boi_token_id",
+            "eoi_token_id",
+            "audio_token_id",
+            "boa_token_id",
+            "eoa_token_id",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            config[key] = serde_json::json!(last - i as i64);
+        }
+        let dir = crate::common::Fixture::new("mlx-llm-gemma4-load-", None);
+        crate::common::write_snapshot(&dir, &config, &map, cfg.vocab_size as usize);
+        mlx_llm::LlamaProvider::load(&core_llm::LoadSpec::dense(dir.to_str().unwrap()))
+            .expect("the Gemma 4 fixture loads with every source consumed");
     }
 }

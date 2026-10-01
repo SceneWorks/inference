@@ -75,7 +75,10 @@ pub fn gelu_tanh(x: &Array, role: ActivationRole) -> Result<Array> {
 /// 2⁻⁹ relative; the residual stream then stays BF16 too, so each later op rounds where the `f32`
 /// path did not. Over the fixtures' 2–4 layers and the LM head that measures 1–2 % (the Gemma 4
 /// decoder golden: 1.1e-2 against an `f32` oracle); 2⁻⁵ keeps ~1.5–3x headroom and is still far
-/// below what a structural error moves (a dropped layer scalar: 1.1e-1). **Greedy tokens** must
+/// below what a structural error moves (a dropped layer scalar: 1.1e-1; swapping the GELU for a
+/// different activation such as SiLU: 7.7e-2–1.4e-1 — a near-identical one such as the exact erf
+/// GELU is *not* caught here, which is why `gelu_tanh_is_the_tanh_approximation` pins the formula
+/// directly). **Greedy tokens** must
 /// agree at every step whose `f32` top-2 margin exceeds twice that step's `|Δlogit|` — a closer
 /// race may legitimately flip, and is counted, never silently accepted.
 #[cfg(test)]
@@ -211,6 +214,36 @@ pub(crate) mod parity {
 mod tests {
     use super::*;
     use mlx_rs::Dtype;
+
+    /// The tanh approximation itself, against the formula evaluated on the host:
+    /// `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`, to f32 rounding. The exact (erf) GELU differs
+    /// from it by up to ~5e-4 over this range, far outside the 2e-6 tolerance.
+    ///
+    /// MUTATION: route `gelu_tanh` through `mlx_rs::nn::gelu` (erf) and this goes RED.
+    #[test]
+    fn gelu_tanh_is_the_tanh_approximation() {
+        let xs: Vec<f32> = (-60..=60).map(|i| i as f32 * 0.1).collect();
+        let x = Array::from_slice(&xs, &[xs.len() as i32]);
+        for role in [
+            ActivationRole::LlmDecode,
+            ActivationRole::LtxTextEncoder,
+            ActivationRole::VisionEncoder,
+        ] {
+            let got = gelu_tanh(&x, role).unwrap();
+            for (&xi, &yi) in xs.iter().zip(got.as_slice::<f32>()) {
+                let x64 = f64::from(xi);
+                let want = 0.5
+                    * x64
+                    * (1.0
+                        + ((2.0 / std::f64::consts::PI).sqrt() * (x64 + 0.044715 * x64.powi(3)))
+                            .tanh());
+                assert!(
+                    (f64::from(yi) - want).abs() <= 2e-6 * want.abs().max(1.0),
+                    "{role:?} x={xi}: {yi} vs {want}"
+                );
+            }
+        }
+    }
 
     /// The policy, and what each precision returns for a BF16 input: an LLM decoder keeps BF16
     /// (the GELU rounded once from its `f32` evaluation), a pinned role keeps `f32`.
