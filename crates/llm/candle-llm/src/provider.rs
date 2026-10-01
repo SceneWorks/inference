@@ -992,13 +992,12 @@ pub struct LoadRecord {
     /// `None` for a provider assembled without a load ([`LlamaProvider::from_parts`]), which
     /// follows the process switch.
     pub cuda_graphs: Option<bool>,
-    /// Every feature the load asked for but did not deliver, each named by the feature: with the
-    /// CUDA-graph switch on, a decoder whose step cannot be captured
-    /// (`cuda_graphs: <graph_support reason>`, sc-24441), known at load so a product can disable
-    /// its graph toggle before the first generation; a companion MTP head
-    /// ([`LoadSpec::mtp_head_source`]) that was refused by load admission, did not match the
-    /// target, or named a non-Qwen3.5 target (`mtp_head: …`, sc-24444). The model still loaded
-    /// (epic sc-24432 E2).
+    /// Every feature the load asked for but did not deliver, each named by the feature:
+    /// `mtp_head: …`, a companion MTP head ([`LoadSpec::mtp_head_source`]) that was refused by
+    /// load admission, did not match the target, or named a non-Qwen3.5 target; and, with the
+    /// CUDA-graph switch on, `cuda_graphs: <graph_support reason>` for a decoder whose step the
+    /// graph runner can never capture (sc-24441), known at load so a product can disable its
+    /// graph toggle before the first generation. The target still loaded (epic sc-24432 E2).
     pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (sc-24437): the requested
     /// budget clamped to the headroom admission left. `None` for a provider assembled without a
@@ -9836,11 +9835,17 @@ mod tests {
             "every step of the Off request went through the runner: {}",
             engine.cuda_graphs.describe()
         );
-        let reason = engine
-            .cuda_graphs
-            .fallback_reason
-            .expect("an eager step names why");
-        assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH);
+        // An eager step names why — unless it is the warm-up or capture of a shape the runner
+        // did capture (sc-24441: the dense decoders capture on CUDA; a 3-token request can end
+        // before the first replay, and its prefill segments are never captured).
+        match engine.cuda_graphs.fallback_reason {
+            Some(reason) => assert_ne!(reason, crate::decode::graph::REASON_REFERENCE_PATH),
+            None => assert!(
+                engine.cuda_graphs.captured > 0,
+                "an eager step with no reason belongs to a captured shape: {}",
+                engine.cuda_graphs.describe()
+            ),
+        }
         assert_eq!(run(&off).cuda_graphs.label(), "none");
 
         let describe = |provider: &mut super::LlamaProvider| {

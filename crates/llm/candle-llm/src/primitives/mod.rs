@@ -45,8 +45,9 @@ pub use decode_cache::{tensor_bytes, CacheMemory, DecodeCache};
 #[doc(hidden)]
 pub use device_positions::device_positions_policy_guard;
 pub use device_positions::{
-    device_positions_default, set_device_positions_default, DevicePositions, DeviceRope,
-    DEVICE_POSITIONS_DEFAULT, DEVICE_POSITIONS_ENV, MAX_DEVICE_STEP_TOKENS,
+    device_positions_default, in_prefill, prefill_scope, set_device_positions_default,
+    DevicePositions, DeviceRope, PrefillScope, DEVICE_POSITIONS_DEFAULT, DEVICE_POSITIONS_ENV,
+    MAX_DEVICE_STEP_TOKENS,
 };
 pub use fused::{
     fused_kernels_enabled, fused_tally, set_fused_kernels, FusedTally, FUSED_KERNELS_ENV,

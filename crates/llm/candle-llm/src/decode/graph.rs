@@ -1442,11 +1442,12 @@ mod cuda {
             }
         };
         let base = cache.len();
-        if base == 0 {
-            // A step from an empty cache is a prompt prefill: never captured, so it runs plain
-            // eager — outside the parameter-cache guard (the prefill builds host-side RoPE tables
-            // and masks, uploads a guarded forward must not make; see `guarded_request`) and
-            // outside the warm-up bookkeeping.
+        if base == 0 || request.prefill {
+            // A step from an empty cache, or one marked a prefill segment (a prefix-cache hit's
+            // suffix, sc-24437), is a prompt prefill: never captured, so it runs plain eager —
+            // outside the parameter-cache guard (the prefill builds host-side RoPE tables and
+            // masks, uploads a guarded forward must not make; see `guarded_request`) and outside
+            // the warm-up bookkeeping.
             let out = model.forward_step(cache, request)?;
             note_eager(None);
             return Ok(out);
@@ -1512,6 +1513,7 @@ mod cuda {
                             tokens: StepTokens::Device(&ids),
                             scope: request.scope,
                             want_hidden: request.want_hidden,
+                            prefill: request.prefill,
                         },
                     )?;
                     stage_outputs(&logits, hidden.as_ref(), out)
@@ -1634,6 +1636,7 @@ mod cuda {
             tokens: StepTokens::Device(ids),
             scope: request.scope,
             want_hidden: request.want_hidden,
+            prefill: request.prefill,
         }
     }
 

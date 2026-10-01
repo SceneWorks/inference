@@ -193,6 +193,7 @@ fn qwen38_27b_step_census() {
                 tokens: StepTokens::Device(&ids4),
                 scope: LogitsScope::All,
                 want_hidden: true,
+                prefill: false,
             },
         )
         .unwrap();
@@ -213,6 +214,7 @@ fn qwen38_27b_step_census() {
             tokens: StepTokens::Device(&ids4),
             scope: LogitsScope::All,
             want_hidden: true,
+            prefill: false,
         },
     )
     .unwrap();

@@ -24,9 +24,10 @@
 //!   written to ([`ring_write`](DevicePositions::ring_write)).
 //!
 //! The path is taken only for a step of at most [`MAX_DEVICE_STEP_TOKENS`] tokens (a decode or a
-//! verify step — exactly the shapes the graph runner captures); a longer prefill keeps the host
-//! positions and the `sdpa_gqa` attention, and both paths keep the cache's host-side length in
-//! step, so they interleave freely.
+//! verify step — exactly the shapes the graph runner captures); a prompt prefill — from an empty
+//! cache, longer than that, or marked as one ([`prefill_scope`], e.g. a prefix-cache hit's
+//! suffix) — keeps the host positions and the `sdpa_gqa` attention, and both paths keep the
+//! cache's host-side length in step, so they interleave freely.
 //!
 //! [`CausalLm`]: crate::models::CausalLm
 //! [`Qwen35Model`]: crate::models::Qwen35Model
@@ -87,6 +88,40 @@ pub fn set_device_positions_default(enabled: Option<bool>) {
 #[doc(hidden)]
 pub fn device_positions_policy_guard(enabled: Option<bool>) -> SwitchGuard {
     SWITCH.guard(enabled)
+}
+
+thread_local! {
+    /// Set while the current thread runs a prompt-prefill forward ([`prefill_scope`]).
+    static PREFILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the forwards the current thread runs until the returned scope drops as a prompt
+/// **prefill** (`on`) or not — [`StepRequest::prefill`](crate::decode::StepRequest::prefill),
+/// set by each model's `forward_step`. A prefill segment runs the host-position path and the
+/// reference (`sdpa_gqa`) attention even from a non-empty cache — a prefix-cache hit's suffix
+/// (sc-24437), a split prefill's second segment — so a restored request attends its prompt
+/// exactly as a cold prefill does; only decode / verify steps take the device-positions path.
+pub fn prefill_scope(on: bool) -> PrefillScope {
+    PrefillScope {
+        previous: PREFILL.with(|p| p.replace(on)),
+    }
+}
+
+/// Whether the current thread is inside a prefill forward ([`prefill_scope`]).
+pub fn in_prefill() -> bool {
+    PREFILL.with(std::cell::Cell::get)
+}
+
+/// Restores the thread's previous prefill marking when dropped ([`prefill_scope`]).
+#[must_use = "the prefill marking only applies while the scope is alive"]
+pub struct PrefillScope {
+    previous: bool,
+}
+
+impl Drop for PrefillScope {
+    fn drop(&mut self) {
+        PREFILL.with(|p| p.set(self.previous));
+    }
 }
 
 /// The longest step the device-positions path serves: the graph runner's largest captured step
