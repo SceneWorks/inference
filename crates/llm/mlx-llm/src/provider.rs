@@ -790,6 +790,7 @@ impl LlamaProvider {
             outcome,
             &mut self.descriptor.capabilities,
             &mut self.load_report.fallbacks,
+            recommended_depths(),
         );
         self.draft = draft;
         self.load_report.draft = Some(report);
@@ -996,7 +997,7 @@ impl LlamaProvider {
             Ok(max_depth) => self
                 .descriptor
                 .capabilities
-                .advertise_mtp(max_depth, MTP_RECOMMENDED_DEPTH),
+                .advertise_mtp(max_depth, recommended_depths().mtp),
             Err(reason) => self
                 .load_report
                 .fallbacks
@@ -2531,14 +2532,18 @@ fn qwen35_attention_geometry(cfg: &Qwen35Config) -> (i32, i32, i32, i32) {
     (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.head_dim)
 }
 
-/// The recommended MTP and prompt-lookup depths are the shared ones (E8): both backends run
-/// [`Speculative::Auto`](core_llm::Speculative::Auto) at the same depths.
-pub use core_llm::{MTP_RECOMMENDED_DEPTH, PROMPT_LOOKUP_RECOMMENDED_DEPTH};
+/// The per-proposer depths [`Speculative::Auto`](core_llm::Speculative::Auto) runs and every MLX
+/// advertisement recommends: the MLX row of the decode-defaults table (E5,
+/// [`core_llm::defaults`]).
+fn recommended_depths() -> &'static core_llm::RecommendedDepths {
+    &core_llm::DecodeBackend::Mlx.defaults().recommended_depths
+}
 
 /// The prompt-lookup advertisement every `mlx-llama` decoder carries, at the model's
-/// [`speculative_max_depth`] (the shared [`core_llm::prompt_lookup_capabilities`]).
+/// [`speculative_max_depth`] (the shared [`core_llm::prompt_lookup_capabilities`], recommending the
+/// MLX row's depth).
 fn prompt_lookup_capabilities(max_depth: u32) -> ProposerCapabilities {
-    core_llm::prompt_lookup_capabilities(max_depth)
+    core_llm::prompt_lookup_capabilities(max_depth, recommended_depths())
 }
 
 /// The proposer a request runs on the engine, after its resolved plan meets the request's shape
@@ -2871,7 +2876,7 @@ fn descriptor_for_qwen35(cfg: &Qwen35Config) -> TextLlmDescriptor {
     d.capabilities.speculative = vec![prompt_lookup_capabilities(max_depth)];
     if cfg.mtp_num_hidden_layers > 0 {
         d.capabilities
-            .advertise_mtp(max_depth, MTP_RECOMMENDED_DEPTH);
+            .advertise_mtp(max_depth, recommended_depths().mtp);
     }
     d
 }
@@ -3448,6 +3453,10 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The MLX row of the decode-defaults table, read directly (not through the provider's own
+    /// reader) so a provider that stops following the table is caught.
+    const MLX_ROW: &core_llm::DecodeDefaults = core_llm::DecodeBackend::Mlx.defaults();
 
     #[test]
     fn qwen35_dense_checkpoint_selects_one_decoder_root() {
@@ -4496,7 +4505,10 @@ mod tests {
             ProposerKind::PromptLookup,
             "auto without a head"
         );
-        assert_eq!(report.draft_tokens, Some(PROMPT_LOOKUP_RECOMMENDED_DEPTH));
+        assert_eq!(
+            report.draft_tokens,
+            Some(MLX_ROW.recommended_depths.prompt_lookup)
+        );
         assert!(report.fallbacks.is_empty());
 
         provider.descriptor.capabilities.speculative.clear();
@@ -4594,7 +4606,10 @@ mod tests {
             .descriptor
             .capabilities
             .speculative
-            .push(core_llm::draft_model_capabilities(max_depth));
+            .push(core_llm::draft_model_capabilities(
+                max_depth,
+                &MLX_ROW.recommended_depths,
+            ));
         provider
     }
 
@@ -4684,7 +4699,7 @@ mod tests {
             assert_eq!(
                 fallen,
                 SpeculativeRoute::PromptLookup {
-                    width: PROMPT_LOOKUP_RECOMMENDED_DEPTH as usize
+                    width: MLX_ROW.recommended_depths.prompt_lookup as usize
                 }
             );
             assert_eq!(why.len(), 1);
@@ -4811,7 +4826,10 @@ mod tests {
             let lookup = caps.proposer(SpeculativeProposer::PromptLookup).unwrap();
             // The fixtures' head dims (4, 8) are not vector-kernel dims: the 8-row bound.
             assert_eq!(lookup.max_depth, SPECULATIVE_MAX_DEPTH);
-            assert_eq!(lookup.recommended_depth, PROMPT_LOOKUP_RECOMMENDED_DEPTH);
+            assert_eq!(
+                lookup.recommended_depth,
+                MLX_ROW.recommended_depths.prompt_lookup
+            );
             let too_deep = spec_request(Speculative::proposer(
                 SpeculativeProposer::PromptLookup,
                 lookup.max_depth + 1,
@@ -4823,7 +4841,7 @@ mod tests {
         let mtp = caps.proposer(SpeculativeProposer::Mtp).unwrap();
         assert_eq!(
             (mtp.max_depth, mtp.recommended_depth),
-            (SPECULATIVE_MAX_DEPTH, MTP_RECOMMENDED_DEPTH)
+            (SPECULATIVE_MAX_DEPTH, MLX_ROW.recommended_depths.mtp)
         );
         assert_eq!(
             caps.mtp,
@@ -5292,7 +5310,7 @@ mod tests {
             .capabilities
             .proposer(SpeculativeProposer::Mtp)
             .expect("the attached head is advertised");
-        assert_eq!(advertised.recommended_depth, MTP_RECOMMENDED_DEPTH);
+        assert_eq!(advertised.recommended_depth, MLX_ROW.recommended_depths.mtp);
 
         let (off, off_ids) = run(&provider, &prism_request(Speculative::Off));
         assert_eq!(off_ids.len(), 20);
@@ -5567,7 +5585,12 @@ mod tests {
             speculative: Speculative::Auto,
             expect_proposer,
         };
-        let depths = [1, 3, PROMPT_LOOKUP_RECOMMENDED_DEPTH, SPECULATIVE_MAX_DEPTH];
+        let depths = [
+            1,
+            3,
+            MLX_ROW.recommended_depths.prompt_lookup,
+            SPECULATIVE_MAX_DEPTH,
+        ];
         for (label, provider, cases) in [
             (
                 "causal",

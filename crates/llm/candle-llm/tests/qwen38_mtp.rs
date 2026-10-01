@@ -365,7 +365,11 @@ fn frozen_qwen38_provider_executes_ar_mtp_tools_and_stops() {
         capabilities.mtp,
         Some(core_llm::MtpCapabilities {
             max_draft_tokens: candle_llm::provider::MTP_MAX_DEPTH,
-            recommended_draft_tokens: candle_llm::provider::MTP_RECOMMENDED_DEPTH,
+            recommended_draft_tokens: candle_llm::device::decode_defaults(
+                &candle_llm::device::select_device().unwrap()
+            )
+            .recommended_depths
+            .mtp,
         })
     );
 

@@ -47,8 +47,9 @@ use candle_gen::quant as shared;
 use candle_gen::CandleError;
 use candle_llm::decode::{
     generate_with_sampler, FinishReason, GenerationConfig, LogitsScope, SpeculativePrompt,
-    StepModel, StepOutput, StepRequest, TokenSampler,
+    StepModel, StepOutput, StepRequest, StreamEvent, TokenSampler,
 };
+use candle_llm::primitives::sampler::argmax_device;
 use candle_llm::primitives::{tensor_bytes, CacheMemory, DecodeCache, SamplerPath, SamplingParams};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1240,12 +1241,14 @@ impl LensReasonerModel {
     /// the harmony `<|return|>` stop or `max_new_tokens`. Returns the **new** tokens (including the
     /// trailing stop, which [`crate::text::clean_reasoner_output`] strips) — mirroring the vendor
     /// `out_ids[0, input_len:]`. At least one token (the prefill's) is always drawn. The mandatory
-    /// `cancel` flag is checked before prefill and before every subsequent decode step.
+    /// `cancel` flag is checked before prefill and, bridged onto the engine's flag, after every
+    /// emitted token (the engine's typed `Cancelled` finish).
     ///
     /// The decode is the shared Candle engine's token-at-a-time loop
     /// ([`candle_llm::decode::generate_with_sampler`], epic sc-24432 E8) over this model
-    /// (`ReasonerStep`), drawing every token through `ReasonerArgmax` — the f32 argmax this decode
-    /// always took — so a rewrite is token-identical to the pre-engine loop.
+    /// (`ReasonerStep`), drawing every token through `ReasonerArgmax` — candle-llm's shared
+    /// [`argmax_device`] over the f32 row, the argmax this decode always took — so a rewrite is
+    /// token-identical to the pre-engine loop.
     pub fn generate_greedy(
         &self,
         input_ids: &[u32],
@@ -1257,17 +1260,22 @@ impl LensReasonerModel {
             max_new_tokens,
             crate::text::HARMONY_RETURN,
             cancel,
+            &mut |_| {},
         )
     }
 
-    /// [`generate_greedy`](Self::generate_greedy) stopping at `stop`. The pre-engine loop kept the
-    /// final stop in its list, which the engine does not emit, so a stop-token end appends it.
+    /// [`generate_greedy`](Self::generate_greedy) stopping at `stop`, handing every engine event to
+    /// `on_event` before the cancel bridge reads `cancel`. The pre-engine loop kept the final stop in
+    /// its list, which the engine does not emit, so a stop-token end appends it. Past the prefill
+    /// check, `cancel` is observed after every emitted token — where the pre-engine loop checked it,
+    /// before every token after the first (a one-token budget never reaches it).
     fn generate_greedy_until(
         &self,
         input_ids: &[u32],
         max_new_tokens: usize,
         stop: u32,
         cancel: &CancelFlag,
+        on_event: &mut dyn FnMut(&StreamEvent),
     ) -> candle_gen::Result<Vec<u32>> {
         check_reasoner_cancel(cancel)?;
         let prompt: Vec<i32> = input_ids.iter().map(|&id| id as i32).collect();
@@ -1277,17 +1285,21 @@ impl LensReasonerModel {
             seed: None,
             stop_tokens: vec![stop as i32],
         };
-        let mut argmax = ReasonerArgmax {
-            cancel,
-            draws: 0,
-            last: None,
+        let mut argmax = ReasonerArgmax { last: None };
+        let engine_cancel = candle_llm::decode::CancelFlag::new();
+        let bridged = engine_cancel.clone();
+        let mut bridge = |event: StreamEvent| {
+            on_event(&event);
+            if cancel.is_cancelled() {
+                bridged.cancel();
+            }
         };
         let run = generate_with_sampler(
             &ReasonerStep(self),
             SpeculativePrompt::Tokens(&prompt),
             &generation,
-            &candle_llm::decode::CancelFlag::new(),
-            &mut |_| {},
+            &engine_cancel,
+            &mut bridge,
             None,
             None,
             &mut argmax,
@@ -1297,6 +1309,9 @@ impl LensReasonerModel {
             candle_llm::error::Error::Candle(e) => CandleError::Candle(e),
             other => CandleError::Msg(format!("lens reasoner decode: {other}")),
         })?;
+        if run.output.finish_reason == FinishReason::Cancelled {
+            return Err(CandleError::Canceled);
+        }
         let mut out: Vec<u32> = run.output.tokens.iter().map(|&id| id as u32).collect();
         if run.output.finish_reason == FinishReason::StopToken {
             out.extend(argmax.last.map(|id| id as u32));
@@ -1420,17 +1435,14 @@ impl StepModel for ReasonerStep<'_> {
     }
 }
 
-/// The reasoner's draw on the engine's sampler seam: the f32 argmax of the flattened logits row,
-/// one index read back — exactly the pre-engine loop's draw. The pre-engine loop checked `cancel`
-/// before every token after the first, which is where this draw checks it.
-struct ReasonerArgmax<'a> {
-    cancel: &'a CancelFlag,
-    draws: u64,
+/// The reasoner's draw on the engine's sampler seam: candle-llm's shared [`argmax_device`] over the
+/// flattened f32 logits row, one index read back — exactly the pre-engine loop's draw.
+struct ReasonerArgmax {
     /// The last token drawn — on a stop-token end, the stop the engine does not emit.
     last: Option<i32>,
 }
 
-impl TokenSampler for ReasonerArgmax<'_> {
+impl TokenSampler for ReasonerArgmax {
     fn sample(
         &mut self,
         logits: &Tensor,
@@ -1442,11 +1454,7 @@ impl TokenSampler for ReasonerArgmax<'_> {
                 "the Lens reasoner draw takes no constraint mask".into(),
             ));
         }
-        if self.draws > 0 && self.cancel.is_cancelled() {
-            return Err(candle_llm::error::Error::Canceled);
-        }
-        let id = logits.flatten_all()?.argmax(D::Minus1)?.to_vec0::<u32>()? as i32;
-        self.draws += 1;
+        let id = argmax_device(logits)?;
         self.last = Some(id);
         Ok((id, SamplerPath::Device))
     }
@@ -1667,7 +1675,9 @@ mod tests {
                 (1, u32::MAX),
             ] {
                 let want = reference_greedy(&m, prompt, max, stop, &none).unwrap();
-                let got = m.generate_greedy_until(prompt, max, stop, &none).unwrap();
+                let got = m
+                    .generate_greedy_until(prompt, max, stop, &none, &mut |_| {})
+                    .unwrap();
                 assert_eq!(got, want, "prompt {prompt:?} max {max} stop {stop}");
                 if want.last() == Some(&stop) {
                     stop_ends += 1;
@@ -1693,37 +1703,38 @@ mod tests {
                 Err(CandleError::Canceled)
             ));
             assert!(matches!(
-                m.generate_greedy_until(&prompt, max, u32::MAX, &cancel),
+                m.generate_greedy_until(&prompt, max, u32::MAX, &cancel, &mut |_| {}),
                 Err(CandleError::Canceled)
             ));
         }
-        // Past the prefill check, the draw checks before every token but the first — the
-        // pre-engine loop's in-loop check (a one-token budget never reaches it).
-        let decode = |max_new_tokens: usize| {
-            let mut argmax = ReasonerArgmax {
-                cancel: &cancel,
-                draws: 0,
-                last: None,
-            };
-            let generation = GenerationConfig {
-                max_new_tokens,
-                sampling: SamplingParams::default(),
-                seed: None,
-                stop_tokens: Vec::new(),
-            };
-            generate_with_sampler(
-                &ReasonerStep(&m),
-                SpeculativePrompt::Tokens(&[3, 17, 42]),
-                &generation,
-                &candle_llm::decode::CancelFlag::new(),
-                &mut |_| {},
-                None,
-                None,
-                &mut argmax,
-            )
-        };
-        assert_eq!(decode(1).unwrap().output.tokens.len(), 1);
-        assert!(matches!(decode(2), Err(candle_llm::error::Error::Canceled)));
+    }
+
+    /// Past the prefill check, a cancel set mid-decode is bridged onto the engine's flag: the
+    /// engine finishes `Cancelled` right after the token it was emitting and the decode returns the
+    /// typed [`CandleError::Canceled`]; a one-token budget (the pre-engine loop never reached its
+    /// in-loop check) still returns its token.
+    #[test]
+    fn a_mid_run_cancel_ends_the_decode_typed() {
+        let m = tiny_reasoner();
+        let prompt = [3u32, 17, 42, 8];
+        for (max, cancel_after) in [(16, 2usize), (1, 0)] {
+            let cancel = CancelFlag::new();
+            let mut emitted = 0;
+            let run = m.generate_greedy_until(&prompt, max, u32::MAX, &cancel, &mut |event| {
+                if let StreamEvent::Token { step, .. } = event {
+                    emitted = step + 1;
+                    if *step == cancel_after {
+                        cancel.cancel();
+                    }
+                }
+            });
+            if max == 1 {
+                assert_eq!(run.unwrap().len(), 1, "a one-token budget never checks");
+            } else {
+                assert!(matches!(run, Err(CandleError::Canceled)), "{run:?}");
+                assert_eq!(emitted, cancel_after + 1, "cancelled after that token");
+            }
+        }
     }
 
     #[test]

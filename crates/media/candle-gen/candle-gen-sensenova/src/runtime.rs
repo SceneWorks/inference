@@ -17,20 +17,28 @@
 //! Every text rollout — `generate_planned` and the interleave rollout's text segments (`t2i.rs`,
 //! which alternates them with gen-path image generation) — is the shared Candle engine's
 //! token-at-a-time loop ([`generate_with_sampler`], epic sc-24432 E8) over the understanding path
-//! (`UndStep`), drawing every token through `UndPick` — this crate's own host argmax / sort-based
-//! sampler over the f32 row, from its own seeded stream — so every stream is token-identical to the
-//! pre-engine loops.
+//! (`UndStep`), drawing every token through `UndPick` — the shared candle-llm sampler
+//! ([`sample_host`]: the device argmax for greedy, the shared temperature / top-k / nucleus
+//! reference for a stochastic draw) from the rollout's seeded [`SplitMix64`]. Greedy streams are
+//! token-identical to the pre-engine loops (ties break to the lowest index on the CPU, as they
+//! did). **Behaviour change (sc-24446):** a seeded *stochastic* stream is a valid draw from the
+//! same shaped distribution but no longer the pre-engine crate-local sort-based sampler's exact
+//! stream — the MLX twin (`mlx-gen-sensenova`) made the same move onto its shared sampler. The
+//! pipeline's cancel is bridged onto the engine's flag, so a cancel ends the rollout as the
+//! engine's typed `Cancelled` finish.
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::gen_core::attention_budget::AttentionPlan;
 use candle_gen::gen_core::CancelFlag;
 use candle_gen::{CandleError, Result};
+use candle_llm::decode::StreamEvent;
 use candle_llm::decode::{
     generate_with_sampler, FinishReason, GenerationConfig, LogitsScope, SpeculativePrompt,
     StepModel, StepOutput, StepRequest, TokenSampler,
 };
+use candle_llm::primitives::sampler::{argmax_host, sample_host};
 use candle_llm::primitives::{
-    CacheMemory, DecodeCache, HostSampleReason, SamplerPath, SamplingParams,
+    CacheMemory, DecodeCache, HostSampleReason, SamplerPath, SamplingParams, SplitMix64,
 };
 
 use crate::qwen3::{KvCache, Path, Qwen3Backbone};
@@ -51,17 +59,29 @@ pub enum Sampler {
 }
 
 impl Sampler {
-    /// Pick a token id from a `[vocab]` logits row, advancing `rng` for the stochastic variants.
-    fn pick(&self, logits: &[f32], rng: &mut SplitMix64) -> i32 {
+    /// The knobs in the shared sampler's vocabulary: greedy, or temperature + top-k + nucleus with
+    /// no penalty.
+    fn params(&self) -> SamplingParams {
         match *self {
-            Sampler::Greedy => argmax(logits),
+            Sampler::Greedy => SamplingParams::default(),
             Sampler::Sample {
                 temperature,
                 top_p,
                 top_k,
                 ..
-            } => sample(logits, temperature, top_p, top_k, rng),
+            } => SamplingParams {
+                temperature,
+                top_p,
+                top_k,
+                ..SamplingParams::default()
+            },
         }
+    }
+
+    /// Draw a token id from a logits row through the shared candle-llm sampler ([`sample_host`]),
+    /// advancing `rng` for the stochastic variants.
+    fn pick(&self, logits: &Tensor, rng: &mut SplitMix64) -> candle_llm::error::Result<i32> {
+        sample_host(logits, &[], &self.params(), rng, None)
     }
 
     fn seed(&self) -> u64 {
@@ -155,9 +175,10 @@ impl Qwen3Backbone {
 
     /// Roll out up to `max_new_tokens` understanding-path tokens on the shared engine from
     /// `first_logits` (the prefix's last-position row), the first fed at temporal `t_idx + 1`, until
-    /// any of `stops` is drawn. `cancel` is checked before every draw — where the pre-engine loops
-    /// checked it — and returns [`CandleError::Canceled`]. The caller's cache is lent to the engine
-    /// for the run and handed back whatever the outcome.
+    /// any of `stops` is drawn. `cancel` is bridged onto the engine's flag — set before the run, the
+    /// engine refuses it before any draw; set mid-run, it is observed after the token being emitted
+    /// and the engine finishes `Cancelled` — and either way returns [`CandleError::Canceled`]. The
+    /// caller's cache is lent to the engine for the run and handed back whatever the outcome.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rollout_planned(
         &self,
@@ -169,6 +190,34 @@ impl Qwen3Backbone {
         sampler: Sampler,
         cancel: Option<&CancelFlag>,
         attention: AttentionPlan<'_>,
+    ) -> Result<UndRollout> {
+        self.rollout_observed(
+            first_logits,
+            cache,
+            t_idx,
+            stops,
+            max_new_tokens,
+            sampler,
+            cancel,
+            attention,
+            &mut |_| {},
+        )
+    }
+
+    /// [`rollout_planned`](Self::rollout_planned), handing every engine event to `on_event` before
+    /// the cancel bridge reads the pipeline's flag.
+    #[allow(clippy::too_many_arguments)]
+    fn rollout_observed(
+        &self,
+        first_logits: &[f32],
+        cache: &mut KvCache,
+        t_idx: i32,
+        stops: &[i32],
+        max_new_tokens: usize,
+        sampler: Sampler,
+        cancel: Option<&CancelFlag>,
+        attention: AttentionPlan<'_>,
+        on_event: &mut dyn FnMut(&StreamEvent),
     ) -> Result<UndRollout> {
         let logits = Tensor::from_vec(
             first_logits.to_vec(),
@@ -183,7 +232,7 @@ impl Qwen3Backbone {
             delta: t_idx + 1 - start as i32,
             vocab: first_logits.len(),
         };
-        let mut pick = UndPick::new(sampler, cancel);
+        let mut pick = UndPick::new(sampler);
         let generation = GenerationConfig {
             max_new_tokens,
             sampling: pick.params,
@@ -193,6 +242,20 @@ impl Qwen3Backbone {
         // The engine's history is the penalty window and the draw reads none; the prefix (spliced
         // image rows included) is its length in placeholder ids.
         let history = vec![0; start.max(1)];
+        // The pipeline's cancel, bridged onto the engine's flag: before a run that would draw (the
+        // engine's typed pre-inference refusal; a zero budget draws nothing and ends `Ok`, as the
+        // pre-engine loops did) and after every emitted token (its `Cancelled` finish).
+        let engine_cancel = candle_llm::decode::CancelFlag::new();
+        if max_new_tokens > 0 && cancel.is_some_and(CancelFlag::is_cancelled) {
+            engine_cancel.cancel();
+        }
+        let bridged = engine_cancel.clone();
+        let mut bridge = |event: StreamEvent| {
+            on_event(&event);
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                bridged.cancel();
+            }
+        };
         let mut lent = UndCache(std::mem::replace(cache, self.new_cache()));
         let run = generate_with_sampler(
             &step,
@@ -205,8 +268,8 @@ impl Qwen3Backbone {
                 warm_proposer: false,
             },
             &generation,
-            &candle_llm::decode::CancelFlag::new(),
-            &mut |_| {},
+            &engine_cancel,
+            &mut bridge,
             None,
             None,
             &mut pick,
@@ -217,6 +280,9 @@ impl Qwen3Backbone {
             candle_llm::error::Error::Candle(e) => CandleError::Candle(e),
             other => CandleError::Msg(format!("sensenova text decode: {other}")),
         })?;
+        if run.output.finish_reason == FinishReason::Cancelled {
+            return Err(CandleError::Canceled);
+        }
         let stop = (run.output.finish_reason == FinishReason::StopToken)
             .then_some(pick.last)
             .flatten();
@@ -323,46 +389,32 @@ impl StepModel for UndStep<'_> {
     }
 }
 
-/// A rollout's draw on the engine's sampler seam — exactly the pre-engine loops' draw: the f32 row
-/// on the host, then [`Sampler::pick`] (this crate's host argmax, or its sort-based stochastic
-/// sampler from the rollout's seeded stream). `cancel` is checked before every draw.
-struct UndPick<'a> {
+/// A rollout's draw on the engine's sampler seam: the shared candle-llm sampler ([`Sampler::pick`],
+/// [`sample_host`]) from the rollout's seeded stream. It exists only to remember the last token
+/// drawn, which on a stop-token end is the stop the engine does not emit (an interleave segment
+/// ends differently on each of its two stops). Greedy is the device argmax; a stochastic draw is
+/// the shared host reference.
+struct UndPick {
     sampler: Sampler,
     rng: SplitMix64,
-    cancel: Option<&'a CancelFlag>,
-    /// The same knobs in the engine's vocabulary (reported, never drawn from).
+    /// The same knobs in the engine's vocabulary.
     params: SamplingParams,
     /// The last token drawn — on a stop-token end, the stop the engine does not emit.
     last: Option<i32>,
 }
 
-impl<'a> UndPick<'a> {
-    fn new(sampler: Sampler, cancel: Option<&'a CancelFlag>) -> Self {
-        let params = match sampler {
-            Sampler::Greedy => SamplingParams::default(),
-            Sampler::Sample {
-                temperature,
-                top_p,
-                top_k,
-                ..
-            } => SamplingParams {
-                temperature,
-                top_p,
-                top_k,
-                ..SamplingParams::default()
-            },
-        };
+impl UndPick {
+    fn new(sampler: Sampler) -> Self {
         Self {
             sampler,
             rng: SplitMix64::new(sampler.seed()),
-            cancel,
-            params,
+            params: sampler.params(),
             last: None,
         }
     }
 }
 
-impl TokenSampler for UndPick<'_> {
+impl TokenSampler for UndPick {
     fn sample(
         &mut self,
         logits: &Tensor,
@@ -374,115 +426,14 @@ impl TokenSampler for UndPick<'_> {
                 "the SenseNova rollout draw takes no constraint mask".into(),
             ));
         }
-        if self.cancel.is_some_and(CancelFlag::is_cancelled) {
-            return Err(candle_llm::error::Error::Canceled);
-        }
-        let row = logits.flatten_all()?.to_vec1::<f32>()?;
-        let token = self.sampler.pick(&row, &mut self.rng);
+        let token = self.sampler.pick(logits, &mut self.rng)?;
         self.last = Some(token);
-        Ok((token, SamplerPath::Host(HostSampleReason::Reference)))
-    }
-}
-
-/// Index of the maximum logit (ties → lowest index, matching `torch.argmax`).
-pub(crate) fn argmax(logits: &[f32]) -> i32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as i32
-}
-
-/// Temperature + top-k + nucleus (top-p) sampling over a logits row.
-fn sample(logits: &[f32], temperature: f32, top_p: f32, top_k: usize, rng: &mut SplitMix64) -> i32 {
-    let temperature = temperature.max(1e-6);
-    let mut order: Vec<usize> = (0..logits.len()).collect();
-    // Total order: descending logit, ties broken by ascending index.
-    let by_logit_then_index = |&a: &usize, &b: &usize| {
-        logits[b]
-            .partial_cmp(&logits[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    };
-
-    let k = if top_k == 0 {
-        order.len()
-    } else {
-        top_k.min(order.len())
-    };
-    if k < order.len() {
-        order.select_nth_unstable_by(k - 1, by_logit_then_index);
-        order.truncate(k);
-    }
-    order.sort_unstable_by(by_logit_then_index);
-
-    // Softmax (in the truncated set) at the given temperature, numerically stabilised.
-    let max_logit = logits[order[0]];
-    let mut probs: Vec<f32> = order
-        .iter()
-        .map(|&i| ((logits[i] - max_logit) / temperature).exp())
-        .collect();
-    let sum: f32 = probs.iter().sum();
-    for p in &mut probs {
-        *p /= sum;
-    }
-
-    // top-p (nucleus): keep the smallest prefix whose cumulative prob ≥ top_p.
-    if top_p < 1.0 {
-        let mut cum = 0.0f32;
-        let mut cutoff = probs.len();
-        for (i, &p) in probs.iter().enumerate() {
-            cum += p;
-            if cum >= top_p {
-                cutoff = i + 1;
-                break;
-            }
-        }
-        order.truncate(cutoff);
-        probs.truncate(cutoff);
-        let renorm: f32 = probs.iter().sum();
-        for p in &mut probs {
-            *p /= renorm;
-        }
-    }
-
-    // Inverse-CDF sample.
-    let r = rng.next_f32();
-    let mut cum = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cum += p;
-        if r <= cum {
-            return order[i] as i32;
-        }
-    }
-    order[order.len() - 1] as i32
-}
-
-/// SplitMix64 increment (the golden-ratio odd constant).
-pub(crate) const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// SplitMix64 — a tiny deterministic PRNG for reproducible sampling.
-pub(crate) struct SplitMix64(u64);
-
-impl SplitMix64 {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(SPLITMIX64_INCREMENT);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn next_f32(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) / ((1u64 << 24) as f32)
+        let path = if self.params.temperature <= 0.0 {
+            SamplerPath::Device
+        } else {
+            SamplerPath::Host(HostSampleReason::Reference)
+        };
+        Ok((token, path))
     }
 }
 
@@ -490,24 +441,36 @@ impl SplitMix64 {
 mod tests {
     use super::*;
 
+    fn row(logits: &[f32]) -> Tensor {
+        Tensor::from_slice(logits, logits.len(), &Device::Cpu).unwrap()
+    }
+
     #[test]
-    fn argmax_breaks_ties_to_lowest_index() {
-        assert_eq!(argmax(&[0.1, 0.5, 0.5, 0.2]), 1);
-        assert_eq!(argmax(&[3.0, 1.0, 2.0]), 0);
+    fn greedy_breaks_ties_to_lowest_index() {
+        let mut rng = SplitMix64::new(0);
+        for (logits, want) in [(&[0.1, 0.5, 0.5, 0.2][..], 1), (&[3.0, 1.0, 2.0][..], 0)] {
+            assert_eq!(Sampler::Greedy.pick(&row(logits), &mut rng).unwrap(), want);
+        }
     }
 
     #[test]
     fn top_k_one_is_argmax() {
-        let logits = [0.1, 2.0, 0.5, 1.0];
-        let mut rng = SplitMix64::new(123);
+        let logits = row(&[0.1, 2.0, 0.5, 1.0]);
+        let s = Sampler::Sample {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 1,
+            seed: 123,
+        };
+        let mut rng = SplitMix64::new(s.seed());
         for _ in 0..16 {
-            assert_eq!(sample(&logits, 1.0, 1.0, 1, &mut rng), 1);
+            assert_eq!(s.pick(&logits, &mut rng).unwrap(), 1);
         }
     }
 
     #[test]
     fn sampling_is_seed_deterministic() {
-        let logits = [0.2, 1.5, 0.3, 0.9, 0.1];
+        let logits = row(&[0.2, 1.5, 0.3, 0.9, 0.1]);
         let s = Sampler::Sample {
             temperature: 1.0,
             top_p: 1.0,
@@ -517,7 +480,7 @@ mod tests {
         let run = || {
             let mut rng = SplitMix64::new(s.seed());
             (0..8)
-                .map(|_| s.pick(&logits, &mut rng))
+                .map(|_| s.pick(&logits, &mut rng).unwrap())
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(), run(), "same seed → identical token sequence");
@@ -605,7 +568,10 @@ mod tests {
             .unwrap()
     }
 
-    /// The pre-engine `generate_planned` loop, verbatim.
+    /// The pre-engine `generate_planned` loop. Its greedy draw is frozen verbatim (the host scan,
+    /// ties to the lowest index — the pre-engine crate-local `argmax` was a byte copy of
+    /// [`argmax_host`]); its stochastic draw is the shared sampler the engine now draws through
+    /// (sc-24446: the pre-engine crate-local sort-based sampler's stream is not preserved).
     #[allow(clippy::too_many_arguments)]
     fn reference_generate(
         model: &Qwen3Backbone,
@@ -626,7 +592,10 @@ mod tests {
             if cancel.is_some_and(CancelFlag::is_cancelled) {
                 return Err(CandleError::Canceled);
             }
-            let next = sampler.pick(&logits, &mut rng);
+            let next = match sampler {
+                Sampler::Greedy => argmax_host(&logits),
+                Sampler::Sample { .. } => sampler.pick(&row(&logits), &mut rng).unwrap(),
+            };
             if eos.contains(&next) {
                 break;
             }
@@ -659,7 +628,7 @@ mod tests {
                 .decode_logits_planned(next, (*t_cond + 1) as i32, cache, AttentionPlan::UNBOUNDED)
                 .unwrap();
             *t_cond += 1;
-            next = argmax(&logits);
+            next = argmax_host(&logits);
             if *total_tokens >= max_new_tokens {
                 hit_max = true;
                 break;
@@ -683,10 +652,11 @@ mod tests {
         all
     }
 
-    /// `generate_planned` on the engine emits the pre-engine stream — greedy and seeded stochastic,
-    /// across eos ends (an eos the run itself emits), budget ends and the zero budget — and leaves
-    /// the caller's cache exactly as the pre-engine loop did (same length, same next-step logits).
-    /// A cancel stays typed and is checked before every token, the first included.
+    /// `generate_planned` on the engine emits the pre-engine stream — greedy token-identical to the
+    /// frozen pre-engine loop, seeded stochastic identical to that loop drawing through the shared
+    /// sampler — across eos ends (an eos the run itself emits), budget ends and the zero budget,
+    /// and leaves the caller's cache exactly as the pre-engine loop did (same length, same
+    /// next-step logits). A cancel set before the run stays typed.
     #[test]
     fn generate_on_the_engine_is_the_pre_engine_loop() {
         let (model, ids, idx) = fixture();
@@ -807,7 +777,7 @@ mod tests {
             let (mut t_cond, mut want_total) = (t_idx as usize, total);
             let (want, next, hit_max) = reference_segment(
                 &model,
-                argmax(&first),
+                argmax_host(&first),
                 &mut want_cache,
                 &mut t_cond,
                 stops,
@@ -839,5 +809,127 @@ mod tests {
             }
         }
         assert!(stop_ends > 0 && budget_ends > 0);
+    }
+
+    /// sc-24446 behaviour change: the seeded stochastic rollout now draws through the shared
+    /// sampler, so the pre-engine stream is not pinned. What it must keep: a seed reproduces its
+    /// stream, different seeds explore different streams, `top_k = 1` collapses to the greedy
+    /// stream, and the first draw follows the shaped (temperature-softmax) distribution of its row.
+    #[test]
+    fn stochastic_rollouts_reproduce_per_seed_and_follow_the_shaped_distribution() {
+        let (model, ids, idx) = fixture();
+        let plan = AttentionPlan::UNBOUNDED;
+        let (_, first, t_idx) = prefill(&model, &ids, &idx);
+        let roll = |sampler: Sampler, max: usize| {
+            let (mut c, _, _) = prefill(&model, &ids, &idx);
+            model
+                .rollout_planned(&first, &mut c, t_idx, &[], max, sampler, None, plan)
+                .unwrap()
+                .tokens
+        };
+        let sample = |seed, top_k, temperature| Sampler::Sample {
+            temperature,
+            top_p: 1.0,
+            top_k,
+            seed,
+        };
+        let streams: Vec<_> = (0..6).map(|seed| roll(sample(seed, 0, 1.0), 10)).collect();
+        for (seed, stream) in streams.iter().enumerate() {
+            assert_eq!(
+                &roll(sample(seed as u64, 0, 1.0), 10),
+                stream,
+                "seed {seed}"
+            );
+        }
+        assert!(
+            streams.iter().any(|s| s != &streams[0]),
+            "six seeds drew one stream: {streams:?}"
+        );
+        assert_eq!(roll(sample(9, 1, 1.0), 10), roll(Sampler::Greedy, 10));
+
+        // The first draw (no forward) over many seeds against softmax(first / T). The fixture's
+        // first row is nearly flat (a spread under one logit), so `T = 0.1` shapes it into a
+        // distribution a wrong temperature or a wrong draw cannot hide in.
+        let temperature = 0.1f32;
+        let n = 2000;
+        let mut counts = vec![0usize; first.len()];
+        let (mut c, _, _) = prefill(&model, &ids, &idx);
+        for seed in 0..n {
+            let got = model
+                .rollout_planned(
+                    &first,
+                    &mut c,
+                    t_idx,
+                    &[],
+                    1,
+                    sample(seed, 0, temperature),
+                    None,
+                    plan,
+                )
+                .unwrap()
+                .tokens;
+            counts[got[0] as usize] += 1;
+        }
+        let max = first.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<f64> = first
+            .iter()
+            .map(|&l| (f64::from(l - max) / f64::from(temperature)).exp())
+            .collect();
+        let total: f64 = weights.iter().sum();
+        let n = n as f64;
+        let mut seen = 0;
+        for (token, (w, &k)) in weights.iter().zip(&counts).enumerate() {
+            let p = w / total;
+            // Five binomial standard deviations (the seeds are fixed, so this never flakes).
+            let bound = 5.0 * (p * (1.0 - p) / n).sqrt() + 1.0 / n;
+            assert!(
+                (k as f64 / n - p).abs() <= bound,
+                "token {token}: drawn {k} of {n}, softmax {p}"
+            );
+            seen += usize::from(k > 0);
+        }
+        assert!(seen > 1, "the first row's draw is not degenerate");
+    }
+
+    /// The pipeline's cancel, set mid-rollout, is bridged onto the engine's flag: the engine
+    /// finishes `Cancelled` right after the token it was emitting, the rollout returns the typed
+    /// [`CandleError::Canceled`] (greedy and stochastic), and the lent cache comes back.
+    #[test]
+    fn a_mid_run_cancel_ends_the_rollout_typed() {
+        let (model, ids, idx) = fixture();
+        let (_, first, t_idx) = prefill(&model, &ids, &idx);
+        for sampler in [Sampler::Greedy, samplers()[1]] {
+            let cancel = CancelFlag::new();
+            let mut emitted = 0;
+            let (mut c, _, _) = prefill(&model, &ids, &idx);
+            let run = model.rollout_observed(
+                &first,
+                &mut c,
+                t_idx,
+                &[],
+                12,
+                sampler,
+                Some(&cancel),
+                AttentionPlan::UNBOUNDED,
+                &mut |event| {
+                    if let StreamEvent::Token { step, .. } = event {
+                        emitted = step + 1;
+                        if *step == 2 {
+                            cancel.cancel();
+                        }
+                    }
+                },
+            );
+            assert!(matches!(run, Err(CandleError::Canceled)), "{sampler:?}");
+            assert_eq!(
+                emitted, 3,
+                "{sampler:?}: cancelled right after the third token"
+            );
+            assert_eq!(
+                c.len(),
+                ids.len() + 2,
+                "{sampler:?}: the lent cache comes back"
+            );
+        }
     }
 }
