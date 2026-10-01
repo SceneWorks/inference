@@ -284,9 +284,15 @@ extern "C" __global__ void __launch_bounds__(MMA_THREADS) nvfp4_gemv_indexed_bf1
     int num_k_atoms,
     int vec_x,
     int slots,
-    int per_slot) {
+    int per_slot,
+    unsigned int n_experts) {
     const int task = blockIdx.y;
     const unsigned int e = ids[task];
+    // Bounds-checked: an id past the bank (only a corrupted route table can hold one) traps the
+    // launch rather than reading another allocation through the tables.
+    if (e >= n_experts) {
+        __trap();
+    }
     const int row = per_slot ? task : task / slots;
     nvfp4_gemv_core((const unsigned char*)packed_tab[e], (const unsigned char*)scales_tab[e],
                     x + (size_t)row * (size_t)k, y + (size_t)task * (size_t)n_rows, n_rows, k,

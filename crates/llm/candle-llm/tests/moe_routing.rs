@@ -22,8 +22,9 @@
 //!   `moe_router_host_read` for an MoE model.
 //!
 //! * **On CUDA (the `windows-cuda` lane), the indexed dispatch.** Every fixture — dense, Q8_0,
-//!   Q4_0, Q4_K, and NVFP4 on an sm_120 device — decodes greedily through the CUDA-graph runner
-//!   with its experts dispatched by the indexed kernels, token-identical to the same request
+//!   MLX-affine Q8 experts, Q4_0, Q4_K, and NVFP4 on an sm_120 device — decodes greedily
+//!   through the CUDA-graph runner with its experts dispatched by the indexed kernels,
+//!   token-identical to the same request
 //!   dispatched grouped (the per-expert path); the graph is captured and replayed (a host read in
 //!   the step would refuse it), and a decode step reads nothing back and gathers no expert matrix.
 //!
@@ -587,6 +588,74 @@ fn moe_models_are_not_refused_for_a_router_host_read() {
     }
 }
 
+/// The fixture with every routed expert stored as an MLX affine 8-bit triple (`U32` codes,
+/// four per word, plus per-group `scales` / `biases`, group 32) — what an mlx-community 8-bit
+/// checkpoint ships, loaded as the dequantize-per-forward Q8 tier.
+fn mlx_q8_experts(weights: &HashMap<String, Tensor>) -> HashMap<String, Tensor> {
+    const GROUP: usize = 32;
+    let mut out = HashMap::new();
+    for (key, w) in weights {
+        let Some(stem) = key
+            .strip_suffix(".weight")
+            .filter(|_| key.contains(".mlp.experts."))
+        else {
+            out.insert(key.clone(), w.clone());
+            continue;
+        };
+        let (rows, cols) = w.dims2().unwrap();
+        let values = w.to_vec2::<f32>().unwrap();
+        let (mut words, mut scales, mut biases) = (vec![0u32; rows * cols / 4], vec![], vec![]);
+        for (r, row) in values.iter().enumerate() {
+            for (g, group) in row.chunks(GROUP).enumerate() {
+                let lo = group.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let scale = ((hi - lo) / 255.0).max(f32::MIN_POSITIVE);
+                scales.push(scale);
+                biases.push(lo);
+                for (j, v) in group.iter().enumerate() {
+                    let code = ((v - lo) / scale).round().clamp(0.0, 255.0) as u32;
+                    let col = g * GROUP + j;
+                    words[(r * cols + col) / 4] |= code << (8 * (col % 4));
+                }
+            }
+        }
+        let dev = &Device::Cpu;
+        out.insert(
+            key.clone(),
+            Tensor::from_vec(words, (rows, cols / 4), dev).unwrap(),
+        );
+        let groups = (rows, cols / GROUP);
+        out.insert(
+            format!("{stem}.scales"),
+            Tensor::from_vec(scales, groups, dev).unwrap(),
+        );
+        out.insert(
+            format!("{stem}.biases"),
+            Tensor::from_vec(biases, groups, dev).unwrap(),
+        );
+    }
+    out
+}
+
+/// sc-24440 review: the MLX-affine Q8 expert fixture loads through the triple loader (a code
+/// matrix read as a dense weight would not even have the expert's shape) and its experts are
+/// the dequantize-per-forward Q8 tier — refused for graph capture off CUDA by that bank's cause —
+/// and decodes greedily through the grouped dispatch.
+#[test]
+fn the_mlx_q8_expert_fixture_loads_its_triples_and_decodes() {
+    let (q2n, q2nw) = qwen2_moe(WIDE, true, 0x2444_0002);
+    let model = causal(
+        &q2n,
+        &mlx_q8_experts(&q2nw),
+        Some(QuantSpec::from_bits_and_group_size(8, 32).unwrap()),
+    );
+    assert_eq!(
+        model.graph_support(),
+        Err("moe_expert_host_dispatch:not_cuda")
+    );
+    assert_eq!(greedy_causal(&model).len(), GREEDY_STEPS + 1);
+}
+
 /// sc-24440 part 2: the indexed MoE dispatch on CUDA, end to end. Each fixture runs twice on the
 /// device: eagerly with every MoE step dispatched grouped (routes read back, each expert on its
 /// own tokens — the path the indexed kernels replace), and through the CUDA-graph runner with
@@ -735,6 +804,15 @@ mod cuda {
         check(
             "qwen2_moe_norm_q8",
             &causal_on(&q2n, &q2nw, Some(QuantSpec::q8())),
+            WIDE.layers as u64,
+        );
+        check(
+            "qwen2_moe_norm_mlx_q8 (MLX affine Q8 experts)",
+            &causal_on(
+                &q2n,
+                &mlx_q8_experts(&q2nw),
+                Some(QuantSpec::from_bits_and_group_size(8, 32).unwrap()),
+            ),
             WIDE.layers as u64,
         );
         check(

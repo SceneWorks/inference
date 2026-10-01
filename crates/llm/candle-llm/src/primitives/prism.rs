@@ -1805,6 +1805,32 @@ mod tests {
         assert_eq!(bits(&fused), bits(&chain), "Prism forward, fused vs chain");
     }
 
+    /// sc-24440 review: the fused rotation's affine factor is the one the op chain multiplies by
+    /// — candle's `affine` on a tensor of the activation dtype — for every block size and served
+    /// dtype; an unserved dtype has none.
+    #[test]
+    fn the_rotation_affine_factor_is_the_chains() {
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            for log2 in 0..=13 {
+                let block = 1usize << log2;
+                let chain = Tensor::ones(1, dtype, &Device::Cpu)
+                    .unwrap()
+                    .affine((block as f64).sqrt().recip(), 0.0)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()[0];
+                assert_eq!(
+                    rotation_affine_factor(block, dtype).map(f32::to_bits),
+                    Some(chain.to_bits()),
+                    "{dtype:?} block {block}"
+                );
+            }
+        }
+        assert_eq!(rotation_affine_factor(128, DType::U32), None);
+    }
+
     /// sc-24440 review: the fused CUDA rotation reads the signs and the GDN gather the weight
     /// uploaded at load (sc-24444's resident tensors) — with the fused path on, repeated forward
     /// and inverse rotations upload nothing — and still equals the op chain.

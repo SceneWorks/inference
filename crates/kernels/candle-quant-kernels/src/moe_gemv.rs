@@ -462,7 +462,9 @@ impl IndexedExperts {
 
     /// `y[task] = x[row(task)] · W[ids[task]]ᵀ` for every task `task = token · slots + slot`:
     /// `ids` is the `[tokens, slots]` u32 route table (each id `< experts`, as a top-k over the
-    /// bank's router guarantees — the kernel reads `table[id]` unchecked), `x` is `[tokens, k]`
+    /// bank's router guarantees; the kernels check it on the device and trap the launch — a CUDA
+    /// error, never a read through the table out of bounds — on an id past the bank), `x` is
+    /// `[tokens, k]`
     /// ([`MoeRows::PerToken`]) or `[tokens · slots, k]` ([`MoeRows::PerSlot`]) in the format's
     /// [`io_dtype`](IndexedFormat::io_dtype). Returns `[tokens · slots, n]` in that dtype.
     pub fn forward(&self, x: &Tensor, ids: &Tensor, rows: MoeRows) -> Result<Tensor, MoeGemvError> {
@@ -776,6 +778,8 @@ mod cuda_impl {
             };
             let (n_i, k_i, slots_i) = (n as i32, k as i32, slots as i32);
             let per_slot = i32::from(rows == MoeRows::PerSlot);
+            // Every kernel bounds-checks each route against the bank (a bad id traps the launch).
+            let n_experts = bank.experts as u32;
             let (is, il) = ids.storage_and_layout();
             let ids_view = cuda_storage(&is)?
                 .as_cuda_slice::<u32>()?
@@ -838,7 +842,8 @@ mod cuda_impl {
                         .arg(&n_i)
                         .arg(&stride_i)
                         .arg(&slots_i)
-                        .arg(&per_slot);
+                        .arg(&per_slot)
+                        .arg(&n_experts);
                     // SAFETY: matches `moe_mmvq_*` in `moe_gemv.cu`.
                     unsafe { b.launch(cfg) }.map_err(drv)?;
                     drop(vy);
@@ -869,6 +874,7 @@ mod cuda_impl {
                             if dense {
                                 b.arg(&vec);
                             }
+                            b.arg(&n_experts);
                             // SAFETY: matches `moe_gemv_{dense,q8_0}_*` in `moe_gemv.cu`.
                             unsafe { b.launch(cfg) }.map_err(drv)?;
                             Ok(wrap(CudaStorage::wrap_cuda_slice(out, dev.clone())))
@@ -917,7 +923,8 @@ mod cuda_impl {
                         .arg(&nka)
                         .arg(&vec_x)
                         .arg(&slots_i)
-                        .arg(&per_slot);
+                        .arg(&per_slot)
+                        .arg(&n_experts);
                     // SAFETY: matches `nvfp4_gemv_indexed_bf16` in `nvfp4_gemv.cu`.
                     unsafe { b.launch(cfg) }.map_err(drv)?;
                     Ok(wrap(CudaStorage::wrap_cuda_slice(out, dev.clone())))

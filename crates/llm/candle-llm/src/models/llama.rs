@@ -1876,8 +1876,10 @@ impl StepModel for CausalLm {
     /// device data: with device positions on (the CUDA default) a step reads its RoPE positions,
     /// KV write index and attention length from the cache's staged buffers. Still declared
     /// uncapturable, so the runner refuses before any capture: a Mixture-of-Experts layer whose
-    /// experts Candle cannot index by a device id (quantized) dispatches them from host-read
-    /// routes (`moe_expert_host_dispatch`; the router itself runs on the device since sc-24440);
+    /// experts no indexed kernel serves — Prism-packed, a mixed or biased bank, NVFP4 with the
+    /// decode GEMV off, a kernel that does not compile, any bank off CUDA — dispatches them from
+    /// host-read routes (`moe_expert_host_dispatch:<cause>`, sc-24440; dense, GGML, MLX-affine Q8
+    /// and NVFP4 banks are dispatched on the device and capture);
     /// with device positions off the positions are Rust-side scalars (`positions_host_scalar`);
     /// and a stack the device path does not serve says why
     /// ([`CausalLm::device_positions_support`]).

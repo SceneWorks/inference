@@ -46,6 +46,7 @@
 //!   grouped one anywhere, the reference a GPU test compares against.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{DType, Device, Tensor};
 use candle_quant_kernels::{IndexedExperts, IndexedFormat, MoeGemvError, MoeRows};
@@ -60,8 +61,47 @@ use crate::primitives::projection::{Projection, WeightCensus};
 /// read once for all of its tokens instead of once per (token, slot) pair.
 pub const DEVICE_DISPATCH_MAX_ROWS: usize = 8;
 
-/// The graph-capture refusal of a model whose MoE bank is dispatched from host-read routes.
+/// The graph-capture refusal of a model whose MoE bank is dispatched from host-read routes. A
+/// refusal is always composed with why the indexed kernels do not serve the bank
+/// ([`HOST_DISPATCH_REASONS`]); the bare reason is only the fallback for a cause the table does
+/// not list.
 pub const REASON_EXPERT_HOST_DISPATCH: &str = "moe_expert_host_dispatch";
+
+/// Every reason an MoE bank can be refused for graph capture, composed as
+/// `moe_expert_host_dispatch:<cause>`: the cause is why the indexed kernels do not serve the bank —
+/// not on CUDA, Prism-packed experts, a bank mixing formats or with an unserved one, an activation
+/// dtype the format refuses, NVFP4 with the decode GEMV switched off, or the indexed kernel's
+/// refusal / compile label (`compute_floor`, `nvrtc`, `load`, `device`, `missing_function`).
+pub const HOST_DISPATCH_REASONS: &[(&str, &str)] = &[
+    ("not_cuda", "moe_expert_host_dispatch:not_cuda"),
+    ("prism", "moe_expert_host_dispatch:prism"),
+    ("mixed", "moe_expert_host_dispatch:mixed"),
+    ("format", "moe_expert_host_dispatch:format"),
+    ("empty", "moe_expert_host_dispatch:empty"),
+    ("input", "moe_expert_host_dispatch:input"),
+    ("dtype", "moe_expert_host_dispatch:dtype"),
+    (
+        "nvfp4_gemv_disabled",
+        "moe_expert_host_dispatch:nvfp4_gemv_disabled",
+    ),
+    ("compute_floor", "moe_expert_host_dispatch:compute_floor"),
+    ("nvrtc", "moe_expert_host_dispatch:nvrtc"),
+    ("load", "moe_expert_host_dispatch:load"),
+    ("device", "moe_expert_host_dispatch:device"),
+    (
+        "missing_function",
+        "moe_expert_host_dispatch:missing_function",
+    ),
+    ("candle", "moe_expert_host_dispatch:candle"),
+];
+
+/// The composed graph refusal for an indexed-kernel `cause` ([`HOST_DISPATCH_REASONS`]).
+fn host_dispatch_reason(cause: Option<&'static str>) -> &'static str {
+    HOST_DISPATCH_REASONS
+        .iter()
+        .find(|(label, _)| Some(*label) == cause)
+        .map_or(REASON_EXPERT_HOST_DISPATCH, |(_, reason)| reason)
+}
 
 thread_local! {
     static FORCE_DEVICE_DISPATCH: Cell<bool> = const { Cell::new(false) };
@@ -369,9 +409,10 @@ impl ExpertBank {
         None
     }
 
-    /// Device bytes a `t`-row decode step's routed dispatch allocates beyond its input, per
-    /// token row, for activations of `act` on this bank's device (the larger of the two device
-    /// dispatches it may take, so admission covers whichever runs).
+    /// Device bytes a decode step's routed dispatch allocates beyond its input, per token row, for
+    /// activations of `act` on this bank's device: the largest of the dispatches it may take
+    /// (grouped; indexed; for a stacked bank on a device, gathered), so admission covers whichever
+    /// runs.
     fn step_bytes_per_token(&self, act: DType, slots: usize) -> u64 {
         let e = act.size_in_bytes();
         let (inter, hidden) = self.dims();
@@ -394,8 +435,10 @@ impl ExpertBank {
                 indexed += bank.workspace_bytes(act, 1, slots, rows) + input * 4 + slots * n * e;
             }
             bytes = bytes.max(indexed);
-        } else if matches!(self.layout, Layout::Stacked { .. }) && !self.on_cpu() {
-            // The gathered dispatch's copies: `slots` expert matrices per projection.
+        }
+        if matches!(self.layout, Layout::Stacked { .. }) && !self.on_cpu() {
+            // A stacked bank on a device may also run gathered (its indexed kernel refused):
+            // `slots` copied expert matrices per projection.
             bytes = bytes.max(slots * 3 * inter * hidden * e + slots * (3 * inter + hidden) * e);
         }
         bytes as u64
@@ -444,6 +487,8 @@ pub struct SparseMoe {
     /// Shared-expert sigmoid gate `[1, hidden]`; `None` ⇒ the shared expert is added ungated.
     shared_gate: Option<Tensor>,
     routing: MoeRouting,
+    /// Whether a gathered dispatch on CUDA (the indexed kernels refused) was logged.
+    gather_noted: AtomicBool,
 }
 
 impl SparseMoe {
@@ -472,6 +517,7 @@ impl SparseMoe {
             shared,
             shared_gate,
             routing,
+            gather_noted: AtomicBool::new(false),
         })
     }
 
@@ -503,21 +549,29 @@ impl SparseMoe {
 
     /// Why a decode step through this block cannot be captured as a CUDA graph, if it cannot: a
     /// decode-sized step (up to [`DEVICE_DISPATCH_MAX_ROWS`] tokens) that is not dispatched on the
-    /// device reads its routes back to the host. With the indexed kernels that is only a bank none
-    /// of them serves — see the module docs, and [`SparseMoe::host_dispatch_cause`] for which.
+    /// device reads its routes back to the host. The reason names why the indexed kernels do not
+    /// serve the bank, `moe_expert_host_dispatch:<cause>` ([`HOST_DISPATCH_REASONS`]), so it reaches
+    /// `graph_support`, the runner's fallback reason and the decode report by name.
     pub fn graph_refusal(&self) -> Option<&'static str> {
         (self.device_dispatch(DEVICE_DISPATCH_MAX_ROWS) == Dispatch::Grouped)
-            .then_some(REASON_EXPERT_HOST_DISPATCH)
+            .then(|| host_dispatch_reason(self.indexed_refusal()))
     }
 
-    /// Why a decode step's experts are dispatched from host-read routes, when they are: the
-    /// indexed kernels' refusal of this bank (`not_cuda`, `prism`, `mixed`, `format`, `dtype`,
-    /// `nvfp4_gemv_disabled`, a compile label), `None` when a device dispatch serves it.
-    pub fn host_dispatch_cause(&self) -> Option<&'static str> {
-        match self.device_dispatch(DEVICE_DISPATCH_MAX_ROWS) {
-            Dispatch::Grouped => self.bank.indexed_refusal(self.router.dtype()),
-            Dispatch::Indexed | Dispatch::Gathered => None,
-        }
+    /// Why the indexed kernels do not serve this block's experts (`not_cuda`, `prism`, `mixed`,
+    /// `format`, `dtype`, `nvfp4_gemv_disabled`, a compile label), `None` when they do. A stacked
+    /// dense bank they refuse still dispatches on the device (gathered); any other bank is
+    /// dispatched grouped and refused for graph capture with this cause.
+    pub fn indexed_refusal(&self) -> Option<&'static str> {
+        self.bank.indexed_refusal(self.router.dtype())
+    }
+
+    /// Device bytes of this block's indexed expert-address tables (the three projections'
+    /// [`IndexedExperts::table_bytes`]) — `0` without them. A load prices at most
+    /// `3 · experts · MAX_TABLE_BYTES_PER_EXPERT` per MoE layer for them.
+    pub fn indexed_table_bytes(&self) -> usize {
+        self.bank.indexed.as_ref().map_or(0, |banks| {
+            banks.iter().map(IndexedExperts::table_bytes).sum()
+        })
     }
 
     /// Device bytes a decode step through this block's routed experts allocates per token row
@@ -575,6 +629,15 @@ impl SparseMoe {
                 dispatch_indexed(&xf, &ids, &weights, banks)?
             }
             (Dispatch::Gathered, _, Layout::Stacked { gate, up, down }) => {
+                if xf.device().is_cuda() && !self.gather_noted.swap(true, Ordering::Relaxed) {
+                    // On CUDA the indexed kernels serve every stacked bank; a gather there means
+                    // they were refused (a compile failure) — said once per block, by name.
+                    tracing::warn!(
+                        cause = self.indexed_refusal().unwrap_or("unknown"),
+                        "MoE experts gathered by index_select on CUDA: the indexed kernels are \
+                         unavailable"
+                    );
+                }
                 bump(&DEVICE_DISPATCHES);
                 bump(&EXPERT_GATHERS);
                 dispatch_stacked(&xf, &ids, &weights, [gate, up, down])?
@@ -965,10 +1028,69 @@ mod tests {
             crate::primitives::projection::ProjectionKind::Ggml
         );
         assert_eq!(with_device_dispatch(|| step_counts(&q8, &x)), (1, 0));
-        assert_eq!(q8.graph_refusal(), Some(REASON_EXPERT_HOST_DISPATCH));
-        // The indexed tables exist on CUDA only: on the CPU a quantized bank says so by name.
-        assert_eq!(q8.host_dispatch_cause(), Some("not_cuda"));
-        assert_eq!(dense.host_dispatch_cause(), None);
+        // The indexed tables exist on CUDA only: on the CPU a quantized bank is refused by name,
+        // the cause composed into the graph refusal itself.
+        assert_eq!(
+            q8.graph_refusal(),
+            Some("moe_expert_host_dispatch:not_cuda")
+        );
+        assert_eq!(q8.indexed_refusal(), Some("not_cuda"));
+        // A dense bank the indexed kernels refuse still dispatches on the device (gathered).
+        assert_eq!(dense.indexed_refusal(), Some("not_cuda"));
+    }
+
+    /// Every cause the indexed kernels can refuse a bank for composes into a named graph refusal
+    /// — the bank's own refusals, the kernel crate's refusal and compile labels — and an unknown
+    /// cause falls back to the bare reason.
+    #[test]
+    fn every_indexed_refusal_cause_composes_a_named_graph_refusal() {
+        use candle_quant_kernels::{KernelCompileError, MoeGemvError, MoeGemvRefusal};
+        let compile = |e: KernelCompileError| MoeGemvError::Compile(e).label();
+        let name = "k";
+        let causes = [
+            "prism",
+            "dtype",
+            "nvfp4_gemv_disabled",
+            MoeGemvRefusal::NotCuda.label(),
+            MoeGemvRefusal::Empty.label(),
+            MoeGemvRefusal::Mixed(String::new()).label(),
+            MoeGemvRefusal::Format(String::new()).label(),
+            MoeGemvRefusal::Input(String::new()).label(),
+            MoeGemvError::Candle(candle_core::Error::Msg(String::new())).label(),
+            compile(KernelCompileError::BelowComputeFloor {
+                name,
+                floor: (7, 0),
+                found: (6, 0),
+            }),
+            compile(KernelCompileError::Nvrtc {
+                name,
+                message: String::new(),
+            }),
+            compile(KernelCompileError::Load {
+                name,
+                message: String::new(),
+            }),
+            compile(KernelCompileError::Device {
+                name,
+                message: String::new(),
+            }),
+            compile(KernelCompileError::MissingFunction {
+                name,
+                function: String::new(),
+            }),
+        ];
+        for cause in causes {
+            assert_eq!(
+                host_dispatch_reason(Some(cause)),
+                format!("{REASON_EXPERT_HOST_DISPATCH}:{cause}"),
+                "{cause}"
+            );
+        }
+        assert_eq!(
+            host_dispatch_reason(Some("new")),
+            REASON_EXPERT_HOST_DISPATCH
+        );
+        assert_eq!(host_dispatch_reason(None), REASON_EXPERT_HOST_DISPATCH);
     }
 
     /// Off CUDA a dense bank's device dispatch is the gathered one (it copies its experts — the
@@ -1099,8 +1221,8 @@ mod tests {
             "dispatch_indexed",
             "project_indexed",
         ];
-        // `forward` is `IndexedExperts::forward` (candle-quant-kernels): kernel launches over
-        // device tables, no host read — audited, and listed on purpose.
+        // `bank.forward` is `IndexedExperts::forward` (candle-quant-kernels): kernel launches
+        // over device tables, no host read — audited, and listed on purpose by its receiver.
         const DEVICE_OPS: [&str; 36] = [
             "Ok",
             "f64::from",
@@ -1135,12 +1257,14 @@ mod tests {
             "io_dtype",
             "ok_or_else",
             "Error::Msg",
-            "forward",
+            "bank.forward",
             "map_err",
             "crate::primitives::nvfp4_path::note_gemv",
         ];
-        // The callee of every `name(` / `path::name(` / `name::<T>(` on a line.
-        fn calls(line: &str) -> Vec<String> {
+        // The callee of every `name(` / `path::name(` / `name::<T>(` on a line — a method call
+        // qualified by its receiver, `receiver.name`, when the receiver is a plain identifier on
+        // this line or (a chained call starting the line) ends the previous code line.
+        fn calls(line: &str, previous: &str) -> Vec<String> {
             let b = line.as_bytes();
             let mut out = Vec::new();
             for (i, _) in line.match_indices('(') {
@@ -1157,7 +1281,21 @@ mod tests {
                     .map_or(0, |at| at + 1);
                 let name = &line[start..end];
                 if !name.is_empty() && !name.starts_with(':') {
-                    out.push(name.to_owned());
+                    let ident = |text: &str| {
+                        let at = text
+                            .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .map_or(0, |at| at + 1);
+                        text[at..].to_owned()
+                    };
+                    let receiver = match line[..start].strip_suffix('.') {
+                        Some(before) if !before.trim().is_empty() => ident(before),
+                        Some(_) => ident(previous.trim_end()),
+                        None => String::new(),
+                    };
+                    out.push(match receiver.is_empty() {
+                        true => name.to_owned(),
+                        false => format!("{receiver}.{name}"),
+                    });
                 }
             }
             out
@@ -1168,6 +1306,7 @@ mod tests {
             .expect("tests marker")];
         let mut current_fn = "";
         let mut raw = Vec::new();
+        let mut previous = "";
         for (n, line) in code.lines().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") {
@@ -1182,13 +1321,18 @@ mod tests {
             if RAW_READS.iter().any(|r| line.contains(r)) && current_fn != "read_routes" {
                 raw.push(format!("line {}: {}", n + 1, line.trim()));
             }
+            let code_part = line.split("//").next().unwrap_or_default();
             if DEVICE_PATH.contains(&current_fn) && signature.is_none() {
-                for callee in calls(line.split("//").next().unwrap_or_default()) {
-                    if !DEVICE_OPS.contains(&callee.as_str()) {
+                for callee in calls(code_part, previous) {
+                    // A method call passes by its bare name or, for a receiver-specific entry
+                    // (`bank.forward`), only by its qualified one.
+                    let bare = callee.rsplit('.').next().unwrap_or_default();
+                    if !DEVICE_OPS.contains(&callee.as_str()) && !DEVICE_OPS.contains(&bare) {
                         raw.push(format!("line {}: `{callee}` on the device path", n + 1));
                     }
                 }
             }
+            previous = code_part;
         }
         assert!(raw.is_empty(), "uncounted host reads:\n{}", raw.join("\n"));
     }
@@ -1314,7 +1458,14 @@ mod cuda_tests {
             }
             let moe = block(&dev, dtype, h, inter, fmt);
             assert_eq!(moe.graph_refusal(), None, "{fmt:?} {dtype:?}");
-            assert_eq!(moe.host_dispatch_cause(), None, "{fmt:?} {dtype:?}");
+            assert_eq!(moe.indexed_refusal(), None, "{fmt:?} {dtype:?}");
+            // The tables the load priced: within the per-layer bound the provider charges.
+            let priced = 3 * moe.num_experts() * candle_quant_kernels::MAX_TABLE_BYTES_PER_EXPERT;
+            let tables = moe.indexed_table_bytes();
+            assert!(
+                tables > 0 && tables <= priced,
+                "{fmt:?} {dtype:?}: {tables} table bytes vs {priced} priced"
+            );
             for t in [1usize, 3, DEVICE_DISPATCH_MAX_ROWS] {
                 let x = randn(&[1, t, h], &mut SplitMix64::new(t as u64 + 9), &dev, dtype);
                 let before = (
@@ -1370,8 +1521,11 @@ mod cuda_tests {
         }
         let moe = block(&dev, DType::BF16, 64, 96, Fmt::Nvfp4);
         let _off = crate::primitives::nvfp4_path::nvfp4_gemv_policy_guard(Some(false));
-        assert_eq!(moe.graph_refusal(), Some(REASON_EXPERT_HOST_DISPATCH));
-        assert_eq!(moe.host_dispatch_cause(), Some("nvfp4_gemv_disabled"));
+        assert_eq!(
+            moe.graph_refusal(),
+            Some("moe_expert_host_dispatch:nvfp4_gemv_disabled")
+        );
+        assert_eq!(moe.indexed_refusal(), Some("nvfp4_gemv_disabled"));
     }
 
     /// Admission's per-token bytes on CUDA cover the indexed dispatch's workspace (GGML: the f32
@@ -1390,5 +1544,11 @@ mod cuda_tests {
             .map(|(b, r)| b.workspace_bytes(DType::BF16, 1, slots, r))
             .sum();
         assert!(moe.step_bytes_per_token() as usize > workspace);
+        // A stacked dense bank on the device may also run gathered (its indexed kernel refused):
+        // admission prices those copies too.
+        let (h, inter) = (64, 96);
+        let dense = block(&dev, DType::BF16, h, inter, Fmt::Dense);
+        let gathered = slots * 3 * inter * h * 2;
+        assert!(dense.step_bytes_per_token() as usize >= gathered);
     }
 }

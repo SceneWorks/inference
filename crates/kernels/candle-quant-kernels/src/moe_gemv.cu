@@ -8,6 +8,10 @@
 // reads a route, and every launch shape depends only on the step shape, so a CUDA graph that
 // recorded one step replays at any routing.
 //
+// Provenance: the DERIVED sections below are candle's `candle-kernels/src/mmvq_gguf.cu` (Apache-2.0
+// OR MIT, huggingface/candle), itself "adapted from llama.cpp's CUDA mmvq path" — llama.cpp /
+// ggml, MIT License, Copyright (c) 2023-2024 The ggml authors.
+//
 // Compiled at runtime through the nvrtc compile-once seam (`nvrtc.rs`): builtins and inline PTX
 // only, no headers. The few fp16 helpers candle's `cuda_fp16.h` would provide are defined below
 // as `gg_half` / `gg_half2` (exact `cvt` conversions).
@@ -818,13 +822,25 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x,
 // one per task (`per_slot != 0`, the down projection).
 // ---------------------------------------------------------------------------------------------
 
+// The expert a task routes to, bounds-checked: an id past the bank (only a corrupted route table
+// can hold one) traps the launch rather than reading another allocation through the table.
+static __device__ __forceinline__ unsigned int moe_expert(const unsigned int *__restrict__ ids,
+                                                          int task, unsigned int n_experts) {
+  const unsigned int e = ids[task];
+  if (e >= n_experts) {
+    __trap();
+  }
+  return e;
+}
+
 #define MOE_MMVQ_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)                        \
   extern "C" __global__ void moe_mmvq_##tag(                                                  \
       const unsigned long long *__restrict__ experts, const void *__restrict__ vy,            \
       const unsigned int *__restrict__ ids, float *__restrict__ dst, const int ncols_x,       \
-      const int nrows_x, const int stride_col_y, const int slots, const int per_slot) {       \
+      const int nrows_x, const int stride_col_y, const int slots, const int per_slot,         \
+      const unsigned int n_experts) {                                                         \
     const int task = blockIdx.y;                                                              \
-    const void *vx = (const void *)experts[ids[task]];                                        \
+    const void *vx = (const void *)experts[moe_expert(ids, task, n_experts)];                 \
     const int yrow = per_slot ? task : task / slots;                                          \
     mmvq_core_impl<float, qk_val, qi_val, block_q_t, vdr_val, vec_dot, 1>(                    \
         vx, (const block_q8_1 *)vy + (size_t)yrow * (size_t)stride_col_y,                     \
@@ -937,7 +953,8 @@ static __device__ __forceinline__ void moe_gemv_dense(const unsigned long long *
                                                       const typename D::T *__restrict__ x,
                                                       const unsigned int *__restrict__ ids,
                                                       typename D::T *__restrict__ y, int n, int k,
-                                                      int slots, int per_slot, int vec) {
+                                                      int slots, int per_slot, int vec,
+                                                      unsigned int n_experts) {
   const int task = blockIdx.y;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -945,7 +962,8 @@ static __device__ __forceinline__ void moe_gemv_dense(const unsigned long long *
   if (row >= n) {
     return;
   }
-  const typename D::T *w = (const typename D::T *)experts[ids[task]] + (size_t)row * (size_t)k;
+  const typename D::T *w =
+      (const typename D::T *)experts[moe_expert(ids, task, n_experts)] + (size_t)row * (size_t)k;
   const typename D::T *xr = x + (size_t)(per_slot ? task : task / slots) * (size_t)k;
   float acc = 0.0f;
   if (vec) {
@@ -974,7 +992,8 @@ static __device__ __forceinline__ void moe_gemv_q8_0(const unsigned long long *_
                                                      const typename D::T *__restrict__ x,
                                                      const unsigned int *__restrict__ ids,
                                                      typename D::T *__restrict__ y, int n, int k,
-                                                     int slots, int per_slot) {
+                                                     int slots, int per_slot,
+                                                     unsigned int n_experts) {
   const int task = blockIdx.y;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -984,7 +1003,7 @@ static __device__ __forceinline__ void moe_gemv_q8_0(const unsigned long long *_
   }
   const int blocks = k / QK8_0;
   const block_q8_0 *w =
-      (const block_q8_0 *)experts[ids[task]] + (size_t)row * (size_t)blocks;
+      (const block_q8_0 *)experts[moe_expert(ids, task, n_experts)] + (size_t)row * (size_t)blocks;
   const typename D::T *xr = x + (size_t)(per_slot ? task : task / slots) * (size_t)k;
   float acc = 0.0f;
   for (int b = lane; b < blocks; b += 32) {
@@ -1005,14 +1024,14 @@ static __device__ __forceinline__ void moe_gemv_q8_0(const unsigned long long *_
   extern "C" __global__ void __launch_bounds__(MOE_GEMV_WARPS * 32) moe_gemv_dense_##tag(      \
       const unsigned long long *__restrict__ experts, const D::T *__restrict__ x,               \
       const unsigned int *__restrict__ ids, D::T *__restrict__ y, int n, int k, int slots,      \
-      int per_slot, int vec) {                                                                  \
-    moe_gemv_dense<D>(experts, x, ids, y, n, k, slots, per_slot, vec);                          \
+      int per_slot, int vec, unsigned int n_experts) {                                          \
+    moe_gemv_dense<D>(experts, x, ids, y, n, k, slots, per_slot, vec, n_experts);               \
   }                                                                                             \
   extern "C" __global__ void __launch_bounds__(MOE_GEMV_WARPS * 32) moe_gemv_q8_0_##tag(       \
       const unsigned long long *__restrict__ experts, const D::T *__restrict__ x,               \
       const unsigned int *__restrict__ ids, D::T *__restrict__ y, int n, int k, int slots,      \
-      int per_slot) {                                                                           \
-    moe_gemv_q8_0<D>(experts, x, ids, y, n, k, slots, per_slot);                                \
+      int per_slot, unsigned int n_experts) {                                                   \
+    moe_gemv_q8_0<D>(experts, x, ids, y, n, k, slots, per_slot, n_experts);                     \
   }
 
 MOE_GEMV_ENTRIES(f32, TF32)

@@ -7654,6 +7654,43 @@ mod tests {
         assert_eq!(dense.moe_indexed_table_bytes(), 0);
     }
 
+    /// sc-24440 review: a CUDA load estimate's device requirement carries the indexed MoE
+    /// dispatch's expert tables — the same snapshot with its experts declared away (the config
+    /// alone changes; every tensor is the same) requires exactly the tables' bytes less on the
+    /// device, and nothing less off it.
+    #[test]
+    fn a_cuda_load_estimate_requires_the_moe_expert_tables_on_the_device() {
+        use core_llm::LoadSpec;
+        let dir = qwen35_snapshot(true, false, true);
+        let spec = LoadSpec::dense(dir.path().display().to_string());
+        let device = |cuda: bool| {
+            super::LlamaProvider::load_memory_estimate(&spec, cuda)
+                .unwrap()
+                .device_required_bytes
+        };
+        let config_path = dir.path().join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let tables = super::PricedDecoder::from_config(Some(&config)).moe_indexed_table_bytes();
+        assert!(tables > 0, "the MoE snapshot prices expert tables");
+        let (moe_cuda, moe_host) = (device(true).unwrap(), device(false));
+        fn strip(v: &mut serde_json::Value) {
+            if let Some(object) = v.as_object_mut() {
+                object.remove("num_experts");
+                object.values_mut().for_each(strip);
+            }
+        }
+        strip(&mut config);
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        assert_eq!(
+            super::PricedDecoder::from_config(Some(&config)).moe_indexed_table_bytes(),
+            0,
+            "the stripped config is dense"
+        );
+        assert_eq!(moe_cuda - device(true).unwrap(), tables);
+        assert_eq!(moe_host, device(false), "off CUDA there are no tables");
+    }
+
     /// sc-24440: admission's MLP term covers the MoE dispatch's per-token working set — the
     /// geometry's intermediate width is at least the routed experts' bytes per token row over the
     /// `3 · element_bytes` the estimators charge per intermediate unit.
