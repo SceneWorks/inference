@@ -1340,14 +1340,23 @@ pub fn record_recomputed_kv(
         try_emit_metadata(state);
         state.recomputed_projections += 1;
         state.recomputed_dense = state.recomputed_dense.max(dense);
-        state.recomputed_candidate = candidate;
+        // A route may recompute slices of different lengths (Wan-VACE projects each CFG branch over
+        // its own unpadded context): the candidate is the largest live slice's packed layer stack,
+        // like the dense read workspace is the largest live slice.
+        state.recomputed_candidate = state.recomputed_candidate.max(candidate);
         let fields = EventFields {
             transient_bytes: dense,
             tensor_shape: format!(
                 "k=[{},{},{},{}];v=[{},{},{},{}]",
                 shape[0], shape[1], tokens, shape[3], shape[0], shape[1], tokens, shape[3]
             ),
-            extra: vec![("kv_batch", json!(shape[0]))],
+            // The projection's own live dtype: a route may mix them (the Wan2.1-VACE-1.3B checkpoint
+            // ships its main blocks F32 and its VACE blocks BF16), so the event-level `dtype`
+            // (the bound context's) cannot account for every slice's bytes.
+            extra: vec![
+                ("kv_batch", json!(shape[0])),
+                ("kv_dtype", json!(dtype_name(key_array.dtype()))),
+            ],
             ..EventFields::default()
         };
         emit(state, "cross-kv-created", operation, fields);

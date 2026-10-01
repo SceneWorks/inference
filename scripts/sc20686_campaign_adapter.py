@@ -1057,10 +1057,21 @@ def make_row(args, config, snapshot_hash, snapshot_bytes, events):
             or metrics["minimum_cache_reads"] > observed_reuse
         ):
             raise ValueError("logical payload reuse differs from product-owned recomputations")
-        exact_dense = dense_reference_kv_bytes(geometry)
+        if backend == "mlx-metal":
+            # Slice-by-slice exactness: a Metal route may recompute slices of different live lengths
+            # and dtypes (Wan-VACE's unpadded CFG branches over F32 main and BF16 VACE blocks).
+            exact_dense = reducer.exact_metal_recomputed_slices(
+                create_events, read_events, geometry, reducer.expected_kv_batch(entry, geometry)
+            )
+            uniform = True
+        else:
+            exact_dense = dense_reference_kv_bytes(geometry)
+            uniform = all(
+                event.get("transient_bytes") == exact_dense
+                for event in (*create_events, *read_events)
+            )
         if (
-            any(event.get("transient_bytes") != exact_dense for event in create_events)
-            or any(event.get("transient_bytes") != exact_dense for event in read_events)
+            not uniform
             or metrics["current_read_transient_bytes"] != exact_dense
             or metrics["candidate_read_transient_bytes"] != exact_dense
         ):

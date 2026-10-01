@@ -532,9 +532,10 @@ impl WanVaceTransformer {
     }
 
     /// SC-20686 Metal lane: bind the live recomputed-text-K/V geometry (every main + VACE block
-    /// projects the full context per forward) and open the first denoise-step window. No-op unless a
-    /// campaign is armed.
-    fn sc20686_bind(&self, cache: &VaceStepCache, context_emb: &Array) {
+    /// projects the full context per forward) and open the first denoise-step window. Each CFG
+    /// branch projects its own unpadded context (`[L, dim]`), so the bound `skv` is the longest
+    /// branch's token count. No-op unless a campaign is armed.
+    fn sc20686_bind(&self, cache: &VaceStepCache, contexts: &[&Array]) {
         if !mlx_gen::sc20686::active() {
             return;
         }
@@ -545,7 +546,11 @@ impl WanVaceTransformer {
                 heads: head.num_heads as u32,
                 head_dimension: head.head_dim as u32,
                 sq: cache.l as u64,
-                skv: context_emb.shape()[1] as u64,
+                skv: contexts
+                    .iter()
+                    .map(|context| context.shape()[context.ndim() - 2] as u64)
+                    .max()
+                    .unwrap_or(0),
             },
             Some(self.compute_dtype),
             "none",
@@ -951,7 +956,13 @@ pub fn denoise_vace(
         &cache.control_emb,
         &ctx_cond_emb,
     ])?;
-    transformer.sc20686_bind(&cache, &ctx_cond_emb);
+    transformer.sc20686_bind(
+        &cache,
+        &[
+            &ctx_cond_emb,
+            ctx_uncond_emb.as_ref().unwrap_or(&ctx_cond_emb),
+        ],
+    );
 
     // F-073 (documented divergence from the base loop): CFG here runs cond/uncond as two
     // sequential B=1 forwards, while `crate::pipeline::denoise` batches them into one B=2 forward
@@ -1083,7 +1094,13 @@ pub(crate) fn denoise_vace_range(
         &cache.control_emb,
         &ctx_cond_emb,
     ])?;
-    transformer.sc20686_bind(&cache, &ctx_cond_emb);
+    transformer.sc20686_bind(
+        &cache,
+        &[
+            &ctx_cond_emb,
+            ctx_uncond_emb.as_ref().unwrap_or(&ctx_cond_emb),
+        ],
+    );
 
     for i in range {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).

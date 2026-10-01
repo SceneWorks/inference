@@ -552,6 +552,57 @@ fn recomputed_kv_reports_zero_persistence_and_per_layer_candidate() {
     assert_eq!(metrics["minimum_cache_reads"], 3);
 }
 
+/// The SC-20686 W2 `wan_vace` evidence: Wan-VACE recomputes each CFG branch over its own unpadded
+/// context (cond 13 tokens, uncond 126) and the 1.3B checkpoint's main blocks project in F32 while
+/// its VACE blocks project in BF16. Every projection records its own live dtype, and the candidate
+/// is the largest live slice's packed layer stack (as the dense read workspace is the largest slice).
+#[test]
+fn recomputed_kv_records_each_projections_live_dtype_and_largest_slice() {
+    let h = harness();
+    let scope = h.activate(false);
+    bind_geometry(
+        KvGeometry {
+            layers: 2,
+            heads: 2,
+            head_dimension: 8,
+            sq: 16,
+            skv: 7,
+        },
+        None,
+        "",
+        "",
+    );
+    let (cond_k, cond_v) = kv(1, 3);
+    let (uncond_k, uncond_v) = kv(1, 7);
+    let bf16 = |a: &Array| a.as_dtype(Dtype::Bfloat16).unwrap();
+    // Per branch: one BF16 (VACE-block) and one F32 (main-block) projection.
+    // The longer slice is not the last one: the candidate must still be the largest.
+    let projections = [
+        (bf16(&uncond_k), bf16(&uncond_v), 7, 2),
+        (uncond_k.clone(), uncond_v.clone(), 7, 4),
+        (bf16(&cond_k), bf16(&cond_v), 3, 2),
+        (cond_k.clone(), cond_v.clone(), 3, 4),
+    ];
+    for (k, v, tokens, itemsize) in &projections {
+        let recorded = record_recomputed_kv(k, v, *tokens, "slice").unwrap();
+        assert_eq!(recorded, Some(2 * 2 * tokens * 8 * itemsize));
+    }
+    observe_generation_end();
+    drop(scope);
+    let created = h.of("cross-kv-created");
+    let dtypes: Vec<_> = created.iter().map(|e| e["kv_dtype"].clone()).collect();
+    assert_eq!(
+        dtypes,
+        [json!("BF16"), json!("F32"), json!("BF16"), json!("F32")]
+    );
+    let metrics = h.of("metrics").pop().unwrap();
+    assert_eq!(metrics["current_read_transient_bytes"], 2 * 2 * 7 * 8 * 4);
+    assert_eq!(
+        metrics["candidate_persistent_bytes"],
+        packed_group_affine_kv_bytes(1, 2, 7, 8).unwrap() * 2
+    );
+}
+
 #[test]
 fn reference_forward_scope_restores_and_packed_projection_matches_candle() {
     let h = harness();
