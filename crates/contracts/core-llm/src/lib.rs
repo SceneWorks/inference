@@ -31,6 +31,9 @@
 //! - [`Scheduler`] — backend-neutral continuous-batching policy (admission + per-sequence retire).
 //! - [`PrefixIndex`] — backend-neutral shared-prefix KV-reuse policy (longest-match + LRU).
 //! - [`BlockAllocator`] — backend-neutral paged-KV block allocation policy (refcounts + free list).
+//! - [`defaults`] — the per-backend decode defaults table (epic sc-24432 E5): every decode
+//!   optimization's default on MLX / Candle CUDA / Candle Metal / Candle CPU, with its
+//!   justification; [`switch`] is the process switch the backends' runtime toggles share.
 //! - [`speculative`] — backend-neutral speculative-decoding policy (n-gram proposer + distribution-
 //!   preserving acceptance sampler).
 //! - [`report`] — backend-neutral evidence a product renders: [`DecodeReport`] (which decode path
@@ -47,6 +50,7 @@
 pub mod cancel;
 pub mod capabilities;
 pub mod constraint;
+pub mod defaults;
 pub mod detok;
 pub mod error;
 pub mod message;
@@ -64,6 +68,7 @@ pub mod schedule;
 pub mod speculative;
 pub mod starvector;
 pub mod stop;
+pub mod switch;
 pub mod template;
 pub mod text_llm;
 pub mod thinking;
@@ -78,6 +83,7 @@ pub use capabilities::{
 pub use constraint::{
     Constraint, ConstraintDecodeTable, ConstraintKind, JsonConstraint, JsonState,
 };
+pub use defaults::{speculative_default, DecodeBackend, DecodeDefaults, RecommendedDepths};
 pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};
@@ -94,8 +100,8 @@ pub use paging::BlockAllocator;
 pub use prefix::{
     prefix_cache_budget, prefix_path_before_lookup, requested_prefix_cache_bytes, InsertOutcome,
     PrefixAdmission, PrefixHit, PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse,
-    PrefixStats, PrefixStore, DEFAULT_PREFIX_CACHE_BYTES, PREFIX_COPY_FAILED,
-    PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED, PREFIX_PAGED_NOT_SNAPSHOTTED,
+    PrefixStats, PrefixStore, PREFIX_COPY_FAILED, PREFIX_MULTIMODAL_BYPASS, PREFIX_NOT_ADMITTED,
+    PREFIX_PAGED_NOT_SNAPSHOTTED,
 };
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,

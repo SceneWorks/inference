@@ -440,6 +440,10 @@ pub struct LlavaProvider {
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
     stop_tokens: Vec<i32>,
+    /// The speculative option a request that leaves it unset runs with — this backend's row of
+    /// the defaults table ([`core_llm::defaults`], E5). The captioner runs no proposer, so a
+    /// non-`off` default is reported as the named no-proposer fallback, as an explicit one is.
+    speculative_default: core_llm::Speculative,
 }
 
 impl LlavaProvider {
@@ -460,6 +464,7 @@ impl LlavaProvider {
             tokenizer,
             template: load_chat_template(dir),
             stop_tokens,
+            speculative_default: crate::device::decode_defaults(&device).speculative,
         })
     }
 
@@ -623,7 +628,7 @@ impl TextLlm for LlavaProvider {
             // (no graph runner wraps its decoder), so the report says the switch was off here.
             // A captioner advertises no proposer and has no prefix cache: both are named, in the
             // words MLX's JoyCaption uses (E2, E8).
-            decode: Some(caption_report(&gen.record, req)),
+            decode: Some(caption_report(&gen.record, req, self.speculative_default)),
             finish_reason: Some(finish),
         })
     }
@@ -632,11 +637,16 @@ impl TextLlm for LlavaProvider {
 /// A caption's measured report (sc-24139): the engine record with the CUDA-graph switch off (no
 /// graph runner wraps this decoder), and — the captioner advertising no proposer and having no
 /// prefix cache — the request's speculative fallback and the prefix-cache reason named in the
-/// words MLX's JoyCaption uses (E2, E8).
-fn caption_report(record: &DecodeRecord, req: &TextLlmRequest) -> core_llm::DecodeReport {
+/// words MLX's JoyCaption uses (E2, E8). The request's option is resolved against the provider's
+/// per-backend `default` (E5), so a table default of `auto` is named too.
+fn caption_report(
+    record: &DecodeRecord,
+    req: &TextLlmRequest,
+    default: core_llm::Speculative,
+) -> core_llm::DecodeReport {
     record
         .report(false)
-        .with_captioner_reasons(req.speculative_mode())
+        .with_captioner_reasons(req.speculative_or(default))
 }
 
 /// The LLaVA provider descriptor (constructible without weights; used for catalog composition).
@@ -776,7 +786,7 @@ mod tests {
             Speculative::Auto,
             Speculative::proposer(SpeculativeProposer::PromptLookup, 2),
         ] {
-            let report = caption_report(&record, &request(mode));
+            let report = caption_report(&record, &request(mode), Speculative::Off);
             assert_eq!(
                 report.fallbacks,
                 core_llm::no_proposer_fallback(mode, core_llm::CAPTIONER_NO_PROPOSER)
@@ -789,8 +799,29 @@ mod tests {
         }
         let source = include_str!("llava.rs");
         let production = &source[..source.find("mod tests {").expect("the test module")];
-        assert!(production.contains("decode: Some(caption_report(&gen.record, req)),"));
-        let off = caption_report(&record, &request(Speculative::Off));
+        assert!(production
+            .contains("decode: Some(caption_report(&gen.record, req, self.speculative_default)),"));
+        // E5: an unset option takes the provider's per-backend default — a table `auto` is named
+        // as the same no-proposer fallback — and an explicit `off` still overrides the default.
+        let unset = core_llm::TextLlmRequest {
+            messages: vec![Message::user("x")],
+            ..Default::default()
+        };
+        assert_eq!(
+            caption_report(&record, &unset, Speculative::Auto).fallbacks,
+            core_llm::no_proposer_fallback(Speculative::Auto, core_llm::CAPTIONER_NO_PROPOSER)
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(caption_report(&record, &unset, Speculative::Off)
+            .fallbacks
+            .is_empty());
+        assert!(
+            caption_report(&record, &request(Speculative::Off), Speculative::Auto)
+                .fallbacks
+                .is_empty()
+        );
+        let off = caption_report(&record, &request(Speculative::Off), Speculative::Off);
         assert!(off.fallbacks.is_empty());
         assert_eq!(off.prefix_cache.path, "none");
         assert_eq!(

@@ -22,6 +22,10 @@ pub const REASON_CPU_STREAM: &str = "cpu_stream";
 pub const REASON_SHAPE: &str = "shape";
 /// Why a fused route did not run: a test forced the reference route (the parity oracle).
 pub const REASON_FORCED_REFERENCE: &str = "forced_reference";
+/// Why a fused route did not run: its process switch ([`crate::switches`]) — the MLX row of the
+/// defaults table, the environment, or a runtime override — turned the kernel off (the label
+/// Candle uses for its own switch).
+pub const REASON_DISABLED: &str = "disabled";
 
 thread_local! {
     static TALLY: Cell<FusedTally> = const {

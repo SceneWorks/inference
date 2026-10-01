@@ -98,6 +98,10 @@ impl StarVector1bModel {
 
 /// MLX-loaded StarVector provider. It remains a `TextLlm`; SVG is the narrow typed extension.
 pub struct StarVector1bProvider {
+    /// The speculative option a request that leaves it unset runs with — the MLX row of the
+    /// defaults table ([`core_llm::defaults::MLX`], E5). The captioner runs no proposer, so a
+    /// non-`off` default is reported as the named no-proposer fallback, as an explicit one is.
+    speculative_default: core_llm::Speculative,
     descriptor: TextLlmDescriptor,
     starvector: StarVectorDescriptor,
     model: StarVector1bModel,
@@ -123,6 +127,7 @@ impl StarVector1bProvider {
             tokenizer.encode(SVG_PROMPT, false)?.len(),
         )?;
         Ok(Self {
+            speculative_default: core_llm::defaults::MLX.speculative,
             descriptor,
             starvector,
             model: StarVector1bModel::from_dir(dir).map_err(to_core)?,
@@ -389,7 +394,9 @@ impl TextLlm for StarVector1bProvider {
             // StarVector advertises no proposer and has no prefix cache: the request's speculative
             // fallback and the prefix-cache reason join the measured report in the shared words
             // Candle's StarVector uses — never a silent downgrade (E2, E8).
-            decode: report.map(|report| report.with_captioner_reasons(request.speculative_mode())),
+            decode: report.map(|report| {
+                report.with_captioner_reasons(request.speculative_or(self.speculative_default))
+            }),
             finish_reason: Some(map_finish(output.finish_reason)),
         })
     }
@@ -761,6 +768,7 @@ mod tests {
             .linear(&format!("{l}.mlp.c_proj"), hidden, 32);
         let weights = w.weights();
         StarVector1bProvider {
+            speculative_default: core_llm::defaults::MLX.speculative,
             descriptor: descriptor(),
             starvector: starvector_descriptor(),
             model: StarVector1bModel {
@@ -885,7 +893,7 @@ mod tests {
     /// provider that advertises no proposer.
     #[test]
     fn the_provider_reports_its_decode_and_the_auto_fallback() {
-        let provider = tiny_provider();
+        let mut provider = tiny_provider();
         let out = provider
             .generate(
                 &image_request(Some(core_llm::Speculative::Auto)),
@@ -924,6 +932,18 @@ mod tests {
             .unwrap();
         assert_eq!(off.text, out.text, "the fallback decodes plainly");
         assert!(off.decode.unwrap().fallbacks.is_empty());
+        // E5: an unset option takes the provider's per-backend default, so a table `auto` decodes
+        // plainly with the same named no-proposer fallback as an explicit `auto`.
+        provider.speculative_default = core_llm::Speculative::Auto;
+        let defaulted = provider
+            .generate(&image_request(None), &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            defaulted.text, out.text,
+            "the defaulted fallback decodes plainly"
+        );
+        assert_eq!(defaulted.decode.unwrap().fallbacks, report.fallbacks);
+        provider.speculative_default = core_llm::Speculative::Off;
         // An explicit proposer it does not advertise is not refused: it decodes plainly, named.
         let lookup =
             core_llm::Speculative::proposer(core_llm::SpeculativeProposer::PromptLookup, 2);

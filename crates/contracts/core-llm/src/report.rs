@@ -308,10 +308,10 @@ pub struct LoadReport {
     pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (story sc-24437): the requested
     /// budget ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes), else
-    /// [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES)) clamped to the headroom
-    /// the load's admission left — memory the loaded model may hold beyond its weights. `Some(0)`
-    /// when the cache is off or no headroom was left; `None` where the provider has no prefix
-    /// cache or was assembled without a load.
+    /// the backend's [`DecodeDefaults::prefix_cache_bytes`](crate::DecodeDefaults::prefix_cache_bytes))
+    /// clamped to the headroom the load's admission left — memory the loaded model may hold
+    /// beyond its weights. `Some(0)` when the cache is off or no headroom was left; `None` where
+    /// the provider has no prefix cache or was assembled without a load.
     pub prefix_cache_bytes: Option<u64>,
     /// The draft model the load named ([`LoadSpec::draft_source`](crate::LoadSpec::draft_source),
     /// epic sc-24432 story sc-24436): resident, or refused with the reason named. `None` when no
@@ -327,25 +327,34 @@ impl LoadReport {
         self.draft = Some(draft.named_in(&mut self.fallbacks));
     }
 
-    /// Record the prefix-cache budget the load settled (story sc-24437) for a request of
-    /// `requested` ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes)): in
+    /// Record the prefix-cache budget a load on `backend` settled (story sc-24437) for a request
+    /// of `requested` ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes)): in
     /// [`prefix_cache_bytes`](Self::prefix_cache_bytes), and — when a non-zero request settled to
     /// zero because admission left no headroom — a named `prefix_cache: …` entry in
     /// [`fallbacks`](Self::fallbacks). An explicit `Some(0)` turns the cache off and names nothing.
-    pub fn record_prefix_budget(&mut self, requested: Option<u64>, settled: u64) {
+    pub fn record_prefix_budget(
+        &mut self,
+        backend: crate::DecodeBackend,
+        requested: Option<u64>,
+        settled: u64,
+    ) {
         self.fallbacks
-            .extend(prefix_budget_fallback(requested, settled));
+            .extend(prefix_budget_fallback(backend, requested, settled));
         self.prefix_cache_bytes = Some(settled);
     }
 }
 
-/// The load fallback for a prefix-cache budget (story sc-24437) that settled to zero bytes
-/// although `requested` ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes),
-/// `None` = [`DEFAULT_PREFIX_CACHE_BYTES`](crate::DEFAULT_PREFIX_CACHE_BYTES)) asked for some —
+/// The load fallback for a prefix-cache budget (story sc-24437) that settled to zero bytes on
+/// `backend` although `requested` ([`LoadSpec::prefix_cache_bytes`](crate::LoadSpec::prefix_cache_bytes),
+/// `None` = the backend's [`DecodeDefaults::prefix_cache_bytes`](crate::defaults::DecodeDefaults::prefix_cache_bytes)) asked for some —
 /// load admission left no headroom beside the model (E2/E7). `None` when the cache settled to a
 /// non-zero budget or the request turned it off (`Some(0)`).
-pub fn prefix_budget_fallback(requested: Option<u64>, settled: u64) -> Option<String> {
-    let asked = crate::requested_prefix_cache_bytes(requested);
+pub fn prefix_budget_fallback(
+    backend: crate::DecodeBackend,
+    requested: Option<u64>,
+    settled: u64,
+) -> Option<String> {
+    let asked = crate::requested_prefix_cache_bytes(backend, requested);
     (settled == 0 && asked > 0).then(|| {
         format!(
             "prefix_cache: the requested {asked}-byte cache settled to 0 bytes — load admission \
@@ -470,7 +479,7 @@ mod tests {
     #[test]
     fn a_prefix_cache_settled_to_zero_by_admission_is_named() {
         let mut load = LoadReport::default();
-        load.record_prefix_budget(None, 0);
+        load.record_prefix_budget(crate::DecodeBackend::Mlx, None, 0);
         assert_eq!(load.prefix_cache_bytes, Some(0));
         assert_eq!(load.fallbacks.len(), 1, "{:?}", load.fallbacks);
         assert!(
@@ -480,7 +489,7 @@ mod tests {
         );
         for (requested, settled) in [(Some(0), 0), (Some(64), 64), (None, 5)] {
             let mut load = LoadReport::default();
-            load.record_prefix_budget(requested, settled);
+            load.record_prefix_budget(crate::DecodeBackend::Mlx, requested, settled);
             assert_eq!(load.prefix_cache_bytes, Some(settled));
             assert!(load.fallbacks.is_empty(), "{requested:?} -> {settled}");
         }

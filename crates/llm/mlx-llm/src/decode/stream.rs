@@ -6,6 +6,11 @@
 //! (the Llama decoder today, Qwen3 / BYO architectures later), emitting a [`StreamEvent`] per token
 //! through a callback.
 //!
+//! No production path decodes through this loop any more (epic sc-24432 E8): the provider, the
+//! captioners and the LTX-2.5 prompt enhancer all run the shared engine
+//! ([`generate_speculative`](super::generate_speculative)). The loop stays as the plain,
+//! non-engine **parity reference** the engine's token-identity tests compare against.
+//!
 //! Cancellation follows the established contract: a request that is *already cancelled* before any
 //! work returns the typed [`Error::Canceled`]; a cancel that trips
 //! *mid-stream* stops promptly and returns the partial output marked
@@ -283,6 +288,10 @@ pub fn generate_with_cache(
 /// The `decoder` drives the **decode steps** only (the prompt is already cached); for the Qwen3.6
 /// multimodal path that decoder shifts the RoPE offset by `mrope_delta` so post-image text positions
 /// continue correctly. Returns [`Error::Canceled`] on an already-set cancel.
+///
+/// Plain-loop parity reference only: production caller-prefilled decoding runs the engine with
+/// [`SpeculativePrompt::Prefilled`](super::SpeculativePrompt::Prefilled).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn generate_from_prefill(
     decoder: &dyn Decode,
@@ -321,6 +330,9 @@ pub fn generate_from_prefill(
 /// The two entry points differ only in how the cache + first `logits` are produced (cold prefill vs.
 /// shared-prefix reuse); the loop is identical, so a cached run is token-for-token the same as a cold
 /// one for the same prompt.
+///
+/// Plain-loop parity reference only: it has no production caller (E8); every production decode
+/// runs [`generate_speculative`](super::generate_speculative).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_loop(
     decoder: &dyn Decode,

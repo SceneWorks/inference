@@ -581,6 +581,10 @@ pub struct LlamaProvider {
     /// optional accelerator — the companion MTP head (sc-24444) — requested but not attached,
     /// named in `fallbacks`. Read through [`TextLlm::load_report`].
     load_report: core_llm::LoadReport,
+    /// The speculative option a request that leaves it unset runs with (E5, sc-24446): the MLX
+    /// defaults-table row ([`core_llm::defaults::MLX`]) unless
+    /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
+    speculative_default: core_llm::Speculative,
 }
 
 /// A draft model resident beside its target (sc-24436).
@@ -726,8 +730,12 @@ impl LlamaProvider {
         // The cross-turn prefix cache's budget (sc-24437, E7): what the load asked for, clamped to
         // the headroom this admission leaves beside the target, any admitted draft and any
         // admitted companion head, so the cache can never push the load past it.
-        let prefix_budget =
-            core_llm::prefix_cache_budget(spec.prefix_cache_bytes, admitted, available);
+        let prefix_budget = core_llm::prefix_cache_budget(
+            core_llm::DecodeBackend::Mlx,
+            spec.prefix_cache_bytes,
+            admitted,
+            available,
+        );
 
         let mut provider = Self::load_admitted(spec, quant)?.with_prefix_budget(prefix_budget);
         provider.load_report.requested = spec.quantize;
@@ -735,9 +743,11 @@ impl LlamaProvider {
         // (a configured native MTP head the snapshot does not carry).
         provider.load_report.fallbacks.splice(0..0, fallbacks);
         provider.attach_mtp_head(mtp_head.map(|(head, _)| head));
-        provider
-            .load_report
-            .record_prefix_budget(spec.prefix_cache_bytes, prefix_budget);
+        provider.load_report.record_prefix_budget(
+            core_llm::DecodeBackend::Mlx,
+            spec.prefix_cache_bytes,
+            prefix_budget,
+        );
         match draft {
             DraftPlan::None => {}
             DraftPlan::Refused(report) => provider.load_report.record_draft(report),
@@ -955,6 +965,7 @@ impl LlamaProvider {
             gemma4,
             _prism_vision_weights: prism_vision_weights,
             prefix: RefCell::new(PrefixCache::with_budget(0)),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport {
                 fallbacks: load_fallbacks,
@@ -1049,8 +1060,9 @@ impl LlamaProvider {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         })
@@ -1084,6 +1096,19 @@ impl LlamaProvider {
         self
     }
 
+    /// The speculative option a request that leaves it unset runs with on this provider: the MLX
+    /// defaults-table default ([`core_llm::DecodeDefaults::speculative`], epic sc-24432 E5)
+    /// unless [`set_speculative_default`](Self::set_speculative_default) replaced it.
+    pub fn speculative_default(&self) -> core_llm::Speculative {
+        self.speculative_default
+    }
+
+    /// Replace the speculative option an unset request runs with on this provider (a deployment
+    /// choice, e.g. a server flag); a request's own `speculative` / legacy `mtp` still wins.
+    pub fn set_speculative_default(&mut self, speculative: core_llm::Speculative) {
+        self.speculative_default = speculative;
+    }
+
     /// Whether a Prism VLM's dense vision tensors were retained for the multimodal adapter.
     pub fn has_deferred_prism_vision(&self) -> bool {
         self._prism_vision_weights.is_some()
@@ -1109,8 +1134,9 @@ impl LlamaProvider {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         }
@@ -1750,9 +1776,12 @@ impl TextLlm for LlamaProvider {
         // The backend-neutral speculative resolution (core-llm, sc-24433) against what this
         // provider advertises, then the proposer this request's shape can run on the engine
         // (sc-24434). Anything less than the request asked for is named in the report's
-        // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure.
-        let resolution =
-            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities);
+        // `fallbacks` (epic sc-24432 E2) — never a silent downgrade, never a failure. A request
+        // that leaves the option unset runs the MLX defaults-table default (E5, sc-24446).
+        let resolution = core_llm::resolve_speculative(
+            req.speculative_or(self.speculative_default),
+            &self.descriptor.capabilities,
+        );
         let mut fallbacks: Vec<String> = resolution.fallback.into_iter().collect();
         let route = self.speculative_route(resolution.plan, gemma4_mm_request, &mut fallbacks);
         // A `draft_model` request reaching past the draft's own context window runs `auto`
@@ -4210,8 +4239,9 @@ mod tests {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         }
@@ -4235,8 +4265,9 @@ mod tests {
             gemma4: None,
             _prism_vision_weights: None,
             prefix: RefCell::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::defaults::MLX.prefix_cache_bytes,
             )),
+            speculative_default: core_llm::defaults::MLX.speculative,
             draft: None,
             load_report: core_llm::LoadReport::default(),
         }
@@ -4980,7 +5011,7 @@ mod tests {
         assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
         let mut legacy = spec_request(Speculative::Off);
         legacy.speculative = None;
-        legacy.mtp = MtpMode::Enabled { draft_tokens: 40 };
+        legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 40 });
         let fallbacks = check(&hybrid, legacy, ProposerKind::Mtp, mtp_max, "legacy");
         assert_eq!(fallbacks, clamp("mtp", 40, mtp_max));
     }
@@ -4988,8 +5019,9 @@ mod tests {
     /// sc-24438 AC2: a sparse-MoE Qwen35 snapshot carrying an MTP head — its predictor layer a
     /// sparse-MoE block, as the 35B-A3B ships it, in the fused (Qwen3.6) and the per-expert
     /// (Qwen3.5) expert layout — loads through the production load path, advertises MTP on both
-    /// fields, and **runs** it: `{mtp, 3}`, the legacy `enabled 3` and `auto` each report the MTP
-    /// proposer with drafts proposed, and emit exactly `off`'s stream.
+    /// fields, and **runs** it: `{mtp}` at depths 1, 3 and the advertised max, the legacy
+    /// `enabled 3` and `auto` each report the MTP proposer with drafts proposed, and emit exactly
+    /// `off`'s stream.
     #[test]
     fn a_moe_snapshot_with_an_mtp_head_runs_mtp() {
         use crate::models::qwen35::tests::{cfg_json_moe_mtp, seeded_moe_mtp_tensors};
@@ -5034,20 +5066,26 @@ mod tests {
             let (_, off_ids) = run(&provider, &spec_request(Speculative::Off));
             let mut legacy = spec_request(Speculative::Off);
             legacy.speculative = None;
-            legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
-            for (case, req) in [
+            legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
+            // Epic AT1: the explicit option at depths 1, 3 and the advertised max.
+            let explicit = |depth| {
                 (
-                    "explicit",
-                    spec_request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
-                ),
-                ("legacy", legacy),
-                ("auto", spec_request(Speculative::Auto)),
+                    depth,
+                    spec_request(Speculative::proposer(SpeculativeProposer::Mtp, depth)),
+                )
+            };
+            for (case, (depth, req)) in [
+                ("explicit 1", explicit(1)),
+                ("explicit 3", explicit(3)),
+                ("explicit max", explicit(mtp.max_depth)),
+                ("legacy", (3, legacy)),
+                ("auto", (3, spec_request(Speculative::Auto))),
             ] {
                 provider.validate(&req).unwrap();
                 let (out, ids) = run(&provider, &req);
                 let report = out.decode.unwrap();
                 assert_eq!(report.proposer, ProposerKind::Mtp, "{label} {case}");
-                assert_eq!(report.draft_tokens, Some(3), "{label} {case}");
+                assert_eq!(report.draft_tokens, Some(depth), "{label} {case}");
                 assert!(
                     report.proposed_tokens > 0,
                     "{label} {case}: the head drafted"
@@ -5473,7 +5511,7 @@ mod tests {
         assert_eq!(load.prefix_cache_bytes, Some(0));
         assert_eq!(
             load.fallbacks,
-            core_llm::prefix_budget_fallback(None, 0)
+            core_llm::prefix_budget_fallback(core_llm::DecodeBackend::Mlx, None, 0)
                 .into_iter()
                 .collect::<Vec<_>>()
         );
@@ -5574,6 +5612,84 @@ mod tests {
             if label == "qwen35 mtp" {
                 assert!(drafted(ProposerKind::Mtp), "{label}: the head drafted");
             }
+        }
+    }
+
+    /// Epic AT1 at a production SDPA geometry: the shared fixture's hybrid target — 6 query heads
+    /// over 1 KV head at head dim 64, a GQA group of 6 — beside its hybrid draft advertises every
+    /// proposer at its geometry's depth (the vector kernel takes `32 / 6 = 5` query rows → 4
+    /// drafts, below the 8-row ceiling), and every proposer at depths 1, 3 and that max emits
+    /// `off`'s greedy stream. Every head-dim-64 attention call ran a fused MLX kernel, never the
+    /// fallback: the prefill on the full kernel and each verify on the vector kernel, a max-depth
+    /// verify (5 rows) in one call — the kernels `vector_verify_rows` / `speculative_max_depth`
+    /// are justified by, which the narrow-head-dim fixtures never reach.
+    #[test]
+    fn every_proposer_is_greedy_exact_on_the_vector_kernel_geometry() {
+        use crate::primitives::attention::kernel_tally::{record, SdpaKernel};
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let provider = LlamaProvider::load(
+            &LoadSpec::dense(fixture.hybrid_target.display().to_string())
+                .with_draft(fixture.hybrid_draft.display().to_string()),
+        )
+        .unwrap();
+        let Decoder::Qwen35(model) = &provider.model else {
+            panic!("the hybrid target loads as the Qwen35 decoder");
+        };
+        let geometry = qwen35_attention_geometry(model.config());
+        assert_eq!(geometry, (6, 1, 64, 64));
+        let caps = &provider.descriptor().capabilities;
+        let cases = core_llm_testkit::advertised_parity_cases(caps);
+        let prompts = core_llm_testkit::draft_model_prompts();
+        let (rows, calls) = record(|| {
+            core_llm_testkit::check_speculative_greedy_parity(&provider, &prompts, &cases, 24)
+        });
+        let rows = rows.unwrap_or_else(|failures| panic!("{failures}"));
+        assert!(rows.iter().all(|r| r.report.fallbacks.is_empty()));
+        for kind in [
+            ProposerKind::Mtp,
+            ProposerKind::PromptLookup,
+            ProposerKind::DraftModel,
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|r| r.report.proposer == kind && r.report.proposed_tokens > 0),
+                "{kind:?} drafted"
+            );
+        }
+
+        // The kernels every head-dim-64 call — the target's and its MTP head's — reached.
+        let wide: Vec<_> = calls.iter().filter(|c| c.head_dim == 64).collect();
+        let fallback: Vec<_> = wide
+            .iter()
+            .filter(|c| c.kernel == SdpaKernel::Fallback)
+            .collect();
+        assert!(fallback.is_empty(), "fell back: {fallback:?}");
+        assert!(
+            wide.iter().any(|c| c.kernel == SdpaKernel::Full),
+            "a prefill on the full kernel"
+        );
+        let deepest = rows
+            .iter()
+            .filter_map(|r| r.report.draft_tokens)
+            .max()
+            .unwrap();
+        assert!(
+            wide.iter()
+                .any(|c| c.kernel == SdpaKernel::Vector && c.q_len == 1 + deepest as i32),
+            "a max-depth ({deepest}) verify in one vector-kernel call"
+        );
+
+        // And that max is the geometry's: every proposer advertises it, the table covers it.
+        let max = speculative_max_depth([geometry]);
+        assert_eq!(max, 4, "the vector kernel's 5 rows, not the 8-row ceiling");
+        assert_eq!(deepest, max);
+        for proposer in SpeculativeProposer::ALL {
+            assert_eq!(
+                caps.proposer(proposer).unwrap().max_depth,
+                max,
+                "{proposer:?}"
+            );
         }
     }
 
@@ -5811,7 +5927,7 @@ mod tests {
             spec.prefix_cache_bytes = None;
             assert_eq!(
                 LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
-                headroom.min(core_llm::DEFAULT_PREFIX_CACHE_BYTES)
+                headroom.min(core_llm::defaults::MLX.prefix_cache_bytes)
             );
         }
         spec.prefix_cache_bytes = Some(u64::MAX);
@@ -5949,5 +6065,35 @@ mod tests {
                 vec![prompt[..boundary].to_vec()]
             );
         }
+    }
+
+    /// sc-24446 (E5): a provider loads with the MLX defaults-table speculative default, and a
+    /// request that leaves the option unset runs whatever the provider's default is — here set to
+    /// `auto` so the hook is observable — while an explicit off (new or legacy spelling) wins.
+    #[test]
+    fn an_unset_speculative_option_runs_the_providers_default() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let mut provider =
+            LlamaProvider::load(&LoadSpec::dense(fixture.target.to_string_lossy())).unwrap();
+        assert_eq!(
+            provider.speculative_default(),
+            core_llm::defaults::MLX.speculative,
+            "loaded with the defaults table's default"
+        );
+        let prompt = &core_llm_testkit::draft_model_prompts()[0];
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            core_llm::defaults::MLX.speculative,
+            prompt,
+            8,
+        );
+        provider.set_speculative_default(core_llm::Speculative::Auto);
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            core_llm::Speculative::Auto,
+            prompt,
+            8,
+        );
     }
 }

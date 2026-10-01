@@ -103,17 +103,11 @@ use crate::primitives::switch::{ProcessSwitch, SwitchGuard};
 /// it off, and unset leaves [`CUDA_GRAPHS_DEFAULT`].
 pub const CUDA_GRAPHS_ENV: &str = "CANDLE_LLM_CUDA_GRAPHS";
 
-/// **The Candle CUDA-graph default** (epic sc-24432 E5) — the one place it is set: whether the
-/// runner captures when neither [`CUDA_GRAPHS_ENV`], [`set_cuda_graphs`] nor a load's
-/// `LoadSpec::cuda_graphs` says otherwise.
-///
-/// **Off.** Justification: until sc-24441 no production step was capturable at all (every model
-/// declared `positions_host_scalar`), so no measurement of a captured production decode exists
-/// yet. Dense `CausalLm` / `Qwen35Model` steps now capture (device positions + the vendored
-/// candle parameter cache) and are token-identical to eager by construction, but the decode-rate
-/// win on real weights — and the absence of a regression anywhere (E6) — is measured once by the
-/// epic's terminal benchmark campaign (sc-24446), which sets this value from that measurement.
-pub const CUDA_GRAPHS_DEFAULT: bool = false;
+/// **The Candle CUDA-graph default** (epic sc-24432 E5): whether the runner captures when neither
+/// [`CUDA_GRAPHS_ENV`], [`set_cuda_graphs`] nor a load's `LoadSpec::cuda_graphs` says otherwise —
+/// read from the per-backend defaults table ([`core_llm::defaults::CANDLE_CUDA`]), where the
+/// value and its justification live (PROVISIONAL until the sc-24446 campaign measures it).
+pub const CUDA_GRAPHS_DEFAULT: bool = core_llm::defaults::CANDLE_CUDA.cuda_graphs;
 
 /// Fallback reason: the switch is off.
 pub const REASON_DISABLED: &str = "disabled";

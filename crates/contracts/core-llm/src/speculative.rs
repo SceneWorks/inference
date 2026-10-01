@@ -220,13 +220,15 @@ pub fn no_proposer_fallback(mode: crate::Speculative, why: &str) -> Option<Strin
 }
 
 /// The MTP depth [`Speculative::Auto`](crate::Speculative::Auto) runs on a Qwen3.8 head — native
-/// or companion — on both backends (the upstream recommendation).
+/// or companion — on both backends (the upstream recommendation). Recorded per backend in
+/// [`crate::defaults`].
 pub const MTP_RECOMMENDED_DEPTH: u32 = 3;
 
 /// The prompt-lookup depth [`Speculative::Auto`](crate::Speculative::Auto) runs on a model without
 /// an MTP head (sc-24433), on both backends. A lookup that finds no match proposes nothing and the
 /// step is an ordinary single-token decode, so the depth only prices a match; 4 keeps the
-/// Qwen3.5 hybrid's DeltaNet checkpoint ring at `K + 2 = 6` states.
+/// Qwen3.5 hybrid's DeltaNet checkpoint ring at `K + 2 = 6` states. Recorded per backend in
+/// [`crate::defaults`].
 pub const PROMPT_LOOKUP_RECOMMENDED_DEPTH: u32 = 4;
 
 /// The prompt-lookup advertisement every text decoder carries (both backends' decoders run the

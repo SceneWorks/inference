@@ -369,7 +369,9 @@ pub fn draw_token(
 /// so it takes the host — plus Candle's degenerate-temperature guard: a positive temperature whose
 /// reciprocal is not a finite, non-zero scale (subnormal, `+inf`, NaN) cannot shape device weights
 /// and takes the host reference ([`HostSampleReason::DegenerateTemperature`]). Everything else,
-/// greedy or stochastic, draws on the device.
+/// greedy or stochastic, draws on the device — unless the device sampler is switched off
+/// ([`DEVICE_SAMPLER`](crate::switches::DEVICE_SAMPLER)), when it takes the host reference
+/// ([`HostSampleReason::Reference`]).
 pub fn sampler_path(params: &SamplingParams, constrained: bool) -> SamplerPath {
     if constrained {
         SamplerPath::Host(HostSampleReason::Constraint)
@@ -377,6 +379,8 @@ pub fn sampler_path(params: &SamplingParams, constrained: bool) -> SamplerPath {
         SamplerPath::Host(HostSampleReason::Penalty)
     } else if degenerate_temperature(params.temperature) {
         SamplerPath::Host(HostSampleReason::DegenerateTemperature)
+    } else if !crate::switches::DEVICE_SAMPLER.enabled() {
+        SamplerPath::Host(HostSampleReason::Reference)
     } else {
         SamplerPath::Device
     }
@@ -848,6 +852,22 @@ mod tests {
 
     /// The reported path is the branch that ran: the on-device argmax only for a plain greedy,
     /// unconstrained draw; otherwise the host, with the reason the row came there.
+    /// sc-24446 (E5): with the device sampler switched off (`MLX_LLM_DEVICE_SAMPLER`; here its
+    /// thread-scoped layer) a request that would draw on the device takes the host reference.
+    #[test]
+    fn the_device_sampler_switch_off_routes_to_the_host_reference() {
+        let stochastic = SamplingParams {
+            temperature: 0.8,
+            ..Default::default()
+        };
+        for params in [SamplingParams::default(), stochastic] {
+            assert_eq!(sampler_path(&params, false), SamplerPath::Device);
+            let off =
+                crate::switches::DEVICE_SAMPLER.scoped(false, || sampler_path(&params, false));
+            assert_eq!(off, SamplerPath::Host(HostSampleReason::Reference));
+        }
+    }
+
     #[test]
     fn sample_with_path_reports_the_branch_that_ran() {
         let l = logits(&[0.1, 0.2, 9.0, 0.3]);

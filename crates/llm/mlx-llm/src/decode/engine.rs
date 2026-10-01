@@ -1015,6 +1015,7 @@ where
         sampler.sample(&logits, &history, mask)?
     };
     if pipelining == Pipelining::Auto
+        && crate::switches::PIPELINING.enabled()
         && kind == ProposerKind::None
         && constraint.is_none()
         && !wants_hidden
@@ -3542,6 +3543,29 @@ pub(crate) mod tests {
     fn pipelining_is_invisible_on_the_causal_and_hybrid_targets() {
         pipelining_is_invisible_on(&causal());
         pipelining_is_invisible_on(&qwen35(false));
+    }
+
+    /// sc-24446 (E5): the process switches the campaign isolates pipelining and the device sampler
+    /// with (`MLX_LLM_PIPELINING`, `MLX_LLM_DEVICE_SAMPLER`; here their thread-scoped layer) turn
+    /// each off for a request that would otherwise take it, and the greedy tokens do not move.
+    #[test]
+    fn the_pipelining_and_device_sampler_switches_turn_each_path_off() {
+        use crate::switches::{DEVICE_SAMPLER, PIPELINING};
+        fn check<T: SpeculativeTarget>(label: &str, model: &T) {
+            let run = || off_run(model, &greedy(12), Pipelining::Auto, None);
+            let on = run();
+            assert_eq!(on.stats.pipelined, 11, "{label}: pipelined when allowed");
+            assert_eq!(on.report.sampler, "device", "{label}");
+            let unpipelined = PIPELINING.scoped(false, run);
+            assert_eq!(unpipelined.stats.pipelined, 0, "{label}: the switch is off");
+            assert_eq!(unpipelined.output.tokens, on.output.tokens, "{label}");
+            let host = DEVICE_SAMPLER.scoped(false, run);
+            assert_eq!(host.report.sampler, "host:reference", "{label}");
+            assert_eq!(host.stats.pipelined, 0, "{label}: a host draw is read back");
+            assert_eq!(host.output.tokens, on.output.tokens, "{label}");
+        }
+        check("causal", &causal());
+        check("qwen35", &qwen35(false));
     }
 
     /// AC1 (speculative half): a run with a proposer is never pipelined — the proposer reads the

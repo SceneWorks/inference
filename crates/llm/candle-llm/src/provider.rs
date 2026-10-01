@@ -898,6 +898,10 @@ pub struct LlamaProvider {
     /// What became of the load's named draft (resident, or refused with the reason), reported in
     /// [`TextLlm::load_report`]. `None` when no draft was named.
     draft_report: Option<DraftReport>,
+    /// The speculative option a request that leaves it unset runs with (E5, sc-24446): the
+    /// device's defaults-table row ([`crate::device::decode_defaults`]) unless
+    /// [`set_speculative_default`](LlamaProvider::set_speculative_default) overrides it.
+    speculative_default: core_llm::Speculative,
 }
 
 /// A draft model resident beside its target (sc-24436).
@@ -1383,6 +1387,19 @@ impl LlamaProvider {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The speculative option a request that leaves it unset runs with on this provider: its
+    /// device's defaults-table default ([`core_llm::DecodeDefaults::speculative`], epic sc-24432
+    /// E5) unless [`set_speculative_default`](Self::set_speculative_default) replaced it.
+    pub fn speculative_default(&self) -> core_llm::Speculative {
+        self.speculative_default
+    }
+
+    /// Replace the speculative option an unset request runs with on this provider (a deployment
+    /// choice, e.g. a server flag); a request's own `speculative` / legacy `mtp` still wins.
+    pub fn set_speculative_default(&mut self, speculative: core_llm::Speculative) {
+        self.speculative_default = speculative;
+    }
+
     /// Select the loop a request whose speculation is off decodes on — one selector for both
     /// families (sc-24138, sc-24140): [`DecodePath::StepModel`] (the default) runs the unified
     /// engine over the step seam with no proposer on the static KV cache (through the CUDA-graph
@@ -1654,11 +1671,13 @@ impl LlamaProvider {
         // the headroom this admission leaves beside the target, any admitted draft and any
         // admitted companion head in the domain the cache lives in — the device's on CUDA, the
         // host's otherwise — so the cache can never push the load past it.
+        let backend = crate::device::decode_backend(&device);
         let prefix_budget = match device_admitted.zip(device_available) {
             Some((admitted, available)) => {
-                core_llm::prefix_cache_budget(spec.prefix_cache_bytes, admitted, available)
+                core_llm::prefix_cache_budget(backend, spec.prefix_cache_bytes, admitted, available)
             }
             None => core_llm::prefix_cache_budget(
+                backend,
                 spec.prefix_cache_bytes,
                 host_admitted,
                 host_available,
@@ -1697,6 +1716,7 @@ impl LlamaProvider {
             .load_record
             .fallbacks
             .extend(core_llm::prefix_budget_fallback(
+                backend,
                 spec.prefix_cache_bytes,
                 prefix_budget,
             ));
@@ -2044,7 +2064,10 @@ impl LlamaProvider {
             payload_bytes: payload,
             host_required_bytes: host_required,
             device_required_bytes: device_required,
-            prefix_cache_bytes: core_llm::requested_prefix_cache_bytes(spec.prefix_cache_bytes),
+            prefix_cache_bytes: core_llm::requested_prefix_cache_bytes(
+                crate::device::decode_backend_for(cuda),
+                spec.prefix_cache_bytes,
+            ),
             source_bytes: on_device(working.source),
             cast_copy_bytes: on_device(working.cast),
             quantized_copy_bytes: on_device(working.copy),
@@ -2283,8 +2306,9 @@ impl LlamaProvider {
             last_decode: Mutex::new(None),
             decode_path: DecodePath::StepModel,
             prefix: Mutex::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::requested_prefix_cache_bytes(crate::device::decode_backend(device), None),
             )),
+            speculative_default: crate::device::decode_defaults(device).speculative,
             draft: None,
             draft_report: None,
             vision,
@@ -2426,8 +2450,12 @@ impl LlamaProvider {
                 last_decode: Mutex::new(None),
                 decode_path: DecodePath::StepModel,
                 prefix: Mutex::new(PrefixCache::with_budget(
-                    core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                    core_llm::requested_prefix_cache_bytes(
+                        crate::device::decode_backend(device),
+                        None,
+                    ),
                 )),
+                speculative_default: crate::device::decode_defaults(device).speculative,
                 draft: None,
                 draft_report: None,
                 constraint_table: OnceCell::new(),
@@ -2486,8 +2514,9 @@ impl LlamaProvider {
             last_decode: Mutex::new(None),
             decode_path: DecodePath::StepModel,
             prefix: Mutex::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::requested_prefix_cache_bytes(crate::device::decode_backend(device), None),
             )),
+            speculative_default: crate::device::decode_defaults(device).speculative,
             draft: None,
             draft_report: None,
             constraint_table: OnceCell::new(),
@@ -2563,6 +2592,7 @@ impl LlamaProvider {
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
+        let backend = crate::device::decode_backend(model.device());
         Self {
             descriptor: provider_descriptor(),
             model: Decoder::Causal(model),
@@ -2573,8 +2603,9 @@ impl LlamaProvider {
             last_decode: Mutex::new(None),
             decode_path: DecodePath::StepModel,
             prefix: Mutex::new(PrefixCache::with_budget(
-                core_llm::DEFAULT_PREFIX_CACHE_BYTES,
+                core_llm::requested_prefix_cache_bytes(backend, None),
             )),
+            speculative_default: backend.defaults().speculative,
             draft: None,
             draft_report: None,
             constraint_table: OnceCell::new(),
@@ -2937,7 +2968,8 @@ pub struct LoadMemoryEstimate {
     /// bound and `graph_param_cache_bytes`.
     pub device_required_bytes: Option<u64>,
     /// The cross-turn prefix cache's budget the load asks for (sc-24437):
-    /// [`LoadSpec::prefix_cache_bytes`], else [`core_llm::DEFAULT_PREFIX_CACHE_BYTES`]. Memory
+    /// [`LoadSpec::prefix_cache_bytes`], else the backend's defaults-table budget
+    /// ([`core_llm::DecodeDefaults::prefix_cache_bytes`]). Memory
     /// the loaded model may hold **beside** the required bytes, in the domain the cache lives in
     /// (the device's on CUDA, the host's otherwise). It is not part of either required figure:
     /// `load` clamps it to the headroom its admission leaves, so it never refuses a load by
@@ -4158,9 +4190,11 @@ impl TextLlm for LlamaProvider {
         // the checkpoint has a head, else prompt lookup; anything the plan cannot deliver is
         // named in the report's `fallbacks` (epic sc-24432 E2), never a silent downgrade.
         // A `draft_model` request reaching past the draft's own context window runs `auto`
-        // instead, by name (sc-24436, E2).
+        // instead, by name (sc-24436, E2). A request that leaves the option unset runs this
+        // device's defaults-table default (E5, sc-24446).
+        let speculative = req.speculative_or(self.speculative_default);
         let resolution = core_llm::fit_draft_context(
-            core_llm::resolve_speculative(req.speculative_mode(), &self.descriptor.capabilities),
+            core_llm::resolve_speculative(speculative, &self.descriptor.capabilities),
             &self.descriptor.capabilities,
             self.draft_context(),
             admitted_prompt,
@@ -9044,7 +9078,7 @@ mod tests {
             sampling: Sampling::greedy(),
             max_new_tokens: 6,
             seed: Some(0),
-            mtp,
+            mtp: Some(mtp),
             ..Default::default()
         };
         let out = provider
@@ -9664,7 +9698,7 @@ mod tests {
         assert_eq!(fallbacks, clamp("mtp", 40, super::MTP_MAX_DEPTH));
         let mut legacy = request(Speculative::Off);
         legacy.speculative = None;
-        legacy.mtp = MtpMode::Enabled { draft_tokens: 40 };
+        legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 40 });
         let fallbacks = check(
             &with_head,
             legacy,
@@ -9678,8 +9712,9 @@ mod tests {
     /// sc-24438 AC2: a qwen3_5 MoE snapshot carrying an MTP head — its predictor layer a
     /// sparse-MoE block, as the 35B-A3B ships it, in the fused (Qwen3.6) and the per-expert
     /// (Qwen3.5) expert layout — loads (before, `Qwen35Mtp` refused it and the whole load failed),
-    /// advertises MTP on both fields, and **runs** it: `{mtp, 3}`, the legacy `enabled 3` and
-    /// `auto` each report the MTP proposer with drafts proposed, and emit exactly `off`'s stream.
+    /// advertises MTP on both fields, and **runs** it: `{mtp}` at depths 1, 3 and the advertised
+    /// max, the legacy `enabled 3` and `auto` each report the MTP proposer with drafts proposed,
+    /// and emit exactly `off`'s stream.
     /// Under Q8 the head is priced: the estimate equals the copy the load builds, head included,
     /// and exceeds the headless MoE snapshot's.
     #[test]
@@ -9719,20 +9754,26 @@ mod tests {
             let (off, _) = token_events(&provider, &request(Speculative::Off));
             let mut legacy = request(Speculative::Off);
             legacy.speculative = None;
-            legacy.mtp = MtpMode::Enabled { draft_tokens: 3 };
-            for (case, req) in [
+            legacy.mtp = Some(MtpMode::Enabled { draft_tokens: 3 });
+            // Epic AT1: the explicit option at depths 1, 3 and the advertised max.
+            let explicit = |depth| {
                 (
-                    "explicit",
-                    request(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
-                ),
-                ("legacy", legacy),
-                ("auto", request(Speculative::Auto)),
+                    depth,
+                    request(Speculative::proposer(SpeculativeProposer::Mtp, depth)),
+                )
+            };
+            for (case, (depth, req)) in [
+                ("explicit 1", explicit(1)),
+                ("explicit 3", explicit(3)),
+                ("explicit max", explicit(mtp.max_depth)),
+                ("legacy", (3, legacy)),
+                ("auto", (3, request(Speculative::Auto))),
             ] {
                 provider.validate(&req).expect(case);
                 let (events, out) = token_events(&provider, &req);
                 let report = out.decode.unwrap();
                 assert_eq!(report.proposer, ProposerKind::Mtp, "{label} {case}");
-                assert_eq!(report.draft_tokens, Some(3), "{label} {case}");
+                assert_eq!(report.draft_tokens, Some(depth), "{label} {case}");
                 assert!(
                     report.proposed_tokens > 0,
                     "{label} {case}: the head drafted"
@@ -9888,6 +9929,7 @@ mod tests {
             ],
             warmup: false,
             sampling: core_llm::Sampling::greedy(),
+            repeats: 1,
         };
         let prompts = core_llm_testkit::speculative_prompt_set();
         let doc = core_llm_testkit::run_speculative_bench(&provider, &prompts, &config)
@@ -9965,7 +10007,7 @@ mod tests {
     /// switch off neither record shows the runner.
     #[test]
     fn the_runner_wraps_the_off_path_and_a_reference_record_names_why_it_did_not_run() {
-        use core_llm::{LoadSpec, Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
+        use core_llm::{LoadSpec, Message, Sampling, TextLlm, TextLlmRequest};
 
         let dir = synthetic_qwen35_snapshot_without_mtp();
         let request = TextLlmRequest {
@@ -9973,7 +10015,7 @@ mod tests {
             sampling: Sampling::greedy(),
             max_new_tokens: 3,
             seed: Some(0),
-            mtp: MtpMode::Off,
+            mtp: None,
             ..Default::default()
         };
         let load = |on: bool| {
@@ -10079,7 +10121,7 @@ mod tests {
     /// and the record says why; every draw is recorded either way.
     #[test]
     fn a_stochastic_off_request_draws_through_the_device_sampler_where_there_is_one() {
-        use core_llm::{Message, MtpMode, Sampling, TextLlm, TextLlmRequest};
+        use core_llm::{Message, Sampling, TextLlm, TextLlmRequest};
 
         let (_dir, provider) = synthetic_qwen35_provider_without_mtp();
         let request = TextLlmRequest {
@@ -10091,7 +10133,7 @@ mod tests {
             },
             max_new_tokens: 8,
             seed: Some(5),
-            mtp: MtpMode::Off,
+            mtp: None,
             ..Default::default()
         };
         let out = provider.generate(&request, &mut |_| {}).unwrap();
@@ -10453,9 +10495,13 @@ mod tests {
         assert_eq!(fits.load_record().prefix_cache_bytes, Some(0));
         assert_eq!(
             fits.load_record().fallbacks,
-            core_llm::prefix_budget_fallback(None, 0)
-                .into_iter()
-                .collect::<Vec<_>>()
+            core_llm::prefix_budget_fallback(
+                crate::device::decode_backend(&crate::device::select_device().unwrap()),
+                None,
+                0,
+            )
+            .into_iter()
+            .collect::<Vec<_>>()
         );
         assert!(mtp_advertised(&fits).is_some());
         // The prefix-cache snapshot of an MTP request carries the head's KV too (sc-24437).
@@ -10463,6 +10509,36 @@ mod tests {
         assert!(
             snapshot(true) > snapshot(false) + 4 * 64,
             "the head's KV is priced"
+        );
+    }
+
+    /// sc-24446 (E5): a provider loads with its device's defaults-table speculative default, and a
+    /// request that leaves the option unset runs whatever the provider's default is — here set to
+    /// `auto` so the hook is observable — while an explicit off (new or legacy spelling) wins.
+    #[test]
+    fn an_unset_speculative_option_runs_the_providers_default() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = core_llm_testkit::write_draft_model_fixture(root.path()).unwrap();
+        let mut provider =
+            super::LlamaProvider::load(&LoadSpec::dense(fixture.target.to_string_lossy())).unwrap();
+        assert_eq!(
+            provider.speculative_default(),
+            crate::device::decode_defaults(provider.model.device()).speculative,
+            "loaded with the defaults table's default"
+        );
+        let prompt = &core_llm_testkit::draft_model_prompts()[0];
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            crate::device::decode_defaults(provider.model.device()).speculative,
+            prompt,
+            8,
+        );
+        provider.set_speculative_default(core_llm::Speculative::Auto);
+        core_llm_testkit::check_speculative_default(
+            &provider,
+            core_llm::Speculative::Auto,
+            prompt,
+            8,
         );
     }
 
@@ -10717,7 +10793,13 @@ mod tests {
                     .unwrap()
                     .prefix_cache_bytes
             };
-            assert_eq!(asked(&spec), core_llm::DEFAULT_PREFIX_CACHE_BYTES);
+            assert_eq!(
+                asked(&spec),
+                crate::device::decode_backend_for(false)
+                    .defaults()
+                    .prefix_cache_bytes,
+                "unset: the backend's defaults-table budget"
+            );
             spec.prefix_cache_bytes = Some(u64::MAX);
             assert_eq!(asked(&spec), u64::MAX);
             assert_eq!(
@@ -10740,9 +10822,12 @@ mod tests {
                     100
                 );
                 spec.prefix_cache_bytes = None;
+                let provider = LlamaProvider::load(&spec).unwrap();
                 assert_eq!(
-                    LlamaProvider::load(&spec).unwrap().prefix_cache_budget(),
-                    headroom.min(core_llm::DEFAULT_PREFIX_CACHE_BYTES)
+                    provider.prefix_cache_budget(),
+                    headroom.min(
+                        crate::device::decode_defaults(provider.model.device()).prefix_cache_bytes
+                    )
                 );
             }
             spec.prefix_cache_bytes = Some(u64::MAX);

@@ -6,12 +6,19 @@
 //!   smaller tiny Qwen3 **draft** sharing one tokenizer vocabulary, plus a **foreign** draft whose
 //!   tokenizer is the same size over different tokens. Target and draft share their embedding and
 //!   output projection and differ in depth, width and layer weights, so the draft agrees with the
-//!   target often but not always: a greedy run accepts drafts *and* rejects some. Written as plain
-//!   safetensors from this crate, so the fixture itself needs no tensor library. No real weights.
+//!   target often but not always: a greedy run accepts drafts *and* rejects some. Beside them, a
+//!   tiny Qwen3.5 **hybrid** target with an MTP head, its sparse-MoE variant, a Qwen2-MoE Causal
+//!   target and a smaller hybrid draft, all over the same tokenizer and shared embedding. Written
+//!   as plain safetensors from this crate, so the fixture itself needs no tensor library. No real
+//!   weights.
 //! * **Resident** ([`check_draft_model_resident`]): a target loaded with the draft advertises
 //!   `draft_model`, its load report names the draft resident, `{proposer: draft_model}` at every
 //!   depth emits exactly the greedy stream of `off` with a report naming `draft_model`, drafts
 //!   were proposed, accepted and rejected, and a seeded stochastic run is reproducible.
+//! * **Other targets** ([`check_draft_model_targets`]): the resident check on the hybrid, hybrid
+//!   MoE and Causal MoE targets beside the hybrid and the Causal draft, and every other proposer
+//!   those targets advertise (MTP, prompt lookup) at depths 1, 3 and max, greedy-identical to
+//!   `off` (epic AT1).
 //! * **Refused** ([`check_draft_model_refused`]): a target loaded with the foreign draft still
 //!   loads, its load report names the tokenizer refusal, `draft_model` is not advertised (so a
 //!   request for it is refused up front), and the target decodes as it would alone.
@@ -34,13 +41,14 @@ use core_llm::{
 use serde_json::{json, Map, Value};
 
 use crate::speculative::{
-    bench_request, check_speculative_greedy_parity, BenchPrompt, ParityCase, PromptClass,
+    advertised_parity_cases, bench_request, check_speculative_greedy_parity, BenchPrompt,
+    ParityCase, PromptClass,
 };
 
-/// The fixture's vocabulary size (the tokenizer's and both models' `vocab_size`).
+/// The fixture's vocabulary size (the tokenizer's and every model's `vocab_size`).
 pub const DRAFT_FIXTURE_VOCAB: usize = 32;
 
-/// The three snapshots [`write_draft_model_fixture`] writes.
+/// The snapshots [`write_draft_model_fixture`] writes.
 #[derive(Clone, Debug)]
 pub struct DraftModelFixture {
     /// The tiny Qwen3 target (2 layers, hidden 16).
@@ -51,6 +59,18 @@ pub struct DraftModelFixture {
     /// A draft identical in shape to [`draft`](Self::draft) whose tokenizer is the same size over
     /// different tokens — the mismatched-tokenizer case.
     pub foreign_draft: PathBuf,
+    /// A tiny Qwen3.5 hybrid target (a Gated DeltaNet layer then a gated full-attention layer,
+    /// 6 query heads over 1 KV head at head dim 64) with an MTP head, over the target's
+    /// tokenizer.
+    pub hybrid_target: PathBuf,
+    /// [`hybrid_target`](Self::hybrid_target) with every FFN — the MTP predictor layer's too — a
+    /// sparse-MoE block (`qwen3_5_moe`, fused expert layout).
+    pub hybrid_moe_target: PathBuf,
+    /// A tiny Qwen2-MoE Causal target (2 layers, every FFN a sparse-MoE block) over the target's
+    /// tokenizer.
+    pub moe_target: PathBuf,
+    /// A smaller tiny Qwen3.5 hybrid draft (no MTP head) over the target's tokenizer.
+    pub hybrid_draft: PathBuf,
 }
 
 impl DraftModelFixture {
@@ -63,6 +83,24 @@ impl DraftModelFixture {
     pub fn spec_with_foreign_draft(&self) -> LoadSpec {
         LoadSpec::dense(self.target.to_string_lossy())
             .with_draft(self.foreign_draft.to_string_lossy())
+    }
+
+    /// Every (target, draft) pairing [`check_draft_model_targets`] runs beyond the Causal
+    /// target's own: each hybrid target beside the hybrid draft and the Causal draft, and the
+    /// Causal MoE target beside both, labelled.
+    pub fn target_pairings(&self) -> Vec<(&'static str, &Path, &Path)> {
+        vec![
+            ("hybrid/hybrid", &self.hybrid_target, &self.hybrid_draft),
+            ("hybrid/causal", &self.hybrid_target, &self.draft),
+            (
+                "hybrid-moe/hybrid",
+                &self.hybrid_moe_target,
+                &self.hybrid_draft,
+            ),
+            ("hybrid-moe/causal", &self.hybrid_moe_target, &self.draft),
+            ("moe/causal", &self.moe_target, &self.draft),
+            ("moe/hybrid", &self.moe_target, &self.hybrid_draft),
+        ]
     }
 }
 
@@ -135,18 +173,253 @@ fn tokenizer_json(prefix: &str) -> String {
     .to_string()
 }
 
-/// One tiny Qwen3 decoder's geometry and layer-weight scale.
+/// The decoder a fixture snapshot is written as.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arch {
+    /// `Qwen3ForCausalLM`: the Causal decoder.
+    Qwen3,
+    /// `Qwen2MoeForCausalLM`: the Causal decoder with every FFN a sparse MoE block (per-expert
+    /// layout, sigmoid-gated shared expert) and biased q/k/v projections.
+    Qwen2Moe,
+    /// The Qwen3.5 hybrid (`qwen3_5` / `qwen3_5_moe`): Gated DeltaNet and gated full-attention
+    /// layers alternating (`full_attention_interval` 2), every FFN dense or — `moe` — a sparse MoE
+    /// block (fused Qwen3.6 expert layout), with an MTP head (`mtp`) whose predictor layer's FFN
+    /// follows the body's.
+    Qwen35 { moe: bool, mtp: bool },
+}
+
+/// One tiny decoder's geometry and layer-weight scale.
 struct Shape {
+    arch: Arch,
     layers: usize,
     heads: usize,
     kv_heads: usize,
+    head_dim: usize,
     intermediate: usize,
     layer_scale: f32,
     seed: u64,
 }
 
 const HIDDEN: usize = 16;
+/// The Causal decoders' attention head dim.
 const HEAD_DIM: usize = 4;
+/// The hybrid targets' attention: 6 query heads over 1 KV head (a GQA group of 6) at head dim 64
+/// — a geometry MLX's fused SDPA kernels serve (the vector kernel up to `32 / 6 = 5` query rows,
+/// the full kernel past 8), so a verify there runs the production kernels rather than the
+/// score-materializing fallback the narrow head dims take, and MLX's geometry-derived maximum
+/// depth (4) differs from its 8-row ceiling.
+const VECTOR_HEADS: usize = 6;
+const VECTOR_HEAD_DIM: usize = 64;
+/// The sparse-MoE blocks: experts, experts per token, expert and shared-expert widths.
+const EXPERTS: usize = 4;
+const EXPERTS_PER_TOKEN: usize = 2;
+const MOE_INTERMEDIATE: usize = 16;
+const SHARED_INTERMEDIATE: usize = 16;
+/// The Gated DeltaNet layers: key heads, value heads, per-head dim and conv kernel width.
+const LINEAR_KEY_HEADS: usize = 2;
+const LINEAR_VALUE_HEADS: usize = 4;
+const LINEAR_HEAD_DIM: usize = 4;
+const CONV_KERNEL: usize = 4;
+
+impl Shape {
+    /// The weight-name root the decoder's layers, embedding and final norm live under.
+    fn root(&self) -> &'static str {
+        match self.arch {
+            Arch::Qwen35 { .. } => "model.language_model",
+            _ => "model",
+        }
+    }
+
+    fn config(&self) -> Value {
+        // `eos_token_id` outside the vocabulary: every run decodes to its token budget.
+        let mut config = json!({
+            "hidden_size": HIDDEN,
+            "intermediate_size": self.intermediate,
+            "num_hidden_layers": self.layers,
+            "num_attention_heads": self.heads,
+            "num_key_value_heads": self.kv_heads,
+            "head_dim": self.head_dim,
+            "vocab_size": DRAFT_FIXTURE_VOCAB,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 512,
+            "eos_token_id": 999,
+        });
+        let moe = json!({
+            "num_experts": EXPERTS,
+            "num_experts_per_tok": EXPERTS_PER_TOKEN,
+            "moe_intermediate_size": MOE_INTERMEDIATE,
+            "shared_expert_intermediate_size": SHARED_INTERMEDIATE,
+            "norm_topk_prob": true,
+        });
+        let extend = |config: &mut Value, extra: &Value| {
+            for (k, v) in extra.as_object().unwrap() {
+                config[k] = v.clone();
+            }
+        };
+        match self.arch {
+            Arch::Qwen3 => {
+                extend(
+                    &mut config,
+                    &json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}),
+                );
+                config
+            }
+            Arch::Qwen2Moe => {
+                extend(
+                    &mut config,
+                    &json!({"architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe"}),
+                );
+                extend(&mut config, &moe);
+                config
+            }
+            Arch::Qwen35 { moe: sparse, mtp } => {
+                extend(
+                    &mut config,
+                    &json!({
+                        "model_type": if sparse { "qwen3_5_moe_text" } else { "qwen3_5_text" },
+                        "rope_theta": 10000000.0,
+                        "partial_rotary_factor": 0.5,
+                        "full_attention_interval": 2,
+                        "linear_num_key_heads": LINEAR_KEY_HEADS,
+                        "linear_num_value_heads": LINEAR_VALUE_HEADS,
+                        "linear_key_head_dim": LINEAR_HEAD_DIM,
+                        "linear_value_head_dim": LINEAR_HEAD_DIM,
+                        "linear_conv_kernel_dim": CONV_KERNEL,
+                        "mtp_num_hidden_layers": u32::from(mtp),
+                        "mtp_use_dedicated_embeddings": false,
+                    }),
+                );
+                if sparse {
+                    extend(&mut config, &moe);
+                }
+                json!({
+                    "architectures": [if sparse {
+                        "Qwen3_5MoeForConditionalGeneration"
+                    } else {
+                        "Qwen3_5ForConditionalGeneration"
+                    }],
+                    "model_type": if sparse { "qwen3_5_moe" } else { "qwen3_5" },
+                    "eos_token_id": 999,
+                    "text_config": config,
+                })
+            }
+        }
+    }
+
+    /// Layer `prefix`'s full-attention projections (and the per-head q/k norms where the family
+    /// has them); the hybrid's query projection carries its output gate.
+    fn attention(&self, prefix: &str, rng: &mut Stream, tensors: &mut Vec<Tensor>) {
+        let gate = if matches!(self.arch, Arch::Qwen35 { .. }) {
+            2
+        } else {
+            1
+        };
+        let (qd, kvd, s) = (
+            self.heads * self.head_dim,
+            self.kv_heads * self.head_dim,
+            self.layer_scale,
+        );
+        let name = |s: &str| format!("{prefix}.self_attn.{s}");
+        if self.arch != Arch::Qwen2Moe {
+            for norm in ["q_norm", "k_norm"] {
+                tensors.push((
+                    name(&format!("{norm}.weight")),
+                    vec![self.head_dim],
+                    vec![1.0; self.head_dim],
+                ));
+            }
+        }
+        for (proj, rows, cols) in [
+            ("q_proj", qd * gate, HIDDEN),
+            ("k_proj", kvd, HIDDEN),
+            ("v_proj", kvd, HIDDEN),
+            ("o_proj", HIDDEN, qd),
+        ] {
+            tensors.push((
+                name(&format!("{proj}.weight")),
+                vec![rows, cols],
+                rng.uniform(rows * cols, s),
+            ));
+        }
+        if self.arch == Arch::Qwen2Moe {
+            for (proj, rows) in [("q_proj", qd), ("k_proj", kvd), ("v_proj", kvd)] {
+                tensors.push((
+                    name(&format!("{proj}.bias")),
+                    vec![rows],
+                    rng.uniform(rows, s),
+                ));
+            }
+        }
+    }
+
+    /// Layer `prefix`'s Gated DeltaNet mixer.
+    fn linear_attention(&self, prefix: &str, rng: &mut Stream, tensors: &mut Vec<Tensor>) {
+        let key = LINEAR_KEY_HEADS * LINEAR_HEAD_DIM;
+        let value = LINEAR_VALUE_HEADS * LINEAR_HEAD_DIM;
+        let conv = 2 * key + value;
+        let s = self.layer_scale;
+        let name = |s: &str| format!("{prefix}.linear_attn.{s}");
+        for (t, dims) in [
+            ("in_proj_qkv.weight", vec![conv, HIDDEN]),
+            ("in_proj_z.weight", vec![value, HIDDEN]),
+            ("in_proj_a.weight", vec![LINEAR_VALUE_HEADS, HIDDEN]),
+            ("in_proj_b.weight", vec![LINEAR_VALUE_HEADS, HIDDEN]),
+            ("conv1d.weight", vec![conv, 1, CONV_KERNEL]),
+            ("A_log", vec![LINEAR_VALUE_HEADS]),
+            ("dt_bias", vec![LINEAR_VALUE_HEADS]),
+            ("out_proj.weight", vec![HIDDEN, value]),
+        ] {
+            let n = dims.iter().product();
+            tensors.push((name(t), dims, rng.uniform(n, s)));
+        }
+        tensors.push((
+            name("norm.weight"),
+            vec![LINEAR_HEAD_DIM],
+            vec![1.0; LINEAR_HEAD_DIM],
+        ));
+    }
+
+    /// Layer `prefix`'s FFN: the dense MLP, or the family's sparse-MoE block.
+    fn ffn(&self, prefix: &str, rng: &mut Stream, tensors: &mut Vec<Tensor>) {
+        let s = self.layer_scale;
+        let mut push = |name: String, dims: Vec<usize>| {
+            let n = dims.iter().product();
+            tensors.push((name, dims, rng.uniform(n, s)));
+        };
+        let mlp = |s: &str| format!("{prefix}.mlp.{s}");
+        let triple = |push: &mut dyn FnMut(String, Vec<usize>), at: &str, inter: usize| {
+            push(format!("{at}.gate_proj.weight"), vec![inter, HIDDEN]);
+            push(format!("{at}.up_proj.weight"), vec![inter, HIDDEN]);
+            push(format!("{at}.down_proj.weight"), vec![HIDDEN, inter]);
+        };
+        let sparse = match self.arch {
+            Arch::Qwen3 | Arch::Qwen35 { moe: false, .. } => {
+                return triple(&mut push, &format!("{prefix}.mlp"), self.intermediate);
+            }
+            Arch::Qwen2Moe => false,
+            Arch::Qwen35 { moe: true, .. } => true,
+        };
+        push(mlp("gate.weight"), vec![EXPERTS, HIDDEN]);
+        if sparse {
+            push(
+                mlp("experts.gate_up_proj"),
+                vec![EXPERTS, 2 * MOE_INTERMEDIATE, HIDDEN],
+            );
+            push(
+                mlp("experts.down_proj"),
+                vec![EXPERTS, HIDDEN, MOE_INTERMEDIATE],
+            );
+        } else {
+            for e in 0..EXPERTS {
+                triple(&mut push, &mlp(&format!("experts.{e}")), MOE_INTERMEDIATE);
+            }
+        }
+        triple(&mut push, &mlp("shared_expert"), SHARED_INTERMEDIATE);
+        push(mlp("shared_expert_gate.weight"), vec![1, HIDDEN]);
+    }
+}
 
 fn write_snapshot(
     dir: &Path,
@@ -155,101 +428,61 @@ fn write_snapshot(
     tokenizer_prefix: &str,
 ) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    // `eos_token_id` outside the vocabulary: every run decodes to its token budget.
-    let config = json!({
-        "architectures": ["Qwen3ForCausalLM"],
-        "model_type": "qwen3",
-        "hidden_size": HIDDEN,
-        "intermediate_size": shape.intermediate,
-        "num_hidden_layers": shape.layers,
-        "num_attention_heads": shape.heads,
-        "num_key_value_heads": shape.kv_heads,
-        "head_dim": HEAD_DIM,
-        "vocab_size": DRAFT_FIXTURE_VOCAB,
-        "rms_norm_eps": 1e-6,
-        "rope_theta": 10000.0,
-        "tie_word_embeddings": false,
-        "max_position_embeddings": 512,
-        "eos_token_id": 999,
-    });
-    fs::write(dir.join("config.json"), config.to_string())?;
+    fs::write(dir.join("config.json"), shape.config().to_string())?;
     fs::write(dir.join("tokenizer.json"), tokenizer_json(tokenizer_prefix))?;
 
     let mut rng = Stream(shape.seed);
-    let mut tensors: Vec<Tensor> = shared.to_vec();
-    let (qd, kvd, inter, s) = (
-        shape.heads * HEAD_DIM,
-        shape.kv_heads * HEAD_DIM,
-        shape.intermediate,
-        shape.layer_scale,
-    );
+    let root = shape.root();
+    // The shared tensors are written by name under this decoder's root (`lm_head` stays at the
+    // checkpoint root in every layout).
+    let mut tensors: Vec<Tensor> = shared
+        .iter()
+        .map(|(name, dims, data)| {
+            let name = match name.strip_prefix("model.") {
+                Some(rest) => format!("{root}.{rest}"),
+                None => name.clone(),
+            };
+            (name, dims.clone(), data.clone())
+        })
+        .collect();
+    let ones = |name: String| (name, vec![HIDDEN], vec![1.0; HIDDEN]);
     for i in 0..shape.layers {
-        let p = |s: &str| format!("model.layers.{i}.{s}");
-        let mut push = |name: String, dims: Vec<usize>, data: Vec<f32>| {
-            tensors.push((name, dims, data));
-        };
-        push(p("input_layernorm.weight"), vec![HIDDEN], vec![1.0; HIDDEN]);
-        push(
-            p("post_attention_layernorm.weight"),
-            vec![HIDDEN],
-            vec![1.0; HIDDEN],
-        );
-        push(
-            p("self_attn.q_norm.weight"),
-            vec![HEAD_DIM],
-            vec![1.0; HEAD_DIM],
-        );
-        push(
-            p("self_attn.k_norm.weight"),
-            vec![HEAD_DIM],
-            vec![1.0; HEAD_DIM],
-        );
-        push(
-            p("self_attn.q_proj.weight"),
-            vec![qd, HIDDEN],
-            rng.uniform(qd * HIDDEN, s),
-        );
-        push(
-            p("self_attn.k_proj.weight"),
-            vec![kvd, HIDDEN],
-            rng.uniform(kvd * HIDDEN, s),
-        );
-        push(
-            p("self_attn.v_proj.weight"),
-            vec![kvd, HIDDEN],
-            rng.uniform(kvd * HIDDEN, s),
-        );
-        push(
-            p("self_attn.o_proj.weight"),
-            vec![HIDDEN, qd],
-            rng.uniform(HIDDEN * qd, s),
-        );
-        push(
-            p("mlp.gate_proj.weight"),
-            vec![inter, HIDDEN],
-            rng.uniform(inter * HIDDEN, s),
-        );
-        push(
-            p("mlp.up_proj.weight"),
-            vec![inter, HIDDEN],
-            rng.uniform(inter * HIDDEN, s),
-        );
-        push(
-            p("mlp.down_proj.weight"),
-            vec![HIDDEN, inter],
-            rng.uniform(HIDDEN * inter, s),
-        );
+        let prefix = format!("{root}.layers.{i}");
+        tensors.push(ones(format!("{prefix}.input_layernorm.weight")));
+        tensors.push(ones(format!("{prefix}.post_attention_layernorm.weight")));
+        // The hybrid alternates (interval 2): even layers are Gated DeltaNet, odd ones attention.
+        if matches!(shape.arch, Arch::Qwen35 { .. }) && i % 2 == 0 {
+            shape.linear_attention(&prefix, &mut rng, &mut tensors);
+        } else {
+            shape.attention(&prefix, &mut rng, &mut tensors);
+        }
+        shape.ffn(&prefix, &mut rng, &mut tensors);
+    }
+    if let Arch::Qwen35 { mtp: true, .. } = shape.arch {
+        tensors.push((
+            "mtp.fc.weight".into(),
+            vec![HIDDEN, 2 * HIDDEN],
+            rng.uniform(2 * HIDDEN * HIDDEN, shape.layer_scale),
+        ));
+        for norm in ["pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm"] {
+            tensors.push(ones(format!("mtp.{norm}.weight")));
+        }
+        let prefix = "mtp.layers.0";
+        tensors.push(ones(format!("{prefix}.input_layernorm.weight")));
+        tensors.push(ones(format!("{prefix}.post_attention_layernorm.weight")));
+        shape.attention(prefix, &mut rng, &mut tensors);
+        shape.ffn(prefix, &mut rng, &mut tensors);
     }
     write_safetensors(&dir.join("model.safetensors"), &tensors)
 }
 
-/// Write the draft-model fixture under `root` (which must exist): `target/`, `draft/` and
-/// `foreign_draft/` snapshot directories, each `config.json` + `tokenizer.json` +
-/// `model.safetensors`, all `F32`. Deterministic: the same bytes on every call.
+/// Write the draft-model fixture under `root` (which must exist): one snapshot directory per
+/// [`DraftModelFixture`] field, each `config.json` + `tokenizer.json` + `model.safetensors`, all
+/// `F32`. Deterministic: the same bytes on every call.
 pub fn write_draft_model_fixture(root: &Path) -> io::Result<DraftModelFixture> {
-    // Embedding and output projection are shared, so both models see the same token geometry and
-    // their argmax agrees where the layers do not overturn it; the draft's single, weaker layer
-    // overturns it less often than the target's two, which is where drafts get rejected.
+    // Embedding and output projection are shared, so every model sees the same token geometry and
+    // their argmax agrees where the layers do not overturn it; a draft's fewer, weaker layers
+    // overturn it less often than a target's, which is where drafts get rejected.
     let mut rng = Stream(0x5EED_2443_6000);
     let shared: Vec<Tensor> = vec![
         (
@@ -265,29 +498,80 @@ pub fn write_draft_model_fixture(root: &Path) -> io::Result<DraftModelFixture> {
         ("model.norm.weight".into(), vec![HIDDEN], vec![1.0; HIDDEN]),
     ];
     let target = Shape {
+        arch: Arch::Qwen3,
         layers: 2,
         heads: 4,
         kv_heads: 2,
+        head_dim: HEAD_DIM,
         intermediate: 32,
         layer_scale: 0.25,
         seed: 0x7A26_E700,
     };
     let draft = Shape {
+        arch: Arch::Qwen3,
         layers: 1,
         heads: 2,
         kv_heads: 1,
+        head_dim: HEAD_DIM,
         intermediate: 16,
         layer_scale: 0.1,
         seed: 0xD2AF_7000,
+    };
+    let hybrid = |moe, seed| Shape {
+        arch: Arch::Qwen35 { moe, mtp: true },
+        layers: 2,
+        heads: VECTOR_HEADS,
+        kv_heads: 1,
+        head_dim: VECTOR_HEAD_DIM,
+        intermediate: 32,
+        layer_scale: 0.25,
+        seed,
+    };
+    let hybrid_draft = Shape {
+        arch: Arch::Qwen35 {
+            moe: false,
+            mtp: false,
+        },
+        layers: 2,
+        heads: 2,
+        kv_heads: 1,
+        head_dim: HEAD_DIM,
+        intermediate: 16,
+        layer_scale: 0.1,
+        seed: 0xD2AF_7035,
+    };
+    let moe_target = Shape {
+        arch: Arch::Qwen2Moe,
+        intermediate: 2 * HIDDEN,
+        seed: 0x7A26_E702,
+        ..target
     };
     let fixture = DraftModelFixture {
         target: root.join("target"),
         draft: root.join("draft"),
         foreign_draft: root.join("foreign_draft"),
+        hybrid_target: root.join("hybrid_target"),
+        hybrid_moe_target: root.join("hybrid_moe_target"),
+        moe_target: root.join("moe_target"),
+        hybrid_draft: root.join("hybrid_draft"),
     };
     write_snapshot(&fixture.target, &target, &shared, "t")?;
     write_snapshot(&fixture.draft, &draft, &shared, "t")?;
     write_snapshot(&fixture.foreign_draft, &draft, &shared, "w")?;
+    write_snapshot(
+        &fixture.hybrid_target,
+        &hybrid(false, 0x7A26_E735),
+        &shared,
+        "t",
+    )?;
+    write_snapshot(
+        &fixture.hybrid_moe_target,
+        &hybrid(true, 0x7A26_E736),
+        &shared,
+        "t",
+    )?;
+    write_snapshot(&fixture.moe_target, &moe_target, &shared, "t")?;
+    write_snapshot(&fixture.hybrid_draft, &hybrid_draft, &shared, "t")?;
     Ok(fixture)
 }
 
@@ -439,6 +723,95 @@ pub fn check_draft_model_resident(provider: &dyn TextLlm, source: &str) -> Resul
         ));
     }
     Ok(())
+}
+
+/// The fixture's other targets (epic sc-24432 AT1, E1), each loaded through `load` beside each
+/// draft ([`DraftModelFixture::target_pairings`] — the Qwen3.5 hybrid and its MoE variant, and
+/// the Qwen2-MoE Causal target, beside the hybrid draft and the Causal draft): every pairing
+/// passes [`check_draft_model_resident`] (`draft_model` at depths 1, 3, the recommended depth and
+/// the advertised max emits `off`'s greedy stream, drafts accepted and rejected), and on each
+/// target every other proposer it must advertise — the hybrids' MTP head and prompt lookup,
+/// prompt lookup on the Causal MoE target — at depths 1, 3 and its advertised max
+/// ([`advertised_parity_cases`]) emits `off`'s greedy stream, with no fallback, the report naming
+/// the depth, and each proposer drafting somewhere.
+pub fn check_draft_model_targets(
+    fixture: &DraftModelFixture,
+    load: DraftLoader<'_>,
+) -> Result<(), String> {
+    let prompts = draft_model_prompts();
+    let mut failures = Vec::new();
+    let mut checked: Vec<&Path> = Vec::new();
+    for (label, target, draft) in fixture.target_pairings() {
+        let source = draft.to_string_lossy();
+        let spec = LoadSpec::dense(target.to_string_lossy()).with_draft(source.clone());
+        let provider = match load(&spec) {
+            Ok(provider) => provider,
+            Err(e) => {
+                failures.push(format!("{label}: load failed: {e}"));
+                continue;
+            }
+        };
+        if let Err(e) = check_draft_model_resident(provider.as_ref(), &source) {
+            failures.push(format!("{label}: {e}"));
+        }
+        if checked.contains(&target) {
+            continue;
+        }
+        checked.push(target);
+        let expected: &[SpeculativeProposer] = if target == fixture.moe_target {
+            &[SpeculativeProposer::PromptLookup]
+        } else {
+            &[SpeculativeProposer::Mtp, SpeculativeProposer::PromptLookup]
+        };
+        let caps = &provider.descriptor().capabilities;
+        for proposer in expected {
+            if caps.proposer(*proposer).is_none() {
+                failures.push(format!("{label}: `{}` is not advertised", proposer.label()));
+            }
+        }
+        let cases: Vec<ParityCase> = advertised_parity_cases(caps)
+            .into_iter()
+            .filter(|case| case.expect_proposer != ProposerKind::DraftModel)
+            .collect();
+        let rows = match check_speculative_greedy_parity(
+            provider.as_ref(),
+            &prompts,
+            &cases,
+            MAX_NEW_TOKENS,
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                failures.push(format!("{label}: {e}"));
+                continue;
+            }
+        };
+        for row in &rows {
+            let depth = match row.speculative {
+                Speculative::Proposer { depth, .. } => Some(depth),
+                _ => None,
+            };
+            if !row.report.fallbacks.is_empty() || row.report.draft_tokens != depth {
+                failures.push(format!(
+                    "{label} [{}] {:?}: depth {:?}, fallbacks {:?}",
+                    row.prompt_id, row.speculative, row.report.draft_tokens, row.report.fallbacks
+                ));
+            }
+        }
+        for proposer in expected {
+            let kind = ProposerKind::from(*proposer);
+            if !rows
+                .iter()
+                .any(|r| r.report.proposer == kind && r.report.proposed_tokens > 0)
+            {
+                failures.push(format!("{label}: `{}` never drafted", proposer.label()));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
 }
 
 /// A provider loaded with the foreign draft ([`DraftModelFixture::spec_with_foreign_draft`]):
@@ -751,10 +1124,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_fixture_writes_three_readable_snapshots() {
+    fn the_fixture_writes_every_snapshot_readable() {
         let root = tempfile::tempdir().unwrap();
         let fixture = write_draft_model_fixture(root.path()).unwrap();
-        for dir in [&fixture.target, &fixture.draft, &fixture.foreign_draft] {
+        for dir in [
+            &fixture.target,
+            &fixture.draft,
+            &fixture.foreign_draft,
+            &fixture.hybrid_target,
+            &fixture.hybrid_moe_target,
+            &fixture.moe_target,
+            &fixture.hybrid_draft,
+        ] {
             let bytes = fs::read(dir.join("model.safetensors")).unwrap();
             let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
             assert_eq!(header_len % 8, 0);
@@ -779,9 +1160,26 @@ mod tests {
         assert!(tok(&fixture.target)
             .vocabulary_mismatch(&tok(&fixture.foreign_draft))
             .is_some());
-        // The draft is the smaller model.
+        // Each draft is smaller than the targets it drafts for.
         let size = |d: &PathBuf| fs::metadata(d.join("model.safetensors")).unwrap().len();
         assert!(size(&fixture.draft) < size(&fixture.target));
+        for (_, target, draft) in fixture.target_pairings() {
+            assert!(size(&draft.to_path_buf()) < size(&target.to_path_buf()));
+        }
+        // The hybrids are written as the qwen3_5 family, the MoE variants with expert banks.
+        let config = |d: &PathBuf| -> Value {
+            serde_json::from_slice(&fs::read(d.join("config.json")).unwrap()).unwrap()
+        };
+        assert_eq!(config(&fixture.hybrid_target)["model_type"], "qwen3_5");
+        assert_eq!(
+            config(&fixture.hybrid_moe_target)["model_type"],
+            "qwen3_5_moe"
+        );
+        assert_eq!(
+            config(&fixture.hybrid_target)["text_config"]["mtp_num_hidden_layers"],
+            1
+        );
+        assert_eq!(config(&fixture.moe_target)["model_type"], "qwen2_moe");
         // Deterministic bytes.
         let again = tempfile::tempdir().unwrap();
         let second = write_draft_model_fixture(again.path()).unwrap();

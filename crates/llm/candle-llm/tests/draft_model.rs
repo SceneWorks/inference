@@ -1,13 +1,14 @@
 //! Draft-model speculation through the provider (epic sc-24432, story sc-24436), on the shared
 //! core-llm-testkit fixture: a tiny Qwen3 target loaded with a smaller tiny Qwen3 draft over the
-//! same tokenizer, and with a draft whose tokenizer is not the target's. The checks are the
+//! same tokenizer, and with a draft whose tokenizer is not the target's; and the fixture's Qwen3.5
+//! hybrid, hybrid-MoE and Qwen2-MoE targets beside a hybrid and a Causal draft. The checks are the
 //! backend-neutral ones MLX runs too.
 
 use candle_llm::LlamaProvider;
 use core_llm::{LoadSpec, TextLlm};
 use core_llm_testkit::{
     check_draft_model_refused, check_draft_model_resident, check_draft_model_short_context,
-    check_draft_model_stop_token, write_draft_model_fixture,
+    check_draft_model_stop_token, check_draft_model_targets, write_draft_model_fixture,
 };
 
 mod common;
@@ -60,4 +61,14 @@ fn a_request_past_the_draft_context_falls_back_by_name() {
     let root = Fixture::new("candle-llm-draft-model-", None);
     let fixture = write_draft_model_fixture(&root).unwrap();
     check_draft_model_short_context(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Epic AT1 (E1): the hybrid, hybrid-MoE and Causal-MoE targets, each beside the hybrid draft
+/// and the Causal draft, run `draft_model` and every other proposer they advertise (MTP, prompt
+/// lookup) at depths 1, 3 and the advertised max, each emitting exactly `off`'s greedy stream.
+#[test]
+fn every_target_and_draft_pairing_is_greedy_exact_at_every_depth() {
+    let root = Fixture::new("candle-llm-draft-model-", None);
+    let fixture = write_draft_model_fixture(&root).unwrap();
+    check_draft_model_targets(&fixture, &load).unwrap_or_else(|e| panic!("{e}"));
 }
