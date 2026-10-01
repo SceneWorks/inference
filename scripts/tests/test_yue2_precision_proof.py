@@ -149,7 +149,7 @@ class PrecisionControlTests(unittest.TestCase):
         source = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("workflow_dispatch:", source)
         self.assertNotIn("schedule:", source)
-        self.assertIn("options: [fixture, cuda, metal]", source)
+        self.assertIn("options: [fixture, cuda, metal, cuda-diagnostic]", source)
         self.assertIn("if: inputs.stage == 'fixture'", source)
         self.assertIn("if: inputs.stage == 'cuda'", source)
         self.assertIn("if: inputs.stage == 'metal'", source)
@@ -171,6 +171,27 @@ class PrecisionControlTests(unittest.TestCase):
         self.assertNotIn("tier_quality_against_the_f32_reference", source)
         self.assertNotIn("registered_loader_generates_a_song_with_every_artifact", source)
         self.assertNotIn("SIGKILL", source)
+
+    def test_cuda_diagnostic_is_provenance_guarded_and_cannot_launch_proof(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        job = workflow.split("  cuda_diagnostic:\n", 1)[1].split("  reference:\n", 1)[0]
+        probe = (ROOT / "scripts/ci/yue2_cuda_context_diagnostic.ps1").read_text(encoding="utf-8")
+        self.assertIn("if: inputs.stage == 'cuda-diagnostic'", job)
+        self.assertIn("group: inference-real-weights-physical-host", workflow)
+        self.assertIn("$env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA", job)
+        self.assertIn("(git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA", job)
+        self.assertIn("diagnostic_pid must be a positive decimal PID", job)
+        self.assertIn("if: always()", job)
+        self.assertNotIn("cargo ", job)
+        self.assertNotIn("download-artifact", job)
+        self.assertNotIn("yue2_precision_proof.py run", job)
+        for required in ("cuDeviceGetLuid", "cuDeviceGetPCIBusId", "Get-Counter",
+                         "Get-AuthenticodeSignature", "process-before", "process-after",
+                         "compute-apps-$gpu-$i", "pmon-$gpu-$i", "driverInitializationOnly"):
+            self.assertIn(required, probe)
+        for forbidden in ("extern int cuCtxCreate", "extern int cuDevicePrimaryCtxRetain",
+                          "extern int cudaMalloc", "Start-Process", "Stop-Process"):
+            self.assertNotIn(forbidden, probe)
 
 
 if __name__ == "__main__":

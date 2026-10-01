@@ -9,8 +9,8 @@ on:
       stage:
         type: choice
         required: true
-        options: [fixture, cuda, metal]
-        description: "fixture = CPU-only pinned reference transfer; cuda/metal = one precision test"
+        options: [fixture, cuda, metal, cuda-diagnostic]
+        description: "fixture = CPU reference; cuda/metal = precision test; cuda-diagnostic = read-only context evidence"
       expected_engine_sha:
         type: string
         required: true
@@ -29,6 +29,11 @@ on:
         required: false
         default: ""
         description: "Optional caller-provided app SHA for provenance; engine test does not verify app admission"
+      diagnostic_pid:
+        type: string
+        required: false
+        default: ""
+        description: "Exact Windows PID to inspect on cuda-diagnostic only; no other process metadata is queried"
 
 permissions:
   contents: read
@@ -44,6 +49,59 @@ env:
   CARGO_TARGET_DIR: ${{ github.workspace }}/../cargo-target
 
 jobs:
+  cuda_diagnostic:
+    if: inputs.stage == 'cuda-diagnostic'
+    runs-on: [self-hosted, windows, cuda, real-weights]
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: control
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.expected_engine_sha }}
+          path: engine
+          persist-credentials: false
+      - name: Verify exact control and measured source before read-only probe
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          DIAGNOSTIC_PID: ${{ inputs.diagnostic_pid }}
+        run: |
+          if ($env:EXPECTED_ENGINE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_engine_sha must be 40 lowercase hex' }
+          if ($env:EXPECTED_CONTROL_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'expected_control_sha must be 40 lowercase hex' }
+          if ($env:DIAGNOSTIC_PID -notmatch '^[1-9][0-9]*$') { throw 'diagnostic_pid must be a positive decimal PID' }
+          if ($env:GITHUB_SHA -cne $env:EXPECTED_CONTROL_SHA -or (git rev-parse HEAD).Trim() -cne $env:EXPECTED_CONTROL_SHA) { throw 'workflow control SHA mismatch' }
+          if ((git -C ../engine rev-parse HEAD).Trim() -cne $env:EXPECTED_ENGINE_SHA) { throw 'engine SHA mismatch' }
+          if (git status --porcelain --untracked-files=normal) { throw 'workflow control checkout is dirty' }
+          if (git -C ../engine status --porcelain --untracked-files=normal) { throw 'engine checkout is dirty' }
+      - name: Collect bounded read-only context and adapter evidence
+        shell: powershell
+        env:
+          EXPECTED_ENGINE_SHA: ${{ inputs.expected_engine_sha }}
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          DIAGNOSTIC_PID: ${{ inputs.diagnostic_pid }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "yue2-cuda-diagnostic-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path $out) { throw 'run-owned diagnostic directory already exists' }
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "YUE2_CUDA_DIAGNOSTIC_OUT=$out"
+          & .\scripts\ci\yue2_cuda_context_diagnostic.ps1 -TargetPid ([int]$env:DIAGNOSTIC_PID) -OutputDirectory $out -EngineSha $env:EXPECTED_ENGINE_SHA -ControlSha $env:EXPECTED_CONTROL_SHA
+          if (-not (Test-Path (Join-Path $out 'manifest.json'))) { throw 'diagnostic manifest was not produced' }
+      - name: Upload raw read-only CUDA diagnostic
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: yue2-cuda-diagnostic-engine-${{ inputs.expected_engine_sha }}-control-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.YUE2_CUDA_DIAGNOSTIC_OUT }}
+          if-no-files-found: warn
+          retention-days: 30
+
   reference:
     if: inputs.stage == 'fixture'
     runs-on: [self-hosted, macOS, ARM64, rw-starvector]
