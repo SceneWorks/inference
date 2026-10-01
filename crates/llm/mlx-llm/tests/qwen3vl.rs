@@ -465,6 +465,7 @@ fn qwen3vl_vision_q4_q8_import_path() {
             projector_source: None,
             quantize: Some(q),
             cuda_graphs: None,
+            prefix_cache_bytes: None,
             draft_source: None,
         };
 

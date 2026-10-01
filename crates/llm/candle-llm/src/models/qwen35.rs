@@ -1201,6 +1201,140 @@ impl Qwen35Cache {
     }
 }
 
+/// A [`Qwen35Cache`]'s state after its first `len` positions, held by the cross-turn prefix cache
+/// (story sc-24437): every full-attention layer's KV `[1, heads, len, dim]` and every linear
+/// layer's conv tail and recurrent state — **copies**, so the live cache's in-place writes (the
+/// static KV buffers, the checkpoint ring) can never reach it.
+#[derive(Clone, Debug)]
+pub struct Qwen35PrefixState {
+    layers: Vec<Qwen35PrefixLayer>,
+    len: usize,
+}
+
+#[derive(Clone, Debug)]
+enum Qwen35PrefixLayer {
+    Attn(Option<(Tensor, Tensor)>),
+    Delta(Option<(Tensor, Tensor)>),
+}
+
+impl Qwen35PrefixState {
+    /// The positions the state covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the state covers no position.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Bytes the held tensors occupy.
+    pub fn bytes(&self) -> usize {
+        self.layers.iter().fold(0usize, |acc, l| {
+            let (Qwen35PrefixLayer::Attn(Some((a, b))) | Qwen35PrefixLayer::Delta(Some((a, b)))) =
+                l
+            else {
+                return acc;
+            };
+            acc.saturating_add(tensor_bytes(a))
+                .saturating_add(tensor_bytes(b))
+        })
+    }
+}
+
+impl Qwen35Cache {
+    /// Copy the cache's whole state — it must hold exactly the positions a later request resumes
+    /// at, because a recurrent state exists only at the position it was taken (story sc-24437).
+    pub fn prefix_snapshot(&self) -> Result<Qwen35PrefixState> {
+        let len = self.offset().max(0) as usize;
+        let copy_kv = |k: &Tensor, v: &Tensor| -> Result<(Tensor, Tensor)> {
+            // Compact copies of exactly `len` positions: `Tensor::copy` would keep the view's
+            // layout over a clone of the whole static buffer — the cache's full capacity, pinned
+            // by an entry charged for `len` positions.
+            Ok((
+                k.narrow(2, 0, len)?.force_contiguous()?,
+                v.narrow(2, 0, len)?.force_contiguous()?,
+            ))
+        };
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| {
+                Ok(match l {
+                    Qwen35LayerCache::Delta(c) => {
+                        Qwen35PrefixLayer::Delta(match (c.conv_state(), c.ssm_state()) {
+                            // Compact copies: the live state may be a slot view of the
+                            // checkpoint ring, which `copy` would clone whole.
+                            (Some(conv), Some(ssm)) => {
+                                Some((conv.force_contiguous()?, ssm.force_contiguous()?))
+                            }
+                            _ => None,
+                        })
+                    }
+                    Qwen35LayerCache::Attn(a) => Qwen35PrefixLayer::Attn(
+                        a.kv.as_ref().map(|(k, v)| copy_kv(k, v)).transpose()?,
+                    ),
+                    Qwen35LayerCache::StaticAttn(s) => {
+                        let (k, v) = s.views(0)?;
+                        Qwen35PrefixLayer::Attn(Some(copy_kv(&k, &v)?))
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Qwen35PrefixState { layers, len })
+    }
+
+    /// Seed an **empty** cache with `state`, positioning it at `state.len()`: the attention KV is
+    /// written at positions `0..len` (into a static layer's buffers, or held by a growing one,
+    /// which never writes in place), and each linear layer takes the stored conv tail and
+    /// recurrent state as its live state at `len` — through its checkpoint ring when it keeps
+    /// one, so `len` is the ring's oldest restorable position and a verify step's rollback never
+    /// reaches below it. The stored tensors are never written.
+    pub fn restore_prefix(&mut self, state: &Qwen35PrefixState) -> Result<()> {
+        if self.offset() != 0 {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: a prefix restores into an empty cache, not one at {}",
+                self.offset()
+            )));
+        }
+        if state.layers.len() != self.layers.len() {
+            return Err(Error::Msg(format!(
+                "Qwen35Cache: a {}-layer prefix state for a {}-layer cache",
+                state.layers.len(),
+                self.layers.len()
+            )));
+        }
+        let len = i32::try_from(state.len)
+            .map_err(|_| Error::Msg("Qwen35Cache: prefix length overflow".into()))?;
+        for (slot, stored) in self.layers.iter_mut().zip(&state.layers) {
+            match (slot, stored) {
+                (Qwen35LayerCache::Delta(c), Qwen35PrefixLayer::Delta(Some((conv, ssm)))) => {
+                    c.update(conv.clone(), ssm.clone(), len)?
+                }
+                (Qwen35LayerCache::Attn(a), Qwen35PrefixLayer::Attn(Some((k, v)))) => {
+                    a.kv = Some((k.clone(), v.clone()))
+                }
+                (Qwen35LayerCache::StaticAttn(s), Qwen35PrefixLayer::Attn(Some((k, v)))) => {
+                    s.update(0, k, v)?;
+                }
+                (Qwen35LayerCache::Delta(_), Qwen35PrefixLayer::Delta(None))
+                | (
+                    Qwen35LayerCache::Attn(_) | Qwen35LayerCache::StaticAttn(_),
+                    Qwen35PrefixLayer::Attn(None),
+                ) if len == 0 => {}
+                _ => {
+                    self.reset();
+                    return Err(Error::Msg(
+                        "Qwen35Cache: the prefix state's layer schedule does not match the cache"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DecodeCache for Qwen35Cache {
     fn len(&self) -> i32 {
         self.offset()
@@ -1483,6 +1617,25 @@ impl Qwen35MtpCache {
         for layer in &mut self.layers {
             layer.kv = None;
         }
+    }
+
+    /// Bytes the predictor's KV holds (story sc-24437).
+    pub fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .fold(0usize, |acc, l| acc.saturating_add(l.bytes()))
+    }
+
+    /// Every layer's keys then values, flattened to f32 (test comparison of two warm-ups).
+    #[cfg(test)]
+    pub(crate) fn flat_keys(&self) -> Result<Vec<f32>> {
+        let mut out = Vec::new();
+        for (k, v) in self.layers.iter().filter_map(|l| l.kv.as_ref()) {
+            for t in [k, v] {
+                out.extend(t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -3069,6 +3222,44 @@ pub(crate) mod tests {
     use crate::primitives::moe::ExpertPart;
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// sc-24437: a prefix snapshot owns compact copies of exactly the positions it holds — never a
+    /// view into the live cache's static KV buffer, which would pin that whole buffer beyond the
+    /// bytes the entry is charged for.
+    #[test]
+    fn a_prefix_snapshot_holds_compact_copies_of_its_positions() {
+        use crate::decode::{StepModel, StepRequest};
+        let (_, model) = text_model();
+        let mut cache = model.new_cache_for(32, 3).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[3, 9, 4, 11, 3, 9, 4, 11]))
+            .unwrap();
+        let state = cache.prefix_snapshot().unwrap();
+        let pinned = crate::primitives::decode_cache::pinned_f32_elems;
+        for layer in &state.layers {
+            if let Qwen35PrefixLayer::Delta(Some((conv, ssm))) = layer {
+                for t in [conv, ssm] {
+                    assert_eq!(pinned(t), t.elem_count(), "{:?}", t.layout());
+                }
+            }
+        }
+        let mut attention = 0;
+        for layer in &state.layers {
+            if let Qwen35PrefixLayer::Attn(Some((k, v))) = layer {
+                for t in [k, v] {
+                    assert_eq!(t.dim(2).unwrap(), 8);
+                    assert_eq!(
+                        pinned(t),
+                        t.elem_count(),
+                        "the entry pins more than it holds: {:?}",
+                        t.layout()
+                    );
+                }
+                attention += 1;
+            }
+        }
+        assert!(attention > 0, "the fixture has full-attention layers");
+    }
 
     #[test]
     fn published_prism_norm_multiplier_matches_independent_rms_oracle() {
@@ -5315,6 +5506,24 @@ pub(crate) mod tests {
             identity,
             DecodeCache::graph_identity(&cache),
             "fresh position buffers"
+        );
+
+        // A prefix restore (sc-24437): a fresh cache seeded with the live cache's prefix and
+        // moved into its place holds the same positions in different buffers.
+        let mut cache = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        model
+            .forward_step(&mut cache, StepRequest::last(&[1, 7, 3]))
+            .unwrap();
+        let identity = DecodeCache::graph_identity(&cache);
+        let state = cache.prefix_snapshot().unwrap();
+        let mut restored = model.new_static_cache(16, STEP_MAX_CHECKPOINTS).unwrap();
+        restored.restore_prefix(&state).unwrap();
+        cache = restored;
+        assert_eq!(cache.len(), 3);
+        assert_ne!(
+            identity,
+            DecodeCache::graph_identity(&cache),
+            "a restored cache in its place"
         );
     }
 

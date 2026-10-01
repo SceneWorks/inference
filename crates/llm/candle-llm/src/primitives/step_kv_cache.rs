@@ -263,6 +263,25 @@ impl StepKvCache {
         }
     }
 
+    /// `layer`'s cached `(keys, values)` over the live positions `[1, heads, len, dim]` — views of
+    /// the cache's own storage (copy them to keep them past the next write) — or `None` for a
+    /// layer that caches nothing (or has not been written). What the cross-turn prefix cache
+    /// snapshots (sc-24437); a paged backing is [`Error::Unsupported`] (its blocks are shared
+    /// through the pool's own copy-on-write, not snapshotted).
+    pub fn layer_kv(&self, layer: usize) -> Result<Option<(Tensor, Tensor)>> {
+        match &self.backing {
+            Backing::Static(layers) => layers
+                .get(layer)
+                .and_then(Option::as_ref)
+                .map(|l| l.views(0))
+                .transpose(),
+            Backing::Growing(c) => Ok(c.peek(layer).cloned()),
+            Backing::Paged(_) => Err(Error::Unsupported(
+                "StepKvCache: a paged backing is not snapshotted by the prefix cache".into(),
+            )),
+        }
+    }
+
     fn first_static(layers: &[Option<StaticKvCache>]) -> Option<&StaticKvCache> {
         layers.iter().flatten().next()
     }
@@ -715,6 +734,29 @@ mod tests {
         // The same K/V buffers with fresh position buffers.
         cache.positions = Some(DevicePositions::new(&Device::Cpu).unwrap());
         assert_ne!(identity, cache.graph_identity(), "fresh position buffers");
+
+        // A prefix restore (sc-24437): a fresh cache seeded with the live cache's prefix and
+        // moved into its place holds the same positions in different buffers.
+        use crate::decode::prefix::PrefixSnapshot;
+        let fresh = || {
+            StepKvCache::preallocated(&l, 16)
+                .unwrap()
+                .with_device_positions()
+                .unwrap()
+        };
+        let mut cache = fresh();
+        feed(&mut cache, 3, 0.0);
+        let identity = cache.graph_identity();
+        let entry = cache.snapshot(3).unwrap();
+        let mut restored = fresh();
+        restored.restore(&entry, 3).unwrap();
+        cache = restored;
+        assert_eq!(DecodeCache::len(&cache), 3);
+        assert_ne!(
+            identity,
+            cache.graph_identity(),
+            "a restored cache in its place"
+        );
     }
 
     /// The paged backing sits behind the same seam: exact rollback, memory as reserved slots.

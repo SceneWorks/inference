@@ -84,7 +84,11 @@ pub use output::{
     Channel, FinishReason, GenerationTimings, MtpStats, StreamEvent, TextLlmOutput, Usage,
 };
 pub use paging::BlockAllocator;
-pub use prefix::{InsertOutcome, PrefixId, PrefixIndex, PrefixMatch};
+pub use prefix::{
+    prefix_cache_budget, requested_prefix_cache_bytes, InsertOutcome, PrefixAdmission, PrefixHit,
+    PrefixId, PrefixIndex, PrefixInsert, PrefixMatch, PrefixReuse, PrefixStats, PrefixStore,
+    DEFAULT_PREFIX_CACHE_BYTES,
+};
 pub use prepare::{
     detect_format, ModelFormat, PrepareReport, PrepareSpec, SnapshotPreparerRegistration,
     SnapshotPreparerRegistry, SnapshotPreparerRegistryBuilder,

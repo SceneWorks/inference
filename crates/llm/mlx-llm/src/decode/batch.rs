@@ -37,7 +37,7 @@ use crate::decode::stream::{default_seed, Decode, FinishReason, GenerationOutput
 use crate::decode::{record_lane_token, BufferRelease, LaneStep};
 use crate::error::{Error, Result};
 use crate::models::CausalLm;
-use crate::primitives::sampler::{sample, SamplingParams, SplitMix64};
+use crate::primitives::sampler::{draw_token, SamplingParams, SplitMix64};
 
 /// The pad token id stuffed into the left-pad region. Any in-vocabulary id works — the attention
 /// mask blocks these positions and their outputs are never read — so `0` is a safe choice.
@@ -296,7 +296,7 @@ fn decode_mask(active: &[Lane], k_total: i32, dtype: mlx_rs::Dtype) -> Result<Ar
 fn sample_row(logits: &Array, row: usize, lane: &mut Lane) -> Result<i32> {
     let idx = Array::from_slice(&[row as i32], &[1]);
     let lg = logits.take_axis(&idx, 0)?; // [1, vocab]
-    sample(&lg, &lane.history, &lane.params, &mut lane.rng, None)
+    draw_token(&lg, &lane.history, &lane.params, &mut lane.rng, None)
 }
 
 /// Record `tok` for `lane` through the scheduler and emit its stream events, mirroring the

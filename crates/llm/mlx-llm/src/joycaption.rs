@@ -865,7 +865,8 @@ mod tests {
         core_llm::ImageRef::new(width, height, vec![0x80; (width * height * 3) as usize]).unwrap()
     }
 
-    /// The pre-engine JoyCaption loop, verbatim — the reference the engine port is held to.
+    /// The pre-engine JoyCaption loop, verbatim but for its draw, which is the shared decode
+    /// sampler's (story sc-24439) — the reference the engine port's loop is held to.
     #[allow(clippy::too_many_arguments)]
     fn pre_engine_loop(
         model: &JoyCaptionModel,
@@ -876,7 +877,7 @@ mod tests {
         seed: Option<u64>,
         stop_tokens: &[i32],
     ) -> (Vec<i32>, FinishReason) {
-        use crate::primitives::sampler::{sample, SplitMix64};
+        use crate::primitives::sampler::{draw_token, SplitMix64};
         let expanded = expand_image_tokens(prompt_ids);
         let embeds = model.language.embed(&input_ids(&expanded)).unwrap();
         let feat_bf16 = image_features.as_dtype(Dtype::Bfloat16).unwrap();
@@ -892,7 +893,7 @@ mod tests {
             .unwrap();
         let mut finish = FinishReason::MaxTokens;
         for step in 0..max_new_tokens {
-            let next = sample(&logits, &history, params, &mut rng, None).unwrap();
+            let next = draw_token(&logits, &history, params, &mut rng, None).unwrap();
             if stop_tokens.contains(&next) {
                 finish = FinishReason::StopToken;
                 break;
@@ -936,7 +937,7 @@ mod tests {
         for (name, params, sampler) in [
             ("greedy", greedy, "device"),
             ("penalized", penalized, "host:penalty"),
-            ("stochastic", stochastic, "host:device_unavailable"),
+            ("stochastic", stochastic, "device"),
         ] {
             let (expected, finish) = pre_engine_loop(
                 &model,

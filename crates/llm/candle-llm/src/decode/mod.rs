@@ -41,8 +41,11 @@ pub use graph::{
     graph_workspace_admission_bytes, set_cuda_graphs, CudaGraphsScope, GraphRunner, GraphTally,
     GraphWorkspace, CUDA_GRAPHS_ENV, PARAM_CACHE_ADMISSION_BYTES,
 };
-pub use prefix::{generate_cached, PrefixCache, PrefixStats};
-pub use proposers::{DraftModelProposer, MtpProposer, NgramProposer};
+pub use prefix::{
+    generate_cached, prefill_restored, Boundary, PrefixCache, PrefixEntry, PrefixPrefill,
+    PrefixSnapshot, PrefixStats, Restored,
+};
+pub use proposers::{DraftModelProposer, MtpBoundary, MtpProposer, NgramProposer};
 pub use record::{
     CountingDecode, DecodePath, DecodeRecord, RequestSpan, SamplerTelemetry, SpanCounters,
 };

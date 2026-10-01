@@ -284,11 +284,50 @@ pub struct Qwen35MtpMultimodalPrompt<'a> {
 /// target-selected and therefore always-valid token); the recursively drafted state after it is
 /// discarded on commit even when its tokens were accepted, because replay must pair each accepted
 /// token with the **target's** hidden row rather than the head's own.
+///
+/// **Prefix-cache resume (story sc-24437).** A prompt whose leading `M` positions came from the
+/// cross-turn prefix cache is prefilled from `M` on, so the target returns hidden rows only for
+/// positions `M..P`. The head's warm-up pairs `embed(x[j + 1])` with `H[j]`, so it needs the head's
+/// cache at the boundary plus `H[M - 1]` — an [`MtpBoundary`] the prefix cache stored beside the
+/// target state ([`resume_from`](Self::resume_from)); the warm-up then seeds only positions
+/// `M..P`. [`capture_at`](Self::capture_at) records the same state at a boundary inside this
+/// prompt for a later request to resume from.
 #[derive(Default)]
 pub struct MtpProposer<'a> {
     multimodal: Option<&'a Qwen35MtpMultimodalPrompt<'a>>,
     cache: Option<MtpCache>,
     after_cur: Option<MtpCache>,
+    resume: Option<MtpBoundary>,
+    capture_at: Option<usize>,
+    captured: Option<MtpBoundary>,
+}
+
+/// The MTP head's state at a prompt boundary `len` (story sc-24437): its cache after warming on
+/// the first `len` prompt positions, and the target's final-normalized hidden row `H[len - 1]` the
+/// next warm-up pair needs. Immutable once captured — a resume clones the cache (MLX arrays are
+/// refcounted and the KV write copies a shared block), so the stored boundary is never written.
+#[derive(Clone, Debug)]
+pub struct MtpBoundary {
+    cache: MtpCache,
+    hidden: Array,
+    len: usize,
+}
+
+impl MtpBoundary {
+    /// The prompt positions the state covers.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the boundary covers no position (never true for a captured boundary).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Bytes the state holds (the head's KV buffers plus the hidden row).
+    pub fn bytes(&self) -> u64 {
+        self.cache.bytes() + self.hidden.nbytes() as u64
+    }
 }
 
 impl<'a> MtpProposer<'a> {
@@ -306,10 +345,117 @@ impl<'a> MtpProposer<'a> {
         }
     }
 
+    /// Resume from a prefix-cache boundary: the next [`warm`](Proposer::warm) is handed the full
+    /// prompt but hidden rows only for positions `boundary.len()..` and seeds from there.
+    pub fn resume_from(mut self, boundary: Option<MtpBoundary>) -> Self {
+        self.resume = boundary;
+        self
+    }
+
+    /// Record the head's state at prompt position `len` during the next warm-up (see
+    /// [`take_captured`](Self::take_captured)); ignored unless `len` falls strictly inside the
+    /// warmed span.
+    pub fn capture_at(mut self, len: Option<usize>) -> Self {
+        self.capture_at = len;
+        self
+    }
+
+    /// The state captured by [`capture_at`](Self::capture_at), once.
+    pub fn take_captured(&mut self) -> Option<MtpBoundary> {
+        self.captured.take()
+    }
+
     fn cache(&mut self) -> Result<&mut MtpCache> {
         self.cache
             .as_mut()
             .ok_or_else(|| Error::Msg("MtpProposer: propose before warm".into()))
+    }
+}
+
+impl MtpProposer<'_> {
+    /// The text warm-up: seed the head with the pairs `embed(x[j + 1]) + H[j]` at positions
+    /// `j + 1` for every prompt position the target prefilled — all of them cold, or `M..P` when
+    /// resuming from a prefix-cache boundary at `M` (whose `H[M - 1]` the boundary carries).
+    /// `hidden` holds the target's rows for the prefilled positions only. With a capture point
+    /// `B` the seeding is split there and the head's state at `B` recorded.
+    fn warm_text(
+        &mut self,
+        model: &Qwen35Model,
+        prompt: &[i32],
+        hidden: &Array,
+    ) -> Result<Option<Array>> {
+        let (mut cache, offset, boundary_row) = match self.resume.take() {
+            Some(b) => (b.cache, b.len, Some(b.hidden)),
+            None => (
+                model.new_mtp_cache().ok_or_else(|| {
+                    Error::Msg("MtpProposer: the model has no loaded MTP predictor".into())
+                })?,
+                0,
+                None,
+            ),
+        };
+        let prompt_len = prompt.len();
+        let rows = hidden.shape()[1] as usize;
+        if offset >= prompt_len || rows != prompt_len - offset {
+            return Err(Error::Msg(format!(
+                "MtpProposer: {rows} hidden rows for a {prompt_len}-token prompt resumed at {offset}"
+            )));
+        }
+        // The target's hidden rows for positions `start .. start + n` — `H[offset - 1]` comes
+        // from the resumed boundary, everything later from this prefill.
+        let target_rows = |start: usize, n: usize| -> Result<Array> {
+            match &boundary_row {
+                Some(row) if start + 1 == offset => {
+                    if n == 1 {
+                        Ok(row.clone())
+                    } else {
+                        let rest = seq_rows(hidden, 0, n as i32 - 1)?;
+                        Ok(mlx_rs::ops::concatenate_axis(&[row, &rest], 1)?)
+                    }
+                }
+                _ => seq_rows(hidden, (start - offset) as i32, n as i32),
+            }
+        };
+        let first = offset.max(1);
+        let split = self
+            .capture_at
+            .take()
+            .filter(|&b| b > offset && b < prompt_len);
+        let mut seed = None;
+        let mut segments = Vec::with_capacity(2);
+        let mut from = first;
+        if let Some(b) = split {
+            segments.push(from..b);
+            from = b;
+        }
+        segments.push(from..prompt_len);
+        for segment in segments {
+            if !segment.is_empty() {
+                let shifted = model.embed_input_ids(&input_ids(&prompt[segment.clone()]))?;
+                let aligned = target_rows(segment.start - 1, segment.len())?;
+                let positions: Vec<i32> = segment.clone().map(|p| p as i32).collect();
+                seed = Some(model.mtp_warm_from_embeds(
+                    &shifted,
+                    &aligned,
+                    &mut cache,
+                    [&positions, &positions, &positions],
+                )?);
+            }
+            if split == Some(segment.end) {
+                let row = target_rows(segment.end - 1, 1)?;
+                let mut pending: Vec<&Array> = seed.iter().collect();
+                pending.push(&row);
+                eval(pending)?;
+                self.captured = Some(MtpBoundary {
+                    cache: cache.clone(),
+                    hidden: row,
+                    len: segment.end,
+                });
+            }
+        }
+        self.cache = Some(cache);
+        self.after_cur = None;
+        Ok(seed)
     }
 }
 
@@ -328,11 +474,20 @@ impl Proposer<Qwen35Model> for MtpProposer<'_> {
         prompt: &[i32],
         prompt_hidden: Option<&Array>,
     ) -> Result<Option<Array>> {
-        let mut cache = model.new_mtp_cache().ok_or_else(|| {
-            Error::Msg("MtpProposer: the model has no loaded MTP predictor".into())
-        })?;
         let hidden = prompt_hidden.ok_or_else(|| {
             Error::Msg("MtpProposer: the target did not return prompt hidden states".into())
+        })?;
+        if self.multimodal.is_none() {
+            return self.warm_text(model, prompt, hidden);
+        }
+        if self.resume.is_some() || self.capture_at.is_some() {
+            return Err(Error::Msg(
+                "MtpProposer: a multimodal prompt never resumes from or feeds the prefix cache"
+                    .into(),
+            ));
+        }
+        let mut cache = model.new_mtp_cache().ok_or_else(|| {
+            Error::Msg("MtpProposer: the model has no loaded MTP predictor".into())
         })?;
         // Seed with shifted prompt pairs: embed(x[j + 1]) + final-normalized target H[j], at
         // absolute positions 1..P-1. The first draft step pairs `cur` with H[P - 1].
