@@ -54,6 +54,8 @@ pub mod block_stream;
 pub mod chunk;
 pub mod config;
 pub mod convert;
+#[cfg(test)]
+mod encode_footprint_harness;
 pub mod feature_cache;
 pub mod i2v_memory_strategy;
 pub mod memory_strategy;

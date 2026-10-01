@@ -76,12 +76,27 @@ impl DeadStageBuffers {
     /// whose buffers it is meant to free.
     pub(crate) fn materialize(self, x: &Array) -> Result<()> {
         eval(x)?;
+        self.release();
+        Ok(())
+    }
+
+    /// [`Self::materialize`] for a chunked encoder: `x` is evaluated together with every carried
+    /// conv-cache slot, so a lazy slot (a slice of a block's full output) can never keep that
+    /// output alive past the release.
+    pub(crate) fn materialize_with_cache(self, x: &Array, cache: &FeatCache) -> Result<()> {
+        let mut arrays: Vec<&Array> = cache.slots.iter().flatten().collect();
+        arrays.push(x);
+        mlx_rs::transforms::eval(arrays)?;
+        self.release();
+        Ok(())
+    }
+
+    fn release(self) {
         if self.releases() {
             #[cfg(test)]
             BLOCK_RELEASES.with(|count| count.set(count.get() + 1));
             mlx_gen::memory_probe::clear_cache();
         }
-        Ok(())
     }
 }
 

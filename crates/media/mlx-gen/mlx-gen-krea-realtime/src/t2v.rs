@@ -603,8 +603,10 @@ pub fn generate_i2v_from_components(
     let width = (params.latent_width * SPATIAL_STRIDE) as u32;
     let height = (params.latent_height * SPATIAL_STRIDE) as u32;
     // Stage 1: VAE-encode the reference still → clean context latent.
-    let reference_latents = encode_reference_image(vae, reference_image, width, height)?;
-    mlx_rs::transforms::eval([&reference_latents])?;
+    // The encoder's buffers must not persist into generation (sc-20686).
+    let reference_latents = materialize_and_release_phase(|| {
+        encode_reference_image(vae, reference_image, width, height)
+    })?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }
@@ -658,8 +660,11 @@ pub fn generate_v2v_from_components(
     let height = (params.latent_height * SPATIAL_STRIDE) as u32;
     // Stage 1: VAE-encode the source clip → clean source latent (deterministic eps from the seed).
     let key = random::key(params.seed)?;
-    let source_latents = encode_source_clip(vae, cfg, source_frames, width, height, &key)?;
-    mlx_rs::transforms::eval([&source_latents])?;
+    // The encoder's buffers (and the full-resolution source clip) must not persist into
+    // generation: W2 run 36832899832 carried 43 GB of cached encode buffers into v2v generation.
+    let source_latents = materialize_and_release_phase(|| {
+        encode_source_clip(vae, cfg, source_frames, width, height, &key)
+    })?;
     if cancel.is_cancelled() {
         return Err(Error::Canceled);
     }

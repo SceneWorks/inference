@@ -192,10 +192,13 @@ impl ResidualBlock {
     }
 
     /// Encode path (chunked, with `feat_cache`).
+    ///
+    /// The encoder is always single-pass, so the block releases its dead buffers mid-block.
     fn forward_cached(&self, x: &Array, cache: &mut FeatCache) -> Result<Array> {
         let h = self.shortcut(x)?;
         let y = silu(&rms_norm_channels(x, &self.norm1)?)?;
         let y = cached_conv(&self.conv1, &y, cache)?;
+        DeadStageBuffers::Release.materialize_with_cache(&y, cache)?;
         let y = silu(&rms_norm_channels(&y, &self.norm2)?)?;
         let y = cached_conv(&self.conv2, &y, cache)?;
         Ok(add(&y, &h)?)
@@ -517,19 +520,29 @@ impl Encoder3d {
         })
     }
 
+    /// Chunk forward. Every block boundary materializes (with the carried conv-cache slots) and
+    /// releases its dead buffers (sc-20686): the encode is single-pass per chunk.
     fn forward(&self, x: &Array, cache: &mut FeatCache) -> Result<Array> {
+        let dead = DeadStageBuffers::Release;
         let mut x = cached_conv(&self.conv1, x, cache)?;
+        dead.materialize_with_cache(&x, cache)?;
         for layer in &self.downsamples {
             x = match layer {
                 DownLayer::Res(r) => r.forward_cached(&x, cache)?,
                 DownLayer::Down(d) => d.forward(&x, cache)?,
             };
+            dead.materialize_with_cache(&x, cache)?;
         }
         x = self.middle.0.forward_cached(&x, cache)?;
+        dead.materialize_with_cache(&x, cache)?;
         x = self.middle.1.forward(&x)?;
+        dead.materialize_with_cache(&x, cache)?;
         x = self.middle.2.forward_cached(&x, cache)?;
+        dead.materialize_with_cache(&x, cache)?;
         let x = silu(&rms_norm_channels(&x, &self.head_norm)?)?;
-        cached_conv(&self.head_conv, &x, cache)
+        let out = cached_conv(&self.head_conv, &x, cache)?;
+        dead.materialize_with_cache(&out, cache)?;
+        Ok(out)
     }
 }
 
@@ -829,10 +842,12 @@ impl WanVae {
                 slice_t(video, 1 + 4 * (i - 1), 1 + 4 * i)
             }?;
             let chunk_out = encoder.forward(&chunk, &mut cache)?;
-            out = Some(match out {
+            let joined = match out.take() {
                 None => chunk_out,
                 Some(o) => concatenate_axis(&[&o, &chunk_out], 2)?,
-            });
+            };
+            DeadStageBuffers::Release.materialize_with_cache(&joined, &cache)?;
+            out = Some(joined);
         }
         let out = out.ok_or_else(|| Error::Msg("wan vae: encode produced no chunks".into()))?;
         let parts = split(&post_conv1.forward(&out, None)?, 2, 1)?; // [mean, logvar]
@@ -848,8 +863,13 @@ impl WanVae {
     /// `[B, z, T_lat, H/8, W/8]` via chunked causal encoding (`DiagonalGaussianDistribution.mode()` =
     /// the Gaussian mean). Requires encoder weights.
     pub fn encode(&self, video: &Array) -> Result<Array> {
-        let (mean, _logvar) = self.encode_moments(video)?;
-        self.normalize_latent(&mean)
+        let latent = {
+            let (mean, _logvar) = self.encode_moments(video)?;
+            self.normalize_latent(&mean)?
+        };
+        // The encoder's intermediates are dropped before this release (sc-20686).
+        DeadStageBuffers::Release.materialize(&latent)?;
+        Ok(latent)
     }
 
     /// Encode + **sample** the Gaussian (`DiagonalGaussianDistribution.sample()`): `mean +
@@ -858,8 +878,13 @@ impl WanVae {
     /// (the reference draws it from the request seed). Bernini's `get_vae_features` uses this for
     /// **video** source conditioning; images use [`Self::encode`] (`.mode()`).
     pub fn encode_sample(&self, video: &Array, eps: &Array) -> Result<Array> {
-        let (mean, logvar) = self.encode_moments(video)?;
-        self.normalize_latent(&reparameterize(&mean, &logvar, eps)?)
+        let latent = {
+            let (mean, logvar) = self.encode_moments(video)?;
+            self.normalize_latent(&reparameterize(&mean, &logvar, eps)?)?
+        };
+        // The encoder's intermediates are dropped before this release (sc-20686).
+        DeadStageBuffers::Release.materialize(&latent)?;
+        Ok(latent)
     }
 }
 
@@ -1127,6 +1152,98 @@ mod tests {
              live+cache {:.0} B/voxel",
             live as f64 / voxels,
             footprint as f64 / voxels
+        );
+    }
+
+    /// sc-20686: the chunked encode releases at every encoder block boundary (mid-block too) and
+    /// per chunk, plus once with the normalized latent. Sized: width 8, clip [1,3,5,64,64].
+    #[test]
+    fn encode_releases_every_block_of_every_chunk() {
+        let vae = crate::encode_footprint_harness::synthetic_z16(8);
+        let (_, encoder) = vae.encoder.as_ref().unwrap();
+        let layers: usize = encoder
+            .downsamples
+            .iter()
+            .map(|layer| match layer {
+                DownLayer::Res(_) => 2,
+                DownLayer::Down(_) => 1,
+            })
+            .sum();
+        // conv1 + layers + middle (2 + 1 + 2) + head + the joined chunk output.
+        let per_chunk = 1 + layers + 5 + 1 + 1;
+        let clip =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, 5, 64, 64], None).unwrap();
+        let before = block_releases();
+        let latent = vae.encode(&clip).unwrap();
+        assert_eq!(latent.shape(), &[1, 16, 2, 8, 8]);
+        assert_eq!(block_releases() - before, 2 * per_chunk + 1);
+        let eps = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+        let before = block_releases();
+        vae.encode_sample(&clip, &eps).unwrap();
+        assert_eq!(block_releases() - before, 2 * per_chunk + 1);
+    }
+
+    const ENCODE_CACHE_CHILD: &str = "WAN_Z16_ENCODE_CACHE_CHILD";
+
+    /// sc-20686: right after an encode MLX's allocator cache is empty (W2 run 36832899832 carried
+    /// 43 GB of cached encode buffers into Krea v2v generation). Isolated child (MLX's counters are
+    /// process-wide). Sized: width 16 f32, clip [1,3,5,64,64], 16 MiB seeded scratch.
+    #[test]
+    fn encode_leaves_mlx_cache_empty() {
+        if std::env::var_os(ENCODE_CACHE_CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vae::tests::encode_leaves_mlx_cache_empty",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(ENCODE_CACHE_CHILD, "1")
+                .output()
+                .expect("spawn the isolated encode-cache child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated encode-cache child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        const MIB: usize = 1 << 20;
+        let vae = crate::encode_footprint_harness::synthetic_z16(16);
+        let clip =
+            mlx_rs::random::uniform::<f32, f32>(-1.0, 1.0, &[1, 3, 5, 64, 64], None).unwrap();
+        eval(&clip);
+        {
+            let scratch = mlx_rs::ops::zeros::<f32>(&[(4 * MIB) as i32]).unwrap();
+            eval(&scratch);
+        }
+        assert!(mlx_rs::memory::get_cache_memory() >= 16 * MIB);
+        let latent = vae.encode(&clip).unwrap();
+        eval(&latent);
+        let left = mlx_rs::memory::get_cache_memory();
+        assert!(
+            left < 64 * 1024,
+            "an encode must leave the cache empty: {left} B"
+        );
+
+        // A carried conv-cache slot is a lazy slice of a block's full output; materializing a
+        // boundary must evaluate it so that output (64 MiB here) is not kept alive by the slot.
+        let mut cache = FeatCache::new(1);
+        {
+            let block_output = mlx_rs::ops::zeros::<f32>(&[1, 1, 16, 1024, 1024]).unwrap();
+            eval(&block_output);
+            cache.slots[0] = Some(last_t(&block_output, 1).unwrap());
+        }
+        let held = mlx_rs::memory::get_active_memory();
+        let boundary = mlx_rs::ops::zeros::<f32>(&[4]).unwrap();
+        DeadStageBuffers::Keep
+            .materialize_with_cache(&boundary, &cache)
+            .unwrap();
+        let after = mlx_rs::memory::get_active_memory();
+        assert!(
+            after + 32 * MIB < held,
+            "the slot must stop holding its source: {held} -> {after} live bytes"
         );
     }
 }
