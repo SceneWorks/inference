@@ -37,9 +37,7 @@ use candle_core::cuda_backend::cudarc::driver::{result, sys, CudaContext};
 use candle_llm::device::select_device;
 use candle_llm::primitives::ProjectionTally;
 use candle_llm::LlamaProvider;
-use core_llm::{
-    LoadSpec, Message, MtpMode, Quantize, Sampling, StreamEvent, TextLlm, TextLlmRequest,
-};
+use core_llm::{LoadSpec, Message, Quantize, Sampling, StreamEvent, TextLlm, TextLlmRequest};
 use serde_json::{json, Value};
 
 const PROMPT: &str = "Write a detailed, multi-paragraph explanation of how transformer language \
@@ -192,7 +190,6 @@ fn load_residency_by_format() {
         sampling: Sampling::greedy(),
         max_new_tokens: new_tokens,
         seed: Some(0),
-        mtp: None,
         ..Default::default()
     };
     // Sampled at every streamed token (the stream can merge a token into its neighbour's text

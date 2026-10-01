@@ -486,7 +486,7 @@ fn provider_off_path_is_token_identical_to_the_reference_loop() {
         "story": "sc-24140",
         "commit": commit,
         "worktree_dirty": dirty,
-        "check": "feature-end review item 2: Qwen3.8-27B provider default path (MtpMode::Off) vs the reference Decode loop, greedy",
+        "check": "feature-end review item 2: Qwen3.8-27B provider default path (speculative unset) vs the reference Decode loop, greedy",
         "snapshot": snapshot.display().to_string(),
         "device": format!("{:?}", candle_llm::device::select_device().unwrap().location()),
         "prompt": PROMPT,
