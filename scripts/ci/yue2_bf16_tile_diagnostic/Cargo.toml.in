@@ -1,0 +1,24 @@
+[package]
+name = "yue2-bf16-tile-diagnostic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+resolver = "2"
+
+[dependencies]
+candle-audio = { path = "__ENGINE_ROOT__/crates/audio/candle-audio" }
+candle-audio-yue2 = { path = "__ENGINE_ROOT__/crates/audio/candle-audio-yue2" }
+serde_json = "1"
+sha2 = "0.10"
+
+[features]
+default = []
+cuda = ["candle-audio/cuda", "candle-audio-yue2/cuda"]
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[patch."https://github.com/huggingface/candle"]
+candle-kernels = { path = "__ENGINE_ROOT__/crates/media/candle-gen/vendor/candle-kernels" }
