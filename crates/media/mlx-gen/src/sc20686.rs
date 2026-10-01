@@ -205,7 +205,7 @@ struct Context {
     dtype: String,
     mask: String,
     rope: String,
-    real_weights: bool,
+    real_weights: Option<bool>, // None until a product projection confirms it; gates metadata.
 }
 
 impl Context {
@@ -543,7 +543,7 @@ fn activate_pending(
         dtype: String::new(),
         mask: "none".into(),
         rope: "none".into(),
-        real_weights: false,
+        real_weights: None,
     };
     let run_high = instruments
         .counters
@@ -915,7 +915,7 @@ fn emit(state: &mut State, phase: &'static str, operation: &str, fields: EventFi
                 BACKEND, context.source_ref, context.variant
             ));
         }
-        value["real_weights"] = json!(context.real_weights);
+        value["real_weights"] = json!(context.real_weights == Some(true));
         value["full_generation"] = json!(!state.cancellation_armed);
         value["schedule_control"] = json!(state.schedule_control);
         value["attention_kind"] = json!("cross");
@@ -990,7 +990,10 @@ fn emit_metrics(state: &mut State) {
             ),
             ("reused_requests", json!(reused)),
             ("minimum_cache_reads", json!(minimum)),
-            ("real_weights", json!(state.context.real_weights)),
+            (
+                "real_weights",
+                json!(state.context.real_weights == Some(true)),
+            ),
             ("full_generation", json!(!state.cancellation_armed)),
             ("attention_kind", json!("cross")),
         ],
@@ -1037,13 +1040,16 @@ pub fn bind_geometry(geometry: KvGeometry, dtype: Option<Dtype>, mask: &str, rop
 /// crate can never produce a promotable (`real_weights: true`) transcript.
 pub fn confirm_real_weights() {
     with_state(|state| {
-        state.context.real_weights = !cfg!(test);
+        state.context.real_weights = Some(!cfg!(test));
         try_emit_metadata(state);
     });
 }
 
 fn try_emit_metadata(state: &mut State) {
-    if state.metadata_emitted || !state.context.geometry_ready() {
+    if state.metadata_emitted
+        || state.context.real_weights.is_none()
+        || !state.context.geometry_ready()
+    {
         return;
     }
     state.metadata_emitted = true;
@@ -1151,7 +1157,7 @@ pub fn register_cache(
         if state.context.dtype.is_empty() {
             state.context.dtype = dtype_name(key_array.dtype()).into();
         }
-        state.context.real_weights = !cfg!(test);
+        state.context.real_weights = Some(!cfg!(test));
         try_emit_metadata(state);
         let id = state.next_cache_id;
         state.next_cache_id += 1;
@@ -1330,7 +1336,7 @@ pub fn record_recomputed_kv(
         if state.context.dtype.is_empty() {
             state.context.dtype = dtype_name(key_array.dtype()).into();
         }
-        state.context.real_weights = !cfg!(test);
+        state.context.real_weights = Some(!cfg!(test));
         try_emit_metadata(state);
         state.recomputed_projections += 1;
         state.recomputed_dense = state.recomputed_dense.max(dense);

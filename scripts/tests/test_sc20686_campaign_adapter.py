@@ -823,6 +823,53 @@ class CampaignAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "corrupted"):
                 self.adapter._load_unit(resume, "run-00-normal", identity_sha, "wan_vace", "normal")
 
+    def test_a_refused_completed_arm_retains_its_transcript_unaccepted(self):
+        # SC-20686 D2: a 40-minute arm whose transcript the row builder refused vanished with the
+        # run's private directory, taking its decode measurements with it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            resume = root / "resume"
+            private = root / "sc20686-events-x"
+            sealed = private / "sealed-run"
+            media = sealed / "media"
+            media.mkdir(parents=True)
+            (media / "frame.png").write_bytes(b"real output bytes")
+            (sealed / "events.jsonl").write_bytes(b'{"phase":"metadata"}\n')
+            policy = self.runner_safety()["safety_policy"]
+            identity_raw = self.adapter.canonical({"safetyPolicySha256": policy.sha256})
+            identity_sha = self.adapter.digest(identity_raw)
+            resume.mkdir()
+            (resume / "units").mkdir()
+            (resume / "identity.json").write_bytes(identity_raw)
+            admission = self.adapter.supervisor.runtime_guarded_admission(policy)
+
+            def runner(_spec, _arm):
+                return self.adapter.CampaignRun(
+                    [{"phase": "metadata"}], b"stdout", b"",
+                    ("producer", "--sc20686-events", str(sealed / "events.jsonl"), "--out", str(media)),
+                    ({"phase": "process-sample", "sample_kind": "process", "peak_bytes": 1},),
+                    b'{"phase":"metadata"}\n', media, private,
+                    {"pid": 321, "exitCode": 0, "ownedProcessGroupReaped": True, "admission": admission},
+                )
+
+            def row_builder(*_args):
+                raise ValueError("entrypoint must identify a real product cross-attention route")
+
+            with self.assertRaisesRegex(ValueError, "real product cross-attention route.*retained at"):
+                self.adapter.publish_campaign(
+                    [SimpleNamespace(variant="wan2_2_ti2v_5b")], runner, row_builder, root / "final",
+                    resume_root=resume, resume_identity_sha=identity_sha,
+                )
+            [retained] = (resume / "failed").glob("incomplete-*")
+            self.assertFalse(private.exists())
+            self.assertEqual((retained / "sealed-run" / "events.jsonl").read_bytes(), b'{"phase":"metadata"}\n')
+            record = json.loads((retained / "unaccepted.json").read_bytes())
+            self.assertEqual(
+                (record["accepted"], record["outcome"], record["reason"], record["pid"], record["coordinate"]),
+                (False, "failed", "invalid-evidence", 321, "wan2_2_ti2v_5b/normal"),
+            )
+            self.assertFalse((resume / "units" / "run-00-normal").exists())
+
     def test_operator_stop_halts_between_arms_and_resume_completes_the_loop(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

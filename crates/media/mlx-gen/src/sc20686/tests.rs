@@ -708,3 +708,41 @@ fn the_schedule_control_arm_opens_no_read_windows() {
     assert_eq!(metadata["schedule_control"], true);
     assert_eq!(metadata["full_generation"], true);
 }
+
+/// SC-20686 D2: a route that binds its complete geometry (dtype included) before its first
+/// projection — Wan-VACE's `sc20686_bind`, and `register_cross_kv_set`'s own bind — must not emit
+/// metadata until the projection is confirmed, or the transcript's single metadata event claims
+/// `real_weights: false` for a real-weight run and the adapter refuses the row.
+#[test]
+fn metadata_waits_for_the_confirmed_projection_after_a_complete_bind() {
+    let h = harness();
+    let scope = h.activate(false);
+    bind_geometry(
+        KvGeometry {
+            layers: 1,
+            heads: 2,
+            head_dimension: 8,
+            sq: 16,
+            skv: 4,
+        },
+        Some(Dtype::Float32),
+        "none",
+        "none",
+    );
+    assert!(
+        h.of("metadata").is_empty(),
+        "complete geometry alone is not a confirmed product projection"
+    );
+    let set = vec![kv(1, 4)];
+    let guard = register_cross_kv_set(&set, 16, "create", "release")
+        .unwrap()
+        .unwrap();
+    let phases = h.phases();
+    let metadata = phases.iter().position(|p| p == "metadata").unwrap();
+    let start = phases.iter().position(|p| p == "generation-start").unwrap();
+    let create = phases.iter().position(|p| p == "cross-kv-created").unwrap();
+    assert!(metadata < start && start < create, "{phases:?}");
+    assert_eq!(phases.iter().filter(|p| *p == "metadata").count(), 1);
+    drop(guard);
+    drop(scope);
+}
