@@ -847,13 +847,18 @@ fn sc20684_decode_plan_prices_the_full_raw_frame_count() {
     assert_eq!(estimate, Some(12_643_205_120));
 }
 
+/// One phase-boundary memory reading. It is also printed as it is taken, so a role the launcher's
+/// footprint watchdog aborts mid-run still leaves which phases completed, and with what MLX active
+/// versus cached bytes, in its bounded stdout transcript.
 fn sc20684_phase_memory(name: &str) -> serde_json::Value {
-    serde_json::json!({
+    let value = serde_json::json!({
         "phase": name,
         "process": sc20684_process_memory(),
         "mlxActiveBytes": mlx_rs::memory::get_active_memory() as u64,
         "mlxCacheBytes": mlx_rs::memory::get_cache_memory() as u64,
-    })
+    });
+    println!("SC20684_KREA_PHASE {value}");
+    value
 }
 
 fn sc20684_source_budget(
@@ -1525,10 +1530,11 @@ fn sc20684_packed_campaign_observer() {
     let load_started = Instant::now();
     let tokenizer = load_tokenizer(root.join("tokenizer.json"), config.wan.text_len)
         .expect("load product tokenizer");
-    let mut text_weights =
-        mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors"))
-            .expect("open product text encoder");
-    let context = {
+    // The product's own UMT5 release (`encode_prompt`): the encoder and its weight map live only
+    // inside the phase, its context is materialized, then MLX's cache of their buffers is returned.
+    let context = mlx_gen_krea_realtime::materialize_and_release_phase(|| {
+        let mut text_weights =
+            mlx_gen::weights::Weights::from_file(root.join("t5_encoder.safetensors"))?;
         let encoder = Umt5Encoder::from_weights_quantized(
             &mut text_weights,
             &config.wan,
@@ -1536,18 +1542,13 @@ fn sc20684_packed_campaign_observer() {
                 bits: 8,
                 group_size: 64,
             },
+        )?;
+        encoder.encode(
+            &tokenizer,
+            "a red fox trotting through a snowy pine forest at sunrise",
         )
-        .expect("load product text encoder");
-        let value = encoder
-            .encode(
-                &tokenizer,
-                "a red fox trotting through a snowy pine forest at sunrise",
-            )
-            .expect("encode product prompt");
-        mlx_rs::transforms::eval([&value]).expect("materialize product prompt context");
-        value
-    };
-    drop(text_weights);
+    })
+    .expect("encode product prompt and release the text encoder");
     drop(tokenizer);
     let dit_weights = mlx_gen::weights::Weights::from_file(root.join("dit.safetensors"))
         .expect("open product DiT");
@@ -1794,6 +1795,10 @@ fn sc20684_packed_campaign_observer() {
     drop(packed_media);
     let allocator = allocator_probe.finish();
     let candidate_wall_ms = campaign_started.elapsed().as_secs_f64() * 1000.0;
+    // The candidate's measurements are taken. Return the packed decode's cached working set before
+    // the dense parity generation: its buffers fit no DiT shape, so MLX would otherwise hold them
+    // beside the dense run until its ~0.95 x working-set trim, far above the child cap.
+    mlx_rs::memory::clear_cache();
 
     let (dense_latents, _, dense_elapsed, _) = sc20684_generate_latents(
         &transformer,

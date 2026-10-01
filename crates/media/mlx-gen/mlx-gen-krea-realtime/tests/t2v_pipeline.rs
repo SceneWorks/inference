@@ -201,11 +201,16 @@ fn native_dit_map(cfg: &KreaRealtimeConfig) -> HashMap<String, Array> {
 /// A tiny UMT5-XXL text encoder (MLX-layout keys), dense random weights matching the real dtype
 /// convention (bf16 projections/embedding; f32 norms/pos-bias). `t5_ffn` rides on the weights.
 fn tiny_umt5(cfg: &KreaRealtimeConfig) -> Weights {
+    tiny_umt5_with_vocab(cfg, 64)
+}
+
+/// [`tiny_umt5`] with a chosen token-embedding height, so a release test can make the encoder's
+/// footprint large enough to measure.
+fn tiny_umt5_with_vocab(cfg: &KreaRealtimeConfig, vocab: i32) -> Weights {
     let w = &cfg.wan;
     let text_dim = w.text_dim as i32;
     let dim_attn = w.t5_dim_attn as i32;
     let t5_ffn = 64i32;
-    let vocab = 64i32;
     let mut map: HashMap<String, Array> = HashMap::new();
     let mut seed = 500u64;
     let mut put = |map: &mut HashMap<String, Array>, name: &str, shape: &[i32], dtype: Dtype| {
@@ -882,4 +887,89 @@ fn v2v_pipeline_conditions_on_source_and_strength() {
             "same seed + strength ⇒ byte-identical v2v clip"
         );
     }
+}
+
+// ── SC-20684: phase boundaries return freed buffers from MLX's allocator cache ──────────────────
+
+const PHASE_RELEASE_CHILD: &str = "KREA_PHASE_RELEASE_CHILD";
+
+/// MLX's active/cache counters are process-wide and this binary runs tests on parallel threads, so
+/// the measurement runs alone in a child process of this same test binary.
+#[test]
+fn phase_boundaries_release_the_text_encoder_and_the_denoise_cache() {
+    if std::env::var_os(PHASE_RELEASE_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "t2v_pipeline::phase_boundaries_release_the_text_encoder_and_the_denoise_cache",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(PHASE_RELEASE_CHILD, "1")
+            .output()
+            .expect("spawn the isolated phase-release child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated phase-release child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use mlx_gen_krea_realtime::{decode_latents_to_video, materialize_and_release_phase};
+    use mlx_gen_wan::Umt5Encoder;
+    use mlx_rs::memory::{clear_cache, get_active_memory, get_cache_memory};
+    const MIB: usize = 1 << 20;
+
+    // UMT5 phase: a 262,144 x 32 bf16 token embedding (16 MiB) owned only by the phase.
+    let cfg = tiny_cfg();
+    clear_cache();
+    let active_before = get_active_memory();
+    let mut active_during = 0;
+    let context = materialize_and_release_phase(|| {
+        let weights = tiny_umt5_with_vocab(&cfg, 1 << 18);
+        let enc = Umt5Encoder::from_weights(&weights, &cfg.wan)?;
+        let ids = Array::from_slice(&[1i32, 2, 3, 4, 5], &[1, 5]);
+        let mask = Array::from_slice(&[1i32; 5], &[1, 5]);
+        let hidden = enc.forward(&ids, &mask)?;
+        mlx_rs::transforms::eval([&hidden])?;
+        active_during = get_active_memory();
+        Ok(hidden)
+    })
+    .expect("tiny UMT5 phase");
+    assert_eq!(context.shape(), &[1, 5, cfg.wan.text_dim as i32]);
+    assert!(
+        active_during >= active_before + 16 * MIB,
+        "the phase must hold the encoder: {active_before} -> {active_during}"
+    );
+    assert!(
+        get_active_memory() < active_before + MIB,
+        "the encoder's arrays must be dropped once its output is materialized: {} live bytes",
+        get_active_memory() - active_before
+    );
+    assert!(
+        get_cache_memory() < MIB,
+        "the encoder's freed buffers must leave MLX's cache: {} cached bytes",
+        get_cache_memory()
+    );
+
+    // Denoise -> decode boundary: a 64 MiB buffer the denoise freed, which no VAE shape can reuse,
+    // must not survive into (or past) the decode.
+    let vae = tiny_vae();
+    let latents = det_fill(&[16, 3, 5, 6], 123, 1.0, 0.0, Dtype::Float32);
+    mlx_rs::transforms::eval([&latents]).unwrap();
+    {
+        let denoise_scratch = mlx_rs::ops::zeros::<f32>(&[(16 * MIB) as i32]).unwrap();
+        mlx_rs::transforms::eval([&denoise_scratch]).unwrap();
+    }
+    assert!(
+        get_cache_memory() >= 64 * MIB,
+        "the freed denoise scratch must start in MLX's cache"
+    );
+    decode_latents_to_video(&vae, &latents, 24, None, None, &CancelFlag::default()).unwrap();
+    assert!(
+        get_cache_memory() < 64 * MIB,
+        "the decode must return the denoise's cached buffers first: {} cached bytes",
+        get_cache_memory()
+    );
 }
