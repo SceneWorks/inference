@@ -322,6 +322,26 @@ impl Qwen35Config {
         let rd = (self.head_dim as f32 * self.partial_rotary_factor).round() as i32;
         rd & !1
     }
+
+    /// This config projected onto the backend-neutral companion-head contract (sc-24444, E8): the
+    /// one geometry check both backends refuse a mismatched head by.
+    pub fn companion_mtp_geometry(&self) -> core_llm::CompanionMtpGeometry {
+        core_llm::CompanionMtpGeometry {
+            hidden_size: self.hidden_size,
+            num_attention_heads: self.num_heads,
+            num_key_value_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            intermediate_size: self.intermediate_size,
+            vocab_size: self.vocab_size,
+            rotary_dim: self.rotary_dim(),
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            mrope_section: self.mrope_section_resolved(),
+            mtp_num_hidden_layers: self.mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings: self.mtp_use_dedicated_embeddings,
+            moe: self.moe.is_some(),
+        }
+    }
 }
 
 /// L2-normalize over the last axis: `x · rsqrt(Σ x² + eps)` (the FLA `use_qk_l2norm_in_kernel`
@@ -1772,50 +1792,62 @@ impl Qwen35Mtp {
             )));
         }
 
+        let proj_q = |key: &str| -> Result<Projection> {
+            debug_assert_priced(key, format);
+            keyed_projection(w, key, target.dtype, format, &target.device)
+        };
+        Self::assemble(w, target, format, &proj_q)
+    }
+
+    /// Build the one-layer predictor from `mtp.`-prefixed tensors in `w`, reading each projection
+    /// with `proj_q`, sharing the target's embedding and LM head. The geometry is the target's:
+    /// the predictor runs inside its residual stream, RoPE and vocabulary. Every RMSNorm vector is
+    /// zero-centred (`1 + w`) — the Qwen3.8 checkpoint convention of the native and the published
+    /// companion heads alike, whatever convention the target's own norms follow.
+    fn assemble(
+        w: &Weights,
+        target: &Qwen35Model,
+        format: Option<&ProjectionFormat>,
+        proj_q: &dyn Fn(&str) -> Result<Projection>,
+    ) -> Result<Self> {
+        let cfg = &target.cfg;
         let dtype = target.dtype;
         let eps = cfg.rms_norm_eps as f64;
         let req = |key: &str| -> Result<Tensor> { dense_weight(w, key, dtype) };
         // Qwen3.5/Qwen3.8 RMSNorm parameters are zero-centered (`1 + weight`).
         let norm_w = |key: &str| -> Result<Tensor> { Ok(req(key)?.affine(1.0, 1.0)?) };
-        let proj_q = |key: &str| -> Result<Projection> {
-            debug_assert_priced(key, format);
-            keyed_projection(w, key, dtype, format, &target.device)
-        };
         let groups = (cfg.num_heads / cfg.num_kv_heads) as usize;
-        let mut layers = Vec::with_capacity(cfg.mtp_num_hidden_layers);
-        for i in 0..cfg.mtp_num_hidden_layers {
-            let lp = |suffix: &str| format!("mtp.layers.{i}.{suffix}");
-            layers.push(DecoderLayer {
-                input_ln: norm_w(&lp("input_layernorm.weight"))?,
-                post_ln: norm_w(&lp("post_attention_layernorm.weight"))?,
-                mixer: Mixer::Attn(Qwen35Attention {
-                    q_proj: proj_q(&lp("self_attn.q_proj.weight"))?,
-                    k_proj: proj_q(&lp("self_attn.k_proj.weight"))?,
-                    v_proj: proj_q(&lp("self_attn.v_proj.weight"))?,
-                    o_proj: proj_q(&lp("self_attn.o_proj.weight"))?,
-                    q_norm: norm_w(&lp("self_attn.q_norm.weight"))?,
-                    k_norm: norm_w(&lp("self_attn.k_norm.weight"))?,
-                    num_heads: cfg.num_heads as usize,
-                    num_kv_heads: cfg.num_kv_heads as usize,
-                    head_dim: cfg.head_dim as usize,
-                    groups,
-                    scale: (cfg.head_dim as f32).powf(-0.5),
-                    eps,
-                }),
-                // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
-                // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`).
-                ffn: build_ffn(
-                    w,
-                    &lp(""),
-                    cfg,
-                    format,
-                    dtype,
-                    &target.device,
-                    &|key: String| proj_q(&key),
-                )?,
+        let lp = |suffix: &str| format!("mtp.layers.0.{suffix}");
+        let layer = DecoderLayer {
+            input_ln: norm_w(&lp("input_layernorm.weight"))?,
+            post_ln: norm_w(&lp("post_attention_layernorm.weight"))?,
+            mixer: Mixer::Attn(Qwen35Attention {
+                q_proj: proj_q(&lp("self_attn.q_proj.weight"))?,
+                k_proj: proj_q(&lp("self_attn.k_proj.weight"))?,
+                v_proj: proj_q(&lp("self_attn.v_proj.weight"))?,
+                o_proj: proj_q(&lp("self_attn.o_proj.weight"))?,
+                q_norm: norm_w(&lp("self_attn.q_norm.weight"))?,
+                k_norm: norm_w(&lp("self_attn.k_norm.weight"))?,
+                num_heads: cfg.num_heads as usize,
+                num_kv_heads: cfg.num_kv_heads as usize,
+                head_dim: cfg.head_dim as usize,
+                groups,
+                scale: (cfg.head_dim as f32).powf(-0.5),
                 eps,
-            });
-        }
+            }),
+            // The predictor layer carries the body's FFN choice: the dense MLP (27B) or the
+            // sparse-MoE block (35B-A3B), in either expert layout (vLLM `qwen3_5_mtp.py`).
+            ffn: build_ffn(
+                w,
+                &lp(""),
+                cfg,
+                format,
+                dtype,
+                &target.device,
+                &|key: String| proj_q(&key),
+            )?,
+            eps,
+        };
 
         Ok(Self {
             embed_tokens: target.embed_tokens.clone(),
@@ -1823,7 +1855,7 @@ impl Qwen35Mtp {
             pre_fc_norm_embedding: norm_w("mtp.pre_fc_norm_embedding.weight")?,
             pre_fc_norm_hidden: norm_w("mtp.pre_fc_norm_hidden.weight")?,
             fc: proj_q("mtp.fc.weight")?,
-            layers,
+            layers: vec![layer],
             norm: norm_w("mtp.norm.weight")?,
             rope: Rope::partial(cfg.rotary_dim(), cfg.rope_theta, false),
             mrope_section: cfg.mrope_section_resolved(),
@@ -1833,6 +1865,152 @@ impl Qwen35Mtp {
             device: target.device.clone(),
             vocab_size: cfg.vocab_size as usize,
         })
+    }
+
+    /// Load a standalone Qwen3.8 MTP proposal head (a directory holding its `config.json` and
+    /// `*.safetensors`, `model_type` [`core_llm::COMPANION_MTP_MODEL_TYPE`]) for a target that has
+    /// none of its own — the Prism/Bonsai path, whose packed artifact ships no `mtp.*` tensors
+    /// (sc-24444, the Candle twin of mlx-llm's `attach_companion_mtp`).
+    ///
+    /// The head owns only its predictor layer; it reads token embeddings and projects logits
+    /// through the target's own embedding and `lm_head` (for Prism, the packed ones). Its geometry
+    /// is checked against the target's by the shared [`core_llm::CompanionMtpGeometry`] contract
+    /// and every stored tensor's `[out, in]` / width against the target's before anything is
+    /// built; a mismatch is an [`Error::Config`] naming each disagreement. Tensor names may be bare
+    /// (`fc.weight`, the published layout) or `mtp.`-prefixed; bare names are remapped to `mtp.`.
+    /// Projections are read in the head's own stored MLX affine quantization (its `quantization`
+    /// block: 4- or 8-bit, re-packed to Q8_0 like every MLX affine triple Candle loads) or dense;
+    /// RMSNorm vectors are `1 + w`. Every tensor in the head must be consumed.
+    pub fn from_companion_dir(dir: &std::path::Path, target: &Qwen35Model) -> Result<Self> {
+        if target.cfg.moe.is_some() {
+            return Err(Error::Config(
+                "a MoE target has no companion MTP predictor path on this architecture".into(),
+            ));
+        }
+        let value =
+            core_llm::read_companion_mtp_config(dir).map_err(|e| Error::Config(e.to_string()))?;
+        let head_cfg = Qwen35Config::from_json(&value)?;
+        let geometry = head_cfg.companion_mtp_geometry();
+        let mismatches = geometry.mismatches(&target.cfg.companion_mtp_geometry());
+        if !mismatches.is_empty() {
+            return Err(Error::Config(format!(
+                "companion MTP head geometry does not match the target: {}",
+                mismatches.join("; ")
+            )));
+        }
+        let quant = value
+            .get("text_config")
+            .and_then(|t| t.get("quantization"))
+            .or_else(|| value.get("quantization"))
+            .map(|q| -> Result<(usize, usize)> {
+                let field = |k: &str| q.get(k).and_then(serde_json::Value::as_u64);
+                match (field("bits"), field("group_size"), q.get("mode")) {
+                    (Some(bits @ (4 | 8)), Some(group), mode)
+                        if group > 0 && mode.is_none_or(|m| m.as_str() == Some("affine")) =>
+                    {
+                        Ok((bits as usize, group as usize))
+                    }
+                    _ => Err(Error::Config(format!(
+                        "companion MTP head quantization {q} is not MLX affine 4- or 8-bit"
+                    ))),
+                }
+            })
+            .transpose()?;
+        let raw = Weights::from_dir(dir, &target.device)?;
+        let prefix = core_llm::companion_mtp_prefix(|key| raw.contains(key))
+            .map_err(|e| Error::Config(e.to_string()))?;
+
+        let logical = |key: &str| -> Option<[usize; 2]> {
+            let (rows, cols) = raw.get(key)?.dims2().ok()?;
+            match quant {
+                Some((_, group)) => {
+                    let stem = key.strip_suffix(".weight").unwrap_or(key);
+                    let (_, groups) = raw.get(&format!("{stem}.scales"))?.dims2().ok()?;
+                    Some([rows, groups.checked_mul(group)?])
+                }
+                None => Some([rows, cols]),
+            }
+        };
+        let mut expected_keys = std::collections::BTreeSet::new();
+        let mut wrong = Vec::new();
+        for (name, expected) in geometry.matrices() {
+            let key = format!("{prefix}{name}.weight");
+            expected_keys.insert(key.clone());
+            if quant.is_some() {
+                expected_keys.insert(format!("{prefix}{name}.scales"));
+                expected_keys.insert(format!("{prefix}{name}.biases"));
+            }
+            match logical(&key) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => wrong.push(format!(
+                    "`{name}` is {actual:?}, the target needs {expected:?}"
+                )),
+                None => wrong.push(format!("`{name}` is missing or not a matrix")),
+            }
+        }
+        for (name, expected) in geometry.norms() {
+            let key = format!("{prefix}{name}.weight");
+            match raw.get(&key).map(|t| t.dims().to_vec()) {
+                Some(shape) if shape == [expected] => {}
+                Some(shape) => wrong.push(format!(
+                    "`{name}` is {shape:?}, the target needs [{expected}]"
+                )),
+                None => wrong.push(format!("`{name}` is missing")),
+            }
+            expected_keys.insert(key);
+        }
+        if !wrong.is_empty() {
+            return Err(Error::Config(format!(
+                "companion MTP head tensors do not match the target: {}",
+                wrong.join("; ")
+            )));
+        }
+        let mut unused: Vec<&str> = raw
+            .keys()
+            .filter(|key| !expected_keys.contains(*key))
+            .collect();
+        if !unused.is_empty() {
+            unused.sort_unstable();
+            return Err(Error::Config(format!(
+                "companion MTP head carries tensors the predictor does not use: {}",
+                unused.join(", ")
+            )));
+        }
+
+        // The predictor reads the native `mtp.` layout.
+        let device = raw.device().clone();
+        let w = Weights::from_map(
+            raw.into_map()
+                .into_iter()
+                .map(|(key, t)| match key.strip_prefix(prefix) {
+                    Some(bare) if prefix.is_empty() => (format!("mtp.{bare}"), t),
+                    _ => (key, t),
+                })
+                .collect(),
+            device,
+        );
+        let proj_q = |key: &str| -> Result<Projection> {
+            match quant {
+                Some((bits, group)) => {
+                    let stem = key.strip_suffix(".weight").unwrap_or(key);
+                    Projection::load_mlx_affine(
+                        w.require(key)?,
+                        w.require(&format!("{stem}.scales"))?,
+                        w.require(&format!("{stem}.biases"))?,
+                        bits,
+                        group,
+                        &target.device,
+                    )
+                }
+                None => keyed_projection(&w, key, target.dtype, None, &target.device),
+            }
+        };
+        Self::assemble(&w, target, None, &proj_q)
+    }
+
+    /// The predictor's decoder layers (one for every head this runtime loads).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// Select how the predictor layers attend (see [`Qwen35Model::set_attn_formulation`]); the
@@ -4300,6 +4478,407 @@ pub(crate) mod tests {
         )
         .unwrap();
         (cfg, model)
+    }
+
+    // ---- Prism/Bonsai companion MTP head fixtures (epic sc-24432, story sc-24444). ----
+
+    /// A uniform `[-0.4, 0.4)` draw — mlx-llm's `Synth::randn` — from `rng`.
+    fn uniform(rng: &mut crate::primitives::sampler::SplitMix64, n: usize) -> Vec<f32> {
+        use crate::primitives::sampler::TokenRng;
+        (0..n).map(|_| (rng.next_f32() - 0.5) * 0.8).collect()
+    }
+
+    /// The text geometry of the Prism fixture — mlx-llm's `prism_qwen35_config` (hidden 128, one
+    /// Gated DeltaNet and one attention layer, heads 2/1 × 64, MLP 256, vocab 64).
+    pub(crate) fn prism_text_config() -> Value {
+        json!({
+            "model_type": "qwen3_5_text", "hidden_size": 128, "num_hidden_layers": 2,
+            "intermediate_size": 256, "num_attention_heads": 2, "num_key_value_heads": 1,
+            "head_dim": 64, "vocab_size": 64, "rms_norm_eps": 1e-6, "rope_theta": 10000000.0,
+            "partial_rotary_factor": 0.5, "max_position_embeddings": 512,
+            "tie_word_embeddings": false, "full_attention_interval": 2,
+            "linear_num_value_heads": 2, "linear_num_key_heads": 1, "linear_key_head_dim": 64,
+            "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4,
+            "mtp_num_hidden_layers": 0, "mtp_use_dedicated_embeddings": false
+        })
+    }
+
+    /// Write a frozen Prism MLX snapshot (schema-2 `config.json`, `hadamard.json`,
+    /// `model.safetensors` — no tokenizer) of [`prism_text_config`] with random packed codes and
+    /// signs from `seed`, the layout `PrismMlxCheckpoint::open` reads.
+    pub(crate) fn write_prism_snapshot(dir: &std::path::Path, seed: u64) {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        const BLOCK: usize = 128;
+        let mut rng = SplitMix64::new(seed);
+        let mut signs_by_width = std::collections::BTreeMap::new();
+        for width in [128usize, 256] {
+            let signs: Vec<i8> = (0..width)
+                .map(|_| if rng.next_u64() & 1 == 0 { -1 } else { 1 })
+                .collect();
+            signs_by_width.insert(width, signs);
+        }
+        // (module path, embedding, rows, input width, scale magnitude)
+        let packed: [(&str, bool, usize, usize, f32); 15] = [
+            ("lm_head", false, 64, 128, 0.25),
+            ("model.embed_tokens", true, 64, 128, 0.5),
+            (
+                "model.layers.0.linear_attn.in_proj_qkv",
+                false,
+                256,
+                128,
+                0.05,
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z",
+                false,
+                128,
+                128,
+                0.05,
+            ),
+            ("model.layers.0.linear_attn.out_proj", false, 128, 128, 0.05),
+            ("model.layers.0.mlp.gate_proj", false, 256, 128, 0.05),
+            ("model.layers.0.mlp.up_proj", false, 256, 128, 0.05),
+            ("model.layers.0.mlp.down_proj", false, 128, 256, 0.05),
+            ("model.layers.1.self_attn.q_proj", false, 256, 128, 0.05),
+            ("model.layers.1.self_attn.k_proj", false, 64, 128, 0.05),
+            ("model.layers.1.self_attn.v_proj", false, 64, 128, 0.05),
+            ("model.layers.1.self_attn.o_proj", false, 128, 128, 0.05),
+            ("model.layers.1.mlp.gate_proj", false, 256, 128, 0.05),
+            ("model.layers.1.mlp.up_proj", false, 256, 128, 0.05),
+            ("model.layers.1.mlp.down_proj", false, 128, 256, 0.05),
+        ];
+        let cpu = Device::Cpu;
+        let mut tensors = HashMap::new();
+        let (mut forward, mut inverse) = (Vec::new(), Vec::new());
+        for (path, embedding, rows, width, magnitude) in packed {
+            let words: Vec<u32> = (0..rows * width / 16)
+                .map(|_| rng.next_u64() as u32)
+                .collect();
+            let scales: Vec<half::f16> = (0..rows * width / BLOCK)
+                .map(|_| half::f16::from_f32(magnitude * (0.5 + rng.next_f32())))
+                .collect();
+            let biases: Vec<half::f16> = scales.iter().map(|s| -*s).collect();
+            let signs: Vec<f32> = signs_by_width[&width].iter().map(|&s| s as f32).collect();
+            let base = format!("language_model.{path}");
+            let t = |v, shape: &[usize]| Tensor::from_vec(v, shape, &cpu).unwrap();
+            tensors.insert(format!("{base}.weight"), t(words, &[rows, width / 16]));
+            tensors.insert(
+                format!("{base}.scales"),
+                Tensor::from_vec(scales, (rows, width / BLOCK), &cpu).unwrap(),
+            );
+            tensors.insert(
+                format!("{base}.biases"),
+                Tensor::from_vec(biases, (rows, width / BLOCK), &cpu).unwrap(),
+            );
+            tensors.insert(format!("{base}.signs"), Tensor::new(signs, &cpu).unwrap());
+            match embedding {
+                true => inverse.push(format!("{base}.weight")),
+                false => forward.push(format!("{base}.weight")),
+            }
+        }
+        let mut rng = SplitMix64::new(seed ^ 0x5eed);
+        let p = "language_model.model";
+        let mut dense = |key: String, shape: &[usize], shift: f32| {
+            let n = shape.iter().product();
+            let values: Vec<f32> = uniform(&mut rng, n)
+                .into_iter()
+                .map(|v| v + shift)
+                .collect();
+            tensors.insert(key, Tensor::from_vec(values, shape, &cpu).unwrap());
+        };
+        // Direct-multiplier norms near one; small GDN decay/gate parameters.
+        for (key, width) in [
+            (format!("{p}.norm.weight"), 128),
+            (format!("{p}.layers.0.input_layernorm.weight"), 128),
+            (format!("{p}.layers.0.post_attention_layernorm.weight"), 128),
+            (format!("{p}.layers.1.input_layernorm.weight"), 128),
+            (format!("{p}.layers.1.post_attention_layernorm.weight"), 128),
+            (format!("{p}.layers.1.self_attn.q_norm.weight"), 64),
+            (format!("{p}.layers.1.self_attn.k_norm.weight"), 64),
+            (format!("{p}.layers.0.linear_attn.norm.weight"), 64),
+        ] {
+            dense(key, &[width], 1.0);
+        }
+        dense(
+            format!("{p}.layers.0.linear_attn.in_proj_a.weight"),
+            &[2, 128],
+            0.0,
+        );
+        dense(
+            format!("{p}.layers.0.linear_attn.in_proj_b.weight"),
+            &[2, 128],
+            0.0,
+        );
+        dense(
+            format!("{p}.layers.0.linear_attn.conv1d.weight"),
+            &[256, 1, 4],
+            0.0,
+        );
+        dense(format!("{p}.layers.0.linear_attn.A_log"), &[2], 0.0);
+        dense(format!("{p}.layers.0.linear_attn.dt_bias"), &[2], 0.0);
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+
+        let modules: Vec<Value> = packed
+            .iter()
+            .map(|(path, embedding, ..)| {
+                json!({"path": path, "block": BLOCK, "embedding": embedding, "dtype": "float16"})
+            })
+            .collect();
+        let config = json!({
+            "model_type": "prism_hadamard_qwen35",
+            "text_config": prism_text_config(),
+            "schema_version": 2, "base_model_type": "qwen3_5",
+            "tensor_namespace": "mlx-vlm-qwen3_5", "requires_runtime": "runtime/artifact.py",
+            "hadamard_config": "hadamard.json", "gdn_activation_layout": "grouped",
+            "components": {"text": true, "vision": false, "mtp": false},
+            "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+            "modules": modules,
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let widths: Vec<usize> = signs_by_width.keys().copied().collect();
+        let values: Vec<f64> = signs_by_width
+            .values()
+            .flatten()
+            .map(|&s| f64::from(s))
+            .collect();
+        let hadamard = json!({
+            "prism.hadamard.version": 1,
+            "prism.hadamard.block_size": BLOCK,
+            "prism.hadamard.transform": "normalized-sylvester-walsh-hadamard",
+            "prism.hadamard.axis": "input-last-dimension",
+            "prism.hadamard.sign_mode": "explicit",
+            "prism.hadamard.weight_names": forward,
+            "prism.hadamard.inverse_weight_names": inverse,
+            "prism.hadamard.sign_widths": widths,
+            "prism.hadamard.sign_values": values,
+            "prism.hadamard.gdn_v_grouped": true,
+        });
+        std::fs::write(dir.join("hadamard.json"), hadamard.to_string()).unwrap();
+    }
+
+    /// Write a standalone companion MTP head (`model_type` `qwen3_5_mtp`, bare tensor names, MLX
+    /// affine Q4 group 64 with BF16 scales — the published `EigenLabs/Qwen3.8-27B-MTP-4bit`
+    /// layout; group 32 when an input width is not a multiple of 64) of `text_config`'s geometry
+    /// into `dir`, with random codes from `seed`. Every norm vector is zero-centred (the runtime
+    /// applies `1 + w`); `pre_fc_norm_embedding` is all `embedding_norm` when given.
+    pub(crate) fn write_companion_head(
+        dir: &std::path::Path,
+        text_config: &Value,
+        seed: u64,
+        embedding_norm: Option<f32>,
+    ) {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let mut text = text_config.clone();
+        text["mtp_num_hidden_layers"] = json!(1);
+        let geometry = Qwen35Config::from_json(&text)
+            .unwrap()
+            .companion_mtp_geometry();
+        let group = match geometry.matrices().iter().all(|(_, [_, c])| c % 64 == 0) {
+            true => 64,
+            false => 32,
+        };
+        let quantization = json!({"bits": 4, "group_size": group, "mode": "affine"});
+        let config = json!({
+            "model_type": "qwen3_5_mtp",
+            "block_size": 3,
+            "quantization": quantization,
+            "quantization_config": quantization,
+            "text_config": text,
+            "tie_word_embeddings": false,
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let mut rng = SplitMix64::new(seed);
+        let cpu = Device::Cpu;
+        let mut tensors = HashMap::new();
+        for (name, [rows, cols]) in geometry.matrices() {
+            let words: Vec<u32> = (0..rows * cols / 8)
+                .map(|_| rng.next_u64() as u32)
+                .collect();
+            // Codes 0..15 around zero: scale · code − 7.5 · scale.
+            let scales: Vec<f32> = (0..rows * cols / group)
+                .map(|_| 0.02 * (0.5 + rng.next_f32()))
+                .collect();
+            let biases: Vec<f32> = scales.iter().map(|s| -7.5 * s).collect();
+            let bf16 = |v: Vec<f32>| {
+                Tensor::from_vec(v, (rows, cols / group), &cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+            };
+            tensors.insert(
+                format!("{name}.weight"),
+                Tensor::from_vec(words, (rows, cols / 8), &cpu).unwrap(),
+            );
+            tensors.insert(format!("{name}.scales"), bf16(scales));
+            tensors.insert(format!("{name}.biases"), bf16(biases));
+        }
+        for (name, width) in geometry.norms() {
+            let values = match (name, embedding_norm) {
+                ("pre_fc_norm_embedding", Some(v)) => vec![v; width],
+                _ => uniform(&mut rng, width)
+                    .into_iter()
+                    .map(|v| v * 0.25)
+                    .collect(),
+            };
+            tensors.insert(
+                format!("{name}.weight"),
+                Tensor::from_vec(values, width, &cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap(),
+            );
+        }
+        candle_core::safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+    }
+
+    /// The Prism fixture loaded as a target model on the CPU.
+    fn prism_target(seed: u64) -> (tempfile::TempDir, Qwen35Model) {
+        let dir = tempfile::tempdir().unwrap();
+        write_prism_snapshot(dir.path(), seed);
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("config.json")).unwrap())
+                .unwrap();
+        let ck =
+            crate::prism_checkpoint::PrismMlxCheckpoint::open(dir.path(), &Device::Cpu, &config)
+                .unwrap();
+        let model = Qwen35Model::from_prism_weights(
+            &ck.weights,
+            "language_model.model",
+            Qwen35Config::from_json(&config).unwrap(),
+            &ck.registry,
+            DType::F32,
+        )
+        .unwrap();
+        (dir, model)
+    }
+
+    /// Story sc-24444: a companion head's RMSNorm vectors follow the zero-centred Qwen3.8
+    /// checkpoint convention (`1 + w`) whatever the target's own convention — a Prism target's
+    /// norms are direct multipliers, the head's are not (the published Qwen3.8 heads'
+    /// `pre_fc_norm_embedding` values are all negative, mean ≈ −0.46).
+    #[test]
+    fn a_companion_heads_norms_are_applied_as_one_plus_w() {
+        let (_target_dir, target) = prism_target(11);
+        let head = tempfile::tempdir().unwrap();
+        write_companion_head(head.path(), &prism_text_config(), 3, Some(-0.5));
+        let predictor = Qwen35Mtp::from_companion_dir(head.path(), &target).unwrap();
+        let applied = predictor
+            .pre_fc_norm_embedding
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(applied, vec![0.5f32; 128]);
+    }
+
+    /// Story sc-24444 E2/E8: the Candle companion head is refused by the same shared geometry
+    /// check as mlx-llm's — each field the predictor computes with but no tensor shape reveals
+    /// named on its own (`vocab_size` is the only guard against a head for another tokenizer) —
+    /// and a stored tensor that disagrees, an unused tensor and a head for another model type are
+    /// each named refusals.
+    #[test]
+    fn a_mismatched_companion_head_is_refused_by_name() {
+        let (_target_dir, target) = prism_target(11);
+        let text = prism_text_config();
+        let refusal = |edit: &dyn Fn(&mut Value)| {
+            let head = tempfile::tempdir().unwrap();
+            let mut other = text.clone();
+            edit(&mut other);
+            write_companion_head(head.path(), &other, 3, None);
+            match Qwen35Mtp::from_companion_dir(head.path(), &target) {
+                Ok(_) => panic!("a mismatched head attached"),
+                Err(e) => e.to_string(),
+            }
+        };
+        for (field, value, named) in [
+            (
+                "intermediate_size",
+                json!(128),
+                "intermediate_size 128 != target 256",
+            ),
+            (
+                "num_key_value_heads",
+                json!(2),
+                "num_key_value_heads 2 != target 1",
+            ),
+            ("vocab_size", json!(65), "vocab_size 65 != target 64"),
+            (
+                "partial_rotary_factor",
+                json!(0.25),
+                "rotary_dim 16 != target 32",
+            ),
+            (
+                "rope_theta",
+                json!(1000000.0),
+                "rope_theta 1000000 != target 10000000",
+            ),
+            (
+                "rms_norm_eps",
+                json!(1e-5),
+                "rms_norm_eps 0.00001 != target 0.000001",
+            ),
+        ] {
+            let err = refusal(&|t| t[field] = value.clone());
+            assert!(err.contains("geometry does not match"), "{field}: {err}");
+            assert!(err.contains(named), "{field}: {err}");
+        }
+
+        // The config matches but a stored tensor does not: overwrite `q_proj` with half its rows.
+        let head = tempfile::tempdir().unwrap();
+        write_companion_head(head.path(), &text, 3, None);
+        let path = head.path().join("model.safetensors");
+        let mut tensors = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        for part in ["weight", "scales", "biases"] {
+            let key = format!("layers.0.self_attn.q_proj.{part}");
+            let half = tensors[&key]
+                .narrow(0, 0, 128)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            tensors.insert(key, half);
+        }
+        tensors.insert(
+            "extra.weight".into(),
+            Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+        let err = Qwen35Mtp::from_companion_dir(head.path(), &target)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("`layers.0.self_attn.q_proj` is [128, 128], the target needs [256, 128]"),
+            "{err}"
+        );
+        // Shapes fixed, the stray tensor alone is named.
+        write_companion_head(head.path(), &text, 3, None);
+        let mut tensors = candle_core::safetensors::load(&path, &Device::Cpu).unwrap();
+        tensors.insert(
+            "extra.weight".into(),
+            Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+        let err = Qwen35Mtp::from_companion_dir(head.path(), &target)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("tensors the predictor does not use: extra.weight"),
+            "{err}"
+        );
+
+        let head = tempfile::tempdir().unwrap();
+        write_companion_head(head.path(), &text, 3, None);
+        let config_path = head.path().join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["model_type"] = json!("qwen3_5");
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        let err = Qwen35Mtp::from_companion_dir(head.path(), &target)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("must be `qwen3_5_mtp`"), "{err}");
     }
 
     /// The synthetic decoder's config JSON (4 layers: 3 linear, 1 full attention).

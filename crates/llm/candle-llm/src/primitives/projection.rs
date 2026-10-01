@@ -536,6 +536,22 @@ impl Projection {
         )?))
     }
 
+    /// Load a `bits`-wide (4 or 8) MLX affine triple — a companion MTP head's stored projections
+    /// (sc-24444) — as its exact affine grid re-packed to the resident Q8_0 form
+    /// ([`QuantizedLinear::from_mlx_affine`]).
+    pub fn load_mlx_affine(
+        weight: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        bits: usize,
+        group_size: usize,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        Ok(Projection::Quantized(QuantizedLinear::from_mlx_affine(
+            weight, scales, biases, None, group_size, bits, device,
+        )?))
+    }
+
     /// `x @ weightᵀ`.
     ///
     /// An NVFP4 projection dispatches between the fused decode GEMV (≤ 8 bf16 rows) and the

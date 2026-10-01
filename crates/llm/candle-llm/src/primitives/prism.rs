@@ -108,6 +108,13 @@ pub struct PrismPackedWeight {
     storage: PackedStorage,
     role: PrismTransformRole,
     signs: Option<Arc<[i8]>>,
+    /// `signs` as an F32 `[input_width]` tensor on `device`, built once at load: the tensor
+    /// rotation path multiplies by it every forward without a host upload (which would also
+    /// break CUDA-graph capture).
+    device_signs: Option<Tensor>,
+    /// The GDN activation reorder's `[input_width]` U32 gather index on `device`, built once at
+    /// load for the same reason.
+    gdn_gather: Option<Tensor>,
     block_size: usize,
     gdn: Option<GdnLayout>,
     row_map: Option<GdnRowMap>,
@@ -286,6 +293,13 @@ impl PrismPackedWeight {
                 "Prism GDN activation reorder on {name} requires a forward Hadamard transform"
             )));
         }
+        let device_signs = classified
+            .signs
+            .map(|signs| upload_signs(signs, &device))
+            .transpose()?;
+        let gdn_gather = gdn
+            .map(|layout| gdn_gather_index(layout, &device))
+            .transpose()?;
         Ok(Self {
             name,
             rows,
@@ -293,6 +307,8 @@ impl PrismPackedWeight {
             storage,
             role: classified.role,
             signs: classified.signs.map(|s| Arc::<[i8]>::from(s.to_vec())),
+            device_signs,
+            gdn_gather,
             block_size: metadata.block_size,
             gdn,
             row_map,
@@ -439,21 +455,23 @@ impl PrismPackedWeight {
             }
             return Ok(Tensor::from_vec(values, shape, x.device())?.to_dtype(x.dtype())?);
         }
-        if let Some(y) = self.fused_rotation(x, Rotation::Inverse, signs)? {
+        if let Some(y) = self.fused_rotation(x, Rotation::Inverse)? {
             return Ok(y);
         }
+        self.transform_inverse_tensor(x)
+    }
+
+    /// The device-tensor inverse rotation (normalized H, then signs): the op chain, the oracle
+    /// of the fused inverse.
+    fn transform_inverse_tensor(&self, x: &Tensor) -> Result<Tensor> {
         let h = fwht_tensor(x, self.block_size)?;
-        multiply_signs(&h, signs)
+        multiply_signs(&h, self.resident_signs()?)
     }
 
     /// The device rotation: the fused CUDA kernel where it serves `x` (sc-24440), otherwise the
     /// op chain ([`transform_forward_chain`](Self::transform_forward_chain)).
     fn transform_forward_tensor(&self, x: &Tensor) -> Result<Tensor> {
-        let signs = self
-            .signs
-            .as_deref()
-            .ok_or_else(|| Error::Config(format!("Prism {} has no explicit signs", self.name)))?;
-        if let Some(y) = self.fused_rotation(x, Rotation::Forward, signs)? {
+        if let Some(y) = self.fused_rotation(x, Rotation::Forward)? {
             return Ok(y);
         }
         self.transform_forward_chain(x)
@@ -465,14 +483,20 @@ impl PrismPackedWeight {
     /// the oracle the fused kernel is bit-identical to.
     fn transform_forward_chain(&self, x: &Tensor) -> Result<Tensor> {
         let mut out = x.clone();
-        if let Some(gdn) = self.gdn {
-            out = gdn_reorder_tensor(&out, gdn)?;
+        if let Some(gather) = &self.gdn_gather {
+            out = gdn_reorder_tensor(&out, gather)?;
         }
-        let signs = self
-            .signs
-            .as_deref()
-            .ok_or_else(|| Error::Config(format!("Prism {} has no explicit signs", self.name)))?;
-        fwht_tensor(&multiply_signs(&out, signs)?, self.block_size)
+        fwht_tensor(
+            &multiply_signs(&out, self.resident_signs()?)?,
+            self.block_size,
+        )
+    }
+
+    /// The load-time device copy of `signs`.
+    fn resident_signs(&self) -> Result<&Tensor> {
+        self.device_signs
+            .as_ref()
+            .ok_or_else(|| Error::Config(format!("Prism {} has no explicit signs", self.name)))
     }
 
     /// The fused CUDA rotation (sc-24440) of `x` in `rotation`'s order, or `None` when it does
@@ -480,12 +504,11 @@ impl PrismPackedWeight {
     /// wider than [`FUSED_ROTATION_MAX_BLOCK`], or the fused-kernel switch off — recorded in the
     /// fused-primitive tally either way (`crate::primitives::fused`). The forward returns f32 (the
     /// forward's cast fused), the inverse `x`'s dtype; both bit-identical to the op chain.
-    fn fused_rotation(
-        &self,
-        x: &Tensor,
-        rotation: Rotation,
-        signs: &[i8],
-    ) -> Result<Option<Tensor>> {
+    ///
+    /// It reads the load-time device signs and GDN gather ([`resident_signs`]
+    /// (Self::resident_signs), `gdn_gather`): nothing is uploaded per forward, so the rotation
+    /// is graph-capturable.
+    fn fused_rotation(&self, x: &Tensor, rotation: Rotation) -> Result<Option<Tensor>> {
         if !x.device().is_cuda() {
             return Ok(None);
         }
@@ -503,19 +526,26 @@ impl PrismPackedWeight {
                 note_reference("shape");
                 return Ok(None);
             }
-            let signs = sign_tensor(signs, x.device())?;
-            let gather = match (rotation, self.gdn) {
-                (Rotation::Forward, Some(layout)) => Some(gdn_gather_index(layout, x.device())?),
-                _ => None,
+            let gather = match rotation {
+                Rotation::Forward => self.gdn_gather.as_ref(),
+                Rotation::Inverse => None,
             };
-            let y = cuda::rotate(x, &signs, gather.as_ref(), self.block_size, rotation)?;
+            let y = cuda::rotate(
+                x,
+                self.resident_signs()?,
+                gather,
+                self.block_size,
+                rotation_affine_factor(self.block_size, x.dtype())
+                    .ok_or_else(|| Error::Unsupported(format!("{:?} rotation", x.dtype())))?,
+                rotation,
+            )?;
             note_fused();
             Ok(Some(y))
         }
         #[cfg(not(feature = "cuda"))]
         {
             // A CUDA tensor cannot exist without the feature.
-            let _ = (rotation, signs);
+            let _ = rotation;
             Ok(None)
         }
     }
@@ -660,6 +690,20 @@ impl PrismRegistry {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const FUSED_ROTATION_MAX_BLOCK: usize = 8192;
 
+/// `1 / sqrt(block)` as `dtype` holds it — exactly the factor candle's `affine` hands its kernel
+/// (`T::from_f64`), which the fused rotation must multiply by to stay bit-identical to the chain.
+/// `None` for a dtype the fused rotation does not serve.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn rotation_affine_factor(block: usize, dtype: DType) -> Option<f32> {
+    let factor = (block as f64).sqrt().recip();
+    match dtype {
+        DType::F32 => Some(factor as f32),
+        DType::BF16 => Some(half::bf16::from_f64(factor).to_f32()),
+        DType::F16 => Some(half::f16::from_f64(factor).to_f32()),
+        _ => None,
+    }
+}
+
 /// The order of a rotation: the forward (activation) transform or the inverse (embedding) one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -670,23 +714,31 @@ enum Rotation {
     Inverse,
 }
 
-/// `signs` as an F32 `[width]` tensor on `device`.
-fn sign_tensor(signs: &[i8], device: &Device) -> Result<Tensor> {
-    let signs = signs.iter().map(|&v| v as f32).collect::<Vec<_>>();
+#[cfg(test)]
+thread_local! {
+    /// Host→device uploads of a Prism sign vector or GDN gather index on this thread (test
+    /// builds): they happen once per weight at load, never per forward.
+    pub(crate) static ROTATION_UPLOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Upload `signs` once, as the F32 `[width]` tensor the rotation multiplies by.
+fn upload_signs(signs: &[i8], device: &Device) -> Result<Tensor> {
+    #[cfg(test)]
+    ROTATION_UPLOADS.with(|n| n.set(n.get() + 1));
+    let signs = signs.iter().map(|&v| f32::from(v)).collect::<Vec<_>>();
     let width = signs.len();
     Ok(Tensor::from_vec(signs, (width,), device)?)
 }
 
-fn multiply_signs(x: &Tensor, signs: &[i8]) -> Result<Tensor> {
+fn multiply_signs(x: &Tensor, signs: &Tensor) -> Result<Tensor> {
     let width = x.dim(x.rank() - 1)?;
-    if signs.len() != width {
+    if signs.dim(0)? != width {
         return Err(Error::Config(format!(
             "Prism sign width {} != activation width {width}",
-            signs.len()
+            signs.dim(0)?
         )));
     }
-    let signs = sign_tensor(signs, x.device())?.to_dtype(x.dtype())?;
-    Ok(x.broadcast_mul(&signs)?)
+    Ok(x.broadcast_mul(&signs.to_dtype(x.dtype())?)?)
 }
 
 fn fwht_tensor(x: &Tensor, block_size: usize) -> Result<Tensor> {
@@ -717,21 +769,10 @@ fn fwht_tensor(x: &Tensor, block_size: usize) -> Result<Tensor> {
         .reshape(shape)?)
 }
 
-fn gdn_reorder_tensor(x: &Tensor, layout: GdnLayout) -> Result<Tensor> {
-    let width = x.dim(x.rank() - 1)?;
-    if layout.width() != width {
-        return Err(Error::Config(format!(
-            "Prism GDN activation width {width} != {}",
-            layout.width()
-        )));
-    }
-    let gather = gdn_gather_index(layout, x.device())?;
-    Ok(x.index_select(&gather, x.rank() - 1)?)
-}
-
-/// The GDN activation reorder's `[width]` U32 gather index (column `c` reads column
-/// `gather[c]`) on `device`.
+/// The GDN activation reorder's gather index, uploaded once per weight at load.
 fn gdn_gather_index(layout: GdnLayout, device: &Device) -> Result<Tensor> {
+    #[cfg(test)]
+    ROTATION_UPLOADS.with(|n| n.set(n.get() + 1));
     let width = layout.width();
     let mut gather = vec![0u32; width];
     for head_dim in 0..layout.head_dim {
@@ -745,6 +786,17 @@ fn gdn_gather_index(layout: GdnLayout, device: &Device) -> Result<Tensor> {
         }
     }
     Ok(Tensor::from_vec(gather, (width,), device)?)
+}
+
+fn gdn_reorder_tensor(x: &Tensor, gather: &Tensor) -> Result<Tensor> {
+    let width = x.dim(x.rank() - 1)?;
+    if gather.dim(0)? != width {
+        return Err(Error::Config(format!(
+            "Prism GDN activation width {width} != {}",
+            gather.dim(0)?
+        )));
+    }
+    Ok(x.index_select(gather, x.rank() - 1)?)
 }
 
 /// The Prism packed-operator kernels, compiled through the shared nvrtc compile-once seam
@@ -1073,25 +1125,18 @@ mod cuda {
         ))
     }
 
-    /// `1 / sqrt(block)` as `dtype` holds it: candle's `affine` hands its kernel the factor as
-    /// `T::from_f64` — the CPU cast below is that same conversion.
-    fn affine_factor(block: usize, dtype: DType) -> Result<f32> {
-        let factor = (block as f64).sqrt().recip();
-        Ok(Tensor::from_vec(vec![factor], 1, &Device::Cpu)?
-            .to_dtype(dtype)?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?[0])
-    }
-
     /// The fused block-Hadamard rotation (`prism_rotate` in `prism_cuda.cu`) of `x` `[.., width]`
     /// (f32 / bf16 / f16): one launch, one block per (row, Hadamard block). `signs` is F32
-    /// `[width]`; `gather` (forward only) the U32 `[width]` GDN source-column index. The forward
-    /// returns F32 (the chain's trailing cast fused), the inverse `x`'s dtype.
+    /// `[width]`; `gather` (forward only) the U32 `[width]` GDN source-column index; `mul` the
+    /// affine factor as `x`'s dtype holds it
+    /// ([`rotation_affine_factor`](super::rotation_affine_factor)). The forward returns F32 (the
+    /// chain's trailing cast fused), the inverse `x`'s dtype.
     pub(super) fn rotate(
         x: &Tensor,
         signs: &Tensor,
         gather: Option<&Tensor>,
         block: usize,
+        mul: f32,
         rotation: Rotation,
     ) -> Result<Tensor> {
         let Device::Cuda(dev) = x.device() else {
@@ -1113,10 +1158,10 @@ mod cuda {
         let x = x.contiguous()?;
         let signs = signs.to_dtype(DType::F32)?.contiguous()?;
         let gather = gather.map(|g| g.contiguous()).transpose()?;
-        let (dtype_code, mul) = match x.dtype() {
-            DType::F32 => (0i32, affine_factor(block, DType::F32)?),
-            DType::BF16 => (1, affine_factor(block, DType::BF16)?),
-            DType::F16 => (2, affine_factor(block, DType::F16)?),
+        let dtype_code = match x.dtype() {
+            DType::F32 => 0i32,
+            DType::BF16 => 1,
+            DType::F16 => 2,
             other => {
                 return Err(Error::Unsupported(format!(
                     "the fused Prism rotation serves f32 / bf16 / f16, not {other:?}"
@@ -1431,6 +1476,75 @@ mod tests {
         assert!((actual - expected).abs() < 2e-3, "{actual} != {expected}");
     }
 
+    /// sc-24444: the device-tensor rotation (the CUDA path) multiplies by a sign vector and
+    /// gathers by a GDN index uploaded once per weight at load — repeated forwards upload
+    /// nothing — and it agrees with the host rotation, forward (with the GDN reorder) and inverse.
+    #[test]
+    fn the_tensor_rotation_uploads_its_signs_once_at_load_never_per_forward() {
+        let uploads = || ROTATION_UPLOADS.with(std::cell::Cell::get);
+        let device = Device::Cpu;
+        let name = "model.layers.0.linear_attn.ssm_out.weight";
+        let signs = (0..128)
+            .map(|i| if i % 3 == 0 { -1i8 } else { 1 })
+            .collect::<Vec<_>>();
+        let layout = GdnLayout {
+            head_dim: 32,
+            groups: 2,
+            repetitions: 2,
+        };
+        let before = uploads();
+        let forward = PrismPackedWeight::from_mlx_affine2(
+            name,
+            Tensor::zeros((1, 8), DType::U32, &device).unwrap(),
+            Tensor::from_vec(vec![1f32], (1, 1), &device).unwrap(),
+            &Tensor::from_vec(vec![-1f32], (1, 1), &device).unwrap(),
+            &metadata(name, PrismTransformRole::Forward, signs.clone()),
+            None,
+            Some(layout),
+        )
+        .unwrap();
+        assert_eq!(uploads() - before, 2, "signs and the GDN gather, once each");
+        let inverse = mlx_weight("embed.weight", &[1; 128], PrismTransformRole::Inverse);
+        let at_load = uploads();
+
+        let x = Tensor::from_vec(
+            (0..3 * 128).map(|i| (i % 97) as f32 / 16.0 - 3.0).collect(),
+            (3, 128),
+            &device,
+        )
+        .unwrap();
+        let host_forward = forward.transform_forward(&x).unwrap();
+        let host_inverse = inverse.transform_inverse(&x).unwrap();
+        for _ in 0..3 {
+            let close = |a: &Tensor, b: &Tensor| {
+                let d = (a - b)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .max(0)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(d < 1e-4, "tensor and host rotations differ by {d}");
+            };
+            close(
+                &forward.transform_forward_tensor(&x).unwrap(),
+                &host_forward,
+            );
+            close(
+                &inverse.transform_inverse_tensor(&x).unwrap(),
+                &host_inverse,
+            );
+        }
+        assert_eq!(
+            uploads(),
+            at_load,
+            "a forward uploaded a sign vector or index"
+        );
+    }
+
     #[test]
     fn published_grouped_ssm_out_does_not_permute_activation() {
         let name = "model.layers.0.linear_attn.ssm_out.weight";
@@ -1607,19 +1721,21 @@ mod tests {
                 let signs = (0..width)
                     .map(|i| if (i * 7) % 5 < 2 { -1i8 } else { 1 })
                     .collect::<Vec<_>>();
-                let sign_t = sign_tensor(&signs, &device).unwrap();
+                let sign_t = upload_signs(&signs, &device).unwrap();
+                let gather = gdn.map(|layout| gdn_gather_index(layout, &device).unwrap());
+                let mul = rotation_affine_factor(block, dtype).unwrap();
                 // Forward: the chain (`transform_forward_chain`'s ops), then the forward's cast.
                 let mut chain = x.clone();
-                if let Some(layout) = gdn {
-                    chain = gdn_reorder_tensor(&chain, layout).unwrap();
+                if let Some(gather) = &gather {
+                    chain = gdn_reorder_tensor(&chain, gather).unwrap();
                 }
-                let chain = fwht_tensor(&multiply_signs(&chain, &signs).unwrap(), block)
+                let chain = fwht_tensor(&multiply_signs(&chain, &sign_t).unwrap(), block)
                     .unwrap()
                     .to_dtype(DType::F32)
                     .unwrap();
-                let gather = gdn.map(|layout| gdn_gather_index(layout, &device).unwrap());
                 let fused =
-                    cuda::rotate(&x, &sign_t, gather.as_ref(), block, Rotation::Forward).unwrap();
+                    cuda::rotate(&x, &sign_t, gather.as_ref(), block, mul, Rotation::Forward)
+                        .unwrap();
                 assert_eq!(fused.dtype(), DType::F32);
                 assert_eq!(
                     bits(&fused),
@@ -1628,8 +1744,8 @@ mod tests {
                     gdn.is_some()
                 );
                 // Inverse: Hadamard then signs, in the activation dtype.
-                let chain = multiply_signs(&fwht_tensor(&x, block).unwrap(), &signs).unwrap();
-                let fused = cuda::rotate(&x, &sign_t, None, block, Rotation::Inverse).unwrap();
+                let chain = multiply_signs(&fwht_tensor(&x, block).unwrap(), &sign_t).unwrap();
+                let fused = cuda::rotate(&x, &sign_t, None, block, mul, Rotation::Inverse).unwrap();
                 assert_eq!(fused.dtype(), dtype);
                 assert_eq!(
                     bits(&fused),
@@ -1687,6 +1803,89 @@ mod tests {
             weight.forward(&x).unwrap()
         };
         assert_eq!(bits(&fused), bits(&chain), "Prism forward, fused vs chain");
+    }
+
+    /// sc-24440 review: the fused CUDA rotation reads the signs and the GDN gather the weight
+    /// uploaded at load (sc-24444's resident tensors) — with the fused path on, repeated forward
+    /// and inverse rotations upload nothing — and still equals the op chain.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_fused_rotation_uploads_nothing_per_forward() {
+        use super::super::fused::{fused_policy_guard, fused_tally};
+        let device = crate::device::new_cuda_for_test()
+            .expect("CUDA is required for the fused rotation fixture");
+        let uploads = || ROTATION_UPLOADS.with(std::cell::Cell::get);
+        let signs = (0..128)
+            .map(|i| if i % 3 == 0 { -1i8 } else { 1 })
+            .collect::<Vec<_>>();
+        let weight = |name: &str, role, gdn| {
+            PrismPackedWeight::from_mlx_affine2(
+                name,
+                Tensor::zeros((1, 8), DType::U32, &device).unwrap(),
+                Tensor::from_vec(vec![1f32], (1, 1), &device).unwrap(),
+                &Tensor::from_vec(vec![-1f32], (1, 1), &device).unwrap(),
+                &metadata(name, role, signs.clone()),
+                None,
+                gdn,
+            )
+            .unwrap()
+        };
+        let before = uploads();
+        let forward = weight(
+            "model.layers.0.linear_attn.ssm_out.weight",
+            PrismTransformRole::Forward,
+            Some(GdnLayout {
+                head_dim: 32,
+                groups: 2,
+                repetitions: 2,
+            }),
+        );
+        let inverse = weight("embed.weight", PrismTransformRole::Inverse, None);
+        let at_load = uploads();
+        assert_eq!(
+            at_load - before,
+            3,
+            "two sign vectors and one GDN gather, at load"
+        );
+        let x = Tensor::from_vec(
+            (0..3 * 128).map(|i| (i % 97) as f32 / 16.0 - 3.0).collect(),
+            (3, 128),
+            &device,
+        )
+        .unwrap()
+        .to_dtype(DType::BF16)
+        .unwrap();
+        let bits = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        };
+        let _on = fused_policy_guard(Some(true));
+        let tally = fused_tally();
+        for _ in 0..3 {
+            let fused = forward.transform_forward(&x).unwrap();
+            let chain = forward.transform_forward_chain(&x).unwrap();
+            assert_eq!(bits(&fused), bits(&chain), "forward");
+            let fused = inverse.transform_inverse(&x).unwrap();
+            let chain = inverse.transform_inverse_tensor(&x).unwrap();
+            assert_eq!(bits(&fused), bits(&chain), "inverse");
+        }
+        assert_eq!(
+            fused_tally().since(&tally).fused,
+            6,
+            "every rotation ran fused"
+        );
+        assert_eq!(
+            uploads(),
+            at_load,
+            "a fused rotation uploaded a sign vector or index"
+        );
     }
 
     #[cfg(feature = "cuda")]
