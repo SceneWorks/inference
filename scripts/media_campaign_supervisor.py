@@ -469,7 +469,12 @@ def _group_pids(pgid: int) -> set[int]:
 
 
 def _expand_owned(table: dict[int, tuple[int, int]], known: set[int]) -> set[int]:
-    """Track descendants already observed, even if a child changes process group."""
+    """Track descendants by ancestry, even if a child changes process group.
+
+    A known PID absent from the snapshot has exited (or is a zombie) and is forgotten, so a
+    later process reusing that PID is never mistaken for a descendant, counted or signalled.
+    """
+    known.intersection_update(table)
     changed = True
     while changed:
         changed = False
@@ -477,7 +482,29 @@ def _expand_owned(table: dict[int, tuple[int, int]], known: set[int]) -> set[int
             if parent in known and pid not in known:
                 known.add(pid)
                 changed = True
-    return {pid for pid in known if pid in table}
+    return set(known)
+
+
+@dataclass
+class PosixTree:
+    """A POSIX row's owned processes: the child's process group plus every descendant observed
+    by ancestry, including one that moved to a group of its own -- system_profiler runs its
+    `-nospawn` collector in a new process group (SC-20684 W2 run 36808330752). Such a
+    descendant is measured, awaited and reaped like any other. The POSIX counterpart of
+    WindowsJob.members()."""
+
+    pgid: int
+    known: set[int]
+
+    def snapshot(self) -> tuple[set[int], set[int]]:
+        """(process-group members, ancestry-owned descendants) from one process table."""
+        table = _process_table()
+        owned = _expand_owned(table, self.known)
+        return {pid for pid, (_parent, group) in table.items() if group == self.pgid}, owned
+
+    def members(self) -> set[int]:
+        group, owned = self.snapshot()
+        return group | owned
 
 
 class SystemProbe:
@@ -522,15 +549,14 @@ class SystemProbe:
             raise SupervisionError("probe-failure", f"cgroup memory budget unavailable: {error}") from error
         return free
 
-    def tree_footprint(self, owner: int | windows.WindowsJob) -> int | None:
+    def tree_footprint(self, owner: PosixTree | windows.WindowsJob) -> int | None:
         """The owned tree's footprint, or None when every owned process vanished mid-sample."""
         if self.policy.backend == "windows-cuda":
             try:
                 return owner.footprint_bytes()
             except windows.WindowsJobError as error:
                 raise SupervisionError("probe-failure", str(error)) from error
-        pgid = owner
-        pids = _group_pids(pgid)
+        pids = owner.members()
         self.last_tree_breakdown = {}
         if not pids:
             return None
@@ -557,11 +583,11 @@ class SystemProbe:
                 sampled = True
         return total if sampled else None
 
-    def gpu_free_and_tree_bytes(self, owner: int | windows.WindowsJob) -> tuple[int, int]:
+    def gpu_free_and_tree_bytes(self, owner: PosixTree | windows.WindowsJob) -> tuple[int, int]:
         free = self.gpu_free()
         assert self.policy.cuda_device_uuid
         uuid = self.policy.cuda_device_uuid
-        pids = owner.members() if self.policy.backend == "windows-cuda" else _group_pids(owner)
+        pids = owner.members()
         usage = _bounded_output([self._smi, "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
                                  "--format=csv,noheader,nounits"])
         used = 0
@@ -954,8 +980,8 @@ def _run_admitted(
                                          start_new_session=True)
             except OSError as error:
                 raise SupervisionError("spawn-failure", str(error)) from error
-        owner = job if job is not None else child.pid
         known = {child.pid}
+        owner = job if job is not None else PosixTree(child.pid, known)
         peak_host = 0
         peak_gpu = 0
         samples: list[dict[str, object]] = []
@@ -980,12 +1006,7 @@ def _run_admitted(
                 except windows.WindowsJobError as error:
                     raise SupervisionError("probe-failure", str(error)) from error
                 return pids, pids
-            table = _process_table()
-            owned = _expand_owned(table, known)
-            pids = {pid for pid, (_parent, group) in table.items() if group == child.pid}
-            if any(table[pid][1] != child.pid for pid in owned):
-                raise SupervisionError("process-escape", "observed descendant left the owned process group")
-            return pids, owned
+            return owner.snapshot()
 
         def finished_result(status: int | None, pids: set[int], owned: set[int]) -> RunResult | None:
             if status is None or pids or owned:

@@ -28,8 +28,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Error, LatentDecoder, PinnedWeightsFile, Result};
 
 use crate::vae_common::{
-    contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, validate_decoder_tiling,
-    FeatCache,
+    contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate,
+    validate_decoder_tiling, DeadStageBuffers, FeatCache,
 };
 
 /// Last-`CACHE_T` frames are carried across chunks as causal left-context during encode.
@@ -418,7 +418,7 @@ impl Decoder3d {
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        self.forward_upsample_tail(&self.forward_middle(x)?)
+        self.forward_upsample_tail(&self.forward_middle(x)?, DeadStageBuffers::Release)
     }
 
     /// The **globally-scoped** half: `conv1` → the three middle blocks, all at latent resolution
@@ -444,13 +444,25 @@ impl Decoder3d {
     /// `RMS → SiLU → conv` head. Every op here is a convolution, a nearest upsample, or the
     /// per-position channel-L2 norm, so evaluating it on a crop is exact up to the convolution
     /// padding at the crop boundary — which is what the trapezoidal overlap blend absorbs.
-    fn forward_upsample_tail(&self, middle: &Array) -> Result<Array> {
+    ///
+    /// With [`DeadStageBuffers::Release`] each up-stage (its residual blocks plus the resample that
+    /// ends it, or the last stage's residual blocks) is materialized before its dead buffers are
+    /// released; with [`DeadStageBuffers::Keep`] the tail stays one lazy graph, as before.
+    fn forward_upsample_tail(&self, middle: &Array, dead: DeadStageBuffers) -> Result<Array> {
         let mut x = middle.clone();
         for layer in &self.upsamples {
             x = match layer {
                 UpLayer::Res(r) => r.forward(&x)?,
                 UpLayer::Up(u) => u.forward(&x)?,
             };
+            if dead.releases() && matches!(layer, UpLayer::Up(_)) {
+                eval(&x)?;
+                dead.stage_finished();
+            }
+        }
+        if dead.releases() {
+            eval(&x)?;
+            dead.stage_finished();
         }
         let x = silu(&rms_norm_channels(&x, &self.head_norm)?)?;
         self.head_conv.forward(&x, None)
@@ -788,7 +800,9 @@ impl WanVae {
 
         // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile work = upsample tail + clamp.
         tile_decode_accumulate(&middle, &plan, [2, 3, 4], cancel, |tile| {
-            let dec = self.decoder.forward_upsample_tail(tile)?;
+            let dec = self
+                .decoder
+                .forward_upsample_tail(tile, DeadStageBuffers::Keep)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)
         })
     }
@@ -891,5 +905,123 @@ mod tests {
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() <= 1e-3 * w.abs().max(1.0), "got {g} want {w}");
         }
+    }
+
+    /// A tiny-width z16 decoder (production topology, base width 8) with seeded random weights.
+    fn tiny_decoder() -> WanVae {
+        let key = mlx_rs::random::key(20686).unwrap();
+        let mut tensors = std::collections::HashMap::new();
+        let mut put = |name: String, shape: &[i32]| {
+            let value = mlx_rs::random::normal::<f32>(shape, None, Some(0.2), Some(&key)).unwrap();
+            tensors.insert(name, value);
+        };
+        fn conv(put: &mut dyn FnMut(String, &[i32]), p: &str, o: i32, i: i32, kt: i32, k: i32) {
+            put(format!("{p}.weight"), &[o, kt, k, k, i]);
+            put(format!("{p}.bias"), &[o]);
+        }
+        fn res(put: &mut dyn FnMut(String, &[i32]), p: &str, i: i32, o: i32) {
+            put(format!("{p}.residual.0.gamma"), &[i]);
+            conv(put, &format!("{p}.residual.2"), o, i, 3, 3);
+            put(format!("{p}.residual.3.gamma"), &[o]);
+            conv(put, &format!("{p}.residual.6"), o, o, 3, 3);
+            if i != o {
+                conv(put, &format!("{p}.shortcut"), o, i, 1, 1);
+            }
+        }
+        let dim = 8;
+        let top = dim * DIM_MULT[3];
+        conv(&mut put, "conv2", 16, 16, 1, 1);
+        conv(&mut put, "decoder.conv1", top, 16, 3, 3);
+        res(&mut put, "decoder.middle.0", top, top);
+        res(&mut put, "decoder.middle.2", top, top);
+        put("decoder.middle.1.norm.gamma".into(), &[top]);
+        put(
+            "decoder.middle.1.to_qkv.weight".into(),
+            &[3 * top, 1, 1, top],
+        );
+        put("decoder.middle.1.to_qkv.bias".into(), &[3 * top]);
+        put("decoder.middle.1.proj.weight".into(), &[top, 1, 1, top]);
+        put("decoder.middle.1.proj.bias".into(), &[top]);
+        let mut input = top;
+        let mut index = 0;
+        for stage in 0..DIM_MULT.len() {
+            let output = dim * DIM_MULT[DIM_MULT.len() - 1 - stage];
+            for block in 0..=NUM_RES_BLOCKS {
+                let block_input = if block == 0 { input } else { output };
+                res(
+                    &mut put,
+                    &format!("decoder.upsamples.{index}"),
+                    block_input,
+                    output,
+                );
+                index += 1;
+            }
+            input = output;
+            if let Some(&temporal) = TEMPORAL_UPSAMPLE.get(stage) {
+                let p = format!("decoder.upsamples.{index}");
+                if temporal {
+                    conv(
+                        &mut put,
+                        &format!("{p}.time_conv"),
+                        2 * output,
+                        output,
+                        3,
+                        1,
+                    );
+                }
+                put(
+                    format!("{p}.resample.1.weight"),
+                    &[output / 2, 3, 3, output],
+                );
+                put(format!("{p}.resample.1.bias"), &[output / 2]);
+                input = output / 2;
+                index += 1;
+            }
+        }
+        put("decoder.head.0.gamma".into(), &[dim]);
+        conv(&mut put, "decoder.head.2", 3, dim, 3, 3);
+        WanVae::from_weights(&Weights::from_map(tensors)).unwrap()
+    }
+
+    fn stage_releases() -> usize {
+        crate::vae_common::STAGE_RELEASES.with(std::cell::Cell::get)
+    }
+
+    /// sc-20686: a single-pass decode materializes and releases each up-stage (one flush per
+    /// stage) without changing a single output value; a tiled decode keeps its stage pool.
+    #[test]
+    fn single_pass_decode_releases_each_dead_stage_and_tiles_keep_them() {
+        let vae = tiny_decoder();
+        let latent = mlx_rs::random::normal::<f32>(&[1, 16, 2, 8, 8], None, None, None).unwrap();
+
+        let before = stage_releases();
+        let released = vae.decode(&latent).unwrap();
+        assert_eq!(stage_releases() - before, DIM_MULT.len());
+
+        let denorm = add(divide(&latent, &vae.inv_std).unwrap(), &vae.mean).unwrap();
+        let middle = vae
+            .decoder
+            .forward_middle(&vae.conv2.forward(&denorm, None).unwrap())
+            .unwrap();
+        let kept = vae
+            .decoder
+            .forward_upsample_tail(&middle, DeadStageBuffers::Keep)
+            .unwrap();
+        let kept =
+            contiguous(&minimum(maximum(&kept, scalar(-1.0)).unwrap(), scalar(1.0)).unwrap())
+                .unwrap();
+        assert_eq!(released.shape(), kept.shape());
+        assert_eq!(released.as_slice::<f32>(), kept.as_slice::<f32>());
+
+        let before = stage_releases();
+        let tiled = vae
+            .decode_tiled(&latent, &TilingConfig::spatial_only(32, 16), None)
+            .unwrap();
+        assert_eq!(tiled.shape(), released.shape());
+        assert_eq!(
+            stage_releases(),
+            before,
+            "tiled decode must keep its stage pool"
+        );
     }
 }

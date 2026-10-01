@@ -46,6 +46,49 @@ pub(crate) fn eval(x: &Array) -> Result<()> {
     Ok(())
 }
 
+/// What a decoder's up-sampling tail does with the buffers each finished up-stage frees
+/// (sc-20686).
+///
+/// Every up-stage of a Wan decoder works at a larger extent than the one before it, so a freed
+/// stage buffer is too small to serve any later stage of the *same* pass. MLX nevertheless keeps it
+/// in its buffer cache, which counts toward the process footprint until the allocator's own GC
+/// limit (~0.95 x the device working set) forces a flush. On the production-width z48 decoder that
+/// cache measured 1.6-2.3x the active peak (active 3.0-3.2 kB, active + cache 8.1-10.1 kB per
+/// output voxel), so a single-pass 768x512x33 decode with a ~37 GiB active peak carried a footprint
+/// far past 64 GiB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeadStageBuffers {
+    /// Single-pass decode: nothing after the pass reuses a finished stage's buffers, so each one is
+    /// returned to the OS as its stage ends.
+    Release,
+    /// Tiled decode: the next tile runs the same stages at the same extents and reuses the cached
+    /// buffers, so they stay pooled.
+    Keep,
+}
+
+impl DeadStageBuffers {
+    /// Whether a finished stage must be materialized and its dead buffers released.
+    pub(crate) fn releases(self) -> bool {
+        self == Self::Release
+    }
+
+    /// Called once per finished up-stage, after the stage's output is materialized.
+    pub(crate) fn stage_finished(self) {
+        if self.releases() {
+            #[cfg(test)]
+            STAGE_RELEASES.with(|count| count.set(count.get() + 1));
+            mlx_rs::memory::clear_cache();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of [`DeadStageBuffers::Release`] flushes, so a test pins which decode paths
+    /// release their dead stages without reading the process-global MLX counters.
+    pub(crate) static STAGE_RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Per-conv last-frames cache threaded through the chunked encode. `idx` resets to 0 each chunk and
 /// advances once per cache-bearing conv (in the fixed traversal order), so slots stay aligned.
 pub(crate) struct FeatCache {
