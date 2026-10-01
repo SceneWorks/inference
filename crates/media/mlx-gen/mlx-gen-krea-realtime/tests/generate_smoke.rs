@@ -788,6 +788,66 @@ enum Sc20684Mode {
 }
 
 const SC20684_V2V_STRENGTH: f32 = 0.6;
+
+/// An `f32` request knob as the decimal the request declared, for the launcher's identity check.
+/// `serde_json` widens an `f32` to `f64` exactly, so `0.6f32` would serialize as
+/// `0.6000000238418579` and fail the launcher's `v2vStrength == 0.6` (W2 run 36854186685). The
+/// shortest decimal that round-trips the `f32` is the requested value; the generation itself still
+/// consumes the `f32`.
+fn sc20684_identity_decimal(value: f32) -> f64 {
+    value
+        .to_string()
+        .parse()
+        .expect("an f32's shortest decimal is a valid f64")
+}
+
+/// The V2V conditioning's input identity, exactly as the launcher validates it.
+fn sc20684_v2v_input_identity(
+    source_sha256: &str,
+    frames: usize,
+    width: usize,
+    height: usize,
+    strength: f32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "deterministic-smooth-motion-clip", "sha256": source_sha256,
+        "frameCount": frames, "width": width, "height": height,
+        "vaeEncoding": "WanVae.encode-sample",
+        "v2vStrength": sc20684_identity_decimal(strength),
+    })
+}
+
+#[test]
+fn sc20684_v2v_strength_identity_is_the_requested_decimal() {
+    let emitted = serde_json::to_string(&sc20684_v2v_input_identity(
+        &"0".repeat(64),
+        25,
+        832,
+        480,
+        SC20684_V2V_STRENGTH,
+    ))
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&emitted).unwrap();
+    assert_eq!(
+        parsed["v2vStrength"].as_f64(),
+        Some(0.6),
+        "the launcher expects the requested V2V strength, 0.6: {emitted}"
+    );
+    assert!(emitted.contains(r#""v2vStrength":0.6}"#) || emitted.contains(r#""v2vStrength":0.6,"#));
+    let identity = |strength: serde_json::Value| {
+        serde_json::to_string(&serde_json::json!({ "v2vStrength": strength })).unwrap()
+    };
+    // The defect this guards: the raw f32 widens on serialization.
+    assert_ne!(
+        identity(SC20684_V2V_STRENGTH.into()),
+        r#"{"v2vStrength":0.6}"#
+    );
+    // Still the same f32 the generation consumes.
+    assert_eq!(
+        sc20684_identity_decimal(SC20684_V2V_STRENGTH) as f32,
+        SC20684_V2V_STRENGTH
+    );
+}
 const SC20684_Q8_PARITY_MAX_ABS_ERROR: f32 = 0.25;
 const SC20684_Q4_PARITY_MAX_ABS_ERROR: f32 = 0.75;
 const SC20684_Q8_MAX_ABS_RGB_U8: u8 = 32;
@@ -1374,11 +1434,13 @@ fn sc20684_conditioning(
                     context_latents: None,
                     source: Some((latents, strength)),
                 },
-                serde_json::json!({
-                    "kind": "deterministic-smooth-motion-clip", "sha256": sc20684_hash_media(&source),
-                    "frameCount": frames, "width": width, "height": height,
-                    "vaeEncoding": "WanVae.encode-sample", "v2vStrength": strength,
-                }),
+                sc20684_v2v_input_identity(
+                    &sc20684_hash_media(&source),
+                    frames,
+                    width,
+                    height,
+                    strength,
+                ),
             )
         }
     }

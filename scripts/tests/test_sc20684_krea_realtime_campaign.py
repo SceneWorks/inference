@@ -399,6 +399,20 @@ class KreaRealtimeCampaignTests(unittest.TestCase):
                 expected_source=SOURCE, expected_snapshot=MODEL,
             )
 
+    def test_v2v_strength_identity_is_the_requested_decimal_not_a_widened_f32(self) -> None:
+        # W2 run 36854186685: the observer emitted f32 0.6 widened to f64. The launcher keeps the
+        # exact requested decimal; a widened or different strength is still refused.
+        self.validate("v2v")
+        for strength in (0.6000000238418579, 0.5, None):
+            row = observation("v2v", "q8", "run")
+            row["input"]["v2vStrength"] = strength
+            with self.subTest(strength=strength), self.assertRaisesRegex(
+                    campaign.CampaignError, "input identity does not match"):
+                campaign._validate_observation(
+                    row, expected_mode="v2v", expected_tier="q8", run_id="run",
+                    expected_source=SOURCE, expected_snapshot=MODEL,
+                )
+
     def validate(self, mode: str = "t2v", tier: str = "q8", run_id: str = "run") -> dict:
         return campaign._validate_observation(
             observation(mode, tier, run_id),
