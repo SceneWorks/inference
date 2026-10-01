@@ -1459,77 +1459,7 @@ impl Qwen35Model {
             if let Some(pack) = prism {
                 return Ok(Projection::Prism(pack.linear(w, &key)?));
             }
-            let base = key.strip_suffix(".weight").unwrap_or(&key);
-            let scales_key = format!("{base}.scales");
-            let biases_key = format!("{base}.biases");
-            let present = [
-                w.contains(&key),
-                w.contains(&scales_key),
-                w.contains(&biases_key),
-            ];
-            let any_packed_part = present[1] || present[2];
-            if any_packed_part || stored_quant.is_some() {
-                let spec = stored_quant.ok_or_else(|| {
-                    Error::Config(format!(
-                        "snapshot stores quantized parts for `{base}` but config.json has no \
-                         `quantization` block"
-                    ))
-                })?;
-                if !present.iter().all(|&part| part) {
-                    let names = ["weight", "scales", "biases"];
-                    let missing = names
-                        .iter()
-                        .zip(present)
-                        .filter_map(|(name, yes)| (!yes).then_some(*name))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    return Err(Error::Config(format!(
-                        "stored quantized projection `{base}` is incomplete; missing {missing}"
-                    )));
-                }
-                let weight = w.require(&key)?.clone();
-                let scales = w.require(&scales_key)?.clone();
-                let biases = w.require(&biases_key)?.clone();
-                let ws = weight.shape();
-                let ss = scales.shape();
-                let bs = biases.shape();
-                if ws.len() != 2 || ss.len() != 2 || bs != ss {
-                    return Err(Error::Config(format!(
-                        "stored quantized projection `{base}` has invalid part shapes: weight \
-                         {ws:?}, scales {ss:?}, biases {bs:?}"
-                    )));
-                }
-                let input = ss[1].checked_mul(spec.group_size).ok_or_else(|| {
-                    Error::Config(format!(
-                        "stored quantized projection `{base}` input overflow"
-                    ))
-                })?;
-                let packed_cols =
-                    input
-                        .checked_mul(spec.bits)
-                        .map(|n| n / 32)
-                        .ok_or_else(|| {
-                            Error::Config(format!(
-                                "stored quantized projection `{base}` pack overflow"
-                            ))
-                        })?;
-                if ss[0] <= 0
-                    || ss[1] <= 0
-                    || ws[0] != ss[0]
-                    || ws[1] != packed_cols
-                    || input % spec.group_size != 0
-                {
-                    return Err(Error::Config(format!(
-                        "stored quantized projection `{base}` shapes do not match Q{} group {}: \
-                         weight {ws:?}, scales {ss:?}, biases {bs:?}",
-                        spec.bits, spec.group_size
-                    )));
-                }
-                saw_stored.set(true);
-                Ok(Projection::from_quantized(weight, scales, biases, spec))
-            } else {
-                Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, quant)
-            }
+            load_projection(w, &key, stored_quant, quant, &saw_stored)
         };
         let proj_dense = |key: String| -> Result<Projection> {
             Projection::load(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, None)
@@ -1634,36 +1564,16 @@ impl Qwen35Model {
                             .into(),
                     ));
                 }
-                let lp = |s: &str| format!("mtp.layers.0.{s}");
-                let layer = DecoderLayer {
-                    input_ln: norm_w(lp("input_layernorm.weight"))?,
-                    post_ln: norm_w(lp("post_attention_layernorm.weight"))?,
-                    mixer: Mixer::Attn(Qwen35Attention {
-                        q_proj: proj_q(lp("self_attn.q_proj.weight"))?,
-                        k_proj: proj_q(lp("self_attn.k_proj.weight"))?,
-                        v_proj: proj_q(lp("self_attn.v_proj.weight"))?,
-                        o_proj: proj_q(lp("self_attn.o_proj.weight"))?,
-                        q_norm: norm_w(lp("self_attn.q_norm.weight"))?,
-                        k_norm: norm_w(lp("self_attn.k_norm.weight"))?,
-                        num_heads: cfg.num_heads,
-                        num_kv_heads: cfg.num_kv_heads,
-                        head_dim: cfg.head_dim,
-                        scale: (cfg.head_dim as f32).powf(-0.5),
-                        eps,
-                    }),
-                    // The predictor layer carries the body's FFN choice: the dense MLP (27B) or
-                    // the sparse-MoE block (35B-A3B), in either expert layout (vLLM
-                    // `qwen3_5_mtp.py`, sc-24438).
-                    ffn: build_ffn(w, "mtp.layers.0.", &cfg, quant, &proj_q)?,
-                    eps,
-                };
-                Some(MtpPredictor {
-                    fc: proj_q("mtp.fc.weight".into())?,
-                    pre_fc_norm_embedding: norm_w("mtp.pre_fc_norm_embedding.weight".into())?,
-                    pre_fc_norm_hidden: norm_w("mtp.pre_fc_norm_hidden.weight".into())?,
-                    layers: vec![layer],
-                    norm: norm_w("mtp.norm.weight".into())?,
-                })
+                // The predictor layer carries the body's FFN choice: the dense MLP (27B) or
+                // the sparse-MoE block (35B-A3B), in either expert layout (vLLM
+                // `qwen3_5_mtp.py`, sc-24438).
+                Some(build_mtp_predictor(
+                    &cfg,
+                    "mtp.",
+                    &|key| proj_q(key),
+                    &|key| norm_w(key),
+                    &|lp| build_ffn(w, lp, &cfg, quant, &proj_q),
+                )?)
             }
             count => {
                 return Err(Error::Config(format!(
@@ -1768,6 +1678,267 @@ fn build_ffn(
             routed_scaling_factor: 1.0,
         },
     )?))
+}
+
+/// Load one `[out, in]` projection that is either a stored MLX affine-quantized triple
+/// (`weight`/`scales`/`biases` with `stored_quant` from `config.json`) or a dense matrix
+/// (optionally quantized on load with `quant`). `saw_stored` records that a stored triple was used.
+fn load_projection(
+    w: &Weights,
+    key: &str,
+    stored_quant: Option<QuantSpec>,
+    quant: Option<QuantSpec>,
+    saw_stored: &Cell<bool>,
+) -> Result<Projection> {
+    let base = key.strip_suffix(".weight").unwrap_or(key);
+    let scales_key = format!("{base}.scales");
+    let biases_key = format!("{base}.biases");
+    let present = [
+        w.contains(key),
+        w.contains(&scales_key),
+        w.contains(&biases_key),
+    ];
+    let any_packed_part = present[1] || present[2];
+    if any_packed_part || stored_quant.is_some() {
+        let spec = stored_quant.ok_or_else(|| {
+            Error::Config(format!(
+                "snapshot stores quantized parts for `{base}` but config.json has no \
+                 `quantization` block"
+            ))
+        })?;
+        if !present.iter().all(|&part| part) {
+            let names = ["weight", "scales", "biases"];
+            let missing = names
+                .iter()
+                .zip(present)
+                .filter_map(|(name, yes)| (!yes).then_some(*name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::Config(format!(
+                "stored quantized projection `{base}` is incomplete; missing {missing}"
+            )));
+        }
+        let weight = w.require(key)?.clone();
+        let scales = w.require(&scales_key)?.clone();
+        let biases = w.require(&biases_key)?.clone();
+        let ws = weight.shape();
+        let ss = scales.shape();
+        let bs = biases.shape();
+        if ws.len() != 2 || ss.len() != 2 || bs != ss {
+            return Err(Error::Config(format!(
+                "stored quantized projection `{base}` has invalid part shapes: weight \
+                 {ws:?}, scales {ss:?}, biases {bs:?}"
+            )));
+        }
+        let input = ss[1].checked_mul(spec.group_size).ok_or_else(|| {
+            Error::Config(format!(
+                "stored quantized projection `{base}` input overflow"
+            ))
+        })?;
+        let packed_cols = input
+            .checked_mul(spec.bits)
+            .map(|n| n / 32)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "stored quantized projection `{base}` pack overflow"
+                ))
+            })?;
+        if ss[0] <= 0
+            || ss[1] <= 0
+            || ws[0] != ss[0]
+            || ws[1] != packed_cols
+            || input % spec.group_size != 0
+        {
+            return Err(Error::Config(format!(
+                "stored quantized projection `{base}` shapes do not match Q{} group {}: \
+                 weight {ws:?}, scales {ss:?}, biases {bs:?}",
+                spec.bits, spec.group_size
+            )));
+        }
+        saw_stored.set(true);
+        Ok(Projection::from_quantized(weight, scales, biases, spec))
+    } else {
+        Projection::load(w.require(key)?.as_dtype(COMPUTE_DTYPE)?, quant)
+    }
+}
+
+/// Build Qwen3.8's one-layer multi-token predictor from tensors named `{prefix}fc.weight`,
+/// `{prefix}layers.0.…` etc. The geometry comes from the **target** config: the predictor runs
+/// inside the target's residual stream, RoPE and vocabulary.
+fn build_mtp_predictor(
+    cfg: &Qwen35Config,
+    prefix: &str,
+    proj: &dyn Fn(String) -> Result<Projection>,
+    norm: &dyn Fn(String) -> Result<Array>,
+    ffn: &dyn Fn(&str) -> Result<Ffn>,
+) -> Result<MtpPredictor> {
+    let eps = cfg.rms_norm_eps;
+    let lp = |s: &str| format!("{prefix}layers.0.{s}");
+    let layer = DecoderLayer {
+        input_ln: norm(lp("input_layernorm.weight"))?,
+        post_ln: norm(lp("post_attention_layernorm.weight"))?,
+        mixer: Mixer::Attn(Qwen35Attention {
+            q_proj: proj(lp("self_attn.q_proj.weight"))?,
+            k_proj: proj(lp("self_attn.k_proj.weight"))?,
+            v_proj: proj(lp("self_attn.v_proj.weight"))?,
+            o_proj: proj(lp("self_attn.o_proj.weight"))?,
+            q_norm: norm(lp("self_attn.q_norm.weight"))?,
+            k_norm: norm(lp("self_attn.k_norm.weight"))?,
+            num_heads: cfg.num_heads,
+            num_kv_heads: cfg.num_kv_heads,
+            head_dim: cfg.head_dim,
+            scale: (cfg.head_dim as f32).powf(-0.5),
+            eps,
+        }),
+        ffn: ffn(&format!("{prefix}layers.0."))?,
+        eps,
+    };
+    Ok(MtpPredictor {
+        fc: proj(format!("{prefix}fc.weight"))?,
+        pre_fc_norm_embedding: norm(format!("{prefix}pre_fc_norm_embedding.weight"))?,
+        pre_fc_norm_hidden: norm(format!("{prefix}pre_fc_norm_hidden.weight"))?,
+        layers: vec![layer],
+        norm: norm(format!("{prefix}norm.weight"))?,
+    })
+}
+
+impl Qwen35Config {
+    /// This config projected onto the backend-neutral companion-head contract (sc-24444, E8): the
+    /// one geometry check both backends refuse a mismatched head by.
+    pub fn companion_mtp_geometry(&self) -> core_llm::CompanionMtpGeometry {
+        core_llm::CompanionMtpGeometry {
+            hidden_size: self.hidden_size,
+            num_attention_heads: self.num_heads,
+            num_key_value_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            intermediate_size: self.intermediate_size,
+            vocab_size: self.vocab_size,
+            rotary_dim: self.rotary_dim(),
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            mrope_section: self.mrope_section_resolved(),
+            mtp_num_hidden_layers: self.mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings: self.mtp_use_dedicated_embeddings,
+            moe: self.moe.is_some(),
+        }
+    }
+}
+
+/// The `[out, in]` a stored projection computes, whether dense or stored-quantized.
+fn logical_matrix_shape(
+    w: &Weights,
+    key: &str,
+    stored_quant: Option<QuantSpec>,
+) -> Option<[i32; 2]> {
+    let weight = w.get(key)?;
+    let base = key.strip_suffix(".weight").unwrap_or(key);
+    match (w.get(&format!("{base}.scales")), stored_quant) {
+        (Some(scales), Some(spec)) if scales.ndim() == 2 && weight.ndim() == 2 => Some([
+            weight.shape()[0],
+            scales.shape()[1].checked_mul(spec.group_size)?,
+        ]),
+        _ if weight.ndim() == 2 => Some([weight.shape()[0], weight.shape()[1]]),
+        _ => None,
+    }
+}
+
+impl Qwen35Model {
+    /// Attach a standalone Qwen3.8 MTP proposal head (a directory holding its `config.json` and
+    /// `*.safetensors`, `model_type` [`core_llm::COMPANION_MTP_MODEL_TYPE`]) to a target that has none of its
+    /// own — the Prism/Bonsai path, whose packed artifact ships no `mtp.*` tensors.
+    ///
+    /// The head owns only its predictor layer; it reads token embeddings and projects logits
+    /// through the target's own embedding and `lm_head` **modules** (for Prism, the packed
+    /// [`PrismEmbedding`] and packed `lm_head`), never a raw `.weight`. Its geometry is checked
+    /// against the target's config and every projection's `[out, in]` against the target's
+    /// widths before anything is built; a mismatch is an [`Error::Config`] naming each
+    /// disagreement, and the target is left exactly as it was. Tensor names may be bare
+    /// (`fc.weight`, the published layout) or `mtp.`-prefixed. Stored MLX affine quantization is
+    /// read from the head's own `quantization` block; its RMSNorm vectors follow the zero-centred
+    /// Qwen3.8 checkpoint convention (`1 + w`) of the official lineage the published heads are
+    /// derived from. Every tensor in the head must be consumed.
+    pub fn attach_companion_mtp(&mut self, dir: &std::path::Path) -> Result<()> {
+        if self.mtp.is_some() {
+            return Err(Error::Config(
+                "the target already carries its own MTP predictor".into(),
+            ));
+        }
+        if self.cfg.moe.is_some() {
+            return Err(Error::Config(
+                "a MoE target has no MTP predictor path on this architecture".into(),
+            ));
+        }
+        let value =
+            core_llm::read_companion_mtp_config(dir).map_err(|e| Error::Config(e.to_string()))?;
+        let head_cfg = Qwen35Config::from_json(&value)?;
+        let head_geometry = head_cfg.companion_mtp_geometry();
+        let mismatches = head_geometry.mismatches(&self.cfg.companion_mtp_geometry());
+        if !mismatches.is_empty() {
+            return Err(Error::Config(format!(
+                "companion MTP head geometry does not match the target: {}",
+                mismatches.join("; ")
+            )));
+        }
+        let w = Weights::from_dir(dir)?;
+        let prefix = core_llm::companion_mtp_prefix(|key| w.contains(key))
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let stored = head_cfg.quantization;
+        let mut wrong = Vec::new();
+        for (name, [rows, cols]) in head_geometry.matrices() {
+            let expected = [rows as i32, cols as i32];
+            let key = format!("{prefix}{name}.weight");
+            match logical_matrix_shape(&w, &key, stored) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => wrong.push(format!(
+                    "`{name}` is {actual:?}, the target needs {expected:?}"
+                )),
+                None => wrong.push(format!("`{name}` is missing or not a matrix")),
+            }
+        }
+        for (name, expected) in head_geometry.norms() {
+            let expected = expected as i32;
+            match w
+                .get(&format!("{prefix}{name}.weight"))
+                .map(|a| a.shape().to_vec())
+            {
+                Some(shape) if shape == [expected] => {}
+                Some(shape) => wrong.push(format!(
+                    "`{name}` is {shape:?}, the target needs [{expected}]"
+                )),
+                None => wrong.push(format!("`{name}` is missing")),
+            }
+        }
+        if !wrong.is_empty() {
+            return Err(Error::Config(format!(
+                "companion MTP head tensors do not match the target: {}",
+                wrong.join("; ")
+            )));
+        }
+        let saw_stored = Cell::new(false);
+        let proj = |key: String| load_projection(&w, &key, stored, None, &saw_stored);
+        let predictor = build_mtp_predictor(
+            &self.cfg,
+            prefix,
+            &proj,
+            &|key| checkpoint_norm_weight(w.require(&key)?.as_dtype(COMPUTE_DTYPE)?, false),
+            // A dense target (MoE targets are refused above) → the dense SwiGLU arm.
+            &|lp| build_ffn(&w, lp, &self.cfg, None, &proj),
+        )?;
+        let mut unused = w.unused_keys();
+        if !unused.is_empty() {
+            unused.sort_unstable();
+            return Err(Error::Config(format!(
+                "companion MTP head carries tensors the predictor does not use: {}",
+                unused.join(", ")
+            )));
+        }
+        w.verify_accessed_gpu_view()?;
+        self.mtp = Some(predictor);
+        // The target now carries one predictor layer: what its config prices the head's state by
+        // (the prefix-cache snapshot's head KV, sc-24437).
+        self.cfg.mtp_num_hidden_layers = 1;
+        Ok(())
+    }
 }
 
 impl KvCache for Qwen35Cache {
@@ -2534,6 +2705,299 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("config disables MTP"), "{err}");
+    }
+
+    fn greedy_config(max_new_tokens: usize) -> crate::decode::GenerationConfig {
+        crate::decode::GenerationConfig {
+            max_new_tokens,
+            sampling: crate::primitives::sampler::SamplingParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                presence_penalty: 0.0,
+                repetition_penalty: 1.0,
+                repetition_context: 0,
+            },
+            seed: Some(7),
+            stop_tokens: Vec::new(),
+        }
+    }
+
+    fn bits(a: &Array) -> Vec<u32> {
+        a.as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    const PRISM_PROMPT: [i32; 7] = [1, 5, 9, 2, 33, 17, 4];
+
+    /// Story sc-24444 AC1: on a Prism fixture (packed two-bit projections with random codes and
+    /// signs, one Gated DeltaNet and one attention layer) the fused rotation leaves the prefill
+    /// logits bit-identical and the greedy tokens unchanged.
+    #[test]
+    fn prism_greedy_tokens_and_logits_are_unchanged_by_the_fused_rotation() {
+        use crate::decode::{generate, CancelFlag};
+        use crate::primitives::prism::tests::with_unfused_rotation;
+        use crate::primitives::prism::{recording_rotation_routes, RotationRoute};
+
+        let fixture = crate::synthetic::prism_qwen35(11);
+        let cfg = Qwen35Config::from_json(&fixture.config).unwrap();
+        let model = Qwen35Model::from_prism_weights(&fixture.weights, cfg, &fixture.pack).unwrap();
+        assert!(model.is_prism());
+        let run = || {
+            let mut cache = model.new_cache();
+            let (hidden, logits) = model
+                .hidden_and_logits(&crate::primitives::input_ids(&PRISM_PROMPT), &mut cache, 0)
+                .unwrap();
+            let out = generate(
+                &model,
+                &PRISM_PROMPT,
+                &greedy_config(24),
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            (bits(&hidden), bits(&logits), out.tokens)
+        };
+        // Count the routes, not just the numbers: the two paths are bit-identical by
+        // construction, so only the route shows the fused kernel actually ran.
+        let fused_count = |routes: &[RotationRoute]| {
+            routes
+                .iter()
+                .filter(|r| **r == RotationRoute::Fused)
+                .count()
+        };
+        let (fused, fused_routes) = mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+            recording_rotation_routes(run)
+        });
+        let (unfused, unfused_routes) =
+            mlx_rs::with_new_default_stream(mlx_rs::Stream::gpu(), || {
+                recording_rotation_routes(|| with_unfused_rotation(run))
+            });
+        assert!(
+            fused_count(&fused_routes) > 0,
+            "the fused rotation never ran: {fused_routes:?}"
+        );
+        assert!(
+            !fused_routes.contains(&RotationRoute::Unfused),
+            "every rotation at the fixture's widths is fused: {fused_routes:?}"
+        );
+        assert_eq!(
+            fused_count(&unfused_routes),
+            0,
+            "the oracle run used the kernel"
+        );
+        assert!(!unfused_routes.is_empty());
+        assert!(fused.0 == unfused.0, "prefill hidden states differ");
+        assert!(fused.1 == unfused.1, "prefill logits differ");
+        assert_eq!(fused.2, unfused.2, "greedy tokens differ");
+        let distinct: std::collections::BTreeSet<_> = fused.2.iter().collect();
+        assert!(
+            distinct.len() > 2,
+            "fixture must not be degenerate: {:?}",
+            fused.2
+        );
+    }
+
+    /// Story sc-24444 AC2 (model level): a companion MTP head attached to a Prism target borrows
+    /// the packed embedding and `lm_head`, drafts, and every depth emits exactly the target's
+    /// greedy tokens.
+    #[test]
+    fn prism_target_with_a_companion_head_drafts_and_keeps_greedy_tokens() {
+        use crate::decode::{generate, generate_qwen35_mtp, CancelFlag};
+
+        let fixture = crate::synthetic::prism_qwen35(11);
+        let cfg = Qwen35Config::from_json(&fixture.config).unwrap();
+        let mut model =
+            Qwen35Model::from_prism_weights(&fixture.weights, cfg, &fixture.pack).unwrap();
+        assert!(!model.has_mtp());
+        assert!(model.new_mtp_cache().is_none());
+        let head = crate::test_fixture::Fixture::new("mlx-companion-head-", None);
+        crate::synthetic::write_companion_head(&head, &fixture.config["text_config"], 3, None);
+        model.attach_companion_mtp(&head).unwrap();
+        assert!(model.has_mtp());
+        assert!(
+            model.is_prism(),
+            "the target stays the packed Prism decoder"
+        );
+
+        let greedy = greedy_config(24);
+        let plain = generate(
+            &model,
+            &PRISM_PROMPT,
+            &greedy,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        for depth in [1, 3, 7] {
+            let (speculative, stats) = generate_qwen35_mtp(
+                &model,
+                &PRISM_PROMPT,
+                &greedy,
+                depth,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(speculative.tokens, plain.tokens, "depth {depth}");
+            assert!(stats.proposed > 0, "depth {depth}: the head drafted");
+        }
+    }
+
+    /// Story sc-24444 AC2 / E2: a head whose geometry disagrees with the target is refused with a
+    /// reason naming each disagreement, and the target is left exactly as it was — still loaded,
+    /// no predictor, same greedy tokens.
+    #[test]
+    fn a_mismatched_companion_head_is_refused_by_name_and_leaves_the_target_intact() {
+        use crate::decode::{generate, CancelFlag};
+
+        let fixture = crate::synthetic::prism_qwen35(11);
+        let text = &fixture.config["text_config"];
+        let cfg = Qwen35Config::from_json(&fixture.config).unwrap();
+        let mut model =
+            Qwen35Model::from_prism_weights(&fixture.weights, cfg, &fixture.pack).unwrap();
+        let greedy = greedy_config(12);
+        let before = generate(
+            &model,
+            &PRISM_PROMPT,
+            &greedy,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        // The head's own config disagrees (a head for another model size).
+        let mut other = text.clone();
+        other["intermediate_size"] = json!(128);
+        other["num_key_value_heads"] = json!(2);
+        let config_mismatch = crate::test_fixture::Fixture::new("mlx-head-geometry-", None);
+        crate::synthetic::write_companion_head(&config_mismatch, &other, 3, None);
+        let err = model
+            .attach_companion_mtp(&config_mismatch)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("geometry does not match"), "{err}");
+        assert!(err.contains("intermediate_size 128 != target 256"), "{err}");
+        assert!(err.contains("num_key_value_heads 2 != target 1"), "{err}");
+
+        // Each field the predictor computes with but no tensor shape reveals is its own named
+        // refusal: `vocab_size` is the only guard against a head for another tokenizer.
+        for (field, value, named) in [
+            ("vocab_size", json!(65), "vocab_size 65 != target 64"),
+            (
+                "partial_rotary_factor",
+                json!(0.25),
+                "rotary_dim 16 != target 32",
+            ),
+            (
+                "rope_theta",
+                json!(1000000.0),
+                "rope_theta 1000000 != target 10000000",
+            ),
+            (
+                "rms_norm_eps",
+                json!(1e-5),
+                "rms_norm_eps 0.00001 != target 0.000001",
+            ),
+        ] {
+            let mut other = text.clone();
+            other[field] = value;
+            let head = crate::test_fixture::Fixture::new("mlx-head-field-", None);
+            crate::synthetic::write_companion_head(&head, &other, 3, None);
+            let err = model.attach_companion_mtp(&head).unwrap_err().to_string();
+            assert!(err.contains("geometry does not match"), "{field}: {err}");
+            assert!(err.contains(named), "{field}: {err}");
+        }
+
+        // The config matches but a stored tensor does not.
+        let tensor_mismatch = crate::test_fixture::Fixture::new("mlx-head-tensors-", None);
+        crate::synthetic::write_companion_head(&tensor_mismatch, text, 3, Some(128));
+        let err = model
+            .attach_companion_mtp(&tensor_mismatch)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`layers.0.self_attn.q_proj` is [128, 128], the target needs [256, 128]"),
+            "{err}"
+        );
+
+        // Not a companion head at all.
+        let wrong_type = crate::test_fixture::Fixture::new("mlx-head-type-", None);
+        crate::synthetic::write_companion_head(&wrong_type, text, 3, None);
+        let path = wrong_type.join("config.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["model_type"] = json!("qwen3_5");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let err = model
+            .attach_companion_mtp(&wrong_type)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be `qwen3_5_mtp`"), "{err}");
+
+        assert!(!model.has_mtp());
+        let after = generate(
+            &model,
+            &PRISM_PROMPT,
+            &greedy,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(after.tokens, before.tokens);
+
+        // A target with its own native predictor never takes a second one.
+        let mut native = crate::decode::engine::tests::qwen35(true);
+        let native_head = crate::test_fixture::Fixture::new("mlx-head-native-", None);
+        crate::synthetic::write_companion_head(&native_head, text, 3, None);
+        let err = native
+            .attach_companion_mtp(&native_head)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("already carries its own MTP predictor"),
+            "{err}"
+        );
+    }
+
+    /// Story sc-24444: a companion head's RMSNorm vectors follow the zero-centred Qwen3.8
+    /// checkpoint convention (`1 + w`) whatever the target's own convention — a Prism target's
+    /// norms are direct multipliers, the head's are not (the published Qwen3.8 heads'
+    /// `pre_fc_norm_embedding` values are all negative, mean ≈ −0.46).
+    #[test]
+    fn a_companion_heads_norms_are_applied_as_one_plus_w() {
+        let fixture = crate::synthetic::prism_qwen35(11);
+        let cfg = Qwen35Config::from_json(&fixture.config).unwrap();
+        let mut model =
+            Qwen35Model::from_prism_weights(&fixture.weights, cfg, &fixture.pack).unwrap();
+        let head = crate::test_fixture::Fixture::new("mlx-head-norm-", None);
+        crate::synthetic::write_companion_head(&head, &fixture.config["text_config"], 3, None);
+        let path = head.join("model.safetensors");
+        let mut tensors = Array::load_safetensors(&path).unwrap();
+        // The load is lazy: materialize every tensor before overwriting the file it reads.
+        mlx_rs::transforms::eval(tensors.values()).unwrap();
+        tensors.insert(
+            "pre_fc_norm_embedding.weight".into(),
+            Array::from_slice(&[-0.5f32; 128], &[128])
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap(),
+        );
+        Array::save_safetensors(tensors.iter().map(|(k, v)| (k.as_str(), v)), None, &path).unwrap();
+        model.attach_companion_mtp(&head).unwrap();
+        let applied = model
+            .mtp
+            .as_ref()
+            .unwrap()
+            .pre_fc_norm_embedding
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        assert_eq!(applied.as_slice::<f32>(), [0.5f32; 128]);
     }
 
     #[test]

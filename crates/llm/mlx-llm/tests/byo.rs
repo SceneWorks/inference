@@ -77,6 +77,7 @@ fn llama_quantize_on_load_q8() {
         projector_source: None,
         quantize: Some(Quantize::Q8),
         cuda_graphs: None,
+        mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
     })
@@ -97,6 +98,7 @@ fn llama_quantize_on_load_q4() {
         projector_source: None,
         quantize: Some(Quantize::Q4),
         cuda_graphs: None,
+        mtp_head_source: None,
         prefix_cache_bytes: None,
         draft_source: None,
     })

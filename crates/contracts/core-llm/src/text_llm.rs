@@ -28,8 +28,9 @@ pub trait TextLlm {
         None
     }
 
-    /// What the load produced: the requested weight format and the projection kinds the loaded
-    /// model actually holds (sc-24139). `None` (the default) when the provider does not report it.
+    /// What the load produced: the requested weight format, the projection kinds the loaded
+    /// model actually holds (sc-24139) and every requested optional accelerator the load did not
+    /// attach (sc-24444). `None` (the default) when the provider does not report it.
     fn load_report(&self) -> Option<crate::report::LoadReport> {
         None
     }

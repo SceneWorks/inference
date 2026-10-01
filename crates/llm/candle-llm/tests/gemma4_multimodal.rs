@@ -564,6 +564,7 @@ fn gemma4_generates_dense_and_at_each_quantized_tier() {
             projector_source: None,
             quantize,
             cuda_graphs: None,
+            mtp_head_source: None,
             prefix_cache_bytes: None,
             draft_source: None,
         };

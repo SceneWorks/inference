@@ -108,6 +108,13 @@ pub struct PrismPackedWeight {
     storage: PackedStorage,
     role: PrismTransformRole,
     signs: Option<Arc<[i8]>>,
+    /// `signs` as an F32 `[input_width]` tensor on `device`, built once at load: the tensor
+    /// rotation path multiplies by it every forward without a host upload (which would also
+    /// break CUDA-graph capture).
+    device_signs: Option<Tensor>,
+    /// The GDN activation reorder's `[input_width]` U32 gather index on `device`, built once at
+    /// load for the same reason.
+    gdn_gather: Option<Tensor>,
     block_size: usize,
     gdn: Option<GdnLayout>,
     row_map: Option<GdnRowMap>,
@@ -286,6 +293,13 @@ impl PrismPackedWeight {
                 "Prism GDN activation reorder on {name} requires a forward Hadamard transform"
             )));
         }
+        let device_signs = classified
+            .signs
+            .map(|signs| upload_signs(signs, &device))
+            .transpose()?;
+        let gdn_gather = gdn
+            .map(|layout| gdn_gather_index(layout, &device))
+            .transpose()?;
         Ok(Self {
             name,
             rows,
@@ -293,6 +307,8 @@ impl PrismPackedWeight {
             storage,
             role: classified.role,
             signs: classified.signs.map(|s| Arc::<[i8]>::from(s.to_vec())),
+            device_signs,
+            gdn_gather,
             block_size: metadata.block_size,
             gdn,
             row_map,
@@ -435,20 +451,31 @@ impl PrismPackedWeight {
             }
             return Ok(Tensor::from_vec(values, shape, x.device())?.to_dtype(x.dtype())?);
         }
+        self.transform_inverse_tensor(x)
+    }
+
+    /// The device-tensor inverse rotation (normalized H, then signs).
+    fn transform_inverse_tensor(&self, x: &Tensor) -> Result<Tensor> {
         let h = fwht_tensor(x, self.block_size)?;
-        multiply_signs(&h, signs)
+        multiply_signs(&h, self.resident_signs()?)
     }
 
     fn transform_forward_tensor(&self, x: &Tensor) -> Result<Tensor> {
         let mut out = x.clone();
-        if let Some(gdn) = self.gdn {
-            out = gdn_reorder_tensor(&out, gdn)?;
+        if let Some(gather) = &self.gdn_gather {
+            out = gdn_reorder_tensor(&out, gather)?;
         }
-        let signs = self
-            .signs
-            .as_deref()
-            .ok_or_else(|| Error::Config(format!("Prism {} has no explicit signs", self.name)))?;
-        fwht_tensor(&multiply_signs(&out, signs)?, self.block_size)
+        fwht_tensor(
+            &multiply_signs(&out, self.resident_signs()?)?,
+            self.block_size,
+        )
+    }
+
+    /// The load-time device copy of `signs`.
+    fn resident_signs(&self) -> Result<&Tensor> {
+        self.device_signs
+            .as_ref()
+            .ok_or_else(|| Error::Config(format!("Prism {} has no explicit signs", self.name)))
     }
 
     fn cpu_matmul(&self, x: &Tensor) -> Result<Tensor> {
@@ -586,17 +613,31 @@ impl PrismRegistry {
     }
 }
 
-fn multiply_signs(x: &Tensor, signs: &[i8]) -> Result<Tensor> {
+#[cfg(test)]
+thread_local! {
+    /// Host→device uploads of a Prism sign vector or GDN gather index on this thread (test
+    /// builds): they happen once per weight at load, never per forward.
+    pub(crate) static ROTATION_UPLOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Upload `signs` once, as the F32 `[width]` tensor the rotation multiplies by.
+fn upload_signs(signs: &[i8], device: &Device) -> Result<Tensor> {
+    #[cfg(test)]
+    ROTATION_UPLOADS.with(|n| n.set(n.get() + 1));
+    let signs = signs.iter().map(|&v| f32::from(v)).collect::<Vec<_>>();
+    let width = signs.len();
+    Ok(Tensor::from_vec(signs, (width,), device)?)
+}
+
+fn multiply_signs(x: &Tensor, signs: &Tensor) -> Result<Tensor> {
     let width = x.dim(x.rank() - 1)?;
-    if signs.len() != width {
+    if signs.dim(0)? != width {
         return Err(Error::Config(format!(
             "Prism sign width {} != activation width {width}",
-            signs.len()
+            signs.dim(0)?
         )));
     }
-    let signs = signs.iter().map(|&v| v as f32).collect::<Vec<_>>();
-    let signs = Tensor::from_vec(signs, (width,), x.device())?.to_dtype(x.dtype())?;
-    Ok(x.broadcast_mul(&signs)?)
+    Ok(x.broadcast_mul(&signs.to_dtype(x.dtype())?)?)
 }
 
 fn fwht_tensor(x: &Tensor, block_size: usize) -> Result<Tensor> {
@@ -627,14 +668,11 @@ fn fwht_tensor(x: &Tensor, block_size: usize) -> Result<Tensor> {
         .reshape(shape)?)
 }
 
-fn gdn_reorder_tensor(x: &Tensor, layout: GdnLayout) -> Result<Tensor> {
-    let width = x.dim(x.rank() - 1)?;
-    if layout.width() != width {
-        return Err(Error::Config(format!(
-            "Prism GDN activation width {width} != {}",
-            layout.width()
-        )));
-    }
+/// The GDN activation reorder's gather index, uploaded once per weight at load.
+fn gdn_gather_index(layout: GdnLayout, device: &Device) -> Result<Tensor> {
+    #[cfg(test)]
+    ROTATION_UPLOADS.with(|n| n.set(n.get() + 1));
+    let width = layout.width();
     let mut gather = vec![0u32; width];
     for head_dim in 0..layout.head_dim {
         for group in 0..layout.groups {
@@ -646,8 +684,18 @@ fn gdn_reorder_tensor(x: &Tensor, layout: GdnLayout) -> Result<Tensor> {
             }
         }
     }
-    let gather = Tensor::from_vec(gather, (width,), x.device())?;
-    Ok(x.index_select(&gather, x.rank() - 1)?)
+    Ok(Tensor::from_vec(gather, (width,), device)?)
+}
+
+fn gdn_reorder_tensor(x: &Tensor, gather: &Tensor) -> Result<Tensor> {
+    let width = x.dim(x.rank() - 1)?;
+    if gather.dim(0)? != width {
+        return Err(Error::Config(format!(
+            "Prism GDN activation width {width} != {}",
+            gather.dim(0)?
+        )));
+    }
+    Ok(x.index_select(gather, x.rank() - 1)?)
 }
 
 /// The Prism packed-operator kernels, compiled through the shared nvrtc compile-once seam
@@ -1202,6 +1250,75 @@ mod tests {
             .to_vec2::<f32>()
             .unwrap()[0][0];
         assert!((actual - expected).abs() < 2e-3, "{actual} != {expected}");
+    }
+
+    /// sc-24444: the device-tensor rotation (the CUDA path) multiplies by a sign vector and
+    /// gathers by a GDN index uploaded once per weight at load — repeated forwards upload
+    /// nothing — and it agrees with the host rotation, forward (with the GDN reorder) and inverse.
+    #[test]
+    fn the_tensor_rotation_uploads_its_signs_once_at_load_never_per_forward() {
+        let uploads = || ROTATION_UPLOADS.with(std::cell::Cell::get);
+        let device = Device::Cpu;
+        let name = "model.layers.0.linear_attn.ssm_out.weight";
+        let signs = (0..128)
+            .map(|i| if i % 3 == 0 { -1i8 } else { 1 })
+            .collect::<Vec<_>>();
+        let layout = GdnLayout {
+            head_dim: 32,
+            groups: 2,
+            repetitions: 2,
+        };
+        let before = uploads();
+        let forward = PrismPackedWeight::from_mlx_affine2(
+            name,
+            Tensor::zeros((1, 8), DType::U32, &device).unwrap(),
+            Tensor::from_vec(vec![1f32], (1, 1), &device).unwrap(),
+            &Tensor::from_vec(vec![-1f32], (1, 1), &device).unwrap(),
+            &metadata(name, PrismTransformRole::Forward, signs.clone()),
+            None,
+            Some(layout),
+        )
+        .unwrap();
+        assert_eq!(uploads() - before, 2, "signs and the GDN gather, once each");
+        let inverse = mlx_weight("embed.weight", &[1; 128], PrismTransformRole::Inverse);
+        let at_load = uploads();
+
+        let x = Tensor::from_vec(
+            (0..3 * 128).map(|i| (i % 97) as f32 / 16.0 - 3.0).collect(),
+            (3, 128),
+            &device,
+        )
+        .unwrap();
+        let host_forward = forward.transform_forward(&x).unwrap();
+        let host_inverse = inverse.transform_inverse(&x).unwrap();
+        for _ in 0..3 {
+            let close = |a: &Tensor, b: &Tensor| {
+                let d = (a - b)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .max(0)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert!(d < 1e-4, "tensor and host rotations differ by {d}");
+            };
+            close(
+                &forward.transform_forward_tensor(&x).unwrap(),
+                &host_forward,
+            );
+            close(
+                &inverse.transform_inverse_tensor(&x).unwrap(),
+                &host_inverse,
+            );
+        }
+        assert_eq!(
+            uploads(),
+            at_load,
+            "a forward uploaded a sign vector or index"
+        );
     }
 
     #[test]
