@@ -9,7 +9,7 @@
 //! `core_llm::JinjaChatTemplate`, story 7164), falling back to the typed [`Llama3Template`] when a
 //! snapshot ships no `tokenizer_config.json`.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::path::Path;
 use std::time::Instant;
 
@@ -17,17 +17,19 @@ use core_llm::{
     AudioRef, Channel, ChatTemplate, Constraint, ConstraintDecodeTable, ConstraintKind, Content,
     Error as CoreError, FinishReason as CoreFinish, ImageRef, IncrementalDetok, JinjaChatTemplate,
     JsonConstraint, Llama3Template, LlmMemoryGeometry, LoadSpec, Message, ModelSamplingDefaults,
-    MtpMode, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Sampling, StopMatcher,
-    StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingSegmenter, Tokenizer, ToolCallSegmenter, Usage, VideoRef,
+    MtpMode, Quantize, ReasoningEffort, RenderOptions, Result as CoreResult, Role, Sampling,
+    StopMatcher, StreamEvent as CoreEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
+    TextLlmOutput, TextLlmRequest, ThinkingMode, ThinkingSegmenter, Tokenizer, ToolCall,
+    ToolCallSegmenter, Usage, VideoRef,
 };
 
 use crate::config::{Architecture, ModelConfig};
 use crate::decode::{
-    generate_from_prefill, generate_from_prefill_with_timings,
+    generate_batch, generate_from_prefill, generate_from_prefill_with_timings,
     generate_qwen35_mtp_multimodal_with_timings, generate_qwen35_mtp_with_timings,
-    generate_with_timings, ConstraintMask, Decode, FinishReason, GenerationConfig,
-    Qwen35MtpMultimodalPrompt, RewindableConstraintMask, StreamEvent,
+    generate_with_observer, generate_with_timings, BatchRequest, CancelFlag, ConstraintMask,
+    Decode, FinishReason, GenerationConfig, GenerationOutput, Qwen35MtpMultimodalPrompt,
+    RewindableConstraintMask, StreamEvent,
 };
 use crate::image::Qwen35ImageProcessor;
 use crate::models::gemma4_mm;
@@ -35,24 +37,353 @@ use crate::models::{
     CausalLm, Gemma4Layout, Gemma4Mm, Gemma4MmConfig, Qwen35Config, Qwen35Model,
     Qwen35VisionConfig, Qwen35VisionModel, VlmDecode,
 };
-use crate::primitives::attention::SDPA_MAX_FUSED_QLEN;
-use crate::primitives::kv_cache::KvCache;
+use crate::primitives::attention::prefill_attention_tile_bytes;
+use crate::primitives::kv_cache::{ContiguousKvCache, KvCache};
 use crate::primitives::projection::QuantSpec;
 use crate::primitives::sampler::SamplingParams;
-use crate::primitives::{input_ids, Weights};
+use crate::primitives::{dtype_bytes, input_ids, Weights};
 use crate::prism::PrismMlxPack;
 use mlx_rs::ops::concatenate_axis;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 /// The registry id of this provider.
 pub const PROVIDER_ID: &str = "mlx-llama";
+
+enum CapturedCacheLifecycle {
+    Allocation(&'static str, &'static str, &'static str, u64),
+    Snapshot(u64, u64, u64, u64),
+    Release(&'static str, &'static str, u64),
+    PackedEvidence(Box<crate::primitives::PackedCacheEvidence>),
+    DenseFallback(String, String),
+    DenseReconstruction(u64),
+    CompressedStorage(crate::primitives::CompressedCacheStorage),
+}
+
+#[derive(Default)]
+struct CacheLifecycleCapture {
+    events: Vec<CapturedCacheLifecycle>,
+}
+
+impl CacheLifecycleCapture {
+    fn replay(self, observer: &mut dyn crate::campaign::Observer) {
+        for event in self.events {
+            match event {
+                CapturedCacheLifecycle::Allocation(kind, role, lifetime, bytes) => {
+                    observer.allocation_event(kind, role, lifetime, bytes);
+                }
+                CapturedCacheLifecycle::Snapshot(bytes, tokens, capacity, element_bytes) => {
+                    observer.cache_snapshot(bytes, tokens, capacity, element_bytes);
+                }
+                CapturedCacheLifecycle::Release(kind, role, bytes) => {
+                    observer.release_event(kind, role, bytes);
+                }
+                CapturedCacheLifecycle::PackedEvidence(evidence) => {
+                    observer.packed_cache_evidence(&evidence);
+                }
+                CapturedCacheLifecycle::DenseFallback(operation, reason) => {
+                    observer.dense_fallback(&operation, &reason);
+                }
+                CapturedCacheLifecycle::DenseReconstruction(bytes) => {
+                    observer.dense_reconstruction(bytes);
+                }
+                CapturedCacheLifecycle::CompressedStorage(storage) => {
+                    observer.compressed_storage(&storage);
+                }
+            }
+        }
+    }
+}
+
+impl crate::campaign::Observer for CacheLifecycleCapture {
+    fn phase(&mut self, _name: &'static str) {}
+
+    fn allocation(&mut self, role: &'static str, lifetime: &'static str, bytes: u64) {
+        self.events.push(CapturedCacheLifecycle::Allocation(
+            role, role, lifetime, bytes,
+        ));
+    }
+
+    fn allocation_event(
+        &mut self,
+        kind: &'static str,
+        role: &'static str,
+        lifetime: &'static str,
+        bytes: u64,
+    ) {
+        self.events.push(CapturedCacheLifecycle::Allocation(
+            kind, role, lifetime, bytes,
+        ));
+    }
+
+    fn cache_snapshot(&mut self, bytes: u64, tokens: u64, capacity: u64, element_bytes: u64) {
+        self.events.push(CapturedCacheLifecycle::Snapshot(
+            bytes,
+            tokens,
+            capacity,
+            element_bytes,
+        ));
+    }
+
+    fn release_event(&mut self, kind: &'static str, role: &'static str, bytes: u64) {
+        self.events
+            .push(CapturedCacheLifecycle::Release(kind, role, bytes));
+    }
+
+    fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+        self.events
+            .push(CapturedCacheLifecycle::PackedEvidence(Box::new(
+                evidence.clone(),
+            )));
+    }
+
+    fn dense_fallback(&mut self, operation: &str, reason: &str) {
+        self.events.push(CapturedCacheLifecycle::DenseFallback(
+            operation.into(),
+            reason.into(),
+        ));
+    }
+
+    fn dense_reconstruction(&mut self, bytes: u64) {
+        self.events
+            .push(CapturedCacheLifecycle::DenseReconstruction(bytes));
+    }
+
+    fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+        self.events
+            .push(CapturedCacheLifecycle::CompressedStorage(*storage));
+    }
+}
+
+/// Campaign-only compressed decoder (SC-20676 compressed rows): every cache it makes is the
+/// session's compressed representation bound to its retained fused reader. A selection the model
+/// refuses before mutation stays dense and is recorded as an explicit, reasoned fallback rather
+/// than silently replacing the fused path.
+struct PackedCampaignDecoder<'a> {
+    model: &'a CausalLm,
+    arm: &'a crate::campaign::CompressedKvArm,
+    selection_fallbacks: RefCell<Vec<String>>,
+}
+
+impl Decode for PackedCampaignDecoder<'_> {
+    fn make_cache(&self) -> Box<dyn KvCache> {
+        let selection = self.arm.select_cache(self.model);
+        // Every refused selection keeps its own reason, including a packed cache whose reader
+        // binding failed: that cache's later update fallback would otherwise hide why.
+        if let crate::primitives::CacheRoute::DenseFallback { reason } = selection.route() {
+            self.selection_fallbacks.borrow_mut().push(reason.clone());
+        }
+        selection.into_cache()
+    }
+
+    fn step(
+        &self,
+        input_ids: &Array,
+        cache: &mut dyn KvCache,
+        offset: i32,
+    ) -> crate::error::Result<Array> {
+        self.model.step(input_ids, cache, offset)
+    }
+}
+
+/// [`LlamaProvider::campaign_steady_decode`] over an already-tokenized context. A compressed arm's
+/// measurement must run wholly on its fused compressed reader (selected cache, no fallback, no
+/// dense reconstruction): a timing that silently decoded dense would carry a compressed label.
+fn campaign_steady_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    tokens: usize,
+    stop_tokens: &[i32],
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
+    let measured = campaign_forced_decode_on(
+        model,
+        prompt_ids,
+        tokens,
+        stop_tokens,
+        compressed,
+        None,
+        false,
+    )?;
+    Ok(crate::campaign::SteadyDecodeMeasurement {
+        prompt_tokens: prompt_ids.len() as u64,
+        generated_tokens: measured.tokens.len() as u64,
+        timed_tokens: measured.timed_tokens,
+        decode_ms: measured.decode_ms,
+        forced_stop_tokens: measured.forced_stop_tokens,
+    })
+}
+
+/// One fixed-length greedy decode through every stop token on a fresh cache of the session's
+/// representation, optionally teacher-forced on `teacher_forced` and scored on its stream with
+/// `score` (see [`crate::decode::forced_greedy_decode`]). A compressed arm must run wholly on its
+/// fused compressed reader or the call fails closed.
+fn campaign_forced_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    tokens: usize,
+    stop_tokens: &[i32],
+    compressed: Option<&crate::campaign::CompressedKvArm>,
+    teacher_forced: Option<&[i32]>,
+    score: bool,
+) -> CoreResult<crate::decode::ForcedDecode> {
+    let packed = match (compressed, model) {
+        (None, _) => None,
+        (Some(arm), Decoder::Causal(causal)) => Some(PackedCampaignDecoder {
+            model: causal,
+            arm,
+            selection_fallbacks: RefCell::new(Vec::new()),
+        }),
+        (Some(_), Decoder::Qwen35(_)) => {
+            return Err(CoreError::Unsupported(
+                "compressed campaign steady decode requires the causal decoder".into(),
+            ))
+        }
+    };
+    let decoder: &dyn Decode = match &packed {
+        Some(packed) => packed,
+        None => model,
+    };
+    let mut cache = decoder.make_cache();
+    let measured = crate::decode::forced_greedy_decode(
+        decoder,
+        cache.as_mut(),
+        prompt_ids,
+        tokens,
+        stop_tokens,
+        teacher_forced,
+        score,
+        &mut |_| {},
+    );
+    let evidence = cache.packed_evidence();
+    cache.reset().map_err(to_core)?;
+    let measured = measured.map_err(to_core)?;
+    if let Some(packed) = &packed {
+        let fused = packed.selection_fallbacks.borrow().is_empty()
+            && evidence.is_some_and(|evidence| {
+                evidence.accepted_direct_calls > 0
+                    && evidence.fallback_reasons.is_empty()
+                    && !evidence.dense_active
+                    && evidence.full_cache_dequantizations == 0
+                    && evidence.failed_dispatches == 0
+            });
+        if !fused {
+            return Err(CoreError::Load(
+                "compressed forced decode did not run wholly on the fused compressed reader".into(),
+            ));
+        }
+    }
+    Ok(measured)
+}
+
+/// SC-20669 dense noise-floor control: the dense model teacher-forced on `stream` and scored, as
+/// [`campaign_forced_decode_on`] does it, except that all but the last prompt token are prefilled
+/// in `prefill_chunk`-token steps. Every value is exact bf16 dense attention over the same K/V; only
+/// the computation order differs (projection row tiling, attention over the cached prefix instead
+/// of in-step K/V). Its agreement with — and likelihood of — the one-shot dense continuation is the
+/// dense arm's own numerical floor for the frozen greedy and perplexity thresholds.
+fn campaign_chunked_prefill_decode_on(
+    model: &Decoder,
+    prompt_ids: &[i32],
+    stream: &[i32],
+    stop_tokens: &[i32],
+    prefill_chunk: usize,
+) -> CoreResult<crate::decode::ForcedDecode> {
+    if prefill_chunk == 0 || prompt_ids.len() < 2 {
+        return Err(CoreError::InvalidRequest(
+            "chunked prefill needs a positive chunk and a prompt of two or more tokens".into(),
+        ));
+    }
+    let mut cache = chunked_prefill_cache(model, prompt_ids.len() + stream.len())?;
+    let prefilled = prompt_ids.len() - 1;
+    let measured = (|| -> crate::error::Result<crate::decode::ForcedDecode> {
+        chunked_prefill(model, &mut cache, &prompt_ids[..prefilled], prefill_chunk)?;
+        crate::decode::forced_greedy_decode_from(
+            model,
+            &mut cache,
+            prompt_ids,
+            prefilled,
+            stream.len(),
+            stop_tokens,
+            Some(stream),
+            true,
+            &mut |_| {},
+        )
+    })();
+    cache.reset().map_err(to_core)?;
+    measured.map_err(to_core)
+}
+
+/// The chunked control's dense cache: ONE allocation covering the prompt and the forced stream.
+/// The decoder's default cache grows by concatenation as chunks arrive, so every chunk of a long
+/// prompt retired a whole-history buffer into MLX's freed-buffer cache (run 37021783368: the
+/// 130k-token llama row's 64 growths reached a 73.8 GB footprint against a 68 GiB cap). Sized
+/// once, the chunked control holds what a one-shot dense run holds: one dense K/V history.
+fn chunked_prefill_cache(model: &Decoder, positions: usize) -> CoreResult<ContiguousKvCache> {
+    let block = i32::try_from(positions.max(1))
+        .map_err(|_| CoreError::InvalidRequest("chunked prefill length overflows i32".into()))?;
+    match model {
+        Decoder::Causal(model) => Ok(ContiguousKvCache::with_block_tokens(
+            model.config().num_layers,
+            block,
+        )),
+        Decoder::Qwen35(_) => Err(CoreError::Unsupported(
+            "the chunked-prefill noise-floor control needs the causal decoder".into(),
+        )),
+    }
+}
+
+/// Prefill `prompt_ids` into `cache` in `prefill_chunk`-token steps, evaluating each step and
+/// releasing MLX's freed-buffer cache after it, so no chunk's transients outlive it.
+fn chunked_prefill(
+    model: &Decoder,
+    cache: &mut dyn KvCache,
+    prompt_ids: &[i32],
+    prefill_chunk: usize,
+) -> crate::error::Result<()> {
+    for start in (0..prompt_ids.len()).step_by(prefill_chunk.max(1)) {
+        let end = (start + prefill_chunk).min(prompt_ids.len());
+        let offset = cache.offset();
+        let logits = model.step(
+            &crate::primitives::nn::input_ids(&prompt_ids[start..end]),
+            cache,
+            offset,
+        )?;
+        logits.eval()?;
+        drop(logits);
+        mlx_rs::memory::clear_cache();
+    }
+    Ok(())
+}
+
+/// The cache record of one prompt-cache turn: whether the lookup since `before` hit, and how many
+/// prompt tokens it reused.
+fn prompt_cache_turn(
+    before: crate::decode::PrefixStats,
+    store: &crate::decode::PrefixCache,
+    prompt_ids: &[i32],
+) -> CoreResult<crate::campaign::PromptCacheTurn> {
+    let after = store.stats();
+    if after.lookups != before.lookups + 1 {
+        return Err(CoreError::Load(
+            "multi-turn prompt cache: a turn must perform exactly one prompt-cache lookup".into(),
+        ));
+    }
+    let cache_hit = after.hits > before.hits;
+    let reused = after.reused_prefix_tokens - before.reused_prefix_tokens;
+    Ok(crate::campaign::PromptCacheTurn {
+        prompt_tokens: prompt_ids.len() as u64,
+        prompt_sha256: crate::campaign::token_stream_sha256(prompt_ids),
+        cache_hit,
+        reused_prefix_tokens: reused as u64,
+    })
+}
 
 /// The loaded decoder, dispatched by architecture. The generic softmax-attention decoders share
 /// [`CausalLm`]; Qwen3.6 (`qwen3_5`) is the hybrid linear-attention/full-attention decoder. Both
 /// implement [`Decode`], so the generation loop is identical.
 enum Decoder {
-    Causal(CausalLm),
-    Qwen35(Qwen35Model),
+    Causal(Box<CausalLm>),
+    Qwen35(Box<Qwen35Model>),
 }
 
 impl Decode for Decoder {
@@ -113,12 +444,17 @@ impl Decoder {
                     )
                 }
             };
+        let (compute, prism) = match self {
+            Decoder::Causal(m) => (m.compute_dtype(), false),
+            Decoder::Qwen35(m) => (m.compute_dtype(), m.is_prism()),
+        };
         LlmMemoryGeometry {
             query_heads: query_heads.max(0) as u64,
             kv_heads: kv_heads.max(0) as u64,
             head_dim: head_dim.max(0) as u64,
             layers: layers as u64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(compute, prism),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: hidden as u64,
             intermediate_size: intermediate as u64,
             vocab_size: vocab as u64,
@@ -161,8 +497,8 @@ impl Decoder {
     /// decoder type.
     fn as_vlm(&self) -> &dyn VlmDecode {
         match self {
-            Decoder::Causal(m) => m,
-            Decoder::Qwen35(m) => m,
+            Decoder::Causal(m) => m.as_ref(),
+            Decoder::Qwen35(m) => m.as_ref(),
         }
     }
 }
@@ -575,9 +911,14 @@ fn substitute_vision_placeholders(
 /// A generic Llama provider implementing [`core_llm::TextLlm`].
 pub struct LlamaProvider {
     descriptor: TextLlmDescriptor,
+    /// Architecture parsed from the loaded snapshot. Campaign receipts use this product-owned
+    /// identity instead of trusting the matrix row's caller-authored family label.
+    architecture: Architecture,
+    campaign_family: Option<&'static str>,
     model: Decoder,
     tokenizer: Tokenizer,
     template: Box<dyn ChatTemplate>,
+    tool_call_format: Option<ToolCallFormat>,
     stop_tokens: Vec<i32>,
     /// Cached per-vocab decode table for constrained decoding — built once (it decodes the whole
     /// vocabulary) on the first JSON-constrained request, then reused.
@@ -589,6 +930,8 @@ pub struct LlamaProvider {
     /// checkpoint that actually ships them (sc-18772). Independent of [`vision`](Self::vision):
     /// Gemma 4 does not use the Qwen-VL ViT/M-RoPE/DeepStack machinery at all.
     gemma4: Option<Gemma4Runtime>,
+    /// Campaign-only prefix cache; ordinary serving never consults this state.
+    campaign_prefix_cache: RefCell<Option<crate::decode::PrefixCache>>,
     /// Dense Prism `vision_tower.*` tensors retained verbatim for the native multimodal adapter.
     /// Text loading must not discard them merely because sc-23937 constructs only the decoder.
     _prism_vision_weights: Option<Weights>,
@@ -613,10 +956,563 @@ fn qwen35_dense_prefix(has_key: impl Fn(&str) -> bool) -> CoreResult<&'static st
 }
 
 impl LlamaProvider {
+    /// Frozen SC-20671 family identity for architectures that implement the campaign's contiguous
+    /// cache controls. Other architectures fail closed instead of being mislabeled as Llama/Qwen.
+    pub(crate) fn campaign_family(&self) -> CoreResult<&'static str> {
+        self.campaign_family.ok_or_else(|| {
+            CoreError::Unsupported(format!(
+                "SC-20671 does not support loaded architecture {:?} as Llama or Qwen",
+                self.architecture
+            ))
+        })
+    }
+
+    pub(crate) fn campaign_context_window(&self) -> CoreResult<u64> {
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "SC-20671 requires a causal decoder context window".into(),
+            ));
+        };
+        u64::try_from(model.config().max_position_embeddings)
+            .ok()
+            .filter(|tokens| *tokens >= 1_024)
+            .ok_or_else(|| {
+                CoreError::Load(
+                    "SC-20671 requires max_position_embeddings >= 1024 in loaded config".into(),
+                )
+            })
+    }
+
+    pub(crate) fn campaign_prompt_tokens(&self, prompt: &str) -> CoreResult<u64> {
+        u64::try_from(self.tokenizer.encode(prompt, false)?.len())
+            .map_err(|_| CoreError::Load("campaign prompt token count overflows u64".into()))
+    }
+
+    pub(crate) fn campaign_context_band_measurement(
+        &self,
+        context_band: &str,
+    ) -> CoreResult<(String, u64, u64)> {
+        let context_window = self.campaign_context_window()?;
+        let target = crate::campaign::context_band_target(context_window, context_band)
+            .map_err(CoreError::Load)?;
+        self.campaign_band_payload(context_band, target)
+    }
+
+    /// The multi-turn prompt-cache fixture's payload (contract v4): the band payload capped by
+    /// [`crate::campaign::multi_turn_payload_target`], so turn 2 plus the full turn-2 forced
+    /// continuation fits the native window. The row's coordinate operations keep the full band.
+    pub(crate) fn campaign_multi_turn_payload(
+        &self,
+        context_band: &str,
+    ) -> CoreResult<(String, u64, u64)> {
+        let context_window = self.campaign_context_window()?;
+        let band = crate::campaign::context_band_target(context_window, context_band)
+            .map_err(CoreError::Load)?;
+        let target = crate::campaign::multi_turn_payload_target(context_window, band)
+            .map_err(CoreError::Load)?;
+        self.campaign_band_payload(context_band, target)
+    }
+
+    /// The largest `context_band` payload of at most `target` tokens.
+    fn campaign_band_payload(
+        &self,
+        context_band: &str,
+        target: u64,
+    ) -> CoreResult<(String, u64, u64)> {
+        let header = format!("SC20671-CONTEXT-BAND-{context_band}");
+        let mut lower = 0usize;
+        let mut upper = usize::try_from(target)
+            .map_err(|_| CoreError::Load("campaign context target overflows usize".into()))?;
+        while lower < upper {
+            let midpoint = lower + (upper - lower).div_ceil(2);
+            let candidate = format!("{header}{}", " context".repeat(midpoint));
+            if self.campaign_prompt_tokens(&candidate)? <= target {
+                lower = midpoint;
+            } else {
+                upper = midpoint - 1;
+            }
+        }
+        let payload = format!("{header}{}", " context".repeat(lower));
+        let observed_tokens = self.campaign_prompt_tokens(&payload)?;
+        if observed_tokens < target / 2 || observed_tokens > target {
+            return Err(CoreError::Load(format!(
+                "context band {context_band} produced {observed_tokens} tokens for target {target}"
+            )));
+        }
+        Ok((payload, target, observed_tokens))
+    }
+
+    /// Loaded decoder geometry for the receipt producer.  This is crate-private so a campaign
+    /// cannot substitute JSON-provided head/layer values for the actual provider configuration.
+    /// SC-20677 K/V capture: the loaded causal decoder the campaign decodes through, and the
+    /// snapshot's own tokenizer. Only campaign families (Llama/Qwen3) are accepted.
+    pub(crate) fn campaign_causal_decoder(&self) -> CoreResult<(&CausalLm, &Tokenizer)> {
+        self.campaign_family()?;
+        match &self.model {
+            Decoder::Causal(model) => Ok((model, &self.tokenizer)),
+            Decoder::Qwen35(_) => Err(CoreError::Unsupported(
+                "SC-20677 K/V capture requires the causal campaign decoder".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn campaign_geometry(&self) -> crate::campaign::ProductGeometry {
+        let (query_heads, kv_heads, head_dimension, layers) = match &self.model {
+            Decoder::Causal(model) => {
+                let config = model.config();
+                (
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.num_layers,
+                )
+            }
+            Decoder::Qwen35(model) => {
+                let config = model.config();
+                (
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.num_layers,
+                )
+            }
+        };
+        crate::campaign::ProductGeometry {
+            query_heads: query_heads.max(0) as u64,
+            kv_heads: kv_heads.max(0) as u64,
+            head_dimension: head_dimension.max(0) as u64,
+            layers: layers as u64,
+            // The product observer fills this from the first retained MLX key/value arrays.
+            element_bytes: 0,
+        }
+    }
+
+    /// Exercise real contiguous-cache prefix reuse on the loaded causal decoder.  Hybrid Qwen3.6
+    /// has a distinct cache contract and is rejected here rather than being mislabeled as a
+    /// successful contiguous-cache observation.
+    pub(crate) fn campaign_prefix_reuse(&self, prompt: &str) -> CoreResult<u64> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        let cache = cache_slot.get_or_insert_with(|| crate::decode::PrefixCache::new(2));
+        let mut sink = |_| {};
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
+            .map_err(to_core)?;
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, cache)
+            .map_err(to_core)?;
+        if cache.stats().hits == 0 {
+            return Err(CoreError::Load(
+                "campaign prefix reuse did not produce a cache hit".into(),
+            ));
+        }
+        u64::try_from(cache.stats().hits)
+            .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))
+    }
+
+    /// Seed the provider-owned prefix cache before a campaign opens its phase-local MLX peak
+    /// window.  The observed cache-hit dispatch is deliberately separate so seed allocations and
+    /// compile work cannot establish the peak used as measured prefill evidence.
+    pub(crate) fn campaign_seed_prefix_reuse(&self, prompt: &str) -> CoreResult<f64> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        if cache_slot.is_some() {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix cache was already seeded".into(),
+            ));
+        }
+        let mut cache = crate::decode::PrefixCache::new(2);
+        let mut sink = |_| {};
+        let dispatch_started = std::time::Instant::now();
+        crate::decode::generate_cached(model, &ids, &config, &cancel, &mut sink, &mut cache)
+            .map_err(to_core)?;
+        let dispatch_elapsed_ms = dispatch_started.elapsed().as_secs_f64() * 1_000.0;
+        if !dispatch_elapsed_ms.is_finite() || dispatch_elapsed_ms <= 0.0 {
+            return Err(CoreError::Load(
+                "campaign prefix seed produced no positive dispatch duration".into(),
+            ));
+        }
+        *cache_slot = Some(cache);
+        Ok(dispatch_elapsed_ms)
+    }
+
+    /// Execute only the cache-hit half of the real prefix-reuse path with campaign observation
+    /// attached. The caller must seed before resetting the phase-local peak; this method proves a
+    /// new hit and emitted token before its output can be used as coordinate evidence. A
+    /// `compressed` arm imports the reused prefix into its compressed cache.
+    pub(crate) fn campaign_prefix_reuse_observed(
+        &self,
+        prompt: &str,
+        observer: &mut dyn crate::campaign::Observer,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<(GenerationOutput, u64, u64)> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        if ids.len() < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign prefix-reuse prompt needs at least two tokens".into(),
+            ));
+        }
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign prefix reuse is not implemented for the hybrid Qwen3.6 cache".into(),
+            ));
+        };
+        let config = GenerationConfig {
+            max_new_tokens: 1,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = crate::decode::CancelFlag::new();
+        let mut cache_slot = self.campaign_prefix_cache.borrow_mut();
+        let cache = cache_slot.as_mut().ok_or_else(|| {
+            CoreError::InvalidRequest("campaign prefix cache was not seeded".into())
+        })?;
+        let before_hits = cache.stats().hits;
+        let mut emitted = 0usize;
+        let output = crate::decode::prefix::generate_cached_with_observer(
+            model,
+            &ids,
+            &config,
+            &cancel,
+            &mut |event| emitted += usize::from(matches!(event, StreamEvent::Token { .. })),
+            cache,
+            None,
+            None,
+            Some(observer),
+            compressed,
+        )
+        .map_err(to_core)?;
+        let hits = cache.stats().hits;
+        if hits <= before_hits || emitted == 0 {
+            return Err(CoreError::Load(
+                "campaign prefix reuse did not produce an observed cache hit and token".into(),
+            ));
+        }
+        Ok((
+            output,
+            u64::try_from(hits)
+                .map_err(|_| CoreError::Load("campaign prefix hit count overflow".into()))?,
+            u64::try_from(ids.len())
+                .map_err(|_| CoreError::Load("campaign prefix token count overflow".into()))?,
+        ))
+    }
+
+    /// Drop campaign-only shared-prefix ownership before a post-request release sample. Ordinary
+    /// serving has no access to this cache; campaign workers must not let it retain MLX arrays and
+    /// then claim that request-scoped cache memory was released.
+    /// The stop tokens every product generation of this provider ends on.
+    pub(crate) fn campaign_stop_tokens(&self) -> &[i32] {
+        &self.stop_tokens
+    }
+
+    pub(crate) fn campaign_release_cache_state(&self) {
+        self.campaign_prefix_cache.borrow_mut().take();
+    }
+
+    /// Exercise the actual synchronous MLX batch decoder for the baseline's supported-batch arm.
+    /// This is not emulated by serial `TextLlm` requests.
+    pub(crate) fn campaign_supported_batch(&self, prompt: &str, batch: usize) -> CoreResult<u64> {
+        if batch < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign supported batch requires at least two rows".into(),
+            ));
+        }
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign supported batch is unavailable for the hybrid Qwen3.6 decoder".into(),
+            ));
+        };
+        let requests = (0..batch)
+            .map(|lane| BatchRequest {
+                prompt_ids: ids.clone(),
+                sampling: SamplingParams::default(),
+                seed: Some(lane as u64),
+                max_new_tokens: 2,
+                stop_tokens: self.stop_tokens.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cancel = CancelFlag::new();
+        let mut emitted = 0usize;
+        let outputs = generate_batch(model, &requests, &cancel, &mut |_, event| {
+            emitted += usize::from(matches!(event, StreamEvent::Token { .. }));
+        })
+        .map_err(to_core)?;
+        if outputs.len() != batch || emitted == 0 {
+            return Err(CoreError::InvalidRequest(
+                "campaign batch produced no product tokens".into(),
+            ));
+        }
+        Ok(outputs.len() as u64)
+    }
+
+    /// Run the actual batched decoder while the receipt observer is attached to its prefill and
+    /// decode path.  Ordinary scheduling continues to call [`Self::campaign_supported_batch`].
+    pub(crate) fn campaign_supported_batch_observed(
+        &self,
+        prompt: &str,
+        batch: usize,
+        observer: &mut dyn crate::campaign::Observer,
+    ) -> CoreResult<(Vec<GenerationOutput>, u64)> {
+        if batch < 2 {
+            return Err(CoreError::InvalidRequest(
+                "campaign supported batch requires at least two rows".into(),
+            ));
+        }
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "campaign supported batch is unavailable for the hybrid Qwen3.6 decoder".into(),
+            ));
+        };
+        let requests = (0..batch)
+            .map(|lane| BatchRequest {
+                prompt_ids: ids.clone(),
+                sampling: SamplingParams::default(),
+                seed: Some(lane as u64),
+                max_new_tokens: 2,
+                stop_tokens: self.stop_tokens.clone(),
+            })
+            .collect::<Vec<_>>();
+        let cancel = CancelFlag::new();
+        let mut emitted = 0usize;
+        let outputs = crate::decode::batch::generate_batch_with_observer(
+            model,
+            &requests,
+            &cancel,
+            &mut |_, event| emitted += usize::from(matches!(event, StreamEvent::Token { .. })),
+            Some(observer),
+        )
+        .map_err(to_core)?;
+        if outputs.len() != batch || emitted == 0 {
+            return Err(CoreError::InvalidRequest(
+                "campaign batch produced no observed product tokens".into(),
+            ));
+        }
+        Ok((
+            outputs,
+            u64::try_from(ids.len())
+                .map_err(|_| CoreError::Load("campaign batch token count overflow".into()))?,
+        ))
+    }
+
+    /// Deliberately cancel after the first emitted product token, proving the decoder's cooperative
+    /// cleanup path rather than recording a pre-cancelled no-op request. This uses a dedicated
+    /// no-tools prompt: a valid tool-only response is intentionally lifted out of the content
+    /// stream, so reusing a structured-output fixture would never trigger a content-token cancel.
+    pub(crate) fn campaign_cancel_after_first_token(
+        &self,
+        observer: &mut dyn crate::campaign::Observer,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<()> {
+        let mut request = campaign_cancellation_probe_request();
+        let cancel = crate::decode::CancelFlag::new();
+        request.cancel = cancel.clone();
+        let mut sink = |event: CoreEvent| {
+            if matches!(event, CoreEvent::Token { .. }) {
+                cancel.cancel();
+            }
+        };
+        let mut captured = CacheLifecycleCapture::default();
+        let output = self.generate_inner(&request, &mut sink, Some(&mut captured), packed, None)?;
+        if output.finish_reason != Some(CoreFinish::Cancelled) {
+            return Err(CoreError::Load(
+                "campaign cancellation did not finish as cancelled".into(),
+            ));
+        }
+        observer.phase("cancellation-cleanup");
+        captured.replay(observer);
+        Ok(())
+    }
+
+    /// SC-20671 steady-decode timing: prefill the raw `prompt` (the row's context) into a fresh
+    /// cache of the session's representation and greedily decode exactly `tokens` ids through any
+    /// stop token (see [`crate::decode::forced_greedy_decode`]). No observer is attached: this runs
+    /// outside every coordinate's memory attribution, and its request-scoped cache is reset and
+    /// MLX's buffer cache released before it returns.
+    pub(crate) fn campaign_steady_decode(
+        &self,
+        prompt: &str,
+        tokens: usize,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<crate::campaign::SteadyDecodeMeasurement> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let budget = u32::try_from(tokens)
+            .map_err(|_| CoreError::InvalidRequest("steady-decode length overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured =
+            campaign_steady_decode_on(&self.model, &ids, tokens, &self.stop_tokens, compressed);
+        mlx_rs::memory::clear_cache();
+        measured
+    }
+
+    /// SC-20671 forced continuation (compressed rows): on the session's representation, prefill the
+    /// raw `prompt` and greedily decode `min(tokens, context window - prompt)` ids through every
+    /// stop token. With `teacher_forced`, the decode is forced on that stream instead and the
+    /// session's argmax at each position is returned (its length is the stream's). Either way the
+    /// session's probability of every stream token is returned beside its choices, so both arms'
+    /// likelihoods are measured on the same tokens. Runs outside every coordinate's memory
+    /// attribution on a request-scoped cache.
+    pub(crate) fn campaign_forced_continuation(
+        &self,
+        prompt: &str,
+        tokens: usize,
+        compressed: Option<&crate::campaign::CompressedKvArm>,
+        teacher_forced: Option<&[i32]>,
+    ) -> CoreResult<crate::campaign::ScoredContinuation> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let window = usize::try_from(self.campaign_context_window()?)
+            .map_err(|_| CoreError::Load("context window overflows usize".into()))?;
+        let length = match teacher_forced {
+            Some(forced) => forced.len(),
+            None => tokens.min(window.saturating_sub(ids.len())),
+        };
+        let budget = u32::try_from(length)
+            .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured = campaign_forced_decode_on(
+            &self.model,
+            &ids,
+            length,
+            &self.stop_tokens,
+            compressed,
+            teacher_forced,
+            true,
+        );
+        mlx_rs::memory::clear_cache();
+        let measured = measured?;
+        Ok(crate::campaign::ScoredContinuation {
+            choices: measured.tokens,
+            stream_probabilities: measured.stream_probabilities,
+        })
+    }
+
+    /// SC-20669 dense noise-floor control (see [`campaign_chunked_prefill_decode_on`]): the dense
+    /// session teacher-forced on `stream` over the raw `prompt` prefilled in `prefill_chunk`-token
+    /// steps, scored on that stream. Refused on a compressed session's provider path by
+    /// construction: it always decodes the dense cache.
+    pub(crate) fn campaign_chunked_prefill_continuation(
+        &self,
+        prompt: &str,
+        stream: &[i32],
+        prefill_chunk: usize,
+    ) -> CoreResult<crate::campaign::ScoredContinuation> {
+        let ids = self
+            .tokenizer
+            .encode(prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect::<Vec<_>>();
+        let budget = u32::try_from(stream.len())
+            .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            ids.len(),
+            budget,
+        )?;
+        let measured = campaign_chunked_prefill_decode_on(
+            &self.model,
+            &ids,
+            stream,
+            &self.stop_tokens,
+            prefill_chunk,
+        );
+        mlx_rs::memory::clear_cache();
+        let measured = measured?;
+        Ok(crate::campaign::ScoredContinuation {
+            choices: measured.tokens,
+            stream_probabilities: measured.stream_probabilities,
+        })
+    }
+
     /// Load a provider from a snapshot directory (config.json + tokenizer.json + shards). Dispatches
     /// the decoder architecture from `config.json` (Llama / Mistral / Qwen3) and optionally
     /// quantizes the projections on load per `spec.quantize`.
     pub fn load(spec: &LoadSpec) -> CoreResult<Self> {
+        Self::load_inner(spec, false)
+    }
+
+    /// Campaign-only load which evaluates every tensor consumed by the product model constructor.
+    /// Ordinary serving keeps MLX's lazy-load behavior; the sealed memory campaign needs an exact
+    /// parameter-only materialization boundary before it samples `weights-loaded`.
+    pub(crate) fn load_for_campaign(spec: &LoadSpec) -> CoreResult<Self> {
+        Self::load_inner(spec, true)
+    }
+
+    fn load_inner(spec: &LoadSpec, materialize_campaign_weights: bool) -> CoreResult<Self> {
         if spec.projector_source.is_some()
             && Path::new(&spec.source).extension().and_then(|v| v.to_str()) != Some("gguf")
         {
@@ -655,6 +1551,26 @@ impl LlamaProvider {
         // has its own config/weights path (and `ModelConfig` deliberately rejects it).
         let cfg_value = read_config_value(dir)?;
         let arch = Architecture::from_config(&cfg_value).map_err(to_core)?;
+        let text_config = cfg_value.get("text_config").unwrap_or(&cfg_value);
+        let architecture_name = text_config
+            .get("architectures")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let model_type = text_config
+            .get("model_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let campaign_family = match arch {
+            Architecture::Qwen3 => Some("qwen"),
+            Architecture::Llama if architecture_name.contains("llama") || model_type == "llama" => {
+                Some("llama")
+            }
+            _ => None,
+        };
         let weights = Weights::from_dir(dir).map_err(to_core)?;
         let is_prism =
             cfg_value.get("model_type").and_then(|v| v.as_str()) == Some("prism_hadamard_qwen35");
@@ -691,12 +1607,12 @@ impl LlamaProvider {
                 let prefix = qwen35_dense_prefix(|key| weights.contains(key))?;
                 Qwen35Model::from_weights_with(&weights, prefix, qcfg, quant).map_err(to_core)?
             };
-            (Decoder::Qwen35(m), descriptor)
+            (Decoder::Qwen35(Box::new(m)), descriptor)
         } else {
             let cfg = ModelConfig::from_json(&cfg_value).map_err(to_core)?;
             let descriptor = descriptor_for(&cfg);
             let m = CausalLm::from_weights_with(&weights, "", cfg, quant).map_err(to_core)?;
-            (Decoder::Causal(m), descriptor)
+            (Decoder::Causal(Box::new(m)), descriptor)
         };
 
         // Qwen-VL vision: load the ViT tower when the checkpoint carries `model.visual.*` (a wrapped
@@ -775,6 +1691,7 @@ impl LlamaProvider {
             supports_reasoning_effort,
             supports_preserve_thinking,
             supports_tools,
+            tool_call_format,
         ) = load_chat_template(dir);
         descriptor.capabilities.supports_thinking = supports_thinking;
         descriptor.capabilities.supports_reasoning_effort = supports_reasoning_effort;
@@ -794,15 +1711,22 @@ impl LlamaProvider {
         }
         descriptor.capabilities.supports_preserve_thinking = supports_preserve_thinking;
         descriptor.capabilities.supports_tools = supports_tools;
+        if materialize_campaign_weights {
+            weights.materialize_accessed().map_err(to_core)?;
+        }
         Ok(Self {
             descriptor,
+            architecture: arch,
+            campaign_family,
             model,
             tokenizer,
             template,
+            tool_call_format,
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision,
             gemma4,
+            campaign_prefix_cache: RefCell::new(None),
             _prism_vision_weights: prism_vision_weights,
         })
     }
@@ -854,13 +1778,17 @@ impl LlamaProvider {
         };
         Ok(Self {
             descriptor,
-            model: Decoder::Qwen35(model),
+            architecture: Architecture::Qwen35,
+            campaign_family: None,
+            model: Decoder::Qwen35(Box::new(model)),
             tokenizer: loaded.tokenizer,
             template: loaded.template,
+            tool_call_format: tools.then_some(ToolCallFormat::Tagged),
             stop_tokens: loaded.stop_tokens,
             constraint_table: OnceCell::new(),
             vision,
             gemma4: None,
+            campaign_prefix_cache: RefCell::new(None),
             _prism_vision_weights: None,
         })
     }
@@ -878,15 +1806,25 @@ impl LlamaProvider {
     /// Assemble a provider from already-loaded parts with a default Llama-3 template (used by tests
     /// and converters that don't have a `tokenizer_config.json`).
     pub fn from_parts(model: CausalLm, tokenizer: Tokenizer, stop_tokens: Vec<i32>) -> Self {
+        let architecture = model.config().architecture;
+        let campaign_family = match architecture {
+            Architecture::Llama => Some("llama"),
+            Architecture::Qwen3 => Some("qwen"),
+            _ => None,
+        };
         Self {
             descriptor: provider_descriptor(),
-            model: Decoder::Causal(model),
+            architecture,
+            campaign_family,
+            model: Decoder::Causal(Box::new(model)),
             tokenizer,
             template: Box::new(Llama3Template),
+            tool_call_format: None,
             stop_tokens,
             constraint_table: OnceCell::new(),
             vision: None,
             gemma4: None,
+            campaign_prefix_cache: RefCell::new(None),
             _prism_vision_weights: None,
         }
     }
@@ -1174,6 +2112,20 @@ impl LlamaProvider {
     }
 }
 
+fn campaign_cancellation_probe_request() -> TextLlmRequest {
+    TextLlmRequest {
+        messages: vec![Message::text(
+            Role::User,
+            "Reply with exactly these words: alpha beta gamma delta epsilon zeta eta theta.",
+        )],
+        sampling: Sampling::greedy(),
+        max_new_tokens: 16,
+        seed: Some(0),
+        thinking: ThinkingMode::Disabled,
+        ..Default::default()
+    }
+}
+
 /// Adapts a `core_llm::JsonConstraint` to the engine's [`ConstraintMask`] decode seam.
 struct JsonMask<'a> {
     inner: JsonConstraint<'a>,
@@ -1282,22 +2234,50 @@ impl RewindableConstraintMask for JsonMask<'_> {
 /// present; otherwise fall back to the typed Llama-3 template. Also reports two template-gated
 /// capabilities, detected from the source (not the family, matching the transformers convention):
 /// - **thinking** — the template gates an `enable_thinking` kwarg (sc-7585).
-/// - **tools** — the template renders tool calls (it mentions `tool_call`), so it has a `tools`
-///   section and the model emits parseable `<tool_call>` blocks (sc-7636). Covers the Qwen3.6 XML and
-///   the Qwen2.5/Hermes JSON tool templates alike.
-fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool, bool, bool) {
+/// - **tools** — the template renders either tagged tool-call blocks or the bare JSON format shipped
+///   by Llama 3.2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolCallFormat {
+    Tagged,
+    BareJson,
+}
+
+fn tool_call_format(source: &str) -> Option<ToolCallFormat> {
+    if source.contains("<tool_call>") {
+        Some(ToolCallFormat::Tagged)
+    } else if source.contains("tool_call")
+        && source.contains("respond with JSON for a function call")
+    {
+        Some(ToolCallFormat::BareJson)
+    } else {
+        None
+    }
+}
+
+fn load_chat_template(
+    dir: &Path,
+) -> (
+    Box<dyn ChatTemplate>,
+    bool,
+    bool,
+    bool,
+    bool,
+    Option<ToolCallFormat>,
+) {
     // The sidecar `chat_template.jinja` wins over the embedded key — see `sidecar_chat_template`.
     if let Some(t) = sidecar_chat_template(dir) {
         let supports_thinking = t.source().contains("enable_thinking");
         let supports_reasoning_effort = t.source().contains("reasoning_effort");
         let supports_preserve_thinking = t.source().contains("preserve_thinking");
         let supports_tools = t.source().contains("tool_call");
+        let format = tool_call_format(t.source());
         return (
             Box::new(t),
             supports_thinking,
             supports_reasoning_effort,
             supports_preserve_thinking,
             supports_tools,
+            format,
         );
     }
     match JinjaChatTemplate::from_tokenizer_config_file(dir.join("tokenizer_config.json")) {
@@ -1306,16 +2286,48 @@ fn load_chat_template(dir: &Path) -> (Box<dyn ChatTemplate>, bool, bool, bool, b
             let supports_reasoning_effort = t.source().contains("reasoning_effort");
             let supports_preserve_thinking = t.source().contains("preserve_thinking");
             let supports_tools = t.source().contains("tool_call");
+            let format = tool_call_format(t.source());
             (
                 Box::new(t),
                 supports_thinking,
                 supports_reasoning_effort,
                 supports_preserve_thinking,
                 supports_tools,
+                format,
             )
         }
-        Err(_) => (Box::new(Llama3Template), false, false, false, false),
+        Err(_) => (Box::new(Llama3Template), false, false, false, false, None),
     }
+}
+
+/// Match the text-only `generate_inner` rendering/tokenization path without loading weights.
+/// Campaign preflight uses this before MLX admission; the product still revalidates at dispatch.
+pub(crate) fn campaign_preflight_request_tokens(
+    snapshot: &Path,
+    request: &TextLlmRequest,
+) -> CoreResult<u64> {
+    let tokenizer = Tokenizer::from_file(snapshot.join("tokenizer.json"))?;
+    let (template, ..) = load_chat_template(snapshot);
+    let prompt = template.render_with(
+        &request.messages,
+        &RenderOptions {
+            add_generation_prompt: true,
+            enable_thinking: request.enable_thinking_kwarg(),
+            reasoning_effort: request.reasoning_effort,
+            preserve_thinking: request.preserve_thinking,
+            tools: &request.tools,
+        },
+    )?;
+    u64::try_from(tokenizer.encode(&prompt, false)?.len())
+        .ok()
+        .and_then(|tokens| tokens.checked_add(u64::from(request.max_new_tokens)))
+        .ok_or_else(|| {
+            CoreError::InvalidRequest("campaign rendered request token count overflow".into())
+        })
+}
+
+pub(crate) fn campaign_preflight_cancellation_tokens(snapshot: &Path) -> CoreResult<u64> {
+    campaign_preflight_request_tokens(snapshot, &campaign_cancellation_probe_request())
 }
 
 /// The modern HF layout ships the chat template as a **separate `chat_template.jinja`** beside
@@ -1368,6 +2380,22 @@ fn tool_pieces(seg: &mut Option<ToolCallSegmenter>, text: &str) -> Vec<String> {
     }
 }
 
+/// Parse the complete bare JSON tool-call form emitted by Llama 3.2. This is deliberately an
+/// end-of-generation operation: unlike tagged formats, raw JSON has no streaming boundary that can
+/// distinguish a tool call from ordinary answer text until the document is complete.
+fn bare_json_tool_calls(text: &str, tools: &[core_llm::ToolSpec]) -> Vec<ToolCall> {
+    let mut parser = ToolCallSegmenter::new(tools);
+    let wrapped = format!("<tool_call>{text}</tool_call>");
+    let mut remainder = parser.push(&wrapped).concat();
+    remainder.push_str(&parser.flush().concat());
+    let calls = parser.take_calls();
+    if remainder.trim().is_empty() {
+        calls
+    } else {
+        Vec::new()
+    }
+}
+
 /// Push one content piece through the stop matcher and emit the released text as a Content token
 /// event. Shared by the streaming loop and the end-of-generation tails. `*last_id` / `*emit_index`
 /// advance only when text is actually emitted, so the contract's token index stays gap-free across
@@ -1416,6 +2444,288 @@ impl TextLlm for LlamaProvider {
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(CoreEvent),
     ) -> CoreResult<TextLlmOutput> {
+        self.generate_inner(req, on_event, None, None, None)
+    }
+}
+
+impl LlamaProvider {
+    /// Campaign-only entrypoint. The observer is never installed on ordinary production calls.
+    /// `packed` selects the compressed arm: the observed decode then runs on the packed
+    /// group-affine cache with the retained fused reader (SC-20676 compressed rows).
+    pub(crate) fn generate_observed(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        observer: &mut dyn crate::campaign::Observer,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<TextLlmOutput> {
+        self.generate_inner(req, on_event, Some(observer), packed, None)
+    }
+
+    /// Render `messages` with `req`'s template options and tokenize. The template already includes
+    /// BOS, so encode without auto special tokens. `enable_thinking` (sc-7585) flows into the
+    /// template kwarg so a no-think (Disabled) request injects the model's empty `<think></think>`
+    /// generation prompt; Auto omits the kwarg (template default).
+    fn render_prompt(
+        &self,
+        req: &TextLlmRequest,
+        messages: &[Message],
+    ) -> CoreResult<(String, Vec<i32>)> {
+        let prompt = self.template.render_with(
+            messages,
+            &RenderOptions {
+                add_generation_prompt: true,
+                enable_thinking: req.enable_thinking_kwarg(),
+                // Bonsai's official model card does not recommend `low` as an effective distinct
+                // level, so it is omitted from the selectable capability list. The frozen template
+                // still accepts and renders `low`; preserve that compatibility input verbatim.
+                reasoning_effort: req.reasoning_effort,
+                preserve_thinking: req.preserve_thinking,
+                tools: &req.tools,
+            },
+        )?;
+        let prompt_ids: Vec<i32> = self
+            .tokenizer
+            .encode(&prompt, false)?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+        Ok((prompt, prompt_ids))
+    }
+
+    /// SC-20671 multi-turn prompt-cache fixture, turn 1: the request runs on the product
+    /// prompt-cache path into a fresh `store` (always a miss) and its `prompt + answer` K/V is
+    /// stored there for turn 2. Turn 1 is dense in every arm: the provider prefix store holds
+    /// shared prefixes as dense K/V, and only a compressed cache hit imports one. Returns the
+    /// answer, the turn's cache record, and its rendered prompt ids.
+    fn campaign_turn_one(
+        &self,
+        turn1: &TextLlmRequest,
+        store: &mut crate::decode::PrefixCache,
+    ) -> CoreResult<(TextLlmOutput, crate::campaign::PromptCacheTurn, Vec<i32>)> {
+        let (_, ids) = self.render_prompt(turn1, &turn1.messages)?;
+        let mut unobserved = CacheLifecycleCapture::default();
+        let before = store.stats();
+        let output = self.generate_inner(
+            turn1,
+            &mut |_| {},
+            Some(&mut unobserved),
+            None,
+            Some(&mut *store),
+        )?;
+        let turn = prompt_cache_turn(before, store, &ids)?;
+        if turn.cache_hit || store.len() != 1 {
+            return Err(CoreError::Load(
+                "multi-turn prompt cache: turn 1 must miss a fresh store and store its K/V".into(),
+            ));
+        }
+        Ok((output, turn, ids))
+    }
+
+    /// Turn 2 of the multi-turn fixture: turn 1's conversation, its answer, then `follow_up`.
+    fn campaign_turn_two_request(
+        turn1: &TextLlmRequest,
+        answer: &TextLlmOutput,
+        follow_up: &str,
+    ) -> TextLlmRequest {
+        let mut turn2 = turn1.clone();
+        turn2
+            .messages
+            .push(Message::text(Role::Assistant, answer.text.clone()));
+        turn2.messages.push(Message::text(Role::User, follow_up));
+        turn2
+    }
+
+    /// Turn 2 must be served by a prompt-cache hit reusing at least the prompt it shares with
+    /// turn 1 (fail closed otherwise: the fixture would measure a cold prefill).
+    fn require_turn_two_hit(
+        turn: &crate::campaign::PromptCacheTurn,
+        turn1_ids: &[i32],
+        turn2_ids: &[i32],
+    ) -> CoreResult<()> {
+        let shared = turn1_ids
+            .iter()
+            .zip(turn2_ids)
+            .take_while(|(left, right)| left == right)
+            .count()
+            .min(turn2_ids.len().saturating_sub(1)) as u64;
+        if !turn.cache_hit || turn.reused_prefix_tokens == 0 || turn.reused_prefix_tokens < shared {
+            return Err(CoreError::Load(format!(
+                "multi-turn prompt cache: turn 2 was not served by a prompt-cache hit over its \
+                 shared prefix (hit={}, reused={}, shared={shared})",
+                turn.cache_hit, turn.reused_prefix_tokens
+            )));
+        }
+        Ok(())
+    }
+
+    /// SC-20671 multi-turn prompt-cache fixture on the product prompt-cache path. Turn 1 runs the
+    /// request and stores its K/V ([`Self::campaign_turn_one`]); turn 2 appends the answer and
+    /// `follow_up` and is served by the cache hit — a dense seed, or, with `packed`, the prefix
+    /// imported into the compressed cache — with `observer` attached. Turn 2's output and both
+    /// turns' cache records are returned; a turn 2 that missed is refused.
+    pub(crate) fn campaign_multi_turn_observed(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        on_event: &mut dyn FnMut(CoreEvent),
+        observer: &mut dyn crate::campaign::Observer,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+    ) -> CoreResult<(TextLlmOutput, crate::campaign::MultiTurnPromptCacheTurns)> {
+        let mut store = crate::decode::PrefixCache::new(2);
+        let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
+        let turn2 = Self::campaign_turn_two_request(turn1, &answer, follow_up);
+        let (_, turn2_ids) = self.render_prompt(&turn2, &turn2.messages)?;
+        let before = store.stats();
+        let output =
+            self.generate_inner(&turn2, on_event, Some(observer), packed, Some(&mut store))?;
+        let turn2_cache = prompt_cache_turn(before, &store, &turn2_ids)?;
+        Self::require_turn_two_hit(&turn2_cache, &turn1_ids, &turn2_ids)?;
+        drop(store);
+        mlx_rs::memory::clear_cache();
+        Ok((
+            output,
+            crate::campaign::MultiTurnPromptCacheTurns {
+                turn1: turn1_cache,
+                turn2: turn2_cache,
+            },
+        ))
+    }
+
+    /// The multi-turn fixture's turn-2 forced continuation (SC-20671 contract v4): turn 1 exactly
+    /// as [`Self::campaign_multi_turn_observed`] runs it, then turn 2's prompt served by the same
+    /// prompt-cache hit (dense seed, or with `packed` the compressed import) and greedily decoded
+    /// for `min(tokens, context window - turn 2 prompt)` ids through every stop token. With
+    /// `teacher_forced`, the decode is forced on that stream and the session's argmax at every
+    /// position is returned. A compressed pass must run wholly on the fused reader.
+    pub(crate) fn campaign_multi_turn_forced_continuation(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        tokens: usize,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+        teacher_forced: Option<&[i32]>,
+    ) -> CoreResult<(Vec<i32>, crate::campaign::MultiTurnPromptCacheTurns)> {
+        self.campaign_multi_turn_continuation(
+            turn1,
+            follow_up,
+            tokens,
+            packed,
+            teacher_forced,
+            false,
+        )
+        .map(|(scored, turns)| (scored.choices, turns))
+    }
+
+    /// [`Self::campaign_multi_turn_forced_continuation`], also scoring the session's probability
+    /// of every turn-2 stream token (the SC-20669 dense multi-turn noise-floor control).
+    pub(crate) fn campaign_multi_turn_scored_continuation(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        tokens: usize,
+        teacher_forced: Option<&[i32]>,
+    ) -> CoreResult<(
+        crate::campaign::ScoredContinuation,
+        crate::campaign::MultiTurnPromptCacheTurns,
+    )> {
+        self.campaign_multi_turn_continuation(turn1, follow_up, tokens, None, teacher_forced, true)
+    }
+
+    fn campaign_multi_turn_continuation(
+        &self,
+        turn1: &TextLlmRequest,
+        follow_up: &str,
+        tokens: usize,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+        teacher_forced: Option<&[i32]>,
+        score: bool,
+    ) -> CoreResult<(
+        crate::campaign::ScoredContinuation,
+        crate::campaign::MultiTurnPromptCacheTurns,
+    )> {
+        let Decoder::Causal(model) = &self.model else {
+            return Err(CoreError::Unsupported(
+                "the multi-turn prompt-cache fixture requires the causal decoder's prefix cache"
+                    .into(),
+            ));
+        };
+        let mut store = crate::decode::PrefixCache::new(2);
+        let (answer, turn1_cache, turn1_ids) = self.campaign_turn_one(turn1, &mut store)?;
+        let turn2 = Self::campaign_turn_two_request(turn1, &answer, follow_up);
+        let (_, turn2_ids) = self.render_prompt(&turn2, &turn2.messages)?;
+        let window = usize::try_from(self.campaign_context_window()?)
+            .map_err(|_| CoreError::Load("context window overflows usize".into()))?;
+        // The fixture is sized so turn 2 leaves the full continuation; never shorten it.
+        if teacher_forced.is_none() && window.saturating_sub(turn2_ids.len()) < tokens {
+            return Err(CoreError::InvalidRequest(format!(
+                "multi-turn turn 2 ({} tokens) leaves fewer than the {tokens}-token forced \
+                 continuation in the {window}-token window",
+                turn2_ids.len()
+            )));
+        }
+        let length = teacher_forced.map_or(tokens, <[i32]>::len);
+        let budget = u32::try_from(length)
+            .map_err(|_| CoreError::InvalidRequest("forced continuation overflows".into()))?;
+        validate_context_window(
+            self.descriptor.capabilities.max_context_tokens,
+            turn2_ids.len(),
+            budget,
+        )?;
+        let before = store.stats();
+        let measured = crate::decode::prefix::forced_cached_decode(
+            model,
+            &turn2_ids,
+            &mut store,
+            packed,
+            length,
+            &self.stop_tokens,
+            teacher_forced,
+            score,
+        );
+        let turn2_cache = prompt_cache_turn(before, &store, &turn2_ids);
+        drop(store);
+        mlx_rs::memory::clear_cache();
+        let measured = measured.map_err(to_core)?;
+        let turn2_cache = turn2_cache?;
+        Self::require_turn_two_hit(&turn2_cache, &turn1_ids, &turn2_ids)?;
+        if packed.is_some() {
+            let fused = measured.fallbacks.is_empty()
+                && measured.packed_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.accepted_direct_calls > 0
+                        && evidence.fallback_reasons.is_empty()
+                        && !evidence.dense_active
+                        && evidence.full_cache_dequantizations == 0
+                        && evidence.failed_dispatches == 0
+                });
+            if !fused {
+                return Err(CoreError::Load(
+                    "compressed multi-turn forced continuation did not run wholly on the fused \
+                     compressed reader"
+                        .into(),
+                ));
+            }
+        }
+        Ok((
+            crate::campaign::ScoredContinuation {
+                choices: measured.decode.tokens,
+                stream_probabilities: measured.decode.stream_probabilities,
+            },
+            crate::campaign::MultiTurnPromptCacheTurns {
+                turn1: turn1_cache,
+                turn2: turn2_cache,
+            },
+        ))
+    }
+
+    fn generate_inner(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(CoreEvent),
+        observer: Option<&mut dyn crate::campaign::Observer>,
+        packed: Option<&crate::campaign::CompressedKvArm>,
+        prefix_cache: Option<&mut crate::decode::PrefixCache>,
+    ) -> CoreResult<TextLlmOutput> {
         self.validate(req)?;
         if req.cancel.is_cancelled() {
             return Err(CoreError::Canceled); // typed pre-inference cancel
@@ -1443,6 +2753,18 @@ impl TextLlm for LlamaProvider {
         let gemma4_mm_request = self.gemma4.is_some()
             && (!collect_images(&req.messages).is_empty()
                 || !collect_audio(&req.messages).is_empty());
+        // The compressed arm is wired only through the observed text decode; any other route would
+        // silently run dense under a compressed label.
+        if packed.is_some() && (observer.is_none() || multimodal || gemma4_mm_request) {
+            return Err(CoreError::Unsupported(
+                "compressed campaign decode supports only observed text generation".into(),
+            ));
+        }
+        if prefix_cache.is_some() && (observer.is_none() || multimodal || gemma4_mm_request) {
+            return Err(CoreError::Unsupported(
+                "campaign prompt-cache decode supports only observed text generation".into(),
+            ));
+        }
         let substituted;
         let messages: &[Message] = if gemma4_mm_request {
             substituted = substitute_gemma4_placeholders(&req.messages)?;
@@ -1454,29 +2776,7 @@ impl TextLlm for LlamaProvider {
             &req.messages
         };
 
-        // Render the conversation and tokenize. The template already includes BOS, so encode
-        // without auto special tokens. `enable_thinking` (sc-7585) flows into the template kwarg so
-        // a no-think (Disabled) request injects the model's empty `<think></think>` generation
-        // prompt; Auto omits the kwarg (template default).
-        let prompt = self.template.render_with(
-            messages,
-            &RenderOptions {
-                add_generation_prompt: true,
-                enable_thinking: req.enable_thinking_kwarg(),
-                // Bonsai's official model card does not recommend `low` as an effective distinct
-                // level, so it is omitted from the selectable capability list. The frozen template
-                // still accepts and renders `low`; preserve that compatibility input verbatim.
-                reasoning_effort: req.reasoning_effort,
-                preserve_thinking: req.preserve_thinking,
-                tools: &req.tools,
-            },
-        )?;
-        let prompt_ids: Vec<i32> = self
-            .tokenizer
-            .encode(&prompt, false)?
-            .into_iter()
-            .map(|id| id as i32)
-            .collect();
+        let (prompt, prompt_ids) = self.render_prompt(req, messages)?;
 
         // MLX uses unified memory. Admit from a fresh host availability snapshot before visual
         // preprocessing or model execution, using pure request geometry for visual expansion.
@@ -1649,8 +2949,9 @@ impl TextLlm for LlamaProvider {
         // it lifts `<tool_call>` blocks out of the answer channel (markup excluded from the streamed
         // text) and parses them into structured calls (sc-7636). `None` otherwise, so a no-tools
         // request flows straight through `tool_pieces` unchanged.
-        let tools_active = self.descriptor.capabilities.supports_tools && !req.tools.is_empty();
-        let mut tool_seg = tools_active.then(|| ToolCallSegmenter::new(&req.tools));
+        let tools_active = self.tool_call_format.is_some() && !req.tools.is_empty();
+        let mut tool_seg = matches!(self.tool_call_format, Some(ToolCallFormat::Tagged))
+            .then(|| ToolCallSegmenter::new(&req.tools));
 
         // Drive the internal loop; translate token-id events to contract text-delta events via
         // incremental detokenization (re-decode the running sequence, emit the new suffix). The
@@ -1825,37 +3126,109 @@ impl TextLlm for LlamaProvider {
                         .map_err(to_core)?;
                         (out, None, None)
                     }
-                    None => match (&self.model, mtp_draft_tokens) {
-                        (Decoder::Qwen35(model), Some(num_draft)) => {
-                            let (timed, stats) = generate_qwen35_mtp_with_timings(
-                                model,
-                                &prompt_ids,
-                                &config,
-                                num_draft,
-                                &req.cancel,
-                                &mut sink,
-                                json_mask
-                                    .as_mut()
-                                    .map(|m| m as &mut dyn RewindableConstraintMask),
-                                should_stop_opt,
-                            )
+                    None => {
+                        if let Some(observer) = observer {
+                            if mtp_draft_tokens.is_some() {
+                                return Err(CoreError::Unsupported(
+                                    "campaign observer cannot measure MTP decode".into(),
+                                ));
+                            }
+                            let packed_decoder = match (packed, &self.model) {
+                                (None, _) => None,
+                                (Some(arm), Decoder::Causal(model)) => {
+                                    Some(PackedCampaignDecoder {
+                                        model,
+                                        arm,
+                                        selection_fallbacks: RefCell::new(Vec::new()),
+                                    })
+                                }
+                                (Some(_), Decoder::Qwen35(_)) => {
+                                    return Err(CoreError::Unsupported(
+                                        "compressed campaign decode requires the causal decoder"
+                                            .into(),
+                                    ))
+                                }
+                            };
+                            let decoder: &dyn Decode = match &packed_decoder {
+                                Some(packed) => packed,
+                                None => &self.model,
+                            };
+                            let output = match (prefix_cache, &self.model) {
+                                // The product prompt-cache path (SC-20671 multi-turn fixture):
+                                // a hit seeds the dense cache or imports into the packed one.
+                                (Some(store), Decoder::Causal(model)) => {
+                                    crate::decode::prefix::generate_cached_with_observer(
+                                        model,
+                                        &prompt_ids,
+                                        &config,
+                                        &req.cancel,
+                                        &mut sink,
+                                        store,
+                                        json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                        should_stop_opt,
+                                        Some(&mut *observer),
+                                        packed,
+                                    )
+                                }
+                                (Some(_), Decoder::Qwen35(_)) => {
+                                    return Err(CoreError::Unsupported(
+                                        "the campaign prompt cache requires the causal decoder"
+                                            .into(),
+                                    ))
+                                }
+                                (None, _) => generate_with_observer(
+                                    decoder,
+                                    &prompt_ids,
+                                    &config,
+                                    &req.cancel,
+                                    &mut sink,
+                                    json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                    should_stop_opt,
+                                    Some(&mut *observer),
+                                ),
+                            }
                             .map_err(to_core)?;
-                            (timed.output, Some(stats), Some(timed.timer))
+                            for reason in packed_decoder
+                                .map(|packed| packed.selection_fallbacks.into_inner())
+                                .unwrap_or_default()
+                            {
+                                observer.dense_fallback("cache-selection", &reason);
+                            }
+                            (output, None, None)
+                        } else {
+                            match (&self.model, mtp_draft_tokens) {
+                                (Decoder::Qwen35(model), Some(num_draft)) => {
+                                    let (timed, stats) = generate_qwen35_mtp_with_timings(
+                                        model,
+                                        &prompt_ids,
+                                        &config,
+                                        num_draft,
+                                        &req.cancel,
+                                        &mut sink,
+                                        json_mask
+                                            .as_mut()
+                                            .map(|m| m as &mut dyn RewindableConstraintMask),
+                                        should_stop_opt,
+                                    )
+                                    .map_err(to_core)?;
+                                    (timed.output, Some(stats), Some(timed.timer))
+                                }
+                                _ => {
+                                    let timed = generate_with_timings(
+                                        &self.model,
+                                        &prompt_ids,
+                                        &config,
+                                        &req.cancel,
+                                        &mut sink,
+                                        json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
+                                        should_stop_opt,
+                                    )
+                                    .map_err(to_core)?;
+                                    (timed.output, None, Some(timed.timer))
+                                }
+                            }
                         }
-                        _ => {
-                            let timed = generate_with_timings(
-                                &self.model,
-                                &prompt_ids,
-                                &config,
-                                &req.cancel,
-                                &mut sink,
-                                json_mask.as_mut().map(|m| m as &mut dyn ConstraintMask),
-                                should_stop_opt,
-                            )
-                            .map_err(to_core)?;
-                            (timed.output, None, Some(timed.timer))
-                        }
-                    },
+                    }
                 },
             }
         };
@@ -1931,14 +3304,21 @@ impl TextLlm for LlamaProvider {
         // `streamed` accumulates only `IncrementalDetok`-released deltas, so it carries no
         // transient U+FFFD placeholders; a character truncated by end-of-generation is dropped
         // rather than surfaced as U+FFFD (sc-12452).
-        let text = if stop_active || thinking_active || tools_active {
+        let mut text = if stop_active || thinking_active || tools_active {
             streamed
         } else {
             let gen_u32: Vec<u32> = out.tokens.iter().map(|&i| i as u32).collect();
             tokenizer.decode(&gen_u32, true)?
         };
         let thinking = (!thinking_buf.is_empty()).then_some(thinking_buf);
-        let tool_calls = tool_seg.map(|mut ts| ts.take_calls()).unwrap_or_default();
+        let mut tool_calls = tool_seg.map(|mut ts| ts.take_calls()).unwrap_or_default();
+        if matches!(self.tool_call_format, Some(ToolCallFormat::BareJson)) && tools_active {
+            let parsed = bare_json_tool_calls(&text, &req.tools);
+            if !parsed.is_empty() {
+                tool_calls = parsed;
+                text.clear();
+            }
+        }
         let finish = map_finish(out.finish_reason);
         let usage = Usage {
             prompt_tokens: prompt_len as u32,
@@ -2216,16 +3596,12 @@ fn estimate_qwen35_workspace_extra_bytes(
         evaluator_elements,
     ])?;
     let prompt_workspace = checked_product([prompt, per_token_elements, 4])?;
-    // The shared tiled estimate prices one score/mask/softmax set. MLX can retain the same three
-    // buffers for the rest of its evaluator window, so price those additional tiles here.
-    let attention_window = checked_product([
-        prompt,
-        prompt.min(SDPA_MAX_FUSED_QLEN as u64),
-        query_heads,
-        3,
-        MLX_EVAL_BUFFER_WINDOW.checked_sub(1)?,
-        4,
-    ])?;
+    // The shared tiled estimate prices one attention tile (F32 scores). MLX can retain the same
+    // tile's buffers for the rest of its evaluator window, so price those additional tiles here.
+    let kv_heads = nonnegative(config.num_kv_heads)?;
+    let attention_window =
+        prefill_attention_tile_bytes(prompt, query_heads, kv_heads, head_dim, 4)?
+            .checked_mul(MLX_EVAL_BUFFER_WINDOW.checked_sub(1)?)?;
 
     // Each retained recurrence row owns a separate allocator buffer; price its VM-page rounding.
     let y_row_bytes = value_width.checked_mul(4)?;
@@ -2257,6 +3633,54 @@ fn estimate_qwen35_workspace_extra_bytes(
     ])
 }
 
+/// Scalar width of the attention scores, additive mask and softmax weights priced by the request
+/// estimate: `sdpa_eager` upcasts all three to F32 for a BF16 decoder.
+const EAGER_SCORE_ELEMENT_BYTES: u64 = dtype_bytes(Dtype::Float32);
+
+/// Scalar width the request estimate prices K/V, decoder activations and logits at.
+///
+/// Since sc-20671 every decoder runs these in its compute dtype, whatever dtype the snapshot
+/// stores its quantized scales in. The Prism/Bonsai path is held at the F32 width: its F16 scales
+/// promoted the whole decoder to F32 before sc-20671, and its frozen allocator peaks (the
+/// `qwen35_prism_estimate_covers_frozen_allocator_peaks…` floors) were measured on that path. At
+/// the compute width the 27-token floor is no longer covered, so the width stays until those
+/// peaks are re-taken on the BF16 path at epic end (SC-20671 dense-baseline contract doc).
+fn priced_compute_element_bytes(compute: Dtype, prism: bool) -> u64 {
+    if prism {
+        dtype_bytes(Dtype::Float32)
+    } else {
+        dtype_bytes(compute)
+    }
+}
+
+/// The shared tiled estimate with the attention term priced from the tile `sdpa` actually runs for
+/// this geometry ([`prefill_attention_tile_bytes`]): a `rows × k_len` mask slice for fused
+/// full-kernel blocks, a per-head score/mask/softmax set for row chunks (sc-20676).
+fn estimate_routed_request_bytes(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+) -> Option<u64> {
+    let attention = prefill_attention_tile_bytes(
+        u64::try_from(prompt_tokens).ok()?,
+        geometry.query_heads,
+        geometry.kv_heads,
+        geometry.head_dim,
+        geometry.score_element_bytes,
+    )?;
+    core_llm::estimate_tiled_request_bytes_with_recurrent_copies(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        attention,
+        if mtp_width > 0 { 3 } else { 1 },
+    )
+}
+
 /// Select the estimate matching the complete decoder execution graph. Generic fused attention uses
 /// the shared tiled estimate. Dense Qwen3.5 adds its F32 recurrence, packed-Hadamard, allocator, and
 /// lazy-evaluator lifetimes; eager/otherwise-unbounded implementations retain the quadratic model.
@@ -2276,22 +3700,20 @@ fn estimate_mlx_request_bytes(
             vision_workspace_bytes,
             mtp_width,
         ),
-        MlxWorkspaceContract::Chunked => core_llm::estimate_chunked_request_bytes(
+        MlxWorkspaceContract::Chunked => estimate_routed_request_bytes(
             prompt_tokens,
             max_new_tokens,
             geometry,
             vision_workspace_bytes,
             mtp_width,
-            SDPA_MAX_FUSED_QLEN as usize,
         ),
         MlxWorkspaceContract::Qwen35 { config, prism } => {
-            let base = core_llm::estimate_chunked_request_bytes(
+            let base = estimate_routed_request_bytes(
                 prompt_tokens,
                 max_new_tokens,
                 geometry,
                 vision_workspace_bytes,
                 mtp_width,
-                SDPA_MAX_FUSED_QLEN as usize,
             )?;
             base.checked_add(estimate_qwen35_workspace_extra_bytes(
                 prompt_tokens,
@@ -2532,6 +3954,55 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[derive(Default)]
+    struct RecordingLifecycleObserver(Vec<(&'static str, u64)>);
+
+    impl crate::campaign::Observer for RecordingLifecycleObserver {
+        fn phase(&mut self, _name: &'static str) {}
+
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+
+        fn cache_snapshot(
+            &mut self,
+            bytes: u64,
+            _tokens: u64,
+            _capacity: u64,
+            _element_bytes: u64,
+        ) {
+            self.0.push(("persistent", bytes));
+        }
+
+        fn release_event(&mut self, _kind: &'static str, _role: &'static str, bytes: u64) {
+            self.0.push(("released", bytes));
+        }
+    }
+
+    #[test]
+    fn cancellation_capture_replays_persistent_then_release_without_allocation_aliasing() {
+        let mut capture = CacheLifecycleCapture::default();
+        crate::campaign::Observer::cache_snapshot(&mut capture, 64, 8, 8, 4);
+        crate::campaign::Observer::release_event(&mut capture, "cache_release", "cache", 64);
+        assert!(matches!(
+            capture.events.first(),
+            Some(CapturedCacheLifecycle::Snapshot(64, 8, 8, 4))
+        ));
+        let mut observer = RecordingLifecycleObserver::default();
+        capture.replay(&mut observer);
+        assert_eq!(observer.0, vec![("persistent", 64), ("released", 64)]);
+    }
+
+    #[test]
+    fn campaign_cancellation_probe_is_bounded_content_without_tools_or_thinking() {
+        let request = campaign_cancellation_probe_request();
+        assert_eq!(request.messages.len(), 1);
+        assert!(request.tools.is_empty());
+        assert!(request.stop.is_empty());
+        assert!(request.constraint.is_none());
+        assert_eq!(request.thinking, ThinkingMode::Disabled);
+        assert_eq!(request.max_new_tokens, 16);
+        assert!(request.sampling.is_greedy());
+    }
+
     #[test]
     fn qwen35_dense_checkpoint_selects_one_decoder_root() {
         let select = |keys: &[&str]| qwen35_dense_prefix(|key| keys.contains(&key));
@@ -2581,7 +4052,8 @@ mod tests {
             kv_heads: 4,
             head_dim: 128,
             layers: 64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, false),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -2602,6 +4074,71 @@ mod tests {
         );
     }
 
+    /// The shared tiled estimate with the attention term `sdpa`'s routing implies for `geometry`.
+    fn routed_estimate(prompt: usize, new_tokens: u32, geometry: LlmMemoryGeometry) -> u64 {
+        let attention = prefill_attention_tile_bytes(
+            prompt as u64,
+            geometry.query_heads,
+            geometry.kv_heads,
+            geometry.head_dim,
+            geometry.score_element_bytes,
+        )
+        .unwrap();
+        core_llm::estimate_tiled_request_bytes_with_recurrent_copies(
+            prompt, new_tokens, geometry, 0, 0, attention, 1,
+        )
+        .unwrap()
+    }
+
+    /// sc-20676: the chunked contract prices the tile `sdpa` actually runs — a `rows × k_len` mask
+    /// slice for a full-kernel head dim, a per-head score set over `rows · gqa ≤ 32` rows otherwise
+    /// (Phi-3's head dim 96 used to be priced as 8-row tiles while running one unfused call).
+    #[test]
+    fn chunked_contract_prices_the_routed_attention_tile() {
+        let with_head_dim = |head_dim, query_heads, kv_heads| LlmMemoryGeometry {
+            query_heads,
+            kv_heads,
+            head_dim,
+            layers: 32,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, false),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
+            hidden_size: 3072,
+            intermediate_size: 8192,
+            vocab_size: 32_064,
+            recurrent_bytes: 0,
+        };
+        let prompt = 16_384usize;
+        for (head_dim, query_heads, kv_heads) in [(128, 24, 8), (96, 32, 32), (256, 16, 2)] {
+            let geometry = with_head_dim(head_dim, query_heads, kv_heads);
+            let estimate = estimate_mlx_request_bytes(
+                prompt,
+                16,
+                geometry,
+                0,
+                0,
+                MlxWorkspaceContract::Chunked,
+            )
+            .unwrap();
+            assert_eq!(
+                estimate,
+                routed_estimate(prompt, 16, geometry),
+                "head_dim {head_dim}"
+            );
+        }
+        // The full-kernel block's mask slice (16k × 2048 × 4 B) outweighs the old 8-row tile.
+        let block = routed_estimate(prompt, 16, with_head_dim(128, 24, 8));
+        let old_tile = core_llm::estimate_chunked_request_bytes(
+            prompt,
+            16,
+            with_head_dim(128, 24, 8),
+            0,
+            0,
+            8,
+        )
+        .unwrap();
+        assert!(block > old_tile);
+    }
+
     #[test]
     fn fused_request_estimate_is_checked_and_preserves_mtp_and_media_costs() {
         let geometry = LlmMemoryGeometry {
@@ -2609,7 +4146,8 @@ mod tests {
             kv_heads: 2,
             head_dim: 64,
             layers: 4,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, false),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 256,
             intermediate_size: 512,
             vocab_size: 1024,
@@ -2651,7 +4189,8 @@ mod tests {
             kv_heads: 4,
             head_dim: 256,
             layers: 64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, true),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -2675,10 +4214,33 @@ mod tests {
         assert!(arithmetic >= 773_229_760, "estimate: {arithmetic}");
         assert!(context_64 >= 4_091_010_468, "estimate: {context_64}");
         assert!(context_512 >= 22_885_373_536, "estimate: {context_512}");
-        assert_eq!(arithmetic, 788_726_144);
-        assert_eq!(context_64, 7_974_200_704);
-        assert_eq!(context_512, 32_756_098_432);
-        assert_eq!(context_2048, 117_722_604_928);
+        // The Prism hold (see `priced_compute_element_bytes`) exceeds the compute-width estimate
+        // by exactly the K/V, activation and last-row logit terms at the width difference; every
+        // other term is width-independent.
+        let compute_width = LlmMemoryGeometry {
+            element_bytes: dtype_bytes(Dtype::Bfloat16),
+            ..geometry
+        };
+        let delta = geometry.element_bytes - compute_width.element_bytes;
+        for (prompt, estimate) in [
+            (27_u64, arithmetic),
+            (1_187, context_64),
+            (9_251, context_512),
+            (36_899, context_2048),
+        ] {
+            let g = geometry;
+            let kv = (prompt + 128) * g.layers * g.kv_heads * g.head_dim * delta * 2;
+            let activations = prompt * (g.intermediate_size * 3 + g.hidden_size * 8) * delta
+                + g.vocab_size * delta;
+            let at_compute_width =
+                estimate_mlx_request_bytes(prompt as usize, 128, compute_width, 0, 0, contract)
+                    .unwrap();
+            assert_eq!(
+                estimate - at_compute_width,
+                kv + activations,
+                "prompt {prompt}"
+            );
+        }
         assert!(arithmetic < context_64 && context_64 < context_512 && context_512 < context_2048);
         assert!(
             core_llm::admit_request_memory(context_2048, 47_922_610_176).is_err(),
@@ -2694,7 +4256,8 @@ mod tests {
             kv_heads: 4,
             head_dim: 256,
             layers: 64,
-            element_bytes: 4,
+            element_bytes: priced_compute_element_bytes(Dtype::Bfloat16, true),
+            score_element_bytes: EAGER_SCORE_ELEMENT_BYTES,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -2708,8 +4271,14 @@ mod tests {
         // 256-step floor. A normal 128-token prompt remains admitted on an 8-GB machine.
         let scalar = estimate_mlx_request_bytes(1, 1, geometry, 0, 0, contract).unwrap();
         let ordinary = estimate_mlx_request_bytes(128, 128, geometry, 0, 0, contract).unwrap();
-        assert_eq!(scalar, 231_142_880);
-        assert_eq!(ordinary, 2_695_981_056);
+        for (prompt, new_tokens, estimate) in [(1, 1, scalar), (128, 128, ordinary)] {
+            assert_eq!(
+                estimate,
+                routed_estimate(prompt, new_tokens, geometry)
+                    + estimate_qwen35_workspace_extra_bytes(prompt, &config, true).unwrap(),
+                "prompt {prompt}"
+            );
+        }
         assert!(scalar < ordinary);
         assert!(core_llm::admit_request_memory(ordinary, 8_000_000_000).is_ok());
         assert!(
@@ -2787,7 +4356,7 @@ mod tests {
             "{{ enable_thinking }} {{ tool_call }}",
         )
         .unwrap();
-        let (_, thinking, effort, preserve, tools) = load_chat_template(dir.path());
+        let (_, thinking, effort, preserve, tools, _) = load_chat_template(dir.path());
         assert!(thinking);
         assert!(!effort);
         assert!(!preserve);
@@ -2798,7 +4367,7 @@ mod tests {
             "{{ enable_thinking }} {{ reasoning_effort }} {{ preserve_thinking }}",
         )
         .unwrap();
-        let (_, thinking, effort, preserve, tools) = load_chat_template(dir.path());
+        let (_, thinking, effort, preserve, tools, _) = load_chat_template(dir.path());
         assert!(thinking);
         assert!(effort);
         assert!(preserve);
@@ -2860,6 +4429,42 @@ mod tests {
         assert!(can_load_value(
             &json!({ "architectures": ["LlamaForCausalLM"], "model_type": "llama" })
         ));
+    }
+
+    #[test]
+    fn tool_format_distinguishes_tagged_and_llama_bare_json() {
+        assert_eq!(
+            tool_call_format("emit <tool_call>...</tool_call>"),
+            Some(ToolCallFormat::Tagged)
+        );
+        assert_eq!(
+            tool_call_format(
+                "message.tool_calls; please respond with JSON for a function call exactly"
+            ),
+            Some(ToolCallFormat::BareJson)
+        );
+        assert_eq!(tool_call_format("message.tool_calls only"), None);
+
+        let tools = [core_llm::ToolSpec::new(
+            "record_baseline_fact",
+            "Record a fact",
+            json!({
+                "type": "object",
+                "properties": {"fact": {"type": "string"}},
+                "required": ["fact"]
+            }),
+        )];
+        let calls = bare_json_tool_calls(
+            r#"{"name":"record_baseline_fact","parameters":{"fact":"SC20671 structured fixture"}}"#,
+            &tools,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "record_baseline_fact");
+        assert_eq!(
+            calls[0].arguments.get("fact"),
+            Some(&json!("SC20671 structured fixture"))
+        );
+        assert!(bare_json_tool_calls("ordinary answer", &tools).is_empty());
     }
 
     #[test]
@@ -2967,7 +4572,7 @@ mod tests {
         assert_eq!(cfg.architecture, Architecture::Qwen3Vl);
         assert_eq!(cfg.max_position_embeddings, 262144, "256K context");
 
-        let (template, _, _, _, _) = load_chat_template(&dir);
+        let (template, _, _, _, _, _) = load_chat_template(&dir);
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).expect("load tokenizer");
 
         for (case, expected) in oracle["cases"].as_object().unwrap() {
@@ -3281,5 +4886,1014 @@ mod tests {
             "w within per-frame grid"
         );
         let _ = h;
+    }
+
+    /// Tiny synthetic Llama whose head dimension the packed Metal reader supports.
+    fn tiny_packed_capable_model() -> CausalLm {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let cfg = crate::config::ModelConfig {
+            hidden_size: 128,
+            intermediate_size: 64,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 64,
+            vocab_size: 32,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            tie_word_embeddings: false,
+            architecture: crate::config::Architecture::Llama,
+            max_position_embeddings: 0,
+            quantization: None,
+            moe: None,
+            attn_logit_softcap: None,
+            final_logit_softcap: None,
+            query_pre_attn_scalar: None,
+            partial_rotary_factor: 1.0,
+            mla: None,
+            yarn: None,
+            mrope_section: None,
+            gemma4: None,
+        };
+        let mut rng = SplitMix64::new(0x5c20676);
+        let mut randn = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+            Array::from_slice(&data, shape)
+        };
+        let (h, v, inter) = (cfg.hidden_size, cfg.vocab_size, cfg.intermediate_size);
+        let (qd, kvd) = (
+            cfg.num_heads * cfg.head_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+        );
+        let mut m = std::collections::HashMap::new();
+        m.insert("model.embed_tokens.weight".to_string(), randn(&[v, h]));
+        m.insert(
+            "model.norm.weight".into(),
+            Array::ones::<f32>(&[h]).unwrap(),
+        );
+        m.insert("lm_head.weight".into(), randn(&[v, h]));
+        for i in 0..cfg.num_layers {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            m.insert(
+                p("input_layernorm.weight"),
+                Array::ones::<f32>(&[h]).unwrap(),
+            );
+            m.insert(
+                p("post_attention_layernorm.weight"),
+                Array::ones::<f32>(&[h]).unwrap(),
+            );
+            m.insert(p("self_attn.q_proj.weight"), randn(&[qd, h]));
+            m.insert(p("self_attn.k_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.v_proj.weight"), randn(&[kvd, h]));
+            m.insert(p("self_attn.o_proj.weight"), randn(&[h, qd]));
+            m.insert(p("mlp.gate_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.up_proj.weight"), randn(&[inter, h]));
+            m.insert(p("mlp.down_proj.weight"), randn(&[h, inter]));
+        }
+        CausalLm::from_weights(&Weights::from_map(m), "", cfg).unwrap()
+    }
+
+    /// sc-20671: admission prices K/V, activations and logits at the width the decoder actually
+    /// caches (its compute dtype), and only the eager score term at F32. The Prism/Bonsai path is
+    /// held at F32 until its frozen allocator peaks are re-taken.
+    #[test]
+    fn memory_geometry_prices_kv_at_the_cached_width() {
+        let decoder = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let geometry = decoder.memory_geometry();
+        let Decoder::Causal(model) = &decoder else {
+            unreachable!()
+        };
+        let mut cache = model.new_cache();
+        model
+            .decode_logits(&input_ids(&[1, 2, 3]), &mut cache, 0)
+            .unwrap();
+        assert_eq!(cache.element_bytes().unwrap(), Some(geometry.element_bytes));
+        assert_eq!(geometry.element_bytes, dtype_bytes(model.compute_dtype()));
+        assert_eq!(
+            geometry.score_element_bytes,
+            dtype_bytes(Dtype::Float32),
+            "sdpa_eager scores stay F32"
+        );
+        assert_eq!(
+            priced_compute_element_bytes(Dtype::Bfloat16, true),
+            dtype_bytes(Dtype::Float32),
+            "Prism admission holds the pre-fix width until its peaks are re-taken"
+        );
+    }
+
+    #[derive(Default)]
+    struct CompressedArmCapture {
+        snapshots: Vec<u64>,
+        releases: Vec<u64>,
+        reconstructions: usize,
+        evidence: Vec<crate::primitives::PackedCacheEvidence>,
+        fallbacks: Vec<(String, String)>,
+        storage_tokens: Vec<u64>,
+    }
+
+    impl crate::campaign::Observer for CompressedArmCapture {
+        fn phase(&mut self, _name: &'static str) {}
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+        fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, _element: u64) {
+            self.snapshots.push(bytes);
+        }
+        fn release_event(&mut self, _kind: &'static str, _role: &'static str, bytes: u64) {
+            self.releases.push(bytes);
+        }
+        fn dense_reconstruction(&mut self, _bytes: u64) {
+            self.reconstructions += 1;
+        }
+        fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+            self.evidence.push(evidence.clone());
+        }
+        fn dense_fallback(&mut self, operation: &str, reason: &str) {
+            self.fallbacks.push((operation.into(), reason.into()));
+        }
+        fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+            self.storage_tokens.push(storage.tokens);
+        }
+    }
+
+    /// A compressed prefix hit imports the reused dense prefix into the arm's compressed cache by
+    /// quantize-on-append: the suffix prefill and decode run on the fused reader over the imported
+    /// history, nothing is reconstructed or recorded as a fallback, and the compressed cache never
+    /// re-enters the dense prefix store. A refused compressed selection keeps the dense seed and
+    /// records its reason instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_prefix_hit_imports_the_reused_prefix_into_the_compressed_cache() {
+        let model = tiny_packed_capable_model();
+        // Longer than one 32-token group, so the import packs a K group and keeps a residual. The
+        // ids stay inside the 32-token vocabulary: MLX's embedding gather is not bounds-checked,
+        // so an out-of-vocabulary id reads whatever the allocator last left past the table and
+        // the logits then depend on which test ran before.
+        let prompt = (0..40).map(|i| i % 31 + 1).collect::<Vec<i32>>();
+        let vocab = model.config().vocab_size;
+        assert!(prompt.iter().all(|id| (0..vocab).contains(id)));
+        let config = GenerationConfig {
+            max_new_tokens: 2,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = CancelFlag::new();
+        let seeded_store = || {
+            let mut store = crate::decode::PrefixCache::new(2);
+            crate::decode::generate_cached(
+                &model,
+                &prompt,
+                &config,
+                &cancel,
+                &mut |_| {},
+                &mut store,
+            )
+            .unwrap();
+            assert_eq!(store.len(), 1);
+            store
+        };
+
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        let mut store = seeded_store();
+        let mut capture = CompressedArmCapture::default();
+        let output = crate::decode::prefix::generate_cached_with_observer(
+            &model,
+            &prompt,
+            &config,
+            &cancel,
+            &mut |_| {},
+            &mut store,
+            None,
+            None,
+            Some(&mut capture),
+            Some(&arm),
+        )
+        .unwrap();
+        assert_eq!(output.tokens.len(), 2);
+        assert_eq!(store.stats().hits, 1);
+        assert!(capture.fallbacks.is_empty(), "{:?}", capture.fallbacks);
+        let [evidence] = capture.evidence.as_slice() else {
+            panic!("the compressed cache must export evidence once");
+        };
+        assert!(evidence.accepted_direct_calls > 0);
+        assert!(evidence.fallback_reasons.is_empty() && !evidence.dense_active);
+        assert_eq!(evidence.full_cache_dequantizations, 0);
+        assert_eq!(capture.reconstructions, 0);
+        // 39 imported prefix tokens (a whole-prompt match recomputes the last) plus the suffix.
+        assert_eq!(capture.storage_tokens.first(), Some(&40));
+        assert_eq!(store.len(), 1, "the compressed cache is not stored back");
+
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20676-prefix-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let mut store = seeded_store();
+        let mut capture = CompressedArmCapture::default();
+        crate::decode::prefix::generate_cached_with_observer(
+            &model,
+            &prompt,
+            &config,
+            &cancel,
+            &mut |_| {},
+            &mut store,
+            None,
+            None,
+            Some(&mut capture),
+            Some(&refused),
+        )
+        .unwrap();
+        assert!(
+            matches!(capture.fallbacks.as_slice(), [(operation, _)] if operation == "cache-selection"),
+            "{:?}",
+            capture.fallbacks
+        );
+        assert!(
+            capture.evidence.is_empty(),
+            "the dense seed carries the request"
+        );
+    }
+
+    /// Prefill logits, packed evidence and fallbacks of one observed generation.
+    #[derive(Default)]
+    struct PrefillLogitsCapture {
+        prefill: Vec<f32>,
+        evidence: Vec<crate::primitives::PackedCacheEvidence>,
+        fallbacks: Vec<(String, String)>,
+    }
+
+    impl crate::campaign::Observer for PrefillLogitsCapture {
+        fn phase(&mut self, _name: &'static str) {}
+        fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+        fn logits(&mut self, stage: &'static str, values: &[f32]) {
+            if stage == "prefill" {
+                self.prefill = values.to_vec();
+            }
+        }
+        fn packed_cache_evidence(&mut self, evidence: &crate::primitives::PackedCacheEvidence) {
+            self.evidence.push(evidence.clone());
+        }
+        fn dense_fallback(&mut self, operation: &str, reason: &str) {
+            self.fallbacks.push((operation.into(), reason.into()));
+        }
+    }
+
+    /// Multi-turn prompt-cache reuse on the 8-bit compressed arm agrees with dense (SC-20671
+    /// `multiTurnPromptCache` diagnosis). Turn 2 extends turn 1's prompt and answer; the dense
+    /// store holds turn 1. The dense hit, the compressed hit (prefix imported by quantize-on-append
+    /// at the reused offset) and a cold compressed turn 2 must choose the same tokens, with turn-2
+    /// prefill logits within 8-bit rounding of the dense hit. A misplaced, dropped or re-quantized
+    /// imported prefix moves the compressed logits by far more than that.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_8bit_multi_turn_prompt_cache_reuse_agrees_with_dense() {
+        let model = tiny_packed_capable_model();
+        let vocab = model.config().vocab_size;
+        // Turn 1 spans two 32-token groups plus a residual; ids stay inside the vocabulary.
+        let turn1 = (0..70).map(|i| (i * 7) % 31 + 1).collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 6,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let cancel = CancelFlag::new();
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine8
+            .arm()
+            .unwrap();
+        let turn1_store = || {
+            let mut store = crate::decode::PrefixCache::new(2);
+            let out = crate::decode::generate_cached(
+                &model,
+                &turn1,
+                &config,
+                &cancel,
+                &mut |_| {},
+                &mut store,
+            )
+            .unwrap();
+            (store, out.tokens)
+        };
+        let (_, answer) = turn1_store();
+        let mut turn2 = turn1.clone();
+        turn2.extend_from_slice(&answer);
+        turn2.extend((0..9).map(|i| (i * 5) % 31 + 1));
+        assert!(turn2.iter().all(|id| (0..vocab).contains(id)));
+
+        let turn2_run =
+            |store: &mut crate::decode::PrefixCache,
+             compressed: Option<&crate::campaign::CompressedKvArm>| {
+                let mut capture = PrefillLogitsCapture::default();
+                let out = crate::decode::prefix::generate_cached_with_observer(
+                    &model,
+                    &turn2,
+                    &config,
+                    &cancel,
+                    &mut |_| {},
+                    store,
+                    None,
+                    None,
+                    Some(&mut capture),
+                    compressed,
+                )
+                .unwrap();
+                (out.tokens, capture)
+            };
+        let (mut dense_store, _) = turn1_store();
+        let (dense_tokens, dense) = turn2_run(&mut dense_store, None);
+        let (mut hit_store, _) = turn1_store();
+        let (hit_tokens, hit) = turn2_run(&mut hit_store, Some(&arm));
+        let mut cold_store = crate::decode::PrefixCache::new(2);
+        let (cold_tokens, cold) = turn2_run(&mut cold_store, Some(&arm));
+
+        assert_eq!(dense_store.stats().hits, 1);
+        assert_eq!(
+            hit_store.stats().hits,
+            1,
+            "turn 2 must reuse turn 1's prefix"
+        );
+        assert_eq!(cold_store.stats().hits, 0);
+        for (label, capture) in [("hit", &hit), ("cold", &cold)] {
+            assert!(
+                capture.fallbacks.is_empty(),
+                "{label}: {:?}",
+                capture.fallbacks
+            );
+            assert!(
+                !capture.evidence.is_empty()
+                    && capture
+                        .evidence
+                        .iter()
+                        .all(|e| e.accepted_direct_calls > 0 && !e.dense_active),
+                "{label} must decode on the fused reader"
+            );
+        }
+        let max_abs = |a: &[f32], b: &[f32]| {
+            assert_eq!(a.len(), b.len());
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let scale = dense.prefill.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(scale > 0.0);
+        let hit_error = max_abs(&hit.prefill, &dense.prefill) / scale;
+        let cold_error = max_abs(&cold.prefill, &dense.prefill) / scale;
+        eprintln!(
+            "mtpc: 8-bit turn-2 prefill relative max error hit {hit_error} cold {cold_error}"
+        );
+        assert!(
+            hit_error < 0.02 && cold_error < 0.02,
+            "8-bit turn-2 prefill logits drifted from dense: hit {hit_error}, cold {cold_error}"
+        );
+        assert_eq!(hit_tokens, dense_tokens, "compressed reuse vs dense turn 2");
+        assert_eq!(cold_tokens, dense_tokens, "compressed cold vs dense turn 2");
+    }
+
+    /// A tiny packed-capable on-disk snapshot (head dim 64, 32-word vocabulary, a 2048-token
+    /// window, no reachable stop token) the provider loads like a real one.
+    fn tiny_packed_capable_snapshot() -> tempfile::TempDir {
+        use crate::primitives::sampler::{SplitMix64, TokenRng};
+        let dir = tempfile::tempdir().unwrap();
+        let mut vocab = serde_json::Map::new();
+        for (id, word) in ["<unk>", "<|", "|>", "user", "assistant", "eot_id"]
+            .into_iter()
+            .map(String::from)
+            .chain((6..32).map(|id| format!("w{id}")))
+            .enumerate()
+        {
+            vocab.insert(word, json!(id));
+        }
+        let tokenizer = json!({
+            "version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" }, "post_processor": null, "decoder": null,
+            "model": { "type": "WordLevel", "vocab": vocab, "unk_token": "<unk>" },
+        });
+        std::fs::write(dir.path().join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        let config = json!({
+            "architectures": ["LlamaForCausalLM"], "hidden_size": 128,
+            "intermediate_size": 64, "num_hidden_layers": 2, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 64, "vocab_size": 32, "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0, "tie_word_embeddings": false,
+            "max_position_embeddings": 2048, "eos_token_id": 99,
+        });
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let mut rng = SplitMix64::new(0x5c20671);
+        let mut randn = |shape: &[i32]| {
+            let n: i32 = shape.iter().product();
+            let data: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 0.4).collect();
+            Array::from_slice(&data, shape)
+        };
+        let mut arrays = vec![
+            (
+                "model.embed_tokens.weight".to_string(),
+                randn(&[32, 128]) * 4.0f32,
+            ),
+            (
+                "model.norm.weight".into(),
+                Array::ones::<f32>(&[128]).unwrap(),
+            ),
+        ];
+        // A head partly aligned with the embeddings gives decisive next-token margins (a random
+        // head over 32 words leaves bf16-rounding ties that flip even dense against dense), while
+        // the attention path still moves the argmax (2-bit K/V flips positions).
+        let head = &arrays[0].1 * 4.0f32 + randn(&[32, 128]);
+        arrays.push(("lm_head.weight".into(), head));
+        for i in 0..2 {
+            let p = |s: &str| format!("model.layers.{i}.{s}");
+            arrays.extend([
+                (
+                    p("input_layernorm.weight"),
+                    Array::ones::<f32>(&[128]).unwrap(),
+                ),
+                (
+                    p("post_attention_layernorm.weight"),
+                    Array::ones::<f32>(&[128]).unwrap(),
+                ),
+                (p("self_attn.q_proj.weight"), randn(&[128, 128])),
+                (p("self_attn.k_proj.weight"), randn(&[64, 128])),
+                (p("self_attn.v_proj.weight"), randn(&[64, 128])),
+                (p("self_attn.o_proj.weight"), randn(&[128, 128])),
+                (p("mlp.gate_proj.weight"), randn(&[64, 128])),
+                (p("mlp.up_proj.weight"), randn(&[64, 128])),
+                (p("mlp.down_proj.weight"), randn(&[128, 64])),
+            ]);
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, a)| (k.as_str(), a)).collect();
+        Array::save_safetensors(refs, None, dir.path().join("model.safetensors")).unwrap();
+        dir
+    }
+
+    /// SC-20671 contract v4 multi-turn prompt-cache fixture on the product provider path, at
+    /// 8-bit. Turn 1 runs and stores its K/V; turn 2 (turn 1's conversation, answer and a
+    /// follow-up) is served by a prompt-cache hit in both arms — the compressed arm importing the
+    /// prefix — and the compressed arm, teacher-forced on the dense turn-2 forced continuation,
+    /// agrees at >= 0.999 of 1024 positions. A turn 2 the cache did not serve is refused.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn multi_turn_prompt_cache_fixture_agrees_at_8_bit_and_requires_a_turn_two_hit() {
+        let snapshot = tiny_packed_capable_snapshot();
+        let provider = LlamaProvider::load_for_campaign(&core_llm::LoadSpec::dense(
+            snapshot.path().to_string_lossy().to_string(),
+        ))
+        .unwrap();
+        let words = (0..70)
+            .map(|i| format!("w{}", (i * 7) % 26 + 6))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let turn1 = TextLlmRequest {
+            messages: vec![Message::text(Role::User, words)],
+            sampling: core_llm::Sampling::greedy(),
+            max_new_tokens: 8,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let follow_up = "w7 w9 w11 w13 w15 w17 w19 w21 w23";
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine8
+            .arm()
+            .unwrap();
+
+        let (reference, dense_turns) = provider
+            .campaign_multi_turn_forced_continuation(&turn1, follow_up, 1024, None, None)
+            .unwrap();
+        assert_eq!(reference.len(), 1024, "every stop token is decoded through");
+        // SC-20669 dense multi-turn noise-floor control: the same flow scored. The dense reference
+        // reproduces the unscored stream, and a dense session teacher-forced on it through the
+        // same cache-hit path scores every turn-2 position.
+        let (scored, scored_turns) = provider
+            .campaign_multi_turn_scored_continuation(&turn1, follow_up, 1024, None)
+            .unwrap();
+        assert_eq!(scored.choices, reference);
+        assert_eq!(scored.stream_probabilities.len(), 1024);
+        assert_eq!(scored_turns, dense_turns);
+        let (forced, forced_turns) = provider
+            .campaign_multi_turn_scored_continuation(&turn1, follow_up, 1024, Some(&reference))
+            .unwrap();
+        assert_eq!(forced.choices, reference);
+        assert_eq!(forced.stream_probabilities, scored.stream_probabilities);
+        assert_eq!(forced_turns, dense_turns);
+        let (choices, compressed_turns) = provider
+            .campaign_multi_turn_forced_continuation(
+                &turn1,
+                follow_up,
+                1024,
+                Some(&arm),
+                Some(&reference),
+            )
+            .unwrap();
+        dense_turns.validate("dense").unwrap();
+        assert!(
+            dense_turns.turn2.reused_prefix_tokens >= dense_turns.turn1.prompt_tokens,
+            "turn 2 reuses all of turn 1's prompt: {dense_turns:?}"
+        );
+        assert_eq!(compressed_turns, dense_turns, "the same flow in both arms");
+        let evidence =
+            crate::campaign::multi_turn_forced_continuation_evidence(&reference, &choices).unwrap();
+        eprintln!(
+            "mtpc v4: 8-bit turn-2 teacher-forced agreement {} ({}/{}; flips {:?})",
+            evidence.agreement, evidence.matches, evidence.tokens, evidence.first_flip_positions
+        );
+        assert!(
+            evidence.agreement >= crate::campaign::COMPRESSED_MULTI_TURN_PROMPT_CACHE_MIN,
+            "{evidence:?}"
+        );
+
+        // The observed fixture: both arms' turn 2 is the same prompt-cache hit.
+        let observed = |packed: Option<&crate::campaign::CompressedKvArm>| {
+            let mut capture = CompressedArmCapture::default();
+            let (output, turns) = provider
+                .campaign_multi_turn_observed(&turn1, follow_up, &mut |_| {}, &mut capture, packed)
+                .unwrap();
+            assert!(capture.fallbacks.is_empty(), "{:?}", capture.fallbacks);
+            (output.text, turns, capture.evidence)
+        };
+        let (dense_text, dense_observed, dense_evidence) = observed(None);
+        let (compressed_text, compressed_observed, compressed_evidence) = observed(Some(&arm));
+        assert_eq!(dense_observed, dense_turns);
+        assert_eq!(compressed_observed, dense_turns);
+        assert!(dense_evidence.is_empty(), "the dense arm stays dense");
+        assert!(
+            !compressed_evidence.is_empty()
+                && compressed_evidence
+                    .iter()
+                    .all(|e| e.accepted_direct_calls > 0 && !e.dense_active),
+            "turn 2 decodes on the fused reader over the imported prefix"
+        );
+        assert!(!dense_text.is_empty() && !compressed_text.is_empty());
+
+        // The 2048-token window cannot hold turn 2 of a ~1100-token turn 1 plus the 1024-token
+        // continuation: refused before decoding, never shortened.
+        let long_turn1 = TextLlmRequest {
+            messages: vec![Message::text(
+                Role::User,
+                (0..1_100)
+                    .map(|i| format!("w{}", (i * 5) % 26 + 6))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )],
+            ..turn1.clone()
+        };
+        let error = provider
+            .campaign_multi_turn_forced_continuation(&long_turn1, follow_up, 1024, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("fewer than the 1024-token forced continuation"),
+            "{error}"
+        );
+
+        // A turn 2 the cache did not serve is refused.
+        let mut store = crate::decode::PrefixCache::new(2);
+        let (answer, _, turn1_ids) = provider.campaign_turn_one(&turn1, &mut store).unwrap();
+        let turn2 = LlamaProvider::campaign_turn_two_request(&turn1, &answer, follow_up);
+        let (_, turn2_ids) = provider.render_prompt(&turn2, &turn2.messages).unwrap();
+        let missed = crate::campaign::PromptCacheTurn {
+            prompt_tokens: turn2_ids.len() as u64,
+            prompt_sha256: crate::campaign::token_stream_sha256(&turn2_ids),
+            cache_hit: false,
+            reused_prefix_tokens: 0,
+        };
+        let error = LlamaProvider::require_turn_two_hit(&missed, &turn1_ids, &turn2_ids)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not served by a prompt-cache hit"),
+            "{error}"
+        );
+    }
+
+    /// A packed cache whose retained reader fails to bind still records the selection's own
+    /// reason rather than only the later generic dense-attention fallback.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_campaign_decoder_records_a_refused_reader_binding() {
+        let model = tiny_packed_capable_model();
+        let reader = crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+            crate::primitives::OpaqueCompiledKernel::new(
+                "sc20676rx-refused",
+                "cpu",
+                0,
+                std::sync::Arc::new(()),
+            ),
+        ));
+        let arm = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            reader,
+        );
+        let decoder = PackedCampaignDecoder {
+            model: &model,
+            arm: &arm,
+            selection_fallbacks: RefCell::new(Vec::new()),
+        };
+        let cache = decoder.make_cache();
+        assert!(
+            cache.packed_evidence().is_some(),
+            "a refused binding still yields the packed cache"
+        );
+        let fallbacks = decoder.selection_fallbacks.into_inner();
+        assert!(
+            matches!(fallbacks.as_slice(), [reason] if reason.contains("packed reader rejected before mutation")),
+            "{fallbacks:?}"
+        );
+    }
+
+    /// The compressed campaign decoder runs the whole observed generation (prefill and decode) on
+    /// the packed cache through the fused reader: no fallback, no dense reconstruction, and the
+    /// persistent KV it reports is the packed storage it later releases.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_campaign_decoder_keeps_prefill_and_decode_on_the_fused_reader() {
+        let model = tiny_packed_capable_model();
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        let decoder = PackedCampaignDecoder {
+            model: &model,
+            arm: &arm,
+            selection_fallbacks: RefCell::new(Vec::new()),
+        };
+        let mut capture = CompressedArmCapture::default();
+        let config = GenerationConfig {
+            max_new_tokens: 4,
+            seed: Some(0),
+            ..Default::default()
+        };
+        let output = crate::decode::generate_with_observer(
+            &decoder,
+            &[1, 2, 3, 4, 5],
+            &config,
+            &CancelFlag::new(),
+            &mut |_| {},
+            None,
+            None,
+            Some(&mut capture),
+        )
+        .unwrap();
+        assert_eq!(output.tokens.len(), 4);
+        assert!(decoder.selection_fallbacks.borrow().is_empty());
+        let [evidence] = capture.evidence.as_slice() else {
+            panic!("one compressed cache must export evidence once");
+        };
+        // Two layers: one fused prefill call plus three fused decode steps each.
+        assert_eq!(evidence.accepted_direct_calls, 2 * 4);
+        assert!(evidence.fallback_reasons.is_empty() && !evidence.dense_active);
+        assert_eq!(evidence.full_cache_dequantizations, 0);
+        assert_eq!(capture.reconstructions, 0);
+        assert!(!capture.snapshots.is_empty());
+        assert_eq!(capture.releases, vec![*capture.snapshots.last().unwrap()]);
+    }
+
+    /// SC-20671 prefill attribution through the real decode loop, at 2- and 4-bit. An empty
+    /// cache's first multi-row step attends on dense SDPA, so no output reads the packed store;
+    /// the cache must still materialize the store it reports at the step's commit. Left lazy, the
+    /// prefill-peak sample holds the step's dense K/V instead of the store, and the campaign's
+    /// `baseline + persistent KV` floor fails whenever that dense K/V is smaller than the
+    /// block-allocated store (Mac2 A2 qwen-short 4-bit: 80 prompt tokens, active growth
+    /// 9,504,184 B for a 12,845,056 B store; 2-bit passed only because its 9,175,040 B store
+    /// equals the 80-token dense K/V).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_prefill_sample_holds_the_reported_packed_store() {
+        #[derive(Default)]
+        struct PrefillCapture {
+            phase: Option<&'static str>,
+            prefill_active: Option<u64>,
+            prefill_kv: u64,
+            element_bytes: u64,
+        }
+        impl crate::campaign::Observer for PrefillCapture {
+            fn phase(&mut self, name: &'static str) {
+                self.phase = Some(name);
+                if name == "prefill-peak" {
+                    self.prefill_active = Some(mlx_rs::memory::get_active_memory() as u64);
+                }
+            }
+            fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+            fn cache_snapshot(&mut self, bytes: u64, _tokens: u64, _capacity: u64, element: u64) {
+                if self.phase == Some("prefill-peak") {
+                    self.prefill_kv = self.prefill_kv.max(bytes);
+                    self.element_bytes = element;
+                }
+            }
+        }
+        let model = tiny_packed_capable_model();
+        // 40 tokens: past the fused-SDPA row limit (the dense first step), one flushed 32-token
+        // group and an 8-token residual.
+        let prompt = (0..40).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
+        let config = GenerationConfig {
+            max_new_tokens: 2,
+            seed: Some(0),
+            ..Default::default()
+        };
+        for method in crate::campaign::CompressedKvMethod::ALL {
+            let arm = method.arm().unwrap();
+            let decoder = PackedCampaignDecoder {
+                model: &model,
+                arm: &arm,
+                selection_fallbacks: RefCell::new(Vec::new()),
+            };
+            let run = |observer: Option<&mut dyn crate::campaign::Observer>| {
+                crate::decode::generate_with_observer(
+                    &decoder,
+                    &prompt,
+                    &config,
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                    None,
+                    None,
+                    observer,
+                )
+                .unwrap();
+            };
+            // Warm the reader and the lazily created weights so the baseline is steady. Tests run
+            // one at a time (`.cargo/config.toml`), so the process-global counter is ours.
+            run(None);
+            let baseline = mlx_rs::memory::get_active_memory() as u64;
+            let mut capture = PrefillCapture::default();
+            run(Some(&mut capture));
+            assert!(
+                decoder.selection_fallbacks.borrow().is_empty(),
+                "{method:?} selected the packed cache"
+            );
+            // The failing scenario: the prompt's dense K + V (2 layers, 1 KV head, D64, at the
+            // cache's element width) is smaller than the reported store.
+            let dense_prompt_kv = 2 * 2 * 40 * 64 * capture.element_bytes;
+            assert!(
+                dense_prompt_kv < capture.prefill_kv,
+                "{method:?}: dense {dense_prompt_kv} B vs store {} B",
+                capture.prefill_kv
+            );
+            let growth = capture.prefill_active.unwrap().saturating_sub(baseline);
+            assert!(
+                growth >= capture.prefill_kv,
+                "{method:?}: prefill-peak active growth {growth} B does not hold the reported \
+                 packed store {} B",
+                capture.prefill_kv
+            );
+        }
+    }
+
+    /// SC-20671 storage reconciliation through the real decode loop, at 2- and 4-bit: a prompt
+    /// that crosses a 256-token block boundary leaves a pending residual, and the decode that
+    /// follows (including a group flush) stays inside the last block, so the device share is a
+    /// plateau. The coordinate storage the campaign observer keeps must be the plateau's latest
+    /// instant: its device share is the largest persistent snapshot and its length the largest
+    /// live length (the Mac2 32k single-shot row recorded the prefill instant, 32836 tokens,
+    /// against a kvLength of 32843).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressed_coordinate_storage_reconciles_across_a_block_plateau() {
+        #[derive(Default)]
+        struct StorageCapture {
+            snapshots: Vec<(u64, u64)>,
+            storage: Vec<crate::primitives::CompressedCacheStorage>,
+        }
+        impl crate::campaign::Observer for StorageCapture {
+            fn phase(&mut self, _name: &'static str) {}
+            fn allocation(&mut self, _role: &'static str, _lifetime: &'static str, _bytes: u64) {}
+            fn cache_snapshot(&mut self, bytes: u64, tokens: u64, _capacity: u64, _element: u64) {
+                self.snapshots.push((bytes, tokens));
+            }
+            fn compressed_storage(&mut self, storage: &crate::primitives::CompressedCacheStorage) {
+                self.storage.push(*storage);
+            }
+        }
+        let model = tiny_packed_capable_model();
+        // 300 prompt tokens: one full block plus 44 (a 12-token residual after 32-token groups).
+        let prompt = (0..300).map(|i| (i % 31) + 1).collect::<Vec<i32>>();
+        for method in crate::campaign::CompressedKvMethod::ALL {
+            let arm = method.arm().unwrap();
+            let decoder = PackedCampaignDecoder {
+                model: &model,
+                arm: &arm,
+                selection_fallbacks: RefCell::new(Vec::new()),
+            };
+            let mut capture = StorageCapture::default();
+            let config = GenerationConfig {
+                max_new_tokens: 30,
+                seed: Some(0),
+                ..Default::default()
+            };
+            crate::decode::generate_with_observer(
+                &decoder,
+                &prompt,
+                &config,
+                &CancelFlag::new(),
+                &mut |_| {},
+                None,
+                None,
+                Some(&mut capture),
+            )
+            .unwrap();
+            let mut observer = crate::campaign::ProductObserver::new();
+            observer.begin_coordinate_operation();
+            for storage in &capture.storage {
+                crate::campaign::Observer::compressed_storage(&mut observer, storage);
+            }
+            observer.end_coordinate_operation();
+            let peak = observer.coordinate_storage_peak().unwrap();
+            let persistent = capture
+                .snapshots
+                .iter()
+                .map(|(bytes, _)| *bytes)
+                .max()
+                .unwrap();
+            let kv_length = capture
+                .snapshots
+                .iter()
+                .map(|(_, tokens)| *tokens)
+                .max()
+                .unwrap();
+            // The scenario is the failing one: several instants share the peak device share.
+            let plateau = capture
+                .storage
+                .iter()
+                .filter(|storage| storage.device_bytes() == persistent)
+                .map(|storage| storage.tokens)
+                .collect::<Vec<_>>();
+            assert!(
+                plateau.len() > 1 && plateau[0] < kv_length,
+                "{method:?} {plateau:?}"
+            );
+            assert!(
+                kv_length > 300 && kv_length < 512,
+                "{method:?} decode stays in block two"
+            );
+            crate::campaign::coordinate_storage_reconciles(
+                peak.device_code_bytes,
+                Some(peak.device_bytes()),
+                peak.tokens,
+                persistent,
+                kv_length,
+            )
+            .unwrap_or_else(|error| panic!("{method:?}: {error}"));
+        }
+    }
+
+    /// SC-20671 steady decode on a tiny model: both arms decode exactly the fixed length through
+    /// stop tokens (every vocabulary id is declared one), and a compressed arm whose reader is
+    /// refused fails closed instead of timing a dense decode under the compressed label.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn campaign_steady_decode_is_fixed_length_on_both_arms_and_refuses_a_dense_compressed_arm() {
+        let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let every_id = (0..32).collect::<Vec<i32>>();
+        let prompt = [1, 2, 3, 4, 5];
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        for compressed in [None, Some(&arm)] {
+            let measured =
+                campaign_steady_decode_on(&model, &prompt, 8, &every_id, compressed).unwrap();
+            assert_eq!(measured.prompt_tokens, 5);
+            assert_eq!(measured.generated_tokens, 8);
+            assert_eq!(measured.timed_tokens, 7);
+            assert_eq!(
+                measured.forced_stop_tokens, 8,
+                "every token was a forced stop"
+            );
+        }
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20671-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let error = campaign_steady_decode_on(&model, &prompt, 8, &every_id, Some(&refused))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fused compressed reader"), "{error}");
+    }
+
+    /// SC-20671 forced continuation on a tiny model: the dense arm continues greedily through
+    /// every stop token; teacher-forcing the dense arm on its own continuation reproduces it at
+    /// every position; the compressed arm is teacher-forced on the dense stream wholly on its fused
+    /// reader; a position forced off the compressed arm's choice is a recorded flip; and a refused
+    /// compressed reader fails closed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn campaign_forced_continuation_teacher_forces_the_compressed_arm_on_the_dense_stream() {
+        let model = Decoder::Causal(Box::new(tiny_packed_capable_model()));
+        let every_id = (0..32).collect::<Vec<i32>>();
+        let prompt = [1, 2, 3, 4, 5];
+        let arm = crate::campaign::CompressedKvMethod::GroupAffine
+            .arm()
+            .unwrap();
+        let scored = |compressed, stream: Option<&[i32]>| {
+            campaign_forced_decode_on(&model, &prompt, 64, &every_id, compressed, stream, true)
+        };
+        let forced = |compressed, stream: Option<&[i32]>| {
+            scored(compressed, stream).map(|decode| decode.tokens)
+        };
+        let reference = forced(None, None).unwrap();
+        assert_eq!(reference.len(), 64, "every stop token is decoded through");
+        assert_eq!(forced(None, Some(&reference)).unwrap(), reference);
+        // Scored on the same stream, the dense arm teacher-forced on its own continuation has
+        // exactly its free-running likelihood; the compressed arm scores those same tokens.
+        let dense = scored(None, None).unwrap().stream_probabilities;
+        assert_eq!(dense.len(), 64);
+        assert_eq!(
+            scored(None, Some(&reference)).unwrap().stream_probabilities,
+            dense
+        );
+        let compressed = scored(Some(&arm), Some(&reference))
+            .unwrap()
+            .stream_probabilities;
+        assert_eq!(compressed.len(), 64);
+        assert!(compressed
+            .iter()
+            .all(|probability| *probability > 0.0 && *probability <= 1.0));
+        // The dense noise-floor control decodes the same stream after a chunked prefill: an exact
+        // dense computation in another order, so it agrees with the one-shot continuation and
+        // scores the same tokens (here identically: the tiny model's chunks are exact).
+        for chunk in [1, 2, 3, 4, 64] {
+            let control =
+                campaign_chunked_prefill_decode_on(&model, &prompt, &reference, &every_id, chunk)
+                    .unwrap();
+            assert_eq!(control.tokens, reference, "chunk {chunk}");
+            assert_eq!(control.stream_probabilities.len(), 64);
+            let likelihood = crate::campaign::StreamLikelihood::from_probabilities(
+                &dense,
+                &control.stream_probabilities,
+            )
+            .unwrap();
+            assert!(
+                (likelihood.candidate - likelihood.reference).abs() < 1e-3,
+                "chunk {chunk}: {likelihood:?}"
+            );
+        }
+        assert!(
+            campaign_chunked_prefill_decode_on(&model, &prompt, &reference, &every_id, 0).is_err()
+        );
+        // Run 37021783368: the control's cache is ONE allocation for the prompt and stream, so a
+        // prompt longer than the default 256-position block retires no growth buffer (the
+        // default cache retired one per growth into MLX's buffer cache, past the row's cap).
+        let long_prompt = (0..600).map(|index| index % 31).collect::<Vec<_>>();
+        let mut cache = chunked_prefill_cache(&model, long_prompt.len() + 64).unwrap();
+        chunked_prefill(&model, &mut cache, &long_prompt, 64).unwrap();
+        assert_eq!(cache.offset(), 600);
+        assert!(
+            cache
+                .events()
+                .iter()
+                .all(|event| event.operation != "dense_block_growth_retired_buffer"),
+            "the chunked control retired a dense growth buffer"
+        );
+        let mut grown = match &model {
+            Decoder::Causal(model) => model.new_cache(),
+            Decoder::Qwen35(_) => unreachable!(),
+        };
+        chunked_prefill(&model, &mut grown, &long_prompt, 64).unwrap();
+        assert!(
+            grown
+                .events()
+                .iter()
+                .any(|event| event.operation == "dense_block_growth_retired_buffer"),
+            "the default cache grows (the defect the sized cache removes)"
+        );
+        let choices = forced(Some(&arm), Some(&reference)).unwrap();
+        let evidence = crate::campaign::forced_continuation_evidence(&reference, &choices).unwrap();
+        assert_eq!(evidence.tokens, 64);
+        assert_eq!(evidence.matches + evidence.flip_count, 64);
+        // Force position 10 off the compressed arm's own choice there: a guaranteed flip.
+        let mut off = reference.clone();
+        off[10] = (choices[10] + 1) % 32;
+        let off_choices = forced(Some(&arm), Some(&off)).unwrap();
+        assert_eq!(
+            off_choices[..10],
+            choices[..10],
+            "the prefix before 10 is unchanged"
+        );
+        let miss = crate::campaign::forced_continuation_evidence(&off, &off_choices).unwrap();
+        assert!(miss.first_flip_positions.contains(&10), "{miss:?}");
+        assert!(miss.agreement < 1.0);
+        assert!(forced(Some(&arm), Some(&reference[..63])).is_err());
+        let refused = crate::campaign::CompressedKvArm::with_reader(
+            crate::campaign::CompressedKvMethod::GroupAffine,
+            crate::primitives::CompiledKernelHandle::new(std::sync::Arc::new(
+                crate::primitives::OpaqueCompiledKernel::new(
+                    "sc20671-refused",
+                    "cpu",
+                    0,
+                    std::sync::Arc::new(()),
+                ),
+            )),
+        );
+        let error = forced(Some(&refused), Some(&reference))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fused compressed reader"), "{error}");
     }
 }

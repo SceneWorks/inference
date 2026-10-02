@@ -146,10 +146,17 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # snapshot's config.json `"quantization"` marker; the per-crate converters already used serde_json,
 # now the shared core copy does.
 serde_json = { workspace = true }
+# SC-20686 Metal-lane campaign observer: runtime-derived model snapshot identity (src/sc20686.rs).
+sha2 = { workspace = true }
 # Match mlx-rs' safetensors ABI so the opt-in loader can inspect raw E4M3
 # byte views before converting them into MLX's supported bf16 storage dtype.
 safetensors-fp8 = { package = "safetensors", version = "0.4" }
 memmap2 = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# SC-20686 observer: `proc_pid_rusage` reads the process phys_footprint without spawning
+# /usr/bin/footprint (sc-20671).
+libc = { workspace = true }
 
 [dev-dependencies]
 # RAII fixture roots for the test helpers (sc-17791). A `TempDir` guard removes the tree on

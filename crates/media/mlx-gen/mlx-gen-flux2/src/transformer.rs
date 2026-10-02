@@ -134,6 +134,73 @@ fn apply_rope(q: &Array, k: &Array, cos: &Array, sin: &Array) -> Result<(Array, 
     Ok((one(q)?, one(k)?))
 }
 
+/// SC-20686 operation names for the MLX FLUX.2 joint attention (Metal lane). The non-kv edit
+/// recomputes its reference K/V inside every double-stream `DoubleAttention` evaluation (the same
+/// boundary the Candle lane observes); the 9b-kv edit reads its persistent reference-K/V cache.
+pub(crate) const SC20686_REFERENCE_SLICE_CREATE: &str =
+    "DoubleAttention::to_k/to_v(reference-slice)";
+pub(crate) const SC20686_JOINT_READ: &str =
+    "DoubleAttention::attention(joint-context-non-attributable)";
+pub(crate) const SC20686_KV_CACHED_READ: &str = "Flux2KvCache::cached(joint-attention)";
+
+/// Open the SC-20686 read window for one joint attention (campaign mode only):
+/// * 9b-kv edit, [`crate::kv_cache::CacheMode::Cached`] step — a read of the persistent slot;
+/// * non-kv edit, double stream, reference-carrying forward — the recomputed reference slice.
+///
+/// Returns `Ok(None)` — no evaluation, no allocation — whenever no campaign is armed.
+fn sc20686_joint_read(
+    cache: CacheSlot<'_>,
+    stream: Stream,
+    q: &Array,
+    k: &Array,
+    v: &Array,
+) -> Result<Option<(mlx_gen::sc20686::ReadWindow, &'static str)>> {
+    if !mlx_gen::sc20686::active() {
+        return Ok(None);
+    }
+    let target = match cache {
+        Some((c, idx)) => c.sc20686_cached_read(stream, idx).map(|id| {
+            (
+                mlx_gen::sc20686::ReadTarget::Cache(id),
+                SC20686_KV_CACHED_READ,
+            )
+        }),
+        None if stream == Stream::Double && mlx_gen::sc20686::in_reference_forward() => {
+            mlx_gen::sc20686::record_recomputed_kv(
+                k,
+                v,
+                mlx_gen::sc20686::bound_skv(),
+                SC20686_REFERENCE_SLICE_CREATE,
+            )?
+            .map(|dense| {
+                (
+                    mlx_gen::sc20686::ReadTarget::Recomputed(dense),
+                    SC20686_JOINT_READ,
+                )
+            })
+        }
+        None => None,
+    };
+    let Some((target, operation)) = target else {
+        return Ok(None);
+    };
+    Ok(mlx_gen::sc20686::begin_read(Some(target), &[q, k, v])?.map(|window| (window, operation)))
+}
+
+/// Close an [`sc20686_joint_read`] window. Joint attention also covers text and target tokens, so
+/// its duration is non-attributable context on both FLUX routes.
+fn sc20686_finish_joint_read(
+    window: Option<(mlx_gen::sc20686::ReadWindow, &'static str)>,
+    output: &Array,
+) -> Result<()> {
+    match window {
+        Some((window, operation)) => {
+            mlx_gen::sc20686::finish_read(Some(window), output, operation, false)
+        }
+        None => Ok(()),
+    }
+}
+
 /// SDPA over `[B,H,S,D]` → `[B,S,H·D]`.
 fn attention(
     q: &Array,
@@ -328,11 +395,15 @@ impl DoubleAttention {
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
         // KV-cache hook (post-RoPE, pre-SDPA): extract stores the trailing ref K/V; cached splices
         // it back so the `[txt, target]` queries attend over `[txt, target, ref]`.
+        // SC-20686: the read window opens on q + the FRESH K/V, so a cached step's splice of the
+        // stored reference K/V (the concatenation) is materialized inside the window.
+        let sc20686 = sc20686_joint_read(cache, Stream::Double, &q, &k, &v)?;
         let (k, v) = match cache {
             Some((c, idx)) => c.apply(Stream::Double, idx, k, v)?,
             None => (k, v),
         };
         let o = attention(&q, &k, &v, self.head_dim, attention_plan)?;
+        sc20686_finish_joint_read(sc20686, &o)?;
         let txt_seq = txt.shape()[1];
         // `[txt ; img]` is a contiguous split at `txt_seq`; split rather than gather two aranges (F-111).
         let parts = o.split_axis(&[txt_seq], 1)?;
@@ -491,11 +562,15 @@ impl SingleBlock {
         let k = rms_norm(&to_bhsd(k)?, &self.norm_k, RMS_EPS)?;
         let v = to_bhsd(v)?;
         let (q, k) = apply_rope(&q, &k, cos, sin)?;
+        // SC-20686: the read window opens on q + the FRESH K/V, so a cached step's splice of the
+        // stored reference K/V (the concatenation) is materialized inside the window.
+        let sc20686 = sc20686_joint_read(cache, Stream::Single, &q, &k, &v)?;
         let (k, v) = match cache {
             Some((c, idx)) => c.apply(Stream::Single, idx, k, v)?,
             None => (k, v),
         };
         let attn = attention(&q, &k, &v, self.head_dim, attention_plan)?;
+        sc20686_finish_joint_read(sc20686, &attn)?;
 
         let mlp = swiglu(&mlp)?;
         let cat = concatenate_axis(&[&attn, &mlp], -1)?;

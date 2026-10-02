@@ -12,7 +12,13 @@ pub struct LlmMemoryGeometry {
     pub kv_heads: u64,
     pub head_dim: u64,
     pub layers: u64,
+    /// Scalar width of the K/V cache, decoder activations, and logits: the decoder's compute
+    /// dtype (2 for a BF16 decoder, 4 for an F32 one).
     pub element_bytes: u64,
+    /// Scalar width of the attention scores, additive mask, and softmax weights the attention
+    /// workspace term prices. A backend whose score path upcasts (MLX's eager SDPA computes scores
+    /// in F32 for a BF16 decoder) declares that width here rather than widening every other term.
+    pub score_element_bytes: u64,
     pub hidden_size: u64,
     pub intermediate_size: u64,
     pub vocab_size: u64,
@@ -33,7 +39,7 @@ pub fn estimate_request_bytes(
     let attention = prompt
         .checked_mul(prompt)?
         .checked_mul(geometry.query_heads)?
-        .checked_mul(geometry.element_bytes)?
+        .checked_mul(geometry.score_element_bytes)?
         .checked_mul(3)?;
     // K and V caches for every layer through the requested terminal position.
     let kv = total
@@ -124,17 +130,47 @@ pub fn estimate_chunked_request_bytes_with_recurrent_copies(
     max_attention_query_tokens: usize,
     recurrent_copies: u64,
 ) -> Option<u64> {
-    if max_attention_query_tokens == 0 || recurrent_copies == 0 {
+    if max_attention_query_tokens == 0 {
         return None;
     }
     let prompt = u64::try_from(prompt_tokens).ok()?;
-    let total = prompt.checked_add(u64::from(max_new_tokens))?;
     let attention_rows = prompt.min(u64::try_from(max_attention_query_tokens).ok()?);
     let attention = prompt
         .checked_mul(attention_rows)?
         .checked_mul(geometry.query_heads)?
-        .checked_mul(geometry.element_bytes)?
+        .checked_mul(geometry.score_element_bytes)?
         .checked_mul(3)?;
+    estimate_tiled_request_bytes_with_recurrent_copies(
+        prompt_tokens,
+        max_new_tokens,
+        geometry,
+        vision_workspace_bytes,
+        mtp_width,
+        attention,
+        recurrent_copies,
+    )
+}
+
+/// [`estimate_chunked_request_bytes_with_recurrent_copies`] with the prompt-scaled attention
+/// workspace supplied by the backend instead of derived from a row bound: for an attention runtime
+/// whose per-tile transient is not a per-head score/mask/softmax set (e.g. a fused kernel that
+/// keeps scores on chip and only slices an explicit mask per tile). Every other term is identical;
+/// `recurrent_copies == 0` is refused (`None`).
+pub fn estimate_tiled_request_bytes_with_recurrent_copies(
+    prompt_tokens: usize,
+    max_new_tokens: u32,
+    geometry: LlmMemoryGeometry,
+    vision_workspace_bytes: u64,
+    mtp_width: u32,
+    attention_workspace_bytes: u64,
+    recurrent_copies: u64,
+) -> Option<u64> {
+    if recurrent_copies == 0 {
+        return None;
+    }
+    let attention = attention_workspace_bytes;
+    let prompt = u64::try_from(prompt_tokens).ok()?;
+    let total = prompt.checked_add(u64::from(max_new_tokens))?;
     let kv = total
         .checked_mul(geometry.layers)?
         .checked_mul(geometry.kv_heads)?
@@ -150,9 +186,25 @@ pub fn estimate_chunked_request_bytes_with_recurrent_copies(
     } else {
         0
     };
-    // One decoder layer's live projections, MLP tensors, and residuals. The vocabulary projection
-    // is one row because the backend narrows the final hidden state before applying lm_head.
-    let activations = prompt
+    let activations = tiled_prefill_activation_bytes(prompt, geometry)?;
+    attention
+        .checked_add(kv)?
+        .checked_add(mtp)?
+        .checked_add(vision_workspace_bytes)?
+        .checked_add(activations)?
+        .checked_add(geometry.recurrent_bytes.checked_mul(recurrent_copies)?)
+}
+
+/// Decoder activations a tiled prefill of `prompt_tokens` holds at once: one decoder layer's live
+/// projections, MLP tensors, and residuals across the whole prompt, plus one row of vocabulary
+/// logits (the backend narrows the final hidden state before applying lm_head). This is the
+/// activation term of [`estimate_tiled_request_bytes_with_recurrent_copies`], exposed so a caller
+/// pricing a prompt's prefill outside a request admission prices it identically.
+pub fn tiled_prefill_activation_bytes(
+    prompt_tokens: u64,
+    geometry: LlmMemoryGeometry,
+) -> Option<u64> {
+    prompt_tokens
         .checked_mul(
             geometry
                 .intermediate_size
@@ -160,13 +212,7 @@ pub fn estimate_chunked_request_bytes_with_recurrent_copies(
                 .checked_add(geometry.hidden_size.checked_mul(8)?)?,
         )?
         .checked_mul(geometry.element_bytes)?
-        .checked_add(geometry.vocab_size.checked_mul(geometry.element_bytes)?)?;
-    attention
-        .checked_add(kv)?
-        .checked_add(mtp)?
-        .checked_add(vision_workspace_bytes)?
-        .checked_add(activations)?
-        .checked_add(geometry.recurrent_bytes.checked_mul(recurrent_copies)?)
+        .checked_add(geometry.vocab_size.checked_mul(geometry.element_bytes)?)
 }
 
 /// Reject an estimated request before native tensor allocation.
@@ -345,6 +391,7 @@ mod tests {
             head_dim: 128,
             layers: 40,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 5120,
             intermediate_size: 17408,
             vocab_size: 248320,
@@ -360,6 +407,38 @@ mod tests {
         assert!(estimate_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3).is_none());
     }
 
+    /// The tiled estimate is the chunked one with the attention term replaced by the caller's bytes:
+    /// equal at the chunked term, and it moves one-for-one with the supplied workspace.
+    #[test]
+    fn tiled_estimate_is_the_chunked_estimate_with_a_supplied_attention_term() {
+        let g = LlmMemoryGeometry {
+            query_heads: 24,
+            kv_heads: 8,
+            head_dim: 128,
+            layers: 28,
+            element_bytes: 2,
+            score_element_bytes: 4,
+            hidden_size: 3072,
+            intermediate_size: 8192,
+            vocab_size: 128_256,
+            recurrent_bytes: 0,
+        };
+        let (prompt, rows) = (4096u64, 8u64);
+        let chunked_term = prompt * rows * g.query_heads * g.score_element_bytes * 3;
+        let chunked =
+            estimate_chunked_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, 8, 1).unwrap();
+        let tiled = |attention| {
+            estimate_tiled_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, attention, 1)
+                .unwrap()
+        };
+        assert_eq!(tiled(chunked_term), chunked);
+        assert_eq!(tiled(chunked_term + 12_345), chunked + 12_345);
+        assert_eq!(
+            estimate_tiled_request_bytes_with_recurrent_copies(4096, 16, g, 0, 0, 0, 0),
+            None
+        );
+    }
+
     #[test]
     fn chunked_estimate_prices_runtime_tile_and_last_row_logits() {
         let geometry = LlmMemoryGeometry {
@@ -368,6 +447,7 @@ mod tests {
             head_dim: 128,
             layers: 64,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,
@@ -382,6 +462,49 @@ mod tests {
         assert!(estimate_chunked_request_bytes(usize::MAX, u32::MAX, geometry, 0, 3, 8).is_none());
     }
 
+    /// sc-20671: the compute width prices K/V, activations, logits and MTP state; only the
+    /// attention-score term takes the score width. A BF16 decoder with F32 eager scores must not
+    /// be charged a 4-byte K/V cache, and must still be charged 4-byte scores.
+    #[test]
+    fn compute_and_score_widths_price_separate_terms() {
+        let geometry = LlmMemoryGeometry {
+            query_heads: 8,
+            kv_heads: 2,
+            head_dim: 64,
+            layers: 4,
+            element_bytes: 2,
+            score_element_bytes: 4,
+            hidden_size: 256,
+            intermediate_size: 512,
+            vocab_size: 1024,
+            recurrent_bytes: 4096,
+        };
+        let (prompt, new, rows, mtp) = (300_u64, 20_u64, 8_u64, 3_u64);
+        let g = geometry;
+        let kv = (prompt + new) * g.layers * g.kv_heads * g.head_dim * g.element_bytes * 2;
+        let mtp_bytes = kv * 2 + mtp * (g.hidden_size + g.vocab_size) * g.element_bytes;
+        let mlp = g.intermediate_size * 3 + g.hidden_size * 8;
+        let eager = prompt * prompt * g.query_heads * g.score_element_bytes * 3
+            + kv
+            + mtp_bytes
+            + prompt * (mlp + g.vocab_size) * g.element_bytes
+            + g.recurrent_bytes * 3;
+        assert_eq!(
+            estimate_request_bytes(300, 20, geometry, 0, 3).unwrap(),
+            eager
+        );
+        let chunked = prompt * rows * g.query_heads * g.score_element_bytes * 3
+            + kv
+            + mtp_bytes
+            + prompt * mlp * g.element_bytes
+            + g.vocab_size * g.element_bytes
+            + g.recurrent_bytes * 3;
+        assert_eq!(
+            estimate_chunked_request_bytes(300, 20, geometry, 0, 3, 8).unwrap(),
+            chunked
+        );
+    }
+
     #[test]
     fn recurrent_copies_scale_only_the_recurrent_term() {
         let recurrent = 7_000_003u64;
@@ -391,6 +514,7 @@ mod tests {
             head_dim: 128,
             layers: 64,
             element_bytes: 4,
+            score_element_bytes: 4,
             hidden_size: 5120,
             intermediate_size: 17_408,
             vocab_size: 248_320,

@@ -155,6 +155,7 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<(Vec<Image>, u32)> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         let clip = req
             .control_clip()
             .ok_or_else(|| CandleError::Msg("wan-vace: requires a ControlClip".into()))?;
@@ -177,6 +178,29 @@ impl Pipeline {
         // Control video [-1,1] + mask [0,1] (diffusers `clamp((m+1)/2)`), each [1,3,F,H,W].
         let control_video = self.preprocess_clip(clip.frames, width, height)?;
         let mask = self.preprocess_clip(clip.mask, width, height)?;
+        if let Some((persistent, transient, shape, dtype)) =
+            crate::sc20686_observer::campaign_evidence(|| {
+                (
+                    (control_video.elem_count() as u64)
+                        .saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
+                    (mask.elem_count() as u64).saturating_mul(VAE_DTYPE.size_in_bytes() as u64),
+                    format!("{:?};{:?}", control_video.dims(), mask.dims()),
+                    format!("{:?}", control_video.dtype()),
+                )
+            })
+        {
+            crate::sc20686_observer::observe_tensor(
+                "prefill-peak",
+                "control-mask-prepared",
+                persistent,
+                transient,
+                0,
+                shape,
+                dtype,
+                "control-mask",
+                "applied",
+            );
+        }
         let mask = ((mask + 1.0)? * 0.5)?; // (m+1)/2 ∈ [0,1]
 
         // Reference images (optional) → [1,3,1,H,W] each.
@@ -274,6 +298,7 @@ impl Pipeline {
             decode_cap,
         )?;
         let images = frames_to_images(&decoded)?;
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok((images, fps))
     }
 }
@@ -425,13 +450,50 @@ impl Generator for WanVaceGenerator {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
+        crate::sc20686_observer::observe("process-start", 0, 0, 0);
         self.validate(req)?;
         if let Some(prepared) = &self.i2v_memory {
             crate::i2v_memory_strategy::validate_active_request(prepared, req)?;
         }
+        let frames = req
+            .control_clip()
+            .map(|clip| clip.frames.len() as u32)
+            .ok_or_else(|| gen_core::Error::Msg("missing control clip".into()))?;
+        let (latent_frames, latent_height, latent_width) =
+            crate::wan14b::latent_dims(frames, req.width, req.height);
+        let reference_count = u32::try_from(
+            req.conditioning
+                .iter()
+                .filter(|conditioning| matches!(conditioning, Conditioning::Reference { .. }))
+                .count(),
+        )
+        .map_err(|_| gen_core::Error::Msg("too many reference images".into()))?;
+        let _campaign = crate::sc20686_observer::activate_requested(
+            &self.root,
+            &req.cancel,
+            MODEL_ID_VACE,
+            1,
+            frames,
+            req.width,
+            req.height,
+            latent_frames as u32,
+            latent_height as u32,
+            latent_width as u32,
+            &req.prompt,
+            req.guidance,
+            reference_count,
+        )
+        .map_err(|error| gen_core::Error::Msg(format!("campaign activation: {error}")))?;
         let pipe = Pipeline::load(&self.root, &self.device);
         let components = self.components(&pipe)?;
-        let (frames, fps) = pipe.render(req, &components, on_progress)?;
+        let (frames, fps) = match pipe.render(req, &components, on_progress) {
+            Ok(result) => result,
+            Err(error) => {
+                crate::sc20686_observer::observe_cancelled();
+                return Err(error.into());
+            }
+        };
+        crate::sc20686_observer::observe("post-run-release", 0, 0, 0);
         Ok(GenerationOutput::Video {
             frames,
             fps,

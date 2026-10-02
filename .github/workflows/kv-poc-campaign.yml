@@ -1,0 +1,576 @@
+name: KV PoC campaigns (epic 20669, W1 + W2)
+
+# Runs epic 20669's GPU windows on a selected Mac (`rw-krea` = nax-macos-2, the second Mac; `nax` =
+# the dev Mac nax-macos). The runner label names a HOST: config.sh maps it to a label set only that
+# Mac carries and every job asserts its runner name, because each job reuses the previous job's
+# $HOME/kv-poc state and the raw `nax` label is registered on both Macs. Measurement, not a gate:
+# no pull_request / schedule trigger, and nothing here can become a required check.
+#   W1 (mode=w1), the LLM KV campaign, with the exact commands of the dev-Mac prep's W1-COMMANDS.sh:
+#     A1 dense sc20671 -> A3 packed sc20676 -> A2 compressed sc20671 -> B sc20677 capture + compare.
+#     A3 runs once per `a3_bits` value (`--kv-bits`, default "2") and A2 once per `a2_methods`
+#     value (`--kv-method`, default "group-affine"), sequentially in one job, each invocation with
+#     its own resume + evidence dirs (sc20676-b<b>-resume, evidence/sc20676-packed-b<b>;
+#     sc20671-compressed-<m>-resume, evidence/sc20671-compressed-<m>). At most 2 values each.
+#     An A3 QUALITY GATE FAILED (recorded evidence, exit 0) never skips the next value; a stop
+#     ends the list (stopped=true); a hard failure ends the list and fails the job.
+#     NF (opt-in: list it, e.g. "phases": "nf") is the SC-20669 dense noise floor: for all eight
+#     SC-20671 rows, `sc20671_kv_baseline noise-floor-parent` measures the dense arm against a
+#     one-shot repeat and a chunked-prefill recomputation of itself with the compressed rows' own
+#     metrics (teacher-forced agreement, stream-scored perplexity delta), one guarded worker per
+#     row under llm.json; per-row JSON + sealed summary.json in evidence/sc20669-noise-floor.
+#     nf_only_coordinate (run json or dispatch input) runs one row into its own -only-<name> dirs.
+#   W2 (mode=w2), the media campaigns (docs/architecture/SC_20684_*.md, SC_20686_*.md):
+#     C  SC-20684 Krea Realtime six-cell (T2V/I2V/V2V x Q8/Q4 KV) -> D SC-20686 Metal matrix (18
+#     coordinates incl. the A14B Lightning default, normal + cancel arms) -> D-control (the same
+#     matrix's --schedule-control arm). Policy .github/kv-poc/policies/media-64.json (64 GiB child
+#     cap + 16 GiB host reserve, 3600 s arm deadline). Its jobs: w2-assets (disk check FIRST, then
+#     only the missing pinned files of .github/kv-poc/models-w2.tsv, sha256-verified; the assembled
+#     VACE snapshots; the VACE fixtures of fixtures-w2.tsv) -> w2-build (sc20686_wan +
+#     sc20686_flux2_edit examples and the Krea `integration` test binary, release, sealed in
+#     $KV_ROOT/<sha>/frozen-w2) -> c -> d -> d-control. `phases: none` = assets + build only.
+#
+# TRIGGERS
+#   * push to `kv-poc-run/**`: parameters come from `.github/kv-poc-run.json` on the pushed commit
+#     ({mode, inference_ref, sceneworks_ref, runner_label, phases}, plus the optional
+#     baseline_evidence_ref: the inference SHA whose A1 evidence A3 binds, default inference_ref;
+#     a3_bits: comma list of 2|4|8, default "2"; a2_methods: comma list of
+#     group-affine|group-affine-4|group-affine-8, default "group-affine"; a2_only_coordinate: one
+#     scheduled SC-20671 coordinate, default "" = all eight rows. A single-coordinate A2 publishes
+#     a partial, non-publishable manifest into its own `-only-<name>` dirs, never a campaign).
+#     This is how the campaign runs before this file reaches `main` (a workflow_dispatch workflow
+#     must exist on the default branch to be dispatched). Start W1 by flipping "mode" to "w1" in
+#     that file and pushing; start W2 with "mode": "w2" and an inference_ref that carries the W2 sources (SC-20686 product_load /
+#     VACE-Fun Q4, >= a3cde51d5), on a new kv-poc-run/w2-* branch.
+#   * workflow_dispatch (once this file is on `main`):
+#       gh workflow run kv-poc-campaign.yml -R SceneWorks/inference --ref main -f mode=w1
+#     Defaults are the frozen W1 revisions; `phases` selects a subset (run order is fixed).
+#   `mode=probe` (the default) runs only the host probe. `mode=w1` runs probe -> build -> phases;
+#   `mode=w2` runs probe (plus the W2 disk/asset report) -> w2-assets -> w2-build -> phases.
+#   Empty `phases` = every phase of the mode.
+#
+# WHERE STATE LIVES (.github/kv-poc/common.sh): $HOME/kv-poc on the runner, outside the workspace:
+# stable inference + SceneWorks clones at the frozen SHAs (the bins check both HEADs at run time),
+# the sealed frozen dirs (frozen/ for W1, frozen-w2/ for W2; reused, never rebuilt, once they
+# verify), $HOME/kv-poc/w2-inputs (assembled VACE snapshots + fixtures), and $HOME/kv-poc/<sha>-runs
+# (resume dirs + evidence). A re-dispatch with the same parameters therefore RESUMES: accepted
+# rows are kept, finished phases (their --out exists) are skipped.
+#
+# SAFE STOP (mid-job). Push the per-run stop branch; the job summary prints the exact command:
+#   gh api -X POST repos/SceneWorks/inference/git/refs \
+#     -f ref=refs/heads/kv-poc-stop/<RUN_ID> -f sha=cf9937540bf9a4ec42ad44acb07865358b906553
+# Within 60 s the running phase touches <resume-dir>/STOP, the parent exits 75 after its in-flight
+# row, the job ends green with `stopped=true`, and every later phase skips. Delete the branch
+# afterwards (`gh api -X DELETE repos/SceneWorks/inference/git/refs/heads/kv-poc-stop/<RUN_ID>`);
+# a new run id is unaffected by it either way.
+#
+# DO NOT CANCEL A RUNNING CAMPAIGN JOB. A GitHub cancel (or timeout) sends SIGINT, then force-kills
+# the whole process tree ~10 s later, mid-row; killing MLX mid-command-buffer can wedge the GPU.
+# The SIGINT/SIGTERM trap only touches STOP, best effort. Cancel between jobs, or push the stop
+# branch and wait.
+#
+# TIMEOUTS. Each campaign job has a SOFT budget (KV_SOFT_BUDGET_MIN: a1/a2 330, a3 60, b 60, nf 120 min;
+# c 240, d 360, d-control 240 min): when it is spent the watcher requests a safe stop, exactly like
+# the stop branch, and a re-dispatch resumes. The HARD `timeout-minutes` is that budget PLUS the
+# policy's own row deadline (llm.json rowDeadlineSeconds 18000 = 300 min; capture.json 1800 = 30 min;
+# media-64.json deadlineSeconds 3600 = 60 min) plus 20 min (W1) or 30 min (W2: the SC-20686 adapter
+# re-hashes the arm's snapshot, up to ~81 GB for VACE-Fun, after every arm), so a timeout can only
+# land after a row has already overrun its own deadline -- never mid-row on a healthy row.
+# A3 and A2 budget PER INVOCATION (the budget restarts at each list value) and any stop ends the
+# list, so only the last invocation can overrun: their hard timeout is 2 x budget (the 2-value
+# list maximum config.sh enforces) + 300 + 20 = a3 440, a2 980 min.
+
+on:
+  push:
+    branches: ["kv-poc-run/**"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe = host probe only; w1 = LLM window (probe, build, phases); w2 = media window (probe, w2-assets, w2-build, phases)"
+        type: choice
+        options: [probe, w1, w2]
+        default: probe
+      inference_ref:
+        description: "Frozen inference commit (full 40-hex SHA)"
+        type: string
+        default: cf9937540bf9a4ec42ad44acb07865358b906553
+      sceneworks_ref:
+        description: "Frozen SceneWorks commit for SCENEWORKS_ROOT (full 40-hex SHA)"
+        type: string
+        default: 278f4b3af4d252aa58ac5905e08a3ddebaf7568f
+      runner_label:
+        description: "rw-krea = nax-macos-2 (the second Mac); nax = Michael's dev Mac"
+        type: choice
+        options: [rw-krea, nax]
+        default: rw-krea
+      phases:
+        description: "Empty = the mode's default phases (w1: a1,a3,a2,b; w2: c,d,d-control). w1: subset of a1,a3,a2,b,nf (nf = dense noise floor, opt-in); w2: subset of c,d,d-control, or none (assets + build only). Run order is fixed."
+        type: string
+        default: ""
+      baseline_evidence_ref:
+        description: "Inference SHA whose completed A1 evidence ($HOME/kv-poc/<sha>-runs/evidence/sc20671-dense) A3 binds. Empty = inference_ref. sc20676 refuses it unless it is an ancestor of inference_ref with an unchanged SC-20671 dense closure."
+        type: string
+        default: ""
+      a3_bits:
+        description: "A3 --kv-bits values, comma list of 2|4|8 run in order (max 2), e.g. 2,4"
+        type: string
+        default: "2"
+      a2_methods:
+        description: "A2 --kv-method values, comma list of group-affine|group-affine-4|group-affine-8 run in order (max 2)"
+        type: string
+        default: "group-affine"
+      a2_only_coordinate:
+        description: "Empty = all eight A2 rows. One SC-20671 coordinate (e.g. llama-memory-material-single-single-shot-warm) = that row only, published as a PARTIAL non-publishable run in its own dirs"
+        type: string
+        default: ""
+      nf_only_coordinate:
+        description: "Empty = all eight nf rows. One SC-20671 coordinate = that row's dense noise floor only, in its own -only-<name> dirs"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# One campaign per Mac, queued never cancelled. Push runs carry no inputs and key on rw-krea (the
+# only label their run file has ever named); the per-phase precheck still refuses to start beside
+# any other MLX/cargo process whatever the label.
+concurrency:
+  group: kv-poc-campaign-${{ inputs.runner_label || github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  config:
+    name: Resolve parameters
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      inference_sha: ${{ steps.resolve.outputs.inference_sha }}
+      sceneworks_sha: ${{ steps.resolve.outputs.sceneworks_sha }}
+      baseline_evidence_sha: ${{ steps.resolve.outputs.baseline_evidence_sha }}
+      runner_label: ${{ steps.resolve.outputs.runner_label }}
+      phases: ${{ steps.resolve.outputs.phases }}
+      a3_bits: ${{ steps.resolve.outputs.a3_bits }}
+      a2_methods: ${{ steps.resolve.outputs.a2_methods }}
+      a2_only_coordinate: ${{ steps.resolve.outputs.a2_only_coordinate }}
+      nf_only_coordinate: ${{ steps.resolve.outputs.nf_only_coordinate }}
+      runs_on: ${{ steps.resolve.outputs.runs_on }}
+      runner_name: ${{ steps.resolve.outputs.runner_name }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Resolve and validate
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+          DISPATCH_INFERENCE_REF: ${{ inputs.inference_ref }}
+          DISPATCH_SCENEWORKS_REF: ${{ inputs.sceneworks_ref }}
+          DISPATCH_RUNNER_LABEL: ${{ inputs.runner_label }}
+          DISPATCH_PHASES: ${{ inputs.phases }}
+          DISPATCH_BASELINE_EVIDENCE_REF: ${{ inputs.baseline_evidence_ref }}
+          DISPATCH_A3_BITS: ${{ inputs.a3_bits }}
+          DISPATCH_A2_METHODS: ${{ inputs.a2_methods }}
+          DISPATCH_A2_ONLY_COORDINATE: ${{ inputs.a2_only_coordinate }}
+          DISPATCH_NF_ONLY_COORDINATE: ${{ inputs.nf_only_coordinate }}
+        run: bash .github/kv-poc/config.sh
+
+  probe:
+    name: Host probe
+    needs: config
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 15
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_MODE: ${{ needs.config.outputs.mode }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Probe the host (report only)
+        run: bash .github/kv-poc/probe.sh
+
+  build:
+    name: Build and seal the frozen campaign binaries
+    needs: [config, probe]
+    if: ${{ needs.config.outputs.mode == 'w1' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 180
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Put inference and SceneWorks at the frozen SHAs
+        run: bash .github/kv-poc/build.sh trees
+      - name: Materialize and verify the pinned snapshots
+        run: bash .github/kv-poc/build.sh models
+      - name: Build, freeze and seal the campaign binaries
+        run: bash .github/kv-poc/build.sh binaries
+
+  a1:
+    name: "A1 dense baseline (sc20671)"
+    needs: [config, build]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a1,')
+      && needs.build.result == 'success' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 650
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "330"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run A1
+        id: run
+        run: bash .github/kv-poc/phase.sh run a1
+      - name: Collect A1 evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect a1
+      - name: Upload A1 evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-a1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/a1/
+          if-no-files-found: warn
+          retention-days: 30
+
+  a3:
+    name: "A3 packed arms, kv-bits ${{ needs.config.outputs.a3_bits }} (sc20676)"
+    needs: [config, build, a1]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a3,')
+      && needs.build.result == 'success'
+      && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    # 2 invocations x 60 soft + 300 row deadline + 20 (TIMEOUTS above).
+    timeout-minutes: 440
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      BASELINE_EVIDENCE_SHA: ${{ needs.config.outputs.baseline_evidence_sha }}
+      KV_A3_BITS: ${{ needs.config.outputs.a3_bits }}
+      KV_SOFT_BUDGET_MIN: "60"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run A3
+        id: run
+        run: bash .github/kv-poc/phase.sh run a3
+      - name: Collect A3 evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect a3
+      - name: Upload A3 evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-a3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/a3/
+          if-no-files-found: warn
+          retention-days: 30
+
+  a2:
+    name: "A2 compressed ${{ needs.config.outputs.a2_methods }} (sc20671)"
+    needs: [config, build, a1, a3]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',a2,')
+      && needs.build.result == 'success'
+      && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
+      && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    # 2 invocations x 330 soft + 300 row deadline + 20 (TIMEOUTS above).
+    timeout-minutes: 980
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_A2_METHODS: ${{ needs.config.outputs.a2_methods }}
+      KV_A2_ONLY_COORDINATE: ${{ needs.config.outputs.a2_only_coordinate }}
+      KV_SOFT_BUDGET_MIN: "330"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run A2
+        id: run
+        run: bash .github/kv-poc/phase.sh run a2
+      - name: Collect A2 evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect a2
+      - name: Upload A2 evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-a2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/a2/
+          if-no-files-found: warn
+          retention-days: 30
+
+  b:
+    name: "B KV capture + compare (sc20677)"
+    needs: [config, build, a1, a3, a2]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',b,')
+      && needs.build.result == 'success'
+      && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
+      && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true'
+      && (needs.a2.result == 'success' || needs.a2.result == 'skipped') && needs.a2.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 120
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "60"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run B
+        id: run
+        run: bash .github/kv-poc/phase.sh run b
+      - name: Collect B evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect b
+      - name: Upload B evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-b-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/b/
+          if-no-files-found: warn
+          retention-days: 30
+
+  nf:
+    name: "NF dense noise floor (sc20671 noise-floor-parent)"
+    needs: [config, build, a1, a3, a2, b]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w1' && contains(needs.config.outputs.phases, ',nf,')
+      && needs.build.result == 'success'
+      && (needs.a1.result == 'success' || needs.a1.result == 'skipped') && needs.a1.outputs.stopped != 'true'
+      && (needs.a3.result == 'success' || needs.a3.result == 'skipped') && needs.a3.outputs.stopped != 'true'
+      && (needs.a2.result == 'success' || needs.a2.result == 'skipped') && needs.a2.outputs.stopped != 'true'
+      && (needs.b.result == 'success' || needs.b.result == 'skipped') && needs.b.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    # 120 soft + 300 row deadline + 20 (TIMEOUTS above).
+    timeout-minutes: 440
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_NF_ONLY_COORDINATE: ${{ needs.config.outputs.nf_only_coordinate }}
+      KV_SOFT_BUDGET_MIN: "120"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run NF
+        id: run
+        run: bash .github/kv-poc/phase.sh run nf
+      - name: Collect NF evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect nf
+      - name: Upload NF evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-nf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/nf/
+          if-no-files-found: warn
+          retention-days: 30
+
+  w2-assets:
+    name: W2 model assets, VACE snapshots and fixtures
+    needs: [config, probe]
+    if: ${{ needs.config.outputs.mode == 'w2' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    # Downloading every W2 file on an empty host is ~204 GiB; the sha256 pass reads all of it.
+    timeout-minutes: 360
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Put inference and SceneWorks at the frozen SHAs
+        run: bash .github/kv-poc/build.sh trees
+      - name: Check disk, fetch only missing pinned W2 files, verify sha256
+        run: bash .github/kv-poc/build.sh w2-models
+      - name: Assemble the VACE snapshots and materialize the VACE fixtures
+        run: bash .github/kv-poc/build.sh w2-inputs
+
+  w2-build:
+    name: Build and seal the frozen W2 campaign binaries
+    needs: [config, w2-assets]
+    if: ${{ needs.config.outputs.mode == 'w2' && needs.w2-assets.result == 'success' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 180
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Build, freeze and seal the W2 campaign binaries
+        run: bash .github/kv-poc/build.sh w2-binaries
+
+  c:
+    name: "C Krea Realtime six-cell (sc20684)"
+    needs: [config, w2-build]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',c,')
+      && needs.w2-build.result == 'success' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 330
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "240"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run C
+        id: run
+        run: bash .github/kv-poc/phase.sh run c
+      - name: Collect C evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect c
+      - name: Upload C evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-c-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/c/
+          if-no-files-found: warn
+          retention-days: 30
+
+  d:
+    name: "D SC-20686 Metal matrix (sc20686)"
+    needs: [config, w2-build, c]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d,')
+      && needs.w2-build.result == 'success'
+      && (needs.c.result == 'success' || needs.c.result == 'skipped') && needs.c.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 450
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "360"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run D
+        id: run
+        run: bash .github/kv-poc/phase.sh run d
+      - name: Collect D evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect d
+      - name: Upload D evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-d-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/d/
+          if-no-files-found: warn
+          retention-days: 30
+
+  d-control:
+    name: "D-control SC-20686 schedule-control arm"
+    needs: [config, w2-build, c, d]
+    if: >-
+      ${{ !cancelled() && needs.config.outputs.mode == 'w2' && contains(needs.config.outputs.phases, ',d-control,')
+      && needs.w2-build.result == 'success'
+      && (needs.c.result == 'success' || needs.c.result == 'skipped') && needs.c.outputs.stopped != 'true'
+      && (needs.d.result == 'success' || needs.d.result == 'skipped') && needs.d.outputs.stopped != 'true' }}
+    runs-on: ${{ fromJSON(needs.config.outputs.runs_on) }}
+    timeout-minutes: 330
+    outputs:
+      stopped: ${{ steps.run.outputs.stopped }}
+    env:
+      INFERENCE_SHA: ${{ needs.config.outputs.inference_sha }}
+      KV_EXPECTED_RUNNER: ${{ needs.config.outputs.runner_name }}
+      SCENEWORKS_SHA: ${{ needs.config.outputs.sceneworks_sha }}
+      KV_SOFT_BUDGET_MIN: "240"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: .github
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Precheck and run D-control
+        id: run
+        run: bash .github/kv-poc/phase.sh run d-control
+      - name: Collect D-control evidence
+        if: ${{ always() }}
+        run: bash .github/kv-poc/phase.sh collect d-control
+      - name: Upload D-control evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kv-poc-d-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kv-poc-artifact/d-control/
+          if-no-files-found: warn
+          retention-days: 30

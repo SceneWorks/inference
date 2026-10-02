@@ -2,13 +2,15 @@
 //!
 //! The decoders run GQA — fewer KV heads than query heads — so cached K/V must be expanded to the
 //! query head count before attention. [`repeat_kv`] is the `[b, hkv, s, hd] -> [b, hkv*groups, s, hd]`
-//! broadcast the mlx-gen stacks use. [`sdpa`] wraps MLX's fused `scaled_dot_product_attention`,
+//! head expansion the mlx-gen stacks use. [`sdpa`] wraps MLX's fused `scaled_dot_product_attention`,
 //! exposing the two masking modes the references need: implicit bottom-right [`AttnMask::Causal`]
 //! (decode) and an explicit [`AttnMask::Additive`] mask (the block-causal / bidirectional paths).
 
 use mlx_rs::fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis};
+use mlx_rs::ops::{
+    add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis, subtract, which,
+};
 use mlx_rs::{Array, Dtype};
 
 use crate::error::{Error, Result};
@@ -18,13 +20,46 @@ use crate::primitives::nn::soft_cap;
 /// reference slices — avoids `-inf` propagating through the softmax).
 const MASK_NEG: f32 = -1e30;
 
-/// Max query rows per fused SDPA call (sc-7430 / sc-7455). The pinned pmetal mlx-rs fork's fused
-/// `scaled_dot_product_attention` **GPU** kernel miscompiles its `q_len > 8` "full/steel" path for
-/// multi-head, power-of-2 `head_dim` (64, 128, …) — returning numerically wrong attention. The
-/// `q_len <= 8` kernel is correct for ANY cache length, so [`sdpa`] never hands the fused kernel more
-/// than this many query rows on the affected shapes; it chunks prefill instead. When the
-/// `sc7430_*` tripwire test starts failing, the fork is fixed and this whole mitigation can go.
+/// Max query rows MLX serves with its single-pass *vector* SDPA kernel, and the floor of every
+/// chunked prefill tile ([`prefill_tiles`]).
+///
+/// `q_len > 8` shapes MLX's fused **full** kernel does not serve (head dims other than 64/80/128,
+/// mismatched q/v) are chunked so no call materializes an unbounded `[heads, q_len, k_len]` score
+/// tensor: to `≤ 8` rows where the vector kernel serves them, to an unfused tile budget otherwise
+/// (the tile [`prefill_attention_tile_bytes`] prices for admission).
+///
+/// History: sc-7430 believed the full kernel returned O(1)-wrong results above 8 rows and chunked
+/// every multi-head power-of-2 prefill here (sc-7455). sc-20676 bisected it against an independent
+/// f64 host reference: the kernel is correct; the full kernel writes its output as a transposed
+/// view (strides `[L·H·D, D, H·D, 1]`) and the tripwire read that buffer with `as_slice`, which
+/// ignores strides. Production consumers transpose/reshape (stride-aware) and were never affected.
 pub(crate) const SDPA_MAX_FUSED_QLEN: i32 = 8;
+
+/// MLX 0.32 serves `q_len ≤ 8` with its vector kernel only while `q_len · gqa_factor ≤ 32`
+/// (`ScaledDotProductAttention::use_fallback`); past that it falls back to unfused attention.
+const SDPA_VECTOR_MAX_QUERY_HEAD_ROWS: i32 = 32;
+
+/// Maximum query rows left in one unevaluated attention graph on the row-chunk prefill path, and
+/// the prompt length above which the resident decoder stack evaluates per layer. Shorter prefills
+/// keep their lazy path.
+pub(crate) const SDPA_EVAL_GROUP_QLEN: i32 = 256;
+
+/// Query rows per fused-full-kernel call in a long prefill ([`sdpa_tiled_prefill`]), sc-20676.
+///
+/// Measured on an M5 Max (bf16, Hq=24, Hkv=8, D=128, causal self-prefill, one layer, 3 runs):
+/// versus one unchunked fused call, 2048-row blocks with an eval per block cost +1.6 ms at 8k
+/// (8.8 → 10.4 ms) and +4–27% at 32k (run-to-run noise is ±50% there); the per-block eval adds
+/// ≤ 6% at 2048 rows but 13–67% at 512/1024. The old 8-row path took 208 ms / 2667 ms at 8k / 32k;
+/// this path 12–20 ms / 149–153 ms. Blocking bounds one Metal dispatch to one block against its
+/// causal prefix (30–40 ms at 32k keys, ~4× that at 130k) instead of a single quadratic
+/// multi-second dispatch at long context — the GPU-watchdog exposure — and matches mlx-lm's
+/// default 2048-token prefill step.
+///
+/// Precision: in f32 on NAX hardware (M5 / macOS ≥ 26.2) the full kernel runs under MLX's default
+/// TF32 (`MLX_ENABLE_TF32=1`), the same policy every f32 matmul in the graph already uses: f32
+/// prefill at head dims 64/80/128 matches an f64 reference to rel ≤ 1.1e-3 (≤ 3.3e-6 with TF32
+/// off or without NAX), where the old 8-row vector-kernel path was ~2e-7. bf16/f16 are unchanged.
+pub(crate) const SDPA_PREFILL_BLOCK_QLEN: i32 = 2048;
 
 /// How attention should be masked.
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +89,9 @@ pub enum AttnMask<'a> {
 ///
 /// `x` is `[batch, n_kv_heads, seq, head_dim]`; the result is `[batch, n_kv_heads * groups, seq,
 /// head_dim]` where `groups = n_query_heads / n_kv_heads`. `groups == 1` (MHA) is a no-op clone.
+/// (sc-20676 removed a >256-token gather workaround for "broadcast-reshape corruption" that did not
+/// reproduce with a stride-aware readback in f32/bf16 over contiguous, transposed and sliced inputs;
+/// `repeat_kv_long_sequence_preserves_finite_values` still guards it on every backend build.)
 pub fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
     if groups == 1 {
         return Ok(x.clone());
@@ -73,10 +111,11 @@ pub fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
 /// (Pre-expanding with [`repeat_kv`] is equivalent but allocates a `groups`× larger K/V — avoid it
 /// on the hot path; see sc-7307.)
 ///
-/// On the pinned pmetal fork the fused kernel is wrong for `q_len > 8` × multi-head × power-of-2
-/// `head_dim` (sc-7430), so for those shapes this **chunks the queries** into `≤ 8`-row pieces and
-/// runs the correct kernel on each (sc-7455). Decode (`q_len = 1`) and short/odd-head-dim prefill go
-/// straight to the fused kernel unchanged.
+/// `q_len > 8` prefill on a shape MLX's fused full kernel serves (head dims 64/80/128) runs in
+/// 2048-row fused blocks; every other shape is chunked to ≤ 8 rows (`prefill_tiles`,
+/// `sdpa_tiled_prefill`, sc-20676). Decode and every other shape go straight to the fused op. The
+/// fused full kernel's output is a transposed view of `[b, q_len, heads, hd]` storage: read it
+/// through a stride-aware op (`transpose`/`reshape`), never a raw `as_slice`.
 pub fn sdpa(
     queries: &Array,
     keys: &Array,
@@ -84,29 +123,120 @@ pub fn sdpa(
     scale: f32,
     mask: AttnMask<'_>,
 ) -> Result<Array> {
-    // MLX has no fused sliding-window mode; materialize the window into an additive mask and run the
-    // ordinary explicit-mask path (which the chunked-prefill mitigation already slices correctly).
-    //
-    // The mask is built in f32 and cast to the query dtype: the fused kernel requires the mask type
-    // to *promote* to the output type, and f32 does not promote to bf16 — a cached decode in bf16
-    // (every real Gemma 4 forward) fails outright without this cast.
-    if let AttnMask::SlidingCausal { window } = mask {
-        let m = sliding_causal_mask(queries.shape()[2], keys.shape()[2], window)?
-            .as_dtype(queries.dtype())?;
-        return sdpa(queries, keys, values, scale, AttnMask::Additive(&m));
-    }
     let (heads, q_len, head_dim) = (queries.shape()[1], queries.shape()[2], queries.shape()[3]);
-    let hits_broken_kernel = q_len > SDPA_MAX_FUSED_QLEN
-        && heads >= 2
-        && head_dim >= 64
-        && (head_dim as u32).is_power_of_two();
-    if hits_broken_kernel {
-        return sdpa_chunked_prefill(queries, keys, values, scale, mask);
+    let (kv_heads, k_len, v_head_dim) = (keys.shape()[1], keys.shape()[2], values.shape()[3]);
+    match prefill_tiles(q_len, heads, kv_heads, head_dim, v_head_dim, k_len) {
+        Some((rows, eval_rows)) => {
+            sdpa_tiled_prefill(queries, keys, values, scale, mask, rows, eval_rows)
+        }
+        None => sdpa_tile(queries, keys, values, scale, mask, 0, q_len),
     }
-    sdpa_fused(queries, keys, values, scale, mask)
 }
 
-/// The raw fused MLX kernel — correct for `q_len <= 8` (and any `q_len` at non-power-of-2 head dims).
+/// Whether MLX 0.32's fused **full** (steel / NAX) kernel serves `q_len > 8` at these head dims
+/// (`sdpa_full_supported_head_dim`). sc-20676 verified it against an f64 host reference in
+/// bf16/f16/f32 (`fused_full_kernel_matches_host_across_dtypes`).
+fn fused_full_kernel_serves(q_head_dim: i32, v_head_dim: i32) -> bool {
+    q_head_dim == v_head_dim && matches!(q_head_dim, 64 | 80 | 128)
+}
+
+/// Whether MLX 0.32's *vector* kernel serves `≤ 8`-row chunks of this shape
+/// (`sdpa_vector_supported_head_dim` and `q_len · gqa ≤ 32` with at least one row).
+fn vector_kernel_serves(q_head_dim: i32, v_head_dim: i32, gqa: i32) -> bool {
+    let head_dim = (q_head_dim == v_head_dim && matches!(q_head_dim, 64 | 96 | 128 | 256))
+        || (q_head_dim == 192 && v_head_dim == 128);
+    head_dim && gqa <= SDPA_VECTOR_MAX_QUERY_HEAD_ROWS
+}
+
+/// Budget for one unfused attention tile's transient (scores, softmax and mask copies, all heads):
+/// shapes neither fused kernel serves run MLX's unfused fallback, which materializes
+/// `[heads, rows, k_len]` per copy. 256 MiB keeps a SigLIP/Qwen-VL tower (16 heads, head dim 72)
+/// at one call up to ~1.3k tokens and bounds a long prompt to a few-hundred-MiB tile.
+const SDPA_UNFUSED_TILE_BUDGET_BYTES: u64 = 256 << 20;
+/// Score-set copies an unfused tile holds at once (scores, softmax, mask), at F32 width.
+const SDPA_UNFUSED_TILE_COPIES: u64 = 3;
+const SDPA_UNFUSED_SCORE_BYTES: u64 = 4;
+
+/// Rows per unfused tile: as many as fit [`SDPA_UNFUSED_TILE_BUDGET_BYTES`] against `k_len` keys,
+/// never fewer than [`SDPA_MAX_FUSED_QLEN`].
+fn unfused_tile_rows(heads: i32, k_len: i32) -> i32 {
+    let per_row = (heads.max(1) as u64)
+        * (k_len.max(1) as u64)
+        * SDPA_UNFUSED_SCORE_BYTES
+        * SDPA_UNFUSED_TILE_COPIES;
+    let rows = SDPA_UNFUSED_TILE_BUDGET_BYTES / per_row;
+    rows.clamp(SDPA_MAX_FUSED_QLEN as u64, i32::MAX as u64) as i32
+}
+
+/// The `(rows, eval_rows)` tiling [`sdpa`] prefills with, or `None` for one call.
+///
+/// - `q_len <= 8`: `None` — one fused call (MLX's vector kernel, correct for any cache length).
+/// - A shape the fused full kernel serves ([`fused_full_kernel_serves`]):
+///   [`SDPA_PREFILL_BLOCK_QLEN`]-row blocks, each evaluated once the prompt spans more than one.
+/// - A shape the vector kernel serves ([`vector_kernel_serves`]): `min(8, 32 / gqa)`-row chunks,
+///   evaluated per [`SDPA_EVAL_GROUP_QLEN`] rows.
+/// - Anything else runs MLX's unfused fallback: one call when the whole prompt fits the unfused
+///   tile budget ([`unfused_tile_rows`]), otherwise budget-sized chunks, each evaluated.
+fn prefill_tiles(
+    q_len: i32,
+    heads: i32,
+    kv_heads: i32,
+    q_head_dim: i32,
+    v_head_dim: i32,
+    k_len: i32,
+) -> Option<(i32, i32)> {
+    if q_len <= SDPA_MAX_FUSED_QLEN {
+        return None;
+    }
+    if fused_full_kernel_serves(q_head_dim, v_head_dim) {
+        return Some((SDPA_PREFILL_BLOCK_QLEN, SDPA_PREFILL_BLOCK_QLEN));
+    }
+    let gqa = (heads / kv_heads.max(1)).max(1);
+    if vector_kernel_serves(q_head_dim, v_head_dim, gqa) {
+        let rows = (SDPA_VECTOR_MAX_QUERY_HEAD_ROWS / gqa).clamp(1, SDPA_MAX_FUSED_QLEN);
+        return Some((rows, SDPA_EVAL_GROUP_QLEN));
+    }
+    let rows = unfused_tile_rows(heads, k_len);
+    (rows < q_len).then_some((rows, rows))
+}
+
+/// Upper bound on the attention transient one [`sdpa`] prefill tile materializes for a
+/// `prompt`-token single-sequence request (keys = prompt), derived from [`prefill_tiles`]:
+///
+/// - full-kernel shapes: the kernel keeps scores on chip; the only per-tile allocation that scales
+///   with the prompt is an explicit mask's query slice (`rows × k_len`, `rows ≤ 2048`) — priced
+///   whether or not the request passes a mask;
+/// - every other shape (and `prompt ≤ 8`): a score, mask and softmax set per query head for the
+///   tile's rows (`rows × k_len × heads × 3`), MLX's unfused fallback where the vector kernel
+///   does not serve the head dim.
+///
+/// `score_element_bytes` is the priced scalar width of scores/masks (F32 for MLX's fallback).
+pub(crate) fn prefill_attention_tile_bytes(
+    prompt: u64,
+    query_heads: u64,
+    kv_heads: u64,
+    head_dim: u64,
+    score_element_bytes: u64,
+) -> Option<u64> {
+    let narrow = |v: u64| i32::try_from(v).ok();
+    let (heads, kv, hd) = (narrow(query_heads)?, narrow(kv_heads)?, narrow(head_dim)?);
+    let q_len = i32::try_from(prompt).unwrap_or(i32::MAX);
+    match prefill_tiles(q_len, heads, kv, hd, hd, q_len) {
+        Some((rows, _)) if fused_full_kernel_serves(hd, hd) => prompt
+            .checked_mul(prompt.min(rows as u64))?
+            .checked_mul(score_element_bytes),
+        tiles => {
+            let rows = tiles.map_or(prompt, |(rows, _)| prompt.min(rows as u64));
+            prompt
+                .checked_mul(rows)?
+                .checked_mul(query_heads)?
+                .checked_mul(score_element_bytes)?
+                .checked_mul(3)
+        }
+    }
+}
+
+/// The raw fused MLX kernel, one call.
 fn sdpa_fused(
     queries: &Array,
     keys: &Array,
@@ -118,7 +248,7 @@ fn sdpa_fused(
         AttnMask::None => None,
         AttnMask::Causal => Some(ScaledDotProductAttentionMask::Causal),
         AttnMask::Additive(a) => Some(ScaledDotProductAttentionMask::Array(a)),
-        // `sdpa` materializes the window before dispatching; nothing else reaches the fused kernel.
+        // `sdpa_tile` turns the window into a per-tile additive mask before dispatching.
         AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
     };
     Ok(scaled_dot_product_attention(
@@ -126,9 +256,9 @@ fn sdpa_fused(
     )?)
 }
 
-/// The internal invariant [`sdpa`] upholds: it converts [`AttnMask::SlidingCausal`] into an explicit
-/// additive mask before dispatching, so neither the fused kernel nor the chunked-prefill path ever
-/// sees the variant. Reaching either with it is a bug in this module, not bad input.
+/// The internal invariant [`sdpa_tile`] upholds: it converts [`AttnMask::SlidingCausal`] into a
+/// per-tile additive mask before dispatching, so the fused call never sees the variant. Reaching
+/// it with one is a bug in this module, not bad input.
 fn sliding_mask_not_materialized() -> Error {
     Error::Msg(
         "sliding-window masks must be materialized by `sdpa` before dispatch (internal invariant)"
@@ -141,71 +271,157 @@ fn range_index(start: i32, end: i32) -> Array {
     Array::from_slice(&(start..end).collect::<Vec<i32>>(), &[end - start])
 }
 
-/// sc-7455 mitigation for the broken `q_len > 8` fused kernel: split the queries into `≤ 8`-row
-/// chunks so every fused call lands on the correct path, attend each chunk against exactly the keys
-/// it should, and concatenate. Mathematically identical to one correct attention call (gated against
-/// a host reference by `fused_sdpa_correct_vs_host_for_short_qlen` + the chunked-path test).
+/// Attention for query rows `[c0, c1)` against exactly the keys they may see — one fused call
+/// (MLX's vector, full, or unfused kernel, as the shape dictates). `[0, q_len)` is the whole
+/// prompt and passes the arrays through unsliced.
 ///
-/// - **Causal**: chunk rows `[c0, c1)` (with `offset = k_len − q_len`) attend keys `0..(offset+c1)`;
+/// - **Causal**: rows `[c0, c1)` (with `offset = k_len − q_len`) attend keys `0..(offset+c1)`;
 ///   slice K/V to that prefix and use the implicit causal mask, which then bottom-right-aligns the
-///   chunk correctly (`offset' = (offset+c1) − (c1−c0) = offset+c0`). Caps the score matrix at
-///   `[·, ·, 8, k_len]` — no full `[·, ·, q_len, k_len]` materialization. The prefix is taken with a
-///   strided **slice view** (`index`, `mlx_slice`), not a `take_axis` gather — no index-vector alloc
-///   and no eager copy of the growing prefix per chunk (sc-7469).
+///   tile correctly (`offset' = (offset+c1) − (c1−c0) = offset+c0`). The prefix is a strided
+///   **slice view**, not a `take_axis` gather — no eager copy of the growing prefix (sc-7469).
+/// - **SlidingCausal**: row `r` sits at `offset + r` and sees keys `(offset+r−window, offset+r]`;
+///   slice K/V to the tile's union of those windows and build that tile's additive mask on device
+///   ([`sliding_mask_tile`]) — never the full `[q_len, k_len]` mask.
 /// - **None**: every query attends all keys — pass the full K/V.
 /// - **Additive**: the mask already encodes visibility, so pass full K/V and slice the mask's query
 ///   axis to `[c0, c1)` (when that axis isn't broadcast).
-///
-/// The chunk outputs stay **lazy** and are concatenated into one graph for the caller to `eval` — the
-/// same contract as [`sdpa_fused`]. sc-7469 measured the original per-chunk `eval` (a GPU sync every
-/// chunk × every layer, ~1900 syncs for a 512-token 30-layer prefill) at **~95% of total prefill
-/// time**, collapsing a 135M prefill from ~57k to ~1.1k tok/s. It bounded nothing the single forward
-/// `eval` doesn't already bound: MLX frees each chunk's K/V gather as it streams the graph, so peak
-/// transient is one chunk's key prefix, not the sum — exactly as the pre-mitigation fused prefill
-/// (which never OOM'd) behaved ([[mlx-benchmarks-must-bound-memory]] is about unbounded *multi-eval*
-/// sweeps, not one forward's intermediates).
-fn sdpa_chunked_prefill(
+fn sdpa_tile(
     queries: &Array,
     keys: &Array,
     values: &Array,
     scale: f32,
     mask: AttnMask<'_>,
+    c0: i32,
+    c1: i32,
+) -> Result<Array> {
+    let (q_len, k_len) = (queries.shape()[2], keys.shape()[2]);
+    let offset = k_len - q_len; // cached prefix before the new queries
+    let whole = c0 == 0 && c1 == q_len;
+    let q_tile = if whole {
+        queries.clone()
+    } else {
+        queries.try_index((.., .., c0..c1, ..))? // [·, ·, c1−c0, hd] view
+    };
+    let key_range = |start: i32, end: i32| -> Result<(Array, Array)> {
+        if start == 0 && end == k_len {
+            return Ok((keys.clone(), values.clone()));
+        }
+        Ok((
+            keys.try_index((.., .., start..end, ..))?,
+            values.try_index((.., .., start..end, ..))?,
+        ))
+    };
+    match mask {
+        AttnMask::None => sdpa_fused(&q_tile, keys, values, scale, AttnMask::None),
+        AttnMask::Causal => {
+            let (k, v) = key_range(0, offset + c1)?;
+            sdpa_fused(&q_tile, &k, &v, scale, AttnMask::Causal)
+        }
+        AttnMask::SlidingCausal { window } => {
+            if window <= 0 {
+                return Err(Error::Msg(format!(
+                    "sliding-window attention: window must be positive, got {window}"
+                )));
+            }
+            let (first, start, end) = sliding_tile_keys(offset, c0, c1, window);
+            let (k, v) = key_range(start, end)?;
+            let m = sliding_mask_tile(first, c1 - c0, start, end - start, window, queries.dtype())?;
+            sdpa_fused(&q_tile, &k, &v, scale, AttnMask::Additive(&m))
+        }
+        AttnMask::Additive(a) => {
+            let q_axis = a.ndim() as i32 - 2;
+            if !whole && a.shape()[q_axis as usize] == q_len {
+                let a_tile = a.take_axis(range_index(c0, c1), q_axis)?;
+                sdpa_fused(&q_tile, keys, values, scale, AttnMask::Additive(&a_tile))
+            } else {
+                sdpa_fused(&q_tile, keys, values, scale, AttnMask::Additive(a))
+            }
+        }
+    }
+}
+
+/// For sliding-window rows `[c0, c1)` after `offset` cached keys: `(first, start, end)` — the first
+/// row's absolute position and the key range `[start, end)` the tile's rows can see (the union of
+/// their windows, at most `window + rows − 1` keys).
+fn sliding_tile_keys(offset: i32, c0: i32, c1: i32, window: i32) -> (i32, i32, i32) {
+    let first = offset + c0;
+    (first, (first - window + 1).max(0), offset + c1)
+}
+
+/// The additive sliding-window mask `[1, 1, rows, keys]` for queries at absolute positions
+/// `first..first+rows` over keys at `key0..key0+keys`: `0` where `0 ≤ pos − j < window`, a large
+/// negative elsewhere. Built on device from two position vectors, in `dtype` (the fused kernel
+/// needs a mask that promotes to the output type; f16 saturates the negative to `-inf`, as the
+/// f32→f16 cast of [`sliding_causal_mask`] always did).
+fn sliding_mask_tile(
+    first: i32,
+    rows: i32,
+    key0: i32,
+    keys: i32,
+    window: i32,
+    dtype: Dtype,
+) -> Result<Array> {
+    let q_pos = Array::from_slice(&(first..first + rows).collect::<Vec<i32>>(), &[rows, 1]);
+    let k_pos = Array::from_slice(&(key0..key0 + keys).collect::<Vec<i32>>(), &[1, keys]);
+    let causal = k_pos.le(&q_pos)?;
+    let recent = k_pos.gt(&subtract(&q_pos, Array::from_int(window))?)?;
+    let keep = causal.logical_and(&recent)?;
+    let zero = Array::from_f32(0.0).as_dtype(dtype)?;
+    let blocked = Array::from_f32(MASK_NEG).as_dtype(dtype)?;
+    Ok(which(&keep, &zero, &blocked)?.reshape(&[1, 1, rows, keys])?)
+}
+
+/// Tiled prefill: split the queries into `rows`-row tiles, attend each tile against exactly the
+/// keys it should, and concatenate. Mathematically identical to one attention call (gated against a
+/// host reference by the `*_matches_host_*` tests). [`sdpa`] runs it with
+/// the rows [`prefill_tiles`] picks for the shape.
+///
+/// Each tile is one [`sdpa_tile`] call (which slices keys and masks per tile).
+///
+/// For at most `eval_rows` query rows the outputs stay one lazy graph. Longer prefills evaluate a
+/// group as soon as it spans `eval_rows` rows (at most `eval_rows + rows − 1`; `rows` need not
+/// divide `eval_rows`) before constructing the next group, so at most one group's
+/// attention is left unevaluated and earlier tile handles can be released. The
+/// group result remains live because the next layer needs every query position. The old per-8-row
+/// `eval` cost roughly 95% of a 512-token, 30-layer prefill (sc-7469). This bounds graph lifetime,
+/// not MLX allocator or process peak bytes. A single tile returns the fused op's output unchanged
+/// (MLX's `concatenate` of one array is that array); more tiles return a fresh row-major array.
+fn sdpa_tiled_prefill(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    mask: AttnMask<'_>,
+    rows: i32,
+    eval_rows: i32,
 ) -> Result<Array> {
     let q_len = queries.shape()[2];
-    let k_len = keys.shape()[2];
-    let offset = k_len - q_len; // cached prefix before the new queries; ≥ 0 for cached decode/prefill
-
+    let checkpoint = q_len > eval_rows;
     let mut outs: Vec<Array> =
-        Vec::with_capacity(((q_len + SDPA_MAX_FUSED_QLEN - 1) / SDPA_MAX_FUSED_QLEN) as usize);
-    let mut c0 = 0;
+        Vec::with_capacity(((q_len.min(eval_rows) + rows - 1) / rows) as usize);
+    let mut groups = Vec::new();
+    let (mut c0, mut group_start) = (0, 0);
     while c0 < q_len {
-        let c1 = (c0 + SDPA_MAX_FUSED_QLEN).min(q_len);
-        let q_chunk = queries.try_index((.., .., c0..c1, ..))?; // [·, ·, c1−c0, hd] view
-        let out = match mask {
-            AttnMask::None => sdpa_fused(&q_chunk, keys, values, scale, AttnMask::None)?,
-            AttnMask::Causal => {
-                let end = offset + c1;
-                let k_chunk = keys.try_index((.., .., 0..end, ..))?; // [·, ·, end, hd] prefix view
-                let v_chunk = values.try_index((.., .., 0..end, ..))?;
-                sdpa_fused(&q_chunk, &k_chunk, &v_chunk, scale, AttnMask::Causal)?
-            }
-            AttnMask::Additive(a) => {
-                let q_axis = a.ndim() as i32 - 2;
-                if a.shape()[q_axis as usize] == q_len {
-                    let a_chunk = a.take_axis(range_index(c0, c1), q_axis)?;
-                    sdpa_fused(&q_chunk, keys, values, scale, AttnMask::Additive(&a_chunk))?
-                } else {
-                    sdpa_fused(&q_chunk, keys, values, scale, AttnMask::Additive(a))?
-                }
-            }
-            // `sdpa` materializes the window into `Additive` before it ever reaches here.
-            AttnMask::SlidingCausal { .. } => return Err(sliding_mask_not_materialized()),
-        };
-        outs.push(out); // stay lazy: the caller's single forward `eval` streams + frees each chunk's
-                        // K/V prefix slice, so peak transient is one chunk (sc-7469 — no per-chunk sync)
+        let c1 = (c0 + rows).min(q_len);
+        let out = sdpa_tile(queries, keys, values, scale, mask, c0, c1)?;
+        outs.push(out);
+        if checkpoint && (c1 - group_start >= eval_rows || c1 == q_len) {
+            let refs: Vec<&Array> = outs.iter().collect();
+            let group = concatenate_axis(&refs, 2)?;
+            // Evaluate before dropping the tile handles. Otherwise the final concat retains the
+            // full prefill's lazy attention graph despite each fused call covering one tile.
+            group.eval()?;
+            groups.push(group);
+            outs.clear();
+            group_start = c1;
+        }
         c0 = c1;
     }
-    let refs: Vec<&Array> = outs.iter().collect();
+    let refs: Vec<&Array> = if checkpoint {
+        groups.iter().collect()
+    } else {
+        outs.iter().collect()
+    };
     Ok(concatenate_axis(&refs, 2)?)
 }
 
@@ -257,15 +473,14 @@ fn sdpa_eager(
     let q = queries.as_dtype(Dtype::Float32)?;
     let k = repeat_kv(&keys.as_dtype(Dtype::Float32)?, groups)?;
     let v = repeat_kv(&values.as_dtype(Dtype::Float32)?, groups)?;
-    let (b, nh) = (q.shape()[0], q.shape()[1]);
     let q_len = q.shape()[2];
     let k_len = k.shape()[2];
 
-    // scores = (q @ kᵀ) * scale → [b, heads, q_len, k_len]. MLX's batched 4-D `matmul` misreads the
-    // `[b, heads]` leading dims on this fork (wrong results for multi-head/large shapes — the fused
-    // SDPA avoids raw matmul), so fold `[b, heads]` into one batch axis and run 3-D batched matmuls.
+    // scores = (q @ kᵀ) * scale → [b, heads, q_len, k_len], one 4-D batched matmul. (A former 3-D
+    // fold worked around "wrong 4-D matmul results" that sc-20676 could not reproduce with a
+    // stride-aware readback — the same `as_slice` misread as sc-7430.)
     let kt = k.transpose_axes(&[0, 1, 3, 2])?;
-    let scores = bmm(&q, &kt, b * nh)?; // [b, heads, q_len, k_len]
+    let scores = matmul(&q, &kt)?;
     let mut scores = multiply(&scores, Array::from_f32(scale))?;
     if let Some(c) = softcap {
         scores = soft_cap(&scores, c)?;
@@ -280,22 +495,8 @@ fn sdpa_eager(
     };
     let last_axis = scores.ndim() as i32 - 1;
     let weights = softmax_axis(&scores, last_axis, None)?;
-    let out = bmm(&weights, &v, b * nh)?; // [b, heads, q_len, v_head_dim]
+    let out = matmul(&weights, &v)?; // [b, heads, q_len, v_head_dim]
     Ok(out.as_dtype(out_dtype)?)
-}
-
-/// Batched matrix multiply `a @ b` over 4-D `[lead0, lead1, m, k] @ [lead0, lead1, k, n]` tensors,
-/// run as a **3-D** batched matmul over a single folded batch axis (`batch = lead0 · lead1`). MLX's
-/// 4-D batched `matmul` returns wrong results on this fork for multi-batch/large shapes; folding to
-/// 3-D sidesteps it. Reshape materializes any transposed/broadcast operand into row-major storage.
-fn bmm(a: &Array, b: &Array, batch: i32) -> Result<Array> {
-    let sa = a.shape();
-    let sb = b.shape();
-    let (lead0, lead1, m, k) = (sa[0], sa[1], sa[2], sa[3]);
-    let n = sb[3];
-    let a3 = a.reshape(&[batch, m, k])?;
-    let b3 = b.reshape(&[batch, k, n])?;
-    Ok(matmul(&a3, &b3)?.reshape(&[lead0, lead1, m, n])?)
 }
 
 /// The additive causal mask `[1, 1, q_len, k_len]` (`0` keep / [`MASK_NEG`] block) for keys that
@@ -401,6 +602,99 @@ mod tests {
         Array::from_slice(&data, shape)
     }
 
+    /// Host readback in logical row-major order ([`crate::primitives::nn::to_f32_host`]). MLX's
+    /// fused full attention kernel returns a transposed view (strides `[L·H·D, D, H·D, 1]`), and a
+    /// raw `as_slice` returns the physical buffer — the misread behind sc-7430.
+    fn host_f32(a: &Array) -> Vec<f32> {
+        crate::primitives::nn::to_f32_host(a).unwrap()
+    }
+
+    /// Query rows a long-prompt reference checks: both ends plus interior rows around every
+    /// `boundary` (tile edges), deduplicated. Short prompts check every row.
+    fn check_rows(q_len: usize, boundaries: &[usize]) -> Vec<usize> {
+        if q_len <= 64 {
+            return (0..q_len).collect();
+        }
+        let mut rows: Vec<usize> = (0..4).chain(q_len - 4..q_len).collect();
+        rows.extend((1..8).map(|i| i * q_len / 8));
+        for &b in boundaries.iter().filter(|&&b| b > 0 && b < q_len) {
+            rows.extend([b - 1, b]);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// f64 host GQA attention for the listed query rows only, over the dtype-rounded inputs
+    /// (`host_f32` of the MLX arrays), so the comparison measures kernel error, not input rounding.
+    /// Returns `(logical output index, value)` pairs. Causal aligns queries bottom-right.
+    fn host_attn_rows(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        scale: f32,
+        causal: bool,
+        rows: &[usize],
+    ) -> Vec<(usize, f32)> {
+        let (qs, ks) = (q.shape(), k.shape());
+        let (h, ql, hd) = (qs[1] as usize, qs[2] as usize, qs[3] as usize);
+        let (hkv, kl) = (ks[1] as usize, ks[2] as usize);
+        let (qh, kh, vh) = (host_f32(q), host_f32(k), host_f32(v));
+        let mut out = Vec::with_capacity(h * rows.len() * hd);
+        for head in 0..h {
+            let kb = (head / (h / hkv)) * kl * hd;
+            for &i in rows {
+                let jmax = if causal { kl - ql + i } else { kl - 1 };
+                let qrow = &qh[(head * ql + i) * hd..][..hd];
+                let logits: Vec<f64> = (0..=jmax)
+                    .map(|j| {
+                        let krow = &kh[kb + j * hd..][..hd];
+                        let dot: f64 = qrow
+                            .iter()
+                            .zip(krow)
+                            .map(|(a, b)| *a as f64 * *b as f64)
+                            .sum();
+                        dot * scale as f64
+                    })
+                    .collect();
+                let m = logits.iter().cloned().fold(f64::MIN, f64::max);
+                let w: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+                let denom: f64 = w.iter().sum();
+                for d in 0..hd {
+                    let acc: f64 = w
+                        .iter()
+                        .enumerate()
+                        .map(|(j, wj)| wj * vh[kb + j * hd + d] as f64)
+                        .sum();
+                    out.push(((head * ql + i) * hd + d, (acc / denom) as f32));
+                }
+            }
+        }
+        out
+    }
+
+    /// `max|got − ref| / max|ref|` over the reference's rows (nonfinite values fail).
+    fn rel_err_rows(got: &[f32], reference: &[(usize, f32)]) -> f32 {
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "attention output contains nonfinite values"
+        );
+        let maxd = reference
+            .iter()
+            .map(|&(i, r)| (got[i] - r).abs())
+            .fold(0.0f32, f32::max);
+        let maxr = reference
+            .iter()
+            .map(|&(_, r)| r.abs())
+            .fold(0.0f32, f32::max);
+        maxd / (maxr + 1e-20)
+    }
+
+    /// Random `[1, heads, len, hd]` in `dtype`.
+    fn randd(heads: i32, len: i32, hd: i32, seed: u64, dtype: Dtype) -> Array {
+        randf(&[1, heads, len, hd], seed).as_dtype(dtype).unwrap()
+    }
+
     /// Passing GQA-shaped K/V straight to `sdpa` (MLX native GQA) is numerically identical to the
     /// old `repeat_kv`-then-`sdpa` path — across decode (q_len=1), prefill (q_len>8), batched, and
     /// MHA shapes, for both the implicit-causal and no-mask paths. This is the correctness gate for
@@ -433,10 +727,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(native.shape(), expanded.shape());
-                let (a, e) = (
-                    native.as_slice::<f32>().to_vec(),
-                    expanded.as_slice::<f32>().to_vec(),
-                );
+                let (a, e) = (host_f32(&native), host_f32(&expanded));
                 let maxdiff = a
                     .iter()
                     .zip(&e)
@@ -450,8 +741,8 @@ mod tests {
         }
     }
 
-    /// From-scratch host attention `softmax(scale·QKᵀ [+causal])·V` over `[1, h, ·, hd]` GQA tensors
-    /// (kv expanded to `h`), f64 accumulation — the ground truth the chunked-prefill mitigation is
+    /// From-scratch host attention `softmax(scale·QKᵀ [+causal])·V` over `[1, h, ·, hd]` GQA tensors,
+    /// f64 accumulation — the ground truth the chunked-prefill mitigation is
     /// gated against. Causal aligns the `ql` queries to the bottom-right of the `kl` keys
     /// (offset = kl − ql), so it also covers a cached prefix.
     fn host_attn_gqa(
@@ -462,20 +753,18 @@ mod tests {
         scale: f32,
         causal: bool,
     ) -> Vec<f32> {
-        let kx = repeat_kv(k, groups).unwrap();
-        let vx = repeat_kv(v, groups).unwrap();
-        let (qs, ks) = (q.shape(), kx.shape());
+        let (qs, ks) = (q.shape(), k.shape());
         let (h, ql, hd) = (qs[1] as usize, qs[2] as usize, qs[3] as usize);
         let kl = ks[2] as usize;
         let (qh, kh, vh) = (
             q.as_slice::<f32>(),
-            kx.as_slice::<f32>(),
-            vx.as_slice::<f32>(),
+            k.as_slice::<f32>(),
+            v.as_slice::<f32>(),
         );
         let offset = kl as isize - ql as isize;
         let mut out = vec![0f32; h * ql * hd];
         for head in 0..h {
-            let (qb, kb) = (head * ql * hd, head * kl * hd);
+            let (qb, kb) = (head * ql * hd, (head / groups as usize) * kl * hd);
             for i in 0..ql {
                 let jmax = if causal {
                     (offset + i as isize) as usize
@@ -552,6 +841,10 @@ mod tests {
     }
 
     fn rel_err(a: &[f32], host: &[f32]) -> f32 {
+        assert!(
+            a.iter().chain(host).all(|x| x.is_finite()),
+            "attention comparison contains nonfinite values"
+        );
         let maxd = a
             .iter()
             .zip(host)
@@ -561,11 +854,42 @@ mod tests {
         maxd / (maxh + 1e-20)
     }
 
-    /// **The safe-path gate (sc-7430).** Fused `sdpa` is numerically correct vs a host reference for
-    /// `q_len <= 8` at ALL the shapes the engine actually relies on: decode (`q_len = 1`, any cache
-    /// length) and short / chunked prefill, multi-head GQA, the power-of-2 head dims 64 & 128, both
-    /// masks. On the pinned pmetal fork the fused steel kernel miscompiles `q_len > 8` × multi-head ×
-    /// head_dim ∈ {64,128} (see the tripwire below); this gate pins the regime that stays correct.
+    #[test]
+    fn repeat_kv_long_sequence_preserves_finite_values() {
+        // Include the Llama GQA head ratio (8 KV heads -> 24 query heads) on both sides
+        // of the 256-token expansion boundary, using a small head dimension.
+        for (kv_heads, groups, seq, head_dim) in [
+            (2, 2, 256, 64),
+            (2, 2, 257, 64),
+            (2, 2, 268, 64),
+            (8, 3, 257, 8),
+            (8, 3, 268, 8),
+        ] {
+            let k = randf(&[1, kv_heads, seq, head_dim], 2);
+            let expanded = repeat_kv(&k, groups).unwrap();
+            let source = host_f32(&k);
+            let observed = host_f32(&expanded);
+            let head_len = seq as usize * head_dim as usize;
+            assert_eq!(observed.len(), groups as usize * source.len());
+            for head in 0..kv_heads as usize {
+                for copy in 0..groups as usize {
+                    let start = (head * groups as usize + copy) * head_len;
+                    for offset in 0..head_len {
+                        assert_eq!(
+                            observed[start + offset],
+                            source[head * head_len + offset],
+                            "KV heads {kv_heads}, groups {groups}, sequence {seq}, head {head}, copy {copy}, offset {offset}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The vector-kernel gate (sc-7430). Fused `sdpa` is numerically correct vs a host reference for
+    /// `q_len <= 8`: decode (`q_len = 1`, any cache length) and short / 8-row-chunked prefill,
+    /// multi-head GQA, the power-of-2 head dims 64 & 128, both masks. The full kernel (`q_len > 8`)
+    /// is gated separately by `fused_full_kernel_matches_host_across_dtypes`.
     #[test]
     fn fused_sdpa_correct_vs_host_for_short_qlen() {
         // (n_heads, n_kv_heads, q_len, k_len, head_dim)
@@ -574,6 +898,7 @@ mod tests {
             (32, 8, 1, 256, 128), // decode, long cache, hd=128 (Qwen3-like)
             (8, 2, 8, 8, 64),     // short prefill q_len=8 (chunk boundary)
             (8, 2, 8, 256, 64),   // chunked prefill: 8 new queries into a 256-key cache
+            (2, 1, 8, 268, 64),   // chunked prefill across the 256-key boundary
             (8, 2, 8, 8, 128),    // q_len=8 at hd=128 (chunk boundary for the Qwen3 head dim)
             (4, 4, 4, 64, 128),   // MHA, hd=128
         ];
@@ -586,7 +911,7 @@ mod tests {
             for (causal, mask) in [(false, AttnMask::None), (true, AttnMask::Causal)] {
                 let out = sdpa(&q, &k, &v, scale, mask).unwrap();
                 let host = host_attn_gqa(&q, &k, &v, groups, scale, causal);
-                let e = rel_err(out.as_slice::<f32>(), &host);
+                let e = rel_err(&host_f32(&out), &host);
                 assert!(e < 2e-3, "fused sdpa wrong on a SAFE shape {nh}/{nkv}/{ql}/{kl}/{hd} causal={causal}: rel={e}");
             }
         }
@@ -631,54 +956,256 @@ mod tests {
         }
     }
 
-    /// **Characterization tripwire (sc-7430).** Documents the known pmetal-fork bug by calling the
-    /// RAW fused kernel (`scaled_dot_product_attention`) directly — NOT the [`sdpa`] wrapper, which now
-    /// chunks around it. The raw steel kernel returns numerically WRONG results for `q_len > 8` ×
-    /// multi-head × head_dim ∈ {64,128} — diverging from the host reference by ~O(1) (rel ≈ 1.4),
-    /// identically in f32/bf16/f16, GPU only. When this test FAILS, the fork/MLX has FIXED the kernel:
-    /// drop the [`sdpa`] chunked-prefill mitigation (sc-7455) and delete this tripwire.
     #[test]
-    fn sc7430_raw_fused_sdpa_still_broken_for_long_qlen_pow2_headdim() {
-        let mut broken = 0;
-        for hd in [64, 128] {
-            let scale = 1.0 / (hd as f32).sqrt();
-            let q = randf(&[1, 8, 16, hd], 1); // q_len=16 > 8, 8 heads
-            let k = randf(&[1, 8, 16, hd], 2);
-            let v = randf(&[1, 8, 16, hd], 3);
-            let raw = scaled_dot_product_attention(
-                &q,
-                &k,
-                &v,
-                scale,
-                Some(ScaledDotProductAttentionMask::Causal),
-                None,
-            )
-            .unwrap();
-            let host = host_attn_gqa(&q, &k, &v, 1, scale, true);
-            if rel_err(raw.as_slice::<f32>(), &host) > 0.1 {
-                broken += 1;
+    fn sdpa_eager_long_gqa_matches_independent_host() {
+        for q_len in [1, 8] {
+            let (heads, kv_heads, k_len, head_dim) = (2, 1, 268, 64);
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let q = randf(&[1, heads, q_len, head_dim], 1);
+            let k = randf(&[1, kv_heads, k_len, head_dim], 2);
+            let v = randf(&[1, kv_heads, k_len, head_dim], 3);
+            for (causal, mask) in [(false, AttnMask::None), (true, AttnMask::Causal)] {
+                let out = sdpa_eager(&q, &k, &v, scale, None, mask).unwrap();
+                let host = host_attn_gqa(&q, &k, &v, heads / kv_heads, scale, causal);
+                let error = rel_err(out.as_slice::<f32>(), &host);
+                assert!(
+                    error < 2e-3,
+                    "eager long GQA q_len={q_len} causal={causal}: rel={error}"
+                );
             }
         }
+    }
+
+    /// **The full-kernel tripwire (sc-20676).** MLX's fused full (steel / NAX) kernel — the RAW op,
+    /// not the [`sdpa`] wrapper — matches an f64 host reference for every dtype, head dim, and row
+    /// count [`prefill_tiles`] hands it: bf16/f16/f32 × head_dim {64, 80, 128} × q_len from 9 up to
+    /// one full [`SDPA_PREFILL_BLOCK_QLEN`] block × square and cached-prefix keys × causal / none,
+    /// multi-head GQA. (sc-7430's "O(1)-wrong above 8 rows" was a strided-output misread; see
+    /// [`SDPA_MAX_FUSED_QLEN`].) If a future MLX bump breaks any of these, this goes red — narrow
+    /// [`prefill_tiles`] back to 8-row chunks for the failing cell.
+    ///
+    /// Tolerances are relative to `max|ref|`: f32 2e-3 covers MLX's default TF32 on NAX hardware
+    /// (measured ≤ 1.1e-3; ≤ 3e-6 with `MLX_ENABLE_TF32=0` or without NAX — the same policy every
+    /// f32 matmul in the graph already runs under); bf16 1e-2 and f16 2e-3 (measured ≤ 4e-3 / 8e-4).
+    #[test]
+    fn fused_full_kernel_matches_host_across_dtypes() {
+        let (heads, kv_heads) = (6, 2);
+        for (dtype, tolerance) in [
+            (Dtype::Bfloat16, 1e-2f32),
+            (Dtype::Float16, 2e-3),
+            (Dtype::Float32, 2e-3),
+        ] {
+            for head_dim in [64, 80, 128] {
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                for (q_len, k_len) in [
+                    (9, 9),
+                    (16, 16),
+                    (64, 64),
+                    (512, 512),
+                    (64, 1024),
+                    (2048, 2048),
+                ] {
+                    let q = randd(heads, q_len, head_dim, 1, dtype);
+                    let k = randd(kv_heads, k_len, head_dim, 2, dtype);
+                    let v = randd(kv_heads, k_len, head_dim, 3, dtype);
+                    let rows = check_rows(q_len as usize, &[]);
+                    for causal in [true, false] {
+                        let mask = causal.then_some(ScaledDotProductAttentionMask::Causal);
+                        let raw =
+                            scaled_dot_product_attention(&q, &k, &v, scale, mask, None).unwrap();
+                        let reference = host_attn_rows(&q, &k, &v, scale, causal, &rows);
+                        let e = rel_err_rows(&host_f32(&raw), &reference);
+                        assert!(
+                            e < tolerance,
+                            "fused full kernel {dtype:?} hd{head_dim} q{q_len} k{k_len} causal={causal}: rel={e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The routing rule itself: only the shapes the full-kernel tripwire covers get 2048-row blocks;
+    /// vector-kernel shapes get `min(8, 32 / gqa)`-row chunks; everything else runs MLX's unfused
+    /// fallback — one call while the prompt fits the tile budget, budget-sized chunks beyond it.
+    #[test]
+    fn prefill_tiles_routes_each_kernel_family() {
+        let block = Some((SDPA_PREFILL_BLOCK_QLEN, SDPA_PREFILL_BLOCK_QLEN));
+        let chunk = |rows| Some((rows, SDPA_EVAL_GROUP_QLEN));
+        assert_eq!(SDPA_PREFILL_BLOCK_QLEN, 2048);
+        for hd in [64, 80, 128] {
+            assert_eq!(prefill_tiles(9, 24, 8, hd, hd, 9), block, "hd {hd}");
+            let long = prefill_tiles(131_072, 1, 1, hd, hd, 131_072);
+            assert_eq!(long, block, "single head, hd {hd}");
+            let short = prefill_tiles(8, 24, 8, hd, hd, 8);
+            assert_eq!(short, None, "q_len 8 is the vector kernel");
+        }
+        // Vector-kernel head dims: rows · gqa ≤ 32.
+        for (hd, heads, kv_heads, rows) in [
+            (96, 32, 32, 8),
+            (256, 8, 2, 8),
+            (256, 16, 2, 4),
+            (256, 24, 4, 5),
+            (256, 32, 1, 1),
+        ] {
+            let tiles = prefill_tiles(4096, heads, kv_heads, hd, hd, 4096);
+            assert_eq!(tiles, chunk(rows), "hd {hd} gqa {}", heads / kv_heads);
+        }
+        let mla = prefill_tiles(4096, 8, 8, 192, 128, 4096);
+        assert_eq!(mla, chunk(8), "MLA 192/128 is vector-served");
+        // Unfused shapes (head dim 72 SigLIP / Qwen-VL towers, 112, tiny dims, gqa > 32, q ≠ v
+        // outside the vector set): one call while the prompt fits the tile budget.
+        let budget_rows = |heads: u64, k_len: u64| {
+            (SDPA_UNFUSED_TILE_BUDGET_BYTES / (heads * k_len * 4 * 3)) as i32
+        };
         assert_eq!(
-            broken, 2,
-            "raw fused SDPA is no longer broken for q_len>8 × multi-head × hd∈{{64,128}} — \
-             the pmetal-fork steel kernel was fixed; remove the sdpa chunked-prefill mitigation"
+            prefill_tiles(1024, 16, 16, 72, 72, 1024),
+            None,
+            "SigLIP 1k tokens: one call"
+        );
+        for hd in [8, 32, 48, 112] {
+            assert_eq!(prefill_tiles(40, 8, 2, hd, hd, 40), None, "short hd {hd}");
+        }
+        assert_eq!(prefill_tiles(40, 64, 1, 256, 256, 40), None, "gqa 64 short");
+        assert_eq!(
+            prefill_tiles(40, 8, 8, 128, 64, 40),
+            None,
+            "q/v 128/64 short"
+        );
+        // ... and budget-sized, per-tile-evaluated chunks past it.
+        let rows = budget_rows(16, 32_768);
+        assert_eq!(rows, 42);
+        let long = prefill_tiles(32_768, 16, 16, 72, 72, 32_768);
+        assert_eq!(long, Some((rows, rows)), "hd72 at 32k tokens");
+        let rows = budget_rows(16, 4096);
+        assert_eq!(
+            prefill_tiles(4096, 16, 16, 72, 72, 4096),
+            Some((rows, rows))
+        );
+        // Never below the vector-kernel floor, even when one row exceeds the budget.
+        assert_eq!(
+            prefill_tiles(1 << 20, 64, 64, 72, 72, 1 << 20),
+            Some((SDPA_MAX_FUSED_QLEN, SDPA_MAX_FUSED_QLEN))
         );
     }
 
-    /// **The mitigation gate (sc-7455).** The [`sdpa`] wrapper — which chunks queries into ≤8-row
-    /// pieces on the broken envelope — is numerically correct vs the host reference exactly where the
-    /// raw kernel is wrong: `q_len > 8` × multi-head × head_dim ∈ {64,128}, across GQA/MHA, causal &
-    /// no-mask, square prefill and a cached-prefix offset, incl. the real SmolLM2-135M prefill shape.
+    /// Admission prices the tile the routing actually runs: a `rows × k_len` mask slice for
+    /// full-kernel blocks, a per-head score/mask/softmax set for everything else (vector chunks,
+    /// budgeted unfused tiles, or the whole prompt when it fits). Derived from the routing
+    /// constants, not measured bytes.
     #[test]
-    fn sdpa_chunked_prefill_matches_host_for_long_qlen() {
+    fn prefill_attention_tile_bytes_follows_the_routing() {
+        let (prompt, heads, kv_heads, bytes) = (131_072u64, 24u64, 8u64, 4u64);
+        let block = SDPA_PREFILL_BLOCK_QLEN as u64;
+        for hd in [64, 80, 128] {
+            assert_eq!(
+                prefill_attention_tile_bytes(prompt, heads, kv_heads, hd, bytes),
+                Some(prompt * block * bytes),
+                "full-kernel hd {hd}"
+            );
+            // A prompt shorter than one block slices only its own rows.
+            let short = prefill_attention_tile_bytes(100, heads, kv_heads, hd, bytes);
+            assert_eq!(short, Some(100 * 100 * bytes));
+        }
+        for (hd, heads, kv_heads, rows) in [(96, 32, 32, 8), (256, 16, 2, 4)] {
+            assert_eq!(
+                prefill_attention_tile_bytes(prompt, heads, kv_heads, hd, bytes),
+                Some(prompt * rows * heads * bytes * 3),
+                "vector chunks hd {hd} gqa {}",
+                heads / kv_heads
+            );
+        }
+        // Unfused hd72: the budgeted tile at long context (≤ the budget), the whole prompt when
+        // it fits.
+        let rows = unfused_tile_rows(16, prompt as i32) as u64;
+        let long = prefill_attention_tile_bytes(prompt, 16, 16, 72, bytes).unwrap();
+        assert_eq!(long, prompt * rows * 16 * bytes * 3);
+        assert!(long <= SDPA_UNFUSED_TILE_BUDGET_BYTES);
+        let short = prefill_attention_tile_bytes(1024, 16, 16, 72, bytes);
+        assert_eq!(short, Some(1024 * 1024 * 16 * bytes * 3));
+        // Decode-sized prompts: one call over `prompt` rows.
+        let decode = prefill_attention_tile_bytes(5, heads, kv_heads, 128, bytes);
+        assert_eq!(decode, Some(5 * 5 * heads * bytes * 3));
+    }
+
+    /// [`sdpa_tiled_prefill`]'s tile/offset/eval-group bookkeeping at small tiles (many tiles, ragged
+    /// tail, groups of several tiles, a cached prefix) matches the host reference for all three mask
+    /// kinds — the same code path [`sdpa`] runs at 2048-row blocks and 8-row chunks.
+    #[test]
+    fn sdpa_tiled_prefill_matches_host_at_small_tiles() {
+        let (heads, kv_heads, q_len, k_len, hd) = (6, 2, 203, 250, 64);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = randd(heads, q_len, hd, 1, Dtype::Float32);
+        let k = randd(kv_heads, k_len, hd, 2, Dtype::Float32);
+        let v = randd(kv_heads, k_len, hd, 3, Dtype::Float32);
+        let rows: Vec<usize> = (0..q_len as usize).collect();
+        let causal_ref = host_attn_rows(&q, &k, &v, scale, true, &rows);
+        let none_ref = host_attn_rows(&q, &k, &v, scale, false, &rows);
+        let additive = causal_mask(q_len, k_len).unwrap();
+        for (tile, eval_rows) in [(16, 64), (64, 64), (100, 100), (8, 64), (6, 64)] {
+            for (mask, reference, name) in [
+                (AttnMask::Causal, &causal_ref, "causal"),
+                (AttnMask::None, &none_ref, "none"),
+                (AttnMask::Additive(&additive), &causal_ref, "additive"),
+            ] {
+                let out = sdpa_tiled_prefill(&q, &k, &v, scale, mask, tile, eval_rows).unwrap();
+                assert_eq!(out.shape(), &[1, heads, q_len, hd]);
+                let e = rel_err_rows(&host_f32(&out), reference);
+                assert!(e < 2e-3, "tile {tile}/{eval_rows} {name}: rel={e}");
+            }
+        }
+    }
+
+    /// Production prefill for a bf16 causal GQA prompt far past one block (two block boundaries, a
+    /// ragged tail, and a cached prefix) matches the f64 host reference, including the rows either
+    /// side of each block edge.
+    #[test]
+    fn sdpa_long_bf16_causal_gqa_prefill_matches_host() {
+        let (heads, kv_heads, hd) = (6, 2, 128);
+        let (q_len, k_len) = (
+            2 * SDPA_PREFILL_BLOCK_QLEN + 5,
+            2 * SDPA_PREFILL_BLOCK_QLEN + 37,
+        );
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = randd(heads, q_len, hd, 1, Dtype::Bfloat16);
+        let k = randd(kv_heads, k_len, hd, 2, Dtype::Bfloat16);
+        let v = randd(kv_heads, k_len, hd, 3, Dtype::Bfloat16);
+        let block = SDPA_PREFILL_BLOCK_QLEN as usize;
+        let rows = check_rows(q_len as usize, &[block, 2 * block]);
+        let out = sdpa(&q, &k, &v, scale, AttnMask::Causal).unwrap();
+        assert_eq!(out.shape(), &[1, heads, q_len, hd]);
+        out.eval().unwrap();
+        // Three blocks concatenate into a fresh row-major array; one unblocked fused call would
+        // return the kernel's transposed `[b, q_len, heads, hd]` view. Proves the prefill was tiled.
+        let (heads_u, q_len_u, hd_u) = (heads as usize, q_len as usize, hd as usize);
+        assert_eq!(
+            out.strides(),
+            &[heads_u * q_len_u * hd_u, q_len_u * hd_u, hd_u, 1],
+            "a multi-block prefill must be tiled, not one quadratic dispatch"
+        );
+        let reference = host_attn_rows(&q, &k, &v, scale, true, &rows);
+        let e = rel_err_rows(&host_f32(&out), &reference);
+        assert!(e < 1e-2, "long bf16 causal GQA prefill: rel={e}");
+    }
+
+    /// [`sdpa`] is numerically correct vs the host reference for `q_len > 8` prefill on both routes —
+    /// 2048-row blocks (head dims 64/128) and 8-row chunks (head dim 256) — across GQA/MHA, causal &
+    /// no-mask, square prefill and a cached-prefix offset, incl. the SmolLM2-135M prefill shape.
+    #[test]
+    fn sdpa_prefill_matches_host_for_long_qlen() {
         // (n_heads, n_kv_heads, q_len, k_len, head_dim)
         let cases = [
             (8, 2, 16, 16, 64),   // prefill square, GQA, hd64
-            (8, 8, 64, 64, 128),  // prefill square, MHA, hd128, well past the chunk size
+            (8, 8, 64, 64, 128),  // prefill square, MHA, hd128
             (32, 8, 40, 40, 128), // Qwen3-like
             (8, 2, 16, 80, 64),   // 16 new queries into a 64-key cache (offset = 64)
-            (9, 3, 26, 26, 64),   // SmolLM2-135M prefill shape (the sc-7430 real-model case)
+            (9, 3, 26, 26, 64),   // SmolLM2-135M prefill shape
+            (2, 1, 264, 268, 64), // cached keys, past the 8-row path's 256-row eval group
+            (4, 2, 40, 48, 256),  // hd256: row chunks (8 rows at gqa 2), cached prefix
+            (16, 2, 40, 48, 256), // hd256 at gqa 8: 4-row chunks keep rows·gqa ≤ 32
+            (4, 4, 40, 40, 96),   // Phi-3's hd96: row chunks, never one unfused call
+            (6, 1, 30, 30, 32),   // tiny hd32 at gqa 6: unfused, one call (fits the budget)
+            (8, 2, 40, 48, 72),   // SigLIP/Qwen-VL hd72 GQA: unfused, one call, cached prefix
         ];
         for (nh, nkv, ql, kl, hd) in cases {
             let scale = 1.0 / (hd as f32).sqrt();
@@ -690,39 +1217,256 @@ mod tests {
                 let out = sdpa(&q, &k, &v, scale, mask).unwrap();
                 assert_eq!(out.shape(), &[1, nh, ql, hd]);
                 let host = host_attn_gqa(&q, &k, &v, groups, scale, causal);
-                let e = rel_err(out.as_slice::<f32>(), &host);
+                let e = rel_err(&host_f32(&out), &host);
                 assert!(
                     e < 2e-3,
-                    "chunked sdpa wrong {nh}/{nkv}/{ql}/{kl}/{hd} causal={causal}: rel={e}"
+                    "prefill sdpa wrong {nh}/{nkv}/{ql}/{kl}/{hd} causal={causal}: rel={e}"
                 );
             }
         }
     }
 
-    /// sc-7455: the chunked path also handles an explicit **Additive** mask (the batched-prefill
-    /// block-causal mask, shape `[b,1,q_len,k_len]`) by slicing the mask's query axis per chunk — so
-    /// the result matches a causal host reference. Guards the `decode/batch.rs` prefill path.
+    /// Prefill also handles an explicit **Additive** mask (the batched-prefill block-causal mask,
+    /// shape `[b,1,q_len,k_len]`) on both routes — the 8-row route slices the mask's query axis per
+    /// chunk — matching a causal host reference. Guards the `decode/batch.rs` prefill path.
     #[test]
-    fn sdpa_chunked_prefill_additive_mask_matches_host() {
-        let (nh, ql, hd) = (8, 20, 64); // q_len=20 > 8, hd=64 → chunked
-        let scale = 1.0 / (hd as f32).sqrt();
-        let q = randf(&[1, nh, ql, hd], 1);
-        let k = randf(&[1, nh, ql, hd], 2);
-        let v = randf(&[1, nh, ql, hd], 3);
-        // Additive causal mask [1,1,ql,ql]: 0 on/below the diagonal, -inf above.
-        let mut md = vec![0f32; (ql * ql) as usize];
-        for r in 0..ql {
-            for j in 0..ql {
-                if j > r {
-                    md[(r * ql + j) as usize] = f32::NEG_INFINITY;
+    fn sdpa_prefill_additive_mask_matches_host() {
+        for hd in [64, 256] {
+            let (nh, ql) = (8, 20); // q_len=20 > 8
+            let scale = 1.0 / (hd as f32).sqrt();
+            let q = randf(&[1, nh, ql, hd], 1);
+            let k = randf(&[1, nh, ql, hd], 2);
+            let v = randf(&[1, nh, ql, hd], 3);
+            // Additive causal mask [1,1,ql,ql]: 0 on/below the diagonal, -inf above.
+            let mut md = vec![0f32; (ql * ql) as usize];
+            for r in 0..ql {
+                for j in 0..ql {
+                    if j > r {
+                        md[(r * ql + j) as usize] = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            let m = Array::from_slice(&md, &[1, 1, ql, ql]);
+            let out = sdpa(&q, &k, &v, scale, AttnMask::Additive(&m)).unwrap();
+            let host = host_attn_gqa(&q, &k, &v, 1, scale, true);
+            let e = rel_err(&host_f32(&out), &host);
+            assert!(
+                e < 2e-3,
+                "additive-mask prefill sdpa wrong at hd {hd}: rel={e}"
+            );
+        }
+    }
+
+    /// sc-20676: the batched left-padded prefill (`decode_logits_masked`, `[b, 1, q, k]` bf16
+    /// additive mask) on the fused full kernel — one block, and 16-row tiles whose mask slices must
+    /// keep each batch row's own padding — matches an f64 host reference per batch row.
+    #[test]
+    fn sdpa_bf16_batched_left_pad_additive_mask_matches_host() {
+        let (batch, heads, kv_heads, len) = (2usize, 4usize, 2usize, 40usize);
+        let pads = [0usize, 13];
+        // Row i of batch row b sees keys j ≤ i past its padding; a padding row sees only itself.
+        let visible = |b: usize, i: usize, j: usize| (j <= i && j >= pads[b]) || j == i;
+        let mut mask = vec![0f32; batch * len * len];
+        for b in 0..batch {
+            for i in 0..len {
+                for j in 0..len {
+                    if !visible(b, i, j) {
+                        mask[(b * len + i) * len + j] = MASK_NEG;
+                    }
                 }
             }
         }
-        let m = Array::from_slice(&md, &[1, 1, ql, ql]);
-        let out = sdpa(&q, &k, &v, scale, AttnMask::Additive(&m)).unwrap();
-        let host = host_attn_gqa(&q, &k, &v, 1, scale, true);
-        let e = rel_err(out.as_slice::<f32>(), &host);
-        assert!(e < 2e-3, "chunked additive-mask sdpa wrong: rel={e}");
+        let (bi, hi, kvi, li) = (batch as i32, heads as i32, kv_heads as i32, len as i32);
+        let mask = Array::from_slice(&mask, &[bi, 1, li, li])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        for hd in [64usize, 128] {
+            let hdi = hd as i32;
+            let q = randf(&[bi, hi, li, hdi], 1)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let k = randf(&[bi, kvi, li, hdi], 2)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let v = randf(&[bi, kvi, li, hdi], 3)
+                .as_dtype(Dtype::Bfloat16)
+                .unwrap();
+            let (qh, kh, vh) = (host_f32(&q), host_f32(&k), host_f32(&v));
+            let scale = 1.0 / (hd as f64).sqrt();
+            let mut reference = vec![0f32; batch * heads * len * hd];
+            for b in 0..batch {
+                for h in 0..heads {
+                    let kv = b * kv_heads + h / (heads / kv_heads);
+                    for i in 0..len {
+                        let qrow = &qh[((b * heads + h) * len + i) * hd..][..hd];
+                        let keys: Vec<usize> = (0..len).filter(|&j| visible(b, i, j)).collect();
+                        let logits: Vec<f64> = keys
+                            .iter()
+                            .map(|&j| {
+                                let krow = &kh[(kv * len + j) * hd..][..hd];
+                                let dot: f64 = qrow
+                                    .iter()
+                                    .zip(krow)
+                                    .map(|(a, c)| *a as f64 * *c as f64)
+                                    .sum();
+                                dot * scale
+                            })
+                            .collect();
+                        let m = logits.iter().cloned().fold(f64::MIN, f64::max);
+                        let w: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+                        let denom: f64 = w.iter().sum();
+                        for d in 0..hd {
+                            let acc: f64 = keys
+                                .iter()
+                                .zip(&w)
+                                .map(|(&j, wj)| wj * vh[(kv * len + j) * hd + d] as f64)
+                                .sum();
+                            reference[((b * heads + h) * len + i) * hd + d] = (acc / denom) as f32;
+                        }
+                    }
+                }
+            }
+            let whole = sdpa(&q, &k, &v, scale as f32, AttnMask::Additive(&mask)).unwrap();
+            let tiled =
+                sdpa_tiled_prefill(&q, &k, &v, scale as f32, AttnMask::Additive(&mask), 16, 16)
+                    .unwrap();
+            for (name, out) in [("one block", whole), ("16-row tiles", tiled)] {
+                let e = rel_err(&host_f32(&out), &reference);
+                assert!(e < 1e-2, "bf16 batched left-pad hd{hd} {name}: rel={e}");
+            }
+        }
+    }
+
+    /// f64 host GQA attention (batch 1) under an arbitrary visibility rule `visible(row, key)`.
+    fn host_attn_visible(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        scale: f32,
+        rows: &[usize],
+        visible: impl Fn(usize, usize) -> bool,
+    ) -> Vec<(usize, f32)> {
+        let (qs, ks) = (q.shape(), k.shape());
+        let (h, ql, hd) = (qs[1] as usize, qs[2] as usize, qs[3] as usize);
+        let (hkv, kl) = (ks[1] as usize, ks[2] as usize);
+        let (qh, kh, vh) = (host_f32(q), host_f32(k), host_f32(v));
+        let mut out = Vec::new();
+        for head in 0..h {
+            let kb = (head / (h / hkv)) * kl * hd;
+            for &i in rows {
+                let keys: Vec<usize> = (0..kl).filter(|&j| visible(i, j)).collect();
+                let qrow = &qh[(head * ql + i) * hd..][..hd];
+                let logits: Vec<f64> = keys
+                    .iter()
+                    .map(|&j| {
+                        let krow = &kh[kb + j * hd..][..hd];
+                        qrow.iter()
+                            .zip(krow)
+                            .map(|(a, b)| *a as f64 * *b as f64)
+                            .sum::<f64>()
+                            * scale as f64
+                    })
+                    .collect();
+                let m = logits.iter().cloned().fold(f64::MIN, f64::max);
+                let w: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+                let denom: f64 = w.iter().sum();
+                for d in 0..hd {
+                    let acc: f64 = keys
+                        .iter()
+                        .zip(&w)
+                        .map(|(&j, wj)| wj * vh[kb + j * hd + d] as f64)
+                        .sum();
+                    out.push(((head * ql + i) * hd + d, (acc / denom) as f32));
+                }
+            }
+        }
+        out
+    }
+
+    /// A sliding tile sees only the union of its rows' windows, and its device-built mask is the
+    /// window rule over exactly those keys.
+    #[test]
+    fn sliding_tile_keys_and_mask_cover_only_the_window() {
+        // 100 cached keys, rows 8..12 (positions 108..111), window 5: keys 104..=111.
+        assert_eq!(sliding_tile_keys(100, 8, 12, 5), (108, 104, 112));
+        assert_eq!(
+            sliding_tile_keys(0, 0, 4, 16),
+            (0, 0, 4),
+            "clamped at the first key"
+        );
+        let m = sliding_mask_tile(108, 4, 104, 8, 5, Dtype::Float32).unwrap();
+        assert_eq!(m.shape(), &[1, 1, 4, 8]);
+        let m = host_f32(&m);
+        for r in 0..4 {
+            for j in 0..8 {
+                let (pos, key) = (108 + r, 104 + j);
+                let keep = key <= pos && pos - key < 5;
+                assert_eq!(m[r * 8 + j] == 0.0, keep, "row {r} key {j}");
+            }
+        }
+    }
+
+    /// Sliding-window prefill builds its mask per tile on device over the tile's key window
+    /// (sc-20676) — never the full `[q_len, k_len]` mask — and matches the host reference: vector,
+    /// full-kernel and unfused head dims, a cached prefix, windows narrower and wider than a tile.
+    #[test]
+    fn sdpa_sliding_window_tiles_match_host() {
+        let (q_len, k_len) = (37, 50);
+        let offset = k_len - q_len;
+        for (hd, heads, kv_heads) in [(64, 4, 2), (256, 4, 2), (72, 4, 2)] {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let q = randd(heads, q_len, hd, 1, Dtype::Float32);
+            let k = randd(kv_heads, k_len, hd, 2, Dtype::Float32);
+            let v = randd(kv_heads, k_len, hd, 3, Dtype::Float32);
+            let rows: Vec<usize> = (0..q_len as usize).collect();
+            for window in [1, 5, 16, 200] {
+                let visible = |i: usize, j: usize| {
+                    let pos = offset as usize + i;
+                    j <= pos && pos - j < window as usize
+                };
+                let reference = host_attn_visible(&q, &k, &v, scale, &rows, visible);
+                let mask = AttnMask::SlidingCausal { window };
+                let whole = sdpa(&q, &k, &v, scale, mask).unwrap();
+                let tiled = sdpa_tiled_prefill(&q, &k, &v, scale, mask, 8, 16).unwrap();
+                for (name, out) in [("sdpa", whole), ("8-row tiles", tiled)] {
+                    let e = rel_err_rows(&host_f32(&out), &reference);
+                    assert!(e < 2e-3, "sliding hd{hd} window {window} {name}: rel={e}");
+                }
+            }
+        }
+        let bad = sdpa(
+            &randd(2, 16, 64, 1, Dtype::Float32),
+            &randd(2, 16, 64, 2, Dtype::Float32),
+            &randd(2, 16, 64, 3, Dtype::Float32),
+            0.125,
+            AttnMask::SlidingCausal { window: 0 },
+        );
+        assert!(bad.is_err(), "a non-positive window is refused");
+    }
+
+    /// Unfused shapes past the tile budget run budget-sized chunks: head dim 72 GQA (8 over 2
+    /// heads) against 65 536 cached keys tiles 48 rows as 42 + 6 and matches the host reference on
+    /// both sides of the tile edge. (≈ 90 MiB of F32 scores per tile; 38 MiB each for K and V.)
+    #[test]
+    fn sdpa_unfused_budget_tiles_match_host() {
+        let (heads, kv_heads, q_len, k_len, hd) = (8, 2, 48, 65_536, 72);
+        let rows = unfused_tile_rows(heads, k_len);
+        assert_eq!(rows, 42);
+        assert_eq!(
+            prefill_tiles(q_len, heads, kv_heads, hd, hd, k_len),
+            Some((rows, rows))
+        );
+        let scale = 1.0 / (hd as f32).sqrt();
+        let q = randd(heads, q_len, hd, 1, Dtype::Float32);
+        let k = randd(kv_heads, k_len, hd, 2, Dtype::Float32);
+        let v = randd(kv_heads, k_len, hd, 3, Dtype::Float32);
+        let check = [0usize, 41, 42, 47];
+        for (causal, mask) in [(true, AttnMask::Causal), (false, AttnMask::None)] {
+            let out = sdpa(&q, &k, &v, scale, mask).unwrap();
+            let reference = host_attn_rows(&q, &k, &v, scale, causal, &check);
+            let e = rel_err_rows(&host_f32(&out), &reference);
+            assert!(e < 2e-3, "unfused budget tiles causal={causal}: rel={e}");
+        }
     }
 
     /// `sdpa_capped` routes a mismatched query/value head dim (DeepSeek-V2 MLA: q/k=6, v=4) through the

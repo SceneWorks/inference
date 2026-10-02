@@ -25,15 +25,24 @@ autotests = false
 # pmetal build can't shadow the current build's kernels (small-M bm64 GEMM panic). Kept in lock-step
 # with mlx-gen's pin so the two still build ONE mlx-rs.
 mlx-rs = { workspace = true }
+# The mlx-c binding for ops mlx-rs does not wrap (`mlx_contiguous`, sc-20676), same pinned rev.
+mlx-sys = { workspace = true }
 # The backend-neutral contract this crate implements.
 core-llm = { workspace = true }
 # Error plumbing for the engine surface.
 thiserror = { workspace = true }
-# config.json parsing (HF model configs) — Value-based, no derive, matching the mlx-gen convention.
-serde_json = { workspace = true }
+# Config and receipt parsing. Exact float round-tripping is required because the SC-20671
+# cross-language semantic seal normalizes the published JSON numbers by their IEEE-754 bits.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
 # half-precision scalar helpers for host-side dtype handling.
 half = "2"
 memmap2 = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `proc_pid_rusage` reads a PID's phys_footprint without spawning /usr/bin/footprint (sc-20671).
+libc = { workspace = true }
 
 [dev-dependencies]
 # (Tokenizing for the example + real-weights tests goes through core_llm::Tokenizer — no direct

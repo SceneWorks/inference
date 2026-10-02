@@ -10,6 +10,16 @@ use mlx_rs::{Array, Dtype};
 
 use crate::error::Result;
 
+/// Bytes per element of `dtype`.
+pub const fn dtype_bytes(dtype: Dtype) -> u64 {
+    match dtype {
+        Dtype::Bool | Dtype::Uint8 | Dtype::Int8 => 1,
+        Dtype::Uint16 | Dtype::Int16 | Dtype::Float16 | Dtype::Bfloat16 => 2,
+        Dtype::Uint32 | Dtype::Int32 | Dtype::Float32 => 4,
+        Dtype::Uint64 | Dtype::Int64 | Dtype::Float64 | Dtype::Complex64 => 8,
+    }
+}
+
 /// 2-D convolution over NHWC `x` with an mlx `[out, kH, kW, in]` weight (+ optional bias), square
 /// `stride`/`padding`, no dilation, groups = 1 — the patch-embedding conv the SigLIP vision tower
 /// uses (story 7157). HF stores the conv weight `[out, in, kH, kW]`; transpose to `[out, kH, kW, in]`
@@ -39,6 +49,14 @@ pub fn linear(x: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array> 
 
 /// RMSNorm via MLX's fused kernel: `x / rms(x) * weight`.
 pub fn rms_norm(x: &Array, weight: &Array, eps: f32) -> Result<Array> {
+    let x_shape = x.shape();
+    let weight_shape = weight.shape();
+    let x_width = x_shape.last().copied().unwrap_or_default();
+    if weight_shape.len() != 1 || weight_shape[0] != x_width {
+        return Err(crate::error::Error::Msg(format!(
+            "rms_norm width mismatch: activation shape {x_shape:?}, weight shape {weight_shape:?}"
+        )));
+    }
     Ok(mlx_rs::fast::rms_norm(x, weight, eps)?)
 }
 
@@ -136,14 +154,80 @@ pub fn input_ids_batch(rows: &[&[i32]]) -> Result<Array> {
     Ok(Array::from_slice(&flat, &[batch as i32, len as i32]))
 }
 
-/// Convert a logits/last-position `Array` to a host `f32` vector (e.g. for host-side sampling).
+/// A row-major (C-contiguous) copy of `x` — MLX's `contiguous` op, which copies unless `x` is
+/// already row-contiguous. Call it before any raw host read (`as_slice`, `try_as_slice`,
+/// `deep_clone`): those return the physical buffer and ignore strides, so a transposed/permuted
+/// view (e.g. the fused full SDPA kernel's `[b, L, H, D]`-storage output, sc-20676) or a sliced view
+/// reads back in the wrong order. `x · 1` is **not** a substitute: an elementwise op on a
+/// permuted-but-dense input keeps the permuted strides.
+pub fn contiguous(x: &Array) -> Result<Array> {
+    let stream = mlx_rs::StreamOrDevice::default();
+    // SAFETY: `mlx_contiguous` writes a new owned array handle into `result` on success, which
+    // `Array::from_ptr` takes ownership of; on failure the empty handle is freed here.
+    unsafe {
+        let mut result = mlx_sys::mlx_array_new();
+        let status =
+            mlx_sys::mlx_contiguous(&mut result, x.as_ptr(), false, stream.as_ref().as_ptr());
+        if status != 0 {
+            mlx_sys::mlx_array_free(result);
+            return Err(crate::error::Error::Msg(
+                "mlx_contiguous failed while making a row-major copy".into(),
+            ));
+        }
+        Ok(Array::from_ptr(result))
+    }
+}
+
+/// Convert a logits/last-position `Array` to a host `f32` vector (e.g. for host-side sampling), in
+/// logical row-major order whatever its strides ([`contiguous`]).
 pub fn to_f32_host(x: &Array) -> Result<Vec<f32>> {
-    Ok(x.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec())
+    Ok(contiguous(&x.as_dtype(Dtype::Float32)?)?
+        .as_slice::<f32>()
+        .to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transposed view and a sliced view both read back in logical order through [`contiguous`] /
+    /// [`to_f32_host`], where a raw `as_slice` of the transposed view returns physical order.
+    #[test]
+    fn contiguous_reads_transposed_and_sliced_views_in_logical_order() {
+        // x[i][j] = 10·i + j over [3, 4]; its transpose t[j][i] = 10·i + j.
+        let data: Vec<f32> = (0..3)
+            .flat_map(|i| (0..4).map(move |j| (10 * i + j) as f32))
+            .collect();
+        let x = Array::from_slice(&data, &[3, 4]);
+        let t = x.transpose_axes(&[1, 0]).unwrap();
+        let logical: Vec<f32> = (0..4)
+            .flat_map(|j| (0..3).map(move |i| (10 * i + j) as f32))
+            .collect();
+        assert_eq!(
+            t.as_slice::<f32>(),
+            data.as_slice(),
+            "raw read is physical order"
+        );
+        assert_eq!(to_f32_host(&t).unwrap(), logical);
+        t.eval().unwrap();
+        assert_eq!(
+            t.strides(),
+            &[1, 4],
+            "precondition: an evaluated transposed view"
+        );
+        let c = contiguous(&t).unwrap();
+        c.eval().unwrap();
+        assert_eq!(c.strides(), &[3, 1]);
+        // A column slice leaves gaps in the buffer.
+        use mlx_rs::ops::indexing::TryIndexOp;
+        let cols = x.try_index((.., 1..3)).unwrap();
+        assert_eq!(
+            to_f32_host(&cols).unwrap(),
+            vec![1.0, 2.0, 11.0, 12.0, 21.0, 22.0]
+        );
+        // Already row-major input is returned as-is (values unchanged).
+        assert_eq!(to_f32_host(&x).unwrap(), data);
+    }
 
     #[test]
     fn linear_matches_manual_matmul() {
@@ -163,6 +247,14 @@ mod tests {
         let b = Array::from_slice(&[10.0f32, 20.0], &[2]);
         let y = linear(&x, &w, Some(&b)).unwrap();
         assert_eq!(y.as_slice::<f32>().to_vec(), vec![11.0, 21.0]);
+    }
+
+    #[test]
+    fn rms_norm_rejects_width_mismatch_before_backend_dispatch() {
+        let x = Array::zeros::<f32>(&[1, 2, 3]).unwrap();
+        let weight = Array::ones::<f32>(&[4]).unwrap();
+        let error = rms_norm(&x, &weight, 1e-5).unwrap_err().to_string();
+        assert!(error.contains("activation shape [1, 2, 3], weight shape [4]"));
     }
 
     #[test]

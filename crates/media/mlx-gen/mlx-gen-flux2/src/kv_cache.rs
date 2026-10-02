@@ -55,7 +55,11 @@ pub struct Flux2KvCache {
     mode: Cell<Option<CacheMode>>,
     /// Count of trailing reference tokens to cache (the static slice). `0` disables caching.
     num_ref_tokens: Cell<i32>,
+    /// Process-unique SC-20686 owner id (a counter, not an address: the cache may move).
+    sc20686_owner: usize,
 }
+
+static SC20686_NEXT_OWNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 impl Flux2KvCache {
     /// One slot per double-stream and per single-stream block.
@@ -65,6 +69,7 @@ impl Flux2KvCache {
             single: RefCell::new(vec![None; num_single_layers]),
             mode: Cell::new(None),
             num_ref_tokens: Cell::new(0),
+            sc20686_owner: SC20686_NEXT_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -97,6 +102,17 @@ impl Flux2KvCache {
             Some(CacheMode::Extract) if num_ref > 0 => {
                 let ref_k = trailing(&key, num_ref)?;
                 let ref_v = trailing(&value, num_ref)?;
+                if mlx_gen::sc20686::active() {
+                    // SC-20686 Metal lane: the stored slice is a persistent cache; re-extracting an
+                    // occupied slot is recorded as a rebuild.
+                    mlx_gen::sc20686::register_cache(
+                        self.sc20686_key(stream, layer_idx),
+                        &ref_k,
+                        &ref_v,
+                        SC20686_EXTRACT,
+                        SC20686_REBUILD,
+                    )?;
+                }
                 self.slots(stream).borrow_mut()[layer_idx] = Some((ref_k, ref_v));
                 Ok((key, value))
             }
@@ -123,10 +139,153 @@ impl Flux2KvCache {
         }
     }
 
+    fn sc20686_key(&self, stream: Stream, layer_idx: usize) -> mlx_gen::sc20686::CacheKey {
+        mlx_gen::sc20686::CacheKey {
+            owner: self.sc20686_owner,
+            stream: match stream {
+                Stream::Double => 1,
+                Stream::Single => 2,
+            },
+            slot: layer_idx,
+        }
+    }
+
+    /// The SC-20686 cache id this layer reads on a [`CacheMode::Cached`] step (campaign mode only).
+    pub fn sc20686_cached_read(&self, stream: Stream, layer_idx: usize) -> Option<u64> {
+        if self.mode.get() != Some(CacheMode::Cached) || self.num_ref_tokens.get() <= 0 {
+            return None;
+        }
+        mlx_gen::sc20686::cache_id(self.sc20686_key(stream, layer_idx))
+    }
+
+    /// Every stored slot array, in (double, single) layer order. Clones are cheap handles.
+    pub fn slot_arrays(&self) -> Vec<Array> {
+        [&self.double, &self.single]
+            .iter()
+            .flat_map(|slots| {
+                slots
+                    .borrow()
+                    .iter()
+                    .flatten()
+                    .flat_map(|(k, v)| [k.clone(), v.clone()])
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// All per-layer slots are populated (both stacks) — i.e. the extract pass has run.
     pub fn is_populated(&self) -> bool {
         self.double.borrow().iter().all(Option::is_some)
             && self.single.borrow().iter().all(Option::is_some)
+    }
+}
+
+/// Which classifier-free-guidance branch a forward belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfgBranch {
+    Positive,
+    Negative,
+}
+
+/// The per-seed reference-K/V caches of one 9b-kv edit: **one cache per CFG branch**.
+///
+/// The joint attention is unmasked over `[txt, target, ref]`, so from the first double layer on the
+/// reference K/V depend on the prompt. The positive and negative passes therefore each need their
+/// own slots: sharing one cache (the mflux fork's shape) lets the negative extract overwrite the
+/// positive slots at step 0, after which every positive cached step attends over negative-branch
+/// reference K/V.
+pub struct Flux2KvCfgCaches {
+    positive: Flux2KvCache,
+    negative: Option<Flux2KvCache>,
+    extracted: bool,
+    num_ref: usize,
+}
+
+impl Flux2KvCfgCaches {
+    /// `has_negative` = the request runs a true-CFG negative pass.
+    pub fn new(
+        num_double_layers: usize,
+        num_single_layers: usize,
+        has_negative: bool,
+        num_ref: usize,
+    ) -> Self {
+        Self {
+            positive: Flux2KvCache::new(num_double_layers, num_single_layers),
+            negative: has_negative.then(|| Flux2KvCache::new(num_double_layers, num_single_layers)),
+            extracted: false,
+            num_ref,
+        }
+    }
+
+    pub fn cache(&self, branch: CfgBranch) -> Option<&Flux2KvCache> {
+        match branch {
+            CfgBranch::Positive => Some(&self.positive),
+            CfgBranch::Negative => self.negative.as_ref(),
+        }
+    }
+
+    /// One guided velocity. The first call extracts both branches' reference K/V (full
+    /// `[txt, target, ref]` forwards, `include_ref = true`) and materializes every slot together
+    /// with the output in a single evaluation — the lazy `take` slices would otherwise keep each
+    /// layer's full post-RoPE `[txt, target, ref]` K/V alive until step 1. Later calls run the
+    /// `[txt, target]` forwards, each branch splicing **its own** cached reference K/V.
+    /// `run(branch, include_ref, cache)` is one transformer forward; the result is
+    /// `neg + guidance·(pos − neg)` with a negative branch, else the positive velocity.
+    pub fn velocity(
+        &mut self,
+        guidance: f32,
+        mut run: impl FnMut(CfgBranch, bool, &Flux2KvCache) -> Result<Array>,
+    ) -> Result<Array> {
+        let extract = !self.extracted;
+        let mode = if extract {
+            CacheMode::Extract
+        } else {
+            CacheMode::Cached
+        };
+        self.positive.configure(mode, self.num_ref);
+        if let Some(negative) = &self.negative {
+            negative.configure(mode, self.num_ref);
+        }
+        self.extracted = true;
+        let v = run(CfgBranch::Positive, extract, &self.positive)?;
+        let out = match &self.negative {
+            Some(negative) => {
+                let vn = run(CfgBranch::Negative, extract, negative)?;
+                mlx_rs::ops::add(
+                    &vn,
+                    &mlx_rs::ops::multiply(
+                        &mlx_rs::ops::subtract(&v, &vn)?,
+                        mlx_gen::array::scalar(guidance),
+                    )?,
+                )?
+            }
+            None => v,
+        };
+        if extract {
+            let mut to_eval = vec![out.clone()];
+            to_eval.extend(self.positive.slot_arrays());
+            if let Some(negative) = &self.negative {
+                to_eval.extend(negative.slot_arrays());
+            }
+            mlx_rs::transforms::eval(to_eval.iter())?;
+        }
+        Ok(out)
+    }
+}
+
+/// SC-20686 operation names for the persistent reference-K/V cache lifecycle (Metal lane).
+const SC20686_EXTRACT: &str = "Flux2KvCache::extract";
+const SC20686_REBUILD: &str = "Flux2KvCache::extract(rebuild)";
+const SC20686_DROP: &str = "Flux2KvCache::drop";
+
+impl Drop for Flux2KvCache {
+    fn drop(&mut self) {
+        if mlx_gen::sc20686::active() {
+            // Free the cached arrays first so the post-release remnant is sampled after them.
+            self.double.borrow_mut().clear();
+            self.single.borrow_mut().clear();
+            mlx_gen::sc20686::release_owner(self.sc20686_owner, &[1, 2], SC20686_DROP);
+        }
     }
 }
 

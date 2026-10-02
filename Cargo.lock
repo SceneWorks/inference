@@ -680,6 +680,7 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1042,7 +1043,9 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core-testkit",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokenizers 0.22.2",
 ]
@@ -2285,12 +2288,14 @@ dependencies = [
 name = "mlx-gen"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "memmap2",
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "safetensors 0.4.5",
  "sceneworks-gen-core",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
@@ -2825,9 +2830,13 @@ dependencies = [
  "core-llm",
  "core-llm-testkit",
  "half",
+ "libc",
  "memmap2",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
 ]

@@ -503,7 +503,16 @@ impl Generator for Wan {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &req.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(req),
+            on_progress,
+            |on_progress| self.generate_impl(req, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1170,7 +1179,12 @@ impl Wan14b {
         };
         let mut dit = WanTransformer::from_weights(&w, cfg)?;
         if let Some(q) = self.quant {
+            // SC-20686: as VACE-Fun's staged build -- drop the dense map so the materializing
+            // quantize frees each bf16 source as its pack evaluates, then release the freed dense
+            // buffers from MLX's pool before the denoise.
+            drop(w);
             dit.quantize(q.bits(), None)?;
+            mlx_gen::memory_probe::clear_cache();
         }
         // PRE-QUANTIZED (packed Q4/Q8) snapshot: install this expert's adapters as forward-time
         // residuals AFTER building (the bases stay packed) — mirrors `install_adapters_additive`.
@@ -1463,7 +1477,16 @@ impl Generator for Wan14b {
         request: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> mlx_gen::gen_core::Result<GenerationOutput> {
-        self.generate_impl(request, on_progress).map_err(Into::into)
+        // SC-20686 Metal lane: a direct `generate_impl` call unless a campaign is armed.
+        mlx_gen::sc20686::observe_generation(
+            &self.root,
+            &request.cancel,
+            self.descriptor.id,
+            || mlx_gen::sc20686::RequestFacts::from_request(request),
+            on_progress,
+            |on_progress| self.generate_impl(request, on_progress),
+        )
+        .map_err(Into::into)
     }
 
     fn memory_strategy_contract(&self) -> Option<&mlx_gen::gen_core::MemoryProviderContract> {
@@ -1944,6 +1967,110 @@ pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
 /// reuses it.
 ///
 /// [`is_hidden_file`]: mlx_gen::gen_core::weightsmeta::is_hidden_file
+/// SC-20686 estimate-plus-reserve admission: exactly what a dense Wan route's generate-time fit gate
+/// ([`preflight_denoise_memory_guard`]) prices for `req`, plus the output geometry its decode runs
+/// at, resolved from the load spec, the snapshot's `config.json`/file sizes and the request alone --
+/// no weights are loaded and MLX is never touched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DenoiseFacts {
+    pub(crate) resident_bytes: u64,
+    /// The dense (pre-packing) bytes of the largest DiT expert a load-time quantization builds
+    /// before packing it -- live beside its packs while they materialize; 0 for a packed tier.
+    pub(crate) load_transient_bytes: u64,
+    pub(crate) tokens: usize,
+    pub(crate) dim: usize,
+    pub(crate) cfg_batched: bool,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) frames: u32,
+}
+
+/// [`DenoiseFacts`] of the TI2V-5B and the two A14B routes, mirroring their `generate_impl`.
+pub(crate) fn dense_denoise_facts(
+    route: &str,
+    spec: &LoadSpec,
+    req: &GenerationRequest,
+) -> Result<DenoiseFacts> {
+    let WeightsSource::Dir(root) = &spec.weights else {
+        return Err(Error::Msg(format!(
+            "{route}: expected a model directory for the admission estimate"
+        )));
+    };
+    let cfg = WanModelConfig::from_model_dir(root)?;
+    let quant = resolve_load_time_quant(route, &cfg, spec.quantize)?;
+    let adapter_mode = if cfg.quantization.is_some() {
+        AdapterResidencyMode::Additive
+    } else {
+        AdapterResidencyMode::Folded
+    };
+    let frames = req.frames.map(|f| f as usize).unwrap_or(cfg.frame_num);
+    let trim = req.trim_first_frames.unwrap_or(0) as usize;
+    let unsized_adapters = || {
+        Error::Msg(format!(
+            "{route}: cannot size every additive adapter for the estimate"
+        ))
+    };
+    let dense = |file: &str| {
+        if quant.is_some() {
+            dit_resident_bytes(&[root.join(file)], None)
+        } else {
+            0
+        }
+    };
+    let (vae, resident_bytes, cfg_batched, load_transient_bytes) = match route {
+        MODEL_ID => {
+            let adapters = adapter_stack_resident_bytes(&spec.adapters, adapter_mode)
+                .ok_or_else(unsized_adapters)?;
+            let guidance = cfg.sample_guide_scale.resolve_single(req.guidance);
+            (
+                Ti2vProviderVae::VAE_TILING,
+                dit_resident_bytes(&[root.join("model.safetensors")], quant)
+                    .saturating_add(adapters),
+                guidance > 1.0,
+                dense("model.safetensors"),
+            )
+        }
+        MODEL_ID_T2V_14B | MODEL_ID_I2V_14B => {
+            let low = dit_resident_bytes(&[root.join("low_noise_model.safetensors")], quant);
+            let high = dit_resident_bytes(&[root.join("high_noise_model.safetensors")], quant);
+            let (low_adapters, high_adapters) =
+                wan14b_adapter_bytes_per_expert(&spec.adapters, adapter_mode)
+                    .ok_or_else(unsized_adapters)?;
+            (
+                A14bProviderVae::VAE_TILING,
+                wan14b_denoise_resident_bytes(
+                    spec.offload_policy,
+                    req.sampler.as_deref(),
+                    low.saturating_add(low_adapters),
+                    high.saturating_add(high_adapters),
+                ),
+                true,
+                dense("low_noise_model.safetensors").max(dense("high_noise_model.safetensors")),
+            )
+        }
+        other => {
+            return Err(Error::Msg(format!(
+                "{other}: not a dense Wan route for the admission estimate"
+            )))
+        }
+    };
+    let stride = provider_vae_stride(vae);
+    let gen_frames = frames + trim * stride.0;
+    let (width, height) = resolve_capped_dims(req, &cfg, vae);
+    let latent = latent_shape(gen_frames, height, width, cfg.vae_z_dim, stride)?;
+    Ok(DenoiseFacts {
+        resident_bytes,
+        load_transient_bytes,
+        tokens: seq_len(latent, cfg.patch_size),
+        dim: cfg.dim,
+        cfg_batched,
+        width,
+        height,
+        frames: u32::try_from(gen_frames)
+            .map_err(|_| Error::Msg(format!("{route}: frame count overflows")))?,
+    })
+}
+
 pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
     fn weight_bytes_at(p: &std::path::Path) -> u64 {
         match std::fs::metadata(p) {
@@ -1964,13 +2091,17 @@ pub(crate) fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64
             Err(_) => 0,
         }
     }
-    let ratio = match quant.map(|q| q.bits()) {
+    let raw: u64 = files.iter().map(|p| weight_bytes_at(p)).sum();
+    (raw as f64 * quant_resident_ratio(quant)) as u64
+}
+
+/// The resident fraction of a bf16 weight surface after load-time quantization.
+pub(crate) fn quant_resident_ratio(quant: Option<Quant>) -> f64 {
+    match quant.map(|q| q.bits()) {
         Some(4) => 0.30, // 4-bit affine: ~0.5 B/param + scales vs bf16 2 B/param
         Some(8) => 0.55, // 8-bit affine: ~1 B/param + scales
         _ => 1.0,
-    };
-    let raw: u64 = files.iter().map(|p| weight_bytes_at(p)).sum();
-    (raw as f64 * ratio) as u64
+    }
 }
 
 /// The resident transformer bytes the sc-4986 [`preflight_denoise_memory_guard`] must budget for the

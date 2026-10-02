@@ -17,8 +17,11 @@ pub mod attention;
 pub mod coherence;
 pub mod gated_delta;
 pub mod kv_cache;
+pub mod kv_candidates;
 pub mod nn;
+pub mod packed_attention;
 pub mod packed_group_affine_kv;
+pub mod packed_metal;
 pub mod paged_kv_cache;
 pub mod prism;
 pub mod projection;
@@ -32,15 +35,32 @@ pub use coherence::verify_gpu_view;
 pub use gated_delta::{
     causal_depthwise_conv, compute_g, gated_delta_recurrence, rms_norm_gated, DeltaNetCache,
 };
-pub use kv_cache::{CacheRoute, ContiguousKvCache, KvCache};
+pub use kv_cache::{
+    CacheRoute, CompressedCacheStorage, ContiguousKvCache, KvCache, PackedAttentionMask,
+    PackedCacheEvidence, PackedKernelPathEvidence,
+};
 pub use nn::{
-    conv2d, embed, input_ids, input_ids_batch, layer_norm, linear, rms_norm, rms_norm_unscaled,
-    soft_cap,
+    contiguous, conv2d, dtype_bytes, embed, input_ids, input_ids_batch, layer_norm, linear,
+    rms_norm, rms_norm_unscaled, soft_cap,
 };
 pub use packed_group_affine_kv::{
-    select_decoder_cache, CompiledKernelHandle, DecoderCacheSelection, DenseFallbackEvent,
-    DenseFallbackPackedDecoderCache, OpaqueCompiledKernel, PackedCacheRequest,
+    group_affine_kernel_fp32_parity_errors, group_affine_kernel_fp32_parity_errors_at,
+    select_decoder_cache, select_decoder_cache_with_reader, CompiledKernelHandle,
+    DecoderCacheSelection, DenseFallbackEvent, DenseFallbackPackedDecoderCache,
+    OpaqueCompiledKernel, PackedCacheRequest, PackedCodeBits, PackedDispatchTelemetry,
     PackedGroupAffineKvCache, RepresentationMetadata, RetainedPackedKernel,
+    PACKED_METAL_QUANT_GROUP_SIZE,
+};
+pub use packed_metal::{
+    mlx_nax_available, packed_kernel_path_valid, packed_kv_split_count, packed_metal_identity,
+    packed_nax_head_dimension_supported, packed_query_dtype_name, packed_tiled_min_query_tokens,
+    packed_tiled_split_count, PackedAttentionArgs, PackedKernelDescriptor, PackedKernelPath,
+    PackedKernelSelection, PackedMask, PackedMetalGpuFamily, PackedMetalKernel,
+    PackedMetalTuningProfile, PackedNaxSelection, PACKED_METAL_B4_IDENTITY,
+    PACKED_METAL_B8_IDENTITY, PACKED_METAL_DEFAULT_IDENTITY, PACKED_NAX_KERNEL,
+    PACKED_PER_ROW_KERNEL, PACKED_SELECTION_BELOW_MULTI_ROW, PACKED_SELECTION_CONSERVATIVE,
+    PACKED_SELECTION_F32_QUERY, PACKED_SELECTION_HEAD_DIMENSION, PACKED_SELECTION_NAX,
+    PACKED_SELECTION_NAX_UNAVAILABLE, PACKED_TILED_KERNEL,
 };
 pub use paged_kv_cache::{BlockPool, PagedKvCache};
 pub use projection::{KvProjection, Projection, QuantSpec};
