@@ -77,11 +77,13 @@ use std::path::Path;
 
 use mlx_gen::asset_facts::{projected_safetensors_bytes, ResidentProjection};
 use mlx_gen::gen_core::{
-    self, Error as CoreError, MemoryAssetFacts, MemoryBackendRealization, MemoryBehaviorFixture,
-    MemoryBehaviorRoute, MemoryCalibrationIdentity, MemoryFormulaKind, MemoryFormulaVariable,
-    MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier, MemoryParameterRanges, MemoryPhase,
-    MemoryProviderContract, MemoryRequestScope, MemoryRunContext, MemorySafetyDecision,
-    MemoryStrategy, MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
+    self, adapter_stack_resident_bytes, AdapterResidencyMode, Error as CoreError, MemoryAssetFacts,
+    MemoryBackendRealization, MemoryBehaviorFixture, MemoryBehaviorRoute,
+    MemoryCalibrationIdentity, MemoryComponentKind, MemoryComponentResidency, MemoryFormulaKind,
+    MemoryFormulaVariable, MemoryLifecycleCapabilities, MemoryMode, MemoryNumericTier,
+    MemoryParameterRanges, MemoryPhase, MemoryProviderContract, MemoryRequestScope,
+    MemoryResidentComponent, MemoryRunContext, MemorySafetyDecision, MemoryStrategy,
+    MemoryStrategySupport, ResidentRequestMemory, Result as CoreResult,
 };
 use mlx_gen::{LoadSpec, WeightsSource};
 
@@ -844,8 +846,20 @@ fn architecture_facts() -> mlx_gen::gen_core::MemoryArchitectureFacts {
 ///   untied `lm_head` and the whole `model.visual.*` tower are on disk but materialized by nothing
 ///   on this route, so they are [`ResidentProjection::Omit`] — charging them would bill ~2.4 GB of
 ///   weights no render touches;
-/// * the VAE prices `Stored`: it ships f32 and MLX loads at the on-disk dtype.
+/// * the VAE prices `Stored`: it ships f32 and MLX loads at the on-disk dtype;
+/// * a LoRA/LoKr stack (sc-24156) is an overlay, never a base component: it prices into
+///   `overlay_bytes` (the residual factors plus any materialized LyCORIS delta), never into
+///   `base_bytes`.
 pub fn asset_facts(spec: &LoadSpec, root: &Path) -> CoreResult<MemoryAssetFacts> {
+    asset_declaration(spec, root).map(|(facts, _)| facts)
+}
+
+/// [`asset_facts`] plus the typed adapter overlay components its `overlay_bytes` sums — one
+/// computation, so the aggregate and the component axis cannot disagree.
+fn asset_declaration(
+    spec: &LoadSpec,
+    root: &Path,
+) -> CoreResult<(MemoryAssetFacts, Vec<MemoryResidentComponent>)> {
     let tier = resolved_tier(spec, root)?;
     let load_time_quant = crate::quant::installed_tier(root)? == Tier::Bf16;
     let projection = |bits: Option<i32>| -> ResidentProjection {
@@ -869,15 +883,216 @@ pub fn asset_facts(spec: &LoadSpec, root: &Path) -> CoreResult<MemoryAssetFacts>
         }
     })?;
     let decoder = projected_safetensors_bytes(root.join("vae"), |_| ResidentProjection::Stored)?;
-    Ok(MemoryAssetFacts {
-        base_bytes: conditioning
-            .saturating_add(transformer)
-            .saturating_add(decoder),
-        conditioning_bytes: conditioning,
-        transformer_bytes: transformer,
-        decoder_bytes: decoder,
-        overlay_bytes: 0,
-    })
+    // Which DiT Linears are packed, as an input-width multiple: none (bf16), every width the
+    // load-time `QwenImage21Transformer::quantize` can group (a multiple of 32 — it packs at
+    // `GROUP_SIZE` when it divides, else at 32), or only `GROUP_SIZE` multiples on a pre-quantized
+    // tier (the converter leaves every other width dense).
+    let dit_pack_multiple = tier.transformer_bits().map(|_| {
+        if load_time_quant {
+            LOAD_TIME_PACK_MULTIPLE
+        } else {
+            GROUP_SIZE as u64
+        }
+    });
+    let overlays = resident_overlay_components(spec, dit_pack_multiple)?;
+    let overlay_bytes = overlays
+        .iter()
+        .try_fold(0_u64, |total, component| {
+            total.checked_add(component.resident_bytes)
+        })
+        .ok_or_else(|| CoreError::Msg(format!("{MODEL_ID}: overlay byte sum overflow")))?;
+    Ok((
+        MemoryAssetFacts {
+            // The base model only. The shared validator requires `base_bytes` to equal the three
+            // base components and to EXCLUDE `overlay_bytes`; the overlay reaches the resident
+            // total and every predicted peak through the typed auxiliary components instead
+            // (`MemoryProviderContract::total_resident_bytes` / `predicted_peak_from_base`).
+            base_bytes: conditioning
+                .saturating_add(transformer)
+                .saturating_add(decoder),
+            conditioning_bytes: conditioning,
+            transformer_bytes: transformer,
+            decoder_bytes: decoder,
+            overlay_bytes,
+        },
+        overlays,
+    ))
+}
+
+/// Stable provider-local ids for the adapter overlays [`resident_overlay_components`] declares.
+const ADAPTER_RESIDUALS_COMPONENT_ID: &str = "qwen_image_2_1.adapters.forward_residuals";
+const ADAPTER_DELTAS_COMPONENT_ID: &str = "qwen_image_2_1.adapters.materialized_deltas";
+
+/// Width of a materialized LyCORIS `[out, in]` delta: the shared install reconstructs it at bf16.
+const MATERIALIZED_DELTA_ELEMENT_BYTES: u64 = 2;
+
+/// The smallest group `QwenImage21Transformer::quantize` falls back to: a load-time Q4/Q8 packs
+/// every Linear whose input width is a multiple of this and leaves the rest dense.
+const LOAD_TIME_PACK_MULTIPLE: u64 = 32;
+
+/// The adapter stack `load_heavy` installs beside the DiT (sc-24156), priced the way it is held.
+///
+/// * **The factors.** `apply_qwen_image_2_1_adapters` keeps every file's factors on the
+///   `AdaptableLinear`s as forward-time residuals, never folded into the base, so they are priced
+///   through the shared [`adapter_stack_resident_bytes`] at [`AdapterResidencyMode::Additive`]. A
+///   `None` from it means a requested source could not be sized; this fails closed on it rather
+///   than declaring a zero the shared validator would wave through.
+/// * **The materialized deltas.** The shared LyCORIS install does not keep every LoKr/LoHa as
+///   factors. Over a **dense** Linear it reconstructs each LoKr module's full `[out, in]` bf16
+///   delta and holds that; over a **packed** one a linear LoKr stays structured (the small
+///   Kronecker factors, vec-trick residual), but a tucker (`lokr_t2`) LoKr and every LoHa still
+///   materialize. Each such delta is as large as the Linear's own dense weight, so they are priced
+///   from the files' headers ([`materialized_delta_bytes`]) against which Linears the resolved
+///   tier actually packs (`dit_pack_multiple`, `None` for a dense DiT).
+///
+/// A materialized module's factors stay priced too: whether the install releases them after the
+/// reconstruction is not a contract this crate owns, and the error is in the conservative direction.
+fn resident_overlay_components(
+    spec: &LoadSpec,
+    dit_pack_multiple: Option<u64>,
+) -> CoreResult<Vec<MemoryResidentComponent>> {
+    let mut components = Vec::new();
+    let residuals = adapter_stack_resident_bytes(&spec.adapters, AdapterResidencyMode::Additive)
+        .ok_or_else(|| {
+            CoreError::Unsupported(format!(
+                "{MODEL_ID}: an adapter stack was requested but at least one source could not be \
+                 sized; refusing to declare a zero the shared validator would wave through"
+            ))
+        })?;
+    push_overlay(&mut components, ADAPTER_RESIDUALS_COMPONENT_ID, residuals);
+    let mut deltas = 0_u64;
+    for adapter in &spec.adapters {
+        deltas = deltas
+            .checked_add(materialized_delta_bytes(&adapter.path, dit_pack_multiple)?)
+            .ok_or_else(|| {
+                CoreError::Msg(format!("{MODEL_ID}: materialized delta bytes overflow"))
+            })?;
+    }
+    push_overlay(&mut components, ADAPTER_DELTAS_COMPONENT_ID, deltas);
+    Ok(components)
+}
+
+/// Record one adapter overlay, skipping a zero: the shared validator refuses a declared component
+/// with zero bytes, and a component that measured zero is not evidence of residency anyway.
+fn push_overlay(into: &mut Vec<MemoryResidentComponent>, id: &str, resident_bytes: u64) {
+    if resident_bytes == 0 {
+        return;
+    }
+    into.push(MemoryResidentComponent {
+        id: id.to_owned(),
+        kind: MemoryComponentKind::AdapterStack,
+        resident_bytes,
+        // No rung bounds an adapter: it is installed on the DiT `load_heavy` builds and lives as
+        // long as that DiT does.
+        bounded_by: None,
+        residency: MemoryComponentResidency::WholeRender,
+    });
+}
+
+/// Bytes of the full `[out, in]` bf16 deltas the shared LyCORIS install materializes for the adapter
+/// file at `path`, read from its safetensors headers (no tensor data).
+///
+/// A module materializes when it is a **LoHa** (no deferred form exists), a **tucker** LoKr
+/// (`lokr_t2`, no 2-D matrix form), or a LoKr whose target Linear is **dense** — every target when
+/// `pack_multiple` is `None`, otherwise a target whose input width (`c·d` of the `[a,c] ⊗ [b,d]`
+/// factors) is not a multiple of it. A linear LoKr over a packed Linear stays structured and costs
+/// nothing beyond its factors; a LoRA file carries no LyCORIS keys and prices zero here. A module
+/// whose factor set cannot describe a delta fails closed — the install refuses it too.
+fn materialized_delta_bytes(path: &Path, pack_multiple: Option<u64>) -> CoreResult<u64> {
+    use gen_core::weightsmeta::{
+        safetensors_path_tensor_headers, split_factor_key, LOHA_TP_SUFFIXES, LOKR_TP_SUFFIXES,
+    };
+    use std::collections::BTreeMap;
+
+    type Factors<'a> = BTreeMap<&'a str, &'a [usize]>;
+    let headers = safetensors_path_tensor_headers(path)?;
+    let mut lokr: BTreeMap<&str, Factors<'_>> = BTreeMap::new();
+    let mut loha: BTreeMap<&str, Factors<'_>> = BTreeMap::new();
+    for header in &headers {
+        if let Some((module, factor)) = split_factor_key(&header.name, &LOKR_TP_SUFFIXES) {
+            lokr.entry(module)
+                .or_default()
+                .insert(factor, header.shape.as_slice());
+        } else if let Some((module, factor)) = split_factor_key(&header.name, &LOHA_TP_SUFFIXES) {
+            loha.entry(module)
+                .or_default()
+                .insert(factor, header.shape.as_slice());
+        }
+    }
+
+    let refuse = |module: &str, what: &str| {
+        CoreError::Unsupported(format!(
+            "{MODEL_ID}: adapter {} module `{module}` {what}; its materialized delta cannot be \
+             priced",
+            path.display()
+        ))
+    };
+    fn numel(shape: &[usize]) -> u64 {
+        shape.iter().map(|&d| d as u64).product()
+    }
+    // A low-rank pair `a [p, r] · b [r, q, k…]` reconstructs `[p, q, k…]`.
+    fn low_rank(a: &[usize], b: &[usize]) -> Option<u64> {
+        Some((*a.first()? as u64).saturating_mul(numel(b.get(1..)?)))
+    }
+    // A tucker triple `einsum(t [i, j, k…], a [i, p], b [j, q]) → [p, q, k…]`.
+    fn tucker(t: &[usize], a: &[usize], b: &[usize]) -> Option<u64> {
+        Some(
+            (*a.get(1)? as u64)
+                .saturating_mul(*b.get(1)? as u64)
+                .saturating_mul(numel(t.get(2..)?)),
+        )
+    }
+
+    let mut elements = 0_u64;
+    for (&module, f) in &lokr {
+        // Each factor's element count, and its column count (`c` / `d`) where it has a 2-D form.
+        let (w1, w1_cols) = match (f.get("lokr_w1"), f.get("lokr_w1_a"), f.get("lokr_w1_b")) {
+            (Some(w), _, _) => (Some(numel(w)), w.get(1).copied()),
+            (None, Some(a), Some(b)) => (low_rank(a, b), b.get(1).copied()),
+            _ => (None, None),
+        };
+        let w1 = w1.ok_or_else(|| refuse(module, "has no complete w1 factor"))?;
+        let (w2, w2_cols) = match (
+            f.get("lokr_w2"),
+            f.get("lokr_t2"),
+            f.get("lokr_w2_a"),
+            f.get("lokr_w2_b"),
+        ) {
+            (Some(w), _, _, _) => (Some(numel(w)), w.get(1).copied()),
+            (None, Some(t), Some(a), Some(b)) => (tucker(t, a, b), None),
+            (None, None, Some(a), Some(b)) => (low_rank(a, b), b.get(1).copied()),
+            _ => (None, None),
+        };
+        let w2 = w2.ok_or_else(|| refuse(module, "has no complete w2 factor"))?;
+        // The shared install defers exactly a 2-D (non-tucker) LoKr over a packed base.
+        let target_is_packed = match (pack_multiple, w1_cols, w2_cols) {
+            (Some(multiple), Some(c), Some(d)) => {
+                ((c as u64) * (d as u64)).is_multiple_of(multiple)
+            }
+            _ => false,
+        };
+        let structured = target_is_packed
+            && !f.contains_key("lokr_t2")
+            && f.values().all(|shape| shape.len() == 2);
+        if structured {
+            continue;
+        }
+        // `kron(w1, w2)` holds `|w1| · |w2|` elements, reshaped to the base's `[out, in]`.
+        elements = elements.saturating_add(w1.saturating_mul(w2));
+    }
+    for (&module, f) in &loha {
+        // `ΔW = (w1_a·w1_b) ⊙ (w2_a·w2_b)`: one `[out, in]` delta, sized by the first pair.
+        let (Some(a), Some(b)) = (f.get("hada_w1_a"), f.get("hada_w1_b")) else {
+            return Err(refuse(module, "has no complete hada_w1 pair"));
+        };
+        let delta = match f.get("hada_t1") {
+            Some(t) => tucker(t, a, b),
+            None => low_rank(a, b),
+        }
+        .ok_or_else(|| refuse(module, "has a malformed hada_w1 pair"))?;
+        elements = elements.saturating_add(delta);
+    }
+    Ok(elements.saturating_mul(MATERIALIZED_DELTA_ELEMENT_BYTES))
 }
 
 /// The tier this load resolves to: the installed tier of a packed snapshot, or the requested tier
@@ -922,7 +1137,30 @@ pub fn memory_strategy_contract(
             "{MODEL_ID}: memory facts require a snapshot directory"
         )));
     };
-    contract.asset_facts = asset_facts(spec, root)?;
+    let (facts, overlays) = asset_declaration(spec, root)?;
+    contract.asset_facts = facts;
+    // An adapter load (sc-24156) declares its overlay on the typed component axis: the shared
+    // arithmetic adds `overlay_bytes` to the resident total and to every predicted peak ONLY for a
+    // contract that carries auxiliary components and consumes `OverlayBytes`. A clean load keeps
+    // the plain `PhaseEnvelope` — an empty component vector would claim an axis it does not use.
+    if !overlays.is_empty() {
+        let (phases, mut variables) = match &contract.formula {
+            MemoryFormulaKind::PhaseEnvelope { phases, variables } => {
+                (phases.clone(), variables.clone())
+            }
+            _ => {
+                return Err(CoreError::Msg(format!(
+                    "{MODEL_ID}: the weights-free contract no longer declares a PhaseEnvelope"
+                )))
+            }
+        };
+        variables.push(MemoryFormulaVariable::OverlayBytes);
+        contract.formula = MemoryFormulaKind::ComponentPhaseEnvelope {
+            phases,
+            variables,
+            resident_components: overlays,
+        };
+    }
     Ok(contract)
 }
 

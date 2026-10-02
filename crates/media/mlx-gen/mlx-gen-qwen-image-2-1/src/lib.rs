@@ -34,9 +34,14 @@
 //! models condition-image blocks so the reference/edit path (a later story) appends segments
 //! rather than restructuring attention.
 //!
+//! LoRA/LoKr adapters (sc-24156) install onto every Linear of the DiT as forward-time residuals
+//! through the shared strict seam ([`adapters::apply_qwen_image_2_1_adapters`]), after any Q4/Q8
+//! quantization, so they apply on the dense and the packed tiers and on every route alike.
+//!
 //! [`Image`]: mlx_gen::Image
 //! [`QwenImage21Vae::decode_rgba`]: crate::vae::QwenImage21Vae::decode_rgba
 
+pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod loader;
@@ -69,6 +74,7 @@ pub const UPSTREAM_LICENSE_NOTICE: &str = "Qwen is licensed under the Qwen RESEA
     AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights \
     Reserved.";
 
+pub use adapters::apply_qwen_image_2_1_adapters;
 pub use config::{
     SchedulerConfig, SizePreset, TextEncoderConfig, TransformerConfig, VaeConfig, VisionConfig,
     DEFAULT_STEPS, DEFAULT_TRUE_CFG, IMAGE_TOKENS_PER_SLOT, MAX_REFERENCE_IMAGES,
@@ -93,7 +99,9 @@ pub use text_encoder::{
     image_pad_token_id, prompt_template, prompt_template_ti2i, system_prefix,
     system_prompt_drop_count, QwenImage21TextEncoder, TextConditioning, IMAGE_PAD_TOKEN,
 };
-pub use transformer::{JointLayout, QwenImage21Transformer, Segment};
+pub use transformer::{
+    JointLayout, QwenImage21Transformer, Segment, BLOCK_ADAPTER_TARGETS, GLOBAL_ADAPTER_TARGETS,
+};
 pub use vae::QwenImage21Vae;
 
 pub use convert::prequantize_turnkey;

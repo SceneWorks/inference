@@ -20,7 +20,7 @@
 //! (`axes_dims_rope = [16, 56, 56]`, `θ = 10000`) rotates **adjacent** channel pairs
 //! (`view_as_complex`, `use_real=False`), unlike the text tower's half-split RoPE.
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_tanh, rope_rotate, rope_sincos_from_ids, silu, timestep_sincos};
 use mlx_gen::weights::Weights;
@@ -281,6 +281,29 @@ impl Attention {
     }
 }
 
+/// Trained-file (diffusers/peft) naming → fields. 2.1 is **single-stream**: one `to_q/k/v` +
+/// `to_out.0` set serves the whole joint sequence — there is no text-stream `add_{q,k,v}_proj` /
+/// `to_add_out` as on the 2512 dual-stream DiT, so a 2512 adapter's text-stream keys surface as
+/// unmatched (the strict install refuses them by name) rather than landing anywhere.
+impl AdaptableHost for Attention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            ["to_out", "0"] => Some(&mut self.to_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["to_q", "to_k", "to_v", "to_out.0"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
 struct FeedForward {
     gate_layer: AdaptableLinear,
     proj: AdaptableLinear,
@@ -302,6 +325,26 @@ impl FeedForward {
     fn forward(&self, x: &Array) -> Result<Array> {
         let gated = multiply(&silu(&self.gate_layer.forward(x)?)?, &self.proj.forward(x)?)?;
         self.out.forward(&gated)
+    }
+}
+
+/// `img_mlp.{gate_layer, proj, out}` — the SwiGLU's three Linears, in checkpoint naming. The single
+/// stream has no `txt_mlp`.
+impl AdaptableHost for FeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["gate_layer"] => Some(&mut self.gate_layer),
+            ["proj"] => Some(&mut self.proj),
+            ["out"] => Some(&mut self.out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["gate_layer", "proj", "out"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 }
 
@@ -369,6 +412,49 @@ impl Block {
     }
 }
 
+impl AdaptableHost for Block {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["img_mlp", rest @ ..] => self.mlp.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        out.extend(prefixed_paths("img_mlp", &self.mlp));
+        out
+    }
+}
+
+/// Every non-block Linear of the DiT, in checkpoint (diffusers) naming — the dotted path an adapter
+/// file addresses and the key [`QwenImage21Transformer::from_weights`] loads it from. 2.1 has no
+/// per-block modulation Linear (one shared `modulation.1` feeds every block), so these are the only
+/// Linears outside `transformer_blocks.{i}`.
+pub const GLOBAL_ADAPTER_TARGETS: [&str; 8] = [
+    "img_in",
+    "txt_in.in_layer",
+    "txt_in.out_layer",
+    "time_text_embed.timestep_embedder.linear_1",
+    "time_text_embed.timestep_embedder.linear_2",
+    "modulation.1",
+    "norm_out.linear",
+    "proj_out",
+];
+
+/// Per-block adapter targets, relative to `transformer_blocks.{i}`: the attention projections and
+/// the SwiGLU's three Linears. The single-stream DiT has no text-stream twin of any of them.
+pub const BLOCK_ADAPTER_TARGETS: [&str; 7] = [
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "img_mlp.gate_layer",
+    "img_mlp.proj",
+    "img_mlp.out",
+];
+
 /// The single-stream Qwen-Image 2.1 transformer.
 pub struct QwenImage21Transformer {
     cfg: TransformerConfig,
@@ -382,6 +468,47 @@ pub struct QwenImage21Transformer {
     blocks: Vec<Block>,
     norm_out: AdaptableLinear,
     proj_out: AdaptableLinear,
+}
+
+/// The 2.1 adapter key→module map (sc-24156): every Linear of the DiT, addressed by the path it is
+/// keyed under in the checkpoint — per block [`BLOCK_ADAPTER_TARGETS`], outside the blocks
+/// [`GLOBAL_ADAPTER_TARGETS`]. The norms (`norm_q`/`norm_k`, `txt_in.text_norm`) are not Linears
+/// and are not adaptable.
+///
+/// Adapters install as forward-time residuals ([`AdaptableLinear::push`]) that never touch the
+/// base, so the same map serves a dense bf16 DiT and a packed Q4/Q8 one alike.
+impl AdaptableHost for QwenImage21Transformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["img_in"] => Some(&mut self.img_in),
+            ["txt_in", "in_layer"] => Some(&mut self.txt_in),
+            ["txt_in", "out_layer"] => Some(&mut self.txt_out),
+            ["time_text_embed", "timestep_embedder", "linear_1"] => Some(&mut self.time_in),
+            ["time_text_embed", "timestep_embedder", "linear_2"] => Some(&mut self.time_out),
+            ["modulation", "1"] => Some(&mut self.modulation),
+            ["norm_out", "linear"] => Some(&mut self.norm_out),
+            ["proj_out"] => Some(&mut self.proj_out),
+            _ => None,
+        }
+    }
+
+    /// The kohya `lora_unet_` surface: every per-block target plus [`GLOBAL_ADAPTER_TARGETS`], so a
+    /// kohya file that also trains the globals resolves them through the same flattened table
+    /// instead of surfacing them as unmatched. Collision-free once flattened (pinned by a test).
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| prefixed_paths(&format!("transformer_blocks.{i}"), b))
+            .collect();
+        out.extend(GLOBAL_ADAPTER_TARGETS.iter().map(|p| (*p).to_string()));
+        out
+    }
 }
 
 impl QwenImage21Transformer {
