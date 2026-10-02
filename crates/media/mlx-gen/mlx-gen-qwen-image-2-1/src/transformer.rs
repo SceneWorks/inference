@@ -978,7 +978,7 @@ impl QwenImage21Transformer {
     /// sc-24161) form of [`Self::forward_checkpointed`]: `images` are the layout's image blocks in
     /// order (condition images first, target last), exactly as [`Self::forward_joint`] takes them,
     /// and the returned velocity is the target block's. The preamble is the dense path's own
-    /// [`Self::embed_joint`], so the joint sequence, positions and RoPE are identical.
+    /// `embed_joint`, so the joint sequence, positions and RoPE are identical.
     pub fn forward_checkpointed_joint(
         &self,
         text: &Array,
