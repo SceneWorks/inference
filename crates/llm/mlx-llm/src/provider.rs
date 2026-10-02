@@ -6504,4 +6504,390 @@ mod tests {
         assert!(evidence.accepted_direct_calls >= 2 * 40, "{evidence:?}");
         cache.reset().unwrap();
     }
+
+    /// sc-20680: the K8V8 page pool and dense block pool one synthetic model's paged requests
+    /// draw from.
+    fn paged_pools(
+        model: &CausalLm,
+        page_tokens: usize,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<crate::primitives::BlockPool>>,
+        std::rc::Rc<std::cell::RefCell<crate::primitives::PackedPagePool>>,
+    ) {
+        let cfg = model.config();
+        (
+            crate::primitives::BlockPool::new(16),
+            crate::primitives::PackedPagePool::new(
+                cfg.num_layers,
+                cfg.num_kv_heads as usize,
+                cfg.head_dim as usize,
+                page_tokens,
+                crate::primitives::PackedCodeBits::Eight,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A paged request at a context the Qwen3 row admits (the synthetic decode itself is short).
+    fn paged_request<'a>(
+        policy: core_llm::KvCompressionPolicy,
+        dense_pool: &'a std::rc::Rc<std::cell::RefCell<crate::primitives::BlockPool>>,
+        packed_pool: &'a std::rc::Rc<std::cell::RefCell<crate::primitives::PackedPagePool>>,
+        reader: Option<&'a crate::primitives::CompiledKernelHandle>,
+    ) -> crate::primitives::PagedCacheRequest<'a> {
+        crate::primitives::PagedCacheRequest {
+            policy,
+            family: Some(core_llm::KvModelFamily::Qwen3),
+            context_tokens: 20_000,
+            dense_pool,
+            packed_pool,
+            reader,
+        }
+    }
+
+    fn largest_relative_error(reference: &[Vec<f32>], candidate: &[Vec<f32>]) -> f32 {
+        let range = reference
+            .iter()
+            .flatten()
+            .fold(0.0f32, |max, value| max.max(value.abs()));
+        assert!(range > 0.0);
+        reference
+            .iter()
+            .zip(candidate)
+            .flat_map(|(a, b)| a.iter().zip(b))
+            .map(|(a, b)| (a - b).abs() / range)
+            .fold(0.0f32, f32::max)
+    }
+
+    /// sc-20680 AC1/AC2 on a synthetic GQA model: with the qualified opt-in, the paged selection
+    /// runs K8V8 pages read by the fused paged reader; its teacher-forced decode logits equal the
+    /// contiguous compressed cache's exactly (same codes, same kernels, read through the page
+    /// table instead of a contiguous array) and stay within 8-bit rounding of the dense paged
+    /// cache's. Every decode attention call is fused; no call gathers.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paged_compressed_kv_logits_match_contiguous_compressed_and_dense_paged() {
+        let model = tiny_causal_model(4, 2, 64);
+        let reader =
+            crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
+                .unwrap();
+        let prompt = (0..150).map(|i| (i * 7) % 31 + 1).collect::<Vec<i32>>();
+        let stream = (0..60).map(|i| (i * 5) % 31 + 1).collect::<Vec<i32>>();
+        let (dense_pool, packed_pool) = paged_pools(&model, 64);
+        let mut selection = model.select_paged_cache(paged_request(
+            core_llm::KvCompressionPolicy::Qualified,
+            &dense_pool,
+            &packed_pool,
+            Some(&reader),
+        ));
+        assert!(selection.is_compressed());
+        let paged = forced_logits(&model, selection.cache_mut(), &prompt, &stream);
+        let report = selection.report().unwrap();
+        assert!(report.ran_compressed(), "{report:?}");
+        assert_eq!(
+            report.counters.fused_attention_calls,
+            2 * stream.len() as u64
+        );
+        assert_eq!(report.counters.dense_gather_fallbacks, 0);
+        assert!(report.counters.compressed_cache_bytes > 0);
+        assert_eq!(
+            packed_pool.borrow().live_pages(),
+            ((prompt.len() + stream.len()) / 32 * 32).div_ceil(64)
+        );
+
+        let (mut contiguous, refused) =
+            crate::kv_policy::select_compressed_cache(&model, reader, prompt.len());
+        assert_eq!(refused, None);
+        let contiguous = forced_logits(&model, contiguous.as_mut(), &prompt, &stream);
+        assert_eq!(paged, contiguous, "paged and contiguous compressed logits");
+
+        let mut dense = model.new_paged_cache(16);
+        let dense = forced_logits(&model, &mut dense, &prompt, &stream);
+        let error = largest_relative_error(&dense, &paged);
+        assert!(error < 0.02, "paged K8V8 vs dense paged: {error}");
+        drop(selection);
+        assert_eq!(packed_pool.borrow().live_pages(), 0);
+    }
+
+    /// sc-20680 AC3 and the policy's refusals: with the policy off the selection is the existing
+    /// dense paged cache, bit-identical to `new_paged_cache`, and every refused request runs it
+    /// with the reason the report names.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paged_selection_is_the_dense_paged_cache_when_off_or_refused() {
+        use core_llm::{KvCacheFallbackReason as Reason, KvCompressionPolicy as Policy};
+        let model = tiny_causal_model(4, 2, 64);
+        let reader =
+            crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
+                .unwrap();
+        let prompt = (0..70).map(|i| (i * 3) % 31 + 1).collect::<Vec<i32>>();
+        let stream = (0..20).map(|i| (i * 11) % 31 + 1).collect::<Vec<i32>>();
+        let (dense_pool, packed_pool) = paged_pools(&model, 64);
+        let mut off = model.select_paged_cache(paged_request(
+            Policy::Off,
+            &dense_pool,
+            &packed_pool,
+            Some(&reader),
+        ));
+        assert!(!off.is_compressed());
+        assert_eq!(off.report().unwrap().fallback, Some(Reason::PolicyDisabled));
+        assert!(off
+            .cache_mut()
+            .as_any_mut()
+            .downcast_mut::<crate::primitives::PagedKvCache>()
+            .is_some());
+        let off_logits = forced_logits(&model, off.cache_mut(), &prompt, &stream);
+        let mut established = model.new_paged_cache(16);
+        assert_eq!(
+            off_logits,
+            forced_logits(&model, &mut established, &prompt, &stream),
+            "feature off is the established dense paged path"
+        );
+        assert_eq!(packed_pool.borrow().live_pages(), 0, "no page was touched");
+
+        let reason = |request: crate::primitives::PagedCacheRequest<'_>| {
+            let selection = model.select_paged_cache(request);
+            assert!(!selection.is_compressed());
+            selection.report().unwrap().fallback
+        };
+        let qualified =
+            || paged_request(Policy::Qualified, &dense_pool, &packed_pool, Some(&reader));
+        assert_eq!(
+            reason(crate::primitives::PagedCacheRequest {
+                context_tokens: 100,
+                ..qualified()
+            }),
+            Some(Reason::BelowMinimumContext)
+        );
+        assert_eq!(
+            reason(crate::primitives::PagedCacheRequest {
+                family: None,
+                ..qualified()
+            }),
+            Some(Reason::UnqualifiedModel)
+        );
+        assert_eq!(
+            reason(crate::primitives::PagedCacheRequest {
+                reader: None,
+                ..qualified()
+            }),
+            Some(Reason::ReaderUnavailable)
+        );
+        let other_geometry = crate::primitives::PackedPagePool::new(
+            2,
+            1,
+            64,
+            64,
+            crate::primitives::PackedCodeBits::Eight,
+        )
+        .unwrap();
+        assert_eq!(
+            reason(crate::primitives::PagedCacheRequest {
+                packed_pool: &other_geometry,
+                ..qualified()
+            }),
+            Some(Reason::UnsupportedGeometry)
+        );
+        // A head dimension the fused reader does not implement is refused before the pool.
+        assert_eq!(
+            tiny_causal_model(2, 1, 32)
+                .select_paged_cache(qualified())
+                .report()
+                .unwrap()
+                .fallback,
+            Some(Reason::UnsupportedGeometry)
+        );
+    }
+
+    /// sc-20680 AC2 page reuse, fragmentation and cancellation at the model boundary: requests
+    /// decoding interleaved on one page pool, one cancelled mid-stream (its cache dropped) and its
+    /// pages recycled by a later request, each produce exactly the logits they produce alone on a
+    /// fresh pool; the pool's live pages return to zero.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paged_compressed_requests_share_a_fragmented_pool_and_cancellation_frees_pages() {
+        let model = tiny_causal_model(4, 2, 64);
+        let reader =
+            crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
+                .unwrap();
+        let prompts = [40, 75, 120].map(|len| {
+            (0..len)
+                .map(|i| ((i * 7 + len) % 31 + 1) as i32)
+                .collect::<Vec<_>>()
+        });
+        let streams = [0, 1, 2].map(|r| {
+            (0..50)
+                .map(|i| ((i * 5 + r) % 31 + 1) as i32)
+                .collect::<Vec<_>>()
+        });
+        let alone = |r: usize, tokens: usize| {
+            let (dense_pool, packed_pool) = paged_pools(&model, 32);
+            let mut selection = model.select_paged_cache(paged_request(
+                core_llm::KvCompressionPolicy::Qualified,
+                &dense_pool,
+                &packed_pool,
+                Some(&reader),
+            ));
+            forced_logits(
+                &model,
+                selection.cache_mut(),
+                &prompts[r],
+                &streams[r][..tokens],
+            )
+        };
+        let (dense_pool, shared) = paged_pools(&model, 32);
+        let select = || {
+            model.select_paged_cache(paged_request(
+                core_llm::KvCompressionPolicy::Qualified,
+                &dense_pool,
+                &shared,
+                Some(&reader),
+            ))
+        };
+        let host = |logits: Array| {
+            let logits = logits.as_dtype(Dtype::Float32).unwrap();
+            logits.eval().unwrap();
+            logits.as_slice::<f32>().to_vec()
+        };
+        let mut a = select();
+        let mut b = select();
+        let mut rows = [Vec::new(), Vec::new(), Vec::new()];
+        for (r, selection) in [(0, &mut a), (1, &mut b)] {
+            rows[r].push(host(
+                model
+                    .step(&input_ids(&prompts[r]), selection.cache_mut(), 0)
+                    .unwrap(),
+            ));
+        }
+        // Interleaved decode; A is cancelled (dropped) after 30 tokens, C then takes its pages.
+        for i in 0..50 {
+            for (r, selection) in [(0, &mut a), (1, &mut b)] {
+                if r == 0 && i >= 30 {
+                    continue;
+                }
+                let offset = (prompts[r].len() + i) as i32;
+                rows[r].push(host(
+                    model
+                        .step(&input_ids(&[streams[r][i]]), selection.cache_mut(), offset)
+                        .unwrap(),
+                ));
+            }
+            if i == 30 {
+                let before = shared.borrow().live_pages();
+                let a_pages = a
+                    .cache_mut()
+                    .as_any_mut()
+                    .downcast_mut::<crate::primitives::PagedPackedKvCache>()
+                    .unwrap()
+                    .page_ids()
+                    .len();
+                drop(std::mem::replace(&mut a, select()));
+                assert_eq!(shared.borrow().live_pages(), before - a_pages);
+            }
+        }
+        assert_eq!(rows[0], alone(0, 30), "A before its cancellation");
+        assert_eq!(rows[1], alone(1, 50), "B interleaved with A and C");
+        let mut c = a;
+        rows[2].push(host(
+            model
+                .step(&input_ids(&prompts[2]), c.cache_mut(), 0)
+                .unwrap(),
+        ));
+        for (i, &token) in streams[2].iter().enumerate() {
+            let offset = (prompts[2].len() + i) as i32;
+            rows[2].push(host(
+                model
+                    .step(&input_ids(&[token]), c.cache_mut(), offset)
+                    .unwrap(),
+            ));
+        }
+        assert_eq!(rows[2], alone(2, 50), "C on A's recycled pages");
+        let pages = c
+            .cache_mut()
+            .as_any_mut()
+            .downcast_mut::<crate::primitives::PagedPackedKvCache>()
+            .unwrap()
+            .page_ids()
+            .to_vec();
+        assert!(
+            pages.windows(2).any(|w| w[1] != w[0] + 1),
+            "C's pages are fragmented: {pages:?}"
+        );
+        drop(b);
+        drop(c);
+        assert_eq!(shared.borrow().live_pages(), 0);
+    }
+
+    /// sc-20680 AC1: no dense K/V copy survives a fused paged attention call. MLX's active memory
+    /// grows by no more than the page pool's measured arrays plus the sequence's page table and
+    /// residuals (a dense K or V of one layer would exceed the slack several times over).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_dense_kv_copy_survives_a_paged_compressed_attention_call() {
+        use mlx_rs::memory;
+        let model = tiny_causal_model(4, 4, 128);
+        let reader =
+            crate::kv_policy::group_affine_reader(crate::primitives::PackedCodeBits::Eight)
+                .unwrap();
+        let prompt = (0..1536).map(|i| i % 31 + 1).collect::<Vec<i32>>();
+        let step = |cache: &mut dyn KvCache, ids: &[i32], offset: usize| {
+            let logits = model.step(&input_ids(ids), cache, offset as i32).unwrap();
+            logits.eval().unwrap();
+        };
+        {
+            let (dense_pool, packed_pool) = paged_pools(&model, 64);
+            let mut warm = model.select_paged_cache(paged_request(
+                core_llm::KvCompressionPolicy::Qualified,
+                &dense_pool,
+                &packed_pool,
+                Some(&reader),
+            ));
+            step(warm.cache_mut(), &prompt, 0);
+            step(warm.cache_mut(), &[3], prompt.len());
+        }
+        memory::clear_cache();
+        let baseline = memory::get_active_memory() as u64;
+        let (dense_pool, packed_pool) = paged_pools(&model, 64);
+        let mut selection = model.select_paged_cache(paged_request(
+            core_llm::KvCompressionPolicy::Qualified,
+            &dense_pool,
+            &packed_pool,
+            Some(&reader),
+        ));
+        const SLACK: u64 = 256 * 1024;
+        let check = |selection: &crate::primitives::PagedCacheSelection, tokens: u64| {
+            let cache = selection.cache();
+            let evidence = cache.packed_evidence().unwrap();
+            assert!(evidence.dense_gather_calls.is_empty(), "{evidence:?}");
+            let storage = cache.compressed_storage().unwrap().unwrap();
+            assert_eq!(storage.tokens, tokens);
+            let pool = packed_pool.borrow().storage();
+            let (_, page_metadata) = packed_pool.borrow().page_bytes();
+            let per_sequence = storage.device_metadata_bytes - pool.live_pages * page_metadata;
+            let one_dense_tensor = tokens * 4 * 128 * storage.element_bytes;
+            assert!(
+                one_dense_tensor > 4 * SLACK,
+                "the fixture must expose a copy"
+            );
+            let growth = (memory::get_active_memory() as u64).saturating_sub(baseline);
+            assert!(
+                growth <= pool.code_bytes + pool.metadata_bytes + per_sequence + SLACK,
+                "{tokens} tokens: active memory grew {growth} B; the page pool holds {} B and \
+                 the sequence's table and residuals {per_sequence} B (one dense K or V of one \
+                 layer is {one_dense_tensor} B)",
+                pool.code_bytes + pool.metadata_bytes
+            );
+        };
+        step(selection.cache_mut(), &prompt, 0);
+        check(&selection, prompt.len() as u64);
+        for i in 0..40 {
+            let offset = prompt.len() + i;
+            step(selection.cache_mut(), &[(i as i32) % 31 + 1], offset);
+            check(&selection, offset as u64 + 1);
+        }
+        assert_eq!(
+            selection.report().unwrap().counters.fused_attention_calls,
+            2 * 40
+        );
+    }
 }

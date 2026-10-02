@@ -100,6 +100,65 @@ pub(crate) fn select_compressed_cache(
     (selection.into_cache(), refused)
 }
 
+/// The paged cache for one sequence under `request`'s policy (sc-20680), chosen before any K/V
+/// mutation. Every refusal runs the established dense [`PagedKvCache`] on the request's dense pool
+/// and reports why; a qualified request with a matching pool and reader runs quantized pages read
+/// in place by the fused paged reader.
+///
+/// [`PagedKvCache`]: crate::primitives::PagedKvCache
+pub(crate) fn select_paged_cache(
+    model: &CausalLm,
+    request: crate::primitives::PagedCacheRequest<'_>,
+) -> crate::primitives::PagedCacheSelection {
+    use crate::primitives::{PagedCacheSelection, PagedKvCache, PagedPackedKvCache};
+    let cfg = model.config();
+    let dense = |reason, detail: Option<String>| {
+        PagedCacheSelection::dense(
+            PagedKvCache::with_pool(request.dense_pool.clone(), cfg.num_layers),
+            KvCacheReport::dense(reason, detail),
+        )
+    };
+    let row = match core_llm::qualify_kv_compression(
+        request.policy,
+        request.family,
+        request.context_tokens,
+        1,
+    ) {
+        Ok(row) => row,
+        Err(reason) => return dense(reason, None),
+    };
+    if let Some(refusal) = geometry_refusal(cfg) {
+        return dense(KvCacheFallbackReason::UnsupportedGeometry, Some(refusal));
+    }
+    let bits = packed_code_bits(row.format);
+    let Some(reader) = request.reader.filter(|reader| reader.code_bits() == bits) else {
+        return dense(
+            KvCacheFallbackReason::ReaderUnavailable,
+            Some(format!("no fused reader of {} codes", row.format.id())),
+        );
+    };
+    let pool_matches = {
+        let pool = request.packed_pool.borrow();
+        pool.layers() == cfg.num_layers
+            && i32::try_from(pool.kv_heads()) == Ok(cfg.num_kv_heads)
+            && i32::try_from(pool.head_dimension()) == Ok(cfg.head_dim)
+            && pool.code_bits() == bits
+    };
+    if !pool_matches {
+        return dense(
+            KvCacheFallbackReason::UnsupportedGeometry,
+            Some("the page pool was built for another decoder geometry or code width".into()),
+        );
+    }
+    match PagedPackedKvCache::with_pool(request.packed_pool.clone(), reader.clone()) {
+        Ok(cache) => PagedCacheSelection::compressed(cache, row.format),
+        Err(error) => dense(
+            KvCacheFallbackReason::ReaderUnavailable,
+            Some(error.to_string()),
+        ),
+    }
+}
+
 /// The report of a generation that ran on a cache [`select_compressed_cache`] chose, read from the
 /// cache's own evidence before it is reset. A refused selection ran dense from the start; any
 /// explicit dense transition, recorded fallback or full-cache reconstruction afterwards makes it a
@@ -135,28 +194,53 @@ pub(crate) fn compressed_report(
     let compressed_cache_bytes = cache
         .compressed_storage()?
         .map_or(0, |storage| storage.device_bytes());
+    let dense_gather_fallbacks = evidence
+        .dense_gather_calls
+        .iter()
+        .fold(0_u64, |total, (_, calls)| total.saturating_add(*calls));
     let counters = KvCacheCounters {
         fused_attention_calls: u64::try_from(evidence.accepted_direct_calls).unwrap_or(u64::MAX),
         dense_fallback_events: u64::try_from(evidence.fallback_reasons.len()).unwrap_or(u64::MAX),
         full_cache_dequantizations: u64::try_from(evidence.full_cache_dequantizations)
             .unwrap_or(u64::MAX),
+        dense_gather_fallbacks,
         compressed_cache_bytes,
     };
     let fell_back = evidence.dense_active
         || !evidence.fallback_reasons.is_empty()
         || evidence.full_cache_dequantizations > 0;
-    let detail = fell_back.then(|| {
-        evidence
-            .fallback_reasons
-            .iter()
-            .map(|(operation, reason)| format!("{operation}: {reason}"))
-            .collect::<Vec<_>>()
-            .join("; ")
-    });
+    // A dense transition outranks per-call gathers: the history itself left the compressed form.
+    let (fallback, detail) = if fell_back {
+        (
+            Some(KvCacheFallbackReason::RuntimeFallback),
+            Some(
+                evidence
+                    .fallback_reasons
+                    .iter()
+                    .map(|(operation, reason)| format!("{operation}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        )
+    } else if dense_gather_fallbacks > 0 {
+        (
+            Some(KvCacheFallbackReason::DenseGather),
+            Some(
+                evidence
+                    .dense_gather_calls
+                    .iter()
+                    .map(|(reason, calls)| format!("{reason}: {calls} calls"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+        )
+    } else {
+        (None, None)
+    };
     Ok(KvCacheReport {
         format_version: KV_CACHE_FORMAT_VERSION,
         format: Some(format),
-        fallback: fell_back.then_some(KvCacheFallbackReason::RuntimeFallback),
+        fallback,
         detail: detail.filter(|detail| !detail.is_empty()),
         counters,
     })
