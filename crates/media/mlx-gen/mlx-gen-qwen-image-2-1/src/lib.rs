@@ -94,8 +94,9 @@ pub use loader::{
 };
 pub use model::{descriptor, load, QwenImage21, MODEL_ID};
 pub use pipeline::{
-    create_noise, decode_rgb, decode_rgba, denoise, encode_prompt, encode_references, joint_layout,
-    pack_latents, rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs,
+    create_noise, decode_rgb, decode_rgba, denoise, encode_prompt, encode_references, joint_branch,
+    joint_images, joint_layout, pack_latents, prepare_conditioning_references,
+    rgba_to_rgb_over_white, text_rows, unpack_latents, DenoiseInputs, JointBranch,
     ReferenceConditioning,
 };
 pub use reference::{
