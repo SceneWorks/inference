@@ -538,7 +538,7 @@ pub enum PagedPrefixLookup {
     /// A new sequence holding the first `tokens` positions of the prompt on shared pages; prefill
     /// the rest from position `tokens`.
     Hit {
-        cache: PagedPackedKvCache,
+        cache: Box<PagedPackedKvCache>,
         tokens: usize,
     },
     /// Nothing stored shares a reusable prefix with the prompt.
@@ -649,7 +649,10 @@ impl PagedPrefixCache {
         }
         self.stats.hits += 1;
         self.stats.reused_tokens += tokens;
-        Ok(PagedPrefixLookup::Hit { cache, tokens })
+        Ok(PagedPrefixLookup::Hit {
+            cache: Box::new(cache),
+            tokens,
+        })
     }
 
     /// Store the sequence `cache` holds — whose positions are `tokens` (truncated to what the
@@ -725,12 +728,8 @@ impl PagedPrefixCache {
                 tokens.len()
             )));
         }
-        let cache = PagedPackedKvCache::restore(
-            snapshot,
-            self.pool.clone(),
-            reader,
-            &self.identity.model,
-        )?;
+        let cache =
+            PagedPackedKvCache::restore(snapshot, self.pool.clone(), reader, &self.identity.model)?;
         self.store(tokens, cache);
         Ok(())
     }

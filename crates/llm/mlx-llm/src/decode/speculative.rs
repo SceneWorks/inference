@@ -540,3 +540,262 @@ pub(crate) fn logits_row(all: &Array, i: i32) -> Result<Array> {
     let sh = all.shape();
     Ok(all.take_axis(&idx, 1)?.reshape(&[sh[0], sh[2]])?)
 }
+
+/// sc-20681: speculation on paged compressed caches, on synthetic models.
+#[cfg(all(test, target_os = "macos"))]
+mod compressed_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::decode::stream::generate_with_cache;
+    use crate::primitives::{
+        CompiledKernelHandle, PackedCodeBits, PackedPagePool, PagedPackedKvCache,
+        PACKED_METAL_QUANT_GROUP_SIZE,
+    };
+
+    const PAGE_TOKENS: usize = 32;
+
+    fn paged(
+        model: &CausalLm,
+        reader: &CompiledKernelHandle,
+    ) -> (PagedPackedKvCache, Rc<RefCell<PackedPagePool>>) {
+        let cfg = model.config();
+        let pool = PackedPagePool::new(
+            cfg.num_layers,
+            cfg.num_kv_heads as usize,
+            cfg.head_dim as usize,
+            PAGE_TOKENS,
+            PackedCodeBits::Eight,
+        )
+        .unwrap();
+        (
+            PagedPackedKvCache::with_pool(pool.clone(), reader.clone()).unwrap(),
+            pool,
+        )
+    }
+
+    /// The cache holds no page beyond its quantized extent: every rejected draft's page went back.
+    fn assert_no_stray_pages(cache: &PagedPackedKvCache, pool: &Rc<RefCell<PackedPagePool>>) {
+        let quantized =
+            cache.offset() as usize / PACKED_METAL_QUANT_GROUP_SIZE * PACKED_METAL_QUANT_GROUP_SIZE;
+        assert_eq!(cache.page_ids().len(), quantized.div_ceil(PAGE_TOKENS));
+        assert_eq!(pool.borrow().live_pages(), cache.page_ids().len());
+    }
+
+    fn config() -> GenerationConfig {
+        GenerationConfig {
+            max_new_tokens: 48,
+            sampling: Default::default(), // greedy
+            seed: Some(0),
+            stop_tokens: Vec::new(),
+        }
+    }
+
+    fn prompt() -> Vec<i32> {
+        (0..150).map(|i| [3, 9, 14, 27, 5, 11][i % 6]).collect()
+    }
+
+    /// Prompt-lookup speculation on a paged compressed cache: with no drafts it is the plain
+    /// compressed decode token for token; with drafts it proposes, accepts and rejects (each
+    /// rejection a rollback across group and page boundaries, byte-exact by
+    /// `paged_packed_kv`'s `speculative_rollback_is_byte_and_position_exact`), ends holding exactly
+    /// the prompt and every committed token but the last (position-exact), and leaves no page
+    /// past its quantized extent. (A verify forward rounds differently from single-token decode —
+    /// the module's kernel caveat — so drafted tokens track rather than equal the plain decode.)
+    #[test]
+    fn prompt_lookup_speculation_runs_on_compressed_pages() {
+        let model = crate::provider::tests::tiny_causal_model(4, 2, 64);
+        let reader = crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap();
+        let (mut plain, _) = paged(&model, &reader);
+        let reference = generate_with_cache(
+            &model,
+            &prompt(),
+            &mut plain,
+            &config(),
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let speculate = |num_draft: usize| {
+            let (mut cache, pool) = paged(&model, &reader);
+            let (output, stats) = generate_prompt_lookup_on(
+                &model,
+                &mut cache,
+                &prompt(),
+                &config(),
+                &SpeculativeConfig {
+                    max_ngram: 3,
+                    num_draft,
+                },
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+            assert_no_stray_pages(&cache, &pool);
+            assert_eq!(
+                cache.offset() as usize,
+                prompt().len() + output.tokens.len() - 1,
+                "the cache holds the prompt and every fed token"
+            );
+            (output, stats)
+        };
+        let (zero, _) = speculate(0);
+        assert_eq!(zero.tokens, reference.tokens, "no drafts: the plain decode");
+        let (drafted, stats) = speculate(4);
+        eprintln!("prompt lookup on compressed pages: {stats:?}");
+        assert!(stats.accepted > 0, "{stats:?}");
+        assert!(
+            stats.accepted < stats.proposed,
+            "some drafts were rolled back: {stats:?}"
+        );
+        assert_eq!(drafted.tokens.len(), reference.tokens.len());
+    }
+
+    /// Records whether every rollback truncation lands inside an armed speculation window.
+    struct Spy {
+        inner: crate::primitives::kv_cache::ContiguousKvCache,
+        armed_at: Option<i32>,
+        rollbacks: usize,
+        unarmed_rollbacks: usize,
+    }
+
+    impl Spy {
+        fn new(model: &CausalLm) -> Self {
+            Self {
+                inner: model.new_cache(),
+                armed_at: None,
+                rollbacks: 0,
+                unarmed_rollbacks: 0,
+            }
+        }
+    }
+
+    impl KvCache for Spy {
+        fn update(&mut self, layer: usize, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+            self.inner.update(layer, keys, values)
+        }
+        fn offset(&self) -> i32 {
+            self.inner.offset()
+        }
+        fn batch_size(&self) -> i32 {
+            self.inner.batch_size()
+        }
+        fn num_layers(&self) -> usize {
+            self.inner.num_layers()
+        }
+        fn retain_sequences(&mut self, keep: &[i32]) -> Result<()> {
+            self.inner.retain_sequences(keep)
+        }
+        fn begin_speculation(&mut self) -> Result<()> {
+            self.armed_at = Some(self.inner.offset());
+            Ok(())
+        }
+        fn truncate(&mut self, len: i32) -> Result<()> {
+            if len < self.inner.offset() {
+                self.rollbacks += 1;
+                if self.armed_at.is_none_or(|base| len < base) {
+                    self.unarmed_rollbacks += 1;
+                }
+            }
+            self.armed_at = None;
+            self.inner.truncate(len)
+        }
+        fn reset(&mut self) -> Result<()> {
+            self.inner.reset()
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Both speculative loops arm exact rollback before every speculative step: each truncation
+    /// that drops positions lands inside a window armed at or below its length.
+    #[test]
+    fn speculative_loops_arm_exact_rollback_before_every_truncation() {
+        let target = crate::provider::tests::tiny_causal_model(4, 2, 64);
+        let draft = crate::provider::tests::tiny_causal_model(2, 1, 64);
+        let spec = SpeculativeConfig {
+            max_ngram: 3,
+            num_draft: 4,
+        };
+        let mut lookup = Spy::new(&target);
+        generate_prompt_lookup_on(
+            &target,
+            &mut lookup,
+            &prompt(),
+            &config(),
+            &spec,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let (mut target_spy, mut draft_spy) = (Spy::new(&target), Spy::new(&draft));
+        generate_draft_speculative_on(
+            &target,
+            &mut target_spy,
+            &draft,
+            &mut draft_spy,
+            &prompt(),
+            &config(),
+            &spec,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        for spy in [&lookup, &target_spy, &draft_spy] {
+            assert!(spy.rollbacks > 0);
+            assert_eq!(spy.unarmed_rollbacks, 0);
+        }
+    }
+
+    /// Draft-model speculation with the target and the draft each on its own paged compressed
+    /// cache and pool (never shared): a draft that disagrees with the target rolls both caches
+    /// back every step, both end position-exact (prompt + every fed token), and neither pool keeps
+    /// a page past its cache's quantized extent.
+    #[test]
+    fn draft_speculation_runs_target_and_draft_on_separate_compressed_caches() {
+        let target = crate::provider::tests::tiny_causal_model(4, 2, 64);
+        let draft = crate::provider::tests::tiny_causal_model(2, 1, 64);
+        let reader = crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap();
+        let (mut plain, _) = paged(&target, &reader);
+        let reference = generate_with_cache(
+            &target,
+            &prompt(),
+            &mut plain,
+            &config(),
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let (mut target_cache, target_pool) = paged(&target, &reader);
+        let (mut draft_cache, draft_pool) = paged(&draft, &reader);
+        assert!(!Rc::ptr_eq(&target_pool, &draft_pool));
+        let (output, stats) = generate_draft_speculative_on(
+            &target,
+            &mut target_cache,
+            &draft,
+            &mut draft_cache,
+            &prompt(),
+            &config(),
+            &SpeculativeConfig {
+                max_ngram: 3,
+                num_draft: 3,
+            },
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+        eprintln!("draft speculation on compressed pages: {stats:?}");
+        assert!(stats.proposed > stats.accepted, "{stats:?}");
+        assert_eq!(output.tokens.len(), reference.tokens.len());
+        for cache in [&target_cache, &draft_cache] {
+            assert_eq!(
+                cache.offset() as usize,
+                prompt().len() + output.tokens.len() - 1
+            );
+        }
+        assert_no_stray_pages(&target_cache, &target_pool);
+        assert_no_stray_pages(&draft_cache, &draft_pool);
+    }
+}

@@ -60,6 +60,7 @@ use crate::primitives::kv_cache::{KvCache, PackedAttentionMask, PackedCacheEvide
 use crate::primitives::nn::{
     embed, gelu_tanh, linear, rms_norm, rms_norm_unscaled, silu, soft_cap, to_f32_host,
 };
+use crate::primitives::paged_packed_kv::paged_attention_batch;
 use crate::primitives::projection::{KvProjection, Projection, QuantSpec};
 use crate::primitives::quant::{QuantizedEmbedding, QuantizedLinear};
 use crate::primitives::rope::{apply_rope, Rope};
@@ -68,7 +69,6 @@ use crate::primitives::{
     ContiguousKvCache, DecoderCacheSelection, PackedCacheRequest, PagedCacheRequest,
     PagedCacheSelection, PagedKvCache, PagedPackedKvCache, Weights, PACKED_METAL_QUANT_GROUP_SIZE,
 };
-use crate::primitives::paged_packed_kv::paged_attention_batch;
 
 /// Cached decode runs in bf16 (matching the reference engines).
 const COMPUTE_DTYPE: Dtype = Dtype::Bfloat16;

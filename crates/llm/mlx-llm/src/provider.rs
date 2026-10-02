@@ -4108,7 +4108,7 @@ fn gemma4_multimodal(v: &serde_json::Value, block: &str, token_key: &str) -> boo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -5052,12 +5052,24 @@ mod tests {
     }
 
     /// Tiny synthetic two-layer Llama (hidden 128) with the given attention geometry.
-    fn tiny_causal_model(heads: i32, kv_heads: i32, head_dim: i32) -> CausalLm {
+    pub(crate) fn tiny_causal_model(heads: i32, kv_heads: i32, head_dim: i32) -> CausalLm {
+        synthetic_causal_model(128, 2, heads, kv_heads, head_dim)
+    }
+
+    /// A synthetic Llama of `layers` layers and `hidden` width (vocabulary 32) with the given
+    /// attention geometry; random weights from a fixed seed.
+    pub(crate) fn synthetic_causal_model(
+        hidden: i32,
+        layers: usize,
+        heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+    ) -> CausalLm {
         use crate::primitives::sampler::{SplitMix64, TokenRng};
         let cfg = crate::config::ModelConfig {
-            hidden_size: 128,
+            hidden_size: hidden,
             intermediate_size: 64,
-            num_layers: 2,
+            num_layers: layers,
             num_heads: heads,
             num_kv_heads: kv_heads,
             head_dim,

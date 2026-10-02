@@ -5,7 +5,10 @@
 //! These are pure data transforms (no model, no I/O), so they're unit-tested directly. The server
 //! ([`crate::main`]) wires them to a TCP socket + a loaded `core_llm::TextLlm` provider.
 
-use mlx_llm::core_llm::{Constraint, Content, Message, Role, Sampling, TextLlmRequest};
+use mlx_llm::core_llm::{
+    Constraint, Content, KvCacheReport, KvCompressionPolicy, Message, Role, Sampling,
+    TextLlmRequest,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -40,6 +43,11 @@ pub struct ChatRequest {
     pub stop: Option<StringOrVec>,
     /// `{"type":"json_object"}` ⇒ constrain output to valid JSON.
     pub response_format: Option<ResponseFormat>,
+    /// Compressed-KV opt-in (non-OpenAI extension, sc-20681): `"off"` (the default) or
+    /// `"qualified"` — compressed where the engine's qualification table admits the request, dense
+    /// with a reason everywhere else. The response's `kv_cache` object says which ran.
+    #[serde(default)]
+    pub kv_compression: Option<String>,
 }
 
 /// One chat turn. `content` is a string or an array of typed parts (the vision wire form); this
@@ -155,6 +163,15 @@ impl ChatRequest {
             .as_ref()
             .filter(|rf| rf.kind == "json_object")
             .map(|_| Constraint::Json);
+        let kv_compression = match self.kv_compression.as_deref() {
+            None | Some("off") => KvCompressionPolicy::Off,
+            Some("qualified") => KvCompressionPolicy::Qualified,
+            Some(other) => {
+                return Err(format!(
+                    "`kv_compression` must be \"off\" or \"qualified\", not {other:?}"
+                ))
+            }
+        };
 
         Ok(TextLlmRequest {
             messages,
@@ -171,8 +188,7 @@ impl ChatRequest {
             tools: Vec::new(),
             stop: self.stop.map(StringOrVec::into_vec).unwrap_or_default(),
             cancel: Default::default(),
-            // The shim exposes no compressed-KV opt-in: every request stays on the dense default.
-            kv_compression: Default::default(),
+            kv_compression,
         })
     }
 }
@@ -203,9 +219,41 @@ pub fn content_chunk(id: &str, model: &str, created: u64, delta: &str) -> String
     chunk(id, model, created, json!({ "content": delta }), Value::Null)
 }
 
-/// The terminal SSE chunk: an empty delta plus the finish reason.
-pub fn final_chunk(id: &str, model: &str, created: u64, finish: &str) -> String {
-    chunk(id, model, created, json!({}), json!(finish))
+/// The terminal SSE chunk: an empty delta plus the finish reason, and the generation's
+/// `kv_cache` report when the engine produced one.
+pub fn final_chunk(
+    id: &str,
+    model: &str,
+    created: u64,
+    finish: &str,
+    kv_cache: Option<&KvCacheReport>,
+) -> String {
+    let mut chunk =
+        serde_json::from_str::<Value>(&chunk(id, model, created, json!({}), json!(finish)))
+            .expect("a chunk is JSON");
+    if let Some(report) = kv_cache {
+        chunk["kv_cache"] = kv_cache_json(report);
+    }
+    chunk.to_string()
+}
+
+/// The `kv_cache` extension object (sc-20681): the KV cache one generation ran on — its compressed
+/// format, or the reason it ran dense — and the engine's measured counters.
+pub fn kv_cache_json(report: &KvCacheReport) -> Value {
+    let counters = &report.counters;
+    json!({
+        "format_version": report.format_version,
+        "format": report.format.map(|format| format.id()),
+        "fallback": report.fallback.map(|reason| reason.id()),
+        "detail": report.detail,
+        "counters": {
+            "fused_attention_calls": counters.fused_attention_calls,
+            "dense_fallback_events": counters.dense_fallback_events,
+            "full_cache_dequantizations": counters.full_cache_dequantizations,
+            "dense_gather_fallbacks": counters.dense_gather_fallbacks,
+            "compressed_cache_bytes": counters.compressed_cache_bytes,
+        },
+    })
 }
 
 fn chunk(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value) -> String {
@@ -219,7 +267,9 @@ fn chunk(id: &str, model: &str, created: u64, delta: Value, finish_reason: Value
     .to_string()
 }
 
-/// A non-streaming `chat.completion` response body.
+/// A non-streaming `chat.completion` response body, with the generation's `kv_cache` report when
+/// the engine produced one.
+#[allow(clippy::too_many_arguments)]
 pub fn completion(
     id: &str,
     model: &str,
@@ -228,8 +278,9 @@ pub fn completion(
     finish: &str,
     prompt_tokens: u32,
     completion_tokens: u32,
+    kv_cache: Option<&KvCacheReport>,
 ) -> String {
-    json!({
+    let mut body = json!({
         "id": id,
         "object": "chat.completion",
         "created": created,
@@ -244,8 +295,11 @@ pub fn completion(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         },
-    })
-    .to_string()
+    });
+    if let Some(report) = kv_cache {
+        body["kv_cache"] = kv_cache_json(report);
+    }
+    body.to_string()
 }
 
 /// The `GET /v1/models` body listing the single hosted model.
@@ -346,15 +400,64 @@ mod tests {
             serde_json::from_str::<Value>(&content_chunk("id1", "m", 100, "hello")).unwrap();
         assert_eq!(content["choices"][0]["delta"]["content"], "hello");
 
-        let fin = serde_json::from_str::<Value>(&final_chunk("id1", "m", 100, "length")).unwrap();
+        let fin =
+            serde_json::from_str::<Value>(&final_chunk("id1", "m", 100, "length", None)).unwrap();
         assert_eq!(fin["choices"][0]["finish_reason"], "length");
         assert_eq!(fin["choices"][0]["delta"], json!({}));
+        assert!(fin.get("kv_cache").is_none());
+    }
+
+    #[test]
+    fn kv_compression_opt_in_reaches_the_request_and_the_report_the_response() {
+        use mlx_llm::core_llm::{KvCacheFallbackReason, KvCompressionFormat};
+        let off = parse(r#"{"messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(
+            off.into_text_llm_request().unwrap().kv_compression,
+            KvCompressionPolicy::Off
+        );
+        let on =
+            parse(r#"{"messages":[{"role":"user","content":"hi"}],"kv_compression":"qualified"}"#);
+        assert_eq!(
+            on.into_text_llm_request().unwrap().kv_compression,
+            KvCompressionPolicy::Qualified
+        );
+        let bad =
+            parse(r#"{"messages":[{"role":"user","content":"hi"}],"kv_compression":"always"}"#);
+        assert!(bad.into_text_llm_request().is_err());
+
+        let dense = KvCacheReport::dense(KvCacheFallbackReason::BelowMinimumContext, None);
+        let v = serde_json::from_str::<Value>(&completion(
+            "id",
+            "m",
+            1,
+            "x",
+            "stop",
+            1,
+            1,
+            Some(&dense),
+        ))
+        .unwrap();
+        assert_eq!(v["kv_cache"]["fallback"], "below_minimum_context");
+        assert_eq!(v["kv_cache"]["format"], Value::Null);
+        let compressed = KvCacheReport {
+            format: Some(KvCompressionFormat::GroupAffineK8V8),
+            fallback: None,
+            ..dense
+        };
+        let fin =
+            serde_json::from_str::<Value>(&final_chunk("id", "m", 1, "stop", Some(&compressed)))
+                .unwrap();
+        assert_eq!(fin["kv_cache"]["format"], "group-affine-k8v8");
+        assert_eq!(fin["kv_cache"]["fallback"], Value::Null);
     }
 
     #[test]
     fn completion_body_carries_usage_and_message() {
-        let v = serde_json::from_str::<Value>(&completion("id", "m", 1, "hi there", "stop", 3, 2))
-            .unwrap();
+        let v = serde_json::from_str::<Value>(&completion(
+            "id", "m", 1, "hi there", "stop", 3, 2, None,
+        ))
+        .unwrap();
+        assert!(v.get("kv_cache").is_none());
         assert_eq!(v["object"], "chat.completion");
         assert_eq!(v["choices"][0]["message"]["content"], "hi there");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");

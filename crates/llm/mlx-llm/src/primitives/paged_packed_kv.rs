@@ -596,6 +596,8 @@ impl SpeculationWindow {
 #[derive(Clone, Debug, Default)]
 struct AcceptedCalls {
     fused: u64,
+    /// Of `fused`, the calls served by a batched dispatch ([`paged_attention_batch`]).
+    batched: u64,
     kernel_paths: Vec<(PackedKernelSelection, u64)>,
     gathers: BTreeMap<PagedFallbackReason, (u64, String)>,
 }
@@ -686,6 +688,12 @@ impl PagedPackedKvCache {
     /// Attention calls the fused paged reader served.
     pub fn fused_calls(&self) -> u64 {
         self.accepted.fused
+    }
+
+    /// Of [`Self::fused_calls`], those served together with other sequences in one batched
+    /// dispatch ([`paged_attention_batch`]).
+    pub fn batched_calls(&self) -> u64 {
+        self.accepted.batched
     }
 
     /// Dense gather fallbacks, per reason.
@@ -1427,17 +1435,23 @@ impl PagedPackedKvCache {
         }
         let heads = mlx_i32(kv_heads, "KV heads")?;
         let array = |bytes: &[u8], rows: usize, width: usize, dtype: Dtype| -> Result<Array> {
-            let element = dtype_bytes(dtype);
+            let element = if dtype == Dtype::Uint8 {
+                1
+            } else {
+                dtype_bytes(dtype)
+            };
             let shape = [
                 1,
                 heads,
                 mlx_i32(rows, "snapshot rows")?,
                 mlx_i32(width * element, "snapshot width")?,
             ];
-            if bytes.len() != kv_heads * rows * width * element {
-                return Err(Error::Unsupported(
-                    "paged KV snapshot refused: a component has the wrong size".into(),
-                ));
+            let expected = kv_heads * rows * width * element;
+            if bytes.len() != expected {
+                return Err(Error::Unsupported(format!(
+                    "paged KV snapshot refused: a component holds {} bytes, not {expected}",
+                    bytes.len()
+                )));
             }
             let raw = Array::from_slice(bytes, &shape);
             Ok(if dtype == Dtype::Uint8 {
@@ -1981,7 +1995,7 @@ pub(crate) fn paged_attention_batch(
     };
     let step = k[2];
     let float = |dtype| matches!(dtype, Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32);
-    let supported = handle.is_warmed()
+    let supported = handle.is_paged_warmed()
         && k == v
         && k[0] == batch
         && q[0] == batch
@@ -2006,9 +2020,13 @@ pub(crate) fn paged_attention_batch(
                 && cache.layers[layer]
                     .dtypes
                     .is_none_or(|dtypes| dtypes == (keys.dtype(), values.dtype()))
-                // A fresh multi-row step attends its own K/V densely (see `try_packed_attention`).
-                && !(cache.logical_len == 0
-                    && cache.pending.is_none()
+                // A fresh multi-row step attends its own K/V densely in every layer (see
+                // `try_packed_attention`).
+                && !(cache
+                    .pending
+                    .as_ref()
+                    .map_or(cache.logical_len, |pending| pending.original_len)
+                    == 0
                     && step > SDPA_MAX_FUSED_QLEN as usize)
         });
     if !supported {
@@ -2108,6 +2126,7 @@ pub(crate) fn paged_attention_batch(
     for cache in caches.iter_mut() {
         cache.dispatch_attempts += 1;
         cache.accepted.fused += 1;
+        cache.accepted.batched += 1;
         if let Some(selection) = selection {
             match cache
                 .accepted
@@ -2382,7 +2401,7 @@ fn host_bytes(array: &Array) -> Result<Vec<u8>> {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::primitives::packed_attention::{attention_f32_masked, PackedAttentionShape};
     use crate::primitives::packed_group_affine_kv::RetainedPackedKernel;
@@ -3220,7 +3239,7 @@ mod tests {
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn interrupting(fail_at: usize, canceled: bool) -> CompiledKernelHandle {
+    pub(crate) fn interrupting(fail_at: usize, canceled: bool) -> CompiledKernelHandle {
         CompiledKernelHandle::new(Arc::new(Interrupting {
             inner: PackedMetalKernel::for_identity_family_and_bits(
                 "interrupting",
@@ -3590,6 +3609,533 @@ mod tests {
                 median(c[5..].to_vec()),
                 median(d[5..].to_vec())
             );
+        }
+    }
+
+    // ---- sc-20681: prefix sharing, copy-on-write, exact speculative rollback, restore, batching.
+
+    /// A fresh cache on its own pool fed `steps` (`(seed, tokens)`), with each step's outputs.
+    fn alone(steps: &[(u64, usize)], dims: (usize, usize, usize), dtype: Dtype) -> Run {
+        let mut cache =
+            PagedPackedKvCache::with_pool(pool(dims.1, dims.2, 64), k8v8_reader()).unwrap();
+        let outputs = steps
+            .iter()
+            .map(|&(seed, step)| attend_step(&mut cache, seed, step, dims, dtype))
+            .collect();
+        (cache, outputs)
+    }
+
+    type Run = (PagedPackedKvCache, Vec<Vec<Vec<f32>>>);
+
+    /// A fork shares the source's pages by reference (no copy); a fork inside a quantized group
+    /// keeps whole groups only. When both write into the shared, partially filled page, the first
+    /// writer copies it (the last holder then writes in place), and each sequence's outputs and
+    /// independently dequantized K/V equal its own history appended to an empty cache: neither
+    /// sees the other's writes. The untouched full page stays shared; dropping both frees all.
+    #[test]
+    fn a_forked_prefix_shares_pages_and_copy_on_write_keeps_sequences_apart() {
+        let dims = (2, 1, 64);
+        let dtype = Dtype::Float32;
+        let shared = pool(1, 64, 64);
+        let mut source = PagedPackedKvCache::with_pool(shared.clone(), k8v8_reader()).unwrap();
+        attend_step(&mut source, 0, 100, dims, dtype);
+        assert_eq!(
+            source.page_ids().len(),
+            2,
+            "96 quantized tokens: one full, one half page"
+        );
+        let (mut fork, held) = source.fork_prefix(100).unwrap();
+        assert_eq!((held, fork.offset()), (100, 100));
+        assert_eq!(fork.page_ids(), source.page_ids());
+        for &id in source.page_ids() {
+            assert_eq!(shared.borrow().refcount(id), 2);
+        }
+        assert_eq!(shared.borrow().live_pages(), 2, "sharing allocated nothing");
+        assert_eq!(shared.borrow().shared_pages(), 2);
+        let (inner, inner_held) = source.fork_prefix(70).unwrap();
+        assert_eq!(inner_held, 64, "a cut quantized group is not shared");
+        assert_eq!(inner.page_ids(), &source.page_ids()[..1]);
+        assert_eq!(shared.borrow().refcount(source.page_ids()[0]), 3);
+        drop(inner);
+        assert_eq!(shared.borrow().refcount(source.page_ids()[0]), 2);
+
+        let half_page = source.page_ids()[1];
+        let source_out = (11..14)
+            .map(|seed| attend_step(&mut source, seed, 20, dims, dtype))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            source.page_ids()[1],
+            half_page,
+            "the source copied the page it wrote"
+        );
+        assert_eq!(
+            shared.borrow().refcount(half_page),
+            1,
+            "only the fork holds it now"
+        );
+        let fork_out = (21..24)
+            .map(|seed| attend_step(&mut fork, seed, 20, dims, dtype))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fork.page_ids()[1],
+            half_page,
+            "the last holder writes in place"
+        );
+        assert_eq!(
+            source.page_ids()[0],
+            fork.page_ids()[0],
+            "the full page stays shared"
+        );
+        assert_eq!(shared.borrow().refcount(source.page_ids()[0]), 2);
+
+        let (source_ref, source_ref_out) =
+            alone(&[(0, 100), (11, 20), (12, 20), (13, 20)], dims, dtype);
+        let (fork_ref, fork_ref_out) =
+            alone(&[(0, 100), (21, 20), (22, 20), (23, 20)], dims, dtype);
+        assert_eq!(source_out, source_ref_out[1..]);
+        assert_eq!(fork_out, fork_ref_out[1..]);
+        for layer in 0..LAYERS {
+            assert_eq!(oracle_kv(&source, layer), oracle_kv(&source_ref, layer));
+            assert_eq!(oracle_kv(&fork, layer), oracle_kv(&fork_ref, layer));
+        }
+        drop(source);
+        drop(fork);
+        assert_eq!(shared.borrow().live_pages(), 0);
+    }
+
+    /// A step that copied a shared page and then faults returns the copy and restores the shared
+    /// page (refcount and page table); the retried step equals the uninterrupted history, and the
+    /// source never sees the fork's attempt.
+    #[test]
+    fn a_rolled_back_step_returns_its_copy_and_restores_the_shared_page() {
+        let dims = (2, 1, 64);
+        let dtype = Dtype::Float32;
+        let scale = 0.125;
+        let shared = pool(1, 64, 64);
+        // Dispatches 0 and 1 are the source's decode step; 2 is the fork's layer 0; 3 faults.
+        let mut source =
+            PagedPackedKvCache::with_pool(shared.clone(), interrupting(3, false)).unwrap();
+        attend_step(&mut source, 0, 100, dims, dtype);
+        attend_step(&mut source, 1, 1, dims, dtype);
+        let (mut fork, _) = source.fork_prefix(101).unwrap();
+        let before = fork.page_ids().to_vec();
+        let live = shared.borrow().live_pages();
+        let (q0, k0, v0) = qkv(7 * 31, 28, dims, dtype);
+        let (q1, k1, v1) = qkv(7 * 31 + 1, 28, dims, dtype);
+        assert!(fork
+            .try_packed_attention(0, &q0, &k0, &v0, PackedAttentionMask::Causal, scale, false)
+            .unwrap()
+            .is_some());
+        assert_ne!(
+            fork.page_ids()[1],
+            before[1],
+            "layer 0 copied the shared page"
+        );
+        assert_eq!(shared.borrow().live_pages(), live + 1);
+        fork.try_packed_attention(1, &q1, &k1, &v1, PackedAttentionMask::Causal, scale, false)
+            .unwrap_err();
+        assert_eq!(
+            fork.page_ids(),
+            before.as_slice(),
+            "the shared page is back"
+        );
+        assert_eq!(shared.borrow().live_pages(), live, "the copy went back");
+        assert_eq!(shared.borrow().refcount(before[1]), 2);
+        assert_eq!(fork.offset(), 101);
+        let retried = attend_step(&mut fork, 7, 28, dims, dtype);
+        let (fork_ref, fork_ref_out) = alone(&[(0, 100), (1, 1), (7, 28)], dims, dtype);
+        assert_eq!(retried, fork_ref_out[2]);
+        let (source_ref, _) = alone(&[(0, 100), (1, 1)], dims, dtype);
+        for layer in 0..LAYERS {
+            assert_eq!(oracle_kv(&fork, layer), oracle_kv(&fork_ref, layer));
+            assert_eq!(oracle_kv(&source, layer), oracle_kv(&source_ref, layer));
+        }
+    }
+
+    /// Append each layer's rows `rows` of one synthetic verify step (seed `seed`, `step` rows).
+    fn attend_rows(
+        cache: &mut PagedPackedKvCache,
+        seed: u64,
+        step: usize,
+        rows: usize,
+        dims: (usize, usize, usize),
+        dtype: Dtype,
+    ) {
+        for layer in 0..LAYERS {
+            let (q, k, v) = qkv(seed * 31 + layer as u64, step, dims, dtype);
+            let cut = |a: &Array| rows_range(a, 0, rows).unwrap();
+            cache
+                .try_packed_attention(
+                    layer,
+                    &cut(&q),
+                    &cut(&k),
+                    &cut(&v),
+                    PackedAttentionMask::Causal,
+                    (dims.2 as f32).powf(-0.5),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// Speculative rollback with the window armed is byte- and position-exact: after a 20-row
+    /// verify (which completes and quantizes a group) is cut back to `kept` rows, the cache's
+    /// codes, scale/zero metadata, residual rows, offset and pages equal a cache that appended
+    /// only the kept rows, and both continue identically. Without the window the same cut
+    /// re-stages the group from its codes, which is not exact (the control).
+    #[test]
+    fn speculative_rollback_is_byte_and_position_exact() {
+        let dims = (2, 1, 64);
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            for kept in [1, 9, 14, 19] {
+                let prefill = |cache: &mut PagedPackedKvCache| {
+                    attend_step(cache, 0, 50, dims, dtype);
+                };
+                let shared = pool(1, 64, 32);
+                let mut speculated =
+                    PagedPackedKvCache::with_pool(shared.clone(), k8v8_reader()).unwrap();
+                prefill(&mut speculated);
+                speculated.begin_speculation().unwrap();
+                attend_rows(&mut speculated, 9, 20, 20, dims, dtype);
+                assert_eq!(
+                    shared.borrow().live_pages(),
+                    2,
+                    "the verify completed a group"
+                );
+                speculated.truncate((50 + kept) as i32).unwrap();
+
+                let reference_pool = pool(1, 64, 32);
+                let mut reference =
+                    PagedPackedKvCache::with_pool(reference_pool.clone(), k8v8_reader()).unwrap();
+                prefill(&mut reference);
+                attend_rows(&mut reference, 9, 20, kept, dims, dtype);
+
+                assert_eq!(speculated.offset(), reference.offset());
+                assert_eq!(
+                    speculated.snapshot("m").unwrap(),
+                    reference.snapshot("m").unwrap(),
+                    "{dtype:?} kept {kept}"
+                );
+                assert_eq!(
+                    shared.borrow().live_pages(),
+                    reference_pool.borrow().live_pages()
+                );
+                for (seed, step) in [(5, 1), (6, 33), (7, 1)] {
+                    assert_eq!(
+                        attend_step(&mut speculated, seed, step, dims, dtype),
+                        attend_step(&mut reference, seed, step, dims, dtype)
+                    );
+                }
+
+                if 50 + kept < 64 {
+                    let mut control =
+                        PagedPackedKvCache::with_pool(pool(1, 64, 32), k8v8_reader()).unwrap();
+                    prefill(&mut control);
+                    attend_rows(&mut control, 9, 20, 20, dims, dtype);
+                    control.truncate((50 + kept) as i32).unwrap();
+                    let mut fresh_reference =
+                        PagedPackedKvCache::with_pool(pool(1, 64, 32), k8v8_reader()).unwrap();
+                    prefill(&mut fresh_reference);
+                    attend_rows(&mut fresh_reference, 9, 20, kept, dims, dtype);
+                    assert_ne!(
+                        control.snapshot("m").unwrap(),
+                        fresh_reference.snapshot("m").unwrap(),
+                        "{dtype:?} kept {kept}: the unarmed cut must be visibly inexact"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A snapshot round-trips through bytes and restores into another pool exactly (same live
+    /// bytes, same continued outputs). A restore under any other identity — model, KV format
+    /// version, page layout version, page geometry, code width — is refused before allocating, and
+    /// a corrupted or foreign byte string is refused when parsed.
+    #[test]
+    fn a_snapshot_restores_exactly_across_bytes_and_refuses_any_identity_mismatch() {
+        let dims = (2, 1, 64);
+        let dtype = Dtype::Bfloat16;
+        let handle = k8v8_reader();
+        let mut original = PagedPackedKvCache::with_pool(pool(1, 64, 32), handle.clone()).unwrap();
+        for (i, step) in [100, 1, 1].into_iter().enumerate() {
+            attend_step(&mut original, i as u64, step, dims, dtype);
+        }
+        let snapshot = original.snapshot("model-a").unwrap();
+        assert_eq!(snapshot.tokens(), 102);
+        let bytes = snapshot.to_bytes().unwrap();
+        let parsed = PagedCacheSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, snapshot);
+        let target = pool(1, 64, 32);
+        let mut restored =
+            PagedPackedKvCache::restore(&parsed, target.clone(), handle.clone(), "model-a")
+                .unwrap();
+        assert_eq!(restored.offset(), 102);
+        assert_eq!(restored.snapshot("model-a").unwrap(), snapshot);
+        for layer in 0..LAYERS {
+            assert_eq!(oracle_kv(&restored, layer), oracle_kv(&original, layer));
+        }
+        for (i, step) in [1, 40, 1].into_iter().enumerate() {
+            let seed = 50 + i as u64;
+            assert_eq!(
+                attend_step(&mut restored, seed, step, dims, dtype),
+                attend_step(&mut original, seed, step, dims, dtype)
+            );
+        }
+
+        let fresh = pool(1, 64, 32);
+        let refused = |snapshot: &PagedCacheSnapshot,
+                       pool: Rc<RefCell<PackedPagePool>>,
+                       reader: CompiledKernelHandle,
+                       model: &str,
+                       field: &str| {
+            let error = PagedPackedKvCache::restore(snapshot, pool.clone(), reader, model)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field), "{field}: {error}");
+            assert_eq!(pool.borrow().live_pages(), 0, "{field}: nothing allocated");
+        };
+        refused(&snapshot, fresh.clone(), handle.clone(), "model-b", "model");
+        let mut format = snapshot.clone();
+        format.identity.format_version += 1;
+        refused(
+            &format,
+            fresh.clone(),
+            handle.clone(),
+            "model-a",
+            "KV format version",
+        );
+        let mut layout = snapshot.clone();
+        layout.identity.layout_version += 1;
+        refused(
+            &layout,
+            fresh.clone(),
+            handle.clone(),
+            "model-a",
+            "page layout version",
+        );
+        refused(
+            &snapshot,
+            pool(1, 64, 64),
+            handle.clone(),
+            "model-a",
+            "page tokens",
+        );
+        let four_bit = PackedPagePool::new(LAYERS, 1, 64, 32, PackedCodeBits::Four).unwrap();
+        refused(
+            &snapshot,
+            four_bit,
+            reader(PackedCodeBits::Four, PackedMetalGpuFamily::Apple7OrNewer),
+            "model-a",
+            "representation",
+        );
+        // A version-mismatched snapshot is still refused after a trip through bytes.
+        let reread = PagedCacheSnapshot::from_bytes(&format.to_bytes().unwrap()).unwrap();
+        refused(
+            &reread,
+            fresh.clone(),
+            handle.clone(),
+            "model-a",
+            "KV format version",
+        );
+
+        let mut corrupt = bytes.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        let error = PagedCacheSnapshot::from_bytes(&corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("digest"), "{error}");
+        assert!(PagedCacheSnapshot::from_bytes(b"not a paged KV snapshot").is_err());
+        assert!(PagedCacheSnapshot::from_bytes(&bytes[..bytes.len() / 2]).is_err());
+    }
+
+    /// Three jagged sequences on one pool decode through one batched paged dispatch per layer: each
+    /// row equals that sequence decoded alone through the single-sequence fused path, every call is
+    /// fused and batched, and nothing is gathered. A call outside the batched reader (an additive
+    /// mask, a sequence of another pool, another scale) is declined with nothing mutated.
+    #[test]
+    fn a_batched_paged_dispatch_serves_jagged_sequences_like_each_alone() {
+        let dims = (4, 2, 64);
+        let scale = (64f32).powf(-0.5);
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let handle = k8v8_reader();
+            let shared = pool(2, 64, 32);
+            let lengths = [40, 75, 130];
+            let mut batch = lengths
+                .map(|_| PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap());
+            let mut single = lengths
+                .map(|_| PagedPackedKvCache::with_pool(pool(2, 64, 32), handle.clone()).unwrap());
+            for (b, &len) in lengths.iter().enumerate() {
+                for cache in [&mut batch[b], &mut single[b]] {
+                    attend_step(cache, b as u64, len, dims, dtype);
+                    attend_step(cache, 10 + b as u64, 1, dims, dtype);
+                }
+            }
+            let mut worst = 0.0f32;
+            for step in 0..40u64 {
+                for layer in 0..LAYERS {
+                    let rows = (0..3u64)
+                        .map(|b| qkv(1000 * step + 10 * b + layer as u64, 1, dims, dtype))
+                        .collect::<Vec<_>>();
+                    let stack = |pick: fn(&(Array, Array, Array)) -> &Array| {
+                        concatenate_axis(&rows.iter().map(pick).collect::<Vec<_>>(), 0).unwrap()
+                    };
+                    let (q, k, v) = (stack(|r| &r.0), stack(|r| &r.1), stack(|r| &r.2));
+                    let mut members = batch.iter_mut().collect::<Vec<_>>();
+                    let out = paged_attention_batch(
+                        &mut members,
+                        layer,
+                        &q,
+                        &k,
+                        &v,
+                        PackedAttentionMask::Causal,
+                        scale,
+                    )
+                    .unwrap()
+                    .expect("one pool, warmed reader, causal: batched");
+                    for (b, (qb, kb, vb)) in rows.iter().enumerate() {
+                        let alone = single[b]
+                            .try_packed_attention(
+                                layer,
+                                qb,
+                                kb,
+                                vb,
+                                PackedAttentionMask::Causal,
+                                scale,
+                                false,
+                            )
+                            .unwrap()
+                            .unwrap();
+                        let row = out.try_index((b as i32..b as i32 + 1, .., .., ..)).unwrap();
+                        worst = worst.max(
+                            host_f32(&row)
+                                .iter()
+                                .zip(host_f32(&alone))
+                                .map(|(a, b)| (a - b).abs())
+                                .fold(0.0, f32::max),
+                        );
+                    }
+                }
+            }
+            eprintln!("{dtype:?}: batched vs alone worst |Δ| {worst}");
+            assert_eq!(
+                worst, 0.0,
+                "{dtype:?}: a batched row differs from its sequence alone"
+            );
+            for (b, cache) in batch.iter().enumerate() {
+                assert_eq!(cache.offset() as usize, lengths[b] + 41);
+                assert_eq!(cache.batched_calls(), 2 * 40);
+                assert!(cache.dense_gathers().is_empty());
+            }
+
+            let offsets = batch.iter().map(|cache| cache.offset()).collect::<Vec<_>>();
+            let (q, k, v) = qkv(5, 1, (12, 6, 64), dtype);
+            let (q, k, v) = (
+                q.reshape(&[3, 4, 1, 64]).unwrap(),
+                k.reshape(&[3, 2, 1, 64]).unwrap(),
+                v.reshape(&[3, 2, 1, 64]).unwrap(),
+            );
+            let decline = |members: &mut [&mut PagedPackedKvCache], mask, scale| {
+                assert!(paged_attention_batch(members, 0, &q, &k, &v, mask, scale)
+                    .unwrap()
+                    .is_none());
+            };
+            decline(
+                &mut batch.iter_mut().collect::<Vec<_>>(),
+                PackedAttentionMask::Additive,
+                scale,
+            );
+            decline(
+                &mut batch.iter_mut().collect::<Vec<_>>(),
+                PackedAttentionMask::Causal,
+                0.5,
+            );
+            let [first, second, _] = &mut batch;
+            decline(
+                &mut [first, second, &mut single[2]],
+                PackedAttentionMask::Causal,
+                scale,
+            );
+            for (cache, offset) in batch.iter().zip(offsets) {
+                assert_eq!(cache.offset(), offset);
+                assert!(cache.pending.is_none());
+            }
+        }
+    }
+
+    /// A batched dispatch that faults (here at its second layer, after the step allocated a
+    /// page) rolls back every sequence's step: offsets, residuals, pages and accepted calls; the
+    /// retried step then succeeds.
+    #[test]
+    fn a_faulted_batched_dispatch_rolls_back_every_sequence() {
+        let dims = (4, 2, 64);
+        let dtype = Dtype::Float32;
+        let scale = (64f32).powf(-0.5);
+        let shared = pool(2, 64, 32);
+        // Six single-sequence dispatches warm the reader; batched dispatch 6 succeeds, 7 faults.
+        let handle = interrupting(7, false);
+        let mut batch = [40, 62, 95]
+            .map(|_| PagedPackedKvCache::with_pool(shared.clone(), handle.clone()).unwrap());
+        for (b, len) in [40, 62, 95].into_iter().enumerate() {
+            attend_step(&mut batch[b], b as u64, len, dims, dtype);
+            attend_step(&mut batch[b], 10 + b as u64, 1, dims, dtype);
+        }
+        let live = shared.borrow().live_pages();
+        let before = batch
+            .iter()
+            .map(|cache| {
+                (
+                    cache.offset(),
+                    cache.fused_calls(),
+                    cache.page_ids().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let layer_rows = |layer: u64| {
+            let rows = (0..3u64)
+                .map(|b| qkv(77 + 10 * b + layer, 1, dims, dtype))
+                .collect::<Vec<_>>();
+            let stack = |pick: fn(&(Array, Array, Array)) -> &Array| {
+                concatenate_axis(&rows.iter().map(pick).collect::<Vec<_>>(), 0).unwrap()
+            };
+            (stack(|r| &r.0), stack(|r| &r.1), stack(|r| &r.2))
+        };
+        let attend = |batch: &mut [PagedPackedKvCache; 3], layer: usize| {
+            let (q, k, v) = layer_rows(layer as u64);
+            paged_attention_batch(
+                &mut batch.iter_mut().collect::<Vec<_>>(),
+                layer,
+                &q,
+                &k,
+                &v,
+                PackedAttentionMask::Causal,
+                scale,
+            )
+        };
+        assert!(attend(&mut batch, 0).unwrap().is_some());
+        assert_eq!(
+            shared.borrow().live_pages(),
+            live + 1,
+            "the 63rd → 64th token took a page"
+        );
+        attend(&mut batch, 1).unwrap_err();
+        assert_eq!(
+            shared.borrow().live_pages(),
+            live,
+            "the step's page went back"
+        );
+        for (cache, (offset, fused, pages)) in batch.iter().zip(&before) {
+            assert_eq!(cache.offset(), *offset);
+            assert_eq!(cache.fused_calls(), *fused);
+            assert_eq!(cache.page_ids(), pages.as_slice());
+            assert!(cache.pending.is_none());
+        }
+        for layer in 0..LAYERS {
+            assert!(attend(&mut batch, layer).unwrap().is_some());
+        }
+        for (cache, (offset, _, _)) in batch.iter().zip(&before) {
+            assert_eq!(cache.offset(), offset + 1);
         }
     }
 }

@@ -85,8 +85,7 @@ pub use detok::IncrementalDetok;
 pub use error::{Error, RequestResourceExhausted, Result};
 pub use kv_compression::{
     qualify_kv_compression, qualify_kv_sequence, KvCacheCounters, KvCacheFallbackReason,
-    KvCacheReport,
-    KvCompressionFormat, KvCompressionPolicy, KvModelFamily, KvQualification,
+    KvCacheReport, KvCompressionFormat, KvCompressionPolicy, KvModelFamily, KvQualification,
     KV_CACHE_FORMAT_VERSION, KV_COMPRESSION_QUALIFICATIONS,
 };
 pub use message::{AudioRef, Content, ImageRef, Message, Role, VideoRef};

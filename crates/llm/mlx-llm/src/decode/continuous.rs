@@ -244,9 +244,9 @@ impl<'a> KvRun<'a> {
                 Err(error) => run.pool_refusal = Some(error.to_string()),
             }
         }
-        run.reader = kv.reader.or_else(|| {
-            crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).ok()
-        });
+        run.reader = kv
+            .reader
+            .or_else(|| crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).ok());
         run
     }
 
@@ -290,7 +290,11 @@ impl<'a> KvRun<'a> {
 
     /// Start a compressed `selection` on the longest stored prefix of `prompt`; the positions it
     /// already holds.
-    fn reuse_prefix(&mut self, selection: &mut PagedCacheSelection, prompt: &[i32]) -> Result<usize> {
+    fn reuse_prefix(
+        &mut self,
+        selection: &mut PagedCacheSelection,
+        prompt: &[i32],
+    ) -> Result<usize> {
         if !selection.is_compressed() {
             return Ok(0);
         }
@@ -304,7 +308,7 @@ impl<'a> KvRun<'a> {
         };
         match store.lookup(identity, prompt)? {
             PagedPrefixLookup::Hit { cache, tokens } => {
-                selection.replace_compressed(cache)?;
+                selection.replace_compressed(*cache)?;
                 Ok(tokens)
             }
             PagedPrefixLookup::Miss | PagedPrefixLookup::Refused(_) => Ok(0),
@@ -629,10 +633,7 @@ fn step_logits(
             let b = lanes.len();
             let feed: Vec<i32> = lanes.iter().map(|l| l.next_token).collect();
             let ids = Array::from_slice(&feed, &[b as i32, 1]);
-            let positions: Vec<i32> = lanes
-                .iter_mut()
-                .map(|lane| lane.cache().offset())
-                .collect();
+            let positions: Vec<i32> = lanes.iter_mut().map(|lane| lane.cache().offset()).collect();
             let mut caches: Vec<&mut dyn KvCache> =
                 lanes.iter_mut().map(|lane| lane.cache()).collect();
             let logits = model.decode_logits_per_seq_dyn(&ids, &mut caches, &positions)?; // [b, vocab]
@@ -664,4 +665,743 @@ fn record_token(
         &mut lane.next_token,
         on_event,
     )
+}
+
+/// sc-20681 on a synthetic two-layer GQA model (hidden 128, 4 query / 2 KV heads, head dim 64).
+/// Requests that must qualify carry real prompts at the Qwen3 row's memory-material minimum
+/// (10 240 tokens), so the production qualification — not a test override — admits them.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::decode::prefix::PagedPrefixStats;
+    use crate::primitives::PagedCacheSnapshot;
+    use core_llm::KvCompressionFormat;
+
+    const MODEL: &str = "synthetic-tiny@1";
+
+    fn model() -> CausalLm {
+        crate::provider::tests::tiny_causal_model(4, 2, 64)
+    }
+
+    fn reader() -> CompiledKernelHandle {
+        crate::kv_policy::group_affine_reader(PackedCodeBits::Eight).unwrap()
+    }
+
+    fn tokens(len: usize, salt: usize) -> Vec<i32> {
+        (0..len)
+            .map(|i| ((i * 7 + salt * 13 + i / 97) % 31 + 1) as i32)
+            .collect()
+    }
+
+    fn request(prompt: Vec<i32>, max_new_tokens: usize) -> BatchRequest {
+        BatchRequest {
+            prompt_ids: prompt,
+            sampling: SamplingParams::default(), // greedy
+            seed: Some(0),
+            max_new_tokens,
+            stop_tokens: Vec::new(),
+        }
+    }
+
+    fn config(max_batch: usize, exactness: BatchExactness) -> ContinuousConfig {
+        ContinuousConfig {
+            max_batch,
+            block_size: 16,
+            exactness,
+        }
+    }
+
+    fn qualified<'a>(prefix: Option<&'a mut PagedPrefixCache>) -> ContinuousKv<'a> {
+        ContinuousKv {
+            policy: KvCompressionPolicy::Qualified,
+            family: Some(KvModelFamily::Qwen3),
+            page_tokens: 64,
+            reader: Some(reader()),
+            prefix,
+            model_identity: MODEL,
+        }
+    }
+
+    fn run(
+        model: &CausalLm,
+        requests: &[BatchRequest],
+        config: &ContinuousConfig,
+        kv: ContinuousKv<'_>,
+    ) -> Vec<ContinuousOutput> {
+        generate_continuous_kv(
+            model,
+            requests,
+            config,
+            kv,
+            &CancelFlag::new(),
+            &mut |_, _| {},
+        )
+        .unwrap()
+    }
+
+    fn store(model: &CausalLm, identity: &str) -> PagedPrefixCache {
+        let cfg = model.config();
+        let pool = PackedPagePool::new(
+            cfg.num_layers,
+            cfg.num_kv_heads as usize,
+            cfg.head_dim as usize,
+            64,
+            PackedCodeBits::Eight,
+        )
+        .unwrap();
+        PagedPrefixCache::new(pool, identity, 16)
+    }
+
+    fn assert_compressed(out: &ContinuousOutput) {
+        let report = &out.kv_cache;
+        assert!(report.ran_compressed(), "{report:?}");
+        assert_eq!(report.format, Some(KvCompressionFormat::GroupAffineK8V8));
+        // A cold prefill attends its fresh K/V densely; a prefill after a reused prefix and every
+        // decode step read the pages fused, in both layers.
+        let fed = out.output.tokens.len() as u64 - 1 + u64::from(out.reused_prefix_tokens > 0);
+        assert_eq!(report.counters.fused_attention_calls, 2 * fed, "{report:?}");
+        assert_eq!(report.counters.dense_gather_fallbacks, 0);
+        assert!(report.counters.compressed_cache_bytes > 0);
+    }
+
+    /// AC1: a continuous batch of jagged qualified requests (and more requests than slots) runs
+    /// each qualified request on compressed pages and the short one dense with its reason. In
+    /// `Exact` mode every request's tokens equal it run alone; in `Throughput` mode the
+    /// compressed requests stay wholly compressed (no padding mask, no dense gather). With the
+    /// policy off the run is exactly `generate_continuous`.
+    #[test]
+    fn continuous_batching_runs_jagged_qualified_requests_compressed_and_the_rest_dense() {
+        let model = model();
+        let requests = vec![
+            request(tokens(10_240, 0), 9),
+            request(tokens(10_301, 1), 14),
+            request(tokens(300, 2), 6),
+            request(tokens(10_433, 3), 11),
+        ];
+        let exact = run(
+            &model,
+            &requests,
+            &config(3, BatchExactness::Exact),
+            qualified(None),
+        );
+        for (i, out) in exact.iter().enumerate() {
+            assert_eq!(out.output.tokens.len(), requests[i].max_new_tokens);
+            let alone = run(
+                &model,
+                std::slice::from_ref(&requests[i]),
+                &config(1, BatchExactness::Exact),
+                qualified(None),
+            );
+            assert_eq!(out.output.tokens, alone[0].output.tokens, "request {i}");
+            assert_eq!(out.kv_cache, alone[0].kv_cache, "request {i}");
+            if i == 2 {
+                assert_eq!(
+                    out.kv_cache,
+                    KvCacheReport::dense(KvCacheFallbackReason::BelowMinimumContext, None)
+                );
+            } else {
+                assert_compressed(out);
+            }
+        }
+
+        let throughput = run(
+            &model,
+            &requests,
+            &config(3, BatchExactness::Throughput),
+            qualified(None),
+        );
+        for (i, out) in throughput.iter().enumerate() {
+            assert_eq!(out.output.tokens.len(), requests[i].max_new_tokens);
+            if i == 2 {
+                assert_eq!(
+                    out.kv_cache.fallback,
+                    Some(KvCacheFallbackReason::BelowMinimumContext)
+                );
+            } else {
+                assert_compressed(out);
+            }
+        }
+
+        let off = run(
+            &model,
+            &requests,
+            &config(3, BatchExactness::Throughput),
+            ContinuousKv::default(),
+        );
+        let established = generate_continuous(
+            &model,
+            &requests,
+            &config(3, BatchExactness::Throughput),
+            &CancelFlag::new(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        for (out, established) in off.iter().zip(&established) {
+            assert_eq!(out.output.tokens, established.tokens);
+            assert_eq!(
+                out.kv_cache,
+                KvCacheReport::dense(KvCacheFallbackReason::PolicyDisabled, None)
+            );
+        }
+    }
+
+    enum Layout {
+        /// Compressed lanes on one pool: one batched dispatch per layer.
+        Shared,
+        /// Compressed lanes on their own pools: each attends on its own.
+        Separate,
+        /// Every lane dense paged.
+        Dense,
+    }
+
+    /// AC1 at the decode-forward boundary: in a `Throughput` step mixing three paged compressed
+    /// sequences of jagged lengths with a dense one, the compressed sequences attend through one
+    /// batched paged dispatch per layer and produce exactly the logits they produce attending one
+    /// by one; the dense sequence's logits are exactly those of an all-dense batch; the
+    /// compressed rows stay within 8-bit rounding of the dense run.
+    #[test]
+    fn throughput_batches_compressed_sequences_in_one_dispatch_beside_a_dense_one() {
+        let model = model();
+        let reader = reader();
+        let lengths = [40, 75, 130, 57];
+        let run = |layout: Layout| {
+            let cfg = model.config();
+            let new_pool =
+                || PackedPagePool::new(cfg.num_layers, 2, 64, 32, PackedCodeBits::Eight).unwrap();
+            let shared = new_pool();
+            let mut caches: Vec<Box<dyn KvCache>> = (0..4)
+                .map(|b| -> Box<dyn KvCache> {
+                    match (&layout, b) {
+                        (Layout::Dense, _) | (_, 1) => Box::new(PagedKvCache::new(2, 16)),
+                        (Layout::Shared, _) => Box::new(
+                            PagedPackedKvCache::with_pool(shared.clone(), reader.clone()).unwrap(),
+                        ),
+                        (Layout::Separate, _) => Box::new(
+                            PagedPackedKvCache::with_pool(new_pool(), reader.clone()).unwrap(),
+                        ),
+                    }
+                })
+                .collect();
+            for (b, cache) in caches.iter_mut().enumerate() {
+                let logits = model
+                    .decode_logits(&input_ids(&tokens(lengths[b], b)), cache.as_mut(), 0)
+                    .unwrap();
+                logits.eval().unwrap();
+            }
+            let mut rows = Vec::new();
+            for step in 0..24 {
+                let feed = (0..4)
+                    .map(|b| (step * 5 + b) % 31 + 1)
+                    .collect::<Vec<i32>>();
+                let ids = Array::from_slice(&feed, &[4, 1]);
+                let positions = caches
+                    .iter()
+                    .map(|cache| cache.offset())
+                    .collect::<Vec<_>>();
+                let mut refs: Vec<&mut dyn KvCache> = caches
+                    .iter_mut()
+                    .map(|cache| cache.as_mut() as &mut dyn KvCache)
+                    .collect();
+                let logits = model
+                    .decode_logits_per_seq_dyn(&ids, &mut refs, &positions)
+                    .unwrap()
+                    .as_dtype(mlx_rs::Dtype::Float32)
+                    .unwrap();
+                logits.eval().unwrap();
+                let flat = logits.as_slice::<f32>().to_vec();
+                rows.push(flat.chunks(32).map(<[f32]>::to_vec).collect::<Vec<_>>());
+            }
+            let batched = caches
+                .iter_mut()
+                .map(|cache| {
+                    cache
+                        .as_any_mut()
+                        .downcast_mut::<PagedPackedKvCache>()
+                        .map_or(0, |cache| cache.batched_calls())
+                })
+                .collect::<Vec<_>>();
+            (rows, batched)
+        };
+        let (shared, shared_batched) = run(Layout::Shared);
+        let (separate, separate_batched) = run(Layout::Separate);
+        let (dense, _) = run(Layout::Dense);
+        assert_eq!(
+            shared, separate,
+            "batched vs one-by-one compressed attention"
+        );
+        // The first step's layer 0 warms the paged reader one sequence at a time.
+        assert_eq!(shared_batched, vec![2 * 24 - 1, 0, 2 * 24 - 1, 2 * 24 - 1]);
+        assert_eq!(separate_batched, vec![0; 4]);
+        let range = dense
+            .iter()
+            .flatten()
+            .flatten()
+            .fold(0.0f32, |max, value| max.max(value.abs()));
+        let mut worst = 0.0f32;
+        for (shared_step, dense_step) in shared.iter().zip(&dense) {
+            assert_eq!(shared_step[1], dense_step[1], "the dense lane is untouched");
+            for b in [0, 2, 3] {
+                for (a, d) in shared_step[b].iter().zip(&dense_step[b]) {
+                    worst = worst.max((a - d).abs() / range);
+                }
+            }
+        }
+        assert!(worst < 0.02, "compressed vs dense paged: {worst}");
+    }
+
+    /// AC2: requests sharing a 10 272-token prefix (not page-aligned, so the shared last page is
+    /// partially filled and every writer copies it) decode in one batch, the later ones started on
+    /// the first one's pages while it still decodes. Each request's tokens and report equal the
+    /// same requests run one after another on a fresh store — so no request saw another's writes
+    /// — and when the run ends the pool holds exactly the store's pages; clearing the store frees
+    /// every page.
+    #[test]
+    fn in_batch_prefix_sharing_equals_sequential_sharing_and_returns_every_page() {
+        let model = model();
+        let prefix = tokens(10_272, 9);
+        // Suffixes start with distinct tokens, so the longest shared prefix is exactly `prefix`.
+        let with_suffix = |salt: usize, len: usize| {
+            let mut prompt = prefix.clone();
+            prompt.push(salt as i32 + 1);
+            prompt.extend(tokens(len - 1, 20 + salt));
+            prompt
+        };
+        let requests = vec![
+            request(with_suffix(0, 37), 8),
+            request(with_suffix(1, 101), 12),
+            request(with_suffix(2, 5), 6),
+        ];
+        let mut concurrent = store(&model, MODEL);
+        let batched = run(
+            &model,
+            &requests,
+            &config(3, BatchExactness::Exact),
+            qualified(Some(&mut concurrent)),
+        );
+        assert_eq!(
+            batched
+                .iter()
+                .map(|out| out.reused_prefix_tokens)
+                .collect::<Vec<_>>(),
+            vec![0, 10_272, 10_272]
+        );
+        let stats = concurrent.stats();
+        assert_eq!((stats.hits, stats.reused_tokens), (2, 2 * 10_272));
+        assert_eq!(stats.refused, 0);
+
+        let mut sequential = store(&model, MODEL);
+        for (i, r) in requests.iter().enumerate() {
+            let alone = run(
+                &model,
+                std::slice::from_ref(r),
+                &config(1, BatchExactness::Exact),
+                qualified(Some(&mut sequential)),
+            );
+            assert_eq!(
+                batched[i].output.tokens, alone[0].output.tokens,
+                "request {i}"
+            );
+            assert_eq!(
+                batched[i].reused_prefix_tokens,
+                alone[0].reused_prefix_tokens
+            );
+            assert_compressed(&batched[i]);
+        }
+
+        for store in [&mut concurrent, &mut sequential] {
+            let pool = store.pool().clone();
+            assert!(pool.borrow().live_pages() > 0);
+            assert_eq!(
+                pool.borrow().live_pages(),
+                store.held_pages(),
+                "only the store's pages"
+            );
+            store.clear();
+            assert_eq!(pool.borrow().live_pages(), 0);
+        }
+    }
+
+    /// AC2 refcounts: a run cancelled mid-decode, and a run whose fused reader faults mid-decode
+    /// (an error, not a fallback), both leave the pool holding exactly the prefix store's pages.
+    #[test]
+    fn cancellation_and_failure_return_the_pool_to_the_store_baseline() {
+        let model = model();
+        let prefix = tokens(10_240, 4);
+        let requests = (0..4)
+            .map(|i| {
+                let mut prompt = prefix.clone();
+                prompt.extend(tokens(20 + 7 * i, 30 + i));
+                request(prompt, 10)
+            })
+            .collect::<Vec<_>>();
+
+        let mut cancelled_store = store(&model, MODEL);
+        let cancel = CancelFlag::new();
+        let mut emitted = 0;
+        let outputs = generate_continuous_kv(
+            &model,
+            &requests,
+            &config(2, BatchExactness::Throughput),
+            qualified(Some(&mut cancelled_store)),
+            &cancel,
+            &mut |_, event| {
+                emitted += usize::from(matches!(event, StreamEvent::Token { .. }));
+                if emitted == 5 {
+                    cancel.cancel();
+                }
+            },
+        )
+        .unwrap();
+        assert!(outputs
+            .iter()
+            .any(|out| out.output.finish_reason == FinishReason::Cancelled));
+        let pool = cancelled_store.pool().clone();
+        assert_eq!(pool.borrow().live_pages(), cancelled_store.held_pages());
+        cancelled_store.clear();
+        assert_eq!(pool.borrow().live_pages(), 0);
+
+        let mut failed_store = store(&model, MODEL);
+        let failing = ContinuousKv {
+            reader: Some(crate::primitives::paged_packed_kv::tests::interrupting(
+                9, false,
+            )),
+            ..qualified(Some(&mut failed_store))
+        };
+        let error = generate_continuous_kv(
+            &model,
+            &requests,
+            &config(2, BatchExactness::Exact),
+            failing,
+            &CancelFlag::new(),
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"), "{error}");
+        let pool = failed_store.pool().clone();
+        assert!(
+            !failed_store.is_empty(),
+            "the admitted prompts were stored before the fault"
+        );
+        assert_eq!(pool.borrow().live_pages(), failed_store.held_pages());
+        failed_store.clear();
+        assert_eq!(pool.borrow().live_pages(), 0);
+    }
+
+    /// AC2 identity: a store keyed by another model identity, or built for another page geometry,
+    /// is refused for every compressed request — nothing is reused from it or stored into it, and
+    /// its pool is untouched — while the requests still run (compressed, on the run's own pool)
+    /// exactly as they do with no store.
+    #[test]
+    fn a_store_of_another_identity_is_refused_and_never_reused() {
+        let model = model();
+        let prefix = tokens(10_240, 6);
+        let requests = (0..2)
+            .map(|i| {
+                let mut prompt = prefix.clone();
+                prompt.extend(tokens(11 + i, 40 + i));
+                request(prompt, 5)
+            })
+            .collect::<Vec<_>>();
+        let plain = run(
+            &model,
+            &requests,
+            &config(2, BatchExactness::Exact),
+            qualified(None),
+        );
+        let mut primed = store(&model, "another-model@2");
+        run(
+            &model,
+            &requests[..1],
+            &config(1, BatchExactness::Exact),
+            ContinuousKv {
+                model_identity: "another-model@2",
+                ..qualified(Some(&mut primed))
+            },
+        );
+        let held = (primed.len(), primed.held_pages(), primed.stats());
+        let other_geometry = PagedPrefixCache::new(
+            PackedPagePool::new(2, 1, 64, 64, PackedCodeBits::Eight).unwrap(),
+            MODEL,
+            4,
+        );
+        for (mut store, field) in [(primed, "model"), (other_geometry, "KV heads")] {
+            let before = store.pool().borrow().live_pages();
+            let refused_before = store.stats().refused;
+            let outputs = run(
+                &model,
+                &requests,
+                &config(2, BatchExactness::Exact),
+                qualified(Some(&mut store)),
+            );
+            for (out, plain) in outputs.iter().zip(&plain) {
+                assert_eq!(out.reused_prefix_tokens, 0);
+                let refused = out.prefix_refused.as_deref().unwrap_or_default();
+                assert!(refused.contains(field), "{field}: {refused}");
+                assert_eq!(out.output.tokens, plain.output.tokens);
+                assert_compressed(out);
+            }
+            assert_eq!(store.stats().refused, refused_before + 2);
+            assert_eq!(store.pool().borrow().live_pages(), before);
+            if field == "model" {
+                let after = store.stats();
+                assert_eq!((store.len(), store.held_pages()), (held.0, held.1));
+                assert_eq!(
+                    (after.hits, after.stored),
+                    (held.2.hits, held.2.stored),
+                    "nothing reused or stored"
+                );
+            }
+        }
+    }
+
+    /// AC2 restore: a store saved as bytes and restored into a new pool (a process restart) serves
+    /// a new request exactly as the original store does; a snapshot whose KV format version was
+    /// changed is refused and counted, and nothing is stored.
+    #[test]
+    fn a_saved_prefix_store_restores_and_a_version_mismatch_is_refused() {
+        let model = model();
+        let prefix = tokens(10_240, 8);
+        let with_suffix = |salt: usize| {
+            let mut prompt = prefix.clone();
+            prompt.extend(tokens(17 + salt, 50 + salt));
+            request(prompt, 6)
+        };
+        let mut original = store(&model, MODEL);
+        run(
+            &model,
+            &[with_suffix(0)],
+            &config(1, BatchExactness::Exact),
+            qualified(Some(&mut original)),
+        );
+        let saved = original
+            .snapshots()
+            .unwrap()
+            .into_iter()
+            .map(|(tokens, snapshot)| (tokens, snapshot.to_bytes().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(saved.len(), 2, "the prompt and the finished sequence");
+
+        let mut restored = store(&model, MODEL);
+        for (tokens, bytes) in &saved {
+            let snapshot = PagedCacheSnapshot::from_bytes(bytes).unwrap();
+            restored
+                .restore(tokens.clone(), &snapshot, reader())
+                .unwrap();
+        }
+        assert_eq!(restored.len(), 2);
+        let next = [with_suffix(1)];
+        let from_original = run(
+            &model,
+            &next,
+            &config(1, BatchExactness::Exact),
+            qualified(Some(&mut original)),
+        );
+        let from_restored = run(
+            &model,
+            &next,
+            &config(1, BatchExactness::Exact),
+            qualified(Some(&mut restored)),
+        );
+        assert_eq!(from_restored[0].reused_prefix_tokens, 10_240);
+        assert_eq!(
+            from_original[0].reused_prefix_tokens,
+            from_restored[0].reused_prefix_tokens
+        );
+        assert_eq!(
+            from_original[0].output.tokens,
+            from_restored[0].output.tokens
+        );
+
+        let mut tampered = saved[0].1.clone();
+        let needle = br#""format_version":1"#;
+        let at = tampered
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("the header names the format version");
+        tampered[at + needle.len() - 1] = b'2';
+        let snapshot = PagedCacheSnapshot::from_bytes(&tampered).unwrap();
+        let mut fresh = store(&model, MODEL);
+        let error = fresh
+            .restore(saved[0].0.clone(), &snapshot, reader())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("KV format version"), "{error}");
+        assert_eq!(
+            fresh.stats(),
+            PagedPrefixStats {
+                refused: 1,
+                ..PagedPrefixStats::default()
+            }
+        );
+        assert!(fresh.is_empty());
+        assert_eq!(fresh.pool().borrow().live_pages(), 0);
+
+        // A sequence on another pool is never stored: its pages are not the store's to share.
+        let foreign_pool = PackedPagePool::new(2, 2, 64, 64, PackedCodeBits::Eight).unwrap();
+        let mut foreign = PagedPackedKvCache::with_pool(foreign_pool, reader()).unwrap();
+        let prompt = tokens(40, 1);
+        model
+            .decode_logits(&input_ids(&prompt), &mut foreign, 0)
+            .unwrap()
+            .eval()
+            .unwrap();
+        let identity = fresh.identity().clone();
+        assert!(!fresh.insert(&identity, &prompt, &foreign).unwrap());
+        assert_eq!(fresh.stats().refused, 2);
+        assert!(fresh.is_empty());
+    }
+
+    /// AC3 measurement (not a gate): `Throughput` continuous batching of `B` qualified sequences
+    /// with jagged ~10–11k-token contexts on a synthetic 4-layer GQA model (8 query / 2 KV heads,
+    /// head dim 128), paged compressed (K8V8, one batched paged dispatch per layer) against the
+    /// dense paged cache. Reports the KV memory the caches hold after prefill (MLX active memory
+    /// over the weights-only baseline), the decode step's peak, and steady decode throughput over
+    /// three rounds of 64 teacher-forced batched steps (median).
+    ///
+    /// ```text
+    /// cargo test -p mlx-llm --lib -- --ignored --nocapture continuous_batching_memory_and_decode
+    /// ```
+    #[test]
+    #[ignore = "GPU measurement; run explicitly with --ignored --nocapture"]
+    fn continuous_batching_memory_and_decode_throughput_vs_dense_paged() {
+        use mlx_rs::memory;
+        let model = crate::provider::tests::synthetic_causal_model(256, 4, 8, 2, 128);
+        let reader = reader();
+        for batch in [4usize, 8] {
+            let lengths = (0..batch)
+                .map(|b| 10_240 + (b * 97) % 700)
+                .collect::<Vec<_>>();
+            let tokens_total = lengths.iter().sum::<usize>();
+            let mut results = Vec::new();
+            for policy in [KvCompressionPolicy::Qualified, KvCompressionPolicy::Off] {
+                memory::clear_cache();
+                let baseline = memory::get_active_memory() as u64;
+                let cfg = model.config();
+                let dense_pool = BlockPool::new(16);
+                let packed_pool = PackedPagePool::new(
+                    cfg.num_layers,
+                    cfg.num_kv_heads as usize,
+                    cfg.head_dim as usize,
+                    64,
+                    PackedCodeBits::Eight,
+                )
+                .unwrap();
+                let mut lanes = lengths
+                    .iter()
+                    .map(|&len| {
+                        model.select_paged_cache(PagedCacheRequest {
+                            policy,
+                            family: Some(KvModelFamily::Qwen3),
+                            prompt_tokens: len as u64,
+                            max_new_tokens: 1_024,
+                            dense_pool: &dense_pool,
+                            packed_pool: &packed_pool,
+                            reader: Some(&reader),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for (b, lane) in lanes.iter_mut().enumerate() {
+                    assert_eq!(
+                        lane.is_compressed(),
+                        policy == KvCompressionPolicy::Qualified
+                    );
+                    let logits = model
+                        .decode_logits(&input_ids(&tokens(lengths[b], b)), lane.cache_mut(), 0)
+                        .unwrap();
+                    logits.eval().unwrap();
+                }
+                memory::clear_cache();
+                let held = memory::get_active_memory() as u64 - baseline;
+                // The compressed pages' own bytes (live pages, not the pool's doubled capacity)
+                // plus each sequence's table and residuals; the dense caches' K/V.
+                let attributed = lanes
+                    .iter()
+                    .map(|lane| {
+                        lane.cache()
+                            .compressed_storage()
+                            .unwrap()
+                            .map_or(0, |storage| storage.device_bytes())
+                    })
+                    .sum::<u64>();
+                let capacity = packed_pool.borrow().storage();
+                let step = |lanes: &mut [PagedCacheSelection], i: usize| {
+                    let feed = (0..lanes.len())
+                        .map(|b| ((i * 5 + b) % 31 + 1) as i32)
+                        .collect::<Vec<_>>();
+                    let ids = Array::from_slice(&feed, &[lanes.len() as i32, 1]);
+                    let positions = lanes
+                        .iter()
+                        .map(|lane| lane.cache().offset())
+                        .collect::<Vec<_>>();
+                    let mut refs: Vec<&mut dyn KvCache> =
+                        lanes.iter_mut().map(|lane| lane.cache_mut()).collect();
+                    let logits = model
+                        .decode_logits_per_seq_dyn(&ids, &mut refs, &positions)
+                        .unwrap();
+                    logits.eval().unwrap();
+                };
+                for i in 0..4 {
+                    step(&mut lanes, i);
+                }
+                memory::reset_peak_memory();
+                // Median of three 64-step rounds (the host GPU is shared).
+                let steps = 64;
+                let mut rates = (0..3)
+                    .map(|round| {
+                        let started = std::time::Instant::now();
+                        for i in 0..steps {
+                            step(&mut lanes, 4 + round * steps + i);
+                        }
+                        (batch * steps) as f64 / started.elapsed().as_secs_f64()
+                    })
+                    .collect::<Vec<_>>();
+                rates.sort_by(f64::total_cmp);
+                let peak = memory::get_peak_memory() as u64 - baseline;
+                let reports = lanes
+                    .iter()
+                    .map(|lane| lane.report().unwrap())
+                    .collect::<Vec<_>>();
+                if policy == KvCompressionPolicy::Qualified {
+                    assert!(reports.iter().all(KvCacheReport::ran_compressed));
+                }
+                if policy == KvCompressionPolicy::Qualified {
+                    eprintln!(
+                        "  (B={batch} compressed: live pages + tables + residuals {:.1} MiB; pool \
+                         capacity {} pages for {} live = {:.1} MiB)",
+                        attributed as f64 / (1 << 20) as f64,
+                        capacity.capacity_pages,
+                        capacity.live_pages,
+                        (capacity.code_bytes + capacity.metadata_bytes) as f64 / (1 << 20) as f64
+                    );
+                }
+                results.push((policy, held, peak, rates[1]));
+                drop(lanes);
+            }
+            let dense_kv = tokens_total as u64
+                * model.config().num_layers as u64
+                * 2
+                * model.config().num_kv_heads as u64
+                * model.config().head_dim as u64
+                * 2;
+            eprintln!(
+                "B={batch}, {tokens_total} context tokens (dense bf16 K/V {:.1} MiB):",
+                dense_kv as f64 / (1 << 20) as f64
+            );
+            for (policy, held, peak, rate) in &results {
+                eprintln!(
+                    "  {policy:?}: KV held after prefill {:.1} MiB, decode peak {:.1} MiB, \
+                     decode {rate:.1} tok/s",
+                    *held as f64 / (1 << 20) as f64,
+                    *peak as f64 / (1 << 20) as f64
+                );
+            }
+            let (compressed, dense) = (&results[0], &results[1]);
+            eprintln!(
+                "  compressed / dense: memory {:.3}, decode-step peak {:.3}, throughput {:.3}",
+                compressed.1 as f64 / dense.1 as f64,
+                compressed.2 as f64 / dense.2 as f64,
+                compressed.3 / dense.3
+            );
+        }
+    }
 }

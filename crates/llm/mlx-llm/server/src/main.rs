@@ -381,6 +381,7 @@ fn handle_chat(
                     finish,
                     out.usage.prompt_tokens,
                     out.usage.generated_tokens,
+                    out.kv_cache.as_ref(),
                 );
                 write_json(stream, 200, &body)
             }
@@ -442,7 +443,10 @@ fn stream_chat(
                 .finish_reason
                 .map(openai::finish_reason_str)
                 .unwrap_or("stop");
-            let _ = sse(stream, &openai::final_chunk(id, model, created, finish));
+            let _ = sse(
+                stream,
+                &openai::final_chunk(id, model, created, finish, out.kv_cache.as_ref()),
+            );
         }
         Err(CoreError::Canceled) => return Ok(()),
         Err(e) => {
