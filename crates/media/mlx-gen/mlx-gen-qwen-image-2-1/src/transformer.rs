@@ -546,9 +546,17 @@ pub struct QwenImage21Transformer {
 ///
 /// Adapters install as forward-time residuals ([`AdaptableLinear::push`]) that never touch the
 /// base, so the same map serves a dense bf16 DiT and a packed Q4/Q8 one alike.
+///
+/// A raw PEFT `PeftModel.save_pretrained` export wraps every module path in `base_model.model.`
+/// (optionally over a `transformer.` / `diffusion_model.` namespace); the shared loader's prefix
+/// detection only strips the namespaces, so the wrapper is routed here (sc-24158) — matching the
+/// candle twin's normalisation. No checkpoint module is named `base_model`, so the alias can only
+/// turn an otherwise-unmatched key into its projection.
 impl AdaptableHost for QwenImage21Transformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
+            ["base_model", "model", "transformer" | "diffusion_model", rest @ ..]
+            | ["base_model", "model", rest @ ..] => self.adaptable_mut(rest),
             ["transformer_blocks", n, rest @ ..] => self
                 .blocks
                 .get_mut(n.parse::<usize>().ok()?)?

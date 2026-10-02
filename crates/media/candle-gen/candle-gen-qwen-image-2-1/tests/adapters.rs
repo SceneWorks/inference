@@ -719,3 +719,892 @@ fn a_sequential_load_refuses_a_bad_adapter_before_any_render() {
     write_lora(&good, &[(ATTN_TARGET, DIM, DIM)], 0);
     candle_gen_qwen_image_2_1::load(&sequential(&good)).expect("a matching adapter loads");
 }
+
+// ── sc-24158: every adapter format, on the dense and the packed tiers ───────────────────────────
+
+/// `[out, in]` of every adaptable projection of the tiny DiT, by dotted path.
+fn projection_shapes() -> HashMap<String, (usize, usize)> {
+    QwenImage21Transformer::adaptable_projections(dense_dit().config())
+        .into_iter()
+        .collect()
+}
+
+/// The projections that carry an attached residual, in visitor order.
+fn adapted(dit: &mut QwenImage21Transformer) -> Vec<String> {
+    let mut names = Vec::new();
+    dit.visit_adaptable_mut(&mut |name, linear| {
+        if linear.is_adapted() {
+            names.push(name.to_string());
+        }
+        Ok(())
+    })
+    .unwrap();
+    names
+}
+
+fn transformer_ns(path: &str) -> String {
+    format!("transformer.{path}")
+}
+
+fn peft_wrapper(path: &str) -> String {
+    format!("base_model.model.{path}")
+}
+
+fn diffusion_model_ns(path: &str) -> String {
+    format!("diffusion_model.{path}")
+}
+
+fn kohya(path: &str) -> String {
+    format!("lora_unet_{}", path.replace('.', "_"))
+}
+
+fn lycoris(path: &str) -> String {
+    format!("lycoris_{}", path.replace('.', "_"))
+}
+
+fn bare(path: &str) -> String {
+    path.to_string()
+}
+
+/// One LoRA spelling: how a dotted projection path becomes the file's module key, and the factor
+/// suffixes the convention writes.
+struct LoraSpelling {
+    name: &'static str,
+    module: fn(&str) -> String,
+    down: &'static str,
+    up: &'static str,
+    /// Whether the convention ships a per-module `.alpha` scalar.
+    alpha: bool,
+}
+
+const LORA_SPELLINGS: [LoraSpelling; 7] = [
+    LoraSpelling {
+        name: "diffusers transformer.",
+        module: transformer_ns,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "raw PEFT base_model.model.",
+        module: peft_wrapper,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "PEFT .default adapter",
+        module: transformer_ns,
+        down: "lora_A.default.weight",
+        up: "lora_B.default.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "ComfyUI diffusion_model. lora_down/up",
+        module: diffusion_model_ns,
+        down: "lora_down.weight",
+        up: "lora_up.weight",
+        alpha: true,
+    },
+    LoraSpelling {
+        name: "ai-toolkit diffusion_model. lora_A/B",
+        module: diffusion_model_ns,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: false,
+    },
+    LoraSpelling {
+        name: "kohya lora_unet_",
+        module: kohya,
+        down: "lora_down.weight",
+        up: "lora_up.weight",
+        alpha: true,
+    },
+    LoraSpelling {
+        name: "bare (SceneWorks trainer)",
+        module: bare,
+        down: "lora_A.weight",
+        up: "lora_B.weight",
+        alpha: true,
+    },
+];
+
+fn write_spelled_lora(
+    path: &Path,
+    spelling: &LoraSpelling,
+    targets: &[&str],
+    shapes: &HashMap<String, (usize, usize)>,
+) {
+    let mut tensors = Vec::new();
+    for (i, target) in targets.iter().enumerate() {
+        let (out_f, in_f) = shapes[*target];
+        let module = (spelling.module)(target);
+        tensors.push((format!("{module}.{}", spelling.down), filled((2, in_f), i)));
+        tensors.push((
+            format!("{module}.{}", spelling.up),
+            filled((out_f, 2), i + 1),
+        ));
+        if spelling.alpha {
+            tensors.push((
+                format!("{module}.alpha"),
+                Tensor::new(4f32, &Device::Cpu).unwrap(),
+            ));
+        }
+    }
+    save(path, tensors, None);
+}
+
+/// The globals and the block leaves whose names already carry `_` — the kohya flattening is
+/// ambiguous for them unless resolved against the projection table.
+const KOHYA_HARD_TARGETS: [&str; 8] = [
+    "txt_in.in_layer",
+    "time_text_embed.timestep_embedder.linear_1",
+    "modulation.1",
+    "transformer_blocks.0.attn.to_out.0",
+    "transformer_blocks.1.img_mlp.gate_layer",
+    "transformer_blocks.1.img_mlp.out",
+    "norm_out.linear",
+    "proj_out",
+];
+
+/// Every LoRA spelling the shared loaders accept applies on the dense DiT — over the globals and the
+/// underscore-ambiguous leaves — passes the header-only preflight, and lands on exactly the
+/// projections it names (never a neighbour a blind `_` → `.` split would pick).
+#[test]
+fn every_lora_spelling_applies_to_exactly_its_projections_on_the_dense_dit() {
+    let temp = tempfile::tempdir().unwrap();
+    let shapes = projection_shapes();
+    let base = velocity(&dense_dit());
+    let order: Vec<String> = QwenImage21Transformer::adaptable_projections(dense_dit().config())
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    let want: Vec<String> = order
+        .iter()
+        .filter(|path| KOHYA_HARD_TARGETS.contains(&path.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(want.len(), KOHYA_HARD_TARGETS.len());
+    for (i, spelling) in LORA_SPELLINGS.iter().enumerate() {
+        let file = temp.path().join(format!("lora-{i}.safetensors"));
+        write_spelled_lora(&file, spelling, &KOHYA_HARD_TARGETS, &shapes);
+        preflight(&tiny_snapshot(), &[lora(&file, 1.0)], Tier::Bf16)
+            .unwrap_or_else(|e| panic!("{}: preflight: {e}", spelling.name));
+        let mut dit = dense_dit();
+        let report = install(&mut dit, &[lora(&file, 1.0)], Tier::Bf16, &Device::Cpu)
+            .unwrap_or_else(|e| panic!("{}: install: {e}", spelling.name));
+        assert_eq!(
+            report.residuals,
+            KOHYA_HARD_TARGETS.len(),
+            "{}",
+            spelling.name
+        );
+        assert_eq!(adapted(&mut dit), want, "{}", spelling.name);
+        assert!(
+            max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+            "{}: the LoRA must move the output",
+            spelling.name
+        );
+    }
+}
+
+/// The same spellings ride as residuals over the packed q8 / q4 projection, which stays packed.
+#[test]
+fn every_lora_spelling_applies_over_a_packed_projection() {
+    let shapes = projection_shapes();
+    for tier in [Tier::Q8, Tier::Q4] {
+        let temp = tempfile::tempdir().unwrap();
+        let base = velocity(&packed_dit(temp.path(), tier));
+        for (i, spelling) in LORA_SPELLINGS.iter().enumerate() {
+            let file = temp.path().join(format!("lora-{i}.safetensors"));
+            write_spelled_lora(&file, spelling, &[PACKED_TARGET], &shapes);
+            preflight(&tiny_snapshot(), &[lora(&file, 1.0)], tier)
+                .unwrap_or_else(|e| panic!("{tier:?} {}: preflight: {e}", spelling.name));
+            let mut dit = packed_dit(temp.path(), tier);
+            let report = install(&mut dit, &[lora(&file, 1.0)], tier, &Device::Cpu)
+                .unwrap_or_else(|e| panic!("{tier:?} {}: install: {e}", spelling.name));
+            assert_eq!(report.residuals, 1, "{tier:?} {}", spelling.name);
+            assert_eq!(
+                adapted(&mut dit),
+                [PACKED_TARGET],
+                "{tier:?} {}",
+                spelling.name
+            );
+            assert!(
+                max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+                "{tier:?} {}: the residual must move the output",
+                spelling.name
+            );
+        }
+    }
+}
+
+/// One LoKr module's factors, by suffix.
+type LokrModule = Vec<(&'static str, Tensor)>;
+
+/// Full Kronecker factors over `[out, in]`: `w1 [a, c]`, `w2 [out/a, in/c]`.
+fn full_lokr(out_f: usize, in_f: usize, (a, c): (usize, usize)) -> LokrModule {
+    vec![
+        ("lokr_w1", filled((a, c), 3)),
+        ("lokr_w2", filled((out_f / a, in_f / c), 4)),
+    ]
+}
+
+/// Full `w1`, low-rank `w2 = w2_a [out/a, 2] · w2_b [2, in/c]` with a per-module `alpha`.
+fn low_rank_lokr(out_f: usize, in_f: usize, (a, c): (usize, usize), alpha: f32) -> LokrModule {
+    vec![
+        ("lokr_w1", filled((a, c), 3)),
+        ("lokr_w2_a", filled((out_f / a, 2), 5)),
+        ("lokr_w2_b", filled((2, in_f / c), 6)),
+        ("alpha", Tensor::new(alpha, &Device::Cpu).unwrap()),
+    ]
+}
+
+/// A LyCORIS tucker right factor in the Linear form: `lokr_t2 [2, 2, 1, 1]`, `lokr_w2_a [2, b]`,
+/// `lokr_w2_b [2, d]`, rebuilt as `w2_aᵀ · t2 · w2_b`.
+fn tucker_lokr(out_f: usize, in_f: usize, (a, c): (usize, usize), alpha: f32) -> LokrModule {
+    vec![
+        ("lokr_w1", filled((a, c), 3)),
+        ("lokr_t2", filled((2, 2), 7).reshape((2, 2, 1, 1)).unwrap()),
+        ("lokr_w2_a", filled((2, out_f / a), 8)),
+        ("lokr_w2_b", filled((2, in_f / c), 9)),
+        ("alpha", Tensor::new(alpha, &Device::Cpu).unwrap()),
+    ]
+}
+
+fn write_lokr_modules(
+    path: &Path,
+    modules: &[(String, LokrModule)],
+    meta: Option<HashMap<String, String>>,
+) {
+    let mut tensors = Vec::new();
+    for (module, factors) in modules {
+        for (factor, tensor) in factors {
+            tensors.push((format!("{module}.{factor}"), tensor.clone()));
+        }
+    }
+    save(path, tensors, meta);
+}
+
+/// The SceneWorks / PEFT `networkType=lokr` stamp with a global `rank`/`alpha`.
+fn lokr_stamp(rank: &str, alpha: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("networkType".to_string(), "lokr".to_string()),
+        ("rank".to_string(), rank.to_string()),
+        ("alpha".to_string(), alpha.to_string()),
+    ])
+}
+
+fn low_rank_alpha_1(out_f: usize, in_f: usize, w1: (usize, usize)) -> LokrModule {
+    low_rank_lokr(out_f, in_f, w1, 1.0)
+}
+
+fn low_rank_alpha_2(out_f: usize, in_f: usize, w1: (usize, usize)) -> LokrModule {
+    low_rank_lokr(out_f, in_f, w1, 2.0)
+}
+
+fn tucker_alpha_1(out_f: usize, in_f: usize, w1: (usize, usize)) -> LokrModule {
+    tucker_lokr(out_f, in_f, w1, 1.0)
+}
+
+/// One third-party LyCORIS LoKr layout: module spelling and the factor set it writes.
+struct LycorisLayout {
+    name: &'static str,
+    module: fn(&str) -> String,
+    factors: fn(usize, usize, (usize, usize)) -> LokrModule,
+}
+
+const LYCORIS_LOKR_LAYOUTS: [LycorisLayout; 4] = [
+    LycorisLayout {
+        name: "lycoris-lib lycoris_ flattened, low-rank w2",
+        module: lycoris,
+        factors: low_rank_alpha_1,
+    },
+    LycorisLayout {
+        name: "kohya lora_unet_ flattened, both factors full",
+        module: kohya,
+        factors: full_lokr,
+    },
+    LycorisLayout {
+        name: "ai-toolkit diffusion_model. dotted",
+        module: diffusion_model_ns,
+        factors: low_rank_alpha_2,
+    },
+    LycorisLayout {
+        name: "lycoris_ flattened Linear tucker lokr_t2",
+        module: lycoris,
+        factors: tucker_alpha_1,
+    },
+];
+
+/// Every unstamped LyCORIS LoKr layout (no `networkType`, per-module `.alpha`, flattened or
+/// dotted keys, a Linear tucker `lokr_t2`) installs as a structured residual on the dense DiT and
+/// over the packed q8 / q4 projection — the base staying packed — and passes the preflight, under
+/// either declared kind (a third-party file carries no stamp a caller could read the kind from).
+#[test]
+fn every_lycoris_lokr_layout_applies_on_dense_and_packed() {
+    let temp = tempfile::tempdir().unwrap();
+    let dense_targets = [
+        ATTN_TARGET,
+        "txt_in.in_layer",
+        "transformer_blocks.1.img_mlp.gate_layer",
+        "norm_out.linear",
+    ];
+    let shapes = projection_shapes();
+    let dense_base = velocity(&dense_dit());
+    for (i, layout) in LYCORIS_LOKR_LAYOUTS.iter().enumerate() {
+        let modules: Vec<(String, LokrModule)> = dense_targets
+            .iter()
+            .map(|target| {
+                let (out_f, in_f) = shapes[*target];
+                (
+                    (layout.module)(target),
+                    (layout.factors)(out_f, in_f, (2, 2)),
+                )
+            })
+            .collect();
+        let file = temp.path().join(format!("lycoris-dense-{i}.safetensors"));
+        write_lokr_modules(&file, &modules, None);
+        for kind in [AdapterKind::Lokr, AdapterKind::Lora] {
+            let spec = AdapterSpec::new(file.clone(), 1.0, kind);
+            preflight(&tiny_snapshot(), std::slice::from_ref(&spec), Tier::Bf16)
+                .unwrap_or_else(|e| panic!("{}: preflight: {e}", layout.name));
+            let mut dit = dense_dit();
+            let report = install(&mut dit, &[spec], Tier::Bf16, &Device::Cpu)
+                .unwrap_or_else(|e| panic!("{} ({kind:?}): install: {e}", layout.name));
+            assert_eq!(report.residuals, dense_targets.len(), "{}", layout.name);
+            // Exactly the named projections, in visitor order — never a neighbour.
+            assert_eq!(
+                adapted(&mut dit),
+                [
+                    "txt_in.in_layer",
+                    ATTN_TARGET,
+                    "transformer_blocks.1.img_mlp.gate_layer",
+                    "norm_out.linear",
+                ],
+                "{}",
+                layout.name
+            );
+            assert!(
+                max_abs_diff(&dense_base, &velocity(&dit)) > 1e-4,
+                "{}: the LoKr must move the output",
+                layout.name
+            );
+        }
+
+        for tier in [Tier::Q8, Tier::Q4] {
+            let (out_f, in_f) = shapes[PACKED_TARGET];
+            let file = temp
+                .path()
+                .join(format!("lycoris-{}-{i}.safetensors", tier.dir_name()));
+            write_lokr_modules(
+                &file,
+                &[(
+                    (layout.module)(PACKED_TARGET),
+                    (layout.factors)(out_f, in_f, (2, 4)),
+                )],
+                None,
+            );
+            let spec = AdapterSpec::new(file, 1.0, AdapterKind::Lokr);
+            preflight(&tiny_snapshot(), std::slice::from_ref(&spec), tier)
+                .unwrap_or_else(|e| panic!("{tier:?} {}: preflight: {e}", layout.name));
+            let base = velocity(&packed_dit(temp.path(), tier));
+            let mut dit = packed_dit(temp.path(), tier);
+            let report = install(&mut dit, &[spec], tier, &Device::Cpu)
+                .unwrap_or_else(|e| panic!("{tier:?} {}: install: {e}", layout.name));
+            assert_eq!(report.residuals, 1, "{tier:?} {}", layout.name);
+            let mut packed = false;
+            dit.visit_adaptable_mut(&mut |name, linear| {
+                if name == PACKED_TARGET {
+                    packed = linear.is_packed() && linear.is_adapted();
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                packed,
+                "{tier:?} {}: residual over a packed base",
+                layout.name
+            );
+            assert!(
+                max_abs_diff(&base, &velocity(&dit)) > 1e-4,
+                "{tier:?} {}",
+                layout.name
+            );
+        }
+    }
+}
+
+/// The LyCORIS per-module scale (`alpha / lora_dim`; forced 1 when both factors are full) and the
+/// tucker rebuild are exact: each unstamped layout renders the same velocity as the stamped LoKr
+/// carrying the equivalent full right factor at scale 1.
+#[test]
+fn lycoris_lokr_scale_and_tucker_match_the_equivalent_full_factor_lokr() {
+    let temp = tempfile::tempdir().unwrap();
+    let render =
+        |modules: Vec<(String, LokrModule)>, meta: Option<HashMap<String, String>>, name: &str| {
+            let file = temp.path().join(format!("{name}.safetensors"));
+            write_lokr_modules(&file, &modules, meta);
+            let mut dit = dense_dit();
+            install(
+                &mut dit,
+                &[AdapterSpec::new(file, 1.0, AdapterKind::Lokr)],
+                Tier::Bf16,
+                &Device::Cpu,
+            )
+            .unwrap();
+            velocity(&dit)
+        };
+    let factor = |module: &LokrModule, name: &str| {
+        module
+            .iter()
+            .find(|(factor, _)| *factor == name)
+            .map(|(_, t)| t.clone())
+            .unwrap()
+    };
+    // Low-rank, alpha 1 over rank 2 ⇒ scale 0.5.
+    let low = low_rank_lokr(DIM, DIM, (2, 2), 1.0);
+    let low_w2 = (factor(&low, "lokr_w2_a")
+        .matmul(&factor(&low, "lokr_w2_b"))
+        .unwrap()
+        * 0.5)
+        .unwrap();
+    // Both full ⇒ scale 1 whatever the alpha.
+    let mut full = full_lokr(DIM, DIM, (2, 2));
+    full.push(("alpha", Tensor::new(7f32, &Device::Cpu).unwrap()));
+    let full_w2 = factor(&full, "lokr_w2");
+    // Tucker, alpha 1 over rank 2 ⇒ scale 0.5 on w2_aᵀ · t2 · w2_b.
+    let tucker = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    let core = factor(&tucker, "lokr_t2").reshape((2, 2)).unwrap();
+    let tucker_w2 = (factor(&tucker, "lokr_w2_a")
+        .t()
+        .unwrap()
+        .matmul(&core)
+        .unwrap()
+        .matmul(&factor(&tucker, "lokr_w2_b"))
+        .unwrap()
+        * 0.5)
+        .unwrap();
+    let base = velocity(&dense_dit());
+    for (name, module, w2) in [
+        ("low-rank", low, low_w2),
+        ("both-full", full, full_w2),
+        ("tucker", tucker, tucker_w2),
+    ] {
+        let w1 = factor(&module, "lokr_w1");
+        let thirdparty = render(
+            vec![(lycoris(ATTN_TARGET), module)],
+            None,
+            &format!("lycoris-{name}"),
+        );
+        let stamped = render(
+            vec![(
+                ATTN_TARGET.to_string(),
+                vec![("lokr_w1", w1), ("lokr_w2", w2)],
+            )],
+            Some(lokr_stamp("1", "1")),
+            &format!("stamped-{name}"),
+        );
+        assert!(max_abs_diff(&base, &stamped) > 1e-4, "{name}: not a no-op");
+        assert!(
+            max_abs_diff(&thirdparty, &stamped) < 1e-5,
+            "{name}: the LyCORIS scale / rebuild must equal the full-factor LoKr"
+        );
+    }
+}
+
+/// The projections whose output on a fixed probe differs between `before` and `after`, in visitor
+/// order — a fold leaves no residual to look for, so compare what each projection computes.
+fn changed_projections(
+    before: &mut QwenImage21Transformer,
+    after: &mut QwenImage21Transformer,
+) -> Vec<String> {
+    let probe = |dit: &mut QwenImage21Transformer| {
+        let mut out = Vec::new();
+        dit.visit_adaptable_mut(&mut |name, linear| {
+            let (_, in_f) = linear.base_shape();
+            let x = ramp((1, 1, in_f), 3);
+            out.push((name.to_string(), linear.forward(&x)?));
+            Ok(())
+        })
+        .unwrap();
+        out
+    };
+    probe(before)
+        .into_iter()
+        .zip(probe(after))
+        .filter(|((_, a), (_, b))| max_abs_diff(a, b) > 0.0)
+        .map(|((name, _), _)| name)
+        .collect()
+}
+
+/// A LoHa folds under its LyCORIS (`lycoris_…`), kohya (`lora_unet_…`), namespaced
+/// (`diffusion_model.…`) and raw PEFT (`base_model.model.…`) spellings alike — the resolution the
+/// MLX twin uses.
+#[test]
+fn loha_folds_under_every_key_spelling() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = velocity(&dense_dit());
+    for (i, module) in [
+        "lycoris_transformer_blocks_0_attn_to_q",
+        "lora_unet_transformer_blocks_0_attn_to_q",
+        "diffusion_model.transformer_blocks.0.attn.to_q",
+        "base_model.model.transformer_blocks.0.attn.to_q",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let file = temp.path().join(format!("loha-{i}.safetensors"));
+        write_loha(&file, &[(module, DIM, DIM)]);
+        preflight(&tiny_snapshot(), &[lora(&file, 1.0)], Tier::Bf16)
+            .unwrap_or_else(|e| panic!("{module}: preflight: {e}"));
+        let mut dit = dense_dit();
+        let report = install(&mut dit, &[lora(&file, 1.0)], Tier::Bf16, &Device::Cpu)
+            .unwrap_or_else(|e| panic!("{module}: install: {e}"));
+        assert_eq!(report.loha_folds, 1, "{module}");
+        assert_eq!(
+            changed_projections(&mut dense_dit(), &mut dit),
+            [ATTN_TARGET],
+            "{module}: the fold lands on exactly to_q (txt_in.out_layer, img_mlp.proj, … bare)"
+        );
+        assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4, "{module}");
+    }
+}
+
+/// The `__metadata__` the MLX trainer (sc-24159) stamps: the provenance block plus the
+/// `networkType` / `rank` / `alpha` (+ LoKr `decomposeFactor`) reload contract.
+fn trainer_metadata(network: &str) -> HashMap<String, String> {
+    let mut meta = HashMap::from([
+        ("family".to_string(), "qwen-image-2-1".to_string()),
+        ("baseModel".to_string(), "qwen_image_2_1".to_string()),
+        (
+            "ss_base_model_version".to_string(),
+            "qwen_image_2_1".to_string(),
+        ),
+        (
+            "license".to_string(),
+            "Qwen Research License Agreement".to_string(),
+        ),
+        ("networkType".to_string(), network.to_string()),
+        ("rank".to_string(), "2".to_string()),
+        ("alpha".to_string(), "2".to_string()),
+    ]);
+    if network == "lokr" {
+        meta.insert("decomposeFactor".to_string(), "-1".to_string());
+    }
+    meta
+}
+
+/// The trainer's `factorization(dim, -1)`: the most balanced `m ≤ n` with `m · n = dim`.
+fn balanced(dim: usize) -> (usize, usize) {
+    (1..=dim)
+        .filter(|m| dim.is_multiple_of(*m) && *m <= dim / m)
+        .map(|m| (m, dim / m))
+        .next_back()
+        .unwrap()
+}
+
+/// What the MLX trainer writes, key layout for key layout: bare dotted keys; LoRA `lora_A` /
+/// `lora_B` plus a `[1]` `.alpha`; LoKr `lokr_w1 [out_a, in_a]` plus low-rank
+/// `lokr_w2_a [out_b, r]` / `lokr_w2_b [r, in_b]`.
+fn write_trainer_adapter(path: &Path, network: &str, targets: &[&str]) {
+    let shapes = projection_shapes();
+    let mut tensors = Vec::new();
+    for (i, target) in targets.iter().enumerate() {
+        let (out_f, in_f) = shapes[*target];
+        if network == "lora" {
+            tensors.push((format!("{target}.lora_A.weight"), filled((2, in_f), i)));
+            tensors.push((format!("{target}.lora_B.weight"), filled((out_f, 2), i + 1)));
+            tensors.push((
+                format!("{target}.alpha"),
+                Tensor::new(&[2f32], &Device::Cpu).unwrap(),
+            ));
+        } else {
+            let (out_a, out_b) = balanced(out_f);
+            let (in_a, in_b) = balanced(in_f);
+            tensors.push((format!("{target}.lokr_w1"), filled((out_a, in_a), i)));
+            tensors.push((format!("{target}.lokr_w2_a"), filled((out_b, 2), i + 1)));
+            tensors.push((format!("{target}.lokr_w2_b"), filled((2, in_b), i + 2)));
+        }
+    }
+    save(path, tensors, Some(trainer_metadata(network)));
+}
+
+/// An adapter in the MLX trainer's output layout loads on candle with no conversion — LoRA and
+/// LoKr, on the dense DiT and over the packed q8 / q4 projection.
+#[test]
+fn an_mlx_trainer_adapter_loads_on_candle_without_conversion() {
+    let temp = tempfile::tempdir().unwrap();
+    let dense_targets = [
+        ATTN_TARGET,
+        "transformer_blocks.1.img_mlp.proj",
+        PACKED_TARGET,
+    ];
+    let base = velocity(&dense_dit());
+    for (network, kind) in [("lora", AdapterKind::Lora), ("lokr", AdapterKind::Lokr)] {
+        let file = temp.path().join(format!("trainer-{network}.safetensors"));
+        write_trainer_adapter(&file, network, &dense_targets);
+        let spec = AdapterSpec::new(file, 1.0, kind);
+        preflight(&tiny_snapshot(), std::slice::from_ref(&spec), Tier::Bf16).unwrap();
+        let mut dit = dense_dit();
+        let report = install(
+            &mut dit,
+            std::slice::from_ref(&spec),
+            Tier::Bf16,
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(report.residuals, dense_targets.len(), "{network}");
+        assert!(max_abs_diff(&base, &velocity(&dit)) > 1e-4, "{network}");
+
+        let packed_file = temp
+            .path()
+            .join(format!("trainer-{network}-packed.safetensors"));
+        write_trainer_adapter(&packed_file, network, &[PACKED_TARGET]);
+        let spec = AdapterSpec::new(packed_file, 1.0, kind);
+        for tier in [Tier::Q8, Tier::Q4] {
+            preflight(&tiny_snapshot(), std::slice::from_ref(&spec), tier).unwrap();
+            let packed_base = velocity(&packed_dit(temp.path(), tier));
+            let mut dit = packed_dit(temp.path(), tier);
+            let report =
+                install(&mut dit, std::slice::from_ref(&spec), tier, &Device::Cpu).unwrap();
+            assert_eq!(report.residuals, 1, "{tier:?} {network}");
+            assert!(
+                max_abs_diff(&packed_base, &velocity(&dit)) > 1e-4,
+                "{tier:?} {network}"
+            );
+        }
+    }
+}
+
+/// Files the DiT genuinely cannot serve are typed, actionable refusals — at the header-only
+/// preflight and at install — never a silent skip: a spatial (conv) tucker LoKr, a LyCORIS LoKr
+/// whose module reaches no projection, a stray non-factor key beside LyCORIS factors, Kronecker
+/// factors that do not reconstruct the projection, and a stamped LoKr declared as a LoRA.
+#[test]
+fn unservable_lokr_files_are_typed_refusals() {
+    let temp = tempfile::tempdir().unwrap();
+    let refuse = |name: &str,
+                  modules: Vec<(String, LokrModule)>,
+                  meta: Option<HashMap<String, String>>,
+                  kind: AdapterKind,
+                  at_preflight: &str,
+                  at_install: &str| {
+        let file = temp.path().join(format!("{name}.safetensors"));
+        write_lokr_modules(&file, &modules, meta);
+        let spec = AdapterSpec::new(file, 1.0, kind);
+        if !at_preflight.is_empty() {
+            let error = refusal(preflight(
+                &tiny_snapshot(),
+                std::slice::from_ref(&spec),
+                Tier::Bf16,
+            ));
+            assert!(error.contains(at_preflight), "{name}: preflight: {error}");
+        }
+        let mut dit = dense_dit();
+        let error = refusal(install(&mut dit, &[spec], Tier::Bf16, &Device::Cpu));
+        assert!(error.contains(at_install), "{name}: install: {error}");
+        assert!(adapted(&mut dit).is_empty(), "{name}: nothing attached");
+    };
+
+    let mut conv = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    conv[1].1 = filled((2, 18), 7).reshape((2, 2, 3, 3)).unwrap();
+    refuse(
+        "conv-tucker",
+        vec![(lycoris(ATTN_TARGET), conv)],
+        None,
+        AdapterKind::Lokr,
+        "not the Linear form",
+        "not the Linear form",
+    );
+
+    refuse(
+        "unmatched",
+        vec![(
+            "lycoris_transformer_blocks_9_attn_to_q".to_string(),
+            full_lokr(DIM, DIM, (2, 2)),
+        )],
+        None,
+        AdapterKind::Lokr,
+        "lycoris_transformer_blocks_9_attn_to_q",
+        "lycoris_transformer_blocks_9_attn_to_q",
+    );
+
+    let mut stray = full_lokr(DIM, DIM, (2, 2));
+    stray.push(("lokr_w1.bias", filled((1, 2), 1)));
+    refuse(
+        "stray",
+        vec![(lycoris(ATTN_TARGET), stray)],
+        None,
+        AdapterKind::Lokr,
+        "is not a LyCORIS LoKr factor",
+        "is not a LoKr factor",
+    );
+
+    // `w1 [2, 2] ⊗ w2 [4, 4]` reconstructs [8, 8], not to_q's [32, 32]: refused at the
+    // weight-free preflight (so a `Sequential` load never admits it) and at install — LyCORIS and
+    // stamped alike.
+    refuse(
+        "misshaped",
+        vec![(lycoris(ATTN_TARGET), full_lokr(8, 8, (2, 2)))],
+        None,
+        AdapterKind::Lokr,
+        "does not reconstruct",
+        "does not reconstruct",
+    );
+    refuse(
+        "misshaped-stamped",
+        vec![(ATTN_TARGET.to_string(), full_lokr(8, 8, (2, 2)))],
+        Some(lokr_stamp("1", "1")),
+        AdapterKind::Lokr,
+        "does not reconstruct",
+        "",
+    );
+
+    // A present-but-empty alpha is a malformed file, never a silent `alpha = rank`.
+    let mut empty_alpha = low_rank_lokr(DIM, DIM, (2, 2), 1.0);
+    empty_alpha[3].1 = Tensor::zeros(0, candle_core::DType::F32, &Device::Cpu).unwrap();
+    refuse(
+        "empty-alpha",
+        vec![(lycoris(ATTN_TARGET), empty_alpha)],
+        None,
+        AdapterKind::Lokr,
+        "present but empty",
+        "present but empty",
+    );
+
+    // Over-specified / ambiguous factor sets.
+    let mut w1_twice = low_rank_lokr(DIM, DIM, (2, 2), 1.0);
+    w1_twice.push(("lokr_w1_a", filled((2, 1), 1)));
+    w1_twice.push(("lokr_w1_b", filled((1, 2), 2)));
+    refuse(
+        "w1-full-and-low-rank",
+        vec![(lycoris(ATTN_TARGET), w1_twice)],
+        None,
+        AdapterKind::Lokr,
+        "carries both a full lokr_w1",
+        "carries both a full lokr_w1",
+    );
+    let mut t2_and_w2 = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    t2_and_w2.push(("lokr_w2", filled((DIM / 2, DIM / 2), 4)));
+    refuse(
+        "tucker-and-full-w2",
+        vec![(lycoris(ATTN_TARGET), t2_and_w2)],
+        None,
+        AdapterKind::Lokr,
+        "carries both a full lokr_w2",
+        "carries both a full lokr_w2",
+    );
+    let mut half_tucker = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    half_tucker.retain(|(factor, _)| *factor != "lokr_w2_b");
+    refuse(
+        "tucker-without-w2_b",
+        vec![(lycoris(ATTN_TARGET), half_tucker)],
+        None,
+        AdapterKind::Lokr,
+        "missing a Kronecker factor",
+        "missing a Kronecker factor",
+    );
+
+    refuse(
+        "declared-lora",
+        vec![(ATTN_TARGET.to_string(), full_lokr(DIM, DIM, (2, 2)))],
+        Some(lokr_stamp("1", "1")),
+        AdapterKind::Lora,
+        "declared LoRA",
+        "declared LoRA",
+    );
+}
+
+/// A LoKr prices what the install keeps on device — the two small Kronecker factors in f32 (a
+/// low-rank leg materialized to its full `[b, d]`, a tucker leg collapsed to it) plus their
+/// compute-dtype prepared copy — not its (much smaller) file bytes: the overlay is at least the f32
+/// factors every installed `LokrFactors` retains, for stamped, low-rank LyCORIS and tucker files.
+#[test]
+fn a_lokr_overlay_prices_the_resident_kronecker_factors() {
+    use candle_gen::quant::LokrFactors;
+    use candle_gen_qwen_image_2_1::memory_strategy::adapter_overlay;
+
+    let temp = tempfile::tempdir().unwrap();
+    let get = |module: &LokrModule, name: &str| {
+        module
+            .iter()
+            .find(|(factor, _)| *factor == name)
+            .map(|(_, t)| t.clone())
+    };
+    let low = low_rank_lokr(DIM, DIM, (2, 2), 1.0);
+    let tucker = tucker_lokr(DIM, DIM, (2, 2), 1.0);
+    let stamped = low_rank_lokr(DIM, DIM, (2, 2), 1.0)
+        .into_iter()
+        .filter(|(factor, _)| *factor != "alpha")
+        .collect::<LokrModule>();
+    for (name, module, meta, resident_w2) in [
+        (
+            "lycoris-low-rank",
+            low.clone(),
+            None,
+            get(&low, "lokr_w2_a")
+                .unwrap()
+                .matmul(&get(&low, "lokr_w2_b").unwrap())
+                .unwrap(),
+        ),
+        (
+            "lycoris-tucker",
+            tucker.clone(),
+            None,
+            get(&tucker, "lokr_w2_a")
+                .unwrap()
+                .t()
+                .unwrap()
+                .matmul(&get(&tucker, "lokr_t2").unwrap().reshape((2, 2)).unwrap())
+                .unwrap()
+                .matmul(&get(&tucker, "lokr_w2_b").unwrap())
+                .unwrap(),
+        ),
+        (
+            "stamped-low-rank",
+            stamped.clone(),
+            Some(lokr_stamp("2", "2")),
+            get(&stamped, "lokr_w2_a")
+                .unwrap()
+                .matmul(&get(&stamped, "lokr_w2_b").unwrap())
+                .unwrap(),
+        ),
+    ] {
+        let key = if meta.is_some() {
+            ATTN_TARGET.to_string()
+        } else {
+            lycoris(ATTN_TARGET)
+        };
+        let w1 = get(&module, "lokr_w1").unwrap();
+        let file = temp.path().join(format!("{name}.safetensors"));
+        write_lokr_modules(&file, &[(key, module)], meta);
+        let installed = LokrFactors::build(
+            1.0,
+            (DIM, DIM),
+            Some(&w1),
+            None,
+            None,
+            Some(&resident_w2),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("the factors reconstruct to_q")
+        .resident_f32_bytes() as u64;
+        let spec = LoadSpec::new(WeightsSource::Dir(tiny_snapshot()))
+            .with_adapters(vec![AdapterSpec::new(file.clone(), 1.0, AdapterKind::Lokr)]);
+        let overlay = adapter_overlay(&spec, &tiny_snapshot(), Tier::Bf16).unwrap();
+        let file_bytes = std::fs::metadata(&file).unwrap().len();
+        assert!(
+            overlay.residual_bytes >= installed,
+            "{name}: overlay {} must cover the installed f32 factors {installed}",
+            overlay.residual_bytes
+        );
+        assert!(
+            overlay.residual_bytes > file_bytes,
+            "{name}: a low-rank LoKr is resident above its file bytes ({file_bytes})"
+        );
+    }
+}

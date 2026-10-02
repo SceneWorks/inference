@@ -1508,7 +1508,7 @@ pub fn save_lora_peft(
 /// Write a LoKr [`LoraSet`] as `.safetensors`: bare keys `{path}.lokr_w1` + (`lokr_w2` |
 /// `lokr_w2_a`/`lokr_w2_b`), with `networkType`/`rank`/`alpha`/`decomposeFactor` metadata. No key
 /// prefix (the SDXL LoKr loader accepts a `base_model.model.unet.` prefix but bare keys resolve for
-/// every family). Matches the MLX `save_lokr` (integer rank/alpha rendering).
+/// every family). Matches the MLX `save_lokr` (integer rank, lossless alpha).
 pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Path) -> Result<()> {
     if set.kind != AdapterKind::Lokr {
         return Err(CandleError::Msg(
@@ -1519,7 +1519,9 @@ pub fn save_lokr(set: &LoraSet, extra_meta: &HashMap<String, String>, path: &Pat
     let mut meta: HashMap<String, String> = HashMap::new();
     meta.insert("networkType".into(), set.kind.network_type().into());
     meta.insert("rank".into(), (set.rank as i64).to_string());
-    meta.insert("alpha".into(), (set.alpha as i64).to_string());
+    // Lossless (sc-24158): `f32` Display renders an integral alpha as before (`4`) and keeps a
+    // fractional one (`0.5`) — `as i64` truncated it, silently rescaling the reloaded LoKr.
+    meta.insert("alpha".into(), set.alpha.to_string());
     meta.insert("decomposeFactor".into(), set.decompose_factor.to_string());
     for (k, v) in extra_meta {
         meta.entry(k.clone()).or_insert_with(|| v.clone());
@@ -2862,5 +2864,31 @@ mod tests {
             "{not valid json".to_string(),
         )]);
         assert!(LoraAdapterMeta::from_file_metadata(&bad).is_none());
+    }
+
+    /// sc-24158: a fractional LoKr `alpha` survives the save → metadata → reload round trip (the
+    /// writer used `as i64`, truncating `2.5` to `2` and silently rescaling the reloaded LoKr).
+    #[test]
+    fn save_lokr_writes_a_fractional_alpha_losslessly() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("lokr.safetensors");
+        let set = LoraSet {
+            kind: AdapterKind::Lokr,
+            rank: 4,
+            alpha: 2.5,
+            decompose_factor: -1,
+            vars: Vec::new(),
+            targets: Vec::new(),
+        };
+        save_lokr(&set, &HashMap::new(), &path).unwrap();
+        let meta = gen_core::weightsmeta::safetensors_file_metadata(&path).unwrap();
+        assert_eq!(meta.get("alpha").map(String::as_str), Some("2.5"));
+        assert_eq!(meta.get("rank").map(String::as_str), Some("4"));
+        let (rank, alpha) = parse_lokr_metadata(
+            meta.get("rank").map(String::as_str),
+            meta.get("alpha").map(String::as_str),
+        )
+        .unwrap();
+        assert_eq!((rank, alpha), (4.0, 2.5));
     }
 }
